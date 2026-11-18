@@ -344,13 +344,16 @@ pub(crate) const MAX_MODEL_PAGES: usize = 100;
 /// of the page loop behind both the metadata catalogue (`list_models`) and
 /// the launch probe (`discover_model` in `host.rs`). Page params, cursor
 /// advance and the page bound are identical; only failure classification
-/// differs, so every failure maps through the caller's constructors. Returns
-/// the entries plus whether the bound truncated the catalogue: the metadata
-/// read keeps the truncated prefix (as before), the launch probe reports the
-/// bound instead.
+/// differs, so every failure maps through the caller's constructors. Each
+/// page is bounded by `per_page` capped by the caller's overall `deadline`,
+/// so two slow pages fit their individual budgets without exceeding the
+/// reader's overall deadline. Returns the entries plus whether the bound
+/// truncated the catalogue: the metadata read keeps the truncated prefix
+/// (as before), the launch probe reports the bound instead.
 pub(crate) async fn collect_model_pages(
     client: &NativeClient,
-    deadline: Instant,
+    per_page: Duration,
+    overall: Instant,
     encode_error: impl Fn() -> Error,
     call_error: impl Fn(Error) -> Error,
     schema_error: impl Fn() -> Error,
@@ -360,6 +363,7 @@ pub(crate) async fn collect_model_pages(
     let mut cursor: Option<String> = None;
     let mut seen_cursors = HashSet::new();
     for _ in 0..MAX_MODEL_PAGES {
+        let deadline = (Instant::now() + per_page).min(overall);
         let response = client
             .call(
                 "model/list",
@@ -402,6 +406,7 @@ pub(crate) async fn list_models(
         let client = probe.client();
         let (entries, _) = collect_model_pages(
             &client,
+            READ_TIMEOUT,
             deadline,
             invalid_page,
             |error| {

@@ -180,6 +180,7 @@ struct ValidatedStartPlan {
     route: CodexRoute,
     frozen_store: NativeStoreBinding,
     requested_model: Option<String>,
+    daemon_model: Option<String>,
     requested_effort: Option<String>,
     collaboration_mode: Option<NativeCollaborationModeKind>,
     permissions: String,
@@ -279,11 +280,28 @@ fn validate_start_plan(
     // An omitted model selects the harness native default (`isDefault`)
     // at start; an explicit model must match exactly or fail honestly
     // with no substitution. Requested-absent stays null in readback.
+    // The daemon carries its frozen choice separately in `daemon_model`,
+    // so a model-less launch never becomes an explicit request.
     let requested_model: Option<String> = profile
         .get("model")
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .map(str::to_owned);
+    let daemon_model: Option<String> = profile
+        .get("daemon_model")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned);
+    // A caller request and a daemon freeze never name different models:
+    // the freeze only fills an omitted request.
+    if let (Some(requested), Some(frozen)) = (&requested_model, &daemon_model)
+        && requested != frozen
+    {
+        return Err(Error::new(
+            "profile_error",
+            "Codex frozen daemon model does not match the requested model",
+        ));
+    }
     let requested_effort = optional_profile_text(profile, "effort", "Codex")?;
     let collaboration_mode =
         match optional_profile_text(profile, "collaboration_mode", "Codex")?.as_deref() {
@@ -391,6 +409,7 @@ fn validate_start_plan(
         route,
         frozen_store,
         requested_model,
+        daemon_model,
         requested_effort,
         collaboration_mode,
         permissions,
@@ -621,9 +640,10 @@ impl CodexPlugin {
 
     async fn discover(&self, raw: &Value) -> Result<Value> {
         ensure_dedicated_reader(
-            self.session.is_some(),
-            self.failed_start.is_some() || self.failed_attach.is_some(),
-            self.observer.is_some(),
+            self.session.is_some()
+                || self.failed_start.is_some()
+                || self.failed_attach.is_some()
+                || self.observer.is_some(),
             "Codex",
             "discovery",
         )?;
@@ -638,9 +658,7 @@ impl CodexPlugin {
     /// and no inference; the default entry is the native `isDefault`.
     async fn model_list(&self, raw: &Value) -> Result<Value> {
         ensure_dedicated_reader(
-            self.session.is_some(),
-            self.failed_start.is_some(),
-            self.observer.is_some(),
+            self.session.is_some() || self.failed_start.is_some() || self.observer.is_some(),
             "Codex",
             "model.list",
         )?;
@@ -681,9 +699,7 @@ impl CodexPlugin {
     /// identity (including any email) is never read or returned.
     async fn quota_read(&self, raw: &Value) -> Result<Value> {
         ensure_dedicated_reader(
-            self.session.is_some(),
-            self.failed_start.is_some(),
-            self.observer.is_some(),
+            self.session.is_some() || self.failed_start.is_some() || self.observer.is_some(),
             "Codex",
             "quota.read",
         )?;
@@ -709,9 +725,7 @@ impl CodexPlugin {
     /// native archive surface and keeps its sessions.
     async fn native_archive(&self, raw: &Value) -> Result<Value> {
         ensure_dedicated_reader(
-            self.session.is_some(),
-            self.failed_start.is_some(),
-            self.observer.is_some(),
+            self.session.is_some() || self.failed_start.is_some() || self.observer.is_some(),
             "Codex",
             "native.archive",
         )?;
@@ -1259,6 +1273,7 @@ impl CodexPlugin {
             &session.native_client,
             &plan.workspace,
             plan.requested_model.as_deref(),
+            plan.daemon_model.as_deref(),
             plan.requested_effort.as_deref(),
             plan.collaboration_mode.is_some(),
             NativeStartContext {
@@ -1703,6 +1718,7 @@ impl CodexPlugin {
         client: &NativeClient,
         workspace: &Path,
         requested_model: Option<&str>,
+        daemon_model: Option<&str>,
         requested_effort: Option<&str>,
         experimental_api: bool,
         context: NativeStartContext<'_>,
@@ -1862,11 +1878,12 @@ impl CodexPlugin {
             ));
         }
 
-        // The daemon freezes the native default into warm snapshots before
-        // any session spawns; an omitted model here means a cold daemon
-        // cache left the snapshot untouched, so fall back to the native
-        // `isDefault` entry exactly as a daemon freeze would.
-        let model = discover_model(client, requested_model).await?;
+        // The daemon freezes the native default in `daemon_model` before any
+        // session spawns; an omitted model with no frozen value means the
+        // daemon's live read failed, so fall back to the native `isDefault`
+        // entry exactly as a daemon freeze would. `requested` stays null in
+        // readback; the frozen id selects by `id` only.
+        let model = discover_model(client, requested_model, daemon_model).await?;
         let effort = match requested_effort {
             Some(effort)
                 if model
@@ -2745,17 +2762,18 @@ async fn discard_failed_start(session: &mut AgentSession, error: Error) -> Error
 }
 
 /// Pure native catalogue selection shared by start and `model.list`.
-/// An explicit request matches exactly or fails honestly with no
-/// substitution; an omitted request uses the native `isDefault` entry or
-/// fails honestly when the catalogue names none (e.g. an empty catalogue
-/// serves no default to fall back to, or a cold daemon cache left the
-/// snapshot without its daemon-resolved default).
+/// An explicit request matches exactly (`id` and `model`) or fails
+/// honestly with no substitution; a daemon-frozen model-less launch matches
+/// by `id` only, preserving the native `isDefault` acceptance (no
+/// `model ==` check); a cold omitted request uses the native `isDefault`
+/// entry or fails honestly when the catalogue names none.
 fn select_launch_model(
     entries: &[NativeModelEntry],
     requested_model: Option<&str>,
+    daemon_model: Option<&str>,
 ) -> Result<NativeModelEntry> {
     if let Some(requested) = requested_model {
-        entries
+        return entries
             .iter()
             .find(|model| model.id == requested && model.model == requested)
             .cloned()
@@ -2765,30 +2783,66 @@ fn select_launch_model(
                     "model_list",
                     "The exact requested Codex model is unavailable in this account catalogue",
                 )
-            })
-    } else {
-        entries
+            });
+    }
+    if let Some(frozen) = daemon_model.filter(|frozen| !frozen.trim().is_empty()) {
+        return entries
             .iter()
-            .find(|model| model.is_default)
+            .find(|model| model.id == frozen)
             .cloned()
             .ok_or_else(|| {
                 eliot_plugin::start_classification::harness_unavailable_model(
                     "codex",
                     "model_list",
-                    "Codex model/list reported no default model; use an explicit model",
+                    "Codex model/list no longer contains the daemon-frozen default model; use an explicit model",
                 )
-            })
+            });
+    }
+    entries
+        .iter()
+        .find(|model| model.is_default)
+        .cloned()
+        .ok_or_else(|| {
+            eliot_plugin::start_classification::harness_unavailable_model(
+                "codex",
+                "model_list",
+                "Codex model/list reported no default model; use an explicit model",
+            )
+        })
+}
+
+/// Bounded launch catalogue: per-page `RPC_TIMEOUT` capped by an overall
+/// launch budget, so two slow pages fit their individual budgets.
+const LAUNCH_CATALOGUE_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+
+#[cfg(test)]
+mod launch_budget_tests {
+    use super::{LAUNCH_CATALOGUE_BUDGET, RPC_TIMEOUT};
+
+    #[test]
+    fn launch_budget_holds_two_slow_pages() {
+        // Two 20s pages previously fit their individual 30s budgets but
+        // exceeded a single 30s whole-catalogue deadline. The shared loop
+        // keeps the per-page budget capped by the overall budget, so both
+        // fit.
+        assert!(RPC_TIMEOUT.as_secs() >= 30, "per-page budget stays 30s");
+        assert!(
+            LAUNCH_CATALOGUE_BUDGET >= RPC_TIMEOUT * 2,
+            "overall holds at least two pages"
+        );
     }
 }
 
 async fn discover_model(
     client: &NativeClient,
     requested_model: Option<&str>,
+    daemon_model: Option<&str>,
 ) -> Result<NativeModelEntry> {
     // Only prerequisite reads ran; no thread or input was dispatched.
     let (entries, truncated) = crate::discovery::collect_model_pages(
         client,
-        Instant::now() + RPC_TIMEOUT,
+        RPC_TIMEOUT,
+        Instant::now() + LAUNCH_CATALOGUE_BUDGET,
         || Error::new("internal", "Codex model/list params could not be encoded"),
         |error| {
             pre_dispatch_read_error(
@@ -2820,7 +2874,7 @@ async fn discover_model(
     // End of catalogue: select from all pages at once so an omitted
     // request sees the default wherever it is paged. Requested
     // selection still fails honestly with no substitution.
-    select_launch_model(&entries, requested_model)
+    select_launch_model(&entries, requested_model, daemon_model)
 }
 
 async fn read_owned_thread(client: &NativeClient, thread_id: &str) -> Result<Value> {
@@ -3997,36 +4051,48 @@ mod tests {
 
     #[test]
     fn absent_model_selects_the_native_default_without_substitution() {
-        // Cold daemon cache path: the freeze left the snapshot untouched, so
-        // the plugin falls back to the native `isDefault` entry exactly as a
-        // daemon freeze would.
+        // Cold daemon path (no frozen value): the plugin falls back to the
+        // native `isDefault` entry exactly as a daemon freeze would.
         let entries = recorded_catalogue();
-        let selected = super::select_launch_model(&entries, None).expect("default selected");
+        let selected = super::select_launch_model(&entries, None, None).expect("default selected");
         assert_eq!(selected.id, "gpt-6-luna");
         assert_eq!(selected.default_reasoning_effort, "medium");
+    }
+
+    #[test]
+    fn frozen_daemon_model_selects_by_id_without_model_equality() {
+        // Warm daemon path: the frozen `daemon_model` selects by `id` only,
+        // so a model-less launch never becomes an explicit `id == model`
+        // request. `requested` stays null; the frozen id decides.
+        let entries = recorded_catalogue();
+        let selected = super::select_launch_model(&entries, None, Some("gpt-6-mini"))
+            .expect("frozen selected");
+        assert_eq!(selected.id, "gpt-6-mini");
+        let error = super::select_launch_model(&entries, None, Some("gpt-9-ghost")).unwrap_err();
+        assert_eq!(error.code, "native_model_unavailable");
     }
 
     #[test]
     fn explicit_model_matches_exactly_and_unavailable_fails_without_substitution() {
         let entries = recorded_catalogue();
         let selected =
-            super::select_launch_model(&entries, Some("gpt-6-mini")).expect("exact match");
+            super::select_launch_model(&entries, Some("gpt-6-mini"), None).expect("exact match");
         assert_eq!(selected.id, "gpt-6-mini");
         assert!(!selected.is_default);
-        let error = super::select_launch_model(&entries, Some("gpt-9-ghost")).unwrap_err();
+        let error = super::select_launch_model(&entries, Some("gpt-9-ghost"), None).unwrap_err();
         assert_eq!(error.code, "native_model_unavailable");
     }
 
     #[test]
     fn empty_catalogue_names_no_default_and_fails_honestly() {
-        let error = super::select_launch_model(&[], None).unwrap_err();
+        let error = super::select_launch_model(&[], None, None).unwrap_err();
         assert_eq!(error.code, "native_model_unavailable");
     }
 
     #[test]
     fn refused_model_at_start_is_failed_with_harness_origin() {
         let entries = recorded_catalogue();
-        let error = super::select_launch_model(&entries, Some("gpt-9-ghost")).unwrap_err();
+        let error = super::select_launch_model(&entries, Some("gpt-9-ghost"), None).unwrap_err();
         assert_eq!(error.code, "native_model_unavailable");
         assert_eq!(error.origin, Some(eliot_core::FailureOrigin::Harness));
         assert!(eliot_plugin::start_classification::is_proven_no_effect(

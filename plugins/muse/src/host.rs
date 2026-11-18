@@ -957,13 +957,17 @@ impl MusePlugin {
                 )
             };
         // An omitted request accepts the server-selected model as
-        // effective; an explicit request must match exactly. Retain it as
-        // the session-verified model so later turn associations report the
-        // switch instead of the launch value.
+        // effective, but only when the server actually names one; an empty
+        // or missing `modelId` never verifies. An explicit request must
+        // match exactly. Retain it as the session-verified model so later
+        // turn associations report the switch instead of the launch value.
         session.selected_model = effective_model.clone();
-        let model_verified = requested_model
-            .as_deref()
-            .is_none_or(|requested| effective_model.as_deref() == Some(requested));
+        let model_verified = match requested_model.as_deref() {
+            None => effective_model
+                .as_deref()
+                .is_some_and(|model| !model.trim().is_empty()),
+            Some(requested) => effective_model.as_deref() == Some(requested),
+        };
         let approval_verified = requested_approval
             .as_deref()
             .is_some_and(|approval| effective_approval.as_deref() == Some(approval));
@@ -2338,9 +2342,7 @@ impl MusePlugin {
     /// all-false stays unknown and is never invented by list order.
     async fn model_list(&self, raw: &Value) -> Result<Value> {
         ensure_dedicated_reader(
-            self.session.is_some(),
-            self.failed_start.is_some(),
-            false,
+            self.session.is_some() || self.failed_start.is_some(),
             "Muse",
             "model.list",
         )?;
@@ -2443,9 +2445,7 @@ impl MusePlugin {
     /// enters the response, logs or Store.
     async fn quota_read(&self, raw: &Value) -> Result<Value> {
         ensure_dedicated_reader(
-            self.session.is_some(),
-            self.failed_start.is_some(),
-            false,
+            self.session.is_some() || self.failed_start.is_some(),
             "Muse",
             "quota.read",
         )?;

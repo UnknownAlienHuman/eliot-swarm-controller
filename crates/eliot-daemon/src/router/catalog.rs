@@ -249,7 +249,7 @@ impl Router {
             .map_err(|_| Error::new("internal", "harness models could not be encoded"))
     }
 
-    async fn models_for_snapshot(
+    pub(super) async fn models_for_snapshot(
         &self,
         harness: &str,
         snapshot: Option<Value>,
@@ -409,12 +409,38 @@ impl Router {
         let mut profile = snapshot
             .ok_or_else(|| Error::new("profile_error", "quota requires a native profile"))?;
         let route = crate::plugin_host::metadata_route(&profile)?;
-        // Universal policy, decided before any reader spawns: an external
-        // provider route never reports CLI/keyring quota for another route.
-        // The refusal flows through the same shaped error arm as a native
-        // reader refusal, so routing and `harness.quota` see identical facts.
-        let external_refusal = catalog::external_quota_route(&harness, &route.environment)
-            .map(eliot_plugin::quota::environment);
+        // Universal policy, decided before any reader spawns and before any
+        // cache access: an external provider route never reports CLI/keyring
+        // quota for another route. The refusal flows through the same shaped
+        // error arm as a native reader refusal, so routing and
+        // `harness.quota` see identical facts, and it is never cached.
+        // Unavailable quota stays `unknown` via the existing projection,
+        // never 0.
+        if let Some(note) = catalog::external_quota_route(&harness, &route.environment) {
+            let mut response = eliot_core::api::HarnessQuotaResponse {
+                harness: harness.clone(),
+                scope,
+                fetched_at_ms: now_ms(),
+                ttl_ms: catalog::CATALOG_TTL_MS,
+                credential,
+                status: eliot_core::api::HARNESS_QUOTA_SUPPORTED.to_owned(),
+                note: None,
+                details: None,
+            };
+            catalog::quota_read_error(&mut response, eliot_plugin::quota::environment(note));
+            request.validate_response(&response)?;
+            let route_verified = catalog::canonical_cache_identity(
+                &label,
+                &profile,
+                route.identity.as_deref(),
+                &route.environment,
+            )
+            .is_some();
+            return Ok(catalog::ScopedQuota {
+                response,
+                route_verified,
+            });
+        }
         if harness == "antigravity" {
             let cmd = profile["cmd"].as_str().unwrap_or("agy");
             let (cmd, _) = crate::adhoc::reader_executable(cmd, &harness, deadline).await?;
@@ -463,15 +489,11 @@ impl Router {
                 route_verified,
             });
         }
-        let raw = match external_refusal {
-            Some(error) => Err(error),
-            None => {
-                self.inner
-                    .plugin_host
-                    .quota(profile, route.environment, deadline.into())
-                    .await
-            }
-        };
+        let raw = self
+            .inner
+            .plugin_host
+            .quota(profile, route.environment, deadline.into())
+            .await;
         let mut response = eliot_core::api::HarnessQuotaResponse {
             harness: harness.clone(),
             scope,
@@ -1202,28 +1224,6 @@ impl CatalogCache {
         self.models
             .get(key)
             .filter(|entry| quota_fresh(entry.fetched_at_ms, entry.ttl_ms, now))
-            .cloned()
-    }
-
-    /// Freshest daemon-owned catalogue entry for one launch scope, without
-    /// spawning: the freeze path consults only what a previous
-    /// `harness.models` read already cached. A miss leaves the snapshot
-    /// untouched for the plugin's native read, so passive freeze work can
-    /// never fail a launch its readers could serve.
-    pub(crate) fn find_models_by_scope(
-        &self,
-        harness: &str,
-        scope: &str,
-        now: i64,
-    ) -> Option<HarnessModelsResponse> {
-        self.models
-            .values()
-            .filter(|entry| {
-                entry.harness == harness
-                    && entry.scope == scope
-                    && quota_fresh(entry.fetched_at_ms, entry.ttl_ms, now)
-            })
-            .max_by_key(|entry| entry.fetched_at_ms)
             .cloned()
     }
 
@@ -2086,6 +2086,73 @@ mod tests {
             launch_model_default("claude", &response).expect("passthrough"),
             None
         );
+    }
+
+    #[test]
+    fn canonical_identity_separates_cmd_version_and_route() {
+        // A changed `cmd` must never reuse a stale catalogue entry: the key
+        // is the canonical executable/version/route identity, not scope.
+        let base = json!({"harness":"codex","cmd":"/bin/a","route_binding":{"name":"r"}});
+        let other_cmd = json!({"harness":"codex","cmd":"/bin/b","route_binding":{"name":"r"}});
+        let env = json!({});
+        let first = canonical_cache_identity("p", &base, Some("v1"), &env).expect("key");
+        let second = canonical_cache_identity("p", &other_cmd, Some("v1"), &env).expect("key");
+        assert_ne!(first, second, "changed executable separates the key");
+        // The native-read key needs a version: without one there is no key
+        // to share, so scope alone can never hit.
+        assert!(models_key(&first, "/bin/a", Some("1")).is_some());
+        assert!(models_key(&first, "/bin/a", None).is_none());
+        let same_scope = models_key(&first, "/bin/a", Some("1")).unwrap();
+        let other_version = models_key(&first, "/bin/a", Some("2")).unwrap();
+        assert_ne!(
+            same_scope, other_version,
+            "changed version separates the key"
+        );
+    }
+
+    #[test]
+    fn adhoc_freeze_shares_the_catalogue_label() {
+        // Catalogue ad-hoc reads cache under `adhoc`; the freeze must share
+        // it, never `adhoc-<harness>`, or a cold launch misses a warm cache.
+        let snapshot = json!({"harness":"codex"});
+        let (catalogue_scope, _) = describe_snapshot("adhoc", "codex", Some(&snapshot));
+        assert_eq!(catalogue_scope, "profile:adhoc harness:codex route:direct");
+        let (split_scope, _) = describe_snapshot("adhoc-codex", "codex", Some(&snapshot));
+        assert_ne!(
+            catalogue_scope, split_scope,
+            "the adhoc split would miss the catalogue entry"
+        );
+    }
+
+    #[test]
+    fn external_refusal_stays_unknown_never_zero() {
+        // An external-route refusal carries no windows: the existing
+        // projection stays `unknown` (None), never a fabricated 0.
+        let mut response = HarnessQuotaResponse {
+            harness: "antigravity".to_owned(),
+            scope: "profile:adhoc harness:antigravity".to_owned(),
+            fetched_at_ms: 1_000,
+            ttl_ms: CATALOG_TTL_MS,
+            credential: "none".to_owned(),
+            status: eliot_core::api::HARNESS_QUOTA_SUPPORTED.to_owned(),
+            note: None,
+            details: None,
+        };
+        quota_read_error(
+            &mut response,
+            eliot_plugin::quota::environment(
+                "Antigravity profile selects external auth; native keyring quota would describe another route",
+            ),
+        );
+        let details = response.details.expect("refusal carries error details");
+        assert!(details.get("windows").is_none(), "no windows to project");
+        let projection = project_quota(
+            obs("antigravity", &response.scope, 2_000),
+            &details,
+            Some("gemini"),
+            2_000,
+        );
+        assert!(projection.is_none(), "unavailable quota stays unknown");
     }
 
     #[test]

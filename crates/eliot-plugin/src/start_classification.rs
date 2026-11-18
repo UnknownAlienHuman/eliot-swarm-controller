@@ -51,11 +51,6 @@ impl SettledStartFailure {
             Self::ProvenNoEffect(value) => Ok(value.clone()),
         }
     }
-
-    /// Whether this failure proves no native effect happened.
-    pub fn is_proven(&self) -> bool {
-        matches!(self, Self::ProvenNoEffect(_))
-    }
 }
 
 pub fn harness_unavailable_model(harness: &str, phase: &str, message: &str) -> Error {
@@ -102,10 +97,8 @@ mod tests {
     fn settled_start_failure_replays_its_retained_outcome() {
         let failure = SettledStartFailure::Uncertain(Error::new("unknown", "lost reply"));
         assert!(failure.replay().is_err());
-        assert!(!failure.is_proven());
         let value = serde_json::json!({"state": "failed"});
         let proven = SettledStartFailure::ProvenNoEffect(value.clone());
         assert_eq!(proven.replay().unwrap(), value);
-        assert!(proven.is_proven());
     }
 }

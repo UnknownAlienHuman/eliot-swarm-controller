@@ -752,9 +752,7 @@ impl ClaudePlugin {
             .as_ref()
             .ok_or_else(|| not_initialized("Claude"))?;
         ensure_dedicated_reader(
-            self.session.is_some(),
-            self.failed_start.is_some(),
-            false,
+            self.session.is_some() || self.failed_start.is_some(),
             "Claude",
             "model.list",
         )?;

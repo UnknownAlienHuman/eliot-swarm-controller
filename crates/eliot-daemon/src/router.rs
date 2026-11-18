@@ -2176,21 +2176,24 @@ impl Router {
     }
 
     /// Freeze the daemon-owned launch default for a Codex or Muse snapshot
-    /// that omits its model: resolve the native default from the daemon's
-    /// own cached catalogue entry (refusing honestly when none names one),
-    /// so the plugins translate an already-decided launch. Muse defers to
-    /// the server default, so only an empty catalogue refuses there. Only a
-    /// fresh cache entry decides; a miss leaves the snapshot untouched for
-    /// the plugin's native read, so passive freeze work can never fail a
-    /// launch its readers could serve. Explicit models, routed Codex
-    /// profiles (the Responses route requires an explicit model id) and
-    /// other harnesses pass through untouched; the plugins keep validating
-    /// those against their native entries.
-    fn resolve_launch_default(
+    /// that omits its model: resolve the native default through the
+    /// existing catalogue reader (cache hit or live read), then retain it
+    /// separately from the caller's omitted request, so the plugins
+    /// translate an already-decided launch. `requested.model` stays null;
+    /// the effective model is the frozen `daemon_model` (Codex) or the
+    /// server default (Muse). Muse defers to the server default, so only
+    /// an empty catalogue refuses there. A live-read failure leaves the
+    /// snapshot untouched for the plugin's native read, so passive freeze
+    /// work can never fail a launch its readers could serve. Explicit
+    /// models, routed Codex profiles (the Responses route requires an
+    /// explicit model id) and other harnesses pass through untouched; the
+    /// plugins keep validating those against their native entries.
+    async fn resolve_launch_default(
         &self,
         harness: &str,
-        profile_label: &str,
+        cache_label: &str,
         snapshot: &mut Value,
+        deadline: std::time::Instant,
     ) -> Result<()> {
         if !matches!(harness, "codex" | "muse") {
             return Ok(());
@@ -2207,15 +2210,33 @@ impl Router {
         if !omitted {
             return Ok(());
         }
-        let (scope, _) = catalog::describe_snapshot(profile_label, harness, Some(snapshot));
-        let cache = self.inner.catalog_cache.lock_recover();
-        let Some(response) = cache.find_models_by_scope(harness, &scope, crate::common::now_ms())
-        else {
+        if snapshot
+            .get("daemon_model")
+            .and_then(Value::as_str)
+            .is_some_and(|model| !model.trim().is_empty())
+        {
             return Ok(());
+        }
+        // The existing reader decides (cache hit or live native read) under
+        // the canonical executable/version/route key, so a changed `cmd`
+        // never reuses a stale entry. Ad-hoc launches share the catalogue's
+        // `adhoc` label, never `adhoc-<harness>`.
+        let response = match self
+            .models_for_snapshot(
+                harness,
+                Some(snapshot.clone()),
+                cache_label,
+                None,
+                None,
+                deadline,
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(_) => return Ok(()),
         };
-        drop(cache);
         if let Some(model) = catalog::launch_model_default(harness, &response)? {
-            snapshot["model"] = Value::String(model);
+            snapshot["daemon_model"] = Value::String(model);
         }
         Ok(())
     }
@@ -2335,7 +2356,10 @@ impl Router {
             if let Some(args) = request.args.as_object_mut() {
                 args.insert("profile".to_owned(), Value::String(profile_name.clone()));
             }
-            self.resolve_launch_default(&harness, &profile_name, &mut snapshot)?;
+            // The catalogue caches ad-hoc reads under `adhoc`, never
+            // `adhoc-<harness>`: the freeze shares that key.
+            self.resolve_launch_default(&harness, "adhoc", &mut snapshot, deadline)
+                .await?;
             install_frozen_profile(request, &harness, snapshot, true)?;
             {
                 let store = self.inner.store.lock().await;
@@ -2349,7 +2373,9 @@ impl Router {
                 .route_launch_profile(principal, request, arbitrated)
                 .await?;
             request.args["profile"] = Value::String(name.clone());
-            self.resolve_launch_default(&harness, &name, &mut snapshot)?;
+            let deadline = std::time::Instant::now() + crate::adhoc::DISCOVERY_BUDGET;
+            self.resolve_launch_default(&harness, &name, &mut snapshot, deadline)
+                .await?;
             install_frozen_profile(request, &harness, snapshot, true)?;
             let store = self.inner.store.lock().await;
             hierarchy::check_agent_launch_authority(&store, principal, request)?;
@@ -2456,7 +2482,18 @@ impl Router {
         if let Some(args) = request.args.as_object_mut() {
             args.insert("profile".to_owned(), Value::String(profile_name.clone()));
         }
-        self.resolve_launch_default(&harness, &profile_name, &mut snapshot)?;
+        // Reused parent snapshots already carry their frozen default; only
+        // freshly resolved child snapshots need a freeze. The label matches
+        // the catalogue's named-profile key.
+        if snapshot
+            .get("daemon_model")
+            .and_then(Value::as_str)
+            .is_none_or(|model| model.trim().is_empty())
+        {
+            let deadline = std::time::Instant::now() + crate::adhoc::DISCOVERY_BUDGET;
+            self.resolve_launch_default(&harness, &profile_name, &mut snapshot, deadline)
+                .await?;
+        }
         install_frozen_profile(request, &harness, snapshot, true)?;
         {
             let store = self.inner.store.lock().await;

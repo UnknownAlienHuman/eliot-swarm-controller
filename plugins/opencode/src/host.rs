@@ -634,9 +634,7 @@ impl OpenCodePlugin {
     /// its own reader Job and proves family closure before overlaying results.
     async fn model_list(&self, raw: &Value) -> Result<Value> {
         ensure_dedicated_reader(
-            self.session.is_some(),
-            self.failed_start.is_some(),
-            false,
+            self.session.is_some() || self.failed_start.is_some(),
             "OpenCode",
             "model.list",
         )?;

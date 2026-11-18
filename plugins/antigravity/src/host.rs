@@ -331,9 +331,7 @@ impl Plugin {
     /// `agy models` names no default, so `default` stays null.
     async fn model_list(&self, raw: &Value) -> Result<Value> {
         ensure_dedicated_reader(
-            self.session.is_some(),
-            self.start.is_some(),
-            false,
+            self.session.is_some() || self.start.is_some(),
             "Antigravity",
             "model.list",
         )?;

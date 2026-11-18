@@ -1129,15 +1129,11 @@ pub fn redact_request_details_for_commit(details: &Value, policy: &SecretPolicy)
 /// Refuse a `model.list` or `quota.read` call on a session-bound plugin
 /// instance. Catalogue and quota reads run on a dedicated reader instance
 /// with no session, no retained start outcome and no observer; anything else
-/// is caller error, never a native fact.
-pub fn ensure_dedicated_reader(
-    has_session: bool,
-    has_failed_start: bool,
-    has_observer: bool,
-    harness: &str,
-    method: &str,
-) -> Result<()> {
-    if has_session || has_failed_start || has_observer {
+/// is caller error, never a native fact. The caller passes one
+/// occupied-state predicate (`has_session || has_failed_start ||
+/// has_observer`, including attach state where it exists).
+pub fn ensure_dedicated_reader(occupied: bool, harness: &str, method: &str) -> Result<()> {
+    if occupied {
         return Err(Error::new(
             "bad_state",
             format!("{harness} {method} requires a dedicated reader plugin instance"),
@@ -1243,9 +1239,8 @@ mod tests {
             ("claude", "Claude"),
         ] {
             for method in ["model.list", "quota.read"] {
-                super::ensure_dedicated_reader(false, false, false, display, method)
-                    .expect("dedicated reader");
-                let error = super::ensure_dedicated_reader(true, false, false, display, method)
+                super::ensure_dedicated_reader(false, display, method).expect("dedicated reader");
+                let error = super::ensure_dedicated_reader(true, display, method)
                     .expect_err("session-bound reader");
                 assert_eq!(error.code, "bad_state");
                 assert_eq!(
