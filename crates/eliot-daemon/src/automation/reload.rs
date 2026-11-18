@@ -231,6 +231,43 @@ pub(crate) struct RuleWatcher {
     /// the worker rebuilds from the checkout on every reload instead.
     rules_dir: Option<PathBuf>,
     rules_active: bool,
+    /// Identity of the bound rules directory the last time the watch was
+    /// (re-)armed. A rename-away plus fresh-directory replacement keeps the
+    /// path present, so presence alone cannot tell the watcher is still
+    /// bound to the old inode.
+    rules_identity: Option<(u64, u64)>,
+}
+
+/// Stable identity for a watched directory: the OS handle the active watch
+/// is bound to, so a replacement directory rebinds even though the path
+/// never goes absent.
+fn dir_identity(path: &Path) -> Option<(u64, u64)> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_dir() {
+        return None;
+    }
+    Some(platform_dir_identity(path, &metadata))
+}
+
+#[cfg(unix)]
+fn platform_dir_identity(_path: &Path, metadata: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (metadata.dev(), metadata.ino())
+}
+
+#[cfg(windows)]
+fn platform_dir_identity(path: &Path, _metadata: &std::fs::Metadata) -> (u64, u64) {
+    // The open can race a removal the metadata check just passed: fall back
+    // to a sentinel no real directory has so the caller re-arms instead of
+    // trusting the stale watch.
+    crate::platform::windows::directory_identity(path).unwrap_or((0, 0))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn platform_dir_identity(_path: &Path, _metadata: &std::fs::Metadata) -> (u64, u64) {
+    // No stable directory identity here: every present directory compares
+    // equal, so replacement falls back to presence re-arming.
+    (0, 0)
 }
 
 /// Whether a filesystem event can change the loaded rule snapshot: an edit
@@ -322,44 +359,58 @@ impl RuleWatcher {
         // worker re-arms it through `ensure_watches` instead of failing here.
         let distinct_rules = (rules_root != watched_root).then(|| rules_root.to_path_buf());
         let mut rules_active = false;
+        let mut rules_identity = None;
         if let Some(rules) = &distinct_rules
-            && std::fs::metadata(rules).is_ok_and(|meta| meta.is_dir())
+            && dir_identity(rules).is_some()
             && watcher.watch(rules, RecursiveMode::NonRecursive).is_ok()
         {
             rules_active = true;
+            rules_identity = dir_identity(rules);
         }
         Ok(Self {
             changed,
             watcher,
             rules_dir: distinct_rules,
             rules_active,
+            rules_identity,
         })
     }
 
     /// Re-establish the rules-directory watch after creation or replacement.
     /// The worker loop calls this after wakeups; the periodic reconciliation
     /// reloads from disk regardless, so a missed watch event only delays a
-    /// reload, never loses one.
+    /// reload, never loses one. The watch rebinds whenever the directory
+    /// identity changes: a rename-away plus fresh-directory replacement
+    /// keeps the path present, so comparing presence alone would leave the
+    /// watcher bound to the old inode.
     pub(crate) fn ensure_watches(&mut self) {
         let Some(rules) = self.rules_dir.as_ref() else {
             return;
         };
-        let present = std::fs::metadata(rules).is_ok_and(|meta| meta.is_dir());
-        if present == self.rules_active {
+        let identity = dir_identity(rules);
+        if identity == self.rules_identity {
             return;
         }
-        if present {
+        if identity.is_some() {
+            // Unwatch first so the re-arm binds the replacement directory
+            // instead of keeping the stale handle.
+            let _ = self.watcher.unwatch(rules);
             if self
                 .watcher
                 .watch(rules, RecursiveMode::NonRecursive)
                 .is_ok()
             {
+                self.rules_identity = identity;
                 self.rules_active = true;
+                return;
             }
         } else {
             let _ = self.watcher.unwatch(rules);
-            self.rules_active = false;
         }
+        // Absent, or the re-arm failed and must be retried: stay inactive
+        // without recording an identity.
+        self.rules_identity = None;
+        self.rules_active = false;
     }
 
     pub(crate) async fn changed(&mut self) -> std::result::Result<(), watch::error::RecvError> {
@@ -433,6 +484,36 @@ mod watcher_scope_tests {
         fs::create_dir_all(root.join("rules")).unwrap();
         watcher.ensure_watches();
         assert!(watcher.rules_active);
+    }
+
+    #[tokio::test]
+    async fn global_watch_rebinds_replaced_rules_dir_without_absent_check() {
+        let root = std::env::temp_dir().join(format!("eliot-watch-replace-{}", ulid::Ulid::new()));
+        let _temp = crate::test_support::TempDir::own(root.clone());
+        fs::create_dir_all(root.join("rules")).unwrap();
+
+        let mut watcher = RuleWatcher::watch(&root).unwrap();
+        assert!(watcher.rules_active);
+
+        // Replace the directory with no absent check in between: rename it
+        // away and install a fresh one, then re-arm exactly once. Presence
+        // alone would call this a no-op and leave the watcher bound to the
+        // old inode.
+        fs::rename(root.join("rules"), root.join("rules-old")).unwrap();
+        fs::create_dir_all(root.join("rules")).unwrap();
+        watcher.ensure_watches();
+        assert!(watcher.rules_active);
+
+        // Let the replacement's own events land, then require a fresh
+        // wakeup: a write to the replacement directory must arrive. Bound
+        // to the old inode, it never would.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        watcher.changed.mark_unchanged();
+        fs::write(root.join("rules").join("b.toml"), "[[rule]]\n").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), watcher.changed())
+            .await
+            .expect("replacement rules write wakes the watcher")
+            .unwrap();
     }
 
     #[tokio::test]
