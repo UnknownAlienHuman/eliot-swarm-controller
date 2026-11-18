@@ -702,15 +702,31 @@ impl DesktopApp {
         self.set_status("New task.");
     }
 
-    /// The project a new task starts in: its checkout, and its profile
-    /// allowlist when it is registered.
-    pub(super) fn pick_project(&mut self, checkout: &str) {
-        let registered = self
-            .nav
+    /// The registration a checkout path launches under: its own
+    /// registration, or the repository's registration for a linked
+    /// worktree checkout. None for chats and for folders outside the
+    /// registered projects.
+    pub(super) fn launch_registration(&self, checkout: &str) -> Option<&UiProject> {
+        let key = nav::path_key(checkout);
+        self.nav
             .projects
             .iter()
-            .find(|project| project.workspace == checkout)
-            .cloned();
+            .find(|project| nav::path_key(&project.workspace) == key)
+            .or_else(|| {
+                self.nav.projects.iter().find(|project| {
+                    project
+                        .git_checkouts
+                        .iter()
+                        .any(|linked| nav::path_key(&linked.path) == key)
+                })
+            })
+    }
+
+    /// The project a new task starts in: its checkout, and its profile
+    /// allowlist when it is registered (a linked worktree shares its
+    /// repository registration's allowlist).
+    pub(super) fn pick_project(&mut self, checkout: &str) {
+        let registered = self.launch_registration(checkout).cloned();
         self.launch.workspace = checkout.to_owned();
         self.launch.custom_workspace = false;
         self.launch.chat = false;

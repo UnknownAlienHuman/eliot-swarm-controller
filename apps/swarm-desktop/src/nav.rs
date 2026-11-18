@@ -38,7 +38,8 @@ pub struct UiAgent {
     pub harness: String,
     pub state: eliot_core::AgentState,
     /// The recorded registration ID (the daemon's project label), independently
-    /// of the execution path. Move/Handoff query and filter by this.
+    /// of the execution path. Move queries the authorization scope, never
+    /// this label; Handoff narrows listed rows by the scope.
     pub project_id: String,
     /// The authorization scope the server compares for same-project moves
     /// and handoffs, when it differs from [`Self::project_id`]. Absent on
@@ -61,6 +62,11 @@ pub struct UiAgent {
     pub chat: bool,
     /// Archived (`agent.archive`, k92): listed only with Show archived.
     pub archived: bool,
+    /// An optimistic row for a just-launched Agent until the list reads it
+    /// back: its project ID and workspace are the submitted ones, but its
+    /// authorization scope is still unknown. Pickers never treat the ID as
+    /// the scope and never offer this row as a candidate meanwhile.
+    pub pending: bool,
 }
 
 impl UiAgent {
@@ -83,14 +89,20 @@ impl UiAgent {
             tokens: summary.fleet_usage().map(|(tokens, _)| tokens),
             chat: false,
             archived: false,
+            pending: false,
         }
     }
 
     /// The authorization scope the server compares for same-project moves
     /// and handoffs: the retained scope when it differs, else the project
-    /// ID. The daemon stays the judge; the pickers only narrow by this.
-    pub fn scope(&self) -> &str {
-        self.project_scope.as_deref().unwrap_or(&self.project_id)
+    /// ID. None while the row is pending: the daemon row has not arrived,
+    /// so the ID must not stand in for the scope. The daemon stays the
+    /// judge; the pickers only narrow by this.
+    pub fn scope(&self) -> Option<&str> {
+        if self.pending {
+            return None;
+        }
+        Some(self.project_scope.as_deref().unwrap_or(&self.project_id))
     }
 
     /// Working now or on its way.
@@ -1432,6 +1444,7 @@ mod tests {
             tokens: None,
             chat: false,
             archived: false,
+            pending: false,
         }
     }
 
@@ -2351,10 +2364,15 @@ mod tests {
         assert_eq!(agent.workspace.as_deref(), Some("/repo"));
         // The server compares the scope, not the project ID: same ID with
         // a different scope is a different authorization namespace.
-        assert_eq!(agent.scope(), "/repo");
+        assert_eq!(agent.scope(), Some("/repo"));
         let mut legacy = summary(None, None, Some("codex-lite"));
         legacy.project = "p".to_owned();
         let fallback = UiAgent::from_summary(&legacy);
-        assert_eq!(fallback.scope(), "p");
+        assert_eq!(fallback.scope(), Some("p"));
+        // A pending row keeps its submitted ID but its scope is unknown:
+        // the pickers must not treat the ID as the scope.
+        let mut pending = fallback.clone();
+        pending.pending = true;
+        assert_eq!(pending.scope(), None);
     }
 }

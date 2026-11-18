@@ -1123,19 +1123,15 @@ impl DesktopApp {
     }
 
     /// The registration ID the pending launch row carries: the launch
-    /// checkout's registered project, or none for chats and for folders
+    /// checkout's registered project (its repository's registration for a
+    /// linked worktree checkout), or none for chats and for folders
     /// outside the registered projects. Never the workspace path: the
     /// daemon's project label is a registration ID, not a directory.
     fn launch_project_id(&self) -> String {
         if self.launch.chat {
             return String::new();
         }
-        self.nav
-            .projects
-            .iter()
-            .find(|project| {
-                nav::path_key(&project.workspace) == nav::path_key(&self.launch.workspace)
-            })
+        self.launch_registration(&self.launch.workspace)
             .map(|project| project.id.clone())
             .unwrap_or_default()
     }
@@ -1255,7 +1251,9 @@ impl Submitted {
 
 impl LaunchOutcome {
     /// The new Agent's row until the list reads it back: the submitted
-    /// harness and place, titled by the first message.
+    /// harness and place, titled by the first message. Its scope stays
+    /// unknown until the daemon row arrives: the submitted ID must not
+    /// stand in for the scope, and pickers never offer this row meanwhile.
     fn pending_agent(&self, now: i64) -> UiAgent {
         UiAgent {
             id: self.agent.clone(),
@@ -1268,6 +1266,7 @@ impl LaunchOutcome {
                 self.submitted.project.clone()
             },
             project_scope: None,
+            pending: true,
             repo_common_dir: None,
             workspace: if self.submitted.chat {
                 None
@@ -1376,6 +1375,10 @@ mod tests {
         assert_eq!(row.workspace.as_deref(), Some("C:/src/app"));
         assert!(!row.chat);
         assert_eq!(row.title, "Fix the build");
+        // The submitted ID is not the scope: the row stays pending with
+        // an unknown scope until the daemon row arrives.
+        assert!(row.pending);
+        assert_eq!(row.scope(), None);
         assert_eq!(
             starting_label(outcome.submitted.harness.as_deref()),
             "Starting Codex…"
@@ -1401,5 +1404,7 @@ mod tests {
         assert!(row.chat);
         assert!(row.project_id.is_empty());
         assert!(row.workspace.is_none());
+        assert!(row.pending);
+        assert_eq!(row.scope(), None);
     }
 }

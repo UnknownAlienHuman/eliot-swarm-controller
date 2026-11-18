@@ -44,6 +44,7 @@ impl DesktopApp {
                         tokens: None,
                         chat: false,
                         archived: false,
+                        pending: false,
                     })
                 });
                 if let Some(mut agent) = agent {

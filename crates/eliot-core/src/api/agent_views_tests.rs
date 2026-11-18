@@ -762,13 +762,36 @@ fn list_filters_match_projection_and_report_counts_honestly() {
             root: Some("a2".to_owned()),
             ..request.clone()
         },
+        AgentListRequest {
+            project_scope: Some("other".to_owned()),
+            ..request.clone()
+        },
     ] {
         unknown(mutate.validate_response(&reply));
     }
+    // The scope filter reads the effective scope: a registered row whose
+    // project label differs still matches its retained scope, while the
+    // project filter keeps matching the label.
+    let mut registered = reply.clone();
+    registered.agents[0].summary.project = "reg".to_owned();
+    registered.agents[0].summary.project_scope = Some("p".to_owned());
+    let scoped = AgentListRequest {
+        project_scope: Some("p".to_owned()),
+        harness: Some("fake".to_owned()),
+        state: Some(AgentState::Idle),
+        root: Some("a1".to_owned()),
+        ..Default::default()
+    };
+    scoped.validate_response(&registered).unwrap();
+    unknown(request.validate_response(&registered));
     // Unknown filter shapes are invalid, never empty matches.
     for invalid in [
         AgentListRequest {
             project: Some("  ".to_owned()),
+            ..Default::default()
+        },
+        AgentListRequest {
+            project_scope: Some(String::new()),
             ..Default::default()
         },
         AgentListRequest {

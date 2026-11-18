@@ -203,7 +203,8 @@ struct Submitted {
     access: crate::settings::Access,
     chat: bool,
     workspace: String,
-    /// The registration ID of the launch checkout ("" for chats and for
+    /// The registration ID of the launch checkout (its repository's
+    /// registration for a linked worktree checkout; "" for chats and for
     /// folders outside the registered projects): the pending Agent row
     /// carries the project ID or none, never the workspace path.
     project: String,

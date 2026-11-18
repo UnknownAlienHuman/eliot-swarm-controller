@@ -155,6 +155,7 @@ impl DesktopApp {
                                 tokens: row.tokens,
                                 chat: row.chat,
                                 archived: false,
+                                pending: false,
                             })
                     });
                 if let Some(agent) = agent {

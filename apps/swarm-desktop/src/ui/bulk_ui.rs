@@ -1072,6 +1072,7 @@ mod tests {
             tokens: None,
             chat: false,
             archived: true,
+            pending: false,
         }
     }
 
