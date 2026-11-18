@@ -19,6 +19,7 @@ pub struct SwitchLaunch {
     /// the switch worker prepares the target's standard worktree (or verifies
     /// an explicit workspace against it); B still retains A's authorization
     /// scope so the handoff stays in one namespace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
     /// Omitted uses A's retained workspace (or the target project's checkout
     /// when `project` is set). Normal launch workspace checks apply.

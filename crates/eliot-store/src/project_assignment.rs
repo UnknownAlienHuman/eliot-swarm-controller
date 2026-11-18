@@ -856,6 +856,55 @@ pub(super) fn check_dispatch(conn: &Connection, command: &CommandRecord) -> Resu
             ));
         }
     }
+    // A switch that continues in a project carries the target registration
+    // the worker verified before preparation. Reuse the same revision gate
+    // before Git, before setup and before native dispatch, and recheck the
+    // frozen checkout identity before any effect.
+    if let Some(revision) = command
+        .command
+        .args
+        .get(core::api::SWITCH_PROJECT_REVISION_ARG)
+        .and_then(Value::as_i64)
+    {
+        let project = required_string(&command.command.args, "registered_project")?;
+        let Some(registration) = projects::project_registration_tx(conn, &project)? else {
+            return Err(Error::new(
+                "stale_assignment",
+                "switch target registration changed",
+            ));
+        };
+        if registration.revision != revision {
+            return Err(Error::new(
+                "stale_assignment",
+                "switch target registration changed",
+            ));
+        }
+        let workspace = required_string(&command.command.args, "workspace")?;
+        if workspace != registration.checkout {
+            return Err(Error::new(
+                "not_allowed",
+                "switch workspace differs from its target registration",
+            ));
+        }
+        if let Some(preparation) = command.command.args.get("workspace_preparation") {
+            let repo_path = preparation
+                .get("repo_path")
+                .and_then(Value::as_str);
+            let repo_common_dir = preparation
+                .get("repo_common_dir")
+                .and_then(Value::as_str);
+            let preparation_project = preparation.get("project").and_then(Value::as_str);
+            if repo_path != Some(registration.checkout.as_str())
+                || repo_common_dir != Some(registration.repo_common_dir.as_str())
+                || preparation_project != Some(registration.checkout.as_str())
+            {
+                return Err(Error::new(
+                    "not_allowed",
+                    "switch workspace preparation differs from its target registration",
+                ));
+            }
+        }
+    }
     let EffectContext {
         projects,
         caller,

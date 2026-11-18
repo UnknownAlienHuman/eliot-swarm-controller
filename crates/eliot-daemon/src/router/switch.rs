@@ -120,7 +120,19 @@ impl Router {
                     })?
                     .to_owned(),
             };
+            // A targeted continuation explicitly requests standard worktree
+            // preparation, even in a `shared` project: B never starts in the
+            // checkout itself.
+            if target.is_some() && request.launch.worktree.is_none() {
+                launch.args["worktree"] = json!("");
+            }
             launch.args = request.launch.args(&workspace)?;
+            // `request.launch.args` rebuilds from the switch selectors and
+            // would drop the explicit preparation request above; re-assert it
+            // so a `shared` target still mints its standard worktree.
+            if target.is_some() && request.launch.worktree.is_none() {
+                launch.args["worktree"] = json!("");
+            }
             let scope = source.project_scope().to_owned();
             // A switch that requests neither a workspace nor a branch keeps
             // the source checkout: reuse is selected before any preparation.

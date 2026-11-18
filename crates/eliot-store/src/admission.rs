@@ -888,8 +888,25 @@ fn admit_launch_tx(
             // registered project a switch worker resolved for a continue: the
             // registration is daemon-frozen beside the launch selectors, and
             // callers cannot forge it through `reject_launch_derived_keys`.
+            // The workspace record keeps the canonical checkout; the project
+            // ID travels separately in `registered_project`.
             let registered = optional_string(&request.args, "registered_project")?;
-            if input.project != scope && Some(input.project.as_str()) != registered.as_deref() {
+            let mut matches = input.project == scope
+                || Some(input.project.as_str()) == registered.as_deref();
+            if !matches
+                && request
+                    .args
+                    .get(core::api::SWITCH_PROJECT_REVISION_ARG)
+                    .and_then(Value::as_i64)
+                    .is_some()
+                && let Some(project) = registered.as_deref()
+                && let Some(registration) =
+                    projects::project_registration_tx(tx, project)?
+                && input.project == registration.checkout
+            {
+                matches = true;
+            }
+            if !matches {
                 return Err(Error::new(
                     "invalid",
                     "workspace project differs from launch",

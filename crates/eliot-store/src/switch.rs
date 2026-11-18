@@ -249,6 +249,43 @@ impl Store {
                         "switch target registration changed",
                     ));
                 }
+                // The frozen checkout admitted here must already be the
+                // target registration's checkout: a changed registration or
+                // a preparation from another repository refuses before any
+                // workspace row or Agent is created.
+                if request.args.get("workspace").and_then(Value::as_str)
+                    != Some(registration.checkout.as_str())
+                {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "switch workspace differs from its target registration",
+                    ));
+                }
+                if let Some(input) = preparation.as_ref() {
+                    if input.repo_path != registration.checkout
+                        || input.repo_common_dir != registration.repo_common_dir
+                        || input.project != registration.checkout
+                    {
+                        return Err(Error::new(
+                            "not_allowed",
+                            "switch workspace preparation differs from its target registration",
+                        ));
+                    }
+                }
+            } else if agent.project != agent.project_scope() {
+                // An ordinary switch after a continuation preserves both the
+                // execution project and the authorization scope.
+                if request
+                    .args
+                    .get("registered_project")
+                    .and_then(Value::as_str)
+                    != Some(agent.project.as_str())
+                {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "switch must keep the source execution project",
+                    ));
+                }
             }
             if load_command(&tx, &request.id)?.is_some()
                 && component(&tx, id, &request.id, 0)?.is_none()
@@ -575,6 +612,8 @@ fn source_tx(
     // Continue-in-project binds the target registration at reserve time, so
     // preparation resolves the target checkout and never the source repo.
     // A projectless source has no execution project for B: it must name one.
+    // An Agent continued into a project keeps that execution project, so an
+    // ordinary switch afterwards needs no target.
     let target = match request.launch.project.as_deref() {
         Some(project) => Some(projects::project_registration_tx(tx, project)?.ok_or_else(
             || {
@@ -584,7 +623,7 @@ fn source_tx(
                 )
             },
         )?),
-        None if source.project_scope().is_empty() => {
+        None if source.project.is_empty() => {
             return Err(Error::new(
                 "invalid",
                 "switch from a projectless chat needs a target project",
