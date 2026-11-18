@@ -1001,7 +1001,7 @@ fn historical_unknown_turn_resolves_after_resume_and_unblocks_delete() {
 }
 
 #[test]
-fn detached_external_observer_retires_but_attached_observer_stays_blocked() {
+fn detached_external_observer_retires_and_attached_observer_can_only_unarchive() {
     // #651: a successfully detached external observer has unknown state by
     // contract, no turns, no live commands and closed custody: it must
     // retire through archive/delete without pretending native stopped.
@@ -1086,15 +1086,21 @@ fn detached_external_observer_retires_but_attached_observer_stays_blocked() {
     // though Unknown observe-only rows now retire: custody still proves the
     // live reader.
     let (live, _) = attach(&mut store, "scope-651-live", "ref-651-live", now);
-    let blocked = store
-        .change_agent_tree(&Ulid::new().to_string(), &live, None, now)
-        .unwrap_err();
-    assert_eq!(blocked.code, "busy");
-    assert!(
-        blocked.message.contains("open observe source"),
-        "{}",
-        blocked.message
-    );
+    for archived in [None, Some(true)] {
+        let blocked = store
+            .change_agent_tree(&Ulid::new().to_string(), &live, archived, now)
+            .unwrap_err();
+        assert_eq!(blocked.code, "busy");
+        assert!(
+            blocked.message.contains("open observe source"),
+            "{}",
+            blocked.message
+        );
+    }
+    let unarchived = store
+        .change_agent_tree(&Ulid::new().to_string(), &live, Some(false), now)
+        .expect("unarchive skips custody for an external observer");
+    assert_eq!(unarchived["archived"], false);
 }
 
 #[test]

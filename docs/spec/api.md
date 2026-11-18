@@ -690,16 +690,19 @@ optional members are omitted when requests are serialized.
 
 `agent.archive {id, agent:"aN", archived:bool}` is Owner-only and atomically
 archives or unarchives the selected Agent and all current descendants. Every
-member must be idle, ended (stopped, failed or lost), a detached external observer
-(`unknown` with no live reader), or an ended native observation (a stopped observed
+member must be idle, ended (stopped, failed or lost), an external observer in
+`unknown` state, or an ended native observation (a stopped observed
 child keeping its `unknown` turn as retained ended-observation evidence), with no
 active turn, no other uncertain turn, no pending request and no open command.
 Archiving an ended member also needs its custody resolved: no unexited owned process,
 `unknown` artifact or open native source (Eliot's `os`/`git`/`workspace_process`
-observers may stay open); a live observation (an attached observer with an open source)
-still blocks on custody. Otherwise it returns typed `busy`, naming the blocking Agent and its state, request, command, turn,
-process, source or artifact, and stops nothing. Archive preserves retained unknown evidence.
-Unarchive needs no drain. The flag is durable. Admission of send, resume, steer or inject
+observers may stay open). Archiving an external observer in `unknown` state
+also requires resolved custody, so an open `observe` source blocks it.
+A failed guard returns typed `busy` and names the blocking Agent and its state,
+request, command, turn, process, source or artifact. Archive stops nothing and
+preserves retained unknown evidence.
+Unarchive applies the same state, turn, request and command guards and skips
+the custody check. The flag is durable. Admission of send, resume, steer or inject
 atomically unarchives its target, including selector members, so new activity appears in
 the default list. Reattaching an archived observer opens a new `observe` source and
 clears the flag, so a live reader is never hidden.

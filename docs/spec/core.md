@@ -933,15 +933,16 @@ read paths; a retried ack over it succeeds as already acked. An unset
 
 `archived` is a durable presentation flag independent of lifecycle state; archiving
 never stops a generation. Archive/unarchive requires idle, ended (stopped, failed or
-lost), a detached external observer, or an ended native observation, with no active
-turn, no other uncertain turn, and no pending request or open command, so a lost tree
+lost), an external observer in `unknown` state, or an ended native observation, with
+no active turn, no other uncertain turn, and no pending request or open command, so a lost tree
 that cannot be deleted can still be hidden. Archive never hides custody the owner
 must still resolve (an unexited owned process, `unknown` artifact or open native
-source): archiving an ended member requires its custody resolved, and the default list
-still shows an archived ended Agent while its custody is unresolved. Eliot's own `os`,
-`git` and `workspace_process` observers of a resumable Agent may stay open; delete's
-drain waits for them. An idle member keeps its live custody, and unarchive only
-reveals. A refusal names the Agent and its first blocker. Reattaching an archived
+source): archiving an ended member or external observer in `unknown` state requires
+its custody resolved. The default list still shows an archived ended Agent while
+its custody is unresolved. Eliot's own `os`, `git` and `workspace_process` observers
+of a resumable Agent may stay open during archive. Delete's drain waits for them.
+An idle member keeps its live custody. Unarchive skips the custody check.
+A refusal names the Agent and its first blocker. Reattaching an archived
 observer opens a new `observe` source and clears the flag, so a live reader is never hidden.
 Send, resume, steer and inject admission atomically clears the target's archive flag.
 Deletion requires every descendant stopped or failed, a detached external observer, or
@@ -951,7 +952,8 @@ and events without resolving them: no resolution is recorded and no `turn.resolv
 event is emitted. The Store still removes dependent records in one transaction and
 retains mutation replies plus deleted command identities through the retry window. It advances
 the conservative retained-history floor before removing event rows, refusing a live rule
-cursor pin or an applicable unconsumed cleanup plan. Other Agents' Git/stream sources
+cursor pin or an active or uncertain cleanup attempt. An unapplied cleanup review's
+items for the deleted tree are superseded. Other Agents' Git/stream sources
 cannot pin the selected tree's events. An attached observer with an open source still
 prevents deletion under the drained-custody guard.
 Process records are removed across every generation; consumed cleanup-plan replay
