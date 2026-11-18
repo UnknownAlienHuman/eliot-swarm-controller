@@ -62,6 +62,7 @@ impl<'a> RuleFiringKey<'a> {
             verb: "rule",
             args,
             script_context: None,
+            run_rate_limit: None,
             parent_digest: None,
             parent_id,
             child_id,
@@ -86,6 +87,7 @@ impl<'a> RuleFiringKey<'a> {
             verb: "timer.run",
             args,
             script_context: None,
+            run_rate_limit: None,
             parent_digest: Some(parent_digest),
             parent_id: parent_id.to_owned(),
             child_id: derived_manual_timer_id(principal, &state.id, parent_id)?,
@@ -530,6 +532,12 @@ impl Store {
                 parent = Some(rejected_parent);
                 events.extend(event);
             } else {
+                if action.verb == "run" {
+                    // Freeze the admission rate policy in the committed timer
+                    // parent; output validation must not depend on the rule
+                    // definition revision remaining retained.
+                    key.run_rate_limit = Some(rule_action_limit(&rule)?);
+                }
                 let limits = self.hierarchy_limits;
                 match admit_rule_action_tx(&tx, &key, action, now, limits) {
                     Ok((admitted_parent, admitted_child, admitted_events)) => {
@@ -737,6 +745,12 @@ impl Store {
 
         let mut key = RuleFiringKey::manual(principal, &rule.view, &request.id, digest)?;
         key.script_context = timer_context;
+        if action.verb == "run" {
+            // Freeze the admission rate policy in the committed timer parent;
+            // output validation must not depend on the rule definition
+            // revision remaining retained.
+            key.run_rate_limit = Some(limit);
+        }
         let limits = self.hierarchy_limits;
         match admit_rule_action_tx(&tx, &key, action, now, limits) {
             Ok((parent, child, events)) => {
@@ -1047,7 +1061,7 @@ pub(super) fn validate_timer_script_run_admitted_origin_tx(
     tx: &Transaction<'_>,
     run: &Command,
     frozen: &core::api::FrozenScriptRun,
-) -> Result<()> {
+) -> Result<Command> {
     let core::api::FrozenScriptContext::Timer {
         timer: timer_context,
         rule: script_rule,
@@ -1241,7 +1255,7 @@ pub(super) fn validate_timer_script_run_admitted_origin_tx(
         ));
     }
 
-    Ok(())
+    Ok(parent.command)
 }
 
 pub(super) fn resolve_timer_script_run_origin_tx(
@@ -1258,7 +1272,23 @@ pub(super) fn resolve_timer_script_run_origin_tx(
             "timer Run has no frozen timer context",
         ));
     };
-    validate_timer_script_run_admitted_origin_tx(tx, run, frozen)?;
+    let parent = validate_timer_script_run_admitted_origin_tx(tx, run, frozen)?;
+    if let Some(limit) = script_run_parent_rate_limit(parent.outcome.as_ref())? {
+        // The admission froze this Run's rate policy in its committed parent,
+        // so successful output stays valid after the timer rule definition is
+        // retired or replaced. Provenance and current authority were verified
+        // above; the live definition pair is not consulted.
+        let cause = command_cause_tx(tx, &run.id)?
+            .ok_or_else(|| Error::new("source_integrity", "timer Run has no stored cause"))?;
+        return Ok(ScriptRunOrigin {
+            principal: run.principal.clone(),
+            rule: script_rule.id.clone(),
+            cause,
+            limit,
+        });
+    }
+    // Rows committed before the parent policy freeze fall back to the retained
+    // current/retiring definition pair.
     let stored = load_rule_state(tx, &run.principal, &script_rule.id)?
         .ok_or_else(|| Error::new("source_integrity", "timer rule state was removed"))?;
     let revision = script_rule.revision;

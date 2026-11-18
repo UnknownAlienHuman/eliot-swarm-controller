@@ -990,8 +990,10 @@ literal and must pass ordinary command validation. Records cannot supply command
 `executable`, `cmd`, `cwd`, `timeout`, `env` or token fields.
 
 After successful exit, validate each actually emitted record separately against its saved
-scope: project Run uses the project action allowlist and Router generation/turn fences;
-global Run uses ordinary Owner Router checks. All records must pass before atomic admission;
+scope and the admission rate policy frozen in the committed rule parent: project Run uses
+the project action allowlist and Router generation/turn fences;
+global Run uses ordinary Owner Router checks. Output validation must not depend on the
+definition revision remaining retained. All records must pass before atomic admission;
 the rule loader does not statically analyze possible script output. Admitted children use the
 saved rule principal—Owner for global Run, project principal for project Run—even after the
 Run token is revoked.

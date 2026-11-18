@@ -135,6 +135,7 @@ struct RuleFiringKey<'a> {
     verb: &'static str,
     args: Value,
     script_context: Option<core::api::FrozenScriptContext>,
+    run_rate_limit: Option<core::api::RuleLimit>,
     parent_digest: Option<Vec<u8>>,
     parent_id: String,
     child_id: String,
@@ -164,6 +165,7 @@ impl<'a> RuleFiringKey<'a> {
             verb: "rule",
             args,
             script_context: None,
+            run_rate_limit: None,
             parent_digest: None,
             parent_id: derived_rule_id("parent", principal, &state.id, revision, event_seq)?,
             child_id: derived_rule_id("action-0", principal, &state.id, revision, event_seq)?,
@@ -730,7 +732,7 @@ impl Store {
             return Ok(replay);
         }
         let trigger = load_rule_trigger(&tx, event_seq)?;
-        let key = RuleFiringKey::event(
+        let mut key = RuleFiringKey::event(
             principal,
             &stored.view,
             revision,
@@ -827,6 +829,14 @@ impl Store {
         )?;
         if rule_limit_reached(scoped_count, limit.max) || global_count >= GLOBAL_RULE_ACTION_LIMIT {
             return reject_rule_event(tx, &self.write_faulted, &key, "rate_limited", now);
+        }
+
+        if request.verb == "run" {
+            // Freeze the admission rate policy in the committed rule parent:
+            // script output validates against this saved policy plus current
+            // authority, without requiring the definition revision to remain
+            // retained.
+            key.run_rate_limit = Some(limit);
         }
 
         // submit_tx validates and admits the ordinary rule action. Its verb path
@@ -1396,7 +1406,7 @@ pub(super) fn validate_script_run_admitted_origin_tx(
     tx: &Transaction<'_>,
     run: &Command,
     frozen: &core::api::FrozenScriptRun,
-) -> Result<()> {
+) -> Result<Command> {
     match &frozen.context {
         core::api::FrozenScriptContext::Event { .. } => {
             validate_event_script_run_admitted_origin_tx(tx, run, frozen)
@@ -1411,7 +1421,7 @@ fn validate_event_script_run_admitted_origin_tx(
     tx: &Transaction<'_>,
     run: &Command,
     frozen: &core::api::FrozenScriptRun,
-) -> Result<()> {
+) -> Result<Command> {
     let core::api::FrozenScriptContext::Event {
         event: frozen_event,
         subject: frozen_subject,
@@ -1567,7 +1577,7 @@ fn validate_event_script_run_admitted_origin_tx(
         ));
     }
 
-    Ok(())
+    Ok(parent.command)
 }
 
 fn resolve_event_script_run_origin_tx(
@@ -1584,7 +1594,23 @@ fn resolve_event_script_run_origin_tx(
             "event rule Run has no frozen event context",
         ));
     };
-    validate_event_script_run_admitted_origin_tx(tx, run, frozen)?;
+    let parent = validate_event_script_run_admitted_origin_tx(tx, run, frozen)?;
+    if let Some(limit) = script_run_parent_rate_limit(parent.outcome.as_ref())? {
+        // The admission froze this Run's rate policy in its committed parent,
+        // so successful output stays valid after the definition revision is
+        // retired or replaced. Provenance and current authority were verified
+        // above; the live definition pair is not consulted.
+        let cause = command_cause_tx(tx, &run.id)?
+            .ok_or_else(|| Error::new("source_integrity", "script Run has no stored cause"))?;
+        return Ok(ScriptRunOrigin {
+            principal: run.principal.clone(),
+            rule: frozen_rule.id.clone(),
+            cause,
+            limit,
+        });
+    }
+    // Rows committed before the parent policy freeze fall back to the retained
+    // current/retiring definition pair.
     let stored = load_rule_state(tx, &run.principal, &frozen_rule.id)?
         .ok_or_else(|| Error::new("source_integrity", "script rule state was removed"))?;
     let definition = if stored.view.revision == frozen_rule.revision {
@@ -1609,6 +1635,21 @@ fn resolve_event_script_run_origin_tx(
         cause,
         limit,
     })
+}
+
+/// Read the admission rate policy a rule parent froze for its Run child.
+/// `None` is a row committed before the freeze; callers fall back to the
+/// retained current/retiring definition lookup for those rows.
+fn script_run_parent_rate_limit(outcome: Option<&Value>) -> Result<Option<core::api::RuleLimit>> {
+    let Some(value) = outcome.and_then(|outcome| outcome.get("rate_limit")) else {
+        return Ok(None);
+    };
+    let limit = serde_json::from_value::<core::api::RuleLimit>(value.clone())
+        .map_err(|_| Error::new("source_integrity", "saved rule rate policy is invalid"))?;
+    limit
+        .validate()
+        .map_err(|_| Error::new("source_integrity", "saved rule rate policy is invalid"))?;
+    Ok(Some(limit))
 }
 
 pub(super) fn validate_script_output_rate_tx(
@@ -2409,6 +2450,12 @@ fn insert_rule_parent(
     {
         outcome["script_context"] = serde_json::to_value(script_context)
             .map_err(|_| Error::new("internal", "timer script context cannot be encoded"))?;
+    }
+    if rejection_code.is_none()
+        && let Some(rate_limit) = &key.run_rate_limit
+    {
+        outcome["rate_limit"] = serde_json::to_value(rate_limit)
+            .map_err(|_| Error::new("internal", "rule rate policy cannot be encoded"))?;
     }
     let digest = match &key.parent_digest {
         Some(digest) => digest.clone(),
