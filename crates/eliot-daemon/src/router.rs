@@ -15,6 +15,7 @@ mod goals;
 mod handoff;
 mod hierarchy;
 mod inference;
+pub(crate) mod launch_queue;
 mod overview;
 mod project_assignment;
 mod resolution;
@@ -390,6 +391,13 @@ impl Router {
                 }
                 result
             }
+            "launch.enqueue" => {
+                self.enqueue_launch(&params, &principal, remote.as_ref())
+                    .await
+            }
+            "launch.intent.get" => self.read_launch_intent(&params, &principal).await,
+            "launch.queue" => self.read_launch_queue(&params, &principal).await,
+            "project.budget.set" => self.set_manager_budget(&params, &principal).await,
             "command.get" => self.command_get(&params, &principal).await,
             "command.children" => self.command_children(&params, &principal).await,
             "command.resolve" => self.command_resolve(&params, &principal).await,
@@ -766,6 +774,15 @@ impl Router {
             ));
         }
 
+        if let Some(flag) = request.args.get("owner_override") {
+            require_owner(principal)?;
+            if flag != &Value::Bool(true) || request.verb != "launch" {
+                return Err(Error::new(
+                    "invalid",
+                    "owner_override is an explicit Owner launch flag",
+                ));
+            }
+        }
         authorize_command(principal, &mut request)?;
         self.authorize_submission_scope(&mut request, principal)
             .await?;
@@ -1714,10 +1731,28 @@ impl Router {
 
     async fn prepare_submission_after_authorization(
         &self,
+        request: SubmitCommand,
+        principal: &Principal,
+        project_authority_preverified: bool,
+        submission_scope_preverified: bool,
+    ) -> Result<PreparedSubmission> {
+        self.prepare_submission_with_routing(
+            request,
+            principal,
+            project_authority_preverified,
+            submission_scope_preverified,
+            false,
+        )
+        .await
+    }
+
+    async fn prepare_submission_with_routing(
+        &self,
         mut request: SubmitCommand,
         principal: &Principal,
         project_authority_preverified: bool,
         submission_scope_preverified: bool,
+        arbitrated: bool,
     ) -> Result<PreparedSubmission> {
         if request.probe && request.verb != "send" {
             return Err(Error::new(
@@ -1790,6 +1825,7 @@ impl Router {
                         &mut request,
                         resolve_project,
                         parent_workspace_shared,
+                        arbitrated,
                     )
                     .await
                 }
@@ -1968,8 +2004,12 @@ impl Router {
         request: &mut SubmitCommand,
         resolve_project: bool,
         parent_workspace_shared: bool,
+        arbitrated: bool,
     ) -> Result<Option<WorkspacePreparationInput>> {
-        if self.freeze_launch_profile(principal, request).await? {
+        if self
+            .freeze_launch_profile(principal, request, arbitrated)
+            .await?
+        {
             return retained_preparation(&request.args);
         }
         if resolve_project {
@@ -2041,6 +2081,7 @@ impl Router {
         &self,
         principal: &Principal,
         request: &mut SubmitCommand,
+        arbitrated: bool,
     ) -> Result<bool> {
         if self.hydrate_retained_launch(request).await? {
             return Ok(true);
@@ -2160,7 +2201,9 @@ impl Router {
         }
 
         if request.args.get("profile").is_none() {
-            let (name, harness, snapshot) = self.route_launch_profile(principal, request).await?;
+            let (name, harness, snapshot) = self
+                .route_launch_profile(principal, request, arbitrated)
+                .await?;
             request.args["profile"] = Value::String(name);
             install_frozen_profile(request, &harness, snapshot, true)?;
             let store = self.inner.store.lock().await;
@@ -2654,6 +2697,7 @@ impl Router {
         project: Option<&ProjectRegistrationView>,
         state: &TimerStateView,
         slot: TimerSlotCommit,
+        arbitration: Option<eliot_store::ArbitratedTimer>,
         now: i64,
     ) -> Result<Option<TimerSlotAdmission>> {
         let scheduled_at_ms = slot.scheduled_at_ms;
@@ -2682,7 +2726,8 @@ impl Router {
                         ));
                     }
                 }
-                let admission = store.commit_timer_slot(principal, state, slot, now)?;
+                let admission =
+                    store.commit_timer_slot_arbitrated(principal, state, slot, arbitration, now)?;
                 self.publish_locked(&admission.events);
                 admission
             }
@@ -5991,6 +6036,7 @@ fn reject_launch_derived_keys(args: &Value) -> Result<()> {
     }
     for reserved in [
         "registered_project",
+        "admission_mode",
         "project_assignment_launch",
         "project_transfer_launch",
         "profile_choice",
@@ -7618,7 +7664,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             // A retained ID must return before current config or selector capture.
             assert!(
                 router
-                    .freeze_launch_profile(&Principal::Owner, &mut retry)
+                    .freeze_launch_profile(&Principal::Owner, &mut retry, false)
                     .await
                     .unwrap()
             );
@@ -14104,7 +14150,7 @@ mod run_authorization_tests {
         // Agent principal before any discovery or snapshot work.
         normalize_launch(&mut request, &principal).expect("ad-hoc shape is valid");
         let error = router
-            .freeze_launch_profile(&principal, &mut request)
+            .freeze_launch_profile(&principal, &mut request, false)
             .await
             .unwrap_err();
         assert_eq!(error.code, "not_allowed");
@@ -14144,7 +14190,7 @@ mod run_authorization_tests {
         first.expected_generation = Some(0);
         first.args = json!({"workspace":workspace, "project":workspace, "text":"same task"});
         router
-            .freeze_launch_profile(&Principal::Owner, &mut first)
+            .freeze_launch_profile(&Principal::Owner, &mut first, false)
             .await
             .unwrap();
         assert_eq!(first.args["profile"], "first");

@@ -44,6 +44,18 @@ macro_rules! method {
 // Every Router match arm is described here. The coverage regression below makes
 // omission deliberate: new methods must be described before they can ship.
 const METHODS: &[Method] = &[
+    method!("launch.enqueue", LaunchQueueRequest, LaunchIntentView, false, true, "Enqueue an interactive launch intent for fair admission.", {"id":EXAMPLE_ID,"args":{"profile":"worker","workspace":"C:/work"}}),
+    method!("launch.intent.get", LaunchIntentGetRequest, LaunchIntentView, false, false, "Read the current state of a queued interactive launch intent.", {"id":EXAMPLE_ID}),
+    method!(
+        "launch.queue",
+        LaunchQueueListRequest,
+        LaunchQueueView,
+        false,
+        false,
+        "Read scoped interactive launch intents and assignment wait reasons.",
+        {}
+    ),
+    method!("project.budget.set", ManagerBudgetRequest, ManagerBudgetView, false, true, "Change free budget or priority within the current manager's Owner grant.", {"id":EXAMPLE_ID,"project":"project-1","expected_revision":1,"max_live":2}),
     method!("agent.archive", AgentArchiveRequest, AgentTreeResponse, true, true, "Archive or unarchive an idle or ended Agent tree (ended: custody resolved); never stops it.", {"id":EXAMPLE_ID,"agent":"a1","archived":true}),
     method!("agent.delete", AgentDeleteRequest, AgentTreeResponse, true, true, "Delete stopped or failed Agent trees after custody drains; preserve files.", {"id":EXAMPLE_ID,"agent":"a1"}),
     method!("artifact.register", ArtifactRegisterRequest, ArtifactView, false, true, "Register an existing Agent-owned artifact directory with exact generation and opened identity.", {"id":EXAMPLE_ID,"path":"C:/scratch/build","kind":"build","purpose":"assignment build"}),

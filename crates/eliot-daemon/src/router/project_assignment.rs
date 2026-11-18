@@ -38,7 +38,8 @@ impl Router {
                     launch.args = json!({"workspace": workspace, "profile": profile});
                     normalize_launch(&mut launch, principal)?;
                     launch.args["project"] = json!(source.project_scope());
-                    self.freeze_launch_profile(principal, &mut launch).await?;
+                    self.freeze_launch_profile(principal, &mut launch, false)
+                        .await?;
                     if policy.contains_value(&launch.args) {
                         return Err(Error::new(
                             "secret_in_payload",
@@ -165,13 +166,13 @@ impl Router {
                         "adopted checkout is outside this project repository",
                     ));
                 }
-                self.freeze_launch_profile(principal, &mut launch).await?;
+                self.freeze_launch_profile(principal, &mut launch, false).await?;
                 None
             } else {
                 launch.args = json!({"workspace": registration.checkout, "profile": request.profile, "worktree": manager_branch(&request.id)});
                 normalize_launch(&mut launch, principal)?;
                 let input = self
-                    .freeze_launch_admission(principal, &mut launch, false, false)
+                    .freeze_launch_admission(principal, &mut launch, false, false, false)
                     .await?;
                 Some(input.ok_or_else(|| {
                     Error::new("internal", "manager worktree was not frozen")

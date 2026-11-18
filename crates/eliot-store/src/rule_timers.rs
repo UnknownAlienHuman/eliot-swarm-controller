@@ -343,8 +343,19 @@ impl Store {
         slot: TimerSlotCommit,
         now: i64,
     ) -> Result<TimerSlotAdmission> {
+        self.commit_timer_slot_arbitrated(principal, state, slot, None, now)
+    }
+
+    pub fn commit_timer_slot_arbitrated(
+        &mut self,
+        principal: &str,
+        state: &core::api::TimerStateView,
+        slot: TimerSlotCommit,
+        arbitration: Option<crate::ArbitratedTimer>,
+        now: i64,
+    ) -> Result<TimerSlotAdmission> {
         self.ensure_writer_healthy()?;
-        let result = self.commit_timer_slot_inner(principal, state, slot, now);
+        let result = self.commit_timer_slot_inner(principal, state, slot, arbitration, now);
         self.fault_on_persistence_error(&result);
         result
     }
@@ -354,6 +365,7 @@ impl Store {
         principal: &str,
         state: &core::api::TimerStateView,
         slot: TimerSlotCommit,
+        arbitration: Option<crate::ArbitratedTimer>,
         now: i64,
     ) -> Result<TimerSlotAdmission> {
         require_nonempty(principal, "principal")?;
@@ -470,10 +482,33 @@ impl Store {
             });
         }
 
+        if let Some(arbitration) = &arbitration
+            && let Some(reason) = arbitration.wait.clone()
+        {
+            crate::launch_queue::write_timer_wait(
+                &tx,
+                state,
+                &arbitration.project,
+                &crate::TimerWait {
+                    reason,
+                    route: arbitration.route.clone(),
+                },
+            )?;
+            commit_transaction(tx, &self.write_faulted)?;
+            return Ok(TimerSlotAdmission {
+                state: stored.view,
+                parent: None,
+                child: None,
+                events: Vec::new(),
+                is_new: false,
+                blocked: true,
+            });
+        }
+
         let mut events = Vec::new();
         let mut parent = None;
         let mut child = None;
-        if let Some(action) = slot.action {
+        if let Some(mut action) = slot.action {
             let action_rejection = if action.verb == "run" {
                 let expected_context = expected_timer_script_context(
                     &rule.view,
@@ -542,11 +577,42 @@ impl Store {
                 }
                 let limits = self.hierarchy_limits;
                 let policy = self.capacity_policy.as_deref();
-                match admit_rule_action_tx(&tx, &key, action, now, limits, policy) {
+                let admission = if let Some(arbitration) = &arbitration {
+                    action.args["admission_mode"] = json!("arbitrated");
+                    crate::launch_queue::check_arbitrated_project(&tx, &arbitration.project)
+                        .and_then(|()| admit_rule_action_tx(&tx, &key, action, now, limits, policy))
+                } else {
+                    admit_rule_action_tx(&tx, &key, action, now, limits, policy)
+                };
+                match admission {
                     Ok((admitted_parent, admitted_child, admitted_events)) => {
+                        if let Some(arbitration) = &arbitration {
+                            crate::launch_queue::advance_cursor(&tx, &arbitration.project)?;
+                        }
                         parent = Some(admitted_parent);
                         child = Some(admitted_child);
                         events.extend(admitted_events);
+                    }
+                    Err(error)
+                        if let Some(arbitration) = &arbitration
+                            && let Some(wait) =
+                                crate::TimerWait::from_error(&error, arbitration.route.clone()) =>
+                    {
+                        crate::launch_queue::write_timer_wait(
+                            &tx,
+                            state,
+                            &arbitration.project,
+                            &wait,
+                        )?;
+                        commit_transaction(tx, &self.write_faulted)?;
+                        return Ok(TimerSlotAdmission {
+                            state: stored.view,
+                            parent: None,
+                            child: None,
+                            events: Vec::new(),
+                            is_new: false,
+                            blocked: true,
+                        });
                     }
                     Err(error) if core::is_deterministic_pre_admission_rejection(&error.code) => {
                         let (rejected_parent, rejected_events) =
@@ -571,6 +637,10 @@ impl Store {
             events.push(insert_rule_event(&tx, now, "rule.skipped", data)?);
         }
 
+        if arbitration.is_some() {
+            tx.execute("DELETE FROM assignment_waits WHERE timer=?1", [&state.id])
+                .map_err(sql_error)?;
+        }
         let next_state = update_timer_slot_tx(
             &tx,
             principal,

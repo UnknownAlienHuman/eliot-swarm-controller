@@ -164,7 +164,10 @@ impl Store {
 pub(super) fn require_unheld_tx(tx: &Transaction<'_>, agent: &Agent) -> Result<()> {
     let scope = core::frozen_provider_scope(agent)?;
     if get(tx, &scope)?.is_some() {
-        return Err(provider_held());
+        return Err(Error::new(
+            "provider_held",
+            format!("provider scope {scope} is held pending owner correction or an eligible probe"),
+        ));
     }
     Ok(())
 }

@@ -1,9 +1,9 @@
 //! Agent lifecycle and coordination writes.
 use super::args::{
     AnswerArgs, ApproveArgs, AttachArgs, ConfigureArgs, DenyArgs, DetachArgs, DigestArgs,
-    DiscoverArgs, GenerationArgs, InjectCliArgs, InterruptArgs, LaunchArgs, ModelsArgs, PageArgs,
-    QuotaArgs, ReadGenerationArgs, ResumeArgs, SendArgs, SteerArgs, StopArgs, WaitArgs,
-    WorktreeArgs, WorktreeCommand, WorktreeRemoveArgs,
+    DiscoverArgs, GenerationArgs, InjectCliArgs, InterruptArgs, LaunchArgs, LaunchQueueArgs,
+    ModelsArgs, PageArgs, QuotaArgs, ReadGenerationArgs, ResumeArgs, SendArgs, SteerArgs, StopArgs,
+    WaitArgs, WorktreeArgs, WorktreeCommand, WorktreeRemoveArgs,
 };
 use super::support::read_and_print;
 use super::support::{
@@ -207,6 +207,8 @@ pub(crate) async fn run_launch(
         base,
         parent,
         prompt,
+        queue,
+        owner_override,
         wait,
         timeout_seconds,
     }: LaunchArgs,
@@ -328,6 +330,26 @@ pub(crate) async fn run_launch(
     if let Some(prompt) = &prompt {
         args["text"] = Value::String(prompt.clone());
     }
+    if queue {
+        let request = eliot_core::api::LaunchQueueRequest {
+            id: mutation_id(id)?,
+            args,
+        };
+        request.validate().map_err(Failure::for_mutation)?;
+        let receipt: eliot_core::api::LaunchIntentView =
+            eliot_daemon::client_call_typed(&data_dir, "launch.enqueue", &request)
+                .await
+                .map_err(Failure::for_mutation)?;
+        if receipt.id != request.id {
+            return Err(Failure::new(4, "launch.enqueue response id differs"));
+        }
+        let rejected = receipt.state == eliot_core::api::LaunchIntentState::Rejected;
+        print_value(&json!(receipt), json_output);
+        return Ok(u8::from(rejected));
+    }
+    if owner_override {
+        args["owner_override"] = json!(true);
+    }
     let params = submit_request(id, None, "launch", args)?;
     let submitted = submit_command(&data_dir, &params).await?;
     let submit_exit = response_exit_code(submitted.state);
@@ -361,6 +383,41 @@ pub(crate) async fn run_launch(
     };
     print_value(&completed, json_output);
     Ok(exit_code)
+}
+
+pub(crate) async fn run_launch_queue(
+    LaunchQueueArgs {
+        intent,
+        project,
+        after,
+    }: LaunchQueueArgs,
+    data_dir: PathBuf,
+    json_output: bool,
+) -> Result<u8, Failure> {
+    let value = if let Some(id) = intent {
+        let request = eliot_core::api::LaunchIntentGetRequest {
+            id: id.to_ascii_uppercase(),
+        };
+        request.validate().map_err(Failure::for_read)?;
+        let reply: eliot_core::api::LaunchIntentView =
+            eliot_daemon::client_call_typed(&data_dir, "launch.intent.get", &request)
+                .await
+                .map_err(Failure::for_read)?;
+        if reply.id != request.id {
+            return Err(Failure::new(4, "launch.intent.get response id differs"));
+        }
+        json!(reply)
+    } else {
+        let request = eliot_core::api::LaunchQueueListRequest { project, after };
+        request.validate().map_err(Failure::for_read)?;
+        let reply: eliot_core::api::LaunchQueueView =
+            eliot_daemon::client_call_typed(&data_dir, "launch.queue", &request)
+                .await
+                .map_err(Failure::for_read)?;
+        json!(reply)
+    };
+    print_value(&value, json_output);
+    Ok(0)
 }
 
 pub(crate) async fn run_send(

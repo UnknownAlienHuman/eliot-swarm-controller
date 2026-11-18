@@ -1028,6 +1028,11 @@ fn admit_launch_tx(
             ),
         )?);
     let mut accepted_data = json!({"command_id": request.id, "verb": "launch"});
+    if request.args["owner_override"] == true && principal == "owner" {
+        accepted_data["admission_mode"] = json!("owner_override");
+    } else if request.args["admission_mode"] == "arbitrated" {
+        accepted_data["admission_mode"] = json!("arbitrated");
+    }
     if let Some(choice) = request.args.get("profile_choice") {
         accepted_data["profile_choice"] = choice.clone();
     }

@@ -1014,6 +1014,10 @@ pub(crate) struct CapacityProjectEntry {
     pub(crate) max_live: Option<u64>,
     #[serde(default)]
     pub(crate) manager_max_live: Option<u64>,
+    #[serde(default)]
+    pub(crate) manager_min_live: Option<u64>,
+    #[serde(default)]
+    pub(crate) manager_priority_max: Option<u8>,
 }
 
 #[derive(Deserialize)]
@@ -1451,7 +1455,18 @@ fn parse_config(source: &str) -> core::Result<FileConfig> {
             "config.toml: capacity projects exceed 256 entries",
         ));
     }
-    for name in config.capacity.projects.keys() {
+    for (name, budget) in &config.capacity.projects {
+        if budget.manager_min_live.is_some_and(|minimum| {
+            budget
+                .manager_max_live
+                .is_none_or(|maximum| minimum > maximum)
+                || minimum > i64::MAX as u64
+        }) {
+            return Err(core::Error::new(
+                "invalid",
+                "manager_min_live requires a manager_max_live at least as large",
+            ));
+        }
         if name.is_empty() || name.len() > 1024 || name.contains(char::is_control) {
             return Err(core::Error::new(
                 "profile_error",
@@ -1565,6 +1580,8 @@ pub(crate) fn load_scope_limits(data_root: &Path) -> core::Result<core::api::Sco
                     core::api::ProjectScopeLimits {
                         project: limits.max_live,
                         manager_assignment: limits.manager_max_live,
+                        manager_min_live: limits.manager_min_live,
+                        manager_priority_max: limits.manager_priority_max,
                     },
                 )
             })

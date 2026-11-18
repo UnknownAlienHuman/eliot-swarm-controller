@@ -85,6 +85,33 @@ pub(crate) async fn run_project(
         ProjectCommand::Assignment(args) => {
             super::project_assignment::run(args.command, &data_dir, json_output, id).await
         }
+        ProjectCommand::Budget {
+            project,
+            revision,
+            max_live,
+            priority,
+        } => {
+            let request = eliot_core::api::ManagerBudgetRequest {
+                id: mutation_id(id)?,
+                project,
+                expected_revision: revision,
+                max_live,
+                priority,
+            };
+            request.validate().map_err(Failure::for_mutation)?;
+            let reply: eliot_core::api::ManagerBudgetView =
+                eliot_daemon::client_call_typed(&data_dir, "project.budget.set", &request)
+                    .await
+                    .map_err(Failure::for_mutation)?;
+            if reply.project != request.project {
+                return Err(Failure::new(
+                    4,
+                    "project.budget.set response project differs",
+                ));
+            }
+            print_value(&json!(reply), json_output);
+            Ok(0)
+        }
         ProjectCommand::List => {
             let response = eliot_daemon::client_call(&data_dir, "project.list", json!({}))
                 .await
