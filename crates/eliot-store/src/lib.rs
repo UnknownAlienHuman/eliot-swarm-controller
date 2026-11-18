@@ -308,6 +308,7 @@ pub struct Store {
     /// from another holder is a crashed round: it reads as `unknown`.
     goal_holder: String,
     hierarchy_limits: core::api::HierarchyLimits,
+    capacity_policy: Option<std::sync::Arc<capacity::PolicyLoader>>,
     /// Live readback watermark, including unchanged probes. This is not a
     /// durable heartbeat; committed Git views and HEAD transitions fence restart.
     git_observed_at: BTreeMap<String, i64>,
@@ -415,6 +416,7 @@ impl Store {
             git_observed_at: BTreeMap::new(),
             goal_holder: Ulid::new().to_string(),
             hierarchy_limits: core::api::HierarchyLimits::default(),
+            capacity_policy: None,
         };
         store.migrate()?;
         store.bind_custody_namespace(path)?;
@@ -465,6 +467,15 @@ impl Store {
             ));
         }
         Ok(())
+    }
+
+    /// Install the daemon-owned policy reader. The Store calls it only for a
+    /// fresh start, while holding the same writer transaction that reserves it.
+    pub fn set_capacity_policy(
+        &mut self,
+        load: impl Fn() -> Result<core::api::ScopeLimits> + Send + Sync + 'static,
+    ) {
+        self.capacity_policy = Some(std::sync::Arc::new(load));
     }
 
     /// Admit an external launch/send/stop command. Launch allocates its stable
@@ -528,6 +539,7 @@ impl Store {
                 now,
                 false,
                 self.hierarchy_limits,
+                self.capacity_policy.as_deref(),
             )?;
             if admission.is_new {
                 let root_cause =
@@ -669,8 +681,16 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
         let limits = self.hierarchy_limits;
-        let admission =
-            admission::submit_tx(&tx, principal, request, preparation, now, false, limits)?;
+        let admission = admission::submit_tx(
+            &tx,
+            principal,
+            request,
+            preparation,
+            now,
+            false,
+            limits,
+            self.capacity_policy.as_deref(),
+        )?;
         commit_transaction(tx, &self.write_faulted)?;
         Ok(admission)
     }

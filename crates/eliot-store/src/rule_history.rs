@@ -12,7 +12,14 @@ pub struct RuleCatchUpAction {
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub enum RuleCatchUpActionOutcome {
     Command(SubmitCommand),
-    Rejected { code: String },
+    Rejected {
+        code: String,
+    },
+    RejectedWithCapacity {
+        code: String,
+        message: String,
+        failure_where: String,
+    },
 }
 
 impl RuleCatchUpAction {
@@ -27,6 +34,21 @@ impl RuleCatchUpAction {
         Self {
             event_seq,
             outcome: RuleCatchUpActionOutcome::Rejected { code: code.into() },
+        }
+    }
+
+    pub fn rejected_with_capacity(event_seq: i64, error: &Error) -> Self {
+        Self {
+            event_seq,
+            outcome: RuleCatchUpActionOutcome::RejectedWithCapacity {
+                code: error.code.clone(),
+                message: error.message.to_string(),
+                failure_where: error
+                    .failure_where
+                    .as_deref()
+                    .unwrap_or("store.admission.capacity")
+                    .to_owned(),
+            },
         }
     }
 }
@@ -215,7 +237,7 @@ impl Store {
 
         let limit = rule_action_limit(&stored)?;
         let mut planned = Vec::new();
-        let mut rejected = Vec::<(i64, String)>::new();
+        let mut rejected = Vec::<(i64, Error)>::new();
         let mut suppressed = Vec::new();
         let mut seen = HashSet::with_capacity(actions.len());
         let mut scoped_added = HashMap::<String, i64>::new();
@@ -256,7 +278,26 @@ impl Store {
                             "rule catch-up rejection code is not deterministic",
                         ));
                     }
-                    rejected.push((action.event_seq, code.clone()));
+                    rejected.push((action.event_seq, Error::new(code.clone(), code.clone())));
+                    continue;
+                }
+                RuleCatchUpActionOutcome::RejectedWithCapacity {
+                    code,
+                    message,
+                    failure_where,
+                } => {
+                    validate_rule_rejection_code(code)?;
+                    if code != "capacity_unavailable" || failure_where != "store.admission.capacity"
+                    {
+                        return Err(Error::new(
+                            "invalid",
+                            "rule catch-up capacity rejection metadata is invalid",
+                        ));
+                    }
+                    rejected.push((
+                        action.event_seq,
+                        Error::new(code.clone(), message.clone()).with_where(failure_where.clone()),
+                    ));
                     continue;
                 }
             };
@@ -273,7 +314,7 @@ impl Store {
                 rule_action_binding_error(&trigger, action_request)
             };
             if let Some(code) = binding_error {
-                rejected.push((action.event_seq, code));
+                rejected.push((action.event_seq, Error::new(code.clone(), code)));
                 continue;
             }
             if should_suppress_own_event_send_or_run_tx(
@@ -289,7 +330,7 @@ impl Store {
             }
             if let Err(error) = validate_project_rule_action_tx(&tx, principal, action_request) {
                 if core::is_deterministic_pre_admission_rejection(&error.code) {
-                    rejected.push((action.event_seq, error.code));
+                    rejected.push((action.event_seq, error));
                     continue;
                 }
                 return Err(error);
@@ -307,7 +348,10 @@ impl Store {
             if rule_limit_reached(scoped_total, limit.max)
                 || global_count.saturating_add(global_added) >= GLOBAL_RULE_ACTION_LIMIT
             {
-                rejected.push((action.event_seq, "rate_limited".to_owned()));
+                rejected.push((
+                    action.event_seq,
+                    Error::new("rate_limited", "rule action rate limit reached"),
+                ));
                 continue;
             }
 
@@ -338,6 +382,7 @@ impl Store {
             tx.execute_batch("SAVEPOINT rule_catch_up_action")
                 .map_err(sql_error)?;
             let limits = self.hierarchy_limits;
+            let policy = self.capacity_policy.as_deref();
             let mut admission = match admission::submit_tx(
                 &tx,
                 principal,
@@ -346,6 +391,7 @@ impl Store {
                 now,
                 true,
                 limits,
+                policy,
             ) {
                 Ok(admission) if admission.is_new => admission,
                 Ok(_) => {
@@ -359,7 +405,7 @@ impl Store {
                         "ROLLBACK TO rule_catch_up_action; RELEASE rule_catch_up_action",
                     )
                     .map_err(sql_error)?;
-                    rejected.push((action.event_seq, error.code));
+                    rejected.push((action.event_seq, error));
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -467,20 +513,22 @@ impl Store {
                 cause,
             ));
         }
-        for (event_seq, code) in rejected {
-            markers.push((
-                event_seq,
-                "rule.rejected",
-                json!({
-                    "rule": request.rule,
-                    "project": request.project,
-                    "revision": state.revision,
-                    "event_seq": event_seq,
-                    "parent_command": parent.id,
-                    "code": code,
-                }),
-                parent_cause.clone(),
-            ));
+        for (event_seq, error) in rejected {
+            let is_capacity = error.code == "capacity_unavailable"
+                && error.failure_where.as_deref() == Some("store.admission.capacity");
+            let mut data = json!({
+                "rule": request.rule,
+                "project": request.project,
+                "revision": state.revision,
+                "event_seq": event_seq,
+                "parent_command": parent.id,
+                "code": error.code,
+            });
+            if is_capacity {
+                data["message"] = json!(error.message);
+                data["where"] = json!("store.admission.capacity");
+            }
+            markers.push((event_seq, "rule.rejected", data, parent_cause.clone()));
         }
         markers.sort_by_key(|(event_seq, _, _, _)| *event_seq);
         for (_, kind, data, cause) in markers {

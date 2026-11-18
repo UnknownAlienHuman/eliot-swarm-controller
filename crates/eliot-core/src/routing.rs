@@ -135,6 +135,12 @@ impl CapacityScope {
     }
 
     /// Stable scope key for one registered project.
+    pub fn is_daemon_owned(scope: &str) -> bool {
+        scope == "global:swarm"
+            || scope.starts_with("project:")
+            || scope.starts_with("manager_assignment:")
+    }
+
     pub fn project_scope(project: &str) -> String {
         format!("project:{project}")
     }

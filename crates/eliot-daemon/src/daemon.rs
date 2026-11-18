@@ -175,7 +175,7 @@ async fn initialize_runtime(
 ) -> Result<DaemonRuntime> {
     let store_path = data_dir.path().join("eliot.db");
     logging::record(&policy, "daemon.store_opening", &[], None);
-    let store = eliot_store::Store::open_with_observer(&store_path, |phase| match phase {
+    let mut store = eliot_store::Store::open_with_observer(&store_path, |phase| match phase {
         eliot_store::StoreOpenPhase::ConnectionOpened => {
             logging::record(&policy, "daemon.store_connection_opened", &[], None);
         }
@@ -188,6 +188,8 @@ async fn initialize_runtime(
     })?;
     // Startup phase markers: a readiness timeout names the phase that stalled.
     logging::record(&policy, "daemon.store_opened", &[], None);
+    let capacity_root = data_dir.path().to_path_buf();
+    store.set_capacity_policy(move || crate::config::load_scope_limits(&capacity_root));
     let store = std::sync::Arc::new(Mutex::new(store));
     // Settle crash-left pending settings history rows once at startup: reads
     // never reconcile, so this plus the save path cover every pending row.

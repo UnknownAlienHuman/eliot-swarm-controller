@@ -133,9 +133,9 @@ pub use observe::{
     MAX_OBSERVE_WINDOW_SECS, ObserveHeavyRequest, ObserveHeavyResponse, SessionGrowthView,
 };
 pub use overview::{
-    FleetTotals, HarnessCount, NativeChildView, OverviewCoverage, OverviewManagerView,
-    OverviewWorkerView, ProjectOverviewEntry, ProjectOverviewRequest, ProjectOverviewResponse,
-    ProjectScopeLimits, ProjectTotals, ScopeLimits, ScopeUsage,
+    FleetTotals, HarnessCount, LifecycleTotals, NativeChildView, OverviewCoverage,
+    OverviewManagerView, OverviewWorkerView, ProjectOverviewEntry, ProjectOverviewRequest,
+    ProjectOverviewResponse, ProjectScopeLimits, ProjectTotals, ScopeLimits, ScopeUsage,
 };
 pub use provider::{
     ProviderClearHoldRequest, ProviderClearHoldResponse, ProviderCorrectiveEvidence,

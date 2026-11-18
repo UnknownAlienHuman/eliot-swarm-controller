@@ -502,14 +502,15 @@ the verb accepts it. Admission records the current binding even when it is
 omitted. See [coordination](coordination.md#project-manager-assignment) for
 generation, epoch and dispatch behavior.
 
-`project.overview` takes an optional registered project id and returns the
-team entry (current manager, workers, workspaces, queue depth, `project` and
-`manager_assignment` capacity usages beside their Owner limits) or every
-visible team plus `fleet` totals (`global:swarm` usage, live harnesses by
-harness, active turns, queued work, retained-unknown reservations, separately
-listed native children). Counts are exact `COUNT(*)` reads; list views are
-bounded with truncation flags and `coverage: partial` instead of a total when
-a list does not fit. CLI callers use `swarm project overview [--project ID]`.
+`project.overview` returns exact fleet totals beside authorized project and
+native-child detail. A `project` filter scopes the returned detail. Each
+reply has an event watermark from its committed Store snapshot and a separate
+native observation coverage label. When `next_cursor` is present, pass it as
+`after` with the same filter. Each page applies current read authority and
+reports its own snapshot watermark. CLI callers use
+`swarm project overview [--project ID] [--after CURSOR]`. See
+[project manager assignment](coordination.md#project-manager-assignment) for
+detail visibility and capacity semantics.
 
 ### Authenticated method discovery
 

@@ -1574,6 +1574,7 @@ fn admit_start_postlude_tx(
     linked: &Option<String>,
     now: i64,
     events: &mut Vec<Event>,
+    policy: Option<&capacity::PolicyLoader>,
 ) -> Result<(Command, Option<Command>)> {
     if matches!(request.verb.as_str(), "launch" | "resume") {
         workspace::admit_workspace_preparation(tx, request, preparation.as_ref(), now, events)?;
@@ -1601,11 +1602,12 @@ fn admit_start_postlude_tx(
                 .checked_add(1)
                 .ok_or_else(|| Error::new("bad_state", "generation overflow"))?
         };
-        capacity::reserve_tx(tx, &agent, generation)?;
+        capacity::reserve_tx(tx, &agent, generation, policy)?;
     }
     Ok((command, linked_command))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn submit_tx(
     tx: &Transaction<'_>,
     principal: &str,
@@ -1614,6 +1616,7 @@ pub(super) fn submit_tx(
     now: i64,
     derived_rule: bool,
     limits: core::api::HierarchyLimits,
+    policy: Option<&capacity::PolicyLoader>,
 ) -> Result<Admission> {
     let (payload_digest, replay) = submit_head_tx(tx, principal, &request, now, derived_rule)?;
     if let Some(admission) = replay {
@@ -1742,8 +1745,15 @@ pub(super) fn submit_tx(
         }
     };
 
-    let (command, linked_command) =
-        admit_start_postlude_tx(tx, &request, &preparation, &linked, now, &mut events)?;
+    let (command, linked_command) = admit_start_postlude_tx(
+        tx,
+        &request,
+        &preparation,
+        &linked,
+        now,
+        &mut events,
+        policy,
+    )?;
     Ok(Admission {
         command,
         linked_command,

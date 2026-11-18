@@ -614,9 +614,61 @@ fn event_inject_binds_exact_agent_generation_and_turn() {
         .admit_rule_action("owner", &current, forged_event, forged, 64)
         .unwrap();
     assert!(rejected.child.is_none());
-    assert_eq!(
-        rejected.parent.unwrap().outcome.unwrap()["code"],
-        "rule_action_binding_invalid"
+    let rejection = rejected.parent.unwrap().outcome.unwrap();
+    assert_eq!(rejection["code"], "rule_action_binding_invalid");
+    assert_eq!(rejection["message"], "rule_action_binding_invalid");
+}
+
+#[test]
+fn rule_catch_up_capacity_refusal_retains_scope_and_remedy() {
+    let mut store = store();
+    let rule = definition("capacity-refusal", true);
+    let state = store.ensure_rule_state("owner", &rule, 1).unwrap();
+    let event_seq = insert_test_event(&mut store, "command.accepted", 2);
+    let state = store
+        .advance_rule_cursor("owner", &state, event_seq, RuleCursorOutcome::NoMatch, 2)
+        .unwrap()
+        .value;
+    let request_id = Ulid::new().to_string();
+    let mut launch = SubmitCommand::new(Ulid::new().to_string(), "launch");
+    launch.args = json!({
+        "project": "capacity-refusal-project",
+        "harness": "codex",
+        "profile": "fake",
+        "profile_snapshot": {
+            "capacity_scopes": [{"scope": "profile:fake", "max_live": 0}]
+        },
+        "workspace": "capacity-refusal-workspace"
+    });
+    launch.expected_generation = Some(0);
+
+    let admission = store
+        .admit_rule_catch_up(
+            "owner",
+            &core::api::RuleCatchUpRequest::new(request_id, rule.id.as_str(), 0, Some(event_seq)),
+            &state,
+            event_seq,
+            &[RuleCatchUpAction::command(event_seq, launch)],
+            3,
+        )
+        .unwrap();
+    let rejection = admission
+        .events
+        .iter()
+        .find(|event| event.kind == "rule.rejected")
+        .expect("capacity refusal marker");
+    assert_eq!(rejection.data["code"], "capacity_unavailable");
+    assert!(
+        rejection.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("profile:fake")
+    );
+    assert!(
+        rejection.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("[profiles.fake] max_live")
     );
 }
 
@@ -2600,6 +2652,7 @@ fn scheduled_and_manual_timer_store_paths_reject_resume_without_old_generation()
                 next_due_at_ms: None,
                 action: Some(scheduled_resume),
                 skip_code: None,
+                skip_capacity_message: None,
             },
             scheduled_at_ms,
         )

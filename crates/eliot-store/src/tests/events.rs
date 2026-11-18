@@ -114,6 +114,7 @@ fn typed_command_cause_updates_persisted_and_returned_event_without_legacy_backf
         now + 1,
         false,
         eliot_core::api::HierarchyLimits::default(),
+        None,
     )
     .unwrap();
     let event_index = admission

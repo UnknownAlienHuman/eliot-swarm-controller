@@ -1548,81 +1548,28 @@ pub(crate) fn load_daemon_config(data_root: &Path) -> core::Result<DaemonConfig>
     config.daemon.validate()
 }
 
-/// Owner capacity bounds for the 2c scopes, from the one config store.
-/// A missing file means every scope is unlimited.
-pub(crate) fn load_capacity_config(data_root: &Path) -> core::Result<CapacityConfig> {
+/// Current Owner capacity policy for admission and overview readback.
+pub(crate) fn load_scope_limits(data_root: &Path) -> core::Result<core::api::ScopeLimits> {
     let Some((config, _)) = read_config(data_root)? else {
-        return Ok(CapacityConfig::default());
+        return Ok(core::api::ScopeLimits::default());
     };
-    Ok(config.capacity)
-}
-
-/// Daemon-owned capacity scopes (`global:swarm`, `project:*`,
-/// `manager_assignment:*`) are stamped after the launch-authority check from
-/// the inherited project and the Owner capacity config, never chosen by the
-/// launching agent. The child-snapshot comparison skips them for the same
-/// reason; the Store enforces them at admission.
-pub(crate) fn is_daemon_owned_scope(scope: &str) -> bool {
-    scope == core::CapacityScope::global_scope()
-        || scope.starts_with("project:")
-        || scope.starts_with("manager_assignment:")
-}
-
-/// Freeze the daemon-wide, per-project and per-assignment capacity scopes
-/// into a launch snapshot. The helper is idempotent: daemon-owned scope
-/// entries are replaced, caller-frozen profile, account and proxy bounds
-/// are kept. The Store checks and reserves every applicable scope in the
-/// same admission transaction against live physical usage, so another
-/// profile name, a second assignment key or a new worker cannot evade a
-/// project or global cap.
-pub(crate) fn stamp_capacity_scopes(
-    snapshot: &mut Value,
-    project: Option<&str>,
-    capacity: &CapacityConfig,
-) -> core::Result<()> {
-    if let Some(project) = project
-        && (project.is_empty() || project.len() > 1024 || project.contains(char::is_control))
-    {
-        return Err(core::Error::new(
-            "profile_error",
-            "config.toml: capacity project name is invalid",
-        ));
-    }
-    let snapshot_object = snapshot.as_object_mut().ok_or_else(|| {
-        core::Error::new("invalid", "resolved profile snapshot must be a JSON object")
-    })?;
-    let mut scopes: Vec<core::CapacityScope> = match snapshot_object.get("capacity_scopes") {
-        None => Vec::new(),
-        Some(existing) => serde_json::from_value(existing.clone())
-            .map_err(|_| core::Error::new("invalid", "profile capacity scopes are malformed"))?,
-    };
-    scopes.retain(|scope| !is_daemon_owned_scope(&scope.scope));
-    scopes.push(core::CapacityScope {
-        scope: core::CapacityScope::global_scope(),
-        max_live: capacity.global_max_live,
-    });
-    if let Some(project) = project.filter(|name| !name.is_empty()) {
-        let entry = capacity.projects.get(project);
-        scopes.push(core::CapacityScope {
-            scope: core::CapacityScope::project_scope(project),
-            max_live: entry.and_then(|limits| limits.max_live),
-        });
-        scopes.push(core::CapacityScope {
-            scope: core::CapacityScope::manager_assignment_scope(project),
-            max_live: entry.and_then(|limits| limits.manager_max_live),
-        });
-    }
-    for scope in &scopes {
-        scope.validate().map_err(|_| {
-            core::Error::new("profile_error", "config.toml: capacity scope is invalid")
-        })?;
-    }
-    snapshot_object.insert(
-        "capacity_scopes".to_owned(),
-        serde_json::to_value(scopes)
-            .map_err(|_| core::Error::new("internal", "capacity scopes could not be encoded"))?,
-    );
-    Ok(())
+    Ok(core::api::ScopeLimits {
+        global: config.capacity.global_max_live,
+        projects: config
+            .capacity
+            .projects
+            .into_iter()
+            .map(|(project, limits)| {
+                (
+                    project,
+                    core::api::ProjectScopeLimits {
+                        project: limits.max_live,
+                        manager_assignment: limits.manager_max_live,
+                    },
+                )
+            })
+            .collect(),
+    })
 }
 
 pub(crate) fn load_cloud_mcp_config(
@@ -5275,81 +5222,5 @@ output_limit = 4096
             let source = format!("[capacity.projects.\"{bad}\"]\nmax_live=1\n");
             assert!(parse_config(&source).is_err(), "accepted {bad:?}");
         }
-    }
-
-    #[test]
-    fn stamp_capacity_scopes_freezes_current_owner_bounds() {
-        let capacity = CapacityConfig {
-            global_max_live: Some(3),
-            projects: [(
-                "app".to_owned(),
-                CapacityProjectEntry {
-                    max_live: Some(2),
-                    manager_max_live: None,
-                },
-            )]
-            .into_iter()
-            .collect(),
-        };
-        let mut snapshot = serde_json::json!({
-            "control": "tree",
-            "capacity_scopes": [
-                {"scope": "profile:codex-luna", "max_live": null},
-                {"scope": "project:app", "max_live": 0},
-            ],
-        });
-        stamp_capacity_scopes(&mut snapshot, Some("app"), &capacity).unwrap();
-        let scopes = snapshot["capacity_scopes"].as_array().unwrap();
-        assert_eq!(scopes.len(), 4);
-        assert!(
-            scopes
-                .iter()
-                .any(|scope| scope["scope"] == "profile:codex-luna")
-        );
-        assert!(
-            scopes
-                .iter()
-                .any(|scope| scope["scope"] == "global:swarm" && scope["max_live"] == 3)
-        );
-        assert!(
-            scopes
-                .iter()
-                .any(|scope| scope["scope"] == "project:app" && scope["max_live"] == 2)
-        );
-        assert!(
-            scopes
-                .iter()
-                .any(|scope| scope["scope"] == "manager_assignment:app"
-                    && scope["max_live"].is_null())
-        );
-
-        // Idempotent: a second stamp replaces the daemon-owned entries.
-        let once = snapshot.clone();
-        stamp_capacity_scopes(&mut snapshot, Some("app"), &capacity).unwrap();
-        assert_eq!(snapshot, once);
-
-        // Daemon-owned entries are refreshed, caller-frozen bounds are kept.
-        let other = CapacityConfig {
-            global_max_live: None,
-            projects: std::collections::HashMap::new(),
-        };
-        stamp_capacity_scopes(&mut snapshot, None, &other).unwrap();
-        let scopes = snapshot["capacity_scopes"].as_array().unwrap();
-        assert_eq!(scopes.len(), 2);
-        assert!(
-            scopes
-                .iter()
-                .any(|scope| scope["scope"] == "profile:codex-luna")
-        );
-        assert!(
-            scopes
-                .iter()
-                .any(|scope| scope["scope"] == "global:swarm" && scope["max_live"].is_null())
-        );
-
-        // Scope-hostile project names fail closed instead of poisoning the snapshot.
-        // Colons are legal in names (Windows volume prefixes), so the hostile
-        // case is a control character.
-        assert!(stamp_capacity_scopes(&mut snapshot, Some("a:\u{1}b"), &capacity).is_err());
     }
 }

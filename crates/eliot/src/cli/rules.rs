@@ -100,8 +100,8 @@ pub(crate) async fn run_project(
             print_value(&response, json_output);
             Ok(0)
         }
-        ProjectCommand::Overview { project } => {
-            let request = ProjectOverviewRequest { project };
+        ProjectCommand::Overview { project, after } => {
+            let request = ProjectOverviewRequest { project, after };
             request
                 .validate()
                 .map_err(|error| Failure::from_core(error, true))?;

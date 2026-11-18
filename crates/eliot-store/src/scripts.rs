@@ -125,8 +125,16 @@ impl Store {
             rules::validate_script_output_rate_tx(&tx, origin, action.target.as_deref(), now)?;
 
             let limits = self.hierarchy_limits;
-            let admission =
-                admission::submit_tx(&tx, &run.command.principal, action, None, now, true, limits)?;
+            let admission = admission::submit_tx(
+                &tx,
+                &run.command.principal,
+                action,
+                None,
+                now,
+                true,
+                limits,
+                None,
+            )?;
             if !admission.is_new {
                 return Err(Error::new(
                     "source_integrity",

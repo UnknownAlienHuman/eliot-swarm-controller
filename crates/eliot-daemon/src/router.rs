@@ -1991,19 +1991,6 @@ impl Router {
                 request.args["registered_project"] = json!(project);
             }
         }
-        {
-            let capacity = crate::config::load_capacity_config(&self.inner.data_root)?;
-            let project: Option<String> = request
-                .args
-                .get("registered_project")
-                .and_then(Value::as_str)
-                .or_else(|| request.args.get("project").and_then(Value::as_str))
-                .filter(|name| !name.is_empty())
-                .map(str::to_owned);
-            if let Some(snapshot) = request.args.get_mut("profile_snapshot") {
-                crate::config::stamp_capacity_scopes(snapshot, project.as_deref(), &capacity)?;
-            }
-        }
         let Some(branch) = request.args.get("worktree").and_then(Value::as_str) else {
             if !parent_workspace_shared
                 && request
@@ -2759,6 +2746,7 @@ impl Router {
         let report = matches!(
             &outcome,
             eliot_store::RuleCursorOutcome::Rejected { .. }
+                | eliot_store::RuleCursorOutcome::RejectedWithCapacity { .. }
                 | eliot_store::RuleCursorOutcome::Disabled
         );
         let change = {

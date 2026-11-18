@@ -1,6 +1,9 @@
 //! Durable Store reservations for configured live Agent capacity.
 use super::*;
+use eliot_core::api::ScopeLimits;
 use eliot_core::{CapacityScope, ScriptCustody};
+
+pub(super) type PolicyLoader = dyn Fn() -> Result<ScopeLimits> + Send + Sync;
 
 const MIGRATION_BATCH_SIZE: i64 = 128;
 const RETAINED_PAGE_SIZE: i64 = 128;
@@ -389,7 +392,12 @@ pub(super) fn scopes(agent: &Agent) -> Result<Vec<CapacityScope>> {
     Ok(scopes)
 }
 
-pub(super) fn reserve_tx(tx: &Transaction<'_>, agent: &Agent, generation: i64) -> Result<()> {
+pub(super) fn reserve_tx(
+    tx: &Transaction<'_>,
+    agent: &Agent,
+    generation: i64,
+    policy: Option<&PolicyLoader>,
+) -> Result<()> {
     if agent.observe_only {
         return Ok(());
     }
@@ -415,102 +423,170 @@ pub(super) fn reserve_tx(tx: &Transaction<'_>, agent: &Agent, generation: i64) -
     }
 
     require_free(tx, agent, id)?;
-
+    if let Some(load) = policy {
+        let limits = load()?;
+        let scope = CapacityScope::global_scope();
+        if let Some(limit) = limits.global {
+            require_scope_free(&scope, limit, capacity_scope_usage(tx, &scope)?)?;
+        }
+        if let Some(limits) = limits.projects.get(&agent.project) {
+            if let Some(limit) = limits.project {
+                let scope = CapacityScope::project_scope(&agent.project);
+                require_scope_free(&scope, limit, capacity_scope_usage(tx, &scope)?)?;
+            }
+            if let Some(limit) = limits.manager_assignment {
+                let (usage, member) = assignment_usage(tx, &agent.project, Some((id, generation)))?;
+                if member {
+                    let scope = CapacityScope::manager_assignment_scope(&agent.project);
+                    require_scope_free(&scope, limit, usage)?;
+                }
+            }
+        }
+    }
     set_reservation_generation_tx(tx, id, None, generation)
 }
 
-/// Live reservations occupying one capacity scope.
-///
-/// `global:swarm` counts every controlled generation on this daemon. A
-/// `project:<id>` or `manager_assignment:<id>` scope counts live generations
-/// registered to that project, an idle manager included. Profile, account and
-/// proxy scopes keep the frozen-snapshot membership check.
-fn count_scope_usage(connection: &Connection, id: i64, scope: &CapacityScope) -> Result<i64> {
-    if scope.scope == "global:swarm" {
-        return connection
-            .query_row(
-                "SELECT COUNT(*) FROM agents a
-                 WHERE a.capacity_generation IS NOT NULL AND a.id <> ?1",
-                params![id],
-                |row| row.get(0),
-            )
-            .map_err(sql_error);
-    }
-    if let Some(project) = scope
-        .scope
-        .strip_prefix("project:")
-        .or_else(|| scope.scope.strip_prefix("manager_assignment:"))
-    {
-        return connection
-            .query_row(
-                "SELECT COUNT(*) FROM agents a
-                 WHERE a.capacity_generation IS NOT NULL AND a.id <> ?1
-                   AND (a.project = ?2 OR COALESCE(a.project_scope, a.project) = ?2)",
-                params![id, project],
-                |row| row.get(0),
-            )
-            .map_err(sql_error);
-    }
-    connection
-        .query_row(
-            "SELECT COUNT(*) FROM agents a
-             WHERE a.capacity_generation IS NOT NULL AND a.id <> ?1
-               AND (?2 = 'profile:' || a.profile OR EXISTS (
-                   SELECT 1 FROM json_each(a.profile_snapshot, '$.capacity_scopes') s
-                   WHERE CASE WHEN s.type = 'object'
-                              THEN json_extract(s.value, '$.scope') END = ?2
-               ))",
-            params![id, scope.scope],
-            |row| row.get(0),
-        )
-        .map_err(sql_error)
+/// Reservations belonging to the current assignment's root and exact manager
+/// generation. Managed launch and resume can reserve before dispatch installs
+/// the new generation. The candidate row is evaluated by the same predicate.
+fn assignment_usage(
+    conn: &Connection,
+    project: &str,
+    candidate: Option<(i64, i64)>,
+) -> Result<(usize, bool)> {
+    let (candidate_id, candidate_generation) = candidate.unwrap_or((0, 0));
+    conn.query_row(
+        "WITH members AS (
+             SELECT a.id, p.manager, p.manager_generation, m.generation AS current_generation,
+                    CASE WHEN a.id = ?2 THEN ?3 ELSE a.capacity_generation END AS reserved
+             FROM project_assignments p
+             JOIN agents m ON m.id = p.manager AND m.project = p.project
+             JOIN agents a ON a.project = p.project AND a.root = p.manager
+             WHERE p.project = ?1 AND (
+                 m.generation = p.manager_generation OR
+                 (m.generation = 0 AND p.manager_generation = 1 AND p.start_command IS NOT NULL)
+             )
+         )
+         SELECT COUNT(*) FILTER (WHERE id <> ?2), COUNT(*) FILTER (WHERE id = ?2) > 0
+         FROM members WHERE reserved IS NOT NULL AND (
+             id <> manager OR reserved = manager_generation OR
+             (current_generation = manager_generation AND reserved - 1 = manager_generation)
+         )",
+        params![project, candidate_id, candidate_generation],
+        |row| Ok((row.get::<_, i64>(0)? as usize, row.get(1)?)),
+    )
+    .map_err(sql_error)
 }
 
-fn require_free(connection: &Connection, agent: &Agent, id: i64) -> Result<()> {
-    for scope in scopes(agent)? {
-        let Some(max_live) = scope.max_live else {
-            continue;
-        };
-        let count: i64 = count_scope_usage(connection, id, &scope)?;
-        if u64::try_from(count).map_or(true, |count| count >= max_live) {
-            return Err(Error::new(
-                "capacity_unavailable",
-                format!(
-                    "configured capacity bound {} max_live={max_live} is reserved; Owner may raise it in config.toml [capacity]",
-                    scope.scope
-                ),
+pub(super) fn capacity_scope_usage(conn: &Connection, scope: &str) -> Result<usize> {
+    if scope == "global:swarm" {
+        return conn
+            .query_row(
+                "SELECT COUNT(*) FROM agents WHERE capacity_generation IS NOT NULL",
+                [],
+                |row| Ok(row.get::<_, i64>(0)? as usize),
             )
-            .with_where("store.admission.capacity")
-            .with_origin(
-                core::FailureOrigin::Swarm,
-                "configured local capacity bound is reserved",
-            ));
+            .map_err(sql_error);
+    }
+    if let Some(project) = scope.strip_prefix("project:") {
+        return conn
+            .query_row(
+                "SELECT COUNT(*) FROM agents WHERE project = ?1 AND capacity_generation IS NOT NULL",
+                [project],
+                |row| Ok(row.get::<_, i64>(0)? as usize),
+            )
+            .map_err(sql_error);
+    }
+    if let Some(project) = scope.strip_prefix("manager_assignment:") {
+        return Ok(assignment_usage(conn, project, None)?.0);
+    }
+    Err(Error::new("internal", "invalid daemon capacity scope"))
+}
+
+fn frozen_scope_usage(conn: &Connection, id: i64, scope: &str) -> Result<usize> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM agents a
+         WHERE a.capacity_generation IS NOT NULL AND a.id <> ?1
+           AND (?2 = 'profile:' || a.profile OR EXISTS (
+               SELECT 1 FROM json_each(a.profile_snapshot, '$.capacity_scopes') s
+               WHERE CASE WHEN s.type = 'object'
+                          THEN json_extract(s.value, '$.scope') END = ?2
+           ))",
+        params![id, scope],
+        |row| Ok(row.get::<_, i64>(0)? as usize),
+    )
+    .map_err(sql_error)
+}
+
+fn require_free(conn: &Connection, agent: &Agent, id: i64) -> Result<()> {
+    for scope in scopes(agent)? {
+        if let Some(max_live) = scope.max_live
+            && !CapacityScope::is_daemon_owned(&scope.scope)
+        {
+            let usage = frozen_scope_usage(conn, id, &scope.scope)?;
+            require_scope_free(&scope.scope, max_live, usage)?;
         }
     }
-
     Ok(())
 }
 
+fn require_scope_free(scope: &str, max_live: u64, usage: usize) -> Result<()> {
+    if (usage as u64) < max_live {
+        return Ok(());
+    }
+    let (kind, name) = scope.split_once(':').unwrap_or_default();
+    let name = toml_key(name);
+    let setting = match kind {
+        "profile" => format!("[profiles.{name}] max_live"),
+        "account" => format!("[accounts.{name}] max_live"),
+        "proxy" => format!("[proxies.{name}] max_live"),
+        "project" => format!("[capacity.projects.{name}] max_live"),
+        "manager_assignment" => format!("[capacity.projects.{name}] manager_max_live"),
+        _ => "[capacity] global_max_live".to_owned(),
+    };
+    Err(Error::new(
+        "capacity_unavailable",
+        format!("configured capacity bound {scope} max_live={max_live} is reserved; Owner may raise it in config.toml {setting}"),
+    )
+    .with_where("store.admission.capacity")
+    .with_origin(
+        core::FailureOrigin::Swarm,
+        "configured local capacity bound is reserved",
+    ))
+}
+
+fn toml_key(name: &str) -> String {
+    if name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        name.to_owned()
+    } else {
+        format!("{name:?}")
+    }
+}
+
 impl Store {
-    /// Passive admission preflight; admission still rechecks hold and reserves
-    /// capacity transactionally before acknowledging any launch.
-    pub fn routing_unavailable(
+    /// Passive candidate check of the frozen route. The writer rechecks
+    /// provider holds and all applicable capacity during admission.
+    pub fn routing_refusal(
         &self,
         profile: &str,
         harness: &str,
         snapshot: &Value,
-    ) -> Result<Option<core::RouteSkipReason>> {
+    ) -> Result<Option<Error>> {
         self.ensure_committed_reads()?;
         let mut candidate = Agent::new("a1", "routing", harness, profile, 0);
         candidate.profile_snapshot = snapshot.clone();
         if provider_holds::profile_held(&self.connection, &candidate)? {
-            return Ok(Some(core::RouteSkipReason::ProviderHold));
+            return Ok(Some(Error::new(
+                "provider_held",
+                "routing candidate is under a provider hold",
+            )));
         }
         match require_free(&self.connection, &candidate, 0) {
             Ok(()) => Ok(None),
-            Err(error) if error.code == "capacity_unavailable" => {
-                Ok(Some(core::RouteSkipReason::CapacityFull))
-            }
+            Err(error) if error.code == "capacity_unavailable" => Ok(Some(error)),
             Err(error) => Err(error),
         }
     }

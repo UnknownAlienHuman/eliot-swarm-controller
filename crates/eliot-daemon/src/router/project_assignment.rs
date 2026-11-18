@@ -117,7 +117,7 @@ impl Router {
         }
         .await;
         let mut store = self.inner.store.lock().await;
-        let prepared = prepared.and_then(|(mut launch, preparation)| {
+        let prepared = prepared.and_then(|(launch, preparation)| {
             self.check_command_admission_mode("launch")?;
             if !store
                 .get_project_registration("owner", &request.project)?
@@ -127,14 +127,6 @@ impl Router {
                     "stale_assignment",
                     "manager launch registration changed",
                 ));
-            }
-            let capacity = crate::config::load_capacity_config(&self.inner.data_root)?;
-            if let Some(snapshot) = launch.args.get_mut("profile_snapshot") {
-                crate::config::stamp_capacity_scopes(
-                    snapshot,
-                    Some(request.project.as_str()),
-                    &capacity,
-                )?;
             }
             Ok((launch, preparation))
         });

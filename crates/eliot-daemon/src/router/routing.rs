@@ -2,6 +2,24 @@
 use super::*;
 use eliot_core::{RouteQuotaStatus, RouteSkip, RouteSkipReason, RoutingDecision};
 
+#[derive(Default)]
+struct RoutePreflight {
+    held_accounts: HashMap<String, Value>,
+    capacity_refusal: Option<Error>,
+}
+
+impl RoutePreflight {
+    fn record(&mut self, refusal: Error, harness: String, account: Value) -> RouteSkipReason {
+        if refusal.code == "capacity_unavailable" {
+            self.capacity_refusal.get_or_insert(refusal);
+            RouteSkipReason::CapacityFull
+        } else {
+            self.held_accounts.insert(harness, account);
+            RouteSkipReason::ProviderHold
+        }
+    }
+}
+
 impl Router {
     /// `routing.preview`: run the admission selection for `role` without a
     /// command. Nothing is admitted, frozen or reserved; the next launch
@@ -22,7 +40,7 @@ impl Router {
         let decision = match self.route_launch_profile(principal, &mut probe).await {
             Ok(_) => serde_json::from_value(probe.args["profile_choice"].take())
                 .map_err(|_| Error::new("internal", "routing preview decision is malformed"))?,
-            Err(error) if error.code == "routing_unavailable" => *error
+            Err(error) if error.routing.is_some() => *error
                 .routing
                 .ok_or_else(|| Error::new("internal", "routing refusal lost its decision"))?,
             Err(error) => return Err(error),
@@ -81,7 +99,7 @@ impl Router {
         };
         // A held account is never replaced with another account of the same
         // harness. Policy may still select a different native harness.
-        let mut held_accounts = HashMap::<String, Value>::new();
+        let mut preflight = RoutePreflight::default();
         for name in candidates {
             let mut quota_status = RouteQuotaStatus::Unknown;
             let evaluated = self
@@ -91,7 +109,7 @@ impl Router {
                     &name,
                     parent.as_ref(),
                     &mut quota_status,
-                    &mut held_accounts,
+                    &mut preflight,
                 )
                 .await?;
             match evaluated {
@@ -103,20 +121,23 @@ impl Router {
                         .map_err(|_| Error::new("internal", "routing decision encoding failed"))?;
                     return Ok((name, harness, snapshot));
                 }
-                Err(reason) => decision.skipped.push(RouteSkip {
-                    profile: name,
-                    reason,
-                    quota_status,
-                }),
+                Err(reason) => {
+                    decision.skipped.push(RouteSkip {
+                        profile: name,
+                        reason,
+                        quota_status,
+                    });
+                }
             }
         }
-        // The refusal code is closed and the bounded JSON message carries the
-        // same typed per-candidate decision as an accepted launch.
-        let mut error = Error::new(
-            "routing_unavailable",
-            serde_json::to_string(&decision)
-                .map_err(|_| Error::new("internal", "routing refusal encoding failed"))?,
-        );
+        let mut error = match preflight.capacity_refusal {
+            Some(error) => error,
+            None => Error::new(
+                "routing_unavailable",
+                serde_json::to_string(&decision)
+                    .map_err(|_| Error::new("internal", "routing refusal encoding failed"))?,
+            ),
+        };
         error.routing = Some(Box::new(decision));
         Err(error)
     }
@@ -128,7 +149,7 @@ impl Router {
         name: &str,
         parent: Option<&Agent>,
         quota_status: &mut RouteQuotaStatus,
-        held_accounts: &mut HashMap<String, Value>,
+        preflight: &mut RoutePreflight,
     ) -> Result<std::result::Result<(String, Value), RouteSkipReason>> {
         if let Some(parent) = parent
             && name != parent.profile
@@ -183,7 +204,8 @@ impl Router {
             }
         }
         let account = account_identity(&snapshot);
-        if held_accounts
+        if preflight
+            .held_accounts
             .get(&harness)
             .is_some_and(|held| held != &account)
         {
@@ -192,17 +214,11 @@ impl Router {
         if !native_installed(&harness, &snapshot) {
             return Ok(Err(RouteSkipReason::NotInstalled));
         }
-        let unavailable = self
-            .inner
-            .store
-            .lock()
-            .await
-            .routing_unavailable(name, &harness, &snapshot)?;
-        if let Some(reason) = unavailable {
-            if reason == RouteSkipReason::ProviderHold {
-                held_accounts.insert(harness, account);
+        {
+            let store = self.inner.store.lock().await;
+            if let Some(error) = store.routing_refusal(name, &harness, &snapshot)? {
+                return Ok(Err(preflight.record(error, harness, account)));
             }
-            return Ok(Err(reason));
         }
         // Every harness with an implemented quota reader is probed through
         // the one normalized projection, so retained Muse windows and other
@@ -225,22 +241,14 @@ impl Router {
             );
             *quota_status = status;
             if exhausted {
-                held_accounts.insert(harness, account);
+                preflight.held_accounts.insert(harness, account);
                 return Ok(Err(RouteSkipReason::QuotaExhausted));
             }
         }
         // Passive reads can take time. Recheck live state before freezing.
-        if let Some(reason) = self
-            .inner
-            .store
-            .lock()
-            .await
-            .routing_unavailable(name, &harness, &snapshot)?
-        {
-            if reason == RouteSkipReason::ProviderHold {
-                held_accounts.insert(harness, account);
-            }
-            return Ok(Err(reason));
+        let store = self.inner.store.lock().await;
+        if let Some(error) = store.routing_refusal(name, &harness, &snapshot)? {
+            return Ok(Err(preflight.record(error, harness, account)));
         }
         Ok(Ok((harness, snapshot)))
     }
@@ -382,6 +390,37 @@ mod tests {
                 .is_empty()
         );
         drop(router);
+    }
+
+    #[tokio::test]
+    async fn all_full_candidates_preserve_capacity_refusal_details() {
+        let root = std::env::temp_dir().join(format!("eliot-routing-full-{}", ulid::Ulid::new()));
+        let _temp = crate::test_support::TempDir::own(root.clone());
+        std::fs::create_dir_all(&root).unwrap();
+        let cmd = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        std::fs::write(
+            root.join("config.toml"),
+            format!(
+                "[routing]\nworker=['full']\n[profiles.full]\nharness='claude'\ncmd='{cmd}'\nmax_live=0\n"
+            ),
+        )
+        .unwrap();
+        let router = super::super::tests::router_with_data_root(root.clone());
+        let mut request = SubmitCommand::new(ulid::Ulid::new().to_string(), "launch");
+        request.args = json!({"role":"worker","workspace":"w","project":"p"});
+        let error = router
+            .freeze_launch_profile(&Principal::Owner, &mut request)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "capacity_unavailable");
+        assert!(error.message.contains("profile:full"));
+        assert_eq!(
+            error.routing.as_ref().unwrap().skipped[0].reason,
+            RouteSkipReason::CapacityFull
+        );
     }
 
     #[test]

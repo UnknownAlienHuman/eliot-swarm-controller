@@ -234,16 +234,20 @@ automatically through the existing parent link. They run in the manager's ready
 worktree under the current assignment fence and can reuse a frozen profile with
 setup entries. Workspace setup runs only during preparation of a new worktree.
 
-`project.overview` reads back one project team or every team with its manager,
-workers, workspaces, queue depth and capacity usage, plus whole-fleet totals:
-live harnesses (with per-harness breakdown), active turns, queued work and
-retained-unknown reservations, each counted separately, with observed native
-children listed separately and never counted twice. Totals are exact committed
-counts, never a UI page: the worker, workspace and native-child lists are
-bounded and carry truncation flags, and `coverage` says `partial` when a list
-did not fit instead of giving a total for it. The Owner sees every team in
-full; a manager caller sees its own team in full and aggregates for other
-projects. Queue-depth reporting carries no scheduling promise: fairness and
+`project.overview` reads fleet totals and paged project detail from one
+committed Store snapshot, identified by its event watermark. The Owner can
+page through all detail. A live assigned manager can page through its current
+team within its frozen Agent read scope. Other teams, including their native
+children, appear as aggregates. A released manager or worker receives
+aggregates. Authorized detail includes assignment state, revision and workspace
+binding, including adopted workspaces.
+
+Live harnesses, dispatched starts, active turns, waiting work and retained
+unknown reservations use their respective committed generation, command, turn
+and reservation evidence. The fleet separately counts distinct observed native
+children, including any without a project. Observation coverage describes what
+the daemon can observe. The page continuation describes which authorized rows
+remain. Queue-depth reporting carries no scheduling promise. Fairness and
 queued interactive launch are step 4 and stay unsupported.
 
 The current workspace binding to the assignment is recorded separately from
@@ -464,7 +468,7 @@ An allow-listed cross-harness profile is an explicit Owner grant of that profile
 freshly frozen harness, model, permissions and MCP policy. The child gets its own
 credential/selector bindings; parent bindings and native policy names never cross
 harnesses. Same-harness children retain the model/effort-only comparison and inherit
-parent credential bindings verbatim. Every non-profile capacity scope of the parent
+parent credential bindings verbatim. Every frozen account or proxy capacity scope of the parent
 is kept with the same bounds, alongside the child's own scopes; conflicting bounds
 reject. Control is narrowed or equal (never widened). It omits `profile_snapshot` (the daemon
 freezes it) and shares the parent's workspace (an omitted workspace defaults to

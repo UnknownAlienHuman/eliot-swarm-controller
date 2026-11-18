@@ -463,6 +463,7 @@ mod tests {
             next_due_at_ms: Some(scheduled_at_ms + 3_600_000),
             action: None,
             skip_code: Some("missed".to_owned()),
+            skip_capacity_message: None,
         };
         let late = router
             .commit_rule_timer_slot("owner", None, &before, slot, scheduled_at_ms)

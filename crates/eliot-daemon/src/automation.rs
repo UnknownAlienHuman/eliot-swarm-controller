@@ -114,6 +114,32 @@ pub(crate) enum RuleWorkerExit {
     Exited,
 }
 
+fn rule_cursor_rejection(error: &Error) -> RuleCursorOutcome {
+    if error.code == "capacity_unavailable"
+        && error.failure_where.as_deref() == Some("store.admission.capacity")
+    {
+        RuleCursorOutcome::RejectedWithCapacity {
+            code: error.code.clone(),
+            message: error.message.to_string(),
+            failure_where: "store.admission.capacity".to_owned(),
+        }
+    } else {
+        RuleCursorOutcome::Rejected {
+            code: error.code.clone(),
+        }
+    }
+}
+
+fn rule_catch_up_rejection(event_seq: i64, error: &Error) -> eliot_store::RuleCatchUpAction {
+    if error.code == "capacity_unavailable"
+        && error.failure_where.as_deref() == Some("store.admission.capacity")
+    {
+        eliot_store::RuleCatchUpAction::rejected_with_capacity(event_seq, error)
+    } else {
+        eliot_store::RuleCatchUpAction::rejected(event_seq, error.code.clone())
+    }
+}
+
 struct RetiringRule {
     definition: RuleDefinition,
     revision: i64,
@@ -1484,7 +1510,7 @@ async fn process_rule_cursor(
                         rule,
                         retiring,
                         event.seq,
-                        RuleCursorOutcome::Rejected { code: error.code },
+                        rule_cursor_rejection(&error),
                     )
                     .await?;
                     continue;
@@ -1517,7 +1543,7 @@ async fn process_rule_cursor(
                         rule,
                         retiring,
                         event.seq,
-                        RuleCursorOutcome::Rejected { code: error.code },
+                        rule_cursor_rejection(&error),
                     )
                     .await?;
                     continue;
@@ -1544,7 +1570,7 @@ async fn process_rule_cursor(
                         rule,
                         retiring,
                         event.seq,
-                        RuleCursorOutcome::Rejected { code: error.code },
+                        rule_cursor_rejection(&error),
                     )
                     .await?;
                     continue;
@@ -1773,119 +1799,139 @@ async fn reconcile_due_timers(
                 continue;
             }
 
-            let (scheduled_at_ms, next_due_at_ms, action, skip_code, armed_slot) =
-                match timer_decision(timer, now)? {
-                    TimerDecision::NotDue => continue,
-                    TimerDecision::Skip {
-                        scheduled_at_ms,
-                        next_due_at_ms,
-                        code,
-                    } => (scheduled_at_ms, next_due_at_ms, None, Some(code), None),
-                    TimerDecision::Fire {
-                        scheduled_at_ms,
-                        next_due_at_ms,
-                        live_armed,
-                    } => {
-                        if let Some(admission) = router
-                            .replay_rule_timer_slot(&rule.principal, &timer.state, scheduled_at_ms)
-                            .await?
-                        {
-                            timer.state = admission.state;
-                            timer.blocked = admission.blocked;
-                            timer.armed_due_at_ms =
-                                timer.state.next_due_at.filter(|due| *due > now);
-                            continue;
-                        }
+            let (
+                scheduled_at_ms,
+                next_due_at_ms,
+                action,
+                skip_code,
+                skip_capacity_message,
+                armed_slot,
+            ) = match timer_decision(timer, now)? {
+                TimerDecision::NotDue => continue,
+                TimerDecision::Skip {
+                    scheduled_at_ms,
+                    next_due_at_ms,
+                    code,
+                } => (
+                    scheduled_at_ms,
+                    next_due_at_ms,
+                    None,
+                    Some(code),
+                    None,
+                    None,
+                ),
+                TimerDecision::Fire {
+                    scheduled_at_ms,
+                    next_due_at_ms,
+                    live_armed,
+                } => {
+                    if let Some(admission) = router
+                        .replay_rule_timer_slot(&rule.principal, &timer.state, scheduled_at_ms)
+                        .await?
+                    {
+                        timer.state = admission.state;
+                        timer.blocked = admission.blocked;
+                        timer.armed_due_at_ms = timer.state.next_due_at.filter(|due| *due > now);
+                        continue;
+                    }
 
-                        // A per-assignment briefs failure (for example a missing
-                        // briefs folder, `unavailable`) fails only this slot, so
-                        // the worker keeps running every other automation. The
-                        // code is recorded as the slot skip reason below.
-                        let mut assignment_unavailable: Option<String> = None;
-                        let prepared = match rule.definition.evaluate_timer() {
-                            Ok(action) if action.verb == "run" => {
-                                router
-                                    .prepare_timer_rule_run_submission(
-                                        action,
-                                        rule.project.as_ref(),
-                                        timer_script_context(
-                                            &rule.definition.id,
-                                            rule.state.revision,
-                                            &timer.state,
-                                            ScriptTimerInvocation::Scheduled { scheduled_at_ms },
-                                        ),
-                                    )
-                                    .await
-                            }
-                            Ok(action) => {
-                                if action.args.get("assignment").is_some() && rule.project.is_some()
-                                {
-                                    Err(Error::new(
-                                        "not_allowed",
-                                        "assignments require an Owner timer",
-                                    ))
-                                } else {
-                                    match assignment::prepare(router, action).await {
-                                        Ok(action) => match rule.project.as_ref() {
-                                            Some(project) => {
-                                                router
-                                                    .prepare_project_rule_submission(
-                                                        action, project,
-                                                    )
-                                                    .await
-                                            }
-                                            None => router.prepare_owner_submission(action).await,
-                                        },
-                                        Err(error) if error.code == "unavailable" => {
-                                            assignment_unavailable = Some(error.code.clone());
-                                            Err(error)
+                    // A per-assignment briefs failure (for example a missing
+                    // briefs folder, `unavailable`) fails only this slot, so
+                    // the worker keeps running every other automation. The
+                    // code is recorded as the slot skip reason below.
+                    let mut assignment_unavailable: Option<String> = None;
+                    let prepared = match rule.definition.evaluate_timer() {
+                        Ok(action) if action.verb == "run" => {
+                            router
+                                .prepare_timer_rule_run_submission(
+                                    action,
+                                    rule.project.as_ref(),
+                                    timer_script_context(
+                                        &rule.definition.id,
+                                        rule.state.revision,
+                                        &timer.state,
+                                        ScriptTimerInvocation::Scheduled { scheduled_at_ms },
+                                    ),
+                                )
+                                .await
+                        }
+                        Ok(action) => {
+                            if action.args.get("assignment").is_some() && rule.project.is_some() {
+                                Err(Error::new(
+                                    "not_allowed",
+                                    "assignments require an Owner timer",
+                                ))
+                            } else {
+                                match assignment::prepare(router, action).await {
+                                    Ok(action) => match rule.project.as_ref() {
+                                        Some(project) => {
+                                            router
+                                                .prepare_project_rule_submission(action, project)
+                                                .await
                                         }
-                                        Err(error) => Err(error),
+                                        None => router.prepare_owner_submission(action).await,
+                                    },
+                                    Err(error) if error.code == "unavailable" => {
+                                        assignment_unavailable = Some(error.code.clone());
+                                        Err(error)
                                     }
+                                    Err(error) => Err(error),
                                 }
                             }
+                        }
+                        Err(error) if is_deterministic_pre_admission_rejection(&error.code) => {
+                            Err(error)
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    if let Some(code) = assignment_unavailable {
+                        if !router.rule_firings_open() {
+                            return Ok(false);
+                        }
+                        (
+                            scheduled_at_ms,
+                            next_due_at_ms,
+                            None,
+                            Some(code),
+                            None,
+                            None,
+                        )
+                    } else {
+                        match prepared {
+                            Ok(prepared) => (
+                                scheduled_at_ms,
+                                next_due_at_ms,
+                                Some(prepared.request),
+                                None,
+                                None,
+                                live_armed.then_some(scheduled_at_ms),
+                            ),
                             Err(error) if is_deterministic_pre_admission_rejection(&error.code) => {
-                                Err(error)
-                            }
-                            Err(error) => return Err(error),
-                        };
-                        if let Some(code) = assignment_unavailable {
-                            if !router.rule_firings_open() {
-                                return Ok(false);
-                            }
-                            (scheduled_at_ms, next_due_at_ms, None, Some(code), None)
-                        } else {
-                            match prepared {
-                                Ok(prepared) => (
+                                (
                                     scheduled_at_ms,
                                     next_due_at_ms,
-                                    Some(prepared.request),
                                     None,
-                                    live_armed.then_some(scheduled_at_ms),
-                                ),
-                                Err(error)
-                                    if is_deterministic_pre_admission_rejection(&error.code) =>
-                                {
-                                    (
-                                        scheduled_at_ms,
-                                        next_due_at_ms,
-                                        None,
-                                        Some(error.code),
-                                        None,
-                                    )
-                                }
-                                Err(_error) if !router.rule_firings_open() => return Ok(false),
-                                Err(error) => return Err(error),
+                                    Some(error.code.clone()),
+                                    (error.code == "capacity_unavailable"
+                                        && error.failure_where.as_deref()
+                                            == Some("store.admission.capacity"))
+                                    .then_some(*error.message),
+                                    None,
+                                )
                             }
+                            Err(_error) if !router.rule_firings_open() => return Ok(false),
+                            Err(error) => return Err(error),
                         }
                     }
-                };
+                }
+            };
 
             let slot = TimerSlotCommit {
                 scheduled_at_ms,
                 next_due_at_ms,
                 action,
                 skip_code,
+                skip_capacity_message,
             };
             let Some(admission) = router
                 .commit_rule_timer_slot(
@@ -2007,9 +2053,7 @@ pub(crate) async fn prepare_rule_catch_up_actions(
             Ok(Some(request)) => request,
             Ok(None) => continue,
             Err(error) if is_deterministic_pre_admission_rejection(&error.code) => {
-                actions.push(eliot_store::RuleCatchUpAction::rejected(
-                    event.seq, error.code,
-                ));
+                actions.push(rule_catch_up_rejection(event.seq, &error));
                 continue;
             }
             Err(error) => return Err(error),
@@ -2063,9 +2107,7 @@ pub(crate) async fn prepare_rule_catch_up_actions(
                     continue;
                 }
                 Err(error) if is_deterministic_pre_admission_rejection(&error.code) => {
-                    actions.push(eliot_store::RuleCatchUpAction::rejected(
-                        event_seq, error.code,
-                    ));
+                    actions.push(rule_catch_up_rejection(event_seq, &error));
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -2114,9 +2156,7 @@ pub(crate) async fn prepare_rule_catch_up_actions(
                 prepared.request,
             )),
             Err(error) if is_deterministic_pre_admission_rejection(&error.code) => {
-                actions.push(eliot_store::RuleCatchUpAction::rejected(
-                    event_seq, error.code,
-                ));
+                actions.push(rule_catch_up_rejection(event_seq, &error));
             }
             Err(error) => return Err(error),
         }

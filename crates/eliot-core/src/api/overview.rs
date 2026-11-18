@@ -1,12 +1,4 @@
-//! Server fleet readback for one project team and the whole daemon
-//! (`project.overview`): project entries with the current manager, workers,
-//! workspaces, queue depth and capacity usage, plus whole-fleet totals.
-//!
-//! Counts come from exact `COUNT(*)` reads, never from a UI page: the list
-//! views (workers, workspaces, native children) are bounded and carry their
-//! own truncation flags, while every total stays exact. A manager caller sees
-//! its own project in full and aggregates for every other project; the Owner
-//! sees every project in full.
+//! Committed fleet totals and paged project overview details.
 use crate::{AgentState, CapacityScope, Error, Result, parse_agent_id};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -20,6 +12,9 @@ pub struct ProjectOverviewRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(description = "Registered project id; omitted means every visible project.")]
     pub project: Option<String>,
+    /// Opaque continuation from the previous page for the same project filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
 }
 
 impl ProjectOverviewRequest {
@@ -27,13 +22,27 @@ impl ProjectOverviewRequest {
         if let Some(project) = &self.project {
             validate_project_name(project, "params.project")?;
         }
+        if let Some(after) = &self.after
+            && (after.is_empty() || after.len() > 4096 || after.contains(char::is_control))
+        {
+            return Err(Error::invalid_field(
+                "params.after",
+                "project overview continuation",
+            ));
+        }
         Ok(())
     }
 
     pub fn validate_response(&self, reply: &ProjectOverviewResponse) -> Result<()> {
         reply.validate()?;
         if let Some(project) = &self.project
-            && !reply.projects.iter().any(|entry| &entry.project == project)
+            && (reply.projects.iter().any(|entry| &entry.project != project)
+                || self.after.is_none() && reply.projects.is_empty()
+                || reply
+                    .fleet
+                    .native_children
+                    .iter()
+                    .any(|row| row.project.as_ref() != Some(project)))
         {
             return Err(Error::new(
                 "unknown",
@@ -92,6 +101,12 @@ pub struct OverviewManagerView {
     pub agent: String,
     pub generation: i64,
     pub state: AgentState,
+    /// Monotonic assignment revision for this manager binding.
+    #[serde(default)]
+    pub assignment_revision: i64,
+    /// Assignment workspace, including adopted checkouts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
 }
 
 impl OverviewManagerView {
@@ -127,7 +142,7 @@ impl OverviewWorkerView {
     pub fn validate(&self) -> Result<()> {
         parse_agent_id(&self.agent)
             .map_err(|_| Error::new("unknown", "project.overview response is invalid"))?;
-        if self.generation < 1 || self.harness.trim().is_empty() || self.root.trim().is_empty() {
+        if self.generation < 0 || self.harness.trim().is_empty() || self.root.trim().is_empty() {
             return Err(Error::new(
                 "unknown",
                 "project.overview response is invalid",
@@ -152,7 +167,9 @@ pub struct NativeChildView {
     pub child: String,
     pub producer: String,
     pub producer_generation: i64,
-    pub project: String,
+    /// `None` is an explicit no-project native chat. Such children are
+    /// fleet observations only and are never projected into a team.
+    pub project: Option<String>,
     pub state: AgentState,
 }
 
@@ -162,7 +179,12 @@ impl NativeChildView {
             parse_agent_id(id)
                 .map_err(|_| Error::new("unknown", "project.overview response is invalid"))?;
         }
-        if self.producer_generation < 0 || self.project.trim().is_empty() {
+        if self.producer_generation < 0
+            || self
+                .project
+                .as_deref()
+                .is_some_and(|project| project.trim().is_empty())
+        {
             return Err(Error::new(
                 "unknown",
                 "project.overview response is invalid",
@@ -180,9 +202,30 @@ pub struct ProjectTotals {
     pub live: usize,
     #[schemars(description = "Turns in state running for this project.")]
     pub active_turns: usize,
-    #[schemars(description = "Commands accepted, queued or dispatched for this project.")]
+    #[schemars(description = "Commands accepted or queued for this project.")]
     pub queued: usize,
     #[schemars(description = "Capacity holders retained in lost, stopped or failed.")]
+    pub retained_unknown: usize,
+    #[serde(default)]
+    pub lifecycle: LifecycleTotals,
+}
+
+/// Controlled generation states, running turns, and commands awaiting dispatch.
+#[derive(JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LifecycleTotals {
+    pub live: usize,
+    #[serde(default)]
+    pub idle: usize,
+    #[serde(default)]
+    pub busy: usize,
+    #[serde(default)]
+    pub waiting: usize,
+    pub starting: usize,
+    #[serde(default)]
+    pub stopping: usize,
+    pub active: usize,
+    pub queued: usize,
     pub retained_unknown: usize,
 }
 
@@ -197,6 +240,10 @@ pub struct ProjectOverviewEntry {
     pub detail: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manager: Option<OverviewManagerView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignment: Option<crate::api::ProjectAssignment>,
+    #[serde(default)]
+    pub native_child_total: usize,
     #[serde(default)]
     pub workers: Vec<OverviewWorkerView>,
     pub worker_total: usize,
@@ -233,8 +280,20 @@ impl ProjectOverviewEntry {
         }
         if self.worker_total < self.workers.len()
             || self.workspace_total < self.workspaces.len()
-            || (!self.detail && (!self.workers.is_empty() || !self.workspaces.is_empty()))
+            || (!self.detail
+                && (self.manager.is_some()
+                    || self.assignment.is_some()
+                    || !self.workers.is_empty()
+                    || !self.workspaces.is_empty()
+                    || self.workers_truncated
+                    || self.workspaces_truncated))
+            || self
+                .assignment
+                .as_ref()
+                .is_some_and(|assignment| assignment.project != self.project)
             || self.capacity.len() != 2
+            || self.capacity[0].scope != CapacityScope::project_scope(&self.project)
+            || self.capacity[1].scope != CapacityScope::manager_assignment_scope(&self.project)
         {
             return Err(Error::new(
                 "unknown",
@@ -266,17 +325,25 @@ pub struct FleetTotals {
     pub live_by_harness: Vec<HarnessCount>,
     #[schemars(description = "Turns in state running.")]
     pub active_turns: usize,
-    #[schemars(description = "Commands accepted, queued or dispatched.")]
+    #[schemars(description = "Commands accepted or queued.")]
     pub queued_work: usize,
     #[schemars(description = "Capacity holders retained in lost, stopped or failed.")]
     pub retained_unknown: usize,
+    #[serde(default)]
+    pub manager_total: usize,
+    #[serde(default)]
+    pub worker_total: usize,
+    #[serde(default)]
+    pub lifecycle: LifecycleTotals,
     #[serde(default)]
     pub native_children: Vec<NativeChildView>,
     pub native_child_total: usize,
     pub native_children_truncated: bool,
     #[schemars(description = "The global:swarm usage beside its Owner limit.")]
     pub capacity: ScopeUsage,
-    #[schemars(description = "Number of project entries in this readback.")]
+    #[schemars(
+        description = "Exact project count for the fleet, independent of filtering and paging."
+    )]
     pub projects: usize,
 }
 
@@ -292,9 +359,7 @@ impl FleetTotals {
             }
             by_harness += entry.total;
         }
-        if by_harness != self.live_harnesses
-            || self.native_child_total < self.native_children.len()
-            || (self.native_children_truncated && self.native_children.is_empty())
+        if by_harness != self.live_harnesses || self.native_child_total < self.native_children.len()
         {
             return Err(Error::new(
                 "unknown",
@@ -315,8 +380,7 @@ impl FleetTotals {
     }
 }
 
-/// List completeness: totals are always exact counts, so `partial` only says
-/// a list view (workers, workspaces or native children) hit its bound.
+/// Completeness of native-child observation independent of page completion.
 #[derive(JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OverviewCoverage {
@@ -328,8 +392,17 @@ pub enum OverviewCoverage {
 #[derive(JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectOverviewResponse {
+    /// Store event sequence at the committed snapshot used for this reply.
+    #[serde(default)]
+    pub event_watermark: i64,
     pub as_of: i64,
     pub coverage: OverviewCoverage,
+    /// `true` when all authorized detail rows have been returned.
+    #[serde(default)]
+    pub page_complete: bool,
+    /// Cursor for the next response-wide bounded page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
     pub fleet: FleetTotals,
     #[serde(default)]
     pub projects: Vec<ProjectOverviewEntry>,
@@ -337,7 +410,6 @@ pub struct ProjectOverviewResponse {
 
 impl ProjectOverviewResponse {
     pub fn validate(&self) -> Result<()> {
-        let mut truncated = false;
         let mut previous = String::new();
         for entry in &self.projects {
             entry.validate()?;
@@ -348,21 +420,12 @@ impl ProjectOverviewResponse {
                 ));
             }
             previous = entry.project.clone();
-            truncated = truncated || entry.workers_truncated || entry.workspaces_truncated;
         }
         self.fleet.validate()?;
-        if self.fleet.projects != self.projects.len()
-            || self.fleet.native_children_truncated
-                && !truncated
-                && self.fleet.native_children.is_empty()
+        if self.fleet.projects < self.projects.len()
+            || self.event_watermark < 0
+            || self.page_complete == self.next_cursor.is_some()
         {
-            return Err(Error::new(
-                "unknown",
-                "project.overview response is invalid",
-            ));
-        }
-        let expect_partial = truncated || self.fleet.native_children_truncated;
-        if matches!(self.coverage, OverviewCoverage::Partial) != expect_partial {
             return Err(Error::new(
                 "unknown",
                 "project.overview response is invalid",
@@ -400,6 +463,8 @@ mod tests {
             project: project.to_owned(),
             detail,
             manager: None,
+            assignment: None,
+            native_child_total: 0,
             workers: Vec::new(),
             worker_total: 0,
             workers_truncated: false,
@@ -417,14 +482,20 @@ mod tests {
 
     fn response() -> ProjectOverviewResponse {
         ProjectOverviewResponse {
+            event_watermark: 1,
             as_of: 1,
             coverage: OverviewCoverage::Complete,
+            page_complete: true,
+            next_cursor: None,
             fleet: FleetTotals {
                 live_harnesses: 0,
                 live_by_harness: Vec::new(),
                 active_turns: 0,
                 queued_work: 0,
                 retained_unknown: 0,
+                manager_total: 0,
+                worker_total: 0,
+                lifecycle: LifecycleTotals::default(),
                 native_children: Vec::new(),
                 native_child_total: 0,
                 native_children_truncated: false,
@@ -437,17 +508,29 @@ mod tests {
 
     #[test]
     fn overview_round_trips_and_rejects_bad_shapes() {
-        let request = ProjectOverviewRequest { project: None };
+        let request = ProjectOverviewRequest {
+            project: None,
+            after: None,
+        };
         request.validate().unwrap();
         let reply = response();
         request.validate_response(&reply).unwrap();
+        assert!(reply.page_complete);
+        assert!(reply.next_cursor.is_none());
+        let paged = ProjectOverviewRequest {
+            project: None,
+            after: Some("a".to_owned()),
+        };
+        paged.validate().unwrap();
         let specific = ProjectOverviewRequest {
             project: Some("app".to_owned()),
+            after: None,
         };
         specific.validate().unwrap();
         specific.validate_response(&reply).unwrap();
         let missing = ProjectOverviewRequest {
             project: Some("other".to_owned()),
+            after: None,
         };
         assert!(missing.validate_response(&reply).is_err());
 

@@ -1320,6 +1320,9 @@ pub(crate) enum ProjectCommand {
         /// Registered project id; omitted means every visible project.
         #[arg(long)]
         project: Option<String>,
+        /// Continue after the project cursor returned by a prior overview.
+        #[arg(long, visible_alias = "cursor")]
+        after: Option<String>,
     },
     /// Read or change current project manager assignments.
     Assignment(ProjectAssignmentArgs),

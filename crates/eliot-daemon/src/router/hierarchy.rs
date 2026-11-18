@@ -140,13 +140,8 @@ fn stripped_child_snapshot(snapshot: &Value, profile: &str) -> Result<Value> {
     Ok(Value::Object(stripped))
 }
 
-/// The profile scope (`profile:<name>`) necessarily differs between parent
-/// and child, and daemon-owned scopes are stamped by the daemon after this
-/// check from the inherited project and the Owner capacity config, never
-/// chosen by the launching agent. Every other capacity scope
-/// (account/proxy/route) must match exactly, so a child cannot escape the
-/// parent's shared capacity bounds; the stamped scopes are enforced
-/// separately at Store admission against the child's inherited project.
+/// Compare frozen shared scopes across same-harness profiles. Legacy
+/// daemon-owned entries are resolved afresh by Store admission.
 fn without_own_and_daemon_scopes(scopes: &Value, profile: &str) -> Result<Value> {
     let Some(scopes) = scopes.as_array() else {
         return Err(Error::new(
@@ -158,13 +153,13 @@ fn without_own_and_daemon_scopes(scopes: &Value, profile: &str) -> Result<Value>
     Ok(Value::Array(
         scopes
             .iter()
-            .filter(|entry| match entry.get("scope").and_then(Value::as_str) {
-                Some(scope) => {
-                    scope != own.as_str() && !crate::config::is_daemon_owned_scope(scope)
-                }
-                // An entry without a scope key cannot widen authority; the
-                // stamp decoder rejects it when the snapshot is frozen.
-                None => true,
+            .filter(|entry| {
+                entry
+                    .get("scope")
+                    .and_then(Value::as_str)
+                    .is_none_or(|scope| {
+                        scope != own && !eliot_core::CapacityScope::is_daemon_owned(scope)
+                    })
             })
             .cloned()
             .collect(),
@@ -220,7 +215,9 @@ fn cross_harness_capacity_scopes(child: &Value, parent: &Agent) -> Result<Value>
     let mut scopes = decode(child)?;
     let parent_profile_scope = format!("profile:{}", parent.profile);
     for inherited in decode(&parent.profile_snapshot)? {
-        if inherited.scope == parent_profile_scope {
+        if inherited.scope == parent_profile_scope
+            || eliot_core::CapacityScope::is_daemon_owned(&inherited.scope)
+        {
             continue;
         }
         if let Some(existing) = scopes.iter().find(|scope| scope.scope == inherited.scope) {
@@ -1589,9 +1586,6 @@ mod tests {
                     {"scope":"profile:worker","max_live":null},
                     {"scope":"account:child","max_live":8},
                     {"scope":"account:shared","max_live":4},
-                    {"scope":"global:swarm","max_live":null},
-                    {"scope":format!("project:{}", child.project),"max_live":null},
-                    {"scope":format!("manager_assignment:{}", child.project),"max_live":null},
                 ])
             );
             assert!(!child.profile_inherited);
@@ -1646,7 +1640,13 @@ mod tests {
             "harness":"codex", "pass_env":["CODEX_HOME","PARENT_KEY"],
             "pass_env_values":{"CODEX_HOME":"parent-home"},
             "native_store_binding":{"home":"parent-home","root":"parent-root","native_scope":"parent-scope"},
-            "capacity_scopes":[{"scope":"profile:fixture","max_live":1},{"scope":"account:shared","max_live":2}],
+            "capacity_scopes":[
+                {"scope":"profile:fixture","max_live":1},
+                {"scope":"account:shared","max_live":2},
+                {"scope":"global:swarm","max_live":1},
+                {"scope":"project:demo","max_live":1},
+                {"scope":"manager_assignment:demo","max_live":1}
+            ],
         });
         let own = json!({
             "harness":"claude", "pass_env":["CHILD_KEY"],
@@ -1661,6 +1661,16 @@ mod tests {
         assert_eq!(
             child["capacity_scopes"][1],
             parent.profile_snapshot["capacity_scopes"][1]
+        );
+        assert_eq!(child["capacity_scopes"].as_array().unwrap().len(), 2);
+        assert!(
+            !child["capacity_scopes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|scope| eliot_core::CapacityScope::is_daemon_owned(
+                    scope["scope"].as_str().unwrap()
+                ))
         );
         let mut conflicting = own;
         conflicting["capacity_scopes"]
@@ -1712,6 +1722,68 @@ mod tests {
                 "an Agent child reusing its parent snapshot verbatim is inherited"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn omitted_profile_routing_uses_current_daemon_capacity_policy() {
+        let (router, config_root) = router_with_fixture_profile();
+        let _temp = crate::test_support::TempDir::own(config_root);
+        let policy = Arc::new(std::sync::Mutex::new(eliot_core::api::ScopeLimits {
+            global: Some(1),
+            projects: Default::default(),
+        }));
+        {
+            let policy = Arc::clone(&policy);
+            router
+                .inner
+                .store
+                .lock()
+                .await
+                .set_capacity_policy(move || Ok(policy.lock().unwrap().clone()));
+        }
+        let workspace =
+            std::env::temp_dir().join(format!("eliot-capacity-route-{}", ulid::Ulid::new()));
+        let _workspace_temp = crate::test_support::TempDir::own(workspace.clone());
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut launch = SubmitCommand::new(ulid::Ulid::new().to_string(), "launch");
+        launch.args = json!({"workspace":workspace,"profile":"fixture"});
+        let mut prepared = router
+            .prepare_submission(launch, &Principal::Owner)
+            .await
+            .unwrap();
+        prepared.request.args["profile_snapshot"]["capacity_scopes"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"scope":"global:swarm","max_live":1}));
+        let manager = {
+            let mut store = router.inner.store.lock().await;
+            let launch = router
+                .admit_prepared_submission(&mut store, "owner", prepared, None)
+                .unwrap()
+                .command;
+            store.dispatch(&launch.id, now_ms()).unwrap();
+            launch.target.unwrap()
+        };
+
+        // The manager's retained generation used the old global cap of one.
+        // Routing must not reject the omitted-profile child under that stale
+        // snapshot; Store admission reports the current cap instead.
+        let refusal = launch_child(&router, &manager, &workspace, None)
+            .await
+            .unwrap_err();
+        assert_eq!(refusal.code, "capacity_unavailable");
+        assert!(refusal.message.contains("global:swarm"));
+
+        *policy.lock().unwrap() = eliot_core::api::ScopeLimits {
+            global: Some(2),
+            projects: Default::default(),
+        };
+        let admitted = launch_child(&router, &manager, &workspace, None)
+            .await
+            .unwrap();
+        let typed: CommandSubmitResponse = serde_json::from_value(admitted).unwrap();
+        assert_eq!(typed.state, CommandState::Accepted);
+        drop(router);
     }
 
     #[tokio::test]
