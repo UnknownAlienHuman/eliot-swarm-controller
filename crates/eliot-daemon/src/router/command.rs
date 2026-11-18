@@ -129,6 +129,19 @@ impl Router {
             self.process_switch(&id).await;
             return;
         }
+        if self
+            .inner
+            .store
+            .lock()
+            .await
+            .get_command(&id)
+            .ok()
+            .flatten()
+            .is_some_and(|command| command.verb == "continue")
+        {
+            self.process_continue(&id).await;
+            return;
+        }
         let mut receiver = self.inner.bus.subscribe();
         let prepare_started = std::time::Instant::now();
         let Some(prepared) = self

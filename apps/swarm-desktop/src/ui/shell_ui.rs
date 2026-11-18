@@ -685,6 +685,9 @@ impl DesktopApp {
                     Shortcut::Enter(_) if self.menu.renaming.is_some() => {
                         self.menu_update(MenuMsg::RenameCommitted, context);
                     }
+                    Shortcut::Enter(_) if self.menu.org_input.is_some() => {
+                        self.menu_update(MenuMsg::OrgInputCommitted, context);
+                    }
                     Shortcut::Enter(epoch) => {
                         // Enter on a suggestion reached with the arrows, with
                         // no other input since and the box still showing it.
@@ -1857,7 +1860,7 @@ impl DesktopApp {
                 place.name,
                 place.running,
                 place.missing,
-                self.menu.renaming.is_some()
+                self.menu.renaming.is_some() || self.menu.org_input.is_some()
             ),
             row,
         )
@@ -2192,7 +2195,7 @@ impl DesktopApp {
                 row.agent.id,
                 row.expanded,
                 row.agent.archived,
-                self.menu.renaming.is_some()
+                self.menu.renaming.is_some() || self.menu.org_input.is_some()
             ),
             view,
         )

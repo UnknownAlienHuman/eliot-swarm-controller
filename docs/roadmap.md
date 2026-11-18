@@ -96,7 +96,8 @@ Checked layers record delivered increments, not full crash/load qualification.
   reservations and return exact project, manager and fleet usage.
 - [x] **3. Project transfer.** Build on H1/H2/H3 to transfer authority, team and
   workspace bindings atomically, with explicit drain and unknown handling.
-- [ ] **4a. Headless chat organization.** Add conversation association and project continuation.
+- [x] **4a. Headless chat and work organization.** Grouped projection, attach/detach/tag
+  and authorized continue-in-project with a source reference (schema v63).
 - [x] **4b. Fair queue.** Arbitrate automation assignments across projects and support
   explicit queued interactive launch, wait readback and scoped manager budgets.
 - [ ] **5. Desktop and migration.** Consume server readbacks and migrate explicit

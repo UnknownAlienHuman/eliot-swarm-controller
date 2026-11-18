@@ -796,7 +796,7 @@ fn admit_rule_action_tx(
 /// Admit one `launch`: new Agent row, creation events, and optional linked
 /// first input. Returns the linked send id, if any.
 #[allow(clippy::too_many_arguments)]
-fn admit_launch_tx(
+pub(super) fn admit_launch_tx(
     tx: &Transaction<'_>,
     principal: &str,
     request: &SubmitCommand,

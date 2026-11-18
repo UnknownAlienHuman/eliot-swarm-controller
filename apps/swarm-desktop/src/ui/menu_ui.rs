@@ -82,6 +82,12 @@ pub(super) enum Action {
     Resume,
     Archive(bool),
     Delete,
+    /// Attach a chat to a project, tag it, or continue it in a project:
+    /// placement and tags only, never execution scope.
+    OrgAttach,
+    OrgDetach,
+    OrgTag,
+    OrgContinue,
     CopyId,
     More,
 }
@@ -105,6 +111,14 @@ pub(super) enum MenuMsg {
     RenameChanged(String),
     RenameCommitted,
     RenameCancelled,
+    /// The organization editor's text changed.
+    OrgInputChanged(String),
+    /// The organization editor was saved.
+    OrgInputCommitted,
+    /// The organization editor was closed.
+    OrgInputCancelled,
+    /// Put the keyboard in the organization field (tries left).
+    FocusOrg(u8),
     /// The confirmation's answer (true: go ahead).
     Confirmed(bool),
     /// Show archived Agents in the sidebar, or not.
@@ -134,7 +148,19 @@ pub(super) enum MenuMsg {
     Ignored,
 }
 
-/// The open menu, the rename in progress and the pending confirmation.
+/// What the organization editor writes on save.
+/// What the inline organization editor writes on save.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum OrgInput {
+    /// The typed project receives the chat placement.
+    Attach,
+    /// The typed comma-separated tags replace the Agent groups.
+    Tag,
+    /// The typed project hosts the new continued session.
+    Continue,
+}
+
+/// The open menu, the rename and organization edits in progress, and the pending confirmation.
 #[derive(Default)]
 pub(super) struct MenuState {
     pub(super) open: Option<(Target, f64, f64)>,
@@ -146,6 +172,10 @@ pub(super) struct MenuState {
     pub(super) renaming: Option<(Target, String)>,
     pub(super) confirm: Option<(Target, Action)>,
     pub(super) rename_ref: ElementRef<TextBox>,
+    /// The organization edit in progress: its target, what it writes,
+    /// and the text typed so far.
+    pub(super) org_input: Option<(Target, OrgInput, String)>,
+    pub(super) org_ref: ElementRef<TextBox>,
     /// The keyboard-highlighted row, bound when it renders: focusing
     /// it scrolls it into view (WinUI brings a focused element in).
     row_ref: ElementRef<Button>,
@@ -237,7 +267,10 @@ impl DesktopApp {
                     return;
                 };
                 // The rename field and the confirmation own the keyboard.
-                if self.menu.renaming.is_some() || self.menu.confirm.is_some() {
+                if self.menu.renaming.is_some()
+                    || self.menu.confirm.is_some()
+                    || self.menu.org_input.is_some()
+                {
                     return;
                 }
                 let count = self.menu_entries(target).len();
@@ -270,7 +303,10 @@ impl DesktopApp {
                 let Some((target, _, _)) = &self.menu.open else {
                     return;
                 };
-                if self.menu.renaming.is_some() || self.menu.confirm.is_some() {
+                if self.menu.renaming.is_some()
+                    || self.menu.confirm.is_some()
+                    || self.menu.org_input.is_some()
+                {
                     return;
                 }
                 if let Some(index) = self.menu.highlight
@@ -316,6 +352,23 @@ impl DesktopApp {
                 }
             }
             MenuMsg::RenameCancelled => self.menu.renaming = None,
+            MenuMsg::OrgInputChanged(text) => {
+                if let Some((_, _, typed)) = self.menu.org_input.as_mut() {
+                    *typed = text;
+                }
+            }
+            MenuMsg::OrgInputCommitted => {
+                if let Some((target, kind, typed)) = self.menu.org_input.take() {
+                    self.commit_org_input(target, kind, typed, context);
+                }
+            }
+            MenuMsg::OrgInputCancelled => self.menu.org_input = None,
+            MenuMsg::FocusOrg(tries) => {
+                if self.menu.org_input.is_some() && !self.menu.org_ref.request_focus() && tries > 0
+                {
+                    self.focus_org(tries - 1, context);
+                }
+            }
             MenuMsg::Confirmed(yes) => {
                 let Some((target, action)) = self.menu.confirm.take() else {
                     return;
@@ -733,6 +786,30 @@ impl DesktopApp {
                 self.menu.renaming = Some((target, current));
                 self.focus_rename(5, context);
             }
+            (Action::OrgAttach, Target::Agent(agent)) => {
+                self.menu.org_input = Some((
+                    Target::Agent(agent.clone()),
+                    OrgInput::Attach,
+                    String::new(),
+                ));
+                self.focus_org(5, context);
+            }
+            (Action::OrgDetach, Target::Agent(agent)) => {
+                self.menu.confirm = Some((Target::Agent(agent.clone()), action));
+            }
+            (Action::OrgTag, Target::Agent(agent)) => {
+                self.menu.org_input =
+                    Some((Target::Agent(agent.clone()), OrgInput::Tag, String::new()));
+                self.focus_org(5, context);
+            }
+            (Action::OrgContinue, Target::Agent(agent)) => {
+                self.menu.org_input = Some((
+                    Target::Agent(agent.clone()),
+                    OrgInput::Continue,
+                    String::new(),
+                ));
+                self.focus_org(5, context);
+            }
             (Action::Delete, _) => {
                 self.menu.confirm = Some((target, action));
             }
@@ -822,6 +899,14 @@ impl DesktopApp {
         context: &ComponentContext<Self>,
     ) {
         match (action, target) {
+            (Action::OrgDetach, Target::Agent(agent)) => {
+                let id = agent.id.clone();
+                let key = format!("org-detach:{id}");
+                self.submit_lifecycle("Detach", key, context, move |data_dir, mutation| {
+                    client::block_on(client::org_detach(data_dir, mutation, &id))
+                        .map(|reply| format!("{id} detached (revision {})", reply.revision))
+                });
+            }
             (Action::Delete, Target::Agent(agent)) if agent.live() => {
                 self.start_removal(agent, context);
             }
@@ -854,6 +939,75 @@ impl DesktopApp {
             .collect()
     }
 
+    /// Save one organization edit: attach, tags, or a continued session.
+    /// Placement and tags only; execution scope is never edited here.
+    fn commit_org_input(
+        &mut self,
+        target: Target,
+        kind: OrgInput,
+        typed: String,
+        context: &ComponentContext<Self>,
+    ) {
+        if self.submitting() {
+            self.alert("Waiting for the last action to settle.");
+            return;
+        }
+        let Target::Agent(agent) = target else {
+            return;
+        };
+        let agent = agent.clone();
+        match kind {
+            OrgInput::Attach => {
+                let project = typed.trim().to_owned();
+                if project.is_empty() {
+                    self.alert("Attach needs a project id.");
+                    return;
+                }
+                let key = format!("org-attach:{}:{project}", agent.id);
+                self.submit_lifecycle("Attach", key, context, move |data_dir, mutation| {
+                    let id = agent.id.clone();
+                    client::block_on(client::org_attach(data_dir, mutation, &id, &project)).map(
+                        |reply| format!("{id} attached to {project} (revision {})", reply.revision),
+                    )
+                });
+            }
+            OrgInput::Tag => {
+                let tags: Vec<String> = typed
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|tag| !tag.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                let key = format!("org-tag:{}:{}", agent.id, tags.join(","));
+                self.submit_lifecycle("Tag", key, context, move |data_dir, mutation| {
+                    let id = agent.id.clone();
+                    client::block_on(client::org_tag(data_dir, mutation, &id, tags))
+                        .map(|reply| format!("{} tagged (revision {})", id, reply.revision))
+                });
+            }
+            OrgInput::Continue => {
+                let project = typed.trim().to_owned();
+                if project.is_empty() {
+                    self.alert("Continue needs a project id.");
+                    return;
+                }
+                let key = format!("org-continue:{}:{project}", agent.id);
+                self.submit_lifecycle("Continue", key, context, move |data_dir, mutation| {
+                    let id = agent.id.clone();
+                    client::block_on(client::org_continue(data_dir, mutation, &id, &project)).map(
+                        |reply| match &reply.created {
+                            Some(session) => format!(
+                                "continued as {} (launch {})",
+                                session.agent, reply.launch_command
+                            ),
+                            None => format!("continuation {} reserved", reply.launch_command),
+                        },
+                    )
+                });
+            }
+        }
+    }
+
     /// One Agent lifecycle call with a ledger-held mutation id.
     fn submit_lifecycle(
         &mut self,
@@ -875,6 +1029,15 @@ impl DesktopApp {
         let what = what.to_owned();
         let _task = context.spawn_background(move |_| {
             Message::Menu(MenuMsg::Done(what, work(&data_dir, mutation_id)))
+        });
+    }
+
+    /// Focus the organization field once it exists (after the next render).
+    fn focus_org(&self, tries: u8, context: &ComponentContext<Self>) {
+        let _task = context.spawn_background(move |cancel| {
+            let cancelled = || cancel.is_cancelled();
+            let _ = feed::backoff(60, &cancelled);
+            Message::Menu(MenuMsg::FocusOrg(tries))
         });
     }
 
@@ -1073,6 +1236,29 @@ impl DesktopApp {
             m3::glyph::COPY,
             false,
         )];
+        if !agent.native_child {
+            if agent.chat {
+                entries.push((
+                    Action::OrgAttach,
+                    "Attach to project…".to_owned(),
+                    m3::glyph::MOVE,
+                    false,
+                ));
+                entries.push((
+                    Action::OrgDetach,
+                    "Detach from project".to_owned(),
+                    m3::glyph::BACK,
+                    false,
+                ));
+            }
+            entries.push((Action::OrgTag, "Tag…".to_owned(), m3::glyph::COPY, false));
+            entries.push((
+                Action::OrgContinue,
+                "Continue in project…".to_owned(),
+                m3::glyph::RESUME,
+                false,
+            ));
+        }
         // No-project chats never had Open folder: their workspace is a
         // private daemon directory, not a place to open. A chat with a
         // project keeps its old entry, as does any task with a folder.
@@ -1091,6 +1277,9 @@ impl DesktopApp {
     pub(super) fn task_dialog(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         if let Some(removal) = &self.menu.removal {
             return self.removal_dialog(removal, context, palette);
+        }
+        if let Some((target, kind, typed)) = &self.menu.org_input {
+            return self.org_dialog(target, *kind, typed, context, palette);
         }
         if let Some((target, action)) = &self.menu.confirm {
             return self.confirm_dialog(target, *action, context, palette);
@@ -1185,6 +1374,11 @@ impl DesktopApp {
                 "Swarm stops it, waits until it has stopped, then removes its conversation and records for good. Its folder, files and branches stay.",
                 "Stop and delete",
             ),
+            Action::OrgDetach => (
+                format!("Detach {}?", target.title()),
+                "The chat returns to the no-project bucket. Execution scope, workspace and history stay.",
+                "Detach",
+            ),
             Action::Delete => (
                 format!("Delete “{}”?", target.title()),
                 "Its conversation and records leave Swarm for good. Its folder, files and branches stay.",
@@ -1212,6 +1406,70 @@ impl DesktopApp {
                     .element_ref(&self.dialog.primary)
                     .automation_name(format!("{button}: {}", target.title()))
                     .on_click(context.message(Message::Menu(MenuMsg::Confirmed(true))))
+                    .content(m3::label(button)),
+            ),
+            420.0,
+        )
+    }
+
+    /// The organization editor dialog: one text field with Save and Cancel.
+    /// Placement and tags only; the daemon validates the typed value.
+    fn org_dialog(
+        &self,
+        target: &Target,
+        kind: OrgInput,
+        typed: &str,
+        context: &mut ViewContext<Self>,
+        palette: Palette,
+    ) -> View {
+        let (title, body, placeholder, button) = match kind {
+            OrgInput::Attach => (
+                format!("Attach {} to a project", target.title()),
+                "The chat is placed under the typed project. Execution scope, workspace and history stay.",
+                "project id",
+                "Attach",
+            ),
+            OrgInput::Tag => (
+                format!("Tag {}", target.title()),
+                "The typed comma-separated tags replace the Agent's groups.",
+                "tag, another tag",
+                "Save tags",
+            ),
+            OrgInput::Continue => (
+                format!("Continue {} in a project", target.title()),
+                "A new authorized session starts in the typed project with a reference to this conversation. This conversation stays.",
+                "project id",
+                "Continue",
+            ),
+        };
+        let field = m3::field()
+            .element_ref(&self.menu.org_ref)
+            .text(typed.to_owned())
+            .placeholder_text(placeholder)
+            .automation_name(button)
+            .on_text_changed(
+                context.callback(|text| Message::Menu(MenuMsg::OrgInputChanged(text))),
+            );
+        let content: View = StackPanel::new()
+            .orientation(Orientation::Vertical)
+            .spacing(tokens::spacing::SM)
+            .children((m3::secondary(body).text_wrapping(TextWrapping::Wrap), field));
+        super::dialog_ui::surface(
+            context,
+            self.dialog.epoch,
+            palette,
+            title,
+            content,
+            super::dialog_ui::actions(
+                m3::text_button(palette)
+                    .element_ref(&self.dialog.close)
+                    .automation_name("Cancel")
+                    .on_click(context.message(Message::Menu(MenuMsg::OrgInputCancelled)))
+                    .content(m3::label("Cancel")),
+                m3::text_button(palette)
+                    .element_ref(&self.dialog.primary)
+                    .automation_name(format!("{button}: {}", target.title()))
+                    .on_click(context.message(Message::Menu(MenuMsg::OrgInputCommitted)))
                     .content(m3::label(button)),
             ),
             420.0,

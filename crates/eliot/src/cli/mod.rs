@@ -6,6 +6,7 @@ pub(crate) mod args;
 mod cleanup;
 mod coord;
 mod daemon;
+mod organization;
 mod project_assignment;
 mod reads;
 mod rules;
@@ -87,6 +88,9 @@ pub(crate) async fn dispatch(
         CliCommand::Reparent(args) => agents::run_reparent(args, data_dir, json_output, id).await,
         CliCommand::Handoff(args) => agents::run_handoff(args, data_dir, json_output, id).await,
         CliCommand::Switch(args) => agents::run_switch(args, data_dir, json_output, id).await,
+        CliCommand::Chat(args) => {
+            organization::run_chat(args.command, &data_dir, json_output, id).await
+        }
         CliCommand::Msg(args) => coord::run_msg(args, data_dir, json_output, id).await,
         CliCommand::Inbox(args) => coord::run_inbox(args, data_dir, json_output).await,
         CliCommand::Var(args) => coord::run_var(args, data_dir, json_output, id).await,

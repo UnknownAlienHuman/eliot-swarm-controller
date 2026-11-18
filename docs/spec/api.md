@@ -455,6 +455,10 @@ command id frozen at claim. Stored Goal responses/round records use Core
 | `settings.read/save` | owner-only unified section read/save, revision CAS, dry run, restart indication and bounded author history; see configuration |
 | `project.transfer` | Owner-only transfer intent, optional replacement launch, atomic commit or cancellation with typed readback. See [Project transfer](coordination.md#project-transfer). |
 | `project.assignment.get/claim/launch/release` | Current registered project manager, explicit adoption or manager launch, and revision-bound release through the ordinary command path. See [project manager assignments](#project-manager-assignments). |
+| `chat.organization` | owner-only grouped work projection by project assignment, manager, repository/worktree and ancestry, with revision and per-group readback; no client repeats Git discovery or grouping. See [Chat organization](#chat-organization). |
+| `chat.attach` / `chat.detach` | owner-only chat placement moves between a retained project and the no-project bucket; revision and per-Agent readback; execution scope, workspace and history untouched |
+| `chat.tag` | owner-only replacement tag groups for Agents or chats (an omitted tag list clears); revision and per-Agent readback |
+| `chat.continue` | owner-only authorized project session for a chat through the normal launch pipeline with a source reference brief; source history and attribution unchanged; idempotent under the mutation id |
 | `project.discover` | owner-only opened Git checkout registration through the settings writer; non-Git paths return no project |
 | `routing.preview` | owner-only advisory `RoutingDecision` for a role, computed like admission without admitting, freezing or reserving; see configuration |
 | `timer.get/run` | owner-only timer read and idempotent manual firing |
@@ -518,6 +522,51 @@ reports its own snapshot watermark. CLI callers use
 `swarm project overview [--project ID] [--after CURSOR]`. See
 [project manager assignment](coordination.md#project-manager-assignment) for
 detail visibility and capacity semantics.
+
+### Chat organization
+
+The owning semantics are [Coordination: Conversation association](coordination.md#conversation-association).
+Owner only, with identical behavior from the CLI (`swarm chat ...`), MCP
+(`chat.organization`, `chat.attach`, `chat.detach`, `chat.tag`, `chat.continue`)
+and the desktop client code path, which calls the same daemon methods.
+Organization is placement, never authority: attach, detach and tag write the
+organizational overlay beside the Agent id through Owner-only Store
+transactions (schema v62: `chat_organization`, `chat_continuations`,
+`organization_state`); the execution project, scope, workspace and history of
+every Agent keep their retained values.
+
+`chat.organization` (`ChatOrganizationRequest`/`ChatOrganizationResponse` in
+[`organization.rs`](../../crates/eliot-core/src/api/organization.rs)) groups
+work by project assignment, manager, repository or worktree, and ancestry, and
+returns the ready projection with revision and readback, so no client repeats
+Git discovery or grouping. The optional `project` reads back one registered
+project; `archived` includes archived rows (default hides them). Groups carry
+at most 200 members each and 1,000 across the projection; several root
+managers of one project read back as needing assignment and are never
+auto-reassigned.
+
+`chat.attach` places 1-64 chats under a retained project; `chat.detach` returns
+1-64 chats to the no-project bucket. `chat.tag` replaces the tag groups of
+1-64 Agents or chats with at most 16 trimmed nonempty tags of at most 64 bytes
+each; an omitted tag list clears every tag. Every mutation carries an id:
+exact replay returns the committed result before current-state checks, and the
+response carries the committed per-Agent links (`id`, `revision`, `links:
+Vec<OrgLinkView>` with placement, tags and revision). Rename stays the desktop
+`[desktop] display_names` presentation preference and archive stays
+`agent.archive`. Errors include `invalid`, `not_found`, `not_allowed`,
+`bad_state`, `unavailable`, `id_conflict`, `source_integrity` and mutation
+binding/age errors.
+
+`chat.continue` (`ChatContinueRequest`/`ChatContinueResponse`) is the only
+execution operation in this family: an authorized project session for a chat
+through the existing brief-or-handoff launch pipeline (profile freeze,
+workspace preparation, admission, dispatch) with a prepared workspace and a
+source reference (`OrgSourceRef`: Agent id and generation, never a transcript
+copy). The source conversation is never edited, and old events, tokens and
+actions keep their original attribution. A no-project to project move is an
+explicitly authorized transition; drain answers `unavailable`; a running Agent
+cannot change execution scope through an edit. The CLI exit code follows the
+new session state.
 
 ### Authenticated method discovery
 
@@ -2215,6 +2264,11 @@ swarm discover --profile P [--harness H] [--scope S] [--cursor C] [--archived] [
 swarm attach --profile P --harness H --scope S --ref R [--project LABEL]
 swarm history A --view subject|turns|items [--source native|rollout] [--turn-id ID] [--cursor C] [--limit N]
 swarm detach A [--generation N]
+swarm chat organization [--project P] [--archived]
+swarm chat attach CHAT... --project P
+swarm chat detach CHAT...
+swarm chat tag AGENT... [--tag TAG]...
+swarm chat continue CHAT --project P [--profile P | --harness H ...] [--workspace PATH] [--worktree BRANCH [--base REF]] [--text TEXT]
 swarm provider holds [--after SCOPE] [--limit N]
 swarm provider clear-hold SCOPE --corrective-evidence credentials_updated|configuration_updated|owner_verified [--expected-probe-command ID]
 swarm plugin NAME | plugin-test ... | hook ... | mcp

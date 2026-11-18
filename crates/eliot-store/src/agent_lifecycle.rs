@@ -512,6 +512,7 @@ fn delete_tree_tx(tx: &Transaction<'_>, members: &[i64], now: i64) -> Result<()>
         ("attention_wakes", "recipient"),
         ("completion_digests", "parent"),
         ("artifacts", "agent"),
+        ("chat_organization", "agent"),
     ] {
         delete_db!(tx.execute(
             &format!("DELETE FROM {table} WHERE {column} IN (SELECT id FROM deleted_agents)"),
@@ -520,6 +521,7 @@ fn delete_tree_tx(tx: &Transaction<'_>, members: &[i64], now: i64) -> Result<()>
     }
     delete_db!(tx.execute("DELETE FROM native_child_registrations WHERE producer IN (SELECT id FROM deleted_agents) OR parent IN (SELECT id FROM deleted_agents) OR child IN (SELECT id FROM deleted_agents)",[]));
     delete_db!(tx.execute("DELETE FROM messages WHERE recipient IN (SELECT id FROM deleted_agents) OR sender IN (SELECT 'a'||id FROM deleted_agents)",[]));
+    delete_db!(tx.execute("DELETE FROM chat_continuations WHERE session IN (SELECT id FROM deleted_agents) OR source IN (SELECT id FROM deleted_agents)",[]));
     // Mark a conservative history floor before removing individual retained events.
     delete_db!(tx.execute("UPDATE rule_history_coverage SET pruned_through=MAX(pruned_through,COALESCE((SELECT MAX(seq) FROM events WHERE agent IN (SELECT id FROM deleted_agents)),0)) WHERE singleton=1",[]));
     delete_db!(tx.execute(

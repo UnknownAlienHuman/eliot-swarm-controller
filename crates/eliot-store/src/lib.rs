@@ -116,6 +116,9 @@ const RECOVER_ACCEPTED_COMMAND_FILTER: &str =
        OR (link_kind = 'handoff' AND state IN ('accepted','queued'))
        OR (link_kind = 'switch' AND ordinal = 0 AND verb = 'launch' AND state = 'accepted'
            AND EXISTS (SELECT 1 FROM commands p WHERE p.id = commands.parent_command AND p.method = 'swarm.switch')
+           AND NOT EXISTS (SELECT 1 FROM workspaces w WHERE w.agent = commands.target AND w.start_command_id = commands.id))
+       OR (link_kind = 'continue' AND ordinal = 0 AND verb = 'launch' AND state = 'accepted'
+           AND EXISTS (SELECT 1 FROM commands p WHERE p.id = commands.parent_command AND p.method = 'chat.continue')
            AND NOT EXISTS (SELECT 1 FROM workspaces w WHERE w.agent = commands.target AND w.start_command_id = commands.id)))";
 
 /// Retained-unresolved unknowns as a SQL predicate over durable Store facts
@@ -195,6 +198,7 @@ mod agent_lifecycle;
 mod native_events;
 mod observer;
 mod observer_live;
+mod organization;
 mod processes;
 mod project_assignment;
 mod project_transfer;
