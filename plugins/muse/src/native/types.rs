@@ -264,6 +264,11 @@ pub struct NativeModelCatalogEntry {
     pub display_label: Option<String>,
     #[serde(default)]
     pub variants: Option<NativeModelEffortVariants>,
+    /// Native default marker (`isDefault`); optional for older hosts.
+    /// Absent stays unknown, never invented; the provider may legitimately
+    /// return false for every row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_default: Option<bool>,
 }
 
 /// Complete ordered selectable efforts, or an explicit unknown capability.
@@ -1921,6 +1926,32 @@ mod tests {
         assert!(result.models.is_empty());
         assert_eq!(result.provider_id, "meta");
         assert_eq!(result.source.as_deref(), Some("bundledCatalog"));
+    }
+
+    #[test]
+    fn model_catalog_entry_preserves_optional_is_default() {
+        // Audit #655: MSP ModelCatalogEntry.isDefault may be absent (older
+        // hosts), false for every row, or true for the native default.
+        let present: NativeModelCatalogEntry = serde_json::from_value(serde_json::json!({
+            "modelId": "m1",
+            "providerId": "p",
+            "isDefault": true
+        }))
+        .expect("isDefault decodes");
+        assert_eq!(present.is_default, Some(true));
+        let absent: NativeModelCatalogEntry = serde_json::from_value(serde_json::json!({
+            "modelId": "m1",
+            "providerId": "p"
+        }))
+        .expect("absent stays unknown");
+        assert_eq!(absent.is_default, None);
+        let all_false: NativeModelCatalogEntry = serde_json::from_value(serde_json::json!({
+            "modelId": "m1",
+            "providerId": "p",
+            "isDefault": false
+        }))
+        .expect("false decodes");
+        assert_eq!(all_false.is_default, Some(false));
     }
 
     #[test]
