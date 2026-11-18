@@ -560,7 +560,13 @@ pub(crate) fn process_group_empty_except_leader(identity: &ProcessGroupIdentity)
         match read_linux_process_identity(pid) {
             Ok((pgid, _)) if pgid == identity.pgid => return Ok(false),
             Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            // A member that exits after its /proc/<pid>/stat is opened
+            // reports ESRCH on read instead of NotFound on open; either way
+            // it is gone, not unobservable. The leader checks below stay
+            // strict: only this non-leader scan treats ESRCH as exited.
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::ESRCH) => {}
             Err(error) => {
                 return Err(unknown_process_identity(
                     "cannot observe a retained process-group member",

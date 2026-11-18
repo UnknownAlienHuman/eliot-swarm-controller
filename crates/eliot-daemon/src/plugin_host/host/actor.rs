@@ -30,29 +30,20 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, timeout_at};
 
-/// Linux-aware spontaneous root-exit wait: observe the plugin process exit
-/// without reaping while its birth identity still anchors group signals,
-/// drain and terminate the owned group, verify it is empty except the
-/// leader, and only then reap. Returns the reap result plus whether the
-/// group drained; the caller requires both for `control_gone`. A failed
-/// observation reaps without group proof (the actor-teardown Drop still
-/// best-effort terminates the retained group). Never signals a bare reused
-/// PGID: every group signal goes through the birth-checked leader identity.
+/// Linux spontaneous root-exit observation only: report the plugin process
+/// exit without reaping while its birth identity still anchors group
+/// signals. The `select!` caller fences routing once this wins, then runs
+/// the bounded group drain and the reap to completion outside the select so
+/// a queued message cannot cancel the drain and restart the grace period.
+/// Never signals a bare reused PGID: every group signal goes through the
+/// birth-checked leader identity.
 #[cfg(target_os = "linux")]
 async fn spontaneous_root_wait(
     child: &mut OwnedChild,
-    monitoring: &Monitoring,
-    agent: &Agent,
-) -> (Result<std::process::ExitStatus>, bool) {
-    if child.wait_exit_unreaped().await.is_err() {
-        return (child.wait().await, false);
-    }
-    let _ = monitoring.sample_generation(agent).await;
-    let group_drained = super::linux_drain_owned_group(child, STOP_GRACE).await;
-    if group_drained {
-        let _ = monitoring.sample_generation(agent).await;
-    }
-    (child.wait().await, group_drained)
+    _monitoring: &Monitoring,
+    _agent: &Agent,
+) -> Result<()> {
+    child.wait_exit_unreaped().await
 }
 
 /// Non-Linux spontaneous root-exit wait: plain reap; group proof stays with
@@ -236,6 +227,36 @@ pub(super) async fn run_agent_inner(
     loop {
         tokio::select! {
             root_exit = spontaneous_root_wait(&mut child, &monitoring, &agent) => {
+                // The exit observation alone won the select. Fence routing
+                // before the bounded cleanup so no racing dispatch enters.
+                #[cfg(target_os = "linux")]
+                if let Some(state) = state.upgrade() {
+                    fence_command_routing(&state, &key);
+                }
+                #[cfg(target_os = "linux")]
+                let (status, _group_drained) = {
+                    let observed = root_exit;
+                    let _ = monitoring.sample_generation(&agent).await;
+                    // A failed observation proves nothing about the group:
+                    // still terminate and drain before reaping so surviving
+                    // descendants get a signal, then report unknown via the
+                    // drained=false below.
+                    let group_drained = if observed.is_err() {
+                        let _ = child.terminate();
+                        let _ = super::linux_drain_owned_group(&mut child, STOP_GRACE).await;
+                        false
+                    } else {
+                        super::linux_drain_owned_group(&mut child, STOP_GRACE).await
+                    };
+                    if group_drained {
+                        let _ = monitoring.sample_generation(&agent).await;
+                    }
+                    // Reap only after the bounded cleanup: the numeric PGID
+                    // cannot be reused between the final observation and this
+                    // reap because the exited leader is still unreaped.
+                    (child.wait().await, group_drained)
+                };
+                #[cfg(not(target_os = "linux"))]
                 let (status, _group_drained) = root_exit;
                 // The plugin process exit is process evidence: its numeric
                 // code (and NTSTATUS for crash statuses) with the redacted

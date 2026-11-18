@@ -5889,34 +5889,39 @@ mod linux_family_tests {
     use super::*;
 
     /// The leader exits immediately while a same-group grandchild lingers:
-    /// the Linux stop ordering must terminate the owned group before
+    /// the shared family stop path must terminate the owned group before
     /// reaping, so no owned member outlives the stop. Reaping first (the old
     /// order) would clear the birth-checked identity and leave the
     /// grandchild running with no group signal authority.
     #[tokio::test]
     async fn lingering_grandchild_does_not_outlive_linux_family_stop() {
         let dir = std::env::temp_dir().join(format!("eliot-linux-family-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
         let _temp = crate::test_support::TempDir::own(dir.clone());
         let pidfile = dir.join("grandchild.pid");
         let mut command = tokio::process::Command::new("sh");
         command
             .arg("-c")
             .arg(format!(
-                "sleep 120 & echo $! > {}; exec sleep 0",
+                "sleep 120 & echo $! > '{}'; exec sleep 0",
                 pidfile.display()
             ))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         let mut child = OwnedChild::spawn(command).unwrap();
-        // Observe the leader exit without reaping, exactly as the stop path
-        // does while the birth identity still anchors group signals.
-        child.wait_exit_unreaped().await.unwrap();
+        let store = Arc::new(AsyncMutex::new(
+            eliot_store::Store::open(Path::new(":memory:")).expect("open store"),
+        ));
+        let monitoring = Monitoring::new(store, Bus::new(16), Arc::new(Mutex::new(HashSet::new())));
+        let agent = Agent::new("a1", "proj", "opencode", "fake", 0);
+        // The actual stop path: observe the leader exit without reaping,
+        // drain the owned group while the birth identity still anchors
+        // group signals, then reap.
         assert!(
-            linux_drain_owned_group(&mut child, Duration::from_secs(5)).await,
+            wait_child_family(&mut child, STOP_GRACE, FAMILY_GRACE, &monitoring, &agent).await,
             "owned group drains before reap"
         );
-        child.wait().await.unwrap();
         let pid: u32 = std::fs::read_to_string(&pidfile)
             .unwrap()
             .trim()
