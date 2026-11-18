@@ -1,16 +1,13 @@
 //! Durable context-injection queue and exact consumer claims.
 
 use super::*;
-use eliot_core::{ContextItem, ContextOutcome, InjectArgs, InjectPoint};
+use eliot_core::{
+    ContextItem, ContextOutcome, InjectArgs, InjectPoint, api::harness::MAX_HARNESS_MODEL_ID_BYTES,
+    turn_started_data,
+};
 use serde::{Deserialize, Serialize};
 
 const CONTEXT_ITEMS_ARG: &str = "context_items";
-/// Headroom for the `turn.started` envelope around `context_outcomes`
-/// (command and native turn ids plus the model/effort the adapter reports).
-/// The CommitSink measures the same compact JSON against the same bound,
-/// so the claim-time receipt budget and the persisted receipt share exact
-/// serialization rules.
-const TURN_STARTED_HEAD_RESERVE_BYTES: usize = 2048;
 const MAX_CONTEXT_QUERY_ROWS: usize = 32;
 const MAX_CONTEXT_QUERY_BYTES: usize = MAX_FRAME_BYTES;
 type ContextCursor = (i64, i64);
@@ -177,20 +174,37 @@ pub(super) fn claim_next_input_tx(
 ) -> Result<Vec<ContextItem>> {
     let mut selected = Vec::new();
     let mut selected_ids = Vec::new();
+    let mut selected_outcomes: Vec<ContextOutcome> = Vec::new();
     let mut cursor = None;
-    // One compact-JSON outcome per claimed item, measured exactly as the
-    // CommitSink measures the persisted receipt; only the count varies, so
-    // the per-item cost (plus one array separator) is exact for this send.
-    let outcome_len = serde_json::to_vec(&ContextOutcome {
-        mechanism: "send".to_owned(),
-        application_point: InjectPoint::NextInput,
-        consumer_id: send.id.clone(),
-    })
-    .map_err(|_| Error::new("internal", "context outcome could not be encoded"))?
-    .len()
-    .saturating_add(1);
-    let mut outcomes_len = 0_usize;
-    loop {
+    // The mandatory `turn.started` receipt, budgeted in the exact shape the
+    // adapters persist (one outcome per claimed item). Fields fixed only at
+    // native dispatch are worst-cased by their enforced encoded bounds:
+    // command and native turn ids cap at MAX_COMMAND_ID_BYTES, carried
+    // models at MAX_HARNESS_MODEL_ID_BYTES, configured effort at
+    // MAX_CONFIGURE_EFFORT_LEN. A longer native turn id already fails at
+    // commit with `unknown`; real head values are short identifiers.
+    let max_turn_id = "T".repeat(MAX_COMMAND_ID_BYTES);
+    let max_model = "M".repeat(MAX_HARNESS_MODEL_ID_BYTES);
+    let max_effort = "E".repeat(super::admission::MAX_CONFIGURE_EFFORT_LEN);
+    let receipt_len = |outcomes: &[ContextOutcome]| -> Result<usize> {
+        serde_json::to_vec(&turn_started_data(
+            &send.id,
+            &max_turn_id,
+            Some(&max_model),
+            Some(&max_effort),
+            outcomes,
+        ))
+        .map_err(|_| Error::new("internal", "context receipt could not be encoded"))
+        .map(|bytes| bytes.len())
+    };
+    // Lone fitness uses a minimal send: an item that still exceeds a budget
+    // with no send text can never fit a later send either, so it is rejected
+    // with evidence instead of wedging the queue behind every dispatch.
+    let mut minimal_args = send.args.clone();
+    if let Some(object) = minimal_args.as_object_mut() {
+        object.insert("text".to_owned(), Value::String(String::new()));
+    }
+    'scan: loop {
         let (records, next_cursor) = pending_context_batch_page(
             tx,
             agent_num,
@@ -230,9 +244,7 @@ pub(super) fn claim_next_input_tx(
                 text: args.text,
                 expires_at_ms: args.expires_at_ms,
             };
-            let mut candidate = selected.clone();
-            candidate.push(item.clone());
-            if combined_send_text_len(&send.args, &candidate)? > MAX_TEXT_BYTES {
+            if item.text.len().saturating_add(2) > MAX_TEXT_BYTES {
                 reject_pending_context(
                     tx,
                     &record,
@@ -244,33 +256,17 @@ pub(super) fn claim_next_input_tx(
                 )?;
                 continue;
             }
-            let candidate_args = send_args(&send.args, &candidate)?;
-            let frame = json!({
+            let lone = vec![item.clone()];
+            let lone_args = send_args(&minimal_args, &lone)?;
+            let lone_frame = json!({
                 "agent_id": agent.id,
                 "generation": agent.generation,
                 "command_id": send.id,
                 "verb": "send",
-                "args": candidate_args,
+                "args": lone_args,
             });
-            match check_rpc_frame("agent.command", &frame) {
-                Ok(()) => {
-                    // The mandatory turn.started receipt carries one outcome
-                    // per claimed item. Stop before the receipt would exceed
-                    // the persisted-event bound; the rest stays pending for
-                    // a later input instead of dispatching text the Store
-                    // could never associate. A single item always fits.
-                    let next_len = outcomes_len.saturating_add(outcome_len);
-                    if TURN_STARTED_HEAD_RESERVE_BYTES
-                        .saturating_add(next_len)
-                        .saturating_add(2)
-                        > MAX_EVENT_BYTES
-                    {
-                        break;
-                    }
-                    outcomes_len = next_len;
-                    selected = candidate;
-                    selected_ids.push(record.command.id.clone());
-                }
+            match check_rpc_frame("agent.command", &lone_frame) {
+                Ok(()) => {}
                 Err(error) if error.code == "frame_too_large" => {
                     reject_pending_context(
                         tx,
@@ -281,7 +277,42 @@ pub(super) fn claim_next_input_tx(
                         now,
                         events,
                     )?;
+                    continue;
                 }
+                Err(error) => return Err(error),
+            }
+            // Anything that fits alone but not with this batch waits for a
+            // later send: end the entire scan so later FIFO items are
+            // deferred, never rejected against an already-full batch.
+            let mut candidate = selected.clone();
+            candidate.push(item.clone());
+            if combined_send_text_len(&send.args, &candidate)? > MAX_TEXT_BYTES {
+                break 'scan;
+            }
+            let candidate_args = send_args(&send.args, &candidate)?;
+            let frame = json!({
+                "agent_id": agent.id,
+                "generation": agent.generation,
+                "command_id": send.id,
+                "verb": "send",
+                "args": candidate_args,
+            });
+            match check_rpc_frame("agent.command", &frame) {
+                Ok(()) => {
+                    let mut candidate_outcomes = selected_outcomes.clone();
+                    candidate_outcomes.push(ContextOutcome {
+                        mechanism: "send".to_owned(),
+                        application_point: InjectPoint::NextInput,
+                        consumer_id: send.id.clone(),
+                    });
+                    if receipt_len(&candidate_outcomes)? > MAX_EVENT_BYTES {
+                        break 'scan;
+                    }
+                    selected_outcomes = candidate_outcomes;
+                    selected = candidate;
+                    selected_ids.push(record.command.id.clone());
+                }
+                Err(error) if error.code == "frame_too_large" => break 'scan,
                 Err(error) => return Err(error),
             }
         }
@@ -1582,47 +1613,47 @@ mod tests {
             .unwrap()
     }
 
-    /// The adapter receipt shape for a claimed `next_input` batch: one
-    /// outcome per item, exactly as `PluginHost` forwards them.
+    /// The mandatory receipt in its exact persisted shape, with worst-case
+    /// placeholders for fields fixed only at native dispatch: the same
+    /// constructor the adapters persist and the Store budgets against.
     fn prospective_turn_started(send_id: &str, claimed: usize) -> serde_json::Value {
-        let outcomes: Vec<serde_json::Value> = (0..claimed)
-            .map(|_| {
-                json!({
-                    "mechanism": "send",
-                    "application_point": "next_input",
-                    "consumer_id": send_id,
-                })
+        let outcomes: Vec<ContextOutcome> = (0..claimed)
+            .map(|_| ContextOutcome {
+                mechanism: "send".to_owned(),
+                application_point: InjectPoint::NextInput,
+                consumer_id: send_id.to_owned(),
             })
             .collect();
-        json!({
-            "command_id": send_id,
-            "turn_id": "0".repeat(26),
-            "context_outcomes": outcomes,
-        })
+        turn_started_data(
+            send_id,
+            &"T".repeat(MAX_COMMAND_ID_BYTES),
+            Some(&"M".repeat(MAX_HARNESS_MODEL_ID_BYTES)),
+            Some(&"E".repeat(crate::admission::MAX_CONFIGURE_EFFORT_LEN)),
+            &outcomes,
+        )
     }
 
     #[test]
-    fn next_input_claim_is_bounded_by_the_turn_started_receipt() {
+    fn next_input_claim_defers_cumulative_overflow() {
         let mut store = Store::open(Path::new(":memory:")).unwrap();
         let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
         let agent = live_next_input_agent(&mut store, now);
         let mut queued = Vec::new();
-        for _ in 0..1024 {
+        for _ in 0..672 {
             queued.push(submit_inject(&mut store, &agent, "x", now));
         }
+        // 523,000 bytes fits every budget alone with a short send, so it
+        // must wait for a later input instead of being rejected against the
+        // already-full batch.
+        queued.push(submit_inject(&mut store, &agent, &"y".repeat(523_000), now));
         let send_id = submit_send(&mut store, &agent, now);
         let claimed = store
             .dispatch_with_context(&send_id, now)
             .unwrap()
             .value
             .context_items;
-        // Every item fits the send text and frame budgets, but the
-        // mandatory per-item receipt would overflow the persisted-event
-        // bound: the claim must stop early, in FIFO order, and leave the
-        // rest pending for a later input.
         assert!(!claimed.is_empty());
         assert!(claimed.len() < queued.len());
-        assert_eq!(claimed[0].command_id, queued[0]);
         assert_eq!(
             claimed
                 .iter()
@@ -1630,11 +1661,35 @@ mod tests {
                 .collect::<Vec<_>>(),
             queued[..claimed.len()]
         );
+        // The claim stops exactly where one more outcome would exceed the
+        // persisted-event bound; nothing is rejected, so the big item and
+        // the tail stay pending for a later send.
         let receipt = prospective_turn_started(&send_id, claimed.len());
         assert!(serde_json::to_vec(&receipt).unwrap().len() <= MAX_EVENT_BYTES);
+        let fuller = prospective_turn_started(&send_id, claimed.len() + 1);
+        assert!(serde_json::to_vec(&fuller).unwrap().len() > MAX_EVENT_BYTES);
         assert_eq!(
             pending_injects(&store),
             (queued.len() - claimed.len()) as i64
         );
+    }
+
+    #[test]
+    fn next_input_claim_rejects_a_lone_unfit_item() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
+        let agent = live_next_input_agent(&mut store, now);
+        // Exactly the text cap: admissible as an inject, but it can never
+        // fit any send, so it is rejected with evidence instead of wedging
+        // the queue behind every future dispatch.
+        submit_inject(&mut store, &agent, &"z".repeat(MAX_TEXT_BYTES), now);
+        let send_id = submit_send(&mut store, &agent, now);
+        let claimed = store
+            .dispatch_with_context(&send_id, now)
+            .unwrap()
+            .value
+            .context_items;
+        assert!(claimed.is_empty());
+        assert_eq!(pending_injects(&store), 0);
     }
 }

@@ -8,7 +8,7 @@ use crate::native_child::{
 };
 use eliot_core::{
     ChildRegistration, ContextItem, Error, ProviderRestriction, Result, SecretPolicy,
-    SessionTokenTotals, SessionUsage, SourceGap, TurnUsage,
+    SessionTokenTotals, SessionUsage, SourceGap, TurnUsage, turn_started_data,
 };
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
@@ -741,20 +741,17 @@ impl EventProcessor {
         self.turn_usage = None;
         let thread_id = self.status.thread_id.as_deref().unwrap_or_default();
         let native_id = event_id(thread_id, &turn_id, &turn_id, "turn.started")?;
-        let mut data = json!({"command_id": command_id, "turn_id": turn_id});
         // Report the model/effort the native turn request actually carried,
         // so the Store readback shows the carried values instead of the
         // overlay's absent overrides. Omitted when unknown: nothing is
         // invented.
-        if let Some(model) = model.as_deref().filter(|model| !model.trim().is_empty()) {
-            data["model"] = json!(model);
-        }
-        if let Some(effort) = effort.as_deref().filter(|effort| !effort.trim().is_empty()) {
-            data["effort"] = json!(effort);
-        }
-        if !context.is_empty() {
-            data["context_outcomes"] = json!(next_input_outcomes(&context, &command_id));
-        }
+        let data = turn_started_data(
+            &command_id,
+            &turn_id,
+            model.as_deref(),
+            effort.as_deref(),
+            &next_input_outcomes(&context, &command_id),
+        );
         self.commit_event("turn.started", native_id, data).await?;
         self.flush_buffer().await
     }
