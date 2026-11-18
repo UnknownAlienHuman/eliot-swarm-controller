@@ -676,23 +676,6 @@ async fn kill_and_reap(child: &mut Child) -> bool {
         .is_ok_and(|wait| wait.is_ok())
 }
 
-/// The default OpenCode Console server. Credentials saved before August
-/// 2026 store the retired `console.opencode.ai` host, rewritten here
-/// path-for-path exactly like the native `ConsoleAccess.server`, so that
-/// host can shut down without forcing those users to reconnect.
-pub(crate) const CONSOLE_DEFAULT_SERVER: &str = "https://opencode.ai/console";
-
-/// One exported canonical credential for a quota read: the bearer material
-/// (OAuth access token or API key) plus the nonsecret Console binding from
-/// credential metadata (server, workspace id and name). The bearer never
-/// leaves memory except into an `Authorization` header built by the caller;
-/// only the nonsecret binding may enter observations.
-pub(crate) struct ExportedCredential {
-    pub bearer: String,
-    pub server: String,
-    pub org_id: Option<String>,
-}
-
 /// Read only the selected canonical credential using the native export schema.
 /// No import or write is performed; stderr and secret-bearing parse failures are discarded.
 /// The `integration` names one native integration id (`opencode` for the
@@ -702,7 +685,7 @@ pub(crate) async fn quota_credential_for(
     profile: &serde_json::Value,
     environment: Option<&serde_json::Value>,
     integration: &str,
-) -> Result<ExportedCredential> {
+) -> Result<String> {
     let cmd = profile
         .get("cmd")
         .and_then(serde_json::Value::as_str)
@@ -779,36 +762,7 @@ pub(crate) async fn quota_credential_for(
             "OpenCode selected integration native secret is unavailable",
         )
     })?;
-    let metadata = value.get("metadata");
-    let server = metadata
-        .and_then(|metadata| metadata.get("server"))
-        .and_then(serde_json::Value::as_str)
-        .map(normalize_console_server)
-        .unwrap_or_else(|| CONSOLE_DEFAULT_SERVER.to_owned());
-    // The workspace id is the Console binding the quota read authenticates
-    // through; the display name is not a binding and stays out of retention.
-    let org_id = metadata
-        .and_then(|metadata| metadata.get("orgID"))
-        .and_then(serde_json::Value::as_str)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned);
-    Ok(ExportedCredential {
-        bearer,
-        server,
-        org_id,
-    })
-}
-
-/// Rewrite the retired Console host prefix exactly like the native
-/// `ConsoleAccess.server`: only the leading host is replaced, and only
-/// when the remainder is empty or a path.
-fn normalize_console_server(server: &str) -> String {
-    match server.strip_prefix("https://console.opencode.ai") {
-        Some(rest) if rest.is_empty() || rest.starts_with('/') => {
-            format!("{CONSOLE_DEFAULT_SERVER}{rest}")
-        }
-        _ => server.to_owned(),
-    }
+    Ok(bearer)
 }
 
 /// Read only the legacy Go credential's bearer material.
@@ -816,9 +770,7 @@ pub(crate) async fn quota_credential(
     profile: &serde_json::Value,
     environment: Option<&serde_json::Value>,
 ) -> Result<String> {
-    Ok(quota_credential_for(profile, environment, "opencode-go")
-        .await?
-        .bearer)
+    quota_credential_for(profile, environment, "opencode-go").await
 }
 
 #[cfg(test)]
@@ -847,28 +799,5 @@ mod tests {
         assert_eq!(env.len(), 1, "exactly one override: {env:?}");
         assert_eq!(env[0].0, "XDG_CONFIG_HOME");
         assert_eq!(env[0].1, dir.as_os_str());
-    }
-    /// The retired Console host rewrites path-for-path exactly like the
-    /// native `ConsoleAccess.server`: leading-host only, empty remainder or
-    /// a path. Anything else (notably a suffixed lookalike host) passes
-    /// through untouched so a hostile value can never smuggle a host.
-    #[test]
-    fn console_server_rewrite_matches_native_prefix_rule() {
-        assert_eq!(
-            normalize_console_server("https://console.opencode.ai"),
-            "https://opencode.ai/console"
-        );
-        assert_eq!(
-            normalize_console_server("https://console.opencode.ai/console"),
-            "https://opencode.ai/console/console"
-        );
-        assert_eq!(
-            normalize_console_server("https://console.opencode.ai.evil.example/"),
-            "https://console.opencode.ai.evil.example/"
-        );
-        assert_eq!(
-            normalize_console_server("https://opencode.ai/console"),
-            "https://opencode.ai/console"
-        );
     }
 }

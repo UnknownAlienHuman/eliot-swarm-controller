@@ -7,6 +7,7 @@ pub(crate) mod server;
 pub(crate) mod sse;
 pub(crate) mod startup;
 pub(crate) mod types;
+pub(crate) mod usage;
 
 pub(crate) use auth::{
     AuthSetup, AuthTransfer, IntegrationSelector, ensure_no_credential_for_provider,
