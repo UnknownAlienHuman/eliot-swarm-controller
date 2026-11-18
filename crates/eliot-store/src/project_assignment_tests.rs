@@ -109,13 +109,18 @@ fn ready(store: &mut Store, project: &str, now: i64) -> String {
         .submit("owner", launch(id.clone(), project), now)
         .unwrap();
     let agent = start.command.target.unwrap();
-    store.dispatch(&id, now).unwrap();
-    crate::tests::install_fixture_sources(store, &agent, &id, 1, now);
+    settle_ready(store, &agent, &id, now);
+    agent
+}
+
+fn settle_ready(store: &mut Store, agent: &str, id: &str, now: i64) {
+    store.dispatch(id, now).unwrap();
+    crate::tests::install_fixture_sources(store, agent, id, 1, now);
     store
         .put_batch(
             SourceBatch {
                 batch_id: Ulid::new().to_string(),
-                agent_id: agent.clone(),
+                agent_id: agent.to_owned(),
                 generation: 1,
                 source: "stream".into(),
                 events: vec![NativeEvent {
@@ -129,8 +134,7 @@ fn ready(store: &mut Store, project: &str, now: i64) -> String {
             now,
         )
         .unwrap();
-    store.settle(&id, CommandState::Applied, None, now).unwrap();
-    agent
+    store.settle(id, CommandState::Applied, None, now).unwrap();
 }
 
 fn claim_request() -> ProjectAssignmentClaimRequest {
@@ -853,6 +857,111 @@ fn bound_worktree_refuses_removal_until_release() {
     assert_eq!(
         store.submit("owner", remove, now).unwrap_err().code,
         "bad_state"
+    );
+}
+
+#[test]
+fn delete_managed_manager_preserves_launch_and_delete_receipts() {
+    let now = Ulid::new().timestamp_ms() as i64;
+    let mut store = Store::open(Path::new(":memory:")).unwrap();
+    register(&mut store, now);
+    let request = managed_request("alpha");
+    let (command, input) = managed_launch(request.id.clone(), "alpha", "/wt/manager");
+    let launched = store
+        .launch_project_manager(&request, Ok((command, Some(input))), now)
+        .unwrap()
+        .value;
+    assert_eq!(launched.command_id.as_deref(), Some(request.id.as_str()));
+    let agent = store
+        .get_command(&request.id)
+        .unwrap()
+        .unwrap()
+        .target
+        .unwrap();
+    mark_worktree_ready(&store, parse_agent_id(&agent).unwrap());
+    settle_ready(&mut store, &agent, &request.id, now);
+
+    crate::tests::install_live_custody_observations(&mut store, &agent, 1, now);
+    let mut stop = SubmitCommand::new(Ulid::new().to_string(), "stop");
+    stop.target = Some(agent.clone());
+    store.submit("owner", stop.clone(), now).unwrap();
+    store.dispatch(&stop.id, now).unwrap();
+    store
+        .settle(&stop.id, CommandState::Applied, None, now)
+        .unwrap();
+    crate::tests::simulate_normal_stop_proof(&mut store, &agent, 1, now);
+    assert_eq!(
+        release(&mut store, 1, now).outcome,
+        ProjectAssignmentOutcome::Released
+    );
+
+    let mut remove = SubmitCommand::new(Ulid::new().to_string(), "worktree.remove");
+    remove.target = Some(agent.clone());
+    store.submit("owner", remove.clone(), now).unwrap();
+    store.dispatch(&remove.id, now).unwrap();
+    let worktree = store.get_workspace(&agent).unwrap().unwrap();
+    let removed = store
+        .settle_workspace_removal(
+            &remove.id,
+            1,
+            core::WorkspaceRemovalOutcome::Removed {
+                repo_common_dir: worktree.repo_common_dir,
+                worktree_path: worktree.worktree_path,
+                branch: worktree.requested_branch,
+                branch_retained: true,
+            },
+            now,
+        )
+        .unwrap();
+    assert_eq!(removed.value.phase, core::WorkspacePhase::Removed);
+
+    let launch_receipt = write_binding(&store.connection, &request.id).unwrap();
+    assert!(launch_receipt.is_some());
+    let delete_id = Ulid::new().to_string();
+    let result = store
+        .change_agent_tree(&delete_id, &agent, None, now)
+        .unwrap();
+    assert_eq!(
+        result,
+        json!({"agent": agent, "affected": 1, "archived": null, "deleted": true})
+    );
+    assert!(store.get_agent(&agent).unwrap().is_none());
+    assert!(store.get_command(&request.id).unwrap().is_none());
+    assert_eq!(
+        write_binding(&store.connection, &request.id).unwrap(),
+        launch_receipt
+    );
+    assert_eq!(
+        store.replay_project_manager_launch(&request, now).unwrap(),
+        Some(launched)
+    );
+    assert_eq!(
+        store
+            .change_agent_tree(&delete_id, &agent, None, now)
+            .unwrap(),
+        result
+    );
+    assert_eq!(
+        store
+            .change_agent_tree(&delete_id, "a2", None, now)
+            .unwrap_err()
+            .code,
+        "id_conflict"
+    );
+    assert_eq!(
+        store.submit("owner", remove, now).unwrap_err().code,
+        "id_conflict"
+    );
+    assert!(!store.is_write_faulted());
+    let next = managed_request("alpha");
+    let (command, input) = managed_launch(next.id.clone(), "alpha", "/wt/next");
+    assert_eq!(
+        store
+            .launch_project_manager(&next, Ok((command, Some(input))), now)
+            .unwrap()
+            .value
+            .outcome,
+        ProjectAssignmentOutcome::LaunchAdmitted
     );
 }
 
