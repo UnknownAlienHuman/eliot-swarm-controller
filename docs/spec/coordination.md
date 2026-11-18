@@ -453,7 +453,8 @@ or unlisted-profile children. The child's profile, control, credentials, native
 identity, workspace, project, generation, turn, commands, Goal and claims do not
 change. `child_profiles` constrains Agent launch, not this Owner grant; no snapshot
 is widened or replaced, and the new manager cannot use the grant to launch an
-otherwise forbidden profile. All moved rows must share the new parent's project.
+otherwise forbidden profile. All moved rows must share the new parent's project
+(the authorization scope, `COALESCE(project_scope, project)`).
 
 The destination must be a controlled, nonterminal, non-unknown Agent. Observe-only
 sources or descendants reject the whole move: their parent binding belongs to the
@@ -496,7 +497,8 @@ SEND IDs, also bounded by the configured selector-target limit. The sole DTOs li
 context, claims, Goal and children without successor task inputs.
 Refuse rather than implicitly wait while A has an active/unknown turn, pending
 request, dispatched/unknown command, generation transition or running/unknown Goal
-round reservation. B must be controlled, nonterminal, same-project and cleanly idle
+round reservation. B must be controlled, nonterminal, same-scope (the
+authorization scope, `COALESCE(project_scope, project)`) and cleanly idle
 under the existing input/unknown gates. Explicitly retry after quiescence with a new
 operation ID only if the previous operation was definitely rejected before admission.
 

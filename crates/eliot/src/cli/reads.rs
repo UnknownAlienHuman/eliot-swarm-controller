@@ -818,6 +818,7 @@ pub(crate) fn list_params(
         state,
         states: None,
         project: filter.project,
+        project_scope: None,
         harness: filter.harness,
         parent: filter.parent,
         root: filter.root,
@@ -1387,6 +1388,7 @@ mod tests {
             usage,
             usage_scope: usage_scope.map(str::to_owned),
             updated_at: 7,
+            project_scope: None,
             heavy: None,
             session_growth: None,
         }

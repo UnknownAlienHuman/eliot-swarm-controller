@@ -203,6 +203,12 @@ struct Submitted {
     access: crate::settings::Access,
     chat: bool,
     workspace: String,
+    /// The explicitly chosen registered project's ID ("" for chats and
+    /// for every other folder): the pending Agent row carries the project
+    /// ID or none, never the workspace path. The desktop never
+    /// re-implements the daemon's project resolution, so any other folder
+    /// stays unknown until the daemon Agent row arrives.
+    project: String,
 }
 
 type Fallible<T> = Result<T, String>;

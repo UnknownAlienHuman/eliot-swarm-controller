@@ -278,6 +278,19 @@ impl DesktopApp {
                 {
                     return;
                 }
+                // Re-check an existing-Agent destination against the current
+                // candidates: the row may have left the scope, ended, or
+                // moved generation since the choice was saved.
+                if let Target::Existing { agent, generation } = &target
+                    && !Self::existing_choice_fresh(agent, *generation, &self.handoff_targets())
+                {
+                    let refused = format!(
+                        "{agent} can no longer take this work (it left the scope, ended, or moved on); pick another destination."
+                    );
+                    self.handoff.status = refused.clone();
+                    self.handoff.refusal = Some(refused);
+                    return;
+                }
                 self.handoff.refusal = None;
                 match self.handoff_request(target) {
                     Ok(submitted) => self.handoff_send(submitted, context),
@@ -459,40 +472,25 @@ impl DesktopApp {
     }
 
     /// Live, non-source Agents of the navigation list in the source's
-    /// project (the daemon requires a same-project B and checks again).
+    /// authorization scope (the daemon requires a same-scope B and checks
+    /// again). A missing source, an empty scope or an unknown one (a
+    /// pending launch whose daemon row has not arrived) offers nothing,
+    /// and pending rows are never offered: handoff stays in one scope,
+    /// never across projects.
     fn handoff_targets(&self) -> Vec<&UiAgent> {
-        let listed = || {
-            self.nav
-                .agents
-                .iter()
-                .chain(self.nav.branches.values().flat_map(|branch| match branch {
-                    nav::Branch::Loaded { children, .. } => children.as_slice(),
-                    _ => &[],
-                }))
-        };
-        let project = listed()
-            .find(|agent| agent.id == self.handoff.from)
-            .map(|agent| agent.project.clone())
-            .filter(|project| !project.is_empty());
-        let mut seen = HashSet::new();
-        listed()
-            .filter(|agent| seen.insert(agent.id.as_str()))
-            .filter(|agent| agent.id != self.handoff.from)
-            .filter(|agent| {
-                project
-                    .as_ref()
-                    .is_none_or(|project| &agent.project == project)
-            })
-            .filter(|agent| {
-                !matches!(
-                    agent.state,
-                    eliot_core::AgentState::Stopped
-                        | eliot_core::AgentState::Failed
-                        | eliot_core::AgentState::Lost
-                        | eliot_core::AgentState::Unknown
-                )
-            })
-            .collect()
+        handoff_candidates(&self.handoff.from, &self.nav.agents, &self.nav.branches)
+    }
+
+    /// Whether a saved existing-Agent destination is still among the
+    /// current candidates with the same generation and a known scope. A
+    /// row that left the scope, ended, or moved generation since it was
+    /// picked no longer qualifies, nor does a pending row whose daemon row
+    /// has not arrived; the submitter must refuse the stale choice and the
+    /// daemon would refuse it again.
+    fn existing_choice_fresh(agent: &str, generation: i64, targets: &[&UiAgent]) -> bool {
+        targets
+            .iter()
+            .any(|row| row.id == agent && row.generation == generation && row.scope().is_some())
     }
 
     fn handoff_models(&self) -> Vec<String> {
@@ -1172,6 +1170,8 @@ impl DesktopApp {
     /// The submission for the chosen destination, from what is shown: the
     /// existing Agent and its generation, the profile, or the ad-hoc
     /// harness/model/effort on screen. None until a destination is complete.
+    /// A saved existing-Agent choice that is no longer among the current
+    /// candidates (same id and generation) is stale and submits nothing.
     fn handoff_target(
         &self,
         harness: Option<String>,
@@ -1179,10 +1179,15 @@ impl DesktopApp {
         effort: Option<String>,
     ) -> Option<Target> {
         match self.handoff.choice.as_ref()? {
-            Choice::Existing { agent, generation } => Some(Target::Existing {
-                agent: agent.clone(),
-                generation: *generation,
-            }),
+            Choice::Existing { agent, generation } => {
+                if !Self::existing_choice_fresh(agent, *generation, &self.handoff_targets()) {
+                    return None;
+                }
+                Some(Target::Existing {
+                    agent: agent.clone(),
+                    generation: *generation,
+                })
+            }
             Choice::Profile { name, .. } => Some(Target::Profile(name.clone())),
             Choice::Adhoc => harness.map(|harness| Target::Adhoc {
                 harness,
@@ -1288,4 +1293,131 @@ fn small(text: impl Into<String>) -> TextBlock {
         .font_size(tokens::text::BODY.size)
         .text_wrapping(TextWrapping::Wrap)
         .is_text_selection_enabled(true)
+}
+
+/// Live, non-source Agents of the navigation list in the source's
+/// authorization scope (the handoff picker flow): a missing source, an
+/// empty scope or an unknown one (a pending launch whose daemon row has
+/// not arrived) offers nothing, and pending rows are never offered.
+fn handoff_candidates<'a>(
+    from: &str,
+    agents: &'a [UiAgent],
+    branches: &'a std::collections::HashMap<String, nav::Branch>,
+) -> Vec<&'a UiAgent> {
+    let listed = || {
+        agents
+            .iter()
+            .chain(branches.values().flat_map(|branch| match branch {
+                nav::Branch::Loaded { children, .. } => children.as_slice(),
+                _ => &[],
+            }))
+    };
+    let scope = listed()
+        .find(|agent| agent.id == from)
+        .and_then(|agent| agent.scope())
+        .map(str::to_owned)
+        .filter(|scope| !scope.is_empty());
+    let mut seen = HashSet::new();
+    listed()
+        .filter(|agent| seen.insert(agent.id.as_str()))
+        .filter(|agent| agent.id != from)
+        .filter(|agent| {
+            scope
+                .as_ref()
+                .is_some_and(|scope| agent.scope() == Some(scope.as_str()))
+        })
+        .filter(|agent| {
+            !matches!(
+                agent.state,
+                eliot_core::AgentState::Stopped
+                    | eliot_core::AgentState::Failed
+                    | eliot_core::AgentState::Lost
+                    | eliot_core::AgentState::Unknown
+            )
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eliot_core::AgentState;
+
+    fn row(id: &str, generation: i64, pending: bool) -> UiAgent {
+        placed(id, generation, "p", Some("scope"), pending)
+    }
+
+    fn placed(
+        id: &str,
+        generation: i64,
+        project_id: &str,
+        scope: Option<&str>,
+        pending: bool,
+    ) -> UiAgent {
+        UiAgent {
+            id: id.to_owned(),
+            generation,
+            harness: "codex".to_owned(),
+            state: AgentState::Idle,
+            project_id: project_id.to_owned(),
+            project_scope: scope.map(str::to_owned),
+            repo_common_dir: None,
+            workspace: None,
+            parent: None,
+            updated_at: 0,
+            title: id.to_owned(),
+            native_child: false,
+            tokens: None,
+            chat: false,
+            archived: false,
+            pending,
+        }
+    }
+
+    #[test]
+    fn a_stale_saved_destination_is_not_fresh() {
+        let live = row("a2", 3, false);
+        let targets = [&live];
+        assert!(DesktopApp::existing_choice_fresh("a2", 3, &targets));
+        // The row moved generation since the choice was saved.
+        assert!(!DesktopApp::existing_choice_fresh("a2", 2, &targets));
+        // The row left the list.
+        assert!(!DesktopApp::existing_choice_fresh("a9", 1, &targets));
+        // A pending row is never a fresh destination, even with the same
+        // label: its scope is still unknown.
+        let pending = row("a3", 1, true);
+        let pending_targets = [&pending];
+        assert!(!DesktopApp::existing_choice_fresh(
+            "a3",
+            1,
+            &pending_targets
+        ));
+    }
+
+    #[test]
+    fn a_saved_destination_goes_stale_when_the_source_scope_disappears() {
+        use std::collections::HashMap;
+        // The destination shares the source's retained scope under another
+        // registration ID (a legacy row): filtering by ID would miss it.
+        let source = placed("a1", 1, "p", Some("/repo"), false);
+        let legacy = placed("a2", 1, "legacy", Some("/repo"), false);
+        let other_scope = placed("a3", 1, "p", Some("/elsewhere"), false);
+        let agents = vec![source.clone(), legacy.clone(), other_scope];
+        let branches: HashMap<String, nav::Branch> = HashMap::new();
+        // The picker flow offers the legacy row, and the saved choice is
+        // fresh against that flow.
+        let targets = handoff_candidates("a1", &agents, &branches);
+        assert!(targets.iter().any(|row| row.id == "a2"));
+        assert!(!targets.iter().any(|row| row.id == "a3"));
+        assert!(DesktopApp::existing_choice_fresh("a2", 1, &targets));
+        // The source scope disappears after the choice was saved (its
+        // daemon row is pending, so the scope is unknown): the same flow
+        // now offers nothing and the saved choice is stale.
+        let mut pending_source = source.clone();
+        pending_source.pending = true;
+        let agents = vec![pending_source, legacy.clone()];
+        let targets = handoff_candidates("a1", &agents, &branches);
+        assert!(targets.is_empty());
+        assert!(!DesktopApp::existing_choice_fresh("a2", 1, &targets));
+    }
 }

@@ -219,6 +219,9 @@ impl Store {
             usage,
             usage_scope,
             updated_at: record.updated_at,
+            // The authorization scope the server compares for moves and
+            // handoffs; the UI falls back to `project` when absent.
+            project_scope: record.project_scope,
             heavy,
             session_growth,
         })
@@ -292,6 +295,10 @@ pub struct AgentListFilter {
     pub state: Option<AgentState>,
     pub states: Option<Vec<AgentState>>,
     pub project: Option<String>,
+    /// Exact authorization-scope match (`COALESCE(project_scope, project)`),
+    /// the namespace reparent and handoff compare. Combined with `project`
+    /// by conjunction when both are present.
+    pub project_scope: Option<String>,
     pub harness: Option<String>,
     pub parent: Option<String>,
     pub root: Option<String>,
@@ -312,6 +319,9 @@ impl AgentListFilter {
         }
         if let Some(project) = &self.project {
             require_filter_text(project)?;
+        }
+        if let Some(scope) = &self.project_scope {
+            require_filter_text(scope)?;
         }
         if let Some(harness) = &self.harness {
             require_filter_text(harness)?;
@@ -392,14 +402,18 @@ fn agent_list_select(
     };
     let mut predicates = Vec::new();
     let mut params: Vec<rusqlite::types::Value> = Vec::new();
-    // Prefer the selective structural/scope index (parent/root/project) when
-    // present; state/harness composites only lead when no structural filter
-    // does. Project scope without a user filter rides the project composite
-    // the same way.
-    let mut equality = |column: &str, value: rusqlite::types::Value| {
+    // Prefer the selective structural/scope index (parent/root/project/scope)
+    // when present; state/harness composites only lead when no structural
+    // filter does.
+    fn push_equality(
+        predicates: &mut Vec<String>,
+        params: &mut Vec<rusqlite::types::Value>,
+        column: &str,
+        value: rusqlite::types::Value,
+    ) {
         predicates.push(format!("agents.{column} = ?"));
         params.push(value);
-    };
+    }
     let mut structural: Option<&str> = None;
     let mut fallback: Option<&str> = None;
     let mut note_index = |index: &'static str, structural_filter: bool| {
@@ -412,29 +426,53 @@ fn agent_list_select(
         }
     };
     if let Some(parent) = &filter.parent {
-        equality(
+        push_equality(
+            &mut predicates,
+            &mut params,
             "parent",
             rusqlite::types::Value::from(parse_agent_id(parent)?),
         );
         note_index("agents_list_parent", true);
     }
     if let Some(root) = &filter.root {
-        equality("root", rusqlite::types::Value::from(parse_agent_id(root)?));
+        push_equality(
+            &mut predicates,
+            &mut params,
+            "root",
+            rusqlite::types::Value::from(parse_agent_id(root)?),
+        );
         note_index("agents_list_root", true);
     }
     if let Some(project) = &filter.project {
-        equality("project", rusqlite::types::Value::from(project.clone()));
+        push_equality(
+            &mut predicates,
+            &mut params,
+            "project",
+            rusqlite::types::Value::from(project.clone()),
+        );
         note_index("agents_list_project", true);
     }
+    if let Some(scope) = &filter.project_scope {
+        predicates.push("COALESCE(agents.project_scope, agents.project) = ?".to_owned());
+        params.push(rusqlite::types::Value::from(scope.clone()));
+        note_index("agents_list_project_scope", true);
+    }
     if let Some(state) = filter.state {
-        equality(
+        push_equality(
+            &mut predicates,
+            &mut params,
             "state",
             rusqlite::types::Value::from(agent_state_name(state).to_owned()),
         );
         note_index("agents_list_state", false);
     }
     if let Some(harness) = &filter.harness {
-        equality("harness", rusqlite::types::Value::from(harness.clone()));
+        push_equality(
+            &mut predicates,
+            &mut params,
+            "harness",
+            rusqlite::types::Value::from(harness.clone()),
+        );
         note_index("agents_list_harness", false);
     }
     match filter.archived {
@@ -445,7 +483,9 @@ fn agent_list_select(
             "(agents.archived = 0 OR (agents.state IN ('stopped','failed','lost') AND EXISTS({})))",
             super::agent_lifecycle::custody_blockers_sql("agents.id", "0")
         )),
-        core::api::ArchivedFilter::Only => equality("archived", 1.into()),
+        core::api::ArchivedFilter::Only => {
+            push_equality(&mut predicates, &mut params, "archived", 1.into())
+        }
         core::api::ArchivedFilter::Include => {}
     }
     if let Some(states) = &filter.states {
@@ -646,6 +686,13 @@ mod tests {
                     ..Default::default()
                 },
                 "agents_list_project",
+            ),
+            (
+                AgentListFilter {
+                    project_scope: Some("fleet-a".to_owned()),
+                    ..Default::default()
+                },
+                "agents_list_project_scope",
             ),
             (
                 AgentListFilter {
@@ -895,6 +942,75 @@ mod tests {
             .unwrap()
             .join(" | ");
         assert!(plan.contains("USING INDEX agents_list_state"), "{plan}");
+    }
+
+    #[test]
+    fn project_scope_filter_reaches_legacy_and_registered_rows_together() {
+        fn scope_agent(store: &mut Store, project: &str, now: i64) -> String {
+            let mut launch = SubmitCommand::new(Ulid::new().to_string(), "launch");
+            launch.expected_generation = Some(0);
+            launch.args = json!({"harness": "codex", "profile": "codex-test",
+                "profile_snapshot": {}, "project": project, "workspace": "synthetic-workspace"});
+            let command = launch.id.clone();
+            let id = store
+                .submit("owner", launch, now)
+                .expect("admit scope launch")
+                .command
+                .target
+                .expect("launch target");
+            store
+                .dispatch(&command, now)
+                .expect("dispatch scope launch");
+            id
+        }
+
+        let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+        let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+        let legacy = scope_agent(&mut store, "scope-s", now);
+        let registered = scope_agent(&mut store, "reg-id", now + 1);
+        // A registered row keeps its registration label and retains the scope.
+        store
+            .connection
+            .execute(
+                "UPDATE agents SET project_scope = 'scope-s' WHERE id = ?1",
+                [eliot_core::parse_agent_id(&registered).expect("parse registered")],
+            )
+            .expect("retain the registered scope");
+
+        // One scope read reaches both rows; the label filter keeps only the
+        // legacy row with that label.
+        let scoped = store
+            .list_agent_summaries(
+                &AgentListFilter {
+                    project_scope: Some("scope-s".to_owned()),
+                    ..Default::default()
+                },
+                None,
+                10,
+                now + 2,
+                &core::SessionGrowthThresholds::default(),
+            )
+            .expect("filter the fleet by scope");
+        assert_eq!(scoped.total, 2);
+        let mut ids: Vec<_> = scoped.summaries.iter().map(|row| row.id.clone()).collect();
+        ids.sort();
+        let mut expected = vec![legacy.clone(), registered.clone()];
+        expected.sort();
+        assert_eq!(ids, expected);
+        let labeled = store
+            .list_agent_summaries(
+                &AgentListFilter {
+                    project: Some("scope-s".to_owned()),
+                    ..Default::default()
+                },
+                None,
+                10,
+                now + 2,
+                &core::SessionGrowthThresholds::default(),
+            )
+            .expect("filter the fleet by label");
+        assert_eq!(labeled.total, 1);
+        assert_eq!(labeled.summaries[0].id, legacy);
     }
 
     #[test]

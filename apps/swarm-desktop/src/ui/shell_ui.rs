@@ -703,13 +703,17 @@ impl DesktopApp {
     }
 
     /// The project a new task starts in: its checkout, and its profile
-    /// allowlist when it is registered.
+    /// allowlist when the checkout is a registered project's own
+    /// workspace. Anything else stays unregistered: the daemon resolves
+    /// linked worktrees, subfolders and typed folders, so the pending row
+    /// stays unknown until its Agent row arrives.
     pub(super) fn pick_project(&mut self, checkout: &str) {
+        let key = nav::path_key(checkout);
         let registered = self
             .nav
             .projects
             .iter()
-            .find(|project| project.workspace == checkout)
+            .find(|project| nav::path_key(&project.workspace) == key)
             .cloned();
         self.launch.workspace = checkout.to_owned();
         self.launch.custom_workspace = false;
@@ -791,12 +795,9 @@ impl DesktopApp {
             .projects
             .iter()
             .map(|project| nav::path_key(&project.workspace))
-            .chain(
-                self.nav
-                    .agents
-                    .iter()
-                    .map(|agent| nav::path_key(&agent.project)),
-            )
+            .chain(self.nav.agents.iter().map(|agent| {
+                nav::path_key(agent.workspace.as_deref().unwrap_or(&agent.project_id))
+            }))
             .collect();
         project_checkouts(&self.nav.projects)
             .into_iter()

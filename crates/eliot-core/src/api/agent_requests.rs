@@ -104,6 +104,18 @@ pub struct AgentListRequest {
     )]
     #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
     pub project: Option<String>,
+    /// Exact authorization-scope match (`COALESCE(project_scope, project)`),
+    /// the namespace `swarm.reparent` and `swarm.handoff` compare. A legacy
+    /// row without a retained scope matches through its project label, so one
+    /// scope read reaches legacy and registered rows together. Combined with
+    /// `project` by conjunction when both are present.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "optional_text"
+    )]
+    #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
+    pub project_scope: Option<String>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -139,6 +151,7 @@ impl Default for AgentListRequest {
             state: None,
             states: None,
             project: None,
+            project_scope: None,
             harness: None,
             parent: None,
             root: None,
@@ -167,6 +180,9 @@ impl AgentListRequest {
         }
         if let Some(project) = &self.project {
             text(project)?;
+        }
+        if let Some(scope) = &self.project_scope {
+            text(scope)?;
         }
         if let Some(harness) = &self.harness {
             text(harness)?;
@@ -257,6 +273,9 @@ impl AgentListRequest {
                     .project
                     .as_ref()
                     .is_some_and(|project| &row.summary.project != project)
+                || self.project_scope.as_ref().is_some_and(|scope| {
+                    row.summary.project_scope.as_deref().unwrap_or(&row.summary.project) != scope
+                })
                 || self
                     .harness
                     .as_ref()

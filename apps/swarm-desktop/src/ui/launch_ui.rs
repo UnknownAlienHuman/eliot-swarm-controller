@@ -1010,6 +1010,7 @@ impl DesktopApp {
             access: self.launch.access(),
             chat: self.launch.chat,
             workspace: self.launch.workspace.clone(),
+            project: self.launch_project_id(),
         };
         let key = format!("launch:{target:?}:{place:?}:{}", self.launch.launch_rev);
         let mutation_id = self.ledger.id_for(&key);
@@ -1121,6 +1122,24 @@ impl DesktopApp {
         }
     }
 
+    /// The registration ID the pending launch row carries: the explicitly
+    /// chosen registered project's ID, when the launch still runs in its
+    /// checkout. "" for chats and for every other folder: the desktop
+    /// never re-implements the daemon's project resolution, so those rows
+    /// stay unknown until the daemon Agent row arrives. Never the
+    /// workspace path: the daemon's project label is a registration ID,
+    /// not a directory.
+    fn launch_project_id(&self) -> String {
+        if self.launch.chat {
+            return String::new();
+        }
+        chosen_project_id(
+            &self.nav.projects,
+            self.nav.selection.project.as_deref(),
+            &self.launch.workspace,
+        )
+    }
+
     /// A start that did not go through gives its text back to the composer
     /// (with the same draft revision, so a retry reuses the mutation id),
     /// unless the owner already typed something new.
@@ -1224,6 +1243,23 @@ impl DesktopApp {
     }
 }
 
+/// The pending row's project ID: the explicitly chosen registration's
+/// ID, when the launch still runs in that registration's checkout. Every
+/// other folder (a typed path, a subfolder, a linked checkout the daemon
+/// alone resolves) yields none: the row stays unknown until the daemon
+/// Agent row arrives.
+fn chosen_project_id(projects: &[UiProject], selected: Option<&str>, workspace: &str) -> String {
+    let Some(selected) = selected else {
+        return String::new();
+    };
+    let key = nav::path_key(workspace);
+    projects
+        .iter()
+        .find(|project| project.id == selected && nav::path_key(&project.workspace) == key)
+        .map(|project| project.id.clone())
+        .unwrap_or_default()
+}
+
 impl Submitted {
     /// The Recent entry a launch records: the submitted model and effort.
     fn recent(&self) -> Option<crate::settings::ModelRef> {
@@ -1236,21 +1272,28 @@ impl Submitted {
 
 impl LaunchOutcome {
     /// The new Agent's row until the list reads it back: the submitted
-    /// harness and place, titled by the first message.
+    /// harness and place, titled by the first message. Its scope stays
+    /// unknown until the daemon row arrives: the submitted ID must not
+    /// stand in for the scope, and pickers never offer this row meanwhile.
     fn pending_agent(&self, now: i64) -> UiAgent {
         UiAgent {
             id: self.agent.clone(),
             generation: self.generation,
             harness: self.submitted.harness.clone().unwrap_or_default(),
             state: eliot_core::AgentState::Created,
-            project: if self.submitted.chat {
+            project_id: if self.submitted.chat {
                 String::new()
             } else {
-                self.submitted.workspace.clone()
+                self.submitted.project.clone()
             },
-            recorded_project: None,
+            project_scope: None,
+            pending: true,
             repo_common_dir: None,
-            workspace: None,
+            workspace: if self.submitted.chat {
+                None
+            } else {
+                Some(self.submitted.workspace.clone())
+            },
             parent: None,
             updated_at: now,
             title: nav::title(&self.text).unwrap_or_else(|| self.agent.clone()),
@@ -1316,6 +1359,47 @@ mod tests {
         })
     }
 
+    fn project(id: &str, workspace: &str) -> UiProject {
+        UiProject {
+            id: id.to_owned(),
+            profiles: Vec::new(),
+            workspace: workspace.to_owned(),
+            common_dir: String::new(),
+            origin: None,
+            git_checkouts: Vec::new(),
+            missing: false,
+        }
+    }
+
+    #[test]
+    fn a_launch_from_an_arbitrary_folder_yields_an_unknown_pending_project() {
+        let projects = vec![project("p", "/repo/checkout")];
+        // The explicitly chosen registered project: the pending row
+        // carries its ID, and its scope still waits for the daemon row.
+        assert_eq!(
+            chosen_project_id(&projects, Some("p"), "/repo/checkout"),
+            "p"
+        );
+        // A typed folder the owner never picked as a project: unknown.
+        assert_eq!(chosen_project_id(&projects, None, "/elsewhere/work"), "");
+        // The chosen project, but the folder moved elsewhere: unknown.
+        assert_eq!(
+            chosen_project_id(&projects, Some("p"), "/elsewhere/work"),
+            ""
+        );
+        // A subfolder of the registered checkout: the daemon resolves the
+        // containing checkout, so the pending row stays unknown.
+        assert_eq!(
+            chosen_project_id(&projects, Some("p"), "/repo/checkout/sub"),
+            ""
+        );
+        // A registration that is gone: unknown.
+        assert_eq!(
+            chosen_project_id(&projects, Some("gone"), "/repo/checkout"),
+            ""
+        );
+    }
+
     #[test]
     fn completion_records_the_submitted_choice_not_the_current_picker() {
         // Submitted Codex · luna · low into a folder; the owner then picked
@@ -1334,6 +1418,7 @@ mod tests {
                 access: Access::Auto,
                 chat: false,
                 workspace: "C:/src/app".to_owned(),
+                project: "p".to_owned(),
             },
         };
         let _later_picker = pick("claude", "claude-sonnet", "high");
@@ -1348,9 +1433,14 @@ mod tests {
         );
         let row = outcome.pending_agent(5);
         assert_eq!(row.harness, "codex");
-        assert_eq!(row.project, "C:/src/app");
+        assert_eq!(row.project_id, "p");
+        assert_eq!(row.workspace.as_deref(), Some("C:/src/app"));
         assert!(!row.chat);
         assert_eq!(row.title, "Fix the build");
+        // The submitted ID is not the scope: the row stays pending with
+        // an unknown scope until the daemon row arrives.
+        assert!(row.pending);
+        assert_eq!(row.scope(), None);
         assert_eq!(
             starting_label(outcome.submitted.harness.as_deref()),
             "Starting Codex…"
@@ -1361,5 +1451,22 @@ mod tests {
             ..outcome.submitted.clone()
         };
         assert!(preset.recent().is_none());
+        // A chat pending row carries neither a project ID nor a workspace.
+        let chat = LaunchOutcome {
+            agent: "a8".to_owned(),
+            submitted: Submitted {
+                chat: true,
+                workspace: String::new(),
+                project: String::new(),
+                ..outcome.submitted.clone()
+            },
+            ..outcome.clone()
+        };
+        let row = chat.pending_agent(6);
+        assert!(row.chat);
+        assert!(row.project_id.is_empty());
+        assert!(row.workspace.is_none());
+        assert!(row.pending);
+        assert_eq!(row.scope(), None);
     }
 }

@@ -738,9 +738,14 @@ is needed. A later explicit open/launch in that checkout can discover it again.
 `agent.list` returns compact summaries ordered by Agent ID. Each summary can carry
 the retained execution directory in `workspace`; full records stay available through
 `agent.get`. Optional `state`,
-`project`, `harness`, `parent` and `root` filters are exact indexed matches:
-wrong types and unknown state names are `invalid`, and a filter never matches
-silently. The selective structural/scope index (`parent`/`root`/`project`)
+`project`, `project_scope`, `harness`, `parent` and `root` filters are exact
+indexed matches: wrong types and unknown state names are `invalid`, and a
+filter never matches silently. `project_scope` matches the effective
+authorization scope (`COALESCE(project_scope, project)`), the namespace
+`swarm.reparent` and `swarm.handoff` compare, so one read reaches legacy rows
+(matched through their project label) and registered rows with the same scope;
+combined with `project` by conjunction when both are present. The selective
+structural/scope index (`parent`/`root`/`project`/`project_scope`)
 leads when several filters are present. `states` optionally selects 1 through
 9 distinct lifecycle states and is mutually exclusive with `state`. It is one
 ordinary ID-ordered page: `limit` remains a **total** row cap (at most 1,000),
@@ -780,8 +785,11 @@ session fallback never presents as turn usage: its inner `usage.scope` is
 `"session"` as well, and per-turn accounting stays on `usage.summary`.
 A missing outcome or progress
 timestamp reads back absent, never zero or success; `updated_at` is freshness
-metadata, not proof of liveness for a detached or restarted source. The
-response carries the required matching `total` ignoring the cursor, the
+metadata, not proof of liveness for a detached or restarted source. Each
+summary also carries `project_scope`, the authorization namespace the server
+compares for same-project moves and handoffs, present only when it differs
+from `project`; pickers narrow by that scope while the server stays the judge.
+The response carries the required matching `total` ignoring the cursor, the
 required explicit `truncated`, and `next` at the last returned row on every
 nonempty page (empty pages carry no cursor); continue through `next` until the
 page is empty. A missing `total` or `truncated` never reads back as zero or

@@ -144,8 +144,8 @@ impl DesktopApp {
                                 generation: row.generation,
                                 harness: row.harness.clone(),
                                 state: row.state,
-                                project: row.project.clone(),
-                                recorded_project: None,
+                                project_id: row.project.clone(),
+                                project_scope: row.project_scope.clone(),
                                 repo_common_dir: None,
                                 workspace: None,
                                 parent: row.parent.clone(),
@@ -155,6 +155,7 @@ impl DesktopApp {
                                 tokens: row.tokens,
                                 chat: row.chat,
                                 archived: false,
+                                pending: false,
                             })
                     });
                 if let Some(agent) = agent {
@@ -1079,17 +1080,28 @@ impl DesktopApp {
 
         // Where it works: its project's checkout and, on a worktree, that
         // worktree; each row opens in Explorer.
-        let (project, workspace) = match (detail, read) {
+        // `project` on the wire is the registration ID, not a path: the
+        // project folder is that registration's checkout, else the
+        // Agent's own workspace.
+        let (project_id, workspace) = match (detail, read) {
             (Some(detail), _) => (Some(detail.project.clone()), detail.workspace.clone()),
             (None, Some(read)) => (
                 Some(read.agent.agent.project.clone()),
                 read.agent.agent.workspace.clone(),
             ),
-            (None, None) => (
-                self.find_agent(&id).map(|agent| agent.project.clone()),
-                None,
-            ),
+            (None, None) => {
+                let agent = self.find_agent(&id);
+                (
+                    agent.map(|agent| agent.project_id.clone()),
+                    agent.and_then(|agent| agent.workspace.clone()),
+                )
+            }
         };
+        let project = project_id
+            .as_deref()
+            .and_then(|id| self.nav.projects.iter().find(|project| project.id == id))
+            .map(|project| project.workspace.clone())
+            .or_else(|| workspace.clone());
         let mut folders: Vec<KeyedView> = Vec::new();
         if let Some(project) = project.filter(|project| !project.is_empty()) {
             folders.push(KeyedView::new(

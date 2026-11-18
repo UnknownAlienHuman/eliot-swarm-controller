@@ -3569,6 +3569,7 @@ impl Router {
             state: request.state,
             states: request.states.clone(),
             project: request.project.clone(),
+            project_scope: request.project_scope.clone(),
             harness: request.harness.clone(),
             parent: request.parent.clone(),
             root: request.root.clone(),

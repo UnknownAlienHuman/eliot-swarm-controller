@@ -33,8 +33,8 @@ impl DesktopApp {
                         generation: binding.generation,
                         harness: detail.harness.clone(),
                         state: detail.state,
-                        project: detail.project.clone(),
-                        recorded_project: None,
+                        project_id: detail.project.clone(),
+                        project_scope: None,
                         repo_common_dir: None,
                         workspace: None,
                         parent: None,
@@ -44,6 +44,7 @@ impl DesktopApp {
                         tokens: None,
                         chat: false,
                         archived: false,
+                        pending: false,
                     })
                 });
                 if let Some(mut agent) = agent {

@@ -1,10 +1,11 @@
 //! "Move under another task…" (k113): a task's ⋯ menu in the conversation
 //! header and its right-click menu in the sidebar open one picker of the
 //! tasks it can work under ([`reparent::eligible_parents`]: the same
-//! project, or none for a chat, running or ready), with a search box. Picking a task and
-//! pressing Move is the one confirmation. The picker reads its own
-//! candidates ([`reparent::search_managers`], every page up to a bound),
-//! not the sidebar's single page, and says when it left some unread.
+//! authorization scope, or none for a chat, running or ready), with a
+//! search box. Picking a task and pressing Move is the one confirmation.
+//! The picker reads its own candidates ([`reparent::search_managers`],
+//! every page up to a bound), not the sidebar's single page, and says
+//! when it left some unread.
 //!
 //! The picker uses the shared M3 dialog and native modal focus host.
 //! The move is the existing `swarm.reparent` with both
@@ -178,16 +179,16 @@ impl DesktopApp {
     }
 
     /// Read the tasks `agent` can move under on a worker; the reply lands
-    /// only on the picker still open for that task and generation.
+    /// only on the picker still open for that task and generation. The
+    /// search derives its scope filter from the source row itself, so it
+    /// cannot drift from what the picker offers.
     fn spawn_move_search(&self, agent: &UiAgent, context: &ComponentContext<Self>) {
-        let source = agent.id.clone();
-        let generation = agent.generation;
-        let project = agent.project.clone();
+        let source = agent.clone();
         let data_dir = self.data_dir.clone();
         let _task = context.spawn_background(move |_| {
             let result = match data_dir {
                 Ok(data_dir) => client::block_on(reparent::search_managers(
-                    &project,
+                    &source,
                     reparent::SEARCH_PAGE,
                     reparent::SEARCH_BOUND,
                     |request| {
@@ -209,7 +210,11 @@ impl DesktopApp {
                 .map_err(|error: eliot_core::Error| error.user_message()),
                 Err(error) => Err(error),
             };
-            Message::Move(MoveMsg::Searched(source, generation, result))
+            Message::Move(MoveMsg::Searched(
+                source.id.clone(),
+                source.generation,
+                result,
+            ))
         });
     }
 
@@ -227,7 +232,7 @@ impl DesktopApp {
             _ => (&[], 0),
         };
         let eligible = reparent::eligible_parents(candidates, &self.nav.agents, &dialog.agent);
-        let scope = reparent::Scope::of(&dialog.agent.project);
+        let scope = reparent::Scope::of(dialog.agent.scope());
         // A parent past the sidebar's page is named from the candidates.
         let title_of = |id: &str| {
             dialog
@@ -325,7 +330,7 @@ impl DesktopApp {
         };
         // The search is bounded: say what it left unread.
         let incomplete: View =
-            match reparent::unread_words(&dialog.agent.project, candidates.len(), unread) {
+            match reparent::unread_words(dialog.agent.scope(), candidates.len(), unread) {
                 Some(words) => m3::secondary(words)
                     .text_wrapping(TextWrapping::Wrap)
                     .into(),

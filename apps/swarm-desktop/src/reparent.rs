@@ -3,20 +3,23 @@
 //! work under; one confirmation moves it with its own workers.
 //!
 //! The picker reads its own candidates ([`search_managers`]): every page of
-//! `agent.list {project, state}` for each state the daemon accepts as a
-//! destination, up to [`SEARCH_BOUND`] rows, and says how many it left
-//! unread. The sidebar's single page is not the search set. `agent.list`
-//! filters only a nonblank project label, so a chat's search reads every
+//! `agent.list {project_scope, state}` for each state the daemon accepts as
+//! a destination, up to [`SEARCH_BOUND`] rows, and says how many it left
+//! unread. The sidebar's single page is not the search set. The scope
+//! filter is the effective authorization scope
+//! (`COALESCE(project_scope, project)`), so a legacy row and a registered
+//! row with the same scope reach the same candidate set, exactly the
+//! namespace the daemon compares. A chat's search (no scope) reads every
 //! project and says so ([`Scope`]).
 //!
 //! The binding is captured when the owner confirms: the exact source and
 //! destination generations go into the request, so a click acts on exactly
 //! what was displayed. One ULID per action key, reused only after an
 //! uncertain reply. The picker only leaves out what the daemon would
-//! refuse anyway (another project, an ended or observed task, the task
-//! itself or its own workers); the daemon still owns every check (cycle,
-//! fanout, observe-only, generation, destination state) and its refusal is
-//! shown in words.
+//! refuse anyway (another authorization scope, an ended or observed task,
+//! the task itself or its own workers, a row whose scope is still unknown);
+//! the daemon still owns every check (scope, cycle, fanout, observe-only,
+//! generation, destination state) and its refusal is shown in words.
 
 use eliot_core::AgentState;
 use eliot_core::api::{AgentListRequest, ReparentRequest};
@@ -58,19 +61,29 @@ pub struct Managers {
     pub unread: usize,
 }
 
-/// Page through `agent.list {project, state}` for every state in
+/// The `agent.list` scope filter for `source`'s picker: its effective
+/// authorization scope, never its workspace path or its recorded project
+/// ID. Empty (a chat) or unknown (a pending row) reads every project;
+/// [`eligible_parents`] then keeps only same-scope rows.
+pub fn search_scope(source: &UiAgent) -> Option<&str> {
+    source.scope().filter(|scope| !scope.is_empty())
+}
+
+/// Page through `agent.list {project_scope, state}` for every state in
 /// [`MANAGER_STATES`], `page` rows at a time and at most `bound` rows in
 /// all. `fetch` is one validated page read (at most its `limit` rows).
-/// A chat (empty project label) has no project filter, so its search
-/// reads every project's rows ([`Scope::AllProjects`]) and
-/// [`eligible_parents`] keeps the ones without a project.
+/// The scope filter comes from the source itself ([`search_scope`]), so
+/// the search cannot drift from what the picker offers: a chat (empty
+/// scope) or a pending row (unknown scope) reads every project's rows
+/// ([`Scope::AllProjects`]), and [`eligible_parents`] keeps the ones
+/// without a project (never the pending rows).
 ///
 /// A state's total arrives only with a read of at least one row, so one
 /// row of the bound stays reserved for each state not yet read: every
 /// total is counted inside the bound, and those rows are candidates too.
 /// A bound below one row per state is raised to that.
 pub async fn search_managers<F, Fut, E>(
-    project: &str,
+    source: &UiAgent,
     page: usize,
     bound: usize,
     mut fetch: F,
@@ -80,6 +93,7 @@ where
     Fut: std::future::Future<Output = Result<Page, E>>,
 {
     let bound = bound.max(MANAGER_STATES.len());
+    let scope = search_scope(source).map(str::to_owned);
     let mut managers = Managers::default();
     for (index, state) in MANAGER_STATES.into_iter().enumerate() {
         let reserved = MANAGER_STATES.len() - index - 1;
@@ -90,7 +104,8 @@ where
             // At least one row: the previous state stopped one row short.
             let limit = page.min(room(managers.agents.len())).max(1);
             let reply = fetch(AgentListRequest {
-                project: (!project.is_empty()).then(|| project.to_owned()),
+                project: None,
+                project_scope: scope.clone(),
                 state: Some(state),
                 limit,
                 after: after.take(),
@@ -115,10 +130,11 @@ where
     Ok(managers)
 }
 
-/// What a picker search covers. `agent.list` filters only a nonblank
-/// project label, so a chat's search (empty label) reads running or ready
-/// tasks of every project and keeps the ones without a project; its counts
-/// cover every project.
+/// What a picker search covers. The search filters by effective scope, so
+/// a task's search reads running or ready tasks of its own scope; a chat
+/// (empty scope) or a pending row (unknown scope) reads every project's
+/// rows and keeps the ones without a project (never the pending rows); its
+/// counts cover every project.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scope {
     Project,
@@ -126,11 +142,10 @@ pub enum Scope {
 }
 
 impl Scope {
-    pub fn of(project: &str) -> Self {
-        if project.is_empty() {
-            Self::AllProjects
-        } else {
-            Self::Project
+    pub fn of(scope: Option<&str>) -> Self {
+        match scope {
+            Some(scope) if !scope.is_empty() => Self::Project,
+            _ => Self::AllProjects,
         }
     }
 
@@ -153,11 +168,11 @@ impl Scope {
 
 /// What a bounded search left unread, in words, over its [`Scope`]; None
 /// when it read every matching row.
-pub fn unread_words(project: &str, read: usize, unread: usize) -> Option<String> {
+pub fn unread_words(scope: Option<&str>, read: usize, unread: usize) -> Option<String> {
     (unread > 0).then(|| {
         format!(
             "Searched {read} running or ready tasks {}; {unread} more were not read, so the one you want may be missing.",
-            Scope::of(project).read()
+            Scope::of(scope).read()
         )
     })
 }
@@ -195,11 +210,14 @@ impl MoveBinding {
 }
 
 /// The `candidates` `source` can be moved under, newest first: the same
-/// project (the daemon compares the project label exactly), controlled and
-/// not ended (`swarm.reparent` needs a live manager), neither `source`
-/// itself, its current parent, nor one of its own workers (a cycle), each
-/// once. `links` (the sidebar's rows) only add parent links for the cycle
-/// check; the candidates' own rows are fresher and win.
+/// authorization scope (the daemon compares `COALESCE(project_scope,
+/// project)` exactly), controlled and not ended (`swarm.reparent` needs a
+/// live manager), neither `source` itself, its current parent, nor one of
+/// its own workers (a cycle), each once. Rows with an unknown scope (a
+/// pending launch whose daemon row has not arrived) are never offered, and
+/// a pending source is offered nothing. `links` (the sidebar's rows) only
+/// add parent links for the cycle check; the candidates' own rows are
+/// fresher and win.
 pub fn eligible_parents<'a>(
     candidates: &'a [UiAgent],
     links: &[UiAgent],
@@ -228,10 +246,16 @@ pub fn eligible_parents<'a>(
         false
     };
     let mut seen = std::collections::HashSet::new();
+    let scoped = |agent: &UiAgent| {
+        matches!(
+            (source.scope(), agent.scope()),
+            (Some(want), Some(have)) if want == have
+        )
+    };
     let mut eligible: Vec<&UiAgent> = candidates
         .iter()
         .filter(|agent| agent.id != source.id && seen.insert(agent.id.as_str()))
-        .filter(|agent| agent.project == source.project && !agent.native_child)
+        .filter(|agent| scoped(agent) && !agent.native_child)
         .filter(|agent| {
             !matches!(
                 agent.state,
@@ -255,8 +279,8 @@ mod tests {
             generation: 1,
             harness: "claude".to_owned(),
             state,
-            project: "/w".to_owned(),
-            recorded_project: None,
+            project_id: "/w".to_owned(),
+            project_scope: None,
             repo_common_dir: None,
             workspace: None,
             parent: parent.map(str::to_owned),
@@ -266,6 +290,7 @@ mod tests {
             tokens: None,
             chat: false,
             archived: false,
+            pending: false,
         }
     }
 
@@ -294,7 +319,7 @@ mod tests {
     fn only_live_controlled_tasks_of_the_same_project_outside_the_subtree_qualify() {
         let source = agent("a2", Some("a1"), AgentState::Idle, 5);
         let mut other_project = agent("a9", None, AgentState::Idle, 9);
-        other_project.project = "/elsewhere".to_owned();
+        other_project.project_id = "/elsewhere".to_owned();
         let mut native = agent("a8", None, AgentState::Busy, 8);
         native.native_child = true;
         let agents = vec![
@@ -318,12 +343,25 @@ mod tests {
         assert_eq!(ids, ["a7", "a5"]);
     }
 
-    /// `agent.list` over `rows` (listing order): the request's project and
+    /// `agent.list` over `rows` (listing order): the request's scope and
     /// state filters, `limit` rows after the cursor, and the exact total.
+    /// Mirrors the Store: `project_scope` matches the effective scope
+    /// (`COALESCE(project_scope, project)`), `project` the recorded label.
     fn list(rows: &[UiAgent], request: &AgentListRequest) -> Page {
         let matching: Vec<&UiAgent> = rows
             .iter()
-            .filter(|row| request.project.as_deref().is_none_or(|p| row.project == p))
+            .filter(|row| {
+                request
+                    .project
+                    .as_deref()
+                    .is_none_or(|p| row.project_id == p)
+            })
+            .filter(|row| {
+                request
+                    .project_scope
+                    .as_deref()
+                    .is_none_or(|scope| row.scope() == Some(scope))
+            })
             .filter(|row| request.state.is_none_or(|state| row.state == state))
             .collect();
         let start = request.after.as_deref().map_or(0, |after| {
@@ -356,7 +394,7 @@ mod tests {
         // The one valid manager: the fourth page at two rows a page.
         rows.push(agent("a8", None, AgentState::Idle, 8));
         let mut elsewhere = agent("a9", None, AgentState::Busy, 9);
-        elsewhere.project = "/elsewhere".to_owned();
+        elsewhere.project_id = "/elsewhere".to_owned();
         rows.push(elsewhere);
         rows.push(agent("a10", None, AgentState::Busy, 10));
         // a12 works under a stopped worker a11 of a1: only the sidebar's
@@ -364,7 +402,7 @@ mod tests {
         rows.push(agent("a12", Some("a11"), AgentState::Waiting, 12));
         let links = [agent("a11", Some("a1"), AgentState::Stopped, 11)];
         let mut requests = Vec::new();
-        let managers = crate::client::block_on(search_managers("/w", 2, 100, |request| {
+        let managers = crate::client::block_on(search_managers(&source, 2, 100, |request| {
             requests.push(request.clone());
             let page = list(&rows, &request);
             async move { Ok::<_, ()>(page) }
@@ -372,7 +410,8 @@ mod tests {
         .unwrap();
         assert_eq!(managers.unread, 0);
         assert!(requests.iter().all(|request| {
-            request.project.as_deref() == Some("/w")
+            request.project.is_none()
+                && request.project_scope.as_deref() == Some("/w")
                 && request.limit <= 2
                 && request
                     .state
@@ -385,8 +424,8 @@ mod tests {
         assert_eq!(ids, ["a10", "a8"]);
 
         // Bounded: five rows read in all, and the other five of the
-        // project's ten are counted, never dropped silently.
-        let bounded = crate::client::block_on(search_managers("/w", 2, 5, |request| {
+        // scope's ten are counted, never dropped silently.
+        let bounded = crate::client::block_on(search_managers(&source, 2, 5, |request| {
             let page = list(&rows, &request);
             async move { Ok::<_, ()>(page) }
         }))
@@ -403,9 +442,10 @@ mod tests {
             .collect();
         rows.push(agent("a2000", None, AgentState::Busy, 2000));
         rows.push(agent("a2001", None, AgentState::Waiting, 2001));
+        let source = agent("a0", None, AgentState::Idle, 0);
         let mut fetched = 0;
         let managers = crate::client::block_on(search_managers(
-            "/w",
+            &source,
             SEARCH_PAGE,
             SEARCH_BOUND,
             |request| {
@@ -422,21 +462,154 @@ mod tests {
 
     #[test]
     fn a_chats_search_says_it_read_every_project() {
-        // `agent.list` filters only a nonblank project label: a chat's
-        // search reads every project, and its counts say so.
+        // A scope-less search reads every project, and its counts say so:
+        // a chat has an empty scope, a pending row an unknown one.
+        let mut chat = agent("a1", None, AgentState::Idle, 1);
+        chat.project_id = String::new();
+        assert_eq!(search_scope(&chat), None);
+        assert_eq!(Scope::of(chat.scope()), Scope::AllProjects);
         let mut requests = Vec::new();
-        let rows = [agent("a1", None, AgentState::Idle, 1)];
-        crate::client::block_on(search_managers("", 2, 10, |request| {
+        let rows = [chat.clone()];
+        crate::client::block_on(search_managers(&chat, 2, 10, |request| {
             requests.push(request.clone());
             let page = list(&rows, &request);
             async move { Ok::<_, ()>(page) }
         }))
         .unwrap();
-        assert!(requests.iter().all(|request| request.project.is_none()));
-        let chat = unread_words("", 1_000, 4).unwrap();
-        assert!(chat.contains("of every project"), "{chat}");
-        let task = unread_words("/w", 1_000, 4).unwrap();
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.project.is_none() && request.project_scope.is_none())
+        );
+        let every = unread_words(chat.scope(), 1_000, 4).unwrap();
+        assert!(every.contains("of every project"), "{every}");
+        let task = unread_words(Some("/w"), 1_000, 4).unwrap();
         assert!(task.contains("of this project"), "{task}");
-        assert_eq!(unread_words("", 3, 0), None);
+        assert_eq!(unread_words(chat.scope(), 3, 0), None);
+        assert_eq!(unread_words(None, 3, 0), None);
+    }
+
+    #[test]
+    fn same_scope_qualifies_when_the_project_id_differs_from_the_workspace() {
+        // Same ID with another scope is another authorization namespace: the
+        // daemon refuses the move, so the picker never offers it.
+        fn placed(
+            id: &str,
+            project_id: &str,
+            scope: Option<&str>,
+            workspace: &str,
+            state: AgentState,
+        ) -> UiAgent {
+            let mut row = agent(id, None, state, 1);
+            row.project_id = project_id.to_owned();
+            row.project_scope = scope.map(str::to_owned);
+            row.workspace = Some(workspace.to_owned());
+            row
+        }
+        let source = placed("a1", "p", Some("/repo"), "/repo", AgentState::Idle);
+        let same_scope = placed("a2", "p", Some("/repo"), "/repo", AgentState::Idle);
+        // Same project ID and workspace, but another tree's scope.
+        let other_scope = placed("a3", "p", Some("/elsewhere"), "/repo", AgentState::Idle);
+        let other_project = placed("a4", "q", None, "/repo", AgentState::Idle);
+        let candidates = vec![
+            same_scope.clone(),
+            other_scope.clone(),
+            other_project.clone(),
+            source.clone(),
+        ];
+        let ids: Vec<&str> = eligible_parents(&candidates, &[], &source)
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect();
+        assert_eq!(ids, ["a2"]);
+        // A pending row with the same label and workspace is not offered
+        // while its scope is unknown, and a pending source is offered
+        // nothing: the picker never treats the ID as the scope.
+        let mut pending = placed("a5", "p", Some("/repo"), "/repo", AgentState::Idle);
+        pending.pending = true;
+        let candidates_with_pending = [same_scope.clone(), pending.clone()];
+        let ids: Vec<&str> = eligible_parents(&candidates_with_pending, &[], &source)
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect();
+        assert_eq!(ids, ["a2"]);
+        let none: Vec<&str> = eligible_parents(&candidates, &[], &pending)
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect();
+        assert!(none.is_empty(), "{none:?}");
+    }
+
+    #[test]
+    fn the_move_search_filters_by_effective_scope_never_the_workspace_path() {
+        // The search derives its filter from the source row itself
+        // ([`search_managers`] reads [`search_scope`]), exactly as the
+        // picker does: there is no caller-supplied filter to drift. The
+        // source's retained scope differs from its recorded project ID, and
+        // a legacy destination shares the scope under another ID: querying
+        // by ID would miss it, querying by workspace path would read
+        // nothing.
+        fn placed(
+            id: &str,
+            project_id: &str,
+            scope: Option<&str>,
+            workspace: &str,
+            state: AgentState,
+        ) -> UiAgent {
+            let mut row = agent(id, None, state, 1);
+            row.project_id = project_id.to_owned();
+            row.project_scope = scope.map(str::to_owned);
+            row.workspace = Some(workspace.to_owned());
+            row
+        }
+        let source = placed("a1", "p", Some("/repo"), "/repo/linked", AgentState::Idle);
+        let legacy_same_scope = placed("a2", "legacy", Some("/repo"), "/repo", AgentState::Idle);
+        let same_id_other_scope = placed(
+            "a3",
+            "p",
+            Some("/elsewhere"),
+            "/repo/linked",
+            AgentState::Idle,
+        );
+        // The filter is the effective scope, never the ID or workspace path.
+        assert_eq!(search_scope(&source), Some("/repo"));
+        let rows = vec![
+            source.clone(),
+            legacy_same_scope.clone(),
+            same_id_other_scope.clone(),
+        ];
+        let mut requests = Vec::new();
+        let managers = crate::client::block_on(search_managers(&source, 10, 100, |request| {
+            requests.push(request.clone());
+            let page = list(&rows, &request);
+            async move { Ok::<_, ()>(page) }
+        }))
+        .unwrap();
+        assert!(requests.iter().all(|request| request.project.is_none()
+            && request.project_scope.as_deref() == Some("/repo")));
+        let ids: Vec<&str> = eligible_parents(&managers.agents, &[], &source)
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect();
+        assert!(ids.contains(&"a2"), "same-scope agent missing: {ids:?}");
+        assert!(!ids.contains(&"a3"));
+        // By recorded ID the legacy destination is invisible: an
+        // ID-filtered read returns only the source's own label.
+        let by_id = list(
+            &rows,
+            &AgentListRequest {
+                project: Some("p".to_owned()),
+                project_scope: None,
+                state: None,
+                limit: 10,
+                after: None,
+                ..AgentListRequest::default()
+            },
+        );
+        assert!(
+            !by_id.rows.iter().any(|row| row.id == "a2"),
+            "ID query must miss the legacy destination: {:?}",
+            by_id.rows.iter().map(|row| &row.id).collect::<Vec<_>>()
+        );
     }
 }
