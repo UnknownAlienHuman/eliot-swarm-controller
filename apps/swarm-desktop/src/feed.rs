@@ -9,7 +9,7 @@
 //! snapshot or delivered later, never both and never neither. Markdown is
 //! parsed here, off the UI thread, into owned blocks keyed by content hash.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
 use std::time::Duration;
@@ -98,10 +98,32 @@ fn parse_docs(texts: Vec<String>) -> Vec<(u64, Doc)> {
         .collect()
 }
 
-fn linked_commands(events: &[Event]) -> Vec<String> {
+/// Commands of the turns the resident bounds will keep: the newest
+/// [`crate::chat::MAX_RESIDENT_TURNS`] turn ids by first event (the order
+/// the bounds evict by), so a snapshot fetches only resident input texts
+/// instead of one RPC per `turn.started` in the whole scanned window, and
+/// evicted prompts never load the budget (#642).
+fn resident_commands(events: &[Event]) -> Vec<String> {
+    let mut first: HashMap<&str, (i64, i64)> = HashMap::new();
+    for event in events {
+        if let Some(turn_id) = event.data.get("turn_id").and_then(|value| value.as_str()) {
+            first.entry(turn_id).or_insert((event.ts, event.seq));
+        }
+    }
+    let mut resident: Vec<&str> = first.keys().copied().collect();
+    resident.sort_by(|a, b| first[b].cmp(&first[a]));
+    resident.truncate(crate::chat::MAX_RESIDENT_TURNS);
+    let keep: HashSet<&str> = resident.into_iter().collect();
     let mut commands: Vec<String> = events
         .iter()
-        .filter(|event| event.kind == "turn.started")
+        .filter(|event| {
+            event.kind == "turn.started"
+                && event
+                    .data
+                    .get("turn_id")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|turn_id| keep.contains(turn_id))
+        })
         .filter_map(|event| event.data.get("command_id")?.as_str().map(str::to_owned))
         .collect();
     commands.sort();
@@ -129,7 +151,7 @@ pub fn snapshot(data_dir: &Path, agent: &str, depth: Depth) -> Fallible<Snapshot
         )
         .await?;
         let events = scan.events;
-        let inputs = client::input_texts(data_dir, linked_commands(&events)).await;
+        let inputs = client::input_texts(data_dir, resident_commands(&events)).await;
         let docs = parse_docs(Conversation::markdown_texts(&results.turns, &events));
         Ok(Snapshot {
             coverage: Coverage {
@@ -275,4 +297,46 @@ pub fn backoff(delay_ms: u64, cancelled: &dyn Fn() -> bool) -> bool {
         .await
         .is_some()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn started(seq: i64, turn: &str, command: Option<&str>) -> Event {
+        let mut data = serde_json::Map::new();
+        data.insert("turn_id".to_owned(), json!(turn));
+        if let Some(command) = command {
+            data.insert("command_id".to_owned(), json!(command));
+        }
+        Event {
+            seq,
+            ts: 1_000 + seq,
+            kind: "turn.started".to_owned(),
+            agent: Some("a1".to_owned()),
+            subject: None,
+            generation: Some(1),
+            source: "stream".to_owned(),
+            native_id: None,
+            data: serde_json::Value::Object(data),
+            cause: None,
+        }
+    }
+
+    #[test]
+    fn snapshot_fetches_only_resident_turn_inputs() {
+        // #642: a snapshot asks only for the commands of the turns the
+        // resident bounds will keep, not every turn.started in the scan.
+        let last = crate::chat::MAX_RESIDENT_TURNS as i64 + 5;
+        let events: Vec<Event> = (0..last)
+            .map(|index| started(index + 1, &format!("t{index}"), Some(&format!("c{index}"))))
+            .collect();
+        let commands = resident_commands(&events);
+        assert_eq!(commands.len(), crate::chat::MAX_RESIDENT_TURNS);
+        for dropped in 0..5 {
+            assert!(!commands.contains(&format!("c{dropped}")));
+        }
+        assert!(commands.contains(&format!("c{}", last - 1)));
+    }
 }

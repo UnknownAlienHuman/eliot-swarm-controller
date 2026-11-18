@@ -42,12 +42,42 @@ pub(super) struct ProfilesEditor {
     pub(super) raw_dirty: bool,
     /// The draft the running save sent.
     pub(super) sending: Option<String>,
+    /// Source edits so far; bumped by every accepted change of `draft`.
+    pub(super) edit: u64,
+    /// The `edit` revision the running save submitted.
+    pub(super) sending_edit: Option<u64>,
+    /// The `edit` revision the last acknowledged save submitted.
+    pub(super) sent_edit: Option<u64>,
     /// The draft the last save wrote, until a read shows it (the read's
     /// TOML is formatted anew, so a draft equal to it follows the read).
     pub(super) sent: Option<String>,
 }
 
 impl ProfilesEditor {
+    /// A Models save settled: remember the draft it wrote and the edit
+    /// revision it submitted. An edit made after the submission (even
+    /// one that undid back to the old text) is still newer than this
+    /// acknowledgement: it stays dirty and survives the readback (#680).
+    pub(super) fn saved(&mut self, sent: Option<String>, sent_edit: Option<u64>) {
+        self.sent = sent.clone();
+        self.sent_edit = sent_edit;
+        let newer = sent_edit.is_some_and(|rev| rev != self.edit);
+        if !newer && sent.as_ref() == Some(&self.draft) {
+            self.raw_dirty = false;
+        } else if newer {
+            self.raw_dirty = true;
+        }
+    }
+
+    /// Whether a fresh read must not overwrite the source draft: it
+    /// differs from the read in an unsaved way, or it changed after the
+    /// last submission (even back to the old text).
+    pub(super) fn keep_draft(&self, text: &str, sent: Option<&str>) -> bool {
+        let edited =
+            self.draft != self.base && self.draft != text && sent != Some(self.draft.as_str());
+        edited || self.sent_edit.is_some_and(|rev| rev != self.edit)
+    }
+
     /// Keep the selected preset when the draft still has it, else select
     /// the first one.
     pub(super) fn select_existing(&mut self) {
@@ -69,6 +99,7 @@ impl DesktopApp {
                 if self.editor.editable {
                     let draft = profiles::normalize_newlines(&text);
                     if draft != self.editor.draft {
+                        self.editor.edit += 1;
                         self.editor.raw_dirty = draft != self.editor.base;
                         self.editor.draft = draft;
                     }
@@ -105,6 +136,9 @@ impl DesktopApp {
                 match profiles::set_field(&self.editor.draft, &name, key, value) {
                     Ok(draft) => {
                         self.editor.view = draft.clone();
+                        if draft != self.editor.draft {
+                            self.editor.edit += 1;
+                        }
                         self.editor.draft = draft;
                         self.autosave_profiles(context);
                     }
@@ -118,6 +152,9 @@ impl DesktopApp {
                     match profiles::duplicate(&self.editor.draft, &from, &to) {
                         Ok(draft) => {
                             self.editor.view = draft.clone();
+                            if draft != self.editor.draft {
+                                self.editor.edit += 1;
+                            }
                             self.editor.draft = draft;
                             self.editor.selected = Some(to.clone());
                             self.editor.duplicate_name.clear();
@@ -349,5 +386,64 @@ impl DesktopApp {
                 .collect(),
         };
         config_view::profiles_screen(data, actions, palette)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn late_save_ack_keeps_a_newer_source_draft_dirty() {
+        // #680: typing B while save A runs must survive A's
+        // acknowledgement; only an unchanged draft clears.
+        let mut editor = ProfilesEditor {
+            draft: "b".to_owned(),
+            base: String::new(),
+            raw_dirty: true,
+            sending: Some("a".to_owned()),
+            edit: 1,
+            ..ProfilesEditor::default()
+        };
+        let sent = editor.sending.take();
+        editor.saved(sent, Some(0));
+        assert_eq!(editor.sent.as_deref(), Some("a"));
+        assert!(editor.raw_dirty);
+        editor.draft = "a".to_owned();
+        editor.saved(Some("a".to_owned()), Some(1));
+        assert!(!editor.raw_dirty);
+    }
+
+    #[test]
+    fn an_undo_to_base_survives_the_save_acknowledgement() {
+        // Finding 5: save A, then undo back to the old base text while
+        // A is in flight. The undo is newer than the submission, so the
+        // ack restores the dirty flag instead of clearing it.
+        let base = "[profiles.dev]\nharness = \"codex\"\n";
+        let a = "[profiles.dev]\nharness = \"codex\"\nmodel = \"m\"\n";
+        let mut editor = ProfilesEditor {
+            draft: base.to_owned(),
+            base: base.to_owned(),
+            ..ProfilesEditor::default()
+        };
+        // Type A and submit it.
+        editor.edit += 1;
+        editor.draft = a.to_owned();
+        editor.raw_dirty = true;
+        let submitted = editor.edit;
+        // Undo back to the base text: the handler sees no base diff.
+        editor.edit += 1;
+        editor.draft = base.to_owned();
+        editor.raw_dirty = false;
+        // A's acknowledgement: the newer undo keeps the dirty flag.
+        editor.saved(Some(a.to_owned()), Some(submitted));
+        assert!(editor.raw_dirty);
+        assert_eq!(editor.draft, base);
+        // The readback showing A must not overwrite the undo either.
+        assert!(editor.keep_draft(a, Some(a)));
+        assert!(editor.keep_draft(base, Some(a)));
+        // Nothing newer than the submission: the readback adopts.
+        editor.edit = submitted;
+        assert!(!editor.keep_draft(a, Some(a)));
     }
 }

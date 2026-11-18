@@ -407,6 +407,18 @@ impl DesktopApp {
                     self.load_branch(&id, context);
                 }
                 self.load_profile_list(context);
+                // A failed Agent catalogue re-reads with the refresh; a
+                // cached success stays (#681).
+                self.configure.failed = None;
+                self.configure.failed_attempts = 0;
+                if self.popover_agent().is_some()
+                    && matches!(
+                        self.launch.open,
+                        Some(launch_ui::Pop::Model) | Some(launch_ui::Pop::Effort)
+                    )
+                {
+                    self.ensure_catalog(context);
+                }
                 if self.chat.convo.is_some() {
                     self.chat.failures = 0;
                     self.start_snapshot(context);
@@ -459,6 +471,7 @@ impl DesktopApp {
             }
             ShellMsg::WindowResized(size) => {
                 self.window_width = Some(size.width);
+                self.window_height = Some(size.height);
                 self.sync_title_bar();
                 if size.width >= 640.0 && size.height >= 480.0 {
                     let window = (size.width as u32, size.height as u32);
@@ -574,8 +587,18 @@ impl DesktopApp {
                     }
                     Shortcut::Popover(key) if self.menu.open.is_some() => {
                         use crate::shortcuts::PopoverKey;
-                        if matches!(key, PopoverKey::Escape | PopoverKey::Tab) {
-                            self.close_menu();
+                        match key {
+                            PopoverKey::Escape | PopoverKey::Tab => self.close_menu(),
+                            // Arrows reach clipped actions from the
+                            // keyboard; Enter chooses the highlighted row.
+                            PopoverKey::Up => self.menu_update(MenuMsg::HighlightMove(-1), context),
+                            PopoverKey::Down => {
+                                self.menu_update(MenuMsg::HighlightMove(1), context)
+                            }
+                            PopoverKey::Enter => {
+                                self.menu_update(MenuMsg::HighlightActivate, context)
+                            }
+                            _ => {}
                         }
                     }
                     Shortcut::Popover(key) => self.launch_update(LaunchMsg::Key(key), context),
@@ -1761,7 +1784,10 @@ impl DesktopApp {
                 .automation_name(format!("Remove missing {kind} {name}"))
                 .on_click(context.message(Message::Bulk(BulkMsg::Start(
                     super::bulk_ui::BulkOp::RemoveProjects,
-                    super::bulk_ui::Pick::Missing(registered.unwrap_or_default()),
+                    super::bulk_ui::Pick::Missing {
+                        project: registered.unwrap_or_default(),
+                        checkout: place.checkout.to_owned(),
+                    },
                     name.to_owned(),
                 ))))
                 .content(m3::icon(m3::glyph::DELETE))

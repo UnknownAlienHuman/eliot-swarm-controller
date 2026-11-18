@@ -491,7 +491,10 @@ impl SettingsState {
     /// move. A form shows the stored values again under the error; the
     /// settings file's JSON, a raw editor, keeps its draft for correction.
     fn refused(&mut self, page: Page, mut note: Note) {
-        if page != Page::Advanced {
+        // A refused Cloud MCP draft stays for fixing: discarding it would
+        // wipe a first setup back to the empty section.
+        let keep = page == Page::CloudMcp;
+        if page != Page::Advanced && !keep {
             self.discard(page);
             note.text = format!("{}. {SHOWS_SAVED}", note.text.trim_end_matches('.'));
         }
@@ -579,7 +582,18 @@ impl SettingsState {
             Page::Routing => one(Section::Routing, model::routing_for_save(&self.routing)),
             Page::Projects => one(Section::Projects, self.projects.clone()),
             Page::Automations => one(Section::Automation, self.automation.clone()),
-            Page::CloudMcp => one(Section::CloudMcp, self.cloud.clone()),
+            Page::CloudMcp => {
+                let cloud = self.cloud.clone();
+                // A fresh template is a local draft, never a save: its
+                // required fields are empty and the daemon would refuse
+                // it, discarding the new page (#678).
+                if model::cloud_enabled(&cloud)
+                    && let Some(missing) = model::cloud_missing(&cloud)
+                {
+                    return Err(format!("Fill in {missing} before Cloud MCP is saved."));
+                }
+                one(Section::CloudMcp, cloud)
+            }
             Page::Advanced => {
                 let sections = self.json_edits()?;
                 if sections.is_empty() {
@@ -953,6 +967,7 @@ impl DesktopApp {
                 self.settings.saving = None;
                 let sent = self.settings.sending.take().unwrap_or_default();
                 let sent_draft = self.editor.sending.take();
+                let sent_edit = self.editor.sending_edit.take();
                 self.settings.notes.insert(page, Note::of(dry_run, &result));
                 if dry_run {
                     self.drain_saves(context);
@@ -977,8 +992,7 @@ impl DesktopApp {
                             // normalised; the drafts that sent them follow it.
                             self.settings.sent.extend(sent);
                             if page == Page::Models {
-                                self.editor.sent = sent_draft;
-                                self.editor.raw_dirty = false;
+                                self.editor.saved(sent_draft, sent_edit);
                             }
                         }
                         if page == Page::Automations
@@ -1009,8 +1023,9 @@ impl DesktopApp {
                     }
                     // Refused (an invalid value), nothing changed: a form
                     // shows the stored values under the error, a raw editor
-                    // (the JSON, typed presets TOML) keeps its draft, and the
-                    // other pages' changes still save.
+                    // (the JSON, typed presets TOML) and the Cloud MCP form
+                    // keep their drafts, and the other pages' changes still
+                    // save.
                     Err(_) => {
                         if !(page == Page::Models && self.editor.raw_dirty) {
                             if page == Page::Models {
@@ -1149,7 +1164,19 @@ impl DesktopApp {
                     } else {
                         json!({})
                     };
-                    self.autosave(Page::CloudMcp, context);
+                    if on {
+                        // The template stays a local draft until every
+                        // field is filled; each typed field saves when it
+                        // rests, and the gate above holds back the
+                        // incomplete draft instead of sending it to a
+                        // refusal that would discard the new page (#678).
+                        s.notes.insert(
+                            Page::CloudMcp,
+                            Note::info("Fill in every field; Cloud MCP saves when complete."),
+                        );
+                    } else {
+                        self.autosave(Page::CloudMcp, context);
+                    }
                 }
             }
             SettingsMsg::AllDraft(text) => {
@@ -1278,9 +1305,9 @@ impl DesktopApp {
         match model::profiles_toml(&section) {
             Ok(text) => {
                 // A draft a save wrote follows the read's formatting.
-                let edited = editor.draft != editor.base
-                    && editor.draft != text
-                    && sent.as_ref() != Some(&editor.draft);
+                // A draft edited after the last submission stays, even
+                // when the edit undid back to the old text.
+                let edited = editor.keep_draft(&text, sent.as_deref());
                 let saves = &self.settings;
                 let ours = saved_here(
                     Section::Profiles,
@@ -1346,6 +1373,7 @@ impl DesktopApp {
         };
         self.settings.sending = Some(sections.clone());
         self.editor.sending = (page == Page::Models).then(|| self.editor.draft.clone());
+        self.editor.sending_edit = (page == Page::Models).then_some(self.editor.edit);
         let request = SettingsSaveRequest {
             expected_revision: self.settings.revision.clone(),
             sections,
@@ -2201,5 +2229,49 @@ model = \"gpt-6\"
         assert!(saved_here(Section::Profiles, &sent, [&saves]));
         let other = json!({"dev": {"harness": "codex", "model": "gpt-7"}});
         assert!(!saved_here(Section::Profiles, &other, [&saves]));
+    }
+    #[test]
+    fn cloud_template_is_held_back_until_every_field_is_filled() {
+        // #678: a fresh template must never be sent (the daemon would
+        // refuse it and discard the new page); only a complete draft
+        // and the empty (off) section go out.
+        let mut state = SettingsState {
+            cloud: model::cloud_template(),
+            ..SettingsState::default()
+        };
+        let refused = state
+            .request_sections(Page::CloudMcp, "")
+            .expect_err("bare template is not sent");
+        assert!(refused.contains("Public hostname"), "{refused}");
+        for (key, _) in model::CLOUD_FIELDS {
+            model::set_cloud_field(&mut state.cloud, key, "x");
+        }
+        assert!(state.request_sections(Page::CloudMcp, "").is_ok());
+        let off = SettingsState {
+            cloud: serde_json::json!({}),
+            ..SettingsState::default()
+        };
+        assert!(off.request_sections(Page::CloudMcp, "").is_ok());
+    }
+    #[test]
+    fn a_refused_cloud_draft_stays_for_fixing() {
+        // Finding 6: a daemon validation error keeps the Cloud MCP draft
+        // and shows the error; other forms still reset to stored values.
+        let mut state = SettingsState::default();
+        let draft = serde_json::json!({"hostname": "example.com"});
+        state.cloud = draft.clone();
+        state.refused(
+            Page::CloudMcp,
+            Note::error("Cloud MCP configuration is malformed."),
+        );
+        assert_eq!(state.cloud, draft);
+        let note = &state.notes[&Page::CloudMcp];
+        assert!(note.error);
+        assert!(!note.text.contains(SHOWS_SAVED));
+        state.projects = serde_json::json!({"beta": {}});
+        state.refused(Page::Projects, Note::error("bad value."));
+        assert_eq!(state.projects, serde_json::json!({}));
+        let note = &state.notes[&Page::Projects];
+        assert!(note.text.contains(SHOWS_SAVED));
     }
 }

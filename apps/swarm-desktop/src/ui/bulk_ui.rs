@@ -77,8 +77,12 @@ pub(super) enum Pick {
     /// Registrations nothing uses: no live task, and the folder is gone or
     /// no task ever ran there.
     Unused,
-    /// One missing registration's one-click remove (no confirmation).
-    Missing(String),
+    /// One missing registration's one-click remove (no confirmation): the
+    /// registration id and the checkout the click targeted. The checkout
+    /// travels into planning and is checked against the daemon's artifact
+    /// before anything is applied: a repointed id never removes a folder
+    /// the click did not target.
+    Missing { project: String, checkout: String },
     /// The tasks of one project or subproject (its sidebar key), or of
     /// everything (`None`).
     Tasks(Option<String>),
@@ -104,6 +108,9 @@ pub(super) struct BulkPlan {
 pub(super) struct MissingCleanup {
     plan_id: String,
     artifact_id: String,
+    /// The checkout the click targeted, verified against the daemon's
+    /// cleanup-plan artifact before anything is applied.
+    checkout: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -117,8 +124,11 @@ pub(super) enum Phase {
     Done,
 }
 
-/// The open bulk dialog.
+/// The open bulk dialog. `seq` is the dialog's immutable epoch: every
+/// read and step carries the epoch of the dialog that started it, so a
+/// late reply can never land on a cancelled or replaced dialog (#682).
 pub(super) struct BulkDialog {
+    pub(super) seq: u64,
     pub(super) op: BulkOp,
     pub(super) pick: Pick,
     /// What it covers, in words ("all projects", "atlas-web").
@@ -141,14 +151,17 @@ pub(super) enum BulkMsg {
     Menu(String),
     /// Read what an action would touch (the action, what, its scope).
     Start(BulkOp, Pick, String),
-    Planned(Result<BulkPlan, String>),
+    /// The plan read for one dialog epoch, with the operation and
+    /// selection it was read for.
+    Planned(u64, BulkOp, Pick, String, Result<BulkPlan, String>),
     /// The confirmation's answer.
     Confirmed(bool),
-    /// One task tree settled (its index).
-    Stepped(usize, MutationResult<usize>),
-    /// The registrations' save settled: removed names and what stayed, or
-    /// the save's error (whether it is uncertain, its words).
-    Removed(Result<(Vec<String>, Vec<String>), (bool, String)>),
+    /// One task tree settled (its dialog epoch, its index).
+    Stepped(u64, usize, MutationResult<usize>),
+    /// The registrations' save settled (its dialog epoch): removed names
+    /// and what stayed, or the save's error (whether it is uncertain, its
+    /// words).
+    Removed(u64, Result<(Vec<String>, Vec<String>), (bool, String)>),
     /// Stop after the running step.
     Stop,
     Closed,
@@ -217,6 +230,43 @@ fn kept_line(count: usize, one: &str, many: &str, why: &str) -> Option<String> {
             if count == 1 { "s" } else { "" }
         )
     })
+}
+
+/// Whether a planned read belongs to the open dialog: its epoch,
+/// still reading, and the same operation and selection (#682).
+fn planned_current(
+    dialog: Option<&BulkDialog>,
+    seq: u64,
+    op: BulkOp,
+    pick: &Pick,
+    scope: &str,
+) -> bool {
+    dialog.is_some_and(|dialog| {
+        dialog.seq == seq
+            && dialog.phase == Phase::Reading
+            && dialog.op == op
+            && dialog.pick == *pick
+            && dialog.scope == scope
+    })
+}
+
+/// The one-click remove's target: the picked registration, but only when
+/// the dialog's plan is bound to exactly that registration and its own
+/// cleanup identity. A late plan from a cancelled Selected removal has no
+/// cleanup identity and must never auto-apply here (#682).
+fn missing_bound(dialog: &BulkDialog) -> Option<(String, MissingCleanup)> {
+    let Pick::Missing { project, checkout } = &dialog.pick else {
+        return None;
+    };
+    if dialog.plan.items.len() != 1 || dialog.plan.items[0].id != *project {
+        return None;
+    }
+    dialog
+        .plan
+        .missing_cleanup
+        .clone()
+        .filter(|cleanup| same_checkout(&cleanup.checkout, checkout))
+        .map(|cleanup| (project.clone(), cleanup))
 }
 
 /// What archiving or deleting would touch: the roots of top-level task
@@ -379,7 +429,7 @@ fn plan_projects(data_dir: &Path, pick: &Pick) -> Result<BulkPlan, String> {
         let wanted = match pick {
             Pick::Selected(ids) => ids.contains(&id),
             Pick::Unused => true,
-            Pick::Missing(_) | Pick::Tasks(_) => false,
+            Pick::Missing { .. } | Pick::Tasks(_) => false,
         };
         if !wanted {
             continue;
@@ -402,10 +452,18 @@ fn plan_missing_project(
     data_dir: &Path,
     project: &str,
     name: String,
+    checkout: &str,
     retained: Option<MissingCleanup>,
 ) -> Result<BulkPlan, String> {
     let mut plan = BulkPlan::default();
     let cleanup = if let Some(retained) = retained {
+        // A retained identity from an earlier dialog never survives a
+        // repoint: the checkout must still be the clicked one.
+        if !same_checkout(&retained.checkout, checkout) {
+            return Err(format!(
+                "The project now points at a different folder; review {name} again."
+            ));
+        }
         retained
     } else {
         let request = CleanupPlanRequest {
@@ -429,6 +487,14 @@ fn plan_missing_project(
                     .to_owned(),
             );
         };
+        // The id may have been repointed after the click: only the
+        // artifact for the clicked checkout may be applied.
+        if !same_checkout(&item.artifact.path, checkout) {
+            return Err(format!(
+                "The project now points at {} instead of {checkout}; review {name} again.",
+                item.artifact.path
+            ));
+        }
         if item.verdict != "safe" {
             plan.kept.push(format!("{name}: {}", item.reason));
             return Ok(plan);
@@ -436,6 +502,7 @@ fn plan_missing_project(
         MissingCleanup {
             plan_id: reply.plan_id,
             artifact_id: item.artifact.id.clone(),
+            checkout: checkout.to_owned(),
         }
     };
     plan.items.push(BulkItem {
@@ -560,10 +627,12 @@ impl DesktopApp {
                 _ => {}
             },
             BulkMsg::Start(op, pick, scope) => self.start_bulk(op, pick, scope, context),
-            BulkMsg::Planned(result) => {
-                let Some(op) = self.bulk.as_ref().map(|dialog| dialog.op) else {
+            BulkMsg::Planned(seq, op, pick, scope, result) => {
+                // A late plan from a cancelled or replaced dialog never
+                // lands on whatever is open now (#682).
+                if !planned_current(self.bulk.as_ref(), seq, op, &pick, &scope) {
                     return;
-                };
+                }
                 // The owner's own names, where they gave one.
                 let result = result.map(|mut plan| {
                     for item in &mut plan.items {
@@ -592,7 +661,8 @@ impl DesktopApp {
                         dialog.plan = plan;
                         dialog.phase = Phase::Confirm;
                         // The missing folder's one click needs no question.
-                        if matches!(dialog.pick, Pick::Missing(_)) && !dialog.plan.items.is_empty()
+                        if matches!(dialog.pick, Pick::Missing { .. })
+                            && !dialog.plan.items.is_empty()
                         {
                             self.bulk_update(BulkMsg::Confirmed(true), context);
                         }
@@ -620,27 +690,47 @@ impl DesktopApp {
                     return;
                 }
                 dialog.phase = Phase::Running { stopping: false };
+                let seq = dialog.seq;
                 if dialog.op == BulkOp::RemoveProjects {
                     let Ok(data_dir) = self.data_dir.clone() else {
                         return;
                     };
-                    let items = dialog.plan.items.clone();
-                    if let (Pick::Missing(project), Some(cleanup)) =
-                        (&dialog.pick, &dialog.plan.missing_cleanup)
-                    {
-                        let cleanup = cleanup.clone();
+                    let missing = matches!(dialog.pick, Pick::Missing { .. });
+                    if missing {
+                        // The one-click remove runs only for the plan bound
+                        // to its exact registration and cleanup identity;
+                        // a late Selected plan (no cleanup identity) or a
+                        // mismatched one never removes here (#682).
+                        let bound = missing_bound(dialog);
+                        let Some((project, cleanup)) = bound else {
+                            dialog.error = Some(
+                                "The removal plan no longer matches this project; review again."
+                                    .to_owned(),
+                            );
+                            dialog.phase = Phase::Done;
+                            return;
+                        };
+                        let name = dialog
+                            .plan
+                            .items
+                            .first()
+                            .map(|item| item.name.clone())
+                            .unwrap_or_default();
                         self.missing_cleanup
                             .insert(project.clone(), cleanup.clone());
-                        let id = self.ledger.id_for(&missing_cleanup_key(project));
-                        let name = items[0].name.clone();
+                        let id = self
+                            .ledger
+                            .id_for(&missing_cleanup_key(&project, &cleanup.checkout));
                         let _task = context.spawn_background(move |_| {
-                            Message::Bulk(BulkMsg::Removed(apply_missing_project(
-                                &data_dir, &name, cleanup, id,
-                            )))
+                            Message::Bulk(BulkMsg::Removed(
+                                seq,
+                                apply_missing_project(&data_dir, &name, cleanup, id),
+                            ))
                         });
                     } else {
+                        let items = dialog.plan.items.clone();
                         let _task = context.spawn_background(move |_| {
-                            Message::Bulk(BulkMsg::Removed(remove_checked(&data_dir, &items)))
+                            Message::Bulk(BulkMsg::Removed(seq, remove_checked(&data_dir, &items)))
                         });
                     }
                 } else {
@@ -654,16 +744,28 @@ impl DesktopApp {
                     *stopping = true;
                 }
             }
-            BulkMsg::Stepped(index, outcome) => self.bulk_stepped(index, outcome, context),
-            BulkMsg::Removed(result) => {
+            BulkMsg::Stepped(seq, index, outcome) => {
+                // Only the running step's own reply advances the chain:
+                // duplicates and late steps never record twice.
+                if !step_current(self.bulk.as_ref(), seq, index) {
+                    return;
+                }
+                self.bulk_stepped(index, outcome, context)
+            }
+            BulkMsg::Removed(seq, result) => {
+                if !removal_current(self.bulk.as_ref(), seq) {
+                    return;
+                }
                 let Some(dialog) = self.bulk.as_mut() else {
                     return;
                 };
-                if let Pick::Missing(project) = &dialog.pick
+                if let Pick::Missing { project, checkout } = &dialog.pick
                     && !matches!(&result, Err((true, _)))
                 {
-                    self.ledger.complete(&missing_cleanup_key(project));
-                    self.missing_cleanup.remove(project);
+                    self.ledger
+                        .complete(&missing_cleanup_key(project, checkout));
+                    self.missing_cleanup
+                        .remove(&missing_cleanup_key(project, checkout));
                 }
                 match result {
                     Ok((removed, kept)) => {
@@ -675,7 +777,7 @@ impl DesktopApp {
                     Err(error) => dialog.error = Some(save_words(error)),
                 }
                 dialog.phase = Phase::Done;
-                let quiet = matches!(dialog.pick, Pick::Missing(_))
+                let quiet = matches!(dialog.pick, Pick::Missing { .. })
                     && dialog.error.is_none()
                     && dialog.plan.kept.is_empty();
                 self.after_bulk(context);
@@ -706,7 +808,10 @@ impl DesktopApp {
             return;
         };
         self.close_menu();
+        self.bulk_seq += 1;
+        let seq = self.bulk_seq;
         self.bulk = Some(BulkDialog {
+            seq,
             op,
             pick: pick.clone(),
             scope: scope.clone(),
@@ -717,16 +822,21 @@ impl DesktopApp {
         });
         let show_archived = self.nav.show_archived;
         let retained = match &pick {
-            Pick::Missing(project) => self.missing_cleanup.get(project).cloned(),
+            Pick::Missing { project, checkout } => self
+                .missing_cleanup
+                .get(&missing_cleanup_key(project, checkout))
+                .cloned(),
             _ => None,
         };
         let _task = context.spawn_background(move |_| {
             let plan = match &pick {
                 Pick::Tasks(scope) => plan_tasks(&data_dir, op, scope.as_deref(), show_archived),
-                Pick::Missing(project) => plan_missing_project(&data_dir, project, scope, retained),
+                Pick::Missing { project, checkout } => {
+                    plan_missing_project(&data_dir, project, scope.clone(), checkout, retained)
+                }
                 _ => plan_projects(&data_dir, &pick),
             };
-            Message::Bulk(BulkMsg::Planned(plan))
+            Message::Bulk(BulkMsg::Planned(seq, op, pick, scope, plan))
         });
     }
 
@@ -742,6 +852,7 @@ impl DesktopApp {
             return;
         };
         let op = dialog.op;
+        let seq = dialog.seq;
         let agent = item.id.clone();
         let mutation = self.ledger.id_for(&step_key(op, &agent));
         let _task = context.spawn_background(move |_| {
@@ -751,7 +862,7 @@ impl DesktopApp {
                 }
                 _ => client::block_on(client::delete_agent(&data_dir, mutation, &agent)),
             };
-            Message::Bulk(BulkMsg::Stepped(index, outcome))
+            Message::Bulk(BulkMsg::Stepped(seq, index, outcome))
         });
     }
 
@@ -1031,8 +1142,30 @@ impl DesktopApp {
 }
 
 /// The ledger key of one bulk step.
-fn missing_cleanup_key(project: &str) -> String {
-    format!("cleanup.project:{project}")
+fn missing_cleanup_key(project: &str, checkout: &str) -> String {
+    format!("cleanup.project:{project}\u{1f}{checkout}")
+}
+
+/// Whether two checkout paths name the same folder.
+fn same_checkout(left: &str, right: &str) -> bool {
+    crate::nav::path_key(left) == crate::nav::path_key(right)
+}
+
+/// Whether a stepped reply answers the step the dialog is running: its
+/// epoch, the running phase, and the current step index.
+fn step_current(dialog: Option<&BulkDialog>, seq: u64, index: usize) -> bool {
+    dialog.is_some_and(|dialog| {
+        dialog.seq == seq
+            && matches!(dialog.phase, Phase::Running { .. })
+            && index == dialog.outcomes.len()
+    })
+}
+
+/// Whether a removal reply answers the dialog's running apply: its epoch
+/// and the running phase. The apply is spawned once, on the single
+/// Confirm-to-Running transition, so a second reply is always stale.
+fn removal_current(dialog: Option<&BulkDialog>, seq: u64) -> bool {
+    dialog.is_some_and(|dialog| dialog.seq == seq && matches!(dialog.phase, Phase::Running { .. }))
 }
 
 fn step_key(op: BulkOp, agent: &str) -> String {
@@ -1116,5 +1249,194 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["a2"]
         );
+    }
+    fn missing_pick(project: &str, checkout: &str) -> Pick {
+        Pick::Missing {
+            project: project.to_owned(),
+            checkout: checkout.to_owned(),
+        }
+    }
+
+    fn dialog(seq: u64, pick: Pick, plan: BulkPlan, phase: Phase) -> BulkDialog {
+        BulkDialog {
+            seq,
+            op: BulkOp::RemoveProjects,
+            pick,
+            scope: "all projects".to_owned(),
+            phase,
+            plan,
+            error: None,
+            outcomes: Vec::new(),
+        }
+    }
+
+    fn missing_plan(id: &str, checkout: &str, cleanup: bool) -> BulkPlan {
+        BulkPlan {
+            items: vec![BulkItem {
+                id: id.to_owned(),
+                name: id.to_owned(),
+            }],
+            missing_cleanup: cleanup.then(|| MissingCleanup {
+                plan_id: "plan".to_owned(),
+                artifact_id: "artifact".to_owned(),
+                checkout: checkout.to_owned(),
+            }),
+            ..BulkPlan::default()
+        }
+    }
+
+    #[test]
+    fn late_or_foreign_plans_never_land_on_the_open_dialog() {
+        // #682: a cancelled Selected removal's late plan must not install
+        // onto the Missing dialog that replaced it.
+        let missing = missing_pick("p2", "C:/gone/p2");
+        let open = dialog(7, missing.clone(), BulkPlan::default(), Phase::Reading);
+        assert!(planned_current(
+            Some(&open),
+            7,
+            BulkOp::RemoveProjects,
+            &missing,
+            "all projects"
+        ));
+        // An older epoch, another operation, selection or scope: dropped.
+        assert!(!planned_current(
+            Some(&open),
+            6,
+            BulkOp::RemoveProjects,
+            &missing,
+            "all projects"
+        ));
+        assert!(!planned_current(
+            Some(&open),
+            7,
+            BulkOp::ArchiveFinished,
+            &missing,
+            "all projects"
+        ));
+        assert!(!planned_current(
+            Some(&open),
+            7,
+            BulkOp::RemoveProjects,
+            &Pick::Selected(vec!["p1".to_owned()]),
+            "all projects"
+        ));
+        assert!(!planned_current(
+            Some(&open),
+            7,
+            BulkOp::RemoveProjects,
+            &missing,
+            "other"
+        ));
+        // No dialog (cancelled), or no longer reading: dropped.
+        assert!(!planned_current(
+            None,
+            7,
+            BulkOp::RemoveProjects,
+            &missing,
+            "all projects"
+        ));
+        let confirming = dialog(7, missing.clone(), BulkPlan::default(), Phase::Confirm);
+        assert!(!planned_current(
+            Some(&confirming),
+            7,
+            BulkOp::RemoveProjects,
+            &missing,
+            "all projects"
+        ));
+    }
+
+    #[test]
+    fn missing_auto_apply_needs_its_exact_plan() {
+        // #682: only the plan bound to the picked registration and its own
+        // cleanup identity may auto-apply; never a generic Selected plan.
+        let missing = missing_pick("p2", "C:/gone/p2");
+        let bound = dialog(
+            7,
+            missing.clone(),
+            missing_plan("p2", "C:/gone/p2", true),
+            Phase::Confirm,
+        );
+        assert_eq!(
+            missing_bound(&bound).map(|(project, _)| project),
+            Some("p2".to_owned())
+        );
+        // The same checkout spelled differently still binds.
+        let cased = dialog(
+            7,
+            missing.clone(),
+            missing_plan("p2", "c:/gone/p2", true),
+            Phase::Confirm,
+        );
+        assert!(missing_bound(&cased).is_some());
+        // A late Selected plan for another project carries no cleanup.
+        let foreign = dialog(
+            7,
+            missing.clone(),
+            missing_plan("p1", "C:/gone/p1", false),
+            Phase::Confirm,
+        );
+        assert!(missing_bound(&foreign).is_none());
+        // Right shape, wrong registration.
+        let mismatched = dialog(
+            7,
+            missing.clone(),
+            missing_plan("p9", "C:/gone/p9", true),
+            Phase::Confirm,
+        );
+        assert!(missing_bound(&mismatched).is_none());
+        // Right registration, but the id was repointed after the click:
+        // the cleanup names a different checkout.
+        let repointed = dialog(
+            7,
+            missing.clone(),
+            missing_plan("p2", "C:/elsewhere/p2", true),
+            Phase::Confirm,
+        );
+        assert!(missing_bound(&repointed).is_none());
+        // A Selected dialog never auto-applies through the Missing path.
+        let selected = dialog(
+            7,
+            Pick::Selected(vec!["p1".to_owned()]),
+            missing_plan("p1", "C:/gone/p1", false),
+            Phase::Confirm,
+        );
+        assert!(missing_bound(&selected).is_none());
+    }
+
+    #[test]
+    fn step_and_removal_replies_need_the_running_dialog_and_current_request() {
+        // Finding 1: a duplicate step reply, a late step, or a reply in
+        // another phase never advances the chain; only the running
+        // dialog's own apply reply settles it.
+        let pick = missing_pick("p2", "C:/gone/p2");
+        let running = dialog(
+            7,
+            pick.clone(),
+            BulkPlan::default(),
+            Phase::Running { stopping: false },
+        );
+        assert!(step_current(Some(&running), 7, 0));
+        assert!(!step_current(Some(&running), 7, 1));
+        assert!(!step_current(Some(&running), 6, 0));
+        assert!(!step_current(None, 7, 0));
+        assert!(removal_current(Some(&running), 7));
+        assert!(!removal_current(Some(&running), 6));
+        assert!(!removal_current(None, 7));
+        // Another phase answers nothing.
+        let reading = dialog(7, pick.clone(), BulkPlan::default(), Phase::Reading);
+        assert!(!step_current(Some(&reading), 7, 0));
+        assert!(!removal_current(Some(&reading), 7));
+        let done = dialog(7, pick.clone(), BulkPlan::default(), Phase::Done);
+        assert!(!step_current(Some(&done), 7, 0));
+        assert!(!removal_current(Some(&done), 7));
+        // A stop in flight still settles its own step; a replay does not.
+        let stopping = dialog(
+            7,
+            pick.clone(),
+            BulkPlan::default(),
+            Phase::Running { stopping: true },
+        );
+        assert!(step_current(Some(&stopping), 7, 0));
+        assert!(removal_current(Some(&stopping), 7));
     }
 }

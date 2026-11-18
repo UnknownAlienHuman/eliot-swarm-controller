@@ -391,11 +391,17 @@ impl DesktopApp {
                 self.keep_highlight();
             }
             LaunchMsg::CatalogRetry => {
+                // The Agent picker's Retry re-reads live state: opencode
+                // re-opens the live picker (#706); any other open Agent
+                // re-reads its own route (#681); only the new-task picker
+                // re-reads the unified catalogue.
                 if self
                     .popover_agent()
                     .is_some_and(|detail| detail.harness == "opencode")
                 {
                     self.open_popover(Pop::Model, context);
+                } else if self.popover_agent().is_some() {
+                    self.retry_catalog(context);
                 } else {
                     self.load_catalog(context);
                 }

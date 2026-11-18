@@ -1260,8 +1260,9 @@ fn set_window_icon(hwnd: HWND) {
     }
 }
 
-/// This process's visible WinUI window (the desktop has one).
-fn own_window() -> Option<HWND> {
+/// This process's visible WinUI window (the desktop has one). The valid
+/// clipboard owner for [`crate::clipboard`] copies.
+pub(crate) fn own_window() -> Option<HWND> {
     struct Search {
         pid: u32,
         found: HWND,
