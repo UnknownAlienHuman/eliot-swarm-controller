@@ -331,20 +331,18 @@ impl DesktopApp {
         let ready = matches!(read, Some(Ok(_)));
         let enabled = ready && !self.submitting();
         let steps: View = match read {
-            Some(Err(error)) => StackPanel::new()
-                .spacing(tokens::spacing::XS)
-                .children((
-                    m3::secondary(format!(
-                        "Effort levels not read: {}",
-                        crate::state::plain_error(error)
-                    ))
-                    .foreground(palette.error())
-                    .text_wrapping(TextWrapping::Wrap),
-                    m3::text_button(palette)
-                        .automation_name("Retry reading effort levels")
-                        .on_click(context.message(Message::Configure(ConfigureMsg::CatalogRetry)))
-                        .content(m3::label("Retry")),
-                )),
+            Some(Err(error)) => StackPanel::new().spacing(tokens::spacing::XS).children((
+                m3::secondary(format!(
+                    "Effort levels not read: {}",
+                    crate::state::plain_error(error)
+                ))
+                .foreground(palette.error())
+                .text_wrapping(TextWrapping::Wrap),
+                m3::text_button(palette)
+                    .automation_name("Retry reading effort levels")
+                    .on_click(context.message(Message::Configure(ConfigureMsg::CatalogRetry)))
+                    .content(m3::label("Retry")),
+            )),
             _ if effort_locked || (!ready && efforts.is_empty()) => View::empty(),
             _ => {
                 if efforts.is_empty() {
