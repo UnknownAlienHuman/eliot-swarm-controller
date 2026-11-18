@@ -1404,7 +1404,7 @@ impl MusePlugin {
         // the event actor's queued facts/terminal commit, rather than using
         // its potentially older watch snapshot. A durable terminal recovered
         // after projection loss does not restore the live source.
-        let event_status = match session
+        let mut event_status = match session
             .events
             .view_readback(
                 session
@@ -1417,23 +1417,76 @@ impl MusePlugin {
         {
             Ok(status) => status,
             Err(_) => {
+                let owned = session
+                    .session_id
+                    .clone()
+                    .ok_or_else(|| Error::new("unknown", "Muse session identity is unresolved"))?;
+                let idle_proven = match read_owned_session(&session.native_client, &owned).await {
+                    Ok(readback) => {
+                        readback.session.session_id == owned
+                            && readback.session.active_turn_id.is_none()
+                            && readback.history.unavailable_reason().is_none()
+                    }
+                    Err(_) => false,
+                };
+                if idle_proven
+                    && session
+                        .events
+                        .reestablish_idle(owned.clone())
+                        .await
+                        .unwrap_or(false)
+                {
+                    match session.events.view_readback(owned, None).await {
+                        Ok(status) => status,
+                        Err(_) => {
+                            session
+                                .command_inputs
+                                .insert(params.command_id.clone(), text.to_owned());
+                            session.rejected_commands.insert(params.command_id.clone());
+                            return Ok(rejected_control(
+                                "Muse native observation is unresolved after idle re-read; turn/start was not dispatched. Restart the Agent on the same worktree to continue.",
+                            ));
+                        }
+                    }
+                } else {
+                    session
+                        .command_inputs
+                        .insert(params.command_id.clone(), text.to_owned());
+                    session.rejected_commands.insert(params.command_id.clone());
+                    return Ok(rejected_control(
+                        "Muse native observation is unresolved; turn/start was not dispatched. Restart the Agent on the same worktree to continue.",
+                    ));
+                }
+            }
+        };
+        if let Some(reason) = event_status.failure.clone() {
+            let view_related = crate::events::is_view_related_failure(&reason);
+            if view_related
+                && event_status.active_turn_id.is_none()
+                && let Some(owned) = session.session_id.clone()
+                && let Ok(readback) = read_owned_session(&session.native_client, &owned).await
+                && readback.session.session_id == owned
+                && readback.session.active_turn_id.is_none()
+                && readback.history.unavailable_reason().is_none()
+                && session
+                    .events
+                    .reestablish_idle(owned.clone())
+                    .await
+                    .unwrap_or(false)
+                && let Ok(fresh) = session.events.view_readback(owned, None).await
+                && fresh.failure.is_none()
+                && !fresh.view_unavailable
+            {
+                event_status = fresh;
+            } else {
                 session
                     .command_inputs
                     .insert(params.command_id.clone(), text.to_owned());
                 session.rejected_commands.insert(params.command_id.clone());
-                return Ok(rejected_control(
-                    "Muse native observation is unresolved; turn/start was not dispatched",
-                ));
+                return Ok(rejected_control(&format!(
+                    "{reason}; turn/start was not dispatched. Restart the Agent on the same worktree to continue when the source stays unresolved."
+                )));
             }
-        };
-        if let Some(reason) = event_status.failure {
-            session
-                .command_inputs
-                .insert(params.command_id.clone(), text.to_owned());
-            session.rejected_commands.insert(params.command_id.clone());
-            return Ok(rejected_control(&format!(
-                "{reason}; turn/start was not dispatched"
-            )));
         }
         if event_status.active_turn_id.is_some() {
             return Err(Error::new("busy", "Muse already has an active turn"));
@@ -4077,5 +4130,66 @@ mod tests {
         assert!(eliot_plugin::start_classification::is_proven_no_effect(
             eliot_plugin::start_classification::StartPoint::NativeRefusalBeforeDispatch
         ));
+    }
+    #[test]
+    fn followup_turn_start_carries_no_mcp_policy() {
+        use crate::native::types::NativeTurnInputPart;
+        let first = MusePlugin::turn_start_params(
+            "cmd-1".to_owned(),
+            "session-1".to_owned(),
+            vec![NativeTurnInputPart {
+                part_type: "text".to_owned(),
+                text: Some("first".to_owned()),
+            }],
+            Some("high".to_owned()),
+        );
+        let wire = serde_json::to_value(&first).expect("encode turn/start");
+        let keys: std::collections::BTreeSet<String> =
+            wire.as_object().expect("object").keys().cloned().collect();
+        assert!(
+            keys.iter().all(|key| matches!(
+                key.as_str(),
+                "commandId" | "sessionId" | "input" | "reasoningEffort"
+            )),
+            "turn/start must not carry MCP policy fields"
+        );
+        assert_eq!(first.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn stale_view_failure_classification_keeps_mcp_audit_blocking() {
+        use crate::events::is_view_related_failure;
+        for reason in [
+            "Muse native view is unavailable (projectionUnavailable)",
+            "Muse native observation is unresolved",
+            "Muse unavailable-view terminal requires command-plane confirmation",
+        ] {
+            assert!(is_view_related_failure(reason));
+        }
+        assert!(!is_view_related_failure(
+            "invalid run configuration: MCP startup audit failed; MCP is disabled for this runtime"
+        ));
+    }
+
+    #[test]
+    fn idle_latch_clears_only_when_no_turn_is_active() {
+        use crate::events::EventStatus;
+        use crate::native::types::NativeHistoryNoneReason;
+        let mut idle = EventStatus {
+            view_unavailable: true,
+            view_unavailable_reason: Some(NativeHistoryNoneReason::ProjectionUnavailable),
+            source_unknown: true,
+            failure: Some("Muse native view is unavailable (projectionUnavailable)".to_owned()),
+            ..Default::default()
+        };
+        assert!(idle.clear_stale_idle_latch());
+        assert!(!idle.view_unavailable);
+        assert!(idle.failure.is_none());
+        let mut busy = EventStatus {
+            active_turn_id: Some("turn-1".to_owned()),
+            view_unavailable: true,
+            ..Default::default()
+        };
+        assert!(!busy.clear_stale_idle_latch());
     }
 }

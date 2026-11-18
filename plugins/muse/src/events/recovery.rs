@@ -129,6 +129,24 @@ impl EventProcessor {
         Ok(())
     }
 
+    pub(super) fn reestablish_idle(&mut self, session_id: &str) -> Result<bool> {
+        if self.status.session_id.as_deref() != Some(session_id) {
+            return Err(Error::new(
+                "source_integrity",
+                "Muse idle re-establishment named another session",
+            ));
+        }
+        if self.status.active_turn_id.is_some() || self.status.active_command_id.is_some() {
+            return Ok(false);
+        }
+        let cleared = self.status.clear_stale_idle_latch();
+        if cleared {
+            self.view_recovery = None;
+            self.gap_reported = false;
+        }
+        Ok(cleared)
+    }
+
     /// One read-only `view/subscribe` attempt from the last applied cursor.
     /// `None` when the params cannot be built, the call fails, or the
     /// returned head is blank. Changes no session/turn/input state.

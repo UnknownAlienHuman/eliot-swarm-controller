@@ -159,6 +159,51 @@ pub(crate) struct EventStatus {
     pub observation: u64,
 }
 
+impl EventStatus {
+    /// Clear a stale idle latch left by a settled turn (k167 E44). Historical
+    /// gaps stay in the journal; only the live latch resets so the next
+    /// follow-up send can re-prove observation. Returns true when anything
+    /// was cleared. Refuses to clear while a turn is still active.
+    pub(crate) fn clear_stale_idle_latch(&mut self) -> bool {
+        if self.active_turn_id.is_some() || self.active_command_id.is_some() {
+            return false;
+        }
+        let mut cleared = false;
+        if self.view_unavailable {
+            self.view_unavailable = false;
+            cleared = true;
+        }
+        if self.view_unavailable_reason.is_some() {
+            self.view_unavailable_reason = None;
+            cleared = true;
+        }
+        if self.source_unknown {
+            self.source_unknown = false;
+            cleared = true;
+        }
+        if self.failure.as_deref().is_some_and(is_view_related_failure) {
+            self.failure = None;
+            cleared = true;
+        }
+        cleared
+    }
+}
+
+/// View-related failure strings that must not block the next idle follow-up
+/// send once its turn has settled (k167 E44). Anything else is left intact.
+///
+/// The MCP startup-audit failure is deliberately not listed here: that
+/// failure names a host-level runtime posture, not a stale live-view latch,
+/// so it keeps blocking until the Agent restarts on a fresh native host.
+pub(crate) fn is_view_related_failure(reason: &str) -> bool {
+    reason.contains("native view is unavailable")
+        || reason.contains("view recovery pending")
+        || reason.contains("unavailable-view terminal requires")
+        || reason.contains("native observation is unresolved")
+        || reason.contains("native view readback is unavailable")
+        || reason.contains("native observation remains unresolved")
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct TurnFacts {
     pub command_id: String,
@@ -230,6 +275,10 @@ enum Control {
     RecordNativeExit {
         text: String,
         reply: oneshot::Sender<()>,
+    },
+    ReestablishIdle {
+        session_id: String,
+        reply: oneshot::Sender<Result<bool>>,
     },
     Close {
         reply: oneshot::Sender<()>,
@@ -510,6 +559,14 @@ impl EventHandle {
             reply,
         })
         .await
+    }
+
+    /// Re-establish idle observation after a settled turn (k167 E44). The
+    /// caller must have proved the native session idle via session/read
+    /// first; this only clears the actor idle latch, never native state.
+    pub async fn reestablish_idle(&self, session_id: String) -> Result<bool> {
+        self.send(|reply| Control::ReestablishIdle { session_id, reply })
+            .await
     }
 
     pub async fn ready(
@@ -847,6 +904,11 @@ impl EventProcessor {
                     self.status.native_exit = Some(text);
                 }
                 let _ = reply.send(());
+                true
+            }
+            Control::ReestablishIdle { session_id, reply } => {
+                let result = self.reestablish_idle(&session_id);
+                let _ = reply.send(result);
                 true
             }
             Control::Close { reply } => {
@@ -3098,6 +3160,9 @@ impl EventProcessor {
         self.status.active_turn_id = None;
         self.status.active_command_id = None;
         self.messages = TurnMessages::default();
+        self.status.clear_stale_idle_latch();
+        self.view_recovery = None;
+        self.gap_reported = false;
         // The turn's requests die with it: drop them locally (their Store
         // rows stay bound to the dead turn, so no later reply can address
         // them) and swallow their late resolutions. Resume orphans that never
