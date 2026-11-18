@@ -2,7 +2,7 @@ use super::{Store, TurnInactiveProof};
 use crate::tests::{native_batch, ready_agent, send_request};
 use eliot_core::{
     AgentState, CommandState, NativeEvent, SourceBatch, SourceHandoff, SourceHandoffGap,
-    SubmitCommand, TurnState,
+    SubmitCommand, TurnOutcome, TurnResolutionSource, TurnState,
     api::{CommandResolution, CommandResolveRequest, TurnResolveRequest, TurnResolveStatus},
     parse_agent_id,
 };
@@ -69,8 +69,7 @@ fn command_resolution_source(store: &Store, id: &str) -> Option<String> {
 }
 
 /// Resolution source recorded for a turn: the latest `turn.resolved` event
-/// for the exact turn carries `resolution_source=owner` in its data; a turn
-/// with no such event was never owner-resolved.
+/// for the exact turn carries `resolution_source=owner` in its data.
 fn turn_resolution_source(
     store: &Store,
     agent: &str,
@@ -373,8 +372,24 @@ fn unknown_turn_on_live_generation_blocks_next_send_until_owner_resolves() {
             now,
         )
         .expect("resolve unknown turn");
+    let late = store
+        .put_batch(
+            native_batch(
+                &agent,
+                1,
+                "turn.completed",
+                json!({"command_id": first_id, "turn_id": "turn-1", "status": "completed"}),
+            ),
+            now,
+        )
+        .unwrap_err();
+    assert_eq!(late.code, "source_integrity");
     let resolved = store.get_turn(&agent, 1, "turn-1").unwrap().unwrap();
     assert_eq!(resolved.state, TurnState::Completed);
+    assert_eq!(
+        resolved.resolution_source,
+        Some(TurnResolutionSource::Owner)
+    );
     let released = store.dispatch(&next_id, now).unwrap().value;
     assert_eq!(released.state, CommandState::Dispatched);
 }
@@ -1284,6 +1299,7 @@ fn owner_turn_assertion_is_distinguishable_from_native_completion() {
     let native = store.get_turn(&agent, 1, "turn-native").unwrap().unwrap();
     assert_eq!(native.state, TurnState::Completed);
     assert_eq!(native.status.as_deref(), Some("completed"));
+    assert_eq!(native.resolution_source, None);
     assert_eq!(
         turn_resolution_source(&store, &agent, 1, "turn-native"),
         None
@@ -1294,6 +1310,10 @@ fn owner_turn_assertion_is_distinguishable_from_native_completion() {
         .unwrap();
     assert_eq!(asserted.state, TurnState::Completed);
     assert_eq!(asserted.status.as_deref(), Some("failed"));
+    assert_eq!(
+        asserted.resolution_source,
+        Some(TurnResolutionSource::Owner)
+    );
     assert_eq!(
         turn_resolution_source(&store, &agent, 1, "turn-uncertain"),
         Some("owner".to_owned())
@@ -1314,6 +1334,71 @@ fn owner_turn_assertion_is_distinguishable_from_native_completion() {
     assert!(!kinds.contains(&("turn-native".to_owned(), "turn.resolved".to_owned())));
     assert!(kinds.contains(&("turn-uncertain".to_owned(), "turn.resolved".to_owned())));
     assert!(!kinds.contains(&("turn-uncertain".to_owned(), "turn.completed".to_owned())));
+}
+
+#[test]
+fn owner_resolved_completed_turn_keeps_owner_provenance_in_its_row() {
+    // #610: an owner `completed` assertion on a historical unknown turn
+    // settles the gate but must never read back as native success. The turn
+    // row and the generation page keep `resolution_source=owner`; the status
+    // and outcome describe the assertion, not a native receipt.
+    let mut store = store();
+    let now = now_ms();
+    let agent = ready_agent(&mut store, "resolve-turn-owner-success", now);
+
+    let send = send_request(&agent, 1, "uncertain input");
+    let send_id = send.id.clone();
+    store.submit("owner", send, now).expect("admit send");
+    store.dispatch(&send_id, now).expect("dispatch send");
+    store
+        .put_batch(
+            native_batch(
+                &agent,
+                1,
+                "turn.started",
+                json!({"command_id": send_id, "turn_id": "turn-1"}),
+            ),
+            now,
+        )
+        .expect("commit exact turn association");
+    let mut stop = SubmitCommand::new(Ulid::new().to_string(), "stop");
+    stop.target = Some(agent.clone());
+    stop.expected_generation = Some(1);
+    let stop_id = stop.id.clone();
+    store.submit("owner", stop, now).expect("admit stop");
+    store.dispatch(&stop_id, now).expect("dispatch stop");
+    store
+        .settle(&stop_id, CommandState::Applied, None, now)
+        .expect("settle applied stop");
+    assert_eq!(
+        store.get_turn(&agent, 1, "turn-1").unwrap().unwrap().state,
+        TurnState::Unknown
+    );
+
+    store
+        .resolve_turn(
+            "owner",
+            &resolve_turn_request(&agent, 1, "turn-1", TurnResolveStatus::Completed),
+            None,
+            now,
+        )
+        .expect("resolve unknown turn as completed");
+
+    let resolved = store.get_turn(&agent, 1, "turn-1").unwrap().unwrap();
+    assert_eq!(resolved.state, TurnState::Completed);
+    assert_eq!(resolved.status.as_deref(), Some("completed"));
+    assert_eq!(resolved.outcome, Some(TurnOutcome::Success));
+    assert_eq!(
+        resolved.resolution_source,
+        Some(TurnResolutionSource::Owner)
+    );
+    let page = store.list_turns(&agent, 1, 10).unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].resolution_source, Some(TurnResolutionSource::Owner));
+    assert_eq!(
+        turn_resolution_source(&store, &agent, 1, "turn-1"),
+        Some("owner".to_owned())
+    );
 }
 
 fn attach_request() -> SubmitCommand {

@@ -51,8 +51,9 @@ fn masked_results(results: Vec<WaitEntryResult>, hidden: &[bool]) -> Vec<WaitEnt
         .into_iter()
         .enumerate()
         .map(|(i, mut entry)| {
-            if hidden.get(i).copied().unwrap_or(false) && entry.status != "not_visible" {
+            if hidden.get(i).copied().unwrap_or(false) {
                 entry.status = "not_visible".to_owned();
+                entry.resolution_source = None;
             }
             entry
         })
@@ -322,13 +323,15 @@ mod tests {
 
     #[test]
     fn digest_masks_scope_without_widening_reads() {
-        let visible = vec![
+        let mut visible = vec![
             WaitEntryResult::new("command", "c1", "succeeded"),
             WaitEntryResult::new("command", "c2", "failed"),
         ];
+        visible[1].resolution_source = Some(eliot_core::TurnResolutionSource::Owner);
         let masked = masked_results(visible, &[false, true]);
         assert_eq!(masked[0].status, "succeeded");
         assert_eq!(masked[1].status, "not_visible");
+        assert_eq!(masked[1].resolution_source, None);
         // Owner recomputation never clears a registration-time mask.
         let masked = masked_results(masked, &[false, true]);
         assert_eq!(masked[1].status, "not_visible");

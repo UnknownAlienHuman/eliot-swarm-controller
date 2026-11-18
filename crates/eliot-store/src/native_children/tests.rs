@@ -2441,3 +2441,79 @@ fn muse_child_unavailable_cleanup_gaps_only_turn_family() {
     let source = store.read_source_state(&child_id, 1, "stream").unwrap();
     assert_eq!(source["state"], "closed");
 }
+
+#[test]
+fn ended_native_child_with_unknown_turn_does_not_block_tree_delete() {
+    // #650: stopping a manager while a native child turn is open ends the
+    // child as stopped with its turn retained unknown (proven end of
+    // observation, not a native result). Retiring the tree must not pretend
+    // the turn completed, and must not stay blocked on it forever once
+    // producer end and custody drain are proven.
+    let mut store = store();
+    let root = producer(&mut store, "root");
+    let child = register(&mut store, &root, request(&root, "root", "child"));
+    store
+        .put_native_child_batch(
+            &root,
+            1,
+            batch(
+                &child.agent.id,
+                "child-start",
+                vec![event(
+                    "turn.started",
+                    "child-start",
+                    json!({"turn_id": "one"}),
+                )],
+            ),
+            NOW + 2,
+        )
+        .unwrap();
+    crate::tests::install_live_custody_observations(&mut store, &root, 1, NOW + 2);
+    let mut stop = SubmitCommand::new(Ulid::from_parts(NOW as u64 + 2, 650), "stop".to_owned());
+    stop.target = Some(root.clone());
+    stop.expected_generation = Some(1);
+    let stop_id = stop.id.clone();
+    store.submit("owner", stop, NOW + 2).unwrap();
+    store.dispatch(&stop_id, NOW + 2).unwrap();
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "root:ended".to_owned(),
+                agent_id: root.clone(),
+                generation: 1,
+                source: INITIAL_SOURCE.to_owned(),
+                cursor: None,
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ended".to_owned(),
+                    native_id: "root:ended".to_owned(),
+                    data: json!({"command_id": stop_id}),
+                }],
+            },
+            NOW + 2,
+        )
+        .unwrap();
+    store
+        .settle(&stop_id, CommandState::Applied, None, NOW + 2)
+        .unwrap();
+    crate::tests::simulate_normal_stop_proof(&mut store, &root, 1, NOW + 2);
+    // The real stop path ended the child: stopped, no active turn, running
+    // turn retained unknown.
+    let ended = store.get_agent(&child.agent.id).unwrap().unwrap();
+    assert_eq!(ended.state, AgentState::Stopped);
+    assert!(ended.active_turn.is_none());
+    let retained = store.get_turn(&child.agent.id, 1, "one").unwrap().unwrap();
+    assert_eq!(retained.state, TurnState::Unknown);
+    // The producer's retirement owns the reader-closure proof.
+    store
+        .mark_native_children_unavailable(&root, 1, "producer_retired", true, NOW + 3)
+        .unwrap();
+    let delete_id = Ulid::from_parts(NOW as u64 + 3, 650).to_string();
+    let result = store
+        .change_agent_tree(&delete_id, &root, None, NOW + 3)
+        .expect("ended observation with drained custody retires");
+    assert_eq!(result["deleted"], true);
+    assert!(store.get_agent(&root).unwrap().is_none());
+    assert!(store.get_agent(&child.agent.id).unwrap().is_none());
+    assert!(!store.is_write_faulted());
+}

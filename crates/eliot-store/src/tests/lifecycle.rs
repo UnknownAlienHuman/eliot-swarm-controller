@@ -867,3 +867,341 @@ fn an_archived_agent_lost_with_unresolved_custody_stays_in_the_default_list() {
     assert!(list(&store, ArchivedFilter::Exclude).is_empty());
     assert_eq!(list(&store, ArchivedFilter::Only), [agent]);
 }
+
+#[test]
+fn historical_unknown_turn_resolves_after_resume_and_unblocks_delete() {
+    // #610: resuming with a retained unknown old turn used to make that turn
+    // unresolvable (exact-generation gate) while archive/delete kept
+    // rejecting it (whole-history scan). A superseded generation provably
+    // ended when resume committed, so its unknown turns stay
+    // owner-resolvable without touching the current generation.
+    let mut store = Store::open(Path::new(":memory:")).unwrap();
+    let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
+    let agent = ready_agent_with_native_identity(
+        &mut store,
+        "resolve-historical",
+        now,
+        Some(("scope-610", "ref-610")),
+    );
+    let send = send_request(&agent, 1, "historical work");
+    let send_id = send.id.clone();
+    store.submit("owner", send, now + 1).unwrap();
+    store.dispatch(&send_id, now + 1).unwrap();
+    install_live_custody_observations(&mut store, &agent, 1, now + 1);
+    let turn_id = format!("turn-{send_id}");
+    store
+        .put_batch(
+            native_batch(
+                &agent,
+                1,
+                "turn.started",
+                json!({"command_id": send_id, "turn_id": turn_id}),
+            ),
+            now + 2,
+        )
+        .unwrap();
+    // Native loss without a terminal: the turn stays unknown and generation
+    // 1 ends terminal with no active turn.
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "historical:ended".to_owned(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                cursor: None,
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ended".to_owned(),
+                    native_id: "historical:ended".to_owned(),
+                    data: json!({}),
+                }],
+            },
+            now + 3,
+        )
+        .unwrap();
+    // Custody closes without resolving the turn, releasing the generation
+    // for a later resume while the unknown turn is retained.
+    simulate_normal_stop_proof(&mut store, &agent, 1, now + 3);
+    let stuck = store.get_turn(&agent, 1, &turn_id).unwrap().unwrap();
+    assert_eq!(stuck.state, TurnState::Unknown);
+    let before = store.get_agent(&agent).unwrap().unwrap();
+    assert!(before.state.is_terminal());
+    assert!(before.active_turn.is_none());
+
+    // Resume to generation 2.
+    let mut resume = SubmitCommand::new(Ulid::new().to_string(), "resume");
+    resume.target = Some(agent.clone());
+    resume.expected_generation = Some(1);
+    let resume_id = resume.id.clone();
+    store.submit("owner", resume, now + 4).unwrap();
+    store.dispatch(&resume_id, now + 4).unwrap();
+    install_fixture_sources(&mut store, &agent, &resume_id, 2, now + 4);
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "historical:resumed".to_owned(),
+                agent_id: agent.clone(),
+                generation: 2,
+                source: "stream".to_owned(),
+                cursor: None,
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ready".to_owned(),
+                    native_id: "historical:resumed".to_owned(),
+                    data: json!({"command_id": resume_id, "native_scope": "scope-610", "native_ref": "ref-610"}),
+                }],
+            },
+            now + 4,
+        )
+        .unwrap();
+    store
+        .settle(&resume_id, CommandState::Applied, None, now + 4)
+        .unwrap();
+    assert_eq!(store.get_agent(&agent).unwrap().unwrap().generation, 2);
+
+    // The old unknown turn resolves without a readback: generation 1
+    // provably ended when resume committed.
+    store
+        .resolve_turn(
+            "owner",
+            &TurnResolveRequest {
+                id: Ulid::new().to_string(),
+                agent: agent.clone(),
+                generation: 1,
+                turn_id: turn_id.clone(),
+                status: TurnResolveStatus::Failed,
+                reason: "gen1 ended without a terminal; owner retires the assertion".to_owned(),
+            },
+            None,
+            now + 5,
+        )
+        .expect("superseded unknown turn resolves");
+    let resolved = store.get_turn(&agent, 1, &turn_id).unwrap().unwrap();
+    assert_eq!(resolved.state, TurnState::Completed);
+    assert_eq!(resolved.outcome, Some(TurnOutcome::Failure));
+
+    // Future generations stay stale.
+    let future = store
+        .resolve_turn(
+            "owner",
+            &TurnResolveRequest {
+                id: Ulid::new().to_string(),
+                agent: agent.clone(),
+                generation: 3,
+                turn_id: turn_id.clone(),
+                status: TurnResolveStatus::Failed,
+                reason: "future generation is never resolvable".to_owned(),
+            },
+            None,
+            now + 5,
+        )
+        .unwrap_err();
+    assert_eq!(future.code, "stale_generation");
+}
+
+#[test]
+fn detached_external_observer_retires_and_attached_observer_can_only_unarchive() {
+    // #651: a successfully detached external observer has unknown state by
+    // contract, no turns, no live commands and closed custody: it must
+    // retire through archive/delete without pretending native stopped.
+    // A still-attached observer keeps its open source and stays blocked.
+    let mut store = Store::open(Path::new(":memory:")).unwrap();
+    let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
+    let attach = |store: &mut Store, scope: &str, reference: &str, now: i64| -> (String, String) {
+        let mut request = SubmitCommand::new(Ulid::new().to_string(), "attach");
+        request.args = json!({
+            "profile": "reader", "harness": "codex",
+            "native_scope": scope, "native_ref": reference,
+            "mode": "observe", "profile_snapshot": {},
+            "project": "observed",
+        });
+        let admitted = store.submit("owner", request, now).unwrap();
+        let agent = admitted
+            .command
+            .target
+            .expect("attach creates the observer");
+        let attach_id = admitted.command.id.clone();
+        store.dispatch(&attach_id, now).unwrap();
+        let agent_row = store.get_agent(&agent).unwrap().unwrap();
+        store
+            .settle_observe_attach(
+                &attach_id,
+                json!({
+                    "agent_id": agent, "generation": agent_row.generation,
+                    "command_id": attach_id,
+                    "native_scope": scope, "native_ref": reference,
+                    "state": "attached", "observation_state": "unknown",
+                    "metadata": {}, "coverage": {},
+                }),
+                now,
+            )
+            .unwrap();
+        (agent, attach_id)
+    };
+    let detach = |store: &mut Store, agent: &str, scope: &str, reference: &str, now: i64| {
+        let generation = store.get_agent(agent).unwrap().unwrap().generation;
+        let mut request = SubmitCommand::new(Ulid::new().to_string(), "detach");
+        request.target = Some(agent.to_owned());
+        request.args = json!({"mode": "observe"});
+        request.expected_generation = Some(generation);
+        let admitted = store.submit("owner", request, now).unwrap();
+        let detach_id = admitted.command.id.clone();
+        store.dispatch(&detach_id, now).unwrap();
+        let agent_row = store.get_agent(agent).unwrap().unwrap();
+        store
+            .settle_observe_detach(
+                &detach_id,
+                json!({
+                    "agent_id": agent, "generation": agent_row.generation,
+                    "command_id": detach_id,
+                    "native_scope": scope, "native_ref": reference,
+                    "state": "detached", "observation_state": "unknown",
+                }),
+                now,
+            )
+            .unwrap();
+    };
+
+    // Attach then detach: no turns, no live commands, closed custody.
+    let (observer, _) = attach(&mut store, "scope-651", "ref-651", now);
+    detach(&mut store, &observer, "scope-651", "ref-651", now);
+    let settled = store.get_agent(&observer).unwrap().unwrap();
+    assert_eq!(settled.state, AgentState::Unknown);
+    assert!(settled.observe_only);
+    assert!(settled.active_turn.is_none());
+    let archived = store
+        .change_agent_tree(&Ulid::new().to_string(), &observer, Some(true), now)
+        .expect("detached observer archives");
+    assert_eq!(archived["archived"], true);
+    assert!(store.get_agent(&observer).unwrap().unwrap().archived);
+    let deleted = store
+        .change_agent_tree(&Ulid::new().to_string(), &observer, None, now)
+        .expect("detached observer deletes");
+    assert_eq!(deleted["deleted"], true);
+    assert!(store.get_agent(&observer).unwrap().is_none());
+    assert!(!store.is_write_faulted());
+
+    // A still-attached observer keeps its open source and stays blocked even
+    // though Unknown observe-only rows now retire: custody still proves the
+    // live reader.
+    let (live, _) = attach(&mut store, "scope-651-live", "ref-651-live", now);
+    for archived in [None, Some(true)] {
+        let blocked = store
+            .change_agent_tree(&Ulid::new().to_string(), &live, archived, now)
+            .unwrap_err();
+        assert_eq!(blocked.code, "busy");
+        assert!(
+            blocked.message.contains("open observe source"),
+            "{}",
+            blocked.message
+        );
+    }
+    let unarchived = store
+        .change_agent_tree(&Ulid::new().to_string(), &live, Some(false), now)
+        .expect("unarchive skips custody for an external observer");
+    assert_eq!(unarchived["archived"], false);
+}
+
+#[test]
+fn reattached_archived_observer_clears_archived_and_lists_its_live_reader() {
+    // #651: reattaching an archived observer opens a new `observe` source,
+    // which clears the archive flag so the live reader is never hidden from
+    // the default fleet filter.
+    let mut store = Store::open(Path::new(":memory:")).unwrap();
+    let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
+    let attach = |store: &mut Store, now: i64| -> (String, String) {
+        let mut request = SubmitCommand::new(Ulid::new().to_string(), "attach");
+        request.args = json!({
+            "profile": "reader", "harness": "codex",
+            "native_scope": "scope-651-reattach", "native_ref": "ref-651-reattach",
+            "mode": "observe", "profile_snapshot": {},
+            "project": "observed",
+        });
+        let admitted = store.submit("owner", request, now).unwrap();
+        let agent = admitted
+            .command
+            .target
+            .expect("attach creates the observer");
+        let attach_id = admitted.command.id.clone();
+        store.dispatch(&attach_id, now).unwrap();
+        let agent_row = store.get_agent(&agent).unwrap().unwrap();
+        store
+            .settle_observe_attach(
+                &attach_id,
+                json!({
+                    "agent_id": agent, "generation": agent_row.generation,
+                    "command_id": attach_id,
+                    "native_scope": "scope-651-reattach", "native_ref": "ref-651-reattach",
+                    "state": "attached", "observation_state": "unknown",
+                    "metadata": {}, "coverage": {},
+                }),
+                now,
+            )
+            .unwrap();
+        (agent, attach_id)
+    };
+    let list_default = |store: &Store| {
+        store
+            .list_agent_summaries(
+                &crate::AgentListFilter::default(),
+                None,
+                20,
+                now,
+                &SessionGrowthThresholds::default(),
+            )
+            .unwrap()
+    };
+
+    let (observer, _) = attach(&mut store, now);
+    let generation = store.get_agent(&observer).unwrap().unwrap().generation;
+    let mut detach = SubmitCommand::new(Ulid::new().to_string(), "detach");
+    detach.target = Some(observer.clone());
+    detach.args = json!({"mode": "observe"});
+    detach.expected_generation = Some(generation);
+    let admitted = store.submit("owner", detach, now).unwrap();
+    let detach_id = admitted.command.id.clone();
+    store.dispatch(&detach_id, now).unwrap();
+    let detached_row = store.get_agent(&observer).unwrap().unwrap();
+    store
+        .settle_observe_detach(
+            &detach_id,
+            json!({
+                "agent_id": observer, "generation": detached_row.generation,
+                "command_id": detach_id,
+                "native_scope": "scope-651-reattach", "native_ref": "ref-651-reattach",
+                "state": "detached", "observation_state": "unknown",
+            }),
+            now,
+        )
+        .unwrap();
+    store
+        .change_agent_tree(&Ulid::new().to_string(), &observer, Some(true), now)
+        .expect("detached observer archives");
+    assert!(store.get_agent(&observer).unwrap().unwrap().archived);
+    assert!(
+        list_default(&store)
+            .summaries
+            .iter()
+            .all(|row| row.id != observer)
+    );
+
+    // Reattaching the same native subject reuses the archived row and opens a
+    // new `observe` source, which clears the flag before the reader settles.
+    let (same, _) = attach(&mut store, now + 1);
+    assert_eq!(same, observer);
+    let reattached = store.get_agent(&observer).unwrap().unwrap();
+    assert!(!reattached.archived);
+    assert!(
+        store
+            .observer_active(&observer, reattached.generation)
+            .unwrap()
+    );
+    assert!(
+        list_default(&store)
+            .summaries
+            .iter()
+            .any(|row| row.id == observer)
+    );
+    assert!(!store.is_write_faulted());
+}

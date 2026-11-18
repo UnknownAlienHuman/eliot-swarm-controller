@@ -95,15 +95,24 @@ impl Store {
         for num in &members {
             let row = load_agent_by_num(&tx, *num)?
                 .ok_or_else(|| Error::new("source_integrity", "Agent tree changed"))?;
-            // Archive hides a tree that is not working: idle, or ended
-            // (stopped, failed or lost). Delete needs a settled end.
+            // Archive hides a tree that is not working: idle, ended
+            // (stopped, failed or lost), or detached external observation.
+            // Delete needs a settled end or a detached observer. A detached
+            // observer is an observe-only Unknown row with no live reader:
+            // the custody check below still refuses an attached observer
+            // with an open source, and the turn/command checks still apply.
+            // Native observed children keep their own rule: live ones are
+            // Unknown and stay blocked here; ended ones are stopped.
+            let detached_observer = row.observe_only
+                && row.origin == core::AgentOrigin::External
+                && row.state == AgentState::Unknown;
             let allowed = if archived.is_some() {
                 matches!(
                     row.state,
                     AgentState::Idle | AgentState::Stopped | AgentState::Failed | AgentState::Lost
-                )
+                ) || detached_observer
             } else {
-                matches!(row.state, AgentState::Stopped | AgentState::Failed)
+                matches!(row.state, AgentState::Stopped | AgentState::Failed) || detached_observer
             };
             if !allowed {
                 return Err(Error::new(
@@ -161,13 +170,26 @@ impl Store {
                 [num], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             ).optional().map_err(sql_error)?;
             if let Some((turn, state, generation)) = turn {
-                return Err(Error::new(
-                    "busy",
-                    format!(
-                        "{} generation {generation} has {state} turn {turn}; stopped lifecycle does not resolve an uncertain turn",
-                        row.id
-                    ),
-                ));
+                // Ended native observation keeps its unknown turn as retained
+                // evidence, not a live gate: the child reaches stopped only
+                // through the ended-with-parent sweep, whose producer check
+                // proves the granting generation ended, so no live source
+                // remains to complete it. The other guards (no active turn,
+                // no pending or live commands, drained custody) still apply,
+                // and running turns still block everywhere.
+                let ended_observation = state == "unknown"
+                    && row.observe_only
+                    && row.origin == core::AgentOrigin::Native
+                    && row.state == AgentState::Stopped;
+                if !ended_observation {
+                    return Err(Error::new(
+                        "busy",
+                        format!(
+                            "{} generation {generation} has {state} turn {turn}; stopped lifecycle does not resolve an uncertain turn",
+                            row.id
+                        ),
+                    ));
+                }
             }
             // Delete needs drained custody. Archive of an ended member needs
             // resolved custody, so it never hides a process, artifact or
@@ -338,7 +360,12 @@ fn delete_tree_tx(tx: &Transaction<'_>, members: &[i64], now: i64) -> Result<()>
     db!(tx.execute("DELETE FROM processes WHERE EXISTS(SELECT 1 FROM deleted_agents d WHERE processes.owner GLOB 'agent:a'||d.id||'#*' OR processes.owner GLOB 'workspace:a'||d.id||'#*')",[]));
     // Keep retry identities after removing payloads: a deleted native effect can never be admitted again.
     db!(tx.execute("INSERT INTO writes(id,principal,method,payload_digest,result,created_at) SELECT c.id,c.principal,c.method,c.payload_digest,'{}',?1 FROM deleted_commands d JOIN commands c ON c.id=d.id",[now]));
-    db!(tx.execute("UPDATE provider_holds SET probe_command=NULL WHERE probe_command IN (SELECT id FROM deleted_commands)",[]));
+    // A deleted probe binding is proven settled (the tree guard above admits
+    // no live or unknown command), so its claim falls back to the
+    // conservative held restriction instead of violating the held/probing
+    // CHECK or silently dropping the restriction. Genuinely unknown ongoing
+    // probes never reach this statement: they block the delete above.
+    db!(tx.execute("UPDATE provider_holds SET probe_command=NULL, state='held', updated_at=?1 WHERE probe_command IN (SELECT id FROM deleted_commands)",[now]));
     // Active cleanup attempts already block. Deleting the Agent supersedes
     // plan items that never acquired an attempt fence.
     for (table, column) in [

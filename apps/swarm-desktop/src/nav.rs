@@ -2293,6 +2293,7 @@ mod tests {
             progress_age_ms: None,
             last_turn_id: None,
             last_outcome: None,
+            last_resolution_source: None,
             activity: None,
             usage: None,
             usage_scope: None,

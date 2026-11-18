@@ -744,6 +744,24 @@ impl TurnOutcome {
     }
 }
 
+/// Provenance of a terminal result when native completion is unproven.
+#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnResolutionSource {
+    Owner,
+    Unknown,
+}
+
+impl TurnResolutionSource {
+    /// Outcome for fleet summaries and waits that serve as completion signals.
+    pub fn reported_outcome(self, outcome: TurnOutcome) -> TurnOutcome {
+        match (self, outcome) {
+            (Self::Unknown, _) | (Self::Owner, TurnOutcome::Success) => TurnOutcome::Unknown,
+            (Self::Owner, outcome) => outcome,
+        }
+    }
+}
+
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Turn {
     pub agent: String,
@@ -756,9 +774,8 @@ pub struct Turn {
     pub completed_at: Option<i64>,
     #[serde(default)]
     pub usage: Option<TurnUsage>,
-    /// Canonical outcome decided at the plugin boundary. `None` only for
-    /// running turns; terminal turns written before outcomes existed read
-    /// back through [`TurnOutcome::classify_legacy_status_for_harness`].
+    /// Canonical outcome, qualified by `resolution_source`. Legacy native
+    /// statuses are classified by [`TurnOutcome::classify_legacy_status_for_harness`].
     /// Trailing field so existing positional wire order stays stable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<TurnOutcome>,
@@ -786,6 +803,11 @@ pub struct Turn {
     /// recorded. Trailing field; absent on old wire payloads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preceded_by: Option<String>,
+    /// `owner` qualifies the recorded status and outcome as an Owner assertion.
+    /// `unknown` means a legacy terminal row lacks evidence of its source.
+    /// Absent for native completion, unsettled turns, and old wire payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_source: Option<TurnResolutionSource>,
 }
 
 /// Native token usage attributed to one terminal turn. Every member is

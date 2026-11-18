@@ -6,14 +6,16 @@
 //! or turn association, never replays an effect, and never touches capacity
 //! reservations, Agent rows, or any sibling command/turn.
 //!
-//! Provenance lives on existing surfaces only: a resolved command carries
+//! Provenance is retained where every readback can see it: a resolved command carries
 //! `resolution_source=owner` in its outcome, and each resolution emits a
-//! `command.resolved`/`turn.resolved` event with the same marker. No schema
-//! beyond the shared migrations is required.
+//! `command.resolved`/`turn.resolved` event with the same marker, and a resolved turn
+//! carries it in its row. An owner-resolved turn never reads back as native success.
 //!
 //! A turn resolves only when its generation is stored terminal (Eliot no
-//! longer controls it) or the caller passes a native-readback proof that the
-//! exact turn is inactive. The stored active turn alone is never proof.
+//! longer controls it), when its generation is superseded by a later one
+//! (resume proves the old generation ended terminal with no active turn),
+//! or when the caller passes a native-readback proof that the exact turn is
+//! inactive. The stored active turn alone is never proof.
 //! Observe-only Agents have no resolvable commands or turns.
 
 use super::{
@@ -259,7 +261,7 @@ impl Store {
                 "observe-only Agents have no resolvable turns",
             ));
         }
-        if agent.generation != request.generation {
+        if request.generation > agent.generation {
             return Err(Error::new(
                 "stale_generation",
                 "turn resolution requires the Agent's current generation",
@@ -284,9 +286,13 @@ impl Store {
         }
         // The stored active turn alone is never proof: a live generation
         // resolves only with a native readback proving this exact turn
-        // inactive. A stored terminal generation needs no proof.
+        // inactive. A stored terminal generation needs no proof, and neither
+        // does a superseded one: resume commits only from a stored terminal
+        // generation with no active turn, so a generation the Agent has moved
+        // past provably ended. Future generations stay stale.
         let proven_inactive = proof.is_some_and(|proof| proof.turn_id == request.turn_id);
-        if !agent.state.is_terminal() && !proven_inactive {
+        let superseded = request.generation < agent.generation;
+        if !agent.state.is_terminal() && !proven_inactive && !superseded {
             return Err(Error::new(
                 "bad_state",
                 "turn resolution needs a stored terminal generation or a native readback proving the turn inactive",
@@ -452,7 +458,7 @@ fn resolve_command_tx(
 
 /// Complete one proven-inactive unknown turn with its asserted status. The
 /// stored status and completion time describe the owner assertion, not a
-/// native receipt; final text and every command row are left untouched.
+/// native receipt; the row keeps resolution_source owner so no readback mistakes it for native success. Final text and every command row are left untouched.
 fn resolve_turn_tx(
     tx: &Transaction<'_>,
     agent_num: i64,
@@ -466,7 +472,7 @@ fn resolve_turn_tx(
     };
     let changed = tx
         .execute(
-            "UPDATE turns SET state = ?1, status = ?2, outcome = ?3, completed_at = ?4
+            "UPDATE turns SET state = ?1, status = ?2, outcome = ?3, completed_at = ?4, resolution_source = 'owner'
              WHERE agent = ?5 AND generation = ?6 AND turn_id = ?7 AND state = 'unknown'",
             params![
                 turn_state_name(TurnState::Completed),

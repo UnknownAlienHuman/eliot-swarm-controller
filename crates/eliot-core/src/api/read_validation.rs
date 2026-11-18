@@ -207,6 +207,7 @@ mod tests {
             config_revision: 0,
             config: None,
             preceded_by: None,
+            resolution_source: None,
         }
     }
 

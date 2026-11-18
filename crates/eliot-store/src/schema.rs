@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 55;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 56;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -1283,6 +1283,46 @@ impl Store {
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
+        if current < 56 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                // Events and write receipts can both expire while a turn survives.
+                // Only exact retained evidence can classify a pre-56 completion.
+                "ALTER TABLE turns ADD COLUMN resolution_source TEXT
+                   CHECK(resolution_source IS NULL OR resolution_source IN ('owner', 'unknown'));
+                 UPDATE turns SET resolution_source = 'unknown' WHERE state = 'completed';
+                 WITH evidence(agent, generation, turn_id, owner_assertion) AS (
+                     SELECT 'a' || agent, generation, json_extract(data, '$.turn_id'),
+                            kind = 'turn.resolved'
+                       FROM events
+                      WHERE kind IN ('turn.completed', 'turn.resolved')
+                        AND (kind = 'turn.completed' AND native_id IS NOT NULL
+                             OR kind = 'turn.resolved' AND source = 'daemon')
+                     UNION ALL
+                     SELECT json_extract(result, '$.agent'), json_extract(result, '$.generation'),
+                            json_extract(result, '$.turn_id'), 1
+                       FROM writes
+                      WHERE method = 'turn.resolve' AND principal = 'owner'
+                 ), terminal_sources AS (
+                     SELECT agent, generation, turn_id, MAX(owner_assertion) AS owner_assertion
+                       FROM evidence GROUP BY agent, generation, turn_id
+                 )
+                 UPDATE turns
+                    SET resolution_source = CASE owner_assertion WHEN 1 THEN 'owner' ELSE NULL END
+                   FROM terminal_sources
+                  WHERE turns.agent = CAST(substr(terminal_sources.agent, 2) AS INTEGER)
+                    AND terminal_sources.agent = 'a' || turns.agent
+                    AND terminal_sources.generation = turns.generation
+                    AND terminal_sources.turn_id = turns.turn_id
+                    AND turns.state = 'completed';
+                 INSERT INTO schema_migrations(version) VALUES (56);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
         Ok(())
     }
 }
@@ -1292,12 +1332,71 @@ mod continuity_tests {
     use super::*;
 
     #[test]
+    fn v56_upgrade_checks_exact_completion_provenance_after_retention() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        store.connection.execute_batch(
+            r#"INSERT INTO agents(id, project, harness, profile, state, generation, created_at, updated_at)
+                  VALUES (1, 'p', 'codex', 'p', 'stopped', 2, 0, 0);
+             INSERT INTO turns(agent,generation,turn_id,state,status,outcome)
+                  VALUES (1,1,'reused','completed','completed','success'),
+                         (1,2,'reused','completed','completed','success'),
+                         (1,2,'receipt','completed','completed','success'),
+                         (1,2,'event','completed','completed','success'),
+                         (1,2,'unsettled','unknown',NULL,NULL);
+             INSERT INTO events(ts,kind,family,agent,generation,source,native_id,data)
+                  VALUES (0,'turn.resolved','turn',1,1,'daemon',NULL,'{"turn_id":"reused"}'),
+                         (0,'turn.resolved','turn',1,2,'daemon',NULL,'{"turn_id":"receipt"}'),
+                         (172800000,'turn.completed','turn',1,2,'stream','native','{"turn_id":"reused"}'),
+                         (172800000,'turn.resolved','turn',1,2,'daemon',NULL,'{"turn_id":"event"}');
+             INSERT INTO writes(id,principal,method,payload_digest,result,created_at)
+                  VALUES ('expired','owner','turn.resolve',zeroblob(32),
+                          '{"agent":"a1","generation":1,"turn_id":"reused"}',0),
+                         ('retained','owner','turn.resolve',zeroblob(32),
+                          '{"agent":"a1","generation":2,"turn_id":"receipt"}',172800000);"#,
+        ).unwrap();
+        let retention = store
+            .prune_retention(Some(1), Some(1), None, 172_800_000)
+            .unwrap();
+        assert_eq!(retention.events_deleted, 2);
+        assert_eq!(retention.writes_deleted, 1);
+        store
+            .connection
+            .execute_batch(
+                "ALTER TABLE turns DROP COLUMN resolution_source;
+                 DELETE FROM schema_migrations WHERE version = 56;",
+            )
+            .unwrap();
+        store.migrate().unwrap();
+
+        let turn = |generation, id| store.get_turn("a1", generation, id).unwrap().unwrap();
+        let pruned = turn(1, "reused");
+        assert_eq!(pruned.state, TurnState::Completed);
+        assert_eq!(pruned.status.as_deref(), Some("completed"));
+        assert_eq!(pruned.outcome, Some(TurnOutcome::Unknown));
+        assert_eq!(
+            pruned.resolution_source,
+            Some(TurnResolutionSource::Unknown)
+        );
+        let native = turn(2, "reused");
+        assert_eq!(native.outcome, Some(TurnOutcome::Success));
+        assert_eq!(native.resolution_source, None);
+        for id in ["receipt", "event"] {
+            let owner = turn(2, id);
+            assert_eq!(owner.outcome, Some(TurnOutcome::Success));
+            assert_eq!(owner.resolution_source, Some(TurnResolutionSource::Owner));
+        }
+        assert_eq!(turn(2, "unsettled").resolution_source, None);
+    }
+
+    #[test]
     fn v49_upgrade_indexes_only_live_process_owners() {
         let mut store = Store::open(std::path::Path::new(":memory:")).unwrap();
         store
             .connection
             .execute_batch(
-                "ALTER TABLE commands DROP COLUMN assignment_binding;
+                "ALTER TABLE turns DROP COLUMN resolution_source;
+                 DELETE FROM schema_migrations WHERE version=56;
+                 ALTER TABLE commands DROP COLUMN assignment_binding;
                  ALTER TABLE cleanup_plans DROP COLUMN assignment_binding;
                  DROP TABLE project_assignments;
                  DELETE FROM schema_migrations WHERE version=55;
@@ -1362,7 +1461,9 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "ALTER TABLE commands DROP COLUMN assignment_binding;
+                "ALTER TABLE turns DROP COLUMN resolution_source;
+                 DELETE FROM schema_migrations WHERE version=56;
+                 ALTER TABLE commands DROP COLUMN assignment_binding;
                  ALTER TABLE cleanup_plans DROP COLUMN assignment_binding;
                  DROP TABLE project_assignments;
                  DELETE FROM schema_migrations WHERE version=55;
@@ -1412,7 +1513,9 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "ALTER TABLE commands DROP COLUMN assignment_binding;
+                "ALTER TABLE turns DROP COLUMN resolution_source;
+                 DELETE FROM schema_migrations WHERE version=56;
+                 ALTER TABLE commands DROP COLUMN assignment_binding;
                  ALTER TABLE cleanup_plans DROP COLUMN assignment_binding;
                  DROP TABLE project_assignments;
                  DELETE FROM schema_migrations WHERE version=55;
@@ -1505,7 +1608,9 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "ALTER TABLE commands DROP COLUMN assignment_binding;
+                "ALTER TABLE turns DROP COLUMN resolution_source;
+                 DELETE FROM schema_migrations WHERE version=56;
+                 ALTER TABLE commands DROP COLUMN assignment_binding;
                  ALTER TABLE cleanup_plans DROP COLUMN assignment_binding;
                  DROP TABLE project_assignments;
                  DELETE FROM schema_migrations WHERE version=55;

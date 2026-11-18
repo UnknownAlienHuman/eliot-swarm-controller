@@ -1686,7 +1686,9 @@ mod tests {
             let legacy = rusqlite::Connection::open(&path).unwrap();
             legacy
                 .execute_batch(
-                    "ALTER TABLE commands DROP COLUMN assignment_binding;
+                    "ALTER TABLE turns DROP COLUMN resolution_source;
+                 DELETE FROM schema_migrations WHERE version=56;
+                 ALTER TABLE commands DROP COLUMN assignment_binding;
                  ALTER TABLE cleanup_plans DROP COLUMN assignment_binding;
                  DROP TABLE project_assignments;
                  DELETE FROM schema_migrations WHERE version=55;

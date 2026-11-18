@@ -46,9 +46,10 @@ use eliot_core::{
     Effect, Event, EventSubject, FileChangeHint, FrozenSetupFile, GitBaseline, GitHintPage,
     GitSnapshot, InjectPoint, NativeEvent, NativeStoreBinding, PendingRequest, ProcessIdentity,
     ProcessRecord, ProcessSnapshot, ProcessState, SessionUsage, SourceBatch, SourceGap,
-    SourceGapAck, SubmitCommand, Turn, TurnOutcome, TurnState, TurnUsage, WorkspaceCancelOutcome,
-    WorkspaceCreationOutcome, WorkspacePhase, WorkspacePreparation, WorkspacePreparationInput,
-    WorkspaceRemovalOutcome, WorkspaceSetupArg, WorkspaceSetupOutcome, parse_agent_id,
+    SourceGapAck, SubmitCommand, Turn, TurnOutcome, TurnResolutionSource, TurnState, TurnUsage,
+    WorkspaceCancelOutcome, WorkspaceCreationOutcome, WorkspacePhase, WorkspacePreparation,
+    WorkspacePreparationInput, WorkspaceRemovalOutcome, WorkspaceSetupArg, WorkspaceSetupOutcome,
+    parse_agent_id,
 };
 pub use eliot_core::{Error, Result};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -1689,7 +1690,8 @@ impl Store {
             .connection
             .prepare(
                 "SELECT agent, generation, turn_id, state, status, outcome, native_status,
-                        final_text, started_at, completed_at, usage, config_revision, preceded_by
+                        final_text, started_at, completed_at, usage, config_revision, preceded_by,
+                        resolution_source
                  FROM turns WHERE agent = ?1 AND generation = ?2
                  ORDER BY COALESCE(started_at, completed_at, 0) DESC, turn_id DESC
                  LIMIT ?3",
@@ -3324,6 +3326,9 @@ struct TurnRecord {
     /// whose terminal event settled the turn. NULL for success, running
     /// turns and rows settled before predecessors were recorded.
     preceded_by: Option<String>,
+    /// Owner provenance: 'owner' only for turns settled by an owner
+    /// `turn.resolve` assertion without native terminal evidence, else NULL.
+    resolution_source: Option<String>,
 }
 
 struct SourceStateRecord {
@@ -4657,24 +4662,28 @@ fn turn_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TurnRecord>
         usage: row.get(10)?,
         config_revision: row.get(11)?,
         preceded_by: row.get(12)?,
+        resolution_source: row.get(13)?,
     })
 }
 
 fn turn_from_record(record: TurnRecord, harness: &str) -> Result<Turn> {
     let usage = record.usage.as_deref().map(decode_turn_usage).transpose()?;
     let state: TurnState = parse_enum(&record.state, "turn state")?;
-    // Rows written before canonical outcomes existed carry no stored outcome:
-    // classify them explicitly from the legacy status with the stored
-    // harness (Claude rows carry the raw terminal reason), never as success.
-    let outcome = match record.outcome.as_deref() {
-        Some(value) => Some(
+    let resolution_source = record
+        .resolution_source
+        .as_deref()
+        .map(|value| parse_enum(value, "turn resolution source"))
+        .transpose()?;
+    let outcome = match (resolution_source, record.outcome.as_deref()) {
+        (Some(TurnResolutionSource::Unknown), _) => Some(TurnOutcome::Unknown),
+        (_, Some(value)) => Some(
             TurnOutcome::parse(value)
                 .ok_or_else(|| Error::new("internal", "invalid stored turn outcome"))?,
         ),
-        None if state == TurnState::Completed => Some(
+        (_, None) if state == TurnState::Completed => Some(
             TurnOutcome::classify_legacy_status_for_harness(harness, record.status.as_deref()),
         ),
-        None => None,
+        (_, None) => None,
     };
     let native_status = record.native_status.filter(|value| !value.is_empty());
     Ok(Turn {
@@ -4692,6 +4701,7 @@ fn turn_from_record(record: TurnRecord, harness: &str) -> Result<Turn> {
         config_revision: record.config_revision,
         config: None,
         preceded_by: record.preceded_by.filter(|value| !value.is_empty()),
+        resolution_source,
     })
 }
 
@@ -5019,7 +5029,8 @@ fn load_turn(
     let record = connection
         .query_row(
             "SELECT agent, generation, turn_id, state, status, outcome, native_status,
-                    final_text, started_at, completed_at, usage, config_revision, preceded_by
+                    final_text, started_at, completed_at, usage, config_revision, preceded_by,
+                    resolution_source
              FROM turns WHERE agent = ?1 AND generation = ?2 AND turn_id = ?3",
             params![agent, generation, turn_id],
             turn_record_from_row,
