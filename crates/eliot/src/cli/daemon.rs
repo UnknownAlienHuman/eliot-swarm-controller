@@ -199,6 +199,18 @@ pub(crate) fn daemon_now_ms() -> u128 {
 }
 
 pub(crate) const STARTUP_WAIT: Duration = Duration::from_secs(30);
+
+/// Route the human previous-crash note for a ready daemon: the note plus a
+/// flag that is true when it belongs on stderr. JSON stdout must stay pure
+/// machine-readable output (the structured `previous_crash` field already
+/// carries the fact), so JSON mode returns true; human mode keeps the note on
+/// stdout. `None` means there is no crash to report.
+pub(crate) fn crash_note_stream(
+    json_output: bool,
+    crash_note: Option<&str>,
+) -> Option<(&str, bool)> {
+    crash_note.map(|note| (note, json_output))
+}
 const STARTUP_POLL: Duration = Duration::from_millis(200);
 const STARTUP_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -250,8 +262,17 @@ pub(crate) async fn wait_for_daemon_ready(
                 } else {
                     println!("daemon ready; data_dir: {}", data_dir.display());
                 }
-                if let Some(note) = crash_note {
-                    println!("{note}");
+                // The structured `previous_crash` field already carries the
+                // fact in machine-readable stdout; the human note must not
+                // join it there, so JSON mode sends the note to stderr.
+                if let Some((note, to_stderr)) =
+                    crash_note_stream(json_output, crash_note.as_deref())
+                {
+                    if to_stderr {
+                        eprintln!("{note}");
+                    } else {
+                        println!("{note}");
+                    }
                 }
                 return Ok(0);
             }
@@ -420,6 +441,20 @@ mod tests {
     fn missing_dir(name: &str) -> (PathBuf, PathBuf) {
         let root = std::env::temp_dir().join(format!("eliot readiness probe {name}"));
         (root.join("data"), root.join("logs").join("daemon.log"))
+    }
+
+    #[test]
+    fn crash_note_leaves_json_stdout_machine_readable() {
+        let (note, to_stderr) =
+            crash_note_stream(true, Some("previous run crashed: x")).expect("crash note present");
+        assert_eq!(note, "previous run crashed: x");
+        assert!(to_stderr, "JSON mode must send the human note to stderr");
+        let (note, to_stderr) =
+            crash_note_stream(false, Some("previous run crashed: x")).expect("crash note present");
+        assert_eq!(note, "previous run crashed: x");
+        assert!(!to_stderr, "human mode keeps the note on stdout");
+        assert!(crash_note_stream(true, None).is_none());
+        assert!(crash_note_stream(false, None).is_none());
     }
 
     #[test]
