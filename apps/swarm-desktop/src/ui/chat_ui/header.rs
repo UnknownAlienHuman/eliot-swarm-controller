@@ -34,6 +34,8 @@ impl DesktopApp {
                         harness: detail.harness.clone(),
                         state: detail.state,
                         project: detail.project.clone(),
+                        recorded_project: None,
+                        repo_common_dir: None,
                         workspace: None,
                         parent: None,
                         updated_at: 0,

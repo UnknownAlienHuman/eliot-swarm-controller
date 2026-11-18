@@ -37,8 +37,11 @@ pub struct UiAgent {
     pub generation: i64,
     pub harness: String,
     pub state: eliot_core::AgentState,
-    /// The Agent's project label: its workspace path, as listed.
+    /// The location label used by workspace controls.
     pub project: String,
+    /// The project value recorded by the daemon, independently of the workspace.
+    pub recorded_project: Option<String>,
+    pub repo_common_dir: Option<String>,
     pub workspace: Option<String>,
     /// The current manager, if any.
     pub parent: Option<String>,
@@ -70,6 +73,8 @@ impl UiAgent {
                 .filter(|_| !summary.chat)
                 .unwrap_or(&summary.project)
                 .clone(),
+            recorded_project: Some(summary.project.clone()),
+            repo_common_dir: summary.repo_common_dir.clone(),
             workspace: summary.workspace.clone(),
             parent: summary.parent.clone(),
             updated_at: summary.updated_at,
@@ -178,6 +183,7 @@ impl Row {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Checkout {
     pub path: String,
+    pub registration_ids: Vec<String>,
     /// The Git common directory of its repository.
     pub common_dir: String,
     /// The verified checkout's branch; `None` for a
@@ -277,10 +283,8 @@ pub fn subproject_name(checkout: &Checkout) -> Option<String> {
     })
 }
 
-/// Where a task folder (an Agent's project label) belongs, as a person
-/// reads it: the project's logical name, and its subproject when the
-/// folder is in a linked worktree. A folder no checkout holds is a project
-/// of its own, named by its folder.
+/// The display name of a registration or checkout, with its worktree name
+/// when applicable. An unmatched path uses its folder name.
 pub fn place_of(label: &str, checkouts: &[Checkout]) -> (String, Option<String>) {
     match checkout_of(label, checkouts) {
         Some(checkout) => (
@@ -361,20 +365,89 @@ pub fn repository(common_dir: &str) -> (String, Option<String>) {
     (name.to_owned(), None)
 }
 
-/// The registered checkout holding `label` (an Agent's workspace path):
-/// the longest registered path equal to it or containing it.
+/// Match a registration ID or an exact checkout path.
 fn checkout_of<'a>(label: &str, checkouts: &'a [Checkout]) -> Option<&'a Checkout> {
-    let label = path_key(label);
+    let path = path_key(label);
     checkouts
         .iter()
-        .filter(|checkout| {
-            let path = path_key(&checkout.path);
-            label == path
-                || label
-                    .strip_prefix(path.as_str())
-                    .is_some_and(|rest| rest.starts_with('/'))
+        .find(|checkout| checkout.registration_ids.iter().any(|id| id == label))
+        .or_else(|| {
+            checkouts
+                .iter()
+                .find(|checkout| path_key(&checkout.path) == path)
         })
-        .max_by_key(|checkout| path_key(&checkout.path).len())
+}
+
+pub const OTHER_LOCATIONS: &str = "other-locations";
+const OTHER_LOCATIONS_NAME: &str = "Other locations";
+
+/// Resolve the Agent's repository and, independently, its verified workspace.
+fn agent_checkout<'a>(
+    agent: &UiAgent,
+    checkouts: &'a [Checkout],
+) -> Option<(&'a Checkout, Option<&'a Checkout>)> {
+    let project = agent.recorded_project.as_deref().unwrap_or(&agent.project);
+    let workspace = path_key(agent.workspace.as_deref().unwrap_or(&agent.project));
+    let registered = checkouts
+        .iter()
+        .find(|checkout| checkout.registration_ids.iter().any(|id| id == project));
+    let repository = registered.or_else(|| {
+        if let Some(common_dir) = &agent.repo_common_dir {
+            let common_dir = path_key(common_dir);
+            return checkouts
+                .iter()
+                .find(|checkout| path_key(&checkout.common_dir) == common_dir);
+        }
+        if !project.contains(['/', '\\']) {
+            return None;
+        }
+        let mut verified = checkouts.iter().filter(|checkout| {
+            !checkout.missing && checkout.main.is_some() && path_key(&checkout.path) == workspace
+        });
+        let checkout = verified.next()?;
+        verified.next().is_none().then_some(checkout)
+    })?;
+    let common = path_key(&repository.common_dir);
+    let checkout = checkouts.iter().find(|checkout| {
+        !checkout.missing
+            && checkout.main.is_some()
+            && path_key(&checkout.common_dir) == common
+            && path_key(&checkout.path) == workspace
+    });
+    Some((repository, checkout))
+}
+
+fn agent_project_key(agent: &UiAgent, checkouts: &[Checkout]) -> String {
+    agent_checkout(agent, checkouts).map_or_else(
+        || {
+            if agent.workspace.is_some() || agent.project.contains(['/', '\\']) {
+                OTHER_LOCATIONS.to_owned()
+            } else {
+                format!("folder:{}", path_key(&agent.project))
+            }
+        },
+        |(repository, _)| format!("repo:{}", path_key(&repository.common_dir)),
+    )
+}
+
+fn checkout_subproject_key(checkout: &Checkout) -> Option<String> {
+    subproject_name(checkout).map(|_| format!("sub:{}", path_key(&checkout.path)))
+}
+
+pub fn agent_place_label(agent: &UiAgent, checkouts: &[Checkout]) -> String {
+    if agent.chat {
+        return "Chats".to_owned();
+    }
+    match agent_checkout(agent, checkouts) {
+        Some((repository, workspace)) => {
+            let name = checkout_repository_name(repository, checkouts);
+            match workspace.and_then(subproject_name) {
+                Some(sub) => format!("{name} › {sub}"),
+                None => name,
+            }
+        }
+        None => folder_name(&agent.project).to_owned(),
+    }
 }
 
 /// A worktree folder as a task row names it: without its repository's
@@ -408,8 +481,7 @@ pub fn project_of(label: &str, checkouts: &[Checkout]) -> String {
 /// key a subproject collapses and is renamed by; `None` in a main
 /// checkout or an unregistered folder.
 pub fn subproject_key(label: &str, checkouts: &[Checkout]) -> Option<String> {
-    let checkout = checkout_of(label, checkouts)?;
-    subproject_name(checkout).map(|_| format!("sub:{}", path_key(&checkout.path)))
+    checkout_of(label, checkouts).and_then(checkout_subproject_key)
 }
 
 /// One project of the sidebar: a repository with its main checkout's tasks
@@ -605,17 +677,25 @@ pub fn sections(listed: &[UiAgent], checkouts: &[Checkout], shown: &Shown) -> Ve
         }
     }
 
-    let listed_ids: HashSet<&str> = listed.iter().map(|agent| agent.id.as_str()).collect();
+    let placements: HashMap<&str, String> = listed
+        .iter()
+        .filter(|agent| !agent.chat)
+        .map(|agent| (agent.id.as_str(), agent_project_key(agent, checkouts)))
+        .collect();
     let mut counted = HashSet::new();
     // Chats list under Chats, not under a project.
     for agent in listed.iter().filter(|agent| !agent.chat) {
-        let key = project_key(&agent.project, checkouts);
-        let index = match groups.iter().position(|group| group.section.key == key) {
+        let key = &placements[agent.id.as_str()];
+        let index = match groups.iter().position(|group| group.section.key == *key) {
             Some(index) => index,
             None => {
-                let name = folder_name(&agent.project).to_owned();
+                let (name, checkout) = if key == OTHER_LOCATIONS {
+                    (OTHER_LOCATIONS_NAME, "")
+                } else {
+                    (folder_name(&agent.project), agent.project.as_str())
+                };
                 groups.push(Group {
-                    section: empty(key, name, &agent.project),
+                    section: empty(key.clone(), name.to_owned(), checkout),
                     main: None,
                     top: Vec::new(),
                     subs: Vec::new(),
@@ -624,7 +704,9 @@ pub fn sections(listed: &[UiAgent], checkouts: &[Checkout], shown: &Shown) -> Ve
             }
         };
         let group = &mut groups[index];
-        let sub = subproject_key(&agent.project, checkouts)
+        let sub = agent_checkout(agent, checkouts)
+            .and_then(|(_, workspace)| workspace)
+            .and_then(checkout_subproject_key)
             .and_then(|key| group.subs.iter().position(|sub| sub.sub.key == key));
         let first = counted.insert(agent.id.as_str());
         if first && agent.running() {
@@ -639,7 +721,7 @@ pub fn sections(listed: &[UiAgent], checkouts: &[Checkout], shown: &Shown) -> Ve
                     && agent
                         .parent
                         .as_deref()
-                        .is_none_or(|parent| !listed_ids.contains(parent))
+                        .is_none_or(|parent| placements.get(parent) != Some(key))
             }
         };
         match sub {
@@ -741,6 +823,7 @@ pub fn sections(listed: &[UiAgent], checkouts: &[Checkout], shown: &Shown) -> Ve
                 listed,
                 shown,
                 !filtered,
+                checkouts,
                 &mut seen,
                 &mut group.section.rows,
             );
@@ -772,6 +855,7 @@ pub fn sections(listed: &[UiAgent], checkouts: &[Checkout], shown: &Shown) -> Ve
                         listed,
                         shown,
                         !filtered,
+                        checkouts,
                         &mut seen,
                         &mut subproject.rows,
                     );
@@ -793,13 +877,10 @@ pub struct Use {
     pub tasks: usize,
 }
 
-/// Which registrations (`(id, checkout path)`) the Agents use: an Agent
-/// uses the registration whose checkout holds its folder; one in an
-/// unregistered linked worktree uses its repository's registration the
-/// daemon resolves it to (the main checkout's, else the only one), and
-/// every registration of that repository when that is ambiguous, so a
-/// live task never leaves a registration looking unused. `checkouts` must
-/// hold every folder's checkout (registered and resolved). Chats use none.
+/// Count usages of the recorded registration. For legacy Agents, use the
+/// verified checkout's registration, or the repository's preferred registration
+/// when the checkout is unregistered. Count ambiguous legacy usage against every
+/// matching registration so a live task keeps them in use.
 pub fn registration_use(
     registrations: &[(String, String)],
     agents: &[UiAgent],
@@ -814,9 +895,16 @@ pub fn registration_use(
         .iter()
         .filter(|agent| !agent.chat && seen.insert(agent.id.as_str()))
     {
-        let Some(checkout) = checkout_of(&agent.project, checkouts) else {
+        let recorded = agent.recorded_project.as_deref().unwrap_or(&agent.project);
+        if let Some(entry) = usage.get_mut(recorded) {
+            entry.tasks += 1;
+            entry.live += usize::from(agent.live());
+            continue;
+        }
+        let Some((repository, workspace)) = agent_checkout(agent, checkouts) else {
             continue;
         };
+        let checkout = workspace.unwrap_or(repository);
         let path = path_key(&checkout.path);
         let mut users: Vec<&String> = registrations
             .iter()
@@ -877,7 +965,7 @@ pub fn search(listed: &[UiAgent], checkouts: &[Checkout], query: &str) -> Vec<(S
     let mut found: Vec<(&UiAgent, String)> = listed
         .iter()
         .filter(|agent| seen.insert(agent.id.as_str()))
-        .map(|agent| (agent, place_label(&agent.project, checkouts)))
+        .map(|agent| (agent, agent_place_label(agent, checkouts)))
         .filter(|(agent, project)| matches(agent, project, query))
         .collect();
     found.sort_by(|(a, _), (b, _)| {
@@ -941,8 +1029,10 @@ pub fn sidebar_recents<'a>(
 ) -> Vec<&'a UiAgent> {
     recents(agents, limit, &|agent: &UiAgent| {
         !agent.chat
-            && (collapsed.contains(project_key(&agent.project, checkouts).as_str())
-                || subproject_key(&agent.project, checkouts)
+            && (collapsed.contains(agent_project_key(agent, checkouts).as_str())
+                || agent_checkout(agent, checkouts)
+                    .and_then(|(_, workspace)| workspace)
+                    .and_then(checkout_subproject_key)
                     .is_some_and(|key| collapsed.contains(key.as_str())))
     })
 }
@@ -1213,6 +1303,7 @@ fn push(
     listed: &[UiAgent],
     shown: &Shown,
     tree: bool,
+    checkouts: &[Checkout],
     seen: &mut HashSet<String>,
     out: &mut Vec<Row>,
 ) {
@@ -1222,7 +1313,11 @@ fn push(
         return;
     }
     let children = if tree {
+        let key = agent_project_key(agent, checkouts);
         children_of(&agent.id, listed, shown.branches)
+            .into_iter()
+            .filter(|child| child.native_child || agent_project_key(child, checkouts) == key)
+            .collect()
     } else {
         Vec::new()
     };
@@ -1247,7 +1342,17 @@ fn push(
     });
     if is_expanded {
         for child in children {
-            push(child, depth + 1, nested, listed, shown, tree, seen, out);
+            push(
+                child,
+                depth + 1,
+                nested,
+                listed,
+                shown,
+                tree,
+                checkouts,
+                seen,
+                out,
+            );
         }
     }
 }
@@ -1282,7 +1387,7 @@ mod tests {
         // Any checkout's origin names the whole repository.
         let checkouts = [named, linked];
         assert_eq!(
-            place_label(r"\\?\C:\wt\atlas-wt-search\src", &checkouts),
+            place_label(r"\\?\C:\wt\atlas-wt-search", &checkouts),
             "atlas-web › search filters"
         );
         assert_eq!(place_label(r"\\?\C:\src\atlas", &checkouts), "atlas-web");
@@ -1306,6 +1411,8 @@ mod tests {
             harness: "muse".to_owned(),
             state: AgentState::Idle,
             project: project.to_owned(),
+            recorded_project: None,
+            repo_common_dir: None,
             workspace: None,
             parent: parent.map(str::to_owned),
             updated_at: 0,
@@ -1378,7 +1485,10 @@ mod tests {
     }
 
     fn checkout(path: &str, common_dir: &str) -> Checkout {
-        Checkout::new(path, common_dir)
+        let mut checkout = Checkout::new(path, common_dir);
+        checkout.main =
+            Some(repository(common_dir).1.as_deref().map(path_key) == Some(path_key(path)));
+        checkout
     }
 
     #[test]
@@ -1529,8 +1639,7 @@ mod tests {
         let listed = vec![
             with(agent("a1", r"\\?\C:\wt\wt-k1", None), "busy", 0),
             agent("a2", r"\\?\C:\src\app", None),
-            // A workspace below a checkout belongs to it.
-            agent("a3", r"\\?\C:\wt\wt-k2\crates", None),
+            agent("a3", r"\\?\C:\wt\wt-k2", None),
             agent("a4", r"\\?\C:\src\web", None),
             agent("a5", r"\\?\C:\scratch\notes", None),
         ];
@@ -1545,7 +1654,7 @@ mod tests {
                 ("app-web", r"\\?\C:\src\app"),
                 ("web", r"\\?\C:\src\web"),
                 ("idle", r"\\?\C:\src\idle"),
-                ("notes", r"\\?\C:\scratch\notes"),
+                ("Other locations", ""),
             ]
         );
         // The main checkout's tasks sit under the project; each linked
@@ -1568,6 +1677,44 @@ mod tests {
         assert_eq!(place_name("app-wt-tiles", "app"), "wt-tiles");
         assert_eq!(place_name("application", "app"), "application");
         assert_eq!(place_name("app", "app"), "app");
+    }
+
+    #[test]
+    fn nested_repositories_keep_agents_after_worktree_removal_without_parent_fallback() {
+        let outer = r"C:\src";
+        let inner = r"C:\src\app";
+        let git = r"C:\src\app\.git";
+        let linked = r"C:\src\worktrees\app-update";
+        let mut outer_checkout = checkout(outer, r"C:\src\.git");
+        outer_checkout.registration_ids.push("outer".to_owned());
+        let mut inner_checkout = checkout(inner, git);
+        inner_checkout.registration_ids.push("inner".to_owned());
+        let mut checkouts = vec![outer_checkout, inner_checkout, checkout(linked, git)];
+
+        let outer_agent = agent("a1", outer, None);
+        let mut recorded = agent("a2", linked, Some("a1"));
+        recorded.recorded_project = Some("inner".to_owned());
+        recorded.workspace = Some(linked.to_owned());
+        let mut legacy = agent("a3", linked, None);
+        legacy.recorded_project = Some(outer.to_owned());
+        legacy.workspace = Some(linked.to_owned());
+        let mut managed = agent("a4", linked, None);
+        managed.repo_common_dir = Some(git.to_owned());
+        let mut view = View::default();
+        view.expanded.insert("a1".to_owned());
+        let listed = [outer_agent, recorded, legacy, managed];
+
+        let sections = view.sections(&listed, &checkouts);
+        assert_eq!(shape(&sections[0]), (vec!["a1"], vec![]));
+        assert_eq!(sections[0].rows[0].children, 0);
+        assert_eq!(sections[1].subprojects[0].rows.len(), 3);
+
+        checkouts.pop();
+        let sections = view.sections(&listed, &checkouts);
+        assert_eq!(shape(&sections[0]), (vec!["a1"], vec![]));
+        assert_eq!(shape(&sections[1]), (vec!["a2", "a4"], vec![]));
+        assert_eq!(sections[2].name, "Other locations");
+        assert_eq!(shape(&sections[2]), (vec!["a3"], vec![]));
     }
 
     #[test]
@@ -1683,7 +1830,7 @@ mod tests {
         chat.chat = true;
         let agents = vec![
             with(agent("a1", r"C:\src\app", None), "stopped", 0),
-            with(agent("a2", r"C:\wt\legacy\crates", None), "busy", 0),
+            with(agent("a2", r"C:\wt\legacy", None), "busy", 0),
             // The daemon resolves an unregistered worktree to the main
             // checkout's registration.
             with(agent("a3", r"C:\wt\fresh", None), "idle", 0),
@@ -1816,9 +1963,14 @@ mod tests {
         ];
         let mut view = View::default();
         // Collapsing never hides a match.
-        view.collapsed.insert("folder:/p".to_owned());
+        view.collapsed.insert("repo:/p/.git".to_owned());
+        let checkouts = [
+            checkout("/p", "/p/.git"),
+            checkout("/q", "/q/.git"),
+            checkout("/r", "/r/.git"),
+        ];
         let attention = |agent: &UiAgent| agent.needs_attention();
-        let sections = view.filtered(&listed, &[], Some(&attention));
+        let sections = view.filtered(&listed, &checkouts, Some(&attention));
         let flat: Vec<Vec<(&str, usize)>> = sections.iter().map(ids).collect();
         // A lost task needs a decision too (Resume, why or archive).
         assert_eq!(flat, [vec![("a2", 0)], vec![("a4", 0), ("a5", 0)]]);
@@ -1982,8 +2134,8 @@ mod tests {
     #[test]
     fn sidebar_recents_hold_only_collapsed_projects_tasks() {
         let checkouts = [
-            Checkout::new("C:\\w\\atlas", "C:\\w\\atlas\\.git"),
-            Checkout::new("C:\\w\\atlas-wt-1", "C:\\w\\atlas\\.git"),
+            checkout("C:\\w\\atlas", "C:\\w\\atlas\\.git"),
+            checkout("C:\\w\\atlas-wt-1", "C:\\w\\atlas\\.git"),
         ];
         let mut listed = vec![
             with(agent("a1", "C:\\w\\atlas", None), "stopped", 10),
