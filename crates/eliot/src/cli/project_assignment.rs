@@ -37,11 +37,16 @@ pub(super) async fn run(
             };
             call(data_dir, "project.assignment.claim", &request).await?
         }
-        ProjectAssignmentCommand::Launch { project, profile } => {
+        ProjectAssignmentCommand::Launch {
+            project,
+            profile,
+            adopt_worktree,
+        } => {
             let request = ProjectAssignmentLaunchRequest {
                 id: mutation_id(id)?,
                 project,
                 profile,
+                adopt_worktree,
             };
             call(data_dir, "project.assignment.launch", &request).await?
         }

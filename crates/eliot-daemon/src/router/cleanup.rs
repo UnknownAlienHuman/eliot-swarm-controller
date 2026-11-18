@@ -670,6 +670,17 @@ impl Router {
                     candidate.reason = "native_archive_pending".to_owned();
                     candidate.bytes = None;
                 }
+            } else if candidate.artifact.kind == ArtifactKind::Worktree
+                && self
+                    .inner
+                    .store
+                    .lock()
+                    .await
+                    .workspace_assignment_bound(&candidate.artifact.path)?
+            {
+                // A worktree bound to a current manager assignment is never
+                // removed, borrowed or not: release the assignment first.
+                candidate.reason = "assignment_bound".to_owned();
             } else if self
                 .inner
                 .store

@@ -1307,6 +1307,10 @@ pub(crate) enum ProjectAssignmentCommand {
         project: String,
         #[arg(long)]
         profile: String,
+        /// Adopt an existing checkout of the project repository as the manager
+        /// workspace instead of preparing a fresh managed worktree.
+        #[arg(long)]
+        adopt_worktree: Option<String>,
     },
     /// Release an assignment using its current epoch.
     Release {
