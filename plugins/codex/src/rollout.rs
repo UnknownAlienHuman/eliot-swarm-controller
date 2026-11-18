@@ -473,7 +473,12 @@ fn live_gap(cursor: &str, error: &Error) -> LiveRolloutPage {
 
 // Pinned format: openai/codex 979011409de0a60b52f179721948e65531d26144,
 // protocol/src/{protocol,models}.rs and rollout/src/policy.rs. Lifecycle
-// EventMsg records are canonical; legacy message/tool echoes are not republished.
+// EventMsg records (`task_started`/`turn_started`, `task_complete`/
+// `turn_complete`, `task_aborted`/`turn_aborted`) are canonical; routine
+// `token_count` usage metadata and legacy message/tool echoes
+// (`agent_message`, `user_message`, `exec_command_end`) are ignorable
+// without clearing binding. Any other EventMsg gaps without resetting
+// binding unless identity is lost or corrupt.
 fn normalize_live_line(
     state: &mut LiveCursor,
     line: &RolloutLine,
@@ -574,7 +579,13 @@ fn normalize_live_event(
         .and_then(Value::as_str)
         .ok_or_else(integrity)?;
     match event_type {
-        "agent_message" | "user_message" | "exec_command_end" => return Ok(None),
+        "agent_message" | "user_message" | "exec_command_end" | "token_count" => {
+            // Known non-owned metadata: routine usage updates and legacy
+            // echoes are ignorable without clearing turn/tool binding.
+            // Only lifecycle records below mutate binding; genuinely lost
+            // or corrupt identity still gaps via the callers.
+            return Ok(None);
+        }
         "task_started" | "turn_started" | "task_complete" | "turn_complete" | "task_aborted"
         | "turn_aborted" => {}
         _ => return Err(live_unsupported()),
@@ -1903,6 +1914,43 @@ mod live_tests {
         assert_eq!(
             replaced.records[0].events[0].data["native_status"],
             "replaced"
+        );
+        reader.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn token_count_is_ignorable_without_clearing_tool_binding() {
+        // Audit #644: routine usage updates on qualified 0.161.0 must not
+        // gap nor erase in-flight tool binding.
+        let fixture = Fixture::new(&[]);
+        let mut reader = fixture.reader(SecretPolicy::default());
+        let baseline = reader.baseline_cursor().to_owned();
+        fixture.append(line(
+            "event_msg",
+            json!({"type":"task_started","turn_id":"turn-1"}),
+        ));
+        fixture.append(line("response_item", json!({"type":"function_call","name":"exec_command","call_id":"call-1","id":"call-item","arguments":"{}"})));
+        fixture.append(line(
+            "event_msg",
+            json!({"type":"token_count","turn_id":"turn-1","usage":{"input_tokens":10}}),
+        ));
+        fixture.append(line("response_item", json!({"type":"function_call_output","call_id":"call-1","id":"output-item","output":"ok"})));
+        let page = reader.read_page(&baseline, 100, deadline()).await.unwrap();
+        assert!(page.gap.is_none(), "token_count must not gap");
+        let kinds: Vec<_> = page
+            .records
+            .iter()
+            .flat_map(|record| &record.events)
+            .map(|event| event.kind.as_str())
+            .collect();
+        assert_eq!(kinds, ["turn.started", "tool.started", "tool.completed"]);
+        assert_eq!(
+            page.records[2].events[0].data["turn_id"], "turn-1",
+            "output keeps its native turn after token_count"
+        );
+        assert_eq!(
+            page.records[2].events[0].data["item_id"], "call-1",
+            "output keeps its call binding after token_count"
         );
         reader.close().await.unwrap();
     }
