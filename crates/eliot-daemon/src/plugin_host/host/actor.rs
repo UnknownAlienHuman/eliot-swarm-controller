@@ -374,10 +374,10 @@ async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
                     // drained=false below.
                     let group_drained = if observed.is_err() {
                         let _ = child.terminate();
-                        let _ = super::linux_drain_owned_group(&mut child, STOP_GRACE).await;
+                        let _ = super::linux_drain_owned_group(child, STOP_GRACE).await;
                         false
                     } else {
-                        super::linux_drain_owned_group(&mut child, STOP_GRACE).await
+                        super::linux_drain_owned_group(child, STOP_GRACE).await
                     };
                     if group_drained {
                         let _ = monitoring.sample_generation(agent).await;
