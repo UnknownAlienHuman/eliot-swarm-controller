@@ -45,6 +45,8 @@ impl DesktopApp {
                         chat: false,
                         archived: false,
                         pending: false,
+                        organization: None,
+                        tags: Vec::new(),
                     })
                 });
                 if let Some(mut agent) = agent {

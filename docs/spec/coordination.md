@@ -263,8 +263,8 @@ unknown reservations use their respective committed generation, command, turn
 and reservation evidence. The fleet separately counts distinct observed native
 children, including any without a project. Observation coverage describes what
 the daemon can observe. The page continuation describes which authorized rows
-remain. Queue-depth reporting carries no scheduling promise. Fairness and
-queued interactive launch are step 4 and stay unsupported.
+remain. Queue-depth reporting carries no scheduling promise; fairness and
+queued interactive launch follow [command admission](api.md#command-admission).
 
 The current workspace binding to the assignment is recorded separately from
 the historical creator receipt, so a later transfer can move the binding without

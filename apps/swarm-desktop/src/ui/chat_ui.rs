@@ -1021,36 +1021,56 @@ impl DesktopApp {
             (Some((bound, title)), _) => {
                 self.force_stop_banner(bound, title, column, context, palette)
             }
-            (None, Some(text)) => Border::new()
-                .grid_row(4)
-                .width(column)
-                .max_width(tokens::layout::READING_WIDTH)
-                .horizontal_alignment(HorizontalAlignment::Center)
-                .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
-                .background(palette.card())
-                .corner_radius(tokens::radius::CONTAINER)
-                .padding(Thickness::new(
-                    tokens::spacing::MD,
-                    tokens::spacing::XS,
-                    tokens::spacing::XS,
-                    tokens::spacing::XS,
-                ))
-                .content(
-                    Grid::new()
-                        .columns([GridLength::STAR, GridLength::Auto])
-                        .column_spacing(tokens::spacing::SM)
-                        .children((
-                            m3::body(text.clone())
-                                .vertical_alignment(VerticalAlignment::Center)
-                                .text_wrapping(TextWrapping::Wrap)
-                                .is_text_selection_enabled(true),
-                            m3::icon_button(palette)
-                                .grid_column(1)
-                                .automation_name("Dismiss")
-                                .on_click(context.message(Message::Shell(ShellMsg::AlertDismissed)))
-                                .content(m3::icon(m3::glyph::CLOSE)),
-                        )),
-                ),
+            (None, Some(text)) => {
+                let queue: View = if self
+                    .launch
+                    .queue_offer
+                    .as_ref()
+                    .is_some_and(|offer| &offer.alert == text)
+                {
+                    m3::text_button(palette)
+                        .grid_column(1)
+                        .is_enabled(!self.submitting())
+                        .automation_name("Queue it")
+                        .on_click(context.message(Message::Launch(LaunchMsg::QueueRequested)))
+                        .content("Queue it")
+                } else {
+                    View::empty()
+                };
+                Border::new()
+                    .grid_row(4)
+                    .width(column)
+                    .max_width(tokens::layout::READING_WIDTH)
+                    .horizontal_alignment(HorizontalAlignment::Center)
+                    .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
+                    .background(palette.card())
+                    .corner_radius(tokens::radius::CONTAINER)
+                    .padding(Thickness::new(
+                        tokens::spacing::MD,
+                        tokens::spacing::XS,
+                        tokens::spacing::XS,
+                        tokens::spacing::XS,
+                    ))
+                    .content(
+                        Grid::new()
+                            .columns([GridLength::STAR, GridLength::Auto, GridLength::Auto])
+                            .column_spacing(tokens::spacing::SM)
+                            .children((
+                                m3::body(text.clone())
+                                    .vertical_alignment(VerticalAlignment::Center)
+                                    .text_wrapping(TextWrapping::Wrap)
+                                    .is_text_selection_enabled(true),
+                                queue,
+                                m3::icon_button(palette)
+                                    .grid_column(2)
+                                    .automation_name("Dismiss")
+                                    .on_click(
+                                        context.message(Message::Shell(ShellMsg::AlertDismissed)),
+                                    )
+                                    .content(m3::icon(m3::glyph::CLOSE)),
+                            )),
+                    )
+            }
             (None, None) => self
                 .archived_notice(column, context, palette)
                 .or_else(|| self.loss_notice(column))

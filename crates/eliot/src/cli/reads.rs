@@ -1440,6 +1440,8 @@ mod tests {
             project_scope: None,
             heavy: None,
             session_growth: None,
+            organization: None,
+            tags: Vec::new(),
         }
     }
 

@@ -16,7 +16,6 @@
 //! only: folders, files, branches and native store files stay.
 
 use super::*;
-use crate::nav::Checkout;
 use crate::theme::winui::Palette;
 use eliot_core::api::{
     ArtifactKind, CleanupApplyRequest, CleanupApplyResponse, CleanupPlan, CleanupPlanRequest,
@@ -200,25 +199,11 @@ fn read_agents(data_dir: &Path, archived: Option<&str>) -> Result<Vec<UiAgent>, 
     Err("there are more tasks than one bulk action reads; try a single project".to_owned())
 }
 
-/// Scoped mutations use the retained execution directory and an exact
-/// daemon-verified checkout. Folder-only rows have no repository scope.
-fn in_scope(agent: &UiAgent, scope: Option<&str>, checkouts: &[Checkout]) -> bool {
-    let Some(key) = scope else {
-        return true;
-    };
-    let Some(workspace) = agent.workspace.as_deref().filter(|_| !agent.chat) else {
-        return false;
-    };
-    let workspace = nav::path_key(workspace);
-    let mut verified = checkouts
-        .iter()
-        .filter(|checkout| checkout.main.is_some() && nav::path_key(&checkout.path) == workspace);
-    let Some(checkout) = verified.next() else {
-        return false;
-    };
-    verified.next().is_none()
-        && (key == format!("repo:{}", nav::path_key(&checkout.common_dir))
-            || (checkout.main == Some(false) && key == format!("sub:{workspace}")))
+/// A project's scoped bulk action covers the tasks the daemon reads in that
+/// project's organization group (each row's `organization`), exactly what
+/// its sidebar section lists; nothing is matched by path here.
+fn in_scope(agent: &UiAgent, scope: Option<&str>) -> bool {
+    scope.is_none_or(|key| nav::group_key(agent.organization.as_deref()) == key)
 }
 
 /// A kept-count line ("3 live tasks stay: …"), or nothing for zero.
@@ -279,24 +264,14 @@ fn plan_tasks(
     show_archived: bool,
 ) -> Result<BulkPlan, String> {
     let agents = read_agents(data_dir, archived_filter(op, show_archived))?;
-    let checkouts = if scope.is_some() {
-        project_checkouts(&load_projects_blocking(data_dir)?)
-    } else {
-        Vec::new()
-    };
-    Ok(task_plan(&agents, op, scope, &checkouts))
+    Ok(task_plan(&agents, op, scope))
 }
 
 fn archived_filter(op: BulkOp, show_archived: bool) -> Option<&'static str> {
     (op == BulkOp::DeleteStopped || show_archived).then_some("include")
 }
 
-fn task_plan(
-    agents: &[UiAgent],
-    op: BulkOp,
-    scope: Option<&str>,
-    checkouts: &[Checkout],
-) -> BulkPlan {
+fn task_plan(agents: &[UiAgent], op: BulkOp, scope: Option<&str>) -> BulkPlan {
     let mut seen = HashSet::new();
     let roots: Vec<&UiAgent> = agents
         .iter()
@@ -304,7 +279,7 @@ fn task_plan(
             agent.parent.is_none()
                 && !agent.native_child
                 && seen.insert(agent.id.as_str())
-                && in_scope(agent, scope, checkouts)
+                && in_scope(agent, scope)
         })
         .collect();
     let mut plan = BulkPlan::default();
@@ -1207,6 +1182,8 @@ mod tests {
             chat: false,
             archived: true,
             pending: false,
+            organization: None,
+            tags: Vec::new(),
         }
     }
 
@@ -1221,33 +1198,37 @@ mod tests {
             stopped("a2", Some("a1"), "/checkout"),
             stopped("a3", Some("a2"), "/checkout"),
         ];
-        let plan = task_plan(&agents, BulkOp::DeleteStopped, None, &[]);
+        let plan = task_plan(&agents, BulkOp::DeleteStopped, None);
         assert_eq!(plan.items.len(), 1);
         assert_eq!(plan.items[0].id, "a1");
         assert_eq!(plan.affected_tasks, 3);
     }
 
     #[test]
-    fn scope_requires_exact_verified_workspace_even_when_labels_match() {
-        let mut verified = Checkout::new("/repo/linked", "/repo/.git");
-        verified.main = Some(false);
-        let mut shadow = stopped("a1", None, "/repo/linked/other-repo");
-        shadow.project_id = verified.path.clone();
-        let linked = stopped("a2", None, &verified.path);
-        let stale = Checkout::new("/unverified", "/repo/.git");
-        let unverified = stopped("a3", None, &stale.path);
-        let plan = task_plan(
-            &[shadow, linked, unverified],
-            BulkOp::DeleteStopped,
-            Some("repo:/repo/.git"),
-            &[verified, stale],
+    fn scope_follows_the_daemons_organization_group_never_a_path() {
+        // a1 shares the registered checkout's path but the daemon reads it
+        // in the no-project bucket (a legacy label); a2 reads in the
+        // project; a3 reads in another project.
+        let shadow = stopped("a1", None, "/repo");
+        let mut placed = stopped("a2", None, "/repo/wt-k1");
+        placed.organization = Some("app".to_owned());
+        let mut other = stopped("a3", None, "/repo");
+        other.organization = Some("tools".to_owned());
+        let agents = [shadow, placed, other];
+        let ids = |plan: BulkPlan| -> Vec<String> {
+            plan.items.into_iter().map(|item| item.id).collect()
+        };
+        assert_eq!(
+            ids(task_plan(&agents, BulkOp::DeleteStopped, Some("org:app"))),
+            ["a2"]
         );
         assert_eq!(
-            plan.items
-                .iter()
-                .map(|item| item.id.as_str())
-                .collect::<Vec<_>>(),
-            ["a2"]
+            ids(task_plan(
+                &agents,
+                BulkOp::DeleteStopped,
+                Some(nav::OTHER_LOCATIONS)
+            )),
+            ["a1"]
         );
     }
     fn missing_pick(project: &str, checkout: &str) -> Pick {

@@ -25,6 +25,10 @@
 //!
 //! Rename writes an owner display name (`[desktop] display_names`); it
 //! renames what the sidebar shows, not a registration or an Agent record.
+//! Attach to project, Detach from project (chats) and Tags (any task) call
+//! `chat.attach`, `chat.detach` and `chat.tag` (#657 step 5): placement
+//! and tags only, never execution authority; the sidebar reads the result
+//! back from `chat.organization` and the listed rows.
 //! Archive and Delete call `agent.archive` / `agent.delete` and Remove
 //! project the settings writer's `projects` section (k92 contract §2).
 
@@ -44,6 +48,9 @@ pub(super) enum Target {
         collapsed: bool,
     },
     Agent(UiAgent),
+    /// The inline tag editor of an Agent (`chat.tag`), in the rename
+    /// field's place.
+    Tags(UiAgent),
 }
 
 impl Target {
@@ -51,14 +58,14 @@ impl Target {
     fn name_key(&self) -> String {
         match self {
             Self::Project { key, .. } => format!("project:{key}"),
-            Self::Agent(agent) => format!("agent:{}", agent.id),
+            Self::Agent(agent) | Self::Tags(agent) => format!("agent:{}", agent.id),
         }
     }
 
     fn title(&self) -> &str {
         match self {
             Self::Project { name, .. } => name,
-            Self::Agent(agent) => &agent.title,
+            Self::Agent(agent) | Self::Tags(agent) => &agent.title,
         }
     }
 }
@@ -84,6 +91,14 @@ pub(super) enum Action {
     Delete,
     CopyId,
     More,
+    /// "Attach to project…": open the registered projects (a chat).
+    AttachMenu,
+    /// Attach the chat to the opened list's project at this index.
+    AttachTo(usize),
+    /// Return the chat to the no-project bucket.
+    Detach,
+    /// Edit the Agent's tags inline.
+    EditTags,
 }
 
 #[derive(Clone, Debug)]
@@ -141,6 +156,9 @@ pub(super) struct MenuState {
     /// The keyboard-highlighted row (arrow keys, Enter activates).
     pub(super) highlight: Option<usize>,
     pub(super) more: bool,
+    /// "Attach to project…" is open: the registered projects as it
+    /// captured them, `(project, name)`.
+    pub(super) attach: Option<Vec<(String, String)>>,
     pub(super) hovered: Option<String>,
     /// The target being renamed and the text typed so far.
     pub(super) renaming: Option<(Target, String)>,
@@ -228,6 +246,7 @@ impl DesktopApp {
             MenuMsg::Requested(target, x, y) => {
                 self.close_popover();
                 self.menu.more = false;
+                self.menu.attach = None;
                 self.menu.highlight = None;
                 self.menu.open = Some((target, x, y));
                 crate::shortcuts::set_popover(crate::shortcuts::Popover::Menu);
@@ -293,6 +312,13 @@ impl DesktopApp {
                 self.menu.more = !self.menu.more;
                 self.menu.highlight = None;
             }
+            MenuMsg::Chosen(Action::AttachMenu) => {
+                self.menu.attach = match self.menu.attach.take() {
+                    Some(_) => None,
+                    None => Some(self.attach_choices()),
+                };
+                self.menu.highlight = None;
+            }
             MenuMsg::Chosen(action) => {
                 let Some((target, _, _)) = self.menu.open.take() else {
                     return;
@@ -306,7 +332,17 @@ impl DesktopApp {
                 }
             }
             MenuMsg::RenameCommitted => {
-                if let Some((target, typed)) = self.menu.renaming.take() {
+                if let Some((Target::Tags(agent), typed)) = self.menu.renaming.clone() {
+                    self.menu.renaming = None;
+                    self.submit_organize(
+                        "Tags".to_owned(),
+                        client::Organize::Tag {
+                            agent: agent.id.clone(),
+                            tags: nav::parse_tags(&typed),
+                        },
+                        context,
+                    );
+                } else if let Some((target, typed)) = self.menu.renaming.take() {
                     if self.prefs.rename(&target.name_key(), &typed) {
                         self.prefs_rev += 1;
                         self.save_preferences(context);
@@ -327,6 +363,8 @@ impl DesktopApp {
             MenuMsg::ArchivedToggled => {
                 self.nav.show_archived = !self.nav.show_archived;
                 self.load_agents(context, None);
+                // The group totals follow the archived filter too.
+                self.load_organization(context);
             }
             MenuMsg::Done(what, outcome) => {
                 self.settle_mutation(
@@ -796,6 +834,37 @@ impl DesktopApp {
             (Action::MoveUnder, Target::Agent(agent)) => {
                 self.move_update(super::move_ui::MoveMsg::Open(agent.clone()), context);
             }
+            (Action::AttachTo(index), Target::Agent(agent)) => {
+                let chosen = self
+                    .menu
+                    .attach
+                    .take()
+                    .and_then(|choices| choices.into_iter().nth(index));
+                if let Some((project, name)) = chosen {
+                    self.submit_organize(
+                        format!("Attach to {name}"),
+                        client::Organize::Attach {
+                            agent: agent.id.clone(),
+                            project,
+                        },
+                        context,
+                    );
+                }
+            }
+            (Action::Detach, Target::Agent(agent)) => {
+                self.submit_organize(
+                    "Detach from project".to_owned(),
+                    client::Organize::Detach {
+                        agent: agent.id.clone(),
+                    },
+                    context,
+                );
+            }
+            (Action::EditTags, Target::Agent(agent)) => {
+                let typed = agent.tags.join(", ");
+                self.menu.renaming = Some((Target::Tags(agent.clone()), typed));
+                self.focus_rename(5, context);
+            }
             (Action::Resume, Target::Agent(agent)) => {
                 if self.submitting() {
                     self.alert("Waiting for the last action to settle.");
@@ -876,6 +945,54 @@ impl DesktopApp {
         let _task = context.spawn_background(move |_| {
             Message::Menu(MenuMsg::Done(what, work(&data_dir, mutation_id)))
         });
+    }
+
+    /// One organization mutation (`chat.attach`, `chat.detach`,
+    /// `chat.tag`) with a ledger-held id; the refresh after it reads the
+    /// committed placement back.
+    fn submit_organize(
+        &mut self,
+        what: String,
+        change: client::Organize,
+        context: &ComponentContext<Self>,
+    ) {
+        let key = format!("organize:{change:?}");
+        self.submit_lifecycle(&what, key, context, move |data_dir, id| {
+            client::block_on(client::organize(data_dir, id, change)).map(|reply| {
+                reply
+                    .links
+                    .iter()
+                    .map(|link| {
+                        let place = link.project_link.as_deref().unwrap_or("no project");
+                        if link.tags.is_empty() {
+                            format!("{} in {place}", link.agent)
+                        } else {
+                            format!("{} in {place}, tags {}", link.agent, link.tags.join(", "))
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            })
+        });
+    }
+
+    /// The registered projects a chat can be attached to, as the sidebar
+    /// names them, in the daemon's order.
+    fn attach_choices(&self) -> Vec<(String, String)> {
+        let checkouts = self.checkouts();
+        self.nav
+            .organization
+            .registered()
+            .filter_map(|group| {
+                let project = group.project.clone()?;
+                let checkout = group.registration.as_ref()?.checkout.clone();
+                let name = self
+                    .prefs
+                    .display_name(&format!("project:{}", nav::group_key(Some(&project))))
+                    .map_or_else(|| nav::place_label(&checkout, &checkouts), str::to_owned);
+                Some((project, name))
+            })
+            .collect()
     }
 
     /// Focus the rename field once it exists (after the next render).
@@ -975,6 +1092,7 @@ impl DesktopApp {
                 }
                 entries
             }
+            Target::Tags(_) => Vec::new(),
             Target::Agent(agent) => {
                 if self.menu.more && self.menu.open.is_some() {
                     return std::iter::once((
@@ -984,6 +1102,28 @@ impl DesktopApp {
                         false,
                     ))
                     .chain(self.developer_entries(target))
+                    .collect();
+                }
+                if let Some(choices) = self
+                    .menu
+                    .attach
+                    .as_ref()
+                    .filter(|_| self.menu.open.is_some())
+                {
+                    return std::iter::once((
+                        Action::AttachMenu,
+                        "Back".to_owned(),
+                        m3::glyph::BACK,
+                        false,
+                    ))
+                    .chain(choices.iter().enumerate().map(|(index, (_, name))| {
+                        (
+                            Action::AttachTo(index),
+                            name.clone(),
+                            m3::glyph::FOLDER,
+                            false,
+                        )
+                    }))
                     .collect();
                 }
                 let mut entries = vec![(
@@ -997,6 +1137,39 @@ impl DesktopApp {
                         Action::MoveUnder,
                         "Move under another task…".to_owned(),
                         m3::glyph::MOVE,
+                        false,
+                    ));
+                }
+                // Placement and tags (`chat.attach`/`chat.detach`/`chat.tag`):
+                // attach and detach place chats; tags group any task.
+                if agent.chat
+                    && !agent.pending
+                    && self.nav.organization.registered().next().is_some()
+                {
+                    entries.push((
+                        Action::AttachMenu,
+                        "Attach to project…".to_owned(),
+                        m3::glyph::FOLDER,
+                        false,
+                    ));
+                }
+                if agent.chat && agent.organization.is_some() {
+                    entries.push((
+                        Action::Detach,
+                        "Detach from project".to_owned(),
+                        m3::glyph::FOLDER,
+                        false,
+                    ));
+                }
+                if !agent.native_child && !agent.pending {
+                    entries.push((
+                        Action::EditTags,
+                        if agent.tags.is_empty() {
+                            "Tags…".to_owned()
+                        } else {
+                            format!("Tags: {}…", agent.tags.join(", "))
+                        },
+                        m3::glyph::RENAME,
                         false,
                     ));
                 }
@@ -1334,6 +1507,12 @@ impl DesktopApp {
         context: &mut ViewContext<Self>,
         palette: Palette,
     ) -> View {
+        let tags = matches!(self.menu.renaming, Some((Target::Tags(_), _)));
+        let (placeholder, field, save, cancel) = if tags {
+            ("Tags, comma-separated", "Tags", "Save tags", "Cancel tags")
+        } else {
+            ("Name", "Rename", "Save name", "Cancel rename")
+        };
         Grid::new()
             .margin(Thickness::new(
                 indent,
@@ -1347,8 +1526,8 @@ impl DesktopApp {
                 m3::field()
                     .element_ref(&self.menu.rename_ref)
                     .text(typed.to_owned())
-                    .placeholder_text("Name")
-                    .automation_name("Rename")
+                    .placeholder_text(placeholder)
+                    .automation_name(field)
                     .on_text_changed(
                         context.callback(|text| Message::Menu(MenuMsg::RenameChanged(text))),
                     ),
@@ -1356,14 +1535,14 @@ impl DesktopApp {
                     .grid_column(1)
                     .width(tokens::height::CONTROL)
                     .height(tokens::height::CONTROL)
-                    .automation_name("Save name")
+                    .automation_name(save)
                     .on_click(context.message(Message::Menu(MenuMsg::RenameCommitted)))
                     .content(m3::icon(m3::glyph::CHECK)),
                 m3::icon_button(palette)
                     .grid_column(2)
                     .width(tokens::height::CONTROL)
                     .height(tokens::height::CONTROL)
-                    .automation_name("Cancel rename")
+                    .automation_name(cancel)
                     .on_click(context.message(Message::Menu(MenuMsg::RenameCancelled)))
                     .content(m3::icon(m3::glyph::CLOSE)),
             ))

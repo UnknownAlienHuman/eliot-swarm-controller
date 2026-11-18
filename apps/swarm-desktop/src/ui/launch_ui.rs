@@ -123,6 +123,32 @@ pub(super) enum LaunchMsg {
     Reveal(u64),
     /// Put the keyboard in the open popover's search field (tries left).
     FocusField(u8),
+    /// The capacity notice's Queue it: submit the refused launch as a
+    /// queued intent (`launch.enqueue`).
+    QueueRequested,
+    /// `launch.enqueue` settled.
+    Queued(MutationResult<eliot_core::api::LaunchIntentView>),
+}
+
+/// A launch the daemon refused for full capacity, kept so the notice's
+/// Queue it submits exactly that launch as a queued intent.
+#[derive(Clone, Debug)]
+pub(super) struct QueueOffer {
+    /// The notice it belongs to: Queue it shows only beside this text.
+    pub(super) alert: String,
+    target: client::LaunchTarget,
+    place: client::LaunchPlace,
+    text: String,
+    launch_rev: u64,
+}
+
+/// The launch being submitted, for a Queue it after a capacity refusal.
+#[derive(Clone, Debug)]
+pub(super) struct Submission {
+    target: client::LaunchTarget,
+    place: client::LaunchPlace,
+    text: String,
+    launch_rev: u64,
 }
 
 /// The new-task draft and its context.
@@ -178,6 +204,13 @@ pub(super) struct LaunchState {
     pub(super) row_ref: ElementRef<Button>,
     pub(super) reveal_epoch: u64,
     pub(super) reveal_after: u64,
+    /// The launch in flight (its target, place and text).
+    pub(super) submission: Option<Submission>,
+    /// A capacity refusal's Queue it offer.
+    pub(super) queue_offer: Option<QueueOffer>,
+    /// Intents this window queued, with their text, until the arbiter
+    /// admits or refuses them.
+    pub(super) watched: Vec<(String, String)>,
 }
 
 impl LaunchState {
@@ -579,6 +612,8 @@ impl DesktopApp {
             LaunchMsg::FocusField(tries) => self.focus_field(tries, context),
             LaunchMsg::LaunchRequested => self.request_launch(context),
             LaunchMsg::LaunchSubmitted(outcome) => self.launch_submitted(outcome, context),
+            LaunchMsg::QueueRequested => self.request_queue(context),
+            LaunchMsg::Queued(outcome) => self.queued(outcome, context),
             LaunchMsg::ProfilesListed(result) => match result {
                 Ok(list) => {
                     self.launch.profile_summaries = list.profiles.clone();
@@ -1041,6 +1076,13 @@ impl DesktopApp {
         self.in_flight_key = Some(key);
         let launch_rev = self.launch.launch_rev;
         self.alert = None;
+        self.launch.queue_offer = None;
+        self.launch.submission = Some(Submission {
+            target: target.clone(),
+            place: place.clone(),
+            text: text.clone(),
+            launch_rev,
+        });
         // Shown at once: the message and what happens now, until the
         // conversation opens (no empty pause after Send).
         self.launch.starting = Some((text.clone(), starting_label(submitted.harness.as_deref())));
@@ -1138,11 +1180,153 @@ impl DesktopApp {
             }
             Err(error) => {
                 self.restore_launch_text(starting);
-                self.alert(format!(
+                let text = format!(
                     "Start refused: {}",
                     crate::settings_model::launch_error(&error)
-                ));
+                );
+                // Full capacity is not a dead end: the notice offers the
+                // same launch as a queued intent the arbiter admits when a
+                // slot frees (`launch.enqueue`); nothing retries by itself.
+                let offer = (error.code == "capacity_unavailable")
+                    .then(|| self.launch.submission.take())
+                    .flatten()
+                    .map(|submission| QueueOffer {
+                        alert: format!("{text}. Queue it to start when a slot frees."),
+                        target: submission.target,
+                        place: submission.place,
+                        text: submission.text,
+                        launch_rev: submission.launch_rev,
+                    });
+                match offer {
+                    Some(offer) => {
+                        self.alert(offer.alert.clone());
+                        self.launch.queue_offer = Some(offer);
+                    }
+                    None => self.alert(text),
+                }
             }
+        }
+        self.launch.submission = None;
+    }
+
+    /// Queue it: the refused launch as a durable intent with its own
+    /// ledger-held id (a retry after an unconfirmed reply reads back).
+    fn request_queue(&mut self, context: &ComponentContext<Self>) {
+        if self.submitting() {
+            self.alert("Waiting for the last action to settle.");
+            return;
+        }
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        let Some(offer) = self.launch.queue_offer.clone() else {
+            return;
+        };
+        let key = format!(
+            "enqueue:{:?}:{:?}:{}",
+            offer.target, offer.place, offer.launch_rev
+        );
+        let mutation_id = self.ledger.id_for(&key);
+        self.in_flight_key = Some(key);
+        self.set_status(format!("Queueing the launch ({mutation_id})…"));
+        let _task = context.spawn_background(move |_| {
+            Message::Launch(LaunchMsg::Queued(client::block_on(client::enqueue_launch(
+                &data_dir,
+                mutation_id,
+                offer.target,
+                &offer.place,
+                Some(offer.text),
+            ))))
+        });
+    }
+
+    fn queued(
+        &mut self,
+        outcome: MutationResult<eliot_core::api::LaunchIntentView>,
+        context: &ComponentContext<Self>,
+    ) {
+        self.settle_mutation(
+            outcome
+                .as_ref()
+                .err()
+                .is_none_or(|error| !crate::state::uncertain(error)),
+        );
+        match outcome {
+            Ok(intent) => {
+                let offer = self.launch.queue_offer.take();
+                // The queued intent carries the text now; it comes back if
+                // the arbiter refuses the intent.
+                if let Some(offer) = offer {
+                    if offer.launch_rev == self.launch.launch_rev {
+                        self.launch.launch_text.clear();
+                    }
+                    self.launch.watched.push((intent.id.clone(), offer.text));
+                }
+                self.alert = None;
+                let wait = intent
+                    .reason
+                    .as_ref()
+                    .map_or_else(|| "waiting for its turn".to_owned(), nav::wait_reason_words);
+                self.set_status(format!("Queued launch {}: {wait}.", intent.id));
+                // The project's queued launches show their wait reason.
+                self.load_organization(context);
+            }
+            Err(error) if crate::state::uncertain(&error) => self.alert(format!(
+                "Queueing not confirmed (Queue it again reuses its id): {}",
+                error.user_message()
+            )),
+            Err(error) => {
+                self.launch.queue_offer = None;
+                self.alert(format!("Not queued: {}", error.user_message()));
+            }
+        }
+    }
+
+    /// Report what became of this window's queued launches: an admitted
+    /// one lists with the Agents, a refused one says why and gives its
+    /// text back to an empty composer. A queued one stays watched.
+    pub(super) fn settle_queued_launches(&mut self, context: &ComponentContext<Self>) {
+        use eliot_core::api::LaunchIntentState;
+        let intents = self.nav.organization.intents.clone();
+        let mut admitted = false;
+        for intent in intents {
+            let Some(index) = self
+                .launch
+                .watched
+                .iter()
+                .position(|(id, _)| *id == intent.id)
+            else {
+                continue;
+            };
+            match intent.state {
+                LaunchIntentState::Queued => {}
+                LaunchIntentState::Admitted => {
+                    self.launch.watched.remove(index);
+                    admitted = true;
+                    self.set_status(format!(
+                        "Queued launch {} started ({}).",
+                        intent.id,
+                        intent
+                            .command_id
+                            .as_deref()
+                            .unwrap_or("command not read back")
+                    ));
+                }
+                LaunchIntentState::Rejected => {
+                    let (_, text) = self.launch.watched.remove(index);
+                    if self.launch.launch_text.is_empty() {
+                        self.launch.launch_text = text;
+                    }
+                    let reason = intent
+                        .reason
+                        .as_ref()
+                        .map_or_else(|| "no reason read back".to_owned(), nav::wait_reason_words);
+                    self.alert(format!("Queued launch {} refused: {reason}.", intent.id));
+                }
+            }
+        }
+        if admitted {
+            self.load_agents(context, None);
         }
     }
 
@@ -1325,6 +1509,10 @@ impl LaunchOutcome {
             tokens: None,
             chat: self.submitted.chat,
             archived: false,
+            // The open row renders above the list; the daemon's group
+            // arrives with the list read.
+            organization: None,
+            tags: Vec::new(),
         }
     }
 }

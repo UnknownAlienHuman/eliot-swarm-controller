@@ -13,13 +13,17 @@ use std::path::{Path, PathBuf};
 use eliot_core::api::{
     AgentArchiveRequest, AgentDeleteRequest, AgentGetRequest, AgentGetResponse, AgentListRequest,
     AgentListResponse, AgentResultRequest, AgentResultResponse, AgentTreeResponse, ArchivedFilter,
-    CommandCancelRequest, CommandCancelResponse, CommandChildrenRequest, CommandChildrenResponse,
-    CommandGetRequest, CommandResolution, CommandResolveRequest, CommandResolveResponse,
-    CommandSubmitRequest, CommandSubmitResponse, DiagnoseRequest, DiagnoseResponse,
-    EventsBoundsRequest, EventsBoundsResponse, EventsFilter, EventsReadRequest, EventsReadResponse,
+    ChatAttachRequest, ChatDetachRequest, ChatOrganizationMutationResponse,
+    ChatOrganizationRequest, ChatOrganizationResponse, ChatTagRequest, CommandCancelRequest,
+    CommandCancelResponse, CommandChildrenRequest, CommandChildrenResponse, CommandGetRequest,
+    CommandResolution, CommandResolveRequest, CommandResolveResponse, CommandSubmitRequest,
+    CommandSubmitResponse, DiagnoseRequest, DiagnoseResponse, EventsBoundsRequest,
+    EventsBoundsResponse, EventsFilter, EventsReadRequest, EventsReadResponse,
     EventsSubscribeRequest, EventsSubscribeResponse, HandoffRequest, HandoffResponse,
-    HarnessModelsRequest, HarnessModelsResponse, ReparentRequest, ReparentResponse, SwitchRequest,
-    SwitchResponse, UsageSummaryRequest, UsageSummaryResponse,
+    HarnessModelsRequest, HarnessModelsResponse, LaunchIntentGetRequest, LaunchIntentView,
+    LaunchQueueListRequest, LaunchQueueRequest, LaunchQueueView, OrgGroupView,
+    ProjectOverviewEntry, ProjectOverviewRequest, ProjectOverviewResponse, ReparentRequest,
+    ReparentResponse, SwitchRequest, SwitchResponse, UsageSummaryRequest, UsageSummaryResponse,
 };
 use eliot_core::{Command, Error, Result};
 use futures_util::StreamExt;
@@ -517,6 +521,188 @@ pub async fn submit_launch(
     place: &LaunchPlace,
     text: Option<String>,
 ) -> Result<CommandSubmitResponse> {
+    let args = launch_args(target, place, text)?;
+    submit(
+        data_dir,
+        &submit_request(mutation_id, None, "launch", args)?,
+    )
+    .await
+}
+
+/// `launch.enqueue`: the same launch arguments as a durable intent the
+/// daemon's fair arbiter admits when capacity frees (`docs/spec/api.md`,
+/// Command admission). The intent has no Agent or command until admitted;
+/// an exact retry with the same id reads the current intent back.
+pub async fn enqueue_launch(
+    data_dir: &Path,
+    mutation_id: String,
+    target: LaunchTarget,
+    place: &LaunchPlace,
+    text: Option<String>,
+) -> Result<LaunchIntentView> {
+    let request = LaunchQueueRequest {
+        id: mutation_id,
+        args: launch_args(target, place, text)?,
+    };
+    request.validate()?;
+    let reply: LaunchIntentView =
+        eliot_daemon::client_call_typed(data_dir, "launch.enqueue", &request).await?;
+    if reply.id != request.id {
+        return Err(unverified(Error::new(
+            "unknown",
+            "queued launch reply names another intent",
+        )));
+    }
+    Ok(reply)
+}
+
+/// Most `chat.organization` group pages and `project.overview` pages one
+/// sidebar refresh reads; the daemon pages at 1,000 groups and 1.5 MiB.
+const ORGANIZATION_PAGES: usize = 8;
+
+/// Every `chat.organization` group (projects first, the no-project bucket
+/// last), page by page, under the sidebar's archived filter.
+pub async fn chat_organization(
+    data_dir: &Path,
+    archived: ArchivedFilter,
+) -> Result<Vec<OrgGroupView>> {
+    let mut groups = Vec::new();
+    let mut after = None;
+    for _ in 0..ORGANIZATION_PAGES {
+        let request = ChatOrganizationRequest {
+            project: None,
+            after: after.take(),
+            archived,
+        };
+        request.validate()?;
+        let reply: ChatOrganizationResponse =
+            eliot_daemon::client_call_typed(data_dir, "chat.organization", &request).await?;
+        request.validate_response(&reply)?;
+        groups.extend(reply.groups);
+        if !reply.groups_truncated {
+            return Ok(groups);
+        }
+        after = reply.next_after;
+    }
+    Err(Error::new(
+        "unavailable",
+        "more project groups than one sidebar read pages",
+    ))
+}
+
+/// One project's `project.overview` entry with its exact team totals, page
+/// by page (an index-scoped read; the whole-fleet read is far heavier on a
+/// large store). Detail split across pages keeps the first page's totals
+/// and the workspaces of every page.
+pub async fn project_overview(data_dir: &Path, project: &str) -> Result<Vec<ProjectOverviewEntry>> {
+    let mut entries: Vec<ProjectOverviewEntry> = Vec::new();
+    let mut after = None;
+    for _ in 0..ORGANIZATION_PAGES {
+        let request = ProjectOverviewRequest {
+            project: Some(project.to_owned()),
+            after: after.take(),
+        };
+        request.validate()?;
+        let reply: ProjectOverviewResponse =
+            eliot_daemon::client_call_typed(data_dir, "project.overview", &request).await?;
+        request.validate_response(&reply)?;
+        for entry in reply.projects {
+            match entries
+                .iter_mut()
+                .find(|known| known.project == entry.project)
+            {
+                Some(known) => known.workspaces.extend(entry.workspaces),
+                None => entries.push(entry),
+            }
+        }
+        match reply.next_cursor {
+            Some(cursor) => after = Some(cursor),
+            None => return Ok(entries),
+        }
+    }
+    Ok(entries)
+}
+
+/// `launch.intent.get`: one queued launch intent's current state, also
+/// after the arbiter admitted or refused it.
+pub async fn launch_intent(data_dir: &Path, id: &str) -> Result<LaunchIntentView> {
+    let request = LaunchIntentGetRequest { id: id.to_owned() };
+    request.validate()?;
+    let reply: LaunchIntentView =
+        eliot_daemon::client_call_typed(data_dir, "launch.intent.get", &request).await?;
+    if reply.id != request.id {
+        return Err(Error::new(
+            "unknown",
+            "launch intent reply names another intent",
+        ));
+    }
+    Ok(reply)
+}
+
+/// The first `launch.queue` page: queued interactive intents and
+/// automation assignment waits, each with its wait reason.
+pub async fn launch_queue(data_dir: &Path) -> Result<LaunchQueueView> {
+    let request = LaunchQueueListRequest {
+        project: None,
+        after: None,
+    };
+    request.validate()?;
+    eliot_daemon::client_call_typed(data_dir, "launch.queue", &request).await
+}
+
+/// One organization mutation: placement or tags, never authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Organize {
+    Attach { agent: String, project: String },
+    Detach { agent: String },
+    Tag { agent: String, tags: Vec<String> },
+}
+
+/// `chat.attach`, `chat.detach` or `chat.tag` for one Agent, with the
+/// committed link read back and bound to the request.
+pub async fn organize(
+    data_dir: &Path,
+    mutation_id: String,
+    change: Organize,
+) -> Result<ChatOrganizationMutationResponse> {
+    match change {
+        Organize::Attach { agent, project } => {
+            let request = ChatAttachRequest {
+                id: mutation_id,
+                agents: vec![agent],
+                project,
+            };
+            request.validate()?;
+            let reply = eliot_daemon::client_call_typed(data_dir, "chat.attach", &request).await?;
+            request.validate_response(&reply).map_err(unverified)?;
+            Ok(reply)
+        }
+        Organize::Detach { agent } => {
+            let request = ChatDetachRequest {
+                id: mutation_id,
+                agents: vec![agent],
+            };
+            request.validate()?;
+            let reply = eliot_daemon::client_call_typed(data_dir, "chat.detach", &request).await?;
+            request.validate_response(&reply).map_err(unverified)?;
+            Ok(reply)
+        }
+        Organize::Tag { agent, tags } => {
+            let request = ChatTagRequest {
+                id: mutation_id,
+                agents: vec![agent],
+                tags,
+            };
+            request.validate()?;
+            let reply = eliot_daemon::client_call_typed(data_dir, "chat.tag", &request).await?;
+            request.validate_response(&reply).map_err(unverified)?;
+            Ok(reply)
+        }
+    }
+}
+
+/// The ordinary launch arguments of one launch or queued intent.
+fn launch_args(target: LaunchTarget, place: &LaunchPlace, text: Option<String>) -> Result<Value> {
     if let Some(text) = text.as_deref() {
         check_text(text)?;
     }
@@ -556,11 +742,7 @@ pub async fn submit_launch(
     if let Some(text) = text {
         args["text"] = Value::String(text);
     }
-    submit(
-        data_dir,
-        &submit_request(mutation_id, None, "launch", args)?,
-    )
-    .await
+    Ok(args)
 }
 
 /// Mid-run model/effort overlay for the next turn of exactly the generation

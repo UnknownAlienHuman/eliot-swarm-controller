@@ -291,6 +291,8 @@ mod tests {
             chat: false,
             archived: false,
             pending: false,
+            organization: None,
+            tags: Vec::new(),
         }
     }
 

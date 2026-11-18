@@ -138,6 +138,43 @@ fn organization_roots(conn: &Connection, project: &str, archived: &str) -> Resul
     rows.collect::<rusqlite::Result<_>>().map_err(sql_error)
 }
 
+/// The organization group of one Agent row (aliases `a` for `agents`, `o`
+/// for its `chat_organization` overlay): a chat's placement link when it is
+/// a retained registration, any other Agent's execution project when that
+/// is one, else NULL for the no-project bucket. The projection's per-group
+/// totals and every `agent.list` row read this one expression, so a row
+/// never reads in a different group than the projection counts it.
+const ORGANIZATION_GROUP: &str = "CASE WHEN (a.chat = 1 AND o.project_link IS NOT NULL
+         AND EXISTS(SELECT 1 FROM project_registrations r WHERE r.id = o.project_link))
+    THEN o.project_link
+    WHEN (a.chat = 0
+          AND EXISTS(SELECT 1 FROM project_registrations r WHERE r.id = a.project))
+    THEN a.project ELSE NULL END";
+
+/// One Agent's organization group ([`ORGANIZATION_GROUP`]) and tags, for
+/// its `agent.list` row.
+pub(super) fn agent_organization(
+    conn: &Connection,
+    agent: i64,
+) -> Result<(Option<String>, Vec<String>)> {
+    let (group, raw_tags): (Option<String>, Option<String>) = conn
+        .query_row(
+            &format!(
+                "SELECT {ORGANIZATION_GROUP}, o.tags
+                 FROM agents a LEFT JOIN chat_organization o ON o.agent = a.id
+                 WHERE a.id = ?1"
+            ),
+            [agent],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(sql_error)?;
+    let tags = match raw_tags {
+        Some(raw) => decode_tags(&raw)?,
+        None => Vec::new(),
+    };
+    Ok((group, tags))
+}
+
 /// Project-scoped member predicate shared by the count and the page: chats
 /// group by their overlay link alone (a retained execution label never
 /// places a chat), every other Agent by its execution project.
@@ -438,13 +475,7 @@ impl Store {
         {
             let mut totals = conn
                 .prepare(&format!(
-                    "SELECT CASE WHEN (a.chat = 1 AND o.project_link IS NOT NULL
-                                 AND EXISTS(SELECT 1 FROM project_registrations r WHERE r.id = o.project_link))
-                            THEN o.project_link
-                            WHEN (a.chat = 0
-                                  AND EXISTS(SELECT 1 FROM project_registrations r WHERE r.id = a.project))
-                            THEN a.project ELSE NULL END,
-                        COUNT(*)
+                    "SELECT {ORGANIZATION_GROUP}, COUNT(*)
                      FROM agents a LEFT JOIN chat_organization o ON o.agent = a.id
                      WHERE {archived} GROUP BY 1",
                 ))
@@ -548,6 +579,12 @@ impl Store {
         members_truncated: bool,
         archived: &str,
     ) -> Result<OrgGroupView> {
+        let transfer = match project.as_deref() {
+            Some(project) if projects::project_registration_tx(conn, project)?.is_some() => {
+                project_transfer::open_intent(conn, project)?
+            }
+            _ => None,
+        };
         let (registration, assignment, manager, needs_assignment, conflicting_roots) =
             match project.as_deref() {
                 Some(project) => {
@@ -603,6 +640,7 @@ impl Store {
             needs_assignment,
             conflicting_roots,
             manager,
+            transfer,
             members,
             member_total,
             members_truncated,
@@ -1058,6 +1096,41 @@ mod tests {
             .expect("placed chat");
         assert!(member.placed);
         assert_eq!(member.project_link.as_deref(), Some("alpha"));
+        // The `agent.list` row reads in the same group as the projection,
+        // with its tags; an unregistered execution label reads unplaced.
+        let legacy = launch(
+            &mut store,
+            &Ulid::new().to_string(),
+            "/legacy/wt-k1",
+            "/legacy/wt-k1",
+        );
+        let tag = ChatTagRequest {
+            id: Ulid::new().to_string(),
+            agents: vec![chat.clone()],
+            tags: vec!["inbox".to_owned()],
+        };
+        store.tag_agents("owner", &tag, now()).unwrap();
+        let rows = store
+            .list_agent_summaries(
+                &crate::AgentListFilter::default(),
+                None,
+                100,
+                now(),
+                &eliot_core::SessionGrowthThresholds::default(),
+            )
+            .unwrap();
+        let row = |id: &str| {
+            rows.summaries
+                .iter()
+                .find(|row| row.id == id)
+                .cloned()
+                .expect("listed row")
+        };
+        let chat_row = row(&chat);
+        assert_eq!(chat_row.organization.as_deref(), Some("alpha"));
+        assert_eq!(chat_row.tags, vec!["inbox"]);
+        chat_row.validate().unwrap();
+        assert_eq!(row(&legacy).organization, None);
     }
 
     #[test]

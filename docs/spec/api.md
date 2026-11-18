@@ -525,9 +525,10 @@ detail visibility and capacity semantics.
 ### Chat organization
 
 The owning semantics are [Coordination: Conversation association](coordination.md#conversation-association).
-Owner only, with identical behavior from the CLI (`swarm chat ...`) and MCP
-(`chat.organization`, `chat.attach`, `chat.detach`, `chat.tag`);
-the desktop has no organization entry yet (deferred to step 5).
+Owner only, with identical behavior from the CLI (`swarm chat ...`), MCP
+(`chat.organization`, `chat.attach`, `chat.detach`, `chat.tag`) and the desktop
+(its sidebar projects, and a task's Attach to project, Detach from project and
+Tags).
 Organization is placement, never authority: attach, detach and tag write the
 organizational overlay beside the Agent id through Owner-only Store
 transactions (schema v64: `chat_organization` with placement and tags
@@ -547,7 +548,8 @@ takes the previous page's `next_after`, and a truncated page sets
 `groups_truncated` with the cursor for the next page. Competing roots of one
 project surface as an
 explicit ambiguity (`conflicting_roots`, counted independently of the
-archived filter) and are never auto-reassigned. Chats keep their retained
+archived filter) and are never auto-reassigned. A registered group carries the
+open `project.transfer` intent as `transfer` while its manager drains. Chats keep their retained
 execution labels and group by their overlay link alone; a legacy chat that
 carries an execution project reads in the no-project bucket until attached.
 
@@ -911,6 +913,10 @@ metadata, not proof of liveness for a detached or restarted source. Each
 summary also carries `project_scope`, the authorization namespace the server
 compares for same-project moves and handoffs, present only when it differs
 from `project`; pickers narrow by that scope while the server stays the judge.
+`organization` names the [chat organization](#chat-organization) group the row
+reads in, from the same committed predicate as the projection's group totals
+(absent for the no-project bucket), and `tags` carries its organization tags;
+both are placement, never authority.
 The response carries the required matching `total` ignoring the cursor, the
 required explicit `truncated`, and `next` at the last returned row on every
 nonempty page (empty pages carry no cursor); continue through `next` until the

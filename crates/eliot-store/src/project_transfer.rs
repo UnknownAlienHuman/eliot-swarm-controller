@@ -32,6 +32,11 @@ fn intent(conn: &Connection, project: &str) -> Result<Option<Intent>> {
     .map_err(sql_error)
 }
 
+/// The open transfer intent of a project, for the organization readback.
+pub(super) fn open_intent(conn: &Connection, project: &str) -> Result<Option<String>> {
+    Ok(intent(conn, project)?.map(|active| active.id))
+}
+
 pub(super) fn require_no_intent(conn: &Connection, project: &str) -> Result<()> {
     if let Some(active) = intent(conn, project)? {
         return Err(Error::new(

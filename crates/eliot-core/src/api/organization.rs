@@ -60,7 +60,7 @@ fn validate_agents(agents: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn validate_project_name(value: &str, field: &str) -> Result<()> {
+pub(super) fn validate_project_name(value: &str, field: &str) -> Result<()> {
     if value.is_empty() || value.len() > 1024 || value.contains(char::is_control) {
         return Err(Error::invalid_field(
             field,
@@ -70,7 +70,7 @@ fn validate_project_name(value: &str, field: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_tags(tags: &[String]) -> Result<()> {
+pub(super) fn validate_tags(tags: &[String]) -> Result<()> {
     if tags.len() > MAX_ORG_TAGS {
         return Err(Error::new(
             "invalid",
@@ -210,6 +210,11 @@ pub struct OrgGroupView {
     pub conflicting_roots: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manager: Option<OverviewManagerView>,
+    /// The open `project.transfer` intent draining this project's manager:
+    /// new manager actions, Move and Handoff read `transfer_in_progress`
+    /// until the Owner commits or cancels it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer: Option<String>,
     #[serde(default)]
     pub members: Vec<OrgMemberView>,
     pub member_total: usize,
@@ -232,7 +237,7 @@ impl OrgGroupView {
                     "organization group registration differs",
                 ));
             }
-        } else if self.assignment.is_some() || self.manager.is_some() {
+        } else if self.assignment.is_some() || self.manager.is_some() || self.transfer.is_some() {
             return Err(Error::new(
                 "unknown",
                 "organization group carries team detail without a registration",
@@ -250,6 +255,16 @@ impl OrgGroupView {
             manager
                 .validate()
                 .map_err(|_| Error::new("unknown", "organization response manager is invalid"))?;
+        }
+        if self
+            .transfer
+            .as_ref()
+            .is_some_and(|intent| intent.trim().is_empty() || intent.len() > 256)
+        {
+            return Err(Error::new(
+                "unknown",
+                "organization response transfer is invalid",
+            ));
         }
         {
             let mut seen = std::collections::HashSet::new();
@@ -692,6 +707,7 @@ mod tests {
                 needs_assignment: false,
                 conflicting_roots: Vec::new(),
                 manager: None,
+                transfer: None,
                 members: vec![member],
                 member_total: 1,
                 members_truncated: false,
@@ -725,6 +741,7 @@ mod tests {
             needs_assignment: false,
             conflicting_roots: Vec::new(),
             manager: None,
+            transfer: None,
             members: Vec::new(),
             member_total: 0,
             members_truncated: false,

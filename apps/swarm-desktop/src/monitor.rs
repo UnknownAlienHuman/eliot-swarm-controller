@@ -2028,6 +2028,8 @@ mod tests {
                 project_scope: None,
                 heavy: None,
                 session_growth: None,
+                organization: None,
+                tags: Vec::new(),
             },
             observation: None,
         };
@@ -2088,6 +2090,8 @@ mod tests {
             project_scope: None,
             heavy: None,
             session_growth: None,
+            organization: None,
+            tags: Vec::new(),
         };
         let make_row = |usage: Option<TurnUsage>, usage_scope: Option<&str>| {
             MonitorRow::from_list(&AgentListRow {
@@ -2276,6 +2280,8 @@ mod tests {
                 project_scope: None,
                 heavy: None,
                 session_growth: None,
+                organization: None,
+                tags: Vec::new(),
             },
             observation: None,
         }

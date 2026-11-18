@@ -346,6 +346,7 @@ impl Store {
             )
             .optional()
             .map_err(sql_error)?;
+        let (organization, tags) = organization::agent_organization(&self.connection, record.id)?;
         Ok(AgentSummary {
             archived: record.archived,
             chat: record.chat,
@@ -388,6 +389,8 @@ impl Store {
             project_scope: record.project_scope,
             heavy,
             session_growth,
+            organization,
+            tags,
         })
     }
 

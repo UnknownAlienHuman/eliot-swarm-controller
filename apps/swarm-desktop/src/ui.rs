@@ -409,6 +409,57 @@ fn load_projects_blocking(data_dir: &Path) -> Fallible<Vec<UiProject>> {
     })
 }
 
+/// The sidebar's organization readbacks on a worker: `chat.organization`
+/// groups, each registered project's `project.overview` team totals (an
+/// index-scoped read per project; the whole-fleet read is far heavier on a
+/// large store), the `launch.queue` waits and this window's queued intents.
+/// Every poll reads them all: an arbiter's intent decision moves no event
+/// watermark, so no earlier read is reused. A failed read becomes an error
+/// line; the others still show.
+fn load_organization_blocking(
+    data_dir: &Path,
+    archived: eliot_core::api::ArchivedFilter,
+    watched: Vec<String>,
+) -> nav::Organization {
+    client::block_on(async {
+        let mut organization = nav::Organization::default();
+        match client::chat_organization(data_dir, archived).await {
+            Ok(groups) => organization.groups = groups,
+            Err(error) => organization
+                .errors
+                .push(format!("Projects not read: {}", error.user_message())),
+        }
+        let projects: Vec<String> = organization
+            .registered()
+            .filter_map(|group| group.project.clone())
+            .collect();
+        for project in projects {
+            match client::project_overview(data_dir, &project).await {
+                Ok(entries) => organization.overview.extend(entries),
+                Err(error) => {
+                    organization
+                        .errors
+                        .push(format!("Team totals not read: {}", error.user_message()));
+                    break;
+                }
+            }
+        }
+        match client::launch_queue(data_dir).await {
+            Ok(queue) => organization.queue = Some(queue),
+            Err(error) => organization
+                .errors
+                .push(format!("Launch queue not read: {}", error.user_message())),
+        }
+        // A failed read keeps the intent watched; the next read retries.
+        for id in watched {
+            if let Ok(intent) = client::launch_intent(data_dir, &id).await {
+                organization.intents.push(intent);
+            }
+        }
+        organization
+    })
+}
+
 /// Whether a folder is provably gone (an unreadable one is not "missing").
 fn folder_missing(folder: &str) -> bool {
     matches!(
@@ -686,6 +737,8 @@ impl Component for DesktopApp {
             nav: shell_ui::ShellState {
                 selection: Selection::default(),
                 projects: Vec::new(),
+                organization: nav::Organization::default(),
+                organization_loading: false,
                 agents: Vec::new(),
                 branches: HashMap::new(),
                 expanded: HashSet::new(),

@@ -156,6 +156,8 @@ impl DesktopApp {
                                 chat: row.chat,
                                 archived: false,
                                 pending: false,
+                                organization: None,
+                                tags: Vec::new(),
                             })
                     });
                 if let Some(agent) = agent {
