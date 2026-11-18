@@ -345,6 +345,14 @@ qualification is incomplete; do not describe it as feature complete.
       - Swarm adds **no backend-specific integrations**: no Strata, Unsloth Studio, LM Studio, llama.cpp, Ollama or vLLM presets, and no management of model servers. The existing `eliot-local` OpenCode path is reduced to one generic OpenAI-compatible provider shape. #408's backend-specific scope is closed.
       - Completion: one real local-model turn per supported harness on an endpoint the owner provides.
 
+- [ ] **Zed harness (#720): postponed and frozen.** Owner decision, 2026-11-18.
+      - **Why:** the installed Zed (1.28.1) can't run its native agent headless, and it exposes no agent ACP server. The #720 design needs a separate host built from Zed's sources. Swarm doesn't build Zed.
+      - **Frozen sources:**
+        - branch `freeze/zed-native-p1`: the #720 stage-1 `plugins/zed` adapter, never run against a built host;
+        - branch `freeze/zed-eval-cli`: the earlier one-shot `eval-cli` batch runner;
+        - the host crate stays outside this repository, as a patch on Zed `761786a4`.
+      - **Resume when Zed releases a headless agent mode with ACP.** Start from #720 and the frozen branches, against the installed release. Until then, no Zed work.
+
 - [ ] **Failure diagnostics that say why and where (#384).** Typed `where`/`origin`
       on every settled failure, sanitized daemon log with standard/debug modes,
       crash markers surfaced in `daemon.status`, startup output and `swarm why`,
