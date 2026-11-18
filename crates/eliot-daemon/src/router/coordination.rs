@@ -446,15 +446,20 @@ impl Router {
             NoticeKind::Mail => "mail",
             NoticeKind::Claim => "claim",
         };
+        let has_inline = claim.inline_text.is_some();
         let text = claim
             .inline_text
             .unwrap_or_else(|| notice_text(claim.kind, claim.count));
+        let mut args = json!({"text": text, "notice_kind": notice_kind});
+        if has_inline {
+            args["inline_digest"] = json!(true);
+        }
         let params = json!({
             "id": notice_id,
             "target": recipient,
             "verb": "send",
             "expected_generation": claim.generation,
-            "args": {"text": text, "notice_kind": notice_kind},
+            "args": args,
         });
         if self.submit(&params, &Principal::Owner).await.is_err() {
             let mut store = self.inner.store.lock().await;

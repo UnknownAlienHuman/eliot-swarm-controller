@@ -79,6 +79,7 @@ fn wait_request_for_row(row: &DigestRow) -> SwarmWaitRequest {
     SwarmWaitRequest::new(row.commands.clone(), turns, row.mode.clone(), 0)
 }
 
+#[cfg(test)]
 fn masked_results(results: Vec<WaitEntryResult>, hidden: &[bool]) -> Vec<WaitEntryResult> {
     results
         .into_iter()
@@ -166,7 +167,14 @@ impl Router {
         // read `not_visible` now and stay masked at delivery.
         let wait_request = wait_request_for_digest(&request);
         let snapshot = self
-            .wait_snapshot(&wait_request, principal, None)
+            .wait_snapshot_scoped(
+                &wait_request,
+                principal,
+                None,
+                None,
+                Some(&request.to),
+                true,
+            )
             .await?
             .results;
         let hidden: Vec<bool> = snapshot
@@ -182,7 +190,7 @@ impl Router {
                 .row
         };
         if let Some(mail_id) = row.delivered_mail_id.clone() {
-            let results = self.digest_owner_results(&row).await?;
+            let results = self.digest_scoped_results(&row).await?;
             let response = delivered_response(&row, mail_id, results)?;
             request.validate_response(&response)?;
             return serde_json::to_value(response)
@@ -213,14 +221,18 @@ impl Router {
             .map_err(|_| Error::new("internal", "swarm.digest response could not be encoded"))
     }
 
-    async fn digest_owner_results(&self, row: &DigestRow) -> Result<Vec<WaitEntryResult>> {
+    async fn digest_scoped_results(&self, row: &DigestRow) -> Result<Vec<WaitEntryResult>> {
         let wait_request = wait_request_for_row(row);
-        let owner = Principal::Owner;
-        let results = self
-            .wait_snapshot(&wait_request, &owner, None)
-            .await?
-            .results;
-        Ok(masked_results(results, &row.hidden))
+        self.wait_snapshot_scoped(
+            &wait_request,
+            &Principal::Owner,
+            None,
+            Some(&row.hidden),
+            Some(&row.parent),
+            true,
+        )
+        .await
+        .map(|snapshot| snapshot.results)
     }
 
     /// Deliver one pending digest when its mode condition holds. Returns
@@ -240,10 +252,10 @@ impl Router {
             }
         };
         if let Some(mail_id) = row.delivered_mail_id.clone() {
-            let results = self.digest_owner_results(&row).await?;
+            let results = self.digest_scoped_results(&row).await?;
             return Ok(Some(delivered_response(&row, mail_id, results)?));
         }
-        let results = self.digest_owner_results(&row).await?;
+        let results = self.digest_scoped_results(&row).await?;
         if !digest_mode_completed(row.mode.as_str(), &results) {
             return Ok(None);
         }
@@ -540,131 +552,158 @@ mod tests {
         req.validate().unwrap();
     }
 
-    #[tokio::test]
-    async fn self_digest_wake_carries_answers_and_marks_read_on_turn_started() {
+    fn test_router() -> Router {
         use crate::bus::Bus;
-        use eliot_core::{NativeEvent, SourceBatch, SubmitCommand, api::MailInboxResponse};
         use std::path::PathBuf;
         use tokio::sync::Mutex as AsyncMutex;
 
         let store = eliot_store::Store::open(std::path::Path::new(":memory:")).unwrap();
-        let router = Router::new(
+        Router::new(
             PathBuf::from("synthetic-data-root"),
             "owner-credential".to_owned(),
             std::sync::Arc::new(AsyncMutex::new(store)),
             Bus::new(16),
-        );
+        )
+    }
 
-        let spawn_ready = |router: Router, parent: Option<String>| async move {
-            let store_handle = std::sync::Arc::clone(&router.inner.store);
-            let mut store = store_handle.lock().await;
-            let now = now_ms();
-            let launch_id = ulid::Ulid::new().to_string();
-            let mut args = json!({
-                "project": "app",
-                "workspace": "synthetic-workspace",
-                "harness": "codex",
-                "profile": "fixture",
-                "profile_snapshot": {"control": "tree"},
-            });
-            if let Some(parent_id) = parent {
-                args["parent"] = json!(parent_id);
-            }
-            let admission = store
-                .submit(
-                    "owner",
-                    SubmitCommand {
-                        id: launch_id.clone(),
-                        target: None,
-                        selector: None,
-                        verb: "launch".to_owned(),
-                        args,
-                        expected_generation: Some(0),
-                        expected_turn_id: None,
-                        request_id: None,
-                        probe: false,
-                    },
-                    now,
-                )
-                .expect("admit launch");
-            let agent = admission.command.target.expect("launch target");
-            store.dispatch(&launch_id, now).expect("dispatch launch");
-            crate::test_support::install_fixture_sources(&mut store, &agent, &launch_id, 1, now);
-            store
-                .put_batch(
-                    SourceBatch {
-                        batch_id: ulid::Ulid::new().to_string(),
-                        agent_id: agent.clone(),
-                        generation: 1,
-                        source: "stream".to_owned(),
-                        events: vec![NativeEvent {
-                            ts: None,
-                            kind: "session.ready".to_owned(),
-                            native_id: ulid::Ulid::new().to_string(),
-                            data: json!({"command_id": launch_id}),
-                        }],
-                        cursor: None,
-                    },
-                    now,
-                )
-                .expect("session ready");
-            store
-                .settle(&launch_id, eliot_core::CommandState::Applied, None, now)
-                .expect("settle");
-            drop(store);
-            router
-                .inner
-                .plugin_host
-                .mark_generation_controlled_for_test(&agent, 1);
-            agent
-        };
+    async fn spawn_ready_with_control(
+        router: &Router,
+        project: &str,
+        parent: Option<String>,
+        control: &str,
+    ) -> String {
+        use eliot_core::{NativeEvent, SourceBatch, SubmitCommand};
 
-        let manager = spawn_ready(router.clone(), None).await;
-        let worker = spawn_ready(router.clone(), Some(manager.clone())).await;
-
-        // Complete one turn on the worker with final_text.
-        let worker_send_id = ulid::Ulid::new().to_string();
-        {
-            let mut store = router.inner.store.lock().await;
-            let now = now_ms();
-            let mut send = SubmitCommand::new(worker_send_id.clone(), "send");
-            send.target = Some(worker.clone());
-            send.expected_generation = Some(1);
-            send.args = json!({"text": "compute 2+2"});
-            store.submit("owner", send, now).expect("submit worker");
-            store.dispatch(&worker_send_id, now).expect("dispatch");
-            store
-                .put_batch(
-                    SourceBatch {
-                        batch_id: ulid::Ulid::new().to_string(),
-                        agent_id: worker.clone(),
-                        generation: 1,
-                        source: "stream".to_owned(),
-                        events: vec![
-                            NativeEvent {
-                                ts: None,
-                                kind: "turn.started".to_owned(),
-                                native_id: ulid::Ulid::new().to_string(),
-                                data: json!({"command_id": worker_send_id, "turn_id": "t-w1"}),
-                            },
-                            NativeEvent {
-                                ts: None,
-                                kind: "turn.completed".to_owned(),
-                                native_id: ulid::Ulid::new().to_string(),
-                                data: json!({
-                                    "command_id": worker_send_id,
-                                    "turn_id": "t-w1",
-                                    "status": "completed",
-                                    "final_text": "result is 4",
-                                }),
-                            },
-                        ],
-                        cursor: None,
-                    },
-                    now,
-                )
-                .expect("complete worker");
+        let mut store = router.inner.store.lock().await;
+        let now = now_ms();
+        let launch_id = ulid::Ulid::new().to_string();
+        let mut args = json!({
+            "project": project,
+            "workspace": "synthetic-workspace",
+            "harness": "codex",
+            "profile": "fixture",
+            "profile_snapshot": {"control": control},
+        });
+        if let Some(parent_id) = parent {
+            args["parent"] = json!(parent_id);
         }
+        let admission = store
+            .submit(
+                "owner",
+                SubmitCommand {
+                    id: launch_id.clone(),
+                    target: None,
+                    selector: None,
+                    verb: "launch".to_owned(),
+                    args,
+                    expected_generation: Some(0),
+                    expected_turn_id: None,
+                    request_id: None,
+                    probe: false,
+                },
+                now,
+            )
+            .expect("admit launch");
+        let agent = admission.command.target.expect("launch target");
+        store.dispatch(&launch_id, now).expect("dispatch launch");
+        crate::test_support::install_fixture_sources(&mut store, &agent, &launch_id, 1, now);
+        store
+            .put_batch(
+                SourceBatch {
+                    batch_id: ulid::Ulid::new().to_string(),
+                    agent_id: agent.clone(),
+                    generation: 1,
+                    source: "stream".to_owned(),
+                    events: vec![NativeEvent {
+                        ts: None,
+                        kind: "session.ready".to_owned(),
+                        native_id: ulid::Ulid::new().to_string(),
+                        data: json!({"command_id": launch_id}),
+                    }],
+                    cursor: None,
+                },
+                now,
+            )
+            .expect("session ready");
+        store
+            .settle(&launch_id, eliot_core::CommandState::Applied, None, now)
+            .expect("settle");
+        drop(store);
+        router
+            .inner
+            .plugin_host
+            .mark_generation_controlled_for_test(&agent, 1);
+        agent
+    }
+
+    async fn submit_worker_send(router: &Router, worker: &str) -> String {
+        use eliot_core::SubmitCommand;
+
+        let mut store = router.inner.store.lock().await;
+        let now = now_ms();
+        let send_id = ulid::Ulid::new().to_string();
+        let mut send = SubmitCommand::new(send_id.clone(), "send");
+        send.target = Some(worker.to_owned());
+        send.expected_generation = Some(1);
+        send.args = json!({"text": "compute"});
+        store.submit("owner", send, now).expect("submit worker");
+        store.dispatch(&send_id, now).expect("dispatch");
+        send_id
+    }
+
+    async fn complete_worker_turn(
+        router: &Router,
+        worker: &str,
+        send_id: &str,
+        turn_id: &str,
+        final_text: &str,
+    ) {
+        use eliot_core::{NativeEvent, SourceBatch};
+
+        let mut store = router.inner.store.lock().await;
+        let now = now_ms();
+        store
+            .put_batch(
+                SourceBatch {
+                    batch_id: ulid::Ulid::new().to_string(),
+                    agent_id: worker.to_owned(),
+                    generation: 1,
+                    source: "stream".to_owned(),
+                    events: vec![
+                        NativeEvent {
+                            ts: None,
+                            kind: "turn.started".to_owned(),
+                            native_id: ulid::Ulid::new().to_string(),
+                            data: json!({"command_id": send_id, "turn_id": turn_id}),
+                        },
+                        NativeEvent {
+                            ts: None,
+                            kind: "turn.completed".to_owned(),
+                            native_id: ulid::Ulid::new().to_string(),
+                            data: json!({
+                                "command_id": send_id,
+                                "turn_id": turn_id,
+                                "status": "completed",
+                                "final_text": final_text,
+                            }),
+                        },
+                    ],
+                    cursor: None,
+                },
+                now,
+            )
+            .expect("complete worker");
+    }
+
+    #[tokio::test]
+    async fn self_digest_wake_carries_answers_and_marks_read_on_turn_started() {
+        use eliot_core::{NativeEvent, SourceBatch, api::MailInboxResponse};
+
+        let router = test_router();
+        let manager = spawn_ready_with_control(&router, "app", None, "tree").await;
+        let worker = spawn_ready_with_control(&router, "app", Some(manager.clone()), "self").await;
+        let worker_send_id = submit_worker_send(&router, &worker).await;
+        complete_worker_turn(&router, &worker, &worker_send_id, "t-w1", "result is 4").await;
 
         let digest_id = ulid::Ulid::new().to_string();
         let manager_principal = Principal::Agent {
@@ -690,7 +729,8 @@ mod tests {
         assert_eq!(reply.state, "delivered");
 
         // offer_notice inside mail_send_impl submitted the wake `send` directly
-        // with the digest body (including agent, turn_id, final_text, truncated).
+        // with the digest body (including agent, turn_id, final_text, truncated)
+        // for the recipient's turn, while ordinary command.get readback redacts it.
         let open_notice_id = {
             let store = router.inner.store.lock().await;
             store
@@ -714,6 +754,26 @@ mod tests {
             .expect("wake text");
         assert!(wake_text.contains(&format!("agent {worker}, turn_id t-w1, truncated=false")));
         assert!(wake_text.contains("result is 4"));
+
+        let readback: eliot_core::Command = serde_json::from_value(
+            router
+                .command_get(&json!({"id": open_notice_id}), &Principal::Owner)
+                .await
+                .expect("command.get"),
+        )
+        .expect("decode command");
+        assert_eq!(
+            readback.args.get("redacted").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            !readback
+                .args
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .contains("result is 4")
+        );
 
         // Simulating plugin turn.started on the wake command marks the digest read.
         {
@@ -750,5 +810,349 @@ mod tests {
         )
         .expect("decode inbox");
         assert!(inbox.deliveries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn owner_digest_keeps_status_only_for_out_of_scope_workers() {
+        use eliot_core::api::MailInboxResponse;
+
+        let router = test_router();
+        let recipient = spawn_ready_with_control(&router, "app", None, "tree").await;
+        let in_scope =
+            spawn_ready_with_control(&router, "app", Some(recipient.clone()), "self").await;
+        let out_of_scope = spawn_ready_with_control(&router, "other", None, "self").await;
+
+        let c_in = submit_worker_send(&router, &in_scope).await;
+        let c_out = submit_worker_send(&router, &out_of_scope).await;
+        complete_worker_turn(&router, &in_scope, &c_in, "t-in", "visible answer").await;
+        complete_worker_turn(
+            &router,
+            &out_of_scope,
+            &c_out,
+            "t-out",
+            "cross-scope secret",
+        )
+        .await;
+
+        let digest_id = ulid::Ulid::new().to_string();
+        let reply: SwarmDigestResponse = serde_json::from_value(
+            router
+                .swarm_digest(
+                    &json!({
+                        "id": digest_id,
+                        "to": recipient,
+                        "mode": "all",
+                        "commands": [c_in, c_out],
+                        "turns": []
+                    }),
+                    &Principal::Owner,
+                )
+                .await
+                .expect("owner digest"),
+        )
+        .expect("decode digest");
+        assert_eq!(reply.state, "delivered");
+        assert_eq!(reply.results[0].status, "succeeded");
+        assert_eq!(
+            reply.results[0].final_text.as_deref(),
+            Some("visible answer")
+        );
+        assert_eq!(reply.results[1].status, "succeeded");
+        assert_eq!(reply.results[1].agent, None);
+        assert_eq!(reply.results[1].turn_id, None);
+        assert_eq!(reply.results[1].final_text, None);
+        assert!(!reply.results[1].truncated);
+
+        let inbox: MailInboxResponse = serde_json::from_value(
+            router
+                .mail_inbox(
+                    &json!({}),
+                    &Principal::Agent {
+                        id: recipient.clone(),
+                        generation: 1,
+                    },
+                )
+                .await
+                .expect("inbox"),
+        )
+        .expect("decode inbox");
+        assert_eq!(inbox.deliveries.len(), 1);
+        let body = &inbox.deliveries[0].text;
+        assert!(body.contains("visible answer"));
+        assert!(body.contains(&format!("- command {c_out}: succeeded\n")));
+        assert!(!body.contains("cross-scope secret"));
+        assert!(!body.contains(&out_of_scope));
+        assert!(!body.contains("t-out"));
+    }
+
+    #[tokio::test]
+    async fn reparented_worker_before_completion_delivers_status_only() {
+        use eliot_core::api::MailInboxResponse;
+
+        let router = test_router();
+        let manager = spawn_ready_with_control(&router, "app", None, "tree").await;
+        let new_parent = spawn_ready_with_control(&router, "app", None, "tree").await;
+        let stayed = spawn_ready_with_control(&router, "app", Some(manager.clone()), "self").await;
+        let moved = spawn_ready_with_control(&router, "app", Some(manager.clone()), "self").await;
+
+        let c_stayed = submit_worker_send(&router, &stayed).await;
+        let c_moved = submit_worker_send(&router, &moved).await;
+        complete_worker_turn(&router, &stayed, &c_stayed, "t-stay", "stayed answer").await;
+
+        let digest_id = ulid::Ulid::new().to_string();
+        let manager_principal = Principal::Agent {
+            id: manager.clone(),
+            generation: 1,
+        };
+        let pending: SwarmDigestResponse = serde_json::from_value(
+            router
+                .swarm_digest(
+                    &json!({
+                        "id": digest_id,
+                        "to": manager,
+                        "mode": "all",
+                        "commands": [c_stayed, c_moved],
+                        "turns": []
+                    }),
+                    &manager_principal,
+                )
+                .await
+                .expect("register pending digest"),
+        )
+        .expect("decode pending");
+        assert_eq!(pending.state, "pending");
+
+        // Owner reparents `moved` away before completion.
+        router
+            .swarm_reparent(
+                &json!({
+                    "id": ulid::Ulid::new().to_string(),
+                    "agent": moved,
+                    "expected_generation": 1,
+                    "parent": new_parent,
+                    "parent_generation": 1,
+                }),
+                &Principal::Owner,
+            )
+            .await
+            .expect("reparent away");
+
+        // Before `moved` finishes, `deliver_digest` still sees `still_running`.
+        assert!(
+            router
+                .deliver_digest(&digest_id)
+                .await
+                .expect("poll")
+                .is_none()
+        );
+
+        complete_worker_turn(&router, &moved, &c_moved, "t-moved", "moved secret answer").await;
+        let delivered = router
+            .deliver_digest(&digest_id)
+            .await
+            .expect("deliver")
+            .expect("digest completed");
+        assert_eq!(
+            delivered.results[0].final_text.as_deref(),
+            Some("stayed answer")
+        );
+        assert_eq!(delivered.results[1].status, "succeeded");
+        assert_eq!(delivered.results[1].agent, None);
+        assert_eq!(delivered.results[1].turn_id, None);
+        assert_eq!(delivered.results[1].final_text, None);
+
+        // Mark wake not read yet since we didn't emit turn.started; read inbox.
+        let inbox: MailInboxResponse = serde_json::from_value(
+            router
+                .mail_inbox(&json!({}), &manager_principal)
+                .await
+                .expect("inbox"),
+        )
+        .expect("decode inbox");
+        assert_eq!(inbox.deliveries.len(), 1);
+        let body = &inbox.deliveries[0].text;
+        assert!(body.contains("stayed answer"));
+        assert!(body.contains(&format!("- command {c_moved}: succeeded\n")));
+        assert!(!body.contains("moved secret answer"));
+        assert!(!body.contains("t-moved"));
+    }
+
+    #[tokio::test]
+    async fn reparented_recipient_wake_command_redacts_excerpts_from_new_parent() {
+        let router = test_router();
+        let manager = spawn_ready_with_control(&router, "app", None, "tree").await;
+        let worker = spawn_ready_with_control(&router, "app", Some(manager.clone()), "self").await;
+        let foreign_parent = spawn_ready_with_control(&router, "app", None, "tree").await;
+
+        let c_worker = submit_worker_send(&router, &worker).await;
+        complete_worker_turn(&router, &worker, &c_worker, "t-w", "private worker answer").await;
+
+        let manager_principal = Principal::Agent {
+            id: manager.clone(),
+            generation: 1,
+        };
+        router
+            .swarm_digest(
+                &json!({
+                    "id": ulid::Ulid::new().to_string(),
+                    "to": manager,
+                    "mode": "all",
+                    "commands": [c_worker],
+                    "turns": []
+                }),
+                &manager_principal,
+            )
+            .await
+            .expect("digest");
+
+        let open_notice_id = {
+            let store = router.inner.store.lock().await;
+            store
+                .notice_state(&manager)
+                .expect("notice state")
+                .expect("notice claimed")
+                .open_notice_command
+                .expect("open notice")
+        };
+
+        // Reparent the recipient under `foreign_parent` (`worker` moves too, or
+        // suppose `foreign_parent` is a separate manager who now owns `manager`).
+        router
+            .swarm_reparent(
+                &json!({
+                    "id": ulid::Ulid::new().to_string(),
+                    "agent": manager,
+                    "expected_generation": 1,
+                    "parent": foreign_parent,
+                    "parent_generation": 1,
+                }),
+                &Principal::Owner,
+            )
+            .await
+            .expect("reparent recipient");
+
+        let readback: eliot_core::Command = serde_json::from_value(
+            router
+                .command_get(
+                    &json!({"id": open_notice_id}),
+                    &Principal::Agent {
+                        id: foreign_parent,
+                        generation: 1,
+                    },
+                )
+                .await
+                .expect("foreign parent reads wake command"),
+        )
+        .expect("decode command");
+        let text = readback
+            .args
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        assert!(!text.contains("private worker answer"));
+        assert_eq!(
+            readback.args.get("redacted").and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn digest_shares_budget_fairly_so_fifth_short_answer_never_disappears() {
+        use eliot_core::api::{MAX_WAIT_FINAL_TEXT_BYTES, MailInboxResponse};
+
+        let router = test_router();
+        let manager = spawn_ready_with_control(&router, "app", None, "tree").await;
+        let big = "a".repeat(MAX_WAIT_FINAL_TEXT_BYTES);
+        let mut cmds = Vec::new();
+        for idx in 0..4 {
+            let w = spawn_ready_with_control(&router, "app", Some(manager.clone()), "self").await;
+            let c = submit_worker_send(&router, &w).await;
+            complete_worker_turn(&router, &w, &c, &format!("t-{idx}"), &big).await;
+            cmds.push(c);
+        }
+        let w5 = spawn_ready_with_control(&router, "app", Some(manager.clone()), "self").await;
+        let c5 = submit_worker_send(&router, &w5).await;
+        complete_worker_turn(&router, &w5, &c5, "t-5", "fifth short answer").await;
+        cmds.push(c5);
+
+        let manager_principal = Principal::Agent {
+            id: manager.clone(),
+            generation: 1,
+        };
+        let reply: SwarmDigestResponse = serde_json::from_value(
+            router
+                .swarm_digest(
+                    &json!({
+                        "id": ulid::Ulid::new().to_string(),
+                        "to": manager,
+                        "mode": "all",
+                        "commands": cmds,
+                        "turns": []
+                    }),
+                    &manager_principal,
+                )
+                .await
+                .expect("digest"),
+        )
+        .expect("decode");
+        assert_eq!(
+            reply.results[4].final_text.as_deref(),
+            Some("fifth short answer")
+        );
+        assert!(!reply.results[4].truncated);
+
+        let inbox: MailInboxResponse = serde_json::from_value(
+            router
+                .mail_inbox(&json!({}), &manager_principal)
+                .await
+                .expect("inbox"),
+        )
+        .expect("decode inbox");
+        assert_eq!(inbox.deliveries.len(), 1);
+        assert!(inbox.deliveries[0].text.contains("fifth short answer"));
+    }
+
+    #[tokio::test]
+    async fn digest_delivers_when_worker_answer_contains_nul_bytes() {
+        use eliot_core::api::MailInboxResponse;
+
+        let router = test_router();
+        let manager = spawn_ready_with_control(&router, "app", None, "tree").await;
+        let worker = spawn_ready_with_control(&router, "app", Some(manager.clone()), "self").await;
+        let c = submit_worker_send(&router, &worker).await;
+        complete_worker_turn(&router, &worker, &c, "t-nul", "alpha\0omega").await;
+
+        let manager_principal = Principal::Agent {
+            id: manager.clone(),
+            generation: 1,
+        };
+        let reply: SwarmDigestResponse = serde_json::from_value(
+            router
+                .swarm_digest(
+                    &json!({
+                        "id": ulid::Ulid::new().to_string(),
+                        "to": manager,
+                        "mode": "all",
+                        "commands": [c],
+                        "turns": []
+                    }),
+                    &manager_principal,
+                )
+                .await
+                .expect("digest with NUL delivers instead of blocking"),
+        )
+        .expect("decode");
+        assert_eq!(reply.state, "delivered");
+
+        let inbox: MailInboxResponse = serde_json::from_value(
+            router
+                .mail_inbox(&json!({}), &manager_principal)
+                .await
+                .expect("inbox"),
+        )
+        .expect("decode inbox");
+        assert_eq!(inbox.deliveries.len(), 1);
+        assert!(!inbox.deliveries[0].text.contains('\0'));
+        assert!(inbox.deliveries[0].text.contains("alpha\\0omega"));
     }
 }

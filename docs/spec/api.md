@@ -1677,14 +1677,22 @@ Agent mailbox), `mode` (`all`/`any`), and `commands`/`turns` (1..=256 entries,
 frozen at admission like `swarm.wait`). An Agent caller may digest only to its own
 mailbox and only entries within its frozen control scope; out-of-scope entries read
 `not_visible` at registration and stay masked at delivery, which recomputes as
-owner and never widens scope. When the mode condition holds over terminal entries
+owner and never widens scope. At delivery, before writing excerpts, the daemon
+also rechecks that the recipient (`to`) currently has scope over each entry
+(intersected with the registration-time mask, including for Owner-registered
+digests and workers reparented away before completion): entries where the
+recipient lacks scope deliver status-only without `agent`, `turn_id`,
+`final_text` or `truncated`. When the mode condition holds over terminal entries
 (`still_running` is the only non-terminal status; `not_found`/`not_visible` count
 as settled honest outcomes), the daemon delivers exactly one coalesced `mail.send`
 (queue) result to the parent: mail id is the digest id, thread is
 `completion-<id-prefix>`, and the body lists every entry outcome together with
-`agent`, `turn_id`, bounded `final_text` excerpt and `truncated` for completed
-bound turns within `MAX_MAIL_TEXT_BYTES` (32 KiB); `SwarmDigestResponse.results`
-uses `WaitEntryResult` with `not_visible` entries completely masked. Same id plus same
+`agent`, `turn_id`, fairly allocated bounded `final_text` excerpt and `truncated`
+for authorized completed bound turns within `MAX_MAIL_TEXT_BYTES` (32 KiB), with
+NUL escaped (`\0`) before budgeting so one answer never blocks the digest and
+earlier answers never starve later ones; `SwarmDigestResponse.results`
+uses `WaitEntryResult` with `not_visible` entries completely masked and
+out-of-recipient-scope entries reduced to status-only. Same id plus same
 payload replays the retained registration and mail without a second delivery; same
 id plus a different payload or principal rejects `id_conflict`. Reconnect or restart
 replays the same mail id, so the digest is never duplicated. The driver sweeps
@@ -1698,7 +1706,9 @@ command), except that when the registrant and recipient are the same Agent at it
 current generation and the digest body fits within `MAX_EVENT_BYTES` (64 KiB),
 the wake `send` carries that body directly (with `N unread: mail.inbox, then mail.ack`
 appended if other unread mail remains) and `turn.started` of that wake marks the
-digest delivery read; otherwise (for example Owner-registered digests, other
+digest delivery read (ordinary command readback via `command.get`/`command.children`
+redacts the wake `args.text` so only the recipient's own turn sees the excerpt
+text); otherwise (for example Owner-registered digests, other
 generations, or overflow) the generic count notice and `mail.inbox`/`mail.ack`
 apply. The digest emits no `x.user.agent.attention` event; a successful completion stays
 distinct from an attention incident and no model call is needed to poll. The CLI is

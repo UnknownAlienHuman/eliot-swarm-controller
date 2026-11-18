@@ -214,26 +214,39 @@ pub fn digest_thread(id: &str) -> String {
     format!("{DIGEST_THREAD_PREFIX}{prefix}")
 }
 
+fn escape_mail_text(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.contains('\0') {
+        std::borrow::Cow::Owned(text.replace('\0', "\\0"))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
 fn digest_entry_line(entry: &WaitEntryResult, truncated: bool) -> String {
+    let id = escape_mail_text(&entry.id);
     match (entry.agent.as_deref(), entry.turn_id.as_deref()) {
         (Some(agent), Some(turn_id)) if entry.final_text.is_some() || truncated => {
+            let agent = escape_mail_text(agent);
+            let turn_id = escape_mail_text(turn_id);
             format!(
-                "- {} {}: {} (agent {agent}, turn_id {turn_id}, truncated={truncated})",
-                entry.kind, entry.id, entry.status
+                "- {} {id}: {} (agent {agent}, turn_id {turn_id}, truncated={truncated})",
+                entry.kind, entry.status
             )
         }
         (Some(agent), Some(turn_id)) => {
+            let agent = escape_mail_text(agent);
+            let turn_id = escape_mail_text(turn_id);
             format!(
-                "- {} {}: {} (agent {agent}, turn_id {turn_id})",
-                entry.kind, entry.id, entry.status
+                "- {} {id}: {} (agent {agent}, turn_id {turn_id})",
+                entry.kind, entry.status
             )
         }
-        _ => format!("- {} {}: {}", entry.kind, entry.id, entry.status),
+        _ => format!("- {} {id}: {}", entry.kind, entry.status),
     }
 }
 
 /// Fair water-fill per-entry byte cap across `lengths` within `usable` bytes.
-fn fair_excerpt_cap(lengths: &[usize], usable: usize) -> usize {
+pub fn fair_excerpt_cap(lengths: &[usize], usable: usize) -> usize {
     let mut sorted = lengths.to_vec();
     sorted.sort_unstable();
     let mut rem = usable;
@@ -253,6 +266,8 @@ fn fair_excerpt_cap(lengths: &[usize], usable: usize) -> usize {
 /// mail text bound, distinct from attention reports and noting that no model
 /// turn was used.
 pub fn digest_text(id: &str, to: &str, mode: &str, results: &[WaitEntryResult]) -> String {
+    let id = escape_mail_text(id);
+    let to = escape_mail_text(to);
     let terminal = results.iter().filter(|entry| entry.is_terminal()).count();
     let succeeded = results.iter().filter(|entry| entry.succeeded()).count();
     let header = format!(
@@ -260,6 +275,10 @@ pub fn digest_text(id: &str, to: &str, mode: &str, results: &[WaitEntryResult]) 
         results.len()
     );
     let footer = "Delivered once to the parent mailbox. No model turn was used. Successful completion is not an attention incident.";
+    let escaped_texts: Vec<Option<std::borrow::Cow<'_, str>>> = results
+        .iter()
+        .map(|entry| entry.final_text.as_deref().map(escape_mail_text))
+        .collect();
     let base_max_len: usize = results
         .iter()
         .map(|entry| {
@@ -280,9 +299,9 @@ pub fn digest_text(id: &str, to: &str, mode: &str, results: &[WaitEntryResult]) 
         .saturating_add(footer.len());
     if base_frame_len <= MAX_MAIL_TEXT_BYTES {
         let available = MAX_MAIL_TEXT_BYTES - base_frame_len;
-        let text_lens: Vec<usize> = results
+        let text_lens: Vec<usize> = escaped_texts
             .iter()
-            .filter_map(|entry| entry.final_text.as_deref())
+            .filter_map(|text| text.as_deref())
             .filter(|text| !text.is_empty())
             .map(str::len)
             .collect();
@@ -294,8 +313,8 @@ pub fn digest_text(id: &str, to: &str, mode: &str, results: &[WaitEntryResult]) 
             fair_excerpt_cap(&text_lens, available - text_lens.len())
         };
         let mut blocks = Vec::with_capacity(results.len());
-        for entry in results {
-            match entry.final_text.as_deref() {
+        for (entry, escaped) in results.iter().zip(escaped_texts.iter()) {
+            match escaped.as_deref() {
                 Some(text) if !text.is_empty() => {
                     let (kept, cut) = truncate_bytes(text, cap);
                     let truncated = entry.truncated || cut;
@@ -481,6 +500,37 @@ mod tests {
         assert!(text.contains("- command c3: succeeded (agent a3, turn_id t3, truncated=true)"));
         assert!(text.contains("zzzz"));
         assert!(text.contains("- turn a4/1/t4: succeeded (agent a4, turn_id t4, truncated=true)"));
+    }
+
+    #[test]
+    fn digest_text_escapes_nul_before_budgeting_and_validates_as_mail() {
+        use crate::api::{MAX_WAIT_FINAL_TEXT_BYTES, MailMode, MailSendRequest};
+
+        let nul_flood = WaitEntryResult::new("command", "c1", "succeeded")
+            .with_turn("a1", 1, "t1")
+            .with_final_text(
+                &"\0".repeat(MAX_WAIT_FINAL_TEXT_BYTES),
+                MAX_WAIT_FINAL_TEXT_BYTES,
+            );
+        let with_nul = WaitEntryResult::new("command", "c2", "succeeded")
+            .with_turn("a2", 1, "t2")
+            .with_final_text("before\0after", MAX_WAIT_FINAL_TEXT_BYTES);
+
+        let text = digest_text("D1", "a1", "all", &[nul_flood, with_nul]);
+        assert!(!text.contains('\0'));
+        assert!(text.len() <= MAX_MAIL_TEXT_BYTES);
+        assert!(text.contains("before\\0after"));
+        assert!(text.contains("\\0"));
+
+        let mail = MailSendRequest {
+            id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            to: vec!["a1".to_owned()],
+            mode: MailMode::Queue,
+            text,
+            thread: Some(digest_thread("01ARZ3NDEKTSV4RRFFQ69G5FAV")),
+            reply_to_delivery: None,
+        };
+        mail.validate().unwrap();
     }
 
     #[test]

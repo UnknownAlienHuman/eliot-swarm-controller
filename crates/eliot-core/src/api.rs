@@ -83,7 +83,7 @@ pub use coordination::{
 };
 pub use digests::{
     DIGEST_THREAD_PREFIX, SwarmDigestRequest, SwarmDigestResponse, digest_mode_completed,
-    digest_text, digest_thread,
+    digest_text, digest_thread, fair_excerpt_cap,
 };
 pub use git::{
     DEFAULT_GIT_FETCH_TIMEOUT_MS, FrozenGitFetch, GitFetchDefinitionArgs, GitFetchOutcome,
