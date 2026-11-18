@@ -823,7 +823,10 @@ pub(crate) struct WaitArgs {
     pub(crate) any: bool,
     #[arg(long, default_value_t = DEFAULT_WAIT_SECONDS, value_name = "SECONDS")]
     pub(crate) timeout_seconds: u64,
-    /// Command ids, or `agent/generation/turn_id` for exact turn bindings.
+    /// Command ids (linked `<id>/send` stays a command), or exact turn
+    /// bindings as `turn:agent/generation/turn_id`. A bare
+    /// `agent/generation/turn_id` triple stays a turn; prefix an ambiguous
+    /// command with `command:`.
     #[arg(value_name = "ID")]
     pub(crate) ids: Vec<String>,
 }
@@ -839,7 +842,10 @@ pub(crate) struct DigestArgs {
     /// Parent Agent mailbox for the one coalesced result.
     #[arg(long, value_name = "AGENT")]
     pub(crate) to: String,
-    /// Command ids, or `agent/generation/turn_id` for exact turn bindings.
+    /// Command ids (linked `<id>/send` stays a command), or exact turn
+    /// bindings as `turn:agent/generation/turn_id`. A bare
+    /// `agent/generation/turn_id` triple stays a turn; prefix an ambiguous
+    /// command with `command:`.
     #[arg(value_name = "ID")]
     pub(crate) ids: Vec<String>,
 }

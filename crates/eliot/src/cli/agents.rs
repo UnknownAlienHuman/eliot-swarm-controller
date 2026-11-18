@@ -1010,13 +1010,9 @@ pub(crate) async fn swarm_wait(
     let mut commands = Vec::new();
     let mut turns = Vec::new();
     for id in ids {
-        if id.contains('/') {
-            turns.push(parse_wait_turn_ref(&id)?);
-        } else {
-            if id.trim().is_empty() {
-                return Err(Failure::new(2, "swarm wait ids must be non-empty strings"));
-            }
-            commands.push(id);
+        match parse_wait_target(&id, "swarm wait")? {
+            WaitTarget::Command(command) => commands.push(command),
+            WaitTarget::Turn(turn) => turns.push(turn),
         }
     }
     if commands.is_empty() && turns.is_empty() {
@@ -1071,16 +1067,9 @@ pub(crate) async fn swarm_digest(
     let mut commands = Vec::new();
     let mut turns = Vec::new();
     for id in ids {
-        if id.contains('/') {
-            turns.push(parse_wait_turn_ref(&id)?);
-        } else {
-            if id.trim().is_empty() {
-                return Err(Failure::new(
-                    2,
-                    "swarm digest ids must be non-empty strings",
-                ));
-            }
-            commands.push(id);
+        match parse_wait_target(&id, "swarm digest")? {
+            WaitTarget::Command(command) => commands.push(command),
+            WaitTarget::Turn(turn) => turns.push(turn),
         }
     }
     if commands.is_empty() && turns.is_empty() {
@@ -1090,20 +1079,60 @@ pub(crate) async fn swarm_digest(
         ));
     }
     let params = SwarmDigestRequest::new(mutation_id(id)?, to, mode, commands, turns);
-    params
-        .validate()
-        .map_err(|error| Failure::from_core(error, true))?;
+    params.validate().map_err(Failure::for_mutation)?;
     let response: SwarmDigestResponse =
         eliot_daemon::client_call_typed(data_dir, "swarm.digest", &params)
             .await
-            .map_err(|error| Failure::from_core(error, true))?;
+            .map_err(Failure::for_mutation)?;
     params
         .validate_response(&response)
-        .map_err(|_| Failure::new(4, "swarm.digest response is invalid"))?;
+        .map_err(Failure::invalid_response)?;
     let value = serde_json::to_value(&response)
         .map_err(|_| Failure::new(4, "swarm.digest response is invalid"))?;
     print_value(&value, json_output);
     Ok(0)
+}
+
+/// One positional `swarm wait` / `swarm digest` target: an opaque command id
+/// (including linked `<id>/send` and nested derived ids) or an exact turn
+/// binding.
+pub(crate) enum WaitTarget {
+    Command(String),
+    Turn(WaitTurnRef),
+}
+
+/// Classify one positional wait/digest id without inferring its kind from a
+/// bare slash. `turn:...` forces an exact turn binding (whose turn id may
+/// itself contain slashes); `command:...` / `cmd:...` forces an opaque
+/// command id preserved verbatim. A bare id with the strict
+/// `agent/generation/turn_id` shape stays a turn (the historical spelling);
+/// anything else is an opaque command, so linked `<id>/send` ids wait for the
+/// linked input instead of failing locally. `cli` names the caller for usage
+/// errors (`swarm wait` / `swarm digest`).
+pub(crate) fn parse_wait_target(id: &str, cli: &str) -> Result<WaitTarget, Failure> {
+    if let Some(rest) = id.strip_prefix("turn:") {
+        return parse_wait_turn_ref(rest).map(WaitTarget::Turn);
+    }
+    if let Some(rest) = id
+        .strip_prefix("command:")
+        .or_else(|| id.strip_prefix("cmd:"))
+    {
+        if rest.trim().is_empty() {
+            return Err(Failure::new(
+                2,
+                format!("{cli} command ids must be non-empty strings"),
+            ));
+        }
+        return Ok(WaitTarget::Command(rest.to_owned()));
+    }
+    match parse_wait_turn_ref(id) {
+        Ok(turn) => Ok(WaitTarget::Turn(turn)),
+        Err(_) if !id.trim().is_empty() => Ok(WaitTarget::Command(id.to_owned())),
+        Err(_) => Err(Failure::new(
+            2,
+            format!("{cli} ids must be non-empty strings"),
+        )),
+    }
 }
 
 pub(crate) fn parse_wait_turn_ref(id: &str) -> Result<WaitTurnRef, Failure> {
@@ -1198,8 +1227,8 @@ pub(crate) async fn run_tree_change(
 #[cfg(test)]
 mod tests {
     use super::{
-        ExactTurnCapture, INTERRUPTED_EXIT_CODE, missing_turn_failure, parse_wait_turn_ref,
-        race_or_failure, swarm_wait_exit_code,
+        ExactTurnCapture, INTERRUPTED_EXIT_CODE, WaitTarget, missing_turn_failure,
+        parse_wait_target, parse_wait_turn_ref, race_or_failure, swarm_wait_exit_code,
     };
     use crate::cli::args::{Cli, CliCommand, WaitArgs};
     use crate::cli::support::Failure;
@@ -1276,6 +1305,60 @@ mod tests {
         assert!(!any);
         assert_eq!(timeout_seconds, 7);
         assert_eq!(ids, vec!["c1".to_owned()]);
+    }
+
+    #[test]
+    fn wait_targets_keep_linked_commands_verbatim() {
+        // Linked SEND command ids from launch/resume responses are commands,
+        // not turn references, even though they contain a slash.
+        let linked = "01ARZ3NDEKTSV4RRFFQ69G5FAV/send";
+        match parse_wait_target(linked, "swarm wait").expect("linked id parses") {
+            WaitTarget::Command(id) => assert_eq!(id, linked),
+            WaitTarget::Turn(_) => panic!("linked command must not parse as a turn"),
+        }
+        // Nested derived command ids stay opaque commands too.
+        match parse_wait_target("01ARZ3NDEKTSV4RRFFQ69G5FAV/launch/send", "swarm digest")
+            .expect("nested id parses")
+        {
+            WaitTarget::Command(id) => {
+                assert_eq!(id, "01ARZ3NDEKTSV4RRFFQ69G5FAV/launch/send");
+            }
+            WaitTarget::Turn(_) => panic!("nested command must not parse as a turn"),
+        }
+        // Explicit prefixes disambiguate the overlap: the same triple is a
+        // turn with `turn:` and an opaque command with `command:` / `cmd:`.
+        match parse_wait_target("turn:a1/2/t", "swarm wait").expect("turn prefix parses") {
+            WaitTarget::Turn(turn) => {
+                assert_eq!(
+                    (turn.agent.as_str(), turn.generation, turn.turn_id.as_str()),
+                    ("a1", 2, "t")
+                );
+            }
+            WaitTarget::Command(_) => panic!("turn: prefix must parse as a turn"),
+        }
+        match parse_wait_target("command:a1/2/t", "swarm wait").expect("command prefix parses") {
+            WaitTarget::Command(id) => assert_eq!(id, "a1/2/t"),
+            WaitTarget::Turn(_) => panic!("command: prefix must parse as a command"),
+        }
+        match parse_wait_target("cmd:a1/2/t", "swarm digest").expect("cmd prefix parses") {
+            WaitTarget::Command(id) => assert_eq!(id, "a1/2/t"),
+            WaitTarget::Turn(_) => panic!("cmd: prefix must parse as a command"),
+        }
+        // The historical bare triple stays a turn, including turn ids that
+        // themselves contain slashes.
+        match parse_wait_target("a1/2/t/with/slash", "swarm wait").expect("bare triple parses") {
+            WaitTarget::Turn(turn) => assert_eq!(turn.turn_id, "t/with/slash"),
+            WaitTarget::Command(_) => panic!("bare triple must stay a turn"),
+        }
+        // Plain command ids without a slash keep working.
+        match parse_wait_target("c1", "swarm wait").expect("plain id parses") {
+            WaitTarget::Command(id) => assert_eq!(id, "c1"),
+            WaitTarget::Turn(_) => panic!("plain id must stay a command"),
+        }
+        for bad in ["", "   ", "turn:a1/x/t", "turn:a1/2/", "command:", "cmd:  "] {
+            assert!(parse_wait_target(bad, "swarm wait").is_err(), "id: {bad}");
+            assert!(parse_wait_target(bad, "swarm digest").is_err(), "id: {bad}");
+        }
     }
 
     #[test]
