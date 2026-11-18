@@ -482,6 +482,16 @@ An explicit Owner claim supplies the Agent ID and generation. A scoped claim
 omits the manager to select the caller. The project action
 `project.assignment.claim` grants self-claim under the configured profile allowlist.
 
+A managed manager launch always runs in a project worktree. Without an explicit
+`adopt_worktree` the daemon prepares a fresh opaque worktree on a unique
+branch from the frozen base OID and runs the existing preparation and setup chain
+before native dispatch; workers inherit that worktree through the parent link.
+`adopt_worktree` names an existing checkout of the same repository explicitly;
+adoption is never automatic and keeps the checkout environment. The current
+workspace binding is recorded beside the assignment and cleared on release; a
+bound worktree is kept by cleanup and refused by worktree removal until released.
+CLI callers add `--adopt-worktree PATH` to the launch form when adopting.
+
 For ordinary commands, a supplied `args.assignment_epoch` is a precondition when
 the verb accepts it. Admission records the current binding even when it is
 omitted. See [coordination](coordination.md#project-manager-assignment) for

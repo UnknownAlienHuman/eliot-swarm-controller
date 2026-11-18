@@ -197,6 +197,30 @@ with no assignment history retain ordinary control. Adoption must account for
 existing writers before claiming exclusive workspace custody. Assignment is
 Swarm control authority. Filesystem isolation depends on the native sandbox.
 
+A manager launch in managed multi-project mode reserves the assignment,
+the workspace and capacity in one Store transaction before any external
+effect. The daemon resolves the registered repository, verifies its identity,
+freezes the base OID from the local HEAD without fetching, and prepares a
+fresh opaque worktree on a unique branch through the existing [preparation
+and setup chain](monitoring.md#workspace-preparation). Native dispatch starts
+only once that worktree is ready. A retry under the same operation ID returns
+the retained result; after a restart the daemon reads back the existing
+preparation instead of preparing a second worktree or re-running an unknown
+setup. A refused or unknown launch before startup leaves no assignment behind.
+
+Workers launched by that manager inherit its project assignment and workspace
+automatically through the existing parent link: they run in the manager worktree
+under the current assignment fence. A worker launch while the manager worktree
+is not ready is refused rather than admitted into a half-prepared checkout.
+
+The current workspace binding to the assignment is recorded separately from
+the historical creator receipt, so a later transfer can move the binding without
+rewriting history. Cleanup and worktree removal respect the binding: a bound or
+borrowed worktree is never removed, and only release unbinds it. An existing
+checkout may be adopted explicitly as a manager workspace; adoption is never
+automatic, keeps the checkout environment with no setup side effects, and never
+turns the checkout into a cleanup artifact.
+
 ## Conversation association
 
 A conversation association links an existing Agent or chat to a project or
