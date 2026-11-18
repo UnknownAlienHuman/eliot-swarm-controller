@@ -489,18 +489,21 @@ through the same retained cursor and are serialized by Store's cursor compare-an
 The ordinary command ID remains the timer child ID, preserving exact same-ID replay.
 
 The existing Owner timer worker arbitrates due assignments and explicit interactive
-launch intents. It visits projects round-robin after the last successful admission and
-uses the oldest due timer or enqueued intent within each project. Ties between
+launch intents. It uses the oldest eligible due timer or enqueued intent within each
+project. A timer with an open action keeps its due slot and yields to other work in
+its project until the action settles. Ties between
 assignment timers use their rule IDs. An interactive intent wins an exact timestamp
 tie with a timer. Briefs within an assignment remain in filename order. The cursor
-advances in the same Store transaction as successful admission. A blocked head
-keeps its position within its project and other projects still get a chance.
+advances in the same Store transaction as successful admission. A head waiting on
+capacity, a provider, a workspace or transfer keeps its position within its project
+and other projects still get a chance.
 
 After choosing a project, routing selects the first policy-compatible installed
 candidate. Capacity or provider holds keep that route waiting. On subsequent
 attempts the selected model, account and route bindings must still match. The
-manager's Owner-granted priority orders fresh heads within a round. At 30 seconds
-of waiting, heads take precedence in a stable project rotation, so repeated priority
+manager's Owner-granted priority orders fresh heads from highest to lowest. Within
+each priority tier, projects rotate after the last successful admission. At 30 seconds
+of waiting, heads take precedence in a single project rotation, so repeated priority
 changes cannot keep overtaking them. The selected brief filename, previous cursor, assignment
 key and capacity bound accompany the normal launch command for Store validation. Store
 maintains unresolved assignment membership transactionally with command and turn changes.

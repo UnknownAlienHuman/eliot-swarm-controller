@@ -1905,9 +1905,10 @@ pub(super) fn rule_run_action_binding_error(
     }
 }
 
-fn has_open_rule_actions_tx(tx: &Transaction<'_>, principal: &str, rule: &str) -> Result<bool> {
-    tx.query_row(
-        "SELECT EXISTS(
+fn has_open_rule_actions(connection: &Connection, principal: &str, rule: &str) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
              SELECT 1 FROM commands child
              JOIN commands parent ON parent.id = child.parent_command
              WHERE child.link_kind = 'rule_action' AND child.ordinal IS NOT NULL
@@ -1936,10 +1937,10 @@ fn has_open_rule_actions_tx(tx: &Transaction<'_>, principal: &str, rule: &str) -
                     )
                 )
          )",
-        params![principal, rule],
-        |row| row.get(0),
-    )
-    .map_err(sql_error)
+            params![principal, rule],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)
 }
 
 fn load_rule_state(

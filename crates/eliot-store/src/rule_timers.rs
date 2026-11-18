@@ -201,6 +201,10 @@ impl Store {
         Ok(load_timer_state(&self.connection, principal, id)?.map(|timer| timer.view))
     }
 
+    pub fn rule_has_open_actions(&self, principal: &str, rule: &str) -> Result<bool> {
+        has_open_rule_actions(&self.connection, principal, rule)
+    }
+
     /// Return a bounded page of persisted due timers. The caller computes the
     /// selected slot outside the Store lock and supplies it to commit_timer_slot.
     pub fn list_due_timer_states(
@@ -470,7 +474,7 @@ impl Store {
                 "next timer due time must be after its committed slot",
             ));
         }
-        if has_open_rule_actions_tx(&tx, principal, &state.id)? {
+        if has_open_rule_actions(&tx, principal, &state.id)? {
             commit_transaction(tx, &self.write_faulted)?;
             return Ok(TimerSlotAdmission {
                 state: stored.view,
@@ -789,7 +793,7 @@ impl Store {
         } else {
             None
         };
-        if has_open_rule_actions_tx(&tx, principal, &request.rule)? {
+        if has_open_rule_actions(&tx, principal, &request.rule)? {
             commit_transaction(tx, &self.write_faulted)?;
             return Ok(TimerSlotAdmission {
                 state: timer.view,

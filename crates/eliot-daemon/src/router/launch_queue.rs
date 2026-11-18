@@ -153,6 +153,14 @@ impl Router {
         ))
     }
 
+    pub(crate) async fn rule_has_open_actions(&self, principal: &str, rule: &str) -> Result<bool> {
+        self.inner
+            .store
+            .lock()
+            .await
+            .rule_has_open_actions(principal, rule)
+    }
+
     pub(crate) async fn arbitration_timer_wait(
         &self,
         state: &TimerStateView,

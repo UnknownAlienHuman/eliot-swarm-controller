@@ -1813,6 +1813,10 @@ async fn reconcile_due_timers(
                 .and_then(std::result::Result::ok)
                 .filter(|action| action.args.get("assignment").is_some());
             if let Some(action) = assignment {
+                if router.rule_has_open_actions(principal, &state.id).await? {
+                    deferred_timers.push(index);
+                    continue;
+                }
                 let retained = router.arbitration_timer_wait(&state).await?;
                 let route = retained.as_ref().and_then(|(_, wait)| wait.route.clone());
                 let project = match router.queued_launch_project(&action).await {
@@ -1889,20 +1893,21 @@ fn arbitration_order(
     now: i64,
     cursor: Option<&str>,
     priorities: &std::collections::HashMap<String, u8>,
-) -> (bool, bool, std::cmp::Reverse<u8>, String) {
+) -> (bool, std::cmp::Reverse<u8>, bool, String) {
     let protected = priorities.values().any(|&priority| priority > 0)
         && now.saturating_sub(ready_at) >= PRIORITY_WAIT_LIMIT_MS;
-    let priority = |project: &str| {
-        if protected {
-            0
-        } else {
-            priorities.get(project).copied().unwrap_or(0)
-        }
+    let priority = if protected {
+        0
+    } else {
+        priorities.get(project).copied().unwrap_or(0)
     };
-    let position = (std::cmp::Reverse(priority(project)), project);
-    let wrapped =
-        cursor.is_some_and(|cursor| position <= (std::cmp::Reverse(priority(cursor)), cursor));
-    (!protected, wrapped, position.0, project.to_owned())
+    let wrapped = cursor.is_some_and(|cursor| project <= cursor);
+    (
+        !protected,
+        std::cmp::Reverse(priority),
+        wrapped,
+        project.to_owned(),
+    )
 }
 
 async fn reconcile_timer(
@@ -2338,6 +2343,22 @@ pub(crate) async fn prepare_rule_catch_up_actions(
 mod timer_tests {
     use super::*;
     use eliot_core::SubmitCommand;
+
+    #[test]
+    fn assignment_priority_precedes_rotation_for_fresh_projects() {
+        let priorities = std::collections::HashMap::from([
+            ("b".to_owned(), 1),
+            ("c".to_owned(), 2),
+            ("d".to_owned(), 2),
+        ]);
+        let mut projects = ["a", "b", "c", "d"];
+        projects
+            .sort_by_cached_key(|project| arbitration_order(project, 0, 1, Some("b"), &priorities));
+        assert_eq!(projects, ["c", "d", "b", "a"]);
+        projects
+            .sort_by_cached_key(|project| arbitration_order(project, 0, 1, Some("c"), &priorities));
+        assert_eq!(projects, ["d", "c", "b", "a"]);
+    }
 
     #[test]
     fn assignment_priority_cannot_overtake_a_waiting_project_indefinitely() {
@@ -2825,7 +2846,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         assert_eq!(timer_wake_delay(&timer, 135), None);
     }
     #[tokio::test]
-    async fn missing_briefs_folder_fails_only_its_assignment_slot() {
+    async fn assignment_with_open_action_yields_to_later_timer_in_its_project() {
         use eliot_core::api::TimerSchedule;
         use std::{fs, io::Cursor, path::Path};
 
@@ -2851,6 +2872,12 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         let missing_folder = missing_folder.to_string_lossy().replace('\\', "/");
 
         let sources = [
+            (
+                "blocked-assignment",
+                format!(
+                    "[[rule]]\nid = 'blocked-assignment'\non = {{ every = '1s' }}\ndo = [{{ action = 'launch', workspace = 'C:/work', role = 'worker', assignment = {{ key = 'blocked', folder = '{missing_folder}', max_busy = 1 }} }}]\n",
+                ),
+            ),
             (
                 "broken-assignment",
                 format!(
@@ -2878,7 +2905,12 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 .await
                 .ensure_rule_state("owner", &input, now - 10_000)
                 .unwrap();
-            let timer_state = store
+            let due = if *id == "blocked-assignment" {
+                now - 9_000
+            } else {
+                now - 7_000
+            };
+            let mut timer_state = store
                 .lock()
                 .await
                 .ensure_timer_state(
@@ -2891,11 +2923,33 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                             anchor: None,
                         },
                         enabled: true,
-                        initial_next_due_at: Some(now - 9_000),
+                        initial_next_due_at: Some(due),
                     },
-                    now - 10_000,
+                    due - 1_000,
                 )
                 .unwrap();
+            if *id == "blocked-assignment" {
+                let mut action = SubmitCommand::new(ulid::Ulid::new().to_string(), "notify");
+                action.args = serde_json::json!({ "message": "open action" });
+                let admission = store
+                    .lock()
+                    .await
+                    .commit_timer_slot(
+                        "owner",
+                        &timer_state,
+                        TimerSlotCommit {
+                            scheduled_at_ms: due,
+                            next_due_at_ms: Some(due + 1_000),
+                            action: Some(action),
+                            skip_code: None,
+                            skip_capacity_message: None,
+                        },
+                        due,
+                    )
+                    .unwrap();
+                assert!(admission.child.is_some());
+                timer_state = admission.state;
+            }
             rules.push(ActiveRule {
                 principal: "owner".to_owned(),
                 project: None,
@@ -2912,10 +2966,19 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             });
         }
 
+        let blocked = rules[0].timer.as_ref().unwrap().state.clone();
         let worker_continues = reconcile_due_timers(&router, "owner", &mut rules, now)
             .await
             .expect("worker keeps running past a missing briefs folder");
         assert!(worker_continues);
+        assert_eq!(
+            store
+                .lock()
+                .await
+                .get_timer_state("owner", &blocked.id)
+                .unwrap(),
+            Some(blocked)
+        );
 
         for id in ["broken-assignment", "healthy-notify"] {
             let timer = store

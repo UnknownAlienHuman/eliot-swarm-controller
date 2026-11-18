@@ -28,7 +28,7 @@ fn custody_binding_preserves_windows_case_and_junction_aliases() {
         fs::remove_dir(&junction).unwrap();
     } else {
         eprintln!(
-            "DROP TABLE launch_intents; DROP TABLE assignment_waits; DROP TABLE arbitration_cursor; DROP TABLE manager_budgets; DELETE FROM schema_migrations WHERE version=63; junction alias unavailable on this host: {}",
+            "junction alias unavailable on this host: {}",
             String::from_utf8_lossy(&output.stderr)
         );
     }
