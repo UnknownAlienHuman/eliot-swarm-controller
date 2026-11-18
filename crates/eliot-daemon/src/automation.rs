@@ -1981,26 +1981,16 @@ fn timer_wake_delay(timer: &ActiveTimer, now: i64) -> Option<Duration> {
     ))
 }
 
-/// Agent-bound project verbs whose catch-up preparation must verify the
-/// frozen Agent target and generation before admission. This mirrors the
-/// closed project-rule verb classification enforced by `authorize_command`
-/// (router/auth.rs): targetless coordination actions (`run`, `launch`,
-/// `notify`, `emit`, `mail.send`, `var.set`) and project Git actions
-/// (`git.fetch`) skip Agent scope checks here exactly as they do on the live
-/// path. Unknown verbs stay fail-closed at ordinary admission.
+/// Catch-up preparation must verify the frozen Agent target and generation
+/// before admission exactly for the Agent-bound project verbs. This is the
+/// single closed project-rule verb classification enforced by
+/// `authorize_command` (router/auth.rs): targetless coordination actions
+/// (`run`, `launch`, `notify`, `emit`, `mail.send`, `var.set`) and project
+/// Git actions (`git.fetch`) skip Agent scope checks here exactly as they
+/// do on the live path. Unknown verbs stay fail-closed at ordinary
+/// admission.
 fn project_rule_catch_up_binds_agent(verb: &str) -> bool {
-    matches!(
-        verb,
-        "resume"
-            | "stop"
-            | "send"
-            | "steer"
-            | "inject"
-            | "interrupt"
-            | "approve"
-            | "deny"
-            | "answer"
-    )
+    crate::router::project_rule_action_binds_agent_target(verb)
 }
 
 pub(crate) async fn prepare_rule_catch_up_actions(
