@@ -188,7 +188,7 @@ fn validate_harness(harness: &str) -> Result<()> {
     }
     if !matches!(
         trimmed,
-        "codex" | "claude" | "muse" | "opencode" | "antigravity"
+        "codex" | "claude" | "muse" | "opencode" | "antigravity" | "zed"
     ) {
         return Err(Error::new(
             "unsupported",

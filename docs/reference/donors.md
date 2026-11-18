@@ -52,6 +52,17 @@ that actually extracts code; do not install all these projects as dependencies.
 | L6 MCP stdio | **Dependency:** official [`rmcp` 3.9.0](https://crates.io/crates/rmcp/3.9.0); Apache-2.0; MSRV 1.88; crate download verified with Rust 1.99.1. | Use the SDK directly; no source copied. |
 | L6 HTTP origin authentication | **Dependency:** [`jsonwebtoken` 11.1.0](https://crates.io/crates/jsonwebtoken/11.1.0), MIT, MSRV 1.88, inspected 2026-11-07 with pinned Rust 1.99.1. Reuse the already-locked `aws-lc-rs` backend and `reqwest` 0.13.5; PEM features are disabled. | Verify the signed Cloudflare Access application assertion with fixed configured issuer/JWKS/AUD and bounded refresh. Reuse rmcp request extensions and sessions. No copied crypto, OAuth implementation, new service or identity registry. |
 
+## Zed native host (k174 stage 1)
+
+**Pattern / separate program.** The host patch targets Zed revision
+`761786a4ef7144de734e48cb2e8f99bc46b5061e` and adapts the `eval_cli` bootstrap
+within that workspace. The pinned `eval_cli`, `agent`, `paths`, and `project`
+crates carry GPL-3.0-or-later. The linked workspace also includes Apache-2.0
+crates such as GPUI. The separate host keeps Zed's license files and notices,
+and its distribution must include the applicable notices and offer
+corresponding source under the GPL. The Eliot tree contains only its
+adapter and communicates over versioned stdio JSON-RPC.
+
 ## Provider quota pattern (k92, inspected 2026-11-16)
 
 OpenCodex release 2.84.0, local source

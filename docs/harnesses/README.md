@@ -42,6 +42,7 @@ table and reports drift without blocking launch:
 | muse | 1.4.0-R4161.1 | MSP v1 host |
 | opencode | 2.2.7 | native schema |
 | antigravity | 1.5.9 | ACP v1 `7ec5185c.json`, AGY 1.5.2 |
+| zed | pending | versioned `zed-agent-host` handshake at pinned commit |
 
 A drifted install still launches; the mismatch is annotated on `swarm doctor`, the
 `harness.drift` event and the launch flag. Historical source-check dates on adapter
@@ -59,6 +60,7 @@ for the exact check, including the skill and MCP mechanism k61/k62 implemented):
 | [OpenCode](opencode.md) | 2.2.7 | `minimal`; non-empty `mcp_allow` is `unsupported` | copied into the isolated per-Agent global skills directory |
 | [Muse](muse.md) | 1.4.0 (R4161.1; the 1.4.20 catalogue is empty) | `inherit` only | first-turn system-context fallback (no per-session skill flag) |
 | [Antigravity](antigravity.md) | agy 1.5.9 | `inherit` only | written into the `--add-dir` hook discovery root |
+| [Zed native host](zed.md) | pending | disabled in stage 1 | no native skill/subagent surface in stage 1 |
 
 Every worker carries exactly one generic `swarm` MCP tool (`{ method, params }`); Agents
 discover methods through `api.methods` and `api.help` and prove identity with `api.identity`.

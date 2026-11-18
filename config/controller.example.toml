@@ -95,6 +95,14 @@ model = "antigravity-model"
 mcp = "inherit"
 # mode = "auto"
 
+# Zed native host (stage 1). This is a separate zed-agent-host.exe program,
+# not Zed.exe or the editor CLI. Keep the path absolute and pin the model.
+[profiles.zed-openai]
+harness = "zed"
+cmd = "C:/Tools/Zed/zed-agent-host.exe"
+model = "openai/<native-model>"
+# pass_env = ["OPENAI_API_KEY"]
+
 # Ordered routing candidates. Roles are extensible; each candidate must name
 # a profile above. Replace or extend these lists for the work you assign.
 [routing]

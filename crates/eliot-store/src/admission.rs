@@ -852,7 +852,7 @@ fn admit_launch_tx(
     let harness = required_string(&request.args, "harness")?;
     if !matches!(
         harness.as_str(),
-        "codex" | "muse" | "claude" | "opencode" | "antigravity"
+        "codex" | "muse" | "claude" | "opencode" | "antigravity" | "zed"
     ) {
         return Err(Error::new(
             "unsupported",

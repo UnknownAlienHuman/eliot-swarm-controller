@@ -22,7 +22,7 @@ use eliot_core::api::{
 use crate::settings::{ModelRef, Preferences};
 
 /// The harness groups, in the order the picker shows them.
-pub const HARNESSES: [&str; 5] = ["codex", "claude", "opencode", "muse", "antigravity"];
+pub const HARNESSES: [&str; 6] = ["codex", "claude", "opencode", "muse", "antigravity", "zed"];
 /// `models.catalog` availability of a model under a provider hold.
 const HELD: &str = eliot_core::api::harness::CATALOG_HELD;
 
@@ -34,6 +34,7 @@ pub fn harness_label(code: &str) -> &str {
         "opencode" => "OpenCode",
         "muse" => "Muse",
         "antigravity" => "Antigravity",
+        "zed" => "Zed",
         other => other,
     }
 }

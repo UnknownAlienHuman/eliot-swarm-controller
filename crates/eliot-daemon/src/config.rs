@@ -513,7 +513,7 @@ fn desktop_key_valid(value: &str) -> bool {
         && value == value.trim()
 }
 
-const DESKTOP_HARNESSES: [&str; 5] = ["codex", "claude", "muse", "opencode", "antigravity"];
+const DESKTOP_HARNESSES: [&str; 6] = ["codex", "claude", "muse", "opencode", "antigravity", "zed"];
 
 fn desktop_error(message: &str) -> core::Error {
     core::Error::new("profile_error", format!("config.toml: {message}"))
@@ -553,11 +553,11 @@ impl DesktopSettings {
             let harness = entry.harness.as_str();
             if !matches!(
                 harness,
-                "codex" | "claude" | "muse" | "opencode" | "antigravity"
+                "codex" | "claude" | "muse" | "opencode" | "antigravity" | "zed"
             ) {
                 return Err(core::Error::new(
                     "profile_error",
-                    "config.toml: desktop model harness must be codex, claude, muse, opencode or antigravity",
+                    "config.toml: desktop model harness must be codex, claude, muse, opencode, antigravity or zed",
                 ));
             }
             let model = entry.model.as_str();
@@ -616,7 +616,7 @@ impl DesktopSettings {
         for entry in &self.model_visibility {
             if !DESKTOP_HARNESSES.contains(&entry.harness.as_str()) {
                 return Err(desktop_error(
-                    "desktop model_visibility harness must be codex, claude, muse, opencode or antigravity",
+                    "desktop model_visibility harness must be codex, claude, muse, opencode, antigravity or zed",
                 ));
             }
             match (entry.model.as_deref(), entry.provider.as_deref()) {
@@ -1385,7 +1385,12 @@ fn freeze_native_subagents(
                 .child_profiles
                 .as_deref()
                 .is_some_and(|names| !names.is_empty());
-            if has_children { "deny" } else { "allow" }.to_owned()
+            if has_children || harness == "zed" {
+                "deny"
+            } else {
+                "allow"
+            }
+            .to_owned()
         }
     };
     if effective == "deny" && matches!(harness.as_str(), "muse" | "antigravity") {
@@ -1634,6 +1639,7 @@ fn snapshot_from_entry(
         && harness != "claude"
         && harness != "opencode"
         && harness != "antigravity"
+        && harness != "zed"
     {
         return Err(profile_field_error(
             source,
@@ -1669,6 +1675,9 @@ fn snapshot_from_entry(
     }
     if harness == "antigravity" {
         return antigravity_snapshot_from_entry(name, entry, table_offset, source);
+    }
+    if harness == "zed" {
+        return zed_snapshot_from_entry(name, entry, table_offset, source);
     }
     let model = entry.model.as_deref();
     if let Some(model) = model {
@@ -1841,6 +1850,8 @@ fn validate_profile_tail(
                 require_native_claude_cmd(name, cmd, source, table_offset)?
             } else if harness == "antigravity" {
                 require_native_antigravity_cmd(name, cmd, source, table_offset)?
+            } else if harness == "zed" {
+                require_native_zed_cmd(name, cmd, source, table_offset)?
             } else {
                 cmd
             })
@@ -2746,6 +2757,166 @@ fn antigravity_snapshot_from_entry(
     Ok(Value::Object(snapshot))
 }
 
+/// Freeze the stage-1 Zed host profile.  The host owns a persistent native
+/// session, but this first slice deliberately exposes only launch/send/stop;
+/// native MCP, subagents, and all later configuration verbs remain disabled.
+fn zed_snapshot_from_entry(
+    name: &str,
+    entry: &ProfileEntry,
+    table_offset: usize,
+    source: &str,
+) -> core::Result<Value> {
+    let model = entry.model.as_deref().ok_or_else(|| {
+        profile_field_error(
+            source,
+            table_offset,
+            name,
+            "model",
+            "required explicit model is missing",
+            "profile_error",
+        )
+    })?;
+    validate_model(name, model, source, table_offset)?;
+    if !model
+        .strip_prefix("openai/")
+        .is_some_and(|model| !model.is_empty() && !model.contains('/'))
+    {
+        return Err(profile_field_error(
+            source,
+            table_offset,
+            name,
+            "model",
+            "must be openai/<native-model>",
+            "profile_error",
+        ));
+    }
+    for field in [
+        "effort",
+        "approval",
+        "collaboration_mode",
+        "permissions",
+        "approval_policy",
+        "auth_integration",
+        "mode",
+        "dangerously_skip_permissions",
+        "provider_base_url",
+        "api_key_env",
+        "backend",
+        "context_limit",
+        "output_limit",
+    ] {
+        let present = match field {
+            "effort" => entry.effort.is_some(),
+            "approval" => entry.approval.is_some(),
+            "collaboration_mode" => entry.collaboration_mode.is_some(),
+            "permissions" => entry.permissions.is_some(),
+            "approval_policy" => entry.approval_policy.is_some(),
+            "auth_integration" => entry.auth_integration.is_some(),
+            "mode" => entry.mode.is_some(),
+            "dangerously_skip_permissions" => entry.dangerously_skip_permissions.is_some(),
+            "provider_base_url" => entry.provider_base_url.is_some(),
+            "api_key_env" => entry.api_key_env.is_some(),
+            "backend" => entry.backend.is_some(),
+            "context_limit" => entry.context_limit.is_some(),
+            "output_limit" => entry.output_limit.is_some(),
+            _ => false,
+        };
+        if present {
+            return Err(profile_field_error(
+                source,
+                table_offset,
+                name,
+                field,
+                "the stage-1 Zed host has no mapping for this field",
+                "unsupported",
+            ));
+        }
+    }
+    if entry
+        .mcp
+        .as_deref()
+        .is_some_and(|policy| policy.trim() != "minimal")
+    {
+        return Err(profile_field_error(
+            source,
+            table_offset,
+            name,
+            "mcp",
+            "stage-1 Zed native MCP is disabled; only mcp = \"minimal\" is allowed",
+            "unsupported",
+        ));
+    }
+    if entry
+        .mcp_allow
+        .as_ref()
+        .is_some_and(|allow| !allow.is_empty())
+    {
+        return Err(profile_field_error(
+            source,
+            table_offset,
+            name,
+            "mcp_allow",
+            "stage-1 Zed native MCP is disabled",
+            "unsupported",
+        ));
+    }
+    if entry
+        .native_subagents
+        .as_deref()
+        .is_some_and(|mode| mode != "deny")
+    {
+        return Err(profile_field_error(
+            source,
+            table_offset,
+            name,
+            "native_subagents",
+            "stage-1 Zed native subagents are disabled",
+            "unsupported",
+        ));
+    }
+    let tail = validate_profile_tail(name, entry, table_offset, source)?;
+    let expected = if cfg!(windows) {
+        "zed-agent-host.exe"
+    } else {
+        "zed-agent-host"
+    };
+    let is_host_path = tail.cmd.as_deref().map(Path::new).is_some_and(|path| {
+        path.is_absolute()
+            && path
+                .file_name()
+                .and_then(|file| file.to_str())
+                .is_some_and(|file| file.eq_ignore_ascii_case(expected))
+    });
+    if !is_host_path {
+        return Err(profile_field_error(
+            source,
+            table_offset,
+            name,
+            "cmd",
+            "must be an absolute path to the Zed agent host executable",
+            "profile_error",
+        ));
+    }
+    let mut snapshot = serde_json::Map::new();
+    snapshot.insert("harness".to_owned(), Value::String("zed".to_owned()));
+    snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
+    snapshot.insert("mcp".to_owned(), Value::String("minimal".to_owned()));
+    snapshot.insert("mcp_allow".to_owned(), Value::Array(Vec::new()));
+    snapshot.insert(
+        "native_subagents".to_owned(),
+        Value::String("deny".to_owned()),
+    );
+    insert_control(
+        &mut snapshot,
+        name,
+        entry.control.as_deref(),
+        source,
+        table_offset,
+    )?;
+    insert_profile_tail(&mut snapshot, tail, &entry.setup)?;
+    Ok(Value::Object(snapshot))
+}
+
 fn bind_route_and_capacity(
     profile_name: &str,
     entry: &ProfileEntry,
@@ -3226,6 +3397,38 @@ fn require_native_antigravity_cmd(
             profile,
             "cmd",
             "must name the native `agy` CLI, not the Antigravity IDE executable (which does not implement the ACP/model CLI and is never launched); install the `agy` CLI and put it on PATH",
+            "profile_error",
+        ));
+    }
+    Ok(cmd)
+}
+
+/// Zed profiles name the separately built `zed-agent-host` executable.  Eliot
+/// never probes or launches the Zed editor itself, so this is intentionally a
+/// pure path check with no discovery side effects.
+fn require_native_zed_cmd(
+    profile: &str,
+    cmd: String,
+    source: &str,
+    offset: usize,
+) -> core::Result<String> {
+    if !std::path::Path::new(&cmd).is_absolute() {
+        return Err(profile_field_error(
+            source,
+            offset,
+            profile,
+            "cmd",
+            "must be an absolute path to zed-agent-host.exe",
+            "profile_error",
+        ));
+    }
+    if cfg!(windows) && !cmd.to_ascii_lowercase().ends_with(".exe") {
+        return Err(profile_field_error(
+            source,
+            offset,
+            profile,
+            "cmd",
+            "must name zed-agent-host.exe",
             "profile_error",
         ));
     }

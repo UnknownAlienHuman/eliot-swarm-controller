@@ -303,6 +303,11 @@ no mapping and are rejected. The effective permission mode and effective model c
 from native init facts; init does not establish the served model. See the
 [Antigravity page](../harnesses/antigravity.md).
 
+A Zed profile selects `harness = "zed"`, an absolute path to the separate
+`zed-agent-host` executable, and a model selector of the form
+`openai/<native-model>`. Zed requires an explicit profile. The adapter verifies the host revision and instance paths at launch. See [Zed](../harnesses/zed.md)
+for the native API credential source and the stage-1 controls.
+
 A Muse profile selects `harness = "muse"` with an explicit native `cmd`, an optional exact `model`,
 optional `effort`, optional `approval`, and `permissions` (`workspace-write`, the default,
 or `danger-full-access`; `read-only` remains unsupported). Sandbox posture is fixed at

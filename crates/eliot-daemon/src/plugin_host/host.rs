@@ -456,7 +456,7 @@ impl PluginHost {
         }
         if !matches!(
             agent.harness.as_str(),
-            "codex" | "muse" | "claude" | "opencode" | "antigravity"
+            "codex" | "muse" | "claude" | "opencode" | "antigravity" | "zed"
         ) || agent.generation <= 0
         {
             return Err(Error::new(
@@ -2536,7 +2536,7 @@ fn manifest_source_plan(manifest: &PluginManifest, harness: &str) -> Result<Valu
 
     if !matches!(
         harness,
-        "codex" | "muse" | "claude" | "opencode" | "antigravity"
+        "codex" | "muse" | "claude" | "opencode" | "antigravity" | "zed"
     ) {
         return Err(unsupported_manifest());
     }

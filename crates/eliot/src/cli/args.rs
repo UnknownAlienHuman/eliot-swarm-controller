@@ -1407,6 +1407,9 @@ pub(crate) enum PluginCommand {
     /// Internal Antigravity command-hook entry point (hidden).
     #[command(name = "antigravity-hook", hide = true)]
     AntigravityHook,
+    /// Internal Zed native host plugin entry point (hidden).
+    #[command(hide = true)]
+    Zed,
 }
 
 #[cfg(test)]

@@ -518,6 +518,7 @@ dependencies = [
  "eliot-plugin-codex",
  "eliot-plugin-muse",
  "eliot-plugin-opencode",
+ "eliot-plugin-zed",
  "futures-util",
  "jsonwebtoken",
  "libc",
@@ -654,6 +655,18 @@ dependencies = [
  "eliot-core",
  "eliot-plugin",
  "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "ulid",
+]
+
+[[package]]
+name = "eliot-plugin-zed"
+version = "0.2.0-dev"
+dependencies = [
+ "eliot-core",
+ "eliot-plugin",
  "serde",
  "serde_json",
  "tokio",
