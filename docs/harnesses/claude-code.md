@@ -353,18 +353,29 @@ extensionless Unix candidate counts as native only after an ELF or Mach-O
 header check (`#!` scripts never qualify), and every candidate must be an
 absolute path before any `--version` probe runs. `swarm harnesses` reports every discovered install
 newest first in `candidates`. `swarm models --harness claude` reports the
+native initialize inventory when the reader proves one: selectable values with
+display names and per-model effort levels, each entry without a provenance
+marker. Only when the native read is unavailable does it fall back to the
 frozen documented `--model` aliases (`best`, `fable`, `sonnet`, `opus`,
 `haiku`, `sonnet[1m]`, `opus[1m]`, `opusplan`, `opusplan[1m]`) and full model
-ids (for example `claude-haiku-5-5`, `claude-opus-5-5`), each entry marked
-`source = "documented_alias"` with the CLI effort vocabulary attached and
-`unknown` availability; an omitted `--model` selects the CLI default, whose
-effective value is read back from initialize/stream. The native stream-json
-`initialize` response includes `models` with selectable values, display names,
-resolved model IDs and model-specific effort levels when the CLI reports them.
-The plugin's private `model.list` method reads that metadata without a prompt or
-auto-login, using the installed CLI's `--safe-mode` and strict empty MCP config. It declines
-profiles with `pass_env` until the daemon supplies that environment to the reader.
-The public command still uses the daemon's documented catalogue.
+ids (for example `claude-haiku-5-5`, `claude-opus-5-5`), each fallback entry
+marked `source = "documented_alias"` with the CLI effort vocabulary attached
+and `unknown` availability. An `unknown` read or cleanup outcome,
+`cancelled`, an integrity failure or a
+capacity refusal propagates as an error and is never cached as a catalogue.
+An omitted `--model` selects the CLI default. Launch and live `configure`
+use the selectable id. Effort applies at launch, with choices from native
+inventory when available. The
+native stream-json `initialize` response includes `models` with selectable
+values, display names, resolved model IDs and model-specific effort levels when
+the CLI reports them. The plugin private `model.list` method reads that
+metadata without a prompt or auto-login, using the installed CLI
+`--safe-mode` and strict empty MCP config. The daemon verifies the frozen
+store and provider route against the exact private environment it forwards.
+Missing or changed route selectors and legacy snapshots without route
+capture use the alias fallback and bypass the native catalog cache. The
+scope label omits `CLAUDE_CONFIG_DIR` and other private selector values.
+Inventory membership leaves account entitlement unknown.
 [Claude Agent SDK model information](https://code.claude.com/docs/en/agent-sdk/typescript#modelinfo).
 ## Agent skill delivery (`eliot-swarm`)
 

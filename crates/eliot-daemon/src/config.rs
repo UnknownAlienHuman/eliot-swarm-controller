@@ -62,6 +62,15 @@ const PRIVATE_STORE_SELECTORS: &[&str] = &[
 ];
 const PRIVATE_PROVIDER_SELECTORS: &[&str] = &[
     "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_AWS_BASE_URL",
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
+    "ANTHROPIC_FOUNDRY_BASE_URL",
+    "ANTHROPIC_FOUNDRY_RESOURCE",
+    "ANTHROPIC_VERTEX_BASE_URL",
+    "ANTHROPIC_VERTEX_PROJECT_ID",
+];
+const CLAUDE_PROVIDER_MODES: &[&str] = &[
     "CLAUDE_CODE_USE_ANTHROPIC_AWS",
     "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
     "CLAUDE_CODE_USE_BEDROCK",
@@ -73,6 +82,15 @@ const CLAUDE_ROUTE_CREDENTIALS: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "CLAUDE_CODE_OAUTH_TOKEN",
+];
+const CLAUDE_MODEL_SELECTORS: &[&str] = &[
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_MODEL",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION",
 ];
 pub(crate) const ROUTE_HOME_SELECTORS: &[&str] = if cfg!(windows) {
     &["HOME", "USERPROFILE", "LOCALAPPDATA"]
@@ -100,7 +118,33 @@ pub(crate) fn private_route_selector(name: &str) -> bool {
     native_store_selector(name).is_some()
         || PRIVATE_PROVIDER_SELECTORS
             .iter()
+            .chain(CLAUDE_PROVIDER_MODES)
             .any(|selector| env_name_matches(name, selector))
+}
+
+/// Claude can echo a model pin as native metadata. An explicitly bound API
+/// key still contributes a credential, even when it uses a model pin's name.
+pub(crate) fn claude_model_selector(profile: &Value, name: &str) -> bool {
+    profile["harness"] == "claude"
+        && CLAUDE_MODEL_SELECTORS
+            .iter()
+            .any(|selector| env_name_matches(name, selector))
+        && !api_key_name_matches(profile, name)
+}
+
+pub(crate) fn claude_provider_mode_flag(profile: &Value, name: &str, value: &Value) -> bool {
+    profile["harness"] == "claude"
+        && matches!(value.as_str(), Some("0" | "1" | "false" | "true"))
+        && CLAUDE_PROVIDER_MODES
+            .iter()
+            .any(|selector| env_name_matches(name, selector))
+        && !api_key_name_matches(profile, name)
+}
+
+fn api_key_name_matches(profile: &Value, name: &str) -> bool {
+    profile["api_key_env"]
+        .as_str()
+        .is_some_and(|key| env_name_matches(name, key))
 }
 
 fn admitted_selector<'a>(names: &'a [Value], selector: &str) -> Option<&'a str> {
@@ -127,6 +171,7 @@ pub(crate) fn native_route_identity(
         .chain(CODEX_STORE_SELECTORS)
         .chain(PRIVATE_STORE_SELECTORS)
         .chain(PRIVATE_PROVIDER_SELECTORS)
+        .chain(CLAUDE_PROVIDER_MODES)
         .chain(CLAUDE_ROUTE_CREDENTIALS)
     {
         let admitted = admitted_selector(names, selector);
@@ -152,6 +197,9 @@ pub(crate) fn metadata_route_scope_known(
     environment: &serde_json::Map<String, Value>,
 ) -> bool {
     let harness = profile["harness"].as_str().unwrap_or_default();
+    if harness == "claude" && !claude_route_selectors_resolved(profile, environment) {
+        return false;
+    }
     environment
         .iter()
         .filter_map(|(name, value)| value.as_str().map(|value| (name, value)))
@@ -163,6 +211,24 @@ pub(crate) fn metadata_route_scope_known(
                 return false;
             }
             native_store_selector(name).is_none() || Path::new(value.trim()).is_absolute()
+        })
+}
+
+fn claude_route_selectors_resolved(
+    profile: &Value,
+    environment: &serde_json::Map<String, Value>,
+) -> bool {
+    profile["pass_env"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|name| private_route_selector(name))
+        .all(|name| {
+            environment.iter().any(|(key, value)| {
+                env_name_matches(key, name)
+                    && value.as_str().is_some_and(|value| !value.trim().is_empty())
+            })
         })
 }
 
@@ -210,7 +276,12 @@ fn capture_native_store_inputs_inner(
     let credentials = names
         .iter()
         .filter_map(Value::as_str)
-        .filter(|name| !private_route_selector(name))
+        .filter(|name| {
+            (!private_route_selector(name)
+                || (profile["harness"] == "claude" && env_name_matches(name, "CLAUDE_CONFIG_DIR")))
+                && !claude_model_selector(profile, name)
+        })
+        .chain(profile["api_key_env"].as_str())
         .filter_map(&mut credential_lookup)
         .filter_map(|value| value.into_string().ok())
         .collect::<Vec<_>>();
@@ -3855,6 +3926,25 @@ mod tests {
         );
         assert_eq!(profile["native_route_identity"].as_str().unwrap().len(), 64);
         assert!(!profile.to_string().contains("private-"));
+    }
+
+    #[test]
+    fn claude_model_pin_is_metadata_only_for_claude_and_when_not_a_bound_key() {
+        let pin = "ANTHROPIC_DEFAULT_SONNET_MODEL";
+        let mut profile = json!({"harness":"claude","pass_env":[pin],"model":"gateway/sonnet"});
+        let lookup = |name: &str| (name == pin).then(|| "gateway/sonnet".into());
+        capture_native_store_inputs_with_lookups(&mut profile, lookup, lookup).unwrap();
+        for (harness, key_ref) in [("codex", Value::Null), ("claude", json!(pin))] {
+            let mut credential = profile.clone();
+            credential["harness"] = json!(harness);
+            credential["api_key_env"] = key_ref;
+            assert_eq!(
+                capture_native_store_inputs_with_lookups(&mut credential, lookup, lookup)
+                    .unwrap_err()
+                    .code,
+                "secret_in_payload"
+            );
+        }
     }
 
     #[test]

@@ -4,8 +4,10 @@
 //! model turn and without inference. `harness.models` returns the harness's
 //! own read-only catalogue (Codex/Muse native `model/list`, OpenCode
 //! `opencode models` provider/model ids, Antigravity `agy models`; Claude
-//! exposes its documented aliases and full model ids plus the CLI default,
-//! each entry carrying `source = "documented_alias"`), cached per native
+//! prefers its native `initialize` inventory and falls back to its documented
+//! aliases and full model ids plus the CLI default, each fallback entry
+//! carrying `source = "documented_alias"`, only when the native read is
+//! unavailable), cached per native
 //! route/account with a freshness
 //! timestamp and a nonsecret credential identity. `harness.quota`
 //! reports provider-supported account quota readback with timestamp, scope,
@@ -282,9 +284,9 @@ pub struct HarnessModelEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_effort: Option<String>,
     /// Provenance of this entry: absent for a live native read, or
-    /// `documented_alias` for the frozen Claude alias/id list (Claude Code
-    /// exposes no read-only model inventory; availability is never
-    /// asserted from catalogue membership).
+    /// documented_alias for the frozen Claude alias and id list, used only
+    /// when the native initialize inventory is unavailable. Availability is
+    /// never asserted from catalogue membership.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
 }
@@ -308,12 +310,10 @@ pub fn native_model_display_name(name: &str) -> Option<&str> {
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HarnessModelsResponse {
     pub harness: String,
-    /// `native` (live catalogue), `aliases` (Claude documented aliases and
-    /// full model ids, each entry carrying `source = "documented_alias"`),
-    /// `empty` (the native read ran but listed no models; details in
-    /// `note`), or `none` (no catalogue; details in `note`). For OpenCode
-    /// the `note` always names the session-true source (`session`,
-    /// `isolated`, `canonical`).
+    /// `native` (live catalogue, including Claude `initialize`), `aliases`
+    /// (Claude fallback, with `source = "documented_alias"`), `empty` (the
+    /// native read listed no models), or `none` (no catalogue). For OpenCode
+    /// `note` identifies the live session or the launch preview source.
     pub catalogue: String,
     pub models: Vec<HarnessModelEntry>,
     /// Native default model id, when the harness names one.

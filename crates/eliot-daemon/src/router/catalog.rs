@@ -6,8 +6,8 @@
 
 use super::{MODE_OPEN, Principal, Router, catalog, now_ms, require_owner};
 use eliot_core::api::{
-    HARNESS_READ_TTL_MS, HarnessEntry, HarnessModelsResponse, HarnessQuotaResponse,
-    ModelsCatalogEntry, ModelsCatalogFailure,
+    HARNESS_READ_TTL_MS, HarnessCandidate, HarnessEntry, HarnessModelsResponse,
+    HarnessQuotaResponse, ModelsCatalogEntry, ModelsCatalogFailure,
 };
 use eliot_core::{Error, Result};
 use eliot_plugin::sync::LockExt;
@@ -79,15 +79,14 @@ impl Router {
         serde_json::to_value(response)
             .map_err(|_| Error::new("internal", "harness list could not be encoded"))
     }
-    /// Resolve a named profile or a live reader's ad-hoc snapshot.
-    /// The documented Claude aliases have no native reader yet.
+    /// Resolve a named profile or an ad-hoc snapshot with its discovered version.
     async fn resolve_catalog_snapshot(
         &self,
         harness: &str,
         profile: Option<&str>,
         quota: bool,
         deadline: Instant,
-    ) -> Result<(Option<Value>, String)> {
+    ) -> Result<(Option<Value>, String, Option<HarnessCandidate>)> {
         if let Some(name) = profile {
             let mut snapshot = self.resolve_profile_cached(name)?;
             crate::config::capture_native_store_inputs(&mut snapshot, |name| {
@@ -99,44 +98,49 @@ impl Router {
                     "harness does not match the selected profile",
                 ));
             }
-            return Ok((Some(snapshot), name.to_owned()));
+            return Ok((Some(snapshot), name.to_owned(), None));
         }
-        if matches!(harness, "codex" | "muse" | "opencode" | "antigravity")
-            || (quota && harness == "claude")
-        {
-            let cmd = crate::adhoc::discover_cmd_until(harness, deadline).await?;
-            let mut snapshot = crate::adhoc::adhoc_snapshot(
-                harness,
-                None,
-                None,
-                cmd,
-                crate::adhoc::AdhocAuth::Skip,
-                None,
-            )?;
-            if quota && harness == "opencode" {
-                // Preserve the ad-hoc Go read. Named launch routes must bind
-                // their own integration; adopted backends have no Go route.
-                snapshot["auth_integration"] = json!("opencode-go");
+        let (cmd, discovered) = if harness == "claude" && !quota {
+            match crate::adhoc::claude_reader_executable(deadline).await {
+                Ok(candidate) => (Some(candidate.cmd.clone()), Some(candidate)),
+                Err(error) if catalog::claude_fallback_eligible(&error) => {
+                    return Ok((None, "adhoc".to_owned(), None));
+                }
+                Err(error) => return Err(error),
             }
-            crate::config::stamp_cloud_mcp_hostname(&mut snapshot, &self.inner.data_root);
-            crate::config::capture_native_store_inputs(&mut snapshot, |name| {
-                std::env::var_os(name)
-            })?;
-            return Ok((Some(snapshot), "adhoc".to_owned()));
+        } else {
+            (
+                crate::adhoc::discover_cmd_until(harness, deadline).await?,
+                None,
+            )
+        };
+        let mut snapshot = crate::adhoc::adhoc_snapshot(
+            harness,
+            None,
+            None,
+            cmd,
+            crate::adhoc::AdhocAuth::Skip,
+            None,
+        )?;
+        if quota && harness == "opencode" {
+            // Named launch routes bind their own integration.
+            snapshot["auth_integration"] = json!("opencode-go");
         }
-        Ok((None, "adhoc".to_owned()))
+        crate::config::stamp_cloud_mcp_hostname(&mut snapshot, &self.inner.data_root);
+        crate::config::capture_native_store_inputs(&mut snapshot, |name| std::env::var_os(name))?;
+        Ok((Some(snapshot), "adhoc".to_owned(), discovered))
     }
 
     /// The route an existing Agent's `configure` draws from: its frozen
     /// launch snapshot, never the current profile file. The label carries the
     /// exact Agent generation so a later profile edit cannot share its cache
-    /// entry. Observed Agents have no Eliot launch route. The returned
-    /// identity lets an OpenCode read try the live session catalogue first.
+    /// entry. Observed Agents have no Eliot launch route. OpenCode uses the
+    /// captured generation to read the live session catalogue.
     async fn agent_catalog_snapshot(
         &self,
         agent: &str,
         harness: &str,
-    ) -> Result<(Option<Value>, String, Option<(String, i64)>)> {
+    ) -> Result<(Value, String, (String, i64))> {
         let agent = self
             .inner
             .store
@@ -157,12 +161,13 @@ impl Router {
             ));
         }
         let label = format!("{}@{}g{}", agent.profile, agent.id, agent.generation);
-        let identity = (agent.id.clone(), agent.generation);
-        Ok((Some(agent.profile_snapshot), label, Some(identity)))
+        Ok((agent.profile_snapshot, label, (agent.id, agent.generation)))
     }
 
-    /// OpenCode Agent reads go to the owned generation. A standalone
-    /// catalogue is available independently as a launch preview.
+    /// Read-only native model catalogue for a harness: no model turn, no
+    /// inference. Dedicated metadata readers use the harness's own catalogue
+    /// and cache by verified route and executable. Claude can fall back to
+    /// documented aliases when its native inventory is unavailable.
     pub(super) async fn harness_models(
         &self,
         params: &Value,
@@ -194,230 +199,144 @@ impl Router {
             ));
         }
         let profile = request.profile.as_deref().map(str::trim);
-        let (snapshot, label, live_identity) = match request.agent.as_deref() {
-            Some(agent) => self.agent_catalog_snapshot(agent, &harness).await?,
+        let (snapshot, label, discovered, live_identity) = match request.agent.as_deref() {
+            Some(agent) => {
+                let (snapshot, label, identity) =
+                    self.agent_catalog_snapshot(agent, &harness).await?;
+                (Some(snapshot), label, None, Some(identity))
+            }
             None => {
-                let (snapshot, label) = self
+                let (snapshot, label, discovered) = self
                     .resolve_catalog_snapshot(&harness, profile, false, deadline)
                     .await?;
-                (snapshot, label, None)
+                (snapshot, label, discovered, None)
             }
         };
-        let (scope, credential) = catalog::describe_snapshot(&label, &harness, snapshot.as_ref());
-        let live_opencode = live_identity.as_ref().filter(|_| harness == "opencode");
-        let mut snapshot = snapshot;
-        let mut environment = None;
-        let mut cache_key = None;
-        if harness != "claude" && live_opencode.is_none() {
-            let profile = snapshot.as_mut().ok_or_else(|| {
-                Error::new(
-                    "internal",
-                    "live harness catalogue requires a frozen snapshot",
-                )
-            })?;
-            let route = crate::plugin_host::metadata_route(profile)?;
-            let cmd = profile["cmd"].as_str().unwrap_or(&harness);
-            let (cmd, version) = crate::adhoc::reader_executable(cmd, &harness, deadline).await?;
-            profile["cmd"] = Value::String(cmd.clone());
-            if request.workspace.is_none() {
-                cache_key =
-                    catalog::canonical_cache_identity(&label, profile, route.identity.as_deref())
-                        .and_then(|key| catalog::models_key(&key, &cmd, version.as_deref()));
-            }
-            environment = Some(route.environment);
-        }
-        let now = now_ms();
-        if let Some(hit) = cache_key
-            .as_deref()
-            .and_then(|key| self.inner.catalog_cache.lock_recover().get_models(key, now))
-        {
-            request.validate_response(&hit)?;
-            return serde_json::to_value(hit)
-                .map_err(|_| Error::new("internal", "harness models could not be encoded"));
-        }
-        let response = match harness.as_str() {
-            "claude" => eliot_core::api::HarnessModelsResponse {
-                harness: harness.clone(),
-                catalogue: "aliases".to_owned(),
-                models: crate::adhoc::claude_documented_models(),
-                default: None,
-                note: Some(
-                    "Claude Code exposes no read-only model inventory (no models subcommand, \
-                     --model names aliases or a full model name, initialize reports only the \
-                     session model); entries are the documented aliases and full model ids from \
-                     https://code.claude.com/docs/en/model-config (checked 2026-11-16, installed \
-                     CLI 2.1.325), each marked source documented_alias with unknown availability; \
-                     the CLI default applies when no model is passed"
-                        .to_owned(),
-                ),
-                scope: scope.clone(),
-                fetched_at_ms: now_ms(),
-                ttl_ms: catalog::CATALOG_TTL_MS,
-                credential: credential.clone(),
-                configure: eliot_core::api::ConfigureSupport::for_harness(&harness),
-            },
-            "codex" | "muse" | "opencode" | "antigravity" => {
-                let Some(snapshot) = snapshot else {
+        let response =
+            if let Some((agent, generation)) = live_identity.filter(|_| harness == "opencode") {
+                let (scope, credential) =
+                    catalog::describe_snapshot(&label, &harness, snapshot.as_ref());
+                let raw = self
+                    .inner
+                    .plugin_host
+                    .agent_models(&agent, generation)
+                    .await?;
+                if !self
+                    .inner
+                    .store
+                    .lock()
+                    .await
+                    .get_agent(&agent)?
+                    .is_some_and(|agent| agent.generation == generation)
+                {
                     return Err(Error::new(
-                        "internal",
-                        "live harness catalogue requires a frozen snapshot",
+                        "stale_generation",
+                        "Agent generation changed during its model read",
                     ));
-                };
-                let snapshot_cmd = snapshot
-                    .get("cmd")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-                let (raw, provenance) = if let Some((agent_id, generation)) = live_opencode {
-                    let result = self
-                        .inner
-                        .plugin_host
-                        .agent_models(agent_id, *generation)
-                        .await?;
-                    if !self
-                        .inner
-                        .store
-                        .lock()
-                        .await
-                        .get_agent(agent_id)?
-                        .is_some_and(|agent| agent.generation == *generation)
-                    {
-                        return Err(Error::new(
-                            "stale_generation",
-                            "Agent generation changed during its model read",
-                        ));
-                    }
-                    (result, "session")
-                } else {
-                    let environment = environment.ok_or_else(|| {
-                        Error::new("internal", "model reader environment missing")
-                    })?;
-                    let raw = self
-                        .inner
-                        .plugin_host
-                        .models(
-                            snapshot,
-                            environment,
-                            request.workspace.clone(),
-                            deadline.into(),
-                        )
-                        .await?;
-                    let provenance =
-                        if raw.get("provenance").and_then(Value::as_str) == Some("preview") {
-                            "preview"
-                        } else {
-                            "canonical"
-                        };
-                    (raw, provenance)
-                };
-                let models = raw
-                    .get("models")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
-                let mut entries = Vec::new();
-                for model in models {
-                    let id = model
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned();
-                    if id.trim().is_empty() {
-                        continue;
-                    }
-                    entries.push(eliot_core::api::HarnessModelEntry {
-                        id,
-                        display_name: model
-                            .get("display_name")
-                            .and_then(Value::as_str)
-                            .and_then(eliot_core::api::harness::native_model_display_name)
-                            .map(str::to_owned),
-                        default: model
-                            .get("default")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false),
-                        efforts: model
-                            .get("efforts")
-                            .and_then(|efforts| serde_json::from_value(efforts.clone()).ok()),
-                        default_effort: model
-                            .get("default_effort")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned),
-                        // Live native reads carry no provenance marker.
-                        source: None,
-                    });
                 }
-                let default = raw
-                    .get("default")
-                    .and_then(Value::as_str)
-                    .filter(|default| !default.trim().is_empty())
-                    .map(str::to_owned);
-                let (catalogue, note) = if harness == "muse" && entries.is_empty() {
-                    // The launcher-marked Muse binary answered `model/list`
-                    // with an empty catalogue (observed on Muse 1.4.20's
-                    // empty `bundledCatalog`): no server default exists to
-                    // apply, so the read reports `empty` honestly instead of
-                    // the default-marker note. Discovery stays deterministic
-                    // on the launcher mark (no extra native launch beyond
-                    // this read); pass `--cmd` (or a profile pinning `cmd`)
-                    // naming a binary with a live catalogue, e.g. the
-                    // pinned 1.4.0 binary.
-                    let binary = snapshot_cmd.as_deref().unwrap_or("muse");
-                    (
-                        "empty".to_owned(),
-                        Some(format!(
-                            "Muse model/list from {binary} returned an empty catalogue; ad-hoc launch needs an explicit model, or --cmd naming a binary with a live catalogue"
-                        )),
-                    )
-                } else if harness == "muse" {
-                    (
-                        "native".to_owned(),
-                        Some(muse_catalog_note(default.as_deref())),
-                    )
-                } else if harness == "opencode" {
-                    (
-                        "native".to_owned(),
-                        Some(opencode_catalog_note(provenance).to_owned()),
-                    )
-                } else if harness == "antigravity" {
-                    (
-                        "native".to_owned(),
-                        Some(
-                            "Antigravity catalogue from `agy models`; effort-suffixed ids map to thought_level at launch"
-                                .to_owned(),
-                        ),
-                    )
-                } else {
-                    ("native".to_owned(), None)
-                };
-                eliot_core::api::HarnessModelsResponse {
-                    harness: harness.clone(),
-                    catalogue,
-                    models: entries,
-                    default,
-                    note,
-                    scope: scope.clone(),
-                    fetched_at_ms: now_ms(),
-                    ttl_ms: catalog::CATALOG_TTL_MS,
-                    credential: credential.clone(),
-                    configure: eliot_core::api::ConfigureSupport::for_harness(&harness),
-                }
-            }
-            _ => {
-                return Err(Error::new(
-                    "unsupported",
-                    format!("unsupported harness {harness}"),
-                ));
-            }
-        };
+                catalog::native_models_response(&harness, "", scope, credential, "session", &raw)?
+            } else {
+                self.models_for_snapshot(
+                    &harness,
+                    snapshot,
+                    &label,
+                    discovered,
+                    request.workspace.clone(),
+                    deadline,
+                )
+                .await?
+            };
         request.validate_response(&response)?;
-        if let Some(key) = cache_key {
-            self.inner
-                .catalog_cache
-                .lock_recover()
-                .insert_models(key, response.clone());
-        }
         serde_json::to_value(response)
             .map_err(|_| Error::new("internal", "harness models could not be encoded"))
+    }
+
+    async fn models_for_snapshot(
+        &self,
+        harness: &str,
+        snapshot: Option<Value>,
+        label: &str,
+        discovered: Option<HarnessCandidate>,
+        workspace: Option<String>,
+        deadline: Instant,
+    ) -> Result<HarnessModelsResponse> {
+        let (scope, credential) = catalog::describe_snapshot(label, harness, snapshot.as_ref());
+        let read = async {
+            let mut profile = snapshot.ok_or_else(|| {
+                Error::new(
+                    "unavailable",
+                    "native model catalogue executable was not discovered",
+                )
+            })?;
+            let route = crate::plugin_host::metadata_route(&profile)?;
+            if harness == "claude" && route.identity.is_none() {
+                return Err(Error::new(
+                    "unavailable",
+                    "Claude model catalogue route could not be verified",
+                ));
+            }
+            let cmd = profile["cmd"].as_str().unwrap_or(harness);
+            let (cmd, version) = match discovered {
+                Some(candidate) => (candidate.cmd, candidate.version),
+                None => crate::adhoc::reader_executable(cmd, harness, deadline).await?,
+            };
+            profile["cmd"] = Value::String(cmd.clone());
+            let cache_key = if workspace.is_none() {
+                catalog::canonical_cache_identity(
+                    label,
+                    &profile,
+                    route.identity.as_deref(),
+                    &route.environment,
+                )
+                .and_then(|key| catalog::models_key(&key, &cmd, version.as_deref()))
+            } else {
+                None
+            };
+            if let Some(hit) = cache_key.as_deref().and_then(|key| {
+                self.inner
+                    .catalog_cache
+                    .lock_recover()
+                    .get_models(key, now_ms())
+            }) {
+                return Ok((hit, None));
+            }
+            let raw = self
+                .inner
+                .plugin_host
+                .models(profile, route.environment, workspace, deadline.into())
+                .await?;
+            let provenance = if raw["provenance"] == "preview" {
+                "preview"
+            } else {
+                "canonical"
+            };
+            let response = catalog::native_models_response(
+                harness,
+                &cmd,
+                scope.clone(),
+                credential.clone(),
+                provenance,
+                &raw,
+            )?;
+            Ok((response, cache_key))
+        }
+        .await;
+        match read {
+            Ok((response, cache_key)) => {
+                response.validate()?;
+                if let Some(key) = cache_key {
+                    self.inner
+                        .catalog_cache
+                        .lock_recover()
+                        .insert_models(key, response.clone());
+                }
+                Ok(response)
+            }
+            Err(error) if harness == "claude" && catalog::claude_fallback_eligible(&error) => {
+                Ok(catalog::claude_alias_fallback(scope, credential))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Provider-supported account quota readback: timestamp, scope and an
@@ -470,7 +389,7 @@ impl Router {
             ));
         }
         let profile = request.profile.as_deref().map(str::trim);
-        let (snapshot, label) = self
+        let (snapshot, label, _) = self
             .resolve_catalog_snapshot(&harness, profile, true, deadline)
             .await?;
         self.quota_for_snapshot(harness, snapshot, label, deadline)
@@ -497,8 +416,12 @@ impl Router {
             let (cmd, _) = crate::adhoc::reader_executable(cmd, &harness, deadline).await?;
             profile["cmd"] = Value::String(cmd);
         }
-        let cache_key =
-            catalog::canonical_cache_identity(&label, &profile, route.identity.as_deref());
+        let cache_key = catalog::canonical_cache_identity(
+            &label,
+            &profile,
+            route.identity.as_deref(),
+            &route.environment,
+        );
         let route_verified = cache_key.is_some();
         if harness == "muse"
             && route_verified
@@ -751,10 +674,7 @@ impl Router {
                 continue;
             }
             // Reuse the per-scope cached `harness.models` path so one live
-            // native read serves every caller until its TTL lapses. Claude
-            // contributes its frozen documented-alias entries the same way;
-            // quota stays unsupported there, so their availability reads
-            // unknown (membership alone never proves availability).
+            // native read serves every caller until its TTL lapses.
             let params = json!({"harness": harness});
             // A slow read past the request deadline fails open into the
             // partial aggregate instead of holding the coalescing lock.
@@ -907,10 +827,6 @@ pub(crate) const CATALOG_TTL_MS: u64 = HARNESS_READ_TTL_MS;
 /// continuation pages of the listing that built it, for at most this long;
 /// every first page rebuilds it, so the failed harness is read again.
 pub(crate) const PARTIAL_AGGREGATE_TTL_MS: u64 = 30_000;
-/// Muse catalogue note: the native `isDefault` marker names a marked row
-/// for display. An omitted `--model` always defers to the server default at
-/// launch (MSP `session/start.modelId`: "server default when omitted"),
-/// whether or not the catalogue marks a row.
 /// Provenance note for an OpenCode catalogue read: the picker and the
 /// configure gate must never disagree, so the note always names which
 /// session-true source produced the list.
@@ -928,6 +844,10 @@ fn opencode_catalog_note(provenance: &str) -> &'static str {
     }
 }
 
+/// Muse catalogue note: the native `isDefault` marker names a marked row
+/// for display. An omitted `--model` always defers to the server default at
+/// launch (MSP `session/start.modelId`: "server default when omitted"),
+/// whether or not the catalogue marks a row.
 fn muse_catalog_note(default: Option<&str>) -> String {
     match default {
         Some(marked) if !marked.trim().is_empty() => format!(
@@ -1072,8 +992,17 @@ pub(crate) fn canonical_cache_identity(
     profile_label: &str,
     snapshot: &Value,
     verified: Option<&str>,
+    environment: &Value,
 ) -> Option<String> {
     let verified = verified?;
+    // Effective model pins also affect Claude's inventory. Include only the
+    // classified metadata values from the verified reader environment.
+    let model_pins = environment
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(name, _)| crate::config::claude_model_selector(snapshot, name))
+        .collect::<std::collections::BTreeMap<_, _>>();
     let route = json!({
         "label": profile_label,
         "harness": snapshot.get("harness"),
@@ -1085,6 +1014,7 @@ pub(crate) fn canonical_cache_identity(
         "key_ref": snapshot.get("api_key_env"),
         "executable": snapshot.get("cmd"),
         "identity": verified,
+        "model_pins": model_pins,
     });
     let digest = eliot_core::canonical_json_sha256(&route).ok()?;
     Some(digest.iter().map(|byte| format!("{byte:02x}")).collect())
@@ -1228,6 +1158,134 @@ impl CatalogCache {
     pub(crate) fn aggregate_len(&self) -> usize {
         usize::from(self.aggregate.is_some())
     }
+}
+
+fn claude_fallback_eligible(error: &Error) -> bool {
+    matches!(error.code.as_str(), "unavailable" | "unsupported")
+}
+
+fn claude_alias_fallback(scope: String, credential: String) -> HarnessModelsResponse {
+    HarnessModelsResponse {
+        harness: "claude".to_owned(),
+        catalogue: "aliases".to_owned(),
+        models: crate::adhoc::claude_documented_models(),
+        default: None,
+        note: Some(
+            "Claude native initialize inventory is unavailable for this scope. Entries are documented aliases and full model ids with unknown availability. The CLI default applies when no model is passed."
+                .to_owned(),
+        ),
+        scope,
+        fetched_at_ms: now_ms(),
+        ttl_ms: CATALOG_TTL_MS,
+        credential,
+        configure: eliot_core::api::ConfigureSupport::for_harness("claude"),
+    }
+}
+
+fn native_models_response(
+    harness: &str,
+    cmd: &str,
+    scope: String,
+    credential: String,
+    provenance: &str,
+    raw: &Value,
+) -> Result<HarnessModelsResponse> {
+    let models = raw
+        .get("models")
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+    let mut entries = Vec::new();
+    for model in models {
+        let id = model
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        if id.trim().is_empty() {
+            continue;
+        }
+        entries.push(eliot_core::api::HarnessModelEntry {
+            id,
+            display_name: model
+                .get("display_name")
+                .and_then(Value::as_str)
+                .and_then(eliot_core::api::harness::native_model_display_name)
+                .map(str::to_owned),
+            default: model
+                .get("default")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            efforts: model
+                .get("efforts")
+                .and_then(|efforts| serde_json::from_value(efforts.clone()).ok()),
+            default_effort: model
+                .get("default_effort")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            // Live native reads carry no provenance marker.
+            source: None,
+        });
+    }
+    if harness == "claude" && entries.is_empty() {
+        return Err(Error::new(
+            "source_integrity",
+            "Claude model.list returned no usable ids in its projected inventory",
+        ));
+    }
+    let default = raw
+        .get("default")
+        .and_then(Value::as_str)
+        .filter(|default| !default.trim().is_empty())
+        .map(str::to_owned);
+    let (catalogue, note) = if harness == "muse" && entries.is_empty() {
+        // The launcher-marked Muse binary answered `model/list`
+        // with an empty catalogue (observed on Muse 1.4.20's
+        // empty `bundledCatalog`): no server default exists to
+        // apply, so the read reports `empty` honestly instead of
+        // the default-marker note. Discovery stays deterministic
+        // on the launcher mark (no extra native launch beyond
+        // this read); pass `--cmd` (or a profile pinning `cmd`)
+        // naming a binary with a live catalogue, e.g. the
+        // pinned 1.4.0 binary.
+        (
+            "empty".to_owned(),
+            Some(format!(
+                "Muse model/list from {cmd} returned an empty catalogue; ad-hoc launch needs an explicit model, or --cmd naming a binary with a live catalogue"
+            )),
+        )
+    } else if harness == "muse" {
+        (
+            "native".to_owned(),
+            Some(muse_catalog_note(default.as_deref())),
+        )
+    } else if harness == "opencode" {
+        (
+            "native".to_owned(),
+            Some(opencode_catalog_note(provenance).to_owned()),
+        )
+    } else if harness == "antigravity" {
+        (
+            "native".to_owned(),
+            Some(
+                "Antigravity catalogue from `agy models`; effort-suffixed ids map to thought_level at launch"
+                    .to_owned(),
+            ),
+        )
+    } else {
+        ("native".to_owned(), None)
+    };
+    Ok(HarnessModelsResponse {
+        harness: harness.to_owned(),
+        catalogue,
+        models: entries,
+        default,
+        note,
+        scope,
+        fetched_at_ms: now_ms(),
+        ttl_ms: CATALOG_TTL_MS,
+        credential,
+        configure: eliot_core::api::ConfigureSupport::for_harness(harness),
+    })
 }
 
 /// The private native-read key includes executable/version identity without
@@ -2476,27 +2534,44 @@ mod tests {
             "pass_env_values": {"CODEX_HOME": "C:/private/home", "CODEX_SQLITE_HOME": null},
             "literal_env": {"TOKEN": "super-secret-value"},
         });
-        let key = canonical_cache_identity("p", &base, Some("verified-a")).unwrap();
+        let key = canonical_cache_identity("p", &base, Some("verified-a"), &Value::Null).unwrap();
         let (scope, _) = describe_snapshot("p", "codex", Some(&base));
         assert!(scope.contains("account:team-a"));
         assert!(!scope.contains("private/home"));
         assert_eq!(key.len(), 64);
-        assert!(canonical_cache_identity("p", &base, None).is_none());
+        assert!(canonical_cache_identity("p", &base, None, &Value::Null).is_none());
         assert_ne!(
             Some(key.clone()),
-            canonical_cache_identity("p", &base, Some("verified-b"))
+            canonical_cache_identity("p", &base, Some("verified-b"), &Value::Null)
         );
         let mut other = base.clone();
         other["route_binding"]["provider_base_url"] = json!("http://127.0.0.1:10300/v2");
         assert_ne!(
             Some(key.clone()),
-            canonical_cache_identity("p", &other, Some("verified-a"))
+            canonical_cache_identity("p", &other, Some("verified-a"), &Value::Null)
         );
         other = base.clone();
         other["account"] = json!("team-b");
         assert_ne!(
             Some(key),
-            canonical_cache_identity("p", &other, Some("verified-a"))
+            canonical_cache_identity("p", &other, Some("verified-a"), &Value::Null)
+        );
+    }
+
+    #[test]
+    fn cache_identity_includes_effective_claude_model_pins() {
+        let pin = "ANTHROPIC_DEFAULT_SONNET_MODEL";
+        let mut snapshot = json!({"harness":"claude","pass_env":[pin]});
+        let before = json!({pin:"gateway/sonnet-a"});
+        let after = json!({pin:"gateway/sonnet-b"});
+        assert_ne!(
+            canonical_cache_identity("p", &snapshot, Some("same-route"), &before),
+            canonical_cache_identity("p", &snapshot, Some("same-route"), &after)
+        );
+        snapshot["api_key_env"] = json!(pin);
+        assert_eq!(
+            canonical_cache_identity("p", &snapshot, Some("same-route"), &before),
+            canonical_cache_identity("p", &snapshot, Some("same-route"), &after)
         );
     }
 
@@ -2667,50 +2742,150 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn catalog_models_preserves_documented_claude_aliases() {
+    async fn claude_legacy_snapshot_falls_back_before_reader_admission() {
         let router = router();
-        // Claude needs no native installation: the aliases read never spawns
-        // a reader, so this also proves the static path performs no I/O.
-        let first = router
-            .harness_models(&json!({"harness": "claude"}), &Principal::Owner)
+        let snapshot = json!({
+            "harness": "claude", "cmd": "must-not-probe",
+            "pass_env": ["CLAUDE_CONFIG_DIR"],
+            "pass_env_values": {"CODEX_HOME": null, "CODEX_SQLITE_HOME": null}
+        });
+        let response = router
+            .models_for_snapshot(
+                "claude",
+                Some(snapshot),
+                "legacy@a1g1",
+                None,
+                None,
+                Instant::now(),
+            )
             .await
             .unwrap();
-        assert_eq!(first["catalogue"], json!("aliases"));
-        assert_eq!(first["scope"], json!("profile:adhoc harness:claude"));
-        assert_eq!(first["credential"], json!("none"));
-        assert!(first["fetched_at_ms"].as_i64().unwrap_or(-1) >= 0);
-        // The Claude group is no longer empty: documented aliases and full
-        // ids, each marked with its provenance and the CLI effort
-        // vocabulary, never a live availability claim.
-        let models = first["models"].as_array().expect("claude entries");
-        assert!(!models.is_empty());
-        for model in models {
-            assert_eq!(model["source"], json!("documented_alias"));
-            assert!(model["id"].as_str().is_some_and(|id| !id.is_empty()));
-            assert_eq!(
-                model["efforts"].as_array().expect("claude efforts").len(),
-                crate::adhoc::CLAUDE_EFFORT_LEVELS.len()
-            );
-        }
-        let ids: Vec<&str> = models
-            .iter()
-            .filter_map(|model| model["id"].as_str())
-            .collect();
-        for expected in [
-            "haiku",
-            "sonnet",
-            "opus",
-            "opusplan",
-            "claude-haiku-5-5",
-            "claude-opus-5-5",
+        assert_eq!(response.catalogue, "aliases");
+        assert_eq!(response.scope, "profile:legacy@a1g1 harness:claude");
+        assert_eq!(response.credential, "claude-cli-oauth");
+        assert!(response.default.is_none());
+        assert!(!response.models.is_empty());
+        assert!(response.models.iter().all(|model| {
+            model.source.as_deref() == Some("documented_alias")
+                && model.efforts.as_ref().unwrap().len() == crate::adhoc::CLAUDE_EFFORT_LEVELS.len()
+        }));
+        assert!(response.configure.model_refusal.is_none());
+        assert!(response.configure.effort_refusal.is_some());
+        assert_eq!(router.inner.catalog_cache.lock_recover().len().0, 0);
+    }
+
+    #[tokio::test]
+    async fn claude_unresolved_selector_bypasses_a_warm_default_catalogue() {
+        let router = router();
+        let cmd = "must-not-probe";
+        let discovered = HarnessCandidate {
+            cmd: cmd.to_owned(),
+            version: Some("2.1.325".to_owned()),
+        };
+        let mut snapshot = json!({"harness":"claude","cmd":cmd,"pass_env":[]});
+        crate::config::capture_native_store_inputs(&mut snapshot, |name| std::env::var_os(name))
+            .unwrap();
+        let route = crate::plugin_host::metadata_route(&snapshot).unwrap();
+        let key = canonical_cache_identity(
+            "same-profile",
+            &snapshot,
+            route.identity.as_deref(),
+            &route.environment,
+        )
+        .unwrap();
+        let key = models_key(&key, cmd, discovered.version.as_deref()).unwrap();
+        let raw = json!({"models":[{"id":"gateway/custom","display_name":"Gateway model","efforts":["low","high"]}]});
+        let native = native_models_response(
+            "claude",
+            cmd,
+            "profile:same-profile harness:claude".to_owned(),
+            "claude-cli-oauth".to_owned(),
+            "canonical",
+            &raw,
+        )
+        .unwrap();
+        assert_eq!(native.catalogue, "native");
+        assert_eq!(native.models[0].id, "gateway/custom");
+        assert_eq!(
+            native.models[0].display_name.as_deref(),
+            Some("Gateway model")
+        );
+        assert_eq!(
+            native.models[0].efforts,
+            Some(vec!["low".to_owned(), "high".to_owned()])
+        );
+        assert!(native.models[0].source.is_none());
+        router
+            .inner
+            .catalog_cache
+            .lock_recover()
+            .insert_models(key, native.clone());
+        let cached = router
+            .models_for_snapshot(
+                "claude",
+                Some(snapshot.clone()),
+                "same-profile",
+                Some(discovered.clone()),
+                None,
+                Instant::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cached, native);
+
+        snapshot["pass_env"] = json!(["CLAUDE_CONFIG_DIR"]);
+        crate::config::capture_native_store_inputs(&mut snapshot, |name| {
+            if name == "CLAUDE_CONFIG_DIR" {
+                None
+            } else {
+                std::env::var_os(name)
+            }
+        })
+        .unwrap();
+        let result = router
+            .models_for_snapshot(
+                "claude",
+                Some(snapshot),
+                "same-profile",
+                Some(discovered),
+                None,
+                Instant::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.catalogue, "aliases");
+        assert_eq!(router.inner.catalog_cache.lock_recover().len().0, 1);
+    }
+
+    #[test]
+    fn claude_fallback_requires_definite_unavailability() {
+        for code in [
+            "unknown",
+            "source_integrity",
+            "cancelled",
+            "busy",
+            "timeout",
+            "profile_error",
         ] {
-            assert!(ids.contains(&expected), "missing {expected}");
+            assert!(!claude_fallback_eligible(&Error::new(code, "test")));
         }
-        let second = router
-            .harness_models(&json!({"harness": "claude"}), &Principal::Owner)
+        for code in ["unavailable", "unsupported"] {
+            assert!(claude_fallback_eligible(&Error::new(code, "test")));
+        }
+    }
+
+    #[tokio::test]
+    async fn claude_discovery_obeys_the_models_request_deadline() {
+        let router = router();
+        let error = router
+            .harness_models_until(
+                &json!({"harness":"claude"}),
+                &Principal::Owner,
+                Instant::now(),
+            )
             .await
-            .unwrap();
-        assert_eq!(first["models"], second["models"]);
+            .unwrap_err();
+        assert_eq!(error.code, "timeout");
         assert_eq!(router.inner.catalog_cache.lock_recover().len().0, 0);
     }
 
@@ -2721,8 +2896,13 @@ mod tests {
         crate::config::capture_native_store_inputs(&mut profile, |name| std::env::var_os(name))
             .unwrap();
         let route = crate::plugin_host::metadata_route(&profile).unwrap();
-        let cache_key =
-            canonical_cache_identity("fixture", &profile, route.identity.as_deref()).unwrap();
+        let cache_key = canonical_cache_identity(
+            "fixture",
+            &profile,
+            route.identity.as_deref(),
+            &route.environment,
+        )
+        .unwrap();
         let (scope, credential) = describe_snapshot("fixture", "codex", Some(&profile));
         let expected = HarnessQuotaResponse {
             harness: "codex".to_owned(),

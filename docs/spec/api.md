@@ -1582,18 +1582,27 @@ bounded `acp --help` and version checks. An IDE executable is refused.
 `harness.models` (`HarnessModelsRequest`/`HarnessModelsResponse`) returns the
 harness's own read-only catalogue (Codex/Muse native `model/list`, OpenCode
 native `opencode models` provider/model ids verbatim, Antigravity
-`agy models`; Claude reports its documented aliases and full model ids plus the
-CLI default, each entry carrying `source = "documented_alias"` with `unknown`
-availability). Each model keeps its native `id` and carries an optional
-`display_name` from the vendor catalogue. The plugin preserves the name verbatim
-when it is non-blank, contains no control characters and is at most 512 UTF-8
-bytes. Launch and configure catalogues display the name when present and the
-native ID otherwise. Selection in both catalogues uses the native ID only.
+`agy models`; Claude prefers the native `initialize` inventory — selectable
+values with display names and per-model effort levels, no provenance marker —
+and reports the documented aliases and full model ids plus the CLI default,
+each entry carrying `source = "documented_alias"` with `unknown` availability,
+only when the native inventory is unavailable). Each model keeps its native
+`id` and carries an optional `display_name` from the vendor catalogue. The
+plugin preserves the name verbatim when it is non-blank, contains no control
+characters and is at most 512 UTF-8 bytes. Launch and configure catalogues
+display the name when present and the native ID otherwise. Selection in both
+catalogues uses the native ID only.
 The `catalogue`
-member is `native` for a live read, `aliases` for Claude, `empty` when the
+member is `native` for a live read (including the Claude native `initialize`
+inventory), `aliases` for the Claude documented-alias fallback when the native
+read is unavailable, `empty` when the
 native read ran but listed no models (ad-hoc Muse on a launcher-marked binary
 with an empty `model/list`: the note names that binary and the `--cmd` /
-profile remedy), or `none` when the harness exposes no catalogue.
+profile remedy), or `none` when the harness exposes no catalogue. Claude uses
+the alias fallback when the frozen store or provider route cannot be verified.
+The native cache requires a verified opaque route identity, and public scope
+labels omit private route values. An `unknown` read or cleanup outcome,
+`cancelled`, an integrity failure or a capacity refusal propagates as an error.
 An optional `profile` selects the native route/account
 (the named profile must exist and its frozen harness must match); omitted it
 means ad-hoc daemon defaults. An optional `agent` (exclusive with `profile`)

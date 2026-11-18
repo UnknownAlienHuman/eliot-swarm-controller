@@ -2596,7 +2596,11 @@ fn source_secret_snapshot(
         profile.get("pass_env").and_then(Value::as_array),
         environment.as_object(),
     ) {
-        for name in names.iter().filter_map(Value::as_str) {
+        for name in names
+            .iter()
+            .filter_map(Value::as_str)
+            .chain(profile["api_key_env"].as_str())
+        {
             if let Some(value) = environment.iter().find_map(|(key, value)| {
                 let matches = if cfg!(windows) {
                     key.eq_ignore_ascii_case(name)
@@ -2628,6 +2632,15 @@ fn metadata_secret_snapshot(
                 !crate::config::CODEX_STORE_SELECTORS
                     .iter()
                     .any(|selector| crate::config::native_store_selector(name) == Some(*selector))
+                    && !crate::config::claude_model_selector(profile, name)
+                    && !environment
+                        .as_object()
+                        .into_iter()
+                        .flatten()
+                        .any(|(key, value)| {
+                            (key == name || (cfg!(windows) && key.eq_ignore_ascii_case(name)))
+                                && crate::config::claude_provider_mode_flag(profile, name, value)
+                        })
             })
         });
     }
@@ -2639,15 +2652,22 @@ pub(crate) fn build_process_environment(profile: &Value) -> Result<Map<String, V
 }
 
 /// A prepared metadata reader uses the same private environment that was
-/// verified before cache lookup. Legacy inputs can still be read uncached.
+/// verified before cache lookup. Readers that require a verified route can
+/// refuse legacy snapshots before spawning.
 pub(crate) struct MetadataRoute {
     pub(crate) environment: Value,
     pub(crate) identity: Option<String>,
 }
 
 pub(crate) fn metadata_route(profile: &Value) -> Result<MetadataRoute> {
-    let (environment, identity) =
-        prepare_process_environment(profile, |name| std::env::var_os(name))?;
+    metadata_route_with(profile, |name| std::env::var_os(name))
+}
+
+fn metadata_route_with(
+    profile: &Value,
+    lookup: impl FnMut(&str) -> Option<OsString>,
+) -> Result<MetadataRoute> {
+    let (environment, identity) = prepare_process_environment(profile, lookup)?;
     let identity =
         identity.filter(|_| crate::config::metadata_route_scope_known(profile, &environment));
     Ok(MetadataRoute {
@@ -3921,6 +3941,68 @@ mod tests {
         assert!(SecretPolicy::new(metadata.iter()).contains_text("same-literal"));
         let diagnostics = source_secret_snapshot(&selectors_only, &environment, Vec::new());
         assert!(SecretPolicy::new(diagnostics.iter()).contains_text("sqlite-only"));
+    }
+
+    #[test]
+    fn claude_readback_keeps_explicit_and_coincident_credentials_checked() {
+        let pin = "ANTHROPIC_DEFAULT_SONNET_MODEL";
+        let environment = json!({pin:"gateway/sonnet", "OTHER_KEY":"gateway/sonnet", "CLAUDE_CONFIG_DIR":"private-config-dir"});
+        let raw = json!({"models":[{"resolved_model":"gateway/sonnet"}]});
+        for (harness, names, key_ref, forbidden) in [
+            ("claude", json!([pin]), Value::Null, false),
+            ("codex", json!([pin]), Value::Null, true),
+            ("claude", json!([]), json!(pin), true),
+            ("claude", json!([pin, "OTHER_KEY"]), Value::Null, true),
+        ] {
+            let profile = json!({"harness":harness, "pass_env":names,"api_key_env":key_ref});
+            let secrets = metadata_secret_snapshot(&profile, &environment, Vec::new());
+            assert_eq!(
+                SecretPolicy::new(secrets.iter()).contains_value(&raw),
+                forbidden
+            );
+        }
+        let profile = json!({"harness":"claude","pass_env":["CLAUDE_CONFIG_DIR"]});
+        let secrets = metadata_secret_snapshot(&profile, &environment, Vec::new());
+        assert!(SecretPolicy::new(secrets.iter()).contains_text("private-config-dir"));
+
+        let mode = "CLAUDE_CODE_USE_BEDROCK";
+        let profile = json!({"harness":"claude","pass_env":[mode]});
+        let environment = json!({mode:"1"});
+        let secrets = metadata_secret_snapshot(&profile, &environment, Vec::new());
+        assert!(!SecretPolicy::new(secrets.iter()).contains_text("bedrock-version-v1"));
+    }
+
+    #[test]
+    fn claude_metadata_route_verifies_store_and_provider_in_the_reader_environment() {
+        let store = std::env::temp_dir().join("claude-private-catalog-store");
+        let gateway = "https://gateway.example/v1";
+        let lookup = |name: &str| match name {
+            "CLAUDE_CONFIG_DIR" => Some(store.clone().into_os_string()),
+            "ANTHROPIC_BASE_URL" => Some(gateway.into()),
+            _ => None,
+        };
+        let mut profile =
+            json!({"harness":"claude","pass_env":["CLAUDE_CONFIG_DIR","ANTHROPIC_BASE_URL"]});
+        crate::config::capture_native_store_inputs_with_lookups(&mut profile, lookup, |_| None)
+            .unwrap();
+        let route = metadata_route_with(&profile, lookup).unwrap();
+        assert_eq!(
+            route.identity.as_deref(),
+            profile["native_route_identity"].as_str()
+        );
+        assert_eq!(
+            route.environment["CLAUDE_CONFIG_DIR"],
+            store.to_str().unwrap()
+        );
+        assert_eq!(route.environment["ANTHROPIC_BASE_URL"], gateway);
+        assert!(!profile.to_string().contains("claude-private-catalog-store"));
+        assert!(!profile.to_string().contains(gateway));
+        for lost in ["CLAUDE_CONFIG_DIR", "ANTHROPIC_BASE_URL"] {
+            let result = metadata_route_with(&profile, |name| {
+                (name != lost).then(|| lookup(name)).flatten()
+            });
+            assert_eq!(result.err().unwrap().code, "unavailable");
+        }
     }
 
     #[test]
