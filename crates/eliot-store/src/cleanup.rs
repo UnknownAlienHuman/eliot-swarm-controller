@@ -3,6 +3,13 @@ use super::coordination::{Sender, parse_sender, retain_write_tx};
 use super::*;
 use eliot_core::api::*;
 
+/// Retained cleanup plans. A full ledger self-heals on retain (see
+/// `prune_reclaimable_cleanup_plans_tx`) before it refuses admission.
+const MAX_CLEANUP_PLANS: i64 = 1_024;
+/// Reclaimable plans deleted per self-heal batch: fully settled consumed
+/// plans and abandoned never-consumed previews, oldest first.
+const CLEANUP_PLAN_RECLAIM_BATCH: i64 = 64;
+
 impl Store {
     pub fn known_artifact_path(&self, path: &str) -> Result<Option<ArtifactView>> {
         let body: Option<String> = self
@@ -499,7 +506,20 @@ impl Store {
         Ok(artifact)
     }
 
-    pub fn retain_cleanup_plan(&mut self, principal: &str, plan: &CleanupPlan) -> Result<()> {
+    /// Retain one cleanup plan preview. A full ledger self-heals before it
+    /// refuses admission: the retain reclaims fully settled consumed plans
+    /// and abandoned never-consumed previews, oldest first, so ordinary
+    /// preview/apply cycles can never wedge the ledger. Plans with an
+    /// outstanding `unknown` attempt, plans whose consumed receipt is gone,
+    /// and fresh previews are never reclaimed. Anything still full
+    /// afterwards keeps the `unavailable` refusal: delete or settle plans
+    /// through the ordinary apply/settle paths and preview again.
+    pub fn retain_cleanup_plan(
+        &mut self,
+        principal: &str,
+        plan: &CleanupPlan,
+        now: i64,
+    ) -> Result<()> {
         self.ensure_writer_healthy()?;
         if plan.items.len() > MAX_CLEANUP_ITEMS {
             return Err(Error::new("invalid", "cleanup plan exceeds bound"));
@@ -508,14 +528,17 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
-        let count: i64 = tx
+        let mut count: i64 = tx
             .query_row("SELECT COUNT(*) FROM cleanup_plans", [], |r| r.get(0))
             .map_err(sql_error)?;
-        if count >= 1024 {
-            return Err(Error::new(
-                "unavailable",
-                "cleanup plan ledger is full (1024 entries)",
-            ));
+        if count >= MAX_CLEANUP_PLANS {
+            count -= prune_reclaimable_cleanup_plans_tx(&tx, now)?;
+            if count >= MAX_CLEANUP_PLANS {
+                return Err(Error::new(
+                    "unavailable",
+                    "cleanup plan ledger is full (1024 entries)",
+                ));
+            }
         }
         let assignment_binding = project_assignment::coordination_binding(&tx, principal)?;
         tx.execute(
@@ -830,6 +853,48 @@ impl Store {
     }
 }
 
+/// Bounded self-heal for a full cleanup-plan ledger, oldest first. Deletes
+/// fully settled consumed plans (their receipt is retained and no item
+/// outcome is `unknown`, so the exact-apply replay and the unknown-attempt
+/// fences no longer need the row) and abandoned never-consumed previews
+/// (older than the write-id retry window plus clock skew, so no live manager
+/// can still be about to apply them). Never touches a plan with an
+/// outstanding `unknown` attempt, a consumed plan whose receipt is gone
+/// (unprovable settlement), or a fresh preview. Returns the reclaimed count.
+fn prune_reclaimable_cleanup_plans_tx(tx: &Transaction<'_>, now: i64) -> Result<i64> {
+    let settled = tx
+        .execute(
+            "DELETE FROM cleanup_plans WHERE id IN (
+                 SELECT p.id FROM cleanup_plans p JOIN writes w ON w.id = p.apply_id
+                 WHERE p.apply_id IS NOT NULL
+                   AND w.method = 'cleanup.apply'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM json_each(w.result, '$.items') r
+                       WHERE json_extract(r.value, '$.outcome') = 'unknown'
+                   )
+                 ORDER BY p.id LIMIT ?1
+             )",
+            [CLEANUP_PLAN_RECLAIM_BATCH],
+        )
+        .map_err(sql_error)? as i64;
+    // A manager that previews applies promptly; a preview nobody consumed
+    // within the retry window is abandoned, and its delayed apply reads
+    // `not_found` so the manager re-previews through this same path.
+    let stale_cutoff = now.saturating_sub(RETRY_WINDOW_MS + RETRY_CLOCK_SKEW_MS);
+    let stale = tx
+        .execute(
+            "DELETE FROM cleanup_plans WHERE id IN (
+                 SELECT p.id FROM cleanup_plans p
+                 WHERE p.apply_id IS NULL
+                   AND json_extract(p.body, '$.created_at') <= ?1
+                 ORDER BY p.id LIMIT ?2
+             )",
+            params![stale_cutoff, CLEANUP_PLAN_RECLAIM_BATCH],
+        )
+        .map_err(sql_error)? as i64;
+    Ok(settled + stale)
+}
+
 fn update_cleanup_receipt(
     tx: &Transaction<'_>,
     principal: &str,
@@ -993,7 +1058,7 @@ mod tests {
                 }],
                 truncated: false,
             };
-            store.retain_cleanup_plan("owner", &plan).unwrap();
+            store.retain_cleanup_plan("owner", &plan, now).unwrap();
             let request = CleanupApplyRequest {
                 id: Ulid::new().to_string(),
                 plan_id: plan.plan_id,
@@ -1095,8 +1160,10 @@ mod tests {
         };
         let mut other_plan = plan.clone();
         other_plan.plan_id = Ulid::new().to_string();
-        store.retain_cleanup_plan("owner", &plan).unwrap();
-        store.retain_cleanup_plan("owner", &other_plan).unwrap();
+        store.retain_cleanup_plan("owner", &plan, now).unwrap();
+        store
+            .retain_cleanup_plan("owner", &other_plan, now)
+            .unwrap();
         let request = CleanupApplyRequest {
             id: Ulid::new().to_string(),
             plan_id: plan.plan_id.clone(),
@@ -1146,6 +1213,158 @@ mod tests {
     }
 
     #[test]
+    fn full_ledger_reclaims_settled_and_stale_plans_but_keeps_unknown_fences() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
+        store.connection.execute("INSERT INTO agents(project,harness,profile,state,generation,created_at,updated_at) VALUES ('p','codex','p','stopped',1,?1,?1)",[now]).unwrap();
+        let artifact = ArtifactView {
+            id: Ulid::new().to_string(),
+            agent: "a1".to_owned(),
+            generation: 1,
+            project: "p".to_owned(),
+            tree: vec!["a1:1".to_owned()],
+            path: "C:/scratch/target".to_owned(),
+            kind: ArtifactKind::Build,
+            purpose: "build".to_owned(),
+            identity: "original".to_owned(),
+            created_at: now,
+            state: "registered".to_owned(),
+            git: None,
+        };
+        store.record_known_artifact(artifact.clone()).unwrap();
+        let candidate = |artifact: &ArtifactView| CleanupCandidate {
+            artifact: artifact.clone(),
+            bytes: Some(7),
+            verdict: "safe".to_owned(),
+            reason: "terminal".to_owned(),
+        };
+        // A consumed plan whose receipt settled with no `unknown` outcome.
+        let settled = CleanupPlan {
+            plan_id: Ulid::new().to_string(),
+            created_at: now,
+            items: vec![candidate(&artifact)],
+            truncated: false,
+        };
+        store.retain_cleanup_plan("owner", &settled, now).unwrap();
+        let settle_apply = CleanupApplyRequest {
+            id: Ulid::new().to_string(),
+            plan_id: settled.plan_id.clone(),
+            delete_remote: false,
+            artifacts: Some(vec![]),
+        };
+        let (_, settled_response, is_new) = store
+            .begin_cleanup_apply("owner", &settle_apply, now)
+            .unwrap();
+        assert!(is_new);
+        assert!(
+            settled_response
+                .items
+                .iter()
+                .all(|item| item.outcome != "unknown"),
+            "empty selection must settle every item as skipped"
+        );
+        // A consumed plan with an outstanding `unknown` attempt fences.
+        let unknown = CleanupPlan {
+            plan_id: Ulid::new().to_string(),
+            created_at: now,
+            items: vec![candidate(&artifact)],
+            truncated: false,
+        };
+        store.retain_cleanup_plan("owner", &unknown, now).unwrap();
+        let unknown_apply = CleanupApplyRequest {
+            id: Ulid::new().to_string(),
+            plan_id: unknown.plan_id.clone(),
+            delete_remote: false,
+            artifacts: None,
+        };
+        let (_, first, is_new) = store
+            .begin_cleanup_apply("owner", &unknown_apply, now)
+            .unwrap();
+        assert!(is_new);
+        assert_eq!(first.items[0].outcome, "unknown");
+        // One fresh preview that no cycle may reap.
+        let fresh = CleanupPlan {
+            plan_id: Ulid::new().to_string(),
+            created_at: now,
+            items: vec![],
+            truncated: false,
+        };
+        store.retain_cleanup_plan("owner", &fresh, now).unwrap();
+        // Fill the rest of the ledger with abandoned never-consumed previews.
+        let stale_at = now - 2 * 86_400_000;
+        let stale = CleanupPlan {
+            plan_id: String::new(),
+            created_at: stale_at,
+            items: vec![],
+            truncated: false,
+        };
+        for _ in 0..(MAX_CLEANUP_PLANS - 3) {
+            let mut preview = stale.clone();
+            preview.plan_id = Ulid::new().to_string();
+            store
+                .connection
+                .execute(
+                    "INSERT INTO cleanup_plans(id,principal,body) VALUES (?1,'owner',?2)",
+                    params![preview.plan_id, encode_json(&preview).unwrap()],
+                )
+                .unwrap();
+        }
+        let count: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM cleanup_plans", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, MAX_CLEANUP_PLANS);
+        // The already-full ledger still admits: the settled plan and one
+        // reclaim batch of stale previews go, everything fenced stays.
+        let admitted = CleanupPlan {
+            plan_id: Ulid::new().to_string(),
+            created_at: now,
+            items: vec![],
+            truncated: false,
+        };
+        store
+            .retain_cleanup_plan("owner", &admitted, now)
+            .expect("full ledger must self-heal");
+        let count: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM cleanup_plans", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            count,
+            MAX_CLEANUP_PLANS - 1 - CLEANUP_PLAN_RECLAIM_BATCH + 1
+        );
+        assert_eq!(
+            store
+                .cleanup_plan("owner", &settled.plan_id)
+                .unwrap_err()
+                .code,
+            "not_found",
+            "settled consumed plans are reclaimable"
+        );
+        store
+            .cleanup_plan("owner", &fresh.plan_id)
+            .expect("fresh previews are never reclaimed");
+        store
+            .cleanup_plan("owner", &unknown.plan_id)
+            .expect("unknown attempts fence their plan");
+        let different = CleanupApplyRequest {
+            id: Ulid::new().to_string(),
+            plan_id: unknown.plan_id.clone(),
+            delete_remote: false,
+            artifacts: None,
+        };
+        assert!(
+            store.begin_cleanup_apply("owner", &different, now).is_err(),
+            "the unknown fence still blocks a second attempt"
+        );
+        let (_, replay, is_new) = store
+            .begin_cleanup_apply("owner", &unknown_apply, now)
+            .unwrap();
+        assert!(!is_new);
+        assert_eq!(replay.items[0].outcome, "unknown");
+    }
+
+    #[test]
     fn a_selection_attempts_only_its_safe_candidates_and_leaves_the_rest_unfenced() {
         let mut store = Store::open(Path::new(":memory:")).unwrap();
         let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
@@ -1180,7 +1399,7 @@ mod tests {
             items: vec![candidate(&build), candidate(&temp)],
             truncated: false,
         };
-        store.retain_cleanup_plan("owner", &plan).unwrap();
+        store.retain_cleanup_plan("owner", &plan, now).unwrap();
         let foreign = CleanupApplyRequest {
             id: Ulid::new().to_string(),
             plan_id: plan.plan_id.clone(),

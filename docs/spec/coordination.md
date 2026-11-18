@@ -111,8 +111,12 @@ registrations group starts unchecked.
 
 The current limits are 64 candidates, 4,096 retained artifacts, 1,024 retained
 plans, 10,000 filesystem entries, depth 64 and five seconds per tree scan.
-Exceeding a bound refuses the tree before deletion. Ledger exhaustion rejects new
-admission. Removed identities remain tombstones; unknown identities are never
+Exceeding a bound refuses the tree before deletion. A full plan ledger self-heals
+on retain first: it reclaims fully settled consumed plans (no `unknown` item
+outcome) and abandoned never-consumed previews older than the write-id retry
+window, oldest first, so ordinary preview/apply cycles never wedge it. Plans with
+an outstanding `unknown` attempt and their receipt fences are never reclaimed; only
+when nothing reclaimable remains does exhaustion reject new admission. Removed identities remain tombstones; unknown identities are never
 automatically retried. The CLI exposes `artifact register`, `cleanup plan` and
 `cleanup apply`. Desktop Settings › Worktrees & cleanup (Clean up finished work)
 reviews an Owner `all` plan grouped by kind with each item's size and reason,
