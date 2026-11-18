@@ -104,7 +104,9 @@ def preview(path):
         for im in row:
             sheet.paste(im, (x, y0 + pad + (256 - im.height) // 2), im)
             x += im.width + pad
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    # Write only into an existing folder: the script never creates directories.
+    if not Path(path).parent.is_dir():
+        sys.exit(f"preview folder does not exist: {Path(path).parent}")
     sheet.save(path)
 
 
