@@ -156,6 +156,7 @@ mod native_events;
 mod observer;
 mod observer_live;
 mod processes;
+mod project_assignment;
 mod resolution;
 mod retention;
 mod schema;
@@ -4223,6 +4224,7 @@ fn insert_command(
         ));
     }
     let project_binding = projects::capture_project_command_binding_tx(tx, command)?;
+    let assignment_binding = project_assignment::capture_binding(tx, command)?;
     let args = encode_json(command.args)?;
     let outcome = command.outcome.map(encode_json).transpose()?;
     let cause = encode_json(cause)?;
@@ -4231,9 +4233,9 @@ fn insert_command(
              id, principal, method, payload_digest, target, expected_generation,
              generation, expected_turn_id, parent_command, link_kind, ordinal,
              turn_id, request_id, verb, args, state, outcome, created_at, updated_at, probe, cause,
-             project_binding, selector, config_revision
+             project_binding, selector, config_revision, assignment_binding
          ) VALUES (
-             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, 0
+             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, 0, ?24
          )",
         params![
             command.id,
@@ -4259,6 +4261,7 @@ fn insert_command(
             cause,
             project_binding,
             command.selector,
+            assignment_binding,
         ],
     ));
     Ok(())

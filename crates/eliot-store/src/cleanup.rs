@@ -185,6 +185,11 @@ impl Store {
                         "cleanup manager is not current",
                     ));
                 }
+                project_assignment::authorize_coordination(
+                    &self.connection,
+                    principal,
+                    Some(parse_agent_id(&artifact.agent)?),
+                )?;
                 if !artifact.tree.contains(&format!("{id}:{generation}")) {
                     return Ok(false);
                 }
@@ -512,9 +517,15 @@ impl Store {
                 "cleanup plan ledger is full (1024 entries)",
             ));
         }
+        let assignment_binding = project_assignment::coordination_binding(&tx, principal)?;
         tx.execute(
-            "INSERT INTO cleanup_plans(id,principal,body) VALUES (?1,?2,?3)",
-            params![plan.plan_id, principal, encode_json(plan)?],
+            "INSERT INTO cleanup_plans(id,principal,body,assignment_binding) VALUES (?1,?2,?3,?4)",
+            params![
+                plan.plan_id,
+                principal,
+                encode_json(plan)?,
+                assignment_binding
+            ],
         )
         .map_err(sql_error)?;
         commit_transaction(tx, &self.write_faulted)
@@ -612,6 +623,19 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
+        let retained_binding: Option<String> = tx
+            .query_row(
+                "SELECT assignment_binding FROM cleanup_plans WHERE id=?1",
+                [&request.plan_id],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
+        if retained_binding != project_assignment::coordination_binding(&tx, principal)? {
+            return Err(Error::new(
+                "stale_assignment",
+                "project assignment changed after cleanup planning",
+            ));
+        }
         let changed = tx
             .execute(
                 "UPDATE cleanup_plans SET apply_id=?1 WHERE id=?2 AND apply_id IS NULL",

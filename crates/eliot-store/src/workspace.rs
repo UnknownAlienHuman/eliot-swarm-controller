@@ -946,6 +946,7 @@ impl Store {
                 "workspace Git command targets another Agent",
             ));
         }
+        project_assignment::check_dispatch(&tx, &command)?;
         let outcome = workspace.outcome.as_ref();
         let stage = outcome
             .and_then(|value| value.get("stage"))
@@ -1329,6 +1330,9 @@ impl Store {
             .as_ref()
             .and_then(|value| value.get("resume_previous"))
             .cloned();
+        if matches!(&action, WorkspaceAction::Begin(_)) {
+            project_assignment::check_dispatch(&tx, &command)?;
+        }
         let mut marker = match &action {
             WorkspaceAction::Creation(outcome) => {
                 json!({"stage": "creation", "reuse": reuse, "result": outcome})
@@ -1794,6 +1798,7 @@ pub(super) fn request_workspace_cancel_tx(
     let (start, agent) = preparation_command(tx, workspace)?;
     let stop = load_command_record(tx, stop_id)?
         .ok_or_else(|| Error::new("not_found", "stop command was not found"))?;
+    project_assignment::check_dispatch(tx, &stop)?;
     projects::validate_project_command_dispatch_tx(tx, &stop)?;
     if stop.command.verb != "stop"
         || stop.target != start.target

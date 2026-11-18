@@ -970,7 +970,8 @@ fn is_supported_project_action(action: &str) -> bool {
 }
 
 fn is_supported_project_registration_action(action: &str) -> bool {
-    is_supported_project_action(action) || action == "run"
+    is_supported_project_action(action)
+        || matches!(action, "run" | core::api::PROJECT_ASSIGNMENT_CLAIM_ACTION)
 }
 
 fn normalize_allowset(values: &mut [String], name: &str) -> Result<()> {

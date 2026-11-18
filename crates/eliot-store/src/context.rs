@@ -189,6 +189,9 @@ pub(super) fn claim_next_input_tx(
             if args.point != InjectPoint::NextInput {
                 continue;
             }
+            if reject_stale_assignment(tx, &record, agent_num, agent.generation, now, events)? {
+                continue;
+            }
             if args
                 .expires_at_ms
                 .is_some_and(|expires_at| expires_at <= now)
@@ -391,6 +394,9 @@ impl Store {
             if args.point != InjectPoint::TurnSafePoint
                 || record.command.turn_id.as_deref() != Some(turn_id)
             {
+                continue;
+            }
+            if reject_stale_assignment(&tx, &record, agent_num, generation, now, &mut events)? {
                 continue;
             }
             if args
@@ -1352,6 +1358,29 @@ pub(super) fn claim_context_tx(
         }),
     )?);
     Ok(())
+}
+
+fn reject_stale_assignment(
+    tx: &Transaction<'_>,
+    record: &CommandRecord,
+    agent_num: i64,
+    generation: i64,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<bool> {
+    match project_assignment::check_dispatch(tx, record) {
+        Ok(()) => Ok(false),
+        Err(error)
+            if matches!(
+                error.code.as_str(),
+                "stale_assignment" | "not_allowed" | "stale_generation"
+            ) =>
+        {
+            reject_pending_context(tx, record, agent_num, generation, &error.code, now, events)?;
+            Ok(true)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn reject_pending_context(

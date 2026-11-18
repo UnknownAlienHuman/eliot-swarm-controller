@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 54;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 55;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -1261,6 +1261,28 @@ impl Store {
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
+        if current < 55 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE TABLE project_assignments (
+                     project TEXT PRIMARY KEY,
+                     manager INTEGER,
+                     manager_generation INTEGER,
+                     epoch INTEGER NOT NULL CHECK(epoch > 0),
+                     revision INTEGER NOT NULL CHECK(revision > 0),
+                     start_command TEXT,
+                     CHECK((manager IS NULL) = (manager_generation IS NULL))
+                 );
+                 ALTER TABLE commands ADD COLUMN assignment_binding TEXT;
+                 ALTER TABLE cleanup_plans ADD COLUMN assignment_binding TEXT;
+                 INSERT INTO schema_migrations(version) VALUES (55);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
         Ok(())
     }
 }
@@ -1275,7 +1297,11 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP TABLE paused_assignment_timers; ALTER TABLE rule_state DROP COLUMN source_present;
+                "ALTER TABLE commands DROP COLUMN assignment_binding;
+                 ALTER TABLE cleanup_plans DROP COLUMN assignment_binding;
+                 DROP TABLE project_assignments;
+                 DELETE FROM schema_migrations WHERE version=55;
+                 DROP TABLE paused_assignment_timers; ALTER TABLE rule_state DROP COLUMN source_present;
                  DELETE FROM schema_migrations WHERE version=54;
                  DROP INDEX agents_list_project_scope; ALTER TABLE agents DROP COLUMN project_scope;
                  DELETE FROM schema_migrations WHERE version=53;
@@ -1336,7 +1362,11 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP TABLE paused_assignment_timers; ALTER TABLE rule_state DROP COLUMN source_present;
+                "ALTER TABLE commands DROP COLUMN assignment_binding;
+                 ALTER TABLE cleanup_plans DROP COLUMN assignment_binding;
+                 DROP TABLE project_assignments;
+                 DELETE FROM schema_migrations WHERE version=55;
+                 DROP TABLE paused_assignment_timers; ALTER TABLE rule_state DROP COLUMN source_present;
                  DELETE FROM schema_migrations WHERE version=54;
                  DROP INDEX agents_list_project_scope; ALTER TABLE agents DROP COLUMN project_scope;
                  DELETE FROM schema_migrations WHERE version=53;
@@ -1382,7 +1412,11 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP TABLE paused_assignment_timers; ALTER TABLE rule_state DROP COLUMN source_present;
+                "ALTER TABLE commands DROP COLUMN assignment_binding;
+                 ALTER TABLE cleanup_plans DROP COLUMN assignment_binding;
+                 DROP TABLE project_assignments;
+                 DELETE FROM schema_migrations WHERE version=55;
+                 DROP TABLE paused_assignment_timers; ALTER TABLE rule_state DROP COLUMN source_present;
                  DELETE FROM schema_migrations WHERE version=54;
                  DROP INDEX agents_list_project_scope; ALTER TABLE agents DROP COLUMN project_scope;
                  DELETE FROM schema_migrations WHERE version=53;
@@ -1471,7 +1505,11 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP TABLE paused_assignment_timers; ALTER TABLE rule_state DROP COLUMN source_present;
+                "ALTER TABLE commands DROP COLUMN assignment_binding;
+                 ALTER TABLE cleanup_plans DROP COLUMN assignment_binding;
+                 DROP TABLE project_assignments;
+                 DELETE FROM schema_migrations WHERE version=55;
+                 DROP TABLE paused_assignment_timers; ALTER TABLE rule_state DROP COLUMN source_present;
                  DELETE FROM schema_migrations WHERE version=54;
                  DROP INDEX agents_list_project_scope; ALTER TABLE agents DROP COLUMN project_scope;
                  DELETE FROM schema_migrations WHERE version=53;

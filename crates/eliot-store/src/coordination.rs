@@ -1196,6 +1196,7 @@ impl Store {
         }
         validate_id_age(&request.id, now)?;
 
+        super::project_assignment::authorize_coordination(tx, principal, None)?;
         let definition = VarDefinitionArgs {
             scope: request.scope.clone(),
             key: request.key.clone(),

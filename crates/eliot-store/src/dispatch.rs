@@ -290,6 +290,7 @@ fn dispatch_resume_tx(
             [id],
         ));
     }
+    project_assignment::advance_resume(tx, agent, agent_num, next_generation, id)?;
     install_initial_source_plan(tx, agent_num, next_generation, now)?;
     update_command_state(
         tx,
@@ -884,6 +885,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
         let command = load_dispatchable_tx(&tx, id)?;
+        project_assignment::check_dispatch(&tx, &command)?;
         let mut events = Vec::new();
         if native_store.is_some() && command.command.verb != "launch" {
             return Err(Error::new(

@@ -22,7 +22,8 @@ pub fn validate_command_id(id: &str) -> crate::Result<()> {
 pub fn is_deterministic_pre_admission_rejection(code: &str) -> bool {
     matches!(
         code,
-        "bad_state"
+        "assignment_occupied"
+            | "bad_state"
             | "capacity_unavailable"
             | "conflict"
             | "frame_too_large"
@@ -33,6 +34,7 @@ pub fn is_deterministic_pre_admission_rejection(code: &str) -> bool {
             | "routing_unavailable"
             | "secret_in_payload"
             | "stale_generation"
+            | "stale_assignment"
             | "unsupported"
     )
 }

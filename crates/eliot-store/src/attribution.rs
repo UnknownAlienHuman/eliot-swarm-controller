@@ -365,6 +365,11 @@ impl Store {
         }
         validate_id_age(&request.id, now)?;
 
+        super::project_assignment::authorize_coordination(
+            &tx,
+            principal,
+            Some(parse_agent_id(&target.id)?),
+        )?;
         let (target_num, expires_at) =
             Self::admit_claim_row(&tx, &target, &glob, request.note.as_deref(), ttl_secs, now)?;
         let (conflicts, truncated) =
@@ -532,6 +537,7 @@ impl Store {
         }
         validate_id_age(&request.id, now)?;
 
+        super::project_assignment::authorize_coordination(&tx, principal, Some(target_num))?;
         purge_expired_claims_tx(&tx, now)?;
         db!(tx.execute(
             "DELETE FROM claims WHERE agent = ?1 AND generation != ?2",

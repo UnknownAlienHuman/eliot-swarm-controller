@@ -976,6 +976,19 @@ fn admit_launch_tx(
     let agent = load_agent_by_num(tx, agent_num)?
         .ok_or_else(|| Error::new("internal", "new launch Agent disappeared"))?;
     provider_holds::require_unheld_tx(tx, &agent)?;
+    if request
+        .args
+        .get(project_assignment::MANAGER_LAUNCH_ARG)
+        .is_some()
+    {
+        if principal != "owner" || parent_num.is_some() || chat || preparation.is_some() {
+            return Err(Error::new(
+                "not_allowed",
+                "manager launch must be an Owner root launch",
+            ));
+        }
+        project_assignment::reserve_launch(tx, &project, agent_num, &request.id)?;
+    }
     let command = CommandInsert::admitted(principal, request, payload_digest, (agent_num, 0), now);
     let cause = ordinary_command_cause(command.id);
     insert_command(tx, &command, &cause)?;
