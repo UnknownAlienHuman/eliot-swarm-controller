@@ -791,12 +791,9 @@ impl DesktopApp {
             .projects
             .iter()
             .map(|project| nav::path_key(&project.workspace))
-            .chain(
-                self.nav
-                    .agents
-                    .iter()
-                    .map(|agent| nav::path_key(&agent.project)),
-            )
+            .chain(self.nav.agents.iter().map(|agent| {
+                nav::path_key(agent.workspace.as_deref().unwrap_or(&agent.project_id))
+            }))
             .collect();
         project_checkouts(&self.nav.projects)
             .into_iter()

@@ -231,7 +231,7 @@ pub fn eligible_parents<'a>(
     let mut eligible: Vec<&UiAgent> = candidates
         .iter()
         .filter(|agent| agent.id != source.id && seen.insert(agent.id.as_str()))
-        .filter(|agent| agent.project == source.project && !agent.native_child)
+        .filter(|agent| agent.project_id == source.project_id && !agent.native_child)
         .filter(|agent| {
             !matches!(
                 agent.state,
@@ -255,8 +255,7 @@ mod tests {
             generation: 1,
             harness: "claude".to_owned(),
             state,
-            project: "/w".to_owned(),
-            recorded_project: None,
+            project_id: "/w".to_owned(),
             repo_common_dir: None,
             workspace: None,
             parent: parent.map(str::to_owned),
@@ -294,7 +293,7 @@ mod tests {
     fn only_live_controlled_tasks_of_the_same_project_outside_the_subtree_qualify() {
         let source = agent("a2", Some("a1"), AgentState::Idle, 5);
         let mut other_project = agent("a9", None, AgentState::Idle, 9);
-        other_project.project = "/elsewhere".to_owned();
+        other_project.project_id = "/elsewhere".to_owned();
         let mut native = agent("a8", None, AgentState::Busy, 8);
         native.native_child = true;
         let agents = vec![
@@ -323,7 +322,12 @@ mod tests {
     fn list(rows: &[UiAgent], request: &AgentListRequest) -> Page {
         let matching: Vec<&UiAgent> = rows
             .iter()
-            .filter(|row| request.project.as_deref().is_none_or(|p| row.project == p))
+            .filter(|row| {
+                request
+                    .project
+                    .as_deref()
+                    .is_none_or(|p| row.project_id == p)
+            })
             .filter(|row| request.state.is_none_or(|state| row.state == state))
             .collect();
         let start = request.after.as_deref().map_or(0, |after| {
@@ -356,7 +360,7 @@ mod tests {
         // The one valid manager: the fourth page at two rows a page.
         rows.push(agent("a8", None, AgentState::Idle, 8));
         let mut elsewhere = agent("a9", None, AgentState::Busy, 9);
-        elsewhere.project = "/elsewhere".to_owned();
+        elsewhere.project_id = "/elsewhere".to_owned();
         rows.push(elsewhere);
         rows.push(agent("a10", None, AgentState::Busy, 10));
         // a12 works under a stopped worker a11 of a1: only the sidebar's
@@ -438,5 +442,52 @@ mod tests {
         let task = unread_words("/w", 1_000, 4).unwrap();
         assert!(task.contains("of this project"), "{task}");
         assert_eq!(unread_words("", 3, 0), None);
+    }
+
+    #[test]
+    fn move_candidates_use_project_id_when_it_differs_from_workspace() {
+        fn placed(id: &str, project_id: &str, workspace: &str, state: AgentState) -> UiAgent {
+            let mut row = agent(id, None, state, 1);
+            row.project_id = project_id.to_owned();
+            row.workspace = Some(workspace.to_owned());
+            row
+        }
+        let source = placed("a1", "p", "/repo", AgentState::Idle);
+        let same_project = placed("a2", "p", "/repo", AgentState::Idle);
+        let same_workspace_other_project = placed("a3", "q", "/repo", AgentState::Idle);
+        let candidates = vec![
+            same_project.clone(),
+            same_workspace_other_project.clone(),
+            source.clone(),
+        ];
+        let ids: Vec<&str> = eligible_parents(&candidates, &[], &source)
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect();
+        assert_eq!(ids, ["a2"]);
+
+        let rows = vec![
+            source.clone(),
+            same_project.clone(),
+            same_workspace_other_project,
+        ];
+        let mut requests = Vec::new();
+        let managers = crate::client::block_on(search_managers("p", 10, 100, |request| {
+            requests.push(request.clone());
+            let page = list(&rows, &request);
+            async move { Ok::<_, ()>(page) }
+        }))
+        .unwrap();
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.project.as_deref() == Some("p"))
+        );
+        let ids: Vec<&str> = eligible_parents(&managers.agents, &[], &source)
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect();
+        assert!(ids.contains(&"a2"), "same-project agent missing: {ids:?}");
+        assert!(!ids.contains(&"a3"));
     }
 }

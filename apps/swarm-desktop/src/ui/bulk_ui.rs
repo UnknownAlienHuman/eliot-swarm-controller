@@ -1061,8 +1061,7 @@ mod tests {
             generation: 1,
             harness: "codex".to_owned(),
             state: AgentState::Stopped,
-            project: workspace.to_owned(),
-            recorded_project: None,
+            project_id: workspace.to_owned(),
             repo_common_dir: None,
             workspace: Some(workspace.to_owned()),
             parent: parent.map(str::to_owned),
@@ -1097,7 +1096,7 @@ mod tests {
         let mut verified = Checkout::new("/repo/linked", "/repo/.git");
         verified.main = Some(false);
         let mut shadow = stopped("a1", None, "/repo/linked/other-repo");
-        shadow.project = verified.path.clone();
+        shadow.project_id = verified.path.clone();
         let linked = stopped("a2", None, &verified.path);
         let stale = Checkout::new("/unverified", "/repo/.git");
         let unverified = stopped("a3", None, &stale.path);

@@ -1243,12 +1243,11 @@ impl LaunchOutcome {
             generation: self.generation,
             harness: self.submitted.harness.clone().unwrap_or_default(),
             state: eliot_core::AgentState::Created,
-            project: if self.submitted.chat {
+            project_id: if self.submitted.chat {
                 String::new()
             } else {
                 self.submitted.workspace.clone()
             },
-            recorded_project: None,
             repo_common_dir: None,
             workspace: None,
             parent: None,
@@ -1348,7 +1347,7 @@ mod tests {
         );
         let row = outcome.pending_agent(5);
         assert_eq!(row.harness, "codex");
-        assert_eq!(row.project, "C:/src/app");
+        assert_eq!(row.project_id, "C:/src/app");
         assert!(!row.chat);
         assert_eq!(row.title, "Fix the build");
         assert_eq!(

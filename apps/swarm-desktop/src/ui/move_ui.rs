@@ -182,7 +182,7 @@ impl DesktopApp {
     fn spawn_move_search(&self, agent: &UiAgent, context: &ComponentContext<Self>) {
         let source = agent.id.clone();
         let generation = agent.generation;
-        let project = agent.project.clone();
+        let project = agent.project_id.clone();
         let data_dir = self.data_dir.clone();
         let _task = context.spawn_background(move |_| {
             let result = match data_dir {
@@ -227,7 +227,7 @@ impl DesktopApp {
             _ => (&[], 0),
         };
         let eligible = reparent::eligible_parents(candidates, &self.nav.agents, &dialog.agent);
-        let scope = reparent::Scope::of(&dialog.agent.project);
+        let scope = reparent::Scope::of(&dialog.agent.project_id);
         // A parent past the sidebar's page is named from the candidates.
         let title_of = |id: &str| {
             dialog
@@ -325,7 +325,7 @@ impl DesktopApp {
         };
         // The search is bounded: say what it left unread.
         let incomplete: View =
-            match reparent::unread_words(&dialog.agent.project, candidates.len(), unread) {
+            match reparent::unread_words(&dialog.agent.project_id, candidates.len(), unread) {
                 Some(words) => m3::secondary(words)
                     .text_wrapping(TextWrapping::Wrap)
                     .into(),

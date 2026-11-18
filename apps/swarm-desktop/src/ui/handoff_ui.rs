@@ -472,7 +472,7 @@ impl DesktopApp {
         };
         let project = listed()
             .find(|agent| agent.id == self.handoff.from)
-            .map(|agent| agent.project.clone())
+            .map(|agent| agent.project_id.clone())
             .filter(|project| !project.is_empty());
         let mut seen = HashSet::new();
         listed()
@@ -481,7 +481,7 @@ impl DesktopApp {
             .filter(|agent| {
                 project
                     .as_ref()
-                    .is_none_or(|project| &agent.project == project)
+                    .is_none_or(|project| &agent.project_id == project)
             })
             .filter(|agent| {
                 !matches!(

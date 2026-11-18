@@ -634,8 +634,11 @@ impl DesktopApp {
                 self.open_folder(&checkout);
             }
             (Action::OpenFolder, Target::Agent(agent)) => {
-                let project = agent.project.clone();
-                self.open_folder(&project);
+                let folder = agent
+                    .workspace
+                    .clone()
+                    .unwrap_or_else(|| agent.project_id.clone());
+                self.open_folder(&folder);
             }
             (Action::ToggleCollapse, Target::Project { key, .. }) => {
                 self.shell_update(ShellMsg::ProjectToggled(key.clone()), context);
@@ -972,7 +975,12 @@ impl DesktopApp {
             m3::glyph::COPY,
             false,
         )];
-        if !agent.project.is_empty() {
+        if !agent
+            .workspace
+            .as_deref()
+            .unwrap_or(&agent.project_id)
+            .is_empty()
+        {
             entries.push((
                 Action::OpenFolder,
                 "Open folder".to_owned(),

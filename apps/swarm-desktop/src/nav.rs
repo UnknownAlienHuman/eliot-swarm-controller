@@ -37,10 +37,9 @@ pub struct UiAgent {
     pub generation: i64,
     pub harness: String,
     pub state: eliot_core::AgentState,
-    /// The location label used by workspace controls.
-    pub project: String,
-    /// The project value recorded by the daemon, independently of the workspace.
-    pub recorded_project: Option<String>,
+    /// The recorded registration ID (the daemon's project label), independently
+    /// of the execution path. Move/Handoff query and filter by this.
+    pub project_id: String,
     pub repo_common_dir: Option<String>,
     pub workspace: Option<String>,
     /// The current manager, if any.
@@ -67,13 +66,7 @@ impl UiAgent {
             generation: summary.generation,
             harness: summary.harness.clone(),
             state: summary.state,
-            project: summary
-                .workspace
-                .as_ref()
-                .filter(|_| !summary.chat)
-                .unwrap_or(&summary.project)
-                .clone(),
-            recorded_project: Some(summary.project.clone()),
+            project_id: summary.project.clone(),
             repo_common_dir: summary.repo_common_dir.clone(),
             workspace: summary.workspace.clone(),
             parent: summary.parent.clone(),
@@ -386,8 +379,8 @@ fn agent_checkout<'a>(
     agent: &UiAgent,
     checkouts: &'a [Checkout],
 ) -> Option<(&'a Checkout, Option<&'a Checkout>)> {
-    let project = agent.recorded_project.as_deref().unwrap_or(&agent.project);
-    let workspace = path_key(agent.workspace.as_deref().unwrap_or(&agent.project));
+    let project = agent.project_id.as_str();
+    let workspace = path_key(agent.workspace.as_deref().unwrap_or(project));
     let registered = checkouts
         .iter()
         .find(|checkout| checkout.registration_ids.iter().any(|id| id == project));
@@ -420,10 +413,13 @@ fn agent_checkout<'a>(
 fn agent_project_key(agent: &UiAgent, checkouts: &[Checkout]) -> String {
     agent_checkout(agent, checkouts).map_or_else(
         || {
-            if agent.workspace.is_some() || agent.project.contains(['/', '\\']) {
+            if agent.workspace.is_some() || agent.project_id.contains(['/', '\\']) {
                 OTHER_LOCATIONS.to_owned()
             } else {
-                format!("folder:{}", path_key(&agent.project))
+                format!(
+                    "folder:{}",
+                    path_key(agent.workspace.as_deref().unwrap_or(&agent.project_id))
+                )
             }
         },
         |(repository, _)| format!("repo:{}", path_key(&repository.common_dir)),
@@ -446,7 +442,7 @@ pub fn agent_place_label(agent: &UiAgent, checkouts: &[Checkout]) -> String {
                 None => name,
             }
         }
-        None => folder_name(&agent.project).to_owned(),
+        None => folder_name(agent.workspace.as_deref().unwrap_or(&agent.project_id)).to_owned(),
     }
 }
 
@@ -692,7 +688,10 @@ pub fn sections(listed: &[UiAgent], checkouts: &[Checkout], shown: &Shown) -> Ve
                 let (name, checkout) = if key == OTHER_LOCATIONS {
                     (OTHER_LOCATIONS_NAME, "")
                 } else {
-                    (folder_name(&agent.project), agent.project.as_str())
+                    (
+                        folder_name(agent.workspace.as_deref().unwrap_or(&agent.project_id)),
+                        agent.workspace.as_deref().unwrap_or(&agent.project_id),
+                    )
                 };
                 groups.push(Group {
                     section: empty(key.clone(), name.to_owned(), checkout),
@@ -895,7 +894,7 @@ pub fn registration_use(
         .iter()
         .filter(|agent| !agent.chat && seen.insert(agent.id.as_str()))
     {
-        let recorded = agent.recorded_project.as_deref().unwrap_or(&agent.project);
+        let recorded = agent.project_id.as_str();
         if let Some(entry) = usage.get_mut(recorded) {
             entry.tasks += 1;
             entry.live += usize::from(agent.live());
@@ -1410,8 +1409,7 @@ mod tests {
             generation: 1,
             harness: "muse".to_owned(),
             state: AgentState::Idle,
-            project: project.to_owned(),
-            recorded_project: None,
+            project_id: project.to_owned(),
             repo_common_dir: None,
             workspace: None,
             parent: parent.map(str::to_owned),
@@ -1693,10 +1691,10 @@ mod tests {
 
         let outer_agent = agent("a1", outer, None);
         let mut recorded = agent("a2", linked, Some("a1"));
-        recorded.recorded_project = Some("inner".to_owned());
+        recorded.project_id = "inner".to_owned();
         recorded.workspace = Some(linked.to_owned());
         let mut legacy = agent("a3", linked, None);
-        legacy.recorded_project = Some(outer.to_owned());
+        legacy.project_id = outer.to_owned();
         legacy.workspace = Some(linked.to_owned());
         let mut managed = agent("a4", linked, None);
         managed.repo_common_dir = Some(git.to_owned());
@@ -2326,5 +2324,15 @@ mod tests {
     fn path_keys_compare_like_the_daemon_on_windows() {
         assert_eq!(path_key(r"\\?\C:\Src\App\"), path_key("c:/src/app"));
         assert_ne!(path_key(r"C:\src\app"), path_key(r"C:\src\apple"));
+    }
+
+    #[test]
+    fn from_summary_keeps_project_id_separate_from_workspace() {
+        let mut full = summary(None, None, Some("codex-lite"));
+        full.project = "p".to_owned();
+        full.workspace = Some("/repo".to_owned());
+        let agent = UiAgent::from_summary(&full);
+        assert_eq!(agent.project_id, "p");
+        assert_eq!(agent.workspace.as_deref(), Some("/repo"));
     }
 }
