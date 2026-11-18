@@ -1203,11 +1203,15 @@ impl NativePendingRequestPointer {
     }
 }
 
-/// One offered user-input option. Only the selected label is modelled.
+/// One offered user-input option: the selected label plus its optional
+/// native description (<=240 chars). Previews stay out of the DTO; only
+/// the human-readable description is retained for projection.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeUserInputOption {
     pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// The question's answer shape: closed `single | multiple` plus optional

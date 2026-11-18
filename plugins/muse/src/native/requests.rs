@@ -452,13 +452,14 @@ fn public_question_details(details: &Map<String, Value>) -> Result<Value> {
     for question in &offered {
         // The native offer carries labels but no option ids, so the label is
         // the canonical option id; it carries no secrecy marker either.
+        // Native option descriptions are preserved verbatim for display.
         let options = question
             .options
             .iter()
             .map(|option| QuestionOption {
                 id: option.label.clone(),
                 label: option.label.clone(),
-                description: None,
+                description: option.description.clone(),
             })
             .collect::<Vec<_>>();
         let kind = if options.is_empty() {
@@ -481,7 +482,10 @@ fn public_question_details(details: &Map<String, Value>) -> Result<Value> {
             title: Some(question.header.clone()),
             prompt: Some(question.question.clone()),
             options,
-            free_entry: question.options.is_empty(),
+            // The MSP wire always allows the free-text alternative
+            // (`freeText` <=500 chars) alongside offered options, so the
+            // public surface always exposes free entry.
+            free_entry: true,
             is_secret: false,
             min_selections: question
                 .selection
@@ -759,6 +763,8 @@ struct OfferedQuestion {
 #[serde(rename_all = "camelCase")]
 struct OfferedOption {
     label: String,
+    #[serde(default)]
+    description: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -806,14 +812,27 @@ fn answer_for_canonical(
                 "a single-mode question takes exactly one answer",
             ));
         };
-        if !labels.contains(&label.as_str()) {
-            return Err(Error::new(
-                "invalid",
-                "answer names an option that was not offered",
-            ));
+        if labels.contains(&label.as_str()) {
+            wire.selected_label = Some(label.clone());
+        } else {
+            // Upstream-supported free-text alternative: a non-option
+            // string answers with the user's own wording.
+            if label.chars().count() > 500 || label.is_empty() {
+                return Err(Error::new("invalid", "answer text exceeds 500 chars"));
+            }
+            wire.free_text = Some(label.clone());
         }
-        wire.selected_label = Some(label.clone());
     } else if question.selection.mode == "multiple" {
+        // A single non-option string is the free-text alternative; a
+        // multi-string answer must name only offered options.
+        if answers.len() == 1 && !labels.contains(&answers[0].as_str()) {
+            let text = &answers[0];
+            if text.is_empty() || text.chars().count() > 500 {
+                return Err(Error::new("invalid", "answer text exceeds 500 chars"));
+            }
+            wire.free_text = Some(text.clone());
+            return Ok(wire);
+        }
         let mut picked: Vec<String> = Vec::with_capacity(answers.len());
         for label in answers {
             if !labels.contains(&label.as_str()) {
@@ -1091,6 +1110,49 @@ mod tests {
             "userInputId": "prompt-1",
             "viewCursor": "cursor-4",
         })
+    }
+
+    #[test]
+    fn user_input_free_text_alternative_and_descriptions() {
+        // Audit #639: MSP allows freeText alongside 2-3 options; the
+        // public surface exposes free entry and preserves descriptions.
+        let params = serde_json::json!({
+            "itemId": "item-2",
+            "questions": [{
+                "header": "Deploy",
+                "id": "q1",
+                "options": [
+                    {"label": "staging", "description": "Stage env"},
+                    {"label": "production", "description": "Prod env"}
+                ],
+                "question": "Where?",
+                "selection": {"mode": "single"},
+            }],
+            "sessionId": "session-1",
+            "toolCallId": "call-2",
+            "toolName": "ask",
+            "turnId": "turn-1",
+            "userInputId": "prompt-1",
+            "viewCursor": "cursor-4",
+        });
+        let pending = describe_request("userInput/request", &params, "session-1", "turn-1")
+            .expect("user input describes");
+        let details = pending.details.as_object().expect("details");
+        let public = public_question_details(details).expect("public projects");
+        let q = &public["questions"][0];
+        assert_eq!(q["free_entry"], true);
+        assert_eq!(q["options"][0]["description"], "Stage env");
+        // Exact option still maps to selectedLabel.
+        let offered: OfferedQuestion =
+            serde_json::from_value(params["questions"][0].clone()).expect("offered decodes");
+        let exact = answer_for_canonical(&offered, &["staging".to_owned()]).expect("exact maps");
+        assert_eq!(exact.selected_label.as_deref(), Some("staging"));
+        assert!(exact.free_text.is_none());
+        // Non-option wording maps to freeText (<=500 chars).
+        let free =
+            answer_for_canonical(&offered, &["my own wording".to_owned()]).expect("free text maps");
+        assert_eq!(free.free_text.as_deref(), Some("my own wording"));
+        assert!(free.selected_label.is_none());
     }
 
     #[test]
