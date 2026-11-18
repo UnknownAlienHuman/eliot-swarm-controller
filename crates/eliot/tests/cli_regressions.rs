@@ -1240,6 +1240,16 @@ fn foreground_startup_and_cli_help() {
     fixture.stop(false);
 }
 
+/// Birth-verified ownership of a detached background daemon, without
+/// panicking: None while its metadata is absent or unparsable, so the caller
+/// can claim it the moment it appears and retry until the deadline.
+#[cfg(windows)]
+fn claim_background_daemon(data: &Path) -> Option<windows_process::Daemon> {
+    let bytes = fs::read(data.join("daemon.json")).ok()?;
+    let info: Value = serde_json::from_slice(&bytes).ok()?;
+    windows_process::Daemon::try_open(data, &info)
+}
+
 #[cfg(windows)]
 #[test]
 fn background_startup_releases_capture_before_daemon_exit() {
@@ -1255,15 +1265,20 @@ fn background_startup_releases_capture_before_daemon_exit() {
         .arg(data_argument)
         .args(["--json", "daemon"]);
     let mut starter = Captured::spawn(command);
-    assert!(
-        starter
-            .wait(Duration::from_secs(40))
-            .expect("background starter deadline")
-            .success()
-    );
+    let starter_status = starter
+        .wait(Duration::from_secs(40))
+        .expect("background starter deadline");
+    // Claim the detached daemon before asserting anything: under load the
+    // starter may spawn it and then fail its own readiness wait, and only a
+    // birth-verified handle still owns it on that panic path.
+    let mut held = claim_background_daemon(&fixture.data);
+    assert!(starter_status.success());
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     let info = loop {
         if let Ok(bytes) = fs::read(fixture.data.join("daemon.json")) {
+            if held.is_none() {
+                held = claim_background_daemon(&fixture.data);
+            }
             break serde_json::from_slice::<Value>(&bytes).expect("daemon metadata");
         }
         assert!(
@@ -1272,7 +1287,7 @@ fn background_startup_releases_capture_before_daemon_exit() {
         );
         std::thread::sleep(Duration::from_millis(25));
     };
-    let held = windows_process::Daemon::open(&fixture.data, &info);
+    let held = held.unwrap_or_else(|| windows_process::Daemon::open(&fixture.data, &info));
     let status = fixture.json(&["status"]);
     assert_eq!(status["state"], "running");
     assert_eq!(
@@ -1556,5 +1571,70 @@ fn fixture_cli_scrubs_ambient_identity_under_nested_runner() {
             current == original_value,
             "outer ambient context for {key} changed"
         );
+    }
+}
+
+#[cfg(windows)]
+fn daemon_birth_ticks(data: &Path) -> u64 {
+    let info: Value =
+        serde_json::from_slice(&fs::read(data.join("daemon.json")).expect("daemon metadata"))
+            .expect("daemon metadata JSON");
+    info["process_birth"]
+        .as_str()
+        .expect("process birth")
+        .strip_prefix("windows-creation-filetime:")
+        .expect("birth format")
+        .parse()
+        .expect("birth ticks")
+}
+
+/// E43: a panic after spawning a daemon must not leak it. The fixture's guard
+/// kills and reaps the exact owned child while unwinding; afterwards neither
+/// the OS (exact PID, birth-verified on Windows) nor IPC may show a live daemon.
+#[test]
+fn panicking_after_spawn_leaves_no_live_daemon() {
+    use std::cell::RefCell;
+
+    #[derive(Clone)]
+    struct Probe {
+        pid: u32,
+        data: std::path::PathBuf,
+        #[cfg(windows)]
+        birth: u64,
+    }
+
+    let probe: RefCell<Option<Probe>> = RefCell::new(None);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut fixture = Fixture::new("panic-owned-daemon");
+        fixture.start();
+        *probe.borrow_mut() = Some(Probe {
+            pid: fixture.daemon_pid(),
+            data: fixture.data.clone(),
+            #[cfg(windows)]
+            birth: daemon_birth_ticks(&fixture.data),
+        });
+        panic!("intentional panic after spawning the owned daemon");
+    }));
+    assert!(result.is_err(), "the intentional panic must unwind");
+    let probe = probe.borrow().clone().expect("probe recorded before panic");
+    // The fixture dropped during unwinding, so the guard already killed and
+    // reaped the exact child; poll briefly only to stay honest about async
+    // process teardown.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        #[cfg(windows)]
+        let live = windows_process::exact_process_is_live(probe.pid, probe.birth);
+        #[cfg(not(windows))]
+        let live = std::path::Path::new(&format!("/proc/{}", probe.pid)).exists();
+        let status = cli(&probe.data, &["status"]);
+        if !live && !status.status.success() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "leaked live daemon pid={}",
+            probe.pid
+        );
+        std::thread::sleep(Duration::from_millis(100));
     }
 }

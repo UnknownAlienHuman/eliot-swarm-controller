@@ -205,6 +205,78 @@ impl Drop for Captured {
     }
 }
 
+/// A test-owned daemon child. Its stdio is never inherited and never piped
+/// back to the test: stdin, stdout and stderr are all null, so even a leaked
+/// daemon can never hold the harness pipe. Readiness and failure evidence
+/// comes from the daemon's files (`daemon.json`, `logs/daemon.log`) and IPC,
+/// never from a pipe.
+///
+/// Drop kills the exact child handle first and reaps it within a bound, on
+/// every path including a panic mid-startup. Kill targets this exact process
+/// object, so PID reuse cannot redirect it; no IPC to a possibly wedged
+/// daemon is ever required.
+pub struct OwnedDaemon {
+    child: Child,
+}
+
+impl OwnedDaemon {
+    pub fn spawn(mut command: Command) -> Self {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        let child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start test-owned daemon");
+        Self { child }
+    }
+
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    /// Reap an already-stopping daemon without killing it: used after an
+    /// acknowledged shutdown. A daemon still live past the deadline is a test
+    /// failure the caller reports; the guard's Drop still kills it.
+    pub fn reap(&mut self, timeout: Duration) -> io::Result<ExitStatus> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.child.try_wait()? {
+                return Ok(status);
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "owned daemon did not exit",
+                ));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for OwnedDaemon {
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = self.child.kill();
+            if self.reap(Duration::from_secs(10)).is_err() {
+                eprintln!(
+                    "test-owned daemon {} survived kill; leaked",
+                    self.child.id()
+                );
+            }
+        }
+    }
+}
+
 pub struct Reply {
     pub status: ExitStatus,
     pub stdout: String,
@@ -263,12 +335,36 @@ pub fn cli(data: &Path, args: &[&str]) -> Reply {
     run(command)
 }
 
+/// Bounded panic check without pipes: the crash hook records a
+/// `daemon.panicked-<pid>-<ts>.json` marker under `<data>/crashes`, and
+/// daemon startup consumes markers from earlier runs. A marker present after
+/// shutdown proves this run's daemon panicked.
+fn assert_no_daemon_panic(data: &Path) {
+    let mut panicked = false;
+    if let Ok(entries) = fs::read_dir(data.join("crashes")) {
+        for entry in entries.filter_map(|entry| entry.ok()) {
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("daemon.panicked-"))
+            {
+                panicked = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        !panicked,
+        "daemon panicked; see the retained fixture crashes dir"
+    );
+}
+
 pub struct Fixture {
     pub root: PathBuf,
     pub data: PathBuf,
     pub workspace: PathBuf,
     pub retain_data: bool,
-    daemon: Option<Captured>,
+    daemon: Option<OwnedDaemon>,
     daemon_env: Vec<(OsString, OsString)>,
     starts: u32,
 }
@@ -290,6 +386,12 @@ impl Fixture {
         }
     }
 
+    /// Exact PID of the owned daemon child (the guard's handle, never a
+    /// re-resolved PID, so the proof test cannot observe a recycled process).
+    pub fn daemon_pid(&self) -> u32 {
+        self.daemon.as_ref().expect("owned daemon").id()
+    }
+
     pub fn start(&mut self) {
         assert!(self.daemon.is_none());
         let _start_guard = DaemonStartGuard::enter();
@@ -305,8 +407,8 @@ impl Fixture {
             .arg("--data-dir")
             .arg(data_argument)
             .args(["daemon", "--foreground"]);
-        self.daemon = Some(Captured::spawn(command));
-        let child_id = self.daemon.as_ref().unwrap().child.id();
+        self.daemon = Some(OwnedDaemon::spawn(command));
+        let child_id = self.daemon.as_ref().unwrap().id();
         let started = Instant::now();
         let deadline = started + WAIT;
         let mut polls = 0u32;
@@ -316,26 +418,18 @@ impl Fixture {
                 .daemon
                 .as_mut()
                 .unwrap()
-                .child
                 .try_wait()
                 .expect("daemon status")
             {
-                let (_, stderr) = self.daemon.as_ref().unwrap().output(Duration::from_secs(2));
-                let mut end = stderr.len().min(16 * 1024);
-                while !stderr.is_char_boundary(end) {
-                    end -= 1;
-                }
-                let truncated = if end < stderr.len() {
-                    "\n[stderr truncated at 16384 bytes]"
-                } else {
-                    ""
-                };
+                // The owned daemon's stdio is null (never a pipe), so its
+                // last words come from its files: the published endpoint
+                // record and the timestamped phase codes in its log.
                 panic!(
-                    "foreground daemon exited during startup (status={status:?}, per_process currently_starting={}, per_process peak_starting={}); stderr:\n{}{}",
+                    "foreground daemon exited during startup (status={status:?}, per_process currently_starting={}, per_process peak_starting={}); daemon.json={}; log={}",
                     CURRENTLY_STARTING_DAEMONS_PER_PROCESS.load(Ordering::SeqCst),
                     PEAK_STARTING_DAEMONS_PER_PROCESS.load(Ordering::SeqCst),
-                    &stderr[..end],
-                    truncated,
+                    daemon_info_snippet(&self.data),
+                    daemon_log_phases(&self.data),
                 );
             }
             let response = cli(&self.data, &["status"]);
@@ -359,7 +453,7 @@ impl Fixture {
                 started.elapsed(),
                 CURRENTLY_STARTING_DAEMONS_PER_PROCESS.load(Ordering::SeqCst),
                 PEAK_STARTING_DAEMONS_PER_PROCESS.load(Ordering::SeqCst),
-                match self.daemon.as_mut().unwrap().child.try_wait() {
+                match self.daemon.as_mut().unwrap().try_wait() {
                     Ok(None) => "alive".to_owned(),
                     Ok(Some(status)) => format!("exited({status:?})"),
                     Err(_) => "wait_error".to_owned(),
@@ -423,22 +517,29 @@ impl Fixture {
         let daemon = self.daemon.as_mut().unwrap();
         assert!(
             daemon
-                .wait(WAIT)
+                .reap(WAIT)
                 .expect("owned daemon shutdown deadline")
                 .success(),
             "owned daemon returned nonzero"
         );
-        let (_, stderr) = daemon.output(Duration::from_secs(2));
-        assert!(!stderr.contains("panicked"), "daemon panic: {stderr}");
+        assert_no_daemon_panic(&self.data);
         self.daemon = None;
     }
 }
 
 impl Drop for Fixture {
     fn drop(&mut self) {
+        // The owned foreground daemon dies with the fixture on every path,
+        // including a panic mid-startup such as the readiness deadline:
+        // dropping the guard kills the exact child handle first and reaps it,
+        // without depending on IPC to a daemon that may be wedged under load.
+        if let Some(daemon) = self.daemon.take() {
+            drop(daemon);
+        }
         if self.retain_data {
-            // A background starter can fail before metadata is published. Only
-            // attempt authenticated IPC; do not adopt a PID or claim OS exit.
+            // No owned foreground child remains (killed above). A background
+            // starter can fail before metadata is published: only attempt
+            // authenticated IPC, never adopt a PID or claim OS exit.
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 cli(&self.data, &["daemon", "stop", "--force"])
             }));
@@ -447,17 +548,6 @@ impl Drop for Fixture {
                 self.root.display()
             );
             return;
-        }
-        if let Some(mut daemon) = self.daemon.take() {
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                cli(&self.data, &["daemon", "stop", "--force"])
-            }));
-            if daemon.wait(WAIT).is_err() {
-                let _ = daemon.child.kill();
-                if daemon.wait(Duration::from_secs(5)).is_err() {
-                    return;
-                }
-            }
         }
         if thread::panicking() {
             eprintln!("failed fixture retained at {}", self.root.display());
