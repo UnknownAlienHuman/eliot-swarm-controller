@@ -530,18 +530,6 @@ where
                         let is_event_commit = request.method == "events.put";
                         let response_error = match requests.try_send(request) {
                             Ok(()) => None,
-                            Err(mpsc::error::TrySendError::Full(_)) if is_event_commit => {
-                                Some(Error::new(
-                                    "unknown",
-                                    "events.put outcome unknown: plugin_request_queue_overflow",
-                                ))
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_)) if is_event_commit => {
-                                Some(Error::new(
-                                    "unknown",
-                                    "events.put outcome unknown: plugin_request_queue_closed",
-                                ))
-                            }
                             Err(mpsc::error::TrySendError::Full(_)) => Some(
                                 Error::new("busy", "plugin request queue is full")
                                     .with_where("plugin.command.queue")
@@ -550,14 +538,25 @@ where
                                         "plugin request queue is full",
                                     ),
                             ),
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
-                                Some(Error::new("unavailable", "plugin request queue is closed"))
-                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => Some(if is_event_commit {
+                                Error::new("rejected", "plugin request queue is closed")
+                            } else {
+                                Error::new("unavailable", "plugin request queue is closed")
+                            }),
                         };
                         if let Some(error) = response_error {
                             let _ = client
-                                .respond(id, Err(error), Instant::now() + Duration::from_secs(5))
+                                .respond(
+                                    id,
+                                    Err(error.clone()),
+                                    Instant::now() + Duration::from_secs(5),
+                                )
                                 .await;
+                            if is_event_commit {
+                                // The refused frame never reached intake. Losing its native
+                                // coverage still requires daemon-owned reader settlement.
+                                break error;
+                            }
                         }
                     }
                     Err(error) => {

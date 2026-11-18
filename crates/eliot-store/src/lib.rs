@@ -5260,7 +5260,8 @@ fn install_stream_source_plan(
     Ok(())
 }
 
-fn family_for_kind(kind: &str) -> Result<&'static str> {
+/// Resolve the Store-owned source family for a normalized native event kind.
+pub fn family_for_kind(kind: &str) -> Result<&'static str> {
     match kind {
         "session.ready" | "session.ended" | "session.usage" | "quota.observed" => Ok("session"),
         "turn.started" | "turn.completed" | "turn.unknown" | "turn.model_observed" => Ok("turn"),

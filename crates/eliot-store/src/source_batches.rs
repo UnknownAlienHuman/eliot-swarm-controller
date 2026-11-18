@@ -475,7 +475,16 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(sql_error)?;
+            .map_err(|error| {
+                if matches!(
+                    error.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+                ) {
+                    Error::new("busy", "SQLite writer lock unavailable for native batch")
+                } else {
+                    sql_error(error)
+                }
+            })?;
         let mut projection = load_agent_by_num(&tx, agent_num)?.ok_or_else(|| {
             Error::new(
                 "not_found",
@@ -560,7 +569,7 @@ impl Store {
                     })?,
                     cursor: source.cursor,
                 };
-                commit_transaction(tx, &self.write_faulted)?;
+                commit_source_batch(tx, &self.write_faulted)?;
                 return Ok(BatchCommit {
                     ack,
                     events: Vec::new(),
@@ -766,7 +775,7 @@ impl Store {
                 batch.source,
             ],
         ));
-        commit_transaction(tx, &self.write_faulted)?;
+        commit_source_batch(tx, &self.write_faulted)?;
         Ok(BatchCommit {
             ack: BatchAck {
                 first_seq,
@@ -776,4 +785,20 @@ impl Store {
             events: committed_events,
         })
     }
+}
+
+// Statement errors return before COMMIT. If COMMIT itself fails, a
+// successful explicit rollback proves no write. Otherwise retain uncertainty.
+fn commit_source_batch(tx: Transaction<'_>, write_faulted: &Cell<bool>) -> Result<()> {
+    let Err(error) = commit_sql(&tx) else {
+        return Ok(());
+    };
+    if !tx.is_autocommit() && tx.rollback().is_ok() {
+        return Err(sql_error(error));
+    }
+    write_faulted.set(true);
+    Err(Error::new(
+        "unknown",
+        "native batch commit could not be settled",
+    ))
 }

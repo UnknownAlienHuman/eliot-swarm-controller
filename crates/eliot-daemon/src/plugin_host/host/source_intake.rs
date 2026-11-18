@@ -6,20 +6,23 @@
 //! ownership stay with super; actor lifecycle lives in actor.
 
 use super::{
-    AgentKey, EventSource, PluginConnection, deadline, fence_runtime_generation, late_batch_error,
-    record_source_gap, record_store_batch_rejection, redact_native_error, redact_source_batch,
-    safe_cause_code, signal_progress, source_state_binding,
+    AgentKey, Bus, EventSource, PluginConnection, RPC_GRACE, StoreHandle, deadline,
+    fence_runtime_generation, late_batch_error, record_source_gap, record_store_batch_rejection,
+    redact_native_error, redact_source_batch, safe_cause_code, signal_progress,
+    source_state_binding,
 };
 use super::{native_children, observation, source_handoff};
 
 use crate::common::{now_ms, secure_eq};
 
-use eliot_core::{Error, SecretPolicy, SourceBatch};
+use eliot_core::{Error, Result, SourceBatch, SourceGap, SourceHealthUpdate};
 use eliot_plugin::protocol::{HookEvent, HookResponse};
 use eliot_plugin::sync::LockExt;
-use serde_json::Value;
+use eliot_store::family_for_kind;
+use serde_json::{Value, json};
 
-use tokio::time::timeout_at;
+use tokio::time::{Instant, timeout_at};
+use ulid::Ulid;
 
 pub(super) async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSource) {
     let EventSource {
@@ -43,7 +46,14 @@ pub(super) async fn serve_plugin_requests(mut connection: PluginConnection, sour
     while let Some(request) = connection.next_request().await {
         let request_id = request.id.clone();
         let method = request.method.clone();
-        let request_deadline = deadline();
+        let reply_deadline = deadline();
+        // A Store lock timeout must leave time to transmit the proven rejection.
+        let request_deadline = if method == "events.put" {
+            reply_deadline - RPC_GRACE
+        } else {
+            reply_deadline
+        };
+        let mut rejected_batch = None;
         let result = if !matches!(
             method.as_str(),
             "events.put"
@@ -74,16 +84,7 @@ pub(super) async fn serve_plugin_requests(mut connection: PluginConnection, sour
                 .as_deref()
                 .is_some_and(|credential| secure_eq(credential, &expected_credential))
             {
-                if method == "events.put" {
-                    Err(late_batch_error(
-                        &state,
-                        &agent_id,
-                        generation,
-                        "plugin_credential_invalid",
-                    ))
-                } else {
-                    Err(Error::new("not_allowed", "plugin credential is invalid"))
-                }
+                Err(Error::new("not_allowed", "plugin credential is invalid"))
             } else if let Some(error) = observation::callback_error(
                 &store,
                 observation.as_ref(),
@@ -140,124 +141,27 @@ pub(super) async fn serve_plugin_requests(mut connection: PluginConnection, sour
                             }
                         }
                     }
-                    "events.put" => match serde_json::from_value::<SourceBatch>(params) {
-                        Ok(mut batch)
-                            if batch.agent_id == agent_id && batch.generation == generation =>
-                        {
-                            match redact_source_batch(&mut batch, &source_credentials) {
-                                Err(error) => Err(error),
-                                Ok(()) => match binding.expected_subject() {
-                                    Err(error) => Err(error),
-                                    Ok(subject) => match timeout_at(request_deadline, store.lock())
-                                        .await
-                                    {
-                                        Ok(mut store) => {
-                                            let batch_policy =
-                                                SecretPolicy::new(source_credentials.iter());
-                                            let batch_source = batch_policy
-                                                .redact_text(&batch.source)
-                                                .chars()
-                                                .take(256)
-                                                .collect::<String>();
-                                            let batch_id = batch_policy
-                                                .redact_text(&batch.batch_id)
-                                                .chars()
-                                                .take(256)
-                                                .collect::<String>();
-                                            let event_kind = batch
-                                                .events
-                                                .iter()
-                                                .take(4)
-                                                .map(|event| {
-                                                    batch_policy
-                                                        .redact_text(&event.kind)
-                                                        .chars()
-                                                        .take(48)
-                                                        .collect::<String>()
-                                                })
-                                                .collect::<Vec<_>>()
-                                                .join(",");
-                                            let rejection_key = AgentKey {
-                                                id: agent_id.clone(),
-                                                generation,
-                                            };
-                                            let result = match subject {
-                                                Some(subject) => store.put_observed_batch(
-                                                    batch,
-                                                    subject,
-                                                    now_ms(),
-                                                ),
-                                                None => store.put_batch(batch, now_ms()),
-                                            };
-                                            match result {
-                                                Ok(commit) => {
-                                                    bus.publish(&commit.events);
-                                                    drop(store);
-                                                    serde_json::to_value(commit.ack).map_err(|_| {
-                                                        late_batch_error(
-                                                            &state,
-                                                            &agent_id,
-                                                            generation,
-                                                            "ack_encoding_failed",
-                                                        )
-                                                    })
-                                                }
-                                                Err(error) => {
-                                                    let cause = if store.is_write_faulted() {
-                                                        "store_write_faulted".to_owned()
-                                                    } else {
-                                                        format!(
-                                                            "store_{}",
-                                                            safe_cause_code(&error.code)
-                                                        )
-                                                    };
-                                                    let unknown = late_batch_error(
-                                                        &state, &agent_id, generation, &cause,
-                                                    );
-                                                    record_store_batch_rejection(
-                                                        &source_credentials,
-                                                        &rejection_key,
-                                                        &batch_source,
-                                                        &batch_id,
-                                                        &event_kind,
-                                                        &cause,
-                                                        &error,
-                                                    );
-                                                    Err(unknown)
-                                                }
-                                            }
-                                        }
-                                        Err(_) => Err(late_batch_error(
-                                            &state,
-                                            &agent_id,
-                                            generation,
-                                            "store_lock_deadline",
-                                        )),
-                                    },
-                                },
-                            }
+                    "events.put" => {
+                        let result = put_events(
+                            &store,
+                            &bus,
+                            params,
+                            binding,
+                            &source_credentials,
+                            request_deadline,
+                            &mut rejected_batch,
+                        )
+                        .await;
+                        match result {
+                            Err(error) if error.code == "unknown" => Err(late_batch_error(
+                                &state,
+                                &agent_id,
+                                generation,
+                                "store_commit",
+                            )),
+                            result => result,
                         }
-                        Ok(batch) => {
-                            if observation.is_some() {
-                                Err(Error::new(
-                                    "stale_generation",
-                                    "events.put generation does not match this Agent generation",
-                                ))
-                            } else {
-                                native_children::put_child_batch(
-                                    &store,
-                                    &bus,
-                                    &state,
-                                    batch,
-                                    (&agent_id, generation),
-                                    &source_credentials,
-                                    request_deadline,
-                                )
-                                .await
-                            }
-                        }
-                        Err(_) => Err(Error::new("invalid", "events.put params are malformed")),
-                    },
+                    }
                     "source.gap" => {
                         let is_producer = params.get("agent_id").and_then(Value::as_str)
                             == Some(agent_id.as_str())
@@ -448,12 +352,168 @@ pub(super) async fn serve_plugin_requests(mut connection: PluginConnection, sour
             }
         };
         let result = result.map_err(|error| redact_native_error(error, &source_credentials));
-        let _ = client.respond(request_id, result, request_deadline).await;
+        let unsettled = matches!(
+            method.as_str(),
+            "events.put" | "source.gap" | "source.handoff" | "source.health"
+        ) && result.as_ref().is_err_and(|error| error.code == "unknown");
+        let replied = client.respond(request_id, result, reply_deadline).await;
+        if let Some(gap) = rejected_batch {
+            persist_rejected_batch_gap(&store, &bus, binding, gap).await;
+        }
+        // On a broken reply path, the runtime actor owns source retirement and
+        // generation loss. A reader that already reached EOF may still have
+        // terminal facts queued, so drain them before the actor settles loss.
+        if unsettled || (replied.is_err() && !client.reader_closed()) {
+            let _ = client.close_input(Instant::now() + RPC_GRACE).await;
+            break;
+        }
     }
     if let Some(state) = state.upgrade() {
         if observation.is_none() {
             fence_runtime_generation(&state, &key);
         }
         signal_progress(&state);
+    }
+}
+
+async fn put_events(
+    store: &StoreHandle,
+    bus: &Bus,
+    params: Value,
+    binding: source_handoff::SourceBinding<'_>,
+    credentials: &[String],
+    until: Instant,
+    rejected: &mut Option<SourceGap>,
+) -> Result<Value> {
+    let mut batch: SourceBatch = serde_json::from_value(params)
+        .map_err(|_| Error::new("invalid", "events.put params are malformed"))?;
+    let is_child = batch.agent_id != binding.agent_id || batch.generation != binding.generation;
+    let subject = binding.expected_subject()?;
+    if is_child && subject.is_some() {
+        return Err(Error::new(
+            "stale_generation",
+            "events.put generation does not match this Agent generation",
+        ));
+    }
+    redact_source_batch(&mut batch, credentials)?;
+    let mut families: Vec<_> = batch
+        .events
+        .iter()
+        .filter_map(|event| family_for_kind(&event.kind).ok())
+        .map(str::to_owned)
+        .collect();
+    families.sort_unstable();
+    families.dedup();
+    let mut gap = SourceGap {
+        gap_id: String::new(),
+        agent_id: batch.agent_id.clone(),
+        generation: batch.generation,
+        source: batch.source.clone(),
+        families,
+        reason: String::new(),
+        from: None,
+        to: batch.cursor.clone(),
+    };
+    let batch_id = batch.batch_id.clone();
+    let event_kinds = batch
+        .events
+        .iter()
+        .take(4)
+        .map(|event| event.kind.chars().take(48).collect::<String>())
+        .collect::<Vec<_>>()
+        .join(",");
+    let result = match timeout_at(until, store.lock()).await {
+        Ok(mut store) => {
+            let now = now_ms();
+            let result = if is_child {
+                store.put_native_child_batch(binding.agent_id, binding.generation, batch, now)
+            } else if let Some(subject) = subject {
+                store.put_observed_batch(batch, subject, now)
+            } else {
+                store.put_batch(batch, now)
+            };
+            if let Ok(commit) = &result {
+                bus.publish(&commit.events);
+            }
+            result
+        }
+        Err(_) => Err(Error::new(
+            "busy",
+            "Store lock deadline elapsed for events.put",
+        )),
+    };
+    match result {
+        Ok(commit) => Ok(json!(commit.ack)),
+        Err(error) => {
+            let cause = safe_cause_code(&error.code);
+            record_store_batch_rejection(
+                credentials,
+                &AgentKey {
+                    id: gap.agent_id.clone(),
+                    generation: gap.generation,
+                },
+                &gap.source,
+                &batch_id,
+                &event_kinds,
+                &cause,
+                &error,
+            );
+            if !matches!(
+                error.code.as_str(),
+                "not_allowed" | "stale_generation" | "not_found" | "unknown"
+            ) && !gap.families.is_empty()
+                && !matches!(
+                    gap.source.as_str(),
+                    "daemon" | "os" | "git" | "workspace_process"
+                )
+            {
+                gap.gap_id = Ulid::new().to_string();
+                gap.reason = format!("events.put rejected: {cause}");
+                *rejected = Some(gap);
+            }
+            match error.code.as_str() {
+                "unknown" | "busy" | "not_allowed" | "stale_generation" => Err(error),
+                _ => Err(Error::new(
+                    "rejected",
+                    format!("events.put rejected: {cause}"),
+                )),
+            }
+        }
+    }
+}
+
+async fn persist_rejected_batch_gap(
+    store: &StoreHandle,
+    bus: &Bus,
+    binding: source_handoff::SourceBinding<'_>,
+    gap: SourceGap,
+) {
+    let Ok(mut store) = timeout_at(deadline(), store.lock()).await else {
+        return;
+    };
+    let now = now_ms();
+    let is_child = gap.agent_id != binding.agent_id || gap.generation != binding.generation;
+    let Ok(subject) = binding.expected_subject() else {
+        return;
+    };
+    let health = SourceHealthUpdate::new(&gap.agent_id, gap.generation, &gap.source, "stale");
+    let result = if is_child {
+        store.record_native_child_source_gap(binding.agent_id, binding.generation, gap, now)
+    } else if let Some(subject) = subject {
+        store.record_observed_source_gap(gap, subject, now)
+    } else {
+        store.record_source_gap(gap, now)
+    };
+    if let Ok(change) = result {
+        bus.publish(&change.events);
+        if !is_child {
+            let result = match subject {
+                Some(subject) => store.set_native_source_health(health, subject, now),
+                None => store.set_source_health(health, now),
+            };
+            if let Ok(change) = result {
+                bus.publish(&change.events);
+            }
+        }
     }
 }

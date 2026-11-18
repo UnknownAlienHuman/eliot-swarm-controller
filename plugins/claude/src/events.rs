@@ -9,7 +9,7 @@ use eliot_core::{
     requests::{ApprovalChoice, ApprovalDecision, ApprovalRequest},
 };
 use eliot_plugin::{
-    CommitSink, MAX_EVENT_BYTES, MAX_TEXT_BYTES, PeerClient, is_definite_batch_rejection,
+    CommitSink, MAX_EVENT_BYTES, MAX_TEXT_BYTES, PeerClient,
     native_stdio::StreamState,
     protocol::{HookEvent, HookResponse},
     session::{
@@ -1221,10 +1221,9 @@ impl EventProcessor {
             return;
         }
         if let Err(error) = self.process_record(record).await {
-            // A definite pre-transaction rejection already recorded its gap
-            // with the typed reason and cleared the commit latch, so it must
-            // not latch the source unknown or taint later associations.
-            if !is_definite_batch_rejection(&error.code) {
+            // The host settles a definite write rejection. Only unresolved
+            // observations latch the local source unknown.
+            if error.failure_where.as_deref() != Some("plugin.events.put") {
                 self.status.source_unknown = true;
                 if self.status.failure.is_none() {
                     self.status.failure = Some(*error.message);
@@ -1234,7 +1233,7 @@ impl EventProcessor {
         }
         // An association may have unblocked buffered assistant text.
         if let Err(error) = self.flush_buffer().await
-            && !is_definite_batch_rejection(&error.code)
+            && error.failure_where.as_deref() != Some("plugin.events.put")
             && self.status.failure.is_none()
         {
             self.status.failure = Some(*error.message);

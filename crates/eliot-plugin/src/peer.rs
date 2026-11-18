@@ -21,7 +21,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, Stdin, stdin, stdout},
-    sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch},
     time::{Instant, timeout_at},
 };
 use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
@@ -76,6 +76,7 @@ pub struct PeerClient {
     pending: PendingCalls,
     pending_slots: Arc<Semaphore>,
     next_id: Arc<AtomicU64>,
+    retired: watch::Sender<bool>,
 }
 
 struct PreparedCall {
@@ -88,12 +89,10 @@ struct PendingGuard {
     id: String,
 }
 
-/// Serializes `events.put` commits for one source and latches uncertain outcomes.
+/// Sends event batches to the host and validates the returned acknowledgement.
 pub struct CommitSink {
     client: PeerClient,
     credential: String,
-    // One unacknowledged batch per (agent_id, generation, source).
-    unknown_batches: HashMap<(String, i64, String), SourceBatch>,
 }
 
 impl<R> Peer<R>
@@ -115,6 +114,7 @@ where
             pending,
             pending_slots: Arc::new(Semaphore::new(MAX_PENDING_CALLS)),
             next_id: Arc::new(AtomicU64::new(0)),
+            retired: watch::Sender::new(false),
         };
         let reader = FramedRead::new(
             reader,
@@ -135,8 +135,14 @@ where
 
     /// Read until one host request arrives, routing response frames to pending calls.
     pub async fn next_request(&mut self) -> Option<RpcRequest> {
+        let mut retired = self.client.retired.subscribe();
         loop {
-            match self.reader.next().await {
+            let frame = tokio::select! {
+                biased;
+                _ = retired.wait_for(|retired| *retired) => return None,
+                frame = self.reader.next() => frame,
+            };
+            match frame {
                 Some(Ok(line)) if line.len().saturating_add(1) <= MAX_FRAME_BYTES => {
                     match decode_frame(&line) {
                         Ok(Incoming::Request(request)) => return Some(request),
@@ -225,6 +231,9 @@ impl PeerClient {
     }
 
     async fn acquire_pending(&self, deadline: Instant) -> Result<OwnedSemaphorePermit> {
+        if *self.retired.borrow() {
+            return Err(Error::new("transport_closed", "plugin peer is closed"));
+        }
         timeout_at(deadline, Arc::clone(&self.pending_slots).acquire_owned())
             .await
             .map_err(|_| timeout_error("plugin request capacity deadline elapsed"))?
@@ -300,6 +309,12 @@ impl PeerClient {
         true
     }
 
+    pub(crate) fn retire(&self) {
+        self.retired.send_replace(true);
+        self.pending_slots.close();
+        self.fail_pending(Error::new("transport_closed", "plugin peer is closed"));
+    }
+
     fn fail_pending(&self, error: Error) {
         let pending = {
             let mut pending = self.pending.lock_recover();
@@ -317,16 +332,11 @@ impl CommitSink {
         Self {
             client,
             credential: credential.into(),
-            unknown_batches: HashMap::new(),
         }
     }
 
     /// Commit one complete event batch and validate its acknowledgement.
     pub async fn commit(&mut self, batch: SourceBatch, deadline: Instant) -> Result<BatchAck> {
-        let key = Self::scope_key(&batch);
-        if self.unknown_batches.contains_key(&key) {
-            return Err(unknown_batch_error());
-        }
         if self.credential.len() > crate::protocol::MAX_CREDENTIAL_BYTES {
             return Err(Error::new(
                 "invalid",
@@ -353,56 +363,27 @@ impl CommitSink {
         let expected_count = i64::try_from(batch.events.len())
             .map_err(|_| Error::new("frame_too_large", "event batch is too large"))?;
         let expected_cursor = batch.cursor.clone();
-        self.unknown_batches.insert(key.clone(), batch.clone());
-        let permit = match self.client.acquire_pending(deadline).await {
-            Ok(permit) => permit,
-            Err(_) => return Err(unknown_batch_error()),
-        };
-        let mut params = match serde_json::to_value(batch) {
-            Ok(params) => params,
-            Err(_) => {
-                self.unknown_batches.remove(&key);
-                return Err(Error::new("internal", "event batch could not be encoded"));
-            }
-        };
-        let Some(params) = params.as_object_mut() else {
-            self.unknown_batches.remove(&key);
-            return Err(Error::new(
-                "internal",
-                "event batch encoding was not an object",
-            ));
-        };
-        params.insert(
-            "credential".to_owned(),
-            Value::String(self.credential.clone()),
-        );
-
-        // A local frame-size rejection clears the latch because no frame was queued.
-        let prepared = match self
+        let mut params = serde_json::to_value(batch)
+            .map_err(|_| Error::new("invalid", "event batch could not be encoded"))?;
+        params["credential"] = Value::String(self.credential.clone());
+        let prepared = self.client.prepare_call("events.put", params)?;
+        let permit = self
             .client
-            .prepare_call("events.put", Value::Object(std::mem::take(params)))
-        {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                self.unknown_batches.remove(&key);
-                return Err(error);
-            }
-        };
-        let result = self.client.call_prepared(prepared, deadline, permit).await;
-        let value = match result {
-            Ok(value) => value,
-            Err(error) => {
-                if is_definite_batch_rejection(&error.code) {
-                    self.unknown_batches.remove(&key);
-                    return Err(error);
+            .acquire_pending(deadline)
+            .await
+            .map_err(|error| {
+                if error.code == "timeout" {
+                    Error::new("busy", "event batch could not enter the request queue")
+                } else {
+                    error
                 }
-                return Err(unknown_batch_error());
-            }
+            })?;
+        let value = match self.client.call_prepared(prepared, deadline, permit).await {
+            Ok(value) => value,
+            Err(error) if is_definite_batch_rejection(&error.code) => return Err(error),
+            Err(_) => return Err(self.lost_ack()),
         };
-        let ack: BatchAck = match serde_json::from_value(value) {
-            Ok(ack) => ack,
-            Err(_) => return Err(unknown_batch_error()),
-        };
+        let ack: BatchAck = serde_json::from_value(value).map_err(|_| self.lost_ack())?;
         let actual_count = ack
             .last_seq
             .checked_sub(ack.first_seq)
@@ -411,106 +392,14 @@ impl CommitSink {
             || actual_count != Some(expected_count)
             || ack.cursor != expected_cursor
         {
-            return Err(unknown_batch_error());
+            return Err(self.lost_ack());
         }
-
-        self.unknown_batches.remove(&key);
         Ok(ack)
     }
 
-    /// Settle an uncertain commit only when private source-state readback proves
-    /// this exact frozen batch and its complete acknowledgement.
-    pub fn settle_from_state(&mut self, batch: &SourceBatch, state: &Value) -> Result<BatchAck> {
-        let key = Self::scope_key(batch);
-        if self.unknown_batches.get(&key) != Some(batch) {
-            return Err(unknown_batch_error());
-        }
-
-        let digest = batch.semantic_digest().map_err(|_| unknown_batch_error())?;
-        let first_seq = state
-            .get("last_batch_first_seq")
-            .and_then(Value::as_i64)
-            .ok_or_else(unknown_batch_error)?;
-        let last_seq = state
-            .get("last_batch_last_seq")
-            .and_then(Value::as_i64)
-            .ok_or_else(unknown_batch_error)?;
-        let count = last_seq
-            .checked_sub(first_seq)
-            .and_then(|value| value.checked_add(1));
-        let expected_count = i64::try_from(batch.events.len()).ok();
-        let expected_digest = serde_json::to_value(digest).map_err(|_| unknown_batch_error())?;
-
-        if batch.events.is_empty()
-            || first_seq <= 0
-            || last_seq < first_seq
-            || count != expected_count
-            || state.get("agent_id").and_then(Value::as_str) != Some(batch.agent_id.as_str())
-            || state.get("generation").and_then(Value::as_i64) != Some(batch.generation)
-            || state.get("source").and_then(Value::as_str) != Some(batch.source.as_str())
-            || state.get("last_batch_id").and_then(Value::as_str) != Some(batch.batch_id.as_str())
-            || state.get("last_batch_digest") != Some(&expected_digest)
-            || state.get("cursor") != Some(&serde_json::json!(batch.cursor))
-        {
-            return Err(unknown_batch_error());
-        }
-
-        let ack = BatchAck {
-            first_seq,
-            last_seq,
-            cursor: batch.cursor.clone(),
-        };
-        self.unknown_batches.remove(&key);
-        Ok(ack)
-    }
-
-    /// Whether this exact (agent, generation, source) has a commit sent
-    /// without a valid acknowledgement. Other sources never share this latch.
-    pub fn is_unknown(&self, agent_id: &str, generation: i64, source: &str) -> bool {
-        self.unknown_batches
-            .contains_key(&(agent_id.to_owned(), generation, source.to_owned()))
-    }
-
-    /// Reconcile the one unacked batch for this exact scope against a
-    /// private `source.state` readback. `Ok(None)` means no batch is
-    /// waiting, so the caller holds a stale latch. `Ok(Some)` proves the
-    /// batch landed and clears the wait. `Err` means the readback did not
-    /// prove it: the caller may retry the exact batch when the readback
-    /// proves it absent, and must never replay it otherwise.
-    pub fn settle_unknown_from_state(
-        &mut self,
-        agent_id: &str,
-        generation: i64,
-        source: &str,
-        state: &Value,
-    ) -> Result<Option<BatchAck>> {
-        let key = (agent_id.to_owned(), generation, source.to_owned());
-        let Some(batch) = self.unknown_batches.get(&key).cloned() else {
-            return Ok(None);
-        };
-        self.settle_from_state(&batch, state).map(Some)
-    }
-
-    /// Take the one unacked batch for this exact scope so the caller can
-    /// resubmit it after a readback proves it absent. A resubmission is a
-    /// first delivery, never a replay: only call it when the readback shows
-    /// the batch never landed.
-    pub fn take_unknown_batch(
-        &mut self,
-        agent_id: &str,
-        generation: i64,
-        source: &str,
-    ) -> Option<SourceBatch> {
-        self.unknown_batches
-            .remove(&(agent_id.to_owned(), generation, source.to_owned()))
-    }
-
-    fn scope_key(batch: &SourceBatch) -> (String, i64, String) {
-        (
-            batch.agent_id.clone(),
-            batch.generation,
-            batch.source.clone(),
-        )
+    fn lost_ack(&self) -> Error {
+        self.client.retire();
+        Error::new("unknown", "event batch acknowledgement unavailable")
     }
 }
 
@@ -701,25 +590,17 @@ fn timeout_error(message: &str) -> Error {
     Error::new("timeout", message)
 }
 
-/// Pre-transaction `events.put` rejections that prove the batch was never
-/// committed. The daemon returns these directly (never wrapped as `unknown`);
-/// any other error (transport timeout/close, malformed/mismatched ack,
-/// post-transaction `unknown`) keeps the latch.
-pub const DEFINITE_BATCH_REJECTION_CODES: &[&str] = &[
-    "secret_in_payload",
-    "invalid",
-    "not_allowed",
-    "stale_generation",
-];
-
+/// `events.put` errors that prove the batch was never committed.
 pub fn is_definite_batch_rejection(code: &str) -> bool {
-    DEFINITE_BATCH_REJECTION_CODES.contains(&code)
-}
-
-fn unknown_batch_error() -> Error {
-    Error::new(
-        "unknown",
-        "event batch outcome is unknown; do not replay it",
+    matches!(
+        code,
+        "rejected"
+            | "busy"
+            | "frame_too_large"
+            | "secret_in_payload"
+            | "invalid"
+            | "not_allowed"
+            | "stale_generation"
     )
 }
 
@@ -778,6 +659,7 @@ mod tests {
             pending: Arc::new(StdMutex::new(HashMap::new())),
             pending_slots: Arc::new(Semaphore::new(MAX_PENDING_CALLS)),
             next_id: Arc::new(AtomicU64::new(0)),
+            retired: watch::Sender::new(false),
         }
     }
 
@@ -805,332 +687,6 @@ mod tests {
             .expect_err("pending call fails");
         assert_eq!(error.code, "unknown");
         assert!(client.pending.lock_recover().is_empty());
-    }
-
-    fn batch_readback(batch: &SourceBatch) -> Value {
-        json!({
-            "agent_id": batch.agent_id,
-            "generation": batch.generation,
-            "source": batch.source,
-            "state": "open",
-            "cursor": batch.cursor,
-            "last_batch_id": batch.batch_id,
-            "last_batch_digest": batch.semantic_digest().unwrap(),
-            "last_batch_first_seq": 7,
-            "last_batch_last_seq": 7,
-        })
-    }
-
-    #[test]
-    fn uncertain_batch_settlement_requires_exact_scope_digest_cursor_and_range() {
-        let batch = SourceBatch {
-            batch_id: "batch-1".to_owned(),
-            agent_id: "a1".to_owned(),
-            generation: 3,
-            source: "transcript".to_owned(),
-            events: vec![eliot_core::NativeEvent {
-                kind: "message.completed".to_owned(),
-                native_id: "native-1".to_owned(),
-                data: json!({"text":"complete"}),
-                ts: Some(123),
-            }],
-            cursor: Some("opaque-edge".to_owned()),
-        };
-        let mut sink = CommitSink::new(test_client(), "credential");
-        sink.unknown_batches
-            .insert(CommitSink::scope_key(&batch), batch.clone());
-
-        let ack = sink
-            .settle_from_state(&batch, &batch_readback(&batch))
-            .expect("exact retained batch proof");
-        assert_eq!(ack.first_seq, 7);
-        assert_eq!(ack.last_seq, 7);
-        assert_eq!(ack.cursor, batch.cursor);
-        assert!(!sink.is_unknown(&batch.agent_id, batch.generation, &batch.source));
-
-        let mut different_payload = batch.clone();
-        different_payload.events[0].data["text"] = json!("changed");
-        sink.unknown_batches
-            .insert(CommitSink::scope_key(&batch), batch.clone());
-        assert!(
-            sink.settle_from_state(&different_payload, &batch_readback(&batch))
-                .is_err()
-        );
-        assert!(sink.is_unknown(&batch.agent_id, batch.generation, &batch.source));
-
-        for (field, value) in [
-            ("agent_id", json!("a2")),
-            ("generation", json!(4)),
-            ("source", json!("other")),
-            ("last_batch_id", json!("other-batch")),
-            (
-                "last_batch_digest",
-                serde_json::to_value([0u8; 32]).unwrap(),
-            ),
-            ("cursor", json!("other-edge")),
-            ("last_batch_first_seq", json!(0)),
-            ("last_batch_last_seq", json!(8)),
-        ] {
-            let mut proof = batch_readback(&batch);
-            proof[field] = value;
-            sink.unknown_batches
-                .insert(CommitSink::scope_key(&batch), batch.clone());
-            assert!(
-                sink.settle_from_state(&batch, &proof).is_err(),
-                "field={field}"
-            );
-            assert!(
-                sink.is_unknown(&batch.agent_id, batch.generation, &batch.source),
-                "field={field}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn unknown_batch_is_isolated_through_actual_peer_rpc() {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, duplex, split};
-
-        fn mk_batch(id: &str, agent: &str, source: &str, edge: &str, native: &str) -> SourceBatch {
-            SourceBatch {
-                batch_id: id.to_owned(),
-                agent_id: agent.to_owned(),
-                generation: 3,
-                source: source.to_owned(),
-                events: vec![eliot_core::NativeEvent {
-                    kind: "message.completed".to_owned(),
-                    native_id: native.to_owned(),
-                    data: json!({"text": id}),
-                    ts: Some(1),
-                }],
-                cursor: Some(edge.to_owned()),
-            }
-        }
-
-        let batch_a = mk_batch("batch-a", "a1", "transcript", "edge-a", "native-a");
-        let batch_b = mk_batch("batch-b", "a2", "transcript", "edge-b", "native-b");
-        let batch_parent = mk_batch(
-            "batch-parent",
-            "a1",
-            "stream",
-            "edge-parent",
-            "native-parent",
-        );
-
-        let (host_io, plugin_io) = duplex(64 * 1024);
-        let (plugin_read, plugin_write) = split(plugin_io);
-        let mut peer = Peer::from_io(plugin_read, plugin_write);
-        let client = peer.client();
-        let peer_task = tokio::spawn(async move { while peer.next_request().await.is_some() {} });
-
-        let (host_read, mut host_write) = split(host_io);
-        let mut host_reader = BufReader::new(host_read);
-        let mut recorded: Vec<(String, Value)> = Vec::new();
-
-        // Fake host: 1) read A, never reply (ACK lost). 2) read B, ack 7. 3) read parent, ack 8.
-        let fake_host = async {
-            let mut line = String::new();
-            line.clear();
-            host_reader
-                .read_line(&mut line)
-                .await
-                .expect("A request read");
-            let req_a: RpcRequest = serde_json::from_str(&line).expect("decode A");
-            assert_eq!(req_a.method, "events.put");
-            assert_eq!(req_a.params["agent_id"], "a1");
-            assert_eq!(req_a.params["source"], "transcript");
-            recorded.push((req_a.method.clone(), req_a.params.clone()));
-            // ACK for A is dropped on purpose: no response written.
-
-            line.clear();
-            host_reader
-                .read_line(&mut line)
-                .await
-                .expect("B request read");
-            let req_b: RpcRequest = serde_json::from_str(&line).expect("decode B");
-            assert_eq!(req_b.method, "events.put");
-            assert_eq!(req_b.params["agent_id"], "a2");
-            recorded.push((req_b.method.clone(), req_b.params.clone()));
-            let ack_b = RpcResponse::success(
-                req_b.id.clone(),
-                json!({"first_seq":7,"last_seq":7,"cursor":"edge-b"}),
-            );
-            let frame = encode_frame(&ack_b).expect("ack B frame");
-            host_write
-                .write_all(format!("{frame}\n").as_bytes())
-                .await
-                .expect("send ack B");
-
-            line.clear();
-            host_reader
-                .read_line(&mut line)
-                .await
-                .expect("parent request read");
-            let req_p: RpcRequest = serde_json::from_str(&line).expect("decode parent");
-            assert_eq!(req_p.method, "events.put");
-            assert_eq!(req_p.params["agent_id"], "a1");
-            assert_eq!(req_p.params["source"], "stream");
-            recorded.push((req_p.method.clone(), req_p.params.clone()));
-            let ack_p = RpcResponse::success(
-                req_p.id.clone(),
-                json!({"first_seq":8,"last_seq":8,"cursor":"edge-parent"}),
-            );
-            let frame = encode_frame(&ack_p).expect("ack parent frame");
-            host_write
-                .write_all(format!("{frame}\n").as_bytes())
-                .await
-                .expect("send ack parent");
-
-            drop(host_write);
-            drop(host_reader);
-            recorded
-        };
-
-        let plugin_calls = async {
-            let mut sink = CommitSink::new(client, "credential");
-            // Fresh deadline per commit: the first deadline expires while A's
-            // ACK is lost, so B/parent need their own windows.
-            let deadline_a = Instant::now() + Duration::from_millis(300);
-
-            // A: processed by host but ACK lost -> unknown, exact batch retained.
-            let err_a = sink
-                .commit(batch_a.clone(), deadline_a)
-                .await
-                .expect_err("A ACK lost");
-            assert_eq!(err_a.code, "unknown");
-            assert!(sink.is_unknown(&batch_a.agent_id, batch_a.generation, &batch_a.source));
-
-            // SAME sink: sibling B and parent different source commit through healthy RPC.
-            let deadline_b = Instant::now() + Duration::from_secs(5);
-            let ack_b = sink
-                .commit(batch_b.clone(), deadline_b)
-                .await
-                .expect("B commit succeeds");
-            assert_eq!(ack_b.first_seq, 7);
-            assert_eq!(ack_b.cursor.as_deref(), Some("edge-b"));
-            let deadline_p = Instant::now() + Duration::from_secs(5);
-            let ack_p = sink
-                .commit(batch_parent.clone(), deadline_p)
-                .await
-                .expect("parent commit succeeds");
-            assert_eq!(ack_p.first_seq, 8);
-            assert_eq!(ack_p.cursor.as_deref(), Some("edge-parent"));
-
-            // A remains blocked; same-scope retry never hits wire.
-            assert!(sink.is_unknown(&batch_a.agent_id, batch_a.generation, &batch_a.source));
-            let err_retry = sink
-                .commit(batch_a.clone(), Instant::now() + Duration::from_secs(5))
-                .await
-                .expect_err("A same-scope blocked");
-            assert_eq!(err_retry.code, "unknown");
-
-            // Mismatched digest / wrong generation / wrong source cannot settle A.
-            let mut wrong_digest = batch_readback(&batch_a);
-            wrong_digest["last_batch_digest"] = serde_json::to_value([9u8; 32]).unwrap();
-            assert!(sink.settle_from_state(&batch_a, &wrong_digest).is_err());
-            let mut wrong_gen = batch_readback(&batch_a);
-            wrong_gen["generation"] = json!(99);
-            assert!(sink.settle_from_state(&batch_a, &wrong_gen).is_err());
-            let mut wrong_source = batch_readback(&batch_a);
-            wrong_source["source"] = json!("other");
-            assert!(sink.settle_from_state(&batch_a, &wrong_source).is_err());
-            let mut wrong_agent = batch_readback(&batch_a);
-            wrong_agent["agent_id"] = json!("a2");
-            assert!(sink.settle_from_state(&batch_a, &wrong_agent).is_err());
-            assert!(sink.is_unknown(&batch_a.agent_id, batch_a.generation, &batch_a.source));
-
-            // Exact readback settles only A.
-            let ack_a = sink
-                .settle_from_state(&batch_a, &batch_readback(&batch_a))
-                .expect("exact readback");
-            assert_eq!(ack_a.first_seq, 7);
-            assert_eq!(ack_a.cursor, batch_a.cursor);
-            assert!(!sink.is_unknown(&batch_a.agent_id, batch_a.generation, &batch_a.source));
-        };
-
-        let (recorded, ()) = tokio::join!(fake_host, plugin_calls);
-        peer_task.await.expect("peer task clean shutdown");
-
-        // Actual wire evidence: exactly three events.put calls (A, B, parent). The
-        // blocked A retry never reached the wire.
-        assert_eq!(recorded.len(), 3);
-        assert_eq!(recorded[0].0, "events.put");
-        assert_eq!(recorded[0].1["agent_id"], "a1");
-        assert_eq!(recorded[0].1["source"], "transcript");
-        assert_eq!(recorded[1].0, "events.put");
-        assert_eq!(recorded[1].1["agent_id"], "a2");
-        assert_eq!(recorded[2].0, "events.put");
-        assert_eq!(recorded[2].1["agent_id"], "a1");
-        assert_eq!(recorded[2].1["source"], "stream");
-    }
-
-    #[test]
-    fn unknown_scope_reconciles_from_state_then_resubmits_only_when_absent() {
-        let batch = SourceBatch {
-            batch_id: "batch-1".to_owned(),
-            agent_id: "a1".to_owned(),
-            generation: 3,
-            source: "stream".to_owned(),
-            events: vec![eliot_core::NativeEvent {
-                kind: "turn.unknown".to_owned(),
-                native_id: "native-1".to_owned(),
-                data: json!({"turn_id": "turn-1"}),
-                ts: None,
-            }],
-            cursor: None,
-        };
-        let mut sink = CommitSink::new(test_client(), "credential");
-        // No waiting batch: the caller holds a stale latch, not a write.
-        assert_eq!(
-            sink.settle_unknown_from_state("a1", 3, "stream", &batch_readback(&batch))
-                .unwrap(),
-            None
-        );
-        assert!(sink.take_unknown_batch("a1", 3, "stream").is_none());
-        sink.unknown_batches.insert(
-            (
-                batch.agent_id.clone(),
-                batch.generation,
-                batch.source.clone(),
-            ),
-            batch.clone(),
-        );
-        // A foreign readback proves nothing and keeps the wait.
-        let mut foreign = batch_readback(&batch);
-        foreign["agent_id"] = json!("a2");
-        assert!(
-            sink.settle_unknown_from_state("a1", 3, "stream", &foreign)
-                .is_err()
-        );
-        assert!(sink.is_unknown("a1", 3, "stream"));
-        // The exact readback proves the batch landed and clears the wait.
-        let ack = sink
-            .settle_unknown_from_state("a1", 3, "stream", &batch_readback(&batch))
-            .expect("exact readback settles")
-            .expect("ack returned");
-        assert_eq!(ack.cursor, batch.cursor);
-        assert!(!sink.is_unknown("a1", 3, "stream"));
-        // A readback proving another batch last means this one never
-        // landed: take it so the caller can resubmit the exact bytes as a
-        // first delivery, never as a replay of an applied batch.
-        sink.unknown_batches.insert(
-            (
-                batch.agent_id.clone(),
-                batch.generation,
-                batch.source.clone(),
-            ),
-            batch.clone(),
-        );
-        let mut absent = batch_readback(&batch);
-        absent["last_batch_id"] = json!("batch-0");
-        assert!(
-            sink.settle_unknown_from_state("a1", 3, "stream", &absent)
-                .is_err()
-        );
-        let taken = sink
-            .take_unknown_batch("a1", 3, "stream")
-            .expect("absent batch is retaken");
-        assert_eq!(taken, batch);
-        assert!(!sink.is_unknown("a1", 3, "stream"));
     }
 
     #[test]
@@ -1341,6 +897,9 @@ mod tests {
             "invalid",
             "not_allowed",
             "stale_generation",
+            "rejected",
+            "busy",
+            "frame_too_large",
         ] {
             assert!(is_definite_batch_rejection(code), "code={code}");
         }
@@ -1358,7 +917,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn definite_pre_transaction_rejection_clears_latch() {
+    async fn definite_rejection_keeps_peer_available() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, duplex, split};
 
         let batch = SourceBatch {
@@ -1410,13 +969,13 @@ mod tests {
         };
 
         let plugin_calls = async {
-            let mut sink = CommitSink::new(client, "credential");
+            let mut sink = CommitSink::new(client.clone(), "credential");
             let err = sink
                 .commit(batch.clone(), Instant::now() + Duration::from_secs(5))
                 .await
                 .expect_err("definite rejection surfaces");
             assert_eq!(err.code, "secret_in_payload");
-            assert!(!sink.is_unknown(&batch.agent_id, batch.generation, &batch.source));
+            assert!(!*client.retired.borrow());
         };
 
         tokio::join!(fake_host, plugin_calls);
@@ -1424,7 +983,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_transaction_error_stays_unknown_and_latched() {
+    async fn unknown_write_outcome_retires_peer() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, duplex, split};
 
         let batch = SourceBatch {
@@ -1461,7 +1020,7 @@ mod tests {
                 req.id.clone(),
                 RpcError {
                     code: -32000,
-                    message: "events.put outcome unknown: store_lock_deadline".to_owned(),
+                    message: "events.put outcome unknown: store_commit".to_owned(),
                     data: Some(json!({"code": "unknown"})),
                 },
             );
@@ -1475,13 +1034,13 @@ mod tests {
         };
 
         let plugin_calls = async {
-            let mut sink = CommitSink::new(client, "credential");
+            let mut sink = CommitSink::new(client.clone(), "credential");
             let err = sink
                 .commit(batch.clone(), Instant::now() + Duration::from_secs(5))
                 .await
                 .expect_err("post-transaction error stays unknown");
             assert_eq!(err.code, "unknown");
-            assert!(sink.is_unknown(&batch.agent_id, batch.generation, &batch.source));
+            assert!(*client.retired.borrow());
         };
 
         tokio::join!(fake_host, plugin_calls);

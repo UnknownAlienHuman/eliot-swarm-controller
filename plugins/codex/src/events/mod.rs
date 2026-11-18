@@ -1,14 +1,13 @@
 mod children;
 use self::children::{
-    CHILD_GAP_RETRY_INTERVAL, ChildState, ChildThreads, GapAttempt, spawned_item_id,
-    spawned_parent_thread, top_level_parent_thread,
+    ChildState, ChildThreads, spawned_item_id, spawned_parent_thread, top_level_parent_thread,
 };
 use crate::native_child::{
     ChildBinding, binding_from_ack, build_registration, is_admission_rejection, register_child,
 };
 use eliot_core::{
     ChildRegistration, ContextItem, Error, ProviderRestriction, Result, SecretPolicy,
-    SessionTokenTotals, SessionUsage, SourceGap, TurnUsage, turn_started_data,
+    SessionTokenTotals, SessionUsage, TurnUsage, turn_started_data,
 };
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
@@ -22,15 +21,10 @@ use eliot_plugin::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    future::Future,
-    pin::Pin,
-    time::Duration,
-};
+use std::collections::{HashMap, HashSet, VecDeque};
 use tokio::{
     sync::{mpsc, oneshot, watch},
-    time::{Instant, MissedTickBehavior, interval, timeout_at},
+    time::{Instant, timeout_at},
 };
 
 use crate::native::{
@@ -218,7 +212,6 @@ struct EventProcessor {
     child_early_lost: HashSet<String>,
     child_pending: HashMap<String, ChildRegistration>,
     children: ChildThreads,
-    gap_last_served: Option<String>,
     /// The native transport itself was lost (queue overflow, unplanned close,
     /// malformed frame, unplanned reader end): facts may be missing, so the source
     /// is marked `stale` once drained, alongside any recorded gap.
@@ -386,7 +379,6 @@ impl EventProcessor {
             child_early_lost: HashSet::new(),
             child_pending: HashMap::new(),
             children: ChildThreads::default(),
-            gap_last_served: None,
             transport_loss: false,
             source_health_attempted: false,
         }
@@ -499,7 +491,10 @@ impl EventProcessor {
                     self.buffer_frame(BufferedNativeFrame::Request { id, method, params });
                 } else if let Err(error) = self.process_request(id, method, params).await {
                     self.status.source_unknown = true;
-                    if !self.gap_reported && !self.writes_blocked {
+                    if !self.gap_reported
+                        && !self.writes_blocked
+                        && error.failure_where.as_deref() != Some("plugin.events.put")
+                    {
                         let _ = self
                             .record_gap("Codex native request could not be normalized")
                             .await;
@@ -518,7 +513,10 @@ impl EventProcessor {
                     self.buffer_frame(BufferedNativeFrame::Notification { method, params });
                 } else if let Err(error) = self.process_notification(&method, params).await {
                     self.status.source_unknown = true;
-                    if !self.gap_reported && !self.writes_blocked {
+                    if !self.gap_reported
+                        && !self.writes_blocked
+                        && error.failure_where.as_deref() != Some("plugin.events.put")
+                    {
                         // Method and error code only: no native payload text.
                         let reason = format!(
                             "Codex {method} notification could not be normalized ({})",
@@ -571,13 +569,13 @@ impl EventProcessor {
             let _ = self.record_gap(&reason).await;
         }
         if queue_empty && self.transport_loss {
-            self.mark_source_stale().await;
+            self.report_native_transport_loss().await;
         }
     }
 
     /// One explicit `stale` health update for a lost native transport, through the
     /// existing `source.health` mechanism. Attempted once and never replayed.
-    async fn mark_source_stale(&mut self) {
+    async fn report_native_transport_loss(&mut self) {
         if self.source_health_attempted {
             return;
         }
@@ -799,6 +797,9 @@ impl EventProcessor {
             };
             if let Err(error) = result {
                 self.status.source_unknown = true;
+                if error.failure_where.as_deref() == Some("plugin.events.put") {
+                    return Err(error);
+                }
                 if !self.gap_reported && !self.writes_blocked {
                     let _ = self
                         .record_gap("Buffered Codex native frame could not be normalized")
@@ -1699,13 +1700,8 @@ async fn run(
     mut controls: mpsc::Receiver<Control>,
     status_tx: watch::Sender<EventStatus>,
 ) {
-    let mut gap_retry = interval(CHILD_GAP_RETRY_INTERVAL);
-    gap_retry.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut gap_in_flight: Option<GapAttempt> = None;
     loop {
         let accept_frames = processor.accept_frames;
-        let can_start_gap = gap_in_flight.is_none() && processor.has_pending_child_gap();
-        let gap_pending = gap_in_flight.is_some();
         tokio::select! {
             changed = stream.changed(), if accept_frames => {
                 let current = match changed {
@@ -1732,32 +1728,6 @@ async fn run(
                 }
                 processor.handle_frame(frame).await;
                 processor.report_gap_if_queue_empty(frames.is_empty()).await;
-            }
-            _ = gap_retry.tick(), if can_start_gap => {
-                // Start only; never await the RPC here. One attempt at a
-                // time, fair rotation via `next_pending_gap`.
-                if let Some((child_thread, gap)) = processor.next_pending_gap() {
-                    let host = processor.host.clone();
-                    let credential = processor.credential.clone();
-                    let params = StreamSource::gap_request_params(&credential, &gap);
-                    let deadline = Instant::now() + EVENT_DEADLINE;
-                    let future =
-                        Box::pin(async move { host.call("source.gap", params, deadline).await });
-                    gap_in_flight = Some(GapAttempt {
-                        child_thread,
-                        gap,
-                        future,
-                    });
-                }
-            }
-            result = async {
-                match gap_in_flight.as_mut() {
-                    Some(attempt) => attempt.future.as_mut().await,
-                    None => std::future::pending().await,
-                }
-            }, if gap_pending => {
-                let attempt = gap_in_flight.take().expect("guarded by gap_pending");
-                processor.apply_gap_attempt(&attempt.child_thread, &attempt.gap, &result);
             }
         }
         processor.status.native_drained = processor.frames_drained;

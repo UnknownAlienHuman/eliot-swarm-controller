@@ -48,7 +48,7 @@ use std::{
 };
 use tokio::{
     sync::mpsc,
-    time::{Instant, MissedTickBehavior, interval, timeout_at},
+    time::{Instant, MissedTickBehavior, interval},
 };
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
@@ -474,18 +474,10 @@ pub(crate) async fn run() -> Result<()> {
                         .as_mut()
                         .ok_or_else(|| not_initialized("Codex"))?;
                     let until = Instant::now() + LIVE_POLL_DEADLINE;
-                    // Cancelling this future leaves owned file I/O and pending
-                    // publication in the observer/publisher for settlement or close.
-                    tokio::select! {
-                        biased;
-                        request = requests.recv() => request,
-                        result = timeout_at(until, observer.poll_live(&client, &initialized.credential, until)) => {
-                            if result.is_err() {
-                                observer.live_poll_timed_out();
-                            }
-                            continue;
-                        }
-                    }
+                    // Each operation uses this deadline. Finish any publication
+                    // before dispatching another command on the same observer.
+                    let _ = observer.poll_live(&client, &initialized.credential, until).await;
+                    continue;
                 }
             }
         };

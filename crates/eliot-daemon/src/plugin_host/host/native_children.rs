@@ -5,10 +5,9 @@
 
 use super::{Bus, StoreHandle};
 use crate::common::now_ms;
-use eliot_core::{ChildRegistration, Error, Result, SecretPolicy, SourceBatch, SourceGap};
+use eliot_core::{ChildRegistration, Error, Result, SecretPolicy, SourceGap};
 use eliot_plugin::protocol::ChildParams;
 use serde_json::Value;
-use std::sync::Weak;
 use tokio::time::{Instant, timeout_at};
 
 pub(super) async fn register_child(
@@ -49,47 +48,6 @@ pub(super) async fn register_child(
     }
 }
 
-pub(super) async fn put_child_batch(
-    store: &StoreHandle,
-    bus: &Bus,
-    state: &Weak<super::HostState>,
-    mut batch: SourceBatch,
-    producer: (&str, i64),
-    secrets: &[String],
-    until: Instant,
-) -> Result<Value> {
-    let (producer_id, producer_generation) = producer;
-    super::redact_source_batch(&mut batch, secrets)?;
-    let child_id = batch.agent_id.clone();
-    let child_generation = batch.generation;
-    let mut store = timeout_at(until, store.lock()).await.map_err(|_| {
-        super::late_batch_error(state, &child_id, child_generation, "store_lock_deadline")
-    })?;
-    let result = store.put_native_child_batch(producer_id, producer_generation, batch, now_ms());
-    match result {
-        Ok(commit) => {
-            bus.publish(&commit.events);
-            drop(store);
-            serde_json::to_value(commit.ack).map_err(|_| {
-                super::late_batch_error(state, &child_id, child_generation, "ack_encoding_failed")
-            })
-        }
-        Err(error) => {
-            let cause = if store.is_write_faulted() {
-                "store_write_faulted".to_owned()
-            } else {
-                format!("store_{}", super::safe_cause_code(&error.code))
-            };
-            Err(super::late_batch_error(
-                state,
-                &child_id,
-                child_generation,
-                &cause,
-            ))
-        }
-    }
-}
-
 pub(super) async fn record_child_gap(
     store: &StoreHandle,
     bus: &Bus,
@@ -119,10 +77,7 @@ pub(super) async fn record_child_gap(
                 )
             })
         }
-        Err(_) if faulted => Err(Error::new(
-            "unknown",
-            "source.gap outcome is unknown; settle with source.state",
-        )),
+        Err(_) if faulted => Err(Error::new("unknown", "source.gap outcome is unknown")),
         Err(error) => Err(super::redact_native_error(error, secrets)),
     }
 }

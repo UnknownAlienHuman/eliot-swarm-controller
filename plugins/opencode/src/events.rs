@@ -810,7 +810,10 @@ impl EventProcessor {
                     // always terminates.
                     if let Err(error) = self.process_envelope(envelope).await {
                         self.status.source_unknown = true;
-                        if !self.gap_reported && !self.writes_blocked {
+                        if !self.gap_reported
+                            && !self.writes_blocked
+                            && error.failure_where.as_deref() != Some("plugin.events.put")
+                        {
                             let _ = self
                                 .record_gap("OpenCode native event could not be normalized")
                                 .await;

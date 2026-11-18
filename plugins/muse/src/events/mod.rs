@@ -8,7 +8,7 @@ mod workflow_child;
 
 use eliot_core::{
     ContextItem, Error, MUSE_VIEW_UNAVAILABLE_REASON_PREFIX, MUSE_VIEW_UNKNOWN_REASON_PREFIX,
-    ProviderRestriction, Result, SecretPolicy, SessionUsage, SourceGap, SourceHealthUpdate,
+    ProviderRestriction, Result, SecretPolicy, SessionUsage, SourceHealthUpdate,
     VIEW_RECOVERY_MARKER_FIELD, VIEW_RECOVERY_READBACK,
 };
 use eliot_plugin::{
@@ -516,21 +516,15 @@ struct EventProcessor {
     pending_end_stop: Option<oneshot::Sender<Result<()>>>,
     writes_blocked: bool,
     gap_reported: bool,
-    /// The exact gap body whose acknowledgement was lost. Retained across
-    /// the latch (never discarded) so a later expiry can reconcile its
-    /// acknowledgement and retry the write it blocked, instead of leaving
-    /// the turn busy forever behind `writes_blocked`.
-    retained_gap: Option<SourceGap>,
     /// Exact (command, turn) settled `unknown` after a projection gap. A
     /// late terminal or final message naming it is dropped against the
     /// standing gap instead of buffering as a turn awaiting association.
     settled_unknown_turn: Option<(String, String)>,
     /// The native transport itself was lost (queue overflow, unplanned close,
     /// malformed frame, unplanned reader end): facts may be missing, so the
-    /// source is marked `stale` once drained, alongside any recorded gap.
+    /// source reports a gap once the native frames are drained.
     transport_loss: bool,
-    /// The one accompanying `stale` update was attempted (never replayed).
-    source_health_attempted: bool,
+    view_stale_reported: bool,
     /// Advance only after successful processing/commit on this actor.
     last_view_cursor: Option<String>,
     /// Latest merged session-scoped snapshot from `session/tokenUsage`
@@ -857,10 +851,9 @@ impl EventProcessor {
             pending_end_stop: None,
             writes_blocked: false,
             gap_reported: false,
-            retained_gap: None,
             settled_unknown_turn: None,
             transport_loss: false,
-            source_health_attempted: false,
+            view_stale_reported: false,
             last_view_cursor: None,
             session_usage: None,
             session_usage_committed: None,
@@ -1068,7 +1061,10 @@ impl EventProcessor {
                 } else if let Err(error) = self.process_request(id, method, params).await {
                     self.invalidate_view_recovery();
                     self.status.source_unknown = true;
-                    if !self.gap_reported && !self.writes_blocked {
+                    if !self.gap_reported
+                        && !self.writes_blocked
+                        && error.failure_where.as_deref() != Some("plugin.events.put")
+                    {
                         let _ = self
                             .record_gap("Muse native request could not be normalized")
                             .await;
@@ -1095,7 +1091,10 @@ impl EventProcessor {
                     }
                     self.invalidate_view_recovery();
                     self.status.source_unknown = true;
-                    if !self.gap_reported && !self.writes_blocked {
+                    if !self.gap_reported
+                        && !self.writes_blocked
+                        && error.failure_where.as_deref() != Some("plugin.events.put")
+                    {
                         let _ = self
                             .record_gap("Muse notification could not be normalized")
                             .await;
@@ -1143,20 +1142,10 @@ impl EventProcessor {
             && !self.writes_blocked
             && let Some(reason) = self.loss_reason.clone()
         {
-            let health_deadline = Instant::now() + EVENT_DEADLINE;
-            let mut retained = self.retained_gap.take();
-            let _ = self
-                .stream_source()
-                .record_gap_range_with_retained(&reason, None, None, health_deadline, &mut retained)
-                .await;
-            self.retained_gap = retained;
-            if self.transport_loss {
-                self.mark_source_stale(health_deadline).await;
-            }
+            let _ = self.stream_source().record_gap(&reason).await;
         }
         if queue_empty && self.transport_loss {
-            self.mark_source_stale(Instant::now() + EVENT_DEADLINE)
-                .await;
+            self.report_view_stale().await;
             // Reader loss is source loss, not process-death evidence. The
             // command plane may still answer, so keep the same bounded
             // readback path alive even without a view-health notification.
@@ -1360,9 +1349,6 @@ impl EventProcessor {
                 "Muse already has an associated active turn",
             ));
         }
-        // A recovered channel unblocks the send: reconcile a latched batch
-        // and drive the retained gap before refusing for an old ack.
-        self.drive_writes().await;
         if self.writes_blocked {
             return Err(Error::new(
                 "unknown",
@@ -1484,7 +1470,10 @@ impl EventProcessor {
         };
         if let Err(error) = result {
             self.status.source_unknown = true;
-            if !self.gap_reported && !self.writes_blocked {
+            if !self.gap_reported
+                && !self.writes_blocked
+                && error.failure_where.as_deref() != Some("plugin.events.put")
+            {
                 let _ = self
                     .record_gap("Buffered Muse native frame could not be normalized")
                     .await;
@@ -2493,7 +2482,7 @@ impl EventProcessor {
                     self.status.source_unknown = false;
                     self.status.failure = None;
                     self.gap_reported = false;
-                    self.source_health_attempted = false;
+                    self.view_stale_reported = false;
                 } else {
                     self.invalidate_view_recovery();
                 }
@@ -3710,7 +3699,10 @@ impl EventProcessor {
         for child in &notification.item.children {
             if let Err(error) = self.observe_workflow_child(&notification, child).await {
                 self.status.source_unknown = true;
-                if !self.gap_reported && !self.writes_blocked {
+                if !self.gap_reported
+                    && !self.writes_blocked
+                    && error.failure_where.as_deref() != Some("plugin.events.put")
+                {
                     let _ = self
                         .record_gap("Muse workflow child entry could not be normalized")
                         .await;
@@ -4092,95 +4084,16 @@ impl EventProcessor {
     }
 
     async fn commit_event(&mut self, kind: &str, native_id: String, data: Value) -> Result<()> {
-        // A lost acknowledgement latches `writes_blocked` with the exact
-        // gap body and batch retained. Drive them first so a recovered
-        // channel unblocks this commit instead of stranding the turn.
-        self.drive_writes().await;
-        let mut retained = self.retained_gap.take();
-        let result = self
-            .stream_source()
-            .commit_event_with_retained(kind, native_id, data, &mut retained)
-            .await;
-        self.retained_gap = retained;
-        result
-    }
-
-    /// Drive a retained gap acknowledgement, then reconcile a latched batch
-    /// against a private `source.state` readback: a proven batch clears the
-    /// latch, a batch proven absent is resubmitted as a first delivery.
-    /// Best-effort: a failed readback keeps the latch for the next expiry.
-    async fn drive_writes(&mut self) {
-        if self.retained_gap.is_some() {
-            let mut retained = self.retained_gap.take();
-            self.stream_source().drive_retained_gap(&mut retained).await;
-            self.retained_gap = retained;
-        }
-        self.reconcile_blocked_writes().await;
-    }
-
-    async fn reconcile_blocked_writes(&mut self) {
-        if !self.writes_blocked {
-            return;
-        }
-        let state = match self
-            .host
-            .call(
-                "source.state",
-                json!({
-                    "credential": self.credential,
-                    "agent_id": self.agent_id,
-                    "generation": self.generation,
-                    "source": "stream",
-                }),
-                Instant::now() + EVENT_DEADLINE,
-            )
+        self.stream_source()
+            .commit_event(kind, native_id, data)
             .await
-        {
-            Ok(state) => state,
-            Err(_) => return,
-        };
-        match self
-            .sink
-            .settle_unknown_from_state(&self.agent_id, self.generation, "stream", &state)
-        {
-            Ok(Some(_)) => {
-                self.writes_blocked = false;
-                self.status.batch_unknown = false;
-            }
-            Ok(None) => {}
-            Err(_) => {
-                let Some(batch) =
-                    self.sink
-                        .take_unknown_batch(&self.agent_id, self.generation, "stream")
-                else {
-                    return;
-                };
-                match self
-                    .sink
-                    .commit(batch, Instant::now() + EVENT_DEADLINE)
-                    .await
-                {
-                    Ok(_) => {
-                        self.writes_blocked = false;
-                        self.status.batch_unknown = false;
-                    }
-                    Err(_) => {
-                        self.status.failure = Some(
-                            "Muse event batch acknowledgement is unknown; retrying the proven-absent write"
-                                .to_owned(),
-                        );
-                    }
-                }
-            }
-        }
     }
 
     /// Persist a refreshed offer. Returns `Ok(true)` only after the actual
     /// required `request.opened` commit succeeded. `Ok(false)` means the
     /// call was handled but nothing was persisted (a gap was recorded, or
-    /// an oversized envelope was deferred); `Err` means the commit or gap
-    /// acknowledgement itself is unknown. Callers that need persistence
-    /// proof must require `Ok(true)` — never infer it from gap latches.
+    /// an oversized envelope was deferred); `Err` carries the write failure.
+    /// Callers that need persistence proof must require `Ok(true)`.
     async fn commit_offer_update(&mut self, refreshed: &CorePending) -> Result<bool> {
         let Some(command_id) = self.status.active_command_id.clone() else {
             self.record_gap("Muse refreshed offer arrived with no active command")
@@ -4227,15 +4140,11 @@ impl EventProcessor {
         Ok(true)
     }
 
-    /// One explicit `stale` health update for a degraded or lost native stream/view,
-    /// through the existing `source.health` mechanism. Attempted once and settled
-    /// through `source.state` readback on an uncertain acknowledgement; never replayed.
-    async fn mark_source_stale(&mut self, deadline: Instant) {
-        if self.source_health_attempted {
-            return;
+    async fn report_view_stale(&mut self) {
+        if !std::mem::replace(&mut self.view_stale_reported, true) {
+            self.set_source_health("stale", Instant::now() + EVENT_DEADLINE)
+                .await;
         }
-        self.source_health_attempted = true;
-        self.set_source_health("stale", deadline).await;
     }
 
     async fn set_source_health(&mut self, health: &str, deadline: Instant) -> bool {
@@ -4258,42 +4167,13 @@ impl EventProcessor {
             return true;
         }
 
-        // A lost health acknowledgement is settled by readback, never by replay.
-        let readback = self
-            .host
-            .call(
-                "source.state",
-                json!({
-                    "credential": self.credential,
-                    "agent_id": self.agent_id,
-                    "generation": self.generation,
-                    "source": "stream",
-                }),
-                deadline,
-            )
-            .await;
-        let confirmed = readback.as_ref().is_ok_and(|state| {
-            state.get("agent_id").and_then(Value::as_str) == Some(self.agent_id.as_str())
-                && state.get("generation").and_then(Value::as_i64) == Some(self.generation)
-                && state.get("source").and_then(Value::as_str) == Some("stream")
-                && state.get("state").and_then(Value::as_str) == Some("open")
-                && state.get("health").and_then(Value::as_str) == Some(health)
-        });
-        if !confirmed {
-            self.status.source_unknown = true;
-        }
-        confirmed
+        self.status.source_unknown = true;
+        false
     }
 
     async fn record_gap(&mut self, reason: &str) -> Result<()> {
         self.invalidate_view_recovery();
-        let mut retained = self.retained_gap.take();
-        let result = self
-            .stream_source()
-            .record_gap_with_retained(reason, &mut retained)
-            .await;
-        self.retained_gap = retained;
-        result
+        self.stream_source().record_gap(reason).await
     }
 
     /// The shared stream-commit half of this processor.

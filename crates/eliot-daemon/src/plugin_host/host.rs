@@ -1849,6 +1849,10 @@ fn record_store_batch_rejection(
     let generation = key.generation.to_string();
     let code = format!("events_put_{}", safe_cause_code(cause));
     let validation = safe_store_validation_reason(error);
+    let outcome = match error.code.as_str() {
+        "unknown" | "busy" | "not_allowed" | "stale_generation" => error.code.as_str(),
+        _ => "rejected",
+    };
     crate::logging::record(
         &policy,
         &code,
@@ -1859,6 +1863,7 @@ fn record_store_batch_rejection(
             ("batch_id", batch_id),
             ("event_kind", event_kind),
             ("validation", &validation),
+            ("outcome", outcome),
         ],
         None,
     );
@@ -2005,10 +2010,7 @@ async fn record_source_gap(
                 )
             })
         }
-        Err(_) if write_faulted => Err(Error::new(
-            "unknown",
-            "source.gap outcome is unknown; settle with source.state",
-        )),
+        Err(_) if write_faulted => Err(Error::new("unknown", "source.gap outcome is unknown")),
         Err(error) => Err(redact_native_error(error, credentials)),
     }
 }
@@ -4472,7 +4474,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn events_put_malformed_params_are_definite_invalid() {
+    async fn events_put_replies_with_proven_no_write_and_host_gap() {
         let mut store = eliot_store::Store::open(Path::new(":memory:")).unwrap();
         let command_id = Ulid::new().to_string();
         let now = now_ms();
@@ -4548,6 +4550,56 @@ mod tests {
             published.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ));
+        let mut batch = batch();
+        batch.agent_id = agent_id.clone();
+        batch.events[0].data["command_id"] = json!(command_id);
+        let mut params = serde_json::to_value(&batch).unwrap();
+        params["credential"] = json!("wrong-credential");
+        assert_eq!(
+            client
+                .call("events.put", params, deadline())
+                .await
+                .unwrap_err()
+                .code,
+            "not_allowed"
+        );
+        assert_eq!(store.lock().await.high_water().unwrap(), before);
+
+        // The first member would make the session ready. The second cannot
+        // complete an unstarted turn, so none of this batch enters the journal.
+        batch.events.push(NativeEvent {
+            kind: "turn.completed".to_owned(),
+            native_id: "unstarted-turn-completion".to_owned(),
+            ts: None,
+            data: json!({"turn_id":"unstarted", "status":"completed"}),
+        });
+        let mut params = serde_json::to_value(&batch).unwrap();
+        params["credential"] = json!(credential);
+        assert_eq!(
+            client
+                .call("events.put", params, deadline())
+                .await
+                .unwrap_err()
+                .code,
+            "rejected"
+        );
+
+        let source = client
+            .call(
+                "source.state",
+                json!({
+                    "credential":credential, "agent_id":agent_id, "generation":1, "source":"stream",
+                }),
+                deadline(),
+            )
+            .await
+            .unwrap();
+        assert!(source["last_batch_id"].is_null());
+        assert_eq!(source["health"], "stale");
+        let events = store.lock().await.read_events(before, 1000, None).unwrap();
+        assert!(events.iter().any(|event| event.kind == "source.gap"));
+        assert!(events.iter().all(|event| event.native_id.is_none()));
+
         client.close_input(deadline()).await.unwrap();
         timeout_at(deadline(), task).await.unwrap().unwrap();
     }
