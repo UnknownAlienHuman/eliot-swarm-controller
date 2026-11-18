@@ -985,10 +985,28 @@ async fn active_rules(
     Ok(active)
 }
 
+async fn join_cleanup_task(task: &mut Option<tokio::task::JoinHandle<Option<String>>>) {
+    if let Some(task) = task.take() {
+        let _ = task.await;
+    }
+}
+
 pub(crate) async fn run_global_rules(
     router: Router,
     start: RuleWorkerStart,
+    shutdown: watch::Receiver<bool>,
+) -> Result<RuleWorkerExit> {
+    let mut cleanup_task = None;
+    let result = run_global_rules_inner(router, start, shutdown, &mut cleanup_task).await;
+    join_cleanup_task(&mut cleanup_task).await;
+    result
+}
+
+async fn run_global_rules_inner(
+    router: Router,
+    start: RuleWorkerStart,
     mut shutdown: watch::Receiver<bool>,
+    cleanup_task: &mut Option<tokio::task::JoinHandle<Option<String>>>,
 ) -> Result<RuleWorkerExit> {
     let mut rules = start.global_rules;
     let mut project_rules = start.project_rules;
@@ -1019,6 +1037,9 @@ pub(crate) async fn run_global_rules(
     }
     let mut reconcile = tokio::time::interval(RULE_RECONCILE_INTERVAL);
     reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut cleanup_after = None;
+    let mut last_cleanup_at: Option<std::time::Instant> = None;
+    let mut cleanup_enabled = false;
     let mut notices = initial_notices;
     let mut owner_config_notices = ReloadNoticeContext::default();
     let mut max_event_backlog = initial_max_event_backlog;
@@ -1089,6 +1110,7 @@ pub(crate) async fn run_global_rules(
     }
     loop {
         if *shutdown.borrow() {
+            join_cleanup_task(cleanup_task).await;
             return Ok(RuleWorkerExit::Shutdown);
         }
         if recover_rule_children {
@@ -1103,6 +1125,7 @@ pub(crate) async fn run_global_rules(
             if !reconcile_event_rules(&router, &mut rules, high_water, now_ms(), max_event_backlog)
                 .await?
             {
+                join_cleanup_task(cleanup_task).await;
                 return Ok(RuleWorkerExit::AdmissionClosed);
             }
             for namespace in &mut project_rules {
@@ -1116,11 +1139,13 @@ pub(crate) async fn run_global_rules(
                     )
                     .await?
                 {
+                    join_cleanup_task(cleanup_task).await;
                     return Ok(RuleWorkerExit::AdmissionClosed);
                 }
             }
 
             if !reconcile_due_timers(&router, "owner", &mut rules, now_ms()).await? {
+                join_cleanup_task(cleanup_task).await;
                 return Ok(RuleWorkerExit::AdmissionClosed);
             }
             for namespace in &mut project_rules {
@@ -1133,6 +1158,7 @@ pub(crate) async fn run_global_rules(
                     )
                     .await?
                 {
+                    join_cleanup_task(cleanup_task).await;
                     return Ok(RuleWorkerExit::AdmissionClosed);
                 }
             }
@@ -1153,14 +1179,17 @@ pub(crate) async fn run_global_rules(
             None
         };
         let mut reload_requested = false;
+        let mut cleanup_requested = false;
+        let mut shutdown_requested = false;
         tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
-                    return Ok(RuleWorkerExit::Shutdown);
+                    shutdown_requested = true;
                 }
             }
             changed = progress.changed() => {
                 if changed.is_err() {
+                    join_cleanup_task(cleanup_task).await;
                     return Ok(RuleWorkerExit::Exited);
                 }
                 recover_rule_children = true;
@@ -1175,10 +1204,14 @@ pub(crate) async fn run_global_rules(
                     recover_rule_children = true;
                 }
                 Err(broadcast::error::RecvError::Closed) => {
+                    join_cleanup_task(cleanup_task).await;
                     return Err(Error::new("unavailable", "event bus is closed"));
                 }
             },
-            _ = reconcile.tick() => reload_requested = true,
+            _ = reconcile.tick() => {
+                reload_requested = true;
+                cleanup_requested = true;
+            },
             _ = async {
                 if let Some(watcher) = &mut watcher {
                     let _ = watcher.changed().await;
@@ -1193,7 +1226,26 @@ pub(crate) async fn run_global_rules(
                 } else {
                     std::future::pending::<()>().await;
                 }
-            } => {}
+            } => {},
+            completed = async {
+                match cleanup_task.as_mut() {
+                    Some(task) => Some(task.await),
+                    None => std::future::pending::<Option<std::result::Result<Option<String>, tokio::task::JoinError>>>().await,
+                }
+            } => {
+                *cleanup_task = None;
+                cleanup_after = if cleanup_enabled {
+                    completed
+                        .and_then(std::result::Result::ok)
+                        .unwrap_or(None)
+                } else {
+                    None
+                };
+            }
+        }
+        if shutdown_requested {
+            join_cleanup_task(cleanup_task).await;
+            return Ok(RuleWorkerExit::Shutdown);
         }
         if let Some(watcher) = &mut watcher {
             // Re-arm the rules-directory watch after creation or
@@ -1226,6 +1278,22 @@ pub(crate) async fn run_global_rules(
         match crate::config::load_automation_config(&data_root) {
             Ok(config) => {
                 max_event_backlog = config.max_event_backlog;
+                cleanup_enabled = config.auto_cleanup;
+                if !cleanup_enabled {
+                    cleanup_after = None;
+                    last_cleanup_at = None;
+                } else if cleanup_requested
+                    && cleanup_task.is_none()
+                    && last_cleanup_at.is_none_or(|last| last.elapsed() >= Duration::from_secs(60))
+                {
+                    last_cleanup_at = Some(std::time::Instant::now());
+                    let mut after = cleanup_after.take();
+                    let cleanup_router = router.clone();
+                    *cleanup_task = Some(tokio::spawn(async move {
+                        cleanup_router.auto_cleanup_worktrees(&mut after).await;
+                        after
+                    }));
+                }
                 let registrations_valid = refresh_project_namespaces(
                     &router,
                     &data_root,
@@ -1240,6 +1308,9 @@ pub(crate) async fn run_global_rules(
                 }
             }
             Err(error) => {
+                cleanup_enabled = false;
+                cleanup_after = None;
+                last_cleanup_at = None;
                 report_rejected_source(&policy, &error, &mut owner_config_notices)?;
             }
         }

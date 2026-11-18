@@ -579,10 +579,16 @@ The implemented backlog setting is a root-level automation option:
 ```toml
 [automation]
 max_event_backlog = 100000
+auto_cleanup = false
 ```
 
 `max_event_backlog` is a positive signed 64-bit integer. It defaults to `100000`; zero,
-negative, wrong-type and unknown automation values are invalid.
+negative, wrong-type and unknown automation values are invalid. `auto_cleanup` is an
+Owner setting that defaults to `false`. When enabled, the existing automation
+reconciliation timer performs bounded, paginated worktree selection at most once per
+minute, applying eligible merged worktrees through the same cleanup plan and apply path
+used by the cleanup UI and CLI. Eligibility and the durable removal fence are rechecked
+before removal.
 
 The implemented daemon retention setting is a `[daemon]` retention table:
 

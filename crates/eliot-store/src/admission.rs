@@ -1139,7 +1139,7 @@ fn admit_worktree_remove_tx(
     }
     let workspace = workspace::load_workspace(tx, agent_num)?
         .ok_or_else(|| Error::new("not_found", "Agent has no managed worktree"))?;
-    workspace::require_workspace_removable(tx, &agent, &workspace)?;
+    workspace::require_workspace_removable(tx, &agent, &workspace, now)?;
     let args = json!({"target_generation": workspace.target_generation});
     events.push(admit_command(
         tx,

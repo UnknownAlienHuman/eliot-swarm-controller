@@ -455,13 +455,14 @@ impl WorkspaceGit {
     /// Read-only full preflight. The manager holds its removing/cancellation gate
     /// before deleting returned regular files individually; never delete a scratch
     /// directory recursively or use this list as authority for tracked files.
-    pub(crate) async fn scratch_candidates(
+    pub(crate) async fn removal_candidates(
         &self,
         preparation: &WorkspacePreparation,
         scratch: &[String],
     ) -> Result<Vec<PathBuf>> {
         let deadline = Instant::now() + READ_TIME;
         let subject = self.subject(preparation, deadline).await?;
+        self.require_merged(preparation, &subject, deadline).await?;
         self.require_tracked_clean(&subject, deadline).await?;
         let root = &subject.target.root;
         let mut allowed = BTreeSet::new();
@@ -543,6 +544,7 @@ impl WorkspaceGit {
         }
 
         self.require_tracked_clean(&subject, deadline).await?;
+        self.require_merged(preparation, &subject, deadline).await?;
         if cached != scratch_paths(&self.read(root, &cached_args, deadline).await?)?
             || other != scratch_paths(&self.read(root, &other_args, deadline).await?)?
             || ignored != scratch_paths(&self.read(root, &ignored_args, deadline).await?)?
@@ -602,21 +604,63 @@ impl WorkspaceGit {
         }
         let deadline = Instant::now() + READ_TIME;
         let subject = self.subject(preparation, deadline).await?;
+        self.require_merged(preparation, &subject, deadline).await?;
         self.require_clean(&subject, true, deadline).await?;
         self.confirm_subject(preparation, &subject, deadline)
             .await?;
         let target = git_path_argument(&subject.target.root)?;
         self.git
-            .prepare_workspace_command(
+            .prepare_workspace_command_with_config_roots(
                 &subject.source.root,
                 &["worktree", "remove", "--", &target],
                 GitBinding {
                     git_dir: &subject.source.git_dir,
                     common_dir: &subject.source.common_dir,
                 },
+                &[&subject.target.root],
                 deadline,
             )
             .await
+    }
+
+    async fn require_merged(
+        &self,
+        preparation: &WorkspacePreparation,
+        subject: &Subject,
+        deadline: Instant,
+    ) -> Result<()> {
+        if !is_oid(&preparation.base_oid) || !is_oid(&subject.head) {
+            return Err(problem(
+                "source_integrity",
+                "workspace merge identity is malformed",
+            ));
+        }
+        let output = self
+            .git
+            .workspace_command_bound_with_config_roots(
+                &subject.source.root,
+                &[
+                    "merge-base",
+                    "--is-ancestor",
+                    &subject.head,
+                    &preparation.base_oid,
+                ],
+                GitBinding {
+                    git_dir: &subject.source.git_dir,
+                    common_dir: &subject.source.common_dir,
+                },
+                &[&subject.target.root],
+                deadline,
+            )
+            .await?;
+        match output.code {
+            0 => Ok(()),
+            1 => Err(problem(
+                "unmerged",
+                "workspace branch is not merged into its frozen base",
+            )),
+            _ => Err(problem("unavailable", "workspace merge readback failed")),
+        }
     }
 
     /// Call only after confirmed mutator quiescence. Present/partial/conflicting
@@ -1284,6 +1328,38 @@ mod tests {
         git(root, &["commit", "--allow-empty", "-m", "root"]);
     }
 
+    fn linked_preparation(root: &Path, base_oid: String, label: &str) -> WorkspacePreparation {
+        let worktree = root.join(label);
+        git(
+            root,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                label,
+                worktree.to_str().unwrap(),
+                &base_oid,
+            ],
+        );
+        WorkspacePreparation {
+            agent: "a1".to_owned(),
+            target_generation: 1,
+            start_command_id: "start".to_owned(),
+            project: "test".to_owned(),
+            repo_path: path_text(root).unwrap(),
+            repo_common_dir: path_text(&root.join(".git")).unwrap(),
+            requested_branch: label.to_owned(),
+            base_ref: Some("refs/heads/main".to_owned()),
+            base_oid,
+            worktree_path: path_text(&worktree).unwrap(),
+            frozen_setup: Vec::new(),
+            phase: WorkspacePhase::Ready,
+            setup_index: 0,
+            outcome: None,
+            updated_at: 0,
+        }
+    }
+
     #[test]
     fn identity_lines_accepts_exactly_three_nonempty_records() {
         assert_eq!(
@@ -1435,6 +1511,67 @@ mod tests {
             .await
             .expect("free branch freezes");
         assert_eq!(frozen.requested_branch, "atlas/a9-task");
+    }
+
+    #[tokio::test]
+    async fn removal_uses_the_frozen_base_oid_when_the_base_branch_moves() {
+        let root = TestRoot::new("frozen-base");
+        init_repo(&root.0);
+        let base = git_oid(&root.0, "HEAD");
+        let preparation = linked_preparation(&root.0, base, "feature");
+        let worktree = Path::new(&preparation.worktree_path);
+        git(
+            worktree,
+            &[
+                "-c",
+                "user.name=EliotTest",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "task",
+            ],
+        );
+        let branch_tip = git_oid(worktree, "HEAD");
+        git(&root.0, &["merge", "--ff-only", "feature"]);
+        assert_eq!(git_oid(&root.0, "HEAD"), branch_tip);
+
+        let error = WorkspaceGit::new()
+            .unwrap()
+            .removal_candidates(&preparation, &[])
+            .await
+            .expect_err("merge into a later main tip cannot rewrite the frozen base");
+        assert_eq!(error.code, "unmerged");
+    }
+
+    #[tokio::test]
+    async fn partial_removal_readback_stays_unknown() {
+        let root = TestRoot::new("partial-removal");
+        init_repo(&root.0);
+        let base = git_oid(&root.0, "HEAD");
+        let mut preparation = linked_preparation(&root.0, base, "partial");
+        preparation.phase = WorkspacePhase::Removing;
+        fs::remove_dir_all(&preparation.worktree_path).unwrap();
+
+        assert!(matches!(
+            WorkspaceGit::new()
+                .unwrap()
+                .inspect_removal(&preparation)
+                .await,
+            WorkspaceRemovalOutcome::Unknown { .. }
+        ));
+    }
+
+    fn git_oid(root: &Path, rev: &str) -> String {
+        let output = GitCommand::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["rev-parse", "--verify", rev])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
     }
 
     #[tokio::test]

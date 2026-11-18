@@ -592,6 +592,80 @@ impl GitProbe {
         self.build_command(root, args, &overrides, Some(binding))
     }
 
+    /// Prepare a workspace mutation with executable Git configuration disabled
+    /// for both the command checkout and every checkout whose configuration Git
+    /// may consult while performing the mutation.
+    pub(crate) async fn prepare_workspace_command_with_config_roots(
+        &self,
+        root: &Path,
+        args: &[&str],
+        binding: GitBinding<'_>,
+        additional_roots: &[&Path],
+        deadline: Instant,
+    ) -> Result<Command> {
+        let overrides = self
+            .workspace_overrides(root, Some(binding), additional_roots, deadline)
+            .await?;
+        if Instant::now() >= deadline {
+            return Err(unavailable(
+                "workspace command preparation deadline elapsed",
+            ));
+        }
+        self.build_command(root, args, &overrides, Some(binding))
+    }
+
+    /// Run a bounded read using the union of safe overrides from every relevant
+    /// checkout's effective configuration.
+    pub(crate) async fn workspace_command_bound_with_config_roots(
+        &self,
+        root: &Path,
+        args: &[&str],
+        binding: GitBinding<'_>,
+        additional_roots: &[&Path],
+        deadline: Instant,
+    ) -> Result<Captured> {
+        let overrides = self
+            .workspace_overrides(root, Some(binding), additional_roots, deadline)
+            .await?;
+        if Instant::now() >= deadline {
+            return Err(unavailable("bound workspace command deadline elapsed"));
+        }
+        self.run_scoped(root, args, &overrides, &[], deadline, Some(binding))
+            .await
+    }
+
+    async fn workspace_overrides(
+        &self,
+        root: &Path,
+        binding: Option<GitBinding<'_>>,
+        additional_roots: &[&Path],
+        deadline: Instant,
+    ) -> Result<Vec<(String, String)>> {
+        let mut merged = BTreeMap::new();
+        for (config_root, config_binding) in std::iter::once((root, binding))
+            .chain(additional_roots.iter().map(|path| (*path, None)))
+        {
+            for (key, value) in self
+                .safe_overrides_for(config_root, deadline, config_binding)
+                .await?
+            {
+                merged.insert(key, value);
+            }
+        }
+        if merged.len() > CONFIG_PAIRS
+            || merged
+                .iter()
+                .map(|(key, value)| key.len() + value.len())
+                .sum::<usize>()
+                > CONFIG_BYTES
+        {
+            return Err(unavailable(
+                "Git executable configuration exceeds the observation bound",
+            ));
+        }
+        Ok(merged.into_iter().collect())
+    }
+
     async fn checked(
         &self,
         root: &Path,

@@ -237,19 +237,121 @@ fn dispatch_removal(
     now: i64,
 ) -> (String, WorkspacePreparation) {
     end_session(store, fixture, now);
+    let removal_now = now + 60_000;
     let command_id = Ulid::new().to_string();
     let mut remove = SubmitCommand::new(command_id.clone(), "worktree.remove");
     remove.target = Some(fixture.agent.clone());
     remove.expected_generation = Some(1);
     store
-        .submit("owner", remove, now + 1)
+        .submit("owner", remove, removal_now + 1)
         .expect("admit exact terminal worktree removal");
     store
-        .dispatch(&command_id, now + 2)
+        .dispatch(&command_id, removal_now + 2)
         .expect("dispatch removal before native Git boundary");
     let removing = workspace(store, fixture);
     assert_eq!(removing.phase, WorkspacePhase::Removing);
     (command_id, removing)
+}
+
+#[test]
+fn definite_removal_refusal_restores_eligibility() {
+    let now = now_ms();
+    let mut store = open_store();
+    let registration = register_repository(&mut store, now);
+    let owner = ready_workspace(&mut store, &registration, "dirty-refusal", now + 10);
+    let (removal, prepared) = dispatch_removal(&mut store, &owner, now + 20);
+    store
+        .settle_workspace_removal(
+            &removal,
+            prepared.target_generation,
+            WorkspaceRemovalOutcome::Failed {
+                code: "dirty".to_owned(),
+                message: "worktree is dirty before native mutation".to_owned(),
+            },
+            now + 60_030,
+        )
+        .unwrap();
+    let eligible = store
+        .workspace_removal_eligibility(&owner.agent, now + 60_031)
+        .unwrap();
+    assert_eq!(eligible.phase, WorkspacePhase::Ready);
+}
+
+#[test]
+fn live_borrower_blocks_removal_before_fence_and_nested_launch_after_fence() {
+    let now = now_ms();
+    let mut store = open_store();
+    let registration = register_repository(&mut store, now);
+    let owner = ready_workspace(&mut store, &registration, "borrower-fence", now + 10);
+
+    let borrower_id = Ulid::new().to_string();
+    let mut borrower = SubmitCommand::new(borrower_id, "launch");
+    borrower.args = json!({
+        "project": registration.checkout,
+        "workspace": owner.input.worktree_path,
+        "harness": "codex",
+        "profile": "fake",
+        "profile_snapshot": {},
+    });
+    store
+        .submit("owner", borrower, now + 20)
+        .expect("admit a live Agent borrowing the ready worktree");
+
+    end_session(&mut store, &owner, now + 30);
+    let mut remove = SubmitCommand::new(Ulid::new().to_string(), "worktree.remove");
+    remove.target = Some(owner.agent.clone());
+    remove.expected_generation = Some(1);
+    assert_eq!(
+        store
+            .submit("owner", remove, now + 60_031)
+            .unwrap_err()
+            .code,
+        "busy"
+    );
+    assert_eq!(workspace(&store, &owner).phase, WorkspacePhase::Ready);
+
+    let mut fenced_store = open_store();
+    let fenced_registration = register_repository(&mut fenced_store, now + 70_000);
+    let fenced_owner = ready_workspace(
+        &mut fenced_store,
+        &fenced_registration,
+        "nested-borrower-fence",
+        now + 70_010,
+    );
+    let (remove_id, removing) = dispatch_removal(&mut fenced_store, &fenced_owner, now + 70_030);
+    assert_eq!(removing.phase, WorkspacePhase::Removing);
+
+    let nested_repo = Path::new(&fenced_owner.input.worktree_path).join("nested");
+    let mut nested_launch = SubmitCommand::new(Ulid::new().to_string(), "launch");
+    nested_launch.args = json!({
+        "project": fenced_registration.checkout,
+        "workspace": nested_repo,
+        "harness": "codex",
+        "profile": "fake",
+        "profile_snapshot": {},
+    });
+    let mut nested = fenced_owner.input.clone();
+    nested.repo_path = nested_repo.display().to_string();
+    nested.worktree_path = Path::new(&fenced_registration.checkout)
+        .join("other-worktree")
+        .display()
+        .to_string();
+    nested.requested_branch = "codex/nested-borrower".to_owned();
+    assert_eq!(
+        fenced_store
+            .submit_with_workspace("owner", nested_launch, nested, now + 130_050)
+            .unwrap_err()
+            .code,
+        "bad_state"
+    );
+    assert_eq!(
+        workspace(&fenced_store, &fenced_owner).phase,
+        WorkspacePhase::Removing
+    );
+    assert_eq!(
+        fenced_store.get_command(&remove_id).unwrap().unwrap().state,
+        CommandState::Dispatched
+    );
 }
 
 fn frozen_fetch(registration: &ProjectRegistrationView) -> FrozenGitFetch {
@@ -504,10 +606,10 @@ fn unknown_fetch_queues_remove_without_marking_native_effect() {
     remove.target = Some(remove_workspace.agent.clone());
     remove.expected_generation = Some(1);
     store
-        .submit("owner", remove, now + 23)
+        .submit("owner", remove, now + 60_023)
         .expect("admit exact same-repository removal");
     store
-        .dispatch(&remove_id, now + 24)
+        .dispatch(&remove_id, now + 60_024)
         .expect("defer removal before its native Git boundary");
     assert_eq!(
         store.get_command(&remove_id).unwrap().unwrap().state,
@@ -533,16 +635,20 @@ fn unknown_fetch_queues_remove_without_marking_native_effect() {
         Some(remove_id.as_str())
     );
 
-    settle_fetch_applied(&mut store, &fetch_id, &frozen, now + 25);
+    settle_fetch_applied(&mut store, &fetch_id, &frozen, now + 60_025);
     assert_eq!(
-        store.dispatch(&remove_id, now + 26).unwrap().value.state,
+        store
+            .dispatch(&remove_id, now + 60_026)
+            .unwrap()
+            .value
+            .state,
         CommandState::Dispatched
     );
     let removing = workspace(&store, &remove_workspace);
     assert_eq!(removing.phase, WorkspacePhase::Removing);
     assert!(matches!(
         store
-            .begin_workspace_git_effect(&remove_id, &removing, now + 27)
+            .begin_workspace_git_effect(&remove_id, &removing, now + 60_027)
             .unwrap(),
         WorkspaceGitReservation::Reserved
     ));
@@ -633,7 +739,7 @@ fn predrain_remove_inspection_unknown_without_git_marker_does_not_fence_fetch() 
                 code: "preflight_inspection_unknown".to_owned(),
                 message: "read-only pre-removal inspection did not complete".to_owned(),
             },
-            now + 33,
+            now + 60_033,
         )
         .expect("retain read-only removal inspection uncertainty");
     assert_eq!(
@@ -649,7 +755,7 @@ fn predrain_remove_inspection_unknown_without_git_marker_does_not_fence_fetch() 
         Some(&json!(false))
     );
 
-    let (fetch_id, _) = dispatch_fetch(&mut store, &registration, now + 34);
+    let (fetch_id, _) = dispatch_fetch(&mut store, &registration, now + 60_034);
     assert_eq!(
         store.get_command(&fetch_id).unwrap().unwrap().state,
         CommandState::Dispatched

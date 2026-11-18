@@ -28,6 +28,10 @@ pub(crate) struct RunGrantConfig {
 pub(crate) struct AutomationConfig {
     #[serde(default = "default_max_event_backlog")]
     pub(crate) max_event_backlog: i64,
+    /// Automatically apply the shared merged-worktree cleanup plan on the
+    /// existing Owner automation reconciliation timer.
+    #[serde(default)]
+    pub(crate) auto_cleanup: bool,
     #[serde(default)]
     pub(crate) run: RunGrantConfig,
     #[serde(default)]
@@ -59,6 +63,7 @@ impl Default for AutomationConfig {
     fn default() -> Self {
         Self {
             max_event_backlog: default_max_event_backlog(),
+            auto_cleanup: false,
             run: RunGrantConfig::default(),
             assignments: BTreeMap::new(),
         }
@@ -309,6 +314,9 @@ mod tests {
             AutomationConfig::default()
         );
 
+        fixture.write("[automation]\nauto_cleanup = true\n");
+        assert!(load_automation_config(&fixture.root).unwrap().auto_cleanup);
+
         let project_path = format!("{:?}", fixture.root.to_string_lossy());
         fixture.write(&format!(
             "[profiles.fixture]\nharness = \"codex\"\nmodel = \"fixture-model\"\n\
@@ -319,6 +327,7 @@ mod tests {
             load_automation_config(&fixture.root).unwrap(),
             AutomationConfig {
                 max_event_backlog: 4096,
+                auto_cleanup: false,
                 run: RunGrantConfig::default(),
                 assignments: BTreeMap::new(),
             }

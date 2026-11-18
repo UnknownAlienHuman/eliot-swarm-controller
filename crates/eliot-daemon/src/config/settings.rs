@@ -122,6 +122,15 @@ fn section_json(source: &str, name: &str) -> core::Result<JsonValue> {
             }
         }
     }
+    if name == "automation" {
+        value
+            .as_object_mut()
+            .ok_or_else(|| {
+                core::Error::new("source_integrity", "automation settings are not an object")
+            })?
+            .entry("auto_cleanup")
+            .or_insert(JsonValue::Bool(false));
+    }
     Ok(value)
 }
 
@@ -1198,6 +1207,7 @@ mod tests {
                 SettingsSection::Automation,
                 serde_json::json!({
                     "max_event_backlog":123,
+                    "auto_cleanup":true,
                     "run":{"interpreters":{},"run_env":[]},
                     "assignments":{"queue-a":{
                         "folder":"C:/work/briefs",
@@ -1237,6 +1247,11 @@ mod tests {
         assert_eq!(
             load_automation_config(&root.0).unwrap().max_event_backlog,
             123
+        );
+        assert!(load_automation_config(&root.0).unwrap().auto_cleanup);
+        assert_eq!(
+            read.sections[&SettingsSection::Automation]["auto_cleanup"],
+            true
         );
         assert_eq!(
             load_automation_config(&root.0).unwrap().assignments["queue-a"].max_busy,

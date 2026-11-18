@@ -347,7 +347,7 @@ fn dispatch_worktree_remove_tx(
 ) -> Result<Option<Command>> {
     let mut workspace = workspace::load_workspace(tx, agent_num)?
         .ok_or_else(|| Error::new("not_found", "managed worktree was not found"))?;
-    workspace::require_workspace_removable(tx, agent, &workspace)?;
+    workspace::require_workspace_removable(tx, agent, &workspace, now)?;
     if command_generation != agent.generation
         || command
             .command
