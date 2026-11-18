@@ -604,9 +604,10 @@ For the pinned Codex 0.161.0 rollout format at upstream commit
 `thread_rolled_back`, `item_completed`), legacy message/tool echoes and
 legacy-mode records are ignorable without clearing binding; only
 lifecycle records mutate binding. An aborted turn emits an interrupted
-(`reason: interrupted`) or failed terminal turn with its native reason and
-clears the active binding, so a following start is not an anomaly. Only legacy
-message/tool echoes are otherwise suppressed; `FinalAnswer` and EOF are not terminal evidence.
+(`reason: interrupted`) or failed terminal turn with its native reason; it
+clears the active binding and releases the aborted turn id, so a following
+start is not an anomaly and later items cannot attach to the aborted turn.
+Only legacy message/tool echoes are otherwise suppressed; `FinalAnswer` and EOF are not terminal evidence.
 The outer JSONL record timestamp is retained as epoch milliseconds in `NativeEvent.ts`.
 Optional lifecycle `data.started_at` and `data.completed_at` are integer epoch seconds
 from the native payload, converted with checked multiplication to epoch milliseconds;

@@ -1356,7 +1356,6 @@ fn project_line(
             .map(str::to_owned);
         if let Some(turn_id) = aborted_turn_id {
             validate_text(&turn_id, 256)?;
-            state.current_turn_id = Some(turn_id.clone());
             state.any_turn_complete = true;
             state.last_completed_turn_id = Some(turn_id.clone());
             state.pending_turn_context = false;
@@ -1380,14 +1379,16 @@ fn project_line(
                 entries.push(json!({
                     "turn_id": turn_id,
                     "status": if interrupted { "interrupted" } else { "failed" },
+                    "reason": reason,
                     "started_at": started_at.map(super::milliseconds).transpose()?,
                     "completed_at": completed_at.map(super::milliseconds).transpose()?,
                     "duration_ms": duration_ms,
                     "ordinal": line.ordinal,
                 }));
             }
-            // An aborted turn is terminal: a following task_started for a
-            // new turn must not be classified as an anomaly.
+            // An aborted turn is terminal and releases its turn binding, so a
+            // following task_started is not an anomaly and later items cannot attach.
+            state.current_turn_id = None;
             state.active_turn = None;
         }
     }
@@ -2033,7 +2034,12 @@ mod live_tests {
             .expect("abort projects");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["status"], "interrupted");
+        assert_eq!(entries[0]["reason"], "interrupted");
         assert!(state.active_turn.is_none(), "abort clears active binding");
+        assert!(
+            state.current_turn_id.is_none(),
+            "abort releases the turn binding"
+        );
         assert!(state.requested_turn_complete);
         let next = super::RolloutLine {
             timestamp: "2026-01-01T00:00:02Z".to_owned(),
