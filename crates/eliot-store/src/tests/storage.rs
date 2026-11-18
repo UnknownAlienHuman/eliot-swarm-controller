@@ -70,3 +70,35 @@ fn memory_sentinel_creates_no_literal_file() {
     );
     let _ = fs::remove_file(&sentinel);
 }
+
+#[test]
+fn open_store_runs_patched_wal_sqlite() {
+    // RUSTSEC-2026-0459: bundled SQLite before 3.54.0 can return stale
+    // process memory when a database and its sibling WAL disagree on page
+    // size. The Store always opens its private DataDir database with WAL,
+    // so it must run on the patched bundled SQLite and apply WAL at open.
+    // Exposure still needs a less-trusted party to supply the DB and WAL
+    // pair; the daemon only opens its own DataDir file.
+    assert!(
+        rusqlite::version_number() >= 3_054_000,
+        "bundled SQLite predates the RUSTSEC-2026-0459 fix"
+    );
+    let path = std::env::temp_dir().join(format!("eliot-wal-{}", Ulid::new()));
+    let store = Store::open(&path).expect("open new Store");
+    let journal_mode: String = store
+        .connection
+        .query_row("PRAGMA journal_mode", (), |row| row.get(0))
+        .expect("read journal_mode");
+    assert_eq!(
+        journal_mode.to_lowercase(),
+        "wal",
+        "Store must apply WAL journal mode at open"
+    );
+    drop(store);
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut candidate = path.as_os_str().to_os_string();
+        candidate.push(suffix);
+        let _ = fs::remove_file(PathBuf::from(&candidate));
+    }
+    let _ = fs::remove_file(&path);
+}
