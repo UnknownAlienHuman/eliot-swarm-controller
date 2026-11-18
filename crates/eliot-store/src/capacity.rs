@@ -419,29 +419,64 @@ pub(super) fn reserve_tx(tx: &Transaction<'_>, agent: &Agent, generation: i64) -
     set_reservation_generation_tx(tx, id, None, generation)
 }
 
+/// Live reservations occupying one capacity scope.
+///
+/// `global:swarm` counts every controlled generation on this daemon. A
+/// `project:<id>` or `manager_assignment:<id>` scope counts live generations
+/// registered to that project, an idle manager included. Profile, account and
+/// proxy scopes keep the frozen-snapshot membership check.
+fn count_scope_usage(connection: &Connection, id: i64, scope: &CapacityScope) -> Result<i64> {
+    if scope.scope == "global:swarm" {
+        return connection
+            .query_row(
+                "SELECT COUNT(*) FROM agents a
+                 WHERE a.capacity_generation IS NOT NULL AND a.id <> ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .map_err(sql_error);
+    }
+    if let Some(project) = scope
+        .scope
+        .strip_prefix("project:")
+        .or_else(|| scope.scope.strip_prefix("manager_assignment:"))
+    {
+        return connection
+            .query_row(
+                "SELECT COUNT(*) FROM agents a
+                 WHERE a.capacity_generation IS NOT NULL AND a.id <> ?1
+                   AND (a.project = ?2 OR COALESCE(a.project_scope, a.project) = ?2)",
+                params![id, project],
+                |row| row.get(0),
+            )
+            .map_err(sql_error);
+    }
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM agents a
+             WHERE a.capacity_generation IS NOT NULL AND a.id <> ?1
+               AND (?2 = 'profile:' || a.profile OR EXISTS (
+                   SELECT 1 FROM json_each(a.profile_snapshot, '$.capacity_scopes') s
+                   WHERE CASE WHEN s.type = 'object'
+                              THEN json_extract(s.value, '$.scope') END = ?2
+               ))",
+            params![id, scope.scope],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)
+}
+
 fn require_free(connection: &Connection, agent: &Agent, id: i64) -> Result<()> {
     for scope in scopes(agent)? {
         let Some(max_live) = scope.max_live else {
             continue;
         };
-        let count: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM agents a
-                 WHERE a.capacity_generation IS NOT NULL AND a.id <> ?1
-                   AND (?2 = 'profile:' || a.profile OR EXISTS (
-                       SELECT 1 FROM json_each(a.profile_snapshot, '$.capacity_scopes') s
-                       WHERE CASE WHEN s.type = 'object'
-                                  THEN json_extract(s.value, '$.scope') END = ?2
-                   ))",
-                params![id, scope.scope],
-                |row| row.get(0),
-            )
-            .map_err(sql_error)?;
+        let count: i64 = count_scope_usage(connection, id, &scope)?;
         if u64::try_from(count).map_or(true, |count| count >= max_live) {
             return Err(Error::new(
                 "capacity_unavailable",
                 format!(
-                    "configured capacity bound {} max_live={max_live} is reserved",
+                    "configured capacity bound {} max_live={max_live} is reserved; Owner may raise it in config.toml [capacity]",
                     scope.scope
                 ),
             )

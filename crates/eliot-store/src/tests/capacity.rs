@@ -1414,3 +1414,510 @@ fn session_end_alone_retains_capacity_until_exact_owned_exit_proof_settles() {
     );
     assert_eq!(capacity_generation(&store, &agent), Some(2));
 }
+// Step 2c: project, manager-assignment and global admission scopes share one
+// Store transaction with the profile, account and proxy scopes. The unit is a
+// controlled generation or reservation, an idle manager included. A missing
+// limit is unlimited; lowering a limit blocks new admissions without stopping
+// running work; retained unknown reservations stay counted.
+
+use serde_json::Value;
+
+fn stamped_2c_scopes(
+    profile: &str,
+    project: &str,
+    global: Option<u64>,
+    project_cap: Option<u64>,
+    manager_cap: Option<u64>,
+) -> Value {
+    json!([
+        {"scope": format!("profile:{profile}"), "max_live": null},
+        {"scope": "global:swarm", "max_live": global},
+        {"scope": format!("project:{project}"), "max_live": project_cap},
+        {"scope": format!("manager_assignment:{project}"), "max_live": manager_cap},
+    ])
+}
+
+fn launch_2c_root(
+    store: &mut Store,
+    project: &str,
+    profile: &str,
+    scopes: Value,
+    now: i64,
+) -> (String, String) {
+    let request = capacity_launch_request(project, profile, scopes);
+    let launch_id = request.id.clone();
+    let admitted = store.submit("owner", request, now).unwrap();
+    let agent = admitted.command.target.expect("launch target");
+    (launch_id, agent)
+}
+
+fn launch_2c_worker(
+    store: &mut Store,
+    parent: &str,
+    project: &str,
+    profile: &str,
+    scopes: Value,
+    now: i64,
+) -> (String, String) {
+    let mut request = SubmitCommand::new(Ulid::new().to_string(), "launch");
+    request.args = json!({
+        "project": project,
+        "workspace": "synthetic-workspace",
+        "harness": "codex",
+        "profile": profile,
+        "parent": parent,
+        "profile_snapshot": {"capacity_scopes": scopes},
+    });
+    request.expected_generation = Some(0);
+    let launch_id = request.id.clone();
+    let admitted = store.submit("owner", request, now).unwrap();
+    let agent = admitted.command.target.expect("launch target");
+    (launch_id, agent)
+}
+
+fn drive_2c_idle(store: &mut Store, agent: &str, launch_id: &str, now: i64) {
+    store.dispatch(launch_id, now).unwrap();
+    install_fixture_sources(store, agent, launch_id, 1, now);
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: Ulid::new().to_string(),
+                agent_id: agent.to_owned(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ready".to_owned(),
+                    native_id: "ready".to_owned(),
+                    data: json!({"command_id": launch_id, "native_scope": "s", "native_ref": "r"}),
+                }],
+                cursor: None,
+            },
+            now,
+        )
+        .unwrap();
+    store
+        .settle(launch_id, CommandState::Applied, None, now)
+        .unwrap();
+}
+#[test]
+fn overlapping_project_and_global_caps_bind_one_transaction() {
+    let path = capacity_store_path();
+    let mut store = Store::open(&path).unwrap();
+    let now = Ulid::new().timestamp_ms() as i64;
+    let _first = launch_2c_root(
+        &mut store,
+        "proj",
+        "prof-a",
+        stamped_2c_scopes("prof-a", "proj", Some(3), Some(2), Some(5)),
+        now,
+    );
+    let _second = launch_2c_root(
+        &mut store,
+        "proj",
+        "prof-b",
+        stamped_2c_scopes("prof-b", "proj", Some(3), Some(2), Some(5)),
+        now,
+    );
+    assert_eq!(store.agent_count().unwrap(), 2);
+
+    // The project cap is full: a third profile name cannot evade it, and the
+    // refusal names the scope with its Owner remedy.
+    let third = capacity_launch_request(
+        "proj",
+        "prof-c",
+        stamped_2c_scopes("prof-c", "proj", Some(3), Some(2), Some(5)),
+    );
+    let third_id = third.id.clone();
+    let failure = store.submit("owner", third, now + 1).unwrap_err();
+    assert_eq!(failure.code, "capacity_unavailable");
+    assert!(
+        failure.message.contains("project:proj"),
+        "{}",
+        failure.message
+    );
+    assert!(
+        failure.message.contains("config.toml [capacity]"),
+        "{}",
+        failure.message
+    );
+    // Nothing was admitted or reserved: no command, no generation, no Agent.
+    assert!(store.get_command(&third_id).unwrap().is_none());
+    assert_eq!(store.agent_count().unwrap(), 2);
+
+    // Another project still fits under the global cap.
+    let _other = launch_2c_root(
+        &mut store,
+        "other",
+        "prof-d",
+        stamped_2c_scopes("prof-d", "other", Some(3), Some(5), Some(5)),
+        now + 2,
+    );
+    assert_eq!(store.agent_count().unwrap(), 3);
+
+    // The global cap is now full: any new admission is refused by name.
+    let overflow = capacity_launch_request(
+        "other",
+        "prof-e",
+        stamped_2c_scopes("prof-e", "other", Some(3), Some(5), Some(5)),
+    );
+    let failure = store.submit("owner", overflow, now + 3).unwrap_err();
+    assert_eq!(failure.code, "capacity_unavailable");
+    assert!(
+        failure.message.contains("global:swarm"),
+        "{}",
+        failure.message
+    );
+    assert_eq!(store.agent_count().unwrap(), 3);
+    remove_capacity_store_files(&path);
+}
+
+#[test]
+fn worker_launch_counts_against_its_managers_project() {
+    let path = capacity_store_path();
+    let mut store = Store::open(&path).unwrap();
+    let now = Ulid::new().timestamp_ms() as i64;
+    let scopes = |profile: &str| stamped_2c_scopes(profile, "team", None, Some(5), Some(2));
+
+    let (_manager_launch, manager) = launch_2c_root(&mut store, "team", "mgr", scopes("mgr"), now);
+    // The idle manager itself occupies one assignment slot.
+    let (_first_launch, _first_worker) =
+        launch_2c_worker(&mut store, &manager, "team", "w1", scopes("w1"), now + 1);
+    assert_eq!(store.agent_count().unwrap(), 2);
+
+    // A new worker cannot evade the manager-assignment cap.
+    let overflow = {
+        let mut request = SubmitCommand::new(Ulid::new().to_string(), "launch");
+        request.args = json!({
+            "project": "team",
+            "workspace": "synthetic-workspace",
+            "harness": "codex",
+            "profile": "w2",
+            "parent": manager,
+            "profile_snapshot": {"capacity_scopes": scopes("w2")},
+        });
+        request.expected_generation = Some(0);
+        request
+    };
+    let failure = store.submit("owner", overflow, now + 2).unwrap_err();
+    assert_eq!(failure.code, "capacity_unavailable");
+    assert!(
+        failure.message.contains("manager_assignment:team"),
+        "{}",
+        failure.message
+    );
+    assert_eq!(store.agent_count().unwrap(), 2);
+    remove_capacity_store_files(&path);
+}
+
+#[test]
+fn lowered_cap_blocks_new_admissions_without_stopping_work() {
+    let path = capacity_store_path();
+    let mut store = Store::open(&path).unwrap();
+    let now = Ulid::new().timestamp_ms() as i64;
+    let (_first_launch, first) = launch_2c_root(
+        &mut store,
+        "proj",
+        "prof-a",
+        stamped_2c_scopes("prof-a", "proj", None, Some(3), None),
+        now,
+    );
+    let (_second_launch, second) = launch_2c_root(
+        &mut store,
+        "proj",
+        "prof-b",
+        stamped_2c_scopes("prof-b", "proj", None, Some(3), None),
+        now + 1,
+    );
+
+    // The Owner lowers the project cap from 3 to 2: new snapshots carry the
+    // new bound, and the next admission is refused.
+    let late = capacity_launch_request(
+        "proj",
+        "prof-c",
+        stamped_2c_scopes("prof-c", "proj", None, Some(2), None),
+    );
+    let failure = store.submit("owner", late, now + 2).unwrap_err();
+    assert_eq!(failure.code, "capacity_unavailable");
+    assert!(
+        failure.message.contains("project:proj"),
+        "{}",
+        failure.message
+    );
+
+    // Running work is untouched: both reservations stay live and non-terminal.
+    for agent in [first, second] {
+        let row = store.get_agent(&agent).unwrap().unwrap();
+        assert!(capacity_generation(&store, &agent).is_some());
+        assert!(!row.is_terminal(), "{agent} must keep running");
+    }
+    assert_eq!(store.agent_count().unwrap(), 2);
+    remove_capacity_store_files(&path);
+}
+
+#[test]
+fn unknown_reservation_keeps_project_scope_counted() {
+    let path = capacity_store_path();
+    let mut store = Store::open(&path).unwrap();
+    let now = Ulid::new().timestamp_ms() as i64;
+    let (first_id, first) = launch_2c_root(
+        &mut store,
+        "proj",
+        "prof-a",
+        stamped_2c_scopes("prof-a", "proj", None, Some(1), None),
+        now,
+    );
+    store.dispatch(&first_id, now + 1).unwrap();
+    store
+        .settle(
+            &first_id,
+            CommandState::Unknown,
+            Some(json!({"reason": "start_readback_unknown"})),
+            now + 2,
+        )
+        .unwrap();
+    store.recover_on_restart(now + 3).unwrap();
+    assert_eq!(
+        capacity_generation(&store, &first),
+        Some(1),
+        "retained unknown generation must keep its reservation"
+    );
+
+    // The retained reservation still occupies the project scope.
+    let late = capacity_launch_request(
+        "proj",
+        "prof-b",
+        stamped_2c_scopes("prof-b", "proj", None, Some(1), None),
+    );
+    let failure = store.submit("owner", late, now + 4).unwrap_err();
+    assert_eq!(failure.code, "capacity_unavailable");
+    assert!(
+        failure.message.contains("project:proj"),
+        "{}",
+        failure.message
+    );
+    assert_eq!(store.agent_count().unwrap(), 1);
+    remove_capacity_store_files(&path);
+}
+#[test]
+fn overview_totals_match_team_and_fleet_rows() {
+    let root = std::env::temp_dir().join(format!("eliot-overview-{}", Ulid::new()));
+    for name in ["checkout-a", "checkout-b", "common"] {
+        fs::create_dir_all(root.join(name)).unwrap();
+    }
+    let mut store = Store::open(&root.join("eliot.db")).unwrap();
+    let now = Ulid::new().timestamp_ms() as i64;
+    let unlimited =
+        |profile: &str, project: &str| stamped_2c_scopes(profile, project, None, None, None);
+    for project in ["team-a", "team-b"] {
+        let checkout = root.join("checkout-a");
+        store
+            .upsert_project_registration(
+                "owner",
+                &ProjectRegistrationInput {
+                    id: project.to_owned(),
+                    checkout: checkout.to_str().unwrap().to_owned(),
+                    repo_common_dir: root.join("common").to_str().unwrap().to_owned(),
+                    git: None,
+                    profiles: vec![
+                        "m1".to_owned(),
+                        "w1".to_owned(),
+                        "w2".to_owned(),
+                        "o1".to_owned(),
+                    ],
+                    actions: vec![
+                        "launch".to_owned(),
+                        eliot_core::api::PROJECT_ASSIGNMENT_CLAIM_ACTION.to_owned(),
+                    ],
+                    interpreters: std::collections::BTreeMap::new(),
+                    run_env: Vec::new(),
+                },
+                now,
+            )
+            .unwrap();
+    }
+
+    // team-b first: one agent whose unknown start is retained across the
+    // restart below, so the later live team is untouched by the recovery.
+    let (lost_launch, _lost) = launch_2c_root(
+        &mut store,
+        "team-b",
+        "o1",
+        unlimited("o1", "team-b"),
+        now + 1,
+    );
+    store.dispatch(&lost_launch, now + 2).unwrap();
+    store
+        .settle(
+            &lost_launch,
+            CommandState::Unknown,
+            Some(json!({"reason": "start_readback_unknown"})),
+            now + 3,
+        )
+        .unwrap();
+    store.recover_on_restart(now + 4).unwrap();
+
+    // team-a: one claimed manager plus two live workers.
+    let (manager_launch, manager) = launch_2c_root(
+        &mut store,
+        "team-a",
+        "m1",
+        unlimited("m1", "team-a"),
+        now + 5,
+    );
+    drive_2c_idle(&mut store, &manager, &manager_launch, now + 6);
+    store
+        .claim_project_manager(
+            &format!("agent:{manager}:1"),
+            &eliot_core::api::ProjectAssignmentClaimRequest {
+                id: Ulid::new().to_string(),
+                project: "team-a".to_owned(),
+                manager: None,
+            },
+            now + 7,
+        )
+        .unwrap();
+    let (_w1_launch, first_worker) = launch_2c_worker(
+        &mut store,
+        &manager,
+        "team-a",
+        "w1",
+        unlimited("w1", "team-a"),
+        now + 8,
+    );
+    let (_w2_launch, second_worker) = launch_2c_worker(
+        &mut store,
+        &manager,
+        "team-a",
+        "w2",
+        unlimited("w2", "team-a"),
+        now + 9,
+    );
+
+    // One observed native child of the team-a manager, listed separately.
+    let mut attach = SubmitCommand::new(Ulid::new().to_string(), "attach");
+    attach.args = json!({
+        "mode": "observe",
+        "profile": "obs",
+        "harness": "codex",
+        "native_scope": "obs-scope",
+        "native_ref": "obs-ref",
+        "profile_snapshot": {"harness": "codex"},
+        "project": "team-a",
+    });
+    let child = store
+        .submit("owner", attach, now + 10)
+        .unwrap()
+        .command
+        .target
+        .expect("attach target");
+    let manager_num = eliot_core::parse_agent_id(&manager).unwrap();
+    let child_num = eliot_core::parse_agent_id(&child).unwrap();
+    store
+        .connection
+        .execute(
+            "INSERT INTO native_child_registrations(producer, producer_generation, parent, parent_generation, registration_id, child, request, ack) VALUES (?1, 1, ?2, 1, 'obs-reg', ?3, '{}', '{}')",
+            rusqlite::params![manager_num, manager_num, child_num],
+        )
+        .unwrap();
+
+    let limits = eliot_core::api::ScopeLimits {
+        global: Some(4),
+        projects: [
+            (
+                "team-a".to_owned(),
+                eliot_core::api::ProjectScopeLimits {
+                    project: Some(2),
+                    manager_assignment: Some(3),
+                },
+            ),
+            (
+                "team-b".to_owned(),
+                eliot_core::api::ProjectScopeLimits {
+                    project: Some(1),
+                    manager_assignment: Some(1),
+                },
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    };
+    let data = store.fleet_overview_data(&limits).unwrap();
+    assert!(!data.truncated);
+
+    assert_eq!(data.teams.len(), 2);
+    let team_a = &data.teams[0];
+    let team_b = &data.teams[1];
+    assert_eq!(team_a.project, "team-a");
+    assert_eq!(team_b.project, "team-b");
+
+    // team-a: the manager plus both workers are live holders; the queue holds
+    // the two undispatched worker launches and the observer attach.
+    let team_manager = team_a.manager.as_ref().expect("team-a manager");
+    assert_eq!(team_manager.agent, manager);
+    assert_eq!(team_manager.generation, 1);
+    assert_eq!(team_a.worker_total, 2);
+    assert_eq!(team_a.workers.len(), 2);
+    assert!(
+        team_a
+            .workers
+            .iter()
+            .any(|worker| worker.agent == first_worker)
+    );
+    assert!(
+        team_a
+            .workers
+            .iter()
+            .any(|worker| worker.agent == second_worker)
+    );
+    assert_eq!(team_a.totals.live, 3);
+    assert_eq!(team_a.totals.active_turns, 0);
+    assert_eq!(team_a.totals.retained_unknown, 0);
+    assert_eq!(team_a.totals.queued, 3);
+    assert_eq!(team_a.queue, 3);
+    assert_eq!(team_a.capacity.len(), 2);
+    assert_eq!(team_a.capacity[0].scope, "project:team-a");
+    assert_eq!(team_a.capacity[0].usage, 3);
+    assert_eq!(team_a.capacity[0].limit, Some(2));
+    assert_eq!(team_a.capacity[1].scope, "manager_assignment:team-a");
+    assert_eq!(team_a.capacity[1].usage, 3);
+    assert_eq!(team_a.capacity[1].limit, Some(3));
+
+    // team-b: no live team left, but the retained unknown reservation stays
+    // counted against its project scope.
+    assert!(team_b.manager.is_none());
+    assert_eq!(team_b.worker_total, 0);
+    assert!(team_b.workers.is_empty());
+    assert_eq!(team_b.totals.live, 0);
+    assert_eq!(team_b.totals.retained_unknown, 1);
+    assert_eq!(team_b.queue, 0);
+    assert_eq!(team_b.capacity[0].usage, 1);
+    assert_eq!(team_b.capacity[0].limit, Some(1));
+
+    // Fleet totals match the team rows: every holder is counted exactly once,
+    // and the observed native child is listed separately.
+    assert_eq!(data.live_harnesses, 3);
+    assert_eq!(data.live_by_harness.len(), 1);
+    assert_eq!(data.live_by_harness[0].harness, "codex");
+    assert_eq!(data.live_by_harness[0].total, 3);
+    assert_eq!(data.active_turns, 0);
+    assert_eq!(data.queued_work, 3);
+    assert_eq!(data.retained_unknown, 1);
+    assert_eq!(data.global_usage, 4);
+    assert_eq!(data.native_child_total, 1);
+    assert_eq!(data.native_children.len(), 1);
+    assert_eq!(data.native_children[0].child, child);
+    assert_eq!(data.native_children[0].project, "team-a");
+    assert_eq!(data.live_harnesses, team_a.totals.live + team_b.totals.live);
+    assert_eq!(
+        data.retained_unknown,
+        team_a.totals.retained_unknown + team_b.totals.retained_unknown
+    );
+    assert_eq!(
+        data.queued_work,
+        team_a.totals.queued + team_b.totals.queued
+    );
+    drop(data);
+    drop(store);
+    fs::remove_dir_all(&root).unwrap();
+}
