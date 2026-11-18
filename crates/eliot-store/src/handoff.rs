@@ -24,9 +24,6 @@ impl Store {
     ) -> Result<Option<HandoffResponse>> {
         self.ensure_committed_reads()?;
         request.validate()?;
-        if principal != "owner" {
-            return Err(Error::new("not_allowed", "only Owner may hand off tasks"));
-        }
         let digest = canonical::digest(
             &serde_json::to_value(request)
                 .map_err(|_| Error::new("internal", "cannot encode handoff"))?,
@@ -40,7 +37,10 @@ impl Store {
                     "handoff id used by another write",
                 ));
             }
-            return Ok(None);
+            if principal == "owner" || principal.starts_with("agent:") {
+                return Ok(None);
+            }
+            return Err(Error::new("not_allowed", "only Owner may hand off tasks"));
         };
         if p != principal || method != METHOD || binding != digest {
             return Err(Error::new("id_conflict", "handoff id has another binding"));
@@ -106,12 +106,6 @@ impl Store {
         now: i64,
     ) -> Result<Change<CommandCancelResponse>> {
         request.validate()?;
-        if principal != "owner" {
-            return Err(Error::new(
-                "not_allowed",
-                "only Owner may withdraw a handoff input",
-            ));
-        }
         let digest = canonical::digest(&json!({"command_id":request.command_id}))?;
         let tx = self
             .connection
@@ -139,20 +133,93 @@ impl Store {
         let record = load_command_record(&tx, &request.command_id)?
             .ok_or_else(|| Error::new("not_found", "input missing"))?;
         let eligible:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM commands c JOIN commands p ON p.id=c.parent_command WHERE c.id=?1 AND c.link_kind='handoff' AND p.method='swarm.handoff')",[&request.command_id],|row|row.get(0)).map_err(sql_error)?;
-        if !eligible {
-            return Err(Error::new(
-                "bad_state",
-                "command.cancel supports only handoff SEND children; launch/resume inputs and ordinary commands cannot be withdrawn",
-            ));
-        }
-        if record.command.verb != "send"
-            || !matches!(record.state, CommandState::Accepted | CommandState::Queued)
-        {
-            return Err(Error::new(
-                "bad_state",
-                "cancel requires an undispatched handoff SEND",
-            ));
-        }
+        let selector_eligible: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM commands c JOIN commands p ON p.id=c.parent_command WHERE c.id=?1 AND c.link_kind='selector' AND p.selector IS NOT NULL)",[&request.command_id],|row|row.get(0)).map_err(sql_error)?;
+        let reason = if principal == "owner" {
+            if !eligible {
+                return Err(Error::new(
+                    "bad_state",
+                    "command.cancel supports only handoff SEND children; launch/resume inputs and ordinary commands cannot be withdrawn",
+                ));
+            }
+            if record.command.verb != "send"
+                || !matches!(record.state, CommandState::Accepted | CommandState::Queued)
+            {
+                return Err(Error::new(
+                    "bad_state",
+                    "cancel requires an undispatched handoff SEND",
+                ));
+            }
+            "owner_handoff_no_effect"
+        } else {
+            // A manager may cancel a send it issued itself while still
+            // accepted/queued, before dispatch. The target must be in the
+            // caller's controlled scope; dispatched work is never withdrawn.
+            let caller = hierarchy::parse_caller(&tx, principal)?;
+            let caller_num = match &caller {
+                hierarchy::Caller::Agent { num, .. } => *num,
+                _ => {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "only Owner may withdraw a handoff input",
+                    ));
+                }
+            };
+            let caller_agent = load_agent_by_num(&tx, caller_num)?.ok_or_else(|| {
+                Error::new("stale_generation", "caller generation is no longer current")
+            })?;
+            observer::require_controlled(&caller_agent)?;
+            if record.command.principal != principal {
+                return Err(Error::new(
+                    "not_allowed",
+                    "only the send issuer may cancel its queued input",
+                ));
+            }
+            let target_num = record
+                .target
+                .ok_or_else(|| Error::new("source_integrity", "input target missing"))?;
+            let target_agent = load_agent_by_num(&tx, target_num)?
+                .ok_or_else(|| Error::new("not_found", "cancel target is no longer retained"))?;
+            observer::require_controlled(&target_agent)?;
+            hierarchy::caller_may_command(&tx, &caller, &target_agent)?;
+            let ordinary: bool = tx
+                .query_row(
+                    "SELECT parent_command IS NULL AND link_kind IS NULL FROM commands WHERE id=?1",
+                    [&request.command_id],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error)?;
+            if selector_eligible {
+                let parent_principal: String = tx
+                    .query_row(
+                        "SELECT p.principal FROM commands c JOIN commands p ON p.id=c.parent_command WHERE c.id=?1",
+                        [&request.command_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(sql_error)?;
+                if parent_principal != principal {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "only the send issuer may cancel its queued input",
+                    ));
+                }
+            }
+            if !eligible && !ordinary && !selector_eligible {
+                return Err(Error::new(
+                    "bad_state",
+                    "command.cancel supports only own handoff SEND children, own ordinary SENDs and own selector SEND children; launch/resume inputs cannot be withdrawn",
+                ));
+            }
+            if record.command.verb != "send"
+                || !matches!(record.state, CommandState::Accepted | CommandState::Queued)
+                || record.command.turn_id.is_some()
+            {
+                return Err(Error::new(
+                    "bad_state",
+                    "cancel requires an undispatched SEND",
+                ));
+            }
+            "manager_cancel_no_effect"
+        };
         let mut events = Vec::new();
         cancel_pending_command_tx(
             &tx,
@@ -164,7 +231,7 @@ impl Store {
                 .generation
                 .ok_or_else(|| Error::new("source_integrity", "input generation missing"))?,
             &request.command_id,
-            "owner_handoff_no_effect",
+            reason,
             now,
             &mut events,
         )?;
@@ -197,9 +264,25 @@ pub(super) fn handoff_tx(
     limits: core::api::HierarchyLimits,
 ) -> Result<HandoffAdmission> {
     request.validate()?;
-    if principal != "owner" {
-        return Err(Error::new("not_allowed", "only Owner may hand off tasks"));
-    }
+    // Owner hands off anywhere with claims, Goal and children. A manager may
+    // hand off only between two workers in its own controlled scope, never
+    // itself, transferring only task inputs it issued itself. Agent handoffs
+    // never move children, claims or Goals; moving children stays Owner-only.
+    let manager_caller = if principal == "owner" {
+        None
+    } else {
+        let caller = hierarchy::parse_caller(tx, principal)?;
+        match &caller {
+            hierarchy::Caller::Owner => None,
+            hierarchy::Caller::Agent { num, .. } => {
+                let caller_agent = load_agent_by_num(tx, *num)?.ok_or_else(|| {
+                    Error::new("stale_generation", "caller generation is no longer current")
+                })?;
+                observer::require_controlled(&caller_agent)?;
+                Some(caller)
+            }
+        }
+    };
     let payload = serde_json::to_value(request)
         .map_err(|_| Error::new("internal", "cannot encode handoff"))?;
     let digest = canonical::digest(&payload)?;
@@ -249,6 +332,18 @@ pub(super) fn handoff_tx(
             "handoff must stay in one project",
         ));
     }
+    if let Some(hierarchy::Caller::Agent { id: caller_id, .. }) = &manager_caller
+        && (request.from == *caller_id || request.to == *caller_id)
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "handoff endpoints must be workers, not the caller",
+        ));
+    }
+    if let Some(caller) = &manager_caller {
+        hierarchy::caller_may_command(tx, caller, &from)?;
+        hierarchy::caller_may_command(tx, caller, &to)?;
+    }
     project_transfer::require_no_intent(tx, &from.project)?;
     project_transfer::require_no_intent(tx, &to.project)?;
     quiescent(tx, &from, false)?;
@@ -262,6 +357,12 @@ pub(super) fn handoff_tx(
         return Err(Error::new(
             "invalid",
             "original task must be a SEND on A's exact generation",
+        ));
+    }
+    if manager_caller.is_some() && task.principal != principal {
+        return Err(Error::new(
+            "not_allowed",
+            "handoff transfers only SENDs issued by the caller",
         ));
     }
     let mut originals = Vec::new();
@@ -287,6 +388,12 @@ pub(super) fn handoff_tx(
                 "selected work is not an undispatched plain SEND on A",
             ));
         }
+        if manager_caller.is_some() && c.principal != principal {
+            return Err(Error::new(
+                "not_allowed",
+                "handoff transfers only SENDs issued by the caller",
+            ));
+        }
         if policy.contains_value(&c.args) {
             return Err(Error::new(
                 "secret_in_payload",
@@ -297,24 +404,39 @@ pub(super) fn handoff_tx(
     }
     let (brief_text, brief_truncated) = brief::build(tx, request, &task, policy)?;
     let mut events = Vec::new();
-    let (claims, claim_conflicts, conflicts_truncated) =
-        attribution::transfer_claims_tx(tx, &from, &to, policy, now, &mut events)?;
-    let goal_revision = goals::transfer_goal_tx(tx, &from, &to, policy, now, &mut events)?;
-    let moved = reparent::reparent_tx(
-        tx,
-        &ReparentRequest {
-            id: request.id.clone(),
-            agent: None,
-            children_of: Some(from.id.clone()),
-            expected_generation: from.generation,
-            parent: to.id.clone(),
-            parent_generation: to.generation,
-        },
-        limits,
-        now,
-        false,
-    )?;
-    events.extend(moved.events);
+    // Agent authority never widens: an Agent handoff transfers only task
+    // inputs the caller issued itself. Claims, Goals and children stay put;
+    // moving children stays Owner-only.
+    let (claims, claim_conflicts, conflicts_truncated, goal_revision, reparented) =
+        if manager_caller.is_some() {
+            (Vec::new(), Vec::new(), false, None, Vec::new())
+        } else {
+            let (claims, claim_conflicts, conflicts_truncated) =
+                attribution::transfer_claims_tx(tx, &from, &to, policy, now, &mut events)?;
+            let goal_revision = goals::transfer_goal_tx(tx, &from, &to, policy, now, &mut events)?;
+            let moved = reparent::reparent_tx(
+                tx,
+                &ReparentRequest {
+                    id: request.id.clone(),
+                    agent: None,
+                    children_of: Some(from.id.clone()),
+                    expected_generation: from.generation,
+                    parent: to.id.clone(),
+                    parent_generation: to.generation,
+                },
+                limits,
+                now,
+                false,
+            )?;
+            events.extend(moved.events);
+            (
+                claims,
+                claim_conflicts,
+                conflicts_truncated,
+                goal_revision,
+                moved.value.moved,
+            )
+        };
     let brief_command = Ulid::new().to_string();
     let transfers: Vec<SendTransfer> = originals
         .iter()
@@ -339,7 +461,7 @@ pub(super) fn handoff_tx(
         claim_conflicts,
         conflicts_truncated,
         goal_revision,
-        reparented: moved.value.moved,
+        reparented,
         brief_truncated,
         brief_state: CommandState::Accepted,
         successor_gate: "queued_until_brief_applied".into(),
@@ -380,13 +502,23 @@ pub(super) fn handoff_tx(
         let mut child = SubmitCommand::new(id.clone(), "send");
         child.target = Some(to.id.clone());
         child.expected_generation = Some(to.generation);
-        child.args = if ordinal == 0 {
-            json!({"text":brief_text})
+        let (child_principal, args) = if ordinal == 0 {
+            (principal, json!({"text":brief_text}))
         } else {
-            originals[ordinal - 1].args.clone()
+            let original = &originals[ordinal - 1];
+            (original.principal.as_str(), original.args.clone())
         };
+        child.args = args;
         let child_digest = admission::command_payload_digest(&child)?;
-        admission::admit_send_member(tx, principal, &child, &child_digest, &to, now, &mut events)?;
+        admission::admit_send_member(
+            tx,
+            child_principal,
+            &child,
+            &child_digest,
+            &to,
+            now,
+            &mut events,
+        )?;
         tx.execute(
             "UPDATE commands SET parent_command=?1,link_kind='handoff',ordinal=?2 WHERE id=?3",
             params![request.id, ordinal as i64, id],

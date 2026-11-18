@@ -438,7 +438,7 @@ command id frozen at claim. Stored Goal responses/round records use Core
 | `swarm.digest` | durable digest over a frozen child set delivering one coalesced parent mailbox result with the standard mail wake |
 | `command.resolve`, `turn.resolve` | constrained Owner resolution of unknown outcomes; failed handoff brief may be Owner-applied |
 | `swarm.switch` | Owner launch-plus-handoff to a new Agent, using normal launch and the H2 transfer |
-| `swarm.handoff`, `command.cancel` | atomic task transfer to an existing Agent; Owner withdrawal of undispatched handoff input |
+| `swarm.handoff`, `command.cancel` | atomic task transfer to an existing Agent; Owner or issuing-manager withdrawal of undispatched SEND |
 | `command.children` | implemented scoped, paged child readback for a retained expansion |
 | `project.list/get` | owner-only read of registered project authority |
 | `launch.enqueue` | Owner or Agent submits an explicit durable launch intent |
@@ -1530,13 +1530,18 @@ swarm [--id ULID] reparent --children-of MANAGER_A --parent MANAGER_B --generati
 `swarm.handoff` implements the existing-Agent task transfer in
 [Coordination](coordination.md#task-handoff-to-an-existing-agent-implemented).
 [`HandoffRequest` / `HandoffResponse`](../../crates/eliot-core/src/api/handoff.rs)
-are the sole wire shapes. Owner names exact source/destination generations, one
-retained original-task SEND on A's generation, and at most 64 distinct plain
+are the sole wire shapes. The Owner names exact source/destination generations anywhere;
+a manager may hand off only between two workers in its own controlled scope (neither
+endpoint is the caller itself), and `reparent`/`switch` stay Owner-only. The caller
+names one retained original-task SEND on A's generation, and at most 64 distinct plain
 accepted/queued SEND IDs in successor order (also subject to the configured
-selector-target bound). All current live claims, the transferable Eliot Goal
-(paused on B), and all children transfer together. Active/unknown turns, pending
-requests, dispatched/unknown commands, transitions or unresolved Goal rounds refuse;
-B must have no open work. When a Goal transfers, B may have only a cleared Goal. Same-project and shared re-parent
+selector-target bound). An Agent handoff transfers only SENDs the caller issued
+itself (each successor keeps the original issuer's principal and rights) and
+never moves children, claims or Goals; an Owner handoff transfers all
+current live claims, the transferable Eliot Goal (paused on B), and all children
+together. Active/unknown turns, pending requests, dispatched/unknown commands,
+transitions or unresolved Goal rounds refuse; B must have no open work. When a Goal
+transfers, B may have only a cleared Goal. Same-project and shared re-parent
 invariants apply. No partial Store transfer commits.
 
 The result names the applied Store-only parent, brief/ordered child ULIDs,
@@ -1554,14 +1559,17 @@ swarm [--id ULID] handoff A --to B --generation N --to-generation M --task-comma
 swarm [--id ULID] cmd cancel HANDOFF_INPUT_ID
 ```
 
-`command.cancel {id,command_id}` is Owner-only and implemented only for
-accepted/queued SEND children of a handoff. It atomically records no-effect
-cancellation and a retained mutation reply; ordinary, dispatched and unknown
-commands refuse with `bad_state`. Launch/resume inputs, including `<id>/send`,
-are outside this cancellation scope even while queued; the refusal names this
-restriction. It never interrupts a native turn. `command.resolve` can release
+`command.cancel {id,command_id}` atomically records no-effect cancellation and a
+retained mutation reply. The Owner may withdraw accepted/queued SEND children of a
+handoff; ordinary, dispatched and unknown commands refuse with `bad_state` for the
+Owner. A manager may cancel a `send` it issued itself while still accepted/queued
+in its controlled scope (handoff child, ordinary SEND or own selector SEND child),
+with no effect once dispatched; another manager's worker, a foreign issuer, or a
+dispatched command refuses (`not_allowed`/`bad_state`). Launch/resume inputs,
+including `<id>/send`, are outside this cancellation scope even while queued; the
+refusal names this restriction. It never interrupts a native turn. `command.resolve` can release
 an unknown brief, or narrowly assert a failed handoff brief applied, without a
-resend. These Owner recovery operations remain available during drain. MCP
+resend. These recovery operations remain available during drain. MCP
 advertises both mutations and mints omitted IDs using its normal rules.
 
 `swarm.switch` implements Owner launch-plus-handoff to a new Agent, including a

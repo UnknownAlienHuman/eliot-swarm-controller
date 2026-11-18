@@ -182,7 +182,9 @@ below. Only owner/global automation writes
 global vars. Agent-launched children stay within parental Eliot scope; a frozen
 Owner-written `child_profiles` entry explicitly grants a different harness's own
 native policy, as defined under [Claims and hierarchy](#claims-and-hierarchy). Only the Owner
-may grant a different manager control through [Handoff](#handoff). A native child without isolated
+may grant a different manager control through [reparent](#change-the-manager-implemented);
+[Handoff](#task-handoff-to-an-existing-agent-implemented) between two workers of the same
+manager needs only that manager's own controlled scope. A native child without isolated
 environment has no independent Eliot principal; calls from its parent environment are
 attributed to that parent and this limitation is shown.
 
@@ -652,17 +654,25 @@ is an unknown observation until that readback; there is no native effect to repl
 
 ### Task handoff to an existing Agent (implemented)
 
-`swarm.handoff` is one Owner operation bound to explicit A/B generations, an explicit
+`swarm.handoff` is one Owner-or-manager operation bound to explicit A/B generations, an explicit
 original-task SEND command ID and an ordered set of at most 64 distinct undispatched
 SEND IDs, also bounded by the configured selector-target limit. The sole DTOs live in
 [`api/handoff.rs`](../../crates/eliot-core/src/api/handoff.rs). Empty selection transfers
-context, claims, Goal and children without successor task inputs.
+context (Owner: plus claims, Goal and children) without successor task inputs; an
+Agent empty selection transfers context only.
 Refuse rather than implicitly wait while A has an active/unknown turn, pending
 request, dispatched/unknown command, generation transition or running/unknown Goal
 round reservation. B must be controlled, nonterminal, same-scope (the
 authorization scope, `COALESCE(project_scope, project)`) and cleanly idle
 under the existing input/unknown gates. Explicitly retry after quiescence with a new
 operation ID only if the previous operation was definitely rejected before admission.
+Authority never widens: the Owner hands off anywhere, while a manager may hand off
+only between two workers in its own controlled scope (both endpoints pass the
+frozen `control` scope check, and neither endpoint is the caller itself). An
+Agent handoff transfers only task inputs the caller issued itself (Owner-issued
+or other-principal SENDs refuse; each successor keeps the original issuer's
+principal and rights) and never moves children, claims or Goals;
+moving children stays Owner-only. `reparent` and `switch` stay Owner-only.
 
 Only plain `send` commands in `accepted|queued` state are transferable. Never transfer
 in-flight, unknown, turn/request-bound controls or queued context injections; reject
@@ -677,26 +687,29 @@ inputs, not a second work queue. Successor IDs and ordinals are frozen at admiss
 their native dispatch uses the ordinary router after commit. Unselected work stays
 on A; stopping A is a separate explicit command.
 
-In that transaction, release A-generation claims and recreate all live
-globs/notes on B's generation with their exact remaining expiry, reporting advisory
-conflicts. All live A-generation claims transfer; expired and old-generation claims do
-not. An exact live destination glob collision or destination claim-cap overflow rejects
-the operation rather than overwriting B's claim. Known secrets in notes are redacted;
-known-secret identifiers refuse the transfer.
-Claims never prove ownership or silently reassign work. Transfer only a quiescent
-Eliot Goal when B has none: clear A's Goal and install its definition/budgets/counters
-paused on B's generation with a new revision and no inherited idle/round key. A cleared
-destination Goal row may supply the next revision; another destination Goal refuses.
-Completed/cleared source Goals stay historical; a blocked source Goal refuses until
-explicitly reset or cleared, so handoff cannot bypass its block. Without a transferable
-source Goal, B keeps its own Goal unchanged. A private additive used-turn baseline
-preserves consumed turns and charges each subsequent B turn immediately, including
-across another handoff. Cadence re-anchors at handoff; reserved continuations and
-running/unknown Goal markers on either Agent refuse. Explicit
+In that transaction, an Owner handoff releases A-generation claims and recreates all
+live globs/notes on B's generation with their exact remaining expiry, reporting
+advisory conflicts. All live A-generation claims transfer; expired and old-generation
+claims do not. An exact live destination glob collision or destination claim-cap
+overflow rejects the operation rather than overwriting B's claim. Known secrets in
+notes are redacted; known-secret identifiers refuse the transfer. An Agent handoff
+transfers no claims: live claims stay on A.
+Claims never prove ownership or silently reassign work. An Owner handoff transfers
+only a quiescent Eliot Goal when B has none: clear A's Goal and install its
+definition/budgets/counters paused on B's generation with a new revision and no
+inherited idle/round key. A cleared destination Goal row may supply the next revision;
+another destination Goal refuses. Completed/cleared source Goals stay historical; a
+blocked source Goal refuses until explicitly reset or cleared, so handoff cannot
+bypass its block. Without a transferable source Goal, B keeps its own Goal unchanged.
+An Agent handoff transfers no Goal: both Goals stay put. A private additive used-turn
+baseline preserves consumed turns and charges each subsequent B turn immediately,
+including across another handoff. Cadence re-anchors at handoff; reserved continuations
+and running/unknown Goal markers on either Agent refuse. Explicit
 resume is required; reserved/unknown continuations are never copied. Native Goals
-remain `unsupported` until the relevant adapters expose them. Transfer children
-through the same re-parent validation/transaction helper and its limits, not new
-ownership records. Any validation failure rolls back all these Store changes.
+remain `unsupported` until the relevant adapters expose them. An Owner handoff
+transfers children through the same re-parent validation/transaction helper and its
+limits, not new ownership records; an Agent handoff never moves children. Any
+validation failure rolls back all these Store changes.
 
 The first successor input is one bounded handoff brief, admitted as ordinary `send`
 to B's exact generation. It contains the original task text from the named retained
@@ -720,8 +733,11 @@ leave successors queued. Automatic native loss/restart preserves these withheld 
 even when B becomes terminal. Owner may assert an unknown brief applied via
 `command.resolve`; the same Owner assertion is narrowly available for a failed
 handoff brief. It records `resolution_source=owner`, invents no native receipt and
-never resends input. Owner can instead withdraw each accepted/queued handoff input
-with `command.cancel`; dispatched/unknown input cannot be cancelled. Explicit
+never resends input. The Owner can withdraw each accepted/queued handoff input
+with `command.cancel`; a manager may cancel a `send` it issued itself while still
+accepted/queued in its controlled scope (handoff child, ordinary SEND or own
+selector SEND child), with no effect once dispatched.
+Dispatched/unknown input cannot be cancelled. Explicit
 generation/stop lifecycle cancellation keeps its ordinary no-effect semantics.
 The parent result updates only `brief_state` and `successor_gate` as delivery settles;
 its original transfer identities and component facts remain fixed. `command.children`
