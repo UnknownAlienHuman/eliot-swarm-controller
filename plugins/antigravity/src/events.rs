@@ -805,6 +805,9 @@ impl State {
                 .await;
         }
         publication?;
+        self.tools
+            .entry(ask.tool_call_id)
+            .or_insert((ask.title, "pending".to_owned()));
         if let Some(command_id) = self.cancellation_for_pending().map(str::to_owned) {
             self.answer_pending_cancelled(client, &command_id, Some(&turn_id))
                 .await;
@@ -1343,7 +1346,13 @@ impl State {
         if self.load_request_id.is_some() {
             return Ok(());
         }
+        let idle_after_turn = self.pending.is_none() && self.last_turn.is_some();
         match update {
+            // AGY can continue natively when an asynchronous tool finishes
+            // after the fenced terminal reply. Idle output has no Eliot turn.
+            AcpUpdate::MessageChunk { .. } | AcpUpdate::ToolCall { .. } if idle_after_turn => {
+                Ok(())
+            }
             AcpUpdate::MessageChunk { text } => {
                 self.associate().await?;
                 if !self.text_truncated {
@@ -1400,9 +1409,21 @@ impl State {
                 title,
                 status,
             } => {
+                if tool_call_id.trim().is_empty() {
+                    return Err(Error::new(
+                        "native_protocol",
+                        "Antigravity tool call id is absent",
+                    ));
+                }
+                // ACP deltas update an existing call. AGY can finish an
+                // asynchronous tool after its prompt has already ended.
+                // Only calls introduced in the current prompt can receive
+                // turn events or establish its association.
+                if self.pending.is_none() || !self.tools.contains_key(&tool_call_id) {
+                    return Ok(());
+                }
                 self.merge_tool(&tool_call_id, title.as_deref().unwrap_or(""), &status);
-                let (_, merged_status) = self.tools.get(&tool_call_id).cloned().unwrap_or_default();
-                match merged_status.as_str() {
+                match self.tools[&tool_call_id].1.as_str() {
                     "pending" => Ok(()),
                     "in_progress" => {
                         self.tool_event(&tool_call_id, "tool.started", "running")
@@ -1645,37 +1666,36 @@ impl State {
         Ok(())
     }
 
-    /// Settle a failed `session/prompt` call. An unassociated dispatch
-    /// failure (e.g. rejected before admission) withdraws the pending turn
-    /// and reports that exact error; anything after association loses the
-    /// stream honestly instead of inventing a terminal fact.
+    /// A correlated ACP validation refusal can withdraw an unassociated
+    /// prompt. All other errors leave delivery or settlement unproven.
     pub async fn fail_prompt(&mut self, error: Error) {
         if self.failure.is_some() {
             return;
         }
-        self.clear_fenced();
-        let unassociated = self
-            .pending
-            .as_ref()
-            .is_some_and(|pending| !pending.associated);
-        self.fail_pending_steer(Error::new(
-            if unassociated {
-                "stale_turn"
-            } else {
-                "unknown"
-            },
-            "Antigravity prompt ended before PreInvocation confirmed steer",
-        ));
-        if unassociated {
+        if error.code == "native_rejected"
+            && self
+                .pending
+                .as_ref()
+                .is_some_and(|pending| !pending.associated)
+        {
+            self.clear_fenced();
+            self.fail_pending_steer(Error::new(
+                "stale_turn",
+                "Antigravity prompt was rejected before admission",
+            ));
             if let Some(mut pending) = self.pending.take()
                 && let Some(reply) = pending.reply.take()
             {
-                self.settlement = Some((pending.turn.clone(), "unknown".to_owned()));
                 let _ = reply.send(Err(error));
             }
             return;
         }
-        self.lose(&error.message).await;
+        let reason = if error.code == "native_rejected" {
+            "Antigravity refused a prompt with committed progress"
+        } else {
+            &error.message
+        };
+        self.lose(reason).await;
     }
 
     pub async fn ended(&mut self) -> Result<()> {
@@ -2356,6 +2376,84 @@ mod tests {
         result.unwrap();
         association.await.unwrap().unwrap();
         assert!(state.text_accum.is_empty());
+        finish(tasks).await;
+    }
+
+    #[tokio::test]
+    async fn post_turn_output_is_ignored_and_late_tool_delta_cannot_associate_the_follow_up() {
+        let (mut state, mut commits, tasks) = state_with_commits();
+        let first = state.prepare("command-1".into(), "turn-1".into()).unwrap();
+        let tool = json!({"sessionId": "session-1", "update": {
+            "sessionUpdate": "tool_call", "toolCallId": "async-1", "status": "in_progress"}});
+        let late = json!({"sessionId": "session-1", "update": {
+            "sessionUpdate": "tool_call_update", "toolCallId": "async-1", "status": "completed"}});
+        let prompt: PromptResult =
+            serde_json::from_value(json!({"stopReason":"end_turn"})).unwrap();
+        let (result, ()) = tokio::join!(
+            async {
+                state.update(&tool).await?;
+                state.settle_prompt(&prompt).await
+            },
+            async {
+                for kind in ["turn.started", "tool.started", "turn.completed"] {
+                    let (event, ack) = next_commit(&mut commits, kind).await;
+                    assert_eq!(event["data"]["turn_id"], "turn-1");
+                    ack.send(()).unwrap();
+                }
+            }
+        );
+        result.unwrap();
+        first.await.unwrap().unwrap();
+
+        state.update(&json!({"sessionId": "session-1", "update": {
+            "sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Async tool finished"}}}))
+            .await.unwrap();
+        state
+            .update(&json!({"sessionId": "session-1", "update": {
+            "sessionUpdate": "tool_call", "toolCallId": "background", "status": "in_progress"}}))
+            .await
+            .unwrap();
+        state.update(&late).await.unwrap();
+        let mut second = state.prepare("command-2".into(), "turn-2".into()).unwrap();
+        state.update(&late).await.unwrap();
+        assert!(matches!(
+            second.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(commits.try_recv().is_err());
+
+        let (result, ()) = tokio::join!(state.settle_prompt(&prompt), async {
+            for kind in ["turn.started", "turn.completed"] {
+                let (event, ack) = next_commit(&mut commits, kind).await;
+                assert_eq!(event["data"]["turn_id"], "turn-2");
+                assert_eq!(event["data"]["command_id"], "command-2");
+                ack.send(()).unwrap();
+            }
+        });
+        result.unwrap();
+        second.await.unwrap().unwrap();
+        assert!(!state.source_unknown);
+        finish(tasks).await;
+    }
+
+    #[tokio::test]
+    async fn only_pre_admission_validation_refusal_withdraws_a_prompt() {
+        let (mut state, _, tasks) = state_with_commits();
+        let rejected = state.prepare("command-1".into(), "turn-1".into()).unwrap();
+        state
+            .fail_prompt(Error::new("native_rejected", "invalid params"))
+            .await;
+        assert_eq!(rejected.await.unwrap().unwrap_err().code, "native_rejected");
+        assert!(state.pending.is_none());
+        assert!(!state.source_unknown);
+
+        let uncertain = state.prepare("command-2".into(), "turn-2".into()).unwrap();
+        state
+            .fail_prompt(Error::new("unknown", "unclassified ACP error"))
+            .await;
+        assert_eq!(uncertain.await.unwrap().unwrap_err().code, "unknown");
+        assert_eq!(state.active_turn(), Some("turn-2"));
+        assert!(state.source_unknown);
         finish(tasks).await;
     }
 
