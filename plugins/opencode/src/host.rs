@@ -1338,14 +1338,16 @@ impl OpenCodePlugin {
         let effective_model = created
             .model
             .as_ref()
-            .map(|model| format!("{}/{}", model.provider_id.trim(), model.id.trim()));
+            .map(|model| format!("{}/{}", model.provider_id, model.id));
         // An omitted request accepts the configured native default as
         // effective; an explicit request must match exactly. A requested
         // effort must echo as the native variant.
-        let model_verified = parsed
-            .requested_model
-            .as_deref()
-            .is_none_or(|requested| effective_model.as_deref() == Some(requested));
+        let model_verified = parsed.requested_model.as_deref().is_none_or(|requested| {
+            created
+                .model
+                .as_ref()
+                .is_some_and(|model| model_ref_is(requested, model))
+        });
         let effective_variant = created
             .model
             .as_ref()
@@ -1919,8 +1921,7 @@ impl OpenCodePlugin {
             current
                 .model
                 .as_ref()
-                .map(|model| format!("{}/{}", model.provider_id.trim(), model.id.trim()))
-                != Some(target.to_owned())
+                .is_none_or(|model| !model_ref_is(target, model))
         });
         let variant_needed = target_variant.is_some_and(|target| {
             current
@@ -2037,7 +2038,7 @@ impl OpenCodePlugin {
             ));
         }
         let mut effective_value = json!({
-            "model": effective.model.as_ref().map(|model| format!("{}/{}", model.provider_id.trim(), model.id.trim())),
+            "model": effective.model.as_ref().map(|model| format!("{}/{}", model.provider_id, model.id)),
             "model_verified": model_verified,
             "model_variant": effective_variant.clone(),
             "effort": effective_variant,
@@ -2120,11 +2121,11 @@ impl OpenCodePlugin {
                     ),
                 )
             })?;
-        let echoed_model = echoed
+        if echoed
             .model
             .as_ref()
-            .map(|model| format!("{}/{}", model.provider_id.trim(), model.id.trim()));
-        if echoed_model.as_deref() != Some(target) {
+            .is_none_or(|model| !model_ref_is(target, model))
+        {
             return Err(Error::new(
                 "unknown",
                 format!("OpenCode {context} model contradicts the applied configuration"),
@@ -2359,7 +2360,7 @@ impl OpenCodePlugin {
         let current_model = current
             .model
             .as_ref()
-            .map(|model| format!("{}/{}", model.provider_id.trim(), model.id.trim()));
+            .map(|model| format!("{}/{}", model.provider_id, model.id));
         let current_variant = current
             .model
             .as_ref()
@@ -4069,7 +4070,7 @@ async fn verify_local_effective(
     // name one catalogue row. Identical model ids under other providers
     // never satisfy this readback, so an unrelated row cannot conceal an
     // absent model or the wrong limits.
-    let requested = format!("{}/{}", local.provider_id.trim(), local.api_model_id.trim());
+    let requested = format!("{}/{}", local.provider_id, local.api_model_id);
     let entry = catalogue_entry(&models, &requested)
         .ok_or_else(|| Error::new("profile_error", "effective catalogue mismatch"))?;
     let mut limits_unavailable = Vec::new();
@@ -4196,21 +4197,33 @@ fn parse_configure_model(args: &Value) -> Result<ConfigureModelRequest> {
 }
 
 /// The live native catalogue row for one exact `provider/model` id: the
-/// entry's provider AND model id must both match. Entries missing either
-/// half never match, and identical model ids under different providers
-/// never substitute for each other. The installed server echoes even
-/// bogus switches, so this row (read before any write) is what fails an
-/// unknown model honestly.
+/// entry's provider AND model id must both match, compared as independent
+/// fields exactly as the installed resolver does (`model.providerID ===
+/// ref.providerID && model.id === ref.id` in
+/// `packages/core/src/session/runner/model.ts`). No trimming: a native id
+/// carrying whitespace never equals the frozen pair, and identical model
+/// ids under different providers never substitute for each other. The
+/// installed server echoes even bogus switches, so this row (read before
+/// any write) is what fails an unknown model honestly.
 fn catalogue_entry<'a>(
     catalogue: &'a [NativeModelEntry],
     requested: &str,
 ) -> Option<&'a NativeModelEntry> {
+    let (provider, id) = split_provider_model(requested)?;
     catalogue.iter().find(
         |entry| match (entry.provider_id.as_deref(), entry.id.as_deref()) {
-            (Some(provider), Some(id)) => format!("{}/{}", provider.trim(), id.trim()) == requested,
+            (Some(entry_provider), Some(entry_id)) => entry_provider == provider && entry_id == id,
             _ => false,
         },
     )
+}
+
+/// Whether an installed `Model.Ref` names exactly the requested
+/// `provider/model` pair: both fields compared independently, never
+/// trimmed or joined. See [`catalogue_entry`].
+fn model_ref_is(requested: &str, model: &ModelRef) -> bool {
+    split_provider_model(requested)
+        .is_some_and(|(provider, id)| model.provider_id == provider && model.id == id)
 }
 
 /// Whether the live native catalogue carries the exact requested
@@ -4856,6 +4869,31 @@ mod tests {
         );
         assert!(catalogue_variants(&catalogue, "opencode/other").is_none());
         assert!(catalogue_variants(&[], "opencode/kimi").is_none());
+        // Field-by-field without trimming (installed
+        // `SessionRunnerModel.select` compares `providerID` and `id`
+        // independently with `===`): padded native ids never equal the
+        // frozen pair, and padded requests never split.
+        let padded = vec![NativeModelEntry {
+            id: Some("kimi ".to_owned()),
+            provider_id: Some(" opencode".to_owned()),
+            limit: None,
+            variants: None,
+        }];
+        assert!(!catalogue_contains(&padded, "opencode/kimi"));
+        assert!(!catalogue_contains(&catalogue, "opencode/kimi "));
+        assert!(!catalogue_contains(&catalogue, " opencode/kimi"));
+        let echo = crate::native::types::ModelRef {
+            id: "kimi".to_owned(),
+            provider_id: "opencode".to_owned(),
+            variant: None,
+        };
+        assert!(super::model_ref_is("opencode/kimi", &echo));
+        let padded_echo = crate::native::types::ModelRef {
+            id: "kimi ".to_owned(),
+            provider_id: "opencode".to_owned(),
+            variant: None,
+        };
+        assert!(!super::model_ref_is("opencode/kimi", &padded_echo));
     }
 
     #[test]
