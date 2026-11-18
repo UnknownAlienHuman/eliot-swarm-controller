@@ -428,12 +428,25 @@ widening. The level freezes as `access` in the snapshot. Implementation:
 
 ## Read-only provider quota
 
-`plugins/opencode/src/quota.rs` follows OpenCodex 2.84.0's Go usage pattern,
-without copied code. The native `auth export opencode-go --standalone` read is
-bounded and captured only in memory; exactly one active exported credential is
-required. Its key authenticates `GET https://opencode.ai/zen/go/v1/usage`.
-Rolling, weekly and monthly percentages/reset times are projected. Selected
-non-Go integrations report `unsupported`: Zen rate-limit replies require inference
-and are never used as a read-only quota source. No native auth import, login,
-switch or global-config edit occurs. Failures retain supported error states and
-provider/environment origin; secret-bearing native stderr is discarded.
+`plugins/opencode/src/quota.rs` reads the installed usage/limits operation's
+underlying sources directly against Console (pinned v2.2.7
+`packages/protocol/src/groups/usage.ts`,
+`packages/core/src/usage-limits.ts`, `packages/core/src/console-access.ts`;
+quota custody has no running serve, so the native `GET
+/api/experimental/usage/limits` endpoint itself is not callable here). The
+bounded in-memory `auth export <integration> --standalone` read requires
+exactly one active exported credential. An `opencode` (Console sign-in)
+credential supplies the OAuth access token or API key plus the workspace
+binding from credential metadata: the Console server (default
+`https://opencode.ai/console`, with the retired `console.opencode.ai` host
+rewritten path-for-path) and `orgID`. With that binding the adapter reads
+Console `GET {server}/api/policies/current-budgets` (`authorization:
+Bearer` plus `x-org-id`) and Go `GET {origin}/zen/go/v1/usage` (same bearer
+plus `x-opencode-org-id`), projecting Go rolling/weekly/monthly windows and
+one window per budget spend share; 403 on either means no subscription
+there. The legacy `opencode-go` selector keeps the Go-only public-URL path
+(OpenCodex 2.84.0 pattern, without copied code). Selectors without a
+verified read-only path report `unsupported`. No inference probe, native
+auth import, login, switch or global-config edit occurs. Failures retain
+supported error states and provider/environment origin; secret-bearing
+native stderr is discarded.
