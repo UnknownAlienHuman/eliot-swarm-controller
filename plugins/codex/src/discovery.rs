@@ -1066,16 +1066,35 @@ pub(crate) async fn verify_initialized_store(
     validate_pin(home, root, &observed)
 }
 
-/// Archive scope gate: the frozen binding's scope must equal the
-/// canonical home-plus-root scope over its own pinned directories. Accepts
-/// the exact frozen separate-root binding and the home form; anything else
-/// (including a home-form scope on a separate-root binding) is unverified.
+/// Archive scope gate: the frozen binding's scope must equal the canonical
+/// home-plus-root scope over its own pinned directories, derived from the
+/// same canonical representation admission uses (so a `~/.codex` symlink
+/// that starts still archives). Accepts the exact frozen separate-root
+/// binding and the home form; anything else (including a home-form scope on
+/// a separate-root binding) is unverified. Retained legacy scopes are
+/// verified against their original admission identity (the frozen strings
+/// as-is) when the canonical directories are unavailable.
 pub(crate) fn verify_archive_scope(binding: &NativeStoreBinding) -> Result<()> {
     let (home, root) = binding_paths(binding)?;
-    if store_scope(&binding.home, home, root)? != binding.native_scope {
-        return Err(unverified_store());
+    // Primary: the same canonical representation admission freezes. The
+    // frozen paths are already canonical, so re-canonicalizing is
+    // idempotent when the directories still exist; it also normalizes any
+    // alternate spelling of the same directory.
+    if let (Ok(canonical_home), Ok(canonical_root)) = (home.canonicalize(), root.canonicalize()) {
+        let canonical_home_text = canonical_home.to_str().ok_or_else(unverified_store)?;
+        if store_scope(canonical_home_text, &canonical_home, &canonical_root)?
+            == binding.native_scope
+        {
+            return Ok(());
+        }
     }
-    Ok(())
+    // Legacy: the frozen strings as originally admitted, without filesystem
+    // access (covers bindings frozen before the canonical-home fix and
+    // bindings whose directories are gone).
+    if store_scope(&binding.home, home, root)? == binding.native_scope {
+        return Ok(());
+    }
+    Err(unverified_store())
 }
 
 fn binding_paths(binding: &NativeStoreBinding) -> Result<(&Path, &Path)> {
@@ -1730,7 +1749,12 @@ fn verify_store(reported_home: &str, selection: &StoreSelection) -> Result<Store
     }
     let home = canonical_directory(Path::new(reported_home))?;
     let root = canonical_directory(&selection.root)?;
-    let scope = store_scope(reported_home, &home, &root)?;
+    // The home scope derives from the same canonical representation archive
+    // uses: the canonical home directory string, never the reported spelling
+    // (a `~/.codex` symlink reports one spelling and canonicalizes to
+    // another). Separate-root digests already hash the canonical pair.
+    let canonical_home = home.to_str().ok_or_else(unverified_store)?;
+    let scope = store_scope(canonical_home, &home, &root)?;
     let binding = fingerprint(json!({
         "domain": "eliot/codex/discovery/store-selection/v1",
         "home": home.to_str().ok_or_else(unverified_store)?,
@@ -1754,13 +1778,14 @@ fn verify_store(reported_home: &str, selection: &StoreSelection) -> Result<Store
 }
 
 /// Canonical home-plus-SQLite-root scope shared by admission, controlled
-/// startup, observation and archive: the plain Codex-home scope when both
-/// canonical directories match, else the pinned `codex-store:v1:` digest over
-/// the canonical home and root. Store pin verification stays with the
-/// callers; this only names the scope the frozen binding must carry.
-pub(crate) fn store_scope(reported_home: &str, home: &Path, root: &Path) -> Result<String> {
+/// startup, observation and archive: the plain Codex-home scope over the
+/// canonical home string when both canonical directories match, else the
+/// pinned `codex-store:v1:` digest over the canonical home and root. Store
+/// pin verification stays with the callers; this only names the scope the
+/// frozen binding must carry.
+pub(crate) fn store_scope(canonical_home: &str, home: &Path, root: &Path) -> Result<String> {
     if home == root {
-        return Ok(native_scope(reported_home));
+        return Ok(native_scope(canonical_home));
     }
     Ok(format!(
         "codex-store:v1:{}",
@@ -2019,6 +2044,42 @@ mod tests {
                 "native_scope_unverified"
             );
         }
+    }
+
+    /// A `~/.codex` symlink reports one home spelling but canonicalizes to
+    /// another. Admission freezes the canonical scope, so the archive gate
+    /// must derive from the same canonical representation instead of the
+    /// reported spelling.
+    #[cfg(unix)]
+    #[test]
+    fn archive_gate_accepts_canonical_home_behind_symlink() {
+        let base = std::env::temp_dir().join(format!("eliot-codex-link-{}", ulid::Ulid::new()));
+        let real = base.join("real-home");
+        let link = base.join("link-home");
+        std::fs::create_dir_all(&real).expect("real home");
+        std::os::unix::fs::symlink(&real, &link).expect("home symlink");
+        let reported = link.to_str().expect("UTF-8 link").to_owned();
+        let canonical = link.canonicalize().expect("canonical link");
+        let canonical_text = canonical.to_str().expect("UTF-8 canonical").to_owned();
+        // Admission derives from the canonical representation.
+        let scope = store_scope(&canonical_text, &canonical, &canonical).expect("canonical scope");
+        assert!(scope.starts_with("codex-home:"), "scope={scope}");
+        // The reported spelling hashes differently, proving the old
+        // reported-home derivation would miss.
+        let legacy = store_scope(&reported, Path::new(&reported), Path::new(&reported))
+            .expect("reported scope");
+        assert_ne!(scope, legacy, "symlink must change the spelling");
+        // The frozen binding carries the canonical strings, and the gate
+        // accepts it via the canonical directories.
+        assert!(
+            verify_archive_scope(&NativeStoreBinding {
+                home: canonical_text.clone(),
+                root: canonical_text.clone(),
+                native_scope: scope,
+            })
+            .is_ok()
+        );
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
