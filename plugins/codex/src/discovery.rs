@@ -559,8 +559,13 @@ fn archive_acknowledgement(response: &Value, metadata_secrets: &[String]) -> Res
 }
 
 /// Project only quota signals from `account/rateLimits/read`. Account
-/// identifiers and any identity fields are dropped; only windows, used
-/// percent, reset time, credits and plan survive.
+/// identifiers and any identity fields are dropped; windows, used percent,
+/// reset time, credits, plan, the native limit-state fields
+/// (`normalModelSlug`, `individualLimit`, `spendControlReached`,
+/// `rateLimitReachedType`) and limit ids/names survive. Keys of
+/// `rateLimitsByLimitId` are metered `limit_id` values (e.g. `codex`),
+/// never assumed to be model slugs; model mapping uses `normalModelSlug`
+/// where proved and stays unknown otherwise.
 fn project_rate_limits(raw: &Value) -> Result<Value> {
     let raw = raw.as_object().ok_or_else(invalid_page)?;
     let Some(rate_limits) = raw.get("rateLimits") else {
@@ -638,7 +643,7 @@ fn project_rate_limit_snapshot(snapshot: &Value) -> Result<Value> {
         }
         Some(_) => return Err(invalid_page()),
     }
-    for key in ["limitId", "limitName"] {
+    for key in ["limitId", "limitName", "normalModelSlug"] {
         match snapshot.get(key) {
             None | Some(Value::Null) => {}
             Some(Value::String(name)) => {
@@ -647,6 +652,33 @@ fn project_rate_limit_snapshot(snapshot: &Value) -> Result<Value> {
             }
             Some(_) => return Err(invalid_page()),
         }
+    }
+    match snapshot.get("individualLimit") {
+        None | Some(Value::Null) => {}
+        Some(limit) => {
+            out.insert(
+                "individualLimit".to_owned(),
+                project_spend_control_limit(limit)?,
+            );
+        }
+    }
+    match snapshot.get("spendControlReached") {
+        None | Some(Value::Null) => {}
+        Some(Value::Bool(reached)) => {
+            out.insert("spendControlReached".to_owned(), Value::Bool(*reached));
+        }
+        Some(_) => return Err(invalid_page()),
+    }
+    match snapshot.get("rateLimitReachedType") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(kind)) => {
+            check_text(kind, 128, true).map_err(|_| invalid_page())?;
+            out.insert(
+                "rateLimitReachedType".to_owned(),
+                Value::String(kind.clone()),
+            );
+        }
+        Some(_) => return Err(invalid_page()),
     }
     match snapshot.get("credits") {
         None | Some(Value::Null) => {}
@@ -688,6 +720,36 @@ fn project_rate_window(window: &Value) -> Result<Value> {
             out.insert("resetsAt".to_owned(), Value::from(resets));
         }
     }
+    Ok(Value::Object(out))
+}
+
+fn project_spend_control_limit(limit: &Value) -> Result<Value> {
+    let limit = limit.as_object().ok_or_else(invalid_page)?;
+    let mut out = serde_json::Map::new();
+    for key in ["limit", "used"] {
+        let text = limit
+            .get(key)
+            .and_then(Value::as_str)
+            .ok_or_else(invalid_page)?;
+        check_text(text, 128, true).map_err(|_| invalid_page())?;
+        out.insert(key.to_owned(), Value::String(text.to_owned()));
+    }
+    let remaining = limit
+        .get("remainingPercent")
+        .and_then(Value::as_i64)
+        .ok_or_else(invalid_page)?;
+    if !(0..=100).contains(&remaining) {
+        return Err(invalid_page());
+    }
+    out.insert("remainingPercent".to_owned(), Value::from(remaining));
+    let resets = limit
+        .get("resetsAt")
+        .and_then(Value::as_i64)
+        .ok_or_else(invalid_page)?;
+    if resets < 0 {
+        return Err(invalid_page());
+    }
+    out.insert("resetsAt".to_owned(), Value::from(resets));
     Ok(Value::Object(out))
 }
 
@@ -1884,9 +1946,9 @@ mod tests {
     use super::{
         CURSOR_PREFIX, Cursor, NativeLaunch, READ_TIMEOUT, StoreContext, binding_paths,
         decode_cursor, fingerprint, mcp_plugin_states, mcp_server_entries, native_scope,
-        pinned_launch, pinned_launch_for_binding, read_effective_mcp_surface, request_binding,
-        select_store, sqlite_environment, start_initialized_reader, store_scope, validate_pin,
-        validate_store,
+        pinned_launch, pinned_launch_for_binding, project_rate_limit_snapshot, project_rate_limits,
+        read_effective_mcp_surface, request_binding, select_store, sqlite_environment,
+        start_initialized_reader, store_scope, validate_pin, validate_store,
     };
     use crate::native::types::NativeDiscoveryConfigReadResponse;
     use eliot_core::{NativeStoreBinding, SecretPolicy};
@@ -2657,5 +2719,74 @@ mod tests {
         query.root = selected.root.clone();
         query.pin_verified = false;
         assert!(validate_pin(selected.home(), selected.root(), &query).is_err());
+    }
+    #[test]
+    fn rate_limit_snapshot_projects_limit_state_and_mapping() {
+        // Audit #630: pinned rust-v0.167.1 RateLimitSnapshot carries
+        // normalModelSlug, individualLimit, spendControlReached and
+        // rateLimitReachedType; rateLimitsByLimitId keys are limit_ids.
+        let snapshot = serde_json::json!({
+            "limitId": "codex",
+            "limitName": "Codex",
+            "normalModelSlug": "gpt-5.4",
+            "primary": {"usedPercent": 12},
+            "secondary": null,
+            "individualLimit": {
+                "limit": "100",
+                "remainingPercent": 40,
+                "resetsAt": 1700000000,
+                "used": "60"
+            },
+            "spendControlReached": true,
+            "rateLimitReachedType": "rate_limit_reached",
+            "planType": "pro",
+            "credits": {"hasCredits": false, "unlimited": false}
+        });
+        let projected = project_rate_limit_snapshot(&snapshot).expect("limit state projects");
+        assert_eq!(
+            projected.get("normalModelSlug").and_then(|v| v.as_str()),
+            Some("gpt-5.4")
+        );
+        assert_eq!(
+            projected
+                .get("individualLimit")
+                .and_then(|limit| limit.get("remainingPercent"))
+                .and_then(|v| v.as_i64()),
+            Some(40)
+        );
+        assert_eq!(
+            projected
+                .get("spendControlReached")
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "explicit spend control survives independently of usedPercent"
+        );
+        assert_eq!(
+            projected
+                .get("rateLimitReachedType")
+                .and_then(|v| v.as_str()),
+            Some("rate_limit_reached")
+        );
+        // A non-model bucket id is not evidence its quota is unrelated:
+        // the key stays verbatim and mapping stays unknown without
+        // normalModelSlug.
+        let raw = serde_json::json!({
+            "rateLimits": {"primary": {"usedPercent": 1}},
+            "rateLimitsByLimitId": {"codex_other": {"primary": {"usedPercent": 99}}}
+        });
+        let details = project_rate_limits(&raw).expect("buckets project");
+        assert!(
+            details
+                .get("rateLimitsByLimitId")
+                .and_then(|map| map.get("codex_other"))
+                .is_some()
+        );
+        assert!(
+            details
+                .get("rateLimitsByLimitId")
+                .and_then(|map| map.get("codex_other"))
+                .and_then(|snap| snap.get("normalModelSlug"))
+                .is_none()
+        );
     }
 }
