@@ -4,16 +4,16 @@
 //! comment heartbeats (`: heartbeat`), and blank-line dispatch. Only
 //! `data:` payloads are surfaced; `event:`/`id:`/`retry:` fields are
 //! ignored because the envelope carries its own `id` and `type`.
-//! A payload larger than [`MAX_SSE_BYTES`], a line that never terminates
-//! within that bound, or a non-UTF-8 line ends the stream as malformed
+//! A payload (including separators) or raw line larger than
+//! [`MAX_SSE_BYTES`], or a non-UTF-8 line, ends the stream as malformed
 //! rather than growing without bound.
 
 use crate::native::types::SseEnvelope;
 
 /// Largest single SSE payload accepted before the stream is declared
 /// malformed. Envelopes are small control records; message bodies travel
-/// over the readback endpoints, never the stream. The same bound caps one
-/// unterminated line in the pending buffer.
+/// over the readback endpoints, never the stream. The same bound caps each
+/// raw line, excluding its LF terminator.
 pub const MAX_SSE_BYTES: usize = 256 * 1024;
 
 /// One parsed stream item: either an envelope or a malformed payload
@@ -28,7 +28,7 @@ pub enum SseFrame {
 #[derive(Debug, Default)]
 pub struct SseParser {
     buffer: Vec<u8>,
-    data: Vec<String>,
+    data: Option<String>,
     spent: bool,
 }
 
@@ -45,97 +45,70 @@ impl SseParser {
             return Vec::new();
         }
         let mut frames = Vec::new();
-        self.buffer.extend_from_slice(bytes);
-        while let Some(end) = find_line_end(&self.buffer) {
-            let raw: Vec<u8> = self.buffer.drain(..end).collect();
-            // Drop the line terminator (`\n`, or `\r\n` with the `\r` kept in
-            // `raw` and trimmed below).
-            if self.buffer.first() == Some(&b'\n') {
-                self.buffer.drain(..1);
+        let mut pending = std::mem::take(&mut self.buffer);
+        for part in bytes.split_inclusive(|&byte| byte == b'\n') {
+            let complete = part.strip_suffix(b"\n");
+            let raw = complete.unwrap_or(part);
+            if pending.len().saturating_add(raw.len()) > MAX_SSE_BYTES {
+                self.spent = true;
+                frames.push(SseFrame::Malformed);
+                break;
             }
-            let line = raw
-                .strip_suffix(b"\r")
-                .map_or(raw.as_slice(), |stripped| stripped);
-            if line.is_empty() {
-                if let Some(frame) = self.dispatch() {
-                    frames.push(frame);
-                }
-                continue;
+            if complete.is_none() {
+                pending.extend_from_slice(raw);
+                break;
             }
-            if std::str::from_utf8(line).is_err() {
-                // The stream framing is byte-oriented, but every line the
-                // installed server sends is UTF-8; anything else is
-                // corruption, never a skippable line.
-                self.declare_malformed(&mut frames);
-                continue;
-            }
-            if line.starts_with(b":") {
-                continue;
-            }
-            let Some(field) = parse_field(line) else {
-                continue;
+            let frame = if pending.is_empty() {
+                self.accept_line(raw)
+            } else {
+                pending.extend_from_slice(raw);
+                let frame = self.accept_line(&pending);
+                pending.clear();
+                frame
             };
-            if field.name != "data" {
-                continue;
+            if let Some(frame) = frame {
+                self.spent = frame == SseFrame::Malformed;
+                frames.push(frame);
+                if self.spent {
+                    break;
+                }
             }
-            if self.data_bytes().saturating_add(field.value.len()) > MAX_SSE_BYTES {
-                self.declare_malformed(&mut frames);
-                continue;
-            }
-            self.data.push(field.value);
         }
-        if find_line_end(&self.buffer).is_none() && self.buffer.len() > MAX_SSE_BYTES {
-            // An unterminated line past the bound: the stream will never
-            // produce a parseable line from this buffer again.
-            self.declare_malformed(&mut frames);
+        if self.spent {
+            self.data = None;
+        } else {
+            self.buffer = pending;
         }
         frames
     }
 
-    /// Declare the stream malformed exactly once and discard the rest.
-    fn declare_malformed(&mut self, frames: &mut Vec<SseFrame>) {
-        if self.spent {
-            return;
+    fn accept_line(&mut self, raw: &[u8]) -> Option<SseFrame> {
+        let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+        let Ok(line) = std::str::from_utf8(raw) else {
+            return Some(SseFrame::Malformed);
+        };
+        if line.is_empty() {
+            let payload = self.data.take()?;
+            return Some(match serde_json::from_str::<SseEnvelope>(&payload) {
+                Ok(envelope) if !envelope.id.trim().is_empty() => SseFrame::Event(envelope),
+                _ => SseFrame::Malformed,
+            });
         }
-        self.spent = true;
-        self.data.clear();
-        self.buffer.clear();
-        frames.push(SseFrame::Malformed);
-    }
-
-    fn data_bytes(&self) -> usize {
-        self.data.iter().map(|line| line.len()).sum()
-    }
-
-    fn dispatch(&mut self) -> Option<SseFrame> {
-        if self.data.is_empty() {
-            return None;
+        let value = line.strip_prefix("data:")?;
+        let value = value.strip_prefix(' ').unwrap_or(value);
+        let prefix_len = self.data.as_ref().map_or(0, |data| data.len() + 1);
+        if prefix_len + value.len() > MAX_SSE_BYTES {
+            return Some(SseFrame::Malformed);
         }
-        let payload = std::mem::take(&mut self.data).join("\n");
-        match serde_json::from_str::<SseEnvelope>(&payload) {
-            Ok(envelope) if !envelope.id.trim().is_empty() => Some(SseFrame::Event(envelope)),
-            _ => Some(SseFrame::Malformed),
+        match &mut self.data {
+            Some(data) => {
+                data.push('\n');
+                data.push_str(value);
+            }
+            None => self.data = Some(value.to_owned()),
         }
+        None
     }
-}
-
-struct Field {
-    name: String,
-    value: String,
-}
-
-fn find_line_end(buffer: &[u8]) -> Option<usize> {
-    buffer.iter().position(|byte| *byte == b'\n')
-}
-
-fn parse_field(line: &[u8]) -> Option<Field> {
-    let line = std::str::from_utf8(line).ok()?;
-    let (name, value) = line.split_once(':')?;
-    let value = value.strip_prefix(' ').unwrap_or(value);
-    Some(Field {
-        name: name.to_owned(),
-        value: value.to_owned(),
-    })
 }
 
 #[cfg(test)]
@@ -203,6 +176,21 @@ mod tests {
             &[b"data: {\"id\":\"evt_1\",\"type\":\"t\",\"data\":{}}\n\n"],
         );
         assert!(later.is_empty());
+    }
+
+    #[test]
+    fn empty_data_lines_count_toward_the_payload_bound() {
+        let mut parser = SseParser::new();
+        let full_line = format!("data:{}\n", "x".repeat(MAX_SSE_BYTES - "data:".len()));
+        assert!(parser.feed(full_line.as_bytes()).is_empty());
+        assert!(
+            parser
+                .feed(b"data:\ndata:\ndata:\ndata:\ndata:\n")
+                .is_empty()
+        );
+        assert!(parser.feed(b"dat").is_empty());
+        assert_eq!(parser.feed(b"a:\n"), vec![SseFrame::Malformed]);
+        assert!(parser.feed(b"\n").is_empty());
     }
 
     #[test]

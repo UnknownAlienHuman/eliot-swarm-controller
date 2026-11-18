@@ -95,7 +95,10 @@ of the same live controller may preserve it.
 
 ## Transport
 
-Subscribe before session create/input. Route SSE by exact session/directory, never
+Subscribe before session create/input. The SSE reader bounds each raw line and each
+assembled payload at 256 KiB, including the newline between successive data fields
+in the payload. An oversized or malformed frame ends the stream. Route SSE by exact
+session/directory, never
 cwd/title/time heuristics. Missing identity is a visible gap. Session routes bind their
 location from the session; requests outside a session pass the installed API's workspace
 parameter. Read complete error bodies; only authoritative
