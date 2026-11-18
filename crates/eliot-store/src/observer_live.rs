@@ -313,22 +313,13 @@ impl Store {
         }
         let mut events = Vec::new();
         if state.health != update.health {
-            let changed = tx.execute("UPDATE source_state SET health = ?1, updated_at = ?2 WHERE agent = ?3 AND generation = ?4 AND source = ?5 AND state = 'open'",
-                params![update.health,now,id,update.generation,update.source]).map_err(sql_error)?;
-            if changed != 1 {
-                return Err(Error::new(
-                    "source_integrity",
-                    "health source changed before commit",
-                ));
-            }
-            events.push(insert_daemon_event(
+            events.push(update_open_source_health(
                 &tx,
+                id,
+                update.generation,
+                &update.source,
+                &update.health,
                 now,
-                "source.health",
-                "source",
-                Some(id),
-                Some(update.generation),
-                json!({"source":update.source,"state":"open","health":update.health}),
             )?);
         }
         commit_transaction(tx, &self.write_faulted)?;
@@ -337,6 +328,38 @@ impl Store {
             events,
         })
     }
+}
+
+pub(super) fn update_open_source_health(
+    tx: &Transaction<'_>,
+    agent: i64,
+    generation: i64,
+    source: &str,
+    health: &str,
+    now: i64,
+) -> Result<Event> {
+    let changed = tx
+        .execute(
+            "UPDATE source_state SET health = ?1, updated_at = ?2
+             WHERE agent = ?3 AND generation = ?4 AND source = ?5 AND state = 'open'",
+            params![health, now, agent, generation, source],
+        )
+        .map_err(sql_error)?;
+    if changed != 1 {
+        return Err(Error::new(
+            "source_integrity",
+            "health source changed before commit",
+        ));
+    }
+    insert_daemon_event(
+        tx,
+        now,
+        "source.health",
+        "source",
+        Some(agent),
+        Some(generation),
+        json!({"source":source,"state":"open","health":health}),
+    )
 }
 
 #[cfg(test)]

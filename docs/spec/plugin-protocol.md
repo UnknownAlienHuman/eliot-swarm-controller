@@ -431,7 +431,7 @@ There is no `handoff_id`.
 
 `gap_id` identifies one uncovered interval. Same id and canonical fields return its
 stored result; the same id with different fields is an integrity error. After that
-operation is acknowledged/read back, a new interval uses a new stable id and replaces
+operation is acknowledged, a new interval uses a new stable id and replaces
 only the latest gap metadata; the previous gap event remains in retained history.
 
 At most one unacknowledged gap/handoff operation is allowed per source. A lost

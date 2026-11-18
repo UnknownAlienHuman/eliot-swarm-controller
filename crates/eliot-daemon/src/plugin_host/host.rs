@@ -4339,7 +4339,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn source_payload_guards_precede_store_commit_and_bus_publish() {
+    async fn source_payload_guards_record_safe_gaps_without_publishing_rejected_events() {
         let mut store = eliot_store::Store::open(Path::new(":memory:")).unwrap();
         let command_id = Ulid::new().to_string();
         let now = now_ms();
@@ -4420,6 +4420,14 @@ mod tests {
                 .await
                 .unwrap_err(),
         );
+        let mut params = serde_json::to_value(&batch).unwrap();
+        params["events"][0]["native_id"] = json!(42);
+        params["credential"] = json!(credential);
+        let error = client
+            .call("events.put", params, deadline())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "invalid");
 
         let mut gap = gap();
         gap.agent_id = agent_id.clone();
@@ -4436,11 +4444,26 @@ mod tests {
         }
         {
             let store = store.lock().await;
-            assert_eq!(store.read_events(0, 1000, None).unwrap(), before_events);
-            assert_eq!(
-                store.read_source_state(&agent_id, 1, "stream").unwrap(),
-                before_source
-            );
+            let events = store.read_events(0, 1000, None).unwrap();
+            let rejected = &events[before_events.len()..];
+            let gaps: Vec<_> = rejected
+                .iter()
+                .filter(|event| event.kind == "source.gap")
+                .collect();
+            assert_eq!(gaps.len(), 5);
+            assert_eq!(gaps[1].data["to"], Value::Null);
+            assert_eq!(gaps[4].data["reason"], "events.put rejected: invalid");
+            assert_eq!(rejected.len(), 6);
+            assert_eq!(rejected[1].kind, "source.health");
+            assert_eq!(rejected[1].data["health"], "stale");
+            assert!(rejected.iter().all(|event| event.native_id.is_none()));
+            for event in rejected {
+                assert_eq!(published.try_recv().unwrap().seq, event.seq);
+            }
+            let source = store.read_source_state(&agent_id, 1, "stream").unwrap();
+            assert_eq!(source["health"], "stale");
+            assert_eq!(source["cursor"], before_source["cursor"]);
+            assert_eq!(source["last_batch_id"], before_source["last_batch_id"]);
         }
         assert!(matches!(
             published.try_recv(),
@@ -4464,7 +4487,7 @@ mod tests {
         let events = store.lock().await.read_events(0, 1000, None).unwrap();
         let gap_event = events
             .iter()
-            .find(|event| event.kind == "source.gap")
+            .find(|event| event.kind == "source.gap" && event.data["gap_id"] == "gap-1")
             .unwrap();
         assert_eq!(gap_event.data["reason"], json!("reader lost [REDACTED]"));
         assert!(!serde_json::to_string(&events).unwrap().contains(SECRET));

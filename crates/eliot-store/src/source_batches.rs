@@ -172,7 +172,7 @@ impl Store {
     /// Commit one source-loss boundary and its retained acknowledgement.
     pub fn record_source_gap(&mut self, gap: SourceGap, now: i64) -> Result<Change<SourceGapAck>> {
         self.ensure_writer_healthy()?;
-        let result = self.record_source_gap_inner(gap, None, None, now);
+        let result = self.record_source_gap_inner(gap, None, None, false, now);
         self.fault_on_persistence_error(&result);
         result
     }
@@ -184,7 +184,7 @@ impl Store {
         now: i64,
     ) -> Result<Change<SourceGapAck>> {
         self.ensure_writer_healthy()?;
-        let result = self.record_source_gap_inner(gap, Some(expected_subject), None, now);
+        let result = self.record_source_gap_inner(gap, Some(expected_subject), None, false, now);
         self.fault_on_persistence_error(&result);
         result
     }
@@ -197,8 +197,37 @@ impl Store {
         now: i64,
     ) -> Result<Change<SourceGapAck>> {
         self.ensure_writer_healthy()?;
+        let result = self.record_source_gap_inner(
+            gap,
+            None,
+            Some((producer, producer_generation)),
+            false,
+            now,
+        );
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    /// Record the coverage lost by a rejected event write and mark the source stale.
+    /// If the rejected batch identifies no owned family, mark the whole source.
+    pub fn record_rejected_batch_gap(
+        &mut self,
+        gap: SourceGap,
+        producer: (&str, i64),
+        expected_subject: Option<(&str, &str)>,
+        now: i64,
+    ) -> Result<Change<SourceGapAck>> {
+        self.ensure_writer_healthy()?;
+        let native_producer =
+            (producer != (gap.agent_id.as_str(), gap.generation)).then_some(producer);
+        if native_producer.is_some() && expected_subject.is_some() {
+            return Err(Error::new(
+                "not_allowed",
+                "observer cannot record native child gaps",
+            ));
+        }
         let result =
-            self.record_source_gap_inner(gap, None, Some((producer, producer_generation)), now);
+            self.record_source_gap_inner(gap, expected_subject, native_producer, true, now);
         self.fault_on_persistence_error(&result);
         result
     }
@@ -208,13 +237,14 @@ impl Store {
         gap: SourceGap,
         expected_subject: Option<(&str, &str)>,
         native_producer: Option<(&str, i64)>,
+        mark_stale: bool,
         now: i64,
     ) -> Result<Change<SourceGapAck>> {
         require_nonempty(&gap.gap_id, "gap_id")?;
         require_nonempty(&gap.agent_id, "agent_id")?;
         require_nonempty(&gap.source, "source")?;
         require_nonempty(&gap.reason, "reason")?;
-        if gap.families.is_empty() {
+        if gap.families.is_empty() && !mark_stale {
             return Err(Error::new("invalid", "source gap must name a family"));
         }
         if gap.families.len() > MAX_PAGE_ENTRIES {
@@ -239,6 +269,24 @@ impl Store {
         if families.windows(2).any(|pair| pair[0] == pair[1]) {
             return Err(Error::new("invalid", "source gap families must be unique"));
         }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        if mark_stale {
+            let owned: Vec<_> = source_handoff::owner_bindings(&tx, agent_num, gap.generation)?
+                .into_iter()
+                .filter(|owner| owner.source == gap.source)
+                .map(|owner| owner.family)
+                .collect();
+            families.retain(|family| owned.contains(family));
+            if families.is_empty() {
+                if owned.is_empty() {
+                    return Err(Error::new("source_integrity", "source owns no families"));
+                }
+                families = owned;
+            }
+        }
         let gap_data = json!({
             "gap_id": gap.gap_id,
             "agent_id": gap.agent_id,
@@ -257,10 +305,6 @@ impl Store {
         }
         let gap_digest = canonical::digest(&gap_data)?;
 
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(sql_error)?;
         let agent = load_agent_by_num(&tx, agent_num)?
             .ok_or_else(|| Error::new("not_found", "source gap Agent was not found"))?;
         if let Some((producer, generation)) = native_producer {
@@ -380,11 +424,19 @@ impl Store {
             gap_id: gap.gap_id,
             seq: event.seq,
         };
+        let mut events = vec![event];
+        if mark_stale && source_state.health != "stale" {
+            events.push(observer_live::update_open_source_health(
+                &tx,
+                agent_num,
+                gap.generation,
+                &gap.source,
+                "stale",
+                now,
+            )?);
+        }
         commit_transaction(tx, &self.write_faulted)?;
-        Ok(Change {
-            value: ack,
-            events: vec![event],
-        })
+        Ok(Change { value: ack, events })
     }
 
     /// Commit one complete native batch, its reducer projections, derived
@@ -475,16 +527,7 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|error| {
-                if matches!(
-                    error.sqlite_error_code(),
-                    Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
-                ) {
-                    Error::new("busy", "SQLite writer lock unavailable for native batch")
-                } else {
-                    sql_error(error)
-                }
-            })?;
+            .map_err(sql_error)?;
         let mut projection = load_agent_by_num(&tx, agent_num)?.ok_or_else(|| {
             Error::new(
                 "not_found",

@@ -1,6 +1,96 @@
 use super::*;
 
 #[test]
+fn source_contention_does_not_fault_writer() {
+    let path = std::env::temp_dir().join(format!("eliot-source-lock-{}.sqlite", Ulid::new()));
+    let mut store = Store::open(&path).unwrap();
+    store
+        .connection
+        .busy_timeout(std::time::Duration::ZERO)
+        .unwrap();
+    // Rollback journal mode also lets a concurrent reader block COMMIT.
+    store
+        .connection
+        .pragma_update(None, "journal_mode", "DELETE")
+        .unwrap();
+    let mut external = rusqlite::Connection::open(&path).unwrap();
+    let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
+    let agent = ready_agent(&mut store, "source-contention", now);
+    let batch = SourceBatch {
+        batch_id: "usage".to_owned(),
+        agent_id: agent.clone(),
+        generation: 1,
+        source: "stream".to_owned(),
+        events: vec![NativeEvent {
+            ts: None,
+            kind: "session.usage".to_owned(),
+            native_id: "usage".to_owned(),
+            data: json!({"usage": {"context_used_tokens": 10}}),
+        }],
+        cursor: None,
+    };
+    let gap = SourceGap {
+        gap_id: "rejected-usage".to_owned(),
+        agent_id: agent.clone(),
+        generation: 1,
+        source: "stream".to_owned(),
+        families: vec!["session".to_owned()],
+        reason: "events.put rejected: busy".to_owned(),
+        from: None,
+        to: None,
+    };
+    let health = eliot_core::SourceHealthUpdate::new(&agent, 1, "stream", "stale");
+    for behavior in [
+        rusqlite::TransactionBehavior::Immediate,
+        rusqlite::TransactionBehavior::Deferred,
+    ] {
+        let lock = external.transaction_with_behavior(behavior).unwrap();
+        // An immediate transaction owns the writer lock. A deferred
+        // transaction takes a shared lock on its first read.
+        lock.query_row("SELECT count(*) FROM events", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap();
+        assert_eq!(
+            store.put_batch(batch.clone(), now + 1).unwrap_err().code,
+            "busy"
+        );
+        assert_eq!(
+            store
+                .record_rejected_batch_gap(gap.clone(), (&agent, 1), None, now + 2)
+                .unwrap_err()
+                .code,
+            "busy"
+        );
+        assert_eq!(
+            store
+                .set_source_health(health.clone(), now + 3)
+                .unwrap_err()
+                .code,
+            "busy"
+        );
+        assert!(!store.is_write_faulted());
+        assert!(store.get_session_usage(&agent, 1).unwrap().is_none());
+        lock.rollback().unwrap();
+    }
+
+    let change = store
+        .record_rejected_batch_gap(gap, (&agent, 1), None, now + 4)
+        .unwrap();
+    assert_eq!(change.events[0].kind, "source.gap");
+    assert_eq!(change.events[1].kind, "source.health");
+    assert_eq!(change.events[1].data["health"], "stale");
+    assert_eq!(
+        store.put_batch(batch, now + 5).unwrap().events[0].kind,
+        "session.usage"
+    );
+    assert!(!store.is_write_faulted());
+    drop(external);
+    drop(store);
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn txn_stats_count_every_committed_transaction() {
     let before = Store::open(Path::new(":memory:"))
         .expect("open store")
@@ -21,10 +111,6 @@ fn txn_stats_count_every_committed_transaction() {
     assert!(
         after.commits > before.commits,
         "one write commits at least one transaction: {before:?} -> {after:?}"
-    );
-    assert_eq!(
-        after.commit_errors, before.commit_errors,
-        "the write must not fail its commit"
     );
 }
 

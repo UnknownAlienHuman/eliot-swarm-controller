@@ -8,14 +8,14 @@
 use super::{
     AgentKey, Bus, EventSource, PluginConnection, RPC_GRACE, StoreHandle, deadline,
     fence_runtime_generation, late_batch_error, record_source_gap, record_store_batch_rejection,
-    redact_native_error, redact_source_batch, safe_cause_code, signal_progress,
+    redact_native_error, redact_source_batch, redact_source_gap, safe_cause_code, signal_progress,
     source_state_binding,
 };
 use super::{native_children, observation, source_handoff};
 
 use crate::common::{now_ms, secure_eq};
 
-use eliot_core::{Error, Result, SourceBatch, SourceGap, SourceHealthUpdate};
+use eliot_core::{Error, Result, SecretPolicy, SourceBatch, SourceGap};
 use eliot_plugin::protocol::{HookEvent, HookResponse};
 use eliot_plugin::sync::LockExt;
 use eliot_store::family_for_kind;
@@ -385,9 +385,9 @@ async fn put_events(
     until: Instant,
     rejected: &mut Option<SourceGap>,
 ) -> Result<Value> {
-    let mut batch: SourceBatch = serde_json::from_value(params)
-        .map_err(|_| Error::new("invalid", "events.put params are malformed"))?;
-    let is_child = batch.agent_id != binding.agent_id || batch.generation != binding.generation;
+    let invalid_batch = || Error::new("invalid", "events.put params are malformed");
+    let gap = batch_gap(&params).ok_or_else(invalid_batch)?;
+    let is_child = gap.agent_id != binding.agent_id || gap.generation != binding.generation;
     let subject = binding.expected_subject()?;
     if is_child && subject.is_some() {
         return Err(Error::new(
@@ -395,24 +395,18 @@ async fn put_events(
             "events.put generation does not match this Agent generation",
         ));
     }
-    redact_source_batch(&mut batch, credentials)?;
-    let mut families: Vec<_> = batch
-        .events
-        .iter()
-        .filter_map(|event| family_for_kind(&event.kind).ok())
-        .map(str::to_owned)
-        .collect();
-    families.sort_unstable();
-    families.dedup();
-    let mut gap = SourceGap {
-        gap_id: String::new(),
-        agent_id: batch.agent_id.clone(),
-        generation: batch.generation,
-        source: batch.source.clone(),
-        families,
-        reason: String::new(),
-        from: None,
-        to: batch.cursor.clone(),
+    let batch = serde_json::from_value(params)
+        .map_err(|_| invalid_batch())
+        .and_then(|mut batch| {
+            redact_source_batch(&mut batch, credentials)?;
+            Ok(batch)
+        });
+    let batch: SourceBatch = match batch {
+        Ok(batch) => batch,
+        Err(error) => {
+            *rejected = rejection_gap(gap, &error.code, credentials);
+            return Err(error);
+        }
     };
     let batch_id = batch.batch_id.clone();
     let event_kinds = batch
@@ -461,15 +455,8 @@ async fn put_events(
             if !matches!(
                 error.code.as_str(),
                 "not_allowed" | "stale_generation" | "not_found" | "unknown"
-            ) && !gap.families.is_empty()
-                && !matches!(
-                    gap.source.as_str(),
-                    "daemon" | "os" | "git" | "workspace_process"
-                )
-            {
-                gap.gap_id = Ulid::new().to_string();
-                gap.reason = format!("events.put rejected: {cause}");
-                *rejected = Some(gap);
+            ) {
+                *rejected = rejection_gap(gap, &cause, credentials);
             }
             match error.code.as_str() {
                 "unknown" | "busy" | "not_allowed" | "stale_generation" => Err(error),
@@ -482,38 +469,79 @@ async fn put_events(
     }
 }
 
+// Recover only the source binding and recognized kinds from a malformed batch.
+// The Store validates the binding and family ownership before committing the gap.
+fn batch_gap(params: &Value) -> Option<SourceGap> {
+    let mut families: Vec<_> = params["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|event| family_for_kind(event["kind"].as_str()?).ok())
+        .map(str::to_owned)
+        .collect();
+    families.sort_unstable();
+    families.dedup();
+    Some(SourceGap {
+        gap_id: String::new(),
+        agent_id: params["agent_id"].as_str()?.to_owned(),
+        generation: params["generation"].as_i64()?,
+        source: params["source"].as_str()?.to_owned(),
+        families,
+        reason: String::new(),
+        from: None,
+        to: params["cursor"].as_str().map(str::to_owned),
+    })
+}
+
+fn rejection_gap(mut gap: SourceGap, cause: &str, credentials: &[String]) -> Option<SourceGap> {
+    if matches!(
+        gap.source.as_str(),
+        "daemon" | "os" | "git" | "workspace_process"
+    ) {
+        return None;
+    }
+    let policy = SecretPolicy::new(credentials);
+    if gap
+        .to
+        .as_deref()
+        .is_some_and(|cursor| policy.contains_text(cursor))
+    {
+        gap.to = None;
+    }
+    gap.gap_id = Ulid::new().to_string();
+    gap.reason = format!("events.put rejected: {cause}");
+    redact_source_gap(&mut gap, credentials).ok()?;
+    Some(gap)
+}
+
 async fn persist_rejected_batch_gap(
     store: &StoreHandle,
     bus: &Bus,
     binding: source_handoff::SourceBinding<'_>,
     gap: SourceGap,
 ) {
-    let Ok(mut store) = timeout_at(deadline(), store.lock()).await else {
-        return;
-    };
-    let now = now_ms();
-    let is_child = gap.agent_id != binding.agent_id || gap.generation != binding.generation;
     let Ok(subject) = binding.expected_subject() else {
         return;
     };
-    let health = SourceHealthUpdate::new(&gap.agent_id, gap.generation, &gap.source, "stale");
-    let result = if is_child {
-        store.record_native_child_source_gap(binding.agent_id, binding.generation, gap, now)
-    } else if let Some(subject) = subject {
-        store.record_observed_source_gap(gap, subject, now)
-    } else {
-        store.record_source_gap(gap, now)
-    };
-    if let Ok(change) = result {
-        bus.publish(&change.events);
-        if !is_child {
-            let result = match subject {
-                Some(subject) => store.set_native_source_health(health, subject, now),
-                None => store.set_source_health(health, now),
-            };
-            if let Ok(change) = result {
+    let until = deadline();
+    // The gap is a host write. Retry it once after a proven no-write so
+    // contention that outlasts the batch and first gap attempt can still settle.
+    for attempt in 0..2 {
+        let Ok(mut store) = timeout_at(until, store.lock()).await else {
+            return;
+        };
+        match store.record_rejected_batch_gap(
+            gap.clone(),
+            (binding.agent_id, binding.generation),
+            subject,
+            now_ms(),
+        ) {
+            Ok(change) => {
                 bus.publish(&change.events);
+                return;
             }
+            Err(error) if error.code == "busy" && attempt == 0 => {}
+            Err(_) => return,
         }
     }
 }

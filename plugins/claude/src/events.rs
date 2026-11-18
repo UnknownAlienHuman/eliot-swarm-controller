@@ -1168,6 +1168,9 @@ impl EventProcessor {
                 break;
             }
             if let Err(error) = self.process_record(frame.record).await {
+                if error.failure_where.as_deref() == Some("plugin.events.put") {
+                    return Err(error);
+                }
                 self.status.source_unknown = true;
                 if !self.gap_reported && !self.writes_blocked {
                     let _ = self
