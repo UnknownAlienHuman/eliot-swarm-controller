@@ -15,6 +15,7 @@ mod goals;
 mod handoff;
 mod hierarchy;
 mod inference;
+mod overview;
 mod project_assignment;
 mod resolution;
 mod routing;
@@ -453,6 +454,7 @@ impl Router {
                 self.project_assignment_release(&params, &principal).await
             }
             "project.get" => self.project_get(&params, &principal).await,
+            "project.overview" => self.project_overview(&params, &principal).await,
             "project.list" => self.project_list(&params, &principal).await,
             "workspace.list" => self.workspace_list(&params, &principal).await,
             "project.discover" => self.project_discover(&params, &principal).await,
@@ -1987,6 +1989,19 @@ impl Router {
             };
             if let Some(project) = project {
                 request.args["registered_project"] = json!(project);
+            }
+        }
+        {
+            let capacity = crate::config::load_capacity_config(&self.inner.data_root)?;
+            let project: Option<String> = request
+                .args
+                .get("registered_project")
+                .and_then(Value::as_str)
+                .or_else(|| request.args.get("project").and_then(Value::as_str))
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned);
+            if let Some(snapshot) = request.args.get_mut("profile_snapshot") {
+                crate::config::stamp_capacity_scopes(snapshot, project.as_deref(), &capacity)?;
             }
         }
         let Some(branch) = request.args.get("worktree").and_then(Value::as_str) else {

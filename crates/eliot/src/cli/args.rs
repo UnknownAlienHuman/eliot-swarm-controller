@@ -1315,6 +1315,12 @@ pub(crate) enum ProjectCommand {
     List,
     /// Show one owner-registered project readback.
     Show(ProjectShowArgs),
+    /// Read one project team or every team with fleet totals.
+    Overview {
+        /// Registered project id; omitted means every visible project.
+        #[arg(long)]
+        project: Option<String>,
+    },
     /// Read or change current project manager assignments.
     Assignment(ProjectAssignmentArgs),
 }

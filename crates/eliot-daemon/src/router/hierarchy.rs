@@ -94,13 +94,13 @@ fn ignored_child_snapshot_key(key: &str) -> bool {
 }
 
 /// "Same profile except model and effort" over frozen snapshots (#398
-/// follow-up) for same-harness children. After removing the ignorable keys and each
-/// side's own `profile:<name>` capacity scope, every other key must be
-/// equal, including absent-vs-present: that covers permissions, approval
-/// policy, approval, MCP policy, pass_env, cmd, route/account/proxy,
-/// scratch, setup, native-mode knobs, and the inherited credential
-/// bindings. Anything else is a wider (or simply different) authority and
-/// rejects.
+/// follow-up) for same-harness children. After removing the ignorable keys, each
+/// side's own `profile:<name>` scope and the daemon-stamped scopes, every
+/// other key must be equal, including absent-vs-present: that covers
+/// permissions, approval policy, approval, MCP policy, pass_env, cmd,
+/// route/account/proxy, scratch, setup, native-mode knobs, and the
+/// inherited credential bindings. Anything else is a wider (or simply
+/// different) authority and rejects.
 fn child_snapshot_within_parent(
     child: &Value,
     child_profile: &str,
@@ -132,7 +132,7 @@ fn stripped_child_snapshot(snapshot: &Value, profile: &str) -> Result<Value> {
             continue;
         }
         if key == "capacity_scopes" {
-            stripped.insert(key.clone(), without_own_profile_scope(value, profile)?);
+            stripped.insert(key.clone(), without_own_and_daemon_scopes(value, profile)?);
             continue;
         }
         stripped.insert(key.clone(), value.clone());
@@ -141,9 +141,13 @@ fn stripped_child_snapshot(snapshot: &Value, profile: &str) -> Result<Value> {
 }
 
 /// The profile scope (`profile:<name>`) necessarily differs between parent
-/// and child; every other capacity scope (account/proxy/route) must match
-/// exactly, so a child cannot escape the parent's shared capacity bounds.
-fn without_own_profile_scope(scopes: &Value, profile: &str) -> Result<Value> {
+/// and child, and daemon-owned scopes are stamped by the daemon after this
+/// check from the inherited project and the Owner capacity config, never
+/// chosen by the launching agent. Every other capacity scope
+/// (account/proxy/route) must match exactly, so a child cannot escape the
+/// parent's shared capacity bounds; the stamped scopes are enforced
+/// separately at Store admission against the child's inherited project.
+fn without_own_and_daemon_scopes(scopes: &Value, profile: &str) -> Result<Value> {
     let Some(scopes) = scopes.as_array() else {
         return Err(Error::new(
             "invalid",
@@ -154,7 +158,14 @@ fn without_own_profile_scope(scopes: &Value, profile: &str) -> Result<Value> {
     Ok(Value::Array(
         scopes
             .iter()
-            .filter(|entry| entry.get("scope").and_then(Value::as_str) != Some(own.as_str()))
+            .filter(|entry| match entry.get("scope").and_then(Value::as_str) {
+                Some(scope) => {
+                    scope != own.as_str() && !crate::config::is_daemon_owned_scope(scope)
+                }
+                // An entry without a scope key cannot widen authority; the
+                // stamp decoder rejects it when the snapshot is frozen.
+                None => true,
+            })
             .cloned()
             .collect(),
     ))
@@ -232,7 +243,8 @@ fn cross_harness_capacity_scopes(child: &Value, parent: &Agent) -> Result<Value>
 /// Agent's child on the parent profile reuses the parent's frozen snapshot;
 /// a child on an allow-listed same-harness profile carries that profile's
 /// freshly frozen snapshot with only model and effort differing, and the
-/// parent's credential bindings and capacity scopes inherited. An allow-listed
+/// parent's credential bindings inherited; the daemon-owned capacity scopes
+/// are stamped after the check from the inherited project. An allow-listed
 /// cross-harness profile is an explicit Owner grant of its own native policy
 /// and bindings, retaining the parent's shared capacity scopes. Control is
 /// equal or narrower, the workspace is shared, and no worktree is minted:
@@ -1577,6 +1589,9 @@ mod tests {
                     {"scope":"profile:worker","max_live":null},
                     {"scope":"account:child","max_live":8},
                     {"scope":"account:shared","max_live":4},
+                    {"scope":"global:swarm","max_live":null},
+                    {"scope":format!("project:{}", child.project),"max_live":null},
+                    {"scope":format!("manager_assignment:{}", child.project),"max_live":null},
                 ])
             );
             assert!(!child.profile_inherited);
