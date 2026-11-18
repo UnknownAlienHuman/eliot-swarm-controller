@@ -24,6 +24,15 @@ revoked credentials reject, never become owner. No manual `--owner` step is requ
 This prevents accidental attribution errors; it is not isolation from hostile processes
 of the same OS user. Reads are scoped as well as writes.
 
+For Agent-originated commands, Store checks the caller's generation and live
+identity again in the transactions that admit and dispatch work. A missing,
+superseded or terminal generation rejects as `stale_generation`. A current
+nonterminal generation without its own credential rejects as `not_allowed`.
+Exact retained admission replay returns the existing command before the
+new-admission gate. Credentials are still required to reach Store through the
+API. Dispatch refusal leaves already-dispatched commands to their usual
+settlement paths.
+
 A running script has a distinct `Run` principal, bound to exactly one run command and
 its saved originating principal/scope. The daemon creates a random 256-bit token for that
 command and keeps only its SHA-256 hash in an in-memory registry with the command id and
@@ -280,9 +289,11 @@ which validates the Agent credential and current generation. `--require-agent --
 usage error; ordinary Owner MCP stdio and StreamableHTTP behavior are unchanged.
 
 A mutation call may omit `params.id`: the MCP server mints one fresh ULID for that
-call, forwards it, and returns it as top-level `id` in the tool result, so the caller
-retains it for exact retry. An explicit id is forwarded untouched and still validated
-by the daemon. A retry must carry the same id, principal, method and semantic payload;
+call and forwards it to the daemon. Both success and structured daemon errors return
+the minted id as top-level `id` in the tool result. To recover if the entire MCP response
+is lost, supply a stable `params.id` before the first attempt. An explicit id is forwarded
+untouched and still validated by the daemon. A retry must carry the same id, principal,
+method and semantic payload;
 a different binding is `id_conflict`, and an expired id is `id_expired`. Unknown outcomes
 keep the existing exact readback/resolution contract. The server never automatically
 retries uncertain calls and never treats cancellation as rollback. Id admission errors

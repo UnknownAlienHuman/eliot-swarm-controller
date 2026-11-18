@@ -1582,8 +1582,9 @@ pub(super) fn submit_tx(
     }
     submit_target_guards_tx(tx, &request, &preparation)?;
 
-    // Parent links can change after the Router scope read. Recheck admission
-    // against the same transaction that persists the targeted command.
+    // Recheck live identity and target scope in the transaction that persists
+    // the command. Launch and selector admission check the same caller in
+    // their parent and member gates, respectively.
     if principal.starts_with("agent:")
         && request.verb != "launch"
         && let Some(target) = request.target.as_deref()

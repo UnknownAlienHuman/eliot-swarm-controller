@@ -87,6 +87,14 @@ fn reparent_changes_list_command_and_dispatch_scope() {
     let a = agent(&mut s, None);
     let child = agent(&mut s, Some(&a));
     let b = agent(&mut s, None);
+    for manager in [&a, &b] {
+        s.connection
+            .execute(
+                "UPDATE agents SET token = ?1 WHERE id = ?2",
+                params![Ulid::new().to_string(), parse_agent_id(manager).unwrap()],
+            )
+            .unwrap();
+    }
     let old = s.get_agent(&a).unwrap().unwrap();
     let new = s.get_agent(&b).unwrap().unwrap();
     assert!(s.agent_in_scope(&old, &child).unwrap());

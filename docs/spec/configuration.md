@@ -426,6 +426,11 @@ servers. By harness:
   with pre-spawn owner Swarm checks and refusal of unenumerated plugin sources.
   Policy and allow list are reported separately from the unknown ACP inventory.
 
+The file-based MCP scans read regular files only, with a 256 KiB cap per source.
+Missing sources contribute no entries. Unreadable, oversized or malformed sources
+fail startup with `profile_error`. Plugin reads of materialized skill text use the
+same regular-file check with a 64 KiB cap.
+
 No policy edits the owner global native config or copies
 `auth.json`; no project or user file is ever edited by these scans. No
 prompt-surface flags are pinned: the policy is a tool-surface policy and

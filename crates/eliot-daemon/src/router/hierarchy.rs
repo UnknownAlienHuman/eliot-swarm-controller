@@ -1174,10 +1174,7 @@ mod tests {
         "account = \"other\"\n",
     );
 
-    async fn launch_manager(router: &Router, workspace: &std::path::Path, profile: &str) -> String {
-        // These tests exercise admission authority, not native dispatch. Keep
-        // the parent at its admitted generation while asynchronous routing
-        // reads run; a scheduled worker could otherwise advance it mid-test.
+    async fn admit_manager(router: &Router, workspace: &std::path::Path, profile: &str) -> Command {
         let mut request = SubmitCommand::new(ulid::Ulid::new().to_string(), "launch");
         request.args = json!({"workspace":workspace,"profile":profile});
         let prepared = router
@@ -1189,8 +1186,20 @@ mod tests {
             .admit_prepared_submission(&mut store, "owner", prepared, None)
             .unwrap()
             .command
-            .target
-            .unwrap()
+    }
+
+    async fn launch_manager(router: &Router, workspace: &std::path::Path, profile: &str) -> String {
+        // Dispatch in Store so the admission tests carry a valid generation and
+        // identity without scheduling a native worker for the fixture.
+        let command = admit_manager(router, workspace, profile).await;
+        router
+            .inner
+            .store
+            .lock()
+            .await
+            .dispatch(&command.id, now_ms())
+            .unwrap();
+        command.target.unwrap()
     }
 
     async fn launch_child(
@@ -1210,7 +1219,7 @@ mod tests {
                     "verb": "launch",
                     "args": args,
                 }),
-                &agent_principal(caller, 0),
+                &agent_principal(caller, 1),
             )
             .await
     }
@@ -1259,7 +1268,7 @@ mod tests {
         // CLI launch sends workspace and profile without a project argument.
         let manager = launch_manager(&router, &linked, "manager").await;
         let unrelated = launch_manager(&router, &main, "manager").await;
-        let principal = agent_principal(&manager, 0);
+        let principal = agent_principal(&manager, 1);
         for (args, code) in [
             (
                 json!({"workspace": linked, "profile": "stranger"}),
@@ -1297,7 +1306,7 @@ mod tests {
             let child = router
                 .admit_prepared_submission(
                     &mut store,
-                    &format!("agent:{manager}:0"),
+                    &format!("agent:{manager}:1"),
                     prepared,
                     None,
                 )
@@ -1313,7 +1322,7 @@ mod tests {
             assert!(store.agent_in_scope(&parent, &child).unwrap());
             assert!(!store.agent_in_scope(&parent, &unrelated).unwrap());
             let (workers, _) = store
-                .who_workers(&format!("agent:{manager}:0"), None)
+                .who_workers(&format!("agent:{manager}:1"), None)
                 .unwrap();
             assert_eq!(
                 workers
@@ -1500,7 +1509,7 @@ mod tests {
         let _temp_6 = crate::test_support::TempDir::own(workspace.clone());
         std::fs::create_dir_all(&workspace).unwrap();
         let manager = launch_manager(&router, &workspace, "manager").await;
-        let principal = agent_principal(&manager, 0);
+        let principal = agent_principal(&manager, 1);
         assert_eq!(
             launch_child(&router, &manager, &workspace, Some("stranger"))
                 .await
@@ -1741,7 +1750,10 @@ mod tests {
         // The launch freezes its snapshot from config.toml through the
         // daemon's resolve path: the daemon keeps no cached copy, so every
         // fresh resolve is the reload.
-        let agent = launch_manager(&router, &workspace, "reloadable").await;
+        let agent = admit_manager(&router, &workspace, "reloadable")
+            .await
+            .target
+            .unwrap();
         {
             let store = router.inner.store.lock().await;
             let row = store.get_agent(&agent).unwrap().unwrap();
@@ -1870,7 +1882,10 @@ mod tests {
             std::env::temp_dir().join(format!("eliot-reload-after-{}", ulid::Ulid::new()));
         let _temp_10 = crate::test_support::TempDir::own(reloaded_workspace.clone());
         std::fs::create_dir_all(&reloaded_workspace).unwrap();
-        let reloaded = launch_manager(&router, &reloaded_workspace, "reloadable").await;
+        let reloaded = admit_manager(&router, &reloaded_workspace, "reloadable")
+            .await
+            .target
+            .unwrap();
         {
             let store = router.inner.store.lock().await;
             let reloaded_row = store.get_agent(&reloaded).unwrap().unwrap();
@@ -1957,23 +1972,7 @@ mod tests {
         let workspace = std::env::temp_dir().join(format!("eliot-hierarchy-{}", ulid::Ulid::new()));
         let _temp_11 = crate::test_support::TempDir::own(workspace.clone());
         std::fs::create_dir_all(&workspace).unwrap();
-        // The owner launches the parent through the same frozen profile the
-        // Agent child must reuse.
-        let manager = {
-            let response = router
-                .submit(
-                    &json!({
-                        "id": ulid::Ulid::new().to_string(),
-                        "verb": "launch",
-                        "args": {"workspace": workspace, "profile": "fixture"},
-                    }),
-                    &Principal::Owner,
-                )
-                .await
-                .unwrap();
-            let typed: CommandSubmitResponse = serde_json::from_value(response).unwrap();
-            typed.agent.unwrap()
-        };
+        let manager = launch_manager(&router, &workspace, "fixture").await;
         let response = router
             .submit(
                 &json!({
@@ -1981,7 +1980,7 @@ mod tests {
                     "verb": "launch",
                     "args": {"workspace": workspace, "profile": "fixture"},
                 }),
-                &agent_principal(&manager, 0),
+                &agent_principal(&manager, 1),
             )
             .await
             .unwrap();
@@ -2015,17 +2014,12 @@ mod tests {
                 "args": {"workspace": workspace, "profile": "fixture"},
             })
         };
-        let response = router
-            .submit(&launch_as(&home), &Principal::Owner)
-            .await
-            .unwrap();
-        let typed: CommandSubmitResponse = serde_json::from_value(response).unwrap();
-        let manager = typed.agent.unwrap();
+        let manager = launch_manager(&router, &home, "fixture").await;
         // An Agent cannot launch a child into another workspace: the
         // child would escape the parent's frozen authority.
         assert_eq!(
             router
-                .submit(&launch_as(&away), &agent_principal(&manager, 0))
+                .submit(&launch_as(&away), &agent_principal(&manager, 1))
                 .await
                 .unwrap_err()
                 .code,

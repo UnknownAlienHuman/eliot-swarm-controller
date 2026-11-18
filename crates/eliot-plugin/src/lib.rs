@@ -1,3 +1,4 @@
+mod bounded_file;
 pub mod debug;
 mod file_identity;
 pub mod native_lifecycle;

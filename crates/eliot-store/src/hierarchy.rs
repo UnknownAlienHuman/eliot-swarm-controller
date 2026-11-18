@@ -28,9 +28,9 @@ pub(super) enum Caller {
     },
 }
 
-/// Parse the owner-or-Agent principal for hierarchy admission, mirroring the
-/// mail sender rule: a missing Agent row or a moved generation reads
-/// `stale_generation`, any other principal reads `not_allowed`.
+/// Resolve a live Owner or Agent principal inside the writer transaction.
+/// The Agent projection's `own_identity` reflects the current token and
+/// control state without retrieving the credential itself.
 pub(super) fn parse_caller(connection: &Connection, principal: &str) -> Result<Caller> {
     if principal == "owner" {
         return Ok(Caller::Owner);
@@ -58,11 +58,14 @@ pub(super) fn parse_caller(connection: &Connection, principal: &str) -> Result<C
         let agent = load_agent_by_num(connection, num)?.ok_or_else(|| {
             Error::new("stale_generation", "caller generation is no longer current")
         })?;
-        if agent.generation != generation {
+        if agent.generation != generation || agent.is_terminal() {
             return Err(Error::new(
                 "stale_generation",
-                "caller generation is no longer current",
+                "caller generation is no longer live and current",
             ));
+        }
+        if !agent.own_identity {
+            return Err(Error::new("not_allowed", "caller identity was revoked"));
         }
         return Ok(Caller::Agent {
             num,
@@ -278,12 +281,6 @@ pub(super) fn resolve_launch_parent(
     // A child needs a controlled parent: observe-only and unknown Agents
     // have no native control authority to parent new work.
     observer::require_controlled(&parent_agent)?;
-    if matches!(caller, Caller::Agent { .. }) && parent_agent.is_terminal() {
-        return Err(Error::new(
-            "stale_generation",
-            "caller generation is no longer current",
-        ));
-    }
     let root_num = parse_agent_id(&parent_agent.root)?;
     Ok(Some(ParentLink {
         num: parent_num,
@@ -1808,6 +1805,79 @@ mod tests {
             assert!(!agent.profile_inherited);
         }
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn revoked_parent_cannot_admit_or_dispatch_child_work_and_exact_replay_survives() {
+        let mut store = store();
+        let now = now_ms();
+        let mut launch = launch_request("caller-authority", None);
+        launch.args["profile_snapshot"] = json!({"control": "tree"});
+        let parent = store
+            .submit("owner", launch, now)
+            .unwrap()
+            .command
+            .target
+            .unwrap();
+        ready_launched_agent(&mut store, &parent, now + 1);
+        let principal = agent_principal(&parent);
+        let child = launch_child(&mut store, &principal, &parent, json!({}), now + 2);
+        ready_launched_agent(&mut store, &child, now + 3);
+
+        let mut send = SubmitCommand::new(Ulid::new().to_string(), "send");
+        send.target = Some(child.clone());
+        send.expected_generation = Some(1);
+        send.args = json!({"text": "Read the project overview"});
+        let accepted = store.submit(&principal, send.clone(), now + 4).unwrap();
+        assert!(accepted.is_new);
+
+        let mut fresh = send.clone();
+        fresh.id = Ulid::new().to_string();
+        store
+            .connection
+            .execute(
+                "UPDATE agents SET token = NULL WHERE id = ?1",
+                [parse_agent_id(&parent).unwrap()],
+            )
+            .unwrap();
+        let committed = store.get_agent(&parent).unwrap().unwrap();
+        assert_eq!(committed.state, AgentState::Idle);
+        assert!(!committed.own_identity);
+        let error = store
+            .submit(&principal, fresh.clone(), now + 5)
+            .unwrap_err();
+        assert_eq!(error.code, "not_allowed");
+
+        let mut stop = SubmitCommand::new(Ulid::new().to_string(), "stop");
+        stop.target = Some(parent.clone());
+        let stop_id = stop.id.clone();
+        store.submit("owner", stop, now + 6).unwrap();
+        store.dispatch(&stop_id, now + 7).unwrap();
+        store
+            .settle(&stop_id, CommandState::Applied, None, now + 8)
+            .unwrap();
+        let stopped = store.get_agent(&parent).unwrap().unwrap();
+        assert_eq!(stopped.state, AgentState::Stopped);
+        assert_eq!(stopped.generation, 1);
+
+        let error = store
+            .submit(&principal, fresh.clone(), now + 9)
+            .unwrap_err();
+        assert_eq!(error.code, "stale_generation");
+        assert!(store.get_command(&fresh.id).unwrap().is_none());
+
+        let replay = store.submit(&principal, send.clone(), now + 9).unwrap();
+        assert!(!replay.is_new);
+        assert!(replay.events.is_empty());
+        assert_eq!(replay.command, accepted.command);
+
+        let error = store.dispatch(&send.id, now + 10).unwrap_err();
+        assert_eq!(error.code, "stale_generation");
+        assert_eq!(
+            store.get_agent(&child).unwrap().unwrap().state,
+            AgentState::Idle
+        );
+        assert_eq!(store.get_command(&send.id).unwrap(), Some(accepted.command));
     }
 
     #[test]
