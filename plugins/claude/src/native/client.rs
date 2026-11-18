@@ -120,6 +120,13 @@ impl ClaudeProcess {
         self.transport.await_output_drained(deadline).await
     }
 
+    /// Close the owned CLI gracefully without falling back to a kill. The
+    /// daemon's Job remains the sole force-custody path if this cannot be
+    /// proven before the deadline.
+    pub async fn close_gracefully(&mut self, deadline: Instant) -> Result<ExitStatus> {
+        self.transport.close_gracefully(deadline, true).await
+    }
+
     /// Drop stdin so `claude -p` sees EOF and exits, then kill that direct
     /// child by handle. The kill path only fires when the graceful close
     /// cannot be confirmed. Grandchildren are not touched here: the

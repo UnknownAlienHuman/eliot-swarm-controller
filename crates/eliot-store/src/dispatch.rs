@@ -542,15 +542,14 @@ fn dispatch_stop_tx(
             "stop command's captured turn is no longer current",
         ));
     }
-    check_rpc_frame(
-        "agent.stop",
-        &json!({
-            "agent_id": agent.id,
-            "generation": agent.generation,
-            "command_id": id,
-            "force": command.command.args.get("force").and_then(Value::as_bool).unwrap_or(false),
-        }),
-    )?;
+    if command.command.args.get("force").and_then(Value::as_bool) != Some(true)
+        && has_in_flight_stop_tx(tx, agent_num, agent.generation)?
+    {
+        return Err(Error::new(
+            "bad_state",
+            "another stop is unresolved for this generation",
+        ));
+    }
     update_command_state(tx, id, CommandState::Dispatched, None, None, now)?;
     events.push(insert_daemon_command_event(
         tx,

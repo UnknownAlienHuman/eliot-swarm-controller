@@ -12,12 +12,11 @@ use super::{
     PendingSteerFuture, PluginClient, PluginCommandCompletion, PluginSnapshotCompletion, RPC_GRACE,
     RuntimeMessage, STOP_GRACE, agent_command_params, cleanup_actor, cleanup_startup,
     complete_plugin_command, custody_label, deadline, fence_command_routing,
-    fence_runtime_generation, has_committed_session_ended, initialize_agent,
-    is_failed_start_result, mark_lost_state, mark_lost_state_with_exit, prepare_queued_stop_call,
-    record_plugin_error, redact_native_error, resolve_resume_config, resolve_send_config,
-    retire_failed_start, settle_drained_source_exit, settle_owned_source_exit,
-    shutdown_and_wait_child, snapshot_future, start_deadline, validate_applied,
-    validate_start_result, wait_child, wait_stop_child,
+    fence_runtime_generation, initialize_agent, is_failed_start_result, mark_lost_state,
+    mark_lost_state_with_exit, prepare_queued_stop_call, record_plugin_error, redact_native_error,
+    resolve_resume_config, resolve_send_config, retire_failed_start, settle_drained_source_exit,
+    settle_owned_source_exit, shutdown_and_wait_child, snapshot_future, start_deadline,
+    validate_applied, validate_start_result, wait_child, wait_stop_child,
 };
 use crate::monitor::Monitoring;
 use crate::platform::OwnedChild;
@@ -222,7 +221,6 @@ pub(super) async fn run_agent_inner(
         monitoring,
         key,
         agent,
-        start_command,
         plugin_credential,
         source_credentials,
         stderr,
@@ -244,7 +242,6 @@ pub(super) async fn run_agent_inner(
         pending_steers: &mut pending_steers,
         pending_snapshots: &mut pending_snapshots,
         pending_failure,
-        start_command_id: &start_command.id,
     })
     .await;
     settle_agent_actor(
@@ -280,7 +277,6 @@ struct AgentDispatch<'a> {
     pending_steers: &'a mut FuturesUnordered<PendingSteerFuture>,
     pending_snapshots: &'a mut FuturesUnordered<PendingSnapshotFuture>,
     pending_failure: &'a mut Option<PendingFailure>,
-    start_command_id: &'a str,
 }
 
 /// Start sequencing: initialize the native source, resolve resume overlays,
@@ -477,7 +473,6 @@ async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
         pending_steers,
         pending_snapshots,
         pending_failure,
-        start_command_id,
     } = dispatch;
     let mut planned_exit = false;
     // while_let_loop does not apply: the child borrow must end before
@@ -684,192 +679,100 @@ async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
                             ));
                         }
                     }
-                    RuntimeMessage::Stop { command, turn_id, force, deadlines, reply } => {
-                        let params = json!({
-                            "agent_id": agent.id,
-                            "generation": agent.generation,
-                            "command_id": command.id,
-                            "force": force,
-                            "turn_id": turn_id,
-                        });
-                        let stop_call = match prepare_queued_stop_call(client, params, deadlines) {
-                            Ok(call) => call,
-                            Err(error) => {
-                                let _ = reply.send(Err(error));
+                    RuntimeMessage::Stop { command, force, deadlines, reply } => {
+                        let guarantee = child.guarantee();
+                        let (native, graceful, exited) = if force {
+                            // Windows force goes directly to the named Job. The
+                            // actor provides the equivalent weaker Unix custody.
+                            if Instant::now() >= deadlines.queued_until {
+                                let _ = reply.send(Err(Error::new(
+                                    "native_not_dispatched",
+                                    "stop queue deadline elapsed before custody termination",
+                                )));
                                 continue;
                             }
+                            let exited = child.terminate().is_ok()
+                                && wait_stop_child(child, monitoring, agent, deadlines.custody_until).await;
+                            (Ok(None), false, exited)
+                        } else {
+                            let params = json!({
+                                "agent_id": agent.id,
+                                "generation": agent.generation,
+                                "command_id": command.id,
+                            });
+                            let stop_call = match prepare_queued_stop_call(client, params, deadlines) {
+                                Ok(call) => call,
+                                Err(error) => {
+                                    let _ = reply.send(Err(error));
+                                    continue;
+                                }
+                            };
+                            let native = stop_call
+                                .await
+                                .map_err(|error| redact_native_error(error, source_credentials))
+                                .and_then(validate_applied)
+                                .map(Some);
+                            match native {
+                                Ok(_) => {
+                                    let (graceful, exited) = shutdown_and_wait_child(
+                                        client, child, monitoring, agent, deadlines,
+                                    ).await;
+                                    (native, graceful, exited)
+                                }
+                                Err(ref error) if error.code == "unknown" => {
+                                    // The effect is uncertain. Retire owned custody
+                                    // without calling the plugin again.
+                                    let exited = child.terminate().is_ok()
+                                        && wait_stop_child(child, monitoring, agent, deadlines.custody_until).await;
+                                    (native, false, exited)
+                                }
+                                Err(error) => {
+                                    let _ = reply.send(Err(error));
+                                    continue;
+                                }
+                            }
                         };
-                        let cooperative = stop_call
-                            .await
-                            .map_err(|error| redact_native_error(error, source_credentials))
-                            .and_then(validate_applied);
-                        match cooperative {
-                            Ok(result) => {
-                                let guarantee = child.guarantee();
-                                let (graceful, exited) = shutdown_and_wait_child(
-                                    client,
-                                    &mut *child,
-                                    monitoring,
-                                    agent,
-                                    deadlines,
-                                )
-                                .await;
-                                if !exited {
-                                    drop(child_slot.take());
-                                    let _ = settle_owned_source_exit(
-                                        state, key, Some(&mut *event_task), false,
-                                        "stop_exit_without_session_terminal",
-                                    ).await;
-                                    if let Some(state) = state.upgrade() {
-                                        fence_runtime_generation(&state, key);
-                                    }
-                                    planned_exit = true;
-                                    let _ = reply.send(Err(Error::new(
-                                        "unknown",
-                                        "stop could not confirm owned process-family exit",
-                                    )));
-                                    break;
-                                }
-                                let source_exit = settle_owned_source_exit(
-                                    state, key, Some(&mut *event_task), true,
-                                    "stop_exit_without_session_terminal",
-                                ).await;
-                                if let Some(state) = state.upgrade() {
-                                    fence_runtime_generation(&state, key);
-                                }
-                                planned_exit = true;
-                                if let Err(error) = source_exit {
-                                    let _ = reply.send(Err(error));
-                                    break;
-                                }
-                                if Instant::now() > deadlines.source_until {
-                                    let _ = reply.send(Err(Error::new("unknown", "stop source settlement exceeded its absolute deadline")));
-                                    break;
-                                }
-                                let _ = reply.send(Ok(json!({
-                                    "state": "applied",
-                                    "custody": custody_label(guarantee),
-                                    "graceful": graceful,
-                                    "native": result,
-                                })));
-                                break;
-                            }
-                            Err(_) if force => {
-                                let snapshot = if Instant::now() < deadlines.rpc_until { client.call(
-                                    "agent.snapshot",
-                                    json!({
-                                        "agent_id": agent.id,
-                                        "generation": agent.generation,
-                                        "command_id": start_command_id,
-                                    }),
-                                    deadlines.rpc_deadline(STOP_GRACE),
-                                ).await.ok() } else { None };
-                                let guarantee = child.guarantee();
-                                let terminated = child.terminate().is_ok();
-                                let exited = wait_stop_child(&mut *child, monitoring, agent, deadlines.custody_until).await;
-                                if !terminated || !exited {
-                                    drop(child_slot.take());
-                                    let _ = settle_owned_source_exit(
-                                        state, key, Some(&mut *event_task), false,
-                                        "force_stop_exit_without_session_terminal",
-                                    ).await;
-                                    if let Some(state) = state.upgrade() {
-                                        fence_runtime_generation(&state, key);
-                                    }
-                                    planned_exit = true;
-                                    let _ = reply.send(Err(Error::new(
-                                        "unknown",
-                                        format!(
-                                            "force-stop could not confirm owned custody termination ({})",
-                                            custody_label(guarantee)
-                                        ),
-                                    )));
-                                    break;
-                                }
-                                let source_exit = settle_owned_source_exit(
-                                    state, key, Some(&mut *event_task), true,
-                                    "force_stop_exit_without_session_terminal",
-                                ).await;
-                                if let Some(state) = state.upgrade() {
-                                    fence_runtime_generation(&state, key);
-                                }
-                                planned_exit = true;
-                                if let Err(error) = source_exit {
-                                    let _ = reply.send(Err(error));
-                                    break;
-                                }
-                                if Instant::now() > deadlines.source_until {
-                                    let _ = reply.send(Err(Error::new("unknown", "stop source settlement exceeded its absolute deadline")));
-                                    break;
-                                }
-                                let mut response = json!({
-                                    "state": "applied",
-                                    "custody": custody_label(guarantee),
-                                    "terminated": true,
-                                    "cooperative": "unknown",
-                                });
-                                if let Some(snapshot) = snapshot {
-                                    response["snapshot"] = snapshot;
-                                }
-                                let _ = reply.send(Ok(response));
-                                break;
-                            }
-                            Err(error) => {
-                                if error.code == "unknown" && Instant::now() < deadlines.rpc_until {
-                                    let _ = client.call(
-                                        "agent.snapshot",
-                                        json!({
-                                            "agent_id": agent.id,
-                                            "generation": agent.generation,
-                                            "command_id": start_command_id,
-                                        }),
-                                        deadlines.rpc_deadline(STOP_GRACE),
-                                    ).await;
-                                }
-                                if error.code == "unknown"
-                                    && has_committed_session_ended(state, key, deadlines.custody_until).await
-                                {
-                                    // Durable logical End is committed but the stop RPC
-                                    // outcome is unknown. Run the Applied physical
-                                    // sequence so the owning plugin/Job and descendants
-                                    // cannot leak, then return the ORIGINAL unknown:
-                                    // ack uncertainty is separate from physical closure
-                                    // and no Applied is invented.
-                                    let (_, exited) = shutdown_and_wait_child(
-                                        client,
-                                        &mut *child,
-                                        monitoring,
-                                        agent,
-                                        deadlines,
-                                    )
-                                    .await;
-                                    if !exited {
-                                        drop(child_slot.take());
-                                        let _ = settle_owned_source_exit(
-                                            state, key, Some(&mut *event_task), false,
-                                            "unknown_stop_exit_with_session_terminal",
-                                        ).await;
-                                        if let Some(state) = state.upgrade() {
-                                            fence_runtime_generation(&state, key);
-                                        }
-                                        planned_exit = true;
-                                        let _ = reply.send(Err(error));
-                                        break;
-                                    }
-                                    let _ = settle_owned_source_exit(
-                                        state, key, Some(&mut *event_task), true,
-                                        "unknown_stop_exit_with_session_terminal",
-                                    ).await;
-                                    if let Some(state) = state.upgrade() {
-                                        fence_runtime_generation(&state, key);
-                                    }
-                                    planned_exit = true;
-                                    let _ = reply.send(Err(error));
-                                    break;
-                                }
-                                let _ = reply.send(Err(error));
-                            }
+                        if !exited {
+                            drop(child_slot.take());
                         }
+                        let source_exit = settle_owned_source_exit(
+                            state, key, Some(&mut *event_task), exited,
+                            if force {
+                                "force_stop_exit_without_session_terminal"
+                            } else {
+                                "stop_exit_without_session_terminal"
+                            },
+                        ).await;
+                        if let Some(state) = state.upgrade() {
+                            fence_runtime_generation(&state, key);
+                        }
+                        planned_exit = true;
+                        if native.is_err() && source_exit.is_ok() {
+                            mark_lost_state(state, key, "stop_exit_without_session_terminal").await;
+                        }
+                        let result = native.and_then(|native| {
+                            if !exited {
+                                return Err(Error::new(
+                                    "unknown",
+                                    format!(
+                                        "stop could not confirm owned process-family exit ({})",
+                                        custody_label(guarantee),
+                                    ),
+                                ));
+                            }
+                            source_exit?;
+                            if Instant::now() > deadlines.source_until {
+                                return Err(Error::new("unknown", "stop source settlement exceeded its absolute deadline"));
+                            }
+                            Ok(json!({
+                                "state": "applied",
+                                "custody": custody_label(guarantee),
+                                "graceful": graceful,
+                                "native": native,
+                            }))
+                        });
+                        let _ = reply.send(result);
+                        break;
                     }
                     RuntimeMessage::DaemonForce { reply } => {
                         let guarantee = child.guarantee();

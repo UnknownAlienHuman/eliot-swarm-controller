@@ -2645,28 +2645,15 @@ impl CodexPlugin {
                 "Codex stop outcome is unresolved and will not be repeated",
             ));
         }
-        // Latch once before native I/O. An uncertain cancel is never replayed.
+        // Latch once before native I/O. The router owns interrupt/wait and
+        // daemon force custody; this adapter only performs the graceful
+        // native close and verifies the event/source drain.
         session.stop_command_id = Some(params.command_id.clone());
-        if let Some(interrupt) = params.interrupt() {
-            let until = Instant::now() + eliot_plugin::native_lifecycle::STOP_INTERRUPT_TIMEOUT;
-            let _ = tokio::time::timeout_at(until, self.interrupt(interrupt)).await;
-            if let Some(session) = self.session.as_ref() {
-                eliot_plugin::native_lifecycle::wait_for_stop_turn(until, || {
-                    let status = session.events.status();
-                    !status.source_unknown
-                        && !status.batch_unknown
-                        && status.last_turn.as_ref().is_some_and(|turn| {
-                            Some(&turn.turn_id) == params.turn_id.as_ref() && turn.terminal
-                        })
-                })
-                .await;
-            }
-        }
         let session = self
             .session
             .as_mut()
             .ok_or_else(|| Error::new("unknown", "stop lost its retained native session"))?;
-        terminate_session(session, params.force).await?;
+        terminate_session(session, false).await?;
         Ok(json!({"state": "applied"}))
     }
 
@@ -2704,10 +2691,19 @@ impl CodexPlugin {
 
 async fn terminate_session(session: &mut AgentSession, force: bool) -> Result<()> {
     let begin = session.events.begin_stop().await;
-    let process_exit = session
-        .native
-        .terminate(force, Instant::now() + RPC_TIMEOUT)
-        .await;
+    let deadline = Instant::now() + RPC_TIMEOUT;
+    let process_exit = if force {
+        // Startup/plugin-shutdown cleanup retains its separate forceful path.
+        session.native.terminate(true, deadline).await
+    } else {
+        // Agent stop must never escalate to a child kill; daemon Job custody
+        // owns force termination after this graceful close is unresolved.
+        session
+            .native
+            .transport
+            .close_gracefully(deadline, true)
+            .await
+    };
     let drained = session
         .native
         .await_output_drained(Instant::now() + RPC_TIMEOUT)

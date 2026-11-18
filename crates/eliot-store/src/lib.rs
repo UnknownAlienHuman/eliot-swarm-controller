@@ -5321,8 +5321,9 @@ fn send_gate_open(connection: &Connection, agent_num: i64, generation: i64) -> R
         .query_row(
             "SELECT EXISTS(
                  SELECT 1 FROM commands
-                 WHERE target = ?1 AND generation = ?2 AND verb = 'send'
-                   AND state IN ('dispatched', 'unknown') AND turn_id IS NULL
+                 WHERE target = ?1 AND generation = ?2
+                   AND state IN ('dispatched', 'unknown')
+                   AND (verb = 'stop' OR (verb = 'send' AND turn_id IS NULL))
              )",
             params![agent_num, generation],
             |row| row.get(0),

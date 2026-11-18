@@ -106,7 +106,7 @@ normalized native family. Hooks never mirror lifecycle already supplied by the s
 | `initialize` | protocol, frozen plugin config, private instance directory, optional `store_root` (required by OpenCode) | return actual manifest |
 | `agent.start` | agent/generation, profile, workspace, target environment, note, source plan/state, optional resume subject/linked initial input | establish session; input/result settle separately; a proven-no-effect failure returns `"state": "failed"` with a short non-secret `reason` instead of an error, and the launch settles failed, never unknown |
 | `agent.command` | agent/generation, command id, verb/args, exact turn/request where required | applied/rejected/failed/unknown, native mechanism and application point |
-| `agent.stop` | agent/generation, command id, force | success means the bound controlled session/generation ended, not merely that observation detached |
+| `agent.stop` | agent/generation, command id | gracefully close the bound controlled native session and drain its events |
 | `agent.snapshot` | controlled command/turn binding, or exact subject plus `observation` page query | bounded readback; private history never acknowledges controlled effects |
 | `agent.models` | exact Agent and generation ([`AgentModelsParams`](../../crates/eliot-plugin/src/protocol.rs)) | read the owned session's model catalogue; OpenCode advertises `models` in its manifest and echoes the exact binding. A control request can preempt this bounded read |
 | `agent.attach` | exact subject, generation, observe/control, profile/environment, source plan/cursors | attach only to that subject; otherwise not found/unsupported. A bound `failed` result is limited to a proven pre-native refusal or `native_start_failed` (no thread/session effect and confirmed native-helper cleanup); uncertain outcomes remain unknown. |
@@ -114,6 +114,15 @@ normalized native family. Hooks never mirror lifecycle already supplied by the s
 | `discover` | frozen profile, target environment without Agent identity, optional exact scope/cursor, `archived` (default `false`), bounded limit | read-only native-subject metadata page |
 | `profile.store` (L3) | shared [`ProfileStoreParams`](../../crates/eliot-plugin/src/protocol.rs) | Return [`ProfileStoreResult`](../../crates/eliot-plugin/src/protocol.rs): the effective `NativeStoreBinding` and optional plugin-owned startup projection, using the caller's actual prepared workspace and one bounded, owned metadata reader. Store freezes both with the exact launch dispatch; success requires confirmed reader cleanup. It creates no model or thread, performs no native control and publishes no Agent events. This is outside the L1/L2 first-harness subset. |
 | `shutdown` | none | close owned paths, drain, exit; never kill an adopted service |
+
+For an ordinary stop with an active turn, the router dispatches a separate
+`interrupt` command bound to that generation and turn. It waits up to five
+seconds for the exact turn to complete in Store before sending `agent.stop`.
+An interrupt acknowledgement or wait timeout supplies no terminal turn evidence.
+The daemon alone terminates owned custody when needed, using the generation's
+Windows Job or the weaker Unix process custody. Explicit force bypasses plugin
+stop. Unproven stop effects stay unknown even after confirmed custody exit, and
+the daemon never reissues the uncertain native call.
 
 Steer uses an ordered, bounded write followed by a correlated response wait: the host
 writes its `agent.command` frame in dispatch order under the writer deadline, then keeps

@@ -161,7 +161,7 @@ pub(crate) struct Session {
     mcp_config: Option<crate::mcp::OwnedConfig>,
     ready: bool,
     steer_inflight: Option<i64>,
-    stop: Option<(String, bool, Result<Value>)>,
+    stop: Option<(String, Result<Value>)>,
     /// Advertised `model` option values from the latest session open
     /// (`session/new` or `session/load` result), refreshed on resume.
     /// Required writes must name one of these; anything else rejects
@@ -1053,8 +1053,8 @@ impl Session {
     }
 
     pub async fn stop(&mut self, params: AgentStopParams) -> Result<Value> {
-        if let Some((previous, force, result)) = &self.stop {
-            if previous != &params.command_id || *force != params.force {
+        if let Some((previous, result)) = &self.stop {
+            if previous != &params.command_id {
                 return Err(Error::new(
                     "source_integrity",
                     "Antigravity stop inputs changed after dispatch",
@@ -1070,60 +1070,26 @@ impl Session {
         }
         self.stop = Some((
             params.command_id.clone(),
-            params.force,
             Err(Error::new("unknown", "Antigravity stop is unresolved")),
         ));
-        if !params.force
-            && let Some(turn_id) = params.turn_id.as_deref()
-        {
-            let until = Instant::now() + eliot_plugin::native_lifecycle::STOP_INTERRUPT_TIMEOUT;
-            let _ = timeout_at(until, async {
-                let _ = self
-                    .cancel_turn(&params.command_id, turn_id, until, None)
-                    .await;
-                loop {
-                    let terminal = {
-                        let state = self.state.lock().await;
-                        !state.source_unknown
-                            && !state.batch_unknown
-                            && state
-                                .last_turn
-                                .as_ref()
-                                .is_some_and(|turn| turn.turn_id == turn_id && turn.terminal)
-                    };
-                    if terminal {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                }
-            })
-            .await;
-        }
-        // Answer open permission asks `cancelled` best-effort, then close
-        // whatever remains: the native session is ending, so no ask may
-        // stay open behind it. Closing is not best-effort: every retained
-        // ask needs its `request.closed` fact or the Store stales the ask
-        // with no history once `session.ended` publishes, so a closure
-        // failure is terminal for the stop (mirrors Claude `finish_stop`).
+        // The router owns interrupt/wait and daemon force custody. This
+        // adapter only closes the native session gracefully and verifies
+        // source drain; force custody remains in the daemon.
         let closure = {
             let mut state = self.state.lock().await;
             state.stopping = true;
-            state.latch_cancellation(&params.command_id, None);
-            state
-                .answer_pending_cancelled(&self.client, &params.command_id, None)
-                .await;
             state.close_pending_requests(None).await
         };
         if let Err(error) = closure {
             let error = self.client.diagnostic_error(error);
-            self.stop = Some((params.command_id.clone(), params.force, Err(error.clone())));
+            self.stop = Some((params.command_id.clone(), Err(error.clone())));
             return Err(error);
         }
         let result = self
-            .terminate(params.force)
+            .close_gracefully()
             .await
             .map(|()| json!({"state": "applied"}));
-        self.stop = Some((params.command_id, params.force, result.clone()));
+        self.stop = Some((params.command_id, result.clone()));
         result
     }
 
@@ -1161,6 +1127,14 @@ impl Session {
     }
 
     pub async fn terminate(&mut self, force: bool) -> Result<()> {
+        self.terminate_inner(force, false).await
+    }
+
+    async fn close_gracefully(&mut self) -> Result<()> {
+        self.terminate_inner(false, true).await
+    }
+
+    async fn terminate_inner(&mut self, force: bool, graceful: bool) -> Result<()> {
         {
             let mut state = self.state.lock().await;
             state.stopping = true;
@@ -1177,10 +1151,12 @@ impl Session {
                 )
                 .await;
         }
-        self.native
-            .terminate(force, deadline)
-            .await
-            .map_err(|error| self.client.diagnostic_error(error.with_code("unknown")))?;
+        let process_exit = if graceful {
+            self.native.close_gracefully(deadline).await
+        } else {
+            self.native.terminate(force, deadline).await
+        };
+        process_exit.map_err(|error| self.client.diagnostic_error(error.with_code("unknown")))?;
         if let Some(task) = self.task.as_mut() {
             timeout_at(deadline, task)
                 .await

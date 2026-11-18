@@ -4757,14 +4757,6 @@ mod tests {
         processor.status.session_id = Some("session-1".into());
         processor.status.active_command_id = Some("send-1".into());
         processor.status.active_turn_id = Some("turn-1".into());
-        eliot_plugin::native_lifecycle::wait_for_stop_turn(Instant::now(), || {
-            processor
-                .status
-                .last_turn
-                .as_ref()
-                .is_some_and(|turn| turn.turn_id == "turn-1" && turn.terminal)
-        })
-        .await;
         let (read, mut write) = tokio::io::split(host_io);
         let (result, ()) = tokio::join!(processor.finish_stop(), async {
             let mut line = String::new();

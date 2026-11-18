@@ -447,7 +447,6 @@ pub(super) fn admit_stop_member(
             "agent_id": agent.id,
             "generation": agent.generation,
             "command_id": request.id,
-            "force": request.args.get("force").and_then(Value::as_bool).unwrap_or(false),
         }),
     )?;
     events.push(admit_command(

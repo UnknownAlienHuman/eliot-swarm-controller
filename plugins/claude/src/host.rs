@@ -1991,33 +1991,21 @@ impl ClaudePlugin {
         }
         // Latch once before native I/O. An uncertain cancel is never replayed.
         session.stop_command_id = Some(params.command_id.clone());
-        if let Some(interrupt) = params.interrupt() {
-            let until = Instant::now() + eliot_plugin::native_lifecycle::STOP_INTERRUPT_TIMEOUT;
-            let _ = tokio::time::timeout_at(until, self.interrupt_command(interrupt)).await;
-            if let Some(session) = self.session.as_ref() {
-                eliot_plugin::native_lifecycle::wait_for_stop_turn(until, || {
-                    let status = session.events.status();
-                    !status.source_unknown
-                        && !status.batch_unknown
-                        && status.last_turn.as_ref().is_some_and(|turn| {
-                            Some(&turn.turn_id) == params.turn_id.as_ref() && turn.terminal
-                        })
-                })
-                .await;
-            }
-        }
         let session = self
             .session
             .as_mut()
             .ok_or_else(|| Error::new("unknown", "stop lost its retained native session"))?;
-        terminate_session(session, params.force).await?;
+        // The router owns interrupt/wait and daemon force custody. This
+        // adapter only performs the graceful native close and verifies the
+        // event/source drain; force custody remains in the daemon.
+        terminate_session(session, false, true).await?;
         Ok(json!({"state": "applied"}))
     }
 
     async fn shutdown(&mut self) -> Result<Value> {
         if let Some(session) = self.session.as_mut() {
             if session.phase != SessionPhase::Stopped {
-                terminate_session(session, true).await?;
+                terminate_session(session, true, false).await?;
             }
             session.events.close().await;
         }
@@ -2027,7 +2015,7 @@ impl ClaudePlugin {
     async fn shutdown_owned(&mut self) {
         if let Some(session) = self.session.as_mut() {
             if session.phase != SessionPhase::Stopped {
-                let _ = terminate_session(session, true).await;
+                let _ = terminate_session(session, true, false).await;
             }
             session.events.close().await;
         }
@@ -2144,12 +2132,19 @@ fn snapshot_turn_facts<'a>(
     Ok(retained)
 }
 
-async fn terminate_session(session: &mut AgentSession, force: bool) -> Result<()> {
+async fn terminate_session(session: &mut AgentSession, force: bool, graceful: bool) -> Result<()> {
     let begin = session.events.begin_stop().await;
-    let process_exit = session
-        .native
-        .terminate(force, Instant::now() + RPC_TIMEOUT)
-        .await;
+    let process_exit = if graceful {
+        session
+            .native
+            .close_gracefully(Instant::now() + RPC_TIMEOUT)
+            .await
+    } else {
+        session
+            .native
+            .terminate(force, Instant::now() + RPC_TIMEOUT)
+            .await
+    };
     let drained = session
         .native
         .await_output_drained(Instant::now() + RPC_TIMEOUT)

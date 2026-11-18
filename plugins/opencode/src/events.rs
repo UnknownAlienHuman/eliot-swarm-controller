@@ -154,6 +154,12 @@ enum Control {
     EndStop {
         reply: oneshot::Sender<Result<()>>,
     },
+    /// Close the native SSE source after draining queued frames, then publish
+    /// the planned session end. The owned OpenCode server remains alive so
+    /// the daemon Job, rather than this plugin, owns its eventual custody.
+    DrainStop {
+        reply: oneshot::Sender<Result<()>>,
+    },
     Close {
         reply: oneshot::Sender<()>,
     },
@@ -269,6 +275,7 @@ struct EventProcessor {
     loss_reason: Option<&'static str>,
     frames_drained: bool,
     pending_end_stop: Option<oneshot::Sender<Result<()>>>,
+    close_frames: bool,
     writes_blocked: bool,
     gap_reported: bool,
     pending: Option<PendingInbox>,
@@ -526,6 +533,12 @@ impl EventHandle {
         self.send(|reply| Control::EndStop { reply }).await
     }
 
+    /// Drain the queued native SSE frames, publish the exact session end and
+    /// close the stream receiver without terminating the owned server.
+    pub async fn drain_stop(&self) -> Result<()> {
+        self.send(|reply| Control::DrainStop { reply }).await
+    }
+
     pub async fn close(&self) {
         let (reply, response) = oneshot::channel();
         if self.control.send(Control::Close { reply }).await.is_ok() {
@@ -641,6 +654,7 @@ impl EventProcessor {
             loss_reason: None,
             frames_drained: false,
             pending_end_stop: None,
+            close_frames: false,
             writes_blocked: false,
             gap_reported: false,
             pending: None,
@@ -766,6 +780,23 @@ impl EventProcessor {
                     )));
                 } else {
                     self.pending_end_stop = Some(reply);
+                }
+                true
+            }
+            Control::DrainStop { reply } => {
+                self.planned_stop = true;
+                self.abort_context_hooks();
+                if self.frames_drained {
+                    let result = self.finish_stop().await;
+                    let _ = reply.send(result);
+                } else if self.pending_end_stop.is_some() {
+                    let _ = reply.send(Err(Error::new(
+                        "bad_state",
+                        "OpenCode stop is already waiting for native output drain",
+                    )));
+                } else {
+                    self.pending_end_stop = Some(reply);
+                    self.close_frames = true;
                 }
                 true
             }
@@ -2971,6 +3002,10 @@ async fn run(
                     Some(control) => {
                         if !processor.handle_control(control).await {
                             break;
+                        }
+                        if processor.close_frames {
+                            frames.close();
+                            processor.close_frames = false;
                         }
                         processor.report_gap_if_queue_empty(frames.is_empty()).await;
                     }

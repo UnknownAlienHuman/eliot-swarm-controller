@@ -1,7 +1,7 @@
 //! Per-verb execution of Store-dispatched commands and their settlement.
 
 use super::{
-    Router,
+    PreparedSubmission, Router,
     command::{
         RunWorkerStart, classify_start_result, coordination_commit_error_state,
         validate_observer_command_result,
@@ -9,10 +9,14 @@ use super::{
 };
 use crate::common::now_ms;
 use eliot_core::{
-    Agent, Command, CommandState, Error, FailureOrigin, Result,
+    Agent, Command, CommandState, Error, FailureOrigin, Result, SubmitCommand, TurnState,
     api::{FrozenGitFetch, ProjectRegistrationView},
 };
 use serde_json::{Value, json};
+use std::time::Duration;
+use tokio::{sync::broadcast, time::timeout};
+
+const STOP_TURN_GRACE: Duration = Duration::from_secs(5);
 
 impl Router {
     /// Run a dispatched `run` command to worker completion, or settle the
@@ -846,6 +850,15 @@ impl Router {
             .get("force")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        if !force
+            && let Some(turn_id) = agent.active_turn.as_deref()
+            && let Err(error) = self
+                .interrupt_before_stop(agent, turn_id, &dispatched)
+                .await
+        {
+            self.settle_plugin_error(id, &error).await;
+            return true;
+        }
         match self
             .inner
             .plugin_host
@@ -882,6 +895,74 @@ impl Router {
             }
         }
         true
+    }
+
+    async fn interrupt_before_stop(
+        &self,
+        agent: &Agent,
+        turn_id: &str,
+        stop: &Command,
+    ) -> Result<()> {
+        let mut events = self.inner.bus.subscribe();
+        let mut request = SubmitCommand::new(ulid::Ulid::new().to_string(), "interrupt");
+        request.target = Some(agent.id.clone());
+        request.expected_generation = stop.generation;
+        request.expected_turn_id = Some(turn_id.to_owned());
+        let interrupt = {
+            let mut store = self.inner.store.lock().await;
+            let prepared = PreparedSubmission {
+                request,
+                workspace: None,
+            };
+            match self.admit_prepared_submission(&mut store, &stop.principal, prepared, None) {
+                Ok(admission) => {
+                    self.publish_locked(&admission.events);
+                    Some(admission.command.id)
+                }
+                // The exact turn can end between capturing it and admission.
+                Err(error) if matches!(error.code.as_str(), "bad_state" | "stale_generation") => {
+                    None
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        if let Some(id) = interrupt {
+            self.clone().process_command(id, None).await;
+        }
+        // An interrupt acknowledgment does not prove the turn ended. The
+        // budget expiring permits session closure without inventing a result.
+        timeout(STOP_TURN_GRACE, async {
+            loop {
+                {
+                    let store = self.inner.store.lock().await;
+                    store.ensure_committed_reads()?;
+                    if store
+                        .get_turn(&agent.id, agent.generation, turn_id)?
+                        .is_some_and(|turn| turn.state == TurnState::Completed)
+                    {
+                        return Ok(());
+                    }
+                }
+                loop {
+                    match events.recv().await {
+                        Ok(event)
+                            if event.agent.as_deref() == Some(agent.id.as_str())
+                                && event.generation == Some(agent.generation)
+                                && event.kind == "turn.completed"
+                                && event.data.get("turn_id").and_then(Value::as_str)
+                                    == Some(turn_id) =>
+                        {
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(broadcast::error::RecvError::Lagged(_)) => break,
+                        Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap_or(Ok(()))
     }
 
     /// Applied no-op summary for an already-terminal generation with verified

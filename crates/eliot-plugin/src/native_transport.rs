@@ -1145,6 +1145,51 @@ impl NativeChild {
         }
     }
 
+    /// Close native input and wait for exit and its output tail. Custody
+    /// remains with the caller if the graceful close cannot be confirmed.
+    pub async fn close_gracefully(
+        &mut self,
+        deadline: Instant,
+        drop_input: bool,
+    ) -> Result<ExitStatus> {
+        if let Some(status) = self.process_exit_status()? {
+            self.await_output_drained(deadline).await?;
+            return Ok(status);
+        }
+        self.try_graceful_exit(deadline, drop_input)
+            .await?
+            .ok_or_else(|| {
+                Error::new(
+                    "unknown",
+                    format!(
+                        "{} graceful process exit could not be confirmed",
+                        self.labels.short
+                    ),
+                )
+            })
+    }
+
+    async fn try_graceful_exit(
+        &mut self,
+        deadline: Instant,
+        drop_input: bool,
+    ) -> Result<Option<ExitStatus>> {
+        let close_deadline = (Instant::now() + Duration::from_millis(500)).min(deadline);
+        if drop_input {
+            let _ = self.writer.shutdown_input(close_deadline).await;
+        } else {
+            let _ = self.writer.close_input(close_deadline).await;
+        }
+        let grace_deadline = (Instant::now() + Duration::from_secs(2)).min(deadline);
+        match timeout_at(grace_deadline, self.wait_process_exit()).await {
+            Ok(Ok(status)) => {
+                self.await_output_drained(deadline).await?;
+                Ok(Some(status))
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// Flush input, then end the owned process. The graceful close only fires
     /// when the process is still running; the kill path only fires when the
     /// graceful close cannot be confirmed.
@@ -1174,18 +1219,8 @@ impl NativeChild {
             return Ok(status);
         }
 
-        if !force {
-            let close_deadline = (Instant::now() + Duration::from_millis(500)).min(deadline);
-            if drop_input {
-                let _ = self.writer.shutdown_input(close_deadline).await;
-            } else {
-                let _ = self.writer.close_input(close_deadline).await;
-            }
-            let grace_deadline = (Instant::now() + Duration::from_secs(2)).min(deadline);
-            if let Ok(Ok(status)) = timeout_at(grace_deadline, self.wait_process_exit()).await {
-                self.await_output_drained(deadline).await?;
-                return Ok(status);
-            }
+        if !force && let Some(status) = self.try_graceful_exit(deadline, drop_input).await? {
+            return Ok(status);
         }
 
         if let Some(status) = self.process_exit_status()? {
