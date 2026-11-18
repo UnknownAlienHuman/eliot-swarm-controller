@@ -90,6 +90,7 @@ fn replay_goal_write<T: serde::de::DeserializeOwned>(
             format!("{method} id is already used by a command"),
         ));
     }
+    crate::ensure_no_digest_id(tx, id, "write id is already used by a completion digest")?;
     let Some((old_principal, old_method, old_digest, old_result)) = write_binding(tx, id)? else {
         return Ok(None);
     };
@@ -115,6 +116,7 @@ fn retain_goal_result<T: Serialize>(
     view: &T,
     now: i64,
 ) -> Result<()> {
+    crate::ensure_no_digest_id(tx, id, "write id is already used by a completion digest")?;
     let result_json = encode_json(view)?;
     // The retained write stores the full original GoalView, whose
     // definition alone may approach 64 KiB plus counters/marker

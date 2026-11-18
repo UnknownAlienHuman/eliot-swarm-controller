@@ -94,6 +94,11 @@ impl Store {
                 "resolution write id is already used by a command",
             ));
         }
+        crate::ensure_no_digest_id(
+            &tx,
+            &request.id,
+            "resolution write id is already used by a completion digest",
+        )?;
         if let Some((old_principal, old_method, old_digest, old_result)) =
             write_binding(&tx, &request.id)?
         {
@@ -225,6 +230,11 @@ impl Store {
                 "resolution write id is already used by a command",
             ));
         }
+        crate::ensure_no_digest_id(
+            &tx,
+            &request.id,
+            "resolution write id is already used by a completion digest",
+        )?;
         if let Some((old_principal, old_method, old_digest, old_result)) =
             write_binding(&tx, &request.id)?
         {
@@ -347,6 +357,11 @@ impl Store {
                 "resolution write id is already used by a command",
             ));
         }
+        crate::ensure_no_digest_id(
+            &self.connection,
+            &request.id,
+            "resolution write id is already used by a completion digest",
+        )?;
         if let Some((old_principal, old_method, old_digest, old_result)) =
             write_binding(&self.connection, &request.id)?
         {

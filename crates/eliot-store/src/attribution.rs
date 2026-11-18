@@ -724,6 +724,11 @@ fn replay_claim_write(
             "claim write id is already used by a command",
         ));
     }
+    crate::ensure_no_digest_id(
+        tx,
+        id,
+        "claim write id is already used by a completion digest",
+    )?;
     let Some((old_principal, old_method, old_digest, old_result)) = write_binding(tx, id)? else {
         return Ok(None);
     };

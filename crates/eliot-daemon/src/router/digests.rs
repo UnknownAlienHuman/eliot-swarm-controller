@@ -250,14 +250,25 @@ impl Router {
     }
 
     /// Sweep one bounded pending-digest page; returns the count delivered. A
-    /// full mailbox stays pending for the next tick. The page starts after
-    /// the last examined registration and the cursor advances past every
-    /// examined row, wrapping to the oldest row at the end, so pending or
-    /// mailbox-blocked registrations at the front never starve later
-    /// eligible ones: each tick examines the next page, and every pending
-    /// registration is revisited once per full sweep.
+    /// full mailbox stays pending for the next tick. The page seeks after the
+    /// last examined registration through the pending keyset cursor and the
+    /// cursor advances past every examined row, wrapping once it passes the
+    /// sweep high-water observed at sweep start. New registrations that arrive
+    /// mid-sweep join the next sweep, so a continuously growing tail cannot
+    /// starve an older registration that becomes eligible behind the cursor:
+    /// every registration observed at sweep start is revisited once per sweep.
     pub(crate) async fn poll_completion_digests_once(&self) -> Result<usize> {
         let after: Option<(i64, String)> = self.inner.digest_poll_cursor.lock_recover().clone();
+        // Snapshot the sweep high-water when starting a new sweep so the wrap
+        // bound is the eligible set observed at that tick, not a tail that
+        // keeps growing while the sweep runs.
+        if after.is_none() && self.inner.digest_sweep_end.lock_recover().is_none() {
+            let end = {
+                let store = self.inner.store.lock().await;
+                store.pending_completion_digests_max()?
+            };
+            *self.inner.digest_sweep_end.lock_recover() = end;
+        }
         let mut pending: Vec<DigestRow> = {
             let store = self.inner.store.lock().await;
             let after = after
@@ -267,17 +278,50 @@ impl Router {
         };
         if pending.is_empty() && after.is_some() {
             // Swept past the newest row: wrap to the oldest so registrations
-            // behind the old cursor are examined on this same tick.
+            // behind the old cursor are examined on this same tick, starting
+            // a new sweep with a fresh high-water below.
+            *self.inner.digest_sweep_end.lock_recover() = None;
             pending = {
                 let store = self.inner.store.lock().await;
                 store.pending_completion_digests_after(None, DIGEST_POLL_PAGE)?
             };
-        }
-        if let Some(last) = pending.last() {
-            *self.inner.digest_poll_cursor.lock_recover() =
-                Some((last.created_at, last.id.clone()));
+            if pending.is_empty() {
+                *self.inner.digest_poll_cursor.lock_recover() = None;
+            } else if let Some(last) = pending.last() {
+                *self.inner.digest_poll_cursor.lock_recover() =
+                    Some((last.created_at, last.id.clone()));
+                // A single-page sweep that already reached its end wraps next
+                // tick: seed the high-water when the page is short or at the
+                // bound observed at sweep start.
+                let end = {
+                    let store = self.inner.store.lock().await;
+                    store.pending_completion_digests_max()?
+                };
+                *self.inner.digest_sweep_end.lock_recover() = end;
+            }
+        } else if let Some(last) = pending.last() {
+            let last_key = (last.created_at, last.id.clone());
+            *self.inner.digest_poll_cursor.lock_recover() = Some(last_key.clone());
+            // Wrap once the cursor passes the sweep high-water: the next tick
+            // restarts at the oldest row even though later pages are still
+            // populated by registrations that arrived after the sweep began.
+            let wrapped = {
+                let end = self.inner.digest_sweep_end.lock_recover().clone();
+                end.is_some_and(|end| last_key >= end)
+            };
+            if wrapped {
+                *self.inner.digest_poll_cursor.lock_recover() = None;
+                *self.inner.digest_sweep_end.lock_recover() = None;
+            } else if pending.len() < DIGEST_POLL_PAGE {
+                // Short page before the recorded high-water (deliveries
+                // drained rows mid-sweep): wrap next tick as well so the head
+                // is revisited without waiting for an empty page.
+                *self.inner.digest_poll_cursor.lock_recover() = None;
+                *self.inner.digest_sweep_end.lock_recover() = None;
+            }
         } else {
             *self.inner.digest_poll_cursor.lock_recover() = None;
+            *self.inner.digest_sweep_end.lock_recover() = None;
         }
         let mut delivered = 0;
         for row in pending {
