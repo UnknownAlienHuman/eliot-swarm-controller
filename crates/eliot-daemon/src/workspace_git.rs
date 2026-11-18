@@ -151,10 +151,24 @@ impl WorkspaceGit {
         repo_path: &str,
         branch: &str,
         base_ref: Option<&str>,
+        base_repo_path: Option<&str>,
         target: &str,
     ) -> Result<FrozenWorkspaceGit> {
         let deadline = Instant::now() + READ_TIME;
         let source = self.repository(repo_path, deadline).await?;
+        let base_source = match base_repo_path {
+            Some(path) => {
+                let base = self.repository(path, deadline).await?;
+                if base.common_dir != source.common_dir {
+                    return Err(problem(
+                        "source_integrity",
+                        "workspace base repository differs from project checkout",
+                    ));
+                }
+                Some(base)
+            }
+            None => None,
+        };
         self.validate_branch(&source.root, branch, deadline).await?;
         self.require_branch_namespace_free(&source.root, branch, deadline)
             .await?;
@@ -186,9 +200,10 @@ impl WorkspaceGit {
             ));
         }
         let commit = format!("{reference}^{{commit}}");
+        let base_root = base_source.as_ref().map_or(&source.root, |repo| &repo.root);
         let base_oid = self
             .read_line(
-                &source.root,
+                base_root,
                 &["rev-parse", "--verify", "--end-of-options", &commit],
                 deadline,
             )
@@ -208,6 +223,18 @@ impl WorkspaceGit {
                 "source_integrity",
                 "source repository identity changed during freeze",
             ));
+        }
+        if let (Some(base), Some(base_path)) = (base_source.as_ref(), base_repo_path) {
+            let verified_base = self.repository(base_path, deadline).await?;
+            if base.root != verified_base.root
+                || base.git_dir != verified_base.git_dir
+                || base.common_dir != verified_base.common_dir
+            {
+                return Err(problem(
+                    "source_integrity",
+                    "base workspace identity changed during freeze",
+                ));
+            }
         }
         Ok(FrozenWorkspaceGit {
             repo_path: path_text(&source.root)?,
@@ -1487,7 +1514,7 @@ mod tests {
         // An existing branch `atlas` blocks `atlas/a1-task` before admission.
         assert_eq!(
             fixture
-                .freeze(&repo, "atlas/a1-task", None, &target("blocked"))
+                .freeze(&repo, "atlas/a1-task", None, None, &target("blocked"))
                 .await
                 .unwrap_err()
                 .code,
@@ -1498,7 +1525,7 @@ mod tests {
         // And an existing `topic/sub` blocks a new `topic`.
         assert_eq!(
             fixture
-                .freeze(&repo, "topic", None, &target("blocked-topic"))
+                .freeze(&repo, "topic", None, None, &target("blocked-topic"))
                 .await
                 .unwrap_err()
                 .code,
@@ -1507,10 +1534,64 @@ mod tests {
         git(&root.0, &["branch", "-D", "topic/sub"]);
         // A free branch freezes with the requested branch.
         let frozen = fixture
-            .freeze(&repo, "atlas/a9-task", None, &target("pending-free"))
+            .freeze(&repo, "atlas/a9-task", None, None, &target("pending-free"))
             .await
             .expect("free branch freezes");
         assert_eq!(frozen.requested_branch, "atlas/a9-task");
+    }
+
+    #[tokio::test]
+    async fn freeze_from_base_resolves_base_oid_from_linked_worktree_and_freezes_checkout() {
+        let fixture = WorkspaceGit::new().expect("resolve installed Git");
+        let root = TestRoot::new("freeze-from-base");
+        init_repo(&root.0);
+        let main_head = git_oid(&root.0, "HEAD");
+        let retained = root.0.join("retained-wt");
+        git(
+            &root.0,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "retained",
+                retained.to_str().expect("retained path UTF-8"),
+                &main_head,
+            ],
+        );
+        git(
+            &retained,
+            &["commit", "--quiet", "--allow-empty", "-m", "retained-tip"],
+        );
+        let retained_head = git_oid(&retained, "HEAD");
+        assert_ne!(retained_head, main_head);
+
+        let repo = path_text(&root.0).expect("repo path UTF-8");
+        let retained_text = path_text(&retained).expect("retained path UTF-8");
+        let target = root
+            .0
+            .join("worktrees")
+            .join("feature-next")
+            .to_str()
+            .expect("target UTF-8")
+            .to_owned();
+        let frozen = fixture
+            .freeze(&repo, "feature/next", None, Some(&retained_text), &target)
+            .await
+            .expect("freeze against main checkout with base from retained worktree");
+        let expected_repo = path_text(&canonical_root(&repo).expect("canonical repo"))
+            .expect("canonical repo UTF-8");
+        assert_eq!(frozen.repo_path, expected_repo);
+        assert_eq!(frozen.base_oid, retained_head);
+        assert_eq!(frozen.requested_branch, "feature/next");
+
+        let other = TestRoot::new("other-repo");
+        init_repo(&other.0);
+        let other_text = path_text(&other.0).expect("other path UTF-8");
+        let err = fixture
+            .freeze(&repo, "feature/other", None, Some(&other_text), &target)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "source_integrity");
     }
 
     #[tokio::test]

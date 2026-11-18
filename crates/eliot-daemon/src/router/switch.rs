@@ -456,6 +456,319 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ordinary_worktree_switch_after_chat_continue_resolves_retained_base_and_freezes_checkout()
+     {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("eliot-k185c-switch-wt-{}", ulid::Ulid::new()));
+        let _guard = crate::test_support::TempDir::own(root.clone());
+        let checkout_path = root.join("checkout");
+        let data_root = root.join("data");
+        std::fs::create_dir_all(&checkout_path).unwrap();
+        std::fs::create_dir_all(&data_root).unwrap();
+        let git = |dir: &std::path::Path, args: &[&str]| -> String {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        git(
+            &checkout_path,
+            &["init", "--quiet", "--initial-branch=main"],
+        );
+        git(&checkout_path, &["config", "user.name", "ELIOT test"]);
+        git(
+            &checkout_path,
+            &["config", "user.email", "eliot-test@example.invalid"],
+        );
+        git(
+            &checkout_path,
+            &["commit", "--quiet", "--allow-empty", "-m", "main-base"],
+        );
+        let main_head = git(&checkout_path, &["rev-parse", "HEAD"]);
+        let (checkout, repo_common_dir) = crate::workspace_git::WorkspaceGit::new()
+            .unwrap()
+            .repository_identity(&checkout_path.to_string_lossy())
+            .await
+            .unwrap();
+        std::fs::write(
+            data_root.join("config.toml"),
+            format!(
+                "[profiles.fixture]\nharness = \"codex\"\nmodel = \"fixture-model\"\n[projects.app]\npath = {checkout:?}\nprofiles = [\"fixture\"]\nactions = [\"launch\"]\n"
+            ),
+        )
+        .unwrap();
+        let router = super::super::tests::router_with_data_root(data_root.clone());
+        let revision = {
+            let mut store = router.inner.store.lock().await;
+            store
+                .upsert_project_registration(
+                    "owner",
+                    &ProjectRegistrationInput {
+                        id: "app".to_owned(),
+                        checkout: checkout.clone(),
+                        repo_common_dir: repo_common_dir.clone(),
+                        git: None,
+                        profiles: vec!["fixture".to_owned()],
+                        actions: vec!["launch".to_owned()],
+                        interpreters: std::collections::BTreeMap::new(),
+                        run_env: Vec::new(),
+                    },
+                    now_ms(),
+                )
+                .unwrap()
+                .value
+                .revision
+        };
+
+        // 1. Start a chat Agent (A1) and continue it into project `app` (A2).
+        let (a1, a1_task) = {
+            let mut store = router.inner.store.lock().await;
+            let mut launch = SubmitCommand::new(ulid::Ulid::new().to_string(), "launch");
+            launch.args = json!({
+                "chat": true,
+                "project": "",
+                "workspace": "chat-root",
+                "harness": "codex",
+                "profile": "fixture",
+                "profile_snapshot": {"control": "tree", "model": "fixture-model"},
+            });
+            let admission = store.submit("owner", launch, now_ms()).unwrap();
+            let a1 = admission.command.target.unwrap();
+            store.dispatch(&admission.command.id, now_ms()).unwrap();
+            crate::test_support::install_fixture_sources(
+                &mut store,
+                &a1,
+                &admission.command.id,
+                1,
+                now_ms(),
+            );
+            store
+                .put_batch(
+                    eliot_core::SourceBatch {
+                        batch_id: ulid::Ulid::new().to_string(),
+                        agent_id: a1.clone(),
+                        generation: 1,
+                        source: "stream".into(),
+                        cursor: None,
+                        events: vec![eliot_core::NativeEvent {
+                            ts: None,
+                            kind: "session.ready".into(),
+                            native_id: "a1-ready".into(),
+                            data: json!({"command_id": admission.command.id}),
+                        }],
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            store
+                .settle(&admission.command.id, CommandState::Applied, None, now_ms())
+                .unwrap();
+            let mut send = SubmitCommand::new(ulid::Ulid::new().to_string(), "send");
+            send.target = Some(a1.clone());
+            send.expected_generation = Some(1);
+            send.args = json!({"text": "continue into app"});
+            let task = store.submit("owner", send, now_ms()).unwrap().command.id;
+            (a1, task)
+        };
+        let retained_path = data_root.join("worktrees").join("app").join("a2-retained");
+        let a2_prep = eliot_core::WorkspacePreparationInput {
+            project: checkout.clone(),
+            repo_path: checkout.clone(),
+            repo_common_dir: repo_common_dir.clone(),
+            requested_branch: "app/a2-retained".to_owned(),
+            base_ref: Some("HEAD".to_owned()),
+            base_oid: main_head.clone(),
+            worktree_path: retained_path.to_string_lossy().into_owned(),
+            frozen_setup: Vec::new(),
+            generated: None,
+        };
+        let switch1_id = ulid::Ulid::new().to_string();
+        let (a2, a2_task) = {
+            let mut store = router.inner.store.lock().await;
+            let switch1 = SwitchRequest {
+                id: switch1_id.clone(),
+                from: a1,
+                from_generation: 1,
+                task_command: a1_task.clone(),
+                commands: vec![a1_task],
+                launch: serde_json::from_value(json!({"profile": "fixture", "project": "app"}))
+                    .unwrap(),
+            };
+            let plan = store
+                .reserve_switch(
+                    "owner",
+                    &switch1,
+                    &eliot_core::SecretPolicy::default(),
+                    now_ms(),
+                )
+                .unwrap()
+                .value;
+            store.start_switch(&switch1_id, now_ms()).unwrap();
+            let mut launch = SubmitCommand::new(plan.launch_command.clone(), "launch");
+            launch.args = json!({
+                "project": "",
+                "workspace": checkout,
+                "harness": "codex",
+                "profile": "fixture",
+                "profile_snapshot": {"control": "tree", "model": "fixture-model"},
+                "registered_project": "app",
+                SWITCH_PROJECT_REVISION_ARG: revision,
+                SWITCH_BLANK_SCOPE_ARG: true,
+            });
+            let admission = store
+                .admit_switch_launch(&switch1_id, launch, Some(a2_prep.clone()), now_ms())
+                .unwrap();
+            let a2 = admission.command.target.unwrap();
+            (a2, plan.launch_command)
+        };
+        router.inner.workspaces.prepare(&a2_task).await.unwrap();
+        let (a2_send_id, retained_head) = {
+            let mut store = router.inner.store.lock().await;
+            store.dispatch(&a2_task, now_ms()).unwrap();
+            crate::test_support::install_fixture_sources(&mut store, &a2, &a2_task, 1, now_ms());
+            store
+                .put_batch(
+                    eliot_core::SourceBatch {
+                        batch_id: ulid::Ulid::new().to_string(),
+                        agent_id: a2.clone(),
+                        generation: 1,
+                        source: "stream".into(),
+                        cursor: None,
+                        events: vec![eliot_core::NativeEvent {
+                            ts: None,
+                            kind: "session.ready".into(),
+                            native_id: "a2-ready".into(),
+                            data: json!({"command_id": a2_task}),
+                        }],
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            store
+                .settle(&a2_task, CommandState::Applied, None, now_ms())
+                .unwrap();
+            store
+                .finish_switch(&switch1_id, &eliot_core::SecretPolicy::default(), now_ms())
+                .unwrap();
+            // Advance A2's retained worktree one commit past `app`'s primary checkout.
+            git(&retained_path, &["config", "user.name", "ELIOT test"]);
+            git(
+                &retained_path,
+                &["config", "user.email", "eliot-test@example.invalid"],
+            );
+            git(
+                &retained_path,
+                &["commit", "--quiet", "--allow-empty", "-m", "a2-work"],
+            );
+            let retained_head = git(&retained_path, &["rev-parse", "HEAD"]);
+            assert_ne!(retained_head, main_head);
+            let mut send = SubmitCommand::new(ulid::Ulid::new().to_string(), "send");
+            send.target = Some(a2.clone());
+            send.expected_generation = Some(1);
+            send.args = json!({"text": "next step"});
+            let send_id = store.submit("owner", send, now_ms()).unwrap().command.id;
+            (send_id, retained_head)
+        };
+
+        // 2. Ordinary switch of A2 with `--worktree feature/next` and no `--project`.
+        let switch2_id = ulid::Ulid::new().to_string();
+        let switch2 = SwitchRequest {
+            id: switch2_id.clone(),
+            from: a2.clone(),
+            from_generation: 1,
+            task_command: a2_send_id.clone(),
+            commands: vec![a2_send_id],
+            launch: serde_json::from_value(
+                json!({"profile": "fixture", "worktree": "feature/next"}),
+            )
+            .unwrap(),
+        };
+        let plan2 = {
+            let mut store = router.inner.store.lock().await;
+            let plan = store
+                .reserve_switch(
+                    "owner",
+                    &switch2,
+                    &eliot_core::SecretPolicy::default(),
+                    now_ms(),
+                )
+                .unwrap()
+                .value;
+            store.start_switch(&switch2_id, now_ms()).unwrap();
+            plan
+        };
+        let mut launch2 = SubmitCommand::new(plan2.launch_command.clone(), "launch");
+        launch2.args = switch2
+            .launch
+            .args(&retained_path.to_string_lossy())
+            .unwrap();
+        let mut prepared2 = router
+            .prepare_submission_after_authorization(launch2, &Principal::Owner, false, false)
+            .await
+            .unwrap();
+        let prep2 = prepared2
+            .workspace
+            .as_ref()
+            .expect("ordinary switch with --worktree prepares a worktree");
+        assert_eq!(prep2.project, checkout);
+        assert_eq!(prep2.repo_path, checkout);
+        assert_eq!(prep2.repo_common_dir, repo_common_dir);
+        assert_eq!(prep2.base_oid, retained_head);
+        assert_eq!(prep2.requested_branch, "feature/next");
+
+        prepared2.request.args["project"] = json!("");
+        prepared2.request.args["registered_project"] = json!("app");
+        prepared2.request.args[SWITCH_BLANK_SCOPE_ARG] = json!(true);
+        let a3 = {
+            let mut store = router.inner.store.lock().await;
+            let admission = store
+                .admit_switch_launch(
+                    &switch2_id,
+                    prepared2.request,
+                    prepared2.workspace,
+                    now_ms(),
+                )
+                .expect("admission accepts frozen checkout with retained base commit");
+            admission.command.target.unwrap()
+        };
+        router
+            .inner
+            .workspaces
+            .prepare(&plan2.launch_command)
+            .await
+            .unwrap();
+        let (a3_agent, a3_ws) = {
+            let store = router.inner.store.lock().await;
+            (
+                store.get_agent(&a3).unwrap().unwrap(),
+                store.get_workspace(&a3).unwrap().unwrap(),
+            )
+        };
+        assert_eq!(a3_agent.project, "app");
+        assert_eq!(a3_agent.project_scope(), "");
+        assert_eq!(a3_ws.project, checkout);
+        assert_eq!(a3_ws.repo_path, checkout);
+        assert_eq!(a3_ws.base_oid, retained_head);
+        assert_eq!(a3_ws.requested_branch, "feature/next");
+        assert_eq!(
+            git(
+                std::path::Path::new(&a3_ws.worktree_path),
+                &["rev-parse", "HEAD"]
+            ),
+            retained_head
+        );
+    }
+
+    #[tokio::test]
     async fn switch_preparation_failure_and_drain_retry_are_retained_without_launch() {
         let router = super::super::tests::router();
         assert_eq!(

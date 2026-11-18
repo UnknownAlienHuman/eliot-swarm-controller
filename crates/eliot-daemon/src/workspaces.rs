@@ -205,53 +205,30 @@ impl WorkspaceManager {
     /// Freeze an explicitly requested branch into the standard directory
     /// (`<data_dir>/worktrees/<project>/<agent>-<task-slug>`). The branch
     /// always wins; the directory is still finalized with the admitted Agent
-    /// ID by the Store, exactly like a generated worktree.
+    /// ID by the Store, exactly like a generated worktree. When `base_repo` is
+    /// set (for example a retained linked worktree), the base commit is resolved
+    /// from `base_repo` while the worktree itself is frozen against `repo`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn freeze_launch(
         &self,
         repo: &str,
         branch: &str,
         base_ref: Option<&str>,
+        base_repo: Option<&str>,
         project_slug: &str,
         task_slug: &str,
         profile: &Value,
     ) -> Result<WorkspacePreparationInput> {
-        let project_slug = eliot_core::project_slug(project_slug);
-        let task_slug = eliot_core::task_slug(task_slug);
-        let pending = format!("pending-{}", Ulid::new().to_string().to_ascii_lowercase());
-        let branch = branch.to_owned();
-        let target = self
-            .inner
-            .data_root
-            .join("worktrees")
-            .join(&project_slug)
-            .join(&pending);
-        let target = target
-            .to_str()
-            .ok_or_else(|| problem("invalid", "managed workspace path is not UTF-8"))?;
-        let frozen = WorkspaceGit::new()?
-            .freeze(repo, &branch, base_ref, target)
-            .await?;
-        let frozen_setup = setup::freeze(profile, Path::new(&frozen.repo_path))?;
-        let input = WorkspacePreparationInput {
-            project: frozen.repo_path.clone(),
-            repo_path: frozen.repo_path,
-            repo_common_dir: frozen.repo_common_dir,
-            requested_branch: frozen.requested_branch,
-            base_ref: base_ref.map(str::to_owned),
-            base_oid: frozen.base_oid,
-            worktree_path: frozen.worktree_path,
-            frozen_setup,
-            generated: Some(eliot_core::GeneratedWorktreeNaming {
-                project_slug,
-                task_slug,
-                branch: Some(branch),
-            }),
-        };
-        self.check_nonsecret(
-            serde_json::to_value(&input)
-                .map_err(|_| problem("invalid", "workspace preparation cannot be encoded"))?,
-        )?;
-        Ok(input)
+        self.freeze_launch_with_naming(
+            repo,
+            Some(branch),
+            base_ref,
+            base_repo,
+            project_slug,
+            task_slug,
+            profile,
+        )
+        .await
     }
 
     /// Freeze a generated standard worktree (`<project>/<agent>-<task-slug>`
@@ -265,12 +242,39 @@ impl WorkspaceManager {
         project_slug: &str,
         task_slug: &str,
         base_ref: Option<&str>,
+        base_repo: Option<&str>,
+        profile: &Value,
+    ) -> Result<WorkspacePreparationInput> {
+        self.freeze_launch_with_naming(
+            repo,
+            None,
+            base_ref,
+            base_repo,
+            project_slug,
+            task_slug,
+            profile,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn freeze_launch_with_naming(
+        &self,
+        repo: &str,
+        explicit_branch: Option<&str>,
+        base_ref: Option<&str>,
+        base_repo: Option<&str>,
+        project_slug: &str,
+        task_slug: &str,
         profile: &Value,
     ) -> Result<WorkspacePreparationInput> {
         let project_slug = eliot_core::project_slug(project_slug);
         let task_slug = eliot_core::task_slug(task_slug);
         let pending = format!("pending-{}", Ulid::new().to_string().to_ascii_lowercase());
-        let branch = format!("{project_slug}/{pending}");
+        let (branch, generated_branch) = match explicit_branch {
+            Some(branch) => (branch.to_owned(), Some(branch.to_owned())),
+            None => (format!("{project_slug}/{pending}"), None),
+        };
         let target = self
             .inner
             .data_root
@@ -281,7 +285,7 @@ impl WorkspaceManager {
             .to_str()
             .ok_or_else(|| problem("invalid", "managed workspace path is not UTF-8"))?;
         let frozen = WorkspaceGit::new()?
-            .freeze(repo, &branch, base_ref, target)
+            .freeze(repo, &branch, base_ref, base_repo, target)
             .await?;
         let frozen_setup = setup::freeze(profile, Path::new(&frozen.repo_path))?;
         let input = WorkspacePreparationInput {
@@ -296,7 +300,7 @@ impl WorkspaceManager {
             generated: Some(eliot_core::GeneratedWorktreeNaming {
                 project_slug,
                 task_slug,
-                branch: None,
+                branch: generated_branch,
             }),
         };
         self.check_nonsecret(
@@ -2194,7 +2198,13 @@ mod tests {
             .into_owned();
         let frozen = WorkspaceGit::new()
             .expect("resolve installed Git")
-            .freeze(repo_path, &branch, Some("HEAD"), &requested_worktree_path)
+            .freeze(
+                repo_path,
+                &branch,
+                Some("HEAD"),
+                None,
+                &requested_worktree_path,
+            )
             .await
             .expect("freeze canonical workspace identity");
         let input = WorkspacePreparationInput {

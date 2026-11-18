@@ -957,6 +957,158 @@ fn switch_continue_accepts_preparation_bound_to_the_target_project() {
 }
 
 #[test]
+fn ordinary_worktree_switch_after_chat_continue_admits_against_registered_checkout() {
+    let mut s = Store::open(Path::new(":memory:")).unwrap();
+    let root = std::env::temp_dir().join(format!("eliot-k185c-store-{}", Ulid::new()));
+    let repo = root.join("repo");
+    let checkout = repo.to_string_lossy().into_owned();
+    let common_dir = repo.join(".git").to_string_lossy().into_owned();
+    let revision = s
+        .upsert_project_registration(
+            "owner",
+            &ProjectRegistrationInput {
+                id: "app".into(),
+                checkout: checkout.clone(),
+                repo_common_dir: common_dir.clone(),
+                git: None,
+                profiles: vec!["approved".into()],
+                actions: vec!["launch".into()],
+                interpreters: std::collections::BTreeMap::new(),
+                run_env: Vec::new(),
+            },
+            now(),
+        )
+        .unwrap()
+        .value
+        .revision;
+    let (a, task_a) = chat_source(&mut s);
+    let cont_req = SwitchRequest {
+        id: Ulid::new().to_string(),
+        from: a,
+        from_generation: 1,
+        task_command: task_a.clone(),
+        commands: vec![task_a],
+        launch: serde_json::from_value::<SwitchLaunch>(
+            json!({"harness":"antigravity","model":"gemini-4-hydrogen-low","project":"app"}),
+        )
+        .unwrap(),
+    };
+    let plan1 = begin(&mut s, &cont_req);
+    let prep1 = core::WorkspacePreparationInput {
+        project: checkout.clone(),
+        repo_path: checkout.clone(),
+        repo_common_dir: common_dir.clone(),
+        requested_branch: "app/a2-retained".to_owned(),
+        base_ref: None,
+        base_oid: "0".repeat(40),
+        worktree_path: root.join("wt-b").to_string_lossy().into_owned(),
+        frozen_setup: Vec::new(),
+        generated: None,
+    };
+    let b = admit_target(
+        &mut s,
+        &cont_req.id,
+        &plan1,
+        "",
+        "app",
+        Some(revision),
+        true,
+        Some(prep1.clone()),
+    );
+    s.settle_workspace_creation(
+        &plan1.launch_command,
+        1,
+        core::WorkspaceCreationOutcome::Verified {
+            repo_path: prep1.repo_path.clone(),
+            repo_common_dir: prep1.repo_common_dir.clone(),
+            worktree_path: prep1.worktree_path.clone(),
+            branch: prep1.requested_branch.clone(),
+            head: prep1.base_oid.clone(),
+        },
+        now(),
+    )
+    .unwrap();
+    ready(&mut s, &plan1.launch_command, &b);
+    s.finish_switch(&cont_req.id, &core::SecretPolicy::default(), now())
+        .unwrap();
+
+    let mut send_b = SubmitCommand::new(Ulid::new().to_string(), "send");
+    send_b.target = Some(b.clone());
+    send_b.expected_generation = Some(1);
+    send_b.args = json!({"text": "next branch"});
+    let task_b = s.submit("owner", send_b, now()).unwrap().command.id;
+
+    let switch_req = SwitchRequest {
+        id: Ulid::new().to_string(),
+        from: b,
+        from_generation: 1,
+        task_command: task_b.clone(),
+        commands: vec![task_b],
+        launch: serde_json::from_value::<SwitchLaunch>(
+            json!({"harness":"antigravity","model":"gemini-4-hydrogen-low","worktree":"feature/next"}),
+        )
+        .unwrap(),
+    };
+    let plan2 = begin(&mut s, &switch_req);
+    let mut launch_c = SubmitCommand::new(plan2.launch_command.clone(), "launch");
+    launch_c.args = json!({
+        "project": "",
+        "workspace": prep1.worktree_path,
+        "worktree": "feature/next",
+        "harness": "antigravity",
+        "model": "gemini-4-hydrogen-low",
+        "profile": "new",
+        "profile_snapshot": {"control": "tree", "model": "gemini-4-hydrogen-low"},
+        "registered_project": "app",
+        core::api::SWITCH_BLANK_SCOPE_ARG: true,
+    });
+    // Freezing the linked worktree path itself still fails admission; freezing
+    // against P's registered checkout with the retained base commit succeeds.
+    let wrong_prep = core::WorkspacePreparationInput {
+        project: prep1.worktree_path.clone(),
+        repo_path: prep1.worktree_path.clone(),
+        repo_common_dir: common_dir.clone(),
+        requested_branch: "feature/next".to_owned(),
+        base_ref: None,
+        base_oid: "1".repeat(40),
+        worktree_path: root.join("wt-c").to_string_lossy().into_owned(),
+        frozen_setup: Vec::new(),
+        generated: None,
+    };
+    assert_eq!(
+        s.admit_switch_launch(&switch_req.id, launch_c.clone(), Some(wrong_prep), now())
+            .unwrap_err()
+            .code,
+        "invalid"
+    );
+    let fixed_prep = core::WorkspacePreparationInput {
+        project: checkout.clone(),
+        repo_path: checkout.clone(),
+        repo_common_dir: common_dir,
+        requested_branch: "feature/next".to_owned(),
+        base_ref: None,
+        base_oid: "1".repeat(40),
+        worktree_path: root.join("wt-c").to_string_lossy().into_owned(),
+        frozen_setup: Vec::new(),
+        generated: None,
+    };
+    let c = s
+        .admit_switch_launch(&switch_req.id, launch_c, Some(fixed_prep), now())
+        .unwrap()
+        .command
+        .target
+        .unwrap();
+    let agent_c = s.get_agent(&c).unwrap().unwrap();
+    assert_eq!(agent_c.project, "app");
+    assert_eq!(agent_c.project_scope(), "");
+    let ws_c = s.get_workspace(&c).unwrap().unwrap();
+    assert_eq!(ws_c.project, checkout);
+    assert_eq!(ws_c.repo_path, checkout);
+    assert_eq!(ws_c.base_oid, "1".repeat(40));
+    assert_eq!(ws_c.requested_branch, "feature/next");
+}
+
+#[test]
 fn switch_marker_rechecks_registration_revision_and_identity_before_git_setup_and_dispatch() {
     let mut s = Store::open(Path::new(":memory:")).unwrap();
     let root = std::env::temp_dir().join(format!("eliot-k185b-gate-{}", Ulid::new()));

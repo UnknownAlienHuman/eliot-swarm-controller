@@ -2164,9 +2164,10 @@ impl Router {
         {
             return Ok(None);
         }
+        let mut registered_checkout = None;
         if resolve_project {
             let workspace = std::path::Path::new(required_text(&request.args, "workspace")?);
-            let project = if matches!(principal, Principal::Owner) {
+            let registration = if matches!(principal, Principal::Owner) {
                 crate::bootstrap::discover_project(
                     &self.inner.data_root,
                     &self.inner.store,
@@ -2175,14 +2176,31 @@ impl Router {
                 )
                 .await?
                 .project
-                .map(|project| project.id)
             } else {
-                crate::bootstrap::resolve_registered_project(&self.inner.data_root, workspace)
+                match crate::bootstrap::resolve_registered_project(&self.inner.data_root, workspace)
                     .await?
+                {
+                    Some(project) => {
+                        let store = self.inner.store.lock().await;
+                        store.get_project_registration("owner", &project)?
+                    }
+                    None => None,
+                }
             };
-            if let Some(project) = project {
-                request.args["registered_project"] = json!(project);
+            if let Some(project) = registration {
+                request.args["registered_project"] = json!(project.id);
+                registered_checkout = Some(project.checkout);
             }
+        } else if let Some(project) = request
+            .args
+            .get("registered_project")
+            .and_then(Value::as_str)
+            .filter(|project| !project.trim().is_empty())
+        {
+            let store = self.inner.store.lock().await;
+            registered_checkout = store
+                .get_project_registration("owner", project)?
+                .map(|registration| registration.checkout);
         }
         // A requested branch name always wins, but even an explicit branch
         // lands in the standard directory. A bare `--worktree` (an empty
@@ -2234,14 +2252,24 @@ impl Router {
             .get("profile_snapshot")
             .ok_or_else(|| Error::new("internal", "launch profile was not frozen"))?;
         let base = request.args.get("base").and_then(Value::as_str);
+        // When launching or switching from a retained linked worktree of a
+        // registered project, resolve the base commit from that worktree while
+        // freezing the new worktree against the project's registered checkout.
+        let retained_workspace = required_text(&request.args, "workspace")?;
+        let freeze_repo = registered_checkout
+            .as_deref()
+            .filter(|checkout| !checkout.trim().is_empty())
+            .unwrap_or(retained_workspace);
+        let base_repo = (freeze_repo != retained_workspace).then_some(retained_workspace);
         let input = match requested {
             Some(branch) => {
                 self.inner
                     .workspaces
                     .freeze_launch(
-                        required_text(&request.args, "workspace")?,
+                        freeze_repo,
                         &branch,
                         base,
+                        base_repo,
                         &project_slug,
                         &task_slug,
                         snapshot,
@@ -2252,10 +2280,11 @@ impl Router {
                 self.inner
                     .workspaces
                     .freeze_launch_generated(
-                        required_text(&request.args, "workspace")?,
+                        freeze_repo,
                         &project_slug,
                         &task_slug,
                         base,
+                        base_repo,
                         snapshot,
                     )
                     .await?
