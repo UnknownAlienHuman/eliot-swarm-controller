@@ -371,6 +371,13 @@ There is no replay cursor/history API. Snapshots expose retained stream
 facts, not a native history poll. Loss means an explicit gap. Do not
 replay conversation history or infer success from silence/process exit;
 drain buffered stdout first. Unknown input/result is not retried.
+For the exact active turn, `agent.snapshot` names its `turn_evidence`. The
+turn is running while its fenced `session/prompt` awaits the reply on a
+healthy stream and a live process. It is terminal from that reply (ACP
+`cancelled` reads as universal `interrupted`). It is lost when the observed
+process exit drained stdout without a reply. A gap or a lost stream proves
+none of these, so the daemon monitor settles the turn `unknown` after its
+bounded reads.
 
 ## Session MCP servers (managed Agents)
 

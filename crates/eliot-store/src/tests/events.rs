@@ -476,12 +476,12 @@ fn projection_gap_turn_unknown_settles_once_without_resurrection() {
     stale.generation += 1;
     assert!(
         store
-            .settle_recovered_turn(&stale, &recovery, None, now + 7)
+            .settle_recovered_turn(&stale, &recovery, RecoveredTurn::Inconclusive, now + 7)
             .unwrap()
             .is_empty()
     );
     let events = store
-        .settle_recovered_turn(&captured, &recovery, None, now + 7)
+        .settle_recovered_turn(&captured, &recovery, RecoveredTurn::Inconclusive, now + 7)
         .unwrap();
     assert_eq!(events[0].kind, "turn.unknown");
     assert_eq!(events[0].source, "daemon");
@@ -492,7 +492,7 @@ fn projection_gap_turn_unknown_settles_once_without_resurrection() {
     );
     assert!(
         store
-            .settle_recovered_turn(&captured, &recovery, None, now + 7)
+            .settle_recovered_turn(&captured, &recovery, RecoveredTurn::Inconclusive, now + 7)
             .unwrap()
             .is_empty()
     );

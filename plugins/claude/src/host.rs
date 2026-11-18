@@ -2066,7 +2066,14 @@ fn live_session_snapshot(
         Ok(last_turn) => last_turn,
         Err(reason) => return unknown_snapshot(params, reason),
     };
-    let state = if event_status.batch_unknown || event_status.source_unknown {
+    let result_known = last_turn
+        .as_ref()
+        .is_some_and(|turn| turn.final_text.is_some() && turn.final_text_unavailable.is_none());
+    let process_exited = session.native.transport.process_exit_observed();
+    let mut active_turn = event_status.active_turn_id.clone();
+    let mut last_turn = serde_json::to_value(last_turn)
+        .map_err(|_| Error::new("internal", "Claude turn snapshot could not be encoded"))?;
+    let mut state = if event_status.batch_unknown || event_status.source_unknown {
         "unknown"
     } else if event_status.active_turn_id.is_some() {
         "busy"
@@ -2075,9 +2082,25 @@ fn live_session_snapshot(
     } else {
         "unknown"
     };
-    let result_known = last_turn
-        .as_ref()
-        .is_some_and(|turn| turn.final_text.is_some() && turn.final_text_unavailable.is_none());
+    let evidence = exact_turn_evidence(params, event_status, process_exited);
+    match evidence {
+        Some(TurnEvidence::Running) => {
+            last_turn = json!({"command_id": params.command_id, "turn_id": params.turn_id,
+                "status": "running", "terminal": false});
+        }
+        Some(TurnEvidence::Terminal) => {
+            // The exact `result` record ended the turn; the CLI then waits
+            // for input, or its process has since ended.
+            state = if process_exited { "terminal" } else { "idle" };
+        }
+        Some(TurnEvidence::Exited) => {
+            state = "lost";
+            active_turn = None;
+            last_turn = json!({"command_id": params.command_id, "turn_id": params.turn_id,
+                "status": "lost", "terminal": false});
+        }
+        None => {}
+    }
     Ok(json!({
         "agent_id": params.agent_id.clone(),
         "generation": params.generation,
@@ -2085,12 +2108,68 @@ fn live_session_snapshot(
         "state": state,
         "native_scope": session.native_scope.clone(),
         "native_ref": session_id,
-        "active_turn": event_status.active_turn_id.clone(),
+        "active_turn": active_turn,
         "last_turn": last_turn,
         "batch_unknown": event_status.batch_unknown,
         "source_unknown": event_status.source_unknown,
+        "process_exited": process_exited,
         "result_known": result_known,
+        "turn_evidence": evidence.map(TurnEvidence::label),
     }))
+}
+
+/// What the owned stream-json reader and process waiter proved about the
+/// exact requested turn. The CLI has no turn-status query: the reader's own
+/// records are the native read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TurnEvidence {
+    /// Bound turn, no `result` yet, healthy source and a live process.
+    Running,
+    /// The exact turn's `result` record mapped to a universal status.
+    Terminal,
+    /// The process exited and the drained stream held no `result`.
+    Exited,
+}
+
+impl TurnEvidence {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Running => "stream-json active turn without result",
+            Self::Terminal => "stream-json result",
+            Self::Exited => "process exit with drained stream-json and no result",
+        }
+    }
+}
+
+fn exact_turn_evidence(
+    params: &AgentSnapshotParams,
+    status: &EventStatus,
+    process_exited: bool,
+) -> Option<TurnEvidence> {
+    let turn_id = params.turn_id.as_deref()?;
+    if let Some(last) = status
+        .last_turn
+        .as_ref()
+        .filter(|last| last.turn_id == turn_id)
+    {
+        return (last.command_id == params.command_id
+            && last.terminal
+            && last.status.is_some()
+            && status.active_turn_id.is_none()
+            && !status.background_continuation)
+            .then_some(TurnEvidence::Terminal);
+    }
+    if status.active_turn_id.as_deref() != Some(turn_id)
+        || status.active_command_id.as_deref() != Some(params.command_id.as_str())
+        || status.stopped
+    {
+        return None;
+    }
+    if process_exited {
+        return status.native_drained.then_some(TurnEvidence::Exited);
+    }
+    (status.ready && !status.source_unknown && !status.batch_unknown && status.failure.is_none())
+        .then_some(TurnEvidence::Running)
 }
 
 fn snapshot_turn_facts<'a>(
@@ -2817,6 +2896,50 @@ mod tests {
     }
 
     #[test]
+    fn exact_turn_evidence_reads_running_result_or_drained_exit() {
+        use super::{AgentSnapshotParams, EventStatus, TurnEvidence, events::TurnFacts};
+
+        let params = AgentSnapshotParams {
+            agent_id: "a1".to_owned(),
+            generation: 1,
+            command_id: "send-1".to_owned(),
+            turn_id: Some("turn-1".to_owned()),
+        };
+        let evidence =
+            |status: &EventStatus, exited| super::exact_turn_evidence(&params, status, exited);
+        let mut status = EventStatus {
+            ready: true,
+            active_command_id: Some("send-1".to_owned()),
+            active_turn_id: Some("turn-1".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(evidence(&status, false), Some(TurnEvidence::Running));
+        // A declared source gap leaves the turn's outcome unproven.
+        status.source_unknown = true;
+        assert_eq!(evidence(&status, false), None);
+        // An exit proves no result only after the stream drained.
+        assert_eq!(evidence(&status, true), None);
+        status.native_drained = true;
+        assert_eq!(evidence(&status, true), Some(TurnEvidence::Exited));
+
+        status.active_command_id = None;
+        status.active_turn_id = None;
+        status.last_turn = Some(TurnFacts {
+            command_id: "send-1".to_owned(),
+            turn_id: "turn-1".to_owned(),
+            status: Some("interrupted".to_owned()),
+            native_status: Some("aborted_streaming".to_owned()),
+            final_text: None,
+            final_text_unavailable: None,
+            terminal: true,
+        });
+        assert_eq!(evidence(&status, false), Some(TurnEvidence::Terminal));
+        // An unmapped native reason proves no outcome.
+        status.last_turn.as_mut().unwrap().status = None;
+        assert_eq!(evidence(&status, false), None);
+    }
+
+    #[test]
     fn turnless_snapshot_binds_start_and_stop_commands_only() {
         use super::{AgentSnapshotParams, EventStatus, events::TurnFacts, snapshot_turn_facts};
 
@@ -2826,6 +2949,7 @@ mod tests {
                 command_id: "send-1".to_owned(),
                 turn_id: "turn-1".to_owned(),
                 status: None,
+                native_status: None,
                 final_text: None,
                 final_text_unavailable: None,
                 terminal: true,

@@ -70,7 +70,13 @@ pub(crate) struct EventStatus {
 pub(crate) struct TurnFacts {
     pub command_id: String,
     pub turn_id: String,
+    /// Universal terminal status (`completed`, `interrupted` or `failed`);
+    /// absent while non-terminal or when the native reason maps to no
+    /// known outcome.
     pub status: Option<String>,
+    /// The native `result.terminal_reason`, redacted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_status: Option<String>,
     pub final_text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub final_text_unavailable: Option<String>,
@@ -232,6 +238,17 @@ fn claude_outcome(reason: &str) -> &'static str {
             }
         }
     }
+}
+
+/// The universal terminal status of a canonical outcome; `unknown` has none.
+fn universal_status(outcome: &str) -> Option<String> {
+    match outcome {
+        "success" => Some("completed"),
+        "interrupted" => Some("interrupted"),
+        "failure" => Some("failed"),
+        _ => None,
+    }
+    .map(str::to_owned)
 }
 
 /// Classify the original terminal reason first, then redact for persistence:
@@ -3133,7 +3150,8 @@ impl EventProcessor {
         self.status.last_turn = Some(TurnFacts {
             command_id,
             turn_id,
-            status: Some(terminal_reason),
+            status: universal_status(outcome),
+            native_status: Some(terminal_reason),
             final_text: data
                 .get("final_text")
                 .and_then(Value::as_str)
@@ -3315,6 +3333,7 @@ impl EventProcessor {
                 command_id,
                 turn_id,
                 status: None,
+                native_status: None,
                 final_text: None,
                 final_text_unavailable: text_status
                     .get("final_text_unavailable")

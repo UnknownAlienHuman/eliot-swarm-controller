@@ -442,6 +442,24 @@ impl State {
         self.pending.as_ref().map(|p| p.turn.as_str())
     }
 
+    /// True while `turn_id` is the exact prepared turn of `command_id`.
+    pub fn pending_is(&self, command_id: &str, turn_id: &str) -> bool {
+        self.pending
+            .as_ref()
+            .is_some_and(|pending| pending.command == command_id && pending.turn == turn_id)
+    }
+
+    /// True while the exact turn's fenced `session/prompt` call awaits its
+    /// terminal reply on a healthy stream.
+    pub fn prompt_outstanding(&self, command_id: &str, turn_id: &str) -> bool {
+        self.fenced_guard.is_some()
+            && self.pending_is(command_id, turn_id)
+            && self.failure.is_none()
+            && !self.source_unknown
+            && !self.batch_unknown
+            && !self.writes_blocked
+    }
+
     pub fn contains_secret(&self, text: &str) -> bool {
         self.policy.contains_text(text)
     }
