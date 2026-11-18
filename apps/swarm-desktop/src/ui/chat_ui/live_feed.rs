@@ -286,7 +286,9 @@ impl DesktopApp {
                 self.update(Message::Launch(LaunchMsg::LaunchRequested), context);
             }
             _ => {
-                self.chat.drafts.set(&agent, text);
+                // A fresh edit after a definite failure: any unresolved
+                // snapshot for this Agent is abandoned (its key released).
+                self.store_draft_text(&agent, text);
                 if let Some(primary) = self.primary_action() {
                     self.update(primary, context);
                 }

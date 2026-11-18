@@ -109,7 +109,11 @@ impl DesktopApp {
         match outcome {
             Ok(outcome) => {
                 // The submission settled: its snapshot (if any) is resolved.
-                self.chat.pending_retry.remove(&outcome.agent);
+                abandon_retry(
+                    &mut self.chat.pending_retry,
+                    &mut self.ledger,
+                    &outcome.agent,
+                );
                 // Bound to the submitting Agent and draft revision, not
                 // to whatever conversation is open now.
                 self.chat.drafts.ack(&outcome.agent, outcome.draft_rev);
@@ -163,7 +167,7 @@ impl DesktopApp {
                     self.in_flight_key = Some(key.clone());
                     // The steer is definitely settled; its snapshot (if any)
                     // is superseded by the fallback submission below.
-                    self.chat.pending_retry.remove(&bound.agent);
+                    abandon_retry(&mut self.chat.pending_retry, &mut self.ledger, &bound.agent);
                     if let Some(convo) = self.chat.convo.as_mut()
                         && convo.agent() == bound.agent
                     {
@@ -191,12 +195,17 @@ impl DesktopApp {
                 self.rebuild_items();
                 if crate::state::uncertain(&failure.error) {
                     // Keep the exact unresolved identity with the draft so
-                    // the next identical Send retries this snapshot (same
-                    // mutation id and ledger key) instead of rederiving a
-                    // fresh id that could admit a duplicate effect.
+                    // Retry resubmits this snapshot (same action, body,
+                    // mutation id and ledger key) instead of reselecting
+                    // from the Agent state, which could admit a duplicate
+                    // effect under a fresh id. Dead snapshots and
+                    // over-cap entries are pruned (keys released) first.
                     if restored {
-                        self.chat.pending_retry.insert(
-                            agent.clone(),
+                        retain_retry(
+                            &mut self.chat.pending_retry,
+                            &mut self.ledger,
+                            &self.chat.drafts,
+                            &agent,
                             PendingRetry {
                                 action: failure.action.clone(),
                                 text: failure.text.clone(),
@@ -208,19 +217,20 @@ impl DesktopApp {
                         );
                     }
                     self.alert(format!(
-                        "Not confirmed (sending again reuses the same id): {}",
+                        "Not confirmed (Retry resubmits with the same id): {}",
                         failure.error.user_message()
                     ));
                 } else {
                     // A definite refusal settles the action: drop its
-                    // snapshot so a later Send mints fresh identity.
+                    // snapshot (releasing its key) so a later Send mints
+                    // fresh identity.
                     if self
                         .chat
                         .pending_retry
                         .get(&agent)
                         .is_some_and(|pending| pending.revision == failure.revision)
                     {
-                        self.chat.pending_retry.remove(&agent);
+                        abandon_retry(&mut self.chat.pending_retry, &mut self.ledger, &agent);
                     }
                     self.alert(format!("Not sent: {}", failure.error.user_message()));
                 }
