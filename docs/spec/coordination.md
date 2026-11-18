@@ -208,8 +208,8 @@ their own verified, project-scoped ingress identity and are unsupported in 2a.
 Claim and manager launch contend on the same Store transaction. The first wins
 and the competing caller receives the current record with a typed reason.
 Release advances the epoch and retains the vacant record. Resume advances the
-manager generation and epoch atomically with dispatch. Replacement requires an
-explicit release and new assignment. Release revokes Swarm authority and
+manager generation and epoch atomically with dispatch. The Owner can replace a
+manager through [project transfer](#project-transfer). Release revokes Swarm authority and
 leaves existing execution to its native lifecycle. Dispatched or unresolved
 native startup blocks release. Ordinary startup of a separate root is refused while the
 assignment is occupied. Restart reads the existing record. A heartbeat timeout,
@@ -522,6 +522,53 @@ no native MSP turn identity/child principal/control, and private history
 at the owning daemon dispatch boundary. Child control stays a later increment,
 as do tree forms for mail recipients (non-Agent ids stay `invalid`) and watch filters
 (a tree value matches no events today).
+
+## Project transfer
+
+The Owner uses `project.transfer` to move a registered project's assignment to an
+exact local Agent generation. Each action has its own mutation ID and expected
+assignment revision. Same-ID retry reads the retained result, including a wait
+or refusal. Use a fresh mutation ID to check a changed condition. Remote grants
+remain unsupported.
+
+- **Begin** retains an intent, keeps the assignment occupied and fences new A
+  controls and automated work addressed to A. Owner readback, replies,
+  interrupt and stop remain available. Other workers can finish work in their
+  existing native sessions. Unsettled commands, approvals, unresolved Goal
+  rounds and a blocked source Goal are reported. Source custody must close when
+  A has a workspace. Idle alone supplies no writer-exit evidence.
+- **Launch**, if needed, prefers a compatible idle root in A's actual workspace
+  on the requested approved profile. A new root uses ordinary launch admission
+  and reservations. The staged replacement holds a slot in the current
+  assignment as well as in the project and fleet. A full capacity scope returns
+  a capacity wait after continuation policy and source blockers have been checked.
+  The Owner may authorize provisioning after stop by supplying saved
+  continuation context at Begin, with the project launch action permitted.
+  The daemon requires owned-process exit, reader drain and closure of A's
+  workspace helpers before admitting that launch. Windows Job custody supplies
+  the required guarantee. A platform whose custody result leaves escaped
+  descendants possible returns a blocker. The daemon retains the launch command
+  for readback and holds unknown custody.
+- **Commit** requires the exact idle compatible B. Store advances assignment
+  revision and epoch, moves the current workspace binding and worker topology,
+  and transfers advisory claims and the paused Eliot Goal in one transaction.
+  Only controlled workers move. Native observations keep their recorded
+  parentage and roots. The managed workspace and its Git artifacts follow the
+  successor's retained start so cleanup can find them after the old manager is
+  deleted and the assignment is released. The original preparation identity is
+  preserved. If the receipt remains with an earlier owner, deletion is blocked
+  while the path is bound or borrowed. Worker generations, references and
+  reservations stay in place. A successor team over its assignment limit and
+  unsettled queues block the transaction. Queues keep their
+  retained principals and assignment epochs are preserved. Project-owned rules
+  stay project-owned and targeted automation follows current membership.
+- **Cancel** removes the intent and lifts its drain fence once any staged
+  replacement has settled without open custody. Owner can stop a staged B
+  through ordinary recovery.
+
+Saved context is available to the Owner in the retained result. Task brief
+delivery and selected SEND continuation use their own [Handoff](#handoff)
+contract.
 
 ## Handoff
 

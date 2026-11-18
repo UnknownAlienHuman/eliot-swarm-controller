@@ -445,6 +445,7 @@ impl Router {
             "swarm.handoff" => self.swarm_handoff(&params, &principal).await,
             "swarm.switch" => self.swarm_switch(&params, &principal).await,
             "command.cancel" => self.command_cancel(&params, &principal).await,
+            "project.transfer" => self.project_transfer(&params, &principal).await,
             "project.assignment.get" => self.project_assignment_get(&params, &principal).await,
             "project.assignment.claim" => self.project_assignment_claim(&params, &principal).await,
             "project.assignment.launch" => {
@@ -5991,6 +5992,7 @@ fn reject_launch_derived_keys(args: &Value) -> Result<()> {
     for reserved in [
         "registered_project",
         "project_assignment_launch",
+        "project_transfer_launch",
         "profile_choice",
         "source_plan",
         "target_environment",

@@ -94,7 +94,7 @@ Checked layers record delivered increments, not full crash/load qualification.
   with launch, use existing preparation and setup, and have workers inherit it.
 - [x] **2c. Project and global capacity and readback.** Extend transactional
   reservations and return exact project, manager and fleet usage.
-- [ ] **3. Project transfer.** Build on H1/H2/H3 to transfer authority, team and
+- [x] **3. Project transfer.** Build on H1/H2/H3 to transfer authority, team and
   workspace bindings atomically, with explicit drain and unknown handling.
 - [ ] **4. Chats and fair queue.** Add headless conversation association and project
   continuation, then fair arbitration and explicit queued interactive launch.

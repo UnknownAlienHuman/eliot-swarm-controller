@@ -94,6 +94,85 @@ pub(super) fn load_workspace_by_path(
         .map_err(sql_error)
 }
 
+/// Rebind the operational receipt and Git artifacts to the successor's exact
+/// generation. Preserve the first preparation identity and all Git/setup facts.
+pub(super) fn transfer_workspace_custody(
+    tx: &Transaction<'_>,
+    path: &str,
+    from: &Agent,
+    to: &Agent,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<()> {
+    let Some(workspace) = load_workspace_by_path(tx, path)? else {
+        return Ok(()); // Adopted checkout without a Swarm preparation.
+    };
+    if workspace.agent != from.id || workspace.phase != WorkspacePhase::Ready {
+        return Ok(()); // The existing owner stays protected from deletion.
+    }
+    let from_num = parse_agent_id(&from.id)?;
+    let to_num = parse_agent_id(&to.id)?;
+    let start: Option<String> = tx
+        .query_row(
+            "SELECT id FROM commands WHERE target=?1 AND generation=?2
+             AND verb IN ('launch','resume') AND state='applied'
+             ORDER BY created_at DESC,id DESC LIMIT 1",
+            params![to_num, to.generation],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    let Some(start) = start else {
+        // A long-lived idle destination can outlast command retention. Its
+        // assignment may still transfer, but it has no start receipt to bind.
+        return Ok(());
+    };
+    let original = json!({"agent": workspace.agent, "generation": workspace.target_generation,
+        "start_command_id": workspace.start_command_id});
+    db!(tx.execute(
+        "UPDATE workspaces SET agent=?1,target_generation=?2,start_command_id=?3,
+         original_preparation=COALESCE(original_preparation,?4) WHERE agent=?5",
+        params![
+            to_num,
+            to.generation,
+            start,
+            encode_json(&original)?,
+            from_num
+        ],
+    ));
+    let ancestry = encode_json(&json!([format!("{}:{}", to.id, to.generation)]))?;
+    db!(tx.execute(
+        "UPDATE artifacts SET agent=?1,generation=?2,
+         body=json_set(body,'$.agent',?3,'$.generation',?2,'$.tree',json(?4))
+         WHERE agent=?5 AND json_extract(body,'$.state')='registered'
+           AND ((path=?6 AND json_extract(body,'$.kind')='worktree')
+             OR (json_extract(body,'$.git.worktree')=?6 AND json_extract(body,'$.kind')='branch'))",
+        params![to_num, to.generation, to.id, ancestry, from_num, path],
+    ));
+    close_drained_workspace_process_source(tx, from_num, workspace.target_generation, now, events)?;
+    Ok(())
+}
+
+pub(super) fn require_workspace_owner_deletable(tx: &Transaction<'_>, agent: &Agent) -> Result<()> {
+    if let Some(workspace) = load_workspace(tx, parse_agent_id(&agent.id)?)?
+        && workspace.phase != WorkspacePhase::Removed
+    {
+        if project_assignment::workspace_path_bound(tx, &workspace.worktree_path)? {
+            return Err(Error::new(
+                "workspace_path_bound",
+                "worktree is bound to a current project assignment",
+            ));
+        }
+        if workspace_has_borrowers(tx, &agent.id, &workspace.worktree_path)? {
+            return Err(Error::new(
+                "workspace_has_borrowers",
+                "another nonterminal Agent references this worktree or a descendant",
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn workspace_phase_name(phase: WorkspacePhase) -> &'static str {
     match phase {
         WorkspacePhase::Creating => "creating",

@@ -434,6 +434,10 @@ fn update_goal_state_tx(
     Ok(())
 }
 
+pub(super) fn eliot_goal_status(conn: &Connection, agent_num: i64) -> Result<Option<GoalStatus>> {
+    Ok(load_goal_row(conn, agent_num, "eliot")?.map(|row| row.state.status))
+}
+
 /// Keep definition/counters, clear A, and install B paused with a fresh turn baseline.
 pub(super) fn transfer_goal_tx(
     tx: &Transaction<'_>,
@@ -1355,6 +1359,7 @@ impl Store {
                 "observe-only Agents take no Goal rounds",
             ));
         }
+        project_transfer::check_automation_target(&tx, &agent_row)?;
         let Some(row) = load_goal_row(&tx, agent_num, mode)? else {
             return Err(Error::new("not_found", "goal was not found"));
         };

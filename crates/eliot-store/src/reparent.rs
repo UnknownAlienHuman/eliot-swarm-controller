@@ -55,7 +55,13 @@ impl Store {
             });
         }
         validate_id_age(&request.id, now)?;
-        let Change { value, events } = reparent_tx(&tx, request, self.hierarchy_limits, now)?;
+        for id in [request.source()?, &request.parent] {
+            if let Some(agent) = load_agent_by_num(&tx, parse_agent_id(id)?)? {
+                project_transfer::require_no_intent(&tx, &agent.project)?;
+            }
+        }
+        let Change { value, events } =
+            reparent_tx(&tx, request, self.hierarchy_limits, now, false)?;
         let result = serde_json::to_value(&value)
             .map_err(|_| Error::new("internal", "cannot encode reparent result"))?;
         coordination::retain_write_tx(
@@ -78,6 +84,7 @@ pub(super) fn reparent_tx(
     request: &ReparentRequest,
     limits: eliot_core::api::HierarchyLimits,
     now: i64,
+    controlled_only: bool,
 ) -> Result<Change<ReparentResponse>> {
     let source = load_agent_by_num(tx, parse_agent_id(request.source()?)?)?
         .ok_or_else(|| Error::new("not_found", "source Agent was not found"))?;
@@ -102,10 +109,17 @@ pub(super) fn reparent_tx(
     let cap = limits.max_selector_targets;
     let roots = if request.children_of.is_some() {
         let mut stmt = tx
-            .prepare("SELECT id FROM agents WHERE parent = ?1 ORDER BY id LIMIT ?2")
+            .prepare(
+                "SELECT id FROM agents WHERE parent = ?1 AND (NOT ?3 OR observe_only = 0)
+                 ORDER BY id LIMIT ?2",
+            )
             .map_err(sql_error)?;
         stmt.query_map(
-            params![parse_agent_id(&source.id)?, cap.saturating_add(1)],
+            params![
+                parse_agent_id(&source.id)?,
+                cap.saturating_add(1),
+                controlled_only
+            ],
             |row| row.get::<_, i64>(0),
         )
         .map_err(sql_error)?
@@ -119,7 +133,11 @@ pub(super) fn reparent_tx(
     for root in roots {
         let root_agent = load_agent_by_num(tx, root)?
             .ok_or_else(|| Error::new("source_integrity", "moving root disappeared"))?;
-        let members = hierarchy::subtree_member_nums(tx, root, cap)?;
+        let members = if controlled_only {
+            hierarchy::controlled_subtree_member_nums(tx, root, cap)?
+        } else {
+            hierarchy::subtree_member_nums(tx, root, cap)?
+        };
         for num in members {
             if !seen.insert(num) || moves.len() as i64 >= cap {
                 return Err(Error::new(

@@ -1330,6 +1330,42 @@ pub(crate) enum ProjectCommand {
     },
     /// Read or change current project manager assignments.
     Assignment(ProjectAssignmentArgs),
+    /// Transfer an assignment to another manager.
+    Transfer(ProjectTransferArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct ProjectTransferArgs {
+    pub(crate) project: String,
+    #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
+    pub(crate) revision: i64,
+    #[command(subcommand)]
+    pub(crate) command: ProjectTransferCommand,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ProjectTransferCommand {
+    /// Fence the current manager and report drain blockers.
+    Begin {
+        /// Saved continuation context. Authorizes provisioning after verified stop.
+        #[arg(long)]
+        saved_context: Option<String>,
+    },
+    /// Find an eligible idle manager or provision a replacement under policy.
+    Launch {
+        intent: String,
+        #[arg(long)]
+        profile: String,
+    },
+    /// Atomically move the assignment to the exact destination generation.
+    Commit {
+        intent: String,
+        destination: String,
+        #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
+        generation: i64,
+    },
+    /// Cancel the intent and lift the source drain fence.
+    Cancel { intent: String },
 }
 
 #[derive(Args)]

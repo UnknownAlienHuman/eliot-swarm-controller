@@ -157,6 +157,10 @@ impl Store {
                     ),
                 ));
             }
+            if archived.is_none() {
+                project_transfer::require_deletable(&tx, &row)?;
+                workspace::require_workspace_owner_deletable(&tx, &row)?;
+            }
             if let Some(turn) = row.active_turn.as_deref() {
                 return Err(Error::new(
                     "busy",
@@ -382,6 +386,18 @@ fn delete_tree_tx(tx: &Transaction<'_>, members: &[i64], now: i64) -> Result<()>
     ));
     for num in members {
         delete_db!(tx.execute("INSERT INTO deleted_agents VALUES (?1)", [num]));
+    }
+    let retained_root: bool = delete_db!(tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM deleted_agents d JOIN agents a ON a.root=d.id
+                       WHERE a.observe_only=1 AND a.id NOT IN (SELECT id FROM deleted_agents))",
+        [],
+        |row| row.get(0),
+    ));
+    if retained_root {
+        return Err(Error::new(
+            "busy",
+            "a retained native observation still refers to this root",
+        ));
     }
     let mut command_count = delete_db!(tx.execute(
         "INSERT INTO deleted_commands

@@ -98,6 +98,7 @@ impl Store {
             agent,
             now,
             CLAIM_SCAN_ROWS,
+            false,
         )?;
         let scan_capped = claims.len() >= CLAIM_SCAN_ROWS as usize;
         claims.truncate((CLAIM_SCAN_ROWS - 1) as usize);
@@ -297,6 +298,7 @@ impl Store {
         agent: Option<i64>,
         now: i64,
         limit: i64,
+        include_terminal: bool,
     ) -> Result<Vec<ClaimView>> {
         let mut statement = connection
             .prepare(
@@ -304,24 +306,27 @@ impl Store {
                  FROM claims c JOIN agents a ON a.id = c.agent
                  WHERE c.expires_at > ?1
                    AND c.generation = a.generation
-                   AND a.state NOT IN ('stopped','failed','lost')
+                   AND (?5 OR a.state NOT IN ('stopped','failed','lost'))
                    AND (?2 IS NULL OR COALESCE(a.project_scope, a.project) = ?2)
                    AND (?3 IS NULL OR c.agent = ?3)
                  ORDER BY c.agent ASC, c.glob ASC LIMIT ?4",
             )
             .map_err(sql_error)?;
         let rows = statement
-            .query_map(params![now, project, agent, limit], |row| {
-                let num: i64 = row.get(0)?;
-                Ok(ClaimView {
-                    agent: format!("a{num}"),
-                    generation: row.get(1)?,
-                    glob: row.get(2)?,
-                    note: row.get(3)?,
-                    expires_at: row.get(4)?,
-                    created_at: row.get(5)?,
-                })
-            })
+            .query_map(
+                params![now, project, agent, limit, include_terminal],
+                |row| {
+                    let num: i64 = row.get(0)?;
+                    Ok(ClaimView {
+                        agent: format!("a{num}"),
+                        generation: row.get(1)?,
+                        glob: row.get(2)?,
+                        note: row.get(3)?,
+                        expires_at: row.get(4)?,
+                        created_at: row.get(5)?,
+                    })
+                },
+            )
             .map_err(sql_error)?
             .collect::<rusqlite::Result<Vec<ClaimView>>>()
             .map_err(sql_error)?;
@@ -488,7 +493,7 @@ impl Store {
         glob: &str,
         now: i64,
     ) -> Result<(Vec<ClaimConflict>, bool)> {
-        let candidates = Self::live_claims(tx, Some(project), None, now, CLAIM_SCAN_ROWS)?;
+        let candidates = Self::live_claims(tx, Some(project), None, now, CLAIM_SCAN_ROWS, false)?;
         let mut truncated = candidates.len() >= CLAIM_SCAN_ROWS as usize;
         let mut conflicts = Vec::new();
         for candidate in candidates {
@@ -617,6 +622,7 @@ pub(super) fn transfer_claims_tx(
         Some(from_num),
         now,
         MAX_CLAIMS_PER_AGENT as i64 + 1,
+        true,
     )?;
     let destination = Store::live_claims(
         tx,
@@ -624,6 +630,7 @@ pub(super) fn transfer_claims_tx(
         Some(to_num),
         now,
         MAX_CLAIMS_PER_AGENT as i64 + 1,
+        false,
     )?;
     if claims.len() + destination.len() > MAX_CLAIMS_PER_AGENT {
         return Err(Error::new(

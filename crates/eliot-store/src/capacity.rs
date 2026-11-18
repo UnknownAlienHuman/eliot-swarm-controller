@@ -446,9 +446,10 @@ pub(super) fn reserve_tx(
     set_reservation_generation_tx(tx, id, None, generation)
 }
 
-/// Reservations belonging to the current assignment's root and exact manager
-/// generation. Managed launch and resume can reserve before dispatch installs
-/// the new generation. The candidate row is evaluated by the same predicate.
+/// Reservations belonging to the current assignment, including the staged
+/// successor's slot during transfer. Managed launch and resume can reserve
+/// before dispatch installs the new generation. The candidate is evaluated by
+/// the same predicate as the retained reservations.
 fn assignment_usage(
     conn: &Connection,
     project: &str,
@@ -461,7 +462,10 @@ fn assignment_usage(
                     CASE WHEN a.id = ?2 THEN ?3 ELSE a.capacity_generation END AS reserved
              FROM project_assignments p
              JOIN agents m ON m.id = p.manager AND m.project = p.project
-             JOIN agents a ON a.project = p.project AND a.root = p.manager
+             LEFT JOIN project_transfers transfer ON transfer.project = p.project
+             LEFT JOIN commands successor ON successor.id = transfer.launch_command
+             JOIN agents a ON a.project = p.project
+                 AND (a.root = p.manager OR a.id = successor.target)
              WHERE p.project = ?1 AND (
                  m.generation = p.manager_generation OR
                  (m.generation = 0 AND p.manager_generation = 1 AND p.start_command IS NOT NULL)
@@ -530,10 +534,36 @@ fn require_free(conn: &Connection, agent: &Agent, id: i64) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn require_assignment_fits(
+    tx: &Transaction<'_>,
+    project: &str,
+    policy: Option<&PolicyLoader>,
+) -> Result<()> {
+    if let Some(load) = policy
+        && let Some(limit) = load()?
+            .projects
+            .get(project)
+            .and_then(|limits| limits.manager_assignment)
+    {
+        let usage = assignment_usage(tx, project, None)?.0;
+        if usage as u64 > limit {
+            return Err(scope_capacity_error(
+                &CapacityScope::manager_assignment_scope(project),
+                limit,
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn require_scope_free(scope: &str, max_live: u64, usage: usize) -> Result<()> {
     if (usage as u64) < max_live {
         return Ok(());
     }
+    Err(scope_capacity_error(scope, max_live))
+}
+
+fn scope_capacity_error(scope: &str, max_live: u64) -> Error {
     let (kind, name) = scope.split_once(':').unwrap_or_default();
     let name = toml_key(name);
     let setting = match kind {
@@ -544,7 +574,7 @@ fn require_scope_free(scope: &str, max_live: u64, usage: usize) -> Result<()> {
         "manager_assignment" => format!("[capacity.projects.{name}] manager_max_live"),
         _ => "[capacity] global_max_live".to_owned(),
     };
-    Err(Error::new(
+    Error::new(
         "capacity_unavailable",
         format!("configured capacity bound {scope} max_live={max_live} is reserved; Owner may raise it in config.toml {setting}"),
     )
@@ -552,7 +582,7 @@ fn require_scope_free(scope: &str, max_live: u64, usage: usize) -> Result<()> {
     .with_origin(
         core::FailureOrigin::Swarm,
         "configured local capacity bound is reserved",
-    ))
+    )
 }
 
 fn toml_key(name: &str) -> String {

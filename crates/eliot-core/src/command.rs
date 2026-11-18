@@ -38,6 +38,7 @@ pub fn is_deterministic_pre_admission_rejection(code: &str) -> bool {
             | "secret_in_payload"
             | "stale_generation"
             | "stale_assignment"
+            | "transfer_in_progress"
             | "unsupported"
             | "version_conflict"
     )

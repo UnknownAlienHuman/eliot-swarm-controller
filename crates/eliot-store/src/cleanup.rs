@@ -116,6 +116,16 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
+        if matches!(artifact.kind, ArtifactKind::Worktree | ArtifactKind::Branch)
+            && let Some(git) = &artifact.git
+            && let Some(workspace) = workspace::load_workspace_by_path(&tx, &git.worktree)?
+            && workspace.agent != artifact.agent
+        {
+            return Err(Error::new(
+                "stale_generation",
+                "worktree artifact custody changed",
+            ));
+        }
         let count: i64 = tx
             .query_row("SELECT COUNT(*) FROM artifacts", [], |r| r.get(0))
             .map_err(sql_error)?;
