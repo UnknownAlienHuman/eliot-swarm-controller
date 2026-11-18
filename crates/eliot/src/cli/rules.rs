@@ -79,6 +79,9 @@ pub(crate) async fn run_project(
     id: Option<String>,
 ) -> Result<u8, Failure> {
     match command {
+        ProjectCommand::Transfer(args) => {
+            super::project_assignment::transfer(args, &data_dir, json_output, id).await
+        }
         ProjectCommand::Assignment(args) => {
             super::project_assignment::run(args.command, &data_dir, json_output, id).await
         }

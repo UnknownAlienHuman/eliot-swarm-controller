@@ -615,7 +615,8 @@ fn subtree_members_tx(connection: &Connection, root: &str) -> Result<(Vec<Subtre
                     WHERE t.agent = c.target AND t.generation = c.generation
                       AND t.turn_id = c.turn_id AND t.state IN ('running', 'unknown')
                 ),
-                EXISTS(SELECT 1 FROM workspaces w WHERE w.start_command_id = c.id),
+                (EXISTS(SELECT 1 FROM workspaces w WHERE w.start_command_id = c.id)
+                  OR EXISTS(SELECT 1 FROM project_transfers p WHERE p.launch_command = c.id)),
                 EXISTS(SELECT 1 FROM provider_holds h WHERE h.probe_command = c.id),
                 EXISTS(
                     SELECT 1 FROM goals g

@@ -449,6 +449,7 @@ command id frozen at claim. Stored Goal responses/round records use Core
 | `script.list/read/save` | Owner-only scripts under approved Run roots: cursor/encoded-byte-bounded list (one root scan per page; continue through empty pages until `next_cursor` is absent), verified-handle bounded read, and serialized revision-guarded replacement. Complete secret-bearing entries are withheld; raw and decoded TOML/JSON keys/values are checked. Saves never execute; external-writer conflict limits and editor environment are specified in [automation](automation.md#script-editing). DTOs/budgets: [`script_edit.rs`](../../crates/eliot-core/src/api/script_edit.rs). |
 | `config.profiles.read/save` | legacy profile-only read and validated, revision-guarded replacement of the `[profiles.*]` sections of `config.toml` (same writer as `settings.save`) |
 | `settings.read/save` | owner-only unified section read/save, revision CAS, dry run, restart indication and bounded author history; see configuration |
+| `project.transfer` | Owner-only transfer intent, optional replacement launch, atomic commit or cancellation with typed readback. See [Project transfer](coordination.md#project-transfer). |
 | `project.assignment.get/claim/launch/release` | Current registered project manager, explicit adoption or manager launch, and revision-bound release through the ordinary command path. See [project manager assignments](#project-manager-assignments). |
 | `project.discover` | owner-only opened Git checkout registration through the settings writer; non-Git paths return no project |
 | `routing.preview` | owner-only advisory `RoutingDecision` for a role, computed like admission without admitting, freezing or reserving; see configuration |
@@ -486,6 +487,8 @@ unsupported. CLI callers use `swarm project assignment get|claim|launch|release`
 An explicit Owner claim supplies the Agent ID and generation. A scoped claim
 omits the manager to select the caller. The project action
 `project.assignment.claim` grants self-claim under the configured profile allowlist.
+For transfer, use `swarm project transfer <project> --revision <revision> begin|launch|commit|cancel`.
+The request and readback use [ProjectTransferRequest and ProjectTransferResult](../../crates/eliot-core/src/api/project_transfer.rs).
 
 A managed manager launch always runs in a project worktree. Without an explicit
 `adopt_worktree` the daemon prepares a fresh opaque worktree on a unique

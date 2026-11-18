@@ -518,7 +518,7 @@ fn frozen_scope_usage(conn: &Connection, id: i64, scope: &str) -> Result<usize> 
     .map_err(sql_error)
 }
 
-fn require_free(conn: &Connection, agent: &Agent, id: i64) -> Result<()> {
+pub(super) fn require_free(conn: &Connection, agent: &Agent, id: i64) -> Result<()> {
     for scope in scopes(agent)? {
         if let Some(max_live) = scope.max_live
             && !CapacityScope::is_daemon_owned(&scope.scope)

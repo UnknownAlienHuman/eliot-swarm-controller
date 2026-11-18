@@ -1,4 +1,5 @@
 use super::*;
+use eliot_core::api::{ProjectTransferAction, ProjectTransferOutcome};
 use std::{fs, path::Path, sync::Barrier, thread};
 
 fn register(store: &mut Store, now: i64) {
@@ -104,12 +105,18 @@ fn mark_worktree_ready(store: &Store, agent: i64) {
 }
 
 fn ready(store: &mut Store, project: &str, now: i64) -> String {
-    let id = Ulid::new().to_string();
-    let start = store
-        .submit("owner", launch(id.clone(), project), now)
-        .unwrap();
-    let agent = start.command.target.unwrap();
-    settle_ready(store, &agent, &id, now);
+    ready_request(store, launch(Ulid::new().to_string(), project), now)
+}
+
+fn ready_request(store: &mut Store, request: SubmitCommand, now: i64) -> String {
+    let id = request.id.clone();
+    store.submit("owner", request, now).unwrap();
+    ready_admitted(store, &id, now)
+}
+
+fn ready_admitted(store: &mut Store, id: &str, now: i64) -> String {
+    let agent = store.get_command(id).unwrap().unwrap().target.unwrap();
+    settle_ready(store, &agent, id, now);
     agent
 }
 
@@ -1040,5 +1047,331 @@ fn adoption_refuses_overlapping_unmanaged_agent_workspaces() {
     assert_eq!(
         store.project_assignment("owner", "alpha").unwrap().state,
         ProjectAssignmentState::Vacant
+    );
+}
+
+fn transfer_request(action: core::api::ProjectTransferAction) -> core::api::ProjectTransferRequest {
+    core::api::ProjectTransferRequest {
+        id: Ulid::new().to_string(),
+        project: "alpha".into(),
+        expected_revision: 1,
+        action,
+    }
+}
+
+fn transfer_fixture() -> (Store, String, String, i64) {
+    let now = Ulid::new().timestamp_ms() as i64;
+    let mut store = Store::open(Path::new(":memory:")).unwrap();
+    register(&mut store, now);
+    let source = ready(&mut store, "alpha", now);
+    let destination = ready(&mut store, "alpha", now);
+    store
+        .claim_project_manager(&format!("agent:{source}:1"), &claim_request(), now)
+        .unwrap();
+    (store, source, destination, now)
+}
+
+#[cfg(windows)]
+fn stop_with_transfer_custody(store: &mut Store, source: &str, now: i64) {
+    store.ensure_process_source(source, 1, now).unwrap();
+    let mut stop = SubmitCommand::new(Ulid::new().to_string(), "stop");
+    stop.target = Some(source.into());
+    stop.expected_generation = Some(1);
+    stop.args = json!({"force": true});
+    let id = stop.id.clone();
+    store.submit("owner", stop, now).unwrap();
+    store.dispatch(&id, now).unwrap();
+    store.settle(&id, CommandState::Applied, None, now).unwrap();
+    store
+        .connection
+        .execute(
+            "INSERT INTO processes(host_boot_id,pid,start_time,owner,role,state,updated_at)
+         VALUES ('transfer-test',100,1,?1,'plugin','exited',?2)",
+            params![format!("agent:{source}#1"), now],
+        )
+        .unwrap();
+    store.record_owned_control_exit(source, 1, now).unwrap();
+    store
+        .set_process_source_status(source, 1, "ok", true, now)
+        .unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn project_transfer_changes_epoch_and_team_without_changing_worker_identity() {
+    let (mut store, source, destination, now) = transfer_fixture();
+    let mut start = launch(Ulid::new().to_string(), "alpha");
+    start.args["parent"] = json!(source);
+    let worker = ready_request(&mut store, start, now);
+    let before = store.get_agent(&worker).unwrap().unwrap();
+    store.connection.execute(
+        "INSERT INTO claims(agent,generation,glob,expires_at,created_at) VALUES (?1,1,'src/**',?2,?3)",
+        params![parse_agent_id(&source).unwrap(), now + 60000, now],
+    ).unwrap();
+    store
+        .connection
+        .execute(
+            "UPDATE project_assignments SET workspace_path=?1 WHERE project='alpha'",
+            [&before.workspace],
+        )
+        .unwrap();
+
+    let begin = transfer_request(ProjectTransferAction::Begin {
+        saved_context: None,
+    });
+    let commit = transfer_request(ProjectTransferAction::Commit {
+        intent: begin.id.clone(),
+        destination: ProjectManagerIdentity::Local {
+            agent: destination.clone(),
+            generation: 1,
+        },
+    });
+    let policy = core::SecretPolicy::default();
+    let draining = store
+        .project_transfer(&begin, None, &policy, now)
+        .unwrap()
+        .value;
+    assert_eq!(draining.outcome, ProjectTransferOutcome::Draining);
+    assert!(
+        draining
+            .blockers
+            .iter()
+            .any(|b| b.code == "source_custody_open")
+    );
+
+    let mut old_send = SubmitCommand::new(Ulid::new().to_string(), "send");
+    old_send.target = Some(worker.clone());
+    old_send.args = json!({"text": "old manager input"});
+    assert_eq!(
+        store
+            .submit(&format!("agent:{source}:1"), old_send.clone(), now)
+            .unwrap_err()
+            .code,
+        "transfer_in_progress"
+    );
+
+    stop_with_transfer_custody(&mut store, &source, now);
+    let applied = store.project_transfer(&commit, None, &policy, now).unwrap();
+    assert_eq!(
+        applied.value.outcome,
+        ProjectTransferOutcome::Transferred,
+        "{:?}",
+        applied.value.blockers
+    );
+    assert_eq!(applied.value.assignment.epoch, 2);
+    assert_eq!(applied.value.assignment.workspace, before.workspace);
+    assert_eq!(applied.value.moved.len(), 1);
+    assert_eq!(applied.value.claims, ["src/**"]);
+    let after = store.get_agent(&worker).unwrap().unwrap();
+    assert_eq!(after.parent.as_deref(), Some(destination.as_str()));
+    assert_eq!(after.root, destination);
+    assert_eq!(after.generation, before.generation);
+    assert_eq!(after.native_ref, before.native_ref);
+    assert_eq!(after.workspace, before.workspace);
+    assert!(
+        store
+            .submit(&format!("agent:{source}:1"), old_send.clone(), now)
+            .is_err()
+    );
+    store
+        .submit(&format!("agent:{worker}:1"), old_send, now)
+        .unwrap();
+
+    let replay = store.project_transfer(&commit, None, &policy, now).unwrap();
+    assert_eq!(replay.value, applied.value);
+    assert!(replay.events.is_empty());
+    let mut changed = commit;
+    changed.expected_revision = 2;
+    assert_eq!(
+        store
+            .project_transfer(&changed, None, &policy, now)
+            .unwrap_err()
+            .code,
+        "id_conflict"
+    );
+}
+
+#[test]
+fn project_transfer_reports_and_preserves_queued_and_unknown_commands() {
+    let (mut store, source, destination, now) = transfer_fixture();
+    let mut send = SubmitCommand::new(Ulid::new().to_string(), "send");
+    send.target = Some(source.clone());
+    send.args = json!({"text": "unsettled source work"});
+    store.submit("owner", send.clone(), now).unwrap();
+    let mut queued = send.clone();
+    queued.id = Ulid::new().to_string();
+    store.submit("owner", queued.clone(), now).unwrap();
+    store.dispatch(&send.id, now).unwrap();
+    store
+        .settle(&send.id, CommandState::Unknown, None, now)
+        .unwrap();
+
+    let begin = transfer_request(ProjectTransferAction::Begin {
+        saved_context: None,
+    });
+    let commit = transfer_request(ProjectTransferAction::Commit {
+        intent: begin.id.clone(),
+        destination: ProjectManagerIdentity::Local {
+            agent: destination,
+            generation: 1,
+        },
+    });
+    let policy = core::SecretPolicy::default();
+    store.project_transfer(&begin, None, &policy, now).unwrap();
+    let blocked = store
+        .project_transfer(&commit, None, &policy, now)
+        .unwrap()
+        .value;
+    assert_eq!(blocked.outcome, ProjectTransferOutcome::Blocked);
+    for (code, id) in [
+        ("unknown_effect", &send.id),
+        ("queued_command", &queued.id),
+        ("source_custody_open", &source),
+    ] {
+        assert!(
+            blocked
+                .blockers
+                .iter()
+                .any(|b| b.code == code && b.subject.as_ref() == Some(id)),
+            "{blocked:?}"
+        );
+    }
+    let original = store.get_command(&queued.id).unwrap().unwrap();
+    assert_eq!(original.principal, "owner");
+    assert!(matches!(
+        original.state,
+        CommandState::Accepted | CommandState::Queued
+    ));
+    assert_eq!(blocked.assignment.epoch, 1);
+}
+
+#[test]
+fn project_transfer_waits_at_capacity_and_prefers_eligible_idle_manager() {
+    let now = Ulid::new().timestamp_ms() as i64;
+    let mut store = Store::open(Path::new(":memory:")).unwrap();
+    register(&mut store, now);
+    let source = ready(&mut store, "alpha", now);
+    store
+        .claim_project_manager(&format!("agent:{source}:1"), &claim_request(), now)
+        .unwrap();
+
+    let begin = transfer_request(ProjectTransferAction::Begin {
+        saved_context: Some("Saved continuation".into()),
+    });
+    let stage = transfer_request(ProjectTransferAction::Launch {
+        intent: begin.id.clone(),
+        profile: "approved".into(),
+    });
+    let policy = core::SecretPolicy::default();
+    store.project_transfer(&begin, None, &policy, now).unwrap();
+    let mut replacement = launch(Ulid::new().to_string(), "alpha");
+    replacement.args["profile_snapshot"]["capacity_scopes"] =
+        json!([{"scope":"profile:approved","max_live":1}]);
+    let waiting = store
+        .project_transfer(&stage, Some(Ok(replacement)), &policy, now)
+        .unwrap()
+        .value;
+    assert_eq!(waiting.outcome, ProjectTransferOutcome::WaitingCapacity);
+    assert_eq!(
+        reserved_generation(&store, parse_agent_id(&source).unwrap()),
+        Some(1)
+    );
+    assert!(waiting.launch_command.is_none());
+
+    let (mut store, _, destination, now) = transfer_fixture();
+    store.project_transfer(&begin, None, &policy, now).unwrap();
+    let preferred = store
+        .project_transfer(&stage, None, &policy, now)
+        .unwrap()
+        .value;
+    assert_eq!(preferred.outcome, ProjectTransferOutcome::DestinationReady);
+    assert_eq!(
+        preferred.destination,
+        Some(ProjectManagerIdentity::Local {
+            agent: destination,
+            generation: 1
+        })
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn project_transfer_stages_one_replacement_and_requires_readiness_before_commit() {
+    let now = Ulid::new().timestamp_ms() as i64;
+    let policy = core::SecretPolicy::default();
+    let mut store = Store::open(Path::new(":memory:")).unwrap();
+    register(&mut store, now);
+    let source = ready(&mut store, "alpha", now);
+    store
+        .claim_project_manager(&format!("agent:{source}:1"), &claim_request(), now)
+        .unwrap();
+    let begin = transfer_request(ProjectTransferAction::Begin {
+        saved_context: Some("Resume after custody closure".into()),
+    });
+    store.project_transfer(&begin, None, &policy, now).unwrap();
+    stop_with_transfer_custody(&mut store, &source, now);
+
+    let stage = transfer_request(ProjectTransferAction::Launch {
+        intent: begin.id.clone(),
+        profile: "approved".into(),
+    });
+    let replacement = launch(Ulid::new().to_string(), "alpha");
+    let launched = store
+        .project_transfer(&stage, Some(Ok(replacement)), &policy, now)
+        .unwrap()
+        .value;
+    assert_eq!(
+        launched.outcome,
+        ProjectTransferOutcome::LaunchAdmitted,
+        "{:?}",
+        launched.blockers
+    );
+    assert_eq!(
+        store
+            .project_transfer(&stage, None, &policy, now)
+            .unwrap()
+            .value,
+        launched
+    );
+    let launch_id = launched.launch_command.unwrap();
+    let cancel = transfer_request(ProjectTransferAction::Cancel {
+        intent: begin.id.clone(),
+    });
+    let cancellation = store
+        .project_transfer(&cancel, None, &policy, now)
+        .unwrap()
+        .value;
+    assert_eq!(cancellation.outcome, ProjectTransferOutcome::Blocked);
+    assert_eq!(cancellation.blockers[0].code, "replacement_custody_open");
+
+    let destination = ready_admitted(&mut store, &launch_id, now);
+    let commit = transfer_request(ProjectTransferAction::Commit {
+        intent: begin.id,
+        destination: ProjectManagerIdentity::Local {
+            agent: destination.clone(),
+            generation: 1,
+        },
+    });
+    let transferred = store
+        .project_transfer(&commit, None, &policy, now)
+        .unwrap()
+        .value;
+    assert_eq!(
+        transferred.outcome,
+        ProjectTransferOutcome::Transferred,
+        "{:?}",
+        transferred.blockers
+    );
+    assert_eq!(
+        transferred.saved_context.as_deref(),
+        Some("Resume after custody closure")
+    );
+    assert_eq!(
+        reserved_generation(&store, parse_agent_id(&source).unwrap()),
+        None
+    );
+    assert_eq!(
+        reserved_generation(&store, parse_agent_id(&destination).unwrap()),
+        Some(1)
     );
 }

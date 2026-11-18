@@ -249,6 +249,8 @@ pub(super) fn handoff_tx(
             "handoff must stay in one project",
         ));
     }
+    project_transfer::require_no_intent(tx, &from.project)?;
+    project_transfer::require_no_intent(tx, &to.project)?;
     quiescent(tx, &from, false)?;
     quiescent(tx, &to, true)?;
     let task = load_command(tx, &request.task_command)?

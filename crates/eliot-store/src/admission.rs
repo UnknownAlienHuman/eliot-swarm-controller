@@ -1634,6 +1634,12 @@ pub(super) fn submit_tx(
         );
     }
     submit_target_guards_tx(tx, &request, &preparation)?;
+    if derived_rule
+        && let Some(id) = &request.target
+        && let Some(target) = load_agent_by_num(tx, parse_agent_id(id)?)?
+    {
+        project_transfer::check_automation_target(tx, &target)?;
+    }
 
     // Recheck live identity and target scope in the transaction that persists
     // the command. Launch and selector admission check the same caller in

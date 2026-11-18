@@ -1,10 +1,80 @@
 use super::*;
 use eliot_core::api::{
     ProjectAssignmentClaimRequest, ProjectAssignmentGetRequest, ProjectAssignmentLaunchRequest,
-    ProjectAssignmentReleaseRequest, discovery::decode_params,
+    ProjectAssignmentReleaseRequest, ProjectTransferAction, ProjectTransferOutcome,
+    ProjectTransferRequest, discovery::decode_params,
 };
 
 impl Router {
+    pub(super) async fn project_transfer(
+        &self,
+        params: &Value,
+        principal: &Principal,
+    ) -> Result<Value> {
+        require_owner(principal)?;
+        let request: ProjectTransferRequest = decode_params(params.clone())?;
+        request.validate()?;
+        let policy = self.secret_policy_snapshot();
+        let source = {
+            let store = self.inner.store.lock().await;
+            if let Some(retained) = store.replay_project_transfer(&request, now_ms())? {
+                return encode_assignment(retained);
+            }
+            if let ProjectTransferAction::Launch { intent, .. } = &request.action {
+                Some(store.project_transfer_launch_source(&request, intent)?)
+            } else {
+                None
+            }
+        };
+        let prepared = match (&request.action, source) {
+            (ProjectTransferAction::Launch { profile, .. }, Some(source)) => Some(
+                async {
+                    self.check_command_admission_mode("launch")?;
+                    let workspace = source
+                        .workspace
+                        .as_deref()
+                        .ok_or_else(|| Error::new("bad_state", "source workspace is missing"))?;
+                    let mut launch = SubmitCommand::new(ulid::Ulid::new().to_string(), "launch");
+                    launch.args = json!({"workspace": workspace, "profile": profile});
+                    normalize_launch(&mut launch, principal)?;
+                    launch.args["project"] = json!(source.project_scope());
+                    self.freeze_launch_profile(principal, &mut launch).await?;
+                    if policy.contains_value(&launch.args) {
+                        return Err(Error::new(
+                            "secret_in_payload",
+                            "replacement launch contains a known credential",
+                        ));
+                    }
+                    Ok(launch)
+                }
+                .await,
+            ),
+            _ => None,
+        };
+        let mut store = self.inner.store.lock().await;
+        if let Some(retained) = store.replay_project_transfer(&request, now_ms())? {
+            return encode_assignment(retained);
+        }
+        if !matches!(request.action, ProjectTransferAction::Cancel { .. })
+            && self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN
+        {
+            return Err(Error::new(
+                "unavailable",
+                "drain prevents new project transfer actions",
+            ));
+        }
+        let change = store.project_transfer(&request, prepared, &policy, now_ms())?;
+        self.publish_locked(&change.events);
+        if !change.events.is_empty()
+            && change.value.outcome == ProjectTransferOutcome::LaunchAdmitted
+            && let Some(id) = &change.value.launch_command
+        {
+            self.schedule_command(id.clone(), None);
+        }
+        self.signal_progress();
+        encode_assignment(change.value)
+    }
+
     pub(super) async fn project_assignment_get(
         &self,
         params: &Value,

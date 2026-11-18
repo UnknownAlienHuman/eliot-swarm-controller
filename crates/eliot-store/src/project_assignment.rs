@@ -10,7 +10,7 @@ const LAUNCH: &str = "project.assignment.launch";
 const RELEASE: &str = "project.assignment.release";
 pub(super) const MANAGER_LAUNCH_ARG: &str = "project_assignment_launch";
 
-struct AssignmentWrite<'a> {
+pub(super) struct AssignmentWrite<'a> {
     id: &'a str,
     method: &'static str,
     principal: &'a str,
@@ -19,7 +19,7 @@ struct AssignmentWrite<'a> {
 }
 
 impl<'a> AssignmentWrite<'a> {
-    fn new(
+    pub(super) fn new(
         id: &'a str,
         method: &'static str,
         principal: &'a str,
@@ -38,7 +38,10 @@ impl<'a> AssignmentWrite<'a> {
         })
     }
 
-    fn replay(&self, conn: &Connection) -> Result<Option<ProjectAssignmentResult>> {
+    pub(super) fn replay<T: serde::de::DeserializeOwned>(
+        &self,
+        conn: &Connection,
+    ) -> Result<Option<T>> {
         if let Some((principal, method, digest, result)) = write_binding(conn, self.id)? {
             if principal != self.principal || method != self.method || digest != self.digest {
                 return Err(Error::new(
@@ -259,6 +262,7 @@ impl Store {
                     "only the current manager or Owner can release",
                 ));
             }
+            project_transfer::require_no_intent(tx, &request.project)?;
             let outcome = if current.epoch != request.expected_epoch {
                 ProjectAssignmentOutcome::StaleEpoch
             } else if current.manager.is_none() {
@@ -276,11 +280,11 @@ impl Store {
         })
     }
 
-    fn change_project_assignment(
+    pub(super) fn change_project_assignment<T: serde::Serialize + serde::de::DeserializeOwned>(
         &mut self,
         write: AssignmentWrite<'_>,
-        apply: impl FnOnce(&Transaction<'_>) -> Result<(ProjectAssignmentResult, Vec<Event>)>,
-    ) -> Result<Change<ProjectAssignmentResult>> {
+        apply: impl FnOnce(&Transaction<'_>) -> Result<(T, Vec<Event>)>,
+    ) -> Result<Change<T>> {
         self.ensure_committed_reads()?;
         if let Some(value) = write.replay(&self.connection)? {
             return Ok(Change {
@@ -440,7 +444,7 @@ pub(super) fn read_assignment(conn: &Connection, project: &str) -> Result<Projec
     })
 }
 
-fn write_next_assignment(
+pub(super) fn write_next_assignment(
     tx: &Transaction<'_>,
     current: &ProjectAssignment,
     manager: Option<(i64, i64)>,
@@ -591,6 +595,7 @@ pub(super) fn advance_resume(
     if load_row(tx, &agent.project)?.is_some_and(|(num, generation, _, _)| {
         num == Some(manager) && generation == Some(agent.generation)
     }) {
+        project_transfer::require_no_intent(tx, &agent.project)?;
         let current = read_assignment(tx, &agent.project)?;
         write_next_assignment(
             tx,
@@ -689,6 +694,7 @@ fn enforce_agent(
     let caller =
         caller.ok_or_else(|| Error::new("stale_generation", "assignment caller disappeared"))?;
     hierarchy::parse_caller(conn, principal)?;
+    project_transfer::fence(conn, principal, "coordination", Some(caller), None)?;
     for binding in bindings {
         let eligible = if let Some((num, generation)) = binding.manager.zip(binding.generation) {
             let manager = format_agent_id(num);
@@ -715,7 +721,15 @@ fn enforce_agent(
     Ok(())
 }
 
-fn enforce_launch(verb: &str, target: Option<&Agent>, bindings: &[Binding]) -> Result<()> {
+fn enforce_launch(
+    conn: &Connection,
+    principal: &str,
+    verb: &str,
+    id: &str,
+    args: &Value,
+    target: Option<&Agent>,
+    bindings: &[Binding],
+) -> Result<()> {
     if matches!(verb, "launch" | "resume")
         && let Some(agent) = target
         && let Some(binding) = bindings
@@ -723,6 +737,7 @@ fn enforce_launch(verb: &str, target: Option<&Agent>, bindings: &[Binding]) -> R
             .find(|binding| binding.project == agent.project)
         && let Some(manager) = binding.manager
         && agent.root != format_agent_id(manager)
+        && !project_transfer::successor_launch(conn, principal, verb, id, args, agent)?
     {
         return Err(Error::new(
             "assignment_occupied",
@@ -761,7 +776,22 @@ pub(super) fn capture_binding(
             ));
         }
     }
-    enforce_launch(command.verb, target.as_ref(), &projects)?;
+    project_transfer::fence(
+        tx,
+        command.principal,
+        command.verb,
+        caller.as_ref(),
+        target.as_ref(),
+    )?;
+    enforce_launch(
+        tx,
+        command.principal,
+        command.verb,
+        command.id,
+        command.args,
+        target.as_ref(),
+        &projects,
+    )?;
     enforce_agent(
         tx,
         command.principal,
@@ -833,7 +863,22 @@ pub(super) fn check_dispatch(conn: &Connection, command: &CommandRecord) -> Resu
             "project assignment epoch changed before dispatch",
         ));
     }
-    enforce_launch(&command.command.verb, target.as_ref(), &projects)?;
+    project_transfer::fence(
+        conn,
+        &command.command.principal,
+        &command.command.verb,
+        caller.as_ref(),
+        target.as_ref(),
+    )?;
+    enforce_launch(
+        conn,
+        &command.command.principal,
+        &command.command.verb,
+        &command.command.id,
+        &command.command.args,
+        target.as_ref(),
+        &projects,
+    )?;
     enforce_agent(
         conn,
         &command.command.principal,

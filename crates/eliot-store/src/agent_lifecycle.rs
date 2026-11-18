@@ -157,6 +157,9 @@ impl Store {
                     ),
                 ));
             }
+            if archived.is_none() {
+                project_transfer::require_deletable(&tx, &row)?;
+            }
             if let Some(turn) = row.active_turn.as_deref() {
                 return Err(Error::new(
                     "busy",

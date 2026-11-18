@@ -55,6 +55,11 @@ impl Store {
             });
         }
         validate_id_age(&request.id, now)?;
+        for id in [request.source()?, &request.parent] {
+            if let Some(agent) = load_agent_by_num(&tx, parse_agent_id(id)?)? {
+                project_transfer::require_no_intent(&tx, &agent.project)?;
+            }
+        }
         let Change { value, events } = reparent_tx(&tx, request, self.hierarchy_limits, now)?;
         let result = serde_json::to_value(&value)
             .map_err(|_| Error::new("internal", "cannot encode reparent result"))?;

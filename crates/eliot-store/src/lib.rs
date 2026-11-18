@@ -194,6 +194,7 @@ mod observer;
 mod observer_live;
 mod processes;
 mod project_assignment;
+mod project_transfer;
 mod resolution;
 mod retention;
 mod schema;

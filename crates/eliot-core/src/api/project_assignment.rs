@@ -94,7 +94,7 @@ pub struct ProjectAssignmentReleaseRequest {
     pub expected_epoch: i64,
 }
 
-fn validate_name(value: &str, field: &str) -> Result<()> {
+pub(super) fn validate_name(value: &str, field: &str) -> Result<()> {
     if value.is_empty() || value.len() > 256 || value.trim() != value || value.contains('\0') {
         return Err(Error::invalid_field(
             field,

@@ -1355,6 +1355,7 @@ impl Store {
                 "observe-only Agents take no Goal rounds",
             ));
         }
+        project_transfer::check_automation_target(&tx, &agent_row)?;
         let Some(row) = load_goal_row(&tx, agent_num, mode)? else {
             return Err(Error::new("not_found", "goal was not found"));
         };
