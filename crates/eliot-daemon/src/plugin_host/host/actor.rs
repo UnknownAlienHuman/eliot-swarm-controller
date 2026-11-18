@@ -450,6 +450,7 @@ async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
                     mark_lost_state_with_exit(
                         state,
                         key,
+                        eliot_core::PLUGIN_ROOT_EXITED_REASON,
                         Some(exit),
                         Some(stderr_tail),
                     )
@@ -472,7 +473,7 @@ async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
                     state, key, true, control_gone, gap_reason,
                 ).await.is_ok();
                 if source_settled && control_gone {
-                    mark_lost_state(state, key).await;
+                    mark_lost_state(state, key, gap_reason).await;
                 }
                 planned_exit = true;
                 break;
@@ -511,7 +512,7 @@ async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
                         state, key, Some(&mut *event_task), exited,
                         "plugin_owner_closed_without_session_terminal",
                     ).await.is_ok() {
-                        mark_lost_state(state, key).await;
+                        mark_lost_state(state, key, "plugin_owner_closed_without_session_terminal").await;
                     }
                     break;
                 };
@@ -865,7 +866,7 @@ async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
                             let _ = reply.send(Err(error));
                             break;
                         }
-                        mark_lost_state(state, key).await;
+                        mark_lost_state(state, key, "daemon_force_exit_without_session_terminal").await;
                         planned_exit = true;
                         let _ = reply.send(Ok(()));
                         break;

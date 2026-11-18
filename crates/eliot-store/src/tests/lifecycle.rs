@@ -457,6 +457,96 @@ fn failed_turn_records_its_command_as_preceded_by() {
 }
 
 #[test]
+fn lost_cause_names_a_spontaneous_exit_and_an_owner_assertion() {
+    fn busy_agent_with_turn(store: &mut Store, project: &str, now: i64) -> (String, String) {
+        let agent = ready_attention_agent(store, project, now);
+        let send_id = Ulid::new().to_string();
+        let mut send = SubmitCommand::new(send_id.clone(), "send");
+        send.target = Some(agent.clone());
+        send.expected_generation = Some(1);
+        send.args = json!({"text": "work"});
+        store.submit("owner", send, now).expect("admit send");
+        store.dispatch(&send_id, now).expect("dispatch send");
+        let turn_id = format!("{project}-turn");
+        store
+            .put_batch(
+                SourceBatch {
+                    batch_id: format!("{turn_id}:started"),
+                    agent_id: agent.clone(),
+                    generation: 1,
+                    source: "stream".to_owned(),
+                    events: vec![NativeEvent {
+                        ts: None,
+                        kind: "turn.started".to_owned(),
+                        native_id: format!("{turn_id}:started"),
+                        data: json!({"command_id": send_id, "turn_id": turn_id}),
+                    }],
+                    cursor: None,
+                },
+                now,
+            )
+            .expect("commit turn start");
+        (agent, turn_id)
+    }
+
+    // A spontaneous plugin root exit records its own cause, never the Owner
+    // assertion label.
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let (agent, _turn) = busy_agent_with_turn(&mut store, "attention-lost-exited", now);
+    store
+        .mark_lost_with_exit(
+            &agent,
+            1,
+            now + 1,
+            eliot_core::PLUGIN_ROOT_EXITED_REASON,
+            None,
+            None,
+        )
+        .expect("spontaneous loss");
+    assert_eq!(
+        store.get_agent(&agent).unwrap().unwrap().state,
+        AgentState::Lost
+    );
+    let events = store.read_events(0, 1000, None).expect("read events");
+    let lost = events
+        .iter()
+        .find(|event| event.kind == "agent.lost")
+        .expect("agent loss");
+    assert_eq!(lost.data["reason"], json!("root_exited"));
+    let unknown = events
+        .iter()
+        .find(|event| event.kind == "turn.unknown")
+        .expect("unknown turn");
+    assert_eq!(unknown.data["reason"], json!("root_exited"));
+
+    // An explicit Owner assertion still records `owner_marked_lost`.
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let (owner_agent, _owner_turn) =
+        busy_agent_with_turn(&mut store, "attention-lost-owner", now + 2);
+    store
+        .mark_lost(&owner_agent, 1, now + 3)
+        .expect("owner assertion");
+    let events = store.read_events(0, 1000, None).expect("read events");
+    let lost = events
+        .iter()
+        .find(|event| event.kind == "agent.lost")
+        .expect("agent loss");
+    assert_eq!(
+        lost.data["reason"],
+        json!(eliot_core::OWNER_MARKED_LOST_REASON)
+    );
+    let unknown = events
+        .iter()
+        .find(|event| event.kind == "turn.unknown")
+        .expect("unknown turn");
+    assert_eq!(
+        unknown.data["reason"],
+        json!(eliot_core::OWNER_MARKED_LOST_REASON)
+    );
+}
+
+#[test]
 fn startup_lost_agents_returns_bounded_retained_losses() {
     let mut store = Store::open(Path::new(":memory:")).expect("open Store");
     let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");

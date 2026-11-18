@@ -141,6 +141,10 @@ and final native events:
    tail;
 5. only then emit `agent.lost` when exact/shared readback proves control is gone.
 
+The loss records its cause: `root_exited` for a spontaneous plugin root exit,
+and `owner_marked_lost` only for an explicit Owner assertion of loss. The
+drain detail (which gap the reader hit) stays on `source.gap`.
+
 For a controlled start/resume, a plugin may report a positively observed native endpoint
 exit after its reader has closed and finished. The daemon preserves the command outcome
 as `unknown`, drains the plugin source, and marks the Agent `lost` only after the owned

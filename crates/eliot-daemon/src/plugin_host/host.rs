@@ -143,12 +143,13 @@ pub(crate) struct ForceStopGuard {
     key: AgentKey,
     deferred_loss: Arc<AtomicBool>,
     committed: bool,
+    reason: &'static str,
 }
 
 impl ForceStopGuard {
     // Caller holds the Store lock, also used by mark_lost_state.
     #[cfg(any(windows, test))]
-    fn new(state: &Arc<HostState>, key: AgentKey) -> Result<Self> {
+    fn new(state: &Arc<HostState>, key: AgentKey, reason: &'static str) -> Result<Self> {
         let deferred_loss = Arc::new(AtomicBool::new(false));
         let mut planned = state.planned_stops.lock_recover();
         if planned.contains_key(&key) {
@@ -160,6 +161,7 @@ impl ForceStopGuard {
             key,
             deferred_loss,
             committed: false,
+            reason,
         })
     }
 
@@ -181,8 +183,9 @@ impl Drop for ForceStopGuard {
             && let Ok(runtime) = tokio::runtime::Handle::try_current()
         {
             let key = self.key.clone();
+            let reason = self.reason;
             runtime.spawn(async move {
-                mark_lost_state(&Arc::downgrade(&state), &key).await;
+                mark_lost_state(&Arc::downgrade(&state), &key, reason).await;
             });
         }
         // Without a runtime, the persisted exit/drain facts remain available
@@ -1432,7 +1435,11 @@ impl PluginHost {
                     "generation custody belongs to another data-directory binding; its Job was left untouched",
                 ));
             }
-            let guard = ForceStopGuard::new(&self.state, key)?;
+            let guard = ForceStopGuard::new(
+                &self.state,
+                key,
+                "daemon_force_exit_without_session_terminal",
+            )?;
             (namespace, guard)
         };
         let name =
@@ -1670,7 +1677,7 @@ async fn cleanup_startup(
     )
     .await;
     if settled.is_ok() && !proven_no_dispatch {
-        mark_lost_state(&actor.state, &actor.key).await;
+        mark_lost_state(&actor.state, &actor.key, "plugin_startup_exit").await;
     } else if let Err(error) = settled {
         pending_failure.get_or_insert(PendingFailure {
             reply: None,
@@ -3345,8 +3352,11 @@ async fn record_root_exit_gap(state: &Weak<HostState>, key: &AgentKey, reason: &
     Ok(())
 }
 
-async fn mark_lost_state(state: &Weak<HostState>, key: &AgentKey) {
-    mark_lost_state_with_exit(state, key, None, None).await;
+/// Mark an agent generation lost with its truthful cause: a spontaneous
+/// plugin root exit records `root_exited`, never `owner_marked_lost`, which
+/// is reserved for an explicit Owner/host assertion of loss.
+async fn mark_lost_state(state: &Weak<HostState>, key: &AgentKey, reason: &'static str) {
+    mark_lost_state_with_exit(state, key, reason, None, None).await;
 }
 
 /// Mark an agent generation lost with its process exit evidence: the
@@ -3357,6 +3367,7 @@ async fn mark_lost_state(state: &Weak<HostState>, key: &AgentKey) {
 async fn mark_lost_state_with_exit(
     state: &Weak<HostState>,
     key: &AgentKey,
+    reason: &'static str,
     exit: Option<eliot_core::ProcessExit>,
     stderr_tail: Option<String>,
 ) {
@@ -3371,7 +3382,7 @@ async fn mark_lost_state_with_exit(
             return;
         }
         if let Ok(events) =
-            store.mark_lost_with_exit(&key.id, key.generation, now_ms(), exit, stderr_tail)
+            store.mark_lost_with_exit(&key.id, key.generation, now_ms(), reason, exit, stderr_tail)
         {
             state.bus.publish(&events);
             note_unknown_commands(&state, &events);
@@ -4787,7 +4798,12 @@ mod tests {
         )
         .await
         .unwrap();
-        mark_lost_state(&Arc::downgrade(&host.state), &key).await;
+        mark_lost_state(
+            &Arc::downgrade(&host.state),
+            &key,
+            eliot_core::PLUGIN_ROOT_EXITED_REASON,
+        )
+        .await;
         let store = store.lock().await;
         assert_eq!(
             store.get_agent(&agent_id).unwrap().unwrap().state,
@@ -5305,6 +5321,61 @@ mod tests {
         (host, key, stop_id)
     }
 
+    #[tokio::test]
+    async fn spontaneous_root_exit_marks_lost_with_root_exited_cause() {
+        // E45: a spontaneous plugin root exit must not borrow the Owner
+        // assertion label. The drain detail stays on `source.gap`; the loss
+        // itself records `root_exited` on the Agent, the turn and the command.
+        let (host, key, _stop_id) = force_stop_fixture().await;
+        record_root_exit_gap(
+            &Arc::downgrade(&host.state),
+            &key,
+            "root_exit_without_session_terminal",
+        )
+        .await
+        .unwrap();
+        mark_lost_state(
+            &Arc::downgrade(&host.state),
+            &key,
+            eliot_core::PLUGIN_ROOT_EXITED_REASON,
+        )
+        .await;
+        let store = host.state.store.lock().await;
+        assert_eq!(
+            store.get_agent(&key.id).unwrap().unwrap().state,
+            AgentState::Lost
+        );
+        let events = store.read_events(0, 1000, None).unwrap();
+        let gap = events
+            .iter()
+            .find(|event| event.kind == "source.gap")
+            .expect("root exit gap");
+        assert_eq!(
+            gap.data["reason"],
+            json!("root_exit_without_session_terminal")
+        );
+        let lost = events
+            .iter()
+            .find(|event| event.kind == "agent.lost")
+            .expect("agent loss");
+        assert_eq!(lost.data["reason"], json!("root_exited"));
+        assert_ne!(
+            lost.data["reason"],
+            json!(eliot_core::OWNER_MARKED_LOST_REASON)
+        );
+        let unknown = events
+            .iter()
+            .find(|event| event.kind == "turn.unknown")
+            .expect("unknown turn");
+        assert_eq!(unknown.data["reason"], json!("root_exited"));
+        for event in events
+            .iter()
+            .filter(|event| event.kind == "command.unknown")
+        {
+            assert_eq!(event.data["reason"], json!("root_exited"));
+        }
+    }
+
     async fn assert_force_loss(host: &PluginHost, key: &AgentKey, stop_id: &str) {
         let store = host.state.store.lock().await;
         let agent = store.get_agent(&key.id).unwrap().unwrap();
@@ -5340,7 +5411,7 @@ mod tests {
         let (host, key, _) = source_exit_fixture("codex");
         let guard = {
             let _store = host.state.store.try_lock().unwrap();
-            ForceStopGuard::new(&host.state, key.clone()).unwrap()
+            ForceStopGuard::new(&host.state, key.clone(), "owner_marked_lost").unwrap()
         };
         guard.deferred_loss.store(true, Ordering::Release);
         let deferred_loss = Arc::clone(&guard.deferred_loss);
@@ -5356,7 +5427,7 @@ mod tests {
     async fn force_verification_timeout_then_late_proven_exit_settles_lost() {
         let (host, key, stop_id) = force_stop_fixture().await;
         let result = async {
-            let _guard = ForceStopGuard::new(&host.state, key.clone()).unwrap();
+            let _guard = ForceStopGuard::new(&host.state, key.clone(), "late_exit").unwrap();
             timeout_at(Instant::now(), std::future::pending::<()>()).await
         }
         .await;
@@ -5371,7 +5442,7 @@ mod tests {
         settle_drained_source_exit(&Arc::downgrade(&host.state), &key, true, true, "late_exit")
             .await
             .unwrap();
-        mark_lost_state(&Arc::downgrade(&host.state), &key).await;
+        mark_lost_state(&Arc::downgrade(&host.state), &key, "late_exit").await;
         cleanup_actor(&Arc::downgrade(&host.state), &key, "", false).await;
         assert_force_loss(&host, &key, &stop_id).await;
     }
@@ -5379,11 +5450,11 @@ mod tests {
     #[tokio::test]
     async fn force_failure_reconciles_loss_deferred_before_actor_teardown() {
         let (host, key, stop_id) = force_stop_fixture().await;
-        let guard = ForceStopGuard::new(&host.state, key.clone()).unwrap();
+        let guard = ForceStopGuard::new(&host.state, key.clone(), "early_exit").unwrap();
         settle_drained_source_exit(&Arc::downgrade(&host.state), &key, true, true, "early_exit")
             .await
             .unwrap();
-        mark_lost_state(&Arc::downgrade(&host.state), &key).await;
+        mark_lost_state(&Arc::downgrade(&host.state), &key, "early_exit").await;
         cleanup_actor(&Arc::downgrade(&host.state), &key, "", false).await;
         assert!(host.state.planned_stops.lock_recover().contains_key(&key));
         assert_eq!(
@@ -5411,7 +5482,7 @@ mod tests {
     async fn force_outer_cancellation_clears_marker() {
         let (host, key, stop_id) = force_stop_fixture().await;
         let mut force = Box::pin(async {
-            let _guard = ForceStopGuard::new(&host.state, key.clone()).unwrap();
+            let _guard = ForceStopGuard::new(&host.state, key.clone(), "cancelled_exit").unwrap();
             std::future::pending::<()>().await;
         });
         assert!(futures_util::poll!(&mut force).is_pending());
@@ -5439,18 +5510,18 @@ mod tests {
         )
         .await
         .unwrap();
-        mark_lost_state(&Arc::downgrade(&host.state), &key).await;
+        mark_lost_state(&Arc::downgrade(&host.state), &key, "cancelled_exit").await;
         assert_force_loss(&host, &key, &stop_id).await;
     }
 
     #[tokio::test]
     async fn force_success_suppresses_loss_through_stop_commit() {
         let (host, key, stop_id) = force_stop_fixture().await;
-        let guard = ForceStopGuard::new(&host.state, key.clone()).unwrap();
+        let guard = ForceStopGuard::new(&host.state, key.clone(), "force_exit").unwrap();
         settle_drained_source_exit(&Arc::downgrade(&host.state), &key, true, true, "force_exit")
             .await
             .unwrap();
-        mark_lost_state(&Arc::downgrade(&host.state), &key).await;
+        mark_lost_state(&Arc::downgrade(&host.state), &key, "force_exit").await;
         cleanup_actor(&Arc::downgrade(&host.state), &key, "", false).await;
         assert!(host.state.planned_stops.lock_recover().contains_key(&key));
         host.state
@@ -5460,7 +5531,7 @@ mod tests {
             .settle(&stop_id, CommandState::Applied, None, now_ms())
             .unwrap();
         guard.finish();
-        mark_lost_state(&Arc::downgrade(&host.state), &key).await;
+        mark_lost_state(&Arc::downgrade(&host.state), &key, "force_exit").await;
         assert!(!host.state.planned_stops.lock_recover().contains_key(&key));
         let store = host.state.store.lock().await;
         assert_eq!(
@@ -5575,7 +5646,7 @@ mod tests {
         }
         // Proven control loss can advance the Agent while the cap remains
         // reserved until Store has the independent OS-source-close evidence.
-        mark_lost_state(&Arc::downgrade(&host.state), &key).await;
+        mark_lost_state(&Arc::downgrade(&host.state), &key, "test_exit").await;
         let store = host.state.store.lock().await;
         assert_eq!(
             store.get_agent(&key.id).unwrap().unwrap().state,
