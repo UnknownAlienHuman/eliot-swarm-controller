@@ -2150,7 +2150,7 @@ impl OpenCodePlugin {
         // the realignment target (overlay or frozen), never a reverted
         // value. An omitted request keeps the server default and only
         // re-reads.
-        let effective = match target_model {
+        let effective = match target_ref {
             Some(target) => {
                 Self::readback_session_model(
                     &session.http,
@@ -2242,11 +2242,13 @@ impl OpenCodePlugin {
     /// `configure`). The switch dispatch itself stays per-caller: resume
     /// maps every write failure to `unknown` (an earlier setter in the
     /// same realign may have applied), while configure maps a proven
-    /// no-effect refusal to its `rejected` value.
+    /// no-effect refusal to its `rejected` value. The target is the native
+    /// ref, never a joined string: re-splitting a `provider/model` display
+    /// form would change the target when the provider ID contains a slash.
     async fn readback_session_model(
         http: &OpenCodeHttp,
         session_id: &str,
-        target: &str,
+        target: &ModelRef,
         target_variant: Option<&str>,
         deadline: Instant,
         context: &str,
@@ -2266,7 +2268,7 @@ impl OpenCodePlugin {
         if echoed
             .model
             .as_ref()
-            .is_none_or(|model| !model_ref_is(target, model))
+            .is_none_or(|model| !session_model_is(target, model))
         {
             return Err(Error::new(
                 "unknown",
@@ -2499,20 +2501,29 @@ impl OpenCodePlugin {
                     ),
                 )
             })?;
-        let current_model = current
-            .model
-            .as_ref()
-            .map(|model| format!("{}/{}", model.provider_id, model.id));
         let current_variant = current
             .model
             .as_ref()
             .and_then(|model| model.variant.clone());
-        let Some(target_model) = requested.model.clone().or(current_model.clone()) else {
+        // The switch target keeps the native fields apart end to end: an
+        // explicit request re-splits its already catalogue-proven pair,
+        // while an effort-only configure reuses the retained native ref
+        // verbatim. Routing the retained model through a joined
+        // `provider/model` string and back would re-split at the first
+        // slash, silently changing the selected model when the native
+        // provider ID itself contains a slash.
+        let Some(target_ref) =
+            configure_switch_ref(requested.model.as_deref(), current.model.as_ref())?
+        else {
             return Ok(json!({
                 "state": "rejected",
                 "reason": "OpenCode configure effort needs a session model",
             }));
         };
+        // Display form only: catalogue membership, messages and the
+        // response echo the frozen pair text; the switch and its echo
+        // verification below use the native fields, never this string.
+        let target_model = format!("{}/{}", target_ref.provider_id, target_ref.id);
         if let Some(effort) = requested.effort.as_deref() {
             let known = catalogue_variants(&catalogue, &target_model)
                 .is_some_and(|variants| variants.iter().any(|known| known == effort));
@@ -2532,15 +2543,11 @@ impl OpenCodePlugin {
         } else {
             current_variant.clone()
         });
-        let switch_needed = Some(target_model.as_str()) != current_model.as_deref()
-            || target_variant.as_deref() != current_variant.as_deref();
+        let switch_needed = current.model.as_ref().is_none_or(|model| {
+            model.provider_id != target_ref.provider_id || model.id != target_ref.id
+        }) || target_variant.as_deref() != current_variant.as_deref();
         if switch_needed {
-            let mut model_ref = split_model(&target_model).ok_or_else(|| {
-                Error::new(
-                    "source_integrity",
-                    "OpenCode retained session model is not provider/model with non-empty slash segments",
-                )
-            })?;
+            let mut model_ref = target_ref.clone();
             model_ref.variant = target_variant.clone();
             match session
                 .http
@@ -2573,7 +2580,7 @@ impl OpenCodePlugin {
         Self::readback_session_model(
             &session.http,
             &session_id,
-            &target_model,
+            &target_ref,
             target_variant.as_deref(),
             deadline,
             "configure",
@@ -4430,6 +4437,36 @@ fn model_ref_is(requested: &str, model: &ModelRef) -> bool {
         .is_some_and(|(provider, id)| model.provider_id == provider && model.id == id)
 }
 
+/// Whether an installed `Model.Ref` is exactly the switch target: both
+/// native fields compared independently, never joined or re-split. A
+/// joined `provider/model` display string would re-split at the first
+/// slash, so a slash in the native provider ID compares against another
+/// provider here instead of matching. See [`catalogue_entry`].
+fn session_model_is(target: &ModelRef, model: &ModelRef) -> bool {
+    target.provider_id == model.provider_id && target.id == model.id
+}
+
+/// The configure switch target: an explicit request re-splits its
+/// already catalogue-proven pair, while an effort-only configure reuses
+/// the retained native ref verbatim (`None` when the session reports no
+/// model). The retained ref never routes through a joined
+/// `provider/model` string: re-splitting would change the selected model
+/// when the native provider ID itself contains a slash.
+fn configure_switch_ref(
+    requested: Option<&str>,
+    current: Option<&ModelRef>,
+) -> Result<Option<ModelRef>> {
+    match requested {
+        Some(wanted) => Ok(Some(split_model(wanted).ok_or_else(|| {
+            Error::new(
+                "source_integrity",
+                "OpenCode configure model is not provider/model with non-empty slash segments",
+            )
+        })?)),
+        None => Ok(current.cloned()),
+    }
+}
+
 /// Whether the live native catalogue carries the exact requested
 /// `provider/model` id. See [`catalogue_entry`].
 fn catalogue_contains(catalogue: &[NativeModelEntry], requested: &str) -> bool {
@@ -5146,6 +5183,77 @@ mod tests {
             variant: None,
         };
         assert!(!super::model_ref_is("opencode/kimi", &padded_echo));
+    }
+
+    #[test]
+    fn configure_switch_ref_keeps_slash_provider_intact() {
+        // A slash in the native provider ID must survive an effort-only
+        // configure: the retained ref is reused verbatim instead of
+        // round-tripping through a joined `provider/model` string, which
+        // would re-split at the first slash and select another provider.
+        let retained = crate::native::types::ModelRef {
+            id: "c".to_owned(),
+            provider_id: "a/b".to_owned(),
+            variant: Some("low".to_owned()),
+        };
+        let target = super::configure_switch_ref(None, Some(&retained))
+            .expect("effort-only keeps the retained ref")
+            .expect("session reports a model");
+        assert_eq!(target.provider_id, "a/b");
+        assert_eq!(target.id, "c");
+        // The old join/re-split path selects provider "a", model id "b/c"
+        // for the same retained session: this documents the regression the
+        // verbatim reuse closes.
+        let joined = format!("{}/{}", retained.provider_id, retained.id);
+        let misparsed = split_model(&joined).expect("display form splits");
+        assert_ne!(
+            (misparsed.provider_id.as_str(), misparsed.id.as_str()),
+            (target.provider_id.as_str(), target.id.as_str()),
+            "joining and re-splitting the retained pair must not select",
+        );
+        // An explicit request still re-splits its own catalogue-proven pair.
+        let explicit = super::configure_switch_ref(Some("opencode/kimi"), None)
+            .expect("explicit splits")
+            .expect("explicit target");
+        assert_eq!(explicit.provider_id, "opencode");
+        assert_eq!(explicit.id, "kimi");
+        // Neither a request nor a retained model means no target.
+        assert!(
+            super::configure_switch_ref(None, None)
+                .expect("absent target is not an error")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn session_echo_compares_native_fields_without_joining() {
+        // The echo verification compares provider and model id as
+        // independent fields: a slash in the provider ID matches the same
+        // slash provider, never the first-slash re-split. The variant is
+        // checked separately by the readback, so it never affects this.
+        let target = crate::native::types::ModelRef {
+            id: "c".to_owned(),
+            provider_id: "a/b".to_owned(),
+            variant: None,
+        };
+        let same = crate::native::types::ModelRef {
+            id: "c".to_owned(),
+            provider_id: "a/b".to_owned(),
+            variant: Some("low".to_owned()),
+        };
+        assert!(super::session_model_is(&target, &same));
+        let resplit = crate::native::types::ModelRef {
+            id: "b/c".to_owned(),
+            provider_id: "a".to_owned(),
+            variant: None,
+        };
+        assert!(!super::session_model_is(&target, &resplit));
+        let other_provider = crate::native::types::ModelRef {
+            id: "c".to_owned(),
+            provider_id: "other".to_owned(),
+            variant: None,
+        };
+        assert!(!super::session_model_is(&target, &other_provider));
     }
 
     #[test]
