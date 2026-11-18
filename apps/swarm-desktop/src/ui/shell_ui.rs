@@ -471,6 +471,7 @@ impl DesktopApp {
             }
             ShellMsg::WindowResized(size) => {
                 self.window_width = Some(size.width);
+                self.window_height = Some(size.height);
                 self.sync_title_bar();
                 if size.width >= 640.0 && size.height >= 480.0 {
                     let window = (size.width as u32, size.height as u32);
@@ -586,8 +587,20 @@ impl DesktopApp {
                     }
                     Shortcut::Popover(key) if self.menu.open.is_some() => {
                         use crate::shortcuts::PopoverKey;
-                        if matches!(key, PopoverKey::Escape | PopoverKey::Tab) {
-                            self.close_menu();
+                        match key {
+                            PopoverKey::Escape | PopoverKey::Tab => self.close_menu(),
+                            // Arrows reach clipped actions from the
+                            // keyboard; Enter chooses the highlighted row.
+                            PopoverKey::Up => {
+                                self.menu_update(MenuMsg::HighlightMove(-1), context)
+                            }
+                            PopoverKey::Down => {
+                                self.menu_update(MenuMsg::HighlightMove(1), context)
+                            }
+                            PopoverKey::Enter => {
+                                self.menu_update(MenuMsg::HighlightActivate, context)
+                            }
+                            _ => {}
                         }
                     }
                     Shortcut::Popover(key) => self.launch_update(LaunchMsg::Key(key), context),

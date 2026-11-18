@@ -302,6 +302,8 @@ struct DesktopApp {
     startup_done: bool,
     /// The window's client width in DIPs, once observed.
     window_width: Option<f64>,
+    /// The window's client height in DIPs (menu placement clamps to it).
+    window_height: Option<f64>,
     /// The client size for the one `[desktop]` write at close, once at
     /// least 640 x 480.
     window_size: Option<(u32, u32)>,
@@ -647,6 +649,7 @@ impl Component for DesktopApp {
             prefs_rev: 0,
             startup_done: false,
             window_width: None,
+            window_height: None,
             window_size: None,
             close_window: input.close_window.clone(),
             preferred_window: None,

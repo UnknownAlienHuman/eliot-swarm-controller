@@ -91,6 +91,10 @@ pub(super) enum MenuMsg {
     /// A row's right press: its target and the pointer in window DIPs.
     Requested(Target, f64, f64),
     Closed,
+    /// Move the keyboard highlight by `step` rows (wrapping).
+    HighlightMove(i32),
+    /// Choose the keyboard-highlighted row, if any.
+    HighlightActivate,
     Chosen(Action),
     Quick(UiAgent, Action),
     TaskOpened(UiAgent),
@@ -131,6 +135,8 @@ pub(super) enum MenuMsg {
 #[derive(Default)]
 pub(super) struct MenuState {
     pub(super) open: Option<(Target, f64, f64)>,
+    /// The keyboard-highlighted row (arrow keys, Enter activates).
+    pub(super) highlight: Option<usize>,
     pub(super) more: bool,
     pub(super) hovered: Option<String>,
     /// The target being renamed and the text typed so far.
@@ -207,8 +213,34 @@ impl DesktopApp {
             MenuMsg::Requested(target, x, y) => {
                 self.close_popover();
                 self.menu.more = false;
+                self.menu.highlight = None;
                 self.menu.open = Some((target, x, y));
                 crate::shortcuts::set_popover(crate::shortcuts::Popover::Menu);
+            }
+            MenuMsg::HighlightMove(step) => {
+                let Some((target, _, _)) = &self.menu.open else {
+                    return;
+                };
+                // The rename field and the confirmation own the keyboard.
+                if self.menu.renaming.is_some() || self.menu.confirm.is_some() {
+                    return;
+                }
+                let count = self.menu_entries(target).len();
+                self.menu.highlight = highlight_step(self.menu.highlight, step, count);
+            }
+            MenuMsg::HighlightActivate => {
+                let Some((target, _, _)) = &self.menu.open else {
+                    return;
+                };
+                if self.menu.renaming.is_some() || self.menu.confirm.is_some() {
+                    return;
+                }
+                if let Some(index) = self.menu.highlight
+                    && let Some((action, _, _, _)) = self.menu_entries(target).get(index)
+                {
+                    let action = *action;
+                    self.menu_update(MenuMsg::Chosen(action), context);
+                }
             }
             MenuMsg::Closed => self.close_menu(),
             MenuMsg::TaskOpened(agent) => {
@@ -219,7 +251,10 @@ impl DesktopApp {
             MenuMsg::Quick(agent, action) => {
                 self.menu_action(Target::Agent(agent), action, context)
             }
-            MenuMsg::Chosen(Action::More) => self.menu.more = !self.menu.more,
+            MenuMsg::Chosen(Action::More) => {
+                self.menu.more = !self.menu.more;
+                self.menu.highlight = None;
+            }
             MenuMsg::Chosen(action) => {
                 let Some((target, _, _)) = self.menu.open.take() else {
                     return;
@@ -624,6 +659,7 @@ impl DesktopApp {
         if self.menu.open.take().is_some() {
             crate::shortcuts::set_popover(crate::shortcuts::Popover::None);
         }
+        self.menu.highlight = None;
     }
 
     pub(super) fn menu_action(
@@ -1021,11 +1057,17 @@ impl DesktopApp {
             return View::empty();
         };
         let width = self.window_width.unwrap_or(tokens::layout::WINDOW_WIDTH);
+        let height = self
+            .window_height
+            .unwrap_or(tokens::layout::WINDOW_HEIGHT);
         let left = x.min(width - MENU_WIDTH - tokens::spacing::SM).max(0.0);
-        let rows: Vec<KeyedView> = self
-            .menu_entries(target)
+        let entries = self.menu_entries(target);
+        let (top, max_height) = menu_placement(*y, entries.len(), height);
+        let highlight = self.menu.highlight;
+        let rows: Vec<KeyedView> = entries
             .into_iter()
-            .map(|(action, label, glyph, destructive)| {
+            .enumerate()
+            .map(|(index, (action, label, glyph, destructive))| {
                 let text = if destructive {
                     m3::body(label.clone()).foreground(palette.error())
                 } else {
@@ -1033,7 +1075,7 @@ impl DesktopApp {
                 };
                 KeyedView::new(
                     label.clone(),
-                    m3::row(palette, false)
+                    m3::row(palette, highlight == Some(index))
                         .automation_name(label)
                         .on_click(context.message(Message::Menu(MenuMsg::Chosen(action))))
                         .content(
@@ -1055,9 +1097,15 @@ impl DesktopApp {
                 .width(MENU_WIDTH)
                 .horizontal_alignment(HorizontalAlignment::Left)
                 .vertical_alignment(VerticalAlignment::Top)
-                .margin(Thickness::new(left, *y, 0.0, 0.0))
+                .margin(Thickness::new(left, top, 0.0, 0.0))
                 .automation_name(format!("Actions for {}", target.title()))
-                .content(StackPanel::new().keyed_children(rows)),
+                .content(
+                    ScrollViewer::new()
+                        .max_height(max_height)
+                        .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                        .automation_name(format!("Actions for {}", target.title()))
+                        .content(StackPanel::new().keyed_children(rows)),
+                ),
         ))
     }
 
@@ -1294,6 +1342,36 @@ impl DesktopApp {
     }
 }
 
+/// A menu row's height: a default button row.
+const MENU_ROW_HEIGHT: f64 = tokens::height::CONTROL;
+/// The popover's vertical insets around the rows.
+const MENU_VERTICAL_PADDING: f64 = 2.0 * tokens::spacing::XS;
+
+/// The menu's top edge in window DIPs and its visible height cap: the
+/// pointer, moved up when the menu would run past the client bottom. An
+/// oversized menu keeps the top margin and scrolls instead of placing
+/// actions out of reach (#683).
+fn menu_placement(y: f64, rows: usize, height: f64) -> (f64, f64) {
+    let margin = tokens::spacing::SM;
+    let estimated = rows as f64 * MENU_ROW_HEIGHT + MENU_VERTICAL_PADDING;
+    let top = y.min(height - estimated - margin).max(margin);
+    let max_height = (height - top - margin).max(MENU_ROW_HEIGHT + MENU_VERTICAL_PADDING);
+    (top, max_height)
+}
+
+/// The keyboard highlight after moving `step` rows from `current`
+/// (wrapping around both ends).
+fn highlight_step(current: Option<usize>, step: i32, count: usize) -> Option<usize> {
+    if count == 0 {
+        return None;
+    }
+    match current {
+        None if step >= 0 => Some(0),
+        None => Some(count - 1),
+        Some(at) => Some((at as i32 + step).rem_euclid(count as i32) as usize),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1313,5 +1391,27 @@ mod tests {
             RemovalStep::Deleting.progress("codex", elapsed),
             "Deleting… 12 s"
         );
+    }
+    #[test]
+    fn the_menu_stays_inside_the_window_and_scrolls_when_oversized() {
+        // #683: room below fits at the pointer; a low click flips the
+        // menu up; a menu taller than the window keeps the margin and
+        // scrolls.
+        assert_eq!(menu_placement(100.0, 5, 900.0), (100.0, 792.0));
+        assert_eq!(menu_placement(850.0, 5, 900.0), (724.0, 168.0));
+        let (top, max) = menu_placement(10.0, 40, 400.0);
+        assert_eq!(top, 8.0);
+        assert_eq!(max, 384.0);
+    }
+
+    #[test]
+    fn the_keyboard_highlight_starts_wraps_and_stops_at_no_rows() {
+        // #683: arrows reach every clipped action from the keyboard.
+        assert_eq!(highlight_step(None, 1, 3), Some(0));
+        assert_eq!(highlight_step(None, -1, 3), Some(2));
+        assert_eq!(highlight_step(Some(2), 1, 3), Some(0));
+        assert_eq!(highlight_step(Some(0), -1, 3), Some(2));
+        assert_eq!(highlight_step(Some(1), 1, 3), Some(2));
+        assert_eq!(highlight_step(None, 1, 0), None);
     }
 }
