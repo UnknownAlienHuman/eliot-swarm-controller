@@ -2577,6 +2577,16 @@ impl CodexPlugin {
         let result_known = last_turn
             .as_ref()
             .is_some_and(|turn| turn.final_text.is_some());
+        // This is a fresh, read-only native proof for the exact binding. The
+        // daemon may use the marker as evidence provenance; it is never a
+        // settlement signal and carries no retained plugin projection.
+        let turn_evidence = last_turn.as_ref().map(|turn| {
+            if turn.terminal {
+                "thread/read+thread/turns/list+thread/items/list"
+            } else {
+                "thread/read+thread/turns/list"
+            }
+        });
         Ok(json!({
             "agent_id": params.agent_id,
             "generation": params.generation,
@@ -2589,6 +2599,7 @@ impl CodexPlugin {
             "batch_unknown": event_status.batch_unknown,
             "source_unknown": event_status.source_unknown,
             "result_known": result_known,
+            "turn_evidence": turn_evidence,
         }))
     }
 

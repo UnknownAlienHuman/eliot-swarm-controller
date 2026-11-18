@@ -224,11 +224,19 @@ fn merge_trigger(current: Trigger, incoming: Trigger) -> Trigger {
     match (current, incoming) {
         (_, lost @ Trigger::AgentLost { .. }) => lost,
         (lost @ Trigger::AgentLost { .. }, _) => lost,
-        (Trigger::SourceEvent { event_seq: current }, Trigger::SourceEvent { event_seq }) => {
+        (
             Trigger::SourceEvent {
-                event_seq: current.max(event_seq),
-            }
-        }
+                event_seq: current,
+                recovery_due: current_due,
+            },
+            Trigger::SourceEvent {
+                event_seq,
+                recovery_due,
+            },
+        ) => Trigger::SourceEvent {
+            event_seq: current.max(event_seq),
+            recovery_due: current_due || recovery_due,
+        },
         (Trigger::SourceEvent { .. }, Trigger::Sweep) => current,
         (Trigger::Sweep, trigger) => trigger,
     }

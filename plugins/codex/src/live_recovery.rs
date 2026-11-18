@@ -16,7 +16,6 @@ const TRANSCRIPT_SOURCE: &str = "transcript";
 const MECHANISM: &str = "rollout_tail";
 const LIVE_FAMILIES: [&str; 3] = ["turn", "message", "tool"];
 const BASELINE_REASON: &str = "codex_observer_live_baseline";
-const RECOVERY_REASON: &str = "codex_observer_live_recovery";
 
 /// Owns one Codex observer's durable live-source operations.
 pub(super) struct RecoveryPublisher {
@@ -200,15 +199,6 @@ impl RecoveryPublisher {
             self.last_checkpoint = gap.to;
         }
         Ok(())
-    }
-
-    /// Report the verified file edge after a live-reader recovery.
-    pub(super) async fn recover(&mut self, edge: &str, deadline: Instant) -> Result<()> {
-        if self.last_checkpoint.as_deref() == Some(edge) {
-            return Ok(());
-        }
-        self.gap(RECOVERY_REASON, Some(edge.to_owned()), deadline)
-            .await
     }
 
     pub(super) async fn health(&self, source: &str, health: &str, deadline: Instant) -> Result<()> {

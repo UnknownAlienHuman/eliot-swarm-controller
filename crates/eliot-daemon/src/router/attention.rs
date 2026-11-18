@@ -1,9 +1,10 @@
-//! Automatic, advisory Agent attention reports. Native snapshots are
+//! Automatic Agent diagnosis and active-turn recovery. Native snapshots are
 //! generation-bound, read-only, and always run after releasing the Store lock.
 
 mod delivery;
 mod incidents;
 mod observe;
+mod recovery;
 mod sweep;
 
 #[cfg(test)]
@@ -239,7 +240,7 @@ struct NativeStatus {
 #[derive(Clone, Copy)]
 enum Trigger {
     Sweep,
-    SourceEvent { event_seq: i64 },
+    SourceEvent { event_seq: i64, recovery_due: bool },
     AgentLost { event_seq: i64 },
 }
 
@@ -311,6 +312,7 @@ pub(crate) async fn run_attention(
                             suspicion_window,
                             Trigger::SourceEvent {
                                 event_seq: event.seq,
+                                recovery_due: matches!(kind, "source.gap" | "source.health" | "source.closed" | "turn.started"),
                             },
                         )
                     }
@@ -359,6 +361,7 @@ fn attention_transition_event(kind: &str) -> bool {
             kind,
             "turn.started"
                 | "turn.completed"
+                | "turn.unknown"
                 | "request.opened"
                 | "request.resolved"
                 | "request.closed"
@@ -377,7 +380,7 @@ async fn inspect_agent(
     trigger: Trigger,
 ) -> Result<()> {
     let trigger_event_seq = match trigger {
-        Trigger::SourceEvent { event_seq } => Some(event_seq),
+        Trigger::SourceEvent { event_seq, .. } => Some(event_seq),
         Trigger::Sweep | Trigger::AgentLost { .. } => None,
     };
 
@@ -386,6 +389,17 @@ async fn inspect_agent(
         return Ok(());
     };
     if captured.agent.observe_only {
+        return Ok(());
+    }
+    if matches!(
+        trigger,
+        Trigger::Sweep
+            | Trigger::SourceEvent {
+                recovery_due: true,
+                ..
+            }
+    ) && recovery::recover_active_turn(router, &captured).await?
+    {
         return Ok(());
     }
     // A lost Agent always reports under its deterministic loss identity, no

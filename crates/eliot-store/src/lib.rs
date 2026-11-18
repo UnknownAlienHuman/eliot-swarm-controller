@@ -39,6 +39,7 @@ pub use rules::{
     TimerSlotAdmission, TimerSlotCommit,
 };
 pub use scripts::ScriptRunAdmission;
+pub use turn_recovery::ActiveTurnRecovery;
 pub use usage::ResolvedUsageScope;
 
 use eliot_core::api::{HeavySummaryView, SessionGrowthView, agent_state_name};
@@ -204,6 +205,7 @@ mod source_batches;
 mod source_handoff;
 mod source_install;
 mod switch;
+mod turn_recovery;
 pub(crate) mod usage;
 mod workspace;
 

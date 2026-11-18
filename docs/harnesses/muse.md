@@ -136,20 +136,20 @@ read/resume also retain `history.noneReason`. `projectionUnavailable` degrades
 observation and requires explicit degraded health on the unavailable view even when
 the push is lost; `excluded` alone is normal history omission. Missing or unknown
 reasons remain uncertain.
-Private readback cannot clear a live-source gap or replay history. It can,
-however, commit the exact active turn's durable terminal: when a bounded
-`view/page` scan proves the native view durably holds that turn's
-`turn/completed` (plus its final `agentMessage` when present), the adapter
-commits any unacknowledged `message.completed` and then `turn.completed` with
-the real final message rather than settling unknown. A later healthy read
-does not establish live-edge recovery.
+The daemon attention monitor reads `agent.snapshot` for the exact active turn
+on a recorded gap or stale health. The adapter reads the owned session's
+command plane (`session/read`). A running reply must name the exact turn.
+Only explicit idle with a present-null `activeTurnId` permits a bounded
+backward `view/page` scan for the exact durable terminal and optional final
+`agentMessage`. A projection reconstructed from an unfinished source prefix
+can contain a synthetic failed terminal while the native run continues.
 
-Every unavailable-view episode and its outcome is exactly countable from
-`events.read`: unavailable views are `source.gap` events whose reason starts
-with the shared unavailable prefix, settled-unknown outcomes are
-`turn.unknown` events whose reason starts with the shared unknown prefix, and
-readback recoveries are `turn.completed` events carrying the fixed
-`view_recovery: "readback"` marker.
+The daemon commits the proven terminal and available final text, or commits
+`turn.unknown` after its bounded inconclusive reads. It retains the recorded
+gap and source health. In `events.read`, the unavailable-view episodes are
+`source.gap` events carrying the unavailable prefix. Their unknown settlements
+carry the shared unknown prefix, and terminal readbacks carry
+`view_recovery: "readback"`.
 
 Verified 2026-11-13 using the installed host's offline stable and experimental
 JSON/TypeScript exports: Muse Code `1.4.0-R4161.1`, executable SHA-256
@@ -181,92 +181,16 @@ only `unavailable` health. No numeric projection size/time threshold is publishe
 limits without supplying such a threshold. `item/readOutput` fetches known item
 output; there is no dedicated turn-read method.
 
-During an associated turn, the adapter attempts one read-only `view/subscribe`
-with `after` equal to its last successfully applied owned-session cursor. It
-records that lower bound and the returned subscription head (when available)
-on the source gap before processing replay. When the gap lands before turn
-association (while `turn/start` awaits its reply), the acknowledged association
-attempts the same subscribe and arms the same recovery deadline, so the turn
-has bounded readback retries while its source is stale. Replay uses the same
-event actor and exact session/turn/command binding as live delivery; a cursor that was
-already applied skips normalization instead of committing twice. Only a
-successfully processed cursor after the observed subscription head, followed by
-acknowledged `ok` source health, can restore live observation; the historical
-gap stays visible. A terminal replayed while the view remains unavailable
-requires the same command-plane fence and fresh scan described below. An
-interrupt refused during the gap names the
-unavailable-view reason explicitly.
-An exact failed terminal without a structured native error requires the same
-fence even if the best-effort health push is missing. Such synthesized
-host-death/prefix failures do not prove the run stopped. Their free-text
-reason is display-only; the adapter never branches on `incomplete` text.
-An idle, healthy readback can confirm a genuine errorless failure without
-recording a gap. Unavailable readback history, a contradictory running turn,
-or an unproven outcome retains explicit degraded coverage.
-When the recovery window expires without live proof (or recovery cannot be
-attempted), one bounded `session/read` first checks the owned host's command
-plane, independently of its unavailable history. An exact-session `running`
-response naming the exact active turn preserves that binding and schedules
-another bounded read after the recovery interval. A view reconstructed from
-an unfinished source prefix can contain a synthetic failed terminal while
-the native run continues; it is not sufficient terminal proof. A timer alone
-never supplies a native state or terminal outcome.
-Only explicit `idle` with a present-null `activeTurnId` permits a fresh scan
-of the retained view backward (at most four `view/page` reads of up to 1000
-events, reversed within each ascending wire page) for the exact active
-turn's durable terminal and final `agentMessage`. A proven terminal commits
-through the exact live shapes (`message.completed` with the real final
-message, then `turn.completed`). Successfully acknowledged message identities
-are retained for the active turn independently of intervening usage batches
-and bounded cursor history. Recovery skips an already acknowledged message
-and reuses the latest committed final text; unknown writes never populate
-that identity state or replace the text. Recovery marks those records applied
-so a later live replay of the same revision skips instead of recommitting,
-retires the recovery deadline, and keeps the recorded gap and stale health
-latched. A readback that proves nothing (a failed `session/read`, an
-unexpected shape, or an idle scan with no durable terminal) re-arms one more
-bounded `session/read` after a backoff (5s, 10s, 20s, then at most the 30s
-recovery interval). An exact `running` observation resets that cadence: while
-the command plane positively proves the exact turn still runs, the turn stays
-open and the Agent stays busy, and a new send cannot enter that turn. Only the
-fifth consecutive unproven readback settles the active turn `unknown` through
-the shared turn-unknown path (`turn.unknown` with the exact command/turn
-binding, the recorded gap label and the exact readback failure), never as
-success or failure (#427). The turn binding clears only after that terminal
-write is acknowledged; a failed write keeps the binding at the cap and retries
-on the next opportunity instead of stranding the Store turn. A timer,
-subscription admission, or an exhausted read budget never proves completion or
-process death. A failed terminal commit keeps the binding for another attempt.
-Only acknowledged native terminal proof otherwise clears it in recovery. A proven
-terminal commits even when the optional final message cannot persist (an
-oversized message gaps but never discards the terminal proof). Before the
-capped readback settles, one bounded drain gives queued frames a chance to
-restore observation, and the binding is rechecked before writing
-`turn.unknown`. After acknowledgement, a late terminal or final message
-naming the settled turn drops against the standing gap instead of buffering
-as a turn awaiting association, so the next association never trips over it.
-Actual endpoint
-exit still uses the existing host/daemon custody and source-drain path: drain
-queued facts first, then preserve an unestablished outcome as unknown and settle
-loss only after exact generation custody is empty, per monitoring.md's Liveness
-table. A disconnected stream alone leaves source health stale and state unchanged.
+A view-health notification or a read reporting `projectionUnavailable`
+records the exact session's gap. A gap can arrive between send dispatch and
+turn association. The daemon binds it to that turn once its start commits.
+Transport loss also records degraded coverage. The existing process custody
+and source-drain path handles confirmed native endpoint exit.
 
-The cap and the counted projection prefix bind to an acknowledged
-unavailable-view episode only. Transport loss without one (queue overflow,
-unplanned close, malformed frame, unplanned reader end) arms the same
-bounded readbacks, but its retries never settle: the failure names
-transport recovery pending and the source stays stale with state unchanged.
-Only an episode whose view gap was acknowledged may settle `unknown` with
-the counted prefix.
-
-A lost gap or batch acknowledgement never strands the turn behind
-`writes_blocked`: the exact gap body stays retained and the exact
-unacked batch stays in the sink, and every later commit, expiry and send
-first reconciles them — a private `source.state` readback settles a proven
-batch and resubmits the exact batch only when the readback proves it
-absent. The turn binding clears only after the terminal write is
-acknowledged; until then the cap re-arms and the next opportunity settles
-instead of stranding the Store turn.
+An exact failed native terminal without a structured error needs independent
+command-plane confirmation. A contradictory running turn, an unavailable
+readback, or an unproven outcome leaves degraded coverage for the daemon to
+inspect. The terminal's free-text reason is display-only.
 
 Installed Muse 1.4.0-R4161.1 stable and experimental schemas (exported
 2026-11-16) expose only `sessionId` and `excludeItems` on `session/read`.
@@ -291,16 +215,9 @@ the internal projection-failure trigger or establishes that projection failure
 causes a native `failed` terminal with reason `incomplete`. An unavailable-view
 episode alone therefore does not justify changing consumer bounds or claiming
 that batching repairs the native failure.
-PR #422's shared native-exit lifecycle helper still applies only after actual
-endpoint exit; projection unavailability alone cannot invoke that exit path.
-The projection path reuses the turn-unknown settlement without retiring the
-plugin or reporting a stopped session to stand in for lost observation: the host
-stays alive and the Agent is not marked lost, so stop, readback and owner
-resolution keep working after the settle. While the view latch stands,
-`agent.snapshot` still serves a fenced terminal readback for the exact
-requested turn (command plane plus durable view, read directly): a proven
-terminal supplies the `last_turn` proof `turn.resolve` needs, a still-running
-turn keeps refusing, and the latched gap with its stale health is untouched.
+Projection unavailability leaves the owned host available for stop, snapshot,
+and Owner resolution. A later snapshot can still prove the exact native
+terminal for `turn.resolve`. Readback preserves the historical view gap.
 
 Guard a pending-request snapshot with a local observation counter so a newer stream
 resolution cannot be overwritten by stale snapshot data. This is an in-memory race guard,
@@ -802,7 +719,11 @@ No synthetic usage, probing turn or account identity is persisted. The pattern
 reference is OpenCodex 2.84.0 `muse-subscription-usage.ts`; no code was copied.
 ## Follow-up turns after a settled turn (k167 E44, E46, E47)
 
-E44 root cause, proven in code: the live view latch stayed set after a turn settled. The send gate checks the event actor view readback before dispatching turn start. That check fails while view unavailable is latched, and no completed turn cleared it, so idle follow-up sends were rejected forever with Muse native observation is unresolved and turn start was not dispatched. The fix settles idle observation at terminal commit and re-proves it before the next dispatch. On terminal commit the actor now clears a stale idle latch covering view unavailable, the unavailable reason, source unknown, and view related failure, plus the pending view recovery state. Historical gaps stay in the journal. Before rejecting a follow-up send, the host re-reads the owned native session with session read excluding items. When that read proves the exact session idle (status idle with an explicitly null active turn id, never a running status with a missing turn id) with a healthy history envelope, the host asks the actor to clear the stale idle latch and retries the view readback once. When the re-read fails or still proves nothing, the rejection keeps its typed rejected state and now names the recovery action to restart the Agent on the same worktree to continue with a fresh native session. A terminal settled from a bounded durable view readback while the live projection was unavailable keeps its send gate: the next send must prove the owned session idle with a fresh session read even when the actor readback succeeds, until exact idle proof clears the gate. The k170 turn unknown settlement cause (native view recovery did not prove live delivery) classifies as view related, so exact idle proof clears that latch too while the journal turn unknown stands. Every proof read and the native write share the one agent command request budget, and proof reads stop early enough to return the typed rejection before any native write. Implementation covers plugins/muse/src/events/mod.rs with EventStatus clear stale idle latch, is view related failure, session read proves idle, and the readback gate, plugins/muse/src/events/recovery.rs with reestablish idle, and plugins/muse/src/host.rs with the send gate retry, the rejection budget,.
+E44: before dispatching another turn on a degraded view, the host checks for
+the exact native session idle with an explicitly null active turn and a
+healthy history envelope. When the check cannot prove that state, the send is
+rejected before dispatch with the restart action. The historical gap stays in
+the journal.
 
 E47: the second turn failure with invalid run configuration MCP startup audit failed with MCP disabled for this runtime comes from the Muse host, not from Swarm state. Turn start carries only command id, session id, input, and the optional per turn reasoning effort. The model switch runs through session setModel at configure time. The MCP posture is fixed at host birth through the muse serve args for the frozen permissions level, so follow-up turns on the same Agent run the identical MCP policy as the first turn. A host level MCP disabled posture persists across turns on that host: the terminal commit latches it as host scoped state on the event actor, and every later send is rejected with the restart action until the Agent restarts on a fresh native host. View related failure classification deliberately excludes the MCP audit message, so idle recovery can never clear the posture latch.
 

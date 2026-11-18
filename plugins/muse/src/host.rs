@@ -228,14 +228,6 @@ const SEND_REJECTION_RESERVE: std::time::Duration = std::time::Duration::from_se
 /// latch stands (E47): MCP is disabled for this host's lifetime, so only
 /// an Agent restart on a fresh native host can continue.
 const MCP_AUDIT_DISABLED_REJECTION: &str = "Muse MCP startup audit failed; MCP is disabled for this runtime. Restart the Agent on the same worktree to continue with a fresh native host; turn/start was not dispatched.";
-/// Native half of the `agent.stop` RPC budget (`RPC_TIMEOUT` minus the two
-/// reserves above): the bound `BeginStop` must fit native termination and
-/// output drain inside. Recovery applies queued stop controls between native
-/// calls so at most one bounded call overlaps a stop, keeping this budget
-/// for termination (see `events::EventProcessor::recovery_gate`).
-pub(crate) const STOP_NATIVE_BUDGET: std::time::Duration = std::time::Duration::from_secs(
-    RPC_TIMEOUT.as_secs() - STOP_SETTLEMENT_RESERVE.as_secs() - STOP_RESPONSE_RESERVE.as_secs(),
-);
 pub(crate) const VIEW_PAGE_SIZE: i64 = 1000;
 pub(crate) const MAX_VIEW_PAGES: usize = 4;
 
@@ -1447,7 +1439,7 @@ impl MusePlugin {
                 }
                 _ => {
                     return Ok(rejected_control(
-                        "Muse native observation is unresolved after a recovered terminal; turn/start was not dispatched. Restart the Agent on the same worktree to continue.",
+                        "Muse native observation is unresolved after a terminal; turn/start was not dispatched. Restart the Agent on the same worktree to continue.",
                     ));
                 }
             }
@@ -1473,8 +1465,14 @@ impl MusePlugin {
                 }
             }
         }
-        if event_status.active_turn_id.is_some() {
-            return Err(Error::new("busy", "Muse already has an active turn"));
+        if event_status.active_turn_id.is_some()
+            && Self::reprove_idle_send_gate(session, proof_deadline)
+                .await
+                .is_none()
+        {
+            return Ok(rejected_control(
+                "Muse could not prove the native session idle; turn/start was not dispatched.",
+            ));
         }
         // Never dispatch once the rejection reserve is spent: without room
         // to return the outcome the caller settles `unknown` past a
@@ -2071,6 +2069,7 @@ impl MusePlugin {
                 "native_ref": native_ref,
                 "active_turn": null,
                 "last_turn": event_status.last_turn,
+                "turn_evidence": null,
                 "batch_unknown": event_status.batch_unknown,
                 "source_unknown": event_status.source_unknown,
             }));
@@ -2104,28 +2103,7 @@ impl MusePlugin {
         else {
             return unknown_snapshot(&params, "Muse session identity was not acknowledged");
         };
-        if event_status.view_unavailable {
-            // A fenced terminal readback proves the exact turn for owner
-            // resolution while the view latch stands: it reads the command
-            // plane and the durable view directly, never clears the latched
-            // gap, and leaves stream health stale.
-            if let Some(turn) = turn_id.clone()
-                && let Some(fenced) =
-                    read_fenced_terminal(session, &params, session_id, &turn).await
-            {
-                return Ok(fenced);
-            }
-            return view_unknown_snapshot(
-                session,
-                &params,
-                "Muse native observation remains unresolved",
-            );
-        }
-        let snapshot = read_live_snapshot(session, &params, session_id, turn_id).await?;
-        if let Some(model) = snapshot["native_model"].as_str() {
-            session.selected_model = Some(model.to_owned());
-        }
-        Ok(snapshot)
+        read_live_snapshot(session, &params, session_id, turn_id.as_deref()).await
     }
 
     async fn stop(&mut self, raw: &Value, deadline: Instant) -> Result<Value> {
@@ -2684,10 +2662,16 @@ async fn read_live_snapshot(
     session: &AgentSession,
     params: &AgentSnapshotParams,
     session_id: &str,
-    turn_id: Option<String>,
+    turn_id: Option<&str>,
 ) -> Result<Value> {
-    let readback = match read_owned_session(&session.native_client, session_id).await {
-        Ok(readback) => readback,
+    let raw = match read_owned_session_value(
+        &session.native_client,
+        session_id,
+        Instant::now() + RPC_TIMEOUT,
+    )
+    .await
+    {
+        Ok(raw) => raw,
         Err(_) => {
             return view_unknown_snapshot(
                 session,
@@ -2696,113 +2680,63 @@ async fn read_live_snapshot(
             );
         }
     };
-    if let Some(reason) = readback.history.unavailable_reason() {
-        let _ = session
-            .events
-            .view_readback(session_id.to_owned(), Some(reason))
-            .await;
-        return view_unknown_snapshot(session, params, "Muse native view readback is unavailable");
-    }
-
-    let turn_readback = if let Some(turn_id) = turn_id.as_deref() {
-        Some(
-            read_owned_turn(
-                &session.native_client,
-                session_id,
-                turn_id,
-                &params.command_id,
-                readback.session.active_turn_id.as_deref(),
-                &session.secrets,
-            )
-            .await,
-        )
-    } else {
-        None
-    };
-
-    // This is the final serialization point, after every native await. The
-    // actor drains queued health pushes first and returns its current status;
-    // never assemble a result from the pre-read watch snapshot.
-    let event_status = match session
-        .events
-        .view_readback(session_id.to_owned(), None)
-        .await
-    {
-        Ok(status) => status,
-        Err(_) => {
+    let explicit_idle = raw.pointer("/session/activeTurnId") == Some(&Value::Null);
+    let readback: NativeSessionReadResult = serde_json::from_value(raw)
+        .map_err(|_| Error::new("native_readback", "Muse session/read response was invalid"))?;
+    let last_turn = if let Some(turn_id) = turn_id {
+        let exact_running = readback.session.status == "running"
+            && readback.session.active_turn_id.as_deref() == Some(turn_id);
+        if !(exact_running || (readback.session.status == "idle" && explicit_idle)) {
             return view_unknown_snapshot(
                 session,
                 params,
-                "Muse native observation remains unresolved after readback",
+                "Muse session/read did not prove the exact turn was idle or active",
             );
         }
-    };
-    let last_turn = match turn_readback {
-        None => None,
-        Some(Ok(Some(facts))) => Some(facts),
-        _ => {
-            return unknown_snapshot(
-                params,
-                "Muse readback did not prove the exact requested turn",
-            );
+        match read_owned_turn(
+            &session.native_client,
+            session_id,
+            turn_id,
+            &params.command_id,
+            readback.session.active_turn_id.as_deref(),
+            &session.secrets,
+        )
+        .await
+        {
+            Ok(Some(facts)) => Some(facts),
+            _ => {
+                return view_unknown_snapshot(
+                    session,
+                    params,
+                    "Muse readback did not prove the exact requested turn",
+                );
+            }
         }
+    } else {
+        None
     };
+    let event_status = session.events.status();
     let result_known = last_turn
         .as_ref()
         .is_some_and(|turn| turn.final_text.is_some());
+    let turn_evidence = last_turn.as_ref().map(|turn| {
+        if turn.terminal {
+            "session/read+view/page"
+        } else {
+            "session/read"
+        }
+    });
     Ok(json!({
         "agent_id": params.agent_id, "generation": params.generation,
         "command_id": params.command_id, "state": session_state(&readback.session),
         "native_scope": session.native_scope, "native_ref": session_id,
         "native_model": readback.session.model_id,
         "active_turn": readback.session.active_turn_id,
-        "last_turn": last_turn, "native_exit": event_status.native_exit,
+        "last_turn": last_turn, "turn_evidence": turn_evidence,
+        "native_exit": event_status.native_exit,
         "batch_unknown": event_status.batch_unknown,
-        "source_unknown": event_status.source_unknown, "result_known": result_known,
-    }))
-}
-
-/// Fenced terminal readback for owner resolution while the view latch
-/// stands (#427). Reads the command plane (`session/read`) and the durable
-/// view (`view/page`) directly through the native client, never through the
-/// event actor: the latched gap, the stale health and the retained write
-/// latches are untouched. Returns `None` when nothing proves the exact
-/// turn, so the caller keeps the unknown snapshot. A still-running native
-/// turn yields a non-terminal snapshot (resolution keeps refusing); a proven
-/// terminal yields the exact `last_turn` proof `turn.resolve` needs.
-async fn read_fenced_terminal(
-    session: &AgentSession,
-    params: &AgentSnapshotParams,
-    session_id: &str,
-    turn_id: &str,
-) -> Option<Value> {
-    let readback = read_owned_session(&session.native_client, session_id)
-        .await
-        .ok()?;
-    if readback.history.unavailable_reason().is_some() {
-        return None;
-    }
-    let facts = read_owned_turn(
-        &session.native_client,
-        session_id,
-        turn_id,
-        &params.command_id,
-        readback.session.active_turn_id.as_deref(),
-        &session.secrets,
-    )
-    .await
-    .ok()?;
-    let event_status = session.events.status();
-    let result_known = facts.as_ref().is_some_and(|turn| turn.final_text.is_some());
-    Some(json!({
-        "agent_id": params.agent_id, "generation": params.generation,
-        "command_id": params.command_id, "state": session_state(&readback.session),
-        "native_scope": session.native_scope, "native_ref": session_id,
-        "native_model": readback.session.model_id,
-        "active_turn": readback.session.active_turn_id,
-        "last_turn": facts, "native_exit": event_status.native_exit,
-        "batch_unknown": event_status.batch_unknown,
-        "source_unknown": true, "result_known": result_known,
+        "source_unknown": event_status.source_unknown || readback.history.unavailable_reason().is_some(),
+        "result_known": result_known,
     }))
 }
 
@@ -2815,6 +2749,7 @@ fn view_unknown_snapshot(
     snapshot["native_scope"] = json!(session.native_scope);
     snapshot["native_ref"] = json!(session.session_id);
     snapshot["active_turn"] = json!(session.events.status().active_turn_id);
+    snapshot["turn_evidence"] = Value::Null;
     snapshot["native_exit"] = json!(session.events.status().native_exit);
     snapshot["batch_unknown"] = json!(session.events.status().batch_unknown);
     Ok(snapshot)
@@ -4021,8 +3956,6 @@ mod tests {
         for reason in [
             "Muse native view is unavailable (projectionUnavailable)",
             "Muse native observation is unresolved",
-            "Muse unavailable-view terminal requires command-plane confirmation",
-            "Muse native view recovery did not prove live delivery after the recorded gap",
         ] {
             assert!(is_view_related_failure(reason), "{reason}");
         }
