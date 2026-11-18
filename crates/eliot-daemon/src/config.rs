@@ -2254,245 +2254,81 @@ const MAX_OPENCODE_PROVIDERS: usize = 8;
 /// `opencode.jsonc` stays small; larger fragments are a profile error.
 const MAX_OPENCODE_PROVIDER_BYTES: usize = 32 * 1024;
 
-/// An exact `{env:NAME}` reference: the whole trimmed value names one
-/// environment entry. Anything else (literals, prefixes, malformed
-/// placeholders) is not a valid credential reference.
-fn exact_env_ref(value: &str) -> Option<&str> {
-    let trimmed = value.trim();
-    if !(trimmed.starts_with("{env:") && trimmed.ends_with('}')) {
-        return None;
-    }
-    let name = &trimmed[5..trimmed.len() - 1];
-    if name.is_empty() || name.len() > MAX_ENV_NAME_LEN || !valid_environment_name(name) {
-        return None;
-    }
-    Some(name)
+/// Map a shared fragment-shape refusal onto the frozen profile field error
+/// so the freeze location (file, table offset, profile and field) is kept
+/// while the refusal text stays the one every caller shares.
+fn fragment_shape_error(
+    source: &str,
+    table_offset: usize,
+    name: &str,
+    error: &core::Error,
+) -> core::Error {
+    profile_field_error(
+        source,
+        table_offset,
+        name,
+        "provider",
+        &error.message,
+        "profile_error",
+    )
 }
 
-/// True when any `{env:` occurrence in the value is malformed: unclosed,
-/// empty, or not a valid environment name. Well-formed references return
-/// false here; the caller still checks their allowlist membership.
-fn has_malformed_env_ref(value: &str) -> bool {
-    let mut index = 0;
-    while let Some(start) = value[index..].find("{env:") {
-        let base = index + start + 5;
-        let Some(end_rel) = value[base..].find('}') else {
-            return true;
-        };
-        let name = &value[base..base + end_rel];
-        if name.is_empty() || name.len() > MAX_ENV_NAME_LEN || !valid_environment_name(name) {
-            return true;
-        }
-        index = base + end_rel + 1;
-    }
-    false
-}
-
-/// A `{env:NAME}` reference inside a provider fragment. The name is the
-/// captured group; matching is a plain substring scan, never a glob.
-fn provider_env_refs(value: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let bytes = value.as_bytes();
-    let mut index = 0;
-    while index + 6 < value.len() {
-        if &bytes[index..index + 5] == b"{env:" {
-            if let Some(end) = value[index + 5..].find('}') {
-                let name = &value[index + 5..index + 5 + end];
-                if !name.is_empty()
-                    && name.len() <= MAX_ENV_NAME_LEN
-                    && valid_environment_name(name)
-                    && !out.iter().any(|known| known == name)
-                {
-                    out.push(name.to_owned());
-                }
-                index += 5 + end + 1;
-                continue;
-            }
-            break;
-        }
-        index += 1;
-    }
-    out
-}
-
-/// Collect every `{env:NAME}` reference in a JSON provider fragment.
-fn collect_fragment_env_refs(value: &Value, out: &mut Vec<String>) {
-    match value {
-        Value::String(text) => {
-            for name in provider_env_refs(text) {
-                if !out.iter().any(|known| known == &name) {
-                    out.push(name);
-                }
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                collect_fragment_env_refs(item, out);
-            }
-        }
-        Value::Object(map) => {
-            for item in map.values() {
-                collect_fragment_env_refs(item, out);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn valid_provider_fragment_id(raw: &str) -> bool {
-    let id = raw.trim();
-    if id.is_empty() || id.len() > 64 {
-        return false;
-    }
-    id.chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '/')
-        && !id.chars().any(|c| c.is_control() || c.is_whitespace())
-}
-
-/// A credential-bearing key inside a provider fragment: `apiKey` in any
-/// spelling, or any value under a headers table. Such values must be exactly
-/// one valid `{env:NAME}` reference, never a literal.
-fn is_fragment_credential_key(key: &str, parent_key: Option<&str>) -> bool {
-    let key = key.trim().to_ascii_lowercase();
-    if matches!(
-        key.as_str(),
-        "apikey" | "api_key" | "api-key" | "authorization"
-    ) {
-        return true;
-    }
-    if let Some(parent) = parent_key.map(|parent| parent.trim().to_ascii_lowercase())
-        && matches!(parent.as_str(), "headers" | "header")
-    {
-        return true;
-    }
-    false
-}
-
-/// True when a URL-like value carries userinfo (`user@host` in the
-/// authority). A literal credential in the URL reaches disk, so it refuses
-/// the same as a literal `apiKey`.
-fn fragment_url_has_userinfo(value: &str) -> bool {
-    let Some(scheme_end) = value.find("://") else {
-        return false;
-    };
-    let rest = &value[scheme_end + 3..];
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    rest[..authority_end].contains('@')
-}
-
-/// Refuse literal credentials on disk: every credential-bearing field must
-/// be exactly one valid `{env:NAME}` allowed by `pass_env`, every URL must
-/// carry no userinfo, and every `{env:` occurrence must be well-formed.
-/// The scan looks inside `{env:}` placeholders too, so malformed or
-/// unlisted references fail here instead of reaching the isolated config.
-fn validate_fragment_credentials(
-    value: &Value,
-    parent_key: Option<&str>,
+/// Check every `{env:NAME}` in a shape-admitted fragment against the frozen
+/// `pass_env` allowlist (never a native-store selector): key values stay
+/// runtime-only and unlisted references refuse at freeze.
+fn validate_fragment_pass_env(
+    frozen: &serde_json::Map<String, Value>,
     tail: &ProfileTail,
     source: &str,
     table_offset: usize,
     name: &str,
 ) -> core::Result<()> {
-    match value {
-        Value::String(text) => {
-            if has_malformed_env_ref(text) {
-                return Err(profile_field_error(
-                    source,
-                    table_offset,
-                    name,
-                    "provider",
-                    "provider fragment contains a malformed {env:} reference",
-                    "profile_error",
-                ));
-            }
-            if text.contains("://") && fragment_url_has_userinfo(text) {
-                return Err(profile_field_error(
-                    source,
-                    table_offset,
-                    name,
-                    "provider",
-                    "provider fragment URL must not contain credentials",
-                    "profile_error",
-                ));
-            }
-            Ok(())
+    let mut refs = Vec::new();
+    core::opencode_fragment::collect_env_refs(frozen, &mut refs);
+    for name_ref in &refs {
+        if private_route_selector(name_ref) {
+            return Err(profile_field_error(
+                source,
+                table_offset,
+                name,
+                "provider",
+                "provider fragment cannot use a native store selector",
+                "profile_error",
+            ));
         }
-        Value::Array(items) => {
-            for item in items {
-                validate_fragment_credentials(item, None, tail, source, table_offset, name)?;
+        let allowed = tail.pass_env.iter().any(|allowed| {
+            if cfg!(windows) {
+                allowed.eq_ignore_ascii_case(name_ref)
+            } else {
+                allowed == name_ref
             }
-            Ok(())
+        });
+        if !allowed {
+            return Err(profile_field_error(
+                source,
+                table_offset,
+                name,
+                "provider",
+                "provider fragment env references must be explicitly allowed by profile pass_env",
+                "profile_error",
+            ));
         }
-        Value::Object(map) => {
-            for (key, item) in map {
-                if let Value::String(text) = item {
-                    if has_malformed_env_ref(text) {
-                        return Err(profile_field_error(
-                            source,
-                            table_offset,
-                            name,
-                            "provider",
-                            "provider fragment contains a malformed {env:} reference",
-                            "profile_error",
-                        ));
-                    }
-                    if text.contains("://") && fragment_url_has_userinfo(text) {
-                        return Err(profile_field_error(
-                            source,
-                            table_offset,
-                            name,
-                            "provider",
-                            "provider fragment URL must not contain credentials",
-                            "profile_error",
-                        ));
-                    }
-                }
-                validate_fragment_credentials(item, Some(key), tail, source, table_offset, name)?;
-                if let Value::String(text) = item
-                    && is_fragment_credential_key(key, parent_key)
-                {
-                    let Some(ref_name) = exact_env_ref(text) else {
-                        return Err(profile_field_error(
-                            source,
-                            table_offset,
-                            name,
-                            "provider",
-                            "provider fragment credential fields must be a valid {env:NAME} allowed by pass_env",
-                            "profile_error",
-                        ));
-                    };
-                    let allowed = tail.pass_env.iter().any(|allowed| {
-                        if cfg!(windows) {
-                            allowed.eq_ignore_ascii_case(ref_name)
-                        } else {
-                            allowed == ref_name
-                        }
-                    });
-                    if !allowed {
-                        return Err(profile_field_error(
-                            source,
-                            table_offset,
-                            name,
-                            "provider",
-                            "provider fragment env references must be explicitly allowed by profile pass_env",
-                            "profile_error",
-                        ));
-                    }
-                }
-            }
-            Ok(())
-        }
-        _ => Ok(()),
     }
+    Ok(())
 }
 
 /// Freeze the optional native `provider.<id>` fragment of an OpenCode
 /// profile. The fragment is written as-is into the isolated `opencode.jsonc`
 /// under `providers`; only the `provider` table is admitted (no other native
-/// top-level keys). Every `{env:NAME}` reference must name an entry of the
-/// frozen `pass_env` allowlist; key values stay runtime-only. A fragment
-/// combined with `auth_integration` refuses: the custom provider carries its
-/// own `{env:}` credentials, never a canonical integration.
+/// top-level keys). The shared strict validator admits per provider id only
+/// `package`, `settings` (exactly `baseURL`/`apiKey`, no userinfo or query
+/// credentials) and `models`, and refuses every other key — including the
+/// legacy `options`/`provider` shape, Bedrock-style `credentials` and
+/// arbitrary headers — plus literal credentials anywhere inside. Every
+/// `{env:NAME}` reference must name an entry of the frozen `pass_env`
+/// allowlist; key values stay runtime-only. A fragment combined with
+/// `auth_integration` refuses: the custom provider carries its own `{env:}`
+/// credentials, never a canonical integration.
 fn freeze_opencode_provider_fragment(
     snapshot: &mut serde_json::Map<String, Value>,
     name: &str,
@@ -2526,16 +2362,6 @@ fn freeze_opencode_provider_fragment(
     }
     let mut frozen = serde_json::Map::new();
     for (id, raw) in fragment {
-        if !valid_provider_fragment_id(id) {
-            return Err(profile_field_error(
-                source,
-                table_offset,
-                name,
-                "provider",
-                "provider ids must be 1-64 characters",
-                "profile_error",
-            ));
-        }
         let json = serde_json::to_value(raw).map_err(|_| {
             profile_field_error(
                 source,
@@ -2588,48 +2414,11 @@ fn freeze_opencode_provider_fragment(
         }
         frozen.insert(id.trim().to_owned(), Value::Object(map));
     }
-    validate_fragment_credentials(
-        &Value::Object(frozen.clone()),
-        None,
-        tail,
-        source,
-        table_offset,
-        name,
-    )?;
-    let refs = {
-        let mut refs = Vec::new();
-        collect_fragment_env_refs(&Value::Object(frozen.clone()), &mut refs);
-        refs
-    };
-    for name_ref in &refs {
-        if private_route_selector(name_ref) {
-            return Err(profile_field_error(
-                source,
-                table_offset,
-                name,
-                "provider",
-                "provider fragment cannot use a native store selector",
-                "profile_error",
-            ));
-        }
-        let allowed = tail.pass_env.iter().any(|allowed| {
-            if cfg!(windows) {
-                allowed.eq_ignore_ascii_case(name_ref)
-            } else {
-                allowed == name_ref
-            }
-        });
-        if !allowed {
-            return Err(profile_field_error(
-                source,
-                table_offset,
-                name,
-                "provider",
-                "provider fragment env references must be explicitly allowed by profile pass_env",
-                "profile_error",
-            ));
-        }
-    }
+    // One shared strict allowlist at freeze and before any write: per
+    // provider id only package, settings (baseURL/apiKey) and models.
+    core::opencode_fragment::validate_fragment_shape(&frozen)
+        .map_err(|error| fragment_shape_error(source, table_offset, name, &error))?;
+    validate_fragment_pass_env(&frozen, tail, source, table_offset, name)?;
     snapshot.insert("provider".to_owned(), Value::Object(frozen));
     Ok(())
 }
@@ -5043,16 +4832,14 @@ tools = true
         assert_eq!(provider["settings"]["apiKey"], "{env:K173D_PROOF_KEY}");
         assert!(snapshot.get("auth_integration").is_none());
 
-        // X-Auth-Token style header references are allowed when listed in pass_env.
+        // Arbitrary headers are refused even as {env:} references: the
+        // settings block admits only baseURL and apiKey.
         let source = source.replace(
             "apiKey = \"{env:K173D_PROOF_KEY}\"",
             "apiKey = \"{env:K173D_PROOF_KEY}\"\nheaders = { X-Auth-Token = \"{env:K173D_PROOF_KEY}\" }",
         );
-        let snapshot = resolve_text_profile(&source, "local").unwrap();
-        assert_eq!(
-            snapshot["provider"]["k173d-fixture"]["settings"]["headers"]["X-Auth-Token"],
-            "{env:K173D_PROOF_KEY}"
-        );
+        let error = resolve_text_profile(&source, "local").expect_err("headers must fail");
+        assert_eq!(error.code, "profile_error");
 
         // Seventeenth named profile is still discovered: no 16-cap.
         // (Covered by profile_names_for_harness sorting; the aggregate merge
@@ -5141,6 +4928,53 @@ tools = true
         let error =
             resolve_text_profile(&prefixed, "local").expect_err("prefixed apiKey must fail");
         assert_eq!(error.code, "profile_error");
+    }
+
+    #[test]
+    fn opencode_provider_fragment_refuses_unadmitted_keys_and_query_credentials() {
+        let base = "[profiles.local]\nharness='opencode'\nmodel='k173d-fixture/m'\n\
+            cmd='C:/Tools/OpenCode/opencode.exe'\npass_env=['K173D_PROOF_KEY']\n";
+        // Bedrock-style credential tables refuse: only baseURL/apiKey admit.
+        let bedrock = format!(
+            "{base}[profiles.local.provider.k173d-fixture]\npackage='p'\n\
+            [profiles.local.provider.k173d-fixture.settings]\nregion='us-east-1'\n\
+            [profiles.local.provider.k173d-fixture.settings.credentials]\n\
+            accessKeyId='AKIAEXAMPLE'\nsecretAccessKey='literal-secret'\n"
+        );
+        let error = resolve_text_profile(&bedrock, "local").expect_err("Bedrock creds must fail");
+        assert_eq!(error.code, "profile_error");
+        // Credential-bearing baseURL query parameters refuse.
+        let query = format!(
+            "{base}[profiles.local.provider.k173d-fixture]\npackage='p'\n\
+            [profiles.local.provider.k173d-fixture.settings]\n\
+            baseURL='http://127.0.0.1:1234/v1?api_key=secret'\napiKey='{{env:K173D_PROOF_KEY}}'\n"
+        );
+        let error = resolve_text_profile(&query, "local").expect_err("query creds must fail");
+        assert_eq!(error.code, "profile_error");
+        // The legacy options/provider shape, top-level headers/body and any
+        // other key refuse: per provider id only package, settings and models.
+        for (label, extra) in [
+            (
+                "options key",
+                "[profiles.local.provider.k]\noptions={baseURL='http://127.0.0.1:1234/v1'}\n",
+            ),
+            (
+                "provider key",
+                "[profiles.local.provider.k]\nprovider='openai-compatible'\n",
+            ),
+            (
+                "top-level headers",
+                "[profiles.local.provider.k]\nheaders={X-Token='{env:K173D_PROOF_KEY}'}\n",
+            ),
+            (
+                "settings region",
+                "[profiles.local.provider.k.settings]\nregion='us-east-1'\n",
+            ),
+        ] {
+            let source = format!("{base}{extra}");
+            let error = resolve_text_profile(&source, "local").expect_err(label);
+            assert_eq!(error.code, "profile_error", "{label}");
+        }
     }
 
     #[test]

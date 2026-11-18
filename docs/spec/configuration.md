@@ -335,21 +335,28 @@ tools = true
 ```
 
 `model` is the exact `provider/model` string; the `provider.<id>` fragment is
-written as-is into the isolated `opencode.jsonc` under `providers`. Every
-credential-bearing field (`apiKey`, auth headers) must be exactly one valid
-`{env:NAME}` naming a `pass_env`-allowed environment; literals, prefixed or
-malformed references, and URLs with userinfo refuse at freeze. A missing or
-empty required value refuses before startup instead of silently becoming no-auth.
-`auth_integration` must be absent on this path so no unrelated canonical
-credential is imported. The plugin verifies that the fragment defines the
-requested provider, that no workspace config redefines the same
-`providers.<id>`, and verifies the exact pair through the live `GET /api/model`
-catalogue (carrying that row's context and output limits into the ready result,
-omitted as unknown) before any native session is created — every verification
-failure settles the launch as failed with a short safe reason, never unknown —
-rejecting project overrides that retarget the route. An unreachable endpoint is
+written as-is into the isolated `opencode.jsonc` under `providers`. One shared
+strict allowlist (used at freeze and before every isolated-config write) admits
+per provider id only `package`, `settings` with exactly `baseURL`/`apiKey`, and
+`models`; the legacy `options`/`provider` keys, Bedrock-style `credentials`,
+arbitrary headers, and every other key refuse, as do literal credentials, URLs
+with userinfo or credential-bearing query parameters, and malformed `{env:}`
+references. Every surviving `{env:NAME}` must name a `pass_env`-allowed
+environment. A missing or empty required value refuses before startup instead
+of silently becoming no-auth. `auth_integration` must be absent on this path
+so no unrelated canonical credential is imported. Fragment sessions run under
+OpenCode's native project-config disable switch, so workspace project layers
+are never loaded for the session lifetime (including native reloads) and a
+workspace file redefining the fragment provider has no effect. The plugin
+verifies that the fragment defines the requested provider and verifies the
+exact pair through the live `GET /api/model` catalogue (carrying that row's
+context and output limits into the ready result, omitted as unknown) before any
+native session is created — every verification failure settles the launch as
+failed with a short safe reason, never unknown. An unreachable endpoint is
 not a start failure: the catalogue still lists the model and the native turn
-surfaces the refusal.
+surfaces the refusal. Profile-scoped picker rows advertise only the profile's
+configured selection, and named-preview failures coalesce into one bounded
+catalogue entry.
 There is no harness/model/account fallback. Codex profiles against these
 endpoints stay `unsupported`. See the
 [OpenCode harness page](../harnesses/opencode.md#custom-provider-fragments).
@@ -423,8 +430,11 @@ servers. By harness:
 - OpenCode serves the isolated per-Agent config (only the Agent-scoped
   server) under isolated `XDG_CONFIG_HOME`/`XDG_DATA_HOME`, but the
   workspace project layer (`opencode.json`/`opencode.jsonc`) still merges
-  natively, so every start scans that layer pre-create (pre-touch on
-  resume) for owner-identity entries and refuses the start on a match.
+  natively on the cloud path, so every start scans that layer pre-create
+  (pre-touch on resume) for owner-identity entries and refuses the start on
+  a match. Fragment sessions additionally run under the native
+  project-config disable switch, so project layers never load there; the
+  file scan still runs as a fail-closed backstop.
   The settled inventory is then gated: `minimal` refuses any serving
   unexpected server, `inherit` refuses reserved Swarm names, and
   `mcp_servers_verified` is reported only after the gate passes with the

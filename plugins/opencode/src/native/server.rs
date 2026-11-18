@@ -58,187 +58,56 @@ const ELIOT_CONTEXT_PLUGIN_FILE: &str = "eliot-context.ts";
 /// id maps to its definition, written as-is into the isolated
 /// `opencode.jsonc` under `providers`. Secrets stay behind `{env:NAME}`
 /// references resolved at runtime from the serve environment, never as
-/// literal values in the frozen snapshot.
+/// literal values in the frozen snapshot. Shape validation is the one shared
+/// strict allowlist in `eliot_core::opencode_fragment`, also used at freeze.
 pub type ProviderFragment = serde_json::Map<String, serde_json::Value>;
 
-/// Collect every `{env:NAME}` reference in a JSON provider fragment.
-fn fragment_env_refs(value: &serde_json::Value, out: &mut Vec<String>) {
-    match value {
-        serde_json::Value::String(text) => {
-            let bytes = text.as_bytes();
-            let mut index = 0;
-            while index + 6 < text.len() {
-                if index + 5 <= text.len() && &bytes[index..index + 5] == b"{env:" {
-                    if let Some(end) = text[index + 5..].find('}') {
-                        let name = &text[index + 5..index + 5 + end];
-                        if !name.is_empty() && !out.iter().any(|known| known == name) {
-                            out.push(name.to_owned());
-                        }
-                        index += 5 + end + 1;
-                        continue;
-                    }
-                    break;
-                }
-                index += 1;
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                fragment_env_refs(item, out);
-            }
-        }
-        serde_json::Value::Object(map) => {
-            for item in map.values() {
-                fragment_env_refs(item, out);
-            }
-        }
-        _ => {}
+/// Native project-config disable switch for fragment sessions. OpenCode
+/// v2.2.7 `packages/cli/src/server-process.ts` sets `config.project = false`
+/// when `OPENCODE_CONFIG_PROJECT_DISABLE` (fallback
+/// `OPENCODE_DISABLE_PROJECT_CONFIG`) is truthy; the native
+/// `ConfigDiscovery` then skips the whole project walk (ancestor and cwd
+/// `opencode.json(c)` files, `.opencode/` dirs, project `.agents`/`.claude`
+/// dirs), and the config watcher never picks them up on reload either. The
+/// project layer otherwise ranks above the isolated global config
+/// (`packages/core/src/config.ts`), so this is the session-lifetime boundary
+/// that replaces the old workspace file scan: a workspace file redefining
+/// the fragment provider is never loaded, never reloaded.
+pub(crate) const PROJECT_CONFIG_DISABLE_ENV: &str = "OPENCODE_CONFIG_PROJECT_DISABLE";
+/// Truthy value for [`PROJECT_CONFIG_DISABLE_ENV`] (`"1"` or
+/// case-insensitive `"true"` per the native `truthy` helper).
+pub(crate) const PROJECT_CONFIG_DISABLE_VALUE: &str = "1";
+
+/// Serve environment additions for a fragment session: the native
+/// project-config disable switch. Fragment sessions never read workspace
+/// project layers; cloud sessions keep them.
+pub(crate) fn fragment_serve_environment(
+    fragment: Option<&ProviderFragment>,
+) -> Vec<(OsString, OsString)> {
+    if fragment.is_some() {
+        vec![(
+            OsString::from(PROJECT_CONFIG_DISABLE_ENV),
+            OsString::from(PROJECT_CONFIG_DISABLE_VALUE),
+        )]
+    } else {
+        Vec::new()
     }
 }
 
-/// Exact `{env:NAME}` reference, or `None` for literals, prefixed values
-/// and malformed placeholders.
-fn exact_fragment_env_ref(value: &str) -> Option<&str> {
-    let trimmed = value.trim();
-    if !(trimmed.starts_with("{env:") && trimmed.ends_with('}')) {
-        return None;
-    }
-    let name = &trimmed[5..trimmed.len() - 1];
-    if name.is_empty()
-        || name.len() > 256
-        || !(name
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
-    {
-        return None;
-    }
-    Some(name)
-}
-
-fn has_malformed_fragment_env_ref(value: &str) -> bool {
-    let mut index = 0;
-    while let Some(start) = value[index..].find("{env:") {
-        let base = index + start + 5;
-        let Some(end_rel) = value[base..].find('}') else {
-            return true;
-        };
-        let name = &value[base..base + end_rel];
-        if name.is_empty()
-            || name.len() > 256
-            || !(name
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
-        {
-            return true;
-        }
-        index = base + end_rel + 1;
-    }
-    false
-}
-
-fn is_fragment_credential_field(key: &str, parent: Option<&str>) -> bool {
-    let key = key.trim().to_ascii_lowercase();
-    if matches!(
-        key.as_str(),
-        "apikey" | "api_key" | "api-key" | "authorization"
-    ) {
-        return true;
-    }
-    if let Some(parent) = parent.map(|parent| parent.trim().to_ascii_lowercase())
-        && matches!(parent.as_str(), "headers" | "header")
-    {
-        return true;
-    }
-    false
-}
-
-fn fragment_value_has_userinfo(value: &str) -> bool {
-    let Some(scheme_end) = value.find("://") else {
-        return false;
-    };
-    let rest = &value[scheme_end + 3..];
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    rest[..authority_end].contains('@')
-}
-
-/// Refuse literal credentials that bypassed freeze (for example a retained
-/// snapshot): credential-bearing fields must be exactly one valid `{env:}`
-/// reference, URLs must carry no userinfo, and every placeholder must be
-/// well-formed. This looks inside `{env:}` too, so a malformed placeholder
-/// never passes as a credential.
-fn validate_fragment_literals(fragment: &ProviderFragment) -> Result<()> {
-    fn walk(value: &serde_json::Value, parent: Option<&str>) -> Result<()> {
-        match value {
-            serde_json::Value::String(text) => {
-                if has_malformed_fragment_env_ref(text) {
-                    return Err(Error::new(
-                        "profile_error",
-                        "OpenCode provider fragment contains a malformed {env:} reference",
-                    ));
-                }
-                if text.contains("://") && fragment_value_has_userinfo(text) {
-                    return Err(Error::new(
-                        "profile_error",
-                        "OpenCode provider fragment URL must not contain credentials",
-                    ));
-                }
-                Ok(())
-            }
-            serde_json::Value::Array(items) => {
-                for item in items {
-                    walk(item, None)?;
-                }
-                Ok(())
-            }
-            serde_json::Value::Object(map) => {
-                for (key, item) in map {
-                    if let serde_json::Value::String(text) = item {
-                        if has_malformed_fragment_env_ref(text) {
-                            return Err(Error::new(
-                                "profile_error",
-                                "OpenCode provider fragment contains a malformed {env:} reference",
-                            ));
-                        }
-                        if text.contains("://") && fragment_value_has_userinfo(text) {
-                            return Err(Error::new(
-                                "profile_error",
-                                "OpenCode provider fragment URL must not contain credentials",
-                            ));
-                        }
-                    }
-                    walk(item, Some(key))?;
-                    if let serde_json::Value::String(text) = item
-                        && is_fragment_credential_field(key, parent)
-                        && exact_fragment_env_ref(text).is_none()
-                    {
-                        return Err(Error::new(
-                            "profile_error",
-                            "OpenCode provider fragment credential fields must be a valid {env:NAME}",
-                        ));
-                    }
-                }
-                Ok(())
-            }
-            _ => Ok(()),
-        }
-    }
-    walk(&serde_json::Value::Object(fragment.clone()), None)
-}
-
-/// Every `{env:NAME}` in the fragment must resolve to a non-empty runtime
-/// value in the serve environment. A missing or empty value refuses before
-/// `serve` starts, never silently becoming no-auth mode.
+/// A retained fragment is refused here — before any isolated-config write —
+/// when it fails the one shared strict shape allowlist also used at freeze
+/// (unadmitted keys, literal credentials, userinfo or query credentials in
+/// URLs, malformed references). Every surviving `{env:NAME}` must then
+/// resolve to a non-empty runtime value in the serve environment. A missing
+/// or empty value refuses before `serve` starts, never silently becoming
+/// no-auth mode.
 pub(crate) fn validate_fragment_environment(
     fragment: &ProviderFragment,
     environment: &[(OsString, OsString)],
 ) -> Result<()> {
-    validate_fragment_literals(fragment)?;
+    eliot_core::opencode_fragment::validate_fragment_shape(fragment)?;
     let mut refs = Vec::new();
-    fragment_env_refs(&serde_json::Value::Object(fragment.clone()), &mut refs);
+    eliot_core::opencode_fragment::collect_env_refs(fragment, &mut refs);
     for name in refs {
         let present = environment.iter().any(|(key, value)| {
             let matches = if cfg!(windows) {
@@ -459,6 +328,12 @@ impl OwnedServer {
                 "OpenCode provider fragment requires an explicit model with the fragment provider segment",
             ));
         }
+        // Refuse a retained fragment that fails the shared strict allowlist
+        // BEFORE any isolated-config write below: a literal credential or
+        // unadmitted key must never reach disk first.
+        if let Some(fragment) = launch.provider_fragment.as_ref() {
+            validate_fragment_environment(fragment, &launch.environment)?;
+        }
         // The MCP server command carries only public arguments; absolute
         // paths are re-checked here so a malformed launch can never render
         // a relative executable or data root into the per-Agent document.
@@ -551,14 +426,14 @@ impl OwnedServer {
         // canonical credential, so the selected integration moves in opaquely
         // (a refused or ambiguous transfer fails the start with no server
         // child; resume reuses a correctly present credential). Fragment path:
-        // no canonical credential is ever imported; instead every `{env:}`
-        // reference must resolve to a non-empty runtime value (a missing or
-        // empty value refuses before startup, never silently becoming no-auth
-        // mode).
+        // no canonical credential is ever imported; the fragment was already
+        // refused by the shared allowlist before any isolated-config write
+        // above (shape plus non-empty runtime values for every `{env:}`
+        // reference, never silently becoming no-auth mode).
         drop(prepare_timing);
-        if let Some(fragment) = launch.provider_fragment.as_ref() {
-            validate_fragment_environment(fragment, &launch.environment)?;
-        } else {
+        // Fragment path: validated before the config write above and imports
+        // no canonical credential, so only the cloud path transfers.
+        if launch.provider_fragment.is_none() {
             let auth = launch.auth.as_ref().ok_or_else(|| {
                 Error::new(
                     "profile_error",
@@ -656,6 +531,12 @@ impl OwnedServer {
             .arg(port.to_string())
             .current_dir(&native_directory)
             .envs(launch.environment)
+            // Fragment sessions run under the native project-config disable
+            // switch for the session lifetime (including native reloads);
+            // cloud sessions keep the workspace project layers.
+            .envs(fragment_serve_environment(
+                launch.provider_fragment.as_ref(),
+            ))
             .env("OPENCODE_PASSWORD", &password)
             .env("XDG_CONFIG_HOME", &config_root)
             .env("XDG_DATA_HOME", &data_dir)
@@ -1031,7 +912,6 @@ mod tests {
                 "settings": {
                     "baseURL": "http://127.0.0.1:1234/v1",
                     "apiKey": "{env:K173D_PROOF_KEY}",
-                    "headers": { "X-Auth-Token": "{env:K173D_PROOF_KEY}" },
                 },
                 "models": {
                     "test-model": {
@@ -1066,9 +946,9 @@ mod tests {
         );
         assert_eq!(provider["settings"]["baseURL"], "http://127.0.0.1:1234/v1");
         assert_eq!(provider["settings"]["apiKey"], "{env:K173D_PROOF_KEY}");
-        assert_eq!(
-            provider["settings"]["headers"]["X-Auth-Token"],
-            "{env:K173D_PROOF_KEY}"
+        assert!(
+            provider["settings"].get("headers").is_none(),
+            "arbitrary headers never render"
         );
         let rendered = serde_json::to_string(&parsed).expect("encode");
         assert!(
@@ -1230,6 +1110,13 @@ mod tests {
             serde_json::json!({"settings": {"baseURL": "https://user:pass@host/v1"}}),
             serde_json::json!({"settings": {"apiKey": "{env:}"}}),
             serde_json::json!({"settings": {"apiKey": "Bearer {env:K173D_PROOF_KEY}"}}),
+            serde_json::json!({"options": {"baseURL": "http://127.0.0.1:1234/v1"}}),
+            serde_json::json!({"provider": "openai-compatible"}),
+            serde_json::json!({"settings": {"credentials": {"secretAccessKey": "x"}}}),
+            serde_json::json!({"settings": {
+                "baseURL": "http://127.0.0.1:1234/v1?api_key=secret",
+                "apiKey": "{env:K173D_PROOF_KEY}",
+            }}),
         ] {
             let mut fragment = ProviderFragment::new();
             fragment.insert("k173d-fixture".to_owned(), bad);
@@ -1244,6 +1131,25 @@ mod tests {
             serde_json::json!({"settings": {"apiKey": "{env:MISSING_KEY}"}}),
         );
         assert!(validate_fragment_environment(&missing, &env).is_err());
+    }
+
+    #[test]
+    fn fragment_sessions_carry_the_native_project_disable_switch() {
+        use super::{PROJECT_CONFIG_DISABLE_ENV, PROJECT_CONFIG_DISABLE_VALUE};
+        let fragment = fragment_fixture();
+        let env = fragment_serve_environment(Some(&fragment));
+        assert_eq!(
+            env,
+            vec![(
+                std::ffi::OsString::from(PROJECT_CONFIG_DISABLE_ENV),
+                std::ffi::OsString::from(PROJECT_CONFIG_DISABLE_VALUE),
+            )],
+            "fragment sessions disable project config natively"
+        );
+        assert!(
+            fragment_serve_environment(None).is_empty(),
+            "cloud sessions keep the workspace project layers"
+        );
     }
 
     #[test]

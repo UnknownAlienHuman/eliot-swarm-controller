@@ -4,7 +4,7 @@ use crate::{
         AuthSetup, AuthTransfer, HttpOutcome, IntegrationSelector, OpenCodeHttp, OwnedServer,
         ProviderFragment, SWARM_MCP_SERVER_NAME, ServerLaunch,
         models::{MAX_MODEL_ID_BYTES, ReaderContext, run_model_metadata, run_models},
-        server::{provider_config, validate_fragment_environment},
+        server::{fragment_serve_environment, provider_config, validate_fragment_environment},
         transfer_selected_integration,
         types::{
             ConfigEntry, ConfigMcpServer, InboxUser, McpServerReadback, ModelRef, NativeModelEntry,
@@ -669,7 +669,7 @@ impl OpenCodePlugin {
             .map_or(base.as_path(), Path::new);
         let program = OsStr::new(program);
         let TargetEnvironment {
-            variables: environment,
+            variables: mut environment,
             ..
         } = target_environment(
             params.target_environment.as_ref(),
@@ -682,7 +682,13 @@ impl OpenCodePlugin {
         let model = optional_profile_text(profile, "model", "OpenCode")?;
         let fragment = start_provider_fragment(profile)?;
         if let Some(fragment) = fragment.as_ref() {
+            // Retained fragments are refused by the shared strict allowlist
+            // before the reader config write below, exactly like the serve
+            // path. The private reader server runs under the same native
+            // project-config disable switch, so workspace project layers
+            // cannot widen the preview either.
             validate_fragment_environment(fragment, &environment)?;
+            environment.extend(fragment_serve_environment(Some(fragment)));
         }
         let until = Instant::now() + RPC_TIMEOUT;
         let config_home = base.join("config");
@@ -1207,7 +1213,10 @@ impl OpenCodePlugin {
         // Pre-create verification: no native session or prompt exists yet.
         // A fragment profile must define the requested provider locally;
         // the exact pair is proven below through the live model catalogue
-        // like every other profile, with limits from that catalogue row.
+        // like every other profile, with limits from that catalogue row. No
+        // workspace file scan runs here: the serve runs under the native
+        // project-config disable switch, so workspace project layers are
+        // never loaded for the session lifetime, including native reloads.
         if let (Some(fragment), Some(requested)) = (
             parsed.provider_fragment.as_ref(),
             parsed.requested_model.as_deref(),
@@ -1219,13 +1228,6 @@ impl OpenCodePlugin {
                     "OpenCode provider fragment does not define the requested provider",
                 );
                 discard_failed_start(&mut session, failure.clone(), envelope).await;
-                return Ok(CreateOutcome::ProvenFailed(
-                    self.retain_proven_no_effect_start(&parsed.params, StartPhase::Verify, failure),
-                ));
-            }
-            if let Err(error) = refuse_workspace_provider_override(&parsed.workspace, provider_id) {
-                let failure = error.clone();
-                discard_failed_start(&mut session, error, envelope).await;
                 return Ok(CreateOutcome::ProvenFailed(
                     self.retain_proven_no_effect_start(&parsed.params, StartPhase::Verify, failure),
                 ));
@@ -1980,7 +1982,10 @@ impl OpenCodePlugin {
         };
         // The fragment membership rule matches the create path before any
         // write: a catalog-listed model outside the fragment refuses here,
-        // before the quiesce interrupt aborts a running retained turn.
+        // before the quiesce interrupt aborts a running retained turn. No
+        // workspace file scan runs here either: the resumed serve regenerates
+        // under the same native project-config disable switch, so workspace
+        // project layers stay unloaded for the session lifetime.
         if let (Some(fragment), Some(target)) = (parsed.provider_fragment.as_ref(), target_model) {
             let provider_id = target.split('/').next().unwrap_or("");
             if !fragment_defines_provider(fragment, provider_id) {
@@ -1989,7 +1994,6 @@ impl OpenCodePlugin {
                     "OpenCode provider fragment does not define the retained provider",
                 ));
             }
-            refuse_workspace_provider_override(&parsed.workspace, provider_id)?;
         }
         if target_model.is_none() && target_variant.is_none() {
             return Ok(None);
@@ -3855,7 +3859,11 @@ fn start_auth_selector(
 /// The frozen native `provider.<id>` fragment: an object whose keys are
 /// provider ids and whose values are written as-is into the isolated
 /// `opencode.jsonc` under `providers`. Only the `provider` table is admitted;
-/// any fragment without a model fails closed at admission.
+/// any fragment without a model fails closed at admission. The retained
+/// snapshot passes the one shared strict allowlist also used at freeze, so a
+/// snapshot that fails it (unadmitted keys, literal credentials) is refused
+/// before any isolated-config write, on the start path and the model reader
+/// alike.
 /// A retained `eliot-local` profile predates the fragment path: its old
 /// TOML fields are rejected by the strict schema, and the frozen snapshot
 /// reaches here without a `provider` table. Report the migration naming
@@ -3932,6 +3940,10 @@ fn start_provider_fragment(
         }
         out.insert(id.clone(), value.clone());
     }
+    // A retained snapshot that fails the shared strict allowlist is refused
+    // before any isolated-config write, on the start path and the model
+    // reader alike.
+    eliot_core::opencode_fragment::validate_fragment_shape(&out)?;
     Ok(Some(out))
 }
 
@@ -4047,81 +4059,6 @@ fn refuse_owner_project_mcp(
 /// Whether the frozen fragment defines the requested provider id.
 fn fragment_defines_provider(fragment: &ProviderFragment, provider_id: &str) -> bool {
     fragment.contains_key(provider_id)
-}
-
-/// Refuse the start when any workspace-inherited project layer redefines the
-/// frozen fragment provider. The isolated XDG file is not authoritative:
-/// project layers load after the isolated global config, so a workspace
-/// `opencode.json`/`opencode.jsonc` (or `.opencode/` project file) that
-/// carries the same `providers.<id>` would redirect the fragment credential
-/// to another destination. No native precedence input outranks the project
-/// layer, so the collision refuses before the native session exists (create)
-/// or before the retained session is touched (resume), in every policy.
-fn refuse_workspace_provider_override(
-    workspace: &std::path::Path,
-    provider_id: &str,
-) -> Result<()> {
-    let mut layer: Option<&std::path::Path> = Some(workspace);
-    let mut depth = 0usize;
-    while let Some(dir) = layer {
-        if depth > crate::project_mcp::MAX_PROJECT_ANCESTORS {
-            return Err(Error::new(
-                "profile_error",
-                "OpenCode project provider layer scan exceeds its ancestor bound",
-            ));
-        }
-        let prefix = "../".repeat(depth);
-        for &file in crate::project_mcp::PROJECT_CONFIG_FILES {
-            let label = if depth == 0 {
-                file.to_owned()
-            } else {
-                format!("{prefix}{file}")
-            };
-            check_project_provider_file(&dir.join(file), &label, provider_id)?;
-            let project_label = if depth == 0 {
-                format!(".opencode/{file}")
-            } else {
-                format!("{prefix}.opencode/{file}")
-            };
-            check_project_provider_file(
-                &dir.join(".opencode").join(file),
-                &project_label,
-                provider_id,
-            )?;
-        }
-        layer = dir.parent();
-        depth += 1;
-    }
-    Ok(())
-}
-
-fn check_project_provider_file(
-    path: &std::path::Path,
-    label: &str,
-    provider_id: &str,
-) -> Result<()> {
-    use eliot_plugin::owner_scan as shared_scan;
-    let document_label = format!("OpenCode project provider layer in {label}");
-    let Some(document) = shared_scan::read_jsonc_document(
-        path,
-        &document_label,
-        crate::project_mcp::MAX_PROJECT_CONFIG_BYTES,
-    )?
-    else {
-        return Ok(());
-    };
-    let providers = document
-        .get("providers")
-        .and_then(serde_json::Value::as_object);
-    if providers.is_some_and(|providers| providers.contains_key(provider_id)) {
-        return Err(Error::new(
-            "profile_error",
-            format!(
-                "OpenCode workspace {label} redefines provider {provider_id:?}; refusing to redirect the isolated credential"
-            ),
-        ));
-    }
-    Ok(())
 }
 
 /// Refuse the start when any effective `mcp.servers` entry carries the
@@ -6324,34 +6261,6 @@ mod tests {
         }))
         .expect("cloud snapshot decodes");
         assert!(retained_eliot_local_migration(&cloud).is_none());
-    }
-
-    #[test]
-    fn workspace_provider_override_refuses_before_session() {
-        use super::refuse_workspace_provider_override;
-        let dir = std::env::temp_dir().join(format!(
-            "eliot-k173e-provider-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        // No workspace file: no override.
-        assert!(refuse_workspace_provider_override(&dir, "k173d-fixture").is_ok());
-        // A workspace file redefining the same provider refuses.
-        std::fs::write(
-            dir.join("opencode.json"),
-            r#"{"providers": {"k173d-fixture": {"package": "evil"}}}"#,
-        )
-        .expect("workspace file");
-        let error = refuse_workspace_provider_override(&dir, "k173d-fixture")
-            .expect_err("same provider must refuse");
-        assert_eq!(error.code, "profile_error");
-        assert!(error.message.contains("k173d-fixture"));
-        // An unrelated provider does not refuse.
-        assert!(refuse_workspace_provider_override(&dir, "other").is_ok());
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

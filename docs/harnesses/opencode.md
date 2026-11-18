@@ -210,33 +210,54 @@ launcher or a detached command under Agent custody. See
 The profile selects `harness = "opencode"` with `model = "<provider>/<model>"`
 and an optional native `provider.<id>` fragment. The fragment is written as-is
 into the isolated `opencode.jsonc` under `providers`; only the `provider` table
-is admitted. Every credential-bearing field (`apiKey`, auth headers) must be
-exactly one valid `{env:NAME}` naming a frozen `pass_env` entry; any literal,
-prefixed, malformed or unlisted reference refuses at freeze with `profile_error`,
-and every URL must carry no userinfo. Key values stay runtime-only. A fragment
-combined with `auth_integration` refuses. An unresolved or empty `{env:NAME}`
-refuses before `serve` starts, never silently becoming no-auth mode.
+is admitted. One shared strict allowlist (used at freeze and before every
+isolated-config write) admits per provider id only `package`,
+`settings` with exactly `baseURL`/`apiKey`, and `models`: the legacy
+`options`/`provider` keys, Bedrock-style `credentials`, arbitrary
+`headers`/`body`, and every other key refuse. The native v2.2.7 schema names
+the settings block `settings` (`@opencode/schema` `Config.Provider.Info`);
+`options` is the legacy V1 key and is refused rather than silently dropped.
+Every credential-bearing field must be exactly one valid `{env:NAME}` naming a
+frozen `pass_env` entry; any literal, prefixed, malformed or unlisted
+reference refuses at freeze with `profile_error`, and every URL must carry no
+userinfo and no credential-bearing query parameter. Key values stay
+runtime-only. A fragment combined with `auth_integration` refuses. A retained
+snapshot that fails the allowlist is refused before any isolated-config write.
+An unresolved or empty `{env:NAME}` refuses before `serve` starts, never
+silently becoming no-auth mode.
 
-Effective settings are read back, not assumed. The isolated XDG file is not the
-final authority (workspace-inherited layers load after the isolated global
-config), so before inference the plugin checks that the fragment defines the requested
-provider and that no workspace `opencode.json`/`opencode.jsonc` (or
-`.opencode/` project file) redefines the same `providers.<id>`; such a
-collision refuses before any native session exists. It then selects the exact
-frozen provider/model pair locally from the live `GET /api/model` catalogue
-(the endpoint answers an object with a `data` array) and carries that row's
-context and output limits into the ready result (omitted values stay unknown).
-This verification runs before `POST /api/session` creates any native session:
-no session or prompt has been dispatched yet, so every verification failure -
-a known mismatch or an unreadable readback - settles the launch as a definite
-failure with a short safe reason (failed-state start result, never unknown),
-and the daemon retires the plugin and releases capacity on proven exit instead
-of pinning an unknown Agent. Unknown is reserved for failures after a session
-or prompt may have been admitted. An unreachable custom endpoint is not a start
-failure: the catalogue still lists the model, the start succeeds, and the native
-turn surfaces the refusal. Project overrides that retarget the route are
-rejected, never adopted. The readback is a snapshot, not a guarantee about
-every request.
+Fragment sessions run under OpenCode's native project-config disable switch
+(`OPENCODE_CONFIG_PROJECT_DISABLE`, verified against installed v2.2.7
+`packages/cli/src/server-process.ts` and `packages/core/src/config.ts` /
+`config/discovery.ts`): the serve and the model-reader processes skip the
+whole project walk (ancestor and cwd `opencode.json`/`opencode.jsonc`,
+`.opencode/` dirs, project `.agents`/`.claude` dirs) for the session
+lifetime, including native reloads. The project layer otherwise ranks above
+the isolated global config, so the switch — not a file scan — is the
+boundary: a workspace file redefining the fragment provider is never loaded
+and has no effect on the session. Cloud sessions keep the workspace project
+layers.
+
+Effective settings are read back, not assumed. Before inference the plugin
+checks that the fragment defines the requested provider. It then selects the
+exact frozen provider/model pair locally from the live `GET /api/model`
+catalogue (the endpoint answers an object with a `data` array) and carries
+that row's context and output limits into the ready result (omitted values
+stay unknown). This verification runs before `POST /api/session` creates any
+native session: no session or prompt has been dispatched yet, so every
+verification failure - a known mismatch or an unreadable readback - settles
+the launch as a definite failure with a short safe reason (failed-state start
+result, never unknown), and the daemon retires the plugin and releases capacity
+on proven exit instead of pinning an unknown Agent. Unknown is reserved for
+failures after a session or prompt may have been admitted. An unreachable
+custom endpoint is not a start failure: the catalogue still lists the model,
+the start succeeds, and the native turn surfaces the refusal. The readback is
+a snapshot, not a guarantee about every request.
+
+Profile-scoped picker rows advertise only the profile's configured selection:
+choosing the row launches the profile as configured. Named-preview failures
+coalesce into one bounded catalogue entry naming the affected profiles, so
+failing previews never invalidate the whole catalogue.
 
 Several Agents may share one endpoint for inference while each keeps its own
 native session, history, tool execution and approvals; stop ends only the owned

@@ -23,6 +23,7 @@ mod naming;
 mod native_child;
 mod native_store;
 mod observe;
+pub mod opencode_fragment;
 mod presentation;
 mod remote_call;
 mod routing;

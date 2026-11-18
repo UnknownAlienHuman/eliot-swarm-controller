@@ -776,16 +776,20 @@ impl Router {
                     crate::config::profile_names_for_harness(&self.inner.data_root, harness);
                 let total = profile_names.len();
                 let mut attempted: usize = 0;
+                // Named-preview failures coalesce into one bounded entry
+                // naming the affected profiles: per-profile pushes would
+                // exceed the response failure bound and invalidate the whole
+                // catalogue. A profile-scoped row launches its profile as
+                // configured, so only the profile's configured selection is
+                // advertised with the profile tag; anything else the preview
+                // lists stays out of the picker instead of launching a
+                // different model than shown.
+                let mut preview_failed: Vec<String> = Vec::new();
+                let mut preview_incomplete: Option<String> = None;
                 for name in profile_names {
                     if tokio::time::Instant::now() >= discovery_deadline {
-                        failures.push(ModelsCatalogFailure::from_error(
-                            harness,
-                            &Error::new(
-                                "unavailable",
-                                format!(
-                                    "catalogue discovery budget elapsed; profile preview incomplete ({attempted} of {total} named profiles)"
-                                ),
-                            ),
+                        preview_incomplete = Some(format!(
+                            "catalogue discovery budget elapsed; profile preview incomplete ({attempted} of {total} named profiles)"
                         ));
                         break;
                     }
@@ -795,19 +799,13 @@ impl Router {
                         tokio::time::timeout_at(discovery_deadline, read_models(scoped)).await;
                     let scoped_value = match scoped_read {
                         Ok(Ok(value)) => value,
-                        Ok(Err(error)) => {
-                            failures.push(ModelsCatalogFailure::from_error(harness, &error));
+                        Ok(Err(_)) => {
+                            preview_failed.push(name.clone());
                             continue;
                         }
                         Err(_) => {
-                            failures.push(ModelsCatalogFailure::from_error(
-                                harness,
-                                &Error::new(
-                                    "unavailable",
-                                    format!(
-                                        "catalogue discovery budget elapsed; profile preview incomplete ({attempted} of {total} named profiles)"
-                                    ),
-                                ),
+                            preview_incomplete = Some(format!(
+                                "catalogue discovery budget elapsed; profile preview incomplete ({attempted} of {total} named profiles)"
                             ));
                             break;
                         }
@@ -818,20 +816,22 @@ impl Router {
                     {
                         Ok(response) => response,
                         Err(_) => {
-                            failures.push(ModelsCatalogFailure::from_error(
-                                harness,
-                                &Error::new(
-                                    "unavailable",
-                                    format!(
-                                        "profile {name:?} preview could not be decoded; profile preview incomplete"
-                                    ),
-                                ),
-                            ));
+                            preview_failed.push(name.clone());
                             continue;
                         }
                     };
+                    let configured = self
+                        .resolve_profile_cached(&name)
+                        .ok()
+                        .and_then(|snapshot| catalog::profile_configured_model(&snapshot));
                     for model in scoped_response.models {
                         if seen.contains(&model.id) {
+                            continue;
+                        }
+                        if configured
+                            .as_deref()
+                            .is_some_and(|only| only != model.id.as_str())
+                        {
                             continue;
                         }
                         seen.insert(model.id.clone());
@@ -842,6 +842,12 @@ impl Router {
                             now_ms(),
                         ));
                     }
+                }
+                if let Some(entry) = catalog::coalesced_preview_failure(
+                    &preview_failed,
+                    preview_incomplete.as_deref(),
+                ) {
+                    failures.push(entry);
                 }
             }
             if let Some(quota) = ad_hoc_quota_for_cache.filter(|quota| quota.route_verified) {
@@ -1549,6 +1555,74 @@ pub(crate) fn profile_catalog_entry(
     let mut entry = catalog_entry(harness, model, None, None, now);
     entry.profile = Some(profile.to_owned());
     entry
+}
+
+/// The model a named profile launches as configured: a profile-scoped picker
+/// row carries the profile tag only for this selection, so choosing the row
+/// launches exactly the configured model and never a sibling the preview
+/// happens to list. Profiles without a configured model advertise every
+/// previewed row, as before.
+pub(crate) fn profile_configured_model(snapshot: &Value) -> Option<String> {
+    snapshot
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_owned)
+}
+
+/// Coalesce named-preview failures into one bounded OpenCode entry naming the
+/// affected profiles. Per-profile pushes would exceed the response failure
+/// bound (failures count against harnesses, not profiles) and invalidate the
+/// whole catalogue. Returns `None` when every named preview succeeded.
+pub(crate) fn coalesced_preview_failure(
+    failed: &[String],
+    incomplete: Option<&str>,
+) -> Option<ModelsCatalogFailure> {
+    if failed.is_empty() && incomplete.is_none() {
+        return None;
+    }
+    let mut message = String::new();
+    if !failed.is_empty() {
+        // Bound the name list well under the 512-byte failure cap; the
+        // tail always says how many profiles failed.
+        let mut names = String::new();
+        let mut shown = 0usize;
+        for name in failed {
+            let trimmed = name.trim();
+            if trimmed.is_empty() || trimmed.len() > 256 {
+                continue;
+            }
+            let piece = if names.is_empty() {
+                trimmed.to_owned()
+            } else {
+                format!(", {trimmed}")
+            };
+            if names.len() + piece.len() > 320 {
+                break;
+            }
+            names.push_str(&piece);
+            shown += 1;
+        }
+        let hidden = failed.len().saturating_sub(shown);
+        message.push_str(&format!(
+            "OpenCode named-profile preview failed for {} profile(s): {names}",
+            failed.len()
+        ));
+        if hidden > 0 {
+            message.push_str(&format!(" (and {hidden} more)"));
+        }
+    }
+    if let Some(incomplete) = incomplete {
+        if !message.is_empty() {
+            message.push_str("; ");
+        }
+        message.push_str(incomplete);
+    }
+    Some(ModelsCatalogFailure::from_error(
+        "opencode",
+        &Error::new("unavailable", message),
+    ))
 }
 
 /// Catalogue membership establishes identity, not account availability.
@@ -2719,6 +2793,45 @@ mod tests {
         assert_eq!(built.display_name, "Native Display Name");
         assert_eq!(built.provider, "openrouter");
         assert!(eliot_core::api::catalog_matches(&built, "Display Name"));
+    }
+
+    #[test]
+    fn profile_configured_model_selects_the_advertised_row() {
+        assert_eq!(
+            profile_configured_model(&json!({"model": "k173d-fixture/test-model"})),
+            Some("k173d-fixture/test-model".to_owned())
+        );
+        assert_eq!(profile_configured_model(&json!({"model": "  "})), None);
+        assert_eq!(profile_configured_model(&json!({})), None);
+        assert_eq!(profile_configured_model(&json!({"model": 7})), None);
+    }
+
+    #[test]
+    fn named_preview_failures_coalesce_into_one_bounded_entry() {
+        assert!(coalesced_preview_failure(&[], None).is_none());
+        let failed = vec![
+            "opencode-local".to_owned(),
+            "opencode-second".to_owned(),
+            "opencode-third".to_owned(),
+            "opencode-fourth".to_owned(),
+            "opencode-fifth".to_owned(),
+            "opencode-sixth".to_owned(),
+        ];
+        let entry = coalesced_preview_failure(&failed, None).expect("coalesced entry");
+        assert_eq!(entry.harness, "opencode");
+        assert!(entry.message.contains("6 profile(s)"));
+        assert!(entry.message.contains("opencode-local"));
+        assert!(entry.message.len() <= eliot_core::api::harness::MAX_CATALOG_FAILURE_MESSAGE_BYTES);
+        entry.validate().expect("bounded entry validates");
+        // The incomplete tail rides the same entry instead of a second one.
+        let entry = coalesced_preview_failure(
+            &["opencode-local".to_owned()],
+            Some("catalogue discovery budget elapsed; profile preview incomplete (1 of 2 named profiles)"),
+        )
+        .expect("combined entry");
+        assert!(entry.message.contains("opencode-local"));
+        assert!(entry.message.contains("profile preview incomplete"));
+        entry.validate().expect("combined entry validates");
     }
 
     #[tokio::test]
