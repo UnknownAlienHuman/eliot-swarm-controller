@@ -24,8 +24,11 @@ Installed CLI surface (observed 2026-11-17, read-only `--version`/`acp --help`;
 flags; it accepts no hook-config location or registration flag, and the
 top-level `--settings` flag is a print-mode session option, not an `acp`
 option. The install directory ships no bundled docs or settings schema, so
-hook discovery truly requires a directory root. The manifest's native version
-(`1.5.2`) stays diagnostic metadata, not a startup version gate.
+hook discovery truly requires a directory root. Inventory, model and quota reads,
+and launch check one resolved CLI. The daemon verifies the vendor CLI module in
+the executable before running bounded `agy acp --help` and `agy --version`.
+The ACP help must advertise stdio and the permission option used at launch.
+The manifest version stays diagnostic metadata.
 
 The adapter speaks Agent Client Protocol v1 (pinned schema
 `v1-7ec5185c.json`, AGY 1.5.2; permission and usage shapes re-verified

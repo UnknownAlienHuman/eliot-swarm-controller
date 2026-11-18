@@ -2117,14 +2117,18 @@ impl Router {
                 Some(cmd) => Some(cmd),
                 None => crate::adhoc::discover_cmd_for_harness_async(&harness).await?,
             };
-            let mut snapshot = crate::adhoc::adhoc_snapshot(
-                &harness,
-                model.as_deref(),
-                effort.as_deref(),
-                cmd,
-                crate::adhoc::AdhocAuth::Resolve(auth.as_deref()),
-                access.as_deref(),
-            )?;
+            let deadline = std::time::Instant::now() + crate::adhoc::DISCOVERY_BUDGET;
+            let mut snapshot = crate::adhoc::blocking_discovery(deadline, move || {
+                crate::adhoc::adhoc_snapshot(
+                    &harness,
+                    model.as_deref(),
+                    effort.as_deref(),
+                    cmd,
+                    crate::adhoc::AdhocAuth::Resolve(auth.as_deref()),
+                    access.as_deref(),
+                )
+            })
+            .await??;
             crate::config::stamp_cloud_mcp_hostname(&mut snapshot, &self.inner.data_root);
             crate::config::capture_native_store_inputs(&mut snapshot, |name| {
                 std::env::var_os(name)
@@ -7517,7 +7521,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             |name| match name {
                 "CODEX_HOME" => Some("../original-home".into()),
                 "CODEX_SQLITE_HOME" => None,
-                _ => panic!("unexpected selector lookup: {name}"),
+                _ => None,
             },
             |name| match name {
                 "EPHEMERAL_TOKEN" => Some(credential.into()),
@@ -7527,8 +7531,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         .unwrap();
         assert_eq!(
             snapshot["pass_env_values"],
-            json!({"CODEX_HOME":"../original-home", "CODEX_SQLITE_HOME":null,
-                "CLAUDE_CONFIG_DIR":null, "XDG_CONFIG_HOME":null, "XDG_DATA_HOME":null})
+            json!({"CODEX_HOME":"../original-home", "CODEX_SQLITE_HOME":null})
         );
         assert!(!snapshot.to_string().contains(credential));
         let mut replacement = snapshot.clone();
@@ -7543,7 +7546,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         .unwrap();
         assert_eq!(
             replacement["pass_env_values"].as_object().unwrap().len(),
-            crate::config::NATIVE_STORE_SELECTORS.len()
+            crate::config::CODEX_STORE_SELECTORS.len()
         );
         assert!(!replacement.to_string().contains(credential));
         assert_ne!(replacement["pass_env_values"], snapshot["pass_env_values"]);

@@ -39,7 +39,7 @@ pub(crate) async fn ensure_hot_start(
             let mut store = store.lock().await;
             bootstrap_needed(data_root, &mut store, policy)?
         };
-        let muse_cmd = if needs {
+        let profiles = if needs {
             let (cmd, skipped, budget_exhausted) = crate::adhoc::select_muse_hot_start_cmd().await;
             for cmd in &skipped {
                 crate::logging::record(
@@ -57,12 +57,16 @@ pub(crate) async fn ensure_hot_start(
                     None,
                 );
             }
-            cmd
+            let deadline = std::time::Instant::now() + crate::adhoc::DISCOVERY_BUDGET;
+            crate::adhoc::blocking_discovery(deadline, move || {
+                installed_default_profiles(cmd, deadline)
+            })
+            .await?
         } else {
-            None
+            serde_json::Map::new()
         };
         let mut store = store.lock().await;
-        ensure_bootstrap_settings(data_root, &mut store, policy, muse_cmd)?;
+        ensure_bootstrap_settings(data_root, &mut store, policy, profiles)?;
     }
     Ok(())
 }
@@ -230,7 +234,7 @@ fn ensure_bootstrap_settings(
     data_root: &Path,
     store: &mut Store,
     policy: &SecretPolicy,
-    muse_cmd: Option<String>,
+    mut profiles: serde_json::Map<String, Value>,
 ) -> Result<()> {
     use crate::config::settings::{self, SettingsAuthor};
     use eliot_core::api::SettingsSection::{Profiles, Routing};
@@ -253,7 +257,6 @@ fn ensure_bootstrap_settings(
         .unwrap_or_default();
 
     if read.revision.is_none() && profile_names.is_empty() {
-        let mut profiles = installed_default_profiles(muse_cmd);
         profile_names = profiles.keys().cloned().collect();
         let default_profile = bootstrap_default_profile(&profile_names);
         if let Some(profile) = profiles.get_mut(&default_profile) {
@@ -343,7 +346,10 @@ fn bootstrap_worker_profiles(names: &[String], manager: &str) -> Vec<String> {
         .collect()
 }
 
-fn installed_default_profiles(muse_cmd: Option<String>) -> serde_json::Map<String, Value> {
+fn installed_default_profiles(
+    muse_cmd: Option<String>,
+    deadline: std::time::Instant,
+) -> serde_json::Map<String, Value> {
     let mut profiles = serde_json::Map::new();
     for harness in crate::adhoc::SUPPORTED_HARNESSES {
         if *harness == "muse" {
@@ -357,7 +363,7 @@ fn installed_default_profiles(muse_cmd: Option<String>) -> serde_json::Map<Strin
             profiles.insert("muse".to_owned(), Value::Object(profile));
             continue;
         }
-        let discovered = crate::adhoc::harness_installation(harness);
+        let discovered = crate::adhoc::harness_installation(harness, deadline);
         if discovered.get("installed").and_then(Value::as_bool) != Some(true) {
             continue;
         }
@@ -724,13 +730,34 @@ cmd = \"C:/Tools/MuseCode/muse-bin-1.4.0-R4161.1.exe\"
     }
 
     #[test]
+    fn settings_commit_uses_completed_inventory_without_probing() {
+        let root =
+            std::env::temp_dir().join(format!("eliot-bootstrap-inventory-{}", ulid::Ulid::new()));
+        let _temp = crate::test_support::TempDir::own(root.clone());
+        std::fs::create_dir(&root).unwrap();
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let policy = SecretPolicy::default();
+        assert!(bootstrap_needed(&root, &mut store, &policy).unwrap());
+        let profiles = json!({"codex":{"harness":"codex"}})
+            .as_object()
+            .unwrap()
+            .clone();
+        ensure_bootstrap_settings(&root, &mut store, &policy, profiles).unwrap();
+        assert!(!bootstrap_needed(&root, &mut store, &policy).unwrap());
+    }
+
+    #[test]
     fn fresh_bootstrap_grants_only_installed_worker_profiles_and_preserves_edits() {
         let root = std::env::temp_dir().join(format!("eliot-bootstrap-{}", ulid::Ulid::new()));
         let _temp_2 = crate::test_support::TempDir::own(root.clone());
         std::fs::create_dir_all(&root).unwrap();
         let mut store = Store::open(Path::new(":memory:")).unwrap();
         let policy = SecretPolicy::default();
-        ensure_bootstrap_settings(&root, &mut store, &policy, None).unwrap();
+        let profiles = installed_default_profiles(
+            None,
+            std::time::Instant::now() + crate::adhoc::DISCOVERY_BUDGET,
+        );
+        ensure_bootstrap_settings(&root, &mut store, &policy, profiles).unwrap();
         if root.join("config.toml").is_file() {
             let source = std::fs::read_to_string(root.join("config.toml")).unwrap();
             let config: toml::Value = toml::from_str(&source).unwrap();
@@ -760,7 +787,7 @@ cmd = \"C:/Tools/MuseCode/muse-bin-1.4.0-R4161.1.exe\"
             // Restart never adds a new grant or overwrites an Owner edit.
             let edited = "[profiles.only]\nharness='codex'\nchild_profiles=[]\n[routing]\ndefault=['only']\nworker=['only']\n";
             std::fs::write(root.join("config.toml"), edited).unwrap();
-            ensure_bootstrap_settings(&root, &mut store, &policy, None).unwrap();
+            ensure_bootstrap_settings(&root, &mut store, &policy, serde_json::Map::new()).unwrap();
             assert_eq!(
                 std::fs::read_to_string(root.join("config.toml")).unwrap(),
                 edited

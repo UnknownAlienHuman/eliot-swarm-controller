@@ -13,12 +13,27 @@
 //! readback; no substitution is ever made for an unavailable requested model.
 
 use eliot_core as core;
+use eliot_plugin::sync::LockExt;
 use serde_json::{Map, Value, json};
 use std::path::{Path, PathBuf};
 
 pub(crate) const ADHOC_PROFILE_PREFIX: &str = "adhoc-";
 pub(crate) const SUPPORTED_HARNESSES: &[&str] =
     &["codex", "claude", "muse", "opencode", "antigravity"];
+
+pub(crate) const DISCOVERY_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
+use std::time::{Duration, Instant};
+
+pub(crate) fn discovery_timeout() -> core::Error {
+    core::Error::new("timeout", "native discovery deadline elapsed")
+}
+
+fn discovery_remaining(deadline: Instant) -> core::Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(discovery_timeout)
+}
 
 pub(crate) fn adhoc_profile_name(harness: &str) -> String {
     format!("{ADHOC_PROFILE_PREFIX}{harness}")
@@ -647,11 +662,8 @@ pub(crate) fn is_script_wrapper(path: &str) -> bool {
         || lower.ends_with(".js")
 }
 
-/// Native-payload gate for discovery: on Unix an extensionless file counts
-/// as a native executable only after an ELF or Mach-O header check. A `#!`
-/// script or any other text payload is not a native executable, so wrapper
-/// execution is never introduced through discovery. Files with an extension
-/// keep the callers' wrapper rules; Windows behavior is unchanged.
+/// Unix discovery accepts ELF or Mach-O payloads, including resolved
+/// explicit commands. Windows keeps its native executable naming checks.
 pub(crate) fn is_native_executable(path: &std::path::Path) -> bool {
     if !path.is_file() {
         return false;
@@ -661,9 +673,6 @@ pub(crate) fn is_native_executable(path: &std::path::Path) -> bool {
     }
     if is_script_wrapper(&path.to_string_lossy()) {
         return false;
-    }
-    if path.extension().is_some() {
-        return true;
     }
     has_native_executable_magic(path)
 }
@@ -694,32 +703,53 @@ fn has_native_executable_magic(path: &std::path::Path) -> bool {
 /// pool, so slow native CLIs never stall async command/event service while
 /// cached catalogue data already exists.
 pub(crate) async fn discover_cmd_for_harness_async(harness: &str) -> core::Result<Option<String>> {
-    let harness = validate_adhoc_harness(harness)?;
-    tokio::task::spawn_blocking(move || discover_cmd_for_harness(&harness))
-        .await
-        .map_err(|_| core::Error::new("internal", "harness discovery was interrupted"))?
+    discover_cmd_until(harness, Instant::now() + DISCOVERY_BUDGET).await
 }
 
-/// Resolve the installed native executable for a harness. Codex resolves by
-/// name (`codex`) through the existing PATH lookup at spawn, so this returns
-/// `None`. Every other harness returns an absolute native path, or a
-/// deterministic `unsupported`/`profile_error` naming what was searched.
-/// Executable names follow the platform: `*.exe` on Windows, bare names
-/// plus the documented `/usr/local/bin` install paths on Linux.
-///
-/// Blocking: candidate enumeration launches bounded `--version` probes.
-/// Tokio handlers must use [`discover_cmd_for_harness_async`].
-pub(crate) fn discover_cmd_for_harness(harness: &str) -> core::Result<Option<String>> {
+pub(crate) async fn discover_cmd_until(
+    harness: &str,
+    deadline: Instant,
+) -> core::Result<Option<String>> {
     let harness = validate_adhoc_harness(harness)?;
-    match harness.as_str() {
+    blocking_discovery(deadline, move || {
+        discover_cmd_for_harness(&harness, deadline)
+    })
+    .await?
+}
+
+pub(crate) async fn blocking_discovery<T: Send + 'static>(
+    deadline: Instant,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> core::Result<T> {
+    discovery_remaining(deadline)?;
+    let mut task = tokio::task::spawn_blocking(move || {
+        discovery_remaining(deadline)?;
+        Ok(work())
+    });
+    match tokio::time::timeout_at(deadline.into(), &mut task).await {
+        Ok(result) => {
+            result.map_err(|_| core::Error::new("internal", "native discovery was interrupted"))?
+        }
+        Err(_) => {
+            task.abort();
+            Err(discovery_timeout())
+        }
+    }
+}
+
+/// Resolve the installed executable. Codex's default launch keeps its native
+/// PATH resolution; readers pin the resolved executable before probing.
+fn discover_cmd_for_harness(harness: &str, deadline: Instant) -> core::Result<Option<String>> {
+    discovery_remaining(deadline)?;
+    match harness {
         "codex" => Ok(None),
-        "claude" => discover_claude_cmd().map(Some),
+        "claude" => claude_cmd_from_candidates(&discover_claude_candidates(deadline)).map(Some),
         "muse" => discover_muse_cmd(Path::new(r"C:\Tools\MuseCode")).map(Some),
         "opencode" => discover_opencode_cmd().map(Some),
         "antigravity" => discover_antigravity_cmd().map(Some),
         _ => Err(core::Error::new(
             "unsupported",
-            format!("unsupported launch harness {harness}"),
+            "unsupported native discovery harness",
         )),
     }
 }
@@ -853,8 +883,10 @@ fn parse_cli_version(text: &str) -> Option<(u64, u64, u64)> {
 /// Every discovered `claude.exe` install, newest first: `claude.exe` hits on
 /// `PATH` (stable order), the standard user locations, then the desktop-app
 /// bundles. Each entry carries its own bounded `--version`.
-pub(crate) fn discover_claude_candidates() -> Vec<core::api::HarnessCandidate> {
-    probe_candidate_paths(claude_candidate_paths())
+pub(crate) fn discover_claude_candidates(deadline: Instant) -> Vec<core::api::HarnessCandidate> {
+    probe_candidate_paths_with(claude_candidate_paths(), |cmd| {
+        probe_native_version(cmd, false, deadline).ok().flatten()
+    })
 }
 
 /// Filesystem hits in priority order, before versioning: `claude` hits on
@@ -931,10 +963,6 @@ fn claude_candidate_paths() -> Vec<PathBuf> {
 /// without a version so inventory stays complete while launches stay
 /// bounded. The stable sort keeps versioned newest-first; unversioned paths
 /// keep discovery order at the end.
-fn probe_candidate_paths(paths: Vec<PathBuf>) -> Vec<core::api::HarnessCandidate> {
-    probe_candidate_paths_with(paths, native_version_string)
-}
-
 fn probe_candidate_paths_with(
     paths: Vec<PathBuf>,
     mut probe: impl FnMut(&str) -> Option<String>,
@@ -1055,10 +1083,6 @@ fn claude_search_locations() -> Vec<String> {
     }
     searched.dedup();
     searched
-}
-
-fn discover_claude_cmd() -> core::Result<String> {
-    claude_cmd_from_candidates(&discover_claude_candidates())
 }
 
 fn claude_cmd_from_candidates(candidates: &[core::api::HarnessCandidate]) -> core::Result<String> {
@@ -1581,17 +1605,130 @@ pub(crate) fn antigravity_ide_unsupported(cmd: &str) -> core::Error {
     )
 }
 
-/// Establish Antigravity CLI protocol capability from the bounded `--version`
-/// identity probe: the output must parse as a CLI version triple. A PATH
-/// file named `agy` without that capability is refused here, before any
-/// discovery probe uses it for `models`, quota or launch.
-pub(crate) fn antigravity_cli_version(version: Option<String>) -> core::Result<String> {
-    version.filter(|text| parse_cli_version(text).is_some()).ok_or_else(|| {
-        core::Error::new(
-            "unsupported",
-            "antigravity `agy` on PATH does not establish native CLI protocol capability (`--version` is missing or unparseable); install the `agy` CLI and put it on PATH",
-        )
+/// Resolve and check the exact executable before any probe. An IDE symlink
+/// cannot pass the CLI name check on its resolved target.
+fn resolve_native_executable(cmd: &str, antigravity: bool) -> core::Result<String> {
+    if antigravity && !antigravity_cli_identity(cmd) {
+        return Err(antigravity_ide_unsupported(cmd));
+    }
+    let input = Path::new(cmd);
+    let path = if input.is_absolute() {
+        input.to_path_buf()
+    } else if input.components().count() == 1 {
+        let name = if cfg!(windows) && input.extension().is_none() {
+            native_exe_name(cmd)
+        } else {
+            cmd.to_owned()
+        };
+        find_on_path(&name)
+            .filter(|path| path.is_absolute())
+            .ok_or_else(native_cmd_unavailable)?
+    } else {
+        return Err(native_cmd_unavailable());
+    };
+    let canonical = std::fs::canonicalize(&path).map_err(|_| native_cmd_unavailable())?;
+    if antigravity && !antigravity_cli_identity(&canonical.to_string_lossy()) {
+        return Err(antigravity_ide_unsupported(cmd));
+    }
+    if !is_native_executable(&canonical) {
+        return Err(native_cmd_unavailable());
+    }
+    // Keep ordinary platform path spelling; Windows native CLIs may reject
+    // extended-length paths. The canonical target was checked above.
+    let resolved = canonical.to_str().ok_or_else(native_cmd_unavailable)?;
+    Ok(if cfg!(windows) {
+        if let Some(unc) = resolved.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{unc}")
+        } else {
+            resolved
+                .strip_prefix(r"\\?\")
+                .unwrap_or(resolved)
+                .to_owned()
+        }
+    } else {
+        resolved.to_owned()
     })
+}
+
+fn native_cmd_unavailable() -> core::Error {
+    core::Error::new(
+        "unsupported",
+        "command does not resolve to an installed native executable",
+    )
+}
+
+fn antigravity_capability_error() -> core::Error {
+    core::Error::new(
+        "unsupported",
+        "executable did not establish Antigravity CLI ACP capability",
+    )
+}
+
+fn agy_help_has_acp(help: &[u8]) -> bool {
+    std::str::from_utf8(help).is_ok_and(|help| {
+        help.contains("--stdio")
+            && help.contains("--dangerously-skip-permissions")
+            && help.lines().any(|line| {
+                let mut words = line.split_whitespace();
+                words.next() == Some("Usage:")
+                    && matches!(words.next(), Some("agy" | "agy.exe"))
+                    && words.next() == Some("acp")
+            })
+    })
+}
+
+/// The installed CLI carries its upstream Go module name. Screen the file
+/// before execution so an IDE copied to a file named agy is also refused.
+fn has_agy_cli_module(program: &str, deadline: Instant) -> bool {
+    use std::io::Read;
+    const MODULE: &[u8] = b"google-antigravity/antigravity-cli";
+    let Ok(mut file) = std::fs::File::open(program) else {
+        return false;
+    };
+    if !file
+        .metadata()
+        .is_ok_and(|metadata| metadata.len() <= 512 * 1024 * 1024)
+    {
+        return false;
+    }
+    let mut bytes = vec![0; 64 * 1024];
+    let mut carry = 0;
+    while Instant::now() < deadline {
+        let Ok(read) = file.read(&mut bytes[carry..]) else {
+            return false;
+        };
+        if read == 0 {
+            return false;
+        }
+        let end = carry + read;
+        if bytes[..end]
+            .windows(MODULE.len())
+            .any(|window| window == MODULE)
+        {
+            return true;
+        }
+        carry = (MODULE.len() - 1).min(end);
+        bytes.copy_within(end - carry..end, 0);
+    }
+    false
+}
+
+pub(crate) async fn reader_executable(
+    cmd: &str,
+    harness: &str,
+    deadline: Instant,
+) -> core::Result<(String, Option<String>)> {
+    let cmd = cmd.to_owned();
+    let agy = harness == "antigravity";
+    blocking_discovery(deadline, move || {
+        let cmd = resolve_native_executable(&cmd, agy)?;
+        let version = probe_native_version(&cmd, agy, deadline)?;
+        if agy && version.is_none() {
+            return Err(antigravity_capability_error());
+        }
+        Ok((cmd, version))
+    })
+    .await?
 }
 
 /// Error for an `agy`-less install. The IDE path, when seen, is named for
@@ -1618,98 +1755,31 @@ fn antigravity_missing_cli(searched: &[String], ide: Option<&str>) -> core::Erro
 /// discovery, instead of stalling the handler.
 pub(crate) async fn harness_installation_async(harness: &str) -> Value {
     let owned = harness.to_owned();
-    let harness = harness.to_owned();
-    tokio::task::spawn_blocking(move || harness_installation(&owned))
+    let deadline = Instant::now() + DISCOVERY_BUDGET;
+    blocking_discovery(deadline, move || harness_installation(&owned, deadline))
         .await
-        .unwrap_or_else(|_| {
-            json!({
-                "harness": harness,
-                "installed": false,
-                "cmd": Value::Null,
-                "version": Value::Null,
-                "error": "harness inventory was interrupted",
-                "code": "internal",
-            })
-        })
+        .unwrap_or_else(|error| installation_error(harness, error))
 }
 
-/// Read-only harness installation facts. No model turn and no inference:
-/// only filesystem presence plus a bounded `--version` read.
-///
-/// Blocking: filesystem scans plus bounded `--version` probes. Tokio
-/// handlers must use [`harness_installation_async`].
-pub(crate) fn harness_installation(harness: &str) -> Value {
-    match discover_cmd_for_harness(harness) {
-        Ok(Some(cmd)) => {
-            // CLI identity before any discovery probe: an IDE-named binary
-            // is refused without launching it; a PATH `agy` without CLI
-            // protocol capability is refused before any discovery use.
-            if harness == "antigravity" {
-                if !antigravity_cli_identity(&cmd) {
-                    let error = antigravity_ide_unsupported(&cmd);
-                    return json!({
-                        "harness": harness,
-                        "installed": false,
-                        "cmd": Value::Null,
-                        "version": Value::Null,
-                        "error": error.message,
-                        "code": error.code,
-                    });
-                }
-                match antigravity_cli_version(native_version_string(&cmd)) {
-                    Ok(version) => {
-                        return json!({
-                            "harness": harness,
-                            "installed": true,
-                            "cmd": cmd,
-                            "version": Value::String(version),
-                        });
-                    }
-                    Err(error) => {
-                        return json!({
-                            "harness": harness,
-                            "installed": false,
-                            "cmd": Value::Null,
-                            "version": Value::Null,
-                            "error": error.message,
-                            "code": error.code,
-                        });
-                    }
-                }
-            }
-            let version = native_version(&cmd);
-            json!({
-                "harness": harness,
-                "installed": true,
-                "cmd": cmd,
-                "version": version,
-            })
+fn installation_error(harness: &str, error: core::Error) -> Value {
+    json!({"harness": harness, "installed": false, "cmd": null, "version": null,
+        "error": error.message, "code": error.code})
+}
+
+/// Blocking inventory. A shared deadline limits each next native probe.
+pub(crate) fn harness_installation(harness: &str, deadline: Instant) -> Value {
+    let read = || -> core::Result<Value> {
+        let discovered = discover_cmd_for_harness(harness, deadline)?;
+        let agy = harness == "antigravity";
+        let cmd = resolve_native_executable(discovered.as_deref().unwrap_or("codex"), agy)?;
+        let version = probe_native_version(&cmd, agy, deadline)?;
+        if agy && version.is_none() {
+            return Err(antigravity_capability_error());
         }
-        Ok(None) => {
-            // Codex resolves `codex` by name at spawn; report PATH presence.
-            // The probe is keyed by the resolved binary identity, the same
-            // absolute path `harness.models` resolves and probes, so
-            // inventory and model reads share one memoized probe per binary.
-            let resolved = find_on_path("codex.exe").or_else(|| find_on_path("codex"));
-            let version = resolved
-                .as_ref()
-                .and_then(|path| native_version_string(&path.to_string_lossy()));
-            json!({
-                "harness": harness,
-                "installed": resolved.is_some(),
-                "cmd": Value::Null,
-                "version": version.map_or(Value::Null, Value::String),
-            })
-        }
-        Err(error) => json!({
-            "harness": harness,
-            "installed": false,
-            "cmd": Value::Null,
-            "version": Value::Null,
-            "error": error.message,
-            "code": error.code,
-        }),
-    }
+        let cmd = if agy { Some(cmd) } else { discovered };
+        Ok(json!({"harness": harness, "installed": true, "cmd": cmd, "version": version}))
+    };
+    read().unwrap_or_else(|error| installation_error(harness, error))
 }
 
 /// Bound on one `<exe> --version` probe: a hung native executable must not
@@ -1730,166 +1800,158 @@ const VERSION_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30
 /// Bound on memoized executable identities.
 const VERSION_CACHE_MAX: usize = 64;
 
-type VersionCache = std::collections::HashMap<String, (Option<String>, std::time::Instant)>;
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct VersionKey {
+    program: String,
+    modified: Option<std::time::SystemTime>,
+    size: u64,
+    agy: bool,
+}
 
-static VERSION_CACHE: std::sync::LazyLock<std::sync::Mutex<VersionCache>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(VersionCache::new()));
+type VersionResult = core::Result<Option<String>>;
+type VersionCache = std::collections::HashMap<VersionKey, (Option<String>, Instant)>;
 
-/// One in-flight `<exe> --version` probe shared by concurrent cold misses.
-/// The leader runs the probe; followers wait on the condition variable and
-/// share its result instead of launching the same binary again. Keyed by
-/// binary identity (the resolved executable path), so Codex inventory and
-/// model reads share one probe for the same binary.
+#[derive(Default)]
+struct VersionProbes {
+    cache: VersionCache,
+    inflight: std::collections::HashMap<VersionKey, std::sync::Arc<InflightVersionProbe>>,
+}
+
+static VERSION_PROBES: std::sync::LazyLock<std::sync::Mutex<VersionProbes>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(VersionProbes::default()));
+
+#[derive(Default)]
 struct InflightVersionProbe {
-    state: std::sync::Mutex<Option<Option<String>>>,
+    state: std::sync::Mutex<Option<VersionResult>>,
     ready: std::sync::Condvar,
 }
 
-type InflightVersionProbes =
-    std::collections::HashMap<String, std::sync::Arc<InflightVersionProbe>>;
-
-static VERSION_INFLIGHT: std::sync::LazyLock<std::sync::Mutex<InflightVersionProbes>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(InflightVersionProbes::new()));
-
-/// Bound on a follower wait: the leader's probe is itself bounded by
-/// [`VERSION_PROBE_TIMEOUT`], so this only covers scheduling slack. A
-/// follower that times out probes alone rather than blocking forever.
-const VERSION_INFLIGHT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// Bounded `<exe> --version` first line, or `None` when the probe fails.
-/// The existing scoped process runner bounds output and owns the whole family.
-/// Results are memoized per executable (see `VERSION_CACHE_TTL`); concurrent
-/// cold misses for one binary share a single in-flight probe instead of
-/// launching the same CLI once each.
-pub(crate) fn native_version_string(program: &str) -> Option<String> {
-    if let Some(hit) = version_cache_get(program) {
-        return hit;
-    }
-    let probe = match version_inflight_join(program) {
-        VersionProbeRole::Leader(probe) => probe,
-        VersionProbeRole::Follower(probe) => return version_inflight_wait(program, &probe),
-    };
-    let version = native_version_string_uncached(program);
-    version_cache_insert(program, version.clone());
-    version_inflight_finish(program, &probe, version.clone());
-    version
-}
-
-fn version_cache_get(program: &str) -> Option<Option<String>> {
-    if let Ok(cache) = VERSION_CACHE.lock()
-        && let Some((version, at)) = cache.get(program)
-        && at.elapsed() < VERSION_CACHE_TTL
-    {
-        return Some(version.clone());
-    }
-    None
-}
-
-fn version_cache_insert(program: &str, version: Option<String>) {
-    if let Ok(mut cache) = VERSION_CACHE.lock() {
-        if cache.len() >= VERSION_CACHE_MAX {
-            cache.retain(|_, (_, at)| at.elapsed() < VERSION_CACHE_TTL);
-            if cache.len() >= VERSION_CACHE_MAX {
-                cache.clear();
-            }
-        }
-        cache.insert(program.to_owned(), (version, std::time::Instant::now()));
-    }
-}
-
 enum VersionProbeRole {
+    Cached(Option<String>),
     Leader(std::sync::Arc<InflightVersionProbe>),
     Follower(std::sync::Arc<InflightVersionProbe>),
 }
 
-fn version_inflight_join(program: &str) -> VersionProbeRole {
-    let mut inflight = match VERSION_INFLIGHT.lock() {
-        Ok(inflight) => inflight,
-        Err(_) => {
-            // A poisoned singleflight map must not block discovery: probe
-            // alone without sharing.
-            return VersionProbeRole::Leader(std::sync::Arc::new(InflightVersionProbe {
-                state: std::sync::Mutex::new(None),
-                ready: std::sync::Condvar::new(),
-            }));
-        }
+fn probe_native_version(program: &str, agy: bool, deadline: Instant) -> VersionResult {
+    discovery_remaining(deadline)?;
+    let path = Path::new(program);
+    if !path.is_absolute() || !is_native_executable(path) {
+        return Err(native_cmd_unavailable());
+    }
+    let metadata = path.metadata().map_err(|_| native_cmd_unavailable())?;
+    let key = VersionKey {
+        program: program.to_owned(),
+        modified: metadata.modified().ok(),
+        size: metadata.len(),
+        agy,
     };
-    if let Some(probe) = inflight.get(program) {
+    let leader = match version_inflight_join(&key) {
+        VersionProbeRole::Cached(result) => return Ok(result),
+        VersionProbeRole::Leader(probe) => probe,
+        VersionProbeRole::Follower(probe) => return version_inflight_wait(&probe, deadline),
+    };
+    let result = probe_version_uncached(program, agy, deadline);
+    version_inflight_finish(key, &leader, result.clone());
+    result
+}
+
+fn version_inflight_join(key: &VersionKey) -> VersionProbeRole {
+    let mut probes = VERSION_PROBES.lock_recover();
+    if let Some((version, at)) = probes.cache.get(key)
+        && at.elapsed() < VERSION_CACHE_TTL
+    {
+        return VersionProbeRole::Cached(version.clone());
+    }
+    if let Some(probe) = probes.inflight.get(key) {
         return VersionProbeRole::Follower(probe.clone());
     }
-    let probe = std::sync::Arc::new(InflightVersionProbe {
-        state: std::sync::Mutex::new(None),
-        ready: std::sync::Condvar::new(),
-    });
-    inflight.insert(program.to_owned(), probe.clone());
+    let probe = std::sync::Arc::new(InflightVersionProbe::default());
+    probes.inflight.insert(key.clone(), probe.clone());
     VersionProbeRole::Leader(probe)
 }
 
-fn version_inflight_wait(
-    program: &str,
-    probe: &std::sync::Arc<InflightVersionProbe>,
-) -> Option<String> {
-    let mut state = match probe.state.lock() {
-        Ok(state) => state,
-        Err(_) => return None,
-    };
-    while state.is_none() {
-        let (next, timeout) = match probe.ready.wait_timeout(state, VERSION_INFLIGHT_WAIT) {
-            Ok(result) => result,
-            Err(_) => return None,
-        };
+fn version_inflight_wait(probe: &InflightVersionProbe, deadline: Instant) -> VersionResult {
+    let mut state = probe.state.lock_recover();
+    loop {
+        let remaining = discovery_remaining(deadline)?;
+        if let Some(result) = &*state {
+            return result.clone();
+        }
+        let (next, _) = probe
+            .ready
+            .wait_timeout(state, remaining)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state = next;
-        if timeout.timed_out() {
-            // The leader is overdue (its own probe is bounded): probe alone
-            // rather than block the caller indefinitely.
-            drop(state);
-            let version = native_version_string_uncached(program);
-            version_cache_insert(program, version.clone());
-            return version;
+    }
+}
+
+fn version_inflight_finish(key: VersionKey, probe: &InflightVersionProbe, result: VersionResult) {
+    let mut probes = VERSION_PROBES.lock_recover();
+    probes.inflight.remove(&key);
+    if let Ok(version) = &result {
+        if probes.cache.len() >= VERSION_CACHE_MAX {
+            probes
+                .cache
+                .retain(|_, (_, at)| at.elapsed() < VERSION_CACHE_TTL);
+            if probes.cache.len() >= VERSION_CACHE_MAX {
+                probes.cache.clear();
+            }
+        }
+        probes.cache.insert(key, (version.clone(), Instant::now()));
+    }
+    *probe.state.lock_recover() = Some(result);
+    probe.ready.notify_all();
+}
+
+fn probe_version_uncached(program: &str, agy: bool, deadline: Instant) -> VersionResult {
+    if agy {
+        let has_module = has_agy_cli_module(program, deadline);
+        discovery_remaining(deadline)?;
+        if !has_module {
+            return Ok(None);
+        }
+        let help = native_capture(
+            program,
+            &["acp", "--help"],
+            deadline.min(Instant::now() + VERSION_PROBE_TIMEOUT),
+        );
+        discovery_remaining(deadline)?;
+        if !help.is_some_and(|capture| {
+            agy_help_has_acp(&capture.stdout) || agy_help_has_acp(capture.stderr.text.as_bytes())
+        }) {
+            return Ok(None);
         }
     }
-    state.clone().flatten()
-}
-
-fn version_inflight_finish(
-    program: &str,
-    probe: &std::sync::Arc<InflightVersionProbe>,
-    version: Option<String>,
-) {
-    if let Ok(mut state) = probe.state.lock() {
-        *state = Some(version);
-    }
-    probe.ready.notify_all();
-    if let Ok(mut inflight) = VERSION_INFLIGHT.lock() {
-        inflight.remove(program);
-    }
-}
-
-fn native_version_string_uncached(program: &str) -> Option<String> {
-    let bytes = native_read(program, &["--version"], VERSION_PROBE_TIMEOUT)?;
-    let stdout = std::str::from_utf8(&bytes).ok()?;
-    let text = stdout.lines().next()?.trim();
-    (!text.is_empty() && text.len() <= 256).then(|| text.to_owned())
-}
-
-/// Async `<exe> --version` for Tokio handlers: the blocking probe (a new
-/// thread plus a bounded process) runs on the blocking pool, so slow native
-/// CLIs never stall async command/event service while cached catalogue data
-/// already exists.
-pub(crate) async fn native_version_string_async(program: &str) -> Option<String> {
-    let program = program.to_owned();
-    tokio::task::spawn_blocking(move || native_version_string(&program))
-        .await
-        .ok()
-        .flatten()
+    let bytes = native_read(
+        program,
+        &["--version"],
+        deadline.min(Instant::now() + VERSION_PROBE_TIMEOUT),
+    );
+    discovery_remaining(deadline)?;
+    Ok(bytes.as_deref().and_then(|bytes| {
+        let text = std::str::from_utf8(bytes).ok()?.lines().next()?.trim();
+        (!text.is_empty() && text.len() <= 256 && (!agy || parse_cli_version(text).is_some()))
+            .then(|| text.to_owned())
+    }))
 }
 
 /// Bridge synchronous installation/profile resolution to the same bounded
 /// process owner used by inference and actions. A joined thread permits calls
 /// both inside a Tokio runtime and during synchronous configuration loading.
 /// No process handle, pipe reader or runtime survives this call.
-fn native_read(program: &str, args: &[&str], budget: std::time::Duration) -> Option<Vec<u8>> {
+fn native_read(program: &str, args: &[&str], deadline: Instant) -> Option<Vec<u8>> {
+    native_capture(program, args, deadline).map(|capture| capture.stdout)
+}
+
+fn native_capture(
+    program: &str,
+    args: &[&str],
+    deadline: Instant,
+) -> Option<crate::scripts::process::ProcessCapture> {
     use crate::scripts::process::{ProcessOutcome, run_owned_process};
+    if !Path::new(program).is_absolute() || !is_native_executable(Path::new(program)) {
+        return None;
+    }
     use std::sync::Arc;
 
     std::thread::scope(|scope| {
@@ -1901,8 +1963,12 @@ fn native_read(program: &str, args: &[&str], budget: std::time::Duration) -> Opt
                     .build()
                     .ok()?;
                 runtime.block_on(async {
+                    let budget = discovery_remaining(deadline).ok()?;
                     let mut command = tokio::process::Command::new(program);
-                    command.args(args);
+                    command
+                        .args(args)
+                        .env_clear()
+                        .envs(crate::plugin_host::minimal_plugin_environment());
                     let (_cancel, cancellation) = tokio::sync::watch::channel(false);
                     match run_owned_process(
                         command,
@@ -1913,7 +1979,7 @@ fn native_read(program: &str, args: &[&str], budget: std::time::Duration) -> Opt
                     )
                     .await
                     {
-                        ProcessOutcome::Completed(capture) => Some(capture.stdout),
+                        ProcessOutcome::Completed(capture) => Some(capture),
                         _ => None,
                     }
                 })
@@ -1922,10 +1988,6 @@ fn native_read(program: &str, args: &[&str], budget: std::time::Duration) -> Opt
             .join()
             .ok()?
     })
-}
-
-fn native_version(program: &str) -> Value {
-    native_version_string(program).map_or(Value::Null, Value::String)
 }
 
 /// Bound on one `<exe> auth list` read: a hung native executable must not
@@ -1945,7 +2007,7 @@ fn opencode_auth_ids(program: &str) -> Option<Vec<String>> {
     let stdout = native_read(
         program,
         &["auth", "list", "--format", "json", "--standalone"],
-        AUTH_LIST_TIMEOUT,
+        Instant::now() + AUTH_LIST_TIMEOUT,
     )?;
     if stdout.len() > MAX_AUTH_LIST_BYTES {
         return None;
@@ -2682,34 +2744,73 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    #[cfg(unix)]
     #[test]
-    fn concurrent_cold_misses_share_one_in_flight_probe() {
-        let program = format!("eliot-singleflight-{}", ulid::Ulid::new());
-        // The first joiner leads; joiners while it runs follow the same
-        // probe instead of launching the binary again.
-        let VersionProbeRole::Leader(leader) = version_inflight_join(&program) else {
-            panic!("first joiner must lead");
+    fn explicit_unix_paths_require_native_payload_before_discovery() {
+        let root = std::env::temp_dir().join(format!("eliot-native-payload-{}", ulid::Ulid::new()));
+        let _temp = crate::test_support::TempDir::own(root.clone());
+        std::fs::create_dir(&root).unwrap();
+        for name in ["muse", "muse.sh"] {
+            let path = root.join(name);
+            std::fs::write(&path, b"#!/bin/sh\nexit 0\n").unwrap();
+            assert!(resolve_native_executable(path.to_str().unwrap(), false).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn launch_discovery_runs_off_the_async_worker() {
+        let caller = std::thread::current().id();
+        let worker = blocking_discovery(Instant::now() + VERSION_PROBE_TIMEOUT, || {
+            std::thread::current().id()
+        })
+        .await
+        .unwrap();
+        assert_ne!(caller, worker);
+    }
+
+    #[test]
+    fn filename_and_semver_cannot_establish_agy_capability() {
+        let root = std::env::temp_dir().join(format!("eliot-agy-payload-{}", ulid::Ulid::new()));
+        let _temp = crate::test_support::TempDir::own(root.clone());
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join(native_exe_name("agy"));
+        std::fs::write(&path, b"\x7fELF\n1.2.3").unwrap();
+        assert!(antigravity_cli_identity(path.to_str().unwrap()));
+        assert!(!has_agy_cli_module(
+            path.to_str().unwrap(),
+            Instant::now() + VERSION_PROBE_TIMEOUT
+        ));
+        assert!(!agy_help_has_acp(b"1.2.3"));
+    }
+
+    #[test]
+    fn concurrent_cold_misses_share_one_probe_and_overdue_followers_time_out() {
+        let key = VersionKey {
+            program: ulid::Ulid::new().to_string(),
+            modified: None,
+            size: 0,
+            agy: false,
         };
-        let VersionProbeRole::Follower(follower) = version_inflight_join(&program) else {
-            panic!("second joiner must follow");
+        let VersionProbeRole::Leader(leader) = version_inflight_join(&key) else {
+            panic!("expected leader")
         };
-        let VersionProbeRole::Follower(third) = version_inflight_join(&program) else {
-            panic!("third joiner must follow");
+        let VersionProbeRole::Follower(follower) = version_inflight_join(&key) else {
+            panic!("expected follower")
         };
-        let waiter_program = program.clone();
-        let waiter = std::thread::spawn(move || version_inflight_wait(&waiter_program, &follower));
-        version_inflight_finish(&program, &leader, Some("9.9.9 (shared)".to_owned()));
         assert_eq!(
-            waiter.join().expect("waiter joins"),
-            Some("9.9.9 (shared)".to_owned())
+            version_inflight_wait(&follower, Instant::now())
+                .unwrap_err()
+                .code,
+            "timeout"
         );
-        drop(third);
-        // The finished probe leaves the map: the next cold joiner leads
-        // again instead of waiting on a stale entry.
-        let VersionProbeRole::Leader(again) = version_inflight_join(&program) else {
-            panic!("post-finish joiner must lead");
-        };
-        version_inflight_finish(&program, &again, None);
+        assert!(matches!(
+            version_inflight_join(&key),
+            VersionProbeRole::Follower(_)
+        ));
+        version_inflight_finish(key.clone(), &leader, Ok(Some("9.9.9".to_owned())));
+        assert!(
+            matches!(version_inflight_join(&key), VersionProbeRole::Cached(Some(version)) if version == "9.9.9")
+        );
     }
 
     #[test]
@@ -2730,22 +2831,13 @@ mod tests {
             assert_eq!(error.code, "unsupported");
             assert!(error.message.contains("never launched"));
         }
-        // Protocol capability comes from the bounded `--version` output: a
-        // PATH `agy` without a CLI triple is refused before any use.
-        assert_eq!(
-            antigravity_cli_version(Some("1.5.9".to_owned())).expect("agy triple"),
-            "1.5.9"
-        );
-        assert_eq!(
-            antigravity_cli_version(None).unwrap_err().code,
-            "unsupported"
-        );
-        assert_eq!(
-            antigravity_cli_version(Some("not a version".to_owned()))
-                .unwrap_err()
-                .code,
-            "unsupported"
-        );
+        assert!(!agy_help_has_acp(b"1.5.9"));
+        assert!(agy_help_has_acp(
+            b"Usage: agy acp [flags]\n --stdio\n --dangerously-skip-permissions"
+        ));
+        assert!(agy_help_has_acp(
+            b"Usage: agy.exe acp [flags]\n --stdio\n --dangerously-skip-permissions"
+        ));
     }
 
     #[cfg(unix)]

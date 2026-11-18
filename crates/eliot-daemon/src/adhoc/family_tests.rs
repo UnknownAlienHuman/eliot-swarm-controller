@@ -1,6 +1,10 @@
 use super::{native_read, probe_muse_command};
 use crate::test_support::windows_family::{Family, Owner};
-use std::{path::PathBuf, process::Stdio, time::Duration};
+use std::{
+    path::PathBuf,
+    process::Stdio,
+    time::{Duration, Instant},
+};
 
 fn start_read(family: &Family) -> tokio::task::JoinHandle<Option<Vec<u8>>> {
     let command = family.command("read");
@@ -16,7 +20,7 @@ fn start_read(family: &Family) -> tokio::task::JoinHandle<Option<Vec<u8>>> {
         .collect();
     tokio::task::spawn_blocking(move || {
         let args: Vec<_> = args.iter().map(String::as_str).collect();
-        native_read(&program, &args, Duration::from_secs(30))
+        native_read(&program, &args, Instant::now() + Duration::from_secs(30))
     })
 }
 

@@ -6,9 +6,8 @@
 //! errors. Project and automation helpers share this module's parser and
 //! validation path; profile freezing and resolution stay here.
 //!
-//! Snapshots retain admitted environment names. Only nonsecret native-store
-//! selector inputs are captured before admission; other environment values
-//! remain execution-time references.
+//! Snapshots retain admitted environment names. Codex retains its native-store execution inputs. Private
+//! route selectors are bound by digest and resolved only in the process environment.
 use eliot_core as core;
 use eliot_plugin::session::split_provider_model;
 use serde::Deserialize;
@@ -48,31 +47,123 @@ const PERMISSION_READ_ONLY: &str = "read-only";
 const PERMISSION_WORKSPACE_WRITE: &str = "workspace-write";
 const PERMISSION_DANGER_FULL_ACCESS: &str = "danger-full-access";
 
-/// Frozen native store/configuration selectors: the effective nonsecret
-/// environment inputs that select the native account/configuration for
-/// quota and model reads. Codex homes select the Codex state roots, Claude
-/// selects its configuration root through `CLAUDE_CONFIG_DIR`, and OpenCode
-/// isolates its config and data roots through `XDG_CONFIG_HOME` /
-/// `XDG_DATA_HOME`. Their frozen values enter the cache identity, so adding
-/// or removing one invalidates the entry. Values are local paths: the
-/// snapshot policy rejects resolved secrets, and only names and nonsecret
-/// paths ever enter keys.
-pub(crate) const NATIVE_STORE_SELECTORS: &[&str] = &[
-    "CODEX_HOME",
-    "CODEX_SQLITE_HOME",
+/// Codex dispatch already retains these execution inputs verbatim. Other
+/// store and provider selectors are verified against an opaque route identity.
+pub(crate) const CODEX_STORE_SELECTORS: &[&str] = &["CODEX_HOME", "CODEX_SQLITE_HOME"];
+const PRIVATE_STORE_SELECTORS: &[&str] = &[
     "CLAUDE_CONFIG_DIR",
     "XDG_CONFIG_HOME",
     "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_CACHE_HOME",
+    "OPENCODE_CONFIG",
+    "OPENCODE_CONFIG_DIR",
+    "APPDATA",
 ];
+const PRIVATE_PROVIDER_SELECTORS: &[&str] = &[
+    "ANTHROPIC_BASE_URL",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_MANTLE",
+];
+const CLAUDE_ROUTE_CREDENTIALS: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+];
+pub(crate) const ROUTE_HOME_SELECTORS: &[&str] = if cfg!(windows) {
+    &["HOME", "USERPROFILE", "LOCALAPPDATA"]
+} else {
+    &["HOME"]
+};
+
+fn env_name_matches(name: &str, selector: &str) -> bool {
+    if cfg!(windows) {
+        name.eq_ignore_ascii_case(selector)
+    } else {
+        name == selector
+    }
+}
 
 pub(crate) fn native_store_selector(name: &str) -> Option<&'static str> {
-    NATIVE_STORE_SELECTORS.iter().copied().find(|selector| {
-        if cfg!(windows) {
-            name.eq_ignore_ascii_case(selector)
-        } else {
-            name == *selector
+    CODEX_STORE_SELECTORS
+        .iter()
+        .chain(PRIVATE_STORE_SELECTORS)
+        .copied()
+        .find(|selector| env_name_matches(name, selector))
+}
+
+pub(crate) fn private_route_selector(name: &str) -> bool {
+    native_store_selector(name).is_some()
+        || PRIVATE_PROVIDER_SELECTORS
+            .iter()
+            .any(|selector| env_name_matches(name, selector))
+}
+
+fn admitted_selector<'a>(names: &'a [Value], selector: &str) -> Option<&'a str> {
+    names
+        .iter()
+        .filter_map(Value::as_str)
+        .find(|name| env_name_matches(name, selector))
+}
+
+/// The identity binds admitted selector states and the default home inputs.
+/// The serialized inputs exist only during hashing. Credential values never
+/// enter the digest; presence binds the provider mode.
+pub(crate) fn native_route_identity(
+    profile: &Value,
+    mut lookup: impl FnMut(&str) -> core::Result<Option<String>>,
+) -> core::Result<String> {
+    let names = profile
+        .get("pass_env")
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+    let mut selectors = serde_json::Map::new();
+    for &selector in ROUTE_HOME_SELECTORS
+        .iter()
+        .chain(CODEX_STORE_SELECTORS)
+        .chain(PRIVATE_STORE_SELECTORS)
+        .chain(PRIVATE_PROVIDER_SELECTORS)
+        .chain(CLAUDE_ROUTE_CREDENTIALS)
+    {
+        let admitted = admitted_selector(names, selector);
+        if let Some(name) =
+            admitted.or_else(|| ROUTE_HOME_SELECTORS.contains(&selector).then_some(selector))
+        {
+            let value = lookup(name)?;
+            let value = if CLAUDE_ROUTE_CREDENTIALS.contains(&selector) {
+                value.map(|value| Value::Bool(!value.is_empty()))
+            } else {
+                value.map(Value::String)
+            };
+            selectors.insert(selector.to_owned(), value.unwrap_or(Value::Null));
         }
-    })
+    }
+    let digest = core::canonical_json_sha256(&Value::Object(selectors))
+        .map_err(|_| core::Error::new("internal", "native route identity could not be encoded"))?;
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+pub(crate) fn metadata_route_scope_known(
+    profile: &Value,
+    environment: &serde_json::Map<String, Value>,
+) -> bool {
+    let harness = profile["harness"].as_str().unwrap_or_default();
+    environment
+        .iter()
+        .filter_map(|(name, value)| value.as_str().map(|value| (name, value)))
+        .filter(|(_, value)| !value.is_empty())
+        .all(|(name, value)| {
+            if (harness == "claude" && env_name_matches(name, "CLAUDE_CODE_OAUTH_TOKEN"))
+                || (harness == "opencode" && env_name_matches(name, "OPENCODE_CONFIG_CONTENT"))
+            {
+                return false;
+            }
+            native_store_selector(name).is_none() || Path::new(value.trim()).is_absolute()
+        })
 }
 
 /// Called only for a newly resolved launch/attach profile, after retained-ID miss.
@@ -102,11 +193,8 @@ fn capture_native_store_inputs_inner(
         .and_then(Value::as_array)
         .ok_or_else(|| core::Error::new("invalid", "resolved profile pass_env must be an array"))?;
     let mut values = serde_json::Map::new();
-    for selector in NATIVE_STORE_SELECTORS.iter().copied() {
-        let selected = names
-            .iter()
-            .filter_map(Value::as_str)
-            .find(|name| native_store_selector(name) == Some(selector));
+    for &selector in CODEX_STORE_SELECTORS {
+        let selected = admitted_selector(names, selector);
         let value = selected
             .and_then(&mut selector_lookup)
             .map(|value| {
@@ -122,7 +210,7 @@ fn capture_native_store_inputs_inner(
     let credentials = names
         .iter()
         .filter_map(Value::as_str)
-        .filter(|name| native_store_selector(name).is_none())
+        .filter(|name| !private_route_selector(name))
         .filter_map(&mut credential_lookup)
         .filter_map(|value| value.into_string().ok())
         .collect::<Vec<_>>();
@@ -131,6 +219,25 @@ fn capture_native_store_inputs_inner(
     let policy = core::SecretPolicy::new(credentials.iter().map(String::as_str));
     let mut snapshot = profile.clone();
     snapshot["pass_env_values"] = captured;
+    if snapshot.get("harness").and_then(Value::as_str).is_some() {
+        let identity = native_route_identity(&snapshot, |name| {
+            if let Some(selector) = native_store_selector(name)
+                && CODEX_STORE_SELECTORS.contains(&selector)
+            {
+                return Ok(snapshot["pass_env_values"][selector]
+                    .as_str()
+                    .map(str::to_owned));
+            }
+            selector_lookup(name)
+                .map(|value| {
+                    value.into_string().map_err(|_| {
+                        core::Error::new("invalid", "native route selector is not valid Unicode")
+                    })
+                })
+                .transpose()
+        })?;
+        snapshot["native_route_identity"] = Value::String(identity);
+    }
     if policy.contains_value(&snapshot) {
         return Err(core::Error::new(
             "secret_in_payload",
@@ -2195,7 +2302,7 @@ fn freeze_local_backend(
                 "profile_error",
             )
         })?;
-        if native_store_selector(&key).is_some() {
+        if private_route_selector(&key) {
             return Err(profile_field_error(
                 source,
                 table_offset,
@@ -2574,7 +2681,7 @@ fn bind_route_and_capacity(
                     .into_iter()
                     .next()
                     .ok_or_else(|| fail("proxy", "invalid client key environment name"))?;
-                if native_store_selector(&name).is_some() {
+                if private_route_selector(&name) {
                     return Err(fail(
                         "proxy",
                         "client key cannot use a native store selector",
@@ -3667,8 +3774,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             profile["pass_env_values"],
-            json!({"CODEX_HOME":raw, "CODEX_SQLITE_HOME":null,
-                "CLAUDE_CONFIG_DIR":null, "XDG_CONFIG_HOME":null, "XDG_DATA_HOME":null})
+            json!({"CODEX_HOME":raw, "CODEX_SQLITE_HOME":null})
         );
         let mut unselected = json!({"pass_env":[]});
         capture_native_store_inputs(&mut unselected, |_| {
@@ -3677,8 +3783,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             unselected["pass_env_values"],
-            json!({"CODEX_HOME":null, "CODEX_SQLITE_HOME":null,
-                "CLAUDE_CONFIG_DIR":null, "XDG_CONFIG_HOME":null, "XDG_DATA_HOME":null})
+            json!({"CODEX_HOME":null, "CODEX_SQLITE_HOME":null})
         );
         let mut empty = json!({"pass_env":["CODEX_HOME"]});
         capture_native_store_inputs(&mut empty, |_| Some(OsString::new())).unwrap();
@@ -3701,7 +3806,7 @@ mod tests {
 
         assert_eq!(
             alias["pass_env_values"].as_object().unwrap().len(),
-            crate::config::NATIVE_STORE_SELECTORS.len()
+            crate::config::CODEX_STORE_SELECTORS.len()
         );
 
         #[cfg(windows)]
@@ -3729,28 +3834,27 @@ mod tests {
     }
 
     #[test]
-    fn native_store_inputs_capture_claude_and_xdg_selectors() {
-        // Adding a Claude/XDG selector freezes its ambient value; removing
-        // it leaves a null, so the cache identity changes either way.
-        let mut profile =
-            json!({"pass_env":["CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME"]});
+    fn private_route_selectors_freeze_without_persisting_paths_or_urls() {
+        let mut profile = json!({"harness":"claude","pass_env":[
+            "CLAUDE_CONFIG_DIR", "ANTHROPIC_BASE_URL", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+        ]});
         capture_native_store_inputs_with_lookups(
             &mut profile,
             |name| match name {
-                "CLAUDE_CONFIG_DIR" => Some(OsString::from("C:/claude-cfg")),
-                "XDG_CONFIG_HOME" => Some(OsString::from("C:/xdg-cfg")),
-                "XDG_DATA_HOME" => None,
-                _ => panic!("unexpected selector lookup: {name}"),
+                "CLAUDE_CONFIG_DIR" => Some("private-claude-config".into()),
+                "ANTHROPIC_BASE_URL" => Some("https://private-gateway.example/v1".into()),
+                "XDG_CONFIG_HOME" => Some("private-xdg-config".into()),
+                _ => None,
             },
             |_| None,
         )
         .unwrap();
         assert_eq!(
             profile["pass_env_values"],
-            json!({"CODEX_HOME":null, "CODEX_SQLITE_HOME":null,
-                "CLAUDE_CONFIG_DIR":"C:/claude-cfg", "XDG_CONFIG_HOME":"C:/xdg-cfg",
-                "XDG_DATA_HOME":null})
+            json!({"CODEX_HOME":null,"CODEX_SQLITE_HOME":null})
         );
+        assert_eq!(profile["native_route_identity"].as_str().unwrap().len(), 64);
+        assert!(!profile.to_string().contains("private-"));
     }
 
     #[test]
@@ -3926,7 +4030,10 @@ base_url_for.codex = "http://127.0.0.1:10300/v1"
         assert_eq!(snapshot["route_binding"].as_object().unwrap().len(), 5);
         capture_native_store_inputs_with_lookups(
             &mut snapshot,
-            |_| panic!("unselected store selectors must not be read"),
+            |name| {
+                assert!(ROUTE_HOME_SELECTORS.contains(&name));
+                None
+            },
             |name| (name == "RUNTIME_KEY").then(|| OsString::from("runtime-secret-value")),
         )
         .unwrap();

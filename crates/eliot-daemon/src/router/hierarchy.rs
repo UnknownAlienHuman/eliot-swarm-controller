@@ -168,7 +168,11 @@ pub(super) fn inherit_parent_launch_bindings(child: &mut Value, parent: &Value) 
     let Some(child) = child.as_object_mut() else {
         return;
     };
-    for key in ["pass_env_values", "native_store_binding"] {
+    for key in [
+        "pass_env_values",
+        "native_route_identity",
+        "native_store_binding",
+    ] {
         match parent.get(key) {
             Some(value) => {
                 child.insert(key.to_owned(), value.clone());

@@ -449,7 +449,12 @@ the operation before that registration lands; that failure surfaces as
 `quota_unavailable` (unknown), never as ready windows, and only an
 explicit null answer (not signed in) reports `unsupported`. The adapter
 projects Go rolling/weekly/monthly windows and one window per budget
-spend share from the operation's answer. The legacy `opencode-go`
+spend share from the operation's answer. The pinned
+[UsageLimits budget schema](https://github.com/anomalyco/opencode/blob/fedc6f2/packages/schema/src/usage-limits.ts)
+also supplies member or pooled scope, all-model or exact model coverage,
+and per-model spend when applicable. Routing uses this scope on the
+verified Console route and keeps the returned Go allowance separate.
+The legacy `opencode-go`
 selector keeps the Go-only public-URL path (OpenCodex 2.84.0 pattern,
 without copied code). Selectors without a verified read-only path report
 `unsupported`. No inference probe, native auth import, login, switch or

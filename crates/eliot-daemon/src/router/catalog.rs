@@ -1,20 +1,8 @@
 //! Bounded cached catalogue/quota scope derivation for `harness.models`
 //! and `harness.quota`.
 //!
-//! The cache is keyed by the private canonical identity
-//! ([`catalog::canonical_cache_identity`]), so one live native read serves
-//! every caller on that scope until its TTL lapses. The public `scope`
-//! string stays a human-readable display; the key additionally carries the
-//! exact frozen nonsecret selectors that determine the native
-//! account/configuration and endpoint (account binding, native store paths,
-//! full provider URL, frozen executable). Scope, key and credential identity
-//! derive only from frozen snapshot selectors; credential values,
-//! `literal_env` bodies and other resolved secrets are never read here.
-//! A profile/settings edit that changes any selector yields a new key, so
-//! the old account's entry is never served under the new profile; entries
-//! for retired keys linger at most until TTL eviction. Account changes made
-//! outside Eliot configuration (native login flows) take effect within the
-//! same TTL bound.
+//! Live cache reuse requires a frozen route verified against the reader's
+//! private process environment. Public scope labels contain only route names.
 
 use super::{MODE_OPEN, Principal, Router, catalog, now_ms, require_owner};
 use eliot_core::api::{
@@ -25,7 +13,7 @@ use eliot_core::{Error, Result};
 use eliot_plugin::sync::LockExt;
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::{path::PathBuf, sync::atomic::Ordering};
+use std::{sync::atomic::Ordering, time::Instant};
 
 impl Router {
     /// Read-only harness installation facts: no model turn, no inference.
@@ -38,66 +26,67 @@ impl Router {
         let request: eliot_core::api::HarnessListRequest =
             eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
+        Self::harness_inventory(Instant::now() + crate::adhoc::DISCOVERY_BUDGET).await
+    }
+
+    async fn harness_inventory(deadline: Instant) -> Result<Value> {
         // Filesystem presence plus bounded `--version` probes is blocking
         // work: run it on the blocking pool so slow native CLIs never stall
         // async command/event service. Claude candidates are enumerated once
         // and reused for both the entry and the candidate list instead of
         // versioning every install twice per inventory pass.
-        let harnesses: Vec<eliot_core::api::HarnessEntry> = tokio::task::spawn_blocking(|| {
-            let claude_candidates = crate::adhoc::discover_claude_candidates();
-            let mut harnesses = Vec::new();
-            for harness in crate::adhoc::SUPPORTED_HARNESSES {
-                let entry = if *harness == "claude" {
-                    crate::adhoc::claude_installation(&claude_candidates)
-                } else {
-                    crate::adhoc::harness_installation(harness)
-                };
-                // Claude keeps several native installs (PATH, user locations,
-                // desktop-app bundles): report every candidate newest first so
-                // the controller can see which install was preferred and why.
-                let candidates = if *harness == "claude" {
-                    (!claude_candidates.is_empty()).then(|| claude_candidates.clone())
-                } else {
-                    None
-                };
-                harnesses.push(eliot_core::api::HarnessEntry {
-                    harness: (*harness).to_owned(),
-                    installed: entry
-                        .get("installed")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                    cmd: entry.get("cmd").and_then(Value::as_str).map(str::to_owned),
-                    version: entry
-                        .get("version")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
-                    code: entry.get("code").and_then(Value::as_str).map(str::to_owned),
-                    error: entry
-                        .get("error")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
-                    candidates,
-                });
-            }
-            harnesses
-        })
-        .await
-        .map_err(|_| Error::new("internal", "harness inventory was interrupted"))?;
+        let harnesses: Vec<eliot_core::api::HarnessEntry> =
+            crate::adhoc::blocking_discovery(deadline, move || {
+                let claude_candidates = crate::adhoc::discover_claude_candidates(deadline);
+                let mut harnesses = Vec::new();
+                for harness in crate::adhoc::SUPPORTED_HARNESSES {
+                    let entry = if *harness == "claude" {
+                        crate::adhoc::claude_installation(&claude_candidates)
+                    } else {
+                        crate::adhoc::harness_installation(harness, deadline)
+                    };
+                    // Claude keeps several native installs (PATH, user locations,
+                    // desktop-app bundles): report every candidate newest first so
+                    // the controller can see which install was preferred and why.
+                    let candidates = if *harness == "claude" {
+                        (!claude_candidates.is_empty()).then(|| claude_candidates.clone())
+                    } else {
+                        None
+                    };
+                    harnesses.push(eliot_core::api::HarnessEntry {
+                        harness: (*harness).to_owned(),
+                        installed: entry
+                            .get("installed")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                        cmd: entry.get("cmd").and_then(Value::as_str).map(str::to_owned),
+                        version: entry
+                            .get("version")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        code: entry.get("code").and_then(Value::as_str).map(str::to_owned),
+                        error: entry
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        candidates,
+                    });
+                }
+                harnesses
+            })
+            .await?;
         let response = eliot_core::api::HarnessListResponse { harnesses };
         serde_json::to_value(response)
             .map_err(|_| Error::new("internal", "harness list could not be encoded"))
     }
-    /// Resolve the frozen snapshot for a catalogue/quota read. A named
-    /// profile must exist and its frozen harness must match; otherwise the
-    /// daemon defaults cover live harnesses (Codex/Muse/OpenCode, plus
-    /// Antigravity when `live_antigravity` holds for `harness.models`, whose
-    /// `agy models` reader needs a frozen cmd) while static harnesses (Claude,
-    /// and Antigravity for `harness.quota`) need no snapshot at all.
+    /// Resolve a named profile or a live reader's ad-hoc snapshot.
+    /// The documented Claude aliases have no native reader yet.
     async fn resolve_catalog_snapshot(
         &self,
         harness: &str,
         profile: Option<&str>,
-        live_antigravity: bool,
+        quota: bool,
+        deadline: Instant,
     ) -> Result<(Option<Value>, String)> {
         if let Some(name) = profile {
             let mut snapshot = self.resolve_profile_cached(name)?;
@@ -112,10 +101,10 @@ impl Router {
             }
             return Ok((Some(snapshot), name.to_owned()));
         }
-        if matches!(harness, "codex" | "muse" | "opencode")
-            || (live_antigravity && harness == "antigravity")
+        if matches!(harness, "codex" | "muse" | "opencode" | "antigravity")
+            || (quota && harness == "claude")
         {
-            let cmd = crate::adhoc::discover_cmd_for_harness_async(harness).await?;
+            let cmd = crate::adhoc::discover_cmd_until(harness, deadline).await?;
             let mut snapshot = crate::adhoc::adhoc_snapshot(
                 harness,
                 None,
@@ -124,6 +113,11 @@ impl Router {
                 crate::adhoc::AdhocAuth::Skip,
                 None,
             )?;
+            if quota && harness == "opencode" {
+                // Preserve the ad-hoc Go read. Named launch routes must bind
+                // their own integration; adopted backends have no Go route.
+                snapshot["auth_integration"] = json!("opencode-go");
+            }
             crate::config::stamp_cloud_mcp_hostname(&mut snapshot, &self.inner.data_root);
             crate::config::capture_native_store_inputs(&mut snapshot, |name| {
                 std::env::var_os(name)
@@ -177,6 +171,20 @@ impl Router {
         params: &Value,
         principal: &Principal,
     ) -> Result<Value> {
+        self.harness_models_until(
+            params,
+            principal,
+            Instant::now() + crate::adhoc::DISCOVERY_BUDGET,
+        )
+        .await
+    }
+
+    async fn harness_models_until(
+        &self,
+        params: &Value,
+        principal: &Principal,
+        deadline: Instant,
+    ) -> Result<Value> {
         require_owner(principal)?;
         let request: eliot_core::api::HarnessModelsRequest =
             eliot_core::api::discovery::decode_params(params.clone())?;
@@ -192,48 +200,30 @@ impl Router {
         let (snapshot, label) = match request.agent.as_deref() {
             Some(agent) => self.agent_catalog_snapshot(agent, &harness).await?,
             None => {
-                self.resolve_catalog_snapshot(&harness, profile, true)
+                self.resolve_catalog_snapshot(&harness, profile, false, deadline)
                     .await?
             }
         };
         let (scope, credential) = catalog::describe_snapshot(&label, &harness, snapshot.as_ref());
-        let cache_scope = catalog::canonical_cache_identity(&label, &harness, snapshot.as_ref());
-        let cmd = snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.get("cmd"))
-            .and_then(Value::as_str)
-            .unwrap_or(&harness);
-        let executable = if std::path::Path::new(cmd).is_absolute() {
-            Some(PathBuf::from(cmd))
-        } else {
-            crate::adhoc::find_on_path(&format!("{cmd}.exe"))
-                .or_else(|| crate::adhoc::find_on_path(cmd))
-        };
-        let cmd = executable
-            .as_ref()
-            .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_else(|| cmd.to_owned());
-        // Antigravity CLI identity before any probe: an IDE-named cmd is
-        // refused here without launching it, so a profile pointing at
-        // `Antigravity.exe` can never reach the version probe below.
-        if harness == "antigravity" && !crate::adhoc::antigravity_cli_identity(&cmd) {
-            return Err(crate::adhoc::antigravity_ide_unsupported(&cmd));
+        let mut snapshot = snapshot;
+        let mut environment = None;
+        let mut cache_key = None;
+        if harness != "claude" {
+            let profile = snapshot.as_mut().ok_or_else(|| {
+                Error::new(
+                    "internal",
+                    "live harness catalogue requires a frozen snapshot",
+                )
+            })?;
+            let route = crate::plugin_host::metadata_route(profile)?;
+            let cmd = profile["cmd"].as_str().unwrap_or(&harness);
+            let (cmd, version) = crate::adhoc::reader_executable(cmd, &harness, deadline).await?;
+            profile["cmd"] = Value::String(cmd.clone());
+            cache_key =
+                catalog::canonical_cache_identity(&label, profile, route.identity.as_deref())
+                    .and_then(|key| catalog::models_key(&key, &cmd, version.as_deref()));
+            environment = Some(route.environment);
         }
-        let version = if harness == "claude" {
-            Some("static-aliases".to_owned())
-        } else {
-            // The blocking probe (and its memoized reuse across catalogue
-            // pages) runs on the blocking pool, never on a Tokio worker.
-            crate::adhoc::native_version_string_async(&cmd).await
-        };
-        // A PATH `agy` without CLI protocol capability is refused after the
-        // bounded identity probe, before any `models` discovery use.
-        let version = if harness == "antigravity" {
-            Some(crate::adhoc::antigravity_cli_version(version)?)
-        } else {
-            version
-        };
-        let cache_key = catalog::models_key(&cache_scope, &cmd, version.as_deref());
         let now = now_ms();
         if let Some(hit) = cache_key
             .as_deref()
@@ -275,7 +265,13 @@ impl Router {
                     .get("cmd")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
-                let raw = self.inner.plugin_host.models(snapshot).await?;
+                let environment = environment
+                    .ok_or_else(|| Error::new("internal", "model reader environment missing"))?;
+                let raw = self
+                    .inner
+                    .plugin_host
+                    .models(snapshot, environment, deadline.into())
+                    .await?;
                 let models = raw
                     .get("models")
                     .and_then(Value::as_array)
@@ -411,6 +407,23 @@ impl Router {
         params: &Value,
         principal: &Principal,
     ) -> Result<Value> {
+        let evidence = self
+            .harness_quota_until(
+                params,
+                principal,
+                Instant::now() + crate::adhoc::DISCOVERY_BUDGET,
+            )
+            .await?;
+        serde_json::to_value(evidence.response)
+            .map_err(|_| Error::new("internal", "quota encoding failed"))
+    }
+
+    async fn harness_quota_until(
+        &self,
+        params: &Value,
+        principal: &Principal,
+        deadline: Instant,
+    ) -> Result<catalog::ScopedQuota> {
         require_owner(principal)?;
         let request: eliot_core::api::HarnessQuotaRequest =
             eliot_core::api::discovery::decode_params(params.clone())?;
@@ -423,27 +436,11 @@ impl Router {
             ));
         }
         let profile = request.profile.as_deref().map(str::trim);
-        let (mut snapshot, label) = self
-            .resolve_catalog_snapshot(&harness, profile, true)
+        let (snapshot, label) = self
+            .resolve_catalog_snapshot(&harness, profile, true, deadline)
             .await?;
-        if harness == "claude" && snapshot.is_none() {
-            // Candidate probing plus the bounded `--version` reads run on
-            // the blocking pool, never on this async handler.
-            let cmd = crate::adhoc::discover_cmd_for_harness_async(&harness).await?;
-            let mut resolved = crate::adhoc::adhoc_snapshot(
-                &harness,
-                None,
-                None,
-                cmd,
-                crate::adhoc::AdhocAuth::Skip,
-                None,
-            )?;
-            crate::config::capture_native_store_inputs(&mut resolved, |name| {
-                std::env::var_os(name)
-            })?;
-            snapshot = Some(resolved);
-        }
-        self.quota_for_snapshot(harness, snapshot, label).await
+        self.quota_for_snapshot(harness, snapshot, label, deadline)
+            .await
     }
 
     pub(super) async fn quota_for_snapshot(
@@ -451,50 +448,65 @@ impl Router {
         harness: String,
         snapshot: Option<Value>,
         label: String,
-    ) -> Result<Value> {
+        deadline: Instant,
+    ) -> Result<catalog::ScopedQuota> {
         let request = eliot_core::api::HarnessQuotaRequest {
             harness: harness.clone(),
             profile: None,
         };
         let (scope, credential) = catalog::describe_snapshot(&label, &harness, snapshot.as_ref());
-        let cache_key = catalog::canonical_cache_identity(&label, &harness, snapshot.as_ref());
+        let mut profile = snapshot
+            .ok_or_else(|| Error::new("profile_error", "quota requires a native profile"))?;
+        let route = crate::plugin_host::metadata_route(&profile)?;
+        if harness == "antigravity" {
+            let cmd = profile["cmd"].as_str().unwrap_or("agy");
+            let (cmd, _) = crate::adhoc::reader_executable(cmd, &harness, deadline).await?;
+            profile["cmd"] = Value::String(cmd);
+        }
+        let cache_key =
+            catalog::canonical_cache_identity(&label, &profile, route.identity.as_deref());
+        let route_verified = cache_key.is_some();
         if harness == "muse"
-            && let Some(profile) = snapshot.as_ref()
+            && route_verified
             && let Some(observation) = self
                 .inner
                 .store
                 .lock()
                 .await
-                .latest_quota_observation(profile)?
+                .latest_quota_observation(&profile)?
         {
-            return serde_json::to_value(eliot_core::api::HarnessQuotaResponse {
-                harness,scope,credential,fetched_at_ms:observation.observed_at_ms,ttl_ms:catalog::CATALOG_TTL_MS,
-                status:"supported".to_owned(),note:Some("Muse subscription usage observed during a turn".to_owned()),
-                details:Some(json!({"windows":observation.windows,"state":"ready","origin":"provider","source":"Muse MSP usage/changed"})),
-            }).map_err(|_|Error::new("internal","quota encoding failed"));
+            return Ok(catalog::ScopedQuota {
+                route_verified,
+                response: HarnessQuotaResponse {
+                    harness,
+                    scope,
+                    credential,
+                    fetched_at_ms: observation.observed_at_ms,
+                    ttl_ms: catalog::CATALOG_TTL_MS,
+                    status: "supported".to_owned(),
+                    note: Some("Muse subscription usage observed during a turn".to_owned()),
+                    details: Some(json!({"windows": observation.windows, "state": "ready",
+                        "origin": "provider", "source": "Muse MSP usage/changed"})),
+                },
+            });
         }
-        if let Some(hit) = self
-            .inner
-            .catalog_cache
-            .lock_recover()
-            .get_quota(&cache_key, now_ms())
-        {
+        if let Some(hit) = cache_key.as_deref().and_then(|key| {
+            self.inner
+                .catalog_cache
+                .lock_recover()
+                .get_quota(key, now_ms())
+        }) {
             request.validate_response(&hit)?;
-            return serde_json::to_value(hit)
-                .map_err(|_| Error::new("internal", "quota encoding failed"));
+            return Ok(catalog::ScopedQuota {
+                response: hit,
+                route_verified,
+            });
         }
-        let profile = snapshot
-            .ok_or_else(|| Error::new("profile_error", "quota requires a native profile"))?;
-        // A legacy profile pointing at the IDE is refused before the quota
-        // reader can launch it; current profiles are already refused at
-        // save time and discovery never returns an IDE path.
-        if harness == "antigravity"
-            && let Some(cmd) = profile.get("cmd").and_then(Value::as_str)
-            && !crate::adhoc::antigravity_cli_identity(cmd)
-        {
-            return Err(crate::adhoc::antigravity_ide_unsupported(cmd));
-        }
-        let raw = self.inner.plugin_host.quota(profile).await;
+        let raw = self
+            .inner
+            .plugin_host
+            .quota(profile, route.environment, deadline.into())
+            .await;
         let mut response = eliot_core::api::HarnessQuotaResponse {
             harness: harness.clone(),
             scope,
@@ -530,6 +542,7 @@ impl Router {
                         "muse" => "Muse subscription usage observed during a turn; timestamp is the native observation",
                         "claude" => "Claude CLI OAuth usage; provider read-only values",
                         "antigravity" => "Antigravity account quota; provider read-only values",
+                        _ if details["integration"] == "opencode" => "OpenCode Console workspace budgets and Go allowance; provider read-only values",
                         _ => "OpenCode Go account usage; provider read-only values",
                     }.to_owned());
                     if harness == "muse" {
@@ -558,11 +571,16 @@ impl Router {
             }
         }
         request.validate_response(&response)?;
-        self.inner
-            .catalog_cache
-            .lock_recover()
-            .insert_quota(cache_key.clone(), response.clone());
-        serde_json::to_value(response).map_err(|_| Error::new("internal", "quota encoding failed"))
+        if let Some(key) = cache_key {
+            self.inner
+                .catalog_cache
+                .lock_recover()
+                .insert_quota(key, response.clone());
+        }
+        Ok(catalog::ScopedQuota {
+            response,
+            route_verified,
+        })
     }
 
     /// One owner-scoped read-only search over every installed harness
@@ -574,6 +592,20 @@ impl Router {
         &self,
         params: &Value,
         principal: &Principal,
+    ) -> Result<Value> {
+        self.models_catalog_until(
+            params,
+            principal,
+            Instant::now() + crate::adhoc::DISCOVERY_BUDGET,
+        )
+        .await
+    }
+
+    async fn models_catalog_until(
+        &self,
+        params: &Value,
+        principal: &Principal,
+        deadline: Instant,
     ) -> Result<Value> {
         use eliot_core::api::{ModelsCatalogEntry, ModelsCatalogFailure, ModelsCatalogRequest};
         require_owner(principal)?;
@@ -589,15 +621,18 @@ impl Router {
         // The aggregate budget starts here and covers inventory: a slow
         // inventory leaves less (or no) time for per-harness reads, which
         // then fail open into the partial aggregate below.
-        let discovery_deadline = tokio::time::Instant::now() + MODELS_CATALOG_DISCOVERY_BUDGET;
+        let discovery_deadline = tokio::time::Instant::from_std(deadline);
         let query = request.query.as_deref().unwrap_or("").to_owned();
         let limit = request.effective_limit();
         let after = request.after.clone();
         // Coalesce concurrent callers: the first rebuilds, the rest share
         // the fresh aggregate until its TTL lapses.
-        let _coalesce = self.inner.catalog_aggregate_lock.lock().await;
+        let _coalesce =
+            tokio::time::timeout_at(discovery_deadline, self.inner.catalog_aggregate_lock.lock())
+                .await
+                .map_err(|_| crate::adhoc::discovery_timeout())?;
         // Harness inventory with versions for the aggregate key.
-        let harnesses_value = self.harness_list(&json!({}), principal).await?;
+        let harnesses_value = Self::harness_inventory(deadline).await?;
         let harnesses_response: eliot_core::api::HarnessListResponse =
             serde_json::from_value(harnesses_value)
                 .map_err(|_| Error::new("internal", "harness list could not be decoded"))?;
@@ -626,7 +661,9 @@ impl Router {
         // harness marks that harness's models held.
         const HOLD_LIMIT: usize = 1000;
         let holds = {
-            let store = self.inner.store.lock().await;
+            let store = tokio::time::timeout_at(discovery_deadline, self.inner.store.lock())
+                .await
+                .map_err(|_| crate::adhoc::discovery_timeout())?;
             store.list_provider_holds(None, HOLD_LIMIT).ok()
         };
         let held_harness = |harness: &str| {
@@ -649,6 +686,7 @@ impl Router {
         };
         let mut models: Vec<ModelsCatalogEntry> = Vec::new();
         let mut failures: Vec<ModelsCatalogFailure> = Vec::new();
+        let mut quotas = HashMap::new();
         for entry in &harnesses {
             let harness = entry.harness.as_str();
             if tokio::time::Instant::now() >= discovery_deadline {
@@ -674,7 +712,7 @@ impl Router {
             // partial aggregate instead of holding the coalescing lock.
             let response_value = match tokio::time::timeout_at(
                 discovery_deadline,
-                self.harness_models(&params, principal),
+                self.harness_models_until(&params, principal, deadline),
             )
             .await
             {
@@ -706,14 +744,13 @@ impl Router {
                 serde_json::from_value(response_value)
                     .map_err(|_| Error::new("internal", "harness models could not be decoded"))?;
             let held = held_harness(harness);
-            let quota =
-                tokio::time::timeout_at(discovery_deadline, self.harness_quota(&params, principal))
-                    .await
-                    .ok()
-                    .and_then(|result| result.ok())
-                    .and_then(|value| {
-                        serde_json::from_value::<eliot_core::api::HarnessQuotaResponse>(value).ok()
-                    });
+            let quota = tokio::time::timeout_at(
+                discovery_deadline,
+                self.harness_quota_until(&params, principal, deadline),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok);
             for model in response.models {
                 models.push(catalog::catalog_entry(
                     harness,
@@ -722,6 +759,9 @@ impl Router {
                     quota.as_ref(),
                     now_ms(),
                 ));
+            }
+            if let Some(quota) = quota.filter(|quota| quota.route_verified) {
+                quotas.insert(harness.to_owned(), quota);
             }
         }
         models.sort_by(|left, right| {
@@ -745,6 +785,7 @@ impl Router {
                 key: key.clone(),
                 harnesses: harnesses.clone(),
                 models: models.clone(),
+                quotas: HashMap::new(),
                 failures: failures.clone(),
                 fetched_at_ms,
                 ttl_ms,
@@ -844,7 +885,6 @@ fn muse_catalog_note(default: Option<&str>) -> String {
 /// outer deadline so one listing cannot hold the coalescing lock
 /// indefinitely. Harness reads past the deadline fail open into the partial
 /// aggregate, which the next first-page listing rebuilds.
-const MODELS_CATALOG_DISCOVERY_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
 pub(super) fn quota_read_error(response: &mut HarnessQuotaResponse, error: eliot_core::Error) {
     if error.code == "unsupported" {
         response.status = "unsupported".to_owned();
@@ -902,28 +942,9 @@ pub(crate) fn describe_snapshot(
         .and_then(Value::as_str)
         .filter(|name| !name.trim().is_empty())
     {
-        push_display_segment(&mut scope, &format!(" account:{account}"));
-    }
-    // Frozen native store inputs select the native home/configuration. The
-    // values are local paths (the snapshot policy rejects resolved secrets),
-    // so naming them keeps homes apart without leaking credentials. Every
-    // effective selector shows: adding or removing one changes the display
-    // scope as well as the private canonical identity below.
-    if let Some(values) = snapshot.get("pass_env_values").and_then(Value::as_object) {
-        for (selector, marker) in [
-            ("CODEX_HOME", " home:"),
-            ("CODEX_SQLITE_HOME", " sqlhome:"),
-            ("CLAUDE_CONFIG_DIR", " claude_cfg:"),
-            ("XDG_CONFIG_HOME", " xdg_cfg:"),
-            ("XDG_DATA_HOME", " xdg_data:"),
-        ] {
-            if let Some(home) = values
-                .get(selector)
-                .and_then(Value::as_str)
-                .filter(|home| !home.is_empty())
-            {
-                push_display_segment(&mut scope, &format!("{marker}{home}"));
-            }
+        let account = format!(" account:{account}");
+        if scope.len() + account.len() <= eliot_core::api::MAX_HARNESS_SCOPE_BYTES {
+            scope.push_str(&account);
         }
     }
     match harness {
@@ -986,83 +1007,28 @@ pub(crate) fn describe_snapshot(
     (scope, credential)
 }
 
-/// Append one display segment, dropping it when the public scope would
-/// exceed its validated bound. Display stays lossy but valid; the private
-/// canonical identity always carries the full selectors.
-fn push_display_segment(scope: &mut String, segment: &str) {
-    if scope.len() + segment.len() <= eliot_core::api::MAX_HARNESS_SCOPE_BYTES {
-        scope.push_str(segment);
-    }
-}
-
-/// Private canonical cache identity for one frozen snapshot: the public
-/// display scope plus the exact frozen nonsecret selectors that determine
-/// the native account/configuration and endpoint. The full provider URL
-/// enters (authority alone collides across paths sharing a host), as do the
-/// account binding, the native store paths and the frozen executable. Only
-/// names and nonsecret paths enter: never credential values, never
-/// `literal_env` bodies, never resolved secrets.
+/// Separate frozen routes using their verified environment identity and
+/// the full configured provider endpoint (including path).
 pub(crate) fn canonical_cache_identity(
     profile_label: &str,
-    harness: &str,
-    snapshot: Option<&Value>,
-) -> String {
-    let (display, _) = describe_snapshot(profile_label, harness, snapshot);
-    let mut key = display;
-    key.push('\0');
-    let Some(snapshot) = snapshot else {
-        return key;
-    };
-    for value in [
-        snapshot
-            .get("account")
-            .and_then(Value::as_str)
-            .unwrap_or_default(),
-        snapshot
-            .pointer("/route_binding/provider_base_url")
-            .and_then(Value::as_str)
-            .unwrap_or_default(),
-        snapshot
-            .get("provider_base_url")
-            .and_then(Value::as_str)
-            .unwrap_or_default(),
-        snapshot
-            .get("cmd")
-            .and_then(Value::as_str)
-            .unwrap_or_default(),
-        snapshot
-            .pointer("/pass_env_values/CODEX_HOME")
-            .and_then(Value::as_str)
-            .unwrap_or_default(),
-        snapshot
-            .pointer("/pass_env_values/CODEX_SQLITE_HOME")
-            .and_then(Value::as_str)
-            .unwrap_or_default(),
-        snapshot
-            .pointer("/pass_env_values/CLAUDE_CONFIG_DIR")
-            .and_then(Value::as_str)
-            .unwrap_or_default(),
-        snapshot
-            .pointer("/pass_env_values/XDG_CONFIG_HOME")
-            .and_then(Value::as_str)
-            .unwrap_or_default(),
-        snapshot
-            .pointer("/pass_env_values/XDG_DATA_HOME")
-            .and_then(Value::as_str)
-            .unwrap_or_default(),
-        snapshot
-            .get("api_key_env")
-            .and_then(Value::as_str)
-            .unwrap_or_default(),
-        snapshot
-            .pointer("/route_binding/client_key_env_name")
-            .and_then(Value::as_str)
-            .unwrap_or_default(),
-    ] {
-        key.push_str(value);
-        key.push('\0');
-    }
-    key
+    snapshot: &Value,
+    verified: Option<&str>,
+) -> Option<String> {
+    let verified = verified?;
+    let route = json!({
+        "label": profile_label,
+        "harness": snapshot.get("harness"),
+        "account": snapshot.get("account"),
+        "auth": snapshot.get("auth_integration"),
+        "backend": snapshot.get("backend"),
+        "provider": snapshot.get("provider_base_url"),
+        "route": snapshot.get("route_binding"),
+        "key_ref": snapshot.get("api_key_env"),
+        "executable": snapshot.get("cmd"),
+        "identity": verified,
+    });
+    let digest = eliot_core::canonical_json_sha256(&route).ok()?;
+    Some(digest.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 /// Strip a provider base URL to its authority (host with port, no userinfo
@@ -1098,6 +1064,7 @@ pub(crate) struct CachedAggregate {
     pub(crate) key: String,
     pub(crate) harnesses: Vec<HarnessEntry>,
     pub(crate) models: Vec<ModelsCatalogEntry>,
+    pub(crate) quotas: HashMap<String, ScopedQuota>,
     /// Installed harnesses whose read failed; non-empty makes it partial.
     pub(crate) failures: Vec<ModelsCatalogFailure>,
     pub(crate) fetched_at_ms: i64,
@@ -1172,6 +1139,20 @@ impl CatalogCache {
             .filter(|entry| entry.key == key && entry.fresh(now))
             .filter(|entry| continuation || entry.failures.is_empty())
             .cloned()
+            .map(|mut entry| {
+                for model in &mut entry.models {
+                    if model.availability == eliot_core::api::harness::CATALOG_AVAILABLE {
+                        model.availability = availability(
+                            Some(false),
+                            entry.quotas.get(&model.harness),
+                            &model.id,
+                            now,
+                        )
+                        .to_owned();
+                    }
+                }
+                entry
+            })
     }
 
     pub(crate) fn insert_aggregate(&mut self, entry: CachedAggregate) {
@@ -1206,7 +1187,7 @@ pub(crate) fn catalog_entry(
     harness: &str,
     model: eliot_core::api::HarnessModelEntry,
     held: Option<bool>,
-    quota: Option<&HarnessQuotaResponse>,
+    quota: Option<&ScopedQuota>,
     now: i64,
 ) -> eliot_core::api::ModelsCatalogEntry {
     use eliot_core::api::catalog_provider;
@@ -1289,8 +1270,8 @@ pub(crate) struct QuotaObservation<'a> {
 }
 
 /// Normalize provider-specific quota `details` into one projection.
-/// `model` scopes model-named windows; `None` applies every recognized
-/// window. Returns `None` when no signal maps to this observation's provider
+/// A model scopes named windows. Without one only account windows apply.
+/// Returns `None` when no signal maps to this observation's provider
 /// (missing or unsupported shapes stay `unknown` at the caller).
 pub(crate) fn project_quota(
     observation: QuotaObservation<'_>,
@@ -1307,7 +1288,8 @@ pub(crate) fn project_quota(
             windows_projection(observation, &windows, complete, model, now, provenance)
         }
         "codex" => codex_projection(observation, details, model, now),
-        "claude" | "opencode" | "antigravity" => {
+        "opencode" => opencode_projection(observation, details, model, now),
+        "claude" | "antigravity" => {
             let windows = details
                 .get("windows")
                 .and_then(Value::as_array)
@@ -1319,16 +1301,26 @@ pub(crate) fn project_quota(
     }
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ScopedQuota {
+    pub(crate) response: HarnessQuotaResponse,
+    pub(crate) route_verified: bool,
+}
+
 /// One typed entry point for routing and the catalogue: a `supported`
 /// response observed inside its freshness TTL projects, anything else
 /// (missing, stale, unsupported) stays `unknown`. Both consumers share this
 /// function, so a stale observation can neither skip a route nor mark a
 /// model available.
 pub(crate) fn projected_quota(
-    quota: &HarnessQuotaResponse,
+    quota: &ScopedQuota,
     model: Option<&str>,
     now: i64,
 ) -> Option<QuotaProjection> {
+    if !quota.route_verified {
+        return None;
+    }
+    let quota = &quota.response;
     if quota.status != eliot_core::api::HARNESS_QUOTA_SUPPORTED {
         return None;
     }
@@ -1500,7 +1492,6 @@ fn window_mapping(window: &Value, model: Option<&str>) -> QuotaMapping {
         return QuotaMapping::Unmapped;
     };
     match model {
-        None => QuotaMapping::Group(group),
         Some(model) if tokens.iter().any(|token| model_token_present(model, token)) => {
             QuotaMapping::Group(group)
         }
@@ -1516,11 +1507,21 @@ fn windows_projection(
     now: i64,
     provenance: &'static str,
 ) -> Option<QuotaProjection> {
-    let applicable: Vec<(&&Value, QuotaMapping)> = windows
+    let applicable: Vec<(&Value, QuotaMapping)> = windows
         .iter()
-        .map(|window| (window, window_mapping(window, model)))
+        .map(|&window| (window, window_mapping(window, model)))
         .filter(|(_, mapping)| *mapping != QuotaMapping::Unmapped)
         .collect();
+    summarize_windows(observation, &applicable, complete, now, provenance)
+}
+
+fn summarize_windows(
+    observation: QuotaObservation<'_>,
+    applicable: &[(&Value, QuotaMapping)],
+    complete: bool,
+    now: i64,
+    provenance: &'static str,
+) -> Option<QuotaProjection> {
     if applicable.is_empty() {
         // Windows exist but none maps to this model (for example an
         // unrecognized `Model group` label, or an Argon bucket read for a
@@ -1569,6 +1570,50 @@ fn windows_projection(
     })
 }
 
+fn opencode_projection(
+    observation: QuotaObservation<'_>,
+    details: &Value,
+    model: Option<&str>,
+    now: i64,
+) -> Option<QuotaProjection> {
+    let model = model?;
+    let (provider, _) = eliot_plugin::session::split_provider_model(model)?;
+    match (details.get("integration").and_then(Value::as_str), provider) {
+        (Some("opencode-go"), "opencode-go") => {
+            let windows: Vec<_> = details.get("windows")?.as_array()?.iter().collect();
+            windows_projection(observation, &windows, true, Some(model), now, "opencode:go")
+        }
+        (Some("opencode"), _) => {
+            let applicable: Vec<_> = details
+                .get("consoleWindows")?
+                .as_array()?
+                .iter()
+                .filter_map(|window| {
+                    if !matches!(window.get("scope")?.as_str()?, "each" | "combined") {
+                        return None;
+                    }
+                    let mapping = match window.get("coverage")?.as_str()? {
+                        "all" if provider == "opencode" => QuotaMapping::Group("console"),
+                        "models"
+                            if window
+                                .get("models")?
+                                .as_array()?
+                                .iter()
+                                .any(|id| id.as_str() == Some(model)) =>
+                        {
+                            QuotaMapping::ExactId
+                        }
+                        _ => return None,
+                    };
+                    Some((window, mapping))
+                })
+                .collect();
+            summarize_windows(observation, &applicable, true, now, "opencode:console")
+        }
+        _ => None,
+    }
+}
+
 fn codex_projection(
     observation: QuotaObservation<'_>,
     details: &Value,
@@ -1610,14 +1655,15 @@ fn codex_projection(
             }),
             _ => false,
         };
-    // An exact per-model bucket id establishes the mapping; otherwise the
-    // primary bucket scopes this model.
+    // Only the primary bucket can establish exhaustion. Per-model buckets
+    // can establish the mapping for affirmative headroom.
     let mapping = match model {
         Some(model)
-            if details
-                .get("rateLimitsByLimitId")
-                .and_then(|limits| limits.get(model))
-                .is_some() =>
+            if !exhausted
+                && details
+                    .get("rateLimitsByLimitId")
+                    .and_then(|limits| limits.get(model))
+                    .is_some() =>
         {
             QuotaMapping::ExactId
         }
@@ -1639,7 +1685,7 @@ fn codex_projection(
 /// can establish availability. Unsupported and missing signals stay unknown.
 pub(crate) fn availability(
     held: Option<bool>,
-    quota: Option<&HarnessQuotaResponse>,
+    quota: Option<&ScopedQuota>,
     model: &str,
     now: i64,
 ) -> &'static str {
@@ -1859,7 +1905,7 @@ mod tests {
             {"label": "5-hour", "usedPercent": 10.0, "resetsAtMs": 2_000},
             {"label": "Weekly", "usedPercent": 20.0, "resetsAtMs": 3_000},
         ]});
-        for harness in ["claude", "opencode", "antigravity"] {
+        for harness in ["claude", "antigravity"] {
             let scope = format!("profile:test harness:{harness}");
             let projection = project_quota(obs(harness, &scope, now), &windows, Some("m"), now)
                 .unwrap_or_else(|| panic!("{harness} windows project"));
@@ -1914,6 +1960,35 @@ mod tests {
     }
 
     #[test]
+    fn quota_scope_requires_verified_membership_and_attributes_primary_exhaustion() {
+        let now = 1000;
+        let claude =
+            json!({"windows":[{"label":"Opus weekly","usedPercent":100,"resetsAtMs":2000}]});
+        let projection = project_quota(obs("claude", "scope", now), &claude, None, now).unwrap();
+        assert_eq!(projection.mapping, QuotaMapping::Unmapped);
+        assert!(!projection.exhausted);
+        let codex = json!({"rateLimits":{"primary":{"usedPercent":100,"resetsAtMs":2000}},
+            "rateLimitsByLimitId":{"m":{"primary":{"usedPercent":100,"resetsAtMs":2000}}}});
+        let projection = project_quota(obs("codex", "scope", now), &codex, Some("m"), now).unwrap();
+        assert!(projection.exhausted);
+        assert_eq!(projection.mapping, QuotaMapping::Group("primary"));
+    }
+
+    #[test]
+    fn console_budget_applies_to_covered_models_and_excludes_unrelated_go_meters() {
+        let now = 1000;
+        let details = json!({"integration":"opencode",
+            "windows":[{"label":"Weekly","usedPercent":100,"resetsAtMs":2000}],
+            "consoleWindows":[{"scope":"each","coverage":"models","models":["opencode/covered"],
+                "usedPercent":100,"resetsAtMs":2000}]});
+        let project = |model| project_quota(obs("opencode", "scope", now), &details, model, now);
+        assert!(project(Some("opencode/covered")).unwrap().exhausted);
+        assert!(!project(Some("opencode/uncovered")).unwrap().exhausted);
+        assert!(!project(Some("opencode-go/uncovered")).unwrap().exhausted);
+        assert!(project(None).is_none());
+    }
+
+    #[test]
     fn argon_weekly_bucket_does_not_exhaust_hydrogen() {
         // Recorded `retrieveUserQuotaSummary` shape: a depleted
         // `Gemini 4 Argon weekly` bucket must skip Argon models while every
@@ -1958,40 +2033,46 @@ mod tests {
     #[test]
     fn availability_requires_complete_holds_and_affirmative_fresh_quota() {
         let now = 1_000;
-        let mut quota = HarnessQuotaResponse {
-            harness: "muse".to_owned(),
-            scope: "profile:adhoc harness:muse".to_owned(),
-            fetched_at_ms: now,
-            ttl_ms: CATALOG_TTL_MS,
-            credential: "ambient".to_owned(),
-            status: "supported".to_owned(),
-            note: None,
-            details: Some(json!({"window":{"usedPercent":10,"resetsAtMs":2_000},
+        let mut quota = ScopedQuota {
+            route_verified: true,
+            response: HarnessQuotaResponse {
+                harness: "muse".to_owned(),
+                scope: "profile:adhoc harness:muse".to_owned(),
+                fetched_at_ms: now,
+                ttl_ms: CATALOG_TTL_MS,
+                credential: "ambient".to_owned(),
+                status: "supported".to_owned(),
+                note: None,
+                details: Some(json!({"window":{"usedPercent":10,"resetsAtMs":2_000},
                 "weekly":{"usedPercent":20,"resetsAtMs":3_000}})),
+            },
         };
         assert_eq!(
             availability(Some(false), Some(&quota), "m", now),
             "available"
         );
+        quota.route_verified = false;
+        assert_eq!(availability(Some(false), Some(&quota), "m", now), "unknown");
+        quota.route_verified = true;
         assert_eq!(availability(None, Some(&quota), "m", now), "unknown");
         assert_eq!(availability(Some(true), None, "m", now), "held");
         assert_eq!(availability(Some(false), None, "m", now), "unknown");
         for status in ["unsupported", "unknown"] {
-            quota.status = status.to_owned();
+            quota.response.status = status.to_owned();
             assert_eq!(availability(Some(false), Some(&quota), "m", now), "unknown");
         }
-        quota.status = "supported".to_owned();
+        quota.response.status = "supported".to_owned();
         for details in [
             json!({}),
             json!({"window":{"usedPercent":0,"resetsAtMs":2_000}}),
             json!({"window":{"usedPercent":0,"resetsAtMs":2_000},"weekly":{"usedPercent":100,"resetsAtMs":3_000}}),
             json!({"window":{"usedPercent":0,"resetsAtMs":999},"weekly":{"usedPercent":0,"resetsAtMs":3_000}}),
         ] {
-            quota.details = Some(details);
+            quota.response.details = Some(details);
             assert_eq!(availability(Some(false), Some(&quota), "m", now), "unknown");
         }
-        quota.harness = "codex".to_owned();
-        quota.details = Some(json!({"ordinaryUsageAllowed":true,
+        quota.response.harness = "codex".to_owned();
+        quota.response.details = Some(json!({"ordinaryUsageAllowed":true,
             "rateLimits":{"primary":{"usedPercent":0,"resetsAt":2},"secondary":{"usedPercent":0,"resetsAt":3}}}));
         assert_eq!(
             availability(Some(false), Some(&quota), "m", now),
@@ -2006,13 +2087,66 @@ mod tests {
             ),
             "unknown"
         );
-        quota.details.as_mut().unwrap()["ordinaryUsageAllowed"] = Value::Bool(false);
+        quota.response.details.as_mut().unwrap()["ordinaryUsageAllowed"] = Value::Bool(false);
         assert_eq!(availability(Some(false), Some(&quota), "m", now), "unknown");
-        quota.details.as_mut().unwrap()["ordinaryUsageAllowed"] = Value::Bool(true);
-        quota.details.as_mut().unwrap()["rateLimitsByLimitId"] = json!({"other":{}});
+        quota.response.details.as_mut().unwrap()["ordinaryUsageAllowed"] = Value::Bool(true);
+        quota.response.details.as_mut().unwrap()["rateLimitsByLimitId"] = json!({"other":{}});
         assert_eq!(availability(Some(false), Some(&quota), "m", now), "unknown");
-        quota.harness = "opencode".to_owned();
+        quota.response.harness = "opencode".to_owned();
         assert_eq!(availability(Some(false), Some(&quota), "m", now), "unknown");
+    }
+
+    #[test]
+    fn aggregate_cache_reprojects_retained_availability_at_evidence_expiry() {
+        let now = 1000;
+        let quota = ScopedQuota {
+            route_verified: true,
+            response: HarnessQuotaResponse {
+                harness: "muse".to_owned(),
+                scope: "profile:adhoc harness:muse".to_owned(),
+                fetched_at_ms: now - 9,
+                ttl_ms: 10,
+                credential: "ambient".to_owned(),
+                status: "supported".to_owned(),
+                note: None,
+                details: Some(
+                    json!({"windows":[{"label":"Weekly","usedPercent":10,"resetsAtMs":2000}]}),
+                ),
+            },
+        };
+        let model = catalog_entry(
+            "muse",
+            eliot_core::api::HarnessModelEntry {
+                id: "m".to_owned(),
+                display_name: None,
+                default: false,
+                efforts: None,
+                default_effort: None,
+                source: None,
+            },
+            Some(false),
+            Some(&quota),
+            now,
+        );
+        assert_eq!(model.availability, "available");
+        let mut cache = CatalogCache::default();
+        cache.insert_aggregate(CachedAggregate {
+            key: "key".to_owned(),
+            harnesses: Vec::new(),
+            models: vec![model],
+            failures: Vec::new(),
+            quotas: HashMap::from([("muse".to_owned(), quota)]),
+            fetched_at_ms: now,
+            ttl_ms: CATALOG_TTL_MS,
+        });
+        assert_eq!(
+            cache.get_aggregate("key", now + 1, false).unwrap().models[0].availability,
+            "available"
+        );
+        assert_eq!(
+            cache.get_aggregate("key", now + 2, true).unwrap().models[0].availability,
+            "unknown"
+        );
     }
 
     #[test]
@@ -2029,15 +2163,18 @@ mod tests {
         };
         // Claude quota stays unsupported: membership alone never proves
         // availability, and the provenance marker is copied verbatim.
-        let unsupported = HarnessQuotaResponse {
-            harness: "claude".to_owned(),
-            scope: "profile:adhoc harness:claude".to_owned(),
-            fetched_at_ms: 1_000,
-            ttl_ms: CATALOG_TTL_MS,
-            credential: "none".to_owned(),
-            status: "unsupported".to_owned(),
-            note: None,
-            details: None,
+        let unsupported = ScopedQuota {
+            route_verified: true,
+            response: HarnessQuotaResponse {
+                harness: "claude".to_owned(),
+                scope: "profile:adhoc harness:claude".to_owned(),
+                fetched_at_ms: 1_000,
+                ttl_ms: CATALOG_TTL_MS,
+                credential: "none".to_owned(),
+                status: "unsupported".to_owned(),
+                note: None,
+                details: None,
+            },
         };
         let built = catalog_entry(
             "claude",
@@ -2070,6 +2207,22 @@ mod tests {
         assert_eq!(built.display_name, "Native Display Name");
         assert_eq!(built.provider, "openrouter");
         assert!(eliot_core::api::catalog_matches(&built, "Display Name"));
+    }
+
+    #[tokio::test]
+    async fn aggregate_deadline_bounds_lock_acquisition_and_inventory() {
+        let router = router();
+        let _lock = router.inner.catalog_aggregate_lock.lock().await;
+        let deadline = Instant::now() + std::time::Duration::from_millis(10);
+        let error = router
+            .models_catalog_until(&json!({}), &Principal::Owner, deadline)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "timeout");
+        assert_eq!(
+            Router::harness_inventory(deadline).await.unwrap_err().code,
+            "timeout"
+        );
     }
 
     #[tokio::test]
@@ -2153,70 +2306,35 @@ mod tests {
     }
 
     #[test]
-    fn cache_identity_separates_accounts_homes_and_endpoints() {
+    fn cache_identity_separates_verified_routes_and_never_displays_paths() {
         let base = json!({
-            "harness": "codex",
-            "account": "team-a",
-            "route_binding": {
-                "name": "corp",
-                "provider_base_url": "http://127.0.0.1:10300/v1",
-                "client_key_env_name": "LOCAL_CLIENT",
-            },
-            "pass_env_values": {"CODEX_HOME": "C:/homes/a", "CODEX_SQLITE_HOME": null},
+            "harness": "codex", "account": "team-a",
+            "route_binding": {"name": "corp", "provider_base_url": "http://127.0.0.1:10300/v1"},
+            "pass_env_values": {"CODEX_HOME": "C:/private/home", "CODEX_SQLITE_HOME": null},
             "literal_env": {"TOKEN": "super-secret-value"},
         });
-        let key = canonical_cache_identity("p", "codex", Some(&base));
+        let key = canonical_cache_identity("p", &base, Some("verified-a")).unwrap();
         let (scope, _) = describe_snapshot("p", "codex", Some(&base));
-        // Display names the new selectors but never a credential value.
-        assert!(scope.contains("account:team-a"), "{scope}");
-        assert!(scope.contains("home:C:/homes/a"), "{scope}");
-        assert!(!scope.contains("super-secret-value"), "{scope}");
-        assert!(!key.contains("super-secret-value"), "key leaks a secret");
-        // Same profile label, different home: a different key.
-        let mut other = base.clone();
-        other["pass_env_values"]["CODEX_HOME"] = json!("C:/homes/b");
-        assert_ne!(key, canonical_cache_identity("p", "codex", Some(&other)));
-        // Same authority, different endpoint path: a different key.
+        assert!(scope.contains("account:team-a"));
+        assert!(!scope.contains("private/home"));
+        assert_eq!(key.len(), 64);
+        assert!(canonical_cache_identity("p", &base, None).is_none());
+        assert_ne!(
+            Some(key.clone()),
+            canonical_cache_identity("p", &base, Some("verified-b"))
+        );
         let mut other = base.clone();
         other["route_binding"]["provider_base_url"] = json!("http://127.0.0.1:10300/v2");
-        assert_ne!(key, canonical_cache_identity("p", "codex", Some(&other)));
-        // Different account binding: a different key.
-        let mut other = base.clone();
+        assert_ne!(
+            Some(key.clone()),
+            canonical_cache_identity("p", &other, Some("verified-a"))
+        );
+        other = base.clone();
         other["account"] = json!("team-b");
-        assert_ne!(key, canonical_cache_identity("p", "codex", Some(&other)));
-        // Identical selectors: the same key, so reads still coalesce.
-        assert_eq!(key, canonical_cache_identity("p", "codex", Some(&base)));
-        // Adding a Claude/XDG selector invalidates the entry: a same-profile
-        // edit that selects another native store must not reuse it.
-        for selector in ["CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME"] {
-            let mut other = base.clone();
-            other["pass_env_values"][selector] = json!("C:/other-store");
-            let (other_scope, _) = describe_snapshot("p", "codex", Some(&other));
-            assert_ne!(
-                key,
-                canonical_cache_identity("p", "codex", Some(&other)),
-                "{selector} change must miss the cache"
-            );
-            assert_ne!(scope, other_scope, "{selector} change must move the scope");
-            assert!(
-                !canonical_cache_identity("p", "codex", Some(&other))
-                    .contains("super-secret-value"),
-                "key leaks a secret"
-            );
-        }
-        // Display scope stays within its validated bound.
-        eliot_core::api::HarnessQuotaResponse {
-            harness: "codex".to_owned(),
-            scope: scope.clone(),
-            fetched_at_ms: 1_000,
-            ttl_ms: CATALOG_TTL_MS,
-            credential: "env:LOCAL_CLIENT".to_owned(),
-            status: "supported".to_owned(),
-            note: None,
-            details: None,
-        }
-        .validate()
-        .expect("display scope stays valid");
+        assert_ne!(
+            Some(key),
+            canonical_cache_identity("p", &other, Some("verified-a"))
+        );
     }
 
     #[test]
@@ -2317,6 +2435,7 @@ mod tests {
             key: key.clone(),
             harnesses: harnesses.clone(),
             models: Vec::new(),
+            quotas: HashMap::new(),
             failures: Vec::new(),
             fetched_at_ms: 1_000,
             ttl_ms: CATALOG_TTL_MS,
@@ -2346,6 +2465,7 @@ mod tests {
             key: aggregate_key(&upgraded),
             harnesses: upgraded,
             models: Vec::new(),
+            quotas: HashMap::new(),
             failures: Vec::new(),
             fetched_at_ms: 2_000,
             ttl_ms: CATALOG_TTL_MS,
@@ -2365,6 +2485,7 @@ mod tests {
             key: key.clone(),
             harnesses,
             models: Vec::new(),
+            quotas: HashMap::new(),
             failures: vec![ModelsCatalogFailure {
                 harness: "codex".to_owned(),
                 code: "busy".to_owned(),
@@ -2383,7 +2504,7 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn catalog_models_caches_static_harness_per_scope() {
+    async fn catalog_models_preserves_documented_claude_aliases() {
         let router = router();
         // Claude needs no native installation: the aliases read never spawns
         // a reader, so this also proves the static path performs no I/O.
@@ -2426,53 +2547,46 @@ mod tests {
             .harness_models(&json!({"harness": "claude"}), &Principal::Owner)
             .await
             .unwrap();
-        // Served from the per-scope cache: the freshness timestamp is kept.
-        assert_eq!(first["fetched_at_ms"], second["fetched_at_ms"]);
-        assert_eq!(first, second);
+        assert_eq!(first["models"], second["models"]);
+        assert_eq!(router.inner.catalog_cache.lock_recover().len().0, 0);
     }
 
     #[tokio::test]
     async fn catalog_quota_retains_supported_errors_with_scope_and_caches() {
         let router = router();
-        // This check covers cache/error semantics only, without native/provider I/O.
-        let (scope, credential) = catalog::describe_snapshot(
-            "adhoc",
-            "antigravity",
-            Some(&json!({"harness":"antigravity"})),
-        );
-        let cache_key = catalog::canonical_cache_identity(
-            "adhoc",
-            "antigravity",
-            Some(&json!({"harness":"antigravity"})),
-        );
-        router.inner.catalog_cache.lock_recover().insert_quota(
-            cache_key,
-            eliot_core::api::HarnessQuotaResponse {
-                harness: "antigravity".to_owned(),
-                scope,
-                credential,
-                fetched_at_ms: now_ms(),
-                ttl_ms: catalog::CATALOG_TTL_MS,
-                status: "supported".to_owned(),
-                note: Some("Native credential unavailable".to_owned()),
-                details: Some(json!({"state":"error","origin":"environment"})),
-            },
-        );
-        let first = router
-            .harness_quota(&json!({"harness": "antigravity"}), &Principal::Owner)
+        let mut profile = json!({"harness":"codex","pass_env":[]});
+        crate::config::capture_native_store_inputs(&mut profile, |name| std::env::var_os(name))
+            .unwrap();
+        let route = crate::plugin_host::metadata_route(&profile).unwrap();
+        let cache_key =
+            canonical_cache_identity("fixture", &profile, route.identity.as_deref()).unwrap();
+        let (scope, credential) = describe_snapshot("fixture", "codex", Some(&profile));
+        let expected = HarnessQuotaResponse {
+            harness: "codex".to_owned(),
+            scope,
+            credential,
+            fetched_at_ms: now_ms(),
+            ttl_ms: CATALOG_TTL_MS,
+            status: "supported".to_owned(),
+            note: Some("Native credential unavailable".to_owned()),
+            details: Some(json!({"state":"error","origin":"environment"})),
+        };
+        router
+            .inner
+            .catalog_cache
+            .lock_recover()
+            .insert_quota(cache_key, expected.clone());
+        let actual = router
+            .quota_for_snapshot(
+                "codex".to_owned(),
+                Some(profile),
+                "fixture".to_owned(),
+                Instant::now() + crate::adhoc::DISCOVERY_BUDGET,
+            )
             .await
             .unwrap();
-        assert_eq!(first["status"], json!("supported"));
-        assert_eq!(first["scope"], json!("profile:adhoc harness:antigravity"));
-        assert_eq!(first["credential"], json!("antigravity-cli-keyring"));
-        assert!(first["fetched_at_ms"].as_i64().unwrap_or(-1) >= 0);
-        assert!(first["note"].as_str().is_some_and(|note| !note.is_empty()));
-        let second = router
-            .harness_quota(&json!({"harness": "antigravity"}), &Principal::Owner)
-            .await
-            .unwrap();
-        assert_eq!(first["fetched_at_ms"], second["fetched_at_ms"]);
-        assert_eq!(first, second);
+        assert_eq!(actual.response, expected);
+        assert!(actual.route_verified);
         // Unknown profiles fail before any native work, and Agent callers
         // are rejected at the owner-only gate.
         let error = router

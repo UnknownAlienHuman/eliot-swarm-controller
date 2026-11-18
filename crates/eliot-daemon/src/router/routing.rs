@@ -208,30 +208,23 @@ impl Router {
         // the one normalized projection, so retained Muse windows and other
         // adapters' limits skip routes exactly like live reads. Unsupported
         // readers keep `Unknown`/`Unsupported` without skipping.
-        if let Ok(raw) = self
-            .quota_for_snapshot(harness.clone(), Some(snapshot.clone()), name.to_owned())
+        let deadline = std::time::Instant::now() + crate::adhoc::DISCOVERY_BUDGET;
+        if let Ok(evidence) = self
+            .quota_for_snapshot(
+                harness.clone(),
+                Some(snapshot.clone()),
+                name.to_owned(),
+                deadline,
+            )
             .await
         {
-            *quota_status = match raw.get("status").and_then(Value::as_str) {
-                Some("supported") => RouteQuotaStatus::Supported,
-                Some("unsupported") => RouteQuotaStatus::Unsupported,
-                _ => RouteQuotaStatus::Unknown,
-            };
-            // The typed projection carries freshness: a stale observation
-            // stays `unknown` here exactly as in `models.catalog`, through
-            // the same function, so an expired window with a future reset
-            // never skips a route.
-            if *quota_status == RouteQuotaStatus::Supported
-                && serde_json::from_value::<eliot_core::api::HarnessQuotaResponse>(raw)
-                    .ok()
-                    .is_some_and(|response| {
-                        quota_exhausted(
-                            &response,
-                            snapshot.get("model").and_then(Value::as_str),
-                            now_ms(),
-                        )
-                    })
-            {
+            let (status, exhausted) = route_quota(
+                &evidence,
+                snapshot.get("model").and_then(Value::as_str),
+                now_ms(),
+            );
+            *quota_status = status;
+            if exhausted {
                 held_accounts.insert(harness, account);
                 return Ok(Err(RouteSkipReason::QuotaExhausted));
             }
@@ -255,6 +248,7 @@ impl Router {
 
 fn account_identity(snapshot: &Value) -> Value {
     json!({"account":snapshot.get("account"), "native_store":snapshot.get("native_store_binding"),
+        "native_route_identity":snapshot.get("native_route_identity"),
         "codex_home":snapshot.pointer("/pass_env_values/CODEX_HOME"),
         "codex_sqlite_home":snapshot.pointer("/pass_env_values/CODEX_SQLITE_HOME"),
         "integration":snapshot.get("auth_integration"), "route":snapshot.get("route_binding"),
@@ -278,19 +272,39 @@ fn native_installed(harness: &str, snapshot: &Value) -> bool {
     })
 }
 
-/// Only the installed, projected native schemas establish exhaustion. No
-/// generic numeric search or model inference probe is used. Routing shares
-/// the catalogue's normalized projection, so an exhausted route is skipped
-/// exactly when the catalogue would refuse to call it available. For Codex
-/// only the explicit limit state of the bucket the request actually uses
-/// settles exhaustion: the primary window, `spendControlReached`,
-/// `rateLimitReachedType`, or a depleted `individualLimit`.
+fn route_quota(
+    quota: &catalog::ScopedQuota,
+    model: Option<&str>,
+    now: i64,
+) -> (RouteQuotaStatus, bool) {
+    if let Some(projection) = catalog::projected_quota(quota, model, now)
+        && projection.mapping != catalog::QuotaMapping::Unmapped
+    {
+        return (RouteQuotaStatus::Supported, projection.exhausted);
+    }
+    let status = if quota.response.status == "unsupported" {
+        RouteQuotaStatus::Unsupported
+    } else {
+        RouteQuotaStatus::Unknown
+    };
+    (status, false)
+}
+
+#[cfg(test)]
 fn quota_exhausted(
     response: &eliot_core::api::HarnessQuotaResponse,
     model: Option<&str>,
     now: i64,
 ) -> bool {
-    catalog::projected_quota(response, model, now).is_some_and(|projection| projection.exhausted)
+    route_quota(
+        &catalog::ScopedQuota {
+            response: response.clone(),
+            route_verified: true,
+        },
+        model,
+        now,
+    )
+    .1
 }
 
 #[cfg(test)]
@@ -411,7 +425,7 @@ mod tests {
             json!({"windows": [{"label": "Weekly", "usedPercent": 100.0, "resetsAtMs": i64::MAX}]}),
             None,
         ));
-        for harness in ["claude", "opencode", "antigravity"] {
+        for harness in ["claude", "antigravity"] {
             assert!(
                 exhausted(
                     harness,
@@ -481,6 +495,14 @@ mod tests {
         };
         assert!(!quota_exhausted(&stale, Some("m"), 1_000 + 300_000 + 1));
         assert!(quota_exhausted(&stale, Some("m"), 1_000 + 300_000));
+        let scoped = catalog::ScopedQuota {
+            response: stale,
+            route_verified: true,
+        };
+        assert_eq!(
+            route_quota(&scoped, Some("m"), 1_000 + 300_000 + 1),
+            (RouteQuotaStatus::Unknown, false)
+        );
     }
     #[test]
     fn codex_quota_uses_primary_limit_state_only() {

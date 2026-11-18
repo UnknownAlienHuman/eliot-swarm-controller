@@ -849,6 +849,13 @@ requires the retained effective `native_store_binding` and verifies it before na
 control. Capture proves only the supplied inputs, not the effective native home,
 database root or scope; native configuration can affect selection.
 
+Claude and XDG store selectors and private provider selectors are retained
+only in the opaque `native_route_identity`. The daemon verifies admitted
+selector states against the private process environment before using a
+captured route. Legacy snapshots lack that verification and bypass native
+read caches. Codex retains its existing execution inputs in
+`pass_env_values`. Public catalog scope omits store paths.
+
 For a new Codex launch, resolve the effective store only after the actual workspace is
 prepared, including setup. The owned read-only
 [`profile.store`](../../crates/eliot-plugin/src/protocol.rs) reader uses that workspace
@@ -876,7 +883,7 @@ Agents without a binding refuse before control rather than selecting a store ane
 ProfileSnapshot {
   profile_name, harness, plugin,
   model?, effort?, permissions, control, args, mcp, mcp_allow,
-  literal_env, pass_env_values, secret_env_names, inherit_env,
+  literal_env, pass_env_values, native_route_identity?, secret_env_names, inherit_env,
   account?, proxy?, billing?, workspace_mode, git_identity,
   route_binding?, capacity_scopes[], labels, stall_after, notify_parent, wake_on_mail,
   system_note?, setup[], scratch, source_files

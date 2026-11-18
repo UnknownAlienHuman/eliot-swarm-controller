@@ -399,7 +399,7 @@ impl PluginHost {
 
     async fn start_inner(
         &self,
-        agent: Agent,
+        mut agent: Agent,
         command: Command,
         mut source_state: Option<Value>,
         may_have_spawned: &mut bool,
@@ -473,6 +473,13 @@ impl PluginHost {
         } else {
             None
         };
+        if agent.harness == "antigravity" {
+            let cmd = agent.profile_snapshot["cmd"].as_str().unwrap_or("agy");
+            let deadline = std::time::Instant::now() + crate::adhoc::DISCOVERY_BUDGET;
+            let (program, _) =
+                crate::adhoc::reader_executable(cmd, "antigravity", deadline).await?;
+            agent.profile_snapshot["cmd"] = Value::String(program);
+        }
         let key = AgentKey {
             id: agent.id.clone(),
             generation: agent.generation,
@@ -2453,7 +2460,7 @@ const BASE_ENVIRONMENT_NAMES: &[&str] = &[
 #[cfg(not(windows))]
 const BASE_ENVIRONMENT_NAMES: &[&str] = &["HOME", "PATH", "TEMP"];
 
-fn minimal_plugin_environment() -> Vec<(OsString, OsString)> {
+pub(crate) fn minimal_plugin_environment() -> Vec<(OsString, OsString)> {
     BASE_ENVIRONMENT_NAMES
         .iter()
         .filter_map(|name| std::env::var_os(name).map(|value| (OsString::from(*name), value)))
@@ -2499,8 +2506,11 @@ fn metadata_secret_snapshot(
     {
         // Exclude contributions by NAME, never subtract a matching secret value.
         names.retain(|name| {
-            name.as_str()
-                .is_none_or(|name| crate::config::native_store_selector(name).is_none())
+            name.as_str().is_none_or(|name| {
+                !crate::config::CODEX_STORE_SELECTORS
+                    .iter()
+                    .any(|selector| crate::config::native_store_selector(name) == Some(*selector))
+            })
         });
     }
     source_secret_snapshot(&policy_profile, environment, known)
@@ -2510,47 +2520,79 @@ pub(crate) fn build_process_environment(profile: &Value) -> Result<Map<String, V
     build_process_environment_with(profile, |name| std::env::var_os(name))
 }
 
-/// Frozen native store inputs are the exact selector set for new snapshots,
-/// or the legacy two-Codex-home set for snapshots frozen before the Claude
-/// and XDG selectors were captured. Every key must be a known selector with
-/// a null/string value; unknown keys or duplicates stay malformed.
+/// A prepared metadata reader uses the same private environment that was
+/// verified before cache lookup. Legacy inputs can still be read uncached.
+pub(crate) struct MetadataRoute {
+    pub(crate) environment: Value,
+    pub(crate) identity: Option<String>,
+}
+
+pub(crate) fn metadata_route(profile: &Value) -> Result<MetadataRoute> {
+    let (environment, identity) =
+        prepare_process_environment(profile, |name| std::env::var_os(name))?;
+    let identity =
+        identity.filter(|_| crate::config::metadata_route_scope_known(profile, &environment));
+    Ok(MetadataRoute {
+        environment: Value::Object(environment),
+        identity,
+    })
+}
+
 fn captured_store_inputs_valid(values: &Map<String, Value>) -> bool {
-    if !values
+    values
         .values()
         .all(|value| value.is_null() || value.is_string())
-    {
-        return false;
-    }
-    let mut selectors: Vec<&str> = values
-        .keys()
-        .filter_map(|name| crate::config::native_store_selector(name))
-        .collect();
-    selectors.sort_unstable();
-    selectors.dedup();
-    if selectors.len() != values.len() {
-        return false;
-    }
-    let mut full: Vec<&str> = crate::config::NATIVE_STORE_SELECTORS.to_vec();
-    full.sort_unstable();
-    selectors == full || selectors == ["CODEX_HOME", "CODEX_SQLITE_HOME"]
+        && (values.len() == 2 || values.len() == 5)
+        && values
+            .keys()
+            .all(|name| crate::config::native_store_selector(name).is_some())
+        && ["CODEX_HOME", "CODEX_SQLITE_HOME"]
+            .into_iter()
+            .all(|selector| {
+                values
+                    .keys()
+                    .filter(|name| crate::config::native_store_selector(name) == Some(selector))
+                    .count()
+                    == 1
+            })
+        && (values.len() == 2
+            || ["CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME"]
+                .into_iter()
+                .all(|selector| {
+                    values
+                        .keys()
+                        .filter(|name| crate::config::native_store_selector(name) == Some(selector))
+                        .count()
+                        == 1
+                }))
 }
 
 fn build_process_environment_with(
     profile: &Value,
-    mut lookup: impl FnMut(&str) -> Option<OsString>,
+    lookup: impl FnMut(&str) -> Option<OsString>,
 ) -> Result<Map<String, Value>> {
-    let captured = match profile.get("pass_env_values") {
-        Some(value) => value
-            .as_object()
-            .filter(|values| captured_store_inputs_valid(values))
-            .ok_or_else(|| Error::new("invalid", "frozen native store inputs are malformed"))?,
-        None => {
-            return Err(Error::new(
-                "invalid",
-                "frozen native store inputs are malformed",
-            ));
-        }
-    };
+    prepare_process_environment(profile, lookup).map(|(environment, _)| environment)
+}
+
+fn prepare_process_environment(
+    profile: &Value,
+    mut lookup: impl FnMut(&str) -> Option<OsString>,
+) -> Result<(Map<String, Value>, Option<String>)> {
+    let captured = profile
+        .get("pass_env_values")
+        .map(|value| {
+            value
+                .as_object()
+                .filter(|values| captured_store_inputs_valid(values))
+                .ok_or_else(|| Error::new("invalid", "frozen native store inputs are malformed"))
+        })
+        .transpose()?;
+    if captured.is_none() && profile["harness"] == "codex" {
+        return Err(Error::new(
+            "invalid",
+            "frozen native store inputs are missing",
+        ));
+    }
     let mut environment = Map::new();
     for name in BASE_ENVIRONMENT_NAMES {
         if let Some(value) = lookup(name) {
@@ -2595,7 +2637,7 @@ fn build_process_environment_with(
                 ));
             }
             if let Some(selector) = crate::config::native_store_selector(name) {
-                let frozen = captured.iter().find_map(|(name, value)| {
+                let frozen = captured.into_iter().flatten().find_map(|(name, value)| {
                     (crate::config::native_store_selector(name) == Some(selector)).then_some(value)
                 });
                 match frozen {
@@ -2623,7 +2665,26 @@ fn build_process_environment_with(
         }
     }
 
-    Ok(environment)
+    let identity = match profile.get("native_route_identity") {
+        None => None,
+        Some(frozen) => {
+            let current = crate::config::native_route_identity(profile, |name| {
+                Ok(environment.iter().find_map(|(key, value)| {
+                    (key == name || (cfg!(windows) && key.eq_ignore_ascii_case(name)))
+                        .then(|| value.as_str().map(str::to_owned))
+                        .flatten()
+                }))
+            })?;
+            if frozen.as_str() != Some(current.as_str()) {
+                return Err(Error::new(
+                    "unavailable",
+                    "frozen native route could not be verified in the private environment",
+                ));
+            }
+            Some(current)
+        }
+    };
+    Ok((environment, identity))
 }
 
 fn build_target_environment(data_root: &Path, agent: &Agent, agent_token: &str) -> Result<Value> {
@@ -3755,6 +3816,63 @@ mod tests {
         })
         .unwrap();
         assert_eq!(environment["CODEX_HOME"], "");
+    }
+
+    #[test]
+    fn legacy_and_changed_native_routes_cannot_reuse_quota() {
+        let legacy = json!({"harness":"claude", "pass_env":["CLAUDE_CONFIG_DIR","ANTHROPIC_BASE_URL"],
+            "pass_env_values":{"CODEX_HOME":null, "CODEX_SQLITE_HOME":null}});
+        let lookup =
+            |name: &str| (name == "CLAUDE_CONFIG_DIR").then(|| OsString::from("private-dir"));
+        let (environment, verified) = prepare_process_environment(&legacy, lookup).unwrap();
+        assert_eq!(environment["CLAUDE_CONFIG_DIR"], "private-dir");
+        assert!(verified.is_none());
+        let mut captured = legacy.clone();
+        crate::config::capture_native_store_inputs_with_lookups(&mut captured, lookup, |_| None)
+            .unwrap();
+        let (_, verified) = prepare_process_environment(&captured, lookup).unwrap();
+        assert_eq!(
+            verified.as_deref(),
+            captured["native_route_identity"].as_str()
+        );
+        for changed in ["CLAUDE_CONFIG_DIR", "ANTHROPIC_BASE_URL"] {
+            let result = prepare_process_environment(&captured, |name| {
+                if name == changed {
+                    Some(OsString::from("changed"))
+                } else {
+                    lookup(name)
+                }
+            });
+            assert_eq!(result.unwrap_err().code, "unavailable");
+        }
+        let mut states = std::collections::HashSet::new();
+        for (names, selected) in [
+            (json!([]), None),
+            (json!(["CLAUDE_CONFIG_DIR"]), None),
+            (json!(["CLAUDE_CONFIG_DIR"]), Some("")),
+        ] {
+            let mut snapshot = legacy.clone();
+            snapshot["pass_env"] = names;
+            crate::config::capture_native_store_inputs_with_lookups(
+                &mut snapshot,
+                |name| {
+                    (name == "CLAUDE_CONFIG_DIR")
+                        .then_some(selected)
+                        .flatten()
+                        .map(OsString::from)
+                },
+                |_| None,
+            )
+            .unwrap();
+            assert!(
+                states.insert(
+                    snapshot["native_route_identity"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned()
+                )
+            );
+        }
     }
 
     #[test]
