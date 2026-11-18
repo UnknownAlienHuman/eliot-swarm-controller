@@ -1731,6 +1731,27 @@ pub(crate) async fn reader_executable(
     .await?
 }
 
+/// Select the Claude reader under the caller's deadline and reuse the
+/// selected candidate's version from the same discovery pass.
+pub(crate) async fn claude_reader_executable(
+    deadline: Instant,
+) -> core::Result<core::api::HarnessCandidate> {
+    blocking_discovery(deadline, move || {
+        let candidates = discover_claude_candidates(deadline);
+        discovery_remaining(deadline)?;
+        let best = candidates
+            .into_iter()
+            .next()
+            .ok_or_else(native_cmd_unavailable)?;
+        let cmd = resolve_native_executable(&best.cmd, false)?;
+        Ok(core::api::HarnessCandidate {
+            cmd,
+            version: best.version,
+        })
+    })
+    .await?
+}
+
 /// Error for an `agy`-less install. The IDE path, when seen, is named for
 /// guidance only: it is never returned, executed or version-probed.
 fn antigravity_missing_cli(searched: &[String], ide: Option<&str>) -> core::Error {

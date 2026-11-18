@@ -243,11 +243,16 @@ impl PluginHost {
         if !profile
             .get("harness")
             .and_then(Value::as_str)
-            .is_some_and(|harness| matches!(harness, "codex" | "muse" | "opencode" | "antigravity"))
+            .is_some_and(|harness| {
+                matches!(
+                    harness,
+                    "codex" | "claude" | "muse" | "opencode" | "antigravity"
+                )
+            })
         {
             return Err(Error::new(
                 "unsupported",
-                "harness.models needs a codex, muse, opencode or antigravity profile",
+                "harness.models needs a codex, claude, muse, opencode or antigravity profile",
             ));
         }
         let workspace = if let Some(workspace) = workspace {
@@ -266,6 +271,7 @@ impl PluginHost {
         } else {
             None
         };
+        let claude = profile["harness"] == "claude";
         let request = ModelListParams {
             target_environment: Some(environment),
             profile,
@@ -297,9 +303,12 @@ impl PluginHost {
             host.finish_metadata_reader(&id, done_tx, completion.cleanup);
             let _ = reply.send(completion.result);
         });
-        response
-            .await
-            .map_err(|_| Error::new("unavailable", "model.list reader stopped"))?
+        response.await.map_err(|_| {
+            Error::new(
+                if claude { "unknown" } else { "unavailable" },
+                "model.list reader stopped",
+            )
+        })?
     }
 
     /// Read-only native account quota for `harness.quota`. A dedicated
@@ -706,7 +715,10 @@ impl PluginHost {
         };
         let result = tokio::select! {
             result = tokio::time::timeout_at(until, read) =>
-                result.unwrap_or_else(|_| Err(Error::new("unavailable", "model.list deadline exceeded"))),
+                result.unwrap_or_else(|_| Err(Error::new(
+                    if harness == "claude" { "unknown" } else { "unavailable" },
+                    "model.list deadline exceeded",
+                ))),
             _ = stop.changed() => Err(Error::new("cancelled", "model.list was cancelled")),
         };
         let secrets = reader.secrets.clone();
