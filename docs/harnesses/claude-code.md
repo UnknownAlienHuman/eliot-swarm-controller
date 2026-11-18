@@ -426,10 +426,14 @@ Implementation:
 ## Read-only provider quota
 
 `harness.quota` is implemented in `plugins/claude/src/quota.rs`, following
-OpenCodex 2.84.0's OAuth usage reader as a pattern only. It reads the CLI's own
+OpenCodex 2.84.0's OAuth usage reader as a pattern only. It refuses external or
+ambiguous provider and authentication selectors in the profile environment and
+native user settings. The installed CLI's `auth status --json` must confirm a
+first-party subscription route in the isolated reader directory. Then it reads
+the CLI's own
 `CLAUDE_CONFIG_DIR/.credentials.json` (default `~/.claude`) without writes, selects
 `claudeAiOauth.accessToken`, and calls Anthropic `/api/oauth/usage` with
 `anthropic-beta: oauth-2025-04-20`. It projects `five_hour`, `seven_day`, recognized
 model weekly buckets and `limits[kind=weekly_scoped]`, never account identity.
 Missing credentials, expiry and provider failures remain supported error states
-with explicit origin. No refresh, model turn or inference probe is attempted.
+with explicit origin. No refresh, login, model turn or inference probe is attempted.
