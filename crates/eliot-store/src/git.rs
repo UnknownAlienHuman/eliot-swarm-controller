@@ -314,7 +314,6 @@ fn git_changed_data(
 /// observation. Mirrors the file-change `changed_paths_truncated` marker.
 fn bound_git_committed_data(snapshot: &GitSnapshot, commit: &GitCommit) -> Result<Value> {
     let mut paths = commit.paths.clone();
-    let mut truncated = false;
     let mut data = git_committed_data(snapshot, &commit.oid, &paths, false);
     while encode_json(&data)?.len() > MAX_EVENT_BYTES {
         if paths.len() > 1 {
@@ -327,8 +326,7 @@ fn bound_git_committed_data(snapshot: &GitSnapshot, commit: &GitCommit) -> Resul
                 "Git commit identity exceeds its bound",
             ));
         }
-        truncated = true;
-        data = git_committed_data(snapshot, &commit.oid, &paths, truncated);
+        data = git_committed_data(snapshot, &commit.oid, &paths, true);
     }
     Ok(data)
 }

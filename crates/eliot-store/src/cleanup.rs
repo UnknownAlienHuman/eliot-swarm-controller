@@ -1885,7 +1885,7 @@ mod tests {
     #[test]
     fn settled_rows_do_not_starve_eligible_candidates() {
         let mut store = Store::open(Path::new(":memory:")).unwrap();
-        let base = u64::try_from(Ulid::new().timestamp_ms()).unwrap();
+        let base = Ulid::new().timestamp_ms();
         inventory_agent(&mut store, base);
         for i in 0..MAX_CLEANUP_ITEMS {
             let id = Ulid::from_parts(base + i as u64, 0).to_string();
@@ -1924,7 +1924,7 @@ mod tests {
     #[test]
     fn inventory_pages_past_blocked_rows_with_after() {
         let mut store = Store::open(Path::new(":memory:")).unwrap();
-        let base = u64::try_from(Ulid::new().timestamp_ms()).unwrap();
+        let base = Ulid::new().timestamp_ms();
         inventory_agent(&mut store, base);
         let mut ids = Vec::new();
         for i in 0..=MAX_CLEANUP_ITEMS {
@@ -1964,7 +1964,7 @@ mod tests {
     #[test]
     fn retirement_inventory_is_scoped_before_the_cap() {
         let mut store = Store::open(Path::new(":memory:")).unwrap();
-        let base = u64::try_from(Ulid::new().timestamp_ms()).unwrap();
+        let base = Ulid::new().timestamp_ms();
         inventory_agent(&mut store, base);
         inventory_agent(&mut store, base);
         for i in 0..70 {
