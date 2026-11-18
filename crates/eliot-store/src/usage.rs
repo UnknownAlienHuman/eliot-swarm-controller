@@ -5,10 +5,11 @@
 //! scope (`turn`, `main_loop_turn`, `message`, `unknown`) reports its own
 //! subtotals with the turns counted and the per-counter gaps. Session facts
 //! read the latest `session_usage` snapshot per Agent generation in scope;
-//! each generation contributes only its advance past the previously retained
-//! cumulative for the same source (a cumulative below the retained baseline
-//! proves a counter reset and contributes in full), and cost sums only within
-//! one verbatim unit, never converted. Scope
+//! each generation contributes its signed advance past the previously retained
+//! cumulative for the same source (a new session counts from zero, an advance
+//! adds its delta, and a same-session correction retracts the over-count by
+//! moving the baseline down), and cost sums only within one verbatim unit,
+//! never converted. Scope
 //! expansion reuses the hierarchy fanout bound and reports truncation; the
 //! retained-event watermark names the retention floor instead of implying
 //! full totals.
@@ -397,12 +398,15 @@ impl Store {
             }
         }
         chain.sort_by_key(|first| (first.0, first.1));
-        // A cumulative below the retained baseline establishes a new baseline
-        // (a counter reset or a genuinely new native subject) and contributes
-        // in full. Baselines split by normalized provider namespace (the
-        // snapshot source up to any event suffix), so cumulative namespaces
-        // from different provider pipelines never subtract, while different
-        // event kinds from the same native subject (for example Muse
+        // Signed advances past the retained baseline: a first observation for
+        // a session counts from zero, an advance adds its delta, and a lower
+        // observation in the same session is a correction that retracts the
+        // over-count by moving the baseline down (it contributes no new
+        // usage). Only a genuinely new native subject starts a fresh baseline.
+        // Baselines split by normalized provider namespace (the snapshot
+        // source up to any event suffix), so cumulative namespaces from
+        // different provider pipelines never subtract, while different event
+        // kinds from the same native subject (for example Muse
         // `session/tokenUsage` and `session/contextUsage`, where the latter
         // carries the former's cumulative forward) share one baseline instead
         // of double-counting the same subject.
@@ -437,12 +441,16 @@ impl Store {
             ];
             for (index, value) in counters.into_iter().enumerate() {
                 if let Some(value) = value {
-                    let delta = match token_baseline.get(&(*agent, source.clone(), index)) {
-                        Some(&baseline) if value >= baseline => value - baseline,
-                        _ => value,
-                    };
+                    // Signed advance past the retained baseline: a new session
+                    // counts from zero, an advance adds its delta, and a
+                    // same-session correction retracts the over-count by
+                    // moving the baseline down to the corrected cumulative.
+                    let baseline = token_baseline
+                        .get(&(*agent, source.clone(), index))
+                        .copied()
+                        .unwrap_or(0);
                     token_baseline.insert((*agent, source.clone(), index), value);
-                    sums[index] += i128::from(delta);
+                    sums[index] += i128::from(value - baseline);
                     supplied[index] += 1;
                 }
             }
@@ -453,13 +461,13 @@ impl Store {
                 {
                     let unit = cost.unit.clone().expect("cost unit present");
                     let amount = cost.amount.expect("cost amount present");
-                    let delta = match cost_baseline.get(&(*agent, source.clone(), unit.clone())) {
-                        Some(&baseline) if amount >= baseline => amount - baseline,
-                        _ => amount,
-                    };
+                    let baseline = cost_baseline
+                        .get(&(*agent, source.clone(), unit.clone()))
+                        .copied()
+                        .unwrap_or(0.0);
                     cost_baseline.insert((*agent, source.clone(), unit.clone()), amount);
                     let entry = costs.entry(unit).or_insert((0.0, 0));
-                    entry.0 += delta;
+                    entry.0 += amount - baseline;
                     entry.1 += 1;
                 }
                 _ => snapshots_without_cost += 1,
@@ -811,14 +819,14 @@ mod tests {
         let mut store = Store::open(Path::new(":memory:")).expect("open Store");
         let now = now_ms();
         let resumed = launch(&mut store, "usage-resume", now);
+        let reset = launch(&mut store, "usage-resume", now);
         let other = launch(&mut store, "usage-resume", now);
-        // One native session continued across three generations: each
-        // snapshot repeats the session cumulative, so a plain sum would
-        // triple-count it. The third generation proves a counter reset and
-        // contributes in full with a fresh baseline.
-        for (generation, input, output, amount) in
-            [(1, 1000, 300, 1.5), (2, 1500, 500, 2.0), (3, 200, 100, 0.3)]
-        {
+        // One native session continued across two generations: each snapshot
+        // repeats the session cumulative, so a plain sum would double-count
+        // it. Only a genuinely new native subject proves a reset and counts
+        // from zero; a lower cumulative in the same session would be a
+        // correction, not a reset.
+        for (generation, input, output, amount) in [(1, 1000, 300, 1.5), (2, 1500, 500, 2.0)] {
             insert_session(
                 &store,
                 &resumed,
@@ -830,6 +838,17 @@ mod tests {
                 }),
             );
         }
+        // A fresh native subject starts its own baseline and counts from zero.
+        insert_session(
+            &store,
+            &reset,
+            1,
+            json!({
+                "cumulative_tokens": {"input_tokens": 200, "output_tokens": 100},
+                "cumulative_cost": {"amount": 0.3, "unit": "usd_estimate"},
+                "source": "codex:thread/tokenUsage/updated",
+            }),
+        );
         // A different provider pipeline is never subtracted against the
         // first: incomparable cumulative namespaces contribute in full.
         insert_session(
@@ -849,7 +868,7 @@ mod tests {
             root: None,
         };
         let response = summarize(&store, &request);
-        assert_eq!(response.agents_included, 2);
+        assert_eq!(response.agents_included, 3);
         assert_eq!(response.generations_included, 4);
         assert_eq!(response.sessions.snapshots, 4);
         assert_eq!(response.sessions.generations_without_snapshot, 0);
@@ -947,6 +966,62 @@ mod tests {
             .find(|cost| cost.unit == "usd_estimate")
             .expect("usd cost");
         assert_eq!(usd.total_amount, 1.5);
+    }
+
+    #[test]
+    fn muse_same_session_correction_retracts_overcount() {
+        let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+        let now = now_ms();
+        let agent = launch(&mut store, "usage-correction", now);
+        // Generation 1 over-reports the session cumulative at 1000 input.
+        insert_session(
+            &store,
+            &agent,
+            1,
+            json!({
+                "cumulative_tokens": {"input_tokens": 1000, "output_tokens": 100},
+                "cumulative_cost": {"amount": 1.0, "unit": "usd_estimate"},
+                "source": "muse:session/tokenUsage",
+            }),
+        );
+        // Generation 2 corrects the same session down to 900: the correction
+        // becomes the new baseline with no new usage, retracting the phantom
+        // 100 instead of counting the corrected cumulative in full (which
+        // would report 1,900).
+        insert_session(
+            &store,
+            &agent,
+            2,
+            json!({
+                "cumulative_tokens": {"input_tokens": 900, "output_tokens": 90},
+                "cumulative_cost": {"amount": 0.5, "unit": "usd_estimate"},
+                "source": "muse:session/tokenUsage",
+            }),
+        );
+        let response = summarize(
+            &store,
+            &UsageSummaryRequest {
+                agent: None,
+                generation: None,
+                project: Some("usage-correction".to_owned()),
+                root: None,
+            },
+        );
+        assert_eq!(
+            response.sessions.cumulative_tokens.input_tokens.total,
+            Some(900)
+        );
+        assert_eq!(
+            response.sessions.cumulative_tokens.output_tokens.total,
+            Some(90)
+        );
+        let usd = response
+            .sessions
+            .cost_by_unit
+            .iter()
+            .find(|cost| cost.unit == "usd_estimate")
+            .expect("usd cost");
+        assert_eq!(usd.total_amount, 0.5);
     }
 
     #[test]

@@ -839,11 +839,13 @@ gaps, plus the retained non-terminal turns the sums skip
 (`turns_unknown_excluded`, `turns_running_excluded`): an unknown turn may
 have spent tokens the readback cannot see. Session facts contribute per-Agent
 resume-chain deltas: generations of one Agent continue the same native subject, so
-each snapshot adds only its advance past the previous retained cumulative for the
-same normalized provider namespace (the snapshot source up to any event suffix,
-so Muse `session/tokenUsage` and `session/contextUsage` share one baseline;
-a cumulative below the retained baseline establishes a new baseline for a reset
-or new subject and contributes in full with that fresh baseline; coverage still
+each snapshot adds its signed advance past the previous retained cumulative for
+the same normalized provider namespace (the snapshot source up to any event
+suffix, so Muse `session/tokenUsage` and `session/contextUsage` share one
+baseline; a first observation for a session counts from zero, an advance adds
+its delta, and a lower observation in the same session is a correction that
+retracts the over-count by moving the baseline down, contributing no new usage;
+only a genuinely new native subject starts a fresh baseline; coverage still
 reads back where a snapshot is missing), group cost by verbatim unit without
 converting, and never sum context occupancy.
 `history_complete` is false with its reason when the retained-event
