@@ -994,8 +994,10 @@ literal and must pass ordinary command validation. Records cannot supply command
 After successful exit, validate each actually emitted record separately against its saved
 scope and the admission rate policy frozen in the committed rule parent: project Run uses
 the project action allowlist and Router generation/turn fences;
-global Run uses ordinary Owner Router checks. Output validation must not depend on the
-definition revision remaining retained. All records must pass before atomic admission;
+global Run uses ordinary Owner Router checks. For parents with frozen policy this
+validation must not depend on the definition revision remaining retained; rows
+committed before the parent policy freeze still resolve their limit through the
+existing retained-definition lookup. All records must pass before atomic admission;
 the rule loader does not statically analyze possible script output. Admitted children use the
 saved rule principal—Owner for global Run, project principal for project Run—even after the
 Run token is revoked.
