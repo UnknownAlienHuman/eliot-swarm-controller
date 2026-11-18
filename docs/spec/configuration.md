@@ -172,11 +172,12 @@ fields default to the safe posture (Codex `workspace-write` + `never`,
 Claude CLI-default permission mode, Muse current conservative
 defaults); broader authority stays profile-only, owner-written choice. When
 `--cmd` is not given, the daemon resolves the installed native executable
-deterministically and freezes the absolute path: Claude prefers the newest
-install by `--version` (`claude.exe` on `PATH`, the standard user install
-locations, and the desktop-app bundles under
-`%APPDATA%\Claude\claude-code\<version>\<hash>`, refusing
-`.cmd`/`.bat`/`.ps1` wrappers), OpenCode by following the npm shim to the
+deterministically and freezes the absolute path. Ad-hoc Claude uses
+`mcp = "minimal"` and selects the newest standalone CLI by `--version`
+from `PATH` and standard user install locations. The Windows Desktop
+bundle requires an explicit `--cmd` or profile `cmd`. See
+[Claude Code discovery](../harnesses/claude-code.md#ad-hoc-launch).
+OpenCode resolves the npm shim to the
 native `opencode.exe` inside the package (consulting the
 `USERPROFILE`-derived roaming root when `APPDATA` is stripped), Muse via the
 launcher dir version the launcher marks current, Codex via the existing
