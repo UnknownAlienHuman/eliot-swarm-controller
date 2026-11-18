@@ -152,16 +152,6 @@ enum Control {
     SnapshotStatus {
         reply: oneshot::Sender<EventStatus>,
     },
-    /// Durable unresolved start fact: the exact native scope and session id
-    /// of a created session whose removal is unproved, committed without
-    /// publishing readiness so the controller can reconcile the native
-    /// session after this plugin exits. Never sets `ready`.
-    NoteUnresolved {
-        native_scope: String,
-        session_id: String,
-        reason: String,
-        reply: oneshot::Sender<Result<()>>,
-    },
 }
 
 /// Messages flowing from the context poll task and claim/resolve workers
@@ -389,25 +379,6 @@ impl EventHandle {
             native_scope,
             session_id,
             effective,
-            reply,
-        })
-        .await
-    }
-
-    /// Commit the exact native scope and session id as an unresolved start
-    /// fact without publishing readiness. Best-effort: a lost acknowledgement
-    /// still resolves `Err`, and the caller keeps the in-memory session and
-    /// the exact id in its error text either way.
-    pub async fn note_unresolved(
-        &self,
-        native_scope: String,
-        session_id: String,
-        reason: String,
-    ) -> Result<()> {
-        self.send(|reply| Control::NoteUnresolved {
-            native_scope,
-            session_id,
-            reason,
             reply,
         })
         .await
@@ -805,16 +776,6 @@ impl EventProcessor {
                 let _ = reply.send(self.status.clone());
                 true
             }
-            Control::NoteUnresolved {
-                native_scope,
-                session_id,
-                reason,
-                reply,
-            } => {
-                let result = self.note_unresolved(native_scope, session_id, reason).await;
-                let _ = reply.send(result);
-                true
-            }
         }
     }
 
@@ -1022,31 +983,6 @@ impl EventProcessor {
                     | "form.cancelled"
             )
         })
-    }
-
-    /// Commit one unresolved start fact: the exact native scope and session
-    /// id of a created session whose removal is unproved, with the short
-    /// non-secret reason. This is not readiness: `status.ready` stays false,
-    /// `status.session_id` stays unset, and no expected sequence starts. The
-    /// durable fact lets the controller reconcile the native session after
-    /// this plugin exits; unknown folds ignore the kind.
-    async fn note_unresolved(
-        &mut self,
-        native_scope: String,
-        session_id: String,
-        reason: String,
-    ) -> Result<()> {
-        let native_id = format!("opencode:{session_id}:session.unresolved");
-        self.commit_event(
-            "session.unresolved",
-            native_id,
-            json!({
-                "native_scope": native_scope,
-                "native_ref": session_id,
-                "reason": reason,
-            }),
-        )
-        .await
     }
 
     async fn commit_ready(

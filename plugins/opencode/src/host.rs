@@ -100,17 +100,16 @@ fn phase_budget(envelope: Instant, budget: std::time::Duration) -> std::time::Du
     phase_deadline(envelope, budget).saturating_duration_since(Instant::now())
 }
 
-/// Post-create cleanup cutoff, fixed before the first create write: every
-/// check after the session exists ends this far before the envelope, so the
-/// created-session delete plus the event close and server terminate keep
-/// their own deadlines inside the reserve instead of inheriting one expired
-/// deadline. A slow read can no longer leave no time for the delete, and a
-/// config timeout takes the same deletion-proof path as every other
-/// post-create failure.
-fn post_create_cutoff(envelope: Instant) -> Instant {
+/// Cutoff for the create request and response and all checks before readiness.
+/// DELETE and server shutdown keep separate deadlines inside the reserve.
+fn create_cutoff(envelope: Instant) -> Instant {
     envelope
         .checked_sub(START_CLEANUP_BUDGET)
         .unwrap_or_else(Instant::now)
+}
+
+fn create_deadline(cutoff: Instant) -> Instant {
+    phase_deadline(cutoff, RPC_TIMEOUT)
 }
 
 /// Post-create DELETE deadline: the delete share, always ending a full
@@ -1320,12 +1319,7 @@ impl OpenCodePlugin {
         // profiles create the session unchanged.
         let deny_native_subagents = parsed.native_subagents.as_deref() == Some("deny");
         let deny_permissions = deny_native_subagents.then(Self::subagent_deny_permissions);
-        // Fix the post-create cleanup cutoff before the first create write:
-        // every check below runs against this cutoff, never the raw
-        // envelope, so the created-session delete and the server shutdown
-        // keep their own deadlines inside the reserve no matter how slow
-        // the readbacks are.
-        let cutoff = post_create_cutoff(envelope);
+        let cutoff = create_cutoff(envelope);
         let create_timing = crate::native::startup::Step::new("session_create");
         let created = match session
             .http
@@ -1334,7 +1328,7 @@ impl OpenCodePlugin {
                 parsed.model_ref.as_ref(),
                 &directory,
                 deny_permissions.as_deref(),
-                phase_deadline(envelope, RPC_TIMEOUT),
+                create_deadline(cutoff),
             )
             .await
         {
@@ -2603,10 +2597,8 @@ impl OpenCodePlugin {
     /// Every post-create failure funnels through here: the created session
     /// may have been admitted, so the delete is proved first. A proved
     /// removal stops the server inside the shutdown share and settles failed;
-    /// an unproved removal commits the exact native identity as an unresolved
-    /// start fact and retains it as unknown with the live server — the
-    /// server is never stopped while the stable store may silently retain
-    /// the session. The create is never repeated.
+    /// an unproved removal retains the exact session in memory as unknown,
+    /// with the server still live. The create is never repeated.
     async fn fail_created_start(
         &mut self,
         params: &AgentStartParams,
@@ -2623,49 +2615,11 @@ impl OpenCodePlugin {
             discard_created_start(&mut session, envelope).await;
             return self.retain_failed_start(params, error);
         }
-        self.stash_created_unknown(
-            session,
-            native_ref,
-            format!("{}; {kill_note}", error.message),
-        )
-        .await
-    }
-
-    /// Stash a created session whose removal is unproved as unknown: commit
-    /// the exact native scope and id as an unresolved start fact first, so
-    /// the controller can reconcile the native session after this plugin
-    /// exits, then keep the exact native identity with its live server and
-    /// stream for the snapshot instead of stopping the server while the
-    /// stable store silently retains the session. The commit is best-effort:
-    /// a lost acknowledgement still returns unknown with the exact id in
-    /// the error text. The create is never repeated. This never publishes
-    /// readiness.
-    async fn stash_created_unknown(
-        &mut self,
-        mut session: AgentSession,
-        native_ref: &str,
-        message: String,
-    ) -> Error {
-        let _ = session
-            .events
-            .note_unresolved(
-                session.native_scope.clone(),
-                native_ref.to_owned(),
-                message.clone(),
-            )
-            .await;
-        session.session_id = Some(native_ref.to_owned());
+        // The known id was bound at create. Keep it with the live server
+        // and stream for readback, without committing session.ready.
         session.phase = SessionPhase::Unknown;
         self.session = Some(session);
-        Error::new(
-            "unknown",
-            format!("OpenCode session {native_ref} is unresolved ({message})"),
-        )
-        .with_where("plugin.opencode.start.create")
-        .with_origin(
-            FailureOrigin::Harness,
-            "created native session state unresolved after start readback",
-        )
+        created_start_unknown(native_ref, &error.message, &kill_note)
     }
 
     /// Start phase 5, readiness: publish `session.ready` and retain the
@@ -5097,9 +5051,8 @@ async fn discard_created_start(session: &mut AgentSession, envelope: Instant) {
 /// proved the session gone (removed or already gone) and the caller may stop
 /// the server and settle failed. `Err` means removal is unproved (refused
 /// or unconfirmed): the stable store may still retain the session, so the
-/// caller must commit the exact native identity as an unresolved start fact,
-/// retain it as unknown, and must not stop the server while silently leaving
-/// that session behind. The delete runs on its own deadline ending a full
+/// caller retains the exact native identity in memory as unknown and keeps
+/// the server live. The delete runs on its own deadline ending a full
 /// shutdown share before the envelope, never the shutdown's deadline.
 async fn delete_created_session_proved(
     session: &mut AgentSession,
@@ -5125,6 +5078,18 @@ async fn delete_created_session_proved(
             format!("the created native session kill is unconfirmed ({reason})"),
         ),
     }
+}
+
+fn created_start_unknown(native_ref: &str, reason: &str, removal: &str) -> Error {
+    Error::new(
+        "unknown",
+        format!("OpenCode session {native_ref} is unresolved ({reason}; {removal})"),
+    )
+    .with_where("plugin.opencode.start.create")
+    .with_origin(
+        FailureOrigin::Harness,
+        "created native session state unresolved after start readback",
+    )
 }
 
 /// Prove the v1 context-hook binding for one exact session. Only a
@@ -6524,6 +6489,32 @@ mod tests {
         assert!(
             START_ENVELOPE + START_SETTLE_RESERVE <= DAEMON_START_TIMEOUT,
             "envelope must leave Job-retirement and settlement margin"
+        );
+    }
+
+    #[test]
+    fn late_create_leaves_the_full_cleanup_reserve() {
+        let cutoff = super::Instant::now() + std::time::Duration::from_secs(1);
+        let envelope = cutoff + START_CLEANUP_BUDGET;
+        assert_eq!(super::create_cutoff(envelope), cutoff);
+        assert_eq!(super::create_deadline(cutoff), cutoff);
+        assert_eq!(
+            envelope - cutoff,
+            super::START_DELETE_BUDGET + super::START_SHUTDOWN_BUDGET
+        );
+    }
+
+    #[test]
+    fn unproved_created_session_removal_reports_unknown_with_exact_id() {
+        let error = super::created_start_unknown(
+            "ses_exact",
+            "OpenCode session policy verification failed",
+            "the created native session kill is unconfirmed",
+        );
+        assert_eq!(error.code, "unknown");
+        assert_eq!(
+            error.message.as_str(),
+            "OpenCode session ses_exact is unresolved (OpenCode session policy verification failed; the created native session kill is unconfirmed)"
         );
     }
 

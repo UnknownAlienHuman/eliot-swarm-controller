@@ -192,6 +192,11 @@ impl OpenCodeHttp {
             permissions: permissions.map(<[PermissionRule]>::to_vec),
         })
         .map_err(|_| HttpOutcome::unknown("OpenCode session/create params could not be encoded"))?;
+        if Instant::now() >= deadline {
+            return Err(HttpOutcome::NotDispatched {
+                reason: "OpenCode session/create deadline elapsed before dispatch".to_owned(),
+            });
+        }
         let response = self
             .send(
                 reqwest::Method::POST,

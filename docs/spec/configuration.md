@@ -273,17 +273,18 @@ Codex native subagents set `allow`). `deny` has a per-session mapping on
 Codex, Claude and OpenCode only; on Muse and Antigravity the installed
 binaries expose no verified switch, so `deny` is `unsupported` at config load.
 On OpenCode the denial is a per-session `subagent` wildcard deny stored as
-the final `subagent` entry on the session and verified by readback of that
+the final entry in the session's entire ruleset and verified by readback of that
 exact session on create and resume: the server merges session rules after
 every agent/project rule with last-match-wins evaluation, so the final deny
 survives a project `subagent` allow that would beat the isolated per-Agent
 config layer (which is kept only as a second layer). Existing session rules
 are preserved and the deny is appended as final; the same final readback
-sets the verification flag. A missing or unreadable denial goes to cleanup
-before hooks bind: a proved removal fails the start, while an unproved
-removal retains the exact native identity as unknown without stopping the
-server. A retained session that predates the ruleset is repaired with its
-rules preserved and re-read before use.
+sets the verification flag. Create and pre-readiness checks leave a dedicated
+cleanup window. A missing or unreadable denial goes to cleanup before hooks
+bind. A proved removal fails the start. An unproved removal leaves the start
+unknown and retains the exact native identity in the live plugin, as described
+in [Start ordering](plugin-protocol.md#start-ordering). A retained session that
+predates the ruleset is repaired with its rules preserved and re-read before use.
 
 An optional `collaboration_mode` selects Codex's `default` or `plan` preset for each
 turn. The selected mode is frozen with the profile; omission preserves the native
