@@ -1916,31 +1916,51 @@ impl OpenCodePlugin {
                     ),
                 )
             })?;
-        if let Some(target) = target_model
-            && !catalogue_contains(&catalogue, target)
-        {
-            return Err(Error::new(
-                "profile_error",
-                format!("OpenCode model {target} is not in the native catalogue"),
-            ));
+        // The membership lookup uses the native fields, never the joined
+        // display string: see `catalogue_entry_for`.
+        let target_ref = parsed
+            .override_model_ref
+            .as_ref()
+            .or(parsed.model_ref.as_ref());
+        if let Some(target) = target_model {
+            let Some(target_ref) = target_ref else {
+                return Err(Error::new(
+                    "source_integrity",
+                    "OpenCode resume model is missing its native ref",
+                ));
+            };
+            if !catalogue_contains_for(&catalogue, &target_ref.provider_id, &target_ref.id) {
+                return Err(Error::new(
+                    "profile_error",
+                    format!("OpenCode model {target} is not in the native catalogue"),
+                ));
+            }
         }
         if let Some(variant) = target_variant {
-            let retained_model = retained
-                .model
+            // The native fields stay apart end to end: the validation ref
+            // is the overlay/frozen ref when a model is carried, else the
+            // retained native ref verbatim. Joining provider "a/b" plus
+            // model "c" into "a/b/c" and re-splitting would look up
+            // provider "a", model "b/c" instead.
+            let validation_ref = parsed
+                .override_model_ref
                 .as_ref()
-                .map(|model| format!("{}/{}", model.provider_id, model.id));
-            let validation_model = target_model
-                .map(str::to_owned)
-                .or(retained_model)
+                .or(parsed.model_ref.as_ref())
+                .or(retained.model.as_ref())
                 .ok_or_else(|| {
                     Error::new(
                         "profile_error",
                         "OpenCode resume configure effort needs a session model",
                     )
                 })?;
-            let known = catalogue_variants(&catalogue, &validation_model)
-                .is_some_and(|variants| variants.iter().any(|known| known == variant));
+            let known =
+                catalogue_variants_for(&catalogue, &validation_ref.provider_id, &validation_ref.id)
+                    .is_some_and(|variants| variants.iter().any(|known| known == variant));
             if !known {
+                // Display form only for the message; the lookup above uses
+                // the native fields, never this string.
+                let validation_model =
+                    format!("{}/{}", validation_ref.provider_id, validation_ref.id);
                 return Err(Error::new(
                     "profile_error",
                     format!(
@@ -2520,12 +2540,14 @@ impl OpenCodePlugin {
                 "reason": "OpenCode configure effort needs a session model",
             }));
         };
-        // Display form only: catalogue membership, messages and the
-        // response echo the frozen pair text; the switch and its echo
-        // verification below use the native fields, never this string.
+        // Display form only: messages and the response echo the frozen
+        // pair text; the effort gate below, the switch and its echo
+        // verification use the native fields, never this string. Joining
+        // provider "a/b" plus model "c" into "a/b/c" and re-splitting
+        // would look up provider "a", model "b/c" instead.
         let target_model = format!("{}/{}", target_ref.provider_id, target_ref.id);
         if let Some(effort) = requested.effort.as_deref() {
-            let known = catalogue_variants(&catalogue, &target_model)
+            let known = catalogue_variants_for(&catalogue, &target_ref.provider_id, &target_ref.id)
                 .is_some_and(|variants| variants.iter().any(|known| known == effort));
             if !known {
                 return Ok(json!({
@@ -4407,26 +4429,42 @@ fn parse_configure_model(args: &Value) -> Result<ConfigureModelRequest> {
     Ok(ConfigureModelRequest { model, effort })
 }
 
-/// The live native catalogue row for one exact `provider/model` id: the
-/// entry's provider AND model id must both match, compared as independent
-/// fields exactly as the installed resolver does (`model.providerID ===
-/// ref.providerID && model.id === ref.id` in
-/// `packages/core/src/session/runner/model.ts`). No trimming: a native id
-/// carrying whitespace never equals the frozen pair, and identical model
-/// ids under different providers never substitute for each other. The
-/// installed server echoes even bogus switches, so this row (read before
-/// any write) is what fails an unknown model honestly.
+/// The live native catalogue row for one exact native provider/model pair:
+/// the entry's provider AND model id must both match, compared as
+/// independent fields exactly as the installed resolver does
+/// (`model.providerID === ref.providerID && model.id === ref.id` in
+/// `packages/core/src/session/runner/model.ts`). Never join the pair into
+/// a `provider/model` display string first: re-splitting joins at the
+/// first slash, so a slash in the native provider ID would compare against
+/// another provider instead of matching. No trimming: a native id carrying
+/// whitespace never equals the frozen pair, and identical model ids under
+/// different providers never substitute for each other. The installed
+/// server echoes even bogus switches, so this row (read before any write)
+/// is what fails an unknown model honestly.
+fn catalogue_entry_for<'a>(
+    catalogue: &'a [NativeModelEntry],
+    provider_id: &str,
+    id: &str,
+) -> Option<&'a NativeModelEntry> {
+    catalogue.iter().find(
+        |entry| match (entry.provider_id.as_deref(), entry.id.as_deref()) {
+            (Some(entry_provider), Some(entry_id)) => {
+                entry_provider == provider_id && entry_id == id
+            }
+            _ => false,
+        },
+    )
+}
+
+/// The live native catalogue row for one exact `provider/model` id, split
+/// at the first slash. See [`catalogue_entry_for`]: callers holding the
+/// native fields already must use that entry point instead of joining.
 fn catalogue_entry<'a>(
     catalogue: &'a [NativeModelEntry],
     requested: &str,
 ) -> Option<&'a NativeModelEntry> {
     let (provider, id) = split_provider_model(requested)?;
-    catalogue.iter().find(
-        |entry| match (entry.provider_id.as_deref(), entry.id.as_deref()) {
-            (Some(entry_provider), Some(entry_id)) => entry_provider == provider && entry_id == id,
-            _ => false,
-        },
-    )
+    catalogue_entry_for(catalogue, provider, id)
 }
 
 /// Whether an installed `Model.Ref` names exactly the requested
@@ -4467,10 +4505,35 @@ fn configure_switch_ref(
     }
 }
 
+/// Whether the live native catalogue carries the exact native
+/// provider/model pair. See [`catalogue_entry_for`].
+fn catalogue_contains_for(catalogue: &[NativeModelEntry], provider_id: &str, id: &str) -> bool {
+    catalogue_entry_for(catalogue, provider_id, id).is_some()
+}
+
 /// Whether the live native catalogue carries the exact requested
 /// `provider/model` id. See [`catalogue_entry`].
 fn catalogue_contains(catalogue: &[NativeModelEntry], requested: &str) -> bool {
     catalogue_entry(catalogue, requested).is_some()
+}
+
+/// The live native catalogue's selectable variant ids for one exact native
+/// provider/model pair (`Model.Variant` ids in wire order). `None` when
+/// the entry is absent or reports no variants member: unknown, never an
+/// empty wardrobe. See [`catalogue_entry_for`].
+fn catalogue_variants_for(
+    catalogue: &[NativeModelEntry],
+    provider_id: &str,
+    id: &str,
+) -> Option<Vec<String>> {
+    catalogue_entry_for(catalogue, provider_id, id).and_then(|entry| {
+        entry.variants.as_ref().map(|variants| {
+            variants
+                .iter()
+                .filter_map(|variant| variant.id.clone())
+                .collect()
+        })
+    })
 }
 
 /// The live native catalogue's selectable variant ids for one exact
@@ -5254,6 +5317,73 @@ mod tests {
             variant: None,
         };
         assert!(!super::session_model_is(&target, &other_provider));
+    }
+
+    #[test]
+    fn slash_provider_catalogue_lookups_use_native_fields() {
+        // A native provider ID containing a slash must look up by fields,
+        // never by joining to "a/b/c" and re-splitting at the first slash
+        // (provider "a", model "b/c"). Covers the configure effort gate
+        // and the resume catalogue check alike.
+        use crate::native::types::NativeModelVariant;
+        let catalogue = vec![
+            NativeModelEntry {
+                id: Some("c".to_owned()),
+                provider_id: Some("a/b".to_owned()),
+                limit: None,
+                variants: Some(vec![NativeModelVariant {
+                    id: Some("low".to_owned()),
+                }]),
+            },
+            NativeModelEntry {
+                id: Some("b/c".to_owned()),
+                provider_id: Some("a".to_owned()),
+                limit: None,
+                variants: Some(vec![NativeModelVariant {
+                    id: Some("high".to_owned()),
+                }]),
+            },
+        ];
+        // Native-field lookups select the slash-provider row verbatim.
+        assert!(super::catalogue_contains_for(&catalogue, "a/b", "c"));
+        assert_eq!(
+            super::catalogue_variants_for(&catalogue, "a/b", "c"),
+            Some(vec!["low".to_owned()])
+        );
+        // The joined display form re-splits onto the other row, which is
+        // why the gates must never join before looking up.
+        assert_eq!(
+            super::catalogue_variants(&catalogue, "a/b/c"),
+            Some(vec!["high".to_owned()])
+        );
+        // Configure effort verification: an effort-only configure reuses
+        // the retained slash-provider ref, so its wardrobe is ["low"].
+        let retained = crate::native::types::ModelRef {
+            id: "c".to_owned(),
+            provider_id: "a/b".to_owned(),
+            variant: None,
+        };
+        let target = super::configure_switch_ref(None, Some(&retained))
+            .expect("effort-only keeps the retained ref")
+            .expect("session reports a model");
+        let known = super::catalogue_variants_for(&catalogue, &target.provider_id, &target.id)
+            .is_some_and(|variants| variants.iter().any(|known| known == "low"));
+        assert!(known, "slash-provider effort must match its own row");
+        let wrong = super::catalogue_variants_for(&catalogue, &target.provider_id, &target.id)
+            .is_some_and(|variants| variants.iter().any(|known| known == "high"));
+        assert!(
+            !wrong,
+            "slash-provider effort must not read the re-split row"
+        );
+        // Resume catalogue check: the overlay-absent validation ref is the
+        // retained native pair, so the same field lookup applies.
+        let validation: Option<&crate::native::types::ModelRef> = Some(&retained);
+        let row = validation.and_then(|model| {
+            super::catalogue_entry_for(&catalogue, &model.provider_id, &model.id)
+        });
+        assert!(row.is_some_and(|entry| entry.provider_id.as_deref() == Some("a/b")));
+        assert!(super::catalogue_contains_for(&catalogue, "a", "b/c"));
+        assert!(!super::catalogue_contains_for(&catalogue, "a/b", "b/c"));
     }
 
     #[test]
