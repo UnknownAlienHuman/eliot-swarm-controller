@@ -521,9 +521,6 @@ fn delete_tree_tx(tx: &Transaction<'_>, members: &[i64], now: i64) -> Result<()>
     }
     delete_db!(tx.execute("DELETE FROM native_child_registrations WHERE producer IN (SELECT id FROM deleted_agents) OR parent IN (SELECT id FROM deleted_agents) OR child IN (SELECT id FROM deleted_agents)",[]));
     delete_db!(tx.execute("DELETE FROM messages WHERE recipient IN (SELECT id FROM deleted_agents) OR sender IN (SELECT 'a'||id FROM deleted_agents)",[]));
-    // A deleted source leaves no dangling pointer: surviving sessions keep
-    // their placement and tags, only the source reference is cleared.
-    delete_db!(tx.execute("UPDATE chat_organization SET source = NULL, source_generation = NULL WHERE source IN (SELECT id FROM deleted_agents)",[]));
     // Mark a conservative history floor before removing individual retained events.
     delete_db!(tx.execute("UPDATE rule_history_coverage SET pruned_through=MAX(pruned_through,COALESCE((SELECT MAX(seq) FROM events WHERE agent IN (SELECT id FROM deleted_agents)),0)) WHERE singleton=1",[]));
     delete_db!(tx.execute(

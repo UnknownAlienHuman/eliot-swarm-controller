@@ -116,9 +116,6 @@ const RECOVER_ACCEPTED_COMMAND_FILTER: &str =
        OR (link_kind = 'handoff' AND state IN ('accepted','queued'))
        OR (link_kind = 'switch' AND ordinal = 0 AND verb = 'launch' AND state = 'accepted'
            AND EXISTS (SELECT 1 FROM commands p WHERE p.id = commands.parent_command AND p.method = 'swarm.switch')
-           AND NOT EXISTS (SELECT 1 FROM workspaces w WHERE w.agent = commands.target AND w.start_command_id = commands.id))
-       OR (link_kind = 'continue' AND ordinal = 0 AND verb = 'launch' AND state = 'accepted'
-           AND EXISTS (SELECT 1 FROM commands p WHERE p.id = commands.parent_command AND p.method = 'chat.continue')
            AND NOT EXISTS (SELECT 1 FROM workspaces w WHERE w.agent = commands.target AND w.start_command_id = commands.id)))";
 
 /// Retained-unresolved unknowns as a SQL predicate over durable Store facts
@@ -2000,14 +1997,6 @@ impl Store {
             let previous_outcome = encoded_outcome.as_deref().map(decode_json).transpose()?;
             let outcome = if verb == "switch" {
                 previous_outcome.unwrap_or_else(|| json!({}))
-            } else if verb == "continue" {
-                // Keep the typed reservation (launch, brief and source
-                // bindings) so same-ID replay still decodes after a restart.
-                let mut preserved = previous_outcome.unwrap_or_else(|| json!({}));
-                if let Some(outcome) = preserved.as_object_mut() {
-                    outcome.insert("reason".to_owned(), json!("daemon_restart"));
-                }
-                preserved
             } else if verb == "inject" {
                 context::unknown_claim_outcome(previous_outcome.as_ref(), "daemon_restart")
             } else {

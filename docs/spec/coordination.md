@@ -279,7 +279,7 @@ A conversation association links an existing Agent or chat to a project or
 display group. It leaves native session, execution workspace, permissions and
 historical command attribution intact: association is placement, never
 authority. The headless association API stores the overlay beside the
-existing Agent or chat identity (schema v63).
+existing Agent or chat identity (schema v64).
 
 - `chat.organization` returns the grouped projection: teams by project
   assignment, manager, repository or worktree, and ancestry, with
@@ -288,13 +288,9 @@ existing Agent or chat identity (schema v63).
   them to the no-project bucket. `chat.tag` replaces tag groups. Each
   mutation returns the committed per-Agent links; change readback rides the
   projection's event watermark.
-- Continuing work in another project is a separate, authorized execution
-  operation: `chat.continue` starts a new project session through the normal
-  launch pipeline with a prepared workspace and a reference to the source
-  conversation (Agent id and generation, never a transcript copy). The
-  source keeps its history and attribution, and a no-project to project
-  move is an explicitly authorized transition. A running Agent cannot
-  change execution scope through an edit.
+- Continuing work in another project stays a separate, authorized execution
+  operation through the existing switch/handoff path, not an organization
+  mutation: a running Agent cannot change execution scope through an edit.
 
 Migration keeps every ID and all history. Links are derived only from
 unambiguous retained facts (registration, common directory, parent); never

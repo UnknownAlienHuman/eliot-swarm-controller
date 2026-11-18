@@ -167,7 +167,7 @@ pub(crate) enum CliCommand {
     Handoff(HandoffArgs),
     /// Launch a new session and hand off task inputs, claims, Goal and children (Owner only).
     Switch(SwitchArgs),
-    /// Group chats into projects, move placement, tag, or continue a chat in a project (Owner only).
+    /// Group chats into projects, move placement, or tag chats and Agents (Owner only).
     Chat(ChatArgs),
     /// Send, read or acknowledge addressed Agent mail.
     Msg(MsgArgs),
@@ -870,8 +870,6 @@ pub(crate) struct ChatArgs {
 }
 
 #[derive(Subcommand)]
-// Continue carries launch selectors; the parsed value is short-lived.
-#[allow(clippy::large_enum_variant)]
 pub(crate) enum ChatCommand {
     /// Read the grouped work projection: teams by project assignment,
     /// manager, repository/worktree and ancestry, with event-watermark readback.
@@ -883,9 +881,6 @@ pub(crate) enum ChatCommand {
     Detach(ChatDetachArgs),
     /// Replace the tag groups of Agents or chats.
     Tag(ChatTagArgs),
-    /// Start an authorized project session for a chat and record the
-    /// source reference. The source keeps its history and attribution.
-    Continue(ChatContinueArgs),
 }
 
 #[derive(Args)]
@@ -923,50 +918,6 @@ pub(crate) struct ChatTagArgs {
     /// Replacement tags, at most 16; omitted clears every tag.
     #[arg(long, value_name = "TAG")]
     pub(crate) tag: Vec<String>,
-}
-
-#[derive(Args)]
-pub(crate) struct ChatContinueArgs {
-    /// The chat (or Agent) whose conversation continues.
-    #[arg(value_name = "CHAT")]
-    pub(crate) chat: String,
-    /// Retained project the new session joins.
-    #[arg(long, value_name = "PROJECT")]
-    pub(crate) project: String,
-    /// Named profile (exactly one of --profile or --harness is required).
-    #[arg(long, value_name = "PROFILE", conflicts_with = "harness")]
-    pub(crate) profile: Option<String>,
-    /// Ad-hoc Owner launch harness (codex|claude|muse|opencode|antigravity).
-    #[arg(long, value_name = "HARNESS")]
-    pub(crate) harness: Option<String>,
-    /// Ad-hoc model id; omitted uses the harness native default.
-    #[arg(long, requires = "harness")]
-    pub(crate) model: Option<String>,
-    /// Ad-hoc reasoning effort; omitted uses the harness native default.
-    #[arg(long, requires = "harness")]
-    pub(crate) effort: Option<String>,
-    /// Ad-hoc auth integration. Requires --harness.
-    #[arg(long, value_name = "INTEGRATION", requires = "harness")]
-    pub(crate) auth: Option<String>,
-    /// Explicit native executable, overriding discovery. Requires --harness.
-    #[arg(long, value_name = "PATH", requires = "harness")]
-    pub(crate) cmd: Option<String>,
-    /// Ad-hoc access level. Requires --harness.
-    #[arg(long, value_name = "LEVEL", requires = "harness", value_parser = ["ask", "auto", "full"])]
-    pub(crate) access: Option<String>,
-    /// Explicit workspace for the new session; omitted uses the
-    /// registered checkout. Managed worktree checks apply.
-    #[arg(long)]
-    pub(crate) workspace: Option<String>,
-    /// Managed worktree name backing the launch; implies --base.
-    #[arg(long)]
-    pub(crate) worktree: Option<String>,
-    /// Base checkout for --worktree.
-    #[arg(long, requires = "worktree")]
-    pub(crate) base: Option<String>,
-    /// Opening prompt for the new session, after the source reference.
-    #[arg(long, value_name = "TEXT")]
-    pub(crate) text: Option<String>,
 }
 
 #[derive(Args)]

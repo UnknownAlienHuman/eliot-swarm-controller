@@ -1,27 +1,23 @@
-//! Headless chat and work organization (step 4a): placement overlay, tags,
-//! grouped projection and project continuation.
+//! Headless chat and work organization (step 4a): placement overlay, tags
+//! and grouped projection.
 //!
 //! Organization is placement, never authority. Attach/detach move a chat's
 //! display placement between a retained project and the no-project bucket;
 //! tags group Agents and chats. Execution project, scope, workspace and
-//! history are never edited here. `chat.continue` starts a new authorized
-//! project session and records a source reference; the source keeps its
-//! history and usage attribution. Change readback rides the existing event
+//! history are never edited here. Change readback rides the existing event
 //! watermark; there is no organization revision.
 
 use super::*;
 use eliot_core::api::{
-    ArchivedFilter, ChatAttachRequest, ChatContinueRequest, ChatContinueResponse,
-    ChatDetachRequest, ChatOrganizationMutationResponse, ChatOrganizationRequest,
-    ChatOrganizationResponse, ChatTagRequest, MAX_ORG_MEMBERS_PER_GROUP, MAX_ORG_MEMBERS_TOTAL,
-    OrgGroupView, OrgLinkView, OrgMemberView, OrgSourceRef, SwitchAgent,
+    ArchivedFilter, ChatAttachRequest, ChatDetachRequest, ChatOrganizationMutationResponse,
+    ChatOrganizationRequest, ChatOrganizationResponse, ChatTagRequest, MAX_ORG_MEMBERS_PER_GROUP,
+    MAX_ORG_MEMBERS_TOTAL, OrgGroupView, OrgLinkView, OrgMemberView, ProjectManagerIdentity,
 };
 use std::collections::BTreeMap;
 
 pub(super) const CHAT_ATTACH_METHOD: &str = "chat.attach";
 pub(super) const CHAT_DETACH_METHOD: &str = "chat.detach";
 pub(super) const CHAT_TAG_METHOD: &str = "chat.tag";
-pub(super) const CHAT_CONTINUE_METHOD: &str = "chat.continue";
 
 /// Most retained roots read back for one project group: the first roots the
 /// team, the rest surface as the ambiguity. Roots are parentless Agents, so
@@ -66,43 +62,10 @@ fn decode_tags(raw: &str) -> Result<Vec<String>> {
     Ok(tags)
 }
 
-struct OrgRow {
-    link: Option<String>,
-    tags: Vec<String>,
-    source: Option<(i64, i64)>,
-}
-
-fn load_org_rows(conn: &Connection) -> Result<BTreeMap<i64, OrgRow>> {
-    let mut statement = conn
-        .prepare(
-            "SELECT agent, project_link, tags, source, source_generation FROM chat_organization",
-        )
-        .map_err(sql_error)?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<i64>>(3)?,
-                row.get::<_, Option<i64>>(4)?,
-            ))
-        })
-        .map_err(sql_error)?;
-    let mut map = BTreeMap::new();
-    for row in rows {
-        let (agent, link, tags, source, source_generation) = row.map_err(sql_error)?;
-        let source = source.zip(source_generation);
-        map.insert(
-            agent,
-            OrgRow {
-                link,
-                tags: decode_tags(&tags)?,
-                source,
-            },
-        );
-    }
-    Ok(map)
+/// Decode one stored overlay row: the placement link is read back as-is and
+/// the tag set is validated against the API bounds.
+fn decode_overlay(link: Option<String>, raw_tags: String) -> Result<(Option<String>, Vec<String>)> {
+    Ok((link, decode_tags(&raw_tags)?))
 }
 
 enum LinkChange {
@@ -177,14 +140,30 @@ fn organization_roots(conn: &Connection, project: &str, archived: &str) -> Resul
 
 /// Bounded member rows for one group: execution members plus chats placed
 /// here by the overlay for a project, or the unplaced bucket when `project`
-/// is absent. The rowid-ordered scan stops after the group's share, so a
-/// single-project read never materializes the fleet.
+/// is absent. The id-ordered scan stops after the group's share and decodes
+/// the overlay link and tags inline, so a single-project read never
+/// materializes the fleet or the whole overlay table.
+type OrgMemberRow = (
+    i64,
+    i64,
+    String,
+    String,
+    Option<i64>,
+    i64,
+    String,
+    bool,
+    bool,
+    bool,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
 fn organization_members(
     conn: &Connection,
     project: Option<&str>,
     archived: &str,
     take: usize,
-    org_rows: &BTreeMap<i64, OrgRow>,
     members: &mut Vec<OrgMemberView>,
 ) -> Result<()> {
     let take = i64::try_from(take)
@@ -193,7 +172,8 @@ fn organization_members(
         Some(_) => conn
             .prepare(&format!(
                 "SELECT a.id, a.generation, a.state, a.harness, a.parent, a.root, a.project,
-                        a.chat, a.archived, a.observe_only, a.workspace
+                        a.chat, a.archived, a.observe_only, a.workspace,
+                        o.project_link, o.tags
                  FROM agents a LEFT JOIN chat_organization o ON o.agent = a.id
                  WHERE ((a.project = ?1 AND (a.chat = 0 OR o.project_link IS NULL
                         OR NOT EXISTS(SELECT 1 FROM project_registrations r WHERE r.id = o.project_link)))
@@ -205,7 +185,8 @@ fn organization_members(
         None => conn
             .prepare(&format!(
                 "SELECT a.id, a.generation, a.state, a.harness, a.parent, a.root, a.project,
-                        a.chat, a.archived, a.observe_only, a.workspace
+                        a.chat, a.archived, a.observe_only, a.workspace,
+                        o.project_link, o.tags
                  FROM agents a LEFT JOIN chat_organization o ON o.agent = a.id
                  WHERE NOT ((a.chat = 1 AND o.project_link IS NOT NULL
                             AND EXISTS(SELECT 1 FROM project_registrations r WHERE r.id = o.project_link))
@@ -215,19 +196,7 @@ fn organization_members(
             ))
             .map_err(sql_error)?,
     };
-    let rows: Vec<(
-        i64,
-        i64,
-        String,
-        String,
-        Option<i64>,
-        i64,
-        String,
-        bool,
-        bool,
-        bool,
-        Option<String>,
-    )> = match project {
+    let rows: Vec<OrgMemberRow> = match project {
         Some(name) => statement
             .query_map(params![name, take], |row| {
                 Ok((
@@ -242,6 +211,8 @@ fn organization_members(
                     row.get::<_, bool>(8)?,
                     row.get::<_, bool>(9)?,
                     row.get::<_, Option<String>>(10)?,
+                    row.get::<_, Option<String>>(11)?,
+                    row.get::<_, Option<String>>(12)?,
                 ))
             })
             .map_err(sql_error)?
@@ -261,6 +232,8 @@ fn organization_members(
                     row.get::<_, bool>(8)?,
                     row.get::<_, bool>(9)?,
                     row.get::<_, Option<String>>(10)?,
+                    row.get::<_, Option<String>>(11)?,
+                    row.get::<_, Option<String>>(12)?,
                 ))
             })
             .map_err(sql_error)?
@@ -279,10 +252,12 @@ fn organization_members(
         archived,
         _observe_only,
         workspace,
+        link,
+        raw_tags,
     ) in rows
     {
-        let org = org_rows.get(&num);
-        let link = org.and_then(|entry| entry.link.clone());
+        let (project_link, tags) =
+            decode_overlay(link, raw_tags.unwrap_or_else(|| "[]".to_owned()))?;
         members.push(OrgMemberView {
             agent: format_agent_id(num),
             generation,
@@ -293,15 +268,9 @@ fn organization_members(
             project: execution,
             chat,
             archived,
-            project_link: link.clone(),
-            tags: org.map(|entry| entry.tags.clone()).unwrap_or_default(),
-            placed: chat && link.is_some(),
-            continued_from: org.and_then(|entry| {
-                entry.source.map(|(source, generation)| OrgSourceRef {
-                    agent: format_agent_id(source),
-                    generation,
-                })
-            }),
+            placed: chat && project_link.is_some(),
+            project_link,
+            tags,
             workspace,
         });
     }
@@ -315,8 +284,8 @@ impl Store {
     /// repository/worktree and ancestry; chats additionally follow their
     /// placement link. Owner only. Totals come from one aggregate pass and
     /// member rows from index-scoped bounded queries, so a single-project
-    /// read never materializes the fleet; the overlay supplies placement,
-    /// tags and source references on those bounded rows.
+    /// read never materializes the fleet; the overlay supplies placement
+    /// and tags on those bounded rows.
     pub fn chat_organization(
         &self,
         principal: &str,
@@ -369,16 +338,10 @@ impl Store {
                 counts.insert(key, total as usize);
             }
         }
-        let org_rows = load_org_rows(conn)?;
-        let mut response = ChatOrganizationResponse {
-            event_watermark: watermark,
-            as_of: now,
-            groups: Vec::new(),
-            member_total: counts.values().sum(),
-            truncated: false,
-        };
         // Fill in response order (projects first, unplaced last) until the
         // projection cap; totals stay exact and truncation stays explicit.
+        // The totals scope to the requested groups, so a single-project
+        // read never reports the fleet-wide member count.
         let mut budget = MAX_ORG_MEMBERS_TOTAL;
         let mut kept = 0_usize;
         let mut order: Vec<Option<String>> =
@@ -386,6 +349,17 @@ impl Store {
         if request.project.is_none() {
             order.push(None);
         }
+        let member_total: usize = order
+            .iter()
+            .map(|key| counts.get(key).copied().unwrap_or(0))
+            .sum();
+        let mut response = ChatOrganizationResponse {
+            event_watermark: watermark,
+            as_of: now,
+            groups: Vec::new(),
+            member_total,
+            truncated: false,
+        };
         for key in order {
             let full = counts.get(&key).copied().unwrap_or(0);
             if full == 0 {
@@ -406,14 +380,7 @@ impl Store {
             budget -= take;
             kept += take;
             let mut members = Vec::with_capacity(take);
-            organization_members(
-                conn,
-                key.as_deref(),
-                archived,
-                take,
-                &org_rows,
-                &mut members,
-            )?;
+            organization_members(conn, key.as_deref(), archived, take, &mut members)?;
             response.groups.push(self.organization_group(
                 conn,
                 key,
@@ -451,11 +418,28 @@ impl Store {
                             && !organization_roots(conn, project, archived)?.is_empty();
                         // Competing roots surface without reassigning either
                         // root, counted independently of the display filter.
-                        let conflicting_roots = organization_roots(conn, project, "1 = 1")?
-                            .into_iter()
-                            .skip(1)
-                            .map(format_agent_id)
-                            .collect();
+                        // The assigned manager is excluded by id: when the
+                        // manager is an older or newer root, the other
+                        // independent roots still surface.
+                        let manager_num =
+                            assignment
+                                .manager
+                                .as_ref()
+                                .and_then(|manager| match manager {
+                                    ProjectManagerIdentity::Local { agent, .. } => {
+                                        parse_agent_id(agent).ok()
+                                    }
+                                    ProjectManagerIdentity::Remote { .. } => None,
+                                });
+                        let roots = organization_roots(conn, project, "1 = 1")?;
+                        let conflicting_roots = match manager_num {
+                            Some(manager) => roots
+                                .into_iter()
+                                .filter(|root| *root != manager)
+                                .map(format_agent_id)
+                                .collect(),
+                            None => roots.into_iter().skip(1).map(format_agent_id).collect(),
+                        };
                         (
                             registration,
                             Some(assignment),
@@ -664,510 +648,6 @@ impl Store {
         owner_only(principal, "tag Agents")?;
         self.mutate_links(principal, CHAT_TAG_METHOD, LinkRequest::Tag(request), now)
     }
-    /// Router preflight: retained retries during drain, before new admission.
-    pub fn replay_chat_continue(
-        &self,
-        principal: &str,
-        request: &ChatContinueRequest,
-    ) -> Result<Option<ChatContinueResponse>> {
-        self.ensure_committed_reads()?;
-        request.validate()?;
-        owner_only(principal, "continue chats")?;
-        let digest = canonical::digest(
-            &serde_json::to_value(request)
-                .map_err(|_| Error::new("internal", "cannot encode continue"))?,
-        )?;
-        continue_replay_on(&self.connection, principal, request, &digest)
-    }
-
-    /// Reserve one project continuation: the no-project to project crossing
-    /// is explicit in the request, and the parent command carries the
-    /// reserved launch and brief identities before any external work.
-    pub fn reserve_chat_continue(
-        &mut self,
-        principal: &str,
-        request: &ChatContinueRequest,
-        policy: &core::SecretPolicy,
-        now: i64,
-    ) -> Result<Change<ChatContinueResponse>> {
-        if let Some(value) = self.replay_chat_continue(principal, request)? {
-            return Ok(Change {
-                value,
-                events: Vec::new(),
-            });
-        }
-        self.ensure_writer_healthy()?;
-        let result = (|| {
-            let args = serde_json::to_value(request)
-                .map_err(|_| Error::new("internal", "cannot encode continue"))?;
-            let digest = canonical::digest(&args)?;
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            if let Some(value) = continue_replay_on(&tx, principal, request, &digest)? {
-                commit_transaction(tx, &self.write_faulted)?;
-                return Ok(Change {
-                    value,
-                    events: Vec::new(),
-                });
-            }
-            validate_ulid(&request.id)?;
-            validate_id_age(&request.id, now)?;
-            if policy.contains_value(&args) {
-                return Err(Error::new(
-                    "secret_in_payload",
-                    "continue contains a known secret",
-                ));
-            }
-            if encode_json(&args)?.len() > MAX_EVENT_BYTES {
-                return Err(Error::new(
-                    "frame_too_large",
-                    "continue exceeds command budget",
-                ));
-            }
-            let source_num = parse_agent_id(&request.chat)?;
-            let source = load_agent_by_num(&tx, source_num)?
-                .ok_or_else(|| Error::new("not_found", "source conversation was not found"))?;
-            let registration = projects::project_registration_tx(&tx, &request.project)?
-                .ok_or_else(|| {
-                    Error::new(
-                        "not_found",
-                        "continue project is not a retained registration",
-                    )
-                })?;
-            if !registration.actions.iter().any(|action| action == "launch") {
-                return Err(Error::new(
-                    "not_allowed",
-                    "project registration does not approve new sessions",
-                ));
-            }
-            if let Some(profile) = request.launch.profile.as_deref()
-                && !registration
-                    .profiles
-                    .iter()
-                    .any(|approved| approved == profile)
-            {
-                return Err(Error::new(
-                    "not_allowed",
-                    "project registration does not approve the launch profile",
-                ));
-            }
-            project_transfer::require_no_intent(&tx, &request.project)?;
-            let workspace = request
-                .launch
-                .workspace
-                .clone()
-                .unwrap_or_else(|| registration.checkout.clone());
-            let launch_command = Ulid::new().to_string();
-            let value = ChatContinueResponse {
-                id: request.id.clone(),
-                state: CommandState::Accepted,
-                launch_command: launch_command.clone(),
-                brief_command: format!("{launch_command}/send"),
-                created: None,
-                source: OrgSourceRef {
-                    agent: source.id.clone(),
-                    generation: source.generation,
-                },
-                project: request.project.clone(),
-                workspace,
-                registration_revision: registration.revision,
-                error: None,
-                next_action: "preparing_launch".to_owned(),
-            };
-            let mut parent = SubmitCommand::new(&request.id, "continue");
-            parent.args = args;
-            let outcome = serde_json::to_value(&value)
-                .map_err(|_| Error::new("internal", "cannot encode continue result"))?;
-            let event = admit_command(
-                &tx,
-                &CommandInsert {
-                    method: CHAT_CONTINUE_METHOD,
-                    state: CommandState::Accepted,
-                    outcome: Some(&outcome),
-                    ..CommandInsert::targetless_admitted(principal, &parent, &digest, now)
-                },
-                json!({"command_id": request.id, "verb": "continue"}),
-            )?;
-            commit_transaction(tx, &self.write_faulted)?;
-            Ok(Change {
-                value,
-                events: vec![event],
-            })
-        })();
-        self.fault_on_persistence_error(&result);
-        result
-    }
-
-    /// Claim one continuation once. Retries are readback, not another launch.
-    pub fn start_chat_continue(
-        &mut self,
-        id: &str,
-        now: i64,
-    ) -> Result<Change<Option<(ChatContinueRequest, ChatContinueResponse)>>> {
-        self.ensure_writer_healthy()?;
-        let result = (|| {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            let command = continue_parent(&tx, id)?;
-            if command.state != CommandState::Accepted {
-                return Ok(Change {
-                    value: None,
-                    events: Vec::new(),
-                });
-            }
-            let request: ChatContinueRequest = serde_json::from_value(command.args)
-                .map_err(|_| Error::new("source_integrity", "continue request malformed"))?;
-            let value = continue_result_on(&tx, id)?;
-            update_command_state(
-                &tx,
-                id,
-                CommandState::Dispatched,
-                command.outcome.as_ref(),
-                None,
-                now,
-            )?;
-            let event = insert_daemon_command_event(
-                &tx,
-                now,
-                "command.dispatched",
-                None,
-                None,
-                id,
-                json!({"component": "continue_orchestration"}),
-            )?;
-            commit_transaction(tx, &self.write_faulted)?;
-            Ok(Change {
-                value: Some((request, value)),
-                events: vec![event],
-            })
-        })();
-        self.fault_on_persistence_error(&result);
-        result
-    }
-
-    /// Admit the reserved launch in the same transaction as launch admission,
-    /// capacity and workspace reservation. The first input is the source
-    /// reference brief: pointers to the retained source, never a transcript.
-    /// The admitted preparation must still belong to the reserved project's
-    /// repository; the registration revision binds the dispatch.
-    pub fn admit_continue_launch(
-        &mut self,
-        id: &str,
-        request: SubmitCommand,
-        preparation: Option<WorkspacePreparationInput>,
-        now: i64,
-    ) -> Result<Admission> {
-        self.ensure_writer_healthy()?;
-        let result = (|| {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            let parent = continue_parent(&tx, id)?;
-            let plan = continue_result_on(&tx, id)?;
-            if parent.state != CommandState::Dispatched
-                || request.id != plan.launch_command
-                || request.verb != "launch"
-                || request.target.is_some()
-                || request
-                    .args
-                    .get("text")
-                    .is_none_or(|text| text.as_str().is_none_or(str::is_empty))
-                || request.args.get("parent").is_some()
-            {
-                return Err(Error::new(
-                    "bad_state",
-                    "continue launch binding or phase differs",
-                ));
-            }
-            let source: ChatContinueRequest = serde_json::from_value(parent.args)
-                .map_err(|_| Error::new("source_integrity", "continue request malformed"))?;
-            if request.args.get("project").and_then(Value::as_str) != Some(source.project.as_str())
-                || request
-                    .args
-                    .get("registered_project")
-                    .and_then(Value::as_str)
-                    != Some(source.project.as_str())
-            {
-                return Err(Error::new(
-                    "not_allowed",
-                    "continue launch must join the reserved project",
-                ));
-            }
-            let registration = projects::project_registration_tx(&tx, &source.project)?
-                .ok_or_else(|| Error::new("not_found", "continue project was removed"))?;
-            if registration.revision != plan.registration_revision {
-                return Err(Error::new(
-                    "stale_generation",
-                    "continue registration changed during preparation",
-                ));
-            }
-            if let Some(preparation) = &preparation
-                && preparation.repo_common_dir != registration.repo_common_dir
-            {
-                return Err(Error::new(
-                    "not_allowed",
-                    "continue preparation left the project repository",
-                ));
-            }
-            if load_command(&tx, &request.id)?.is_some()
-                && continue_component(&tx, id, &request.id, 0)?.is_none()
-            {
-                return Err(Error::new(
-                    "id_conflict",
-                    "reserved launch id occupied by another command",
-                ));
-            }
-            let admission = admission::submit_tx(
-                &tx,
-                "owner",
-                request,
-                preparation,
-                now,
-                false,
-                self.hierarchy_limits,
-                self.capacity_policy.as_deref(),
-            )?;
-            db!(tx.execute(
-                "UPDATE commands SET parent_command = ?1, link_kind = 'continue', ordinal = 0 WHERE id = ?2",
-                params![id, plan.launch_command],
-            ));
-            commit_transaction(tx, &self.write_faulted)?;
-            Ok(admission)
-        })();
-        self.fault_on_persistence_error(&result);
-        result
-    }
-
-    /// Record the source reference beside the new session and settle the
-    /// parent once its launch applied. The source keeps its history and
-    /// usage attribution; only pointers are retained here, in the Agent's
-    /// organization metadata. The readback carries the admitted workspace
-    /// and the linked brief's actual outcome.
-    pub fn finish_chat_continue(
-        &mut self,
-        id: &str,
-        now: i64,
-    ) -> Result<Change<ChatContinueResponse>> {
-        self.ensure_writer_healthy()?;
-        let result = (|| {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            let parent = continue_parent(&tx, id)?;
-            if parent.state != CommandState::Dispatched {
-                let value = continue_result_on(&tx, id)?;
-                return Ok(Change {
-                    value,
-                    events: Vec::new(),
-                });
-            }
-            let plan = continue_result_on(&tx, id)?;
-            let launch = continue_component(&tx, id, &plan.launch_command, 0)?
-                .ok_or_else(|| Error::new("bad_state", "continue launch not admitted"))?;
-            let brief = load_command(&tx, &plan.brief_command)?
-                .ok_or_else(|| Error::new("bad_state", "continue brief not admitted"))?;
-            let mut events = Vec::new();
-            let state: CommandState;
-            let mut error = None;
-            let mut created = None;
-            let mut workspace = plan.workspace.clone();
-            if launch.state == CommandState::Applied && brief.state == CommandState::Applied {
-                let target = launch.target.clone().ok_or_else(|| {
-                    Error::new("source_integrity", "continue launch has no session")
-                })?;
-                let session = parse_agent_id(&target)?;
-                let agent = load_agent_by_num(&tx, session)?.ok_or_else(|| {
-                    Error::new("source_integrity", "continue session disappeared")
-                })?;
-                let source = parse_agent_id(&plan.source.agent)?;
-                db!(tx.execute(
-                    "INSERT INTO chat_organization(agent, project_link, tags, source, source_generation, updated_at)
-                     VALUES (?1, NULL, '[]', ?2, ?3, ?4)
-                     ON CONFLICT(agent) DO UPDATE SET source = excluded.source,
-                         source_generation = excluded.source_generation, updated_at = excluded.updated_at",
-                    params![session, source, plan.source.generation, now],
-                ));
-                workspace = agent
-                    .workspace
-                    .clone()
-                    .unwrap_or_else(|| plan.workspace.clone());
-                created = Some(SwitchAgent {
-                    agent: agent.id,
-                    generation: agent.generation,
-                });
-                state = CommandState::Applied;
-            } else {
-                state = if matches!(
-                    launch.state,
-                    CommandState::Accepted
-                        | CommandState::Queued
-                        | CommandState::Dispatched
-                        | CommandState::Unknown
-                ) || (launch.state == CommandState::Applied
-                    && matches!(
-                        brief.state,
-                        CommandState::Accepted
-                            | CommandState::Queued
-                            | CommandState::Dispatched
-                            | CommandState::Unknown
-                    )) {
-                    CommandState::Unknown
-                } else {
-                    CommandState::Failed
-                };
-                let code = if launch.state != CommandState::Applied {
-                    "launch_not_ready"
-                } else if matches!(
-                    brief.state,
-                    CommandState::Accepted
-                        | CommandState::Queued
-                        | CommandState::Dispatched
-                        | CommandState::Unknown
-                ) {
-                    "brief_not_ready"
-                } else {
-                    "brief_failed"
-                };
-                error = Some(Error::new(code, "continue brief has no applied outcome"));
-            }
-            if error.as_ref().is_some_and(|error| error.code == "internal") {
-                return Err(error.unwrap());
-            }
-            let mut value = continue_result_on(&tx, id)?;
-            value.error = error.map(|error| error.code);
-            value.state = state;
-            value.created = created;
-            value.workspace = workspace;
-            let outcome = serde_json::to_value(&value)
-                .map_err(|_| Error::new("internal", "cannot encode continue result"))?;
-            update_command_state(&tx, id, state, Some(&outcome), None, now)?;
-            events.push(insert_daemon_command_event(
-                &tx,
-                now,
-                &format!("command.{}", command_state_name(state)),
-                None,
-                None,
-                id,
-                json!({"launch_command": plan.launch_command, "brief_command": plan.brief_command}),
-            )?);
-            let value = continue_result_on(&tx, id)?;
-            commit_transaction(tx, &self.write_faulted)?;
-            Ok(Change { value, events })
-        })();
-        self.fault_on_persistence_error(&result);
-        result
-    }
-
-    pub fn fail_chat_continue_preparation(
-        &mut self,
-        id: &str,
-        code: &str,
-        now: i64,
-    ) -> Result<Change<Command>> {
-        let mut value = self.continue_result(id)?;
-        value.error = Some(code.to_owned());
-        self.settle(
-            id,
-            CommandState::Rejected,
-            Some(
-                serde_json::to_value(value)
-                    .map_err(|_| Error::new("internal", "cannot encode continue result"))?,
-            ),
-            now,
-        )
-    }
-
-    pub fn continue_result(&self, id: &str) -> Result<ChatContinueResponse> {
-        self.ensure_committed_reads()?;
-        continue_result_on(&self.connection, id)
-    }
-
-    /// The new session is ready when its launch applied and the linked
-    /// source-reference brief applied: the readback exposes both outcomes.
-    pub fn continue_launch_ready(&self, id: &str) -> Result<bool> {
-        self.ensure_committed_reads()?;
-        let value = continue_result_on(&self.connection, id)?;
-        let Some(launch) = load_command(&self.connection, &value.launch_command)? else {
-            return Ok(false);
-        };
-        if launch.state != CommandState::Applied {
-            return Ok(false);
-        }
-        let Some(brief) = load_command(&self.connection, &value.brief_command)? else {
-            return Ok(false);
-        };
-        Ok(brief.state == CommandState::Applied)
-    }
-}
-
-fn continue_replay_on(
-    conn: &Connection,
-    principal: &str,
-    request: &ChatContinueRequest,
-    digest: &[u8],
-) -> Result<Option<ChatContinueResponse>> {
-    if let Some((old_principal, method, old_digest)) = command_binding(conn, &request.id)? {
-        if old_principal != principal || method != CHAT_CONTINUE_METHOD || old_digest != digest {
-            return Err(Error::new("id_conflict", "continue id has another binding"));
-        }
-        let value = continue_result_on(conn, &request.id)?;
-        request.validate_response(&value)?;
-        return Ok(Some(value));
-    }
-    if write_exists(conn, &request.id)? || digest_id_bound(conn, &request.id)? {
-        return Err(Error::new(
-            "id_conflict",
-            "continue id is used by another write",
-        ));
-    }
-    Ok(None)
-}
-
-fn continue_parent(conn: &Connection, id: &str) -> Result<Command> {
-    let parent =
-        load_command(conn, id)?.ok_or_else(|| Error::new("not_found", "continue missing"))?;
-    if parent.method != CHAT_CONTINUE_METHOD
-        || parent.verb != "continue"
-        || parent.principal != "owner"
-    {
-        return Err(Error::new("bad_state", "not an Owner continue"));
-    }
-    Ok(parent)
-}
-
-fn continue_result_on(conn: &Connection, id: &str) -> Result<ChatContinueResponse> {
-    let outcome = load_command(conn, id)?
-        .ok_or_else(|| Error::new("not_found", "continue missing"))?
-        .outcome
-        .ok_or_else(|| Error::new("source_integrity", "continue result missing"))?;
-    serde_json::from_value(outcome)
-        .map_err(|_| Error::new("source_integrity", "continue result malformed"))
-}
-
-fn continue_component(
-    conn: &Connection,
-    parent: &str,
-    id: &str,
-    ordinal: i64,
-) -> Result<Option<Command>> {
-    let linked: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM commands WHERE id = ?1 AND parent_command = ?2 AND link_kind = 'continue' AND ordinal = ?3)",
-            params![id, parent, ordinal],
-            |row| row.get(0),
-        )
-        .map_err(sql_error)?;
-    if linked {
-        load_command(conn, id)
-    } else {
-        Ok(None)
-    }
 }
 #[cfg(test)]
 mod tests {
@@ -1237,16 +717,6 @@ mod tests {
             id: id.to_owned(),
             agents: agents.iter().map(|agent| agent.to_string()).collect(),
             project: project.to_owned(),
-        }
-    }
-
-    fn continue_request(id: &str, chat: &str, project: &str) -> ChatContinueRequest {
-        ChatContinueRequest {
-            id: id.to_owned(),
-            chat: chat.to_owned(),
-            project: project.to_owned(),
-            launch: serde_json::from_value(json!({"profile": "approved"})).unwrap(),
-            text: None,
         }
     }
 
@@ -1492,116 +962,14 @@ mod tests {
         let alpha = project_group(&projection, "alpha");
         assert_eq!(alpha.conflicting_roots, vec![second.clone()]);
         assert!(alpha.members.iter().all(|member| member.agent != second));
-    }
 
-    #[test]
-    fn continue_reserve_names_project_and_source_without_touching_either() {
-        let mut store = Store::open(Path::new(":memory:")).unwrap();
-        register(&mut store, "alpha", "/managed/alpha");
-        let chat = launch_chat(&mut store, &Ulid::new().to_string(), "/tmp/wt-k175-chat-d");
-        let before = store.agent_count().unwrap();
-        // Unknown registrations and profiles are refused before reserving.
-        let mut missing = continue_request(&Ulid::new().to_string(), &chat, "missing");
-        assert_eq!(
-            store
-                .reserve_chat_continue("owner", &missing, &core::SecretPolicy::default(), now())
-                .unwrap_err()
-                .code,
-            "not_found"
-        );
-        missing.project = "alpha".to_owned();
-        missing.launch = serde_json::from_value(json!({"profile": "other"})).unwrap();
-        assert_eq!(
-            store
-                .reserve_chat_continue("owner", &missing, &core::SecretPolicy::default(), now())
-                .unwrap_err()
-                .code,
-            "not_allowed"
-        );
-        let request = continue_request(&Ulid::new().to_string(), &chat, "alpha");
-        let reserved = store
-            .reserve_chat_continue("owner", &request, &core::SecretPolicy::default(), now())
-            .unwrap()
-            .value;
-        request.validate_response(&reserved).unwrap();
-        assert_eq!(reserved.source.agent, chat);
-        assert_eq!(reserved.project, "alpha");
-        assert_eq!(reserved.workspace, "/managed/alpha");
-        assert_eq!(reserved.registration_revision, 1);
-        assert_eq!(reserved.state, CommandState::Accepted);
-        // Same id and payload replays the reservation; a different payload conflicts.
-        let replayed = store
-            .reserve_chat_continue("owner", &request, &core::SecretPolicy::default(), now())
-            .unwrap()
-            .value;
-        assert_eq!(replayed.launch_command, reserved.launch_command);
-        let mut conflict = request.clone();
-        conflict.text = Some("different".to_owned());
-        assert_eq!(
-            store
-                .reserve_chat_continue("owner", &conflict, &core::SecretPolicy::default(), now())
-                .unwrap_err()
-                .code,
-            "id_conflict"
-        );
-        // Reservation created no session: the source is untouched.
-        assert_eq!(store.agent_count().unwrap(), before);
-        let source = load_agent_by_num(&store.connection, parse_agent_id(&chat).unwrap())
-            .unwrap()
-            .unwrap();
-        assert!(source.project.is_empty());
-    }
-
-    #[test]
-    fn restart_preserves_typed_continue_outcome_for_replay() {
-        let mut store = Store::open(Path::new(":memory:")).unwrap();
-        register(&mut store, "alpha", "/managed/alpha");
-        let chat = launch_chat(&mut store, &Ulid::new().to_string(), "/tmp/wt-k175-chat-e");
-        let request = continue_request(&Ulid::new().to_string(), &chat, "alpha");
-        let reserved = store
-            .reserve_chat_continue("owner", &request, &core::SecretPolicy::default(), now())
-            .unwrap()
-            .value;
-        store.start_chat_continue(&request.id, now()).unwrap();
-        store.recover_on_restart(now()).unwrap();
-        // The restart marks the parent unknown but keeps the typed launch,
-        // brief and source bindings, so same-ID replay still decodes.
-        let readback = store.continue_result(&request.id).unwrap();
-        assert_eq!(readback.launch_command, reserved.launch_command);
-        assert_eq!(readback.brief_command, reserved.brief_command);
-        assert_eq!(readback.source.agent, chat);
-        let replayed = store
-            .replay_chat_continue("owner", &request)
-            .unwrap()
-            .expect("restarted continue replays");
-        assert_eq!(replayed.launch_command, reserved.launch_command);
-        assert_eq!(replayed.state, CommandState::Unknown);
-    }
-
-    #[test]
-    fn source_reference_reads_back_on_the_overlay() {
-        let mut store = Store::open(Path::new(":memory:")).unwrap();
-        register(&mut store, "alpha", "/managed/alpha");
-        let worker = launch(
-            &mut store,
-            &Ulid::new().to_string(),
-            "alpha",
-            "/managed/alpha",
-        );
-        let session = launch(
-            &mut store,
-            &Ulid::new().to_string(),
-            "alpha",
-            "/managed/alpha",
-        );
-        let worker_num = parse_agent_id(&worker).unwrap();
-        let session_num = parse_agent_id(&session).unwrap();
+        // When the assigned manager is the newer root, the older
+        // independent root still surfaces as the conflict.
         store
             .connection
             .execute(
-                "INSERT INTO chat_organization(agent, project_link, tags, source, source_generation, updated_at)
-                 VALUES (?1, NULL, '[]', ?2, 1, 0)",
-                params![session_num, worker_num],
+                "UPDATE project_assignments SET manager = ?1 WHERE project = 'alpha'",
+                [parse_agent_id(&second).unwrap()],
             )
             .unwrap();
         let projection = store
@@ -1614,22 +982,12 @@ mod tests {
                 now(),
             )
             .unwrap();
-        let member = project_group(&projection, "alpha")
-            .members
-            .iter()
-            .find(|member| member.agent == session)
-            .expect("continued session");
-        assert_eq!(
-            member.continued_from,
-            Some(OrgSourceRef {
-                agent: worker.clone(),
-                generation: 1,
-            })
-        );
+        let alpha = project_group(&projection, "alpha");
+        assert_eq!(alpha.conflicting_roots, vec![first.clone()]);
     }
 
     #[test]
-    fn migration_links_only_unambiguous_projectless_chats() {
+    fn migration_links_only_unambiguous_chats() {
         let mut store = Store::open(Path::new(":memory:")).unwrap();
         register(&mut store, "alpha", "/managed/alpha");
         register(&mut store, "beta", "/managed/beta");
@@ -1655,6 +1013,20 @@ mod tests {
             &Ulid::new().to_string(),
             "/tmp/wt-k175-branched",
         );
+        // A project-bearing chat whose retained worktree points at another
+        // project is ambiguous and links nowhere.
+        let conflicted = launch_chat(
+            &mut store,
+            &Ulid::new().to_string(),
+            "/tmp/wt-k175-conflict",
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE agents SET project = 'alpha' WHERE id = ?1",
+                [parse_agent_id(&conflicted).unwrap()],
+            )
+            .unwrap();
         store
             .connection
             .execute(
@@ -1700,11 +1072,22 @@ mod tests {
                 params![parse_agent_id(&worktree_chat).unwrap(), command],
             )
             .unwrap();
-        // Re-run the v63 migration over the populated store.
+        store
+            .connection
+            .execute(
+                "INSERT INTO workspaces(agent, target_generation, start_command_id, project, repo_path,
+                     repo_common_dir, requested_branch, base_ref, base_oid, worktree_path, frozen_setup,
+                     phase, setup_index, outcome, updated_at)
+                 VALUES (?1, 1, ?2, '', '/managed/beta', '/managed/beta/.git', 'branch',
+                     NULL, 'oid', '/tmp/wt-k175-conflict', '[]', 'ready', 0, NULL, 0)",
+                params![parse_agent_id(&conflicted).unwrap(), command],
+            )
+            .unwrap();
+        // Re-run the v64 migration over the populated store.
         store
             .connection
             .execute_batch(
-                "DROP TABLE chat_organization; DELETE FROM schema_migrations WHERE version = 63;",
+                "DROP TABLE chat_organization; DELETE FROM schema_migrations WHERE version = 64;",
             )
             .unwrap();
         store.migrate().unwrap();
@@ -1740,5 +1123,17 @@ mod tests {
             .unwrap()
             .flatten();
         assert_eq!(branched.as_deref(), Some("alpha"));
+        // The project-bearing chat with conflicting retained evidence
+        // links nowhere: one distinct candidate is required.
+        let conflicted_link: Option<Option<String>> = store
+            .connection
+            .query_row(
+                "SELECT project_link FROM chat_organization WHERE agent = ?1",
+                [parse_agent_id(&conflicted).unwrap()],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert!(conflicted_link.is_none());
     }
 }

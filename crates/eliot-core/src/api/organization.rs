@@ -6,15 +6,14 @@
 //! display_names` presentation preference and archive stays `agent.archive`.
 //! None of these change execution authority, ownership, files or attribution:
 //! the execution project, scope, workspace and history of every Agent keep
-//! their retained values. `chat.continue` is the only operation that starts
-//! execution, and it starts a new authorized project session with a source
-//! reference instead of editing the source.
+//! their retained values: attach/detach/tag never start execution and
+//! never edit history.
 
 use super::{
     agent_lifecycle::ArchivedFilter, overview::OverviewManagerView,
-    project_assignment::ProjectAssignment, switch::SwitchAgent,
+    project_assignment::ProjectAssignment,
 };
-use crate::{AgentState, CommandState, Error, Result, parse_agent_id};
+use crate::{AgentState, Error, Result, parse_agent_id};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -96,26 +95,6 @@ fn validate_tags(tags: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// A retained reference to a source conversation: Agent id and generation,
-/// never a transcript copy. Readers follow it through `agent.result`,
-/// `command.get` and `turn.get`.
-#[derive(Clone, Debug, PartialEq, Eq, JsonSchema, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct OrgSourceRef {
-    pub agent: String,
-    pub generation: i64,
-}
-
-impl OrgSourceRef {
-    pub fn validate(&self) -> Result<()> {
-        parse_agent_id(&self.agent)?;
-        if self.generation < 0 {
-            return Err(Error::new("invalid", "source generation is invalid"));
-        }
-        Ok(())
-    }
-}
-
 /// One Agent's organizational link readback: placement and tags. Change
 /// readback rides the projection's event watermark, not a revision.
 #[derive(Clone, Debug, PartialEq, Eq, JsonSchema, Serialize, Deserialize)]
@@ -166,9 +145,6 @@ pub struct OrgMemberView {
     /// True when this row is grouped by its placement link, not execution.
     #[serde(default)]
     pub placed: bool,
-    /// The authorized session this row continued, when one is retained.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub continued_from: Option<OrgSourceRef>,
 }
 
 impl OrgMemberView {
@@ -210,11 +186,6 @@ impl OrgMemberView {
             }
         }
         validate_tags(&self.tags)?;
-        if let Some(source) = &self.continued_from {
-            source
-                .validate()
-                .map_err(|_| Error::new("unknown", "organization response source is invalid"))?;
-        }
         Ok(())
     }
 }
@@ -527,116 +498,6 @@ impl ChatOrganizationMutationResponse {
     }
 }
 
-/// `chat.continue`: start an authorized project session for a chat and
-/// record the source reference. The source keeps its history and usage
-/// attribution; the new session carries a reference, never a transcript
-/// copy. The no-project to project crossing is explicit: the request names
-/// the retained project, and a running Agent never changes execution scope
-/// through this call.
-#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ChatContinueRequest {
-    pub id: String,
-    /// The chat (or Agent) whose conversation continues.
-    pub chat: String,
-    /// The retained project the new session joins.
-    pub project: String,
-    /// Launch selectors for the new session (workspace defaults to the
-    /// registered checkout; worktree preparation supported).
-    pub launch: super::switch::SwitchLaunch,
-    /// Optional opening prompt for the new session, after the source
-    /// reference brief.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
-}
-
-impl ChatContinueRequest {
-    pub fn validate(&self) -> Result<()> {
-        validate_mutation_id(&self.id)?;
-        parse_agent_id(&self.chat)?;
-        validate_project_name(&self.project, "params.project")?;
-        self.launch.validate()?;
-        if let Some(text) = &self.text
-            && (text.trim().is_empty()
-                || text.len() > crate::limits::MAX_TEXT_BYTES
-                || text.contains('\0'))
-        {
-            return Err(Error::new(
-                "invalid",
-                "continue text is bounded nonblank input",
-            ));
-        }
-        Ok(())
-    }
-
-    pub fn validate_response(&self, reply: &ChatContinueResponse) -> Result<()> {
-        reply.validate()?;
-        if reply.id != self.id
-            || reply.source.agent != self.chat
-            || reply.project != self.project
-            || reply.launch_command == self.id
-        {
-            return Err(Error::new("unknown", "continue response binding differs"));
-        }
-        Ok(())
-    }
-}
-
-/// The continue readback: orchestration state, the admitted launch and
-/// brief, and the new session beside its source reference.
-#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ChatContinueResponse {
-    pub id: String,
-    pub state: CommandState,
-    /// Reserved launch command admitted for the new session.
-    pub launch_command: String,
-    /// Linked first input carrying the source reference brief.
-    pub brief_command: String,
-    /// The new session once its launch is admitted.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub created: Option<SwitchAgent>,
-    pub source: OrgSourceRef,
-    pub project: String,
-    pub workspace: String,
-    pub registration_revision: i64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    pub next_action: String,
-}
-
-impl ChatContinueResponse {
-    pub fn validate(&self) -> Result<()> {
-        validate_mutation_id(&self.id)?;
-        self.source
-            .validate()
-            .map_err(|_| Error::new("unknown", "continue response source is invalid"))?;
-        validate_project_name(&self.project, "continue response")?;
-        if self.launch_command.trim().is_empty()
-            || self.brief_command.trim().is_empty()
-            || self.launch_command == self.id
-            || self.brief_command == self.id
-            || self.launch_command == self.brief_command
-            || self.workspace.trim().is_empty()
-            || self.registration_revision < 0
-            || self.next_action.trim().is_empty()
-        {
-            return Err(Error::new("unknown", "continue response binding differs"));
-        }
-        if let Some(created) = &self.created {
-            parse_agent_id(&created.agent)
-                .map_err(|_| Error::new("unknown", "continue response session is invalid"))?;
-            if created.generation < 0 {
-                return Err(Error::new(
-                    "unknown",
-                    "continue response session is invalid",
-                ));
-            }
-        }
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -740,7 +601,6 @@ mod tests {
             project_link: None,
             tags: Vec::new(),
             placed: false,
-            continued_from: None,
         };
         let reply = ChatOrganizationResponse {
             event_watermark: 7,
@@ -765,37 +625,5 @@ mod tests {
             archived: ArchivedFilter::Exclude,
         };
         assert!(filtered.validate_response(&reply).is_err());
-    }
-
-    #[test]
-    fn continue_binds_session_to_source_and_project() {
-        let request = ChatContinueRequest {
-            id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
-            chat: agent(),
-            project: "app".to_owned(),
-            launch: serde_json::from_value(json!({"profile": "worker"})).unwrap(),
-            text: None,
-        };
-        request.validate().unwrap();
-        let reply = ChatContinueResponse {
-            id: request.id.clone(),
-            state: CommandState::Accepted,
-            launch_command: "01ARZ3NDEKTSV4RRFFQ69G5FB0".to_owned(),
-            brief_command: "01ARZ3NDEKTSV4RRFFQ69G5FB1".to_owned(),
-            created: None,
-            source: OrgSourceRef {
-                agent: agent(),
-                generation: 1,
-            },
-            project: "app".to_owned(),
-            workspace: "C:/repo".to_owned(),
-            registration_revision: 3,
-            error: None,
-            next_action: "preparing_launch".to_owned(),
-        };
-        request.validate_response(&reply).unwrap();
-        let mut moved = reply.clone();
-        moved.source.agent = "a2".to_owned();
-        assert!(request.validate_response(&moved).is_err());
     }
 }

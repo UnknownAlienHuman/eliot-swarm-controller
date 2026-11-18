@@ -38,39 +38,84 @@ pub(crate) struct ProjectRegistrationConfig {
 }
 
 /// Default chat root for one data dir. The Owner's default data dir keeps
-/// the historical `~/Eliot/chats`; every explicit data dir (including a
-/// private `--data-dir` daemon) gets a sibling root specific to that dir,
-/// so ordinary chats never land under the owner's real `Eliot\chats`.
-/// An explicit `daemon.chats_root` always wins; the existing
-/// protected-path checks in `validate_chats_root` still apply.
+/// the historical `~/Eliot/chats`; every other data dir (including a
+/// private `--data-dir` daemon) gets a root specific to that dir that is
+/// never under the owner's canonical `~/Eliot/chats` tree: a
+/// `<data-dir>-chats` sibling when the protected-path checks accept it,
+/// otherwise a deterministic `~/Eliot/chats-<name>-<hash>` fallback.
+/// An explicit `daemon.chats_root` always wins; when no default passes,
+/// the error asks for one.
 pub(crate) fn default_chats_root(data_root: &Path) -> core::Result<std::path::PathBuf> {
     if is_owner_default_data_dir(data_root) {
-        let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
-            .ok_or_else(|| {
-                core::Error::new("profile_error", "user home is unavailable for chats_root")
-            })?;
-        return Ok(std::path::PathBuf::from(home).join("Eliot").join("chats"));
+        return owner_chats_root();
     }
-    let name = data_root
+    let protected = protected_paths(data_root);
+    if let Some(sibling) = sibling_chats_root(data_root)
+        && validate_chats_root(&sibling, &protected).is_ok()
+    {
+        return Ok(sibling);
+    }
+    let fallback = home_namespaced_chats_root(data_root)?;
+    validate_chats_root(&fallback, &protected)?;
+    Ok(fallback)
+}
+
+fn owner_chats_root() -> core::Result<std::path::PathBuf> {
+    let home =
+        std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).ok_or_else(|| {
+            core::Error::new("profile_error", "user home is unavailable for chats_root")
+        })?;
+    Ok(std::path::PathBuf::from(home).join("Eliot").join("chats"))
+}
+
+/// Deterministic per-data-dir fallback beside (never under) the owner's
+/// chats tree, for data dirs whose sibling would overlap a protected root.
+fn home_namespaced_chats_root(data_root: &Path) -> core::Result<std::path::PathBuf> {
+    let home =
+        std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).ok_or_else(|| {
+            core::Error::new(
+                "profile_error",
+                "data dir needs an explicit disjoint daemon.chats_root",
+            )
+        })?;
+    let absolute = std::path::absolute(data_root).unwrap_or_else(|_| data_root.to_owned());
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in absolute.to_string_lossy().bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let raw = data_root
         .file_name()
         .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .ok_or_else(|| {
-            core::Error::new(
-                "profile_error",
-                "data dir needs an explicit disjoint daemon.chats_root",
-            )
-        })?;
+        .unwrap_or("data");
+    let mut sanitized: String = raw
+        .chars()
+        .map(|cell| {
+            if cell.is_ascii_alphanumeric() {
+                cell
+            } else {
+                '_'
+            }
+        })
+        .take(32)
+        .collect();
+    if sanitized.is_empty() {
+        sanitized.push_str("data");
+    }
+    Ok(std::path::PathBuf::from(home)
+        .join("Eliot")
+        .join(format!("chats-{sanitized}-{hash:016x}")))
+}
+
+fn sibling_chats_root(data_root: &Path) -> Option<std::path::PathBuf> {
+    let name = data_root.file_name()?.to_str()?;
+    if name.is_empty() {
+        return None;
+    }
     let parent = data_root
         .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .ok_or_else(|| {
-            core::Error::new(
-                "profile_error",
-                "data dir needs an explicit disjoint daemon.chats_root",
-            )
-        })?;
-    Ok(parent.join(format!("{name}-chats")))
+        .filter(|parent| !parent.as_os_str().is_empty())?;
+    Some(parent.join(format!("{name}-chats")))
 }
 
 fn is_owner_default_data_dir(data_root: &Path) -> bool {
@@ -88,7 +133,21 @@ pub(crate) fn validate_chats_location(
         .map(std::path::PathBuf::from)
         .map(Ok)
         .unwrap_or_else(|| default_chats_root(data_root))?;
+    let protected = protected_paths(data_root);
+    validate_chats_root(&root, &protected)
+}
+
+/// Every location a chat root must stay disjoint from: the daemon data
+/// dir, the canonical owner chat tree for non-default data dirs,
+/// credential and configuration homes. Shared by the explicit path and
+/// every automatic default.
+fn protected_paths(data_root: &Path) -> Vec<PathBuf> {
     let mut protected = vec![data_root.to_owned()];
+    if !is_owner_default_data_dir(data_root)
+        && let Ok(owner_chats) = owner_chats_root()
+    {
+        protected.push(owner_chats);
+    }
     for name in [
         "CODEX_HOME",
         "CODEX_SQLITE_HOME",
@@ -123,7 +182,7 @@ pub(crate) fn validate_chats_location(
             protected.push(home.join("AppData"));
         }
     }
-    validate_chats_root(&root, &protected)
+    protected
 }
 
 fn validate_chats_root(root: &Path, protected: &[PathBuf]) -> core::Result<PathBuf> {

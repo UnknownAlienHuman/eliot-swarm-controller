@@ -458,7 +458,6 @@ command id frozen at claim. Stored Goal responses/round records use Core
 | `chat.organization` | owner-only grouped work projection by project assignment, manager, repository/worktree and ancestry, with event-watermark and per-group readback; no client repeats Git discovery or grouping. See [Chat organization](#chat-organization). |
 | `chat.attach` / `chat.detach` | owner-only chat placement moves between a retained project and the no-project bucket; committed per-Agent link readback; execution scope, workspace and history untouched |
 | `chat.tag` | owner-only replacement tag groups for Agents or chats (an omitted tag list clears); committed per-Agent link readback |
-| `chat.continue` | owner-only authorized project session for a chat through the normal launch pipeline with a source reference brief; source history and attribution unchanged; idempotent under the mutation id |
 | `project.discover` | owner-only opened Git checkout registration through the settings writer; non-Git paths return no project |
 | `routing.preview` | owner-only advisory `RoutingDecision` for a role, computed like admission without admitting, freezing or reserving; see configuration |
 | `timer.get/run` | owner-only timer read and idempotent manual firing |
@@ -527,12 +526,12 @@ detail visibility and capacity semantics.
 
 The owning semantics are [Coordination: Conversation association](coordination.md#conversation-association).
 Owner only, with identical behavior from the CLI (`swarm chat ...`) and MCP
-(`chat.organization`, `chat.attach`, `chat.detach`, `chat.tag`, `chat.continue`);
+(`chat.organization`, `chat.attach`, `chat.detach`, `chat.tag`);
 the desktop has no organization entry yet (deferred to step 5).
 Organization is placement, never authority: attach, detach and tag write the
 organizational overlay beside the Agent id through Owner-only Store
-transactions (schema v63: `chat_organization` with placement, tags and the
-source reference beside the Agent id); the execution project, scope,
+transactions (schema v64: `chat_organization` with placement and tags
+beside the Agent id); the execution project, scope,
 workspace and history of every Agent keep their retained values.
 
 `chat.organization` (`ChatOrganizationRequest`/`ChatOrganizationResponse` in
@@ -558,21 +557,6 @@ projection's event watermark. Rename stays the desktop
 `agent.archive`. Errors include `invalid`, `not_found`, `not_allowed`,
 `bad_state`, `unavailable`, `id_conflict`, `source_integrity` and mutation
 binding/age errors.
-
-`chat.continue` (`ChatContinueRequest`/`ChatContinueResponse`) is the only
-execution operation in this family: an authorized project session for a chat
-through the normal launch pipeline (profile freeze, workspace preparation,
-admission, dispatch). The request names the retained project; the daemon
-resolves that project's canonical checkout and Git common directory before
-preparation and refuses a workspace in another repository, then binds the
-project identity and registration revision through dispatch. The linked
-source-reference brief (`OrgSourceRef`: Agent id and generation, never a
-transcript copy) dispatches through ordinary launch scheduling, and the
-readback exposes its actual outcome. The source conversation is never edited,
-and old events, tokens and actions keep their original attribution. A
-no-project to project move is an explicitly authorized transition; drain
-answers `unavailable`; a running Agent cannot change execution scope through
-an edit. The CLI exit code follows the new session state.
 
 ### Authenticated method discovery
 
@@ -2274,7 +2258,6 @@ swarm chat organization [--project P] [--archived]
 swarm chat attach CHAT... --project P
 swarm chat detach CHAT...
 swarm chat tag AGENT... [--tag TAG]...
-swarm chat continue CHAT --project P [--profile P | --harness H ...] [--workspace PATH] [--worktree BRANCH [--base REF]] [--text TEXT]
 swarm provider holds [--after SCOPE] [--limit N]
 swarm provider clear-hold SCOPE --corrective-evidence credentials_updated|configuration_updated|owner_verified [--expected-probe-command ID]
 swarm plugin NAME | plugin-test ... | hook ... | mcp

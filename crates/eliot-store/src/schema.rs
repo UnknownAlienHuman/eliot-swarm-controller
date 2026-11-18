@@ -1504,28 +1504,22 @@ impl Store {
                      agent INTEGER PRIMARY KEY REFERENCES agents(id),
                      project_link TEXT,
                      tags TEXT NOT NULL DEFAULT '[]',
-                     source INTEGER REFERENCES agents(id),
-                     source_generation INTEGER,
-                     brief_command TEXT,
                      updated_at INTEGER NOT NULL
                  );
                  CREATE INDEX chat_organization_link ON chat_organization(project_link);
-                 INSERT INTO chat_organization(agent, project_link, tags, updated_at)
-                     SELECT a.id, a.project, '[]',
-                         COALESCE((SELECT MAX(updated_at) FROM agents), 0)
-                     FROM agents a
-                     WHERE a.chat = 1 AND a.project <> ''
-                       AND EXISTS(SELECT 1 FROM project_registrations r WHERE r.id = a.project);
                  WITH RECURSIVE chain(chat_id, num) AS (
                      SELECT a.id, a.parent FROM agents a
-                     WHERE a.chat = 1 AND (a.project IS NULL OR a.project = '')
-                       AND a.parent IS NOT NULL
+                     WHERE a.chat = 1 AND a.parent IS NOT NULL
                      UNION ALL
                      SELECT chain.chat_id, p.parent FROM chain
                      JOIN agents p ON p.id = chain.num
                      WHERE chain.num IS NOT NULL
                  ),
                  candidates(chat_id, project) AS (
+                     SELECT a.id, a.project FROM agents a
+                     WHERE a.chat = 1 AND a.project IS NOT NULL AND a.project <> ''
+                       AND EXISTS(SELECT 1 FROM project_registrations r WHERE r.id = a.project)
+                     UNION
                      SELECT chain.chat_id, n.project FROM chain
                      JOIN agents n ON n.id = chain.num
                      WHERE n.project IS NOT NULL AND n.project <> ''
@@ -1534,7 +1528,7 @@ impl Store {
                      SELECT a.id, r.id FROM agents a
                      JOIN workspaces w ON w.agent = a.id AND w.phase <> 'removed'
                      JOIN project_registrations r ON r.repo_common_dir = w.repo_common_dir
-                     WHERE a.chat = 1 AND (a.project IS NULL OR a.project = '')
+                     WHERE a.chat = 1
                  ),
                  single(chat_id, project) AS (
                      SELECT chat_id, MIN(project) FROM candidates
@@ -1543,8 +1537,7 @@ impl Store {
                  INSERT INTO chat_organization(agent, project_link, tags, updated_at)
                      SELECT single.chat_id, single.project, '[]',
                          COALESCE((SELECT MAX(updated_at) FROM agents), 0)
-                     FROM single
-                     WHERE NOT EXISTS(SELECT 1 FROM chat_organization o WHERE o.agent = single.chat_id);
+                     FROM single;
                 INSERT INTO schema_migrations(version) VALUES (64);",
             )
             .map_err(sql_error)?;

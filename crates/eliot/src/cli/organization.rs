@@ -1,13 +1,9 @@
 //! Headless chat and work organization commands (step 4a).
-use super::args::{
-    ChatAttachArgs, ChatCommand, ChatContinueArgs, ChatDetachArgs, ChatOrganizationArgs,
-    ChatTagArgs,
-};
-use super::support::{Failure, mutation_id, print_value, response_exit_code};
+use super::args::{ChatAttachArgs, ChatCommand, ChatDetachArgs, ChatOrganizationArgs, ChatTagArgs};
+use super::support::{Failure, mutation_id, print_value};
 use eliot_core::api::{
-    ArchivedFilter, ChatAttachRequest, ChatContinueRequest, ChatDetachRequest,
-    ChatOrganizationMutationResponse, ChatOrganizationRequest, ChatOrganizationResponse,
-    ChatTagRequest, SwitchLaunch,
+    ArchivedFilter, ChatAttachRequest, ChatDetachRequest, ChatOrganizationMutationResponse,
+    ChatOrganizationRequest, ChatOrganizationResponse, ChatTagRequest,
 };
 use std::path::Path;
 
@@ -103,55 +99,6 @@ pub(super) async fn run_chat(
                 json_output,
             );
             Ok(0)
-        }
-        ChatCommand::Continue(ChatContinueArgs {
-            chat,
-            project,
-            profile,
-            harness,
-            model,
-            effort,
-            auth,
-            cmd,
-            access,
-            workspace,
-            worktree,
-            base,
-            text,
-        }) => {
-            let request = ChatContinueRequest {
-                id: mutation_id(id)?,
-                chat,
-                project,
-                launch: SwitchLaunch {
-                    profile,
-                    harness,
-                    model,
-                    effort,
-                    auth,
-                    cmd,
-                    access,
-                    workspace,
-                    worktree,
-                    base,
-                },
-                text,
-            };
-            request.validate().map_err(Failure::for_mutation)?;
-            let response: eliot_core::api::ChatContinueResponse =
-                eliot_daemon::client_call_typed(data_dir, "chat.continue", &request)
-                    .await
-                    .map_err(Failure::for_mutation)?;
-            request
-                .validate_response(&response)
-                .map_err(Failure::invalid_response)?;
-            let exit = response_exit_code(response.state);
-            print_value(
-                &serde_json::to_value(response)
-                    .map_err(|_| Failure::new(4, "invalid continue response"))?,
-                json_output,
-            );
-            Ok(exit)
         }
     }
 }

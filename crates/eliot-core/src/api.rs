@@ -136,10 +136,10 @@ pub use observe::{
     MAX_OBSERVE_WINDOW_SECS, ObserveHeavyRequest, ObserveHeavyResponse, SessionGrowthView,
 };
 pub use organization::{
-    ChatAttachRequest, ChatContinueRequest, ChatContinueResponse, ChatDetachRequest,
-    ChatOrganizationMutationResponse, ChatOrganizationRequest, ChatOrganizationResponse,
-    ChatTagRequest, MAX_ORG_AGENTS, MAX_ORG_MEMBERS_PER_GROUP, MAX_ORG_MEMBERS_TOTAL,
-    MAX_ORG_TAG_BYTES, MAX_ORG_TAGS, OrgGroupView, OrgLinkView, OrgMemberView, OrgSourceRef,
+    ChatAttachRequest, ChatDetachRequest, ChatOrganizationMutationResponse,
+    ChatOrganizationRequest, ChatOrganizationResponse, ChatTagRequest, MAX_ORG_AGENTS,
+    MAX_ORG_MEMBERS_PER_GROUP, MAX_ORG_MEMBERS_TOTAL, MAX_ORG_TAG_BYTES, MAX_ORG_TAGS,
+    OrgGroupView, OrgLinkView, OrgMemberView,
 };
 pub use overview::{
     FleetTotals, HarnessCount, LifecycleTotals, NativeChildView, OverviewCoverage,
