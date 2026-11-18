@@ -114,6 +114,30 @@ const RECOVER_ACCEPTED_COMMAND_FILTER: &str =
            AND EXISTS (SELECT 1 FROM commands p WHERE p.id = commands.parent_command AND p.method = 'swarm.switch')
            AND NOT EXISTS (SELECT 1 FROM workspaces w WHERE w.agent = commands.target AND w.start_command_id = commands.id)))";
 
+/// Chunk bound for retained-id exclusion lists: far below SQLite default variable
+/// limit, so drain-time exclusion of every classified retained unknown never fails
+/// to prepare.
+const UNSETTLED_EXCLUSION_CHUNK: usize = 500;
+
+/// `AND id NOT IN (...)` fragment excluding retained ids before any
+/// `ORDER BY`/`LIMIT`, in `UNSETTLED_EXCLUSION_CHUNK`-sized groups. An empty
+/// exclusion list leaves the predicate unchanged.
+fn unsettled_exclusion_clause(excluded: &[String]) -> (String, Vec<String>) {
+    if excluded.is_empty() {
+        return (String::new(), Vec::new());
+    }
+    let mut values = Vec::with_capacity(excluded.len());
+    let mut groups = Vec::new();
+    for chunk in excluded.chunks(UNSETTLED_EXCLUSION_CHUNK) {
+        groups.push(format!(
+            "id NOT IN ({})",
+            chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",")
+        ));
+        values.extend(chunk.iter().cloned());
+    }
+    (format!(" AND {}", groups.join(" AND ")), values)
+}
+
 const LIST_PROCESSES_FIRST_PAGE_SQL: &str =
     "SELECT host_boot_id, pid, start_time, owner, role, state, exit_code, updated_at
              FROM processes WHERE owner = ?1
@@ -1204,13 +1228,34 @@ impl Store {
 
     /// Return unsettled commands without letting terminal history consume the limit.
     pub fn list_unsettled_commands(&self, limit: usize) -> Result<Vec<Command>> {
+        self.list_unsettled_commands_excluding(&[], limit)
+    }
+
+    /// Return unsettled commands with retained ids excluded in SQL before
+    /// `ORDER BY`/`LIMIT`, so classified retained unknowns can never occupy
+    /// the bounded drain prefix and hide a live command behind it. The empty
+    /// exclusion list keeps the plain bounded behavior. Callers compare the
+    /// companion excluding count against the returned page and keep blocking
+    /// while unlisted commands remain: an unlisted id is never excused.
+    pub fn list_unsettled_commands_excluding(
+        &self,
+        excluded: &[String],
+        limit: usize,
+    ) -> Result<Vec<Command>> {
         validate_limit(limit)?;
+        let (exclusion, values) = unsettled_exclusion_clause(excluded);
         let sql = format!(
-            "{LIST_UNSETTLED_COMMANDS_COLUMNS} WHERE {UNSETTLED_COMMANDS_WHERE} ORDER BY created_at, rowid LIMIT ?1"
+            "{LIST_UNSETTLED_COMMANDS_COLUMNS} WHERE {UNSETTLED_COMMANDS_WHERE}{exclusion} ORDER BY created_at, rowid LIMIT ?"
         );
         let mut statement = self.connection.prepare(&sql).map_err(sql_error)?;
+        let limit_param = limit as i64;
+        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(values.len() + 1);
+        for value in &values {
+            params.push(value);
+        }
+        params.push(&limit_param);
         let rows = statement
-            .query_map([limit as i64], command_record_from_row)
+            .query_map(params.as_slice(), command_record_from_row)
             .map_err(sql_error)?;
         let mut commands = Vec::new();
         for row in rows {
@@ -1218,6 +1263,24 @@ impl Store {
         }
         enforce_page_bytes(&mut commands)?;
         Ok(commands)
+    }
+
+    /// Total unsettled commands with retained ids excluded in SQL, ignoring
+    /// the drain list bound and the page byte bound. Compare with the
+    /// excluding bounded list to mark truncation honestly for any reason,
+    /// including retained entries that left the list.
+    pub fn count_unsettled_commands_excluding(&self, excluded: &[String]) -> Result<i64> {
+        let (exclusion, values) = unsettled_exclusion_clause(excluded);
+        let sql =
+            format!("SELECT COUNT(*) FROM commands WHERE {UNSETTLED_COMMANDS_WHERE}{exclusion}");
+        let mut statement = self.connection.prepare(&sql).map_err(sql_error)?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(values.len());
+        for value in &values {
+            params.push(value);
+        }
+        statement
+            .query_row(params.as_slice(), |row| row.get(0))
+            .map_err(sql_error)
     }
 
     /// Page only keys for unattempted ordinary Owner admissions in index order.

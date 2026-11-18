@@ -406,6 +406,12 @@ mod tests {
             vec![StatusBlocker::CommandUnknown {
                 command_id: "dummy-old-command".to_owned(),
             }],
+            vec![
+                StatusBlocker::CommandUnsettledMore { count: 3 },
+                StatusBlocker::ScriptRunActive {
+                    run_id: "dummy-run".to_owned(),
+                },
+            ],
         ] {
             for drain in [None, Some(DrainReport::empty())] {
                 let reply = DaemonShutdownResponse {
