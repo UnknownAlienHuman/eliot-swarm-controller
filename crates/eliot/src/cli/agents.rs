@@ -694,7 +694,14 @@ pub(crate) async fn run_wait(
     json_output: bool,
 ) -> Result<u8, Failure> {
     swarm_wait(
-        &data_dir, all, any, timeout_seconds, ids, command, turn, json_output,
+        &data_dir,
+        all,
+        any,
+        timeout_seconds,
+        ids,
+        command,
+        turn,
+        json_output,
     )
     .await
 }
@@ -712,10 +719,7 @@ pub(crate) async fn run_digest(
     json_output: bool,
     id: Option<String>,
 ) -> Result<u8, Failure> {
-    swarm_digest(
-        &data_dir, all, any, to, ids, command, turn, json_output, id,
-    )
-    .await
+    swarm_digest(&data_dir, all, any, to, ids, command, turn, json_output, id).await
 }
 
 pub(crate) async fn run_reparent(
@@ -998,6 +1002,7 @@ pub(crate) fn validate_text(text: Option<&str>) -> Result<(), Failure> {
 /// is frozen client-side before the RPC; the daemon never adds later turns or
 /// children. Exit 0 only when every entry succeeded (`--all`) or at least one
 /// succeeded (`--any`); timeout exits 5 with the honest per-entry snapshot.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn swarm_wait(
     data_dir: &Path,
     all: bool,
@@ -1063,6 +1068,7 @@ pub(crate) async fn swarm_wait(
 /// coalesced mail when the set satisfies `all`/`any` and wakes through the
 /// standard mail notice. Reusing `--id` replays the same digest without a
 /// second mail. Exit 0 when the digest is accepted (pending or delivered).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn swarm_digest(
     data_dir: &Path,
     all: bool,
@@ -1374,7 +1380,10 @@ mod tests {
         };
         assert_eq!(
             command,
-            vec!["01ARZ3NDEKTSV4RRFFQ69G5FAV/send".to_owned(), "c2".to_owned()]
+            vec![
+                "01ARZ3NDEKTSV4RRFFQ69G5FAV/send".to_owned(),
+                "c2".to_owned()
+            ]
         );
         assert_eq!(turn, vec!["a1/2/t".to_owned()]);
     }
@@ -1397,11 +1406,7 @@ mod tests {
         match positional_wait_target("swarm wait", "a1/2/t").expect("parses") {
             WaitTarget::Turn(turn) => {
                 assert_eq!(
-                    (
-                        turn.agent.as_str(),
-                        turn.generation,
-                        turn.turn_id.as_str()
-                    ),
+                    (turn.agent.as_str(), turn.generation, turn.turn_id.as_str()),
                     ("a1", 2, "t")
                 );
             }
@@ -1430,7 +1435,10 @@ mod tests {
             WaitTarget::Command(_) => panic!("bare triple must stay a turn"),
         }
         for bad in ["", "   "] {
-            assert!(positional_wait_target("swarm wait", bad).is_err(), "id: {bad}");
+            assert!(
+                positional_wait_target("swarm wait", bad).is_err(),
+                "id: {bad}"
+            );
             assert!(
                 positional_wait_target("swarm digest", bad).is_err(),
                 "id: {bad}"
@@ -1505,8 +1513,14 @@ mod tests {
         let mut commands = Vec::new();
         let mut turns = Vec::new();
         assert!(
-            explicit_wait_targets("swarm wait", &mut commands, &mut turns, &["  ".to_owned()], &[])
-                .is_err()
+            explicit_wait_targets(
+                "swarm wait",
+                &mut commands,
+                &mut turns,
+                &["  ".to_owned()],
+                &[]
+            )
+            .is_err()
         );
         assert!(
             explicit_wait_targets(
