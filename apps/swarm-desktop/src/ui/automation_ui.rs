@@ -9,18 +9,20 @@
 //! in `settings_ui::automations`.
 
 use super::*;
+use crate::config_client::RuleWorker;
 use crate::config_view::{duration_words, local_time, rule_text};
 use eliot_core::CommandState;
 use eliot_core::api::TimerStateView;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, Write};
 
 #[derive(Clone, Debug)]
 pub(super) enum AutomationMsg {
-    /// The namespaces read, and why the rule worker is down (`Ok(None)`:
-    /// it runs).
+    /// The namespaces and the latest rule worker status.
     RulesLoaded(
         u64,
         Vec<(Option<String>, String, Fallible<RulePage>)>,
-        Fallible<Option<String>>,
+        RuleWorker,
     ),
     AutomationRefreshRequested,
     /// Show or hide one card's technical details (the card key).
@@ -41,8 +43,8 @@ pub(super) enum AutomationMsg {
     Enabled(String, bool),
     /// Run a timer once now: its project (None: global) and rule id.
     RunNow(Option<String>, String),
-    RunSubmitted(String, Box<MutationResult<Command>>),
-    RunSettled(String, Box<Fallible<(Command, Vec<Command>)>>),
+    RunFinished(TimerKey, RunOutcome),
+    RunReadback(TimerKey),
 }
 
 /// The form's text fields.
@@ -65,6 +67,7 @@ pub(super) struct AssignmentForm {
     pub(super) busy: u64,
     pub(super) interval: String,
     pub(super) error: Option<String>,
+    pub(super) saving: bool,
 }
 
 /// What the last Run now of one timer did, in words.
@@ -75,23 +78,28 @@ pub(super) struct RunLine {
     pub(super) error: bool,
 }
 
+#[derive(Clone, Debug)]
+pub(super) enum RunOutcome {
+    NoPendingRun,
+    Complete(RunLine),
+    Retry(RunLine),
+    Readback(String),
+}
+
 /// Rules and timers read for the Automations page, and its local state.
 #[derive(Default)]
 pub(super) struct AutomationState {
     /// Replaced only when a read lands, never cleared by a refresh.
     pub(super) rules: Vec<RuleNamespace>,
-    /// Why the daemon's rule worker is down, as last read; `None` while it
-    /// runs or when its health could not be read.
-    pub(super) worker_down: Option<String>,
+    pub(super) global_rules_current: bool,
+    pub(super) worker: RuleWorker,
     /// Tags rule loads; an older reply is dropped.
     pub(super) epoch: u64,
     /// Cards whose technical details are open.
     pub(super) technical: HashSet<String>,
     pub(super) form: Option<AssignmentForm>,
     /// The last Run now per timer (its run key).
-    pub(super) runs: HashMap<String, RunLine>,
-    /// Distinguishes one Run now click from the next in the mutation ledger.
-    pub(super) run_seq: u64,
+    pub(super) runs: HashMap<TimerKey, RunLine>,
 }
 
 impl AutomationState {
@@ -102,9 +110,105 @@ impl AutomationState {
     }
 }
 
-/// The ledger and Run-now key of one timer.
-pub(super) fn run_key(project: Option<&str>, rule: &str) -> String {
-    format!("{}/{rule}", project.unwrap_or("global"))
+/// One timer within the connected daemon's exact namespace.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(super) struct TimerKey(pub(super) Option<String>, pub(super) String);
+
+impl TimerKey {
+    fn card_key(&self) -> String {
+        match &self.0 {
+            Some(project) => format!("rule:project:{project}/{}", self.1),
+            None => format!("rule:global/{}", self.1),
+        }
+    }
+
+    fn pending_file(&self, data_dir: &Path) -> PathBuf {
+        use sha2::{Digest, Sha256};
+        // A tag distinguishes the Owner namespace from every project ID.
+        let mut digest = Sha256::new();
+        digest.update([u8::from(self.0.is_some())]);
+        if let Some(project) = &self.0 {
+            digest.update((project.len() as u64).to_le_bytes());
+            digest.update(project);
+        }
+        digest.update(&self.1);
+        let hash: String = digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        data_dir.join(format!("desktop-timer-run-{hash}"))
+    }
+}
+
+/// A pending action belongs to one timer and survives closing the window.
+/// The file stays locked through readback so two desktop instances cannot
+/// replace an unresolved action or clear each other's receipts.
+struct PendingTimerRun(File);
+
+impl PendingTimerRun {
+    fn open(data_dir: &Path, key: &TimerKey, create: bool) -> Fallible<Option<Self>> {
+        let file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(create)
+            .truncate(false)
+            .open(key.pending_file(data_dir))
+        {
+            Err(error) if !create && error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            result => {
+                result.map_err(|error| format!("Run now: could not open its saved ID: {error}"))?
+            }
+        };
+        file.try_lock()
+            .map_err(|error| format!("Run now: could not lock its saved ID: {error}"))?;
+        Ok(Some(Self(file)))
+    }
+
+    /// The command ID is the mutation ID, checked by TimerRunRequest.
+    fn read_id(&mut self) -> Fallible<Option<(String, bool)>> {
+        let mut id = String::new();
+        (&mut self.0)
+            .take(28)
+            .read_to_string(&mut id)
+            .map_err(|error| format!("Run now: could not read its saved ID: {error}"))?;
+        if id.is_empty() {
+            return Ok(None);
+        }
+        let admitted = id.ends_with('\n');
+        if admitted {
+            id.pop();
+        }
+        id.parse::<ulid::Ulid>()
+            .map_err(|_| "Run now: its saved ID could not be verified.".to_owned())?;
+        Ok(Some((id, admitted)))
+    }
+
+    fn start(&mut self) -> Fallible<String> {
+        let id = client::new_mutation_id();
+        self.0
+            .write_all(id.as_bytes())
+            .and_then(|()| self.0.sync_all())
+            .map_err(|error| format!("Run now: could not save its ID: {error}"))?;
+        Ok(id)
+    }
+
+    fn mark_admitted(&mut self) -> Fallible<()> {
+        self.0
+            .write_all(b"\n")
+            .and_then(|()| self.0.sync_all())
+            .map_err(|error| format!("Run now: could not save its admitted status: {error}"))
+    }
+
+    fn clear(&mut self) -> Fallible<()> {
+        self.0
+            .set_len(0)
+            .and_then(|()| self.0.sync_all())
+            .and_then(|()| self.0.rewind())
+            .map_err(|error| format!("Run now: could not clear its saved ID: {error}"))
+    }
 }
 
 /// An automation's state, as its card says it.
@@ -117,6 +221,7 @@ pub(super) enum CardState {
     Off,
     /// The settings say on; the daemon has not loaded it yet.
     Starting,
+    Unreadable,
     /// Paused by the daemon, with the reason in words.
     Failed(String),
 }
@@ -128,6 +233,7 @@ impl CardState {
             Self::Paused => "Paused".to_owned(),
             Self::Off => "Off".to_owned(),
             Self::Starting => "Starting…".to_owned(),
+            Self::Unreadable => "Unknown".to_owned(),
             Self::Failed(_) => "Failed".to_owned(),
         }
     }
@@ -136,6 +242,7 @@ impl CardState {
     pub(super) fn reason(&self) -> Option<&str> {
         match self {
             Self::Failed(reason) => Some(reason),
+            Self::Unreadable => Some("Swarm's automation worker status could not be read."),
             _ => None,
         }
     }
@@ -147,7 +254,7 @@ impl CardState {
             Self::Running => StatusTone::Active,
             Self::Failed(_) => StatusTone::Failed,
             Self::Starting => StatusTone::Pending,
-            Self::Paused | Self::Off => StatusTone::Neutral,
+            Self::Paused | Self::Off | Self::Unreadable => StatusTone::Neutral,
         }
     }
 }
@@ -164,7 +271,7 @@ pub(super) struct Card {
     /// Labelled paths, each opened in Explorer.
     pub(super) paths: Vec<(&'static str, String)>,
     /// The timer Run now fires: its project and rule id.
-    pub(super) run: Option<(Option<String>, String)>,
+    pub(super) run: Option<TimerKey>,
     /// The assignment's settings key and whether it is on (Pause/Resume,
     /// Edit).
     pub(super) assignment: Option<(String, bool)>,
@@ -185,9 +292,9 @@ pub(super) struct AssignmentView {
 /// What the cards are built from.
 pub(super) struct CardInputs<'a> {
     pub(super) assignments: Vec<AssignmentView>,
-    /// Why the rule worker is down: nothing runs, whatever the rules say.
-    pub(super) worker_down: Option<&'a str>,
+    pub(super) worker: &'a RuleWorker,
     pub(super) namespaces: &'a [RuleNamespace],
+    pub(super) global_rules_current: bool,
     /// Registered projects: (id, checkout, label).
     pub(super) projects: &'a [(String, String, String)],
     pub(super) data_dir: Option<&'a Path>,
@@ -301,27 +408,33 @@ fn times(timer: &TimerStateView, assignment: bool) -> String {
 /// Every automation in scope as a card: the settings assignments first,
 /// then the rules files' rules and timers.
 pub(super) fn cards(inputs: &CardInputs<'_>) -> Vec<Card> {
-    let global: &[RuleListEntry] = inputs
+    let global = inputs
         .namespaces
         .iter()
-        .find(|namespace| namespace.project.is_none())
+        .find(|namespace| namespace.project.is_none());
+    let rules: &[RuleListEntry] = global
         .and_then(|namespace| namespace.rules.as_ref().ok())
         .map_or(&[], Vec::as_slice);
     let mut cards = Vec::new();
     for assignment in &inputs.assignments {
         let launch_id = format!("assignment-{}", assignment.key);
-        let launch = global.iter().find(|entry| entry.state.id == launch_id);
-        let complete = global
+        let launch = rules.iter().find(|entry| entry.state.id == launch_id);
+        let complete = rules
             .iter()
             .find(|entry| entry.state.id == format!("{launch_id}.complete"));
-        let state = match launch {
-            _ if !assignment.enabled => CardState::Paused,
-            Some(entry) => match &entry.state.paused_reason {
+        let timer = launch.and_then(|entry| entry.timer.as_ref());
+        let pause_confirmed = timer.map_or_else(
+            || global.is_some_and(|namespace| !namespace.more && namespace.rules.is_ok()),
+            |timer| !timer.enabled,
+        );
+        let state = match (assignment.enabled, launch) {
+            (false, _) if inputs.global_rules_current && pause_confirmed => CardState::Paused,
+            (true, Some(entry)) => match &entry.state.paused_reason {
                 Some(reason) => CardState::Failed(reason_words(reason)),
-                None if entry.state.enabled => CardState::Running,
+                None if timer.is_some_and(|timer| timer.enabled) => CardState::Running,
                 None => CardState::Starting,
             },
-            None => CardState::Starting,
+            _ => CardState::Starting,
         };
         let mut technical = vec![
             format!("Settings: [automation.assignments.{}]", assignment.key),
@@ -358,7 +471,7 @@ pub(super) fn cards(inputs: &CardInputs<'_>) -> Vec<Card> {
                 ("Works in", assignment.workspace.clone()),
             ],
             // A paused timer refuses a manual run: no button for it.
-            run: (state == CardState::Running).then(|| (None, launch_id.clone())),
+            run: (state == CardState::Running).then_some(TimerKey(None, launch_id)),
             assignment: Some((assignment.key.clone(), assignment.enabled)),
             state,
             technical,
@@ -379,7 +492,9 @@ pub(super) fn cards(inputs: &CardInputs<'_>) -> Vec<Card> {
                     id == launch || id == format!("{launch}.complete")
                 })
         };
-        let rest = rules.iter().filter(|entry| !generated(&entry.state.id));
+        let rest = rules
+            .iter()
+            .filter(|entry| entry.source_present && !generated(&entry.state.id));
         let project = namespace.project.as_deref().map(|id| {
             inputs
                 .projects
@@ -391,16 +506,6 @@ pub(super) fn cards(inputs: &CardInputs<'_>) -> Vec<Card> {
         });
         for entry in rest {
             let rule = &entry.state;
-            // A rule removed from its file (or a removed assignment's) stays
-            // stored, off, with its definition still on: it no longer exists.
-            let defined_on = entry
-                .definition
-                .get("enabled")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(true);
-            if !rule.enabled && rule.paused_reason.is_none() && defined_on {
-                continue;
-            }
             // A removed assignment's rules until the daemon drops them: they
             // come from no rules file.
             let from_settings = entry.definition.pointer("/do/0/assignment").is_some()
@@ -437,8 +542,9 @@ pub(super) fn cards(inputs: &CardInputs<'_>) -> Vec<Card> {
             if state == CardState::Off {
                 technical.push("enabled = false in its rules file".to_owned());
             }
+            let key = TimerKey(namespace.project.clone(), rule.id.clone());
             cards.push(Card {
-                key: format!("rule:{}", run_key(namespace.project.as_deref(), &rule.id)),
+                key: key.card_key(),
                 title: match &project {
                     Some((label, _)) => format!("{} · {label}", rule.id),
                     None => rule.id.clone(),
@@ -456,8 +562,9 @@ pub(super) fn cards(inputs: &CardInputs<'_>) -> Vec<Card> {
                     .map(|folder| ("Rules file in", folder.to_string_lossy().into_owned()))
                     .into_iter()
                     .collect(),
-                run: (entry.timer.is_some() && state == CardState::Running)
-                    .then(|| (namespace.project.clone(), rule.id.clone())),
+                run: (entry.timer.as_ref().is_some_and(|timer| timer.enabled)
+                    && state == CardState::Running)
+                    .then_some(key),
                 assignment: None,
                 state,
                 technical,
@@ -466,22 +573,19 @@ pub(super) fn cards(inputs: &CardInputs<'_>) -> Vec<Card> {
     }
     // With the rule worker down no rule or timer fires, so no card may say
     // Running, and Run now waits until Swarm restarts.
-    if let Some(down) = inputs.worker_down {
-        for card in &mut cards {
-            if matches!(card.state, CardState::Running | CardState::Starting) {
-                card.state = CardState::Failed(format!(
-                    "Swarm's automation worker {down}; restart Swarm to run automations again."
-                ));
-                card.run = None;
-                // No next run comes while the worker is down.
-                card.times = card
-                    .times
-                    .split(" · ")
-                    .next()
-                    .unwrap_or_default()
-                    .to_owned();
-            }
-        }
+    for card in &mut cards {
+        card.state = match inputs.worker {
+            RuleWorker::Running => continue,
+            RuleWorker::Down(down) => CardState::Failed(format!(
+                "Swarm's automation worker {down}; restart Swarm to run automations again."
+            )),
+            RuleWorker::Starting if card.state == CardState::Running => CardState::Starting,
+            RuleWorker::Unreadable if card.state == CardState::Running => CardState::Unreadable,
+            _ => continue,
+        };
+        card.run = None;
+        card.times
+            .truncate(card.times.find(" · ").unwrap_or(card.times.len()));
     }
     cards
 }
@@ -539,15 +643,24 @@ pub(super) fn run_words(parent: &Command, children: &[Command], assignment: bool
                 true,
             );
         }
-        CommandState::Rejected | CommandState::Failed | CommandState::Cancelled => {
+        CommandState::Cancelled => {
+            return line("Run now: cancelled.".to_owned(), true);
+        }
+        CommandState::Rejected | CommandState::Failed => {
             return line(format!("Run now didn't run: {}", error_words(parent)), true);
         }
         _ => {}
     }
     let launches: Vec<&Command> = children
         .iter()
-        .filter(|child| child.verb == "launch")
+        .filter(|child| child.verb == "launch" && child.state == CommandState::Applied)
         .collect();
+    if let Some(cancelled) = children
+        .iter()
+        .find(|child| child.state == CommandState::Cancelled)
+    {
+        return line(format!("Run now: {} was cancelled.", cancelled.verb), true);
+    }
     if let Some(failed) = children.iter().find(|child| {
         matches!(
             child.state,
@@ -562,6 +675,13 @@ pub(super) fn run_words(parent: &Command, children: &[Command], assignment: bool
             ),
             true,
         );
+    }
+    if parent.state != CommandState::Applied
+        || children
+            .iter()
+            .any(|child| child.state != CommandState::Applied)
+    {
+        return line("Run now: waiting for the result…".to_owned(), false);
     }
     match (launches.first(), children.is_empty()) {
         (Some(launch), _) => {
@@ -600,22 +720,86 @@ impl DesktopApp {
         msg: AutomationMsg,
         context: &ComponentContext<Self>,
     ) {
+        if self
+            .automation
+            .form
+            .as_ref()
+            .is_some_and(|form| form.saving)
+            && matches!(
+                &msg,
+                AutomationMsg::FormOpened(_)
+                    | AutomationMsg::FormClosed
+                    | AutomationMsg::FormText(_, _)
+                    | AutomationMsg::FormBusy(_)
+                    | AutomationMsg::FormRole(_)
+                    | AutomationMsg::FormWorkspace(_)
+                    | AutomationMsg::FormSaved
+                    | AutomationMsg::Removed(_)
+                    | AutomationMsg::Enabled(_, _)
+            )
+        {
+            return;
+        }
         match msg {
             AutomationMsg::RulesLoaded(epoch, namespaces, worker) => {
                 if epoch != self.automation.epoch {
                     return;
                 }
-                // An unreadable health keeps the cards' own states.
-                self.automation.worker_down = worker.ok().flatten();
+                if !matches!(
+                    (&self.automation.worker, &worker),
+                    (RuleWorker::Down(_), RuleWorker::Unreadable)
+                ) {
+                    self.automation.worker = worker;
+                }
+                self.automation.global_rules_current = namespaces
+                    .iter()
+                    .any(|(project, _, page)| project.is_none() && page.is_ok());
+                let previous = std::mem::take(&mut self.automation.rules);
                 self.automation.rules = namespaces
                     .into_iter()
-                    .map(|(project, label, page)| RuleNamespace {
-                        project,
-                        label,
-                        more: page.as_ref().is_ok_and(|(_, more)| *more),
-                        rules: page.map(|(rules, _)| rules),
+                    .map(|(project, label, page)| {
+                        if page.is_err()
+                            && let Some(saved) = previous
+                                .iter()
+                                .find(|row| row.project == project && row.rules.is_ok())
+                        {
+                            return saved.clone();
+                        }
+                        RuleNamespace {
+                            project,
+                            label,
+                            more: page.as_ref().is_ok_and(|(_, more)| *more),
+                            rules: page.map(|(rules, _)| rules),
+                        }
                     })
                     .collect();
+                if let Ok(data_dir) = &self.data_dir {
+                    let pending: Vec<_> = self
+                        .automation
+                        .rules
+                        .iter()
+                        .flat_map(|namespace| {
+                            namespace
+                                .rules
+                                .iter()
+                                .flatten()
+                                .filter(|entry| entry.timer.is_some())
+                                .map(|entry| {
+                                    TimerKey(namespace.project.clone(), entry.state.id.clone())
+                                })
+                        })
+                        .filter(|key| {
+                            !self.automation.runs.contains_key(key)
+                                && key
+                                    .pending_file(data_dir)
+                                    .metadata()
+                                    .is_ok_and(|file| file.len() > 0)
+                        })
+                        .collect();
+                    for key in pending {
+                        self.read_timer_run(key, false, context);
+                    }
+                }
             }
             AutomationMsg::AutomationRefreshRequested => self.load_rules(context),
             AutomationMsg::TechnicalToggled(key) => {
@@ -675,98 +859,71 @@ impl DesktopApp {
                 self.set_assignment_on(&key, on, context);
                 self.reload_rules_soon(context);
             }
-            AutomationMsg::RunNow(project, rule) => self.run_now(project, rule, context),
-            AutomationMsg::RunSubmitted(key, result) => {
-                let result = *result;
-                // Only an uncertain reply keeps the ledger key, so a retry
-                // reuses the same id and the daemon deduplicates it.
-                let uncertain = result.as_ref().err().is_some_and(crate::state::uncertain);
-                self.settle_mutation(!uncertain);
-                if !uncertain {
-                    self.automation.run_seq += 1;
-                }
-                match result {
-                    Ok(command) => {
-                        self.automation.runs.insert(
-                            key.clone(),
-                            RunLine {
-                                text: "Run now: started; waiting for the result…".to_owned(),
-                                busy: true,
-                                error: false,
-                            },
-                        );
-                        let Ok(data_dir) = self.data_dir.clone() else {
-                            return;
-                        };
-                        let _task = context.spawn_background(move |cancel| {
-                            let cancelled = || cancel.is_cancelled();
-                            Message::Automation(AutomationMsg::RunSettled(
-                                key,
-                                Box::new(settle_timer_run(&data_dir, command, &cancelled)),
-                            ))
-                        });
-                    }
-                    Err(error) => {
-                        let line = if uncertain {
-                            RunLine {
-                                text: format!(
-                                    "Run now: the outcome is unknown; Run now again reuses its id, so it cannot run twice ({error})."
-                                ),
-                                busy: false,
-                                error: true,
-                            }
-                        } else {
-                            refusal_words(&error)
-                        };
-                        self.automation.runs.insert(key, line);
-                    }
+            AutomationMsg::RunNow(project, rule) => {
+                let key = TimerKey(project, rule);
+                if !self.submitting()
+                    && !self.automation.runs.get(&key).is_some_and(|line| line.busy)
+                {
+                    self.read_timer_run(key, true, context);
                 }
             }
-            AutomationMsg::RunSettled(key, result) => {
-                let assignment = key.starts_with("global/assignment-");
-                let line = match *result {
-                    Ok((parent, children)) => run_words(&parent, &children, assignment),
-                    Err(error) => RunLine {
-                        text: format!("Run now: the result was not read: {error}"),
-                        busy: false,
-                        error: true,
-                    },
-                };
-                self.automation.runs.insert(key, line);
-                // The timer's last run and the started task show on reread.
-                self.load_rules(context);
-            }
+            AutomationMsg::RunReadback(key) => self.read_timer_run(key, false, context),
+            AutomationMsg::RunFinished(key, outcome) => match outcome {
+                RunOutcome::NoPendingRun => {
+                    self.automation.runs.remove(&key);
+                }
+                RunOutcome::Complete(line) => {
+                    self.automation.runs.insert(key, line);
+                    self.load_rules(context);
+                }
+                RunOutcome::Retry(line) => {
+                    self.automation.runs.insert(key, line);
+                }
+                RunOutcome::Readback(text) => {
+                    self.automation.runs.insert(
+                        key.clone(),
+                        RunLine {
+                            text,
+                            busy: true,
+                            error: true,
+                        },
+                    );
+                    let _task = context.spawn_background(move |cancel| {
+                        let _ = feed::backoff(3_000, &|| cancel.is_cancelled());
+                        Message::Automation(AutomationMsg::RunReadback(key))
+                    });
+                }
+            },
         }
     }
 
-    /// Fire one timer occurrence now (`timer.run`) under one mutation id per
-    /// click; an uncertain reply keeps the id for the retry.
-    fn run_now(&mut self, project: Option<String>, rule: String, context: &ComponentContext<Self>) {
-        let key = run_key(project.as_deref(), &rule);
-        if self.submitting() || self.automation.runs.get(&key).is_some_and(|line| line.busy) {
-            return;
-        }
+    fn read_timer_run(&mut self, key: TimerKey, submit: bool, context: &ComponentContext<Self>) {
         let Ok(data_dir) = self.data_dir.clone() else {
             return;
         };
-        let ledger_key = format!("timer.run:{key}:{}", self.automation.run_seq);
-        let mutation_id = self.ledger.id_for(&ledger_key);
-        self.in_flight_key = Some(ledger_key);
-        self.automation.runs.insert(
-            key.clone(),
-            RunLine {
-                text: "Run now: starting…".to_owned(),
+        self.automation
+            .runs
+            .entry(key.clone())
+            .and_modify(|line| {
+                if submit {
+                    line.text = "Run now: starting…".to_owned();
+                    line.error = false;
+                }
+                line.busy = true;
+            })
+            .or_insert_with(|| RunLine {
+                text: if submit {
+                    "Run now: starting…"
+                } else {
+                    "Run now: waiting for the result…"
+                }
+                .to_owned(),
                 busy: true,
                 error: false,
-            },
-        );
-        let _task = context.spawn_background(move |_| {
-            Message::Automation(AutomationMsg::RunSubmitted(
-                key,
-                Box::new(client::block_on(async {
-                    config_client::run_timer(&data_dir, mutation_id, project, &rule).await
-                })),
-            ))
+            });
+        let _task = context.spawn_background(move |cancel| {
+            let outcome = timer_run_action(&data_dir, &key, submit, &|| cancel.is_cancelled());
+            Message::Automation(AutomationMsg::RunFinished(key, outcome))
         });
     }
 
@@ -808,12 +965,99 @@ impl DesktopApp {
                         .map_err(|error| error.to_string());
                     namespaces.push((Some(project.clone()), format!("Project {project}"), page));
                 }
-                config_client::rule_worker_down(&data_dir)
+                config_client::rule_worker(&data_dir)
                     .await
-                    .map_err(|error| error.to_string())
+                    .unwrap_or_default()
             });
             Message::Automation(AutomationMsg::RulesLoaded(epoch, namespaces, worker))
         });
+    }
+}
+
+fn timer_run_action(
+    data_dir: &Path,
+    key: &TimerKey,
+    submit: bool,
+    cancelled: &dyn Fn() -> bool,
+) -> RunOutcome {
+    let retry = |text| {
+        RunOutcome::Retry(RunLine {
+            text,
+            busy: false,
+            error: true,
+        })
+    };
+    let mut pending = match PendingTimerRun::open(data_dir, key, submit) {
+        Ok(Some(pending)) => pending,
+        Ok(None) => return RunOutcome::NoPendingRun,
+        Err(error) if !submit => return RunOutcome::Readback(error),
+        Err(error) => return retry(error),
+    };
+    let (id, admitted, retained) = match pending.read_id() {
+        Ok(Some((id, admitted))) => (id, admitted, true),
+        Ok(None) if !submit => return RunOutcome::NoPendingRun,
+        Ok(None) => match pending.start() {
+            Ok(id) => (id, false, false),
+            Err(error) => return retry(error),
+        },
+        Err(error) => return RunOutcome::Readback(error),
+    };
+    let request = eliot_core::api::TimerRunRequest {
+        id: id.clone(),
+        project: key.0.clone(),
+        rule: key.1.clone(),
+    };
+    let parent = if retained {
+        match client::block_on(client::read_command(data_dir, &id)).and_then(|parent| {
+            request.validate_response(&parent)?;
+            Ok(parent)
+        }) {
+            Ok(parent) => Some(parent),
+            Err(error) if error.code == "not_found" && !admitted => None,
+            Err(error) => {
+                return RunOutcome::Readback(format!("Run now: the result was not read: {error}"));
+            }
+        }
+    } else {
+        None
+    };
+    let parent = match parent {
+        Some(parent) => parent,
+        None if !submit => {
+            return retry(
+                "Run now: the outcome is unknown; Run now again reuses its ID.".to_owned(),
+            );
+        }
+        None => match client::block_on(config_client::run_timer(
+            data_dir,
+            id,
+            key.0.clone(),
+            &key.1,
+        )) {
+            Ok(parent) => parent,
+            Err(error) if crate::state::uncertain(&error) => {
+                return retry(format!(
+                    "Run now: the outcome is unknown; Run now again reuses its ID ({error})."
+                ));
+            }
+            Err(error) => {
+                return match pending.clear() {
+                    Ok(()) => RunOutcome::Complete(refusal_words(&error)),
+                    Err(error) => RunOutcome::Readback(error),
+                };
+            }
+        },
+    };
+    if !admitted && let Err(error) = pending.mark_admitted() {
+        return RunOutcome::Readback(error);
+    }
+    let assignment = key.0.is_none() && key.1.starts_with("assignment-");
+    match settle_timer_run(data_dir, parent, cancelled) {
+        Ok((parent, children)) => match pending.clear() {
+            Ok(()) => RunOutcome::Complete(run_words(&parent, &children, assignment)),
+            Err(error) => RunOutcome::Readback(error),
+        },
+        Err(error) => RunOutcome::Readback(format!("Run now: the result was not read: {error}")),
     }
 }
 
@@ -834,6 +1078,15 @@ fn settle_timer_run(
             if children.iter().all(|child| child.state.is_terminal()) {
                 return Ok((parent, children));
             }
+            if children
+                .iter()
+                .any(|child| child.state == CommandState::Unknown)
+            {
+                return Err("an action's outcome is unknown; waiting for resolution.".to_owned());
+            }
+        }
+        if parent.state == CommandState::Unknown {
+            return Err("the run's outcome is unknown; waiting for resolution.".to_owned());
         }
         if !feed::backoff(POLL_MS, cancelled) {
             return Err("stopped waiting; the run goes on in Swarm".to_owned());
@@ -876,6 +1129,7 @@ mod tests {
 
     fn entry(id: &str, enabled: bool, timer: Option<TimerSchedule>) -> RuleListEntry {
         RuleListEntry {
+            source_present: true,
             state: RuleStateView {
                 id: id.to_owned(),
                 project: None,
@@ -952,10 +1206,10 @@ mod tests {
         off.definition = json!({"enabled": false, "on": {"event": "turn.failed"}, "do": [{"action": "stop", "target": "${event.agent}"}]});
         let mut backlog = entry("busy", true, None);
         backlog.state.paused_reason = Some("backlog_exceeded".to_owned());
-        // Deleted from its file: stored off, its definition still on.
+        // A disabled rule can be removed from its source.
         let mut removed = entry("gone", false, None);
-        removed.definition["enabled"] = json!(true);
-        let namespaces = vec![RuleNamespace {
+        removed.source_present = false;
+        let mut namespaces = vec![RuleNamespace {
             project: None,
             label: "Global rules".to_owned(),
             rules: Ok(vec![launch, complete, nightly, off, backlog, removed]),
@@ -964,8 +1218,9 @@ mod tests {
         let projects = projects();
         let inputs = |enabled| CardInputs {
             assignments: vec![queue(enabled)],
-            worker_down: None,
+            worker: &RuleWorker::Running,
             namespaces: &namespaces,
+            global_rules_current: true,
             projects: &projects,
             data_dir: Some(Path::new(r"C:\data")),
         };
@@ -975,7 +1230,10 @@ mod tests {
         assert_eq!(titles, ["queue10", "nightly", "old", "busy"]);
         let queue = &cards[0];
         assert_eq!(queue.state, CardState::Running);
-        assert_eq!(queue.run, Some((None, "assignment-queue10".to_owned())));
+        assert_eq!(
+            queue.run,
+            Some(TimerKey(None, "assignment-queue10".to_owned()))
+        );
         assert_eq!(queue.assignment, Some(("queue10".to_owned(), true)));
         assert!(
             queue
@@ -995,7 +1253,7 @@ mod tests {
                 .iter()
                 .any(|line| line == "Rule assignment-queue10.complete · revision 3")
         );
-        assert_eq!(cards[1].run, Some((None, "nightly".to_owned())));
+        assert_eq!(cards[1].run, Some(TimerKey(None, "nightly".to_owned())));
         assert_eq!(
             cards[1].paths,
             [("Rules file in", r"C:\data\rules".to_owned())]
@@ -1008,16 +1266,14 @@ mod tests {
             Some("too many events were waiting, so Swarm stopped it")
         );
 
-        // Paused: no Run now (the daemon refuses a disabled timer).
-        let paused = super::cards(&inputs(false));
-        assert_eq!(paused[0].state, CardState::Paused);
-        assert_eq!(paused[0].run, None);
-        assert_eq!(paused[0].assignment, Some(("queue10".to_owned(), false)));
+        // The saved setting alone can't confirm a pause.
+        let pending = super::cards(&inputs(false));
+        assert_eq!(pending[0].state, CardState::Starting);
+        assert_eq!(pending[0].run, None);
 
-        // The rule worker failed: nothing says Running and Run now waits;
-        // Off and Paused stay as they are.
+        let worker_down = RuleWorker::Down("stopped after an error (unavailable)".to_owned());
         let down = super::cards(&CardInputs {
-            worker_down: Some("stopped after an error (unavailable)"),
+            worker: &worker_down,
             ..inputs(true)
         });
         assert_eq!(
@@ -1028,7 +1284,24 @@ mod tests {
         );
         assert_eq!(down[0].run, None);
         assert_eq!(down[0].times, "Last scheduled check: not yet");
-        assert_eq!(down[2].state, CardState::Off);
+        assert!(down.iter().all(|card| card.state == down[0].state));
+
+        namespaces[0].rules.as_mut().unwrap()[0]
+            .timer
+            .as_mut()
+            .unwrap()
+            .enabled = false;
+        let paused = super::cards(&CardInputs {
+            assignments: vec![self::queue(false)],
+            worker: &RuleWorker::Running,
+            namespaces: &namespaces,
+            global_rules_current: true,
+            projects: &projects,
+            data_dir: None,
+        });
+        assert_eq!(paused[0].state, CardState::Paused);
+        assert_eq!(paused[0].run, None);
+        assert_eq!(paused[0].assignment, Some(("queue10".to_owned(), false)));
     }
 
     fn command(verb: &str, state: CommandState, args: serde_json::Value) -> Command {
@@ -1084,5 +1357,62 @@ mod tests {
         let other = refusal_words(&eliot_core::Error::new("not_allowed", "nope"));
         assert_eq!(other.text, "Run now didn't run: nope (not_allowed).");
         assert!(other.error);
+    }
+
+    #[test]
+    fn run_now_reports_a_cancelled_child_and_waits_for_unsettled_launches() {
+        let parent = command("timer.run", CommandState::Applied, json!({}));
+        let cancelled = command("launch", CommandState::Cancelled, json!({}));
+        let line = run_words(&parent, &[cancelled], true);
+        assert_eq!(line.text, "Run now: launch was cancelled.");
+        assert!(line.error);
+        let dispatched = command("launch", CommandState::Dispatched, json!({}));
+        assert_eq!(
+            run_words(&parent, &[dispatched], true).text,
+            "Run now: waiting for the result…"
+        );
+    }
+
+    #[test]
+    fn pending_run_ids_survive_other_timers_and_reopening_the_desktop() {
+        let root =
+            std::env::temp_dir().join(format!("desktop-timer-runs-{}", client::new_mutation_id()));
+        std::fs::create_dir(&root).unwrap();
+        let global = TimerKey(None, "queue".to_owned());
+        let project = TimerKey(Some("global".to_owned()), "queue".to_owned());
+        let global_id = {
+            let mut pending = PendingTimerRun::open(&root, &global, true)
+                .unwrap()
+                .unwrap();
+            assert_eq!(pending.read_id().unwrap(), None);
+            pending.start().unwrap()
+        };
+        {
+            let mut pending = PendingTimerRun::open(&root, &project, true)
+                .unwrap()
+                .unwrap();
+            assert_eq!(pending.read_id().unwrap(), None);
+            assert_ne!(pending.start().unwrap(), global_id);
+            pending.clear().unwrap();
+        }
+        {
+            let mut reopened = PendingTimerRun::open(&root, &global, false)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                reopened.read_id().unwrap(),
+                Some((global_id.clone(), false))
+            );
+            reopened.mark_admitted().unwrap();
+        }
+        {
+            let mut reopened = PendingTimerRun::open(&root, &global, false)
+                .unwrap()
+                .unwrap();
+            assert_eq!(reopened.read_id().unwrap(), Some((global_id, true)));
+            reopened.clear().unwrap();
+            assert_eq!(reopened.read_id().unwrap(), None);
+        }
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

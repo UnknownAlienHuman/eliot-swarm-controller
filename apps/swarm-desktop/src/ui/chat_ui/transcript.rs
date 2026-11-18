@@ -62,8 +62,18 @@ impl DesktopApp {
             .as_ref()
             .and_then(|detail| detail.workspace.clone())
             .unwrap_or_default();
+        let path_scope = format!("chat:{}:", self.chat.epoch);
+        let path_failure = self
+            .revealed
+            .clone()
+            .filter(|(item, _)| item.starts_with(&path_scope));
+        let path_code = path_failure.as_ref().map_or(0, |(item, note)| {
+            crate::chat::text_hash(item) ^ crate::chat::text_hash(note)
+        });
         let callbacks = RowCallbacks {
-            open_path: context.callback(|path| Message::Chat(ChatMsg::PathOpened(path))),
+            open_path: context.callback(|(key, path)| Message::Reveal(key, path)),
+            path_scope,
+            path_failure,
             workspace,
             copy_part: context.callback(|value| Message::Chat(ChatMsg::CopyPart(value))),
             copy_code: context.callback(|(key, index): (String, usize)| {
@@ -112,6 +122,7 @@ impl DesktopApp {
                 .wrapping_mul(3)
                 .wrapping_add(palette_code)
                 .wrapping_add(expansion_code)
+                .wrapping_add(path_code)
                 .wrapping_add(width_code.wrapping_mul(0x9E37_79B9)),
             earlier,
             move |index| keys[index].key.clone(),

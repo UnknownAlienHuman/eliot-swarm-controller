@@ -5,8 +5,8 @@
 //! beside the settings draft they change, and save at once.
 
 use super::super::automation_ui::{
-    AssignmentForm, AssignmentView, AutomationMsg, Card, CardInputs, FormField, cards, interval_ms,
-    run_key,
+    AssignmentForm, AssignmentView, AutomationMsg, Card, CardInputs, FormField, TimerKey, cards,
+    interval_ms,
 };
 use super::*;
 
@@ -26,9 +26,9 @@ impl DesktopApp {
         ))
     }
 
-    /// The settings draft's assignments, as the cards read them.
+    /// Saved assignments. The timer's effective state comes from rule.list.
     fn assignment_views(&self) -> Vec<AssignmentView> {
-        let automation = &self.settings.automation;
+        let automation = &self.settings.base(Section::Automation);
         model::assignment_keys(automation)
             .into_iter()
             .map(|key| AssignmentView {
@@ -113,6 +113,7 @@ impl DesktopApp {
                 interval: model::assignment_text(automation, &key, AssignmentField::Interval),
                 editing: Some(key),
                 error: None,
+                saving: false,
             },
             None => AssignmentForm {
                 workspace: self
@@ -131,6 +132,11 @@ impl DesktopApp {
 
     /// Check the form, write it into the settings draft and save at once.
     pub(in crate::ui) fn save_assignment_form(&mut self, context: &ComponentContext<Self>) {
+        if self.settings.saving == Some(Page::Automations)
+            || self.settings.queued.contains(&Page::Automations)
+        {
+            return;
+        }
         let Some(form) = self.automation.form.as_mut() else {
             return;
         };
@@ -169,9 +175,14 @@ impl DesktopApp {
         let new = form.editing.is_none();
         match model::put_assignment(&mut self.settings.automation, &key, &draft, new) {
             Ok(()) => {
-                self.automation.form = None;
+                if !self.settings.dirty(Page::Automations) {
+                    self.automation.form = None;
+                    return;
+                }
+                form.error = None;
+                form.saving = true;
+                self.settings.notes.remove(&Page::Automations);
                 self.autosave(Page::Automations, context);
-                self.reload_rules_soon(context);
             }
             Err(error) => form.error = Some(error),
         }
@@ -203,8 +214,9 @@ impl DesktopApp {
         let data_dir = self.data_dir.as_ref().ok().map(PathBuf::as_path);
         let cards = cards(&CardInputs {
             assignments: self.assignment_views(),
-            worker_down: self.automation.worker_down.as_deref(),
+            worker: &self.automation.worker,
             namespaces: &self.automation.rules,
+            global_rules_current: self.automation.global_rules_current,
             projects: &projects,
             data_dir,
         });
@@ -394,14 +406,11 @@ impl DesktopApp {
                     .content(m3::label(label)),
             ));
         }
-        let run = card.run.as_ref().map(|(project, rule)| {
-            (
-                project.clone(),
-                rule.clone(),
-                self.automation.runs.get(&run_key(project.as_deref(), rule)),
-            )
-        });
-        if let Some((project, rule, line)) = &run {
+        let run = card
+            .run
+            .as_ref()
+            .map(|key| (key, self.automation.runs.get(key)));
+        if let Some((TimerKey(project, rule), line)) = &run {
             actions.push(KeyedView::new(
                 "run",
                 m3::outlined(palette)
@@ -458,7 +467,7 @@ impl DesktopApp {
                         )),
                 )),
         ));
-        if let Some((_, _, Some(line))) = &run {
+        if let Some((_, Some(line))) = &run {
             let text = m3::secondary(line.text.clone())
                 .text_wrapping(TextWrapping::Wrap)
                 .is_text_selection_enabled(true);
@@ -507,6 +516,7 @@ impl DesktopApp {
                     m3::form_row(
                         label,
                         m3::field()
+                            .is_enabled(!form.saving)
                             .text(value.to_owned())
                             .placeholder_text(hint)
                             .automation_name(label.to_owned())
@@ -567,6 +577,7 @@ impl DesktopApp {
                     Grid::new().keyed_children(vec![KeyedView::new(
                         format!("{}:{workspace_index:?}", labels.join("\u{1f}")),
                         m3::enum_width(ComboBox::new())
+                            .is_enabled(!form.saving)
                             .items_source(labels)
                             .selected_index(workspace_index)
                             .automation_name("Work in")
@@ -589,6 +600,7 @@ impl DesktopApp {
                     Grid::new().keyed_children(vec![KeyedView::new(
                         format!("{}:{role_index:?}", roles.join("\u{1f}")),
                         m3::enum_width(ComboBox::new())
+                            .is_enabled(!form.saving)
                             .items_source(roles)
                             .selected_index(role_index)
                             .automation_name("Start as")
@@ -607,6 +619,7 @@ impl DesktopApp {
                 m3::form_row(
                     "At most at once",
                     NumberBox::new()
+                        .is_enabled(!form.saving)
                         .width(tokens::layout::NUMBER_WIDTH)
                         .horizontal_alignment(HorizontalAlignment::Left)
                         .minimum(1.0)
@@ -644,6 +657,7 @@ impl DesktopApp {
             KeyedView::new(
                 "save",
                 m3::filled(palette)
+                    .is_enabled(!form.saving)
                     .automation_name(if form.editing.is_some() {
                         "Save automation"
                     } else {
@@ -659,6 +673,7 @@ impl DesktopApp {
             KeyedView::new(
                 "cancel",
                 m3::text_button(palette)
+                    .is_enabled(!form.saving)
                     .automation_name("Cancel")
                     .on_click(context.message(Message::Automation(AutomationMsg::FormClosed)))
                     .content(m3::label("Cancel")),
@@ -668,6 +683,7 @@ impl DesktopApp {
             buttons.push(KeyedView::new(
                 "remove",
                 m3::destructive(palette)
+                    .is_enabled(!form.saving)
                     .automation_name(format!("Remove automation {key}"))
                     .on_click(
                         context.message(Message::Automation(AutomationMsg::Removed(key.clone()))),

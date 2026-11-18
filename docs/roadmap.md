@@ -491,12 +491,17 @@ of the explicitly selected release scope.
       `settings.save` (D8). An invalid draft is never written and stays in the
       editor. The section states that running Agents keep their frozen settings. Settings › Automations shows
       each automation as one card in plain words: what it does, its state
-      (Running, Paused, Off, or Failed with the reason, including a rule
-      worker that `daemon.status` reports down), its last scheduled and next
+      (Running, Paused, Off, Starting, Unknown, or Failed with the reason),
+      its last scheduled and next
       run, its folders, and Technical details with the raw keys. Rules-file
       rules and timers are read-only (`rule.list`) with Run now (`timer.run`);
       a settings assignment also has Pause/Resume (its `enabled` key) and Edit
-      in a short labelled form. A removed rule is not listed. (Refs #407)
+      in a short labelled form. The card confirms a pause from effective timer
+      readback. Confirmed worker downtime appears on every card and survives an
+      unreadable status refresh. Run now retains the exact timer's ID across a
+      lost reply and reads the admitted command to settlement before enabling
+      another run. Only applied launches count as started. The cards show
+      rules with current source membership. (Refs #407)
 
 - [x] **D5 Scripts.** Existing script entries under the approved Run roots
       (`<data_dir>/scripts/`, registered `.eliot/scripts/`) open in a native
@@ -601,7 +606,8 @@ of the explicitly selected release scope.
       revision). A control change saves at once (a typed one when typing
       rests), one revision-checked save at a time; the line under the page
       says Saving…, Saved (with any restart need) or the refusal, and a
-      refused draft stays. A stale revision is read again and the change sent
+      refused draft stays. The assignment form stays open until its save is
+      confirmed and shows refusals beside its retained inputs. A stale revision is read again and the change sent
       once more only when no one changed that page's sections; an unknown
       outcome is read back, never resent. Only the raw editors (the presets'
       TOML and every section's JSON in Advanced) keep Save, Validate and
@@ -665,8 +671,10 @@ of the explicitly selected release scope.
       cleanup, the settings file) opens it in File Explorer on click or
       Enter/Space, with a hover state and the tooltip "Open in Explorer": a
       file selected in its folder, a folder opened, through
-      `%SystemRoot%\explorer.exe` with explicit argv; a path that is gone says
-      so under its row. Shortcuts: Ctrl+N, Ctrl+K, Ctrl+M,
+      absolute `%SystemRoot%\explorer.exe` with explicit argv. This includes
+      checkout reveal controls in Projects and cleanup and UNC and verbatim
+      references in chat. A missing path or a path Explorer cannot represent
+      shows the reason under the clicked item. Shortcuts: Ctrl+N, Ctrl+K, Ctrl+M,
       Ctrl+,. (Refs #407)
 - [x] **D10 The owner's second pass (2026-11-16).** Picker groups (each
       harness, and each OpenCode provider) collapse, remembered in `[desktop]

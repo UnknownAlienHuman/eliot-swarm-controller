@@ -20,19 +20,18 @@ enum Target {
 /// Resolve `path` (a verbatim `\\?\` prefix allowed) to what Explorer shows,
 /// or the plain sentence the row shows when it is not there.
 fn target(path: &str) -> Result<Target, String> {
-    let path = path.trim();
-    if path.is_empty() {
+    if path.trim().is_empty() {
         return Err("No path to open.".to_owned());
     }
     let canonical = std::fs::canonicalize(path).map_err(|error| {
-        let shown = explorer_path(path);
+        let shown = nav::display_path(path);
         if error.kind() == std::io::ErrorKind::NotFound {
             format!("{shown} is not on this computer (it was moved or deleted).")
         } else {
             format!("{shown} could not be opened: {error}")
         }
     })?;
-    let shown = explorer_path(&canonical.to_string_lossy());
+    let shown = explorer_path(&canonical)?;
     Ok(if canonical.is_dir() {
         Target::Folder(shown)
     } else {
@@ -40,14 +39,37 @@ fn target(path: &str) -> Result<Target, String> {
     })
 }
 
-/// A path as Explorer accepts it: Explorer does not read the verbatim
-/// prefix that `canonicalize` adds (`\\?\C:\x` is `C:\x`, `\\?\UNC\host\
-/// share` is `\\host\share`).
-fn explorer_path(path: &str) -> String {
-    match path.strip_prefix(r"\\?\UNC\") {
+/// Explorer receives only an ordinary absolute drive or UNC path whose
+/// Win32 normalization round-trips to the exact canonical target.
+fn explorer_path(canonical: &Path) -> Result<String, String> {
+    use std::path::{Component, Prefix};
+    let unrepresentable = || {
+        format!(
+            "File Explorer cannot open this path without changing its target: {}",
+            canonical.display()
+        )
+    };
+    let path = canonical.to_str().ok_or_else(unrepresentable)?;
+    let shown = match path.strip_prefix(r"\\?\UNC\") {
         Some(rest) => format!(r"\\{rest}"),
         None => path.strip_prefix(r"\\?\").unwrap_or(path).to_owned(),
+    };
+    let ordinary = Path::new(&shown);
+    let mut components = ordinary.components();
+    if !matches!(
+        components.next(),
+        Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::UNC(_, _))
+    ) || !ordinary.is_absolute()
+        || shown
+            .split('\\')
+            .skip(1)
+            .any(|part| part.ends_with(['.', ' ']))
+        || !std::fs::canonicalize(ordinary)
+            .is_ok_and(|round_trip| round_trip.as_os_str() == canonical.as_os_str())
+    {
+        return Err(unrepresentable());
     }
+    Ok(shown)
 }
 
 /// Explorer's own command line. It does not split argv the C runtime way:
@@ -67,9 +89,16 @@ fn explorer_arg(target: &Target) -> String {
 fn explorer() -> Result<std::process::Command, String> {
     let root = std::env::var_os("SystemRoot")
         .ok_or_else(|| "File Explorer was not found: SystemRoot is not set.".to_owned())?;
-    Ok(std::process::Command::new(
-        PathBuf::from(root).join("explorer.exe"),
-    ))
+    Ok(std::process::Command::new(explorer_executable(Path::new(
+        &root,
+    ))?))
+}
+
+fn explorer_executable(root: &Path) -> Result<PathBuf, String> {
+    if !root.is_absolute() {
+        return Err("File Explorer was not found: SystemRoot is not an absolute path.".to_owned());
+    }
+    Ok(root.join("explorer.exe"))
 }
 
 /// Show `path` in File Explorer: a file selected in its folder, a folder
@@ -87,8 +116,11 @@ pub(super) fn reveal(path: &str) -> Result<(), String> {
 /// Open a file with its default app, as a double click in Explorer does
 /// (Open config.toml). Nothing is waited for.
 pub(super) fn open_with_default_app(path: &Path) -> Result<(), String> {
+    let path = match target(&path.to_string_lossy())? {
+        Target::File(path) | Target::Folder(path) => path,
+    };
     explorer()?
-        .arg(explorer_path(&path.to_string_lossy()))
+        .arg(path)
         .spawn()
         .map(drop)
         .map_err(|error| format!("File Explorer did not start: {error}"))
@@ -202,8 +234,8 @@ pub(super) fn path_button(palette: Palette, name: &str, open: Callback<()>) -> V
 impl DesktopApp {
     /// Open `path` in Explorer; a failure stays under the path's row until
     /// the next open.
-    pub(super) fn reveal_path(&mut self, path: String) {
-        self.revealed = reveal(&path).err().map(|note| (path, note));
+    pub(super) fn reveal_path(&mut self, item: String, path: String) {
+        self.revealed = reveal(&path).err().map(|note| (item, note));
     }
 
     /// The message a path click sends.
@@ -212,14 +244,23 @@ impl DesktopApp {
         context: &mut ViewContext<Self>,
         path: &str,
     ) -> Callback<()> {
-        context.message(Message::Reveal(path.to_owned()))
+        self.reveal_item_message(context, path, path)
+    }
+
+    pub(super) fn reveal_item_message(
+        &self,
+        context: &mut ViewContext<Self>,
+        item: &str,
+        path: &str,
+    ) -> Callback<()> {
+        context.message(Message::Reveal(item.to_owned(), path.to_owned()))
     }
 
     /// Why the last open of `path` failed, in the error color; empty
     /// otherwise.
-    pub(super) fn reveal_note(&self, path: &str, palette: Palette) -> View {
+    pub(super) fn reveal_note(&self, item: &str, palette: Palette) -> View {
         match &self.revealed {
-            Some((failed, note)) if failed == path => m3::secondary(note.clone())
+            Some((failed, note)) if failed == item => m3::secondary(note.clone())
                 .foreground(palette.error())
                 .text_wrapping(TextWrapping::Wrap)
                 .is_text_selection_enabled(true)
@@ -275,14 +316,13 @@ mod tests {
     }
 
     #[test]
-    fn explorer_never_sees_the_verbatim_prefix() {
-        assert_eq!(explorer_path(r"\\?\C:\work\x.md"), r"C:\work\x.md");
+    fn explorer_executable_requires_an_absolute_system_root() {
+        assert!(explorer_executable(Path::new("Windows")).is_err());
+        assert!(explorer_executable(Path::new(r"\Windows")).is_err());
         assert_eq!(
-            explorer_path(r"\\?\UNC\host\share\dir"),
-            r"\\host\share\dir"
+            explorer_executable(Path::new(r"C:\Windows")).unwrap(),
+            Path::new(r"C:\Windows\explorer.exe")
         );
-        assert_eq!(explorer_path(r"C:\work"), r"C:\work");
-        assert_eq!(explorer_path(r"\\host\share"), r"\\host\share");
     }
 
     #[test]
@@ -293,8 +333,7 @@ mod tests {
         std::fs::create_dir_all(&folder).unwrap();
         let file = folder.join("01-first.md");
         std::fs::write(&file, "brief").unwrap();
-        let canonical_folder =
-            explorer_path(&std::fs::canonicalize(&folder).unwrap().to_string_lossy());
+        let canonical_folder = explorer_path(&std::fs::canonicalize(&folder).unwrap()).unwrap();
 
         // Given with the verbatim prefix, as the daemon stores workspaces.
         let verbatim = format!(r"\\?\{}", file.display());
@@ -316,5 +355,25 @@ mod tests {
         assert_eq!(target("  ").unwrap_err(), "No path to open.");
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn verbatim_name_that_would_normalize_to_a_different_folder_is_refused() {
+        let root =
+            std::env::temp_dir().join(format!("swarm-reveal-{}", crate::client::new_mutation_id()));
+        std::fs::create_dir_all(root.join("name")).unwrap();
+        let verbatim = std::fs::canonicalize(&root).unwrap().join("name.");
+        std::fs::create_dir(&verbatim).unwrap();
+        assert!(
+            std::fs::canonicalize(&verbatim)
+                .unwrap()
+                .as_os_str()
+                .to_string_lossy()
+                .ends_with("name.")
+        );
+        let error = target(&verbatim.to_string_lossy()).unwrap_err();
+        assert!(error.contains("without changing its target"), "{error}");
+        std::fs::remove_dir(&verbatim).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

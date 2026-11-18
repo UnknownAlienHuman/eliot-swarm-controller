@@ -170,10 +170,17 @@ pub async fn fleet_totals(data_dir: &Path) -> Result<FleetTotals> {
     })
 }
 
-/// How the daemon's rule worker (every rule and timer, settings
-/// assignments included) is not running, from `daemon.status` ("stopped
-/// after an error (unavailable)"); `None` while it runs.
-pub async fn rule_worker_down(data_dir: &Path) -> Result<Option<String>> {
+#[derive(Clone, Debug, Default)]
+pub enum RuleWorker {
+    #[default]
+    Unreadable,
+    Running,
+    Starting,
+    Down(String),
+}
+
+/// Rule worker health from the daemon's own task status.
+pub async fn rule_worker(data_dir: &Path) -> Result<RuleWorker> {
     use eliot_core::api::WorkerTaskHealth;
     let request = DaemonStatusRequest::default();
     request.validate()?;
@@ -184,11 +191,11 @@ pub async fn rule_worker_down(data_dir: &Path) -> Result<Option<String>> {
         .automation_tasks
         .iter()
         .find(|task| task.name == "rule_worker")
-        .and_then(|task| match task.health {
-            WorkerTaskHealth::Running => None,
-            WorkerTaskHealth::Starting => Some("is starting".to_owned()),
-            WorkerTaskHealth::Stopped => Some("stopped".to_owned()),
-            WorkerTaskHealth::Failed => Some(task.failure_code.as_deref().map_or_else(
+        .map_or(RuleWorker::Unreadable, |task| match task.health {
+            WorkerTaskHealth::Running => RuleWorker::Running,
+            WorkerTaskHealth::Starting => RuleWorker::Starting,
+            WorkerTaskHealth::Stopped => RuleWorker::Down("stopped".to_owned()),
+            WorkerTaskHealth::Failed => RuleWorker::Down(task.failure_code.as_deref().map_or_else(
                 || "stopped after an error".to_owned(),
                 |code| format!("stopped after an error ({code})"),
             )),

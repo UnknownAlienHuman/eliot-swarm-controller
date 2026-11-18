@@ -579,6 +579,7 @@ pub fn rule_text(entry: &RuleListEntry) -> RuleText {
 }
 
 /// One rule namespace read for the Automations page.
+#[derive(Clone)]
 pub struct RuleNamespace {
     /// Registered project id; absent for the global namespace.
     pub project: Option<String>,
@@ -818,6 +819,7 @@ mod tests {
         definition: serde_json::Value,
     ) -> RuleListEntry {
         RuleListEntry {
+            source_present: true,
             state: RuleStateView {
                 id: id.to_owned(),
                 project: None,

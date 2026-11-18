@@ -230,7 +230,7 @@ enum Message {
     Move(MoveMsg),
     Bulk(BulkMsg),
     /// Open a path in File Explorer (any path row's click).
-    Reveal(String),
+    Reveal(String, String),
 }
 
 /// The input to the single desktop window: the workspace plus the shared
@@ -759,7 +759,7 @@ impl Component for DesktopApp {
             Message::Menu(msg) => self.menu_update(msg, context),
             Message::Move(msg) => self.move_update(msg, context),
             Message::Bulk(msg) => self.bulk_update(msg, context),
-            Message::Reveal(path) => self.reveal_path(path),
+            Message::Reveal(item, path) => self.reveal_path(item, path),
         }
         self.sync_dialog(context);
     }

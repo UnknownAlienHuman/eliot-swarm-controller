@@ -167,7 +167,9 @@ impl RenderCache {
 #[derive(Clone)]
 pub struct RowCallbacks {
     pub copy_part: Callback<String>,
-    pub open_path: Callback<String>,
+    pub open_path: Callback<(String, String)>,
+    pub path_scope: String,
+    pub path_failure: Option<(String, String)>,
     pub workspace: String,
     /// Retry a local input that did not start (the failure part's key).
     pub retry: Callback<String>,
@@ -349,7 +351,7 @@ fn part_view(
                     crate::m3::secondary(part.detail.join("\n"))
                         .text_wrapping(TextWrapping::Wrap)
                         .is_text_selection_enabled(true),
-                    path_actions(&part.detail_paths, callbacks, palette),
+                    path_actions(&part.key, &part.detail_paths, callbacks, palette),
                 ))
             } else {
                 View::empty()
@@ -463,7 +465,7 @@ pub fn item_view(
                         part.kind,
                         PartKind::Input | PartKind::Progress | PartKind::Final
                     ) {
-                        path_actions(&part.file_paths, callbacks, palette)
+                        path_actions(&part.key, &part.file_paths, callbacks, palette)
                     } else {
                         View::empty()
                     },
@@ -492,7 +494,7 @@ pub fn key_revision(items: &[Rc<RenderedItem>]) -> u64 {
 /// Reactor 0.100.0 hyperlinks only navigate URIs. Native path buttons under
 /// the prose open the file or folder in Explorer (`ui::reveal`), preserving
 /// prose selection.
-fn path_actions(paths: &[String], callbacks: &RowCallbacks, palette: Palette) -> View {
+fn path_actions(part: &str, paths: &[String], callbacks: &RowCallbacks, palette: Palette) -> View {
     StackPanel::new().keyed_children(
         paths
             .iter()
@@ -507,17 +509,29 @@ fn path_actions(paths: &[String], callbacks: &RowCallbacks, palette: Palette) ->
                     std::path::Path::new(&callbacks.workspace).join(path)
                 };
                 let resolved = resolved.to_string_lossy().into_owned();
+                let item = format!("{}{part}:{reference}", callbacks.path_scope);
                 let open = callbacks.open_path.clone();
+                let note = match &callbacks.path_failure {
+                    Some((failed, note)) if failed == &item => crate::m3::secondary(note.clone())
+                        .foreground(palette.error())
+                        .text_wrapping(TextWrapping::Wrap)
+                        .is_text_selection_enabled(true)
+                        .into(),
+                    _ => View::empty(),
+                };
                 Some(KeyedView::new(
                     reference.clone(),
-                    crate::m3::text_button(palette)
-                        .horizontal_alignment(HorizontalAlignment::Left)
-                        .automation_name(format!("Open {reference} in Explorer"))
-                        .on_click(move || {
-                            let _ = open.call(resolved.clone());
-                        })
-                        .content(crate::m3::icon_label(crate::m3::glyph::FOLDER, reference))
-                        .tooltip("Open in Explorer"),
+                    StackPanel::new().children((
+                        crate::m3::text_button(palette)
+                            .horizontal_alignment(HorizontalAlignment::Left)
+                            .automation_name(format!("Open {reference} in Explorer"))
+                            .on_click(move || {
+                                let _ = open.call((item.clone(), resolved.clone()));
+                            })
+                            .content(crate::m3::icon_label(crate::m3::glyph::FOLDER, reference))
+                            .tooltip("Open in Explorer"),
+                        note,
+                    )),
                 ))
             })
             .collect::<Vec<_>>(),

@@ -132,8 +132,7 @@ impl DesktopApp {
                         )),
                 ));
                 let mut details = Vec::new();
-                // A folder or file item opens in Explorer; a branch,
-                // session or registration has no path to show.
+                // File, folder and checkout items open in Explorer.
                 let item_row = |item: &eliot_core::api::CleanupCandidate,
                                 context: &mut ViewContext<Self>| {
                     let (name, line) =
@@ -144,6 +143,7 @@ impl DesktopApp {
                             | ArtifactKind::DataDir
                             | ArtifactKind::Temp
                             | ArtifactKind::Worktree
+                            | ArtifactKind::ProjectRegistration
                     );
                     let lines = StackPanel::new().children((
                         m3::body(name.clone()).text_trimming(TextTrimming::CharacterEllipsis),
@@ -153,14 +153,15 @@ impl DesktopApp {
                     ));
                     let path = &item.artifact.path;
                     let view = if on_disk {
+                        let reveal_item = format!("cleanup:{}", item.artifact.id);
                         StackPanel::new().children((
                             super::super::reveal::path_item(
                                 palette,
                                 &name,
                                 lines,
-                                self.reveal_message(context, path),
+                                self.reveal_item_message(context, &reveal_item, path),
                             ),
-                            self.reveal_note(path, palette),
+                            self.reveal_note(&reveal_item, palette),
                         ))
                     } else {
                         lines

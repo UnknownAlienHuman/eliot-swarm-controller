@@ -875,7 +875,34 @@ impl DesktopApp {
                             self.prefs = crate::settings::Preferences::from_reply(&read);
                         }
                         self.take_profiles(&read);
+                        let automation_changed = self.settings.base.get(&Section::Automation)
+                            != read.sections.get(&Section::Automation);
                         self.settings.take(read);
+                        if automation_changed {
+                            self.automation.global_rules_current = false;
+                            self.load_rules(context);
+                        }
+                        if let Some(form) = self.automation.form.as_mut().filter(|form| form.saving)
+                        {
+                            if let Some(note) = self.settings.notes.get(&Page::Automations)
+                                && note.text == CHANGED_ELSEWHERE
+                            {
+                                form.saving = false;
+                                form.error = Some(note.text.clone());
+                            } else if form.error.is_some() {
+                                // An uncertain reply was followed by a fresh settings read.
+                                if self.settings.dirty(Page::Automations) {
+                                    form.saving = false;
+                                    self.settings.discard(Page::Automations);
+                                } else {
+                                    self.automation.form = None;
+                                }
+                            } else if !self.settings.dirty(Page::Automations)
+                                && self.settings.saving != Some(Page::Automations)
+                            {
+                                self.automation.form = None;
+                            }
+                        }
                         // Saves refused as stale go again first, on this
                         // revision, unless this read showed their edited
                         // section changed (then their drafts are the stored
@@ -891,7 +918,23 @@ impl DesktopApp {
                             self.reprime_fields(context);
                         }
                     }
-                    Err(error) => self.settings.error = Some(format!("Settings not read: {error}")),
+                    Err(error) => {
+                        self.settings.error = Some(format!("Settings not read: {error}"));
+                        if let Some(form) = self.automation.form.as_mut().filter(|form| form.saving)
+                            && (form.error.is_some()
+                                || self.settings.retry.contains(&Page::Automations))
+                        {
+                            form.saving = false;
+                            form.error = self.settings.error.clone();
+                            self.settings
+                                .retry
+                                .retain(|page| *page != Page::Automations);
+                            self.settings
+                                .queued
+                                .retain(|page| *page != Page::Automations);
+                            self.settings.discard(Page::Automations);
+                        }
+                    }
                 }
                 self.drain_saves(context);
             }
@@ -914,6 +957,18 @@ impl DesktopApp {
                     self.drain_saves(context);
                     return;
                 }
+                if page == Page::Automations
+                    && let Some(form) = self.automation.form.as_mut().filter(|form| form.saving)
+                {
+                    match &result {
+                        Ok(_) => self.automation.form = None,
+                        Err(error) if error.code == "conflict" => {}
+                        Err(error) => {
+                            form.error = Some(Note::of(false, &result).text);
+                            form.saving = crate::state::uncertain(error);
+                        }
+                    }
+                }
                 match &result {
                     Ok(reply) => {
                         if reply.saved {
@@ -924,6 +979,13 @@ impl DesktopApp {
                                 self.editor.sent = sent_draft;
                                 self.editor.raw_dirty = false;
                             }
+                        }
+                        if page == Page::Automations
+                            || reply.changed_sections.contains(&Section::Automation)
+                        {
+                            self.automation.global_rules_current = false;
+                            self.load_rules(context);
+                            self.reload_rules_soon(context);
                         }
                         self.after_settings_saved(context);
                     }

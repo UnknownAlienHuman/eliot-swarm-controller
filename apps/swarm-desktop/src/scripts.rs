@@ -298,6 +298,7 @@ mod tests {
 
     fn timer(id: &str, cmd: serde_json::Value) -> RuleListEntry {
         RuleListEntry {
+            source_present: true,
             state: RuleStateView {
                 id: id.to_owned(),
                 project: None,

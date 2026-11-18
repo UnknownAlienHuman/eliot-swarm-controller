@@ -41,7 +41,6 @@ pub(super) enum ChatMsg {
     FollowLatest(u64, u32),
     ToolsToggled(String, bool),
     CopyPart(String),
-    PathOpened(String),
     CopyCode(String, usize),
     /// Send, Steer or Resume with the draft, bound when it was clicked.
     DraftRequested(DraftAction),
@@ -484,15 +483,6 @@ impl DesktopApp {
                     let _ = self.chat.composer_ref.request_focus();
                 } else if tries < FOLLOW_TRIES && !self.chat.items.is_empty() {
                     self.follow_latest(tries + 1, context);
-                }
-            }
-            ChatMsg::PathOpened(path) => {
-                // The callback carries an absolute resolved reference from its own
-                // transcript, so a selection change cannot retarget a stale click.
-                // A transcript row has no line of its own for the failure, so
-                // it shows above the composer.
-                if let Err(note) = super::reveal::reveal(&path) {
-                    self.alert(note);
                 }
             }
             ChatMsg::ToolsToggled(key, expanded) => {
