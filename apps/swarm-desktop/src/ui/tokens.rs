@@ -138,6 +138,8 @@ pub mod layout {
     /// What runs an Agent (`Codex · qwen4-max`) at most in a Monitor row or
     /// the conversation header; a longer label trims.
     pub const RUNS_LABEL_WIDTH: f64 = 200.0;
+    /// The widest trailing word of a Monitor row (model, need or age).
+    pub const MONITOR_TRAILING_WIDTH: f64 = 112.0;
     /// The composer's field grows with its text up to this height.
     pub const COMPOSER_MAX_HEIGHT: f64 = 200.0;
     /// The composer's field below its first line (the design's 44 DIP).

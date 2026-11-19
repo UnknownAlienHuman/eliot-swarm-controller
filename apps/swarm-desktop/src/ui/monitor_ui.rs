@@ -309,9 +309,9 @@ impl DesktopApp {
             .height(tokens::height::CONTROL)
             .columns([GridLength::STAR, GridLength::Auto])
             .margin(Thickness::new(
-                tokens::spacing::ROW,
+                tokens::spacing::ROW + tokens::spacing::XS,
                 tokens::spacing::INSET,
-                tokens::spacing::ROW,
+                tokens::spacing::ROW + tokens::spacing::XS,
                 0.0,
             ))
             .children((
@@ -417,6 +417,7 @@ impl DesktopApp {
                         elapsed_words: &elapsed_words,
                         dot: palette.chart_fill(group_tone(group)),
                         selected: selected == Some(row.id.as_str()),
+                        working: group == monitor::Group::Working,
                     },
                     note.as_ref(),
                     monitor_view::RowActions {
@@ -569,7 +570,7 @@ impl DesktopApp {
             if section.group == monitor::Group::Stopped {
                 // Search results are shown, not folded.
                 let open = self.monitor.stopped_open || filter.is_active();
-                let label = format!("{} ({top})", section.group.title());
+                let label = format!("{} · {top}", section.group.title());
                 items.push(KeyedView::new(
                     format!("section:stopped:{open}"),
                     m3::sub_row(palette, false)
@@ -594,11 +595,8 @@ impl DesktopApp {
                     continue;
                 }
             } else {
-                // The legend above holds the counts. A section counts its
-                // top-level rows, which leave out nested workers, so only
-                // a filtered (flat) section shows its number: there it is
-                // the number that was clicked.
-                // The design's group label: "Working · 2".
+                // The design's group label: "Working · 2" (its top-level
+                // rows; nested workers fold under their task).
                 let label = format!("{} · {top}", section.group.title());
                 items.push(KeyedView::new(
                     format!("section:{:?}", section.group),
@@ -639,13 +637,15 @@ impl DesktopApp {
                     .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
                     .automation_name("Monitored Agents")
                     .content(
+                        // The pane's column (`Conversation.dc.html`): 10 DIPs
+                        // in from its sides, 10 between its pieces.
                         StackPanel::new()
-                            .spacing(tokens::spacing::XS)
+                            .spacing(tokens::spacing::ROW)
                             .margin(Thickness::new(
-                                tokens::spacing::MD,
-                                0.0,
-                                tokens::spacing::MD,
-                                tokens::spacing::MD,
+                                tokens::spacing::ROW,
+                                tokens::spacing::ROW,
+                                tokens::spacing::ROW,
+                                tokens::spacing::INSET,
                             ))
                             .keyed_children(items),
                     ),
@@ -953,12 +953,12 @@ impl DesktopApp {
                     .automation_name("Agent details")
                     .content(
                         StackPanel::new()
-                            .spacing(tokens::spacing::SM)
+                            .spacing(tokens::spacing::ROW)
                             .margin(Thickness::new(
-                                tokens::spacing::MD,
-                                0.0,
-                                tokens::spacing::MD,
-                                tokens::spacing::MD,
+                                tokens::spacing::ROW,
+                                tokens::spacing::ROW,
+                                tokens::spacing::ROW,
+                                tokens::spacing::INSET,
                             ))
                             .keyed_children(sections),
                     ),

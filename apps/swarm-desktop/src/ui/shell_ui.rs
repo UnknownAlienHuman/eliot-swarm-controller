@@ -1825,10 +1825,9 @@ impl DesktopApp {
             };
             items.push(KeyedView::new("no-projects", nested_note(empty, 0, None)));
         }
-        let new_task_selected = home && !self.launch.chat;
-        let launch_key = nav::path_key(&self.launch.workspace);
+        // A project row is never the selection: its home is New task's
+        // (Main.dc.html), with the project named in the hero and the chip.
         for section in &sections {
-            let selected = new_task_selected && nav::path_key(&section.checkout) == launch_key;
             let name = self
                 .prefs
                 .display_name(&format!("project:{}", section.key))
@@ -1842,7 +1841,7 @@ impl DesktopApp {
                 running: section.running,
                 missing: section.missing,
             };
-            items.push(self.place_item(&place, selected, filtered, context, palette));
+            items.push(self.place_item(&place, filtered, context, palette));
             if section.collapsed {
                 continue;
             }
@@ -1985,7 +1984,6 @@ impl DesktopApp {
     fn place_item(
         &self,
         place: &Place,
-        selected: bool,
         filtered: bool,
         context: &mut ViewContext<Self>,
         palette: Palette,
@@ -1998,11 +1996,11 @@ impl DesktopApp {
             .map(|(_, typed)| typed.clone());
         let row = match renaming {
             _ if place.key == nav::OTHER_LOCATIONS => {
-                self.place_row(place, selected, filtered, context, palette)
+                self.place_row(place, filtered, context, palette)
             }
             Some(typed) => self.rename_row(&typed, 0.0, context, palette),
             None => with_menu(
-                self.place_row(place, selected, filtered, context, palette),
+                self.place_row(place, filtered, context, palette),
                 Target::Project {
                     key: place.key.to_owned(),
                     name: place.name.to_owned(),
@@ -2015,7 +2013,7 @@ impl DesktopApp {
         };
         KeyedView::new(
             format!(
-                "project:{}:{selected}:{}:{}:{}:{}:{}",
+                "project:{}:{}:{}:{}:{}:{}",
                 place.key,
                 place.collapsed,
                 place.name,
@@ -2035,7 +2033,6 @@ impl DesktopApp {
     fn place_row(
         &self,
         place: &Place,
-        selected: bool,
         filtered: bool,
         context: &mut ViewContext<Self>,
         palette: Palette,
@@ -2069,7 +2066,7 @@ impl DesktopApp {
         // its tasks in view); the few places with no one checkout fold.
         let toggle = Message::Shell(ShellMsg::ProjectToggled(place.key.to_owned()));
         let opens = place.key != nav::OTHER_LOCATIONS && self.can_launch_here(place.checkout);
-        let row = m3::row(palette, selected)
+        let row = m3::row(palette, false)
             .automation_name(if opens {
                 format!("Open {label}")
             } else {
@@ -2086,10 +2083,10 @@ impl DesktopApp {
             }))
             .content(m3::project_content(name, count))
             .tooltip(name.to_owned());
-        // On hover or selection: fold, then one '…' at the rows' fixed
-        // place; a missing folder offers its one-click removal instead.
+        // On hover: fold, then one '…' at the rows' fixed place; a missing
+        // folder offers its one-click removal instead.
         let hover_key = format!("project:{}", place.key);
-        let over = selected || self.menu.hovered.as_deref() == Some(hover_key.as_str());
+        let over = self.menu.hovered.as_deref() == Some(hover_key.as_str());
         let mut actions: Vec<KeyedView> = Vec::new();
         if over {
             actions.push(KeyedView::new(

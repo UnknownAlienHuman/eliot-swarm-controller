@@ -95,6 +95,7 @@ impl Group {
     /// The state filter's word for the group.
     pub fn filter_label(self) -> &'static str {
         match self {
+            Self::Attention => "Attention",
             Self::Stopped => "Stopped",
             other => other.title(),
         }
@@ -1092,12 +1093,11 @@ pub struct Filter {
 
 /// The states the Monitor's state filter offers, in its order (`None`:
 /// every state).
-pub const STATE_FILTERS: [Option<Group>; 5] = [
+pub const STATE_FILTERS: [Option<Group>; 4] = [
     None,
     Some(Group::Working),
     Some(Group::Attention),
     Some(Group::Idle),
-    Some(Group::Stopped),
 ];
 
 impl Filter {
