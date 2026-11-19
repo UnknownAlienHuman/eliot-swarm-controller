@@ -109,7 +109,7 @@ pub(crate) fn validate_local_provider_environment(
 /// Name of the Agent-scoped swarm MCP server in the per-Agent config.
 /// Fixed per generation: the config document itself is per generation, so
 /// no ULID suffix is needed (unlike the Codex per-run override name).
-pub const SWARM_MCP_SERVER_NAME: &str = "eliot-swarm";
+pub const SWARM_MCP_SERVER_NAME: &str = eliot_plugin::native_cli::WORKER_SWARM_MCP_SERVER_NAME;
 
 /// The generated per-Agent config: the frozen profile model when one was
 /// requested, otherwise no `model` key so the configured native default
@@ -163,11 +163,15 @@ fn agent_config_json(
     native_subagents: Option<&str>,
 ) -> String {
     let mut servers = serde_json::Map::new();
+    let mut command = vec![swarm_executable.to_owned()];
+    command.extend(eliot_plugin::native_cli::worker_swarm_mcp_args(
+        swarm_data_dir,
+    ));
     servers.insert(
         SWARM_MCP_SERVER_NAME.to_owned(),
         serde_json::json!({
             "type": "local",
-            "command": [swarm_executable, "--data-dir", swarm_data_dir, "mcp", "--require-agent"],
+            "command": command,
         }),
     );
     let mcp = serde_json::Value::Object({

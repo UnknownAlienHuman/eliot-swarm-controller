@@ -40,6 +40,7 @@
 use std::{ffi::OsStr, ffi::OsString, path::Path};
 
 use eliot_core::{Error, Result};
+use eliot_plugin::native_cli::{BoundedReadLabels, run_bounded};
 use eliot_plugin::native_lifecycle::kill_and_reap;
 use serde::Deserialize;
 use tokio::{
@@ -322,65 +323,19 @@ fn isolated_command(transfer: &AuthTransfer<'_>) -> Command {
 
 /// Run one list child and parse its metadata, bounded. Stderr is discarded
 /// like every other helper's; failures are static strings only.
-async fn run_list(mut command: Command, deadline: Instant) -> Result<Vec<ListEntry>> {
-    let mut child = command
-        .spawn()
-        .map_err(|_| Error::new("native_spawn", "OpenCode auth list could not start"))?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| Error::new("native_spawn", "OpenCode auth list could not start"))?;
-    let mut buffer = Vec::new();
-    let read = async {
-        let mut limited = (&mut stdout).take((MAX_LIST_BYTES + 1) as u64);
-        limited.read_to_end(&mut buffer).await
-    };
-    match timeout_at(deadline, read).await {
-        Err(_) => {
-            kill_and_reap(&mut child).await;
-            return Err(Error::new(
-                "native_spawn",
-                "OpenCode auth list did not finish before its deadline",
-            ));
-        }
-        Ok(Err(_)) => {
-            kill_and_reap(&mut child).await;
-            return Err(Error::new(
-                "native_readback",
-                "OpenCode auth list metadata was unreadable",
-            ));
-        }
-        Ok(Ok(_)) => {}
-    }
-    if buffer.len() > MAX_LIST_BYTES {
-        kill_and_reap(&mut child).await;
-        return Err(Error::new(
-            "native_readback",
-            "OpenCode auth list metadata was unreadable",
-        ));
-    }
-    let status = match timeout_at(deadline, child.wait()).await {
-        Err(_) => {
-            kill_and_reap(&mut child).await;
-            return Err(Error::new(
-                "native_spawn",
-                "OpenCode auth list did not finish before its deadline",
-            ));
-        }
-        Ok(Err(_)) => {
-            return Err(Error::new(
-                "native_readback",
-                "OpenCode auth list metadata was unreadable",
-            ));
-        }
-        Ok(Ok(status)) => status,
-    };
-    if !status.success() {
-        return Err(Error::new(
-            "native_readback",
-            "OpenCode auth list metadata was unreadable",
-        ));
-    }
+async fn run_list(command: Command, deadline: Instant) -> Result<Vec<ListEntry>> {
+    let buffer = run_bounded(
+        command,
+        MAX_LIST_BYTES,
+        deadline,
+        &BoundedReadLabels {
+            start: "OpenCode auth list could not start",
+            deadline: "OpenCode auth list did not finish before its deadline",
+            unreadable: "OpenCode auth list metadata was unreadable",
+            status: "OpenCode auth list metadata was unreadable",
+        },
+    )
+    .await?;
     serde_json::from_slice(&buffer).map_err(|_| {
         Error::new(
             "native_readback",
@@ -397,69 +352,19 @@ async fn run_list(mut command: Command, deadline: Instant) -> Result<Vec<ListEnt
 async fn export_selected(transfer: &AuthTransfer<'_>, deadline: Instant) -> Result<SecretBytes> {
     let _timing = super::startup::Step::new("auth_export");
     let mut command = canonical_command(transfer);
-    command
-        .args(export_argv(transfer.selector))
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
-    let mut child = command
-        .spawn()
-        .map_err(|_| Error::new("native_spawn", "OpenCode auth export could not start"))?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| Error::new("native_spawn", "OpenCode auth export could not start"))?;
-    let mut buffer = Vec::new();
-    let read = async {
-        let mut limited = (&mut stdout).take((MAX_AUTH_BYTES + 1) as u64);
-        limited.read_to_end(&mut buffer).await
-    };
-    match timeout_at(deadline, read).await {
-        Err(_) => {
-            kill_and_reap(&mut child).await;
-            return Err(Error::new(
-                "native_spawn",
-                "OpenCode auth export did not finish before its deadline",
-            ));
-        }
-        Ok(Err(_)) => {
-            kill_and_reap(&mut child).await;
-            return Err(Error::new(
-                "native_readback",
-                "OpenCode auth export returned no usable credential",
-            ));
-        }
-        Ok(Ok(_)) => {}
-    }
-    if buffer.is_empty() || buffer.len() > MAX_AUTH_BYTES {
-        kill_and_reap(&mut child).await;
-        return Err(Error::new(
-            "native_readback",
-            "OpenCode auth export returned no usable credential",
-        ));
-    }
-    let status = match timeout_at(deadline, child.wait()).await {
-        Err(_) => {
-            kill_and_reap(&mut child).await;
-            return Err(Error::new(
-                "native_spawn",
-                "OpenCode auth export did not finish before its deadline",
-            ));
-        }
-        Ok(Err(_)) => {
-            return Err(Error::new(
-                "native_readback",
-                "OpenCode auth export returned no usable credential",
-            ));
-        }
-        Ok(Ok(status)) => status,
-    };
-    if !status.success() {
-        return Err(Error::new(
-            "native_readback",
-            "OpenCode auth export was refused",
-        ));
-    }
+    command.args(export_argv(transfer.selector));
+    let buffer = run_bounded(
+        command,
+        MAX_AUTH_BYTES,
+        deadline,
+        &BoundedReadLabels {
+            start: "OpenCode auth export could not start",
+            deadline: "OpenCode auth export did not finish before its deadline",
+            unreadable: "OpenCode auth export returned no usable credential",
+            status: "OpenCode auth export was refused",
+        },
+    )
+    .await?;
     if buffer.is_empty() {
         return Err(Error::new(
             "native_readback",
