@@ -316,8 +316,16 @@ pub(crate) fn checked_route(request: &SubmitCommand, previous: Option<&str>) -> 
     let mut workspace = request.args.get("workspace_preparation").cloned();
     if let Some(object) = workspace.as_mut().and_then(Value::as_object_mut) {
         // Preparation chooses a fresh unused destination on each probe.
-        // The repository, frozen base and setup must still match.
+        // The repository, frozen base, naming inputs and setup must still match.
         object.remove("worktree_path");
+        if object
+            .get("generated")
+            .and_then(|generated| generated.get("branch"))
+            .and_then(Value::as_str)
+            .is_none()
+        {
+            object.remove("requested_branch");
+        }
     }
     let digest = eliot_core::canonical_json_sha256(&json!({
         "profile":request.args["profile"],"snapshot":snapshot,"workspace":workspace,
@@ -339,4 +347,50 @@ pub(crate) fn checked_route(request: &SubmitCommand, previous: Option<&str>) -> 
 fn encode(value: impl serde::Serialize) -> Result<Value> {
     serde_json::to_value(value)
         .map_err(|_| Error::new("internal", "cannot encode launch arbitration readback"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checked_route_ignores_generated_pending_branch_and_path() {
+        let mut first = SubmitCommand::new("01ARZ3NDEKTSV4RRFFQ69G5FAV", "launch");
+        first.args = json!({
+            "profile": "worker",
+            "profile_snapshot": {
+                "harness": "codex",
+                "capacity_scopes": [{"scope": "profile:worker", "max_live": 1}]
+            },
+            "workspace_preparation": {
+                "repo_path": "C:/repo",
+                "base_oid": "deadbeef",
+                "requested_branch": "alpha/pending-01arz3ndektsv4rrffq69g5fav",
+                "worktree_path": "C:/data/worktrees/alpha/pending-01arz3ndektsv4rrffq69g5fav",
+                "generated": {"project_slug": "alpha", "task_slug": "task"}
+            }
+        });
+        let digest = checked_route(&first, None).unwrap();
+
+        let mut second = first.clone();
+        second.args["workspace_preparation"]["requested_branch"] =
+            json!("alpha/pending-01arz3ndektsv4rrffq69g5faw");
+        second.args["workspace_preparation"]["worktree_path"] =
+            json!("C:/data/worktrees/alpha/pending-01arz3ndektsv4rrffq69g5faw");
+        assert_eq!(checked_route(&second, Some(&digest)).unwrap(), digest);
+
+        // Explicit branch names remain bound across retries.
+        let mut explicit = first.clone();
+        explicit.args["workspace_preparation"]["generated"]["branch"] = json!("feat/one");
+        explicit.args["workspace_preparation"]["requested_branch"] = json!("feat/one");
+        let explicit_digest = checked_route(&explicit, None).unwrap();
+        let mut changed_branch = explicit.clone();
+        changed_branch.args["workspace_preparation"]["requested_branch"] = json!("feat/two");
+        assert_eq!(
+            checked_route(&changed_branch, Some(&explicit_digest))
+                .unwrap_err()
+                .code,
+            "bad_state"
+        );
+    }
 }
