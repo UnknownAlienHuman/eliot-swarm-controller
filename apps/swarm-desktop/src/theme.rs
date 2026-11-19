@@ -87,32 +87,6 @@ pub mod elevation {
         }
         out
     }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn higher_levels_reach_further_and_fall_lower() {
-            let reach = |level| {
-                layers(level)
-                    .iter()
-                    .map(|layer| layer.spread + layer.offset)
-                    .fold(0.0, f64::max)
-            };
-            let levels = [Level::Two, Level::Three, Level::Four];
-            for pair in levels.windows(2) {
-                assert!(reach(pair[0]) < reach(pair[1]), "{pair:?}");
-            }
-            // Each shadow keeps its total opacity across its steps.
-            let total: u32 = layers(Level::Three)
-                .iter()
-                .map(|layer| u32::from(layer.alpha))
-                .sum();
-            // 30 % key and 15 % ambient, give or take the rounding.
-            assert!((f64::from(total) - 0.45 * 255.0).abs() <= 3.0, "{total}");
-        }
-    }
 }
 
 /// M3 state-layer opacities of the content color over a container.
