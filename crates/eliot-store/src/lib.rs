@@ -228,10 +228,17 @@ fn validate_remote_command_context(
 ) -> Result<()> {
     if let Some(remote) = remote {
         remote.validate()?;
-        if principal != "owner" {
+        let allowed = match remote.manager.as_deref() {
+            None => principal == "owner",
+            Some(instance) => matches!(
+                project_assignment::remote_principal(principal)?,
+                Some((principal_instance, _)) if principal_instance == instance
+            ),
+        };
+        if !allowed {
             return Err(Error::new(
                 "not_allowed",
-                "remote provenance requires the authenticated owner bridge",
+                "remote provenance requires the matching authenticated bridge principal",
             ));
         }
     }

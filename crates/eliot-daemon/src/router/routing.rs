@@ -118,17 +118,22 @@ impl Router {
         };
         for name in candidates {
             let mut quota_status = RouteQuotaStatus::Unknown;
-            let evaluated = self
-                .routing_candidate(
+            let evaluated = if remote_registration
+                .as_ref()
+                .is_some_and(|registration| !registration.profiles.iter().any(|p| p == &name))
+            {
+                Err(RouteSkipReason::Unauthorized)
+            } else {
+                self.routing_candidate(
                     principal,
                     request,
                     &name,
                     parent.as_ref(),
-                    remote_registration.as_ref(),
                     &mut quota_status,
                     &mut preflight,
                 )
-                .await?;
+                .await?
+            };
             match evaluated {
                 Ok((harness, snapshot)) => {
                     decision.profile = Some(name.clone());
@@ -170,7 +175,6 @@ impl Router {
         request: &SubmitCommand,
         name: &str,
         parent: Option<&Agent>,
-        remote_registration: Option<&eliot_core::api::ProjectRegistrationView>,
         quota_status: &mut RouteQuotaStatus,
         preflight: &mut RoutePreflight,
     ) -> Result<std::result::Result<(String, Value), RouteSkipReason>> {
@@ -189,14 +193,6 @@ impl Router {
             return Ok(Err(RouteSkipReason::Unauthorized));
         }
         if let Principal::ProjectRule { registration } = principal
-            && !registration
-                .profiles
-                .iter()
-                .any(|approved| approved == name)
-        {
-            return Ok(Err(RouteSkipReason::Unauthorized));
-        }
-        if let Some(registration) = remote_registration
             && !registration
                 .profiles
                 .iter()
