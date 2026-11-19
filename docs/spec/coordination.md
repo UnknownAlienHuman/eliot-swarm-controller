@@ -422,13 +422,15 @@ parent result when a captured child set satisfies `all`/`any`. The digest mail i
 the digest registration id, so a reconnect or restart replays the same mail id and
 the existing mail stable effect identity makes the retry a no-op. The thread is
 `completion-<id-prefix>` (never `attention-*`, never `-advisory`), the body lists
-every frozen entry outcome together with `agent`, `turn_id`, fairly allocated
-bounded `final_text` excerpt and `truncated` for authorized completed bound
-turns (entries outside registration-time scope stay `not_visible`, entries where
-the recipient lacks scope at delivery—including Owner-registered digests and
-workers reparented away before completion—deliver status-only, and NUL bytes are
-escaped as `\0` before budgeting) within `MAX_MAIL_TEXT_BYTES` (32 KiB), and no
-attention event is emitted: a successful
+every frozen entry outcome with its turn identity once, `truncated` and a fairly
+allocated bounded `final_text` excerpt for authorized completed bound turns
+(entries outside registration-time scope stay `not_visible`, also on a retry
+after they move into scope; entries where the recipient lacks scope at
+delivery—including Owner-registered digests and workers reparented away before
+completion—deliver status-only, the scope recheck and the mail insert sharing
+one Store lock; NUL bytes are escaped as `\0` before budgeting) within
+`MAX_MAIL_TEXT_BYTES` (32 KiB) with a batch-wide excerpt reserve (see
+[api](api.md#waiting)), and no attention event is emitted: a successful
 completion stays distinct from an attention incident. Registration ids share the
 public write-id namespace: every public write path (`mail.send`, `mail.ack`,
 `var.set` and groups, commands, generic writes, claims, cleanup, handoff,

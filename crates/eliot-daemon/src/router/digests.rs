@@ -7,13 +7,16 @@
 //! queued mail (and its generic wake); the thread is `completion-*`, never
 //! `attention-*`, and no attention event is emitted.
 
-use super::{Principal, Router, principal_name};
+use super::{
+    Principal, Router, UnknownMarks, WaitScope, coordination::decode_coordination_request,
+    principal_name,
+};
 use crate::common::now_ms;
 use eliot_core::{
     Error, Result,
     api::{
-        MailSendRequest, MailSendResponse, SwarmDigestRequest, SwarmDigestResponse,
-        SwarmWaitRequest, WaitEntryResult, digest_mode_completed, digest_text, digest_thread,
+        MailSendRequest, SwarmDigestRequest, SwarmDigestResponse, SwarmWaitRequest,
+        WaitEntryResult, digest_mode_completed, digest_text, digest_thread,
     },
 };
 use eliot_plugin::sync::LockExt;
@@ -77,6 +80,29 @@ fn wait_request_for_row(row: &DigestRow) -> SwarmWaitRequest {
         })
         .collect();
     SwarmWaitRequest::new(row.commands.clone(), turns, row.mode.clone(), 0)
+}
+
+/// Delivery-time results inside the caller's Store guard: the persisted
+/// registration mask plus the recipient's live scope over each entry.
+fn digest_results_locked(
+    store: &eliot_store::Store,
+    row: &DigestRow,
+    marks: &UnknownMarks,
+) -> Result<Vec<WaitEntryResult>> {
+    let scope = WaitScope {
+        hidden: Some(&row.hidden),
+        excerpt_recipient: Some(&row.parent),
+        fair_budget: true,
+    };
+    Router::wait_snapshot_locked(
+        store,
+        &wait_request_for_row(row),
+        &Principal::Owner,
+        None,
+        scope,
+        marks,
+    )
+    .map(|snapshot| snapshot.results)
 }
 
 #[cfg(test)]
@@ -166,36 +192,53 @@ impl Router {
         // Freeze visibility with the caller's scope: entries outside scope
         // read `not_visible` now and stay masked at delivery.
         let wait_request = wait_request_for_digest(&request);
-        let snapshot = self
-            .wait_snapshot_scoped(
-                &wait_request,
-                principal,
-                None,
-                None,
-                Some(&request.to),
-                true,
-            )
-            .await?
-            .results;
-        let hidden: Vec<bool> = snapshot
-            .iter()
-            .map(|entry| entry.status == "not_visible")
-            .collect();
         let requester = principal_name(principal);
-        let now = now_ms();
-        let row = {
+        let marks = self.wait_unknown_marks().await;
+        let (row, snapshot) = {
             let mut store = self.inner.store.lock().await;
-            store
-                .digest_register(&requester, &request, &hidden, now)?
-                .row
+            let scope = WaitScope {
+                hidden: None,
+                excerpt_recipient: Some(&request.to),
+                fair_budget: true,
+            };
+            let mut snapshot =
+                Self::wait_snapshot_locked(&store, &wait_request, principal, None, scope, &marks)?
+                    .results;
+            let hidden: Vec<bool> = snapshot
+                .iter()
+                .map(|entry| entry.status == "not_visible")
+                .collect();
+            let row = store
+                .digest_register(&requester, &request, &hidden, now_ms())?
+                .row;
+            if let Some(mail_id) = row.delivered_mail_id.clone() {
+                let results = digest_results_locked(&store, &row, &marks)?;
+                let response = delivered_response(&row, mail_id, results)?;
+                request.validate_response(&response)?;
+                return serde_json::to_value(response).map_err(|_| {
+                    Error::new("internal", "swarm.digest response could not be encoded")
+                });
+            }
+            // A retry keeps the first admitted mask: an entry hidden then
+            // stays hidden even after it moves into scope, so the persisted
+            // mask applies before any excerpt is budgeted.
+            if row.hidden != hidden {
+                let scope = WaitScope {
+                    hidden: Some(&row.hidden),
+                    ..scope
+                };
+                snapshot = Self::wait_snapshot_locked(
+                    &store,
+                    &wait_request,
+                    principal,
+                    None,
+                    scope,
+                    &marks,
+                )?
+                .results;
+            }
+            (row, snapshot)
         };
-        if let Some(mail_id) = row.delivered_mail_id.clone() {
-            let results = self.digest_scoped_results(&row).await?;
-            let response = delivered_response(&row, mail_id, results)?;
-            request.validate_response(&response)?;
-            return serde_json::to_value(response)
-                .map_err(|_| Error::new("internal", "swarm.digest response could not be encoded"));
-        }
         if digest_mode_completed(request.mode.as_str(), &snapshot) {
             match self.deliver_digest(&row.id).await {
                 Ok(Some(response)) => {
@@ -221,80 +264,58 @@ impl Router {
             .map_err(|_| Error::new("internal", "swarm.digest response could not be encoded"))
     }
 
-    async fn digest_scoped_results(&self, row: &DigestRow) -> Result<Vec<WaitEntryResult>> {
-        let wait_request = wait_request_for_row(row);
-        self.wait_snapshot_scoped(
-            &wait_request,
-            &Principal::Owner,
-            None,
-            Some(&row.hidden),
-            Some(&row.parent),
-            true,
-        )
-        .await
-        .map(|snapshot| snapshot.results)
-    }
-
     /// Deliver one pending digest when its mode condition holds. Returns
     /// `Some` when delivered (or already delivered), `None` when still
     /// pending. Reuses the digest id as the mail id for restart safety.
+    ///
+    /// One Store guard spans the recipient-scope authorization and the mail
+    /// insert (which commits the delivered mark in its own transaction): no
+    /// reparent can land between them, so an answer reaches the recipient
+    /// only while it has scope over that worker at commit. Only the wake that
+    /// follows the committed mail runs after the guard.
     pub(super) async fn deliver_digest(
         &self,
         digest_id: &str,
     ) -> Result<Option<SwarmDigestResponse>> {
-        let row: DigestRow = {
-            let store = self.inner.store.lock().await;
-            match store.get_completion_digest(digest_id)? {
-                Some(row) => row,
-                None => {
-                    return Err(Error::new("internal", "digest registration disappeared"));
-                }
+        let marks = self.wait_unknown_marks().await;
+        let (row, results, mail, change) = {
+            let mut store = self.inner.store.lock().await;
+            let row = store
+                .get_completion_digest(digest_id)?
+                .ok_or_else(|| Error::new("internal", "digest registration disappeared"))?;
+            let results = digest_results_locked(&store, &row, &marks)?;
+            if let Some(mail_id) = row.delivered_mail_id.clone() {
+                return Ok(Some(delivered_response(&row, mail_id, results)?));
             }
-        };
-        if let Some(mail_id) = row.delivered_mail_id.clone() {
-            let results = self.digest_scoped_results(&row).await?;
-            return Ok(Some(delivered_response(&row, mail_id, results)?));
-        }
-        let results = self.digest_scoped_results(&row).await?;
-        if !digest_mode_completed(row.mode.as_str(), &results) {
-            return Ok(None);
-        }
-        let text = digest_text(&row.id, &row.parent, &row.mode, &results);
-        let thread = digest_thread(&row.id);
-        let mail = MailSendRequest {
-            id: row.id.clone(),
-            to: vec![row.parent.clone()],
-            mode: eliot_core::api::MailMode::Queue,
-            text,
-            thread: Some(thread),
-            reply_to_delivery: None,
-        };
-        let mail_value = serde_json::to_value(&mail)
-            .map_err(|_| Error::new("internal", "digest mail could not be encoded"))?;
-        let owner = Principal::Owner;
-        let reply = match self.mail_send_impl(&mail_value, &owner, true).await {
-            Ok(reply) => reply,
-            Err(error) => {
-                // A retained binding means the mail already exists (possibly
-                // acked and pruned since): treat as delivered without a
-                // second row. Anything else stays pending for retry.
-                if error.code == "mailbox_full" {
-                    return Err(error);
-                }
-                return Err(error);
+            if !digest_mode_completed(row.mode.as_str(), &results) {
+                return Ok(None);
             }
+            let mail = MailSendRequest {
+                id: row.id.clone(),
+                to: vec![row.parent.clone()],
+                mode: eliot_core::api::MailMode::Queue,
+                text: digest_text(&row.id, &row.parent, &row.mode, &results),
+                thread: Some(digest_thread(&row.id)),
+                reply_to_delivery: None,
+            };
+            let mail: MailSendRequest = decode_coordination_request(
+                &serde_json::to_value(&mail)
+                    .map_err(|_| Error::new("internal", "digest mail could not be encoded"))?,
+                &self.inner.secrets,
+                "mail.send",
+                MailSendRequest::validate,
+            )?;
+            let change =
+                self.mail_send_locked(&mut store, &principal_name(&Principal::Owner), &mail, true)?;
+            (row, results, mail, change)
         };
-        let mail_response: MailSendResponse = serde_json::from_value(reply)
-            .map_err(|_| Error::new("internal", "digest mail response is invalid"))?;
-        let delivery_id = mail_response
+        let delivery_id = self
+            .mail_send_finish(&mail, change)
+            .await?
             .deliveries
             .first()
-            .map(|d| d.delivery_id.clone())
+            .map(|delivery| delivery.delivery_id.clone())
             .ok_or_else(|| Error::new("internal", "digest mail delivered nothing"))?;
-        {
-            let mut store = self.inner.store.lock().await;
-            store.mark_digest_delivered(&row.id, &delivery_id, now_ms())?;
-        }
         self.signal_progress();
         Ok(Some(delivered_response(&row, delivery_id, results)?))
     }
@@ -728,7 +749,7 @@ mod tests {
         .expect("decode digest response");
         assert_eq!(reply.state, "delivered");
 
-        // offer_notice inside mail_send_impl submitted the wake `send` directly
+        // offer_notice after the digest mail commit submitted the wake `send` directly
         // with the digest body (including agent, turn_id, final_text, truncated)
         // for the recipient's turn, while ordinary command.get readback redacts it.
         let open_notice_id = {
@@ -1154,5 +1175,171 @@ mod tests {
         assert_eq!(inbox.deliveries.len(), 1);
         assert!(!inbox.deliveries[0].text.contains('\0'));
         assert!(inbox.deliveries[0].text.contains("alpha\\0omega"));
+    }
+
+    /// Steps the deliverer one Store critical section at a time (tokio's
+    /// Mutex hands the guard over in FIFO order) and reparents the worker in
+    /// each gap. An answer may reach the former parent only when its mail
+    /// committed before the reparent; a reparent that lands between the
+    /// recipient-scope check and the mail insert must never leak it.
+    #[tokio::test]
+    async fn reparent_in_any_lock_gap_never_delivers_answer_to_former_parent() {
+        use eliot_core::api::{MailInboxRequest, MailInboxResponse, ReparentRequest};
+
+        const SECRET: &str = "former parent must not see this";
+        for gap in 1..=4 {
+            let router = test_router();
+            let manager = spawn_ready_with_control(&router, "app", None, "tree").await;
+            let new_parent = spawn_ready_with_control(&router, "app", None, "tree").await;
+            let moved =
+                spawn_ready_with_control(&router, "app", Some(manager.clone()), "self").await;
+            let c_moved = submit_worker_send(&router, &moved).await;
+            let manager_principal = Principal::Agent {
+                id: manager.clone(),
+                generation: 1,
+            };
+            let digest_id = ulid::Ulid::new().to_string();
+            let pending: SwarmDigestResponse = serde_json::from_value(
+                router
+                    .swarm_digest(
+                        &json!({
+                            "id": digest_id,
+                            "to": manager,
+                            "mode": "all",
+                            "commands": [c_moved],
+                            "turns": []
+                        }),
+                        &manager_principal,
+                    )
+                    .await
+                    .expect("register pending digest"),
+            )
+            .expect("decode pending");
+            assert_eq!(pending.state, "pending");
+            complete_worker_turn(&router, &moved, &c_moved, "t-moved", SECRET).await;
+
+            let mut guard = router.inner.store.lock().await;
+            let deliverer = tokio::spawn({
+                let router = router.clone();
+                let digest_id = digest_id.clone();
+                async move { router.deliver_digest(&digest_id).await }
+            });
+            // The deliverer queues on the held guard; each handover lets it
+            // run exactly one critical section before the guard returns here.
+            tokio::task::yield_now().await;
+            for _ in 0..gap {
+                drop(guard);
+                guard = router.inner.store.lock().await;
+            }
+            let inbox_request: MailInboxRequest = serde_json::from_value(json!({})).unwrap();
+            let committed_before_reparent = !guard
+                .mail_inbox(
+                    &principal_name(&manager_principal),
+                    &inbox_request,
+                    now_ms(),
+                )
+                .expect("inbox in gap")
+                .deliveries
+                .is_empty();
+            let reparent: ReparentRequest = serde_json::from_value(json!({
+                "id": ulid::Ulid::new().to_string(),
+                "agent": moved,
+                "expected_generation": 1,
+                "parent": new_parent,
+                "parent_generation": 1,
+            }))
+            .unwrap();
+            let change = guard
+                .reparent("owner", &reparent, now_ms())
+                .expect("reparent in gap");
+            router.publish_locked(&change.events);
+            drop(guard);
+            deliverer
+                .await
+                .expect("join deliverer")
+                .expect("deliver digest");
+
+            let inbox: MailInboxResponse = serde_json::from_value(
+                router
+                    .mail_inbox(&json!({}), &manager_principal)
+                    .await
+                    .expect("inbox"),
+            )
+            .expect("decode inbox");
+            assert_eq!(inbox.deliveries.len(), 1, "gap {gap}");
+            let body = &inbox.deliveries[0].text;
+            if !committed_before_reparent {
+                assert!(!body.contains(SECRET), "gap {gap}: answer crossed scope");
+                assert!(
+                    !body.contains("t-moved"),
+                    "gap {gap}: turn identity crossed"
+                );
+                assert!(body.contains(&format!("- command {c_moved}: succeeded\n")));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_retry_keeps_registration_mask_for_worker_moved_into_scope() {
+        let router = test_router();
+        let manager = spawn_ready_with_control(&router, "app", None, "tree").await;
+        let other_parent = spawn_ready_with_control(&router, "app", None, "tree").await;
+        let running = spawn_ready_with_control(&router, "app", Some(manager.clone()), "self").await;
+        let hidden =
+            spawn_ready_with_control(&router, "app", Some(other_parent.clone()), "self").await;
+        let c_running = submit_worker_send(&router, &running).await;
+        let c_hidden = submit_worker_send(&router, &hidden).await;
+
+        let manager_principal = Principal::Agent {
+            id: manager.clone(),
+            generation: 1,
+        };
+        let params = json!({
+            "id": ulid::Ulid::new().to_string(),
+            "to": manager,
+            "mode": "all",
+            "commands": [c_hidden, c_running],
+            "turns": []
+        });
+        let first: SwarmDigestResponse = serde_json::from_value(
+            router
+                .swarm_digest(&params, &manager_principal)
+                .await
+                .expect("register digest"),
+        )
+        .expect("decode first");
+        assert_eq!(first.state, "pending");
+        assert_eq!(first.results[0].status, "not_visible");
+
+        // The hidden worker moves into the manager's scope and completes
+        // while the other worker keeps the digest pending.
+        router
+            .swarm_reparent(
+                &json!({
+                    "id": ulid::Ulid::new().to_string(),
+                    "agent": hidden,
+                    "expected_generation": 1,
+                    "parent": manager,
+                    "parent_generation": 1,
+                }),
+                &Principal::Owner,
+            )
+            .await
+            .expect("reparent into scope");
+        complete_worker_turn(&router, &hidden, &c_hidden, "t-hidden", "masked answer").await;
+
+        let retry: SwarmDigestResponse = serde_json::from_value(
+            router
+                .swarm_digest(&params, &manager_principal)
+                .await
+                .expect("retry digest"),
+        )
+        .expect("decode retry");
+        assert_eq!(retry.state, "pending");
+        assert_eq!(retry.results[0].status, "not_visible");
+        assert_eq!(retry.results[0].agent, None);
+        assert_eq!(retry.results[0].turn_id, None);
+        assert_eq!(retry.results[0].final_text, None);
+        assert_eq!(retry.results[1].status, "still_running");
     }
 }

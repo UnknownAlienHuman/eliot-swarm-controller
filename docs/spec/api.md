@@ -1677,20 +1677,30 @@ Agent mailbox), `mode` (`all`/`any`), and `commands`/`turns` (1..=256 entries,
 frozen at admission like `swarm.wait`). An Agent caller may digest only to its own
 mailbox and only entries within its frozen control scope; out-of-scope entries read
 `not_visible` at registration and stay masked at delivery, which recomputes as
-owner and never widens scope. At delivery, before writing excerpts, the daemon
-also rechecks that the recipient (`to`) currently has scope over each entry
+owner and never widens scope. A retry of the same registration keeps the first
+admitted mask, so an entry hidden then reads `not_visible` (and takes no excerpt
+budget) even after it moves into scope. At delivery, before writing excerpts, the
+daemon also rechecks that the recipient (`to`) currently has scope over each entry
 (intersected with the registration-time mask, including for Owner-registered
 digests and workers reparented away before completion): entries where the
 recipient lacks scope deliver status-only without `agent`, `turn_id`,
-`final_text` or `truncated`. When the mode condition holds over terminal entries
+`final_text` or `truncated`. That recheck and the mail insert run under one Store
+lock, so a reparent lands either before the check (status-only) or after the
+committed mail. When the mode condition holds over terminal entries
 (`still_running` is the only non-terminal status; `not_found`/`not_visible` count
 as settled honest outcomes), the daemon delivers exactly one coalesced `mail.send`
 (queue) result to the parent: mail id is the digest id, thread is
-`completion-<id-prefix>`, and the body lists every entry outcome together with
-`agent`, `turn_id`, fairly allocated bounded `final_text` excerpt and `truncated`
-for authorized completed bound turns within `MAX_MAIL_TEXT_BYTES` (32 KiB), with
-NUL escaped (`\0`) before budgeting so one answer never blocks the digest and
-earlier answers never starve later ones; `SwarmDigestResponse.results`
+`completion-<id-prefix>`, and the body lists every entry outcome with its turn
+identity once (a turn entry's id is `agent/generation/turn_id`; a command entry
+adds `agent` and `turn_id`), `truncated` and a fairly allocated bounded
+`final_text` excerpt for authorized completed bound turns within
+`MAX_MAIL_TEXT_BYTES` (32 KiB), with NUL escaped (`\0`) before budgeting so one
+answer never blocks the digest and earlier answers never starve later ones. A
+quarter of that bound (or the whole answer demand when smaller) stays reserved
+for excerpts across the batch; status lines that do not fit beside it are cut
+from the tail with an explicit `... N more entries truncated` line, so a full
+batch of long identities never spends the bound before any answer;
+`SwarmDigestResponse.results`
 uses `WaitEntryResult` with `not_visible` entries completely masked and
 out-of-recipient-scope entries reduced to status-only. Same id plus same
 payload replays the retained registration and mail without a second delivery; same

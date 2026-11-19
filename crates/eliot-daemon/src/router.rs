@@ -63,8 +63,7 @@ use eliot_core::{
         ProviderClearHoldRequest, ProviderHoldsRequest, RuleGetRequest, RuleStateView,
         SWITCH_BLANK_SCOPE_ARG, SWITCH_PROJECT_REVISION_ARG, ShutdownMode, SourceState,
         SwarmWaitRequest, SwarmWaitResponse, TimerGetRequest, TimerStateView, TurnGetRequest,
-        UsageScopeView, UsageSummaryRequest, WaitEntryResult, WorkerTaskHealth,
-        fair_excerpt_cap,
+        UsageScopeView, UsageSummaryRequest, WaitEntryResult, WorkerTaskHealth, fair_excerpt_cap,
     },
 };
 use eliot_plugin::{MAX_EVENT_BYTES, sync::LockExt};
@@ -296,6 +295,23 @@ struct PendingEntry {
     bound: Option<usize>,
     command_unknown: bool,
     excerpt_allowed: bool,
+}
+
+/// Digest options for one wait snapshot; the default is a plain wait.
+#[derive(Clone, Copy, Default)]
+struct WaitScope<'a> {
+    /// Registration-time mask: masked entries read `not_visible`.
+    hidden: Option<&'a [bool]>,
+    /// Mailbox whose live scope gates each turn identity and excerpt.
+    excerpt_recipient: Option<&'a str>,
+    /// Fair water-fill excerpts instead of the first-come frame budget.
+    fair_budget: bool,
+}
+
+/// In-memory unknown marks captured before a snapshot's Store guard.
+struct UnknownMarks {
+    causes: HashMap<String, String>,
+    memory: Vec<String>,
 }
 
 impl Router {
@@ -4395,34 +4411,52 @@ impl Router {
         principal: &Principal,
         mailbox: Option<&str>,
     ) -> Result<WaitSnapshot> {
-        self.wait_snapshot_scoped(request, principal, mailbox, None, None, false)
-            .await
+        let marks = self.wait_unknown_marks().await;
+        let store = self.inner.store.lock().await;
+        Self::wait_snapshot_locked(
+            &store,
+            request,
+            principal,
+            mailbox,
+            WaitScope::default(),
+            &marks,
+        )
     }
 
-    /// Snapshot every frozen entry under one Store lock with optional
-    /// registration-time masking (`hidden`), delivery-time recipient scope
-    /// checking (`excerpt_recipient`), and fair water-fill excerpt budgeting
-    /// (`fair_budget`). Out-of-recipient-scope entries keep their status only,
-    /// with no turn identity or `final_text` excerpt.
-    async fn wait_snapshot_scoped(
-        &self,
+    /// Capture the in-memory unknown marks before terminal-cache eviction:
+    /// an uncertainty check must still see a marker whose command already
+    /// settled, mirroring the old per-entry order (check first, evict while
+    /// masking). Masking uses the post-clear ids, also like before. Taken
+    /// before the snapshot's Store guard, so the guarded part never awaits.
+    async fn wait_unknown_marks(&self) -> UnknownMarks {
+        let causes = self.inner.unknown_causes.lock_recover().clone();
+        self.clear_terminal_unknown_cache().await;
+        UnknownMarks {
+            causes,
+            memory: self.unknown_ids(),
+        }
+    }
+
+    /// Snapshot every frozen entry inside the caller's Store guard with
+    /// optional registration-time masking, delivery-time recipient scope
+    /// checking and fair water-fill excerpt budgeting ([`WaitScope`]).
+    /// Out-of-recipient-scope entries keep their status only, with no turn
+    /// identity or `final_text` excerpt. Synchronous, so a caller can keep
+    /// the same guard through a write that depends on the authorization.
+    fn wait_snapshot_locked(
+        store: &eliot_store::Store,
         request: &SwarmWaitRequest,
         principal: &Principal,
         mailbox: Option<&str>,
-        hidden: Option<&[bool]>,
-        excerpt_recipient: Option<&str>,
-        fair_budget: bool,
+        scope: WaitScope<'_>,
+        marks: &UnknownMarks,
     ) -> Result<WaitSnapshot> {
-        // Capture the in-memory unknown marks before terminal-cache
-        // eviction: an uncertainty check must still see a marker whose
-        // command already settled, mirroring the old per-entry order (check
-        // first, evict while masking). Masking below uses the post-clear
-        // ids, also like before.
-        let unknown_causes: HashMap<String, String> =
-            self.inner.unknown_causes.lock_recover().clone();
-        self.clear_terminal_unknown_cache().await;
-        let memory_unknown = self.unknown_ids();
-        let store = self.inner.store.lock().await;
+        let WaitScope {
+            hidden,
+            excerpt_recipient,
+            fair_budget,
+        } = scope;
+        let unknown_causes = &marks.causes;
         let recipient_principal = match excerpt_recipient {
             Some(recipient_id) => store
                 .get_agent(recipient_id)?
@@ -4457,7 +4491,7 @@ impl Router {
                 }
             };
             if let Err(error) =
-                crate::router::hierarchy::authorize_command_read(&store, principal, &command)
+                crate::router::hierarchy::authorize_command_read(store, principal, &command)
             {
                 if error.code == "not_allowed" {
                     pending.push(leaf_entry("command", id.clone(), "not_visible".to_owned()));
@@ -4471,7 +4505,7 @@ impl Router {
             let mut excerpt_allowed = match excerpt_recipient {
                 None => true,
                 Some(_) => recipient_principal.as_ref().is_some_and(|rp| {
-                    crate::router::hierarchy::authorize_command_read(&store, rp, &command).is_ok()
+                    crate::router::hierarchy::authorize_command_read(store, rp, &command).is_ok()
                 }),
             };
             // Uncertain commands are terminal unknown, never still running.
@@ -4485,7 +4519,7 @@ impl Router {
                 command.turn_id.as_deref(),
             ) {
                 if let Err(error) = crate::router::hierarchy::authorize_agent_read(
-                    &store,
+                    store,
                     principal,
                     target,
                     Some(generation),
@@ -4508,7 +4542,7 @@ impl Router {
                     excerpt_allowed = excerpt_allowed
                         && recipient_principal.as_ref().is_some_and(|rp| {
                             crate::router::hierarchy::authorize_agent_read(
-                                &store,
+                                store,
                                 rp,
                                 target,
                                 Some(generation),
@@ -4567,7 +4601,7 @@ impl Router {
                 continue;
             }
             if let Err(error) = crate::router::hierarchy::authorize_agent_read(
-                &store,
+                store,
                 principal,
                 &turn_ref.agent,
                 Some(turn_ref.generation),
@@ -4582,7 +4616,7 @@ impl Router {
                 None => true,
                 Some(_) => recipient_principal.as_ref().is_some_and(|rp| {
                     crate::router::hierarchy::authorize_agent_read(
-                        &store,
+                        store,
                         rp,
                         &turn_ref.agent,
                         Some(turn_ref.generation),
@@ -4622,7 +4656,7 @@ impl Router {
         }
         for ((agent, generation), turn_ids) in &groups {
             let masked =
-                store.turns_with_unknown_commands(agent, *generation, turn_ids, &memory_unknown)?;
+                store.turns_with_unknown_commands(agent, *generation, turn_ids, &marks.memory)?;
             for bound in bounds.iter_mut() {
                 if bound.agent == *agent
                     && bound.generation == *generation
@@ -4637,7 +4671,6 @@ impl Router {
             Some(_) => Some(store.mail_mailbox_high_water(&principal_name(principal), None)?),
             None => None,
         };
-        drop(store);
         let fair_cap = if fair_budget {
             let text_lens: Vec<usize> = pending
                 .iter()

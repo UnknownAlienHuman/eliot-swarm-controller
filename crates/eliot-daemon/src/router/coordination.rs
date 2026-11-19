@@ -17,7 +17,7 @@ use eliot_core::{
     },
 };
 use eliot_plugin::sync::LockExt;
-use eliot_store::{MailSendOutcome, NoticeKind, NoticePending};
+use eliot_store::{MailSendOutcome, MailSendResult, NoticeKind, NoticePending};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::{
@@ -103,47 +103,62 @@ fn notice_text(kind: NoticeKind, count: i64) -> String {
 
 impl Router {
     pub(super) async fn mail_send(&self, params: &Value, principal: &Principal) -> Result<Value> {
-        self.mail_send_impl(params, principal, false).await
-    }
-
-    /// Shared mail send path. `allow_digest_id` is true only for
-    /// completion-digest delivery, whose mail id is the digest registration
-    /// id by design; the public endpoint always rejects digest-bound ids.
-    pub(super) async fn mail_send_impl(
-        &self,
-        params: &Value,
-        principal: &Principal,
-        allow_digest_id: bool,
-    ) -> Result<Value> {
         let request: MailSendRequest = decode_coordination_request(
             params,
             &self.inner.secrets,
             "mail.send",
             MailSendRequest::validate,
         )?;
-        let name = principal_name(principal);
-        let limits = self.inner.mail.limits();
         let change = {
             let mut store = self.inner.store.lock().await;
-            let change = if allow_digest_id {
-                store.mail_send_digest_delivery(&name, &request, limits, now_ms())?
-            } else {
-                store.mail_send(&name, &request, limits, now_ms())?
-            };
-            if change.outcome == MailSendOutcome::Fresh {
-                self.publish_locked(&change.events);
-            }
-            change
+            self.mail_send_locked(&mut store, &principal_name(principal), &request, false)?
+        };
+        let response = self.mail_send_finish(&request, change).await?;
+        serde_json::to_value(response)
+            .map_err(|_| Error::new("internal", "mail delivery could not be encoded"))
+    }
+
+    /// Admit one mail inside the caller's Store guard and publish its
+    /// committed events, so a caller can keep that guard from an
+    /// authorization read through the insert. `allow_digest_id` is true only
+    /// for completion-digest delivery, whose mail id is the digest
+    /// registration id by design; the public endpoint always rejects
+    /// digest-bound ids.
+    pub(super) fn mail_send_locked(
+        &self,
+        store: &mut eliot_store::Store,
+        name: &str,
+        request: &MailSendRequest,
+        allow_digest_id: bool,
+    ) -> Result<MailSendResult> {
+        let limits = self.inner.mail.limits();
+        let change = if allow_digest_id {
+            store.mail_send_digest_delivery(name, request, limits, now_ms())?
+        } else {
+            store.mail_send(name, request, limits, now_ms())?
         };
         if change.outcome == MailSendOutcome::Fresh {
+            self.publish_locked(&change.events);
+        }
+        Ok(change)
+    }
+
+    /// After the Store guard is released: signal progress, check the
+    /// response binding and wake the recipients of a fresh mail.
+    pub(super) async fn mail_send_finish(
+        &self,
+        request: &MailSendRequest,
+        change: MailSendResult,
+    ) -> Result<MailSendResponse> {
+        let fresh = change.outcome == MailSendOutcome::Fresh;
+        if fresh {
             self.signal_progress();
         }
         request.validate_response(&change.value)?;
-        if change.outcome == MailSendOutcome::Fresh {
+        if fresh {
             self.wake_recipients(&change.value).await;
         }
-        serde_json::to_value(change.value)
-            .map_err(|_| Error::new("internal", "mail delivery could not be encoded"))
+        Ok(change.value)
     }
 
     pub(super) async fn mail_inbox(&self, params: &Value, principal: &Principal) -> Result<Value> {
