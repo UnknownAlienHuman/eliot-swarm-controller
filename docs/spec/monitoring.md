@@ -786,7 +786,7 @@ The work probe runs inside the ordinary Git probe: only after the workspace watc
 
 ### Git-aware attention: no_code_progress
 
-A busy Agent whose tool and message activity continues but whose worktree has had no write and no commit for daemon.attention_suspicion_secs gets a distinct no_code_progress diagnostic (IncidentKind::CodeProgress). It is a diagnostic, never a verdict:
+A busy Agent whose tool and message activity continues but whose worktree has had no write and no commit for `daemon.attention_suspicion_secs`, counted from the later of its last write or commit and the active turn's start, gets a distinct no_code_progress diagnostic (IncidentKind::CodeProgress). It is a diagnostic, never a verdict:
 - suppressed for read-only and audit profiles (is_read_only_or_audit_profile) and for Agents without a worktree;
 - retires as soon as a write or commit lands (last_code_progress_at advances);
 - reuses the existing attention machinery: a bounded incident per Agent/generation, no new timer service.
