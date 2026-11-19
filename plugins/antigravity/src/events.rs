@@ -1702,6 +1702,22 @@ impl State {
         if restriction.is_some() {
             status = "failed";
         }
+        // The reply answers the fenced `session/prompt` of the exact prepared
+        // turn: it is that turn's native terminal evidence. Retain its bound
+        // status and raw stopReason before any write (even `turn.started`),
+        // so a failed write costs only its own fact and the exact-turn
+        // snapshot still proves the outcome.
+        let native_status = self.policy.redact_text(&result.stop_reason);
+        if let Some(pending) = self.pending.as_ref() {
+            self.last_turn = Some(TurnFacts {
+                command_id: pending.command.clone(),
+                turn_id: pending.turn.clone(),
+                status: status.to_owned(),
+                native_status: native_status.clone(),
+                final_text: String::new(),
+                terminal: true,
+            });
+        }
         // A terminal response alone suffices: no intermediate update is
         // required, matching the old stream-json rule.
         self.associate().await?;
@@ -1724,18 +1740,6 @@ impl State {
             "cancelled" => "interrupted",
             _ => "unknown",
         };
-        // The reply is the turn's native terminal evidence. Retain its
-        // bounded facts before any projection, so a failed write costs only
-        // its own fact and the exact-turn snapshot still proves the outcome.
-        let native_status = self.policy.redact_text(&result.stop_reason);
-        self.last_turn = Some(TurnFacts {
-            command_id: command.clone(),
-            turn_id: turn.clone(),
-            status: status.to_owned(),
-            native_status: native_status.clone(),
-            final_text: String::new(),
-            terminal: true,
-        });
         // Unanswered asks die with their turn: close them before the
         // terminal commit, without a command binding.
         self.close_pending_requests(Some(&turn)).await?;
@@ -1946,9 +1950,7 @@ impl State {
     }
 
     async fn record_coverage_gap(&mut self, reason: &str, families: &[&str]) -> Result<()> {
-        let mut source = self.source();
-        source.families = families;
-        source.record_coverage_gap(reason).await
+        self.source().record_coverage_gap(reason, families).await
     }
 
     fn source(&mut self) -> StreamSource<'_> {
@@ -2852,6 +2854,33 @@ mod tests {
         assert_eq!(
             exact_turn_evidence(&state, "command-2", "turn-1", false, false),
             None
+        );
+        finish(tasks).await;
+    }
+
+    #[tokio::test]
+    async fn a_terminal_reply_that_arrives_first_is_retained_before_turn_started() {
+        use crate::session::{TurnEvidence, exact_turn_evidence};
+
+        let (mut state, mut commits, tasks) = state_with_commits();
+        let _association = state.prepare("command-1".into(), "turn-1".into()).unwrap();
+        let prompt: PromptResult =
+            serde_json::from_value(json!({"stopReason":"cancelled"})).unwrap();
+        // The direct reply is the first fact: its own turn.started write is
+        // never acknowledged.
+        tokio::join!(state.complete_prompt(&prompt), async {
+            let _unacknowledged = next_commit(&mut commits, "turn.started").await;
+            tasks[1].abort();
+        });
+        assert!(state.source_unknown);
+        let last = state.last_turn.as_ref().unwrap();
+        assert!(last.terminal);
+        assert_eq!(last.status, "cancelled");
+        assert_eq!(last.native_status, "cancelled");
+        // The reply's bound facts still prove the exact turn to the monitor.
+        assert_eq!(
+            exact_turn_evidence(&state, "command-1", "turn-1", false, false),
+            Some(TurnEvidence::Terminal)
         );
         finish(tasks).await;
     }

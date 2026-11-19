@@ -2932,6 +2932,7 @@ mod tests {
             final_text: None,
             final_text_unavailable: None,
             terminal: true,
+            write_pending: false,
         });
         assert_eq!(evidence(&status, false), Some(TurnEvidence::Terminal));
         // An unmapped native reason proves no outcome.
@@ -2953,6 +2954,7 @@ mod tests {
                 final_text: None,
                 final_text_unavailable: None,
                 terminal: true,
+                write_pending: false,
             }),
             ..Default::default()
         };

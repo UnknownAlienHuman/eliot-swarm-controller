@@ -109,6 +109,8 @@ async fn settle(
 }
 
 enum Readback {
+    /// The exact turn is still open: running, or its observed terminal is
+    /// still being written by the adapter. Kept for the next sweep.
     Running,
     Terminal(Value),
     /// The owned native process exited and its drained stream held no
@@ -136,6 +138,12 @@ fn readback(agent: &Agent, command_id: &str, turn_id: &str, snapshot: &Value) ->
     if turn["turn_id"].as_str() != Some(turn_id) || turn["command_id"].as_str() != Some(command_id)
     {
         return Readback::Inconclusive;
+    }
+    // The adapter observed this terminal but its own write of it is still
+    // in flight: that write commits it, or its resolution clears the mark
+    // for the next sweep. Recovery never races the adapter's terminal.
+    if turn["terminal"].as_bool() == Some(true) && turn["write_pending"].as_bool() == Some(true) {
+        return Readback::Running;
     }
     let state = snapshot["state"].as_str();
     let turn_status = turn["status"].as_str();
@@ -291,5 +299,24 @@ mod tests {
         let mut unproven = running;
         unproven["turn_evidence"] = Value::Null;
         assert!(matches!(read(&agent, &unproven), Readback::Inconclusive));
+    }
+
+    #[test]
+    fn a_terminal_whose_adapter_write_is_in_flight_is_never_settled() {
+        let agent = busy_agent("claude");
+        let mut terminal = snapshot(
+            "idle",
+            Value::Null,
+            json!({"command_id":"send-1","turn_id":"turn-1","status":"completed",
+                "native_status":"completed","terminal":true,"write_pending":true}),
+            "stream-json result",
+        );
+        assert!(matches!(read(&agent, &terminal), Readback::Running));
+        // The write resolved without committing: the retained terminal settles.
+        terminal["last_turn"]["write_pending"] = json!(false);
+        let Readback::Terminal(data) = read(&agent, &terminal) else {
+            panic!("terminal readback");
+        };
+        assert_eq!(data["outcome"], json!(TurnOutcome::Success));
     }
 }

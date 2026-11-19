@@ -184,6 +184,9 @@ fn active_turn_recovery(
     let Some((command_id, start_seq)) = command else {
         return Ok(None);
     };
+    // Turn or source loss starts recovery. A gap naming only `message` is
+    // coverage-only (one unpersisted message): the turn's outcome still
+    // arrives on its healthy source, so it never starts outcome settlement.
     let trigger: Option<(i64, Option<String>)> = connection
         .query_row(
             "SELECT e.seq, json_extract(e.data, '$.reason')
@@ -200,7 +203,8 @@ fn active_turn_recovery(
                  SELECT 1 FROM source_owners o
                  WHERE o.agent = s.agent AND o.generation = s.generation AND o.source = s.source
                  AND o.family IN ('session', 'turn', 'message', 'tool', 'request')
-                 AND (e.kind != 'source.gap' OR o.family IN (SELECT value FROM json_each(e.data, '$.families')))
+                 AND (e.kind != 'source.gap' OR (o.family != 'message'
+                     AND o.family IN (SELECT value FROM json_each(e.data, '$.families'))))
              )
              AND NOT EXISTS (
                  SELECT 1 FROM events ok INDEXED BY events_agent

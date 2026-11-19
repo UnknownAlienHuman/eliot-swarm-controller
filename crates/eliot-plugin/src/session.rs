@@ -955,8 +955,7 @@ impl StreamSource<'_> {
                 "{} completed message exceeded the persisted-event bound",
                 self.harness
             );
-            self.families = &["message"];
-            self.record_coverage_gap(&reason).await?;
+            self.record_coverage_gap(&reason, &["message"]).await?;
             return Ok(false);
         }
         self.commit_event("message.completed", native_id, data)
@@ -970,9 +969,12 @@ impl StreamSource<'_> {
             .await
     }
 
-    /// Report missing observation coverage without declaring a native outcome unknown.
-    pub async fn record_coverage_gap(&mut self, reason: &str) -> Result<()> {
-        self.record_gap_inner_until(reason, (None, None), Instant::now() + EVENT_DEADLINE, false)
+    /// Report missing observation coverage for `families` only, without
+    /// declaring a native outcome unknown. The families stay local to this
+    /// gap: the source keeps its configured families for later reports.
+    pub async fn record_coverage_gap(&mut self, reason: &str, families: &[&str]) -> Result<()> {
+        let deadline = Instant::now() + EVENT_DEADLINE;
+        self.record_gap_inner_until(reason, families, (None, None), deadline, false)
             .await
     }
 
@@ -989,13 +991,15 @@ impl StreamSource<'_> {
         to: Option<String>,
         deadline: Instant,
     ) -> Result<()> {
-        self.record_gap_inner_until(reason, (from, to), deadline, true)
+        let families = self.families;
+        self.record_gap_inner_until(reason, families, (from, to), deadline, true)
             .await
     }
 
     async fn record_gap_inner_until(
         &mut self,
         reason: &str,
+        families: &[&str],
         bounds: (Option<String>, Option<String>),
         deadline: Instant,
         terminal_unknown: bool,
@@ -1030,11 +1034,7 @@ impl StreamSource<'_> {
             agent_id: self.agent_id.to_owned(),
             generation: self.generation,
             source: "stream".to_owned(),
-            families: self
-                .families
-                .iter()
-                .map(|family| (*family).to_owned())
-                .collect(),
+            families: families.iter().map(|family| (*family).to_owned()).collect(),
             reason: reason.to_owned(),
             from: bounds.0,
             to: bounds.1,
@@ -1187,6 +1187,80 @@ mod tests {
     use super::{contextual_error, optional_profile_text, request_event_id, validate_source_plan};
     use eliot_core::{Error, StderrSnapshot, StderrSource};
     use serde_json::json;
+
+    #[tokio::test]
+    async fn a_message_gap_keeps_a_reused_source_on_its_configured_families() {
+        use crate::{CommitSink, Peer, RpcRequest};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, duplex, split};
+
+        let (host_io, plugin_io) = duplex(64 * 1024);
+        let (read, write) = split(plugin_io);
+        let mut peer = Peer::from_io(read, write);
+        let client = peer.client();
+        let peer_task = tokio::spawn(async move { while peer.next_request().await.is_some() {} });
+        let mut sink = CommitSink::new(client.clone(), "credential");
+        let (mut writes_blocked, mut gap_reported, mut gap_number) = (false, false, 0);
+        let (mut source_unknown, mut batch_unknown, mut failure) = (false, false, None);
+        let mut source = super::StreamSource {
+            sink: &mut sink,
+            host: &client,
+            credential: "credential",
+            agent_id: "a1",
+            generation: 1,
+            harness: "Test",
+            id_prefix: "test",
+            families: &["session", "turn", "message"],
+            writes_blocked: &mut writes_blocked,
+            gap_reported: &mut gap_reported,
+            gap_number: &mut gap_number,
+            source_unknown: &mut source_unknown,
+            batch_unknown: &mut batch_unknown,
+            failure: &mut failure,
+        };
+        let (read, mut write) = split(host_io);
+        let mut reader = BufReader::new(read);
+        let host = async {
+            let mut families = Vec::new();
+            for _ in 0..2 {
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                let request: RpcRequest = serde_json::from_str(&line).unwrap();
+                assert_eq!(request.method, "source.gap");
+                families.push(request.params["families"].clone());
+                let response = json!({"jsonrpc":"2.0", "id":request.id,
+                    "result":{"gap_id":request.params["gap_id"], "seq":1}});
+                write
+                    .write_all(
+                        format!(
+                            "{response}
+"
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            families
+        };
+        let oversized = json!({"text": "x".repeat(super::MAX_EVENT_BYTES + 1)});
+        let plugin = async {
+            assert!(
+                !source
+                    .commit_message("m1".to_owned(), oversized)
+                    .await
+                    .unwrap()
+            );
+            source.record_gap("stream lost").await.unwrap();
+        };
+        let ((), families) = tokio::join!(plugin, host);
+        // The `message` scope belongs to that one gap; the same source still
+        // reports later loss on every configured family.
+        assert_eq!(
+            families,
+            [json!(["message"]), json!(["session", "turn", "message"])]
+        );
+        peer_task.abort();
+    }
 
     #[test]
     fn failed_start_preserves_origin_location_evidence_and_effect_code() {
