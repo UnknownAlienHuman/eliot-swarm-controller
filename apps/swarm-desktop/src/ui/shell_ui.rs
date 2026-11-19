@@ -821,13 +821,15 @@ impl DesktopApp {
             ShellMsg::SearchChanged(text) => {
                 self.nav.search.text = text.clone();
                 // WinUI writes the suggestion reached with the arrows into
-                // the box: that is not a new query.
-                if !self
-                    .nav
-                    .search
-                    .results
-                    .iter()
-                    .any(|(label, _)| *label == text)
+                // the box: that is not a new query, nor is the query itself
+                // written back after an open (`open_found`).
+                if text != self.nav.search.query
+                    && !self
+                        .nav
+                        .search
+                        .results
+                        .iter()
+                        .any(|(label, _)| *label == text)
                 {
                     self.nav.search.query = text;
                     // The server searches every Agent, not just the loaded
@@ -1117,6 +1119,9 @@ impl DesktopApp {
 
     /// Open the Agent a search found.
     fn open_found(&mut self, id: &str, context: &ComponentContext<Self>) {
+        // The box shows the query again, not the suggestion WinUI wrote
+        // into it when the arrows reached it.
+        self.nav.search.text = self.nav.search.query.clone();
         if let Some(agent) = self.find_agent(id).cloned() {
             self.nav.selection.select_agent(Some(agent.id.clone()));
             self.shell_update(ShellMsg::AgentOpened(agent), context);
