@@ -808,6 +808,7 @@ impl Component for DesktopApp {
                 shortcuts: None,
                 sidebar_collapsed: false,
                 history: Default::default(),
+                batch: None,
             },
             launch: launch_ui::LaunchState {
                 workspace: input
@@ -902,7 +903,6 @@ impl Component for DesktopApp {
 
     fn view(&self, _input: &DesktopInput, context: &mut ViewContext<Self>) -> View {
         self.renders.set(self.renders.get() + 1);
-        crate::views::debug_render(0, "root"); // k210-debug
         self.shell_view(context)
     }
 }

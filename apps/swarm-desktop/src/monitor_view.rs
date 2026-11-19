@@ -631,7 +631,6 @@ impl Component for MonitorList {
     }
 
     fn view(&self, input: &MonitorListInput, _context: &mut ViewContext<Self>) -> View {
-        crate::views::debug_render(4, "monitor"); // k210-debug
         let entries: Vec<KeyedView> = input
             .entries
             .iter()

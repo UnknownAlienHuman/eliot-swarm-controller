@@ -8,6 +8,12 @@
 //! cached per part key + content revision: an unchanged part hands Reactor
 //! the same `RichText`, so its native block is not recreated and a selection
 //! inside it survives updates to other parts.
+//!
+//! The transcript, each part and a running tool row's seconds are Reactor
+//! components ([`Transcript`], [`PartView`], [`Elapsed`]): Reactor 0.100.0
+//! re-renders the whole window for every message, but a component whose
+//! `Input` compares equal is skipped, so a sidebar refresh, a Monitor tick
+//! or the one-second clock never rebuilds the conversation.
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -705,7 +711,6 @@ impl Component for Transcript {
     }
 
     fn view(&self, input: &TranscriptInput, _context: &mut ViewContext<Self>) -> View {
-        debug_render(1, "transcript"); // k210-debug
         let palette = input.palette;
         let load_older: View = match &input.load_older {
             Some((enabled, load)) if self.hidden == 0 => crate::m3::text_button(palette)
@@ -850,32 +855,7 @@ impl Component for PartView {
     }
 
     fn view(&self, input: &PartInput, context: &mut ViewContext<Self>) -> View {
-        debug_render(2, "part"); // k210-debug
         let part = &*input.part.0;
-        // k210-debug: large parts
-        {
-            let blocks: usize = part.blocks.as_ref().map_or(0, |b| {
-                b.iter()
-                    .map(|b| match b {
-                        RenderedBlock::Code(_, t) | RenderedBlock::Heading(_, t) => t.len(),
-                        _ => 0,
-                    })
-                    .sum()
-            });
-            let detail: usize = part.detail.iter().map(String::len).sum();
-            if part.plain.len() + blocks + detail > 2_000 {
-                eprintln!(
-                    "k210dbg part {} {:?} plain={} code={} blocks={} detail={} paths={}",
-                    part.key,
-                    part.kind,
-                    part.plain.len(),
-                    blocks,
-                    part.blocks.as_ref().map_or(0, Vec::len),
-                    detail,
-                    part.file_paths.len()
-                );
-            }
-        }
         let (callbacks, palette) = (&*input.callbacks, input.palette);
         let body = StackPanel::new().spacing(tokens::spacing::XS).children((
             part_view(part, input.expanded, self.hovered, callbacks, palette),
@@ -943,7 +923,6 @@ impl Component for Elapsed {
     }
 
     fn view(&self, input: &ElapsedInput, _context: &mut ViewContext<Self>) -> View {
-        debug_render(3, "elapsed"); // k210-debug
         let seconds = (self.now_ms - input.started_ms).max(0) / 1_000;
         crate::m3::tool_caption(
             format!("Running \u{b7} {seconds} s"),
@@ -1064,23 +1043,4 @@ pub fn attached_chips(files: &[String], palette: Palette) -> View {
                 })
                 .collect::<Vec<_>>(),
         )
-}
-
-// k210-debug: render counters for the live proof; removed before the final commit.
-pub static DEBUG_RENDERS: [std::sync::atomic::AtomicU64; 5] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
-pub fn debug_render(slot: usize, what: &str) {
-    use std::sync::atomic::Ordering::Relaxed;
-    DEBUG_RENDERS[slot].fetch_add(1, Relaxed);
-    if slot != 2 {
-        eprintln!(
-            "k210dbg {} {what} root={} transcript={} parts={} elapsed={} monitor={}",
-            crate::handoff::now_ms(),
-            DEBUG_RENDERS[0].load(Relaxed),
-            DEBUG_RENDERS[1].load(Relaxed),
-            DEBUG_RENDERS[2].load(Relaxed),
-            DEBUG_RENDERS[3].load(Relaxed),
-            DEBUG_RENDERS[4].load(Relaxed),
-        );
-    }
 }

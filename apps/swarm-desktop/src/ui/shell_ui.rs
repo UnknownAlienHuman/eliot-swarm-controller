@@ -72,6 +72,8 @@ pub(super) enum ShellMsg {
     /// The Monitor's attention reports, read on the sidebar's cadence
     /// while the panel is closed (the cursor the read started from).
     AttentionReports(Option<i64>, Fallible<monitor::AttentionRead>),
+    /// The replies of one sidebar refresh, together: one window render.
+    Refreshed(Vec<ShellMsg>),
     /// A sidebar-search page (`agent.list` with `query`): its read epoch,
     /// the query it answers, whether it appends, and the page.
     SearchLoaded(u64, String, bool, Fallible<AgentPage>),
@@ -213,7 +215,13 @@ impl Appearance {
 }
 
 /// Projects, the listed Agents, expanded branches, titles and the selection.
+/// One sidebar read, run on a worker ([`DesktopApp::spawn_read`]).
+pub(super) type SidebarRead = Box<dyn FnOnce() -> ShellMsg + Send>;
+
 pub(super) struct ShellState {
+    /// The reads of the sidebar refresh being collected
+    /// ([`DesktopApp::spawn_read`]).
+    pub(super) batch: Option<Vec<SidebarRead>>,
     pub(super) selection: Selection,
     pub(super) projects: Vec<UiProject>,
     /// The sidebar's projects as the daemon groups and counts them.
@@ -533,6 +541,11 @@ impl DesktopApp {
                     Err(error) => {
                         self.alert(format!("Agents not read: {error}"));
                     }
+                }
+            }
+            ShellMsg::Refreshed(replies) => {
+                for reply in replies {
+                    self.shell_update(reply, context);
                 }
             }
             ShellMsg::AttentionReports(cursor, read) => {
@@ -910,6 +923,9 @@ impl DesktopApp {
                 // arrives without a manual refresh. The queue state polls on
                 // its own worker, so the grouping reads never delay an
                 // arbiter's admission or refusal.
+                // Every message renders the whole window (k209), so the
+                // refresh's reads reply together, as one message.
+                self.nav.batch = Some(Vec::new());
                 if self.preferences_loaded && !self.nav.agents_loading {
                     self.refresh_head(context);
                 }
@@ -924,6 +940,20 @@ impl DesktopApp {
                 if self.preferences_loaded {
                     self.load_organization(context);
                     self.load_queue(context);
+                }
+                let reads = self.nav.batch.take().unwrap_or_default();
+                if !reads.is_empty() {
+                    let _task = context.spawn_background(move |_| {
+                        let replies = std::thread::scope(|scope| {
+                            let running: Vec<_> =
+                                reads.into_iter().map(|read| scope.spawn(read)).collect();
+                            running
+                                .into_iter()
+                                .filter_map(|read| read.join().ok())
+                                .collect()
+                        });
+                        Message::Shell(ShellMsg::Refreshed(replies))
+                    });
                 }
                 self.watch_list(context);
             }
@@ -1323,13 +1353,13 @@ impl DesktopApp {
             query: Some(query.clone()),
             ..Default::default()
         };
-        let _task = context.spawn_background(move |_| {
-            Message::Shell(ShellMsg::SearchLoaded(
+        self.spawn_read(context, move || {
+            ShellMsg::SearchLoaded(
                 epoch,
                 query,
                 append,
                 load_agents_blocking(&data_dir, &request, archived),
-            ))
+            )
         });
     }
 
@@ -1630,9 +1660,11 @@ impl DesktopApp {
             eliot_core::api::ArchivedFilter::Exclude
         };
         let changes_after = self.nav.organization.changes_after;
-        let _task = context.spawn_background(move |_| {
-            Message::Shell(ShellMsg::OrganizationLoaded(Box::new(
-                load_organization_blocking(&data_dir, archived, changes_after),
+        self.spawn_read(context, move || {
+            ShellMsg::OrganizationLoaded(Box::new(load_organization_blocking(
+                &data_dir,
+                archived,
+                changes_after,
             )))
         });
     }
@@ -1654,10 +1686,8 @@ impl DesktopApp {
             .iter()
             .map(|(id, _)| id.clone())
             .collect();
-        let _task = context.spawn_background(move |_| {
-            Message::Shell(ShellMsg::QueueLoaded(Box::new(load_queue_blocking(
-                &data_dir, watched,
-            ))))
+        self.spawn_read(context, move || {
+            ShellMsg::QueueLoaded(Box::new(load_queue_blocking(&data_dir, watched)))
         });
     }
 
@@ -1674,11 +1704,8 @@ impl DesktopApp {
             order: AgentListOrder::Recent,
             ..Default::default()
         };
-        let _task = context.spawn_background(move |_| {
-            Message::Shell(ShellMsg::AttentionLoaded(
-                list_epoch,
-                load_agents_blocking(&data_dir, &request, None),
-            ))
+        self.spawn_read(context, move || {
+            ShellMsg::AttentionLoaded(list_epoch, load_agents_blocking(&data_dir, &request, None))
         });
     }
 
@@ -1699,11 +1726,8 @@ impl DesktopApp {
             order: AgentListOrder::Recent,
             ..Default::default()
         };
-        let _task = context.spawn_background(move |_| {
-            Message::Shell(ShellMsg::HeadLoaded(
-                list_epoch,
-                load_agents_blocking(&data_dir, &head, archived),
-            ))
+        self.spawn_read(context, move || {
+            ShellMsg::HeadLoaded(list_epoch, load_agents_blocking(&data_dir, &head, archived))
         });
         self.load_attention(context);
         self.load_attention_reports(context);
@@ -1722,16 +1746,30 @@ impl DesktopApp {
         }
         self.monitor.sidebar_reading = true;
         let cursor = self.monitor.data.attention_cursor;
-        let _task = context.spawn_background(move |cancel| {
-            let cancelled = || cancel.is_cancelled();
+        self.spawn_read(context, move || {
             let read = client::block_on(monitor::read_attention(
                 &data_dir,
                 cursor,
                 crate::handoff::now_ms(),
-                &cancelled,
+                &|| false,
             ));
-            Message::Shell(ShellMsg::AttentionReports(cursor, read))
+            ShellMsg::AttentionReports(cursor, read)
         });
+    }
+
+    /// Run one sidebar read on a worker: on its own, or in the refresh
+    /// being collected, whose reads reply together (`ShellMsg::Refreshed`).
+    fn spawn_read(
+        &mut self,
+        context: &ComponentContext<Self>,
+        read: impl FnOnce() -> ShellMsg + Send + 'static,
+    ) {
+        match self.nav.batch.as_mut() {
+            Some(batch) => batch.push(Box::new(read)),
+            None => {
+                let _task = context.spawn_background(move |_| Message::Shell(read()));
+            }
+        }
     }
 
     /// The open attention report of a sidebar row's Agent (the Monitor's).

@@ -13,7 +13,6 @@ use crate::ui::chat_ui::DraftAction;
 
 #[derive(Clone, Debug)]
 pub(super) enum MonitorMsg {
-    RefreshDue(u64),
     MonitorLoaded(u64, Option<Box<MonitorSnapshot>>),
     /// A monitor row: open its conversation and its details.
     RowOpened(String),
@@ -68,11 +67,6 @@ fn group_tone(group: Group) -> StatusTone {
 impl DesktopApp {
     pub(super) fn monitor_update(&mut self, msg: MonitorMsg, context: &ComponentContext<Self>) {
         match msg {
-            MonitorMsg::RefreshDue(epoch) => {
-                if epoch == self.monitor.epoch && self.panel != Panel::Closed {
-                    self.start_monitor(context);
-                }
-            }
             MonitorMsg::MonitorLoaded(epoch, snapshot) => {
                 if epoch != self.monitor.epoch || self.panel == Panel::Closed {
                     return;
@@ -92,10 +86,9 @@ impl DesktopApp {
                         let filter = self.monitor.filter.reconciled(&overview);
                         self.monitor.filter = filter;
                     }
-                    self.monitor.task = Some(context.spawn_background(move |cancel| {
-                        feed::backoff(monitor::PERIOD_MS, &|| cancel.is_cancelled());
-                        Message::Monitor(MonitorMsg::RefreshDue(epoch))
-                    }));
+                    // The next read waits on its own worker: a timer message
+                    // would render the whole window for nothing.
+                    self.read_monitor(monitor::PERIOD_MS, context);
                 }
             }
             MonitorMsg::RowOpened(id) => {
@@ -209,6 +202,11 @@ impl DesktopApp {
 
     /// Read while the panel is open, keeping the last successful data visible.
     pub(super) fn start_monitor(&mut self, context: &ComponentContext<Self>) {
+        self.read_monitor(0, context);
+    }
+
+    /// One refresh after `delay_ms` (the next one is planned when it lands).
+    fn read_monitor(&mut self, delay_ms: u64, context: &ComponentContext<Self>) {
         if let Some(task) = self.monitor.task.take() {
             task.cancel();
         }
@@ -232,6 +230,9 @@ impl DesktopApp {
         self.monitor.refreshing = true;
         self.monitor.task = Some(context.spawn_background(move |cancel| {
             let cancelled = || cancel.is_cancelled();
+            if delay_ms > 0 && !feed::backoff(delay_ms, &cancelled) {
+                return Message::Monitor(MonitorMsg::MonitorLoaded(epoch, None));
+            }
             let snapshot = client::block_on(async {
                 // A cancelled epoch may still have an IPC read in flight.
                 let _guard = refresh_gate.lock().await;
