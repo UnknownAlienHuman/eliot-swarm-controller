@@ -406,7 +406,8 @@ impl DesktopApp {
         .or_else(|| parent.map(monitor_view::RowNote::Under));
         // The second line: the attention sentence, else the work line of a
         // controlled Agent that has not stopped (`docs/spec/monitoring.md`,
-        // Git-aware work summary).
+        // Git-aware work summary). A failed or lost one shows it only when
+        // measured: its Git is never read again, so a reason would stay.
         let line = match no_code {
             Some(incident) => {
                 let text = incident.words(now);
@@ -419,7 +420,11 @@ impl DesktopApp {
             None => row
                 .work
                 .as_ref()
-                .filter(|_| !row.native_child && row.state != eliot_core::AgentState::Stopped)
+                .filter(|work| {
+                    !row.native_child
+                        && row.state != eliot_core::AgentState::Stopped
+                        && (!row.ended() || work.available)
+                })
                 .map(|work| monitor_view::RowLine {
                     text: monitor::work_line(work, now),
                     words: monitor::work_words(work, now),

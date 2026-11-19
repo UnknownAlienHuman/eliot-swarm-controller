@@ -1433,14 +1433,21 @@ impl DesktopApp {
         }
     }
 
-    /// The next High Contrast reading, one cadence from now.
+    /// Read High Contrast at its cadence and report only a change. Every
+    /// message re-renders the whole window (k209 measured 30 ms per render,
+    /// 70 ms with a 588-item chat open), so an unchanged reading posts
+    /// nothing.
     pub(super) fn watch_high_contrast(&self, context: &ComponentContext<Self>) {
-        let _task = context.spawn_background(|cancel| {
+        let shown = self.appearance.high_contrast;
+        let _task = context.spawn_background(move |cancel| {
             let cancelled = || cancel.is_cancelled();
-            let _ = feed::backoff(HIGH_CONTRAST_POLL_MS, &cancelled);
-            Message::Shell(ShellMsg::HighContrastRead(
-                crate::accessibility::high_contrast_on(),
-            ))
+            loop {
+                let ran = feed::backoff(HIGH_CONTRAST_POLL_MS, &cancelled);
+                let on = crate::accessibility::high_contrast_on();
+                if on != shown || !ran {
+                    return Message::Shell(ShellMsg::HighContrastRead(on));
+                }
+            }
         });
     }
 
