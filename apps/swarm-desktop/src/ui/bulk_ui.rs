@@ -1039,7 +1039,7 @@ impl DesktopApp {
                         line(
                             format!("refused:{index}"),
                             m3::body(words)
-                                .foreground(palette.error())
+                                .foreground(palette.attention())
                                 .text_wrapping(TextWrapping::Wrap)
                                 .is_text_selection_enabled(true)
                                 .into(),
@@ -1052,7 +1052,7 @@ impl DesktopApp {
             line(
                 "error".to_owned(),
                 m3::body(error.clone())
-                    .foreground(palette.error())
+                    .foreground(palette.attention())
                     .text_wrapping(TextWrapping::Wrap)
                     .is_text_selection_enabled(true)
                     .into(),

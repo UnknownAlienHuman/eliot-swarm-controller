@@ -451,14 +451,19 @@ of the explicitly selected release scope.
       covers turns against the limit, whether creation is still retained, the
       retention floor and evictions; "Load older" pages turns only.
       Markdown renders in native `RichTextBlock` controls (http/https links only;
-      HTML literal) with Copy message and Copy code. A virtualized turn list keeps
-      stable keys and bounded resident turns and bytes. Live events follow a
+      HTML literal) with Copy message and Copy code. The turn list keeps
+      stable keys and bounded resident turns and bytes; every resident turn is
+      laid out (an ItemsRepeater under the anchored viewer left turns
+      unrealized). Live events follow a
       committed `events.bounds` cursor: a limit-1 wake with an explicit `wait_ms`,
       then drains from `next`. A lag or `history_gap` marks the view stale and
-      rereads it; transport failures back off and resnapshot. Reactor 0.100.0
-      has no scroll offset or `ViewChanged`, so the view neither auto-follows the
-      bottom nor shows a "N new" jump button it could not hide at the bottom;
-      opening a conversation brings its latest turn into view. (Refs #407)
+      rereads it; transport failures back off and resnapshot. The transcript is a
+      WinUI `ScrollView` anchored at its far edge (`VerticalAnchorRatio` 1): it
+      opens at the newest turn and follows new activity while it is at the end,
+      and keeps its place when read further up. Reactor 0.100.0 has no scroll
+      offset, so there is no "N new" jump button; a send scrolls the transcript
+      to its end through UI Automation's scroll pattern (its inner scroller,
+      found under the transcript's automation id). (Refs #407)
 - [x] **D3 Swarm monitor.** An openable monitor panel uses one demand-driven
       refresh chain, active only while open. The last successful fleet and
       selected-Agent details stay visible on reopen and failed refreshes, with
@@ -468,34 +473,21 @@ of the explicitly selected release scope.
       count of each persisted lifecycle state in the caller's scope, native
       observed children included), alongside selected-Agent identity, usage
       and diagnosis. At most four
-      reads run concurrently. The panel opens on an overview drawn from that
-      same read: a state bar split in proportion to the live groups (Working in
-      primary, Needs attention in error, Idle in outline-variant), a legend
-      with their counts ("5 working · 1 needs attention · 3 idle"), and the
-      live Agents by project under the sidebar's project names, on one scale,
-      most working first, six rows then "N more projects". A segment, legend
-      item or project row filters the list to exactly the Agents it counts
-      (the filter shows as a chip with ×, one chip per line; a second click
-      clears it, and a complete refresh clears a group or project that has no
-      live Agent left, each on its own), by pointer or keyboard, each with an
-      accessible name ("Working: 5 of 9"); under High Contrast each segment
-      also carries its group's glyph. Every count takes nested workers by
-      their own state and never native subagents, so headline, bar, project
-      rows and the list's sections agree: a parent whose worker needs
-      attention stays in its own section and names the worker on its row.
-      When a live state's `state_totals` count exceeds its rows, the chart
-      says only that its counts are partial (those totals include native
-      children it leaves out, so it claims no number). The list groups Needs
+      reads run concurrently. The pane follows `Conversation.dc.html`:
+      Monitor and Details tabs with the close button, a pill search field
+      and a connected state filter (All, Working, Attention, Idle). The
+      list groups Needs
       attention (waiting, failed,
       lost, a controlled Agent in `unknown`, or an open `x.user.agent.attention`
       report read incrementally from the journal), Working, Idle and a collapsed
       Recently stopped (last 24 hours, its rows read every tenth refresh). Each
-      Agent is one row (status dot in its group's color, title, harness, and
-      for a working Agent the time since its last progress, the daemon's
-      `last_progress_at` over turns, messages, tools and requests, or "no
-      progress yet"; for any other the time since its record changed), with
-      a second line only for why it
-      needs attention or ended; native observed children nest collapsed under
+      Agent is one row under its group's label ("Working · 2"): status dot in
+      its group's color, title and one trailing word: what it needs, in the
+      attention color; for a working Agent its model; else how long it has
+      been quiet (the daemon's `last_progress_at` over turns, messages, tools
+      and requests, or the time since its record changed). Why it ended or
+      the task it runs under is in its tooltip and accessible name; native
+      observed children nest collapsed under
       their parent row and read as their activity, or "Ended with parent".
       Details carry what a row leaves out: what it does now, its tokens and
       CPU time, the daemon-reported sample age and TTL, coverage and clock
@@ -505,10 +497,9 @@ of the explicitly selected release scope.
       and deduplicated; CPU and memory are bar charts with the latest value and a
       labelled scale. Only the actions that apply are offered, bound at click time
       to the Agent, generation and turn shown: Interrupt, Stop, Force stop
-      (confirmed inline), Resume and, for observe-only Agents, Detach. A
-      search field (title, id, harness, model, project) and a state filter
-      (every state, Working, Needs attention, Idle, Stopped) narrow the list,
-      the recently stopped Agents included (k195 P3-2); the panel's
+      (confirmed inline), Resume and, for observe-only Agents, Detach. The
+      search (title, id, harness, model, project) narrows the list, the
+      recently stopped Agents included (k195 P3-2); the panel's
       Monitor/Details switch highlights the pane shown, however it opened.
       (Refs #407)
 - [x] **D4 Launch context, profiles and automation settings.** A new task
@@ -568,10 +559,10 @@ of the explicitly selected release scope.
       one tonal New task row (Ctrl+N), Search tasks (Ctrl+K: title, project and
       harness, through WinUI's AutoSuggestBox), Automations and Usage,
       collapsible projects with their Agents nested (manager, then workers,
-      collapsed), Recents, a fleet line that opens the monitor and says what
+      collapsed), a fleet line that opens the monitor and says what
       is live in at most two counts, so it is never cut off ("2 working · 1
       needs attention", "12 idle", "All quiet" when nothing is; every count
-      is its accessible name and the Monitor's legend), a separate "N need attention" row that lists Agents waiting
+      is its accessible name), a separate "N need attention" row that lists Agents waiting
       on a request, failed or lost ones, and controlled Agents in `unknown`
       (observe-only native children never count), and Settings. A project is a repository
       and nests one level (k142): Project → Subprojects (its linked worktrees) →
@@ -611,38 +602,43 @@ of the explicitly selected release scope.
       click opens it. The conversation has a one-line header (title, status
       dot, details toggle, a "…" menu for Hand off/Switch, Move under another
       task, Resume, Detach, Stop and Force stop); coverage, ids and readback live in
-      the details panel. The composer of a conversation carries its project,
-      harness and access as plain read-only text, the model-and-effort chip
-      (Codex's effort popover: the route's effort steps, applied for the next
-      turn, the model as "Requested model X" until a turn carries it, and
-      "Change model…" into the picker filtered to that Agent's
-      route; one plain line instead when the harness keeps them), and one
-      trailing button as in Codex (owner review 2026-11-19): Send; while a
-      turn runs, Stop (a filled square; it interrupts that turn) with an
-      empty field and Steer once there is text (Enter steers too, D10); a
-      stopped or lost task's one Resume, with the typed message once there
-      is one. There is no separate Interrupt control. The usage ring beside
-      it is Material's determinate circular indicator; a new task's
-      composer is D9. Settings replaces the
-      sidebar with its own navigation and shows one centred page of at most
-      840 DIPs (D9). One tactile Material 3 component system with Codex's
+      the details panel. The composer of a conversation carries + (attach files)
+      and the model-and-effort chip (Codex's effort popover: the route's effort
+      steps, applied for the next turn, the model as "Requested model X" until a
+      turn carries it, and "Change model…" into the picker filtered to that
+      Agent's route; one plain line instead when the harness keeps them), and
+      one trailing button as in Codex (owner review 2026-11-19): Send; while a
+      turn runs, Stop (a rounded square; it interrupts that turn) with an empty
+      field and Steer once there is text (Enter steers too, D10); a stopped or
+      lost task's one Resume, with the typed message once there is one. There is
+      no separate Interrupt control. The usage ring beside it is Material's
+      determinate circular indicator, in the attention color only when a real
+      reading of the account the task runs on has less than 20 % left; where the
+      preset runs through a proxy, or that is not known, it is a neutral outline
+      ring. A steered message reads as "Steer" over its text in the user's
+      bubble shape, filled with the selected role at half strength. Copy under a
+      message shows only while the message is under the pointer or the action
+      has keyboard focus. A new task's composer is D9. Settings replaces the
+      sidebar with its own navigation and shows one centred page of at most 720
+      DIPs (D9). One tactile Material 3 component system with Codex's
       logic (owner reviews 2026-11-15, 2026-11-16 and 2026-11-19), every
       size from one tokens module and every button from one Material
       control template (Uno.Themes' Material styles and Material
       Components' state layers as the pattern): a state layer in the
-      content color on hover (8 %) and press (10 %), a ripple from the
-      centre, a slight press scale on M3's emphasized motion, the FAB's key
-      and ambient shadows drawn under it (WinUI's ThemeShadow draws nothing
-      outside a popup without receivers), deeper on hover; the composer,
-      popovers and in-window menus lifted the same way. Shapes on the M3
-      scale: everything pressed is a pill (buttons, icon buttons, chips,
-      rows, segments, dropdowns; radius half the height), text fields 8,
-      containers 12, the composer 16, dialogs 28; touch-sized heights: 40
-      for controls and rows (the composer's round 40-DIP FAB included), 48
-      for form rows, 36 for tasks under a project; the M3 type roles in one
-      family (Segoe UI Variable), buttons in label-large (14/500); a 4/8
-      spacing grid; icons 16 beside a label, 20 alone in a button, 12 for a
-      dropdown's chevron, Stop a filled square. One action pattern: filled primary (one per page),
+      content color on hover (8 %) and press (12 %), a ripple from the press
+      point, a slight press scale on M3's emphasized motion (150 ms for states,
+      250 ms for a popover's entrance), the FAB's key and ambient shadows drawn
+      under it (WinUI's ThemeShadow draws nothing outside a popup without
+      receivers), deeper on hover; the composer, popovers and in-window menus
+      lifted the same way (elevation 0 to 3). Shapes: everything pressed is a
+      pill (buttons, icon buttons, chips, rows, segments, dropdowns; radius half
+      the height), cards and tool rows 12, the composer 20, dialogs 28. The
+      approved design's density (2026-11-19): rows and controls 32, chips 28,
+      the FAB 36, the header 52, form rows 40; the sidebar 264, the Monitor pane
+      320, the conversation column 720, a nested task 28 in; the type scale
+      28/16/15/14/13/12 in one family (Segoe UI Variable), buttons 14/500; a
+      4-DIP grid; icons 18 in rows and icon buttons, 16 in chips, 14 for a
+      dropdown's chevron, Stop a rounded square. One action pattern: filled primary (one per page),
       outlined secondary, text tertiary, destructive text in the error color;
       orange and red appear only for the Full access warning and destructive
       actions. The Details panel has only a close button. (Refs #407)
@@ -676,8 +672,17 @@ of the explicitly selected release scope.
 - [x] **D9 A desktop you can work in.** Owner review 2026-11-16, the Codex,
       OpenCode and Antigravity apps as references. A new task's composer has
       no profiles: one card holds the project selector (a searchable project
-      list and "Other folder…") as its first row, "Describe a task…", then the
-      model chip (`Harness · Model · effort`), the access chip and Send. The model chip
+      list and "Other folder…") and the New worktree chip as its first row (a
+      fixed fact where the project prepares a worktree for every task, its
+      `workspace = "worktree"`; a switch that sends `worktree` where the folder
+      is shared), "Ask Eliot Swarm to do anything", then + (attach files), the
+      access chip (a preset's access is an outlined chip that is not a control,
+      Full access in the attention tone), the model chip (`Harness · Model ·
+      effort`) and Send. Attached files travel as the message's closing block,
+      `Attached files:` and one `- <absolute path>` line each (the daemon's
+      input is text; the agent reads the files); the transcript shows that block
+      under the owner's bubble as file chips, and files an answer names as chips
+      under it. The model chip
       (Ctrl+M) opens OpenCode's picker pattern fed by `models.catalog` (k76a):
       a search over harnesses, providers and models; Auto with Swarm's pick
       and reason; Favorites and Recent (`[desktop]` `favorite_models` /
@@ -773,8 +778,7 @@ of the explicitly selected release scope.
       Swarm workers and observed native subagents nest under their parent in
       the monitor, collapsed, with their count and states ("22 workers · 2
       working"); a worker that needs attention is named on its parent's
-      row, which stays in its own section. Recents lists the newest top-level tasks
-      of collapsed projects, one per title; older tasks stay under "Show N
+      row, which stays in its own section. Older tasks stay under "Show N
       older" and chats under Chats. Delete
       follows the Store (stopped or failed trees, once drained); a lost task
       offers Resume or Archive instead. Bulk actions (k142) ask once, naming

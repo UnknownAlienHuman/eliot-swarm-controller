@@ -39,6 +39,14 @@ impl SecretPolicy {
         String::from_utf8_lossy(&safe).into_owned()
     }
 
+    /// Redact complete text, then bound it to `max_bytes` at a character
+    /// boundary (a progress fact's label, never the whole native payload).
+    pub fn redact_bounded(&self, text: &str, max_bytes: usize) -> String {
+        let mut safe = self.redact_text(text);
+        safe.truncate(safe.floor_char_boundary(max_bytes));
+        safe
+    }
+
     /// Inspect both string keys and string values; other JSON scalars stay typed.
     pub fn contains_value(&self, value: &Value) -> bool {
         match value {

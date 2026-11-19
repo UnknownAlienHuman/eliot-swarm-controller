@@ -22,7 +22,6 @@ mod access;
 mod advanced;
 mod automations;
 mod cloud_mcp;
-mod folder;
 mod general;
 mod models;
 mod projects;
@@ -467,6 +466,24 @@ impl SettingsState {
         self.reading || self.saving.is_some()
     }
 
+    /// Whether the read `[projects]` entry for `checkout` shares its
+    /// checkout (`workspace = "shared"`) instead of a worktree per task.
+    pub(super) fn shares_checkout(&self, checkout: &str) -> bool {
+        let key = crate::nav::path_key(checkout);
+        self.base
+            .get(&Section::Projects)
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+            .any(|(_, project)| {
+                project
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .is_some_and(|path| crate::nav::path_key(path) == key)
+                    && project.get("workspace").and_then(Value::as_str) == Some("shared")
+            })
+    }
+
     /// A typed change on `page`: the sequence its pause carries.
     fn typed(&mut self, page: Page) -> u64 {
         self.edit_seq += 1;
@@ -884,7 +901,9 @@ impl DesktopApp {
                         // A choice made after this read was issued (or still
                         // being written) wins over the read.
                         if !self.prefs_saving && self.prefs_rev == self.settings.read_prefs_rev {
+                            let before = self.palette();
                             self.prefs = crate::settings::Preferences::from_reply(&read);
+                            self.palette_changed(before, context);
                         }
                         self.take_profiles(&read);
                         let automation_changed = self.settings.base.get(&Section::Automation)
@@ -1122,28 +1141,30 @@ impl DesktopApp {
                     Default::default()
                 };
             }
-            SettingsMsg::ProjectBrowse => match folder::pick() {
-                Ok(Some(path)) => {
-                    let profiles = self.known_profiles();
-                    let s = &mut self.settings;
-                    let id = model::project_id_for_folder(&s.projects, &path);
-                    match model::add_project(&mut s.projects, &id, &path, &profiles) {
-                        Ok(()) => {
-                            s.project_open = Some(id);
-                            self.autosave(Page::Projects, context);
-                        }
-                        Err(error) => {
-                            s.notes.insert(Page::Projects, Note::error(error));
+            SettingsMsg::ProjectBrowse => {
+                match crate::file_dialog::pick_folder("Add a project: choose its checkout folder") {
+                    Ok(Some(path)) => {
+                        let profiles = self.known_profiles();
+                        let s = &mut self.settings;
+                        let id = model::project_id_for_folder(&s.projects, &path);
+                        match model::add_project(&mut s.projects, &id, &path, &profiles) {
+                            Ok(()) => {
+                                s.project_open = Some(id);
+                                self.autosave(Page::Projects, context);
+                            }
+                            Err(error) => {
+                                s.notes.insert(Page::Projects, Note::error(error));
+                            }
                         }
                     }
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.settings
+                            .notes
+                            .insert(Page::Projects, Note::error(error));
+                    }
                 }
-                Ok(None) => {}
-                Err(error) => {
-                    self.settings
-                        .notes
-                        .insert(Page::Projects, Note::error(error));
-                }
-            },
+            }
             SettingsMsg::CloudField(index, text) => {
                 if let Some((key, _)) = model::CLOUD_FIELDS.get(index)
                     && model::cloud_field(&s.cloud, key) != text
@@ -1570,7 +1591,7 @@ impl DesktopApp {
                     "none",
                     m3::secondary("No setting matches. Try another word.")
                         .text_wrapping(TextWrapping::Wrap)
-                        .margin(Thickness::new(tokens::spacing::INSET, 0.0, 0.0, 0.0)),
+                        .margin(Thickness::xy(tokens::spacing::ROW, 0.0)),
                 ));
             }
             for (page, name) in found {
@@ -1611,7 +1632,7 @@ impl DesktopApp {
                         .on_click(
                             context.message(Message::Settings(SettingsMsg::PageSelected(*page))),
                         )
-                        .content(m3::icon_label(page.glyph(), page.label())),
+                        .content(m3::nav_content(page.glyph(), page.label(), "")),
                 ));
             }
         }
@@ -1619,7 +1640,7 @@ impl DesktopApp {
     }
 
     /// The shown Settings page: its title, then its groups, in one centred
-    /// column of at most 840 DIPs with the 24-DIP page padding.
+    /// column of at most 720 DIPs with the 24-DIP page padding.
     pub(super) fn settings_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let page = self.settings_page;
         let body: View = if self.settings.loaded {
@@ -1736,7 +1757,7 @@ impl DesktopApp {
             return View::empty();
         };
         let text = if note.error {
-            m3::text(note.text.clone(), tokens::text::SECONDARY).foreground(palette.error())
+            m3::text(note.text.clone(), tokens::text::SECONDARY).foreground(palette.attention())
         } else {
             m3::secondary(note.text.clone())
         }
@@ -1760,7 +1781,7 @@ impl DesktopApp {
     fn read_error(&self, error: &str, context: &mut ViewContext<Self>, palette: Palette) -> View {
         StackPanel::new().spacing(tokens::spacing::SM).children((
             m3::body(error.to_owned())
-                .foreground(palette.error())
+                .foreground(palette.attention())
                 .text_wrapping(TextWrapping::Wrap)
                 .is_text_selection_enabled(true),
             self.settings
@@ -1807,7 +1828,7 @@ impl DesktopApp {
             .text_wrapping(TextWrapping::Wrap)
             .is_text_selection_enabled(true);
         let note_text = if note.error {
-            note_text.foreground(palette.error())
+            note_text.foreground(palette.attention())
         } else {
             note_text
         };
@@ -1839,12 +1860,7 @@ impl DesktopApp {
     }
 }
 
-/// A settings navigation group label: secondary text at the rows' inset.
-fn nav_label(text: &str) -> TextBlock {
-    m3::section_label(text).margin(Thickness::new(
-        tokens::spacing::INSET,
-        tokens::spacing::MD,
-        0.0,
-        tokens::spacing::XS,
-    ))
+/// A settings navigation group label: the sidebar's section row.
+fn nav_label(text: &str) -> View {
+    m3::section_row(text)
 }

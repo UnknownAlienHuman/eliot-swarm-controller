@@ -16,8 +16,9 @@
 //! `ScrollViewer` exposes no offset, `ViewChanged`, `ChangeView` or anchor
 //! ratio, so the transcript cannot detect "at the bottom" or auto-follow.
 //! A "N new" jump button cannot know it is already at the bottom, so there
-//! is none (k98: it stayed shown at the bottom); opening a conversation
-//! focuses the end anchor, which WinUI brings into view. There is no
+//! is none (k98: it stayed shown at the bottom); opening a conversation or
+//! sending scrolls the transcript to its end through UI Automation's scroll
+//! pattern ([`crate::scroll_end`]). There is no
 //! font-family property (code is not monospace), no
 //! clipboard (see [`crate::clipboard`]) and no key events on `TextBox`: Enter
 //! sends through the window's thread keyboard hook, which marks the line
@@ -366,7 +367,7 @@ struct DesktopApp {
 impl DesktopApp {
     /// The active M3 palette (system colors under High Contrast).
     fn palette(&self) -> theme::winui::Palette {
-        self.appearance.palette()
+        self.appearance.palette(self.prefs.theme)
     }
 
     fn submitting(&self) -> bool {
@@ -822,9 +823,8 @@ impl Component for DesktopApp {
                 docs: HashMap::new(),
                 render_cache: RenderCache::default(),
                 items: Rc::new(Vec::new()),
-                items_revision: 0,
                 expanded: HashSet::new(),
-                end_anchor: ElementRef::new(),
+                hovered: None,
                 composer_ref: ElementRef::new(),
                 pending_local: None,
                 waiting_label: None,
@@ -846,7 +846,7 @@ impl Component for DesktopApp {
             revealed: None,
         };
         // Before the first controls exist (see `app_resources::install`).
-        if let Err(error) = crate::app_resources::install(app.palette().scheme()) {
+        if let Err(error) = crate::app_resources::install(app.palette().roles()) {
             app.status = format!("WinUI M3 resources not applied: {error}");
         }
         if let Ok(data_dir) = app.data_dir.clone() {

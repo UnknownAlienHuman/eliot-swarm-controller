@@ -121,9 +121,14 @@ impl DesktopApp {
     ) -> View {
         let title = self.agent_title(agent);
         let detail = self.chat.detail.as_ref();
-        let tone = detail.map_or(StatusTone::Neutral, |detail| {
-            StatusTone::of_state(detail.state)
-        });
+        // While its detail is read, the sidebar row's state and model stand
+        // in, so opening a task never flashes "Unknown".
+        let row = self.find_agent(agent);
+        let known = detail
+            .map(|detail| detail.state)
+            .or(row.map(|row| row.state));
+        let tone = known.map_or(StatusTone::Neutral, StatusTone::of_state);
+        let state = known.unwrap_or(eliot_core::AgentState::Unknown);
         let note = match &self.chat.live {
             LiveStatus::Stale(_) => "Catching up…",
             LiveStatus::Reconnecting { .. } => "Reconnecting…",
@@ -131,12 +136,18 @@ impl DesktopApp {
             _ => "",
         };
         // The harness and the model the daemon read back (`effective.model`).
-        let runs = detail.map(|detail| {
-            crate::picker::harness_model_label(
-                &detail.harness,
-                detail.settings.effective_model.as_deref(),
-            )
-        });
+        let runs = detail
+            .map(|detail| {
+                crate::picker::harness_model_label(
+                    &detail.harness,
+                    detail.settings.effective_model.as_deref(),
+                )
+            })
+            .or_else(|| {
+                row.map(|row| {
+                    crate::picker::harness_model_label(&row.harness, row.model.as_deref())
+                })
+            });
         let runs_width = runs.as_ref().map_or(0.0, |_| {
             tokens::layout::RUNS_LABEL_WIDTH + tokens::spacing::SM
         });
@@ -182,7 +193,7 @@ impl DesktopApp {
                 items.push(MenuItem::submenu("more", "More", more));
                 m3::icon_button(palette)
                     .automation_name("More actions")
-                    .content(m3::toolbar_icon(m3::glyph::MORE))
+                    .content(m3::icon(m3::glyph::MORE))
                     .menu(Menu::new(
                         items,
                         // Capture-free, so the callback keeps one identity
@@ -195,76 +206,78 @@ impl DesktopApp {
             None => m3::icon_button(palette)
                 .is_enabled(false)
                 .automation_name("More actions")
-                .content(m3::toolbar_icon(m3::glyph::MORE)),
+                .content(m3::icon(m3::glyph::MORE)),
         };
         let details_open = self.panel == Panel::Details;
-        Grid::new()
+        // The status pill: the state in words, then what runs it, and the
+        // live feed's note when it is not following.
+        let mut pill = match state {
+            eliot_core::AgentState::Busy => "Working",
+            eliot_core::AgentState::Idle => "Idle",
+            eliot_core::AgentState::Waiting => "Waiting for you",
+            eliot_core::AgentState::Created | eliot_core::AgentState::Starting => "Starting",
+            eliot_core::AgentState::Stopped => "Stopped",
+            eliot_core::AgentState::Failed => "Failed",
+            eliot_core::AgentState::Lost => "Lost",
+            eliot_core::AgentState::Unknown => "Unknown",
+        }
+        .to_owned();
+        if let Some(runs) = &runs {
+            pill.push_str(&format!(" · {runs}"));
+        }
+        if !note.is_empty() {
+            pill.push_str(&format!(" · {note}"));
+        }
+        let _ = (column, runs_width);
+        // The design's header: a full-width 52-DIP bar on a hairline, the
+        // title at 15/500, the status pill, then Details and More.
+        Border::new()
             .grid_row(0)
-            .columns([
-                GridLength::Auto,
-                GridLength::Auto,
-                GridLength::Auto,
-                GridLength::STAR,
-                GridLength::Auto,
-                GridLength::Auto,
-            ])
-            .column_spacing(tokens::spacing::SM)
-            // On the reading column, so the title starts and the toolbar
-            // ends where the messages and the composer do.
-            .width(column)
-            .max_width(tokens::layout::READING_WIDTH)
-            .horizontal_alignment(HorizontalAlignment::Center)
-            .margin(Thickness::xy(0.0, tokens::spacing::SM))
-            .children((
-                m3::section_title(title.clone())
-                    .max_width(
-                        column.unwrap_or(tokens::layout::READING_WIDTH)
-                            - 2.0 * tokens::height::CONTROL
-                            - 4.0 * tokens::spacing::SM
-                            - tokens::layout::DOT
-                            - runs_width,
-                    )
-                    .vertical_alignment(VerticalAlignment::Center)
-                    .text_trimming(TextTrimming::CharacterEllipsis)
-                    .is_text_selection_enabled(true),
-                Border::new()
-                    .grid_column(1)
-                    .vertical_alignment(VerticalAlignment::Center)
-                    .automation_name(format!(
-                        "State: {}",
-                        eliot_core::api::agent_state_name(
-                            detail.map_or(eliot_core::AgentState::Unknown, |detail| detail.state)
-                        )
-                    ))
-                    .content(m3::dot(palette.header_dot(tone))),
-                StackPanel::new()
-                    .grid_column(2)
-                    .orientation(Orientation::Horizontal)
-                    .spacing(tokens::spacing::SM)
-                    .vertical_alignment(VerticalAlignment::Center)
-                    .children((
-                        runs.map_or_else(View::empty, |runs| {
-                            m3::secondary(runs)
-                                .max_width(tokens::layout::RUNS_LABEL_WIDTH)
-                                .text_trimming(TextTrimming::CharacterEllipsis)
-                                .vertical_alignment(VerticalAlignment::Center)
-                                .into()
-                        }),
-                        m3::secondary(note).vertical_alignment(VerticalAlignment::Center),
-                    )),
-                m3::icon_button(palette)
-                    .grid_column(4)
-                    .automation_name(if details_open {
-                        "Hide details"
-                    } else {
-                        "Show details"
-                    })
-                    .on_click(
-                        context.message(Message::Shell(ShellMsg::PanelToggled(Panel::Details))),
-                    )
-                    .content(m3::toolbar_icon(m3::glyph::INFO)),
-                Border::new().grid_column(5).content(menu),
+            .height(tokens::height::HEADER)
+            .border_brush(palette.outline())
+            .border_thickness(Thickness::new(0.0, 0.0, 0.0, tokens::layout::HAIRLINE))
+            .padding(Thickness::new(
+                tokens::spacing::LG,
+                0.0,
+                tokens::spacing::MD,
+                0.0,
             ))
+            .content(
+                Grid::new()
+                    .columns([GridLength::Auto, GridLength::Auto, GridLength::STAR])
+                    .column_spacing(tokens::spacing::ROW)
+                    .children((
+                        m3::section_title(title.clone())
+                            .max_width(tokens::layout::READING_WIDTH)
+                            .vertical_alignment(VerticalAlignment::Center)
+                            .text_trimming(TextTrimming::CharacterEllipsis)
+                            .is_text_selection_enabled(true),
+                        Border::new()
+                            .grid_column(1)
+                            .vertical_alignment(VerticalAlignment::Center)
+                            .content(m3::status_pill(palette, tone, &pill)),
+                        // Details and More, 2 DIPs apart at the right end.
+                        StackPanel::new()
+                            .grid_column(2)
+                            .orientation(Orientation::Horizontal)
+                            .spacing(tokens::spacing::ROW_GAP)
+                            .horizontal_alignment(HorizontalAlignment::Right)
+                            .vertical_alignment(VerticalAlignment::Center)
+                            .children((
+                                m3::icon_button(palette)
+                                    .automation_name(if details_open {
+                                        "Hide details"
+                                    } else {
+                                        "Show details"
+                                    })
+                                    .on_click(context.message(Message::Shell(
+                                        ShellMsg::PanelToggled(Panel::Details),
+                                    )))
+                                    .content(m3::icon(m3::glyph::INFO)),
+                                menu,
+                            )),
+                    )),
+            )
     }
 
     /// The Force stop question above the composer, bound to the Agent and
@@ -284,7 +297,7 @@ impl DesktopApp {
             .max_width(tokens::layout::READING_WIDTH)
             .horizontal_alignment(HorizontalAlignment::Center)
             .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
-            .background(palette.error_container())
+            .background(palette.attention_container())
             .corner_radius(tokens::radius::CONTAINER)
             .padding(Thickness::uniform(tokens::spacing::MD))
             .content(
@@ -297,7 +310,7 @@ impl DesktopApp {
                             .vertical_alignment(VerticalAlignment::Center)
                             .children((
                                 m3::section_title(format!("Force stop {title}?"))
-                                    .foreground(palette.on_error_container())
+                                    .foreground(palette.attention())
                                     .text_trimming(TextTrimming::CharacterEllipsis),
                                 m3::text(
                                     format!(
@@ -306,7 +319,7 @@ impl DesktopApp {
                                     ),
                                     tokens::text::SECONDARY,
                                 )
-                                .foreground(palette.on_error_container())
+                                .foreground(palette.attention())
                                 .text_wrapping(TextWrapping::Wrap),
                             )),
                         StackPanel::new()
@@ -315,7 +328,7 @@ impl DesktopApp {
                             .spacing(tokens::spacing::SM)
                             .vertical_alignment(VerticalAlignment::Center)
                             .children((
-                                m3::error_text_button(palette)
+                                m3::destructive(palette)
                                     .automation_name("Cancel force stop")
                                     .on_click(context.message(Message::Chat(
                                         ChatMsg::ForceStopAnswered(false),

@@ -23,6 +23,9 @@ const MANAGE_GROUP_ROWS: usize = 150;
 /// requests and the notice row, down to the composer.
 pub(super) const POPOVER_ROWS: i32 = 4;
 
+/// A popover starts this much smaller and settles to its size.
+const ENTRANCE_SCALE: f64 = 0.97;
+
 impl DesktopApp {
     /// A new task composer's first row, inside its card (Codex's): the
     /// project selector as a borderless chip, and the folder field for a
@@ -45,16 +48,17 @@ impl DesktopApp {
         } else {
             m3::glyph::FOLDER
         };
-        let chip = m3::text_chip(palette)
+        let chip = m3::chip(palette)
             .automation_name(format!(
                 "Project: {label} ({})",
                 if open { "list open" } else { "choose" }
             ))
             .on_click(context.message(Message::Launch(LaunchMsg::Toggle(Pop::Project))))
-            .content(chip_content(
-                glyph,
+            .content(m3::chip_content(
+                Some(glyph),
                 &label,
-                Some(tokens::layout::PROJECT_CHIP_WIDTH),
+                true,
+                tokens::layout::PROJECT_CHIP_WIDTH,
             ));
         let folder: View = if !self.launch.chat
             && (self.launch.custom_workspace || self.nav.projects.is_empty())
@@ -72,10 +76,42 @@ impl DesktopApp {
         } else {
             View::empty()
         };
+        // The design's second chip: where the task works.
+        let worktree: View = match self.worktree_chip() {
+            launch_ui::WorktreeChip::Hidden => View::empty(),
+            launch_ui::WorktreeChip::Fixed => m3::fixed_chip(
+                palette,
+                false,
+                Some(m3::glyph::WORKTREE),
+                "New worktree",
+                "New worktree: this project starts each task in its own worktree",
+            )
+            .tooltip("This project starts each task in its own worktree."),
+            launch_ui::WorktreeChip::Toggle(on) => {
+                // Keyed by state: a chip's colors apply when it is created.
+                Grid::new().keyed_children(vec![KeyedView::new(
+                    format!("worktree:{on}"),
+                    m3::chip(palette)
+                        .resource_overrides(palette.toggle_chip(on))
+                        .automation_name(if on {
+                            "New worktree (on): the task works in a new worktree"
+                        } else {
+                            "New worktree (off): the task works in this folder"
+                        })
+                        .on_click(context.message(Message::Launch(LaunchMsg::WorktreeToggled)))
+                        .content(m3::chip_content(
+                            Some(m3::glyph::WORKTREE),
+                            "New worktree",
+                            false,
+                            tokens::layout::PROJECT_CHIP_WIDTH,
+                        )),
+                )])
+            }
+        };
         StackPanel::new()
             .orientation(Orientation::Horizontal)
-            .spacing(tokens::spacing::SM)
-            .children((chip, folder))
+            .spacing(6.0)
+            .children((chip, worktree, folder))
     }
 
     /// The composer's bottom-left chips for a new task: the model chip
@@ -95,7 +131,12 @@ impl DesktopApp {
                 self.launch.choice.chip_name(auto_profile)
             ))
             .on_click(context.message(Message::Launch(LaunchMsg::Toggle(Pop::Model))))
-            .content(chip_content(glyph, &label, None));
+            .content(m3::chip_content(
+                Some(glyph),
+                &label,
+                true,
+                tokens::layout::PROJECT_CHIP_WIDTH,
+            ));
         let access: View = match &self.launch.choice {
             Choice::Model(_) => {
                 let access = self.launch.access();
@@ -104,35 +145,48 @@ impl DesktopApp {
                 Grid::new().keyed_children(vec![KeyedView::new(
                     format!("access:{}", access.wire()),
                     if full {
-                        m3::warning_text_chip(palette)
+                        m3::attention_chip(palette)
                     } else {
-                        m3::text_chip(palette)
+                        m3::chip(palette)
                     }
                     .automation_name(format!("Access: {}", access.label()))
                     .on_click(context.message(Message::Launch(LaunchMsg::Toggle(Pop::Access))))
-                    .content(chip_content(
-                        access_glyph(access),
+                    .content(m3::chip_content(
+                        Some(access_glyph(access)),
                         access.label(),
-                        None,
+                        false,
+                        tokens::layout::PROJECT_CHIP_WIDTH,
                     )),
                 )])
             }
-            // A preset (or Auto's pick) carries its own permissions.
-            _ => m3::meta(
-                m3::glyph::SHIELD,
-                &match self.launch.profile() {
-                    Some(profile) => format!(
-                        "{} (preset)",
-                        launch_ui::access_label(profile.permissions.as_deref())
-                    ),
+            // A preset (or Auto's pick) carries its own permissions: an
+            // outlined chip that is not a control (Full access in the
+            // attention tone, as the design shows it).
+            _ => {
+                let permissions = self
+                    .launch
+                    .profile()
+                    .and_then(|profile| profile.permissions.as_deref());
+                let label = match self.launch.profile() {
+                    Some(_) => launch_ui::access_label(permissions),
                     None => "Access from the preset".to_owned(),
-                },
-            ),
+                };
+                let full = permissions == Some("danger-full-access");
+                m3::fixed_chip(
+                    palette,
+                    full,
+                    Some(m3::glyph::SHIELD),
+                    &label,
+                    &format!("Access: {label}, set by the preset"),
+                )
+                .tooltip("Set by the preset.")
+            }
         };
+        // The design: the access chip, then the model chip.
         StackPanel::new()
             .orientation(Orientation::Horizontal)
-            .spacing(tokens::spacing::SM)
-            .children((model, access))
+            .spacing(6.0)
+            .children((access, model))
     }
 
     /// The open popover in the reading column right above the composer
@@ -160,6 +214,11 @@ impl DesktopApp {
             Pop::Effort => self.effort_popover(context, palette),
             Pop::Usage => self.usage_popover(context, palette),
         };
+        // The design's entrance: a fade with the popover settling into
+        // place (Reactor's transitions take a duration only; the scale from
+        // its bottom stands in for the 4-DIP rise).
+        let entering = self.launch.entering;
+        let entrance = std::time::Duration::from_millis(tokens::motion::POPOVER_MS);
         Border::new()
             .grid_row(1)
             .grid_row_span(POPOVER_ROWS)
@@ -167,6 +226,10 @@ impl DesktopApp {
             .width(column)
             .max_width(tokens::layout::READING_WIDTH)
             .horizontal_alignment(HorizontalAlignment::Center)
+            .opacity(if entering { 0.0 } else { 1.0 })
+            .opacity_transition(Some(entrance))
+            .scale(Some(if entering { ENTRANCE_SCALE } else { 1.0 }))
+            .scale_transition(Some(entrance))
             .content(content)
     }
 
@@ -249,7 +312,7 @@ impl DesktopApp {
                         ))
                         .children((
                             m3::secondary(text.clone())
-                                .foreground(palette.error())
+                                .foreground(palette.attention())
                                 .vertical_alignment(VerticalAlignment::Center)
                                 .text_wrapping(TextWrapping::Wrap),
                             m3::text_button(palette)
@@ -304,7 +367,7 @@ impl DesktopApp {
             .height(tokens::height::CONTROL)
             .automation_name("Manage models")
             .on_click(context.message(Message::Launch(LaunchMsg::ManageOpened)))
-            .content(m3::toolbar_icon(m3::glyph::SLIDERS))
+            .content(m3::icon(m3::glyph::SLIDERS))
             .tooltip("Manage models");
         let search = Grid::new()
             .columns([GridLength::STAR, GridLength::Auto])
@@ -316,6 +379,7 @@ impl DesktopApp {
             .automation_name("Models")
             .content(StackPanel::new().keyed_children(items));
         m3::lifted(
+            palette,
             crate::theme::elevation::Level::Two,
             tokens::radius::CONTAINER,
             Grid::new()
@@ -469,7 +533,7 @@ impl DesktopApp {
             Border::new()
                 .height(tokens::height::CHIP)
                 .corner_radius(tokens::height::CHIP / 2.0)
-                .background(palette.well())
+                .background(palette.container())
                 .vertical_alignment(VerticalAlignment::Center)
                 .content(
                     StackPanel::new()
@@ -485,7 +549,7 @@ impl DesktopApp {
             Border::new()
                 .height(tokens::height::CHIP)
                 .corner_radius(tokens::height::CHIP / 2.0)
-                .background(palette.well())
+                .background(palette.container())
                 .vertical_alignment(VerticalAlignment::Center)
                 .content(chip_text(label, &name).opacity(theme::MUTED_OPACITY))
         } else {
@@ -505,7 +569,7 @@ impl DesktopApp {
                 .on_click(
                     context.message(Message::Launch(LaunchMsg::PickerFavorite(item.key.clone()))),
                 )
-                .content(m3::toolbar_icon(glyph))
+                .content(m3::icon(glyph))
         } else {
             View::empty()
         };
@@ -525,7 +589,7 @@ impl DesktopApp {
         Border::new()
             .corner_radius(tokens::radius::PILL)
             .background(if highlighted {
-                palette.highlight()
+                palette.selected()
             } else {
                 Brush::Solid(Color::transparent())
             })
@@ -564,8 +628,8 @@ impl DesktopApp {
                 .text_wrapping(TextWrapping::Wrap);
             let (title, description) = if warn {
                 (
-                    title.foreground(palette.warning()),
-                    description.foreground(palette.warning()),
+                    title.foreground(palette.attention()),
+                    description.foreground(palette.attention()),
                 )
             } else {
                 (title, description)
@@ -574,7 +638,7 @@ impl DesktopApp {
             let icon = m3::icon(access_glyph(access));
             let row = Button::new()
                 .resource_overrides(if warn {
-                    palette.warning_row()
+                    palette.attention_row()
                 } else {
                     palette.row(false)
                 })
@@ -620,7 +684,7 @@ impl DesktopApp {
                 Border::new()
                     .corner_radius(tokens::radius::PILL)
                     .background(if highlighted {
-                        palette.highlight()
+                        palette.selected()
                     } else {
                         Brush::Solid(Color::transparent())
                     })
@@ -631,6 +695,7 @@ impl DesktopApp {
             ));
         }
         m3::lifted(
+            palette,
             crate::theme::elevation::Level::Two,
             tokens::radius::CONTAINER,
             Grid::new()
@@ -668,7 +733,7 @@ impl DesktopApp {
                     Border::new()
                         .corner_radius(tokens::radius::PILL)
                         .background(if highlighted {
-                            palette.highlight()
+                            palette.selected()
                         } else {
                             Brush::Solid(Color::transparent())
                         })
@@ -701,6 +766,7 @@ impl DesktopApp {
                 context.callback(|text| Message::Launch(LaunchMsg::ProjectQuery(text))),
             );
         m3::lifted(
+            palette,
             crate::theme::elevation::Level::Two,
             tokens::radius::CONTAINER,
             Grid::new()
@@ -843,7 +909,7 @@ impl DesktopApp {
                     .vertical_alignment(VerticalAlignment::Top)
                     .automation_name("Back to the model selector")
                     .on_click(context.message(Message::Launch(LaunchMsg::ManageClosed)))
-                    .content(m3::toolbar_icon(m3::glyph::BACK)),
+                    .content(m3::icon(m3::glyph::BACK)),
                 StackPanel::new().grid_column(1).children((
                     m3::section_title("Manage models"),
                     m3::secondary("Customize which models appear in the model selector"),
@@ -858,6 +924,7 @@ impl DesktopApp {
                 context.callback(|text| Message::Launch(LaunchMsg::ManageQuery(text))),
             );
         m3::lifted(
+            palette,
             crate::theme::elevation::Level::Two,
             tokens::radius::CONTAINER,
             Grid::new()
@@ -961,26 +1028,6 @@ fn group_heading(
                     },
                 )),
         )
-}
-
-/// A chip's content: its icon, label (trimmed past `max_width`) and the ▾
-/// that says it opens.
-fn chip_content(glyph: &str, label: &str, max_width: Option<f64>) -> View {
-    let label = TextBlock::new()
-        .text(label.to_owned())
-        .vertical_alignment(VerticalAlignment::Center)
-        .text_trimming(TextTrimming::CharacterEllipsis);
-    StackPanel::new()
-        .orientation(Orientation::Horizontal)
-        .spacing(tokens::spacing::SM)
-        .children((
-            m3::icon(glyph),
-            match max_width {
-                Some(width) => label.max_width(width),
-                None => label,
-            },
-            m3::dropdown_chevron(),
-        ))
 }
 
 /// The label of a picker row's effort chip or segment: the short effort in

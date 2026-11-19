@@ -38,7 +38,7 @@ impl DesktopApp {
         } else if history.is_empty() {
             m3::secondary("No settings changes recorded yet.").into()
         } else {
-            m3::group(palette, history)
+            m3::settings_card(palette, history)
         };
         let restart = if self.settings.restart_required.is_empty() {
             "Every section applies without a restart.".to_owned()
@@ -57,7 +57,7 @@ impl DesktopApp {
         StackPanel::new()
             .spacing(tokens::spacing::MD)
             .children((
-                m3::group(
+                m3::settings_card(
                     palette,
                     vec![
                         KeyedView::new(

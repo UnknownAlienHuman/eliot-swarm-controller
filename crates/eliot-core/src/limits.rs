@@ -9,6 +9,9 @@ pub const MAX_TEXT_BYTES: usize = 512 * 1024;
 pub const MAX_EVENT_BYTES: usize = 64 * 1024;
 pub const MAX_CREDENTIAL_BYTES: usize = 4 * 1024;
 pub const MAX_COMMAND_ID_BYTES: usize = 256;
+/// A tool's command text on its `tool.started` fact (`command`), after
+/// secret redaction: enough for the line a transcript shows.
+pub const MAX_TOOL_COMMAND_BYTES: usize = 1024;
 
 pub const MAX_DISCOVER_PAGE_ENTRIES: usize = 1_000;
 pub const MAX_DISCOVER_PAGE_BYTES: usize = 900 * 1024;

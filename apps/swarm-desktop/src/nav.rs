@@ -11,8 +11,7 @@
 //! direct-children page, when that read returns.
 //!
 //! The sidebar's projects are the daemon's `chat.organization` groups
-//! (#657 G): a registered project with its manager, the manager's standard
-//! worktree branch, competing roots and the exact server totals, then the
+//! (#657 G): each registered project with its tasks, then the
 //! no-project bucket (unattached chats and Agents whose execution label is
 //! not a registration, such as legacy `wt-*` folders). Every listed row
 //! carries the group the daemon placed it in (`AgentSummary::organization`),
@@ -30,7 +29,6 @@ use std::collections::{HashMap, HashSet};
 
 use eliot_core::api::{
     AgentSummary, LaunchIntentState, LaunchQueueView, LaunchWaitReason, OrgGroupView, OrgRowChange,
-    ProjectAssignmentState, ProjectManagerIdentity,
 };
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
@@ -570,16 +568,12 @@ pub struct Section {
     /// Where a new task in it starts: the registered checkout.
     pub checkout: String,
     pub checkouts: Vec<String>,
-    /// The header's lines: the team (manager, its branch, assignment and
-    /// transfer state, or "Needs assignment"), competing roots, and the
-    /// exact server totals ([`group_detail`]).
-    pub detail: Vec<String>,
     /// Queued launches and automation waits with their reasons ([`waits`]).
     pub waits: Vec<String>,
     /// Visible task rows, newest work first.
     pub rows: Vec<Row>,
-    /// Busy now by the server's team totals, as returned; 0 without a
-    /// team readback.
+    /// Its tasks working now, counted over the listed rows' live states
+    /// (so the count moves with each state event, not with a team read).
     pub running: usize,
     /// Whether the project is collapsed (it then has no rows).
     pub collapsed: bool,
@@ -612,7 +606,9 @@ pub struct Shown<'a> {
     pub only: Option<&'a dyn Fn(&UiAgent) -> bool>,
     /// The open Agent: it renders explicitly above the list, so sections
     /// skip its rows (no duplicate, no folding, no "Show N older" count).
-    pub pinned: Option<&'a str>,
+    /// The open Agent: it stays in view inside its own project (never
+    /// folded under Show older, never hoisted out).
+    pub open: Option<&'a str>,
 }
 
 struct Group<'a> {
@@ -681,132 +677,6 @@ fn group_place(
             false,
         ),
     }
-}
-
-/// Most competing roots a header names before "+N".
-const ROOTS_NAMED: usize = 3;
-
-/// A header's lines, from the server alone: the team line (the assigned
-/// manager with its state and standard worktree branch, a remote manager,
-/// "Needs assignment" or "No manager", plus a starting or blocked
-/// assignment and an open transfer), the competing roots, and the exact
-/// totals of the same `chat.organization` group: its member total, each
-/// lifecycle count under its own word as returned, queued, unknown and the
-/// project slot use.
-pub fn group_detail(group: &OrgGroupView, checkouts: &[Checkout]) -> Vec<String> {
-    let mut lines = Vec::new();
-    if group.registration.is_some() {
-        let assignment = group.assignment.as_ref();
-        let mut team = match (&group.manager, assignment.and_then(|a| a.manager.as_ref())) {
-            (Some(manager), _) => {
-                let mut line = format!(
-                    "Manager {} · {}",
-                    manager.agent,
-                    eliot_core::api::agent_state_name(manager.state)
-                );
-                let workspace = manager
-                    .workspace
-                    .as_deref()
-                    .or_else(|| assignment.and_then(|a| a.workspace.as_deref()));
-                if let Some(place) = workspace
-                    .map(|path| worktree_branch(path, manager.branch.as_deref(), checkouts))
-                {
-                    line.push_str(" · ");
-                    line.push_str(&place);
-                }
-                line
-            }
-            (None, Some(ProjectManagerIdentity::Remote { instance, .. })) => {
-                format!("Remote manager {instance}")
-            }
-            _ if group.needs_assignment => "Needs assignment".to_owned(),
-            _ => NO_MANAGER.to_owned(),
-        };
-        match assignment.map(|assignment| assignment.state) {
-            Some(ProjectAssignmentState::Starting) => team.push_str(" · starting"),
-            Some(ProjectAssignmentState::Blocked) => team.push_str(" · blocked"),
-            _ => {}
-        }
-        if group.transfer.is_some() {
-            team.push_str(" · transfer in progress");
-        }
-        lines.push(team);
-        if !group.conflicting_roots.is_empty() {
-            let named: Vec<&str> = group
-                .conflicting_roots
-                .iter()
-                .take(ROOTS_NAMED)
-                .map(String::as_str)
-                .collect();
-            let rest = group.conflicting_roots.len() - named.len();
-            let mut line = format!(
-                "{}: {}",
-                if group.conflicting_roots.len() == 1 {
-                    "Competing root"
-                } else {
-                    "Competing roots"
-                },
-                named.join(", ")
-            );
-            if rest > 0 {
-                line.push_str(&format!(" +{rest}"));
-            }
-            lines.push(line);
-        }
-    }
-    let mut totals = vec![eliot_core::count_words(
-        group.member_total as u64,
-        "task",
-        "tasks",
-    )];
-    if let Some(team) = &group.totals {
-        let lifecycle = &team.lifecycle;
-        for (count, words) in [
-            (team.live, "live"),
-            (lifecycle.idle, "idle"),
-            (lifecycle.busy, "busy"),
-            (lifecycle.waiting, "waiting"),
-            (lifecycle.starting, "starting"),
-            (lifecycle.stopping, "stopping"),
-            (team.queued, "queued"),
-            (team.retained_unknown, "unknown"),
-        ] {
-            if count > 0 {
-                totals.push(format!("{count} {words}"));
-            }
-        }
-    }
-    if let Some(capacity) = &group.capacity
-        && let Some(limit) = capacity.limit
-    {
-        totals.push(format!("{}/{limit} slots", capacity.usage));
-    }
-    let totals = totals.join(" · ");
-    // A vacant project with no roots says so on one line.
-    match lines.as_slice() {
-        [team] if team == NO_MANAGER => lines = vec![format!("{NO_MANAGER} · {totals}")],
-        _ => lines.push(totals),
-    }
-    lines
-}
-
-/// The team line of a registered project without a manager or roots.
-const NO_MANAGER: &str = "No manager";
-
-/// A manager workspace as the header names it: the branch of its managed
-/// worktree (the manager readback's `branch`), else of its verified
-/// checkout (`project.list`), else its folder.
-fn worktree_branch(workspace: &str, branch: Option<&str>, checkouts: &[Checkout]) -> String {
-    let path = path_key(workspace);
-    branch
-        .map(str::to_owned)
-        .or_else(|| {
-            checkouts
-                .iter()
-                .find(|checkout| path_key(&checkout.path) == path)
-                .and_then(|checkout| checkout.branch.clone())
-        })
-        .unwrap_or_else(|| folder_name(workspace).to_owned())
 }
 
 /// The waits of one group, from `launch.queue` plus this window's watched
@@ -929,9 +799,6 @@ pub fn sections(
         .collect();
     let section = |project: Option<&str>, group: Option<&OrgGroupView>| {
         let (name, checkout, missing) = group_place(project, group, checkouts);
-        let running = group
-            .and_then(|group| group.totals.as_ref())
-            .map_or(0, |team| team.lifecycle.busy);
         Section {
             key: group_key(project),
             project: project.map(str::to_owned),
@@ -942,7 +809,6 @@ pub fn sections(
                 vec![checkout.clone()]
             },
             checkout,
-            detail: group.map_or_else(Vec::new, |group| group_detail(group, checkouts)),
             waits: waits(
                 organization.queue.as_ref(),
                 &organization.intents,
@@ -950,7 +816,7 @@ pub fn sections(
                 &registered,
             ),
             rows: Vec::new(),
-            running,
+            running: 0,
             collapsed: false,
             older: 0,
             older_shown: false,
@@ -1037,9 +903,7 @@ pub fn sections(
             continue;
         };
         // A native observed child shows only nested under its parent
-        // conversation (collapsed), never as a task of its own. The open
-        // Agent renders explicitly above the list.
-        let pinned = shown.pinned == Some(agent.id.as_str());
+        // conversation (collapsed), never as a task of its own.
         let shows = match shown.only {
             Some(keep) => keep(agent) && !agent.native_child,
             None => {
@@ -1050,15 +914,26 @@ pub fn sections(
                         .is_none_or(|parent| placements.get(parent) != Some(key))
             }
         };
-        if shows && !pinned {
+        if shows {
             group.top.push(agent);
         }
     }
 
+    // Working now, per group, from the listed rows' live states.
+    let mut running: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for agent in listed.iter().filter(|agent| agent.running()) {
+        running
+            .entry(placements[agent.id.as_str()].as_str())
+            .or_default()
+            .insert(agent.id.as_str());
+    }
     let filtered = shown.only.is_some();
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for mut group in groups {
+        group.section.running = running
+            .get(group.section.key.as_str())
+            .map_or(0, HashSet::len);
         if filtered && group.top.is_empty() {
             continue;
         }
@@ -1080,7 +955,8 @@ pub fn sections(
             folding(&group.top, shown.today_start, true)
         };
         for agent in &group.top {
-            if folds.contains(agent.id.as_str()) && !unfolded {
+            let open = shown.open == Some(agent.id.as_str());
+            if folds.contains(agent.id.as_str()) && !unfolded && !open {
                 continue;
             }
             push(
@@ -1098,6 +974,17 @@ pub fn sections(
         out.push(group.section);
     }
     out
+}
+
+/// A short age for a quiet task's row: "now", "5m", "2h", "3d".
+pub fn short_age(now_ms: i64, at_ms: i64) -> String {
+    let seconds = (now_ms - at_ms).max(0) / 1000;
+    match seconds {
+        0..60 => "now".to_owned(),
+        60..3_600 => format!("{}m", seconds / 60),
+        3_600..86_400 => format!("{}h", seconds / 3_600),
+        _ => format!("{}d", seconds / 86_400),
+    }
 }
 
 /// Apply `organization.changed` rows to the loaded Agents (the list and
@@ -1279,20 +1166,6 @@ pub fn recents<'a>(
     });
     recent.truncate(limit);
     recent
-}
-
-/// The sidebar's Recents: the newest tasks of collapsed projects (their
-/// group keys in `collapsed`), the ones the list above hides. Tasks folded
-/// under "Show N older" stay there, so Recents never repeats the list or
-/// brings back old runs.
-pub fn sidebar_recents<'a>(
-    agents: &'a [UiAgent],
-    collapsed: &HashSet<&str>,
-    limit: usize,
-) -> Vec<&'a UiAgent> {
-    recents(agents, limit, &|agent: &UiAgent| {
-        collapsed.contains(group_key(agent.organization.as_deref()).as_str())
-    })
 }
 
 /// The tag editor's fields as the tag set, one tag per field: each field
@@ -1606,10 +1479,6 @@ fn push(
     });
     if is_expanded {
         for child in children {
-            // The open Agent renders explicitly above the list.
-            if shown.pinned == Some(child.id.as_str()) {
-                continue;
-            }
             push(child, depth + 1, listed, shown, tree, seen, out);
         }
     }

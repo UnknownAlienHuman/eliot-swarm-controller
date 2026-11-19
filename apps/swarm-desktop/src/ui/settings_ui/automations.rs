@@ -10,9 +10,6 @@ use super::super::automation_ui::{
 };
 use super::*;
 
-/// The label column of a card's path lines.
-const PATH_LABEL_WIDTH: f64 = 96.0;
-
 impl DesktopApp {
     pub(super) fn automation_section(
         &self,
@@ -325,7 +322,7 @@ impl DesktopApp {
             parts.push(KeyedView::new(
                 format!("note:{}", namespace.label),
                 m3::secondary(note)
-                    .foreground(palette.error())
+                    .foreground(palette.attention())
                     .text_wrapping(TextWrapping::Wrap)
                     .is_text_selection_enabled(true),
             ));
@@ -376,7 +373,7 @@ impl DesktopApp {
             lines.push(KeyedView::new(
                 "reason",
                 m3::secondary(reason.to_owned())
-                    .foreground(palette.error())
+                    .foreground(palette.attention())
                     .text_wrapping(TextWrapping::Wrap)
                     .is_text_selection_enabled(true),
             ));
@@ -388,7 +385,10 @@ impl DesktopApp {
             lines.push(KeyedView::new(
                 format!("path:{label}"),
                 Grid::new()
-                    .columns([GridLength::Pixel(PATH_LABEL_WIDTH), GridLength::STAR])
+                    .columns([
+                        GridLength::Pixel(tokens::layout::PATH_LABEL_WIDTH),
+                        GridLength::STAR,
+                    ])
                     .children((
                         m3::secondary(label.to_string())
                             .vertical_alignment(VerticalAlignment::Center),
@@ -485,7 +485,7 @@ impl DesktopApp {
             lines.push(KeyedView::new(
                 "run-line",
                 if line.error {
-                    text.foreground(palette.error())
+                    text.foreground(palette.attention())
                 } else {
                     text
                 },
@@ -660,7 +660,7 @@ impl DesktopApp {
             rows.push(KeyedView::new(
                 "error",
                 m3::body(error.clone())
-                    .foreground(palette.error())
+                    .foreground(palette.attention())
                     .text_wrapping(TextWrapping::Wrap),
             ));
         }
@@ -708,7 +708,7 @@ impl DesktopApp {
                 .orientation(Orientation::Horizontal)
                 .spacing(tokens::spacing::SM)
                 .margin(Thickness::new(
-                    tokens::layout::LABEL_WIDTH + tokens::spacing::SM,
+                    tokens::layout::FIELD_INDENT,
                     tokens::spacing::XS,
                     0.0,
                     0.0,

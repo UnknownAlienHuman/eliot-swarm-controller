@@ -61,35 +61,17 @@ impl DesktopApp {
     ) -> View {
         let agent = self.selected_agent_id();
         let detail = self.chat.detail.as_ref();
-        // The first row: a new task's project chip (its own inset lines its
-        // icon up with the chips below), or the open Agent's read-only
-        // context (inset to where the chips' icons start).
-        let (context_row, chips): (Option<View>, View) = match (agent.as_deref(), detail) {
-            (None, _) => (
-                Some(self.composer_project_row(context, palette)),
-                self.composer_chips(context, palette),
-            ),
-            (Some(_), Some(detail)) => (
-                Some(
-                    Border::new()
-                        .margin(Thickness::new(
-                            tokens::spacing::INSET,
-                            tokens::spacing::XS,
-                            0.0,
-                            0.0,
-                        ))
-                        .content(self.agent_context(detail, palette)),
-                ),
-                self.model_chip(detail, context, palette),
-            ),
-            (Some(_), None) => (None, View::empty()),
-        };
-        let placeholder = match detail.filter(|_| agent.is_some()) {
-            None if agent.is_none() => "Describe a task…",
+        let home = agent.is_none();
+        let running =
+            detail.is_some_and(|detail| detail.active_turn.is_some() && !detail.observe_only);
+        let reading = self.reading_row();
+        let placeholder = match detail.filter(|_| !home) {
+            None if home => "Ask Eliot Swarm to do anything",
             Some(detail) if resumable(detail) => "Type a message to resume and continue…",
+            None if reading == Some(RowMode::Resume) => "Type a message to resume and continue…",
+            _ if running || reading == Some(RowMode::Running) => "Type to steer the running turn",
             _ => "Send a follow-up",
         };
-        let first = usize::from(context_row.is_some());
         let field = TextBox::new()
             .element_ref(&self.chat.composer_ref)
             .text(self.primed(&self.composer_text()).to_owned())
@@ -99,102 +81,112 @@ impl DesktopApp {
             .border_thickness(Thickness::uniform(0.0))
             .accepts_return(true)
             .text_wrapping(TextWrapping::Wrap)
-            .min_height(tokens::height::CONTROL)
+            .min_height(tokens::layout::COMPOSER_MIN_HEIGHT)
             .max_height(tokens::layout::COMPOSER_MAX_HEIGHT)
             .on_text_changed(
                 context.callback(|value| Message::Chat(ChatMsg::ComposerChanged(value))),
             );
-        // WinUI's TextBox handles its own presses and Reactor 0.100.0 has no
-        // focus events: around it, only where the pointer is reaches the
-        // window. The pointer hook reports a press while it is over the
-        // field, which closes an open popover (`shortcuts`).
-        let field = Border::new()
-            .grid_row(first as i32)
-            // Its text starts where the chips' icons do: the chips' content
-            // inset less WinUI's own left text padding.
-            .margin(Thickness::new(
-                tokens::spacing::INSET - WINUI_TEXT_PADDING,
-                0.0,
-                0.0,
-                0.0,
-            ))
-            .on_pointer_entered(context.callback(|info: PointerEventInfo| {
-                Message::Launch(LaunchMsg::ComposerPointer {
-                    over: true,
-                    pressed: info.is_left_button_pressed
-                        || info.is_right_button_pressed
-                        || info.is_middle_button_pressed,
-                })
-            }))
-            .on_pointer_exited(context.callback(|_: PointerEventInfo| {
-                Message::Launch(LaunchMsg::ComposerPointer {
-                    over: false,
-                    pressed: false,
-                })
-            }))
-            .content(field);
-        let actions = self.composer_actions(agent, context, palette);
+        // WinUI's text box insets its text: the margin starts the text at
+        // the card's 16-DIP inset, where the chips start.
+        let mut field_cells = vec![KeyedView::new(
+            "field",
+            Border::new()
+                .margin(Thickness::new(-WINUI_TEXT_PADDING, 0.0, 0.0, 0.0))
+                .content(field),
+        )];
+        // A click into the field closes an open popover. WinUI's text box
+        // keeps its presses and its mouse input never reaches the window's
+        // hooks (observed live), so while a popover is open a clear layer
+        // over the field takes the press, closes it and focuses the field.
+        if self.launch.open.is_some() && self.launch.preset.is_none() {
+            field_cells.push(KeyedView::new(
+                "dismiss",
+                Border::new()
+                    .background(Brush::Solid(Color::transparent()))
+                    .on_pointer_pressed(context.callback(|_: PointerEventInfo| {
+                        Message::Launch(LaunchMsg::ComposerPointer {
+                            over: true,
+                            pressed: true,
+                        })
+                    })),
+            ));
+        }
+        let field = Grid::new().keyed_children(field_cells);
+        let chips: View = match (agent.as_deref(), detail) {
+            (None, _) => self.composer_chips(context, palette),
+            (Some(_), Some(detail)) => self.model_chip(detail, context, palette),
+            (Some(_), None) => View::empty(),
+        };
+        // The design: + (attach files), then the chips, 6 DIPs apart.
+        let chips = StackPanel::new()
+            .orientation(Orientation::Horizontal)
+            .spacing(6.0)
+            .children((
+                m3::icon_button(palette)
+                    .automation_name("Attach files")
+                    .on_click(context.message(Message::Launch(LaunchMsg::AttachRequested)))
+                    .content(m3::icon(m3::glyph::NEW_TASK))
+                    .tooltip("Attach files"),
+                chips,
+            ));
         let bottom = Grid::new()
-            .grid_row(first as i32 + 1)
             .columns([GridLength::STAR, GridLength::Auto])
             .column_spacing(tokens::spacing::SM)
             .children((
                 Border::new()
                     .vertical_alignment(VerticalAlignment::Center)
                     .content(chips),
-                Border::new().grid_column(1).content(actions),
+                Border::new()
+                    .grid_column(1)
+                    .content(self.composer_actions(agent, context, palette)),
             ));
-        // Rows only for what is shown: an empty row would still take the gap.
-        let rows = vec![GridLength::Auto; first + 2];
-        let card = Border::new()
-            // The composer: surface-container-high, its own 16-DIP corner.
-            .background(palette.raised())
-            .corner_radius(tokens::radius::COMPOSER)
-            .padding(Thickness::uniform(tokens::spacing::SM))
-            .content(
-                Grid::new()
-                    .rows(rows)
-                    .row_spacing(tokens::spacing::SM)
-                    .children((context_row.unwrap_or_else(View::empty), field, bottom)),
-            );
+        // Home: the project and worktree chips above the field; attached
+        // files as chips over it.
+        let mut rows: Vec<KeyedView> = Vec::new();
+        if home {
+            rows.push(KeyedView::new(
+                "project",
+                self.composer_project_row(context, palette),
+            ));
+        }
+        let attached = self.attached_to(&self.composer_target()).to_vec();
+        if !attached.is_empty() {
+            rows.push(KeyedView::new(
+                format!("attached:{}", attached.len()),
+                attachment_chips(&attached, context, palette),
+            ));
+        }
+        rows.push(KeyedView::new("field", field));
+        rows.push(KeyedView::new("bottom", bottom));
+        let width = if home {
+            tokens::layout::HOME_WIDTH
+        } else {
+            tokens::layout::READING_WIDTH
+        };
+        // Home's composer takes the home column (760), a conversation's
+        // its reading column (720).
+        let column = if home {
+            self.column_width(width)
+        } else {
+            column
+        };
         Border::new()
             .grid_row(5)
             .width(column)
-            .max_width(tokens::layout::READING_WIDTH)
+            .max_width(width)
             .horizontal_alignment(HorizontalAlignment::Center)
             .margin(Thickness::new(
                 0.0,
-                tokens::spacing::SM,
+                tokens::spacing::INSET,
                 0.0,
-                tokens::spacing::LG,
+                if home { 28.0 } else { tokens::spacing::LG },
             ))
-            .content(m3::lifted(
-                crate::theme::elevation::Level::Two,
-                tokens::radius::COMPOSER,
+            .content(m3::composer_card(
+                palette,
                 Grid::new(),
-                card,
-            ))
-    }
-
-    /// The open Agent's project, harness and access: read-only, so plain
-    /// icon and text (no chip outline); Full access in the warning color.
-    fn agent_context(&self, detail: &UiDetail, palette: Palette) -> View {
-        let access = launch_ui::agent_access_label(&detail.settings);
-        let access: View = if access == crate::settings::Access::Full.label() {
-            m3::meta_tinted(m3::glyph::WARNING, &access, palette.warning())
-        } else {
-            m3::meta(m3::glyph::SHIELD, &access)
-        };
-        StackPanel::new()
-            .orientation(Orientation::Horizontal)
-            .spacing(tokens::spacing::MD)
-            .children((
-                m3::meta(m3::glyph::FOLDER, &self.place_title(&detail.project)),
-                m3::meta(
-                    m3::glyph::PROFILE,
-                    &launch_ui::launched_as(&detail.settings.profile, &detail.harness),
-                ),
-                access,
+                StackPanel::new()
+                    .spacing(tokens::spacing::SM)
+                    .keyed_children(rows),
             ))
     }
 
@@ -206,10 +198,14 @@ impl DesktopApp {
         context: &mut ViewContext<Self>,
         palette: Palette,
     ) -> View {
-        let model = detail.settings.next_model().unwrap_or("Default model");
+        let full = detail.settings.next_model().unwrap_or("Default model");
+        // The chip names the model as the header does ("qwen4-max · high");
+        // its accessible name keeps the full id.
+        let model = full;
         let effort = detail.settings.next_effort();
         let label = format!(
-            "{model} · {}",
+            "{} · {}",
+            crate::picker::model_short(full),
             effort.map_or("default effort", effort_label)
         );
         let name = format!(
@@ -217,25 +213,18 @@ impl DesktopApp {
             effort.map_or_else(|| "default effort".to_owned(), effort_name)
         );
         let open = self.launch.open == Some(Pop::Effort);
-        m3::text_chip(palette)
+        m3::chip(palette)
             .automation_name(format!(
                 "Model and effort: {name} ({})",
                 if open { "open" } else { "change" }
             ))
             .on_click(context.message(Message::Launch(LaunchMsg::Toggle(Pop::Effort))))
-            .content(
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(tokens::spacing::SM)
-                    .children((
-                        m3::icon(m3::glyph::MODEL),
-                        TextBlock::new()
-                            .text(label)
-                            .vertical_alignment(VerticalAlignment::Center)
-                            .text_trimming(TextTrimming::CharacterEllipsis),
-                        m3::dropdown_chevron(),
-                    )),
-            )
+            .content(m3::chip_content(
+                None,
+                &label,
+                true,
+                tokens::layout::PROJECT_CHIP_WIDTH,
+            ))
     }
 
     /// The open Agent and its detail when the popovers act on it (not a
@@ -341,7 +330,7 @@ impl DesktopApp {
                     "Effort levels not read: {}",
                     crate::state::plain_error(error)
                 ))
-                .foreground(palette.error())
+                .foreground(palette.attention())
                 .text_wrapping(TextWrapping::Wrap),
                 m3::text_button(palette)
                     .automation_name("Retry reading effort levels")
@@ -415,6 +404,7 @@ impl DesktopApp {
             m3::secondary("←→ effort   Enter apply   Esc close").into()
         };
         m3::lifted(
+            palette,
             crate::theme::elevation::Level::Two,
             tokens::radius::CONTAINER,
             Grid::new()
@@ -493,6 +483,7 @@ impl DesktopApp {
             })
             .collect();
         m3::lifted(
+            palette,
             crate::theme::elevation::Level::Two,
             tokens::radius::CONTAINER,
             Grid::new()
@@ -544,6 +535,7 @@ impl DesktopApp {
         let detail = self.chat.detail.as_ref();
         let draft_blank = self.composer_text().trim().is_empty();
         let enabled = !self.submitting();
+        let reading = self.reading_row();
         let primary: View = match (agent.clone(), detail) {
             // The unresolved draft's explicit Retry: resubmits the saved
             // action, body, ledger key and mutation id, whatever the Agent
@@ -576,6 +568,16 @@ impl DesktopApp {
                         .tooltip("Resume with this message")
                 }
             }
+            // While the detail is read, the row's button in its final
+            // place, not yet active.
+            (Some(_), None) if reading == Some(RowMode::Resume) => m3::filled(palette)
+                .is_enabled(false)
+                .automation_name("Resume")
+                .content(m3::label("Resume")),
+            (Some(_), None) if reading == Some(RowMode::Running) => m3::send_button(palette)
+                .is_enabled(false)
+                .automation_name("Stop the running turn")
+                .content(m3::stop_mark(palette)),
             (Some(agent), detail) => {
                 // Codex's one trailing button: while a turn runs, Stop with
                 // an empty field (it interrupts that turn) and Steer once
@@ -622,10 +624,29 @@ impl DesktopApp {
                 .content(m3::send_icon())
                 .tooltip("Send"),
         };
+        // The design's hint before the ring and the FAB.
+        let hint = match (agent.as_deref(), detail) {
+            (Some(agent), _) if self.chat.pending_retry.contains_key(agent) => "",
+            (Some(_), Some(detail)) if resumable(detail) => "Enter resumes",
+            (Some(_), None) if reading == Some(RowMode::Resume) => "Enter resumes",
+            (Some(_), None) if reading == Some(RowMode::Running) => "Stop the turn",
+            (Some(_), Some(detail)) if detail.active_turn.is_some() && !detail.observe_only => {
+                if draft_blank {
+                    "Stop the turn"
+                } else {
+                    "Enter steers the running turn"
+                }
+            }
+            _ => "Enter to send",
+        };
         StackPanel::new()
             .orientation(Orientation::Horizontal)
-            .spacing(tokens::spacing::SM)
-            .children((self.usage_indicator(context, palette), primary))
+            .spacing(tokens::spacing::ROW)
+            .children((
+                m3::secondary(hint).vertical_alignment(VerticalAlignment::Center),
+                self.usage_indicator(context, palette),
+                primary,
+            ))
     }
 
     /// The harness the composer talks to: the open Agent's, else the new
@@ -644,10 +665,33 @@ impl DesktopApp {
         }
     }
 
+    /// Whether the harness account's limits govern the composer's target:
+    /// `Some(false)` when its preset runs through a proxy (another
+    /// provider's limits apply), `None` when the preset is not known.
+    fn own_account(&self) -> Option<(bool, Option<String>)> {
+        let summary = match self.selected_agent_id() {
+            Some(_) => {
+                let name = &self.chat.detail.as_ref()?.settings.profile;
+                self.launch
+                    .profile_summaries
+                    .iter()
+                    .find(|profile| &profile.name == name)?
+            }
+            None => match &self.launch.choice {
+                // An ad-hoc harness runs on its own account.
+                crate::picker::Choice::Model(_) => return Some((true, None)),
+                _ => self.launch.profile()?,
+            },
+        };
+        Some((summary.proxy.is_none(), summary.proxy.clone()))
+    }
+
     /// Codex's usage indicator beside Send: the tightest quota window of
     /// the composer's harness as a small ring and the share left; it opens
-    /// the usage popover over the composer. Nothing when the harness
-    /// reports no quota.
+    /// the usage popover over the composer. The attention color only for a
+    /// real reading under the threshold on the account the task runs on; a
+    /// neutral outline ring when that is not known or another provider's
+    /// limits apply. Nothing when the harness reports no quota.
     fn usage_indicator(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let Some(harness) = self.composer_harness() else {
             return View::empty();
@@ -661,46 +705,97 @@ impl DesktopApp {
         let label = crate::picker::harness_label(&harness);
         let open = self.launch.open == Some(Pop::Usage);
         let remaining = window.remaining as f64;
-        let share = m3::secondary(format!("{}%", window.remaining))
-            .vertical_alignment(VerticalAlignment::Center);
-        let share = match palette.usage_label(remaining) {
-            Some(tone) => share.foreground(tone).opacity(1.0),
-            None => share,
+        let (applies, note) = match self.own_account() {
+            Some((true, _)) => (
+                true,
+                format!("{} {}% left", window.name(), window.remaining),
+            ),
+            Some((false, proxy)) => (
+                false,
+                format!(
+                    "{label} limits don't apply here: this preset runs through {}",
+                    proxy.as_deref().unwrap_or("a proxy")
+                ),
+            ),
+            None => (
+                false,
+                format!("Not known whether {label} limits apply here"),
+            ),
         };
-        Button::new()
-            .resource_overrides(palette.usage_ring(remaining))
-            .height(tokens::height::CONTROL)
-            .automation_name(format!(
-                "Usage: {label}, {} {}% left ({})",
-                window.name(),
-                window.remaining,
-                if open { "open" } else { "show limits" }
-            ))
-            .on_click(context.message(Message::Launch(LaunchMsg::Toggle(Pop::Usage))))
-            .content(
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(tokens::spacing::XS)
-                    .children((
-                        // Reactor 0.100.0 has no brush setters on the ring:
-                        // its arc and track come from this button's
-                        // resources (`Palette::usage_ring`).
-                        ProgressRing::new()
-                            .is_indeterminate(false)
-                            .minimum(0.0)
-                            .maximum(100.0)
-                            .value(remaining)
-                            .width(tokens::layout::USAGE_RING)
-                            .height(tokens::layout::USAGE_RING)
-                            .vertical_alignment(VerticalAlignment::Center),
-                        share,
-                    )),
-            )
+        let ring: View = if applies {
+            // Reactor 0.100.0 has no brush setters on the ring: its arc and
+            // track come from this button's resources (`usage_ring`).
+            ProgressRing::new()
+                .is_indeterminate(false)
+                .minimum(0.0)
+                .maximum(100.0)
+                .value(remaining)
+                .width(tokens::layout::USAGE_RING)
+                .height(tokens::layout::USAGE_RING)
+                .horizontal_alignment(HorizontalAlignment::Center)
+                .vertical_alignment(VerticalAlignment::Center)
+                .into()
+        } else {
+            Border::new()
+                .width(tokens::layout::USAGE_RING)
+                .height(tokens::layout::USAGE_RING)
+                .corner_radius(tokens::layout::USAGE_RING / 2.0)
+                .border_brush(palette.outline())
+                .border_thickness(Thickness::uniform(tokens::layout::USAGE_RING_STROKE))
+                .horizontal_alignment(HorizontalAlignment::Center)
+                .vertical_alignment(VerticalAlignment::Center)
+                .into()
+        };
+        // Keyed by whether the reading applies: the ring's colors come from
+        // the button's resources, read when its template is applied.
+        Grid::new().keyed_children(vec![KeyedView::new(
+            format!("usage:{applies}:{}", remaining < crate::theme::QUOTA_LOW),
+            Button::new()
+                .resource_overrides(palette.usage_ring(if applies { remaining } else { 100.0 }))
+                .style(ButtonStyle::Subtle)
+                .width(tokens::height::CONTROL)
+                .height(tokens::height::CONTROL)
+                .automation_name(format!(
+                    "Usage: {label}, {note} ({})",
+                    if open { "open" } else { "show limits" }
+                ))
+                .on_click(context.message(Message::Launch(LaunchMsg::Toggle(Pop::Usage))))
+                .content(ring)
+                .tooltip(note),
+        )])
     }
 }
 
 /// A stopped, failed or lost Agent that Resume starts again (not while a
 /// turn is recorded as running, never an observe-only Agent).
+/// What an open task's composer offers while its detail is still read,
+/// taken from its sidebar row ([`DesktopApp::reading_row`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowMode {
+    Resume,
+    Running,
+}
+
+impl DesktopApp {
+    /// While the open task's detail is read, the mode its sidebar row
+    /// implies: the card keeps the shape it will have (Resume for an ended
+    /// task, Stop for a working one), so an open never flashes another.
+    fn reading_row(&self) -> Option<RowMode> {
+        if self.chat.detail.is_some() {
+            return None;
+        }
+        let row = self.find_agent(&self.selected_agent_id()?)?;
+        match row.state {
+            _ if row.native_child => None,
+            eliot_core::AgentState::Stopped
+            | eliot_core::AgentState::Failed
+            | eliot_core::AgentState::Lost => Some(RowMode::Resume),
+            eliot_core::AgentState::Busy => Some(RowMode::Running),
+            _ => None,
+        }
+    }
+}
+
 fn resumable(detail: &UiDetail) -> bool {
     matches!(
         detail.state,
@@ -709,4 +804,47 @@ fn resumable(detail: &UiDetail) -> bool {
             | eliot_core::AgentState::Lost
     ) && detail.active_turn.is_none()
         && !detail.observe_only
+}
+
+/// Files attached in the composer: one outlined chip each (file glyph,
+/// name, the full path in its tooltip); a click removes it.
+fn attachment_chips(
+    files: &[String],
+    context: &mut ViewContext<DesktopApp>,
+    palette: Palette,
+) -> View {
+    let chips: Vec<KeyedView> = files
+        .iter()
+        .map(|path| {
+            let name = crate::attachments::file_name(path);
+            KeyedView::new(
+                path.clone(),
+                m3::chip(palette)
+                    .automation_name(format!("Remove attached file {name}"))
+                    .on_click(
+                        context
+                            .message(Message::Launch(LaunchMsg::AttachmentRemoved(path.clone()))),
+                    )
+                    .content(
+                        StackPanel::new()
+                            .orientation(Orientation::Horizontal)
+                            .spacing(6.0)
+                            .children((
+                                m3::chip_content(
+                                    Some(m3::glyph::FILE),
+                                    name,
+                                    false,
+                                    tokens::layout::PROJECT_CHIP_WIDTH,
+                                ),
+                                m3::small_icon(m3::glyph::CLOSE),
+                            )),
+                    )
+                    .tooltip(path.clone()),
+            )
+        })
+        .collect();
+    StackPanel::new()
+        .orientation(Orientation::Horizontal)
+        .spacing(6.0)
+        .keyed_children(chips)
 }

@@ -25,7 +25,7 @@ impl DesktopApp {
             .map(|access| {
                 let title = m3::body(access.label());
                 let title = if *access == Access::Full {
-                    title.foreground(palette.warning())
+                    title.foreground(palette.attention())
                 } else {
                     title
                 };

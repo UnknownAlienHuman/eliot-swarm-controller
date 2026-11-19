@@ -24,7 +24,7 @@ fn small(text: impl Into<String>) -> TextBlock {
 /// A failure note: the secondary size at full emphasis in the error color.
 fn error_note(text: impl Into<String>, palette: Palette) -> TextBlock {
     crate::m3::text(text, tokens::text::SECONDARY)
-        .foreground(palette.error())
+        .foreground(palette.attention())
         .text_wrapping(TextWrapping::Wrap)
         .is_text_selection_enabled(true)
 }
@@ -234,7 +234,10 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
     // Only shown parts take a place, so no empty child adds a gap.
     let mut parts = vec![KeyedView::new("profiles", crate::m3::list(palette, rows))];
     if !form.is_empty() {
-        parts.push(KeyedView::new("form", crate::m3::group(palette, form)));
+        parts.push(KeyedView::new(
+            "form",
+            crate::m3::settings_card(palette, form),
+        ));
     }
     parts.push(KeyedView::new("state", small(state)));
     parts.push(KeyedView::new("toggle", toggle));
@@ -701,7 +704,10 @@ pub fn scripts_screen(data: ScriptsData<'_>, actions: ScriptsActions, palette: P
             ),
         ));
     }
-    let mut page = vec![KeyedView::new("picker", crate::m3::group(palette, parts))];
+    let mut page = vec![KeyedView::new(
+        "picker",
+        crate::m3::settings_card(palette, parts),
+    )];
     let mut below: Vec<KeyedView> = Vec::new();
     if selected {
         // The source is a group of its own, 16 DIPs from the picker and

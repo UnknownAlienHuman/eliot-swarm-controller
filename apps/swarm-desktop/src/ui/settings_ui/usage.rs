@@ -243,11 +243,13 @@ pub(super) fn retention_lines(view: Option<&eliot_core::api::RetentionView>) -> 
         );
     }
     if view.unbounded {
-        let advisory = view
-            .size_advisory
-            .as_deref()
-            .map(|advisory| format!(" {advisory}."))
-            .unwrap_or_default();
+        // The daemon's size advisory says the unbounded store has grown
+        // large; the size itself is shown beside this line.
+        let advisory = if view.size_advisory.is_some() {
+            " Set retention windows to keep the store smaller (configuration.md)."
+        } else {
+            ""
+        };
         return (
             size,
             format!(

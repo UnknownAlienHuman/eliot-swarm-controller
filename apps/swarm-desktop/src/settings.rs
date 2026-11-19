@@ -25,13 +25,46 @@ pub enum ThemeChoice {
     System,
     Light,
     Dark,
+    Amoled,
+    Purple,
+    Neon,
+    Matrix,
 }
 impl ThemeChoice {
+    /// Settings › Appearance, in the Themes board's order.
+    pub const ALL: [ThemeChoice; 7] = [
+        Self::System,
+        Self::Light,
+        Self::Dark,
+        Self::Amoled,
+        Self::Purple,
+        Self::Neon,
+        Self::Matrix,
+    ];
+
     pub fn label(self) -> &'static str {
         match self {
             Self::System => "System",
             Self::Light => "Light",
             Self::Dark => "Dark",
+            Self::Amoled => "Amoled",
+            Self::Purple => "Purple",
+            Self::Neon => "Neon",
+            Self::Matrix => "Matrix",
+        }
+    }
+
+    /// The theme shown: System follows Windows between Light and Dark.
+    pub fn theme(self, system_dark: bool) -> crate::theme::Theme {
+        use crate::theme::Theme;
+        match self {
+            Self::System if system_dark => Theme::Dark,
+            Self::System | Self::Light => Theme::Light,
+            Self::Dark => Theme::Dark,
+            Self::Amoled => Theme::Amoled,
+            Self::Purple => Theme::Purple,
+            Self::Neon => Theme::Neon,
+            Self::Matrix => Theme::Matrix,
         }
     }
 }

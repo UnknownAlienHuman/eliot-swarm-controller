@@ -39,6 +39,8 @@ pub struct RenderedPart {
     pub detail: Vec<String>,
     pub file_paths: Vec<String>,
     pub detail_paths: Vec<String>,
+    /// Files the owner attached (an input's closing block).
+    pub attachments: Vec<String>,
 }
 
 /// One virtualized turn item.
@@ -110,11 +112,18 @@ fn render_doc(doc: &Doc) -> Vec<RenderedBlock> {
 fn render_part(part: &Part, docs: &HashMap<u64, Doc>) -> RenderedPart {
     let markdown = matches!(part.kind, PartKind::Final | PartKind::Progress);
     let doc = markdown.then(|| docs.get(&text_hash(&part.text))).flatten();
+    // The owner's message shows its attachments as chips, not as text.
+    let (shown, attachments) = if part.kind == PartKind::Input {
+        crate::attachments::split(&part.text)
+    } else {
+        (part.text.as_str(), Vec::new())
+    };
     RenderedPart {
         key: part.key.clone(),
         kind: part.kind,
         label: part.label.clone(),
-        plain: chat::preview(&part.text),
+        attachments,
+        plain: chat::preview(shown),
         blocks: doc.map(render_doc),
         detail: part.detail.clone(),
         file_paths: chat::file_references(&part.text),
@@ -176,6 +185,10 @@ pub struct RowCallbacks {
     pub pick_model: Option<Callback<()>>,
     pub copy_code: Callback<(String, usize)>,
     pub toggle_tools: Callback<(String, bool)>,
+    /// The part under the pointer: its copy actions show.
+    pub hovered: Option<String>,
+    /// The pointer entered (`true`) or left a part.
+    pub hover: Callback<(String, bool)>,
 }
 
 fn label(text: &str) -> TextBlock {
@@ -196,11 +209,28 @@ fn body_text(text: &str, foreground: Brush) -> TextBlock {
 /// with the text around it (a 32-DIP icon button centres a 16-DIP glyph).
 const INSET: f64 = (tokens::height::CONTROL - tokens::icon::ROW) / 2.0;
 
-/// A small icon button for Copy, named for screen readers.
-fn copy_button(name: &str, palette: Palette, callback: impl Fn() + 'static) -> Button {
-    crate::m3::icon_button(palette)
-        .automation_name(name.to_owned())
-        .on_click(callback)
+/// Copy for `part`: an icon button while the part is under the pointer;
+/// otherwise the same place holds a keyboard stop whose glyph shows only
+/// with keyboard focus ([`crate::m3::reveal_button`]). Never a permanently
+/// visible icon.
+fn copy_button(
+    name: &str,
+    part: &str,
+    callbacks: &RowCallbacks,
+    palette: Palette,
+    callback: impl Fn() + 'static,
+) -> View {
+    if callbacks.hovered.as_deref() == Some(part) {
+        crate::m3::icon_button(palette)
+            .automation_name(name.to_owned())
+            .on_click(callback)
+            .content(copy_glyph())
+    } else {
+        crate::m3::reveal_button()
+            .automation_name(name.to_owned())
+            .on_click(callback)
+            .content(copy_glyph())
+    }
 }
 
 /// The glyph of a copy button.
@@ -212,7 +242,7 @@ fn block_views(part: &RenderedPart, callbacks: &RowCallbacks, palette: Palette) 
     let Some(blocks) = part.blocks.as_ref() else {
         return vec![KeyedView::new(
             "plain",
-            body_text(&part.plain, palette.on_surface()),
+            body_text(&part.plain, palette.text()),
         )];
     };
     blocks
@@ -229,10 +259,8 @@ fn block_views(part: &RenderedPart, callbacks: &RowCallbacks, palette: Palette) 
                 RenderedBlock::Heading(level, text) => crate::m3::text(
                     text.clone(),
                     match level {
-                        1 => theme::typography::DISPLAY,
-                        2 => theme::typography::HEADLINE,
-                        3 => tokens::text::PAGE_TITLE,
-                        _ => tokens::text::SECTION_TITLE,
+                        1 => theme::typography::TITLE,
+                        _ => theme::typography::HEADER,
                     },
                 )
                 .text_wrapping(TextWrapping::Wrap)
@@ -249,7 +277,7 @@ fn block_views(part: &RenderedPart, callbacks: &RowCallbacks, palette: Palette) 
                     let code_index = *code_index;
                     StackPanel::new().spacing(tokens::spacing::XS).children((
                         Border::new()
-                            .background(palette.raised())
+                            .background(palette.composer())
                             .corner_radius(tokens::radius::CONTAINER)
                             .padding(Thickness::uniform(tokens::spacing::MD))
                             .content(
@@ -264,11 +292,18 @@ fn block_views(part: &RenderedPart, callbacks: &RowCallbacks, palette: Palette) 
                                             .is_text_selection_enabled(true),
                                     ),
                             ),
-                        copy_button("Copy code", palette, move || {
-                            let _ = copy.call((key.clone(), code_index));
-                        })
-                        .margin(Thickness::new(-INSET, 0.0, 0.0, 0.0))
-                        .content(copy_glyph()),
+                        Border::new()
+                            .horizontal_alignment(HorizontalAlignment::Left)
+                            .margin(Thickness::new(-INSET, 0.0, 0.0, 0.0))
+                            .content(copy_button(
+                                "Copy code",
+                                &part.key,
+                                callbacks,
+                                palette,
+                                move || {
+                                    let _ = copy.call((key.clone(), code_index));
+                                },
+                            )),
                     ))
                 }
                 RenderedBlock::Rule => crate::m3::divider(palette).into(),
@@ -278,9 +313,6 @@ fn block_views(part: &RenderedPart, callbacks: &RowCallbacks, palette: Palette) 
         .collect()
 }
 
-/// `anchor`, when given, binds the part's own button (Copy or the tool
-/// group header): the end anchor of the transcript.
-///
 /// One style for every part, as in a chat: the user's message is a
 /// secondary-container bubble on the right; the answer is plain body
 /// text on the surface; tool groups are one low-emphasis expandable row;
@@ -290,12 +322,7 @@ fn part_view(
     expanded: bool,
     callbacks: &RowCallbacks,
     palette: Palette,
-    anchor: Option<&ElementRef<Button>>,
 ) -> View {
-    let anchored = |button: Button| match anchor {
-        Some(anchor) => button.element_ref(anchor),
-        None => button,
-    };
     let copy = callbacks.copy_part.clone();
     let key = part.key.clone();
     let copy_message = move || {
@@ -307,63 +334,84 @@ fn part_view(
             .horizontal_alignment(HorizontalAlignment::Right)
             .max_width(tokens::layout::READING_WIDTH * tokens::layout::BUBBLE_SHARE)
             .children((
+                crate::m3::bubble(palette, body_text(&part.plain, palette.text()), None),
+                if part.attachments.is_empty() {
+                    View::empty()
+                } else {
+                    attached_chips(&part.attachments, palette)
+                },
                 Border::new()
-                    .background(palette.bubble())
-                    .corner_radius(tokens::radius::CONTAINER)
-                    .padding(Thickness::xy(tokens::spacing::INSET, tokens::spacing::SM))
-                    .content(body_text(&part.plain, palette.on_bubble())),
-                anchored(copy_button("Copy message", palette, copy_message))
                     .horizontal_alignment(HorizontalAlignment::Right)
                     .margin(Thickness::new(0.0, 0.0, -INSET, 0.0))
-                    .content(copy_glyph()),
+                    .content(copy_button(
+                        "Copy message",
+                        &part.key,
+                        callbacks,
+                        palette,
+                        copy_message,
+                    )),
             )),
-        // Interim notes stay quiet.
+        // A steered message stays in the turn it steered.
+        PartKind::Steer => Border::new()
+            .horizontal_alignment(HorizontalAlignment::Right)
+            .max_width(tokens::layout::READING_WIDTH * tokens::layout::BUBBLE_SHARE)
+            .automation_name(format!("Steered: {}", part.plain))
+            .content(crate::m3::steer_bubble(palette, &part.plain, None)),
+        // The assistant's interim notes read as its text.
         PartKind::Progress => StackPanel::new()
             .spacing(tokens::spacing::SM)
-            .opacity(theme::MUTED_OPACITY)
             .keyed_children(block_views(part, callbacks, palette)),
         PartKind::Tools => {
             let toggle = callbacks.toggle_tools.clone();
             let key = part.key.clone();
-            // A low-emphasis button rather than a ToggleButton: Reactor
-            // 0.100.0 themes only Buttons, so a checked toggle would show the
-            // system accent. The accessible name carries the state.
-            let header = anchored(crate::m3::row(palette, false))
+            // Name, status and duration (`chat::TOOL_FIELDS` apart): the
+            // name, then the status (Running in the primary role) or the
+            // duration at the end.
+            let mut fields = part.plain.split(crate::chat::TOOL_FIELDS);
+            let name = fields.next().unwrap_or_default().to_owned();
+            let status = fields.next().unwrap_or_default().to_owned();
+            let duration = fields.next().unwrap_or_default().to_owned();
+            let running = status == "Running";
+            let trailing = match status.as_str() {
+                "Running" => "Running".to_owned(),
+                "Completed" => duration.clone(),
+                _ => status.clone(),
+            };
+            let glyph = match part.label.as_str() {
+                "Command" => crate::m3::glyph::TERMINAL,
+                "Edit" => crate::m3::glyph::EDIT,
+                _ => crate::m3::glyph::TOOLS,
+            };
+            let row = crate::m3::tool_row(palette, running)
                 .automation_name(format!(
-                    "{} ({})",
-                    part.plain,
+                    "{name} · {status} · {duration} ({})",
                     if expanded { "expanded" } else { "collapsed" }
                 ))
                 .on_click(move || {
                     let _ = toggle.call((key.clone(), !expanded));
                 })
-                .content(crate::m3::row_content(
-                    Some(crate::m3::glyph::TOOLS),
-                    &part.plain,
-                    "",
-                    crate::m3::icon(if expanded {
-                        crate::m3::glyph::CHEVRON_DOWN
-                    } else {
-                        crate::m3::glyph::CHEVRON_RIGHT
-                    }),
+                .content(crate::m3::tool_content(
+                    glyph,
+                    &name,
+                    &trailing,
+                    running.then(|| palette.primary()),
                 ));
             let detail: View = if expanded {
-                StackPanel::new().spacing(tokens::spacing::XS).children((
-                    crate::m3::secondary(part.detail.join("\n"))
-                        .text_wrapping(TextWrapping::Wrap)
-                        .is_text_selection_enabled(true),
-                    path_actions(&part.key, &part.detail_paths, callbacks, palette),
-                ))
+                StackPanel::new()
+                    .spacing(tokens::spacing::XS)
+                    .margin(Thickness::xy(tokens::spacing::INSET, 0.0))
+                    .children((
+                        crate::m3::secondary(part.detail.join("\n"))
+                            .text_wrapping(TextWrapping::Wrap)
+                            .is_text_selection_enabled(true),
+                        path_actions(&part.key, &part.detail_paths, callbacks, palette),
+                    ))
             } else {
                 View::empty()
             };
-            crate::m3::card(palette)
-                .padding(Thickness::uniform(tokens::spacing::XS))
-                .content(
-                    StackPanel::new()
-                        .spacing(tokens::spacing::XS)
-                        .children((header, detail)),
-                )
+            StackPanel::new()
+                .spacing(tokens::spacing::XS)
+                .children((row, detail))
         }
 
         // The answer: plain text on the surface; a label only when the
@@ -379,10 +427,16 @@ fn part_view(
                 StackPanel::new()
                     .spacing(tokens::spacing::SM)
                     .keyed_children(block_views(part, callbacks, palette)),
-                anchored(copy_button("Copy message", palette, copy_message))
+                Border::new()
                     .horizontal_alignment(HorizontalAlignment::Left)
                     .margin(Thickness::new(-INSET, 0.0, 0.0, 0.0))
-                    .content(copy_glyph()),
+                    .content(copy_button(
+                        "Copy message",
+                        &part.key,
+                        callbacks,
+                        palette,
+                        copy_message,
+                    )),
             ))
         }
         PartKind::Working => StackPanel::new().spacing(tokens::spacing::XS).children((
@@ -424,64 +478,74 @@ fn part_view(
                     .font_size(tokens::text::BODY.size)
                     .text_wrapping(TextWrapping::Wrap)
                     .is_text_selection_enabled(true)
-                    .foreground(palette.error()),
+                    .foreground(palette.attention()),
                 label(&part.detail.join(" · ")),
                 action,
             ))
         }
-        PartKind::Notice => TextBlock::new()
-            .text(format!("{} · {}", part.label, part.plain))
-            .font_size(tokens::text::SECONDARY.size)
+        PartKind::Notice => crate::m3::secondary(format!("{} · {}", part.label, part.plain))
             .text_wrapping(TextWrapping::Wrap)
-            .opacity(theme::MUTED_OPACITY)
             .into(),
     }
 }
 
 /// One realized turn: keyed parts, so new activity appends children instead
-/// of replacing the item. `anchor` binds the last part that has a button of
-/// its own (see [`part_view`]).
+/// of replacing the item.
 pub fn item_view(
     item: &RenderedItem,
     expanded: &HashSet<String>,
     callbacks: &RowCallbacks,
     palette: Palette,
-    anchor: Option<&ElementRef<Button>>,
     width: Option<f64>,
 ) -> View {
-    let anchored = anchor.and_then(|_| {
-        item.parts.iter().rposition(|part| {
-            matches!(
-                part.kind,
-                PartKind::Input | PartKind::Tools | PartKind::Final
-            )
-        })
-    });
     let parts: Vec<KeyedView> = item
         .parts
         .iter()
-        .enumerate()
-        .map(|(index, part)| {
-            KeyedView::new(
-                part.key.clone(),
-                StackPanel::new().spacing(tokens::spacing::XS).children((
-                    part_view(
-                        part,
-                        expanded.contains(&part.key),
-                        callbacks,
-                        palette,
-                        anchor.filter(|_| anchored == Some(index)),
-                    ),
-                    if matches!(
-                        part.kind,
-                        PartKind::Input | PartKind::Progress | PartKind::Final
-                    ) {
-                        path_actions(&part.key, &part.file_paths, callbacks, palette)
-                    } else {
-                        View::empty()
-                    },
-                )),
-            )
+        .map(|part| {
+            // A tool row is keyed by whether it runs: WinUI reads a button's
+            // colors only when its template is applied, so a finished row
+            // would keep the running tint.
+            let running = format!(
+                "{}Running{}",
+                crate::chat::TOOL_FIELDS,
+                crate::chat::TOOL_FIELDS
+            );
+            let key = if matches!(part.kind, PartKind::Tools) && part.plain.contains(&running) {
+                format!("{}:running", part.key)
+            } else {
+                part.key.clone()
+            };
+            let body = StackPanel::new().spacing(tokens::spacing::XS).children((
+                part_view(part, expanded.contains(&part.key), callbacks, palette),
+                // The assistant's files are actions; the owner's own
+                // message only names them.
+                if matches!(part.kind, PartKind::Progress | PartKind::Final) {
+                    path_actions(&part.key, &part.file_paths, callbacks, palette)
+                } else {
+                    View::empty()
+                },
+            ));
+            // A message with Copy is a hover area: its actions show while
+            // the pointer is over it (a late exit does not hide the next).
+            let view: View = if matches!(
+                part.kind,
+                PartKind::Input | PartKind::Progress | PartKind::Final
+            ) {
+                let (enter, leave) = (callbacks.hover.clone(), callbacks.hover.clone());
+                let (over, out) = (part.key.clone(), part.key.clone());
+                Border::new()
+                    .background(Brush::Solid(Color::transparent()))
+                    .on_pointer_entered(move |_: PointerEventInfo| {
+                        let _ = enter.call((over.clone(), true));
+                    })
+                    .on_pointer_exited(move |_: PointerEventInfo| {
+                        let _ = leave.call((out.clone(), false));
+                    })
+                    .content(body)
+            } else {
+                body
+            };
+            KeyedView::new(key, view)
         })
         .collect();
     // An ItemsRepeater arranges a turn at its content width, so the turn
@@ -494,57 +558,115 @@ pub fn item_view(
         .keyed_children(parts)
 }
 
-/// Order-sensitive hash of the item keys: Reactor's `key_revision` must
-/// change exactly when the key list changes.
-pub fn key_revision(items: &[Rc<RenderedItem>]) -> u64 {
-    items.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, item| {
-        (hash ^ text_hash(&item.key)).wrapping_mul(0x0100_0000_01b3)
-    })
+/// Most file chips one message shows before "+N more".
+const FILE_CHIPS: usize = 6;
+
+/// The files a message names, as compact chips under it (file glyph and
+/// name, the full path in the tooltip; one chip per file however often it
+/// is named). A click opens it in Explorer (`ui::reveal`); Reactor 0.100.0
+/// hyperlinks only navigate URIs, and prose selection is kept.
+fn path_actions(part: &str, paths: &[String], callbacks: &RowCallbacks, palette: Palette) -> View {
+    let mut seen = HashSet::new();
+    let files: Vec<(String, String)> = paths
+        .iter()
+        .filter_map(|reference| {
+            let path = std::path::Path::new(reference);
+            if path.is_relative() && callbacks.workspace.is_empty() {
+                return None;
+            }
+            let resolved = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                std::path::Path::new(&callbacks.workspace).join(path)
+            };
+            let resolved = resolved.to_string_lossy().into_owned();
+            seen.insert(resolved.to_lowercase())
+                .then(|| (reference.clone(), resolved))
+        })
+        .collect();
+    if files.is_empty() {
+        return View::empty();
+    }
+    let mut note = View::empty();
+    let mut chips: Vec<KeyedView> = Vec::new();
+    for (reference, resolved) in files.iter().take(FILE_CHIPS) {
+        let item = format!("{}{part}:{reference}", callbacks.path_scope);
+        if let Some((failed, text)) = &callbacks.path_failure
+            && failed == &item
+        {
+            note = crate::m3::secondary(text.clone())
+                .foreground(palette.attention())
+                .text_wrapping(TextWrapping::Wrap)
+                .is_text_selection_enabled(true)
+                .into();
+        }
+        let open = callbacks.open_path.clone();
+        let target = resolved.clone();
+        let name = crate::attachments::file_name(resolved).to_owned();
+        chips.push(KeyedView::new(
+            resolved.clone(),
+            crate::m3::chip(palette)
+                .automation_name(format!("Open {resolved} in Explorer"))
+                .on_click(move || {
+                    let _ = open.call((item.clone(), target.clone()));
+                })
+                .content(crate::m3::chip_content(
+                    Some(file_glyph(resolved)),
+                    &name,
+                    false,
+                    tokens::layout::PROJECT_CHIP_WIDTH,
+                ))
+                .tooltip(resolved.clone()),
+        ));
+    }
+    if files.len() > FILE_CHIPS {
+        chips.push(KeyedView::new(
+            "more",
+            crate::m3::secondary(format!("+{} more", files.len() - FILE_CHIPS))
+                .vertical_alignment(VerticalAlignment::Center),
+        ));
+    }
+    StackPanel::new().spacing(tokens::spacing::XS).children((
+        StackPanel::new()
+            .orientation(Orientation::Horizontal)
+            .spacing(6.0)
+            .keyed_children(chips),
+        note,
+    ))
 }
 
-/// Reactor 0.100.0 hyperlinks only navigate URIs. Native path buttons under
-/// the prose open the file or folder in Explorer (`ui::reveal`), preserving
-/// prose selection.
-fn path_actions(part: &str, paths: &[String], callbacks: &RowCallbacks, palette: Palette) -> View {
-    StackPanel::new().keyed_children(
-        paths
-            .iter()
-            .filter_map(|reference| {
-                let path = std::path::Path::new(reference);
-                if path.is_relative() && callbacks.workspace.is_empty() {
-                    return None;
-                }
-                let resolved = if path.is_absolute() {
-                    path.to_path_buf()
-                } else {
-                    std::path::Path::new(&callbacks.workspace).join(path)
-                };
-                let resolved = resolved.to_string_lossy().into_owned();
-                let item = format!("{}{part}:{reference}", callbacks.path_scope);
-                let open = callbacks.open_path.clone();
-                let note = match &callbacks.path_failure {
-                    Some((failed, note)) if failed == &item => crate::m3::secondary(note.clone())
-                        .foreground(palette.error())
-                        .text_wrapping(TextWrapping::Wrap)
-                        .is_text_selection_enabled(true)
-                        .into(),
-                    _ => View::empty(),
-                };
-                Some(KeyedView::new(
-                    reference.clone(),
-                    StackPanel::new().children((
-                        crate::m3::text_button(palette)
-                            .horizontal_alignment(HorizontalAlignment::Left)
-                            .automation_name(format!("Open {reference} in Explorer"))
-                            .on_click(move || {
-                                let _ = open.call((item.clone(), resolved.clone()));
-                            })
-                            .content(crate::m3::icon_label(crate::m3::glyph::FOLDER, reference))
-                            .tooltip("Open in Explorer"),
-                        note,
-                    )),
-                ))
-            })
-            .collect::<Vec<_>>(),
-    )
+/// A folder's glyph for a folder, else a file's.
+fn file_glyph(path: &str) -> &'static str {
+    if std::path::Path::new(path).is_dir() {
+        crate::m3::glyph::FOLDER
+    } else {
+        crate::m3::glyph::FILE
+    }
+}
+
+/// The files the owner attached to a message: chips under the bubble, at
+/// its right edge (`attachments`).
+pub fn attached_chips(files: &[String], palette: Palette) -> View {
+    StackPanel::new()
+        .orientation(Orientation::Horizontal)
+        .spacing(6.0)
+        .horizontal_alignment(HorizontalAlignment::Right)
+        .keyed_children(
+            files
+                .iter()
+                .map(|path| {
+                    KeyedView::new(
+                        path.clone(),
+                        crate::m3::fixed_chip(
+                            palette,
+                            false,
+                            Some(crate::m3::glyph::FILE),
+                            crate::attachments::file_name(path),
+                            &format!("Attached file {path}"),
+                        )
+                        .tooltip(path.clone()),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
 }

@@ -238,7 +238,10 @@ Native foreground tool calls arrive as `assistant` message `tool_use` content bl
 verdict). The adapter commits `tool.started` per `tool_use` block and
 `tool.completed` per matching `tool_result` block, bound to the exact
 turn and generation with the native `tool_use.id` as the item id
-(`status` `completed`, or `error` when `is_error` is true). Only
+(`status` `completed`, or `error` when `is_error` is true). A block whose
+`input` has a string `command` (Bash, PowerShell) adds it to `tool.started`
+as `command`, secret-redacted and bounded (plugin protocol); other input and
+results are not persisted. Only
 foreground blocks map into this tool table. Ordinary sidechain assistant/user
 frames carrying `parent_tool_use_id` and `agent_id` stay out, like sidechain
 text. The per-turn hook bound counts all tool IDs observed, not just in-flight

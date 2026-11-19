@@ -205,6 +205,8 @@ pub(crate) struct AssistantContentBlock {
     pub id: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
+    pub input: Option<Value>,
 }
 
 /// One `user` content block; `tool_result` blocks carry a native tool
@@ -579,6 +581,9 @@ pub(crate) fn assistant_tool_use_ids(record: &Value) -> Vec<String> {
 pub(crate) struct ToolUseBlock {
     pub id: String,
     pub name: String,
+    /// The shell command of a command tool (`input.command`: Bash,
+    /// PowerShell); `None` for other tools.
+    pub command: Option<String>,
 }
 
 /// Tool invocations in one assistant record, in wire order. Blocks with a
@@ -599,7 +604,15 @@ pub(crate) fn assistant_tool_uses(record: &Value) -> Vec<ToolUseBlock> {
         .filter_map(|block| {
             let id = block.id.filter(|id| !id.trim().is_empty())?;
             let name = block.name.filter(|name| !name.trim().is_empty())?;
-            Some(ToolUseBlock { id, name })
+            let command = block
+                .input
+                .as_ref()
+                .and_then(|input| input.get("command"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|command| !command.is_empty())
+                .map(str::to_owned);
+            Some(ToolUseBlock { id, name, command })
         })
         .collect()
 }

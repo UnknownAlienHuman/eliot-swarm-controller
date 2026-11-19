@@ -22,9 +22,9 @@ fn small(text: impl Into<String>) -> TextBlock {
         .is_text_selection_enabled(true)
 }
 
-/// A list row's second line: why a lost or failed Agent ended (from its
-/// loss origin), what an Agent that needs attention needs, or the task a
-/// top-level worker runs under.
+/// What a list row says beyond its state: why a lost or failed Agent ended
+/// (from its loss origin), what an Agent that needs attention needs, or the
+/// task a top-level worker runs under.
 pub enum RowNote {
     Ended(String),
     Attention(String),
@@ -50,13 +50,16 @@ pub struct RowLook<'a> {
     pub dot: Brush,
     /// The open Agent's row.
     pub selected: bool,
+    /// In the Working group: its trailing word is the model.
+    pub working: bool,
 }
 
-/// One Monitor list row: the status dot in its chart color, the title, the
-/// harness and model and how long it has been quiet, on one line; a second line only
-/// says why it needs attention or ended (or the task it runs under). Its
-/// measures live in Details, which the row opens with the conversation;
-/// Resume sits beside it.
+/// One Monitor list row (`Conversation.dc.html`'s `mrow`): the status dot
+/// in its group's color, the title and one trailing word: what it needs
+/// (in the attention color), the model it works on, or how long it has
+/// been quiet. Why it ended or the task it runs under stay in its tooltip
+/// and accessible name; its measures live in Details, which the row opens
+/// with the conversation; Resume sits beside it.
 pub fn list_row(
     row: &MonitorRow,
     look: RowLook,
@@ -66,91 +69,46 @@ pub fn list_row(
 ) -> View {
     let status = row.status_words();
     let harness = crate::picker::harness_model_label(&row.harness, row.model.as_deref());
-    let (note_line, note_name): (Option<View>, String) = match note {
-        Some(RowNote::Ended(text)) => (
-            Some(
-                crate::m3::secondary(text.clone())
-                    .text_trimming(TextTrimming::CharacterEllipsis)
-                    .into(),
-            ),
-            format!(", {text}"),
-        ),
-        Some(RowNote::Attention(text)) => (
-            Some(
-                crate::m3::text(text.clone(), tokens::text::SECONDARY)
-                    .foreground(palette.error())
-                    .text_trimming(TextTrimming::CharacterEllipsis)
-                    .into(),
-            ),
-            format!(", needs attention: {text}"),
-        ),
-        Some(RowNote::Under(parent)) => (
-            Some(
-                crate::m3::secondary(format!("Under {parent}"))
-                    .text_trimming(TextTrimming::CharacterEllipsis)
-                    .into(),
-            ),
-            format!(", under {parent}"),
-        ),
-        None => (None, String::new()),
+    let note_name = match note {
+        Some(RowNote::Ended(text)) => format!(", {text}"),
+        Some(RowNote::Attention(text)) => format!(", needs attention: {text}"),
+        Some(RowNote::Under(parent)) => format!(", under {parent}"),
+        None => String::new(),
     };
-    let line = Grid::new()
-        .columns([
-            GridLength::Auto,
-            GridLength::STAR,
-            GridLength::Auto,
-            GridLength::Auto,
-        ])
-        .column_spacing(tokens::spacing::SM)
+    let trailing = match note {
+        Some(RowNote::Attention(text)) => {
+            crate::m3::text(text.clone(), tokens::text::CAPTION).foreground(palette.attention())
+        }
+        _ if look.working => crate::m3::secondary(row.model.as_deref().map_or_else(
+            || harness.clone(),
+            |model| crate::picker::model_short(model).to_owned(),
+        )),
+        _ => crate::m3::secondary(look.elapsed.to_owned()),
+    };
+    let content = Grid::new()
+        .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
+        .column_spacing(tokens::spacing::ROW)
         .children((
             crate::m3::dot(look.dot),
-            TextBlock::new()
+            crate::m3::text(look.title.to_owned(), tokens::text::CHIP)
                 .grid_column(1)
-                .text(look.title.to_owned())
                 .vertical_alignment(VerticalAlignment::Center)
                 .text_trimming(TextTrimming::CharacterEllipsis),
-            crate::m3::secondary(harness.clone())
+            trailing
                 .grid_column(2)
-                .max_width(tokens::layout::RUNS_LABEL_WIDTH)
+                .max_width(tokens::layout::MONITOR_TRAILING_WIDTH)
                 .text_trimming(TextTrimming::CharacterEllipsis)
                 .vertical_alignment(VerticalAlignment::Center),
-            crate::m3::secondary(look.elapsed.to_owned())
-                .grid_column(3)
-                .vertical_alignment(VerticalAlignment::Center),
         ));
-    let two_lines = note_line.is_some();
-    let content: View = match note_line {
-        // The second line starts under the title, past the dot.
-        Some(note_line) => StackPanel::new()
-            .spacing(tokens::spacing::XS / 2.0)
-            .vertical_alignment(VerticalAlignment::Center)
-            .children((
-                line,
-                Border::new()
-                    .margin(Thickness::new(
-                        tokens::layout::DOT + tokens::spacing::SM,
-                        0.0,
-                        0.0,
-                        0.0,
-                    ))
-                    .content(note_line),
-            )),
-        None => line,
-    };
-    let height = if two_lines {
-        tokens::height::TWO_LINE_ROW
-    } else {
-        tokens::height::CONTROL
-    };
+    let tooltip = format!("{} · {status} · {harness}{note_name}", look.title);
     let button = crate::m3::row(palette, look.selected)
-        .height(height)
-        .min_height(height)
         .automation_name(format!(
             "{}, {status}, {harness}, {}{note_name}",
             look.title, look.elapsed_words
         ))
         .on_click(actions.open)
-        .content(content);
+        .content(content)
+        .tooltip(tooltip);
     let Some((resume, enabled)) = actions.resume else {
         return button;
     };
@@ -261,7 +219,7 @@ fn chart_card(
                 None => Border::new()
                     .height(tokens::layout::PLOT_STUB)
                     .opacity(theme::MUTED_OPACITY)
-                    .background(palette.outline_variant()),
+                    .background(palette.outline()),
             };
             KeyedView::new(
                 index,
@@ -523,7 +481,7 @@ pub fn resource_views(monitor: &Monitor, id: &str, palette: Palette) -> Vec<Keye
                     rss_scale,
                     format!("scale 0–{}", bytes_label(Some(rss_scale as u64))),
                     "sum over the Agent's sampled processes, not host memory share".to_owned(),
-                    palette.tertiary(),
+                    palette.primary(),
                     palette,
                 ),
             ));

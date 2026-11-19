@@ -6,6 +6,7 @@ use self::hooks::{
 
 use eliot_core::{
     ContextItem, ContextOutcome, Error, InjectPoint, Result, SecretPolicy,
+    limits::MAX_TOOL_COMMAND_BYTES,
     requests::{ApprovalChoice, ApprovalDecision, ApprovalRequest},
 };
 use eliot_plugin::{
@@ -1638,12 +1639,18 @@ impl EventProcessor {
             if !self.tools_started.insert(tool_use.id.clone()) {
                 continue;
             }
-            let data = json!({
+            let mut data = json!({
                 "command_id": command_id,
                 "turn_id": turn_id,
                 "item_id": tool_use.id,
                 "tool": tool_use.name,
             });
+            if let Some(command) = &tool_use.command {
+                data["command"] = Value::String(
+                    SecretPolicy::new(self.secrets.iter().cloned())
+                        .redact_bounded(command, MAX_TOOL_COMMAND_BYTES),
+                );
+            }
             if serde_json::to_vec(&data).map_or(true, |bytes| bytes.len() > MAX_EVENT_BYTES) {
                 return self
                     .record_gap("Claude tool start exceeded the persisted-event bound")

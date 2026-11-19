@@ -7,7 +7,7 @@ use crate::native_child::{
 };
 use eliot_core::{
     ChildRegistration, ContextItem, Error, ProviderRestriction, Result, SecretPolicy,
-    SessionTokenTotals, SessionUsage, TurnUsage, turn_started_data,
+    SessionTokenTotals, SessionUsage, TurnUsage, limits::MAX_TOOL_COMMAND_BYTES, turn_started_data,
 };
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
@@ -1179,17 +1179,19 @@ impl EventProcessor {
                         &item_id,
                         "tool.started",
                     )?;
-                    self.commit_event(
-                        "tool.started",
-                        native_id,
-                        json!({
-                            "command_id": command_id,
-                            "turn_id": notification.turn_id,
-                            "item_id": item_id,
-                            "tool": item_type,
-                        }),
-                    )
-                    .await?;
+                    let mut data = json!({
+                        "command_id": command_id,
+                        "turn_id": notification.turn_id,
+                        "item_id": item_id,
+                        "tool": item_type,
+                    });
+                    if let Some(command) = command_text(&notification.item) {
+                        data["command"] = Value::String(
+                            SecretPolicy::new(self.secrets.iter().cloned())
+                                .redact_bounded(&command, MAX_TOOL_COMMAND_BYTES),
+                        );
+                    }
+                    self.commit_event("tool.started", native_id, data).await?;
                 }
             }
             "item/completed" => {
@@ -1970,6 +1972,33 @@ fn tool_item(item: &Value) -> Option<(String, String, Option<String>)> {
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
     Some((item_id, item_type.to_owned(), status))
+}
+
+/// The command a `commandExecution` item runs, as Codex parsed it
+/// (`commandActions[].command`, one per line, without the shell wrapper),
+/// else its raw `command` string; `None` for other items or a blank one.
+fn command_text(item: &Value) -> Option<String> {
+    if item.get("type").and_then(Value::as_str) != Some("commandExecution") {
+        return None;
+    }
+    let parsed: Vec<&str> = item
+        .get("commandActions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|action| action.get("command").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+        .collect();
+    let text = if parsed.is_empty() {
+        item.get("command")
+            .and_then(Value::as_str)?
+            .trim()
+            .to_owned()
+    } else {
+        parsed.join("\n")
+    };
+    (!text.is_empty()).then_some(text)
 }
 
 fn is_tool_type(item_type: &str) -> bool {

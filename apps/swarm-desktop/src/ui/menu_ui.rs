@@ -114,8 +114,8 @@ pub(super) enum MenuMsg {
     /// (the highlight move that needs it).
     Reveal(u64),
     Chosen(Action),
-    Quick(UiAgent, Action),
-    TaskOpened(UiAgent),
+    /// A row's '…': its menu at the pointer.
+    Opened(Target),
     Hovered(Option<String>),
     RenameChanged(String),
     /// The tag editor's field at this index changed (the index past the
@@ -308,14 +308,11 @@ impl DesktopApp {
                 }
             }
             MenuMsg::Closed => self.close_menu(),
-            MenuMsg::TaskOpened(agent) => {
+            MenuMsg::Opened(target) => {
                 let (x, y) = crate::shortcuts::pointer_position();
-                self.menu_update(MenuMsg::Requested(Target::Agent(agent), x, y), context);
+                self.menu_update(MenuMsg::Requested(target, x, y), context);
             }
             MenuMsg::Hovered(agent) => self.menu.hovered = agent,
-            MenuMsg::Quick(agent, action) => {
-                self.menu_action(Target::Agent(agent), action, context)
-            }
             MenuMsg::Chosen(Action::More) => {
                 self.menu.more = !self.menu.more;
                 self.menu.highlight = None;
@@ -1196,7 +1193,7 @@ impl DesktopApp {
                         } else {
                             format!("Tags: {}…", agent.tags.join(", "))
                         },
-                        m3::glyph::RENAME,
+                        m3::glyph::TAG,
                         false,
                     ));
                 }
@@ -1326,7 +1323,7 @@ impl DesktopApp {
             .enumerate()
             .map(|(index, (action, label, glyph, destructive))| {
                 let text = if destructive {
-                    m3::body(label.clone()).foreground(palette.error())
+                    m3::body(label.clone()).foreground(palette.attention())
                 } else {
                     m3::body(label.clone())
                 };
@@ -1343,7 +1340,7 @@ impl DesktopApp {
                     button.content(
                         StackPanel::new()
                             .orientation(Orientation::Horizontal)
-                            .spacing(tokens::spacing::SM)
+                            .spacing(tokens::spacing::ROW)
                             .children((m3::icon(glyph), text)),
                     ),
                 )
@@ -1356,6 +1353,7 @@ impl DesktopApp {
                     context.callback(|_: PointerEventInfo| Message::Menu(MenuMsg::Closed)),
                 ),
             m3::lifted(
+                palette,
                 crate::theme::elevation::Level::Two,
                 tokens::radius::CONTAINER,
                 Grid::new()
@@ -1419,7 +1417,7 @@ impl DesktopApp {
                     .on_click(context.message(Message::Menu(MenuMsg::Confirmed(true))))
                     .content(m3::label(button)),
             ),
-            420.0,
+            tokens::layout::DIALOG_WIDTH,
         )
     }
 
@@ -1434,7 +1432,7 @@ impl DesktopApp {
         let title = format!("Stop and delete “{}”", self.agent_label(&removal.agent));
         let status: View = match &removal.error {
             Some(error) => m3::body(error.clone())
-                .foreground(palette.error())
+                .foreground(palette.attention())
                 .text_wrapping(TextWrapping::Wrap)
                 .is_text_selection_enabled(true)
                 .into(),
@@ -1474,7 +1472,7 @@ impl DesktopApp {
             title,
             status,
             close,
-            420.0,
+            tokens::layout::DIALOG_WIDTH,
         )
     }
 
@@ -1494,7 +1492,7 @@ impl DesktopApp {
                 .max_width(tokens::layout::READING_WIDTH)
                 .horizontal_alignment(HorizontalAlignment::Center)
                 .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
-                .background(palette.card())
+                .background(palette.tonal())
                 .corner_radius(tokens::radius::CONTAINER)
                 .padding(Thickness::new(
                     tokens::spacing::MD,
@@ -1524,7 +1522,7 @@ impl DesktopApp {
                                         None,
                                     ))),
                                 )
-                                .content(m3::toolbar_icon(m3::glyph::CLOSE)),
+                                .content(m3::icon(m3::glyph::CLOSE)),
                         )),
                 ),
         )
@@ -1567,7 +1565,7 @@ impl DesktopApp {
                         .height(tokens::height::CONTROL)
                         .automation_name(format!("Remove tag {}", index + 1))
                         .on_click(context.message(Message::Menu(MenuMsg::TagRemoved(index))))
-                        .content(m3::toolbar_icon(m3::glyph::CLOSE))
+                        .content(m3::icon(m3::glyph::CLOSE))
                 };
                 KeyedView::new(
                     format!("tag:{index}"),
@@ -1590,13 +1588,13 @@ impl DesktopApp {
                         .height(tokens::height::CONTROL)
                         .automation_name("Save tags")
                         .on_click(context.message(Message::Menu(MenuMsg::RenameCommitted)))
-                        .content(m3::toolbar_icon(m3::glyph::CHECK)),
+                        .content(m3::icon(m3::glyph::CHECK)),
                     m3::icon_button(palette)
                         .width(tokens::height::CONTROL)
                         .height(tokens::height::CONTROL)
                         .automation_name("Cancel tags")
                         .on_click(context.message(Message::Menu(MenuMsg::RenameCancelled)))
-                        .content(m3::toolbar_icon(m3::glyph::CLOSE)),
+                        .content(m3::icon(m3::glyph::CLOSE)),
                 )),
         ));
         StackPanel::new()
@@ -1648,14 +1646,14 @@ impl DesktopApp {
                     .height(tokens::height::CONTROL)
                     .automation_name(save)
                     .on_click(context.message(Message::Menu(MenuMsg::RenameCommitted)))
-                    .content(m3::toolbar_icon(m3::glyph::CHECK)),
+                    .content(m3::icon(m3::glyph::CHECK)),
                 m3::icon_button(palette)
                     .grid_column(2)
                     .width(tokens::height::CONTROL)
                     .height(tokens::height::CONTROL)
                     .automation_name(cancel)
                     .on_click(context.message(Message::Menu(MenuMsg::RenameCancelled)))
-                    .content(m3::toolbar_icon(m3::glyph::CLOSE)),
+                    .content(m3::icon(m3::glyph::CLOSE)),
             ))
     }
 

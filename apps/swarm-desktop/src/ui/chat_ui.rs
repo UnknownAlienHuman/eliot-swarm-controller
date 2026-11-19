@@ -36,9 +36,12 @@ pub(super) enum ChatMsg {
     RereadLoaded(u64, Result<Box<Reread>, (eliot_core::Error, Invalidation)>),
     RereadRetry(u64),
     LoadOlderRequested,
-    /// Bring the latest turn into view once it is realized (epoch, tries).
-    FollowLatest(u64, u32),
+    /// The newest turn was scrolled into view, or why not (epoch).
+    FollowLatest(u64, Result<(), String>),
     ToolsToggled(String, bool),
+    /// The pointer entered (`true`) or left a transcript part: its copy
+    /// action shows while it is hovered.
+    PartHovered(String, bool),
     CopyPart(String),
     CopyCode(String, usize),
     /// Send, Steer or Resume with the draft, bound when it was clicked.
@@ -105,9 +108,12 @@ const MENU_FORCE: &str = "Force stop…";
 /// WinUI's own left text padding inside a TextBox
 /// (`TextControlThemePadding`, 10,5,6,6).
 const WINUI_TEXT_PADDING: f64 = 10.0;
-/// Follow-latest retries while the newest turn is not realized yet.
-const FOLLOW_TRIES: u32 = 20;
-const FOLLOW_DELAY_MS: u64 = 50;
+/// Delay before the composer takes focus after an open or a send, and
+/// before a send scrolls the transcript to its end: the next render has
+/// realized the newest turn by then (ms).
+const FOLLOW_DELAY_MS: u64 = 60;
+/// The transcript viewer's automation id, which `crate::scroll_end` finds.
+const TRANSCRIPT_ID: &str = "ConversationTranscript";
 
 /// Admission refusals of a steer after which the text goes as the next
 /// message: the turn ended or changed (`bad_state`, `stale_generation`), or
@@ -332,13 +338,13 @@ pub(super) struct ChatState {
     pub(super) docs: HashMap<u64, Doc>,
     pub(super) render_cache: RenderCache,
     pub(super) items: Rc<Vec<Rc<RenderedItem>>>,
-    pub(super) items_revision: u64,
     pub(super) expanded: HashSet<String>,
+    /// The transcript part under the pointer (its copy action shows).
+    pub(super) hovered: Option<String>,
     /// A button of the latest turn, rendered outside the virtualized
     /// repeater so it always exists: opening a conversation focuses it, and
     /// WinUI brings a focused control into view (Reactor 0.100.0 exposes no
     /// ScrollViewer offset or ChangeView).
-    pub(super) end_anchor: ElementRef<Button>,
     /// The composer, focused again after input is admitted, a launch and New.
     pub(super) composer_ref: ElementRef<TextBox>,
     pub(super) pending_local: Option<(String, String, String)>,
@@ -419,7 +425,7 @@ impl DesktopApp {
             );
         }
         self.rebuild_items();
-        self.follow_latest(0, context);
+        self.follow_latest(true, context);
         let blank = snapshot.text.trim().is_empty();
         self.spawn_draft(
             snapshot.action,
@@ -511,8 +517,9 @@ impl DesktopApp {
                         self.rebuild_items();
                         self.check_waiting_inputs(context);
                         if first_load {
-                            // Opened at the newest turn, like a chat.
-                            self.follow_latest(0, context);
+                            // The transcript opens at its newest turn by
+                            // its anchor; typing goes to the composer.
+                            self.follow_latest(false, context);
                         }
                         self.set_status("Retained history loaded; following live events.");
                         self.follow_next(Next::Wake { after: cursor }, context);
@@ -632,17 +639,19 @@ impl DesktopApp {
                 self.set_status("Loading older retained history…");
                 self.start_snapshot(context);
             }
-            ChatMsg::FollowLatest(epoch, tries) => {
+            ChatMsg::FollowLatest(epoch, outcome) => {
                 if epoch != self.chat.epoch {
                     return;
                 }
-                if self.chat.opened_from_search {
-                    // Focus would leave the search box and close its list.
-                } else if self.chat.end_anchor.request_focus() {
-                    // The latest turn is in view; typing goes on in the composer.
+                if let Err(error) = outcome {
+                    self.set_status(format!(
+                        "The latest turn was not scrolled into view: {error}"
+                    ));
+                }
+                // Typing goes on in the composer; focus would leave the
+                // search box and close its list.
+                if !self.chat.opened_from_search {
                     let _ = self.chat.composer_ref.request_focus();
-                } else if tries < FOLLOW_TRIES && !self.chat.items.is_empty() {
-                    self.follow_latest(tries + 1, context);
                 }
             }
             ChatMsg::ToolsToggled(key, expanded) => {
@@ -700,6 +709,13 @@ impl DesktopApp {
                     self.chat.loss = Some((agent, generation, words));
                 }
             }
+            ChatMsg::PartHovered(key, true) => self.chat.hovered = Some(key),
+            // A late exit of the part just left must not hide the next one.
+            ChatMsg::PartHovered(key, false) => {
+                if self.chat.hovered.as_deref() == Some(key.as_str()) {
+                    self.chat.hovered = None;
+                }
+            }
             ChatMsg::CopyPart(key) => {
                 let text = self
                     .chat
@@ -735,6 +751,8 @@ impl DesktopApp {
                 }
                 let agent_id = action.agent().to_owned();
                 let text = profiles::normalize_newlines(self.chat.drafts.get(&agent_id));
+                // Attached files ride the message as its closing block.
+                let text = crate::attachments::compose(&text, self.attached_to(&agent_id));
                 // A plain Resume needs no text; Send and Steer do.
                 let blank = text.trim().is_empty();
                 if blank && !matches!(action, DraftAction::Resume { .. }) {
@@ -796,6 +814,7 @@ impl DesktopApp {
                 // At once: the composer empties (same revision, so a retry
                 // keeps this id) and the message shows with what it waits for.
                 self.chat.drafts.ack(&agent_id, revision);
+                self.clear_attached(&agent_id);
                 if !blank
                     && let Some(convo) = self.chat.convo.as_mut()
                     && convo.agent() == agent_id
@@ -814,7 +833,7 @@ impl DesktopApp {
                     );
                 }
                 self.rebuild_items();
-                self.follow_latest(0, context);
+                self.follow_latest(true, context);
                 self.spawn_draft(
                     action,
                     mutation_id,
@@ -986,6 +1005,91 @@ impl DesktopApp {
 
     /// The main area for a conversation: the header, the transcript (or the
     /// empty state of a new task), pending requests and the composer.
+    /// The home screen (`Main.dc.html`): the greeting at 28/500 and three
+    /// suggestion cards under it, centred above the composer: continue the
+    /// last task, schedule an automation, and a prompt to review the open
+    /// pull requests (it fills the composer).
+    fn home_view(
+        &self,
+        greeting: String,
+        context: &mut ViewContext<Self>,
+        palette: Palette,
+    ) -> View {
+        const REVIEW: &str =
+            "Review the open pull requests in this repository and summarize what needs attention.";
+        let last = self
+            .nav
+            .agents
+            .iter()
+            .filter(|agent| !agent.native_child && !agent.archived)
+            .max_by_key(|agent| agent.updated_at)
+            .cloned();
+        let mut cards: Vec<KeyedView> = vec![KeyedView::new(
+            "review",
+            m3::suggestion(palette)
+                .automation_name("Review the open PRs")
+                .on_click(
+                    context.message(Message::Chat(ChatMsg::ComposerChanged(REVIEW.to_owned()))),
+                )
+                .content(m3::suggestion_content(
+                    palette,
+                    m3::glyph::LIST,
+                    "Review the open PRs",
+                )),
+        )];
+        cards.push(KeyedView::new(
+            "automation",
+            m3::suggestion(palette)
+                .grid_column(1)
+                .automation_name("Schedule an automation")
+                .on_click(context.message(Message::Shell(ShellMsg::SettingsPage(
+                    settings_ui::Page::Automations,
+                ))))
+                .content(m3::suggestion_content(
+                    palette,
+                    m3::glyph::AUTOMATION,
+                    "Schedule an automation",
+                )),
+        ));
+        if let Some(agent) = last {
+            cards.push(KeyedView::new(
+                format!("continue:{}", agent.id),
+                m3::suggestion(palette)
+                    .grid_column(2)
+                    .automation_name(format!(
+                        "Continue the last task: {}",
+                        self.agent_label(&agent)
+                    ))
+                    .on_click(context.message(Message::Shell(ShellMsg::AgentOpened(agent))))
+                    .content(m3::suggestion_content(
+                        palette,
+                        m3::glyph::CODE,
+                        "Continue the last task",
+                    )),
+            ));
+        }
+        // The design's cards keep their width (a third of the home column);
+        // with no last task to continue, the two left stay centred.
+        let gap = tokens::spacing::INSET;
+        let card = (tokens::layout::HOME_WIDTH - 2.0 * gap) / 3.0;
+        let count = cards.len();
+        StackPanel::new()
+            .grid_row(1)
+            .spacing(28.0)
+            .horizontal_alignment(HorizontalAlignment::Center)
+            .vertical_alignment(VerticalAlignment::Center)
+            .margin(Thickness::xy(tokens::spacing::XL, 0.0))
+            .children((
+                m3::page_title(greeting).horizontal_alignment(HorizontalAlignment::Center),
+                Grid::new()
+                    .width(count as f64 * card + count.saturating_sub(1) as f64 * gap)
+                    .horizontal_alignment(HorizontalAlignment::Center)
+                    .columns(vec![GridLength::STAR; count])
+                    .column_spacing(gap)
+                    .keyed_children(cards),
+            ))
+    }
+
     pub(super) fn chat_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let agent = self.selected_agent_id();
         let column = self.reading_width();
@@ -1009,11 +1113,7 @@ impl DesktopApp {
                     Some(project) => format!("What should we build in {project}?"),
                     None => "What should we build?".to_owned(),
                 };
-                m3::page_title(line)
-                    .grid_row(1)
-                    .horizontal_alignment(HorizontalAlignment::Center)
-                    .vertical_alignment(VerticalAlignment::Center)
-                    .into()
+                self.home_view(line, context, palette)
             }
         };
         let pending = self.pending_view(column, context, palette);
@@ -1043,7 +1143,7 @@ impl DesktopApp {
                     .max_width(tokens::layout::READING_WIDTH)
                     .horizontal_alignment(HorizontalAlignment::Center)
                     .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
-                    .background(palette.card())
+                    .background(palette.tonal())
                     .corner_radius(tokens::radius::CONTAINER)
                     .padding(Thickness::new(
                         tokens::spacing::MD,
@@ -1067,7 +1167,7 @@ impl DesktopApp {
                                     .on_click(
                                         context.message(Message::Shell(ShellMsg::AlertDismissed)),
                                     )
-                                    .content(m3::toolbar_icon(m3::glyph::CLOSE)),
+                                    .content(m3::icon(m3::glyph::CLOSE)),
                             )),
                     )
             }
@@ -1115,9 +1215,14 @@ impl DesktopApp {
     /// arranged in a slot wider than the viewport (off center), so the
     /// column gets an explicit width.
     fn reading_width(&self) -> Option<f64> {
+        self.column_width(tokens::layout::READING_WIDTH)
+    }
+
+    /// The column the main area gives: its width less the design's 32-DIP
+    /// side padding, at most `widest` (720 in a conversation, 760 at home).
+    pub(super) fn column_width(&self, widest: f64) -> Option<f64> {
         self.main_width().map(|width| {
-            (width - 2.0 * tokens::spacing::LG - tokens::spacing::MD)
-                .clamp(tokens::layout::MIN_COLUMN, tokens::layout::READING_WIDTH)
+            (width - 2.0 * tokens::spacing::XL).clamp(tokens::layout::MIN_COLUMN, widest)
         })
     }
 }

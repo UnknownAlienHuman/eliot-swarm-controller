@@ -95,6 +95,7 @@ impl Group {
     /// The state filter's word for the group.
     pub fn filter_label(self) -> &'static str {
         match self {
+            Self::Attention => "Attention",
             Self::Stopped => "Stopped",
             other => other.title(),
         }
@@ -1024,12 +1025,6 @@ impl<'a> Tree<'a> {
     }
 }
 
-/// Project rows the overview shows before "N more projects".
-pub const PROJECT_ROWS: usize = 6;
-
-/// The live groups the overview charts, in bar and legend order.
-pub const LIVE_GROUPS: [Group; 3] = [Group::Working, Group::Attention, Group::Idle];
-
 /// A project as the sidebar names it: its section key and display name.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectRef {
@@ -1067,44 +1062,6 @@ impl LiveCounts {
             Group::UnparentedSubagents | Group::Stopped => {}
         }
     }
-
-    /// "2 working · 1 needs attention · 3 idle" ([`live_words`]).
-    pub fn words(self) -> String {
-        live_words(self.working, self.attention, self.idle)
-    }
-
-    /// The bar's segments and the legend's items: each live group with
-    /// Agents, in [`LIVE_GROUPS`] order.
-    pub fn segments(self) -> Vec<(Group, usize)> {
-        LIVE_GROUPS
-            .into_iter()
-            .map(|group| (group, self.get(group)))
-            .filter(|(_, count)| *count > 0)
-            .collect()
-    }
-
-    /// "3 working, 1 idle": the groups with Agents, for a project row's
-    /// accessible name.
-    pub fn list_words(self) -> String {
-        self.segments()
-            .into_iter()
-            .map(|(group, count)| format!("{count} {}", group_words(group, count)))
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
-}
-
-/// A live group after a count, in words ("working", "needs attention",
-/// "need attention", "idle").
-pub fn group_words(group: Group, count: usize) -> &'static str {
-    match group {
-        Group::Working => "working",
-        Group::Attention if count == 1 => "needs attention",
-        Group::Attention => "need attention",
-        Group::Idle => "idle",
-        Group::UnparentedSubagents => "subagents",
-        Group::Stopped => "stopped",
-    }
 }
 
 /// One Agent the overview counts: its row, its own live group and its
@@ -1136,12 +1093,11 @@ pub struct Filter {
 
 /// The states the Monitor's state filter offers, in its order (`None`:
 /// every state).
-pub const STATE_FILTERS: [Option<Group>; 5] = [
+pub const STATE_FILTERS: [Option<Group>; 4] = [
     None,
     Some(Group::Working),
     Some(Group::Attention),
     Some(Group::Idle),
-    Some(Group::Stopped),
 ];
 
 impl Filter {
@@ -1230,21 +1186,6 @@ pub struct Overview<'a> {
 }
 
 impl<'a> Overview<'a> {
-    /// The longest project bar: every project bar is drawn on this scale.
-    pub fn scale(&self) -> usize {
-        self.projects
-            .iter()
-            .map(|project| project.counts.total())
-            .max()
-            .unwrap_or(0)
-    }
-
-    /// The note beside the chart when the counts are partial.
-    pub fn partial_note(&self) -> Option<&'static str> {
-        self.partial
-            .then_some("Partial counts: more Agents are live than one read returns")
-    }
-
     /// Keep the selected filter on a partial read, but show all loaded
     /// chart rows if none match it.
     pub fn list_for_filter(&self, filter: &Filter) -> (Vec<Section<'a>>, bool) {

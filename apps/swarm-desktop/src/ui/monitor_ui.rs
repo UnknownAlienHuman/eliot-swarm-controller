@@ -5,7 +5,7 @@
 //! the panel is open.
 
 use super::*;
-use crate::monitor::{Filter, Group, MonitorRow, Overview, ProjectRef, Tree};
+use crate::monitor::{Filter, Group, MonitorRow, ProjectRef, Tree};
 use crate::nav::Checkout;
 use crate::theme::StatusTone;
 use crate::theme::winui::Palette;
@@ -24,14 +24,6 @@ pub(super) enum MonitorMsg {
     ChildrenToggled(String),
     /// Show or hide Recently stopped.
     StoppedToggled,
-    /// A state bar segment or legend item: list only that group, or
-    /// everything again when it already filters.
-    GroupFiltered(Group),
-    /// A project row: list only that project, or every project again when
-    /// it already filters.
-    ProjectFiltered(ProjectRef),
-    /// Show every project row, or the first few again.
-    ProjectsToggled,
     TechnicalToggled,
     PanelChosen(Panel),
     /// The search field's text.
@@ -57,8 +49,6 @@ pub(super) struct MonitorState {
     pub(super) stopped_open: bool,
     /// What the list is narrowed to (a group, a project, or both).
     pub(super) filter: Filter,
-    /// Every project row is shown, not only the first few.
-    pub(super) projects_open: bool,
     pub(super) technical_open: bool,
 }
 
@@ -71,31 +61,6 @@ fn group_tone(group: Group) -> StatusTone {
         Group::UnparentedSubagents | Group::Stopped => StatusTone::Neutral,
     }
 }
-
-/// A group's glyph: its mark under High Contrast, where the chart's
-/// colors are system colors.
-fn group_glyph(group: Group) -> &'static str {
-    match group {
-        Group::Working => m3::glyph::PULSE,
-        Group::Attention => m3::glyph::WARNING,
-        Group::Idle => m3::glyph::PAUSE,
-        Group::UnparentedSubagents => m3::glyph::PROFILE,
-        Group::Stopped => m3::glyph::STOP,
-    }
-}
-
-/// A group's mark in the legend: its chart-colored dot, or its glyph under
-/// High Contrast (the same one its bar segment shows).
-fn group_mark(palette: Palette, group: Group) -> View {
-    if palette.scheme().is_none() {
-        m3::icon(group_glyph(group))
-    } else {
-        m3::dot(palette.chart_fill(group_tone(group)))
-    }
-}
-
-/// Opacity of the segments and project bars a filter leaves out.
-const FILTERED_OUT: f64 = 0.38;
 
 impl DesktopApp {
     pub(super) fn monitor_update(&mut self, msg: MonitorMsg, context: &ComponentContext<Self>) {
@@ -201,19 +166,6 @@ impl DesktopApp {
                     self.monitor.filter.group = *group;
                 }
             }
-            MonitorMsg::GroupFiltered(group) => {
-                let filter = &mut self.monitor.filter;
-                filter.group = (filter.group != Some(group)).then_some(group);
-            }
-            MonitorMsg::ProjectFiltered(project) => {
-                let filter = &mut self.monitor.filter;
-                let on = filter
-                    .project
-                    .as_ref()
-                    .is_some_and(|on| on.key == project.key);
-                filter.project = (!on).then_some(project);
-            }
-            MonitorMsg::ProjectsToggled => self.monitor.projects_open = !self.monitor.projects_open,
             MonitorMsg::TechnicalToggled => {
                 self.monitor.technical_open = !self.monitor.technical_open
             }
@@ -288,98 +240,91 @@ impl DesktopApp {
         }));
     }
 
-    /// The Monitor's search field and state filter (k195 P3-2): the text
-    /// matches a task's title, id, harness, model or project, live and
-    /// recently stopped; the state is every state or one group.
-    fn monitor_search(&self, context: &mut ViewContext<Self>) -> View {
+    /// The Monitor's search and state filter (`Conversation.dc.html`): a
+    /// pill search field (title, id, harness, model, project, live and
+    /// recently stopped), then the connected segmented filter.
+    fn monitor_search(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let filter = &self.monitor.filter;
-        let selected = monitor::STATE_FILTERS
+        let field = TextBox::new()
+            .text(filter.text.clone())
+            .placeholder_text("Search agents")
+            .automation_name("Search the monitor")
+            .on_text_changed(
+                context.callback(|text| Message::Monitor(MonitorMsg::SearchChanged(text))),
+            );
+        let segments: Vec<KeyedView> = monitor::STATE_FILTERS
             .iter()
-            .position(|group| *group == filter.group);
-        let labels: Vec<String> = monitor::STATE_FILTERS
-            .iter()
-            .map(|group| {
-                group
-                    .map_or("All states", monitor::Group::filter_label)
-                    .to_owned()
+            .enumerate()
+            .map(|(index, group)| {
+                let label = group.map_or("All", monitor::Group::filter_label);
+                let selected = filter.group == *group;
+                // Keyed by its selection: WinUI reads a button's colors
+                // only when its template is applied.
+                KeyedView::new(
+                    format!("{label}:{selected}"),
+                    m3::segment(palette, selected)
+                        .automation_name(format!("Show {label}"))
+                        .on_click(
+                            context.message(Message::Monitor(MonitorMsg::StateChosen(Some(index)))),
+                        )
+                        .content(m3::segment_label(label)),
+                )
             })
             .collect();
-        Grid::new()
-            .columns([GridLength::STAR, GridLength::Auto])
-            .column_spacing(tokens::spacing::SM)
-            .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
-            .children((
-                TextBox::new()
-                    .text(filter.text.clone())
-                    .placeholder_text("Search tasks")
-                    .automation_name("Search the monitor")
-                    .on_text_changed(
-                        context.callback(|text| Message::Monitor(MonitorMsg::SearchChanged(text))),
-                    ),
-                ComboBox::new()
-                    .grid_column(1)
-                    .items_source(labels)
-                    .selected_index(selected)
-                    .automation_name("State filter")
-                    .on_selection_changed(context.callback(|index: Option<usize>| {
-                        Message::Monitor(MonitorMsg::StateChosen(index))
-                    })),
-            ))
+        StackPanel::new().spacing(tokens::spacing::ROW).children((
+            m3::search_field(palette.tonal(), field),
+            m3::segmented(palette, segments),
+        ))
     }
 
-    /// The panel's header: its title and the one close button.
+    /// The pane's header: the Monitor and Details tabs and the close
+    /// button.
     fn panel_header(
         &self,
         _title: &str,
         context: &mut ViewContext<Self>,
         palette: Palette,
     ) -> View {
+        let tabs: Vec<KeyedView> = [("Monitor", Panel::Monitor), ("Details", Panel::Details)]
+            .into_iter()
+            .map(|(label, panel)| {
+                let selected = self.panel == panel;
+                // Keyed by its selection (k195 P2-5: the highlight follows
+                // the pane, however it opened).
+                KeyedView::new(
+                    format!("{label}:{selected}"),
+                    m3::pane_tab(palette, selected)
+                        .is_enabled(
+                            panel != Panel::Details
+                                || self.monitor.selected.is_some()
+                                || self.selected_agent_id().is_some(),
+                        )
+                        .automation_name(format!("Show {label}"))
+                        .on_click(context.message(Message::Monitor(MonitorMsg::PanelChosen(panel))))
+                        .content(m3::pane_tab_label(label)),
+                )
+            })
+            .collect();
         Grid::new()
+            .height(tokens::height::CONTROL)
             .columns([GridLength::STAR, GridLength::Auto])
             .margin(Thickness::new(
-                tokens::spacing::MD,
-                tokens::spacing::SM,
-                tokens::spacing::SM,
-                tokens::spacing::SM,
+                tokens::spacing::ROW + tokens::spacing::XS,
+                tokens::spacing::INSET,
+                tokens::spacing::ROW + tokens::spacing::XS,
+                0.0,
             ))
             .children((
-                m3::segmented(
-                    palette,
-                    [("Monitor", Panel::Monitor), ("Details", Panel::Details)]
-                        .into_iter()
-                        .map(|(label, panel)| {
-                            let selected = self.panel == panel;
-                            // Keyed by its selection: WinUI reads a button's
-                            // colors only when its template is applied, so
-                            // the highlight follows the pane only on a new
-                            // segment (k195 P2-5: it stayed on Details when
-                            // the sidebar opened the Monitor).
-                            KeyedView::new(
-                                format!("{label}:{selected}"),
-                                m3::segment(palette, selected)
-                                    .is_enabled(
-                                        panel != Panel::Details
-                                            || self.monitor.selected.is_some()
-                                            || self.selected_agent_id().is_some(),
-                                    )
-                                    .automation_name(format!("Show {label}"))
-                                    .on_click(
-                                        context.message(Message::Monitor(MonitorMsg::PanelChosen(
-                                            panel,
-                                        ))),
-                                    )
-                                    .content(m3::segment_label(label)),
-                            )
-                        })
-                        .collect::<Vec<_>>(),
-                ),
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .keyed_children(tabs),
                 m3::icon_button(palette)
                     .grid_column(1)
                     .automation_name("Close panel")
                     .on_click(
                         context.message(Message::Shell(ShellMsg::PanelToggled(Panel::Closed))),
                     )
-                    .content(m3::toolbar_icon(m3::glyph::CLOSE)),
+                    .content(m3::icon(m3::glyph::CLOSE)),
             ))
     }
 
@@ -472,6 +417,7 @@ impl DesktopApp {
                         elapsed_words: &elapsed_words,
                         dot: palette.chart_fill(group_tone(group)),
                         selected: selected == Some(row.id.as_str()),
+                        working: group == monitor::Group::Working,
                     },
                     note.as_ref(),
                     monitor_view::RowActions {
@@ -530,331 +476,6 @@ impl DesktopApp {
         }
     }
 
-    /// The overview above the list: the state bar (one segment per live
-    /// group, proportional to its count), the legend with its numbers, a
-    /// note when the counts are partial or old, the live Agents by project
-    /// on one scale, and the active filters as chips. Every segment, legend
-    /// item and project row filters the list; clicking it again clears it.
-    fn monitor_overview(
-        &self,
-        overview: &Overview,
-        context: &mut ViewContext<Self>,
-        palette: Palette,
-    ) -> Vec<KeyedView> {
-        let filter = &self.monitor.filter;
-        let counts = overview.counts;
-        let total = counts.total();
-        let segments = counts.segments();
-        let mut items: Vec<KeyedView> = Vec::new();
-
-        // Under High Contrast the glyph buttons have their own space,
-        // even when the corresponding proportional segment is very small.
-        let marked = palette.scheme().is_none();
-        let bar_height = tokens::layout::STATE_BAR;
-        let bar = if segments.is_empty() {
-            // Nothing live: the empty track.
-            m3::bar_segment(palette.well(), bar_height)
-        } else if marked {
-            let plot = m3::stacked_bar(
-                segments
-                    .iter()
-                    .map(|&(group, count)| {
-                        (
-                            count,
-                            format!("fill:{group:?}"),
-                            m3::bar_segment(palette.chart_fill(group_tone(group)), bar_height),
-                        )
-                    })
-                    .collect(),
-                0,
-                bar_height,
-            );
-            let controls =
-                Grid::new()
-                    .columns(vec![GridLength::Auto; segments.len()])
-                    .column_spacing(tokens::layout::BAR_GAP)
-                    .keyed_children(segments.iter().enumerate().map(
-                        |(column, &(group, count))| {
-                            let dimmed = filter.group.is_some_and(|only| only != group);
-                            KeyedView::new(
-                                format!("segment:{group:?}"),
-                                m3::bar_glyph_button(palette.chart_button(group_tone(group)))
-                                    .grid_column(column as i32)
-                                    .opacity(if dimmed { FILTERED_OUT } else { 1.0 })
-                                    .automation_name(format!(
-                                        "{}: {count} of {total}",
-                                        group.title()
-                                    ))
-                                    .on_click(context.message(Message::Monitor(
-                                        MonitorMsg::GroupFiltered(group),
-                                    )))
-                                    .content(m3::icon(group_glyph(group))),
-                            )
-                        },
-                    ));
-            StackPanel::new()
-                .spacing(tokens::layout::BAR_GAP)
-                .children((plot, controls))
-        } else {
-            m3::stacked_bar(
-                segments
-                    .iter()
-                    .map(|&(group, count)| {
-                        let dimmed = filter.group.is_some_and(|only| only != group);
-                        (
-                            count,
-                            format!("segment:{group:?}"),
-                            m3::bar_button(palette.chart_button(group_tone(group)), bar_height)
-                                .opacity(if dimmed { FILTERED_OUT } else { 1.0 })
-                                .automation_name(format!("{}: {count} of {total}", group.title()))
-                                .on_click(
-                                    context.message(Message::Monitor(MonitorMsg::GroupFiltered(
-                                        group,
-                                    ))),
-                                )
-                                .content(View::empty()),
-                        )
-                    })
-                    .collect(),
-                0,
-                bar_height,
-            )
-        };
-        let legend: View = if segments.is_empty() {
-            m3::body(counts.words()).into()
-        } else {
-            // Each item as wide as its words, so "needs attention" is
-            // never cut at the panel's width.
-            Grid::new()
-                .columns(vec![GridLength::Auto; segments.len()])
-                .column_spacing(tokens::spacing::XS)
-                .keyed_children(
-                    segments
-                        .iter()
-                        .enumerate()
-                        .map(|(column, &(group, count))| {
-                            let on = filter.group == Some(group);
-                            let words = monitor::group_words(group, count);
-                            KeyedView::new(
-                                format!("legend:{group:?}:{on}"),
-                                m3::row(palette, on)
-                                    .grid_column(column as i32)
-                                    .height(tokens::height::TWO_LINE_ROW)
-                                    .min_height(tokens::height::TWO_LINE_ROW)
-                                    .automation_name(format!(
-                                        "{count} {words}{}",
-                                        if on { ", listed only" } else { "" }
-                                    ))
-                                    .on_click(context.message(Message::Monitor(
-                                        MonitorMsg::GroupFiltered(group),
-                                    )))
-                                    .content(
-                                        StackPanel::new()
-                                            .vertical_alignment(VerticalAlignment::Center)
-                                            .children((
-                                                m3::text(
-                                                    count.to_string(),
-                                                    tokens::text::PAGE_TITLE,
-                                                ),
-                                                StackPanel::new()
-                                                    .orientation(Orientation::Horizontal)
-                                                    .spacing(tokens::spacing::XS)
-                                                    .children((
-                                                        group_mark(palette, group),
-                                                        m3::secondary(words).text_trimming(
-                                                            TextTrimming::CharacterEllipsis,
-                                                        ),
-                                                    )),
-                                            )),
-                                    ),
-                            )
-                        })
-                        .collect::<Vec<_>>(),
-                )
-        };
-        // Partial counts are said next to the chart, never passed as
-        // totals; then read failures and the age of the data.
-        let data = &self.monitor.data;
-        let mut notes: Vec<String> = Vec::new();
-        if !data.errors.is_empty() {
-            notes.push("Some reads failed".to_owned());
-        }
-        if let Some(status) = monitor::read_status(data.read_at_ms, crate::handoff::now_ms()) {
-            notes.push(status);
-        }
-        let partial: View = match overview.partial_note() {
-            Some(note) => m3::icon_label(m3::glyph::WARNING, note),
-            None => View::empty(),
-        };
-        items.push(KeyedView::new(
-            "state",
-            StackPanel::new().spacing(tokens::spacing::XS).children((
-                bar,
-                legend,
-                partial,
-                if notes.is_empty() {
-                    View::empty()
-                } else {
-                    m3::secondary(notes.join(" · "))
-                        .text_wrapping(TextWrapping::Wrap)
-                        .into()
-                },
-            )),
-        ));
-
-        if !overview.projects.is_empty() {
-            items.push(KeyedView::new(
-                "projects-caption",
-                m3::section_label("By project").margin(Thickness::new(
-                    tokens::spacing::INSET,
-                    tokens::spacing::SM,
-                    0.0,
-                    0.0,
-                )),
-            ));
-            let scale = overview.scale();
-            let shown = if self.monitor.projects_open {
-                overview.projects.len()
-            } else {
-                monitor::PROJECT_ROWS
-            };
-            for project in overview.projects.iter().take(shown) {
-                let key = &project.project.key;
-                let name = &project.project.name;
-                let on = filter.project.as_ref().is_some_and(|on| &on.key == key);
-                let dimmed = filter.project.is_some() && !on;
-                let bar = m3::stacked_bar(
-                    project
-                        .counts
-                        .segments()
-                        .into_iter()
-                        .map(|(group, count)| {
-                            (
-                                count,
-                                format!("{group:?}"),
-                                m3::bar_segment(
-                                    palette.chart_fill(group_tone(group)),
-                                    tokens::layout::PROJECT_BAR,
-                                ),
-                            )
-                        })
-                        .collect(),
-                    scale - project.counts.total(),
-                    tokens::layout::PROJECT_BAR,
-                );
-                items.push(KeyedView::new(
-                    format!("project:{key}:{on}"),
-                    m3::row(palette, on)
-                        .height(tokens::layout::PROJECT_ROW)
-                        .min_height(tokens::layout::PROJECT_ROW)
-                        .automation_name(format!(
-                            "{name}: {}{}",
-                            project.counts.list_words(),
-                            if on { ", listed only" } else { "" }
-                        ))
-                        .on_click(
-                            context.message(Message::Monitor(MonitorMsg::ProjectFiltered(
-                                project.project.clone(),
-                            ))),
-                        )
-                        .content(
-                            StackPanel::new()
-                                .spacing(tokens::spacing::XS)
-                                .vertical_alignment(VerticalAlignment::Center)
-                                .children((
-                                    Grid::new()
-                                        .columns([GridLength::STAR, GridLength::Auto])
-                                        .column_spacing(tokens::spacing::SM)
-                                        .children((
-                                            TextBlock::new()
-                                                .text(name.clone())
-                                                .text_trimming(TextTrimming::CharacterEllipsis),
-                                            m3::text(
-                                                project.counts.total().to_string(),
-                                                tokens::text::SECTION_TITLE,
-                                            )
-                                            .grid_column(1)
-                                            .vertical_alignment(VerticalAlignment::Center),
-                                        )),
-                                    Border::new()
-                                        .opacity(if dimmed { FILTERED_OUT } else { 1.0 })
-                                        .content(bar),
-                                )),
-                        )
-                        .tooltip(name.clone()),
-                ));
-            }
-            let hidden = overview
-                .projects
-                .len()
-                .saturating_sub(monitor::PROJECT_ROWS);
-            if hidden > 0 {
-                let open = self.monitor.projects_open;
-                let label = if open {
-                    "Show fewer projects".to_owned()
-                } else if hidden == 1 {
-                    "1 more project".to_owned()
-                } else {
-                    format!("{hidden} more projects")
-                };
-                items.push(KeyedView::new(
-                    format!("projects-more:{open}"),
-                    m3::sub_row(palette, false)
-                        .automation_name(label.clone())
-                        .on_click(context.message(Message::Monitor(MonitorMsg::ProjectsToggled)))
-                        .content(m3::row_content(
-                            Some(if open {
-                                m3::glyph::CHEVRON_DOWN
-                            } else {
-                                m3::glyph::CHEVRON_RIGHT
-                            }),
-                            &label,
-                            "",
-                            View::empty(),
-                        )),
-                ));
-            }
-        }
-
-        // The active filters, each a chip whose × clears it.
-        let mut chips: Vec<KeyedView> = Vec::new();
-        if let Some(group) = filter.group {
-            chips.push(KeyedView::new(
-                format!("chip:group:{group:?}"),
-                filter_chip(
-                    palette,
-                    group.title(),
-                    context.message(Message::Monitor(MonitorMsg::GroupFiltered(group))),
-                ),
-            ));
-        }
-        if let Some(project) = &filter.project {
-            chips.push(KeyedView::new(
-                format!("chip:project:{}", project.key),
-                filter_chip(
-                    palette,
-                    &project.name,
-                    context.message(Message::Monitor(MonitorMsg::ProjectFiltered(
-                        project.clone(),
-                    ))),
-                ),
-            ));
-        }
-        if !chips.is_empty() {
-            // One chip per line: side by side, a group chip and a long
-            // project chip outgrow the narrow panel; each alone fits
-            // (its label is capped at `FILTER_CHIP_TEXT`).
-            items.push(KeyedView::new(
-                "filters",
-                StackPanel::new()
-                    .spacing(tokens::spacing::XS)
-                    .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
-                    .keyed_children(chips),
-            ));
-        }
-        items
-    }
-
     /// The monitor: the overview, then Needs attention, Working, Idle and a
     /// collapsed Recently stopped, workers and subagents under their
     /// parent's row; under a filter the chart's loaded Agents are listed flat.
@@ -879,37 +500,20 @@ impl DesktopApp {
                     format!("Some reads failed: {}", data.errors.join("; ")),
                     tokens::text::BODY,
                 )
-                .foreground(palette.error())
+                .foreground(palette.attention())
                 .text_wrapping(TextWrapping::Wrap),
             ));
         }
-        if data.read_at_ms.is_some() {
-            items.extend(self.monitor_overview(&overview, context, palette));
-        }
-        items.push(KeyedView::new("search", self.monitor_search(context)));
+        items.push(KeyedView::new(
+            "search",
+            self.monitor_search(context, palette),
+        ));
         let tree = data.tree(now);
+        // The open task is selected in its own group (the design has no
+        // separate "current" block).
         let focused = self
             .selected_agent_id()
             .or_else(|| self.monitor.selected.clone());
-        if !filter.is_active()
-            && let Some(row) = focused.as_deref().and_then(|id| data.row(id))
-        {
-            let mut current = Vec::new();
-            self.monitor_rows(row, 0, Some(&tree), None, context, palette, &mut current);
-            items.push(KeyedView::new(
-                "current-task",
-                StackPanel::new().spacing(tokens::spacing::XS).children((
-                    m3::section_label("Current task").margin(Thickness::new(
-                        tokens::spacing::INSET,
-                        tokens::spacing::SM,
-                        0.0,
-                        0.0,
-                    )),
-                    StackPanel::new().keyed_children(current),
-                    m3::divider(palette),
-                )),
-            ));
-        }
         let (mut sections, showing_loaded) = if filter.is_active() {
             overview.list_for_filter(filter)
         } else {
@@ -949,7 +553,7 @@ impl DesktopApp {
             if section.group == monitor::Group::Stopped {
                 // Search results are shown, not folded.
                 let open = self.monitor.stopped_open || filter.is_active();
-                let label = format!("{} ({top})", section.group.title());
+                let label = format!("{} · {top}", section.group.title());
                 items.push(KeyedView::new(
                     format!("section:stopped:{open}"),
                     m3::sub_row(palette, false)
@@ -974,20 +578,14 @@ impl DesktopApp {
                     continue;
                 }
             } else {
-                // The legend above holds the counts. A section counts its
-                // top-level rows, which leave out nested workers, so only
-                // a filtered (flat) section shows its number: there it is
-                // the number that was clicked.
-                let label = if filter.is_active() {
-                    format!("{} ({top})", section.group.title())
-                } else {
-                    section.group.title().to_owned()
-                };
+                // The design's group label: "Working · 2" (its top-level
+                // rows; nested workers fold under their task).
+                let label = format!("{} · {top}", section.group.title());
                 items.push(KeyedView::new(
                     format!("section:{:?}", section.group),
-                    m3::section_label(label).margin(Thickness::new(
-                        tokens::spacing::INSET,
-                        tokens::spacing::SM,
+                    m3::muted(label, tokens::text::LABEL).margin(Thickness::new(
+                        tokens::spacing::ROW,
+                        6.0,
                         0.0,
                         0.0,
                     )),
@@ -1022,13 +620,15 @@ impl DesktopApp {
                     .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
                     .automation_name("Monitored Agents")
                     .content(
+                        // The pane's column (`Conversation.dc.html`): 10 DIPs
+                        // in from its sides, 10 between its pieces.
                         StackPanel::new()
-                            .spacing(tokens::spacing::XS)
+                            .spacing(tokens::spacing::ROW)
                             .margin(Thickness::new(
-                                tokens::spacing::MD,
-                                0.0,
-                                tokens::spacing::MD,
-                                tokens::spacing::MD,
+                                tokens::spacing::ROW,
+                                tokens::spacing::ROW,
+                                tokens::spacing::ROW,
+                                tokens::spacing::INSET,
                             ))
                             .keyed_children(items),
                     ),
@@ -1093,7 +693,7 @@ impl DesktopApp {
             sections.push(KeyedView::new(
                 "read-errors",
                 m3::secondary(format!("Some reads failed: {}", errors.join(" · ")))
-                    .foreground(palette.error())
+                    .foreground(palette.attention())
                     .text_wrapping(TextWrapping::Wrap),
             ));
         }
@@ -1336,12 +936,12 @@ impl DesktopApp {
                     .automation_name("Agent details")
                     .content(
                         StackPanel::new()
-                            .spacing(tokens::spacing::SM)
+                            .spacing(tokens::spacing::ROW)
                             .margin(Thickness::new(
-                                tokens::spacing::MD,
-                                0.0,
-                                tokens::spacing::MD,
-                                tokens::spacing::MD,
+                                tokens::spacing::ROW,
+                                tokens::spacing::ROW,
+                                tokens::spacing::ROW,
+                                tokens::spacing::INSET,
                             ))
                             .keyed_children(sections),
                     ),
@@ -1385,24 +985,4 @@ fn spoken_section(palette: Palette, title: &str, lines: &[String], spoken: &[Str
             .spacing(tokens::spacing::SM)
             .children((m3::section_title(title), body)),
     )
-}
-
-/// An active filter as a chip: its label and a × that clears it.
-fn filter_chip(palette: Palette, label: &str, clear: Callback<()>) -> View {
-    m3::chip(palette)
-        .automation_name(format!("Clear filter: {label}"))
-        .on_click(clear)
-        .content(
-            StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(tokens::spacing::SM)
-                .children((
-                    TextBlock::new()
-                        .text(label.to_owned())
-                        .max_width(tokens::layout::FILTER_CHIP_TEXT)
-                        .vertical_alignment(VerticalAlignment::Center)
-                        .text_trimming(TextTrimming::CharacterEllipsis),
-                    m3::icon(m3::glyph::CLOSE),
-                )),
-        )
 }

@@ -776,10 +776,9 @@ lives in a separate directory. A registered linked worktree reads as its reposit
 name and its branch from the daemon's verified checkout readback when available.
 The sidebar's projects are the daemon's [`chat.organization`](api.md#chat-organization)
 groups in the daemon's order, read in one bounded `chat.organization` read: each
-registered project with its manager, the manager's standard worktree branch, the
-assignment and transfer state, "Needs assignment" or roots competing with an
-assigned manager, and the group's exact server totals (member total, each lifecycle
-count as returned, queued, unknown and the project slot use), plus its queued
+registered project with its tasks and one trailing count, its tasks working now
+over the listed rows' live states (the read's manager, assignment and totals stay
+in the API, not in the sidebar), plus its queued
 launches and automation waits with the wait reason and who can change it
 (`launch.queue`, every page, polled independently); then the no-project bucket.
 Registered projects with no tasks follow the populated ones and stay selectable.
@@ -1049,7 +1048,9 @@ daemon (including limits and retention), automation, mail, cloud_mcp, desktop,
 accounts and proxies.
 Rules/scripts remain files owned by their existing APIs; settings references and
 automation policy do not create a second executor. Desktop preferences use
-`[desktop]`: `theme` (`system`, `light`, `dark`), `window` (`width`/`height`, at least
+`[desktop]`: `theme` (`system`, `light`, `dark`, `amoled`, `purple`, `neon`,
+`matrix`: the desktop's six palettes, `system` following Windows between
+light and dark), `window` (`width`/`height`, at least
 640 by 480), `startup` (`new_task`, or `last_conversation` to reopen the most
 recently active Agent's conversation), `last_access` (`ask`, `auto` or `full`), and
 these bounded lists: `favorite_models` (`{harness, model, effort?}`), `recent_models`

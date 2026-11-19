@@ -302,7 +302,7 @@ impl DesktopApp {
                 "Could not read the tasks {}: {error}",
                 scope.read()
             ))
-            .foreground(palette.error())
+            .foreground(palette.attention())
             .text_wrapping(TextWrapping::Wrap)
             .is_text_selection_enabled(true)
             .into(),
@@ -338,7 +338,7 @@ impl DesktopApp {
             };
         let summary: View = match (&dialog.error, picked) {
             (Some(error), _) => m3::body(error.clone())
-                .foreground(palette.error())
+                .foreground(palette.attention())
                 .text_wrapping(TextWrapping::Wrap)
                 .is_text_selection_enabled(true)
                 .into(),

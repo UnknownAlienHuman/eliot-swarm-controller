@@ -1,13 +1,27 @@
 use super::*;
 
 impl DesktopApp {
-    /// Bring the newest turn into view after the next render.
-    pub(super) fn follow_latest(&self, tries: u32, context: &ComponentContext<Self>) {
+    /// Hand typing to the composer once the conversation is drawn; after a
+    /// send (`scroll`), first scroll the transcript to its end
+    /// (`crate::scroll_end`) in case it was read further up. An opened
+    /// conversation needs no scroll: the transcript is anchored at its end.
+    pub(super) fn follow_latest(&self, scroll: bool, context: &ComponentContext<Self>) {
         let epoch = self.chat.epoch;
         let _task = context.spawn_background(move |cancel| {
             let cancelled = || cancel.is_cancelled();
-            let _ = feed::backoff(FOLLOW_DELAY_MS, &cancelled);
-            Message::Chat(ChatMsg::FollowLatest(epoch, tries))
+            // False: the conversation was left while waiting.
+            if !feed::backoff(FOLLOW_DELAY_MS, &cancelled) || !scroll {
+                return Message::Chat(ChatMsg::FollowLatest(epoch, Ok(())));
+            }
+            let outcome = match crate::app_resources::own_window() {
+                None => Err("the window was not found".to_owned()),
+                Some(window) => match crate::scroll_end::scroll_to_end(window, TRANSCRIPT_ID) {
+                    Ok(Some(_)) => Ok(()),
+                    Ok(None) => Err("the transcript was not realized".to_owned()),
+                    Err(error) => Err(error),
+                },
+            };
+            Message::Chat(ChatMsg::FollowLatest(epoch, outcome))
         });
     }
 
@@ -19,7 +33,6 @@ impl DesktopApp {
             .map(Conversation::items)
             .unwrap_or_default();
         let rendered = self.chat.render_cache.render(&items, &self.chat.docs);
-        self.chat.items_revision = views::key_revision(&rendered);
         self.chat.items = Rc::new(rendered);
         let live: HashSet<u64> = items
             .iter()
@@ -30,20 +43,24 @@ impl DesktopApp {
     }
 
     /// The transcript: "Load older" when more history exists, then every
-    /// turn in the reading column; the newest turn carries the end anchor.
+    /// turn in the reading column.
     pub(super) fn transcript_view(
         &self,
         column: Option<f64>,
         context: &mut ViewContext<Self>,
         palette: Palette,
     ) -> View {
+        // Not while the first read is in flight: its coverage is not known.
+        let loading = matches!(self.chat.live, LiveStatus::Loading);
         let load_older: View = match self.chat.convo.as_ref() {
-            Some(convo) if convo.coverage().can_load_older() => m3::text_button(palette)
-                .is_enabled(!matches!(self.chat.live, LiveStatus::Loading))
-                .horizontal_alignment(HorizontalAlignment::Center)
-                .margin(Thickness::new(0.0, 0.0, 0.0, tokens::spacing::MD))
-                .on_click(context.message(Message::Chat(ChatMsg::LoadOlderRequested)))
-                .content(m3::label("Load older messages")),
+            Some(convo) if convo.coverage().can_load_older() && !self.chat.items.is_empty() => {
+                m3::text_button(palette)
+                    .is_enabled(!loading)
+                    .horizontal_alignment(HorizontalAlignment::Center)
+                    .margin(Thickness::new(0.0, 0.0, 0.0, tokens::spacing::MD))
+                    .on_click(context.message(Message::Chat(ChatMsg::LoadOlderRequested)))
+                    .content(m3::label("Load older messages"))
+            }
             _ => View::empty(),
         };
         let empty: View = if self.chat.items.is_empty() {
@@ -67,15 +84,16 @@ impl DesktopApp {
             .revealed
             .clone()
             .filter(|(item, _)| item.starts_with(&path_scope));
-        let path_code = path_failure.as_ref().map_or(0, |(item, note)| {
-            crate::chat::text_hash(item) ^ crate::chat::text_hash(note)
-        });
         let callbacks = RowCallbacks {
             open_path: context.callback(|(key, path)| Message::Reveal(key, path)),
             path_scope,
             path_failure,
             workspace,
             copy_part: context.callback(|value| Message::Chat(ChatMsg::CopyPart(value))),
+            hovered: self.chat.hovered.clone(),
+            hover: context.callback(|(key, over): (String, bool)| {
+                Message::Chat(ChatMsg::PartHovered(key, over))
+            }),
             copy_code: context.callback(|(key, index): (String, usize)| {
                 Message::Chat(ChatMsg::CopyCode(key, index))
             }),
@@ -94,68 +112,38 @@ impl DesktopApp {
                 Message::Chat(ChatMsg::ToolsToggled(key, expanded))
             }),
         };
-        // Every turn but the latest is virtualized; the latest is a plain
-        // child that always exists and carries the end anchor.
-        let earlier = self.chat.items.len().saturating_sub(1);
+        // Every resident turn is a plain keyed child (the resident bounds
+        // cap them, `chat::MAX_RESIDENT_TURNS`): the anchored ScrollView
+        // below lays them all out at once, so nothing is realized late
+        // while scrolling and nothing waits to be measured after an open.
         let expanded = Rc::new(self.chat.expanded.clone());
-        let latest: View = match self.chat.items.last() {
-            Some(item) => StackPanel::new().keyed_children(vec![KeyedView::new(
-                item.key.clone(),
-                views::item_view(
-                    item,
-                    &expanded,
-                    &callbacks,
-                    palette,
-                    Some(&self.chat.end_anchor),
-                    column,
-                ),
-            )]),
-            None => View::empty(),
-        };
-        let items = Rc::clone(&self.chat.items);
-        let keys = Rc::clone(&self.chat.items);
-        // A palette or width change re-realises the rows in the new colors
-        // and at the new column width.
-        let palette_code = palette
-            .scheme()
-            .map_or(0, |scheme| 1 + u64::from(scheme.dark));
-        let width_code = column.map_or(0, |width| width.round() as u64);
-        // A toggle in an older virtualized turn must re-realize its card too.
-        let expansion_code = self
+        let turns: Vec<KeyedView> = self
             .chat
-            .expanded
+            .items
             .iter()
-            .fold(0, |code, key| code ^ crate::chat::text_hash(key));
-        let source = VirtualSource::new(
-            self.chat
-                .items_revision
-                .wrapping_mul(3)
-                .wrapping_add(palette_code)
-                .wrapping_add(expansion_code)
-                .wrapping_add(path_code)
-                .wrapping_add(width_code.wrapping_mul(0x9E37_79B9)),
-            earlier,
-            move |index| keys[index].key.clone(),
-            move |index| {
-                views::item_view(&items[index], &expanded, &callbacks, palette, None, column)
-            },
-        );
-        ScrollViewer::new()
+            .map(|item| {
+                KeyedView::new(
+                    item.key.clone(),
+                    views::item_view(item, &expanded, &callbacks, palette, column),
+                )
+            })
+            .collect();
+        // The app's one ScrollView: its implicit style anchors it at the
+        // far (bottom) edge (`app_resources::styles_xaml`), so it opens at
+        // the newest turn and stays there while earlier turns are measured
+        // or new activity arrives, with no scroll after the first frame.
+        ScrollView::new()
             .grid_row(1)
-            .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+            .vertical_scroll_bar_visibility(ScrollingScrollBarVisibility::Auto)
             .automation_name("Conversation")
+            .automation_id(TRANSCRIPT_ID)
             .content(
                 StackPanel::new()
                     .width(column)
                     .max_width(tokens::layout::READING_WIDTH)
                     .horizontal_alignment(HorizontalAlignment::Center)
                     .margin(Thickness::xy(0.0, tokens::spacing::MD))
-                    .children((
-                        load_older,
-                        empty,
-                        ItemsRepeater::new().virtual_source(source),
-                        latest,
-                    )),
+                    .children((load_older, empty, StackPanel::new().keyed_children(turns))),
             )
     }
 
@@ -224,7 +212,7 @@ impl DesktopApp {
                                 .content(m3::label("Answer")),
                         ));
                     }
-                    let (fill, on) = palette.attention();
+                    let (fill, on) = palette.status_chip(crate::theme::StatusTone::Attention);
                     KeyedView::new(
                         key,
                         Border::new()
@@ -392,6 +380,7 @@ pub(super) fn starting_view(
     column: Option<f64>,
     palette: Palette,
 ) -> View {
+    let (shown, files) = crate::attachments::split(text);
     StackPanel::new()
         .grid_row(1)
         .width(column)
@@ -401,19 +390,25 @@ pub(super) fn starting_view(
         .margin(Thickness::xy(0.0, tokens::spacing::MD))
         .spacing(tokens::spacing::SM)
         .children((
-            Border::new()
+            // The owner's message as the transcript will show it: the
+            // bubble, and attached files as chips under it.
+            StackPanel::new()
+                .spacing(tokens::spacing::XS)
                 .horizontal_alignment(HorizontalAlignment::Right)
                 .max_width(tokens::layout::READING_WIDTH * tokens::layout::BUBBLE_SHARE)
-                .background(palette.bubble())
-                .corner_radius(tokens::radius::CONTAINER)
-                .padding(Thickness::xy(tokens::spacing::INSET, tokens::spacing::SM))
-                .automation_name(format!("You: {text}"))
-                .content(
-                    TextBlock::new()
-                        .text(text.to_owned())
-                        .foreground(palette.on_bubble())
-                        .text_wrapping(TextWrapping::Wrap),
-                ),
+                .automation_name(format!("You: {shown}"))
+                .children((
+                    m3::bubble(
+                        palette,
+                        m3::body(shown.to_owned()).text_wrapping(TextWrapping::Wrap),
+                        None,
+                    ),
+                    if files.is_empty() {
+                        View::empty()
+                    } else {
+                        views::attached_chips(&files, palette)
+                    },
+                )),
             StackPanel::new()
                 .spacing(tokens::spacing::XS)
                 .automation_name(label.to_owned())

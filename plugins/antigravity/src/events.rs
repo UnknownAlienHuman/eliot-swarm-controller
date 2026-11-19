@@ -1638,9 +1638,7 @@ impl State {
             .entry(tool_call_id.to_owned())
             .or_insert_with(|| (String::new(), ToolStatus::Unknown));
         if !title.is_empty() {
-            let mut redacted = self.policy.redact_text(title);
-            redacted.truncate(redacted.floor_char_boundary(MAX_TOOL_TITLE_BYTES));
-            known.0 = redacted;
+            known.0 = self.policy.redact_bounded(title, MAX_TOOL_TITLE_BYTES);
         }
         if !status.is_empty() {
             known.1 = ToolStatus::parse(status);

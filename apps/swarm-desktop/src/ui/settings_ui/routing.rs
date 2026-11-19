@@ -16,10 +16,16 @@ impl DesktopApp {
         // What Auto picks right now, from the saved policy.
         if let Some(Ok(decision)) = &self.launch.preview {
             let (headline, skipped) = model::decision_lines(decision);
-            let now = std::iter::once(format!(
-                "Right now Auto {}.",
-                headline.replacen("Routing picks", "picks", 1)
-            ))
+            // "Right now Auto picks qwen-dev: …" or "Right now no profile
+            // is available."
+            let now = std::iter::once(match headline.strip_prefix("Routing picks ") {
+                Some(pick) => format!("Right now Auto picks {pick}."),
+                None => {
+                    let mut chars = headline.chars();
+                    let first = chars.next().map(|c| c.to_lowercase().to_string());
+                    format!("Right now {}{}.", first.unwrap_or_default(), chars.as_str())
+                }
+            })
             .chain(skipped)
             .collect::<Vec<_>>()
             .join("\n");
@@ -59,20 +65,20 @@ impl DesktopApp {
                             .on_click(context.message(Message::Settings(
                                 SettingsMsg::RoutingMoved(role.clone(), index, true),
                             )))
-                            .content(m3::toolbar_icon(m3::glyph::ARROW_UP)),
+                            .content(m3::icon(m3::glyph::ARROW_UP)),
                         m3::icon_button(palette)
                             .is_enabled(!last)
                             .automation_name(format!("Move {name} later in {role}"))
                             .on_click(context.message(Message::Settings(
                                 SettingsMsg::RoutingMoved(role.clone(), index, false),
                             )))
-                            .content(m3::toolbar_icon(m3::glyph::ARROW_DOWN)),
+                            .content(m3::icon(m3::glyph::ARROW_DOWN)),
                         m3::icon_button(palette)
                             .automation_name(format!("Remove {name} from {role}"))
                             .on_click(context.message(Message::Settings(
                                 SettingsMsg::RoutingRemoved(role.clone(), index),
                             )))
-                            .content(m3::toolbar_icon(m3::glyph::CLOSE)),
+                            .content(m3::icon(m3::glyph::CLOSE)),
                     ));
                 rows.push(KeyedView::new(
                     format!("{role}:{index}:{name}:{first}:{last}"),
@@ -108,13 +114,13 @@ impl DesktopApp {
                 format!("role:{role}"),
                 StackPanel::new().spacing(tokens::spacing::SM).children((
                     m3::section_heading(headline, supporting, None),
-                    m3::group(palette, rows),
+                    m3::settings_card(palette, rows),
                 )),
             ));
         }
         groups.push(KeyedView::new(
             "new-role",
-            m3::group(
+            m3::settings_card(
                 palette,
                 vec![KeyedView::new(
                     "new-role",

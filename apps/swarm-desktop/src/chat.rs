@@ -65,6 +65,9 @@ pub const CHAT_KINDS: &[&str] = &[
     "request.opened",
     "request.closed",
     "request.resolved",
+    // A steer's acceptance names the turn it steers: its text joins that
+    // turn (the design's "Steer:" bubble).
+    "command.accepted",
 ];
 
 /// FNV-1a over bytes: content revision and Markdown cache key.
@@ -124,13 +127,25 @@ struct ToolRow {
     completed_ms: Option<i64>,
     paths: Vec<String>,
     paths_truncated: bool,
+    /// The command a command tool runs, as its adapter retained it
+    /// (`tool.started` `command`: redacted and bounded).
+    command: Option<String>,
 }
+
+/// Separates a tool row's name, status and duration in its part text (a
+/// command may contain any visible character).
+pub const TOOL_FIELDS: char = '\u{1f}';
 
 #[derive(Clone, Debug)]
 enum Activity {
     Message {
         key: String,
         text: String,
+    },
+    /// An input steered into the running turn (its command id): shown in
+    /// the turn where it was accepted.
+    Steer {
+        command: String,
     },
     Tools {
         key: String,
@@ -201,6 +216,7 @@ impl TurnEntry {
             .iter()
             .map(|entry| match entry {
                 Activity::Message { text, .. } => text.len(),
+                Activity::Steer { command } => command.len(),
                 Activity::Tools { rows, .. } => rows
                     .iter()
                     .map(|row| {
@@ -208,6 +224,7 @@ impl TurnEntry {
                             + row.tool.len()
                             + row.status.as_ref().map_or(0, String::len)
                             + row.paths.iter().map(String::len).sum::<usize>()
+                            + row.command.as_ref().map_or(0, String::len)
                             + 32
                     })
                     .sum(),
@@ -255,6 +272,9 @@ impl TurnEntry {
                             .filter_map(serde_json::Value::as_str)
                             .any(|path| path.chars().count() > 1_024)
                 });
+        let command = data_str(event, "command")
+            .map(|command| command.replace(TOOL_FIELDS, " "))
+            .filter(|command| !command.trim().is_empty());
         let failed_now = done && status.as_deref().is_some_and(|status| !is_success(status));
         if let Some(&group) = self.item_groups.get(item_id)
             && let Some(Activity::Tools {
@@ -274,6 +294,9 @@ impl TurnEntry {
                     }
                     if !paths.is_empty() {
                         row.paths = paths;
+                    }
+                    if row.command.is_none() {
+                        row.command = command;
                     }
                     row.paths_truncated |= paths_truncated;
                     if status.is_some() || done {
@@ -300,6 +323,7 @@ impl TurnEntry {
             completed_ms: done.then_some(event.ts),
             paths,
             paths_truncated,
+            command,
         };
         if !matches!(self.activity.last(), Some(Activity::Tools { .. })) {
             self.activity.push(Activity::Tools {
@@ -492,6 +516,8 @@ impl Invalidation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PartKind {
     Input,
+    /// An input steered into the running turn.
+    Steer,
     Progress,
     Tools,
     Final,
@@ -589,7 +615,28 @@ fn data_str<'a>(event: &'a Event, field: &str) -> Option<&'a str> {
         .filter(|value| !value.is_empty())
 }
 
+impl TurnEntry {
+    /// The commands whose input text this turn shows: the one that started
+    /// it, then every steer accepted into it.
+    fn commands(&self) -> impl Iterator<Item = &str> {
+        self.command_id
+            .as_deref()
+            .into_iter()
+            .chain(self.activity.iter().filter_map(|entry| match entry {
+                Activity::Steer { command } => Some(command.as_str()),
+                _ => None,
+            }))
+    }
+}
+
 impl Conversation {
+    /// Whether a resident turn shows `command`'s input.
+    fn references(&self, command: &str) -> bool {
+        self.turns
+            .values()
+            .any(|turn| turn.commands().any(|known| known == command))
+    }
+
     pub fn new(agent: &str) -> Self {
         Self {
             agent: agent.to_owned(),
@@ -635,13 +682,14 @@ impl Conversation {
         let mut invalidation = self.apply_events(events);
         self.coverage.cursor = cursor.max(self.applied_seq);
         self.apply_turns(turns);
-        self.inputs.retain(|command, _| {
-            self.local.contains(command)
-                || self
-                    .turns
-                    .values()
-                    .any(|turn| turn.command_id.as_deref() == Some(command))
-        });
+        let referenced: HashSet<String> = self
+            .inputs
+            .keys()
+            .filter(|command| self.local.contains(command) || self.references(command))
+            .cloned()
+            .collect();
+        self.inputs
+            .retain(|command, _| referenced.contains(command));
         self.pending_exact
             .retain(|command, _| self.local.iter().any(|known| known == command));
         invalidation.inputs = self.missing_inputs();
@@ -721,6 +769,21 @@ impl Conversation {
                     invalidation.turns = true;
                     invalidation.detail = true;
                 }
+                "command.accepted" if data_str(event, "verb") == Some("steer") => {
+                    if let Some(command) = data_str(event, "command_id") {
+                        let present = turn.activity.iter().any(|entry| {
+                            matches!(entry, Activity::Steer { command: known } if known == command)
+                        });
+                        if !present {
+                            turn.activity.push(Activity::Steer {
+                                command: command.to_owned(),
+                            });
+                        }
+                        if !self.inputs.contains_key(command) {
+                            invalidation.inputs.push(command.to_owned());
+                        }
+                    }
+                }
                 "turn.unknown" => {
                     turn.status = TurnStatus::Unknown;
                     invalidation.turns = true;
@@ -763,12 +826,16 @@ impl Conversation {
                 _ => {}
             }
         }
-        self.local.retain(|command| {
-            !self
-                .turns
-                .values()
-                .any(|turn| turn.command_id.as_deref() == Some(command))
-        });
+        let linked: HashSet<String> = self
+            .local
+            .iter()
+            .filter(|command| self.references(command))
+            .cloned()
+            .collect();
+        self.local.retain(|command| !linked.contains(command));
+        for command in &linked {
+            self.local_notes.remove(command);
+        }
         self.pending_exact
             .retain(|command, _| self.local.iter().any(|known| known == command));
         self.enforce_bounds();
@@ -826,11 +893,8 @@ impl Conversation {
         for (command, text) in inputs {
             // Replies for departed owners never load the budget: only a
             // waiting local input or a resident turn's command keeps text.
-            let wanted = self.local.iter().any(|known| known == &command)
-                || self
-                    .turns
-                    .values()
-                    .any(|turn| turn.command_id.as_deref() == Some(command.as_str()));
+            let wanted =
+                self.local.iter().any(|known| known == &command) || self.references(&command);
             if wanted {
                 self.inputs.insert(command, text);
             }
@@ -922,8 +986,9 @@ impl Conversation {
         let mut missing: Vec<String> = self
             .turns
             .values()
-            .filter_map(|turn| turn.command_id.clone())
-            .filter(|command| !self.inputs.contains_key(command))
+            .flat_map(TurnEntry::commands)
+            .filter(|command| !self.inputs.contains_key(*command))
+            .map(str::to_owned)
             .collect();
         missing.sort();
         missing.dedup();
@@ -948,11 +1013,12 @@ impl Conversation {
     /// Input texts no resident turn and no waiting local input references.
     /// Auxiliary indexes leave with their owner instead of lingering.
     fn prune_inputs(&mut self) {
-        let mut keep: HashSet<&str> = self.local.iter().map(String::as_str).collect();
+        let mut keep: HashSet<String> = self.local.iter().cloned().collect();
         keep.extend(
             self.turns
                 .values()
-                .filter_map(|turn| turn.command_id.as_deref()),
+                .flat_map(TurnEntry::commands)
+                .map(str::to_owned),
         );
         self.inputs
             .retain(|command, _| keep.contains(command.as_str()));
@@ -1113,6 +1179,19 @@ impl Conversation {
                     text.clone(),
                     Vec::new(),
                 )),
+                Activity::Steer { command } => parts.push(Part::new(
+                    format!("steer:{command}"),
+                    PartKind::Steer,
+                    "You · steered".to_owned(),
+                    match self.inputs.get(command) {
+                        Some(InputText::Loaded(text)) => text.clone(),
+                        Some(InputText::Unavailable(reason)) => {
+                            format!("(input text unavailable: {reason})")
+                        }
+                        None => "(loading input text…)".to_owned(),
+                    },
+                    Vec::new(),
+                )),
                 Activity::Tools {
                     key,
                     rows,
@@ -1134,11 +1213,36 @@ impl Conversation {
                         ));
                     }
                     for row in rows {
-                        let name = match row.tool.as_str() {
-                            "commandExecution" => "Run command",
-                            "fileChange" => "Edit files",
-                            other => other,
+                        // As the design's tool rows: a command shows its
+                        // first line ("cargo clippy -p swarm-desktop"), an
+                        // edit names its file ("Edited nav.rs"); the label
+                        // picks the glyph.
+                        let file = |path: &str| {
+                            std::path::Path::new(path)
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or(path)
+                                .to_owned()
                         };
+                        let first_line = row.command.as_deref().and_then(|command| {
+                            command.lines().map(str::trim).find(|line| !line.is_empty())
+                        });
+                        let (label, name) =
+                            match (row.tool.as_str(), row.paths.as_slice(), first_line) {
+                                (_, _, Some(line)) => ("Command", line.to_owned()),
+                                ("commandExecution", _, None) => {
+                                    ("Command", "Run command".to_owned())
+                                }
+                                ("fileChange", [], _) => ("Edit", "Edit files".to_owned()),
+                                ("fileChange", [one], _) => {
+                                    ("Edit", format!("Edited {}", file(one)))
+                                }
+                                ("fileChange", [first, rest @ ..], _) => (
+                                    "Edit",
+                                    format!("Edited {} and {} more", file(first), rest.len()),
+                                ),
+                                (other, _, None) => ("Tool", other.to_owned()),
+                            };
                         let status = match (row.done, row.status.as_deref()) {
                             (false, _) => "Running",
                             (true, Some(status)) if is_success(status) => "Completed",
@@ -1154,7 +1258,13 @@ impl Conversation {
                             || "duration unavailable".to_owned(),
                             |ms| format!("~{:.1} s", ms as f64 / 1_000.0),
                         );
-                        let mut detail = row.paths.clone();
+                        let mut detail: Vec<String> = row
+                            .command
+                            .iter()
+                            .flat_map(|command| command.lines())
+                            .map(str::to_owned)
+                            .collect();
+                        detail.extend(row.paths.iter().cloned());
                         if row.paths_truncated {
                             detail.push(
                                 "More changed paths were not retained in this card.".to_owned(),
@@ -1170,8 +1280,9 @@ impl Conversation {
                         parts.push(Part::new(
                             format!("tools:{}", row.item_id),
                             PartKind::Tools,
-                            "Tool".to_owned(),
-                            format!("{name} · {status} · {duration}"),
+                            label.to_owned(),
+                            [name.as_str(), status, duration.as_str()]
+                                .join(&TOOL_FIELDS.to_string()),
                             detail,
                         ));
                     }
