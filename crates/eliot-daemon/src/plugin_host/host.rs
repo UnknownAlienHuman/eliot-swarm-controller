@@ -1039,7 +1039,7 @@ impl PluginHost {
 
     /// Whether this Agent generation's own terminal write for the exact turn
     /// reached the host and intake has not finished it. Shared recovery
-    /// never settles a turn while it is, for every adapter.
+    /// defers while it is, for every adapter.
     pub(crate) fn terminal_write_in_flight(&self, agent: &Agent, turn_id: &str) -> bool {
         let key = AgentKey {
             id: agent.id.clone(),

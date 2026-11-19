@@ -157,6 +157,87 @@ impl Store {
     }
 }
 
+/// Whether this native event is the adapter's own `turn.completed` for the
+/// exact turn whose latest settlement is the monitor's recovery
+/// `turn.unknown` in this live generation, bound to that settlement's send.
+/// Such a terminal is evidence: it resolves the turn instead of being
+/// refused as inactive. A loss, stop or adapter `turn.unknown`, an Owner
+/// resolution (the turn is no longer unknown), an earlier native resolution,
+/// another turn or another send all return false and keep the ordinary
+/// refusal.
+pub(super) fn resolves_recovered_turn_tx(
+    tx: &Transaction<'_>,
+    agent: &Agent,
+    agent_num: i64,
+    generation: i64,
+    event: &NativeEvent,
+) -> Result<bool> {
+    let (Some(turn_id), Some(command_id)) = (
+        event.data.get("turn_id").and_then(Value::as_str),
+        event.data.get("command_id").and_then(Value::as_str),
+    ) else {
+        return Ok(false);
+    };
+    if event.kind != "turn.completed"
+        || agent.observe_only
+        || agent.generation != generation
+        || agent.active_turn.as_deref() == Some(turn_id)
+        || load_turn(tx, agent_num, generation, turn_id)?
+            .is_none_or(|turn| turn.state != TurnState::Unknown)
+    {
+        return Ok(false);
+    }
+    // Only `settle_recovered_turn` writes a daemon `turn.unknown` naming its
+    // source episode; an expired settlement event proves nothing.
+    let recovered: Option<bool> = tx
+        .query_row(
+            "SELECT source = 'daemon' AND json_extract(data, '$.command_id') = ?4
+                    AND json_type(data, '$.source_event_seq') = 'integer'
+             FROM events INDEXED BY events_agent
+             WHERE agent = ?1 AND generation = ?2 AND kind = 'turn.unknown'
+               AND json_extract(data, '$.turn_id') = ?3
+             ORDER BY seq DESC LIMIT 1",
+            params![agent_num, generation, turn_id, command_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    Ok(recovered == Some(true))
+}
+
+/// The `turn.resolved` event for a recovered turn resolved by its native
+/// terminal, linked to the committed native event and its send.
+pub(super) fn insert_native_resolution_tx(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    generation: i64,
+    terminal: &NativeEvent,
+    native_event_seq: i64,
+    cause: Option<core::EventCause>,
+    now: i64,
+) -> Result<Event> {
+    let mut data = json!({
+        "turn_id": terminal.data.get("turn_id"),
+        "command_id": terminal.data.get("command_id"),
+        "status": terminal.data.get("status"),
+        "resolution_source": "native",
+        "native_event_seq": native_event_seq,
+    });
+    if let Some(outcome) = terminal.data.get("outcome") {
+        data["outcome"] = outcome.clone();
+    }
+    let mut event = DaemonEventInput::new(
+        now,
+        "turn.resolved",
+        "turn",
+        Some(agent_num),
+        Some(generation),
+        data,
+    );
+    event.cause = cause;
+    insert_daemon_event_input(tx, event)
+}
+
 fn active_turn_recovery(
     connection: &Connection,
     agent: &Agent,

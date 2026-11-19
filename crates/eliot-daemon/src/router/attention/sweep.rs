@@ -97,10 +97,7 @@ pub(super) fn launch_check(
 
 fn reserve_check(state: &Arc<Mutex<AttentionState>>, key: &AgentKey) -> bool {
     let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
-    if state.in_flight.len() >= MAX_CHECKS_IN_FLIGHT || !state.in_flight.insert(key.clone()) {
-        return false;
-    }
-    true
+    state.in_flight.len() < MAX_CHECKS_IN_FLIGHT && state.in_flight.insert(key.clone())
 }
 
 fn queue_check(state: &Arc<Mutex<AttentionState>>, key: AgentKey, trigger: Trigger) {

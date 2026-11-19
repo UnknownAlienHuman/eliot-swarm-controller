@@ -91,6 +91,11 @@ pub(crate) struct TurnFacts {
     /// Empty while no bounded reply text is known; never presented as one.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub final_text: String,
+    /// Why no reply text is presented (`event_budget` or
+    /// `empty_native_response`), the same marker the terminal write carries,
+    /// so a recovered terminal keeps it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_text_unavailable: Option<&'static str>,
     pub terminal: bool,
 }
 
@@ -152,6 +157,21 @@ impl PendingNativeRequest {
 struct CancellationIntent {
     turn_id: String,
     command_id: String,
+}
+
+/// Why a terminal presents no reply text: the reply exceeded the event
+/// bound, or the native ended the turn normally but supplied no assistant
+/// text at all. The second keeps the native `end_turn` fact but marks the
+/// missing message instead of presenting a normal answer; consumers tell it
+/// from a real reply by the absent `message.completed` plus this marker.
+fn reply_unavailable(truncated: bool, status: &str, text: &str) -> Option<&'static str> {
+    if truncated {
+        Some("event_budget")
+    } else if status == "completed" && text.is_empty() {
+        Some("empty_native_response")
+    } else {
+        None
+    }
 }
 
 /// The ACP `cancelled` permission outcome: the prompt turn ended before
@@ -1715,6 +1735,11 @@ impl State {
                 status: status.to_owned(),
                 native_status: native_status.clone(),
                 final_text: String::new(),
+                final_text_unavailable: reply_unavailable(
+                    self.text_truncated,
+                    status,
+                    &self.text_accum,
+                ),
                 terminal: true,
             });
         }
@@ -1786,15 +1811,12 @@ impl State {
             // A reply over the persisted-event bound costs only itself.
             truncated = !self.source().commit_message(id, message).await?;
         }
-        if truncated {
-            data["final_text_unavailable"] = json!("event_budget");
-        } else if status == "completed" && text.is_empty() {
-            // The native ended the turn normally but supplied no assistant
-            // text at all: keep the native `end_turn` fact, but mark the
-            // missing final message honestly instead of presenting a
-            // normal answer. Consumers distinguish this from a real reply
-            // by the absent `message.completed` plus this marker.
-            data["final_text_unavailable"] = json!("empty_native_response");
+        let unavailable = reply_unavailable(truncated, status, &text);
+        if let Some(marker) = unavailable {
+            data["final_text_unavailable"] = json!(marker);
+        }
+        if let Some(last) = self.last_turn.as_mut() {
+            last.final_text_unavailable = unavailable;
         }
         // Installed agy 1.5.9 reports the turn's model usage on the
         // terminal response (older servers send none): attach it when

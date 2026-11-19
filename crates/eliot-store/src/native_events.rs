@@ -640,6 +640,24 @@ fn persist_turn_terminal(
             ));
         }
     }
+    // A recovered turn resolved by its native terminal (only the Store's
+    // recovered-turn check admits it): the settlement's unknown outcome and
+    // predecessor give way to the terminal's own.
+    if load_turn(tx, agent_num, generation, turn_id)?
+        .is_some_and(|turn| turn.state == TurnState::Unknown)
+    {
+        if state != TurnState::Completed || native_event.kind != "turn.completed" {
+            return Err(Error::new(
+                "source_integrity",
+                "an unknown turn resolves only from its native turn.completed",
+            ));
+        }
+        db!(tx.execute(
+            "UPDATE turns SET outcome = NULL, preceded_by = NULL
+             WHERE agent = ?1 AND generation = ?2 AND turn_id = ?3 AND state = 'unknown'",
+            params![agent_num, generation, turn_id],
+        ));
+    }
     let usage = usage.map(encode_json).transpose()?;
     let outcome = outcome.map(|outcome| outcome.as_str());
     // A non-success terminal outcome reports on the bound command: record

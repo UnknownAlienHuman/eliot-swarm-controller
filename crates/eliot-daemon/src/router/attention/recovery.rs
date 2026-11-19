@@ -35,7 +35,7 @@ fn can_recover_active_turn(agent: &Agent, sources: &[SourceState]) -> bool {
 /// nothing and spends no read: it defers to the next sweep while the turn
 /// has committed progress within the attention suspicion window. Past that
 /// window a busy read counts like any inconclusive one, so a source that
-/// stays busy still settles.
+/// stays busy still settles; its late terminal then resolves the turn.
 fn defers_busy_read(captured: &CapturedAgent, suspicion_window: Duration) -> bool {
     let window_ms = i64::try_from(suspicion_window.as_millis()).unwrap_or(i64::MAX);
     captured
@@ -124,8 +124,8 @@ async fn settle(
     let mut store = router.inner.store.lock().await;
     // The adapter's own terminal write for this exact turn reached the host
     // and intake has not finished it: that write commits the turn, or its
-    // failure clears the mark for the next sweep. Checked under the Store
-    // lock, so a write that already committed fails the Store recheck.
+    // failure clears the mark for the next sweep. This only spares a needless
+    // `unknown`; a terminal that commits after a settlement resolves it.
     if router
         .inner
         .plugin_host
@@ -175,7 +175,7 @@ fn readback(agent: &Agent, command_id: &str, turn_id: &str, snapshot: &Value) ->
     }
     // The adapter observed this terminal but its own write of it is still
     // in flight: that write commits it, or its resolution clears the mark
-    // for the next sweep. Recovery never races the adapter's terminal.
+    // for the next sweep.
     if turn["terminal"].as_bool() == Some(true) && turn["write_pending"].as_bool() == Some(true) {
         return Readback::Running;
     }
@@ -217,10 +217,13 @@ fn readback(agent: &Agent, command_id: &str, turn_id: &str, snapshot: &Value) ->
         "final_text": turn["final_text"].as_str(),
         "turn_evidence": evidence,
     });
-    // The adapter saw the reply but it exceeded the event bound: the
-    // recovered terminal keeps that reason, as the adapter's own write does.
-    if turn["final_text_unavailable"].as_str() == Some("event_budget") {
-        data["final_text_unavailable"] = json!("event_budget");
+    // The adapter knows why no reply text is presented (it exceeded the event
+    // bound, or a normal completion supplied none): the recovered terminal
+    // keeps that reason, as the adapter's own write does.
+    if let Some(marker @ ("event_budget" | "empty_native_response")) =
+        turn["final_text_unavailable"].as_str()
+    {
+        data["final_text_unavailable"] = json!(marker);
     }
     if let Some(message) = turn["native_error"]
         .as_str()

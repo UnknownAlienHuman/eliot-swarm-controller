@@ -1938,13 +1938,7 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
         }
         "turn.completed" => {
             require_live_turn(agent, event)?;
-            let command_id = required_text(event, "command_id")?;
-            let turn_id = required_text(event, "turn_id")?;
-            let status = required_text(event, "status")?;
-            let outcome = optional_outcome(event)?;
-            let native_status = optional_native_status(event)?;
-            let final_text = optional_text(event, "final_text")?;
-            let usage = optional_usage(event)?;
+            let terminal = native_turn_terminal(event, now)?;
             // A harness-observed MCP inventory rides the terminal the same
             // way an observed model rides its message: merged as the only
             // change into the effective set, so a proven readback surfaces
@@ -1967,17 +1961,7 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
             next.state = AgentState::Idle;
             next.active_turn = None;
             next.pending.clear();
-            effects.push(Effect::TurnTerminal {
-                command_id: Some(command_id),
-                turn_id,
-                state: TurnState::Completed,
-                status: Some(status),
-                outcome,
-                native_status,
-                final_text,
-                usage,
-                completed_at: now,
-            });
+            effects.push(terminal);
         }
         "turn.unknown" => {
             // Live-host projection loss with failed view recovery: settle only
@@ -2090,6 +2074,52 @@ fn record_serving_model(agent: &mut Agent, model: String) {
         effective.insert("model".to_owned(), Value::String(model));
         effective.insert("model_verified".to_owned(), Value::Bool(true));
     }
+}
+
+/// An adapter's exact-turn `turn.completed` for a turn the daemon's recovery
+/// already settled `unknown` in this live generation. The terminal is
+/// evidence that resolves that turn (docs/spec/api.md, turn resolution): it
+/// returns the same turn-terminal effect as the live terminal, while the
+/// projection stays unchanged because the turn left it at settlement. The
+/// Store proves the stored recovery settlement and the exact send binding
+/// in the same transaction before using this.
+pub fn resolve_recovered_turn(agent: &Agent, event: &NativeEvent, now: i64) -> Result<Effect> {
+    if agent.observe_only {
+        return Err(Error::new(
+            "not_allowed",
+            "observer metadata/history cannot reduce controlled native state",
+        ));
+    }
+    if agent.state == AgentState::Unknown || agent.is_terminal() {
+        return Err(bad_state(event, "turn resolution requires a live Agent"));
+    }
+    if event.kind != "turn.completed" {
+        return Err(bad_state(
+            event,
+            "only a native turn.completed resolves a recovered turn",
+        ));
+    }
+    if agent.active_turn.as_deref() == Some(required_text(event, "turn_id")?.as_str()) {
+        return Err(bad_state(event, "the active turn settles through apply"));
+    }
+    // Validated like the live terminal; session metadata is not merged.
+    optional_observed_mcp_servers(event)?;
+    native_turn_terminal(event, now)
+}
+
+/// The turn-terminal effect a native `turn.completed` carries.
+fn native_turn_terminal(event: &NativeEvent, now: i64) -> Result<Effect> {
+    Ok(Effect::TurnTerminal {
+        command_id: Some(required_text(event, "command_id")?),
+        turn_id: required_text(event, "turn_id")?,
+        state: TurnState::Completed,
+        status: Some(required_text(event, "status")?),
+        outcome: optional_outcome(event)?,
+        native_status: optional_native_status(event)?,
+        final_text: optional_text(event, "final_text")?,
+        usage: optional_usage(event)?,
+        completed_at: now,
+    })
 }
 
 fn require_live_turn(agent: &Agent, event: &NativeEvent) -> Result<()> {

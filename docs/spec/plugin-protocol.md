@@ -591,21 +591,24 @@ with a committed native source gap (other than a `message`-only coverage gap), s
 health, or source closure, the daemon's attention
 monitor makes at most four read-only snapshot attempts with backoff, for every
 adapter. Fresh evidence that the exact turn is still running, or a terminal marked
-`write_pending`, keeps it open for the next sweep: recovery never races the adapter's
-own terminal write. A `busy` read (the Agent's snapshot slot or queue is occupied)
+`write_pending`, keeps it open for the next sweep. A `busy` read (the Agent's snapshot slot or queue is occupied)
 proves nothing and spends no attempt: it also defers to the next sweep while the turn
 has committed progress within `daemon.attention_suspicion_secs`. After that window a
 busy read counts as inconclusive, so a source that stays busy still settles. The host
-marks an `events.put` frame carrying this exact turn's `turn.completed`/`turn.unknown`
-from decode until intake finishes it. While such a write is marked, no recovered
-outcome settles the turn (checked under the Store lock). The adapter's write commits
-the turn, or its failure clears the mark for the next sweep. The Store rechecks the generation, native subject, turn, and source episode
+marks an `events.put` frame carrying this exact turn's `turn.completed` from decode
+until intake finishes it, and no recovered outcome settles the turn while such a write
+is marked. The adapter's write commits the turn, or its failure clears the mark for the
+next sweep. These deferrals only spare a needless `unknown`; correctness does not
+depend on them. The Store rechecks the generation, native subject, turn, and source episode
 before committing `turn.completed` from a proven terminal (keeping
 `final_text_unavailable` when the adapter reported it or the recovered text exceeds
 the event bound), `turn.unknown` with
 `native_exit_without_session_terminal` at once from a lost readback, or
 `turn.unknown` after four inconclusive reads. It retains the source gap and settles only that
-turn. Later facts cannot reopen it. Retiring or duplicate
+turn. A settled turn never reopens or runs again. Of its later facts only the adapter's own
+exact-turn `turn.completed` is accepted, and only against an `unknown` settlement: it is
+evidence and resolves that turn once ([turn resolution](api.md#input-turn-and-unknown-gates)).
+Every other late fact is refused. Retiring or duplicate
 exit observations cannot settle a newer generation and never authorize replay.
 An event owner closing before the tail barrier or a drain deadline expiring is
 an explicit unknown retirement error, never successful tail settlement. Retirement
