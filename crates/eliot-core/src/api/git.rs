@@ -225,12 +225,18 @@ fn validate_tracking_ref(value: &str, field: &str) -> Result<()> {
 }
 
 fn validate_oid(value: &str, field: &str) -> Result<()> {
-    if !matches!(value.len(), 40 | 64) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if !is_git_oid(value) {
         return Err(invalid(format!(
             "git.fetch {field} must be an exact Git object ID"
         )));
     }
     Ok(())
+}
+
+/// Whether `value` is an exact Git object ID: 40 hex characters (SHA-1) or
+/// 64 (SHA-256 repositories).
+pub fn is_git_oid(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn validate_setup_file(file: &FrozenSetupFile) -> Result<()> {

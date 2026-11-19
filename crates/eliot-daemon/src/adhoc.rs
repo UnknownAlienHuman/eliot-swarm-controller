@@ -18,8 +18,6 @@ use serde_json::{Map, Value, json};
 use std::path::{Path, PathBuf};
 
 pub(crate) const ADHOC_PROFILE_PREFIX: &str = "adhoc-";
-pub(crate) const SUPPORTED_HARNESSES: &[&str] =
-    &["codex", "claude", "muse", "opencode", "antigravity"];
 
 pub(crate) const DISCOVERY_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
 use std::time::{Duration, Instant};
@@ -59,7 +57,7 @@ fn split_provider_model(model: &str) -> Option<(&str, &str)> {
 
 pub(crate) fn validate_adhoc_harness(harness: &str) -> core::Result<String> {
     let trimmed = harness.trim();
-    if SUPPORTED_HARNESSES.contains(&trimmed) {
+    if core::api::is_supported_harness(trimmed) {
         Ok(trimmed.to_owned())
     } else {
         Err(core::Error::new(

@@ -70,13 +70,15 @@ const PRIVATE_PROVIDER_SELECTORS: &[&str] = &[
     "ANTHROPIC_VERTEX_BASE_URL",
     "ANTHROPIC_VERTEX_PROJECT_ID",
 ];
+/// The provider-mode subset of the core external-route markers, in their
+/// declared order so the frozen route identity digest is unchanged.
 const CLAUDE_PROVIDER_MODES: &[&str] = &[
-    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
-    "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
-    "CLAUDE_CODE_USE_BEDROCK",
-    "CLAUDE_CODE_USE_VERTEX",
-    "CLAUDE_CODE_USE_FOUNDRY",
-    "CLAUDE_CODE_USE_MANTLE",
+    core::api::CLAUDE_EXTERNAL_ROUTE_MARKERS[3],
+    core::api::CLAUDE_EXTERNAL_ROUTE_MARKERS[4],
+    core::api::CLAUDE_EXTERNAL_ROUTE_MARKERS[5],
+    core::api::CLAUDE_EXTERNAL_ROUTE_MARKERS[6],
+    core::api::CLAUDE_EXTERNAL_ROUTE_MARKERS[7],
+    core::api::CLAUDE_EXTERNAL_ROUTE_MARKERS[8],
 ];
 const CLAUDE_ROUTE_CREDENTIALS: &[&str] = &[
     "ANTHROPIC_API_KEY",
@@ -533,8 +535,6 @@ fn desktop_key_valid(value: &str) -> bool {
         && value == value.trim()
 }
 
-const DESKTOP_HARNESSES: [&str; 5] = ["codex", "claude", "muse", "opencode", "antigravity"];
-
 fn desktop_error(message: &str) -> core::Error {
     core::Error::new("profile_error", format!("config.toml: {message}"))
 }
@@ -571,10 +571,7 @@ impl DesktopSettings {
         }
         for entry in self.favorite_models.iter().chain(self.recent_models.iter()) {
             let harness = entry.harness.as_str();
-            if !matches!(
-                harness,
-                "codex" | "claude" | "muse" | "opencode" | "antigravity"
-            ) {
+            if !core::api::is_supported_harness(harness) {
                 return Err(core::Error::new(
                     "profile_error",
                     "config.toml: desktop model harness must be codex, claude, muse, opencode or antigravity",
@@ -634,7 +631,7 @@ impl DesktopSettings {
             ));
         }
         for entry in &self.model_visibility {
-            if !DESKTOP_HARNESSES.contains(&entry.harness.as_str()) {
+            if !core::api::is_supported_harness(&entry.harness) {
                 return Err(desktop_error(
                     "desktop model_visibility harness must be codex, claude, muse, opencode or antigravity",
                 ));

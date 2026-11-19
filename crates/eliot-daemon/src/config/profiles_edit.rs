@@ -28,7 +28,6 @@ use eliot_core::api::{
     ProfilesSaveRequest, ProfilesSaveResponse, REDACTION_MARKER,
 };
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 use super::{
     MAX_CONFIG_BYTES, core, parse_config, project_registrations_in, read_config_source,
@@ -38,10 +37,7 @@ use super::{
 /// Serializes saves within this daemon process.
 /// Lowercase hexadecimal SHA-256 of the file text.
 pub(crate) fn revision_of(source: &str) -> String {
-    Sha256::digest(source.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    eliot_core::api::inference::sha256_hex(source.as_bytes())
 }
 
 /// One table block: a header line and the lines up to the next header.

@@ -19,6 +19,14 @@
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 
+/// The native harness adapters the controller supports.
+pub const SUPPORTED_HARNESSES: &[&str] = &["codex", "claude", "muse", "opencode", "antigravity"];
+
+/// Whether `name` is one of the supported native harnesses.
+pub fn is_supported_harness(name: &str) -> bool {
+    SUPPORTED_HARNESSES.contains(&name)
+}
+
 /// Maximum harness name length.
 pub const MAX_HARNESS_NAME_BYTES: usize = 32;
 /// Maximum models returned in one catalogue page.
@@ -37,6 +45,21 @@ pub const MAX_HARNESS_CREDENTIAL_BYTES: usize = 256;
 pub const MAX_HARNESS_SOURCE_BYTES: usize = 64;
 /// Maximum quota note length.
 pub const MAX_HARNESS_QUOTA_NOTE_BYTES: usize = 1024;
+
+/// Environment markers that select an external Claude route. The daemon
+/// refuses them from the frozen environment and the Claude quota reader
+/// refuses them from native `settings.json`; both share this one list.
+pub const CLAUDE_EXTERNAL_ROUTE_MARKERS: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_MANTLE",
+];
 /// Maximum encoded bytes for structured quota details (provider-verbatim
 /// quota signals, never secrets or personal data).
 pub const MAX_HARNESS_QUOTA_DETAILS_BYTES: usize = 8192;
@@ -186,10 +209,7 @@ fn validate_harness(harness: &str) -> Result<()> {
             "harness must be a non-empty string of at most 32 characters",
         ));
     }
-    if !matches!(
-        trimmed,
-        "codex" | "claude" | "muse" | "opencode" | "antigravity"
-    ) {
+    if !is_supported_harness(trimmed) {
         return Err(Error::new(
             "unsupported",
             format!("unsupported harness {harness}"),

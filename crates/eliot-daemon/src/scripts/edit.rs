@@ -22,7 +22,6 @@ use eliot_core::api::{
 };
 use eliot_core::{Error, Result, SecretPolicy};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 use crate::platform::script_file::{self, Directory};
 
@@ -31,13 +30,6 @@ const MAX_DEPTH: usize = 6;
 const BOM: &str = "\u{feff}";
 
 static SAVE_LOCK: Mutex<()> = Mutex::new(());
-
-fn revision_of(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
 
 fn root_for(
     data_root: &Path,
@@ -246,7 +238,7 @@ fn load(root: &Path, relative: &str) -> Result<Loaded> {
     let (parent, name) = Directory::open(root)?.descend(relative)?;
     let mut file = parent.file(&name)?;
     let bytes = script_file::read(&mut file)?;
-    let revision = revision_of(&bytes);
+    let revision = eliot_core::api::inference::sha256_hex(&bytes);
     Ok(Loaded {
         canonical: parent.path.join(&name),
         parent,
@@ -411,7 +403,7 @@ pub(crate) fn save(
         .replace(&loaded.name, &loaded.file, &original, &bytes)?;
     Ok(ScriptSaveResponse {
         saved: true,
-        revision: revision_of(&bytes),
+        revision: eliot_core::api::inference::sha256_hex(&bytes),
     })
 }
 
@@ -571,7 +563,12 @@ mod tests {
         assert!(files.read("linked.txt", &policy).is_err());
         assert!(
             files
-                .save("linked.txt", revision_of(b"outside"), "changed", &policy)
+                .save(
+                    "linked.txt",
+                    eliot_core::api::inference::sha256_hex(b"outside"),
+                    "changed",
+                    &policy,
+                )
                 .is_err()
         );
         assert!(

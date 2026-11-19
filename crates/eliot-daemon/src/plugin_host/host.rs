@@ -2137,7 +2137,10 @@ fn source_state_binding(
 }
 
 fn redact_native_error(error: Error, credentials: &[String]) -> Error {
-    crate::redaction::redact_error(error, credentials)
+    // The boundary behind every persisted outcome, event and log record:
+    // redacted message, origin evidence and stderr tails, normalized
+    // `where`, every bound re-applied.
+    error.sanitized(&SecretPolicy::new(credentials))
 }
 
 fn diagnose_error(error: Error, stderr: &StderrView, credentials: &[String]) -> Error {

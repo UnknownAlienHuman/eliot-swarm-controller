@@ -1607,7 +1607,7 @@ fn caller_identity_from(
             .and_then(|value| value.to_str())
             .filter(|value| !value.is_empty())
             .ok_or_else(|| Error::new("not_allowed", "managed Agent token is invalid"))?;
-        if !valid_agent_id(id) {
+        if eliot_core::parse_agent_id(id).is_err() {
             return Err(Error::new("not_allowed", "managed Agent id is invalid"));
         }
         return Ok(ClientIdentity::Agent {
@@ -1643,9 +1643,6 @@ fn caller_identity_from(
     }
 
     Ok(ClientIdentity::Owner)
-}
-fn valid_agent_id(id: &str) -> bool {
-    eliot_core::parse_agent_id(id).is_ok()
 }
 
 fn valid_id(id: &Value) -> bool {
@@ -1874,7 +1871,7 @@ mod tests {
     #[test]
     fn shared_helpers_managed_auth_requires_canonical_agent_ids() {
         for id in ["a1", "a10", "a9223372036854775807"] {
-            assert!(valid_agent_id(id));
+            assert!(eliot_core::parse_agent_id(id).is_ok());
         }
         for id in [
             "",
@@ -1893,7 +1890,7 @@ mod tests {
             "a9223372036854775808",
             "01MUTATIONID",
         ] {
-            assert!(!valid_agent_id(id), "{id:?}");
+            assert!(eliot_core::parse_agent_id(id).is_err(), "{id:?}");
         }
     }
 

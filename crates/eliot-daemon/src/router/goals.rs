@@ -15,6 +15,7 @@ use eliot_core::{
     api::{
         GoalClearRequest, GoalGetRequest, GoalMode, GoalPauseRequest, GoalResumeRequest,
         GoalRoundRequest, GoalSetRequest, GoalStatus, MAX_GOAL_OBSERVATION_BYTES,
+        inference::sha256_hex, truncate_bytes,
     },
     limits::MAX_FRAME_BYTES,
 };
@@ -24,7 +25,6 @@ use eliot_store::{
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap},
     future::Future,
@@ -154,24 +154,6 @@ fn require_eliot_mode(mode: GoalMode) -> Result<()> {
         ));
     }
     Ok(())
-}
-
-fn check_output_digest(stdout: &[u8]) -> String {
-    Sha256::digest(stdout)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-fn truncate_observation(text: &str) -> &str {
-    if text.len() <= MAX_GOAL_OBSERVATION_BYTES {
-        return text;
-    }
-    let mut end = MAX_GOAL_OBSERVATION_BYTES;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    &text[..end]
 }
 
 fn failed_check_message(reason: ProcessFailure) -> &'static str {
@@ -1373,12 +1355,13 @@ fn goal_completed_check_result(
             "goal check has no exit code; its outcome is unknown",
         ));
     };
-    let digest = check_output_digest(stdout);
+    let digest = sha256_hex(stdout);
     let text = String::from_utf8_lossy(stdout);
     let observation = if text.is_empty() {
         None
     } else {
-        Some(policy.redact_text(truncate_observation(text.as_ref())))
+        let (kept, _) = truncate_bytes(text.as_ref(), MAX_GOAL_OBSERVATION_BYTES);
+        Some(policy.redact_text(&kept))
     };
     Ok(GoalCheckResult {
         exit_code: Some(exit_code),
@@ -1793,18 +1776,20 @@ mod tests {
 
     #[test]
     fn goal_check_helpers_bound_and_shape_outputs() {
-        let digest = check_output_digest(b"same");
-        assert_eq!(digest, check_output_digest(b"same"));
+        let digest = sha256_hex(b"same");
+        assert_eq!(digest, sha256_hex(b"same"));
         assert_eq!(digest.len(), 64);
-        assert_ne!(digest, check_output_digest(b"other"));
-        assert_eq!(truncate_observation("short"), "short");
+        assert_ne!(digest, sha256_hex(b"other"));
+        let (kept, cut) = truncate_bytes("short", MAX_GOAL_OBSERVATION_BYTES);
+        assert_eq!(kept, "short");
+        assert!(!cut);
         let long = "x".repeat(MAX_GOAL_OBSERVATION_BYTES + 10);
-        assert_eq!(
-            truncate_observation(&long).len(),
-            MAX_GOAL_OBSERVATION_BYTES
-        );
+        let (kept, cut) = truncate_bytes(&long, MAX_GOAL_OBSERVATION_BYTES);
+        assert!(cut);
+        assert_eq!(kept.len(), MAX_GOAL_OBSERVATION_BYTES);
         let boundary = format!("{}é", "y".repeat(MAX_GOAL_OBSERVATION_BYTES - 1));
-        assert!(truncate_observation(&boundary).len() <= MAX_GOAL_OBSERVATION_BYTES);
+        let (kept, _) = truncate_bytes(&boundary, MAX_GOAL_OBSERVATION_BYTES);
+        assert!(kept.len() <= MAX_GOAL_OBSERVATION_BYTES);
         let policy = SecretPolicy::new(Vec::<String>::new());
         let check = GoalCheckResult {
             exit_code: Some(1),

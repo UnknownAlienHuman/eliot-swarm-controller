@@ -4,7 +4,10 @@ use super::{
     AgentKey, PluginHost, build_process_environment, metadata_secret_snapshot, redact_native_error,
     require_proxy_capability, signal_progress,
 };
-use eliot_core::{Error, Result, SecretPolicy, StderrSource, api::DiscoverPage};
+use eliot_core::{
+    Error, Result, SecretPolicy, StderrSource,
+    api::{DiscoverPage, is_supported_harness},
+};
 use eliot_plugin::protocol::{
     ModelListParams, ModelListPart, ProfileStoreParams, ProfileStoreResult,
 };
@@ -243,12 +246,7 @@ impl PluginHost {
         if !profile
             .get("harness")
             .and_then(Value::as_str)
-            .is_some_and(|harness| {
-                matches!(
-                    harness,
-                    "codex" | "claude" | "muse" | "opencode" | "antigravity"
-                )
-            })
+            .is_some_and(is_supported_harness)
         {
             return Err(Error::new(
                 "unsupported",
