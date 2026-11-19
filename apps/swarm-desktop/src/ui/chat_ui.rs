@@ -36,8 +36,8 @@ pub(super) enum ChatMsg {
     RereadLoaded(u64, Result<Box<Reread>, (eliot_core::Error, Invalidation)>),
     RereadRetry(u64),
     LoadOlderRequested,
-    /// Bring the latest turn into view once it is realized (epoch, tries).
-    FollowLatest(u64, u32),
+    /// The newest turn was scrolled into view, or why not (epoch).
+    FollowLatest(u64, Result<(), String>),
     ToolsToggled(String, bool),
     CopyPart(String),
     CopyCode(String, usize),
@@ -106,8 +106,12 @@ const MENU_FORCE: &str = "Force stop…";
 /// (`TextControlThemePadding`, 10,5,6,6).
 const WINUI_TEXT_PADDING: f64 = 10.0;
 /// Follow-latest retries while the newest turn is not realized yet.
-const FOLLOW_TRIES: u32 = 20;
-const FOLLOW_DELAY_MS: u64 = 50;
+/// When the transcript is scrolled to its end after an open or a send:
+/// once it is realized, then as the virtualized earlier turns are
+/// measured and push the end down (ms, each after the previous).
+const FOLLOW_PASSES_MS: [u64; 3] = [60, 250, 600];
+/// The transcript viewer's automation id, which `crate::scroll_end` finds.
+const TRANSCRIPT_ID: &str = "ConversationTranscript";
 
 /// Admission refusals of a steer after which the text goes as the next
 /// message: the turn ended or changed (`bad_state`, `stale_generation`), or
@@ -338,7 +342,6 @@ pub(super) struct ChatState {
     /// repeater so it always exists: opening a conversation focuses it, and
     /// WinUI brings a focused control into view (Reactor 0.100.0 exposes no
     /// ScrollViewer offset or ChangeView).
-    pub(super) end_anchor: ElementRef<Button>,
     /// The composer, focused again after input is admitted, a launch and New.
     pub(super) composer_ref: ElementRef<TextBox>,
     pub(super) pending_local: Option<(String, String, String)>,
@@ -419,7 +422,7 @@ impl DesktopApp {
             );
         }
         self.rebuild_items();
-        self.follow_latest(0, context);
+        self.follow_latest(context);
         let blank = snapshot.text.trim().is_empty();
         self.spawn_draft(
             snapshot.action,
@@ -512,7 +515,7 @@ impl DesktopApp {
                         self.check_waiting_inputs(context);
                         if first_load {
                             // Opened at the newest turn, like a chat.
-                            self.follow_latest(0, context);
+                            self.follow_latest(context);
                         }
                         self.set_status("Retained history loaded; following live events.");
                         self.follow_next(Next::Wake { after: cursor }, context);
@@ -632,17 +635,19 @@ impl DesktopApp {
                 self.set_status("Loading older retained history…");
                 self.start_snapshot(context);
             }
-            ChatMsg::FollowLatest(epoch, tries) => {
+            ChatMsg::FollowLatest(epoch, outcome) => {
                 if epoch != self.chat.epoch {
                     return;
                 }
-                if self.chat.opened_from_search {
-                    // Focus would leave the search box and close its list.
-                } else if self.chat.end_anchor.request_focus() {
-                    // The latest turn is in view; typing goes on in the composer.
+                if let Err(error) = outcome {
+                    self.set_status(format!(
+                        "The latest turn was not scrolled into view: {error}"
+                    ));
+                }
+                // Typing goes on in the composer; focus would leave the
+                // search box and close its list.
+                if !self.chat.opened_from_search {
                     let _ = self.chat.composer_ref.request_focus();
-                } else if tries < FOLLOW_TRIES && !self.chat.items.is_empty() {
-                    self.follow_latest(tries + 1, context);
                 }
             }
             ChatMsg::ToolsToggled(key, expanded) => {
@@ -814,7 +819,7 @@ impl DesktopApp {
                     );
                 }
                 self.rebuild_items();
-                self.follow_latest(0, context);
+                self.follow_latest(context);
                 self.spawn_draft(
                     action,
                     mutation_id,

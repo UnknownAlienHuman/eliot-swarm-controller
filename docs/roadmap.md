@@ -458,7 +458,10 @@ of the explicitly selected release scope.
       rereads it; transport failures back off and resnapshot. Reactor 0.100.0
       has no scroll offset or `ViewChanged`, so the view neither auto-follows the
       bottom nor shows a "N new" jump button it could not hide at the bottom;
-      opening a conversation brings its latest turn into view. (Refs #407)
+      opening a conversation or sending scrolls the transcript to its end
+      through UI Automation's scroll pattern (the viewer found by its
+      automation id), in a few passes as the virtualized turns are measured
+      (k195 P2-4: focusing its last button brought nothing into view). (Refs #407)
 - [x] **D3 Swarm monitor.** An openable monitor panel uses one demand-driven
       refresh chain, active only while open. The last successful fleet and
       selected-Agent details stay visible on reopen and failed refreshes, with

@@ -16,8 +16,9 @@
 //! `ScrollViewer` exposes no offset, `ViewChanged`, `ChangeView` or anchor
 //! ratio, so the transcript cannot detect "at the bottom" or auto-follow.
 //! A "N new" jump button cannot know it is already at the bottom, so there
-//! is none (k98: it stayed shown at the bottom); opening a conversation
-//! focuses the end anchor, which WinUI brings into view. There is no
+//! is none (k98: it stayed shown at the bottom); opening a conversation or
+//! sending scrolls the transcript to its end through UI Automation's scroll
+//! pattern ([`crate::scroll_end`]). There is no
 //! font-family property (code is not monospace), no
 //! clipboard (see [`crate::clipboard`]) and no key events on `TextBox`: Enter
 //! sends through the window's thread keyboard hook, which marks the line
@@ -824,7 +825,6 @@ impl Component for DesktopApp {
                 items: Rc::new(Vec::new()),
                 items_revision: 0,
                 expanded: HashSet::new(),
-                end_anchor: ElementRef::new(),
                 composer_ref: ElementRef::new(),
                 pending_local: None,
                 waiting_label: None,

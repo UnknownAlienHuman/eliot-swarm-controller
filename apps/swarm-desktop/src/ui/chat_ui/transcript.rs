@@ -2,12 +2,30 @@ use super::*;
 
 impl DesktopApp {
     /// Bring the newest turn into view after the next render.
-    pub(super) fn follow_latest(&self, tries: u32, context: &ComponentContext<Self>) {
+    /// Bring the newest turn into view: scroll the transcript to its end
+    /// (`crate::scroll_end`), again as the virtualized earlier turns are
+    /// measured and the end moves, then hand typing to the composer.
+    pub(super) fn follow_latest(&self, context: &ComponentContext<Self>) {
         let epoch = self.chat.epoch;
         let _task = context.spawn_background(move |cancel| {
             let cancelled = || cancel.is_cancelled();
-            let _ = feed::backoff(FOLLOW_DELAY_MS, &cancelled);
-            Message::Chat(ChatMsg::FollowLatest(epoch, tries))
+            let mut outcome = Err("the transcript was not realized".to_owned());
+            for delay in FOLLOW_PASSES_MS {
+                // False: the conversation was left while waiting.
+                if !feed::backoff(delay, &cancelled) {
+                    break;
+                }
+                let Some(window) = crate::app_resources::own_window() else {
+                    outcome = Err("the window was not found".to_owned());
+                    continue;
+                };
+                outcome = match crate::scroll_end::scroll_to_end(window, TRANSCRIPT_ID) {
+                    Ok(Some(_)) => Ok(()),
+                    Ok(None) => Err("the transcript was not realized".to_owned()),
+                    Err(error) => Err(error),
+                };
+            }
+            Message::Chat(ChatMsg::FollowLatest(epoch, outcome))
         });
     }
 
@@ -30,7 +48,7 @@ impl DesktopApp {
     }
 
     /// The transcript: "Load older" when more history exists, then every
-    /// turn in the reading column; the newest turn carries the end anchor.
+    /// turn in the reading column.
     pub(super) fn transcript_view(
         &self,
         column: Option<f64>,
@@ -95,20 +113,13 @@ impl DesktopApp {
             }),
         };
         // Every turn but the latest is virtualized; the latest is a plain
-        // child that always exists and carries the end anchor.
+        // child that always exists.
         let earlier = self.chat.items.len().saturating_sub(1);
         let expanded = Rc::new(self.chat.expanded.clone());
         let latest: View = match self.chat.items.last() {
             Some(item) => StackPanel::new().keyed_children(vec![KeyedView::new(
                 item.key.clone(),
-                views::item_view(
-                    item,
-                    &expanded,
-                    &callbacks,
-                    palette,
-                    Some(&self.chat.end_anchor),
-                    column,
-                ),
+                views::item_view(item, &expanded, &callbacks, palette, column),
             )]),
             None => View::empty(),
         };
@@ -136,14 +147,13 @@ impl DesktopApp {
                 .wrapping_add(width_code.wrapping_mul(0x9E37_79B9)),
             earlier,
             move |index| keys[index].key.clone(),
-            move |index| {
-                views::item_view(&items[index], &expanded, &callbacks, palette, None, column)
-            },
+            move |index| views::item_view(&items[index], &expanded, &callbacks, palette, column),
         );
         ScrollViewer::new()
             .grid_row(1)
             .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
             .automation_name("Conversation")
+            .automation_id(TRANSCRIPT_ID)
             .content(
                 StackPanel::new()
                     .width(column)

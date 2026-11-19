@@ -25,6 +25,8 @@ mod monitor_view;
 #[cfg(windows)]
 mod reparent;
 #[cfg(windows)]
+mod scroll_end;
+#[cfg(windows)]
 mod shortcuts;
 #[cfg(windows)]
 mod ui;

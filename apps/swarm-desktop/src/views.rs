@@ -278,9 +278,6 @@ fn block_views(part: &RenderedPart, callbacks: &RowCallbacks, palette: Palette) 
         .collect()
 }
 
-/// `anchor`, when given, binds the part's own button (Copy or the tool
-/// group header): the end anchor of the transcript.
-///
 /// One style for every part, as in a chat: the user's message is a
 /// secondary-container bubble on the right; the answer is plain body
 /// text on the surface; tool groups are one low-emphasis expandable row;
@@ -290,12 +287,7 @@ fn part_view(
     expanded: bool,
     callbacks: &RowCallbacks,
     palette: Palette,
-    anchor: Option<&ElementRef<Button>>,
 ) -> View {
-    let anchored = |button: Button| match anchor {
-        Some(anchor) => button.element_ref(anchor),
-        None => button,
-    };
     let copy = callbacks.copy_part.clone();
     let key = part.key.clone();
     let copy_message = move || {
@@ -312,7 +304,7 @@ fn part_view(
                     .corner_radius(tokens::radius::CONTAINER)
                     .padding(Thickness::xy(tokens::spacing::INSET, tokens::spacing::SM))
                     .content(body_text(&part.plain, palette.on_bubble())),
-                anchored(copy_button("Copy message", palette, copy_message))
+                copy_button("Copy message", palette, copy_message)
                     .horizontal_alignment(HorizontalAlignment::Right)
                     .margin(Thickness::new(0.0, 0.0, -INSET, 0.0))
                     .content(copy_glyph()),
@@ -328,7 +320,7 @@ fn part_view(
             // A low-emphasis button rather than a ToggleButton: Reactor
             // 0.100.0 themes only Buttons, so a checked toggle would show the
             // system accent. The accessible name carries the state.
-            let header = anchored(crate::m3::row(palette, false))
+            let header = crate::m3::row(palette, false)
                 .automation_name(format!(
                     "{} ({})",
                     part.plain,
@@ -379,7 +371,7 @@ fn part_view(
                 StackPanel::new()
                     .spacing(tokens::spacing::SM)
                     .keyed_children(block_views(part, callbacks, palette)),
-                anchored(copy_button("Copy message", palette, copy_message))
+                copy_button("Copy message", palette, copy_message)
                     .horizontal_alignment(HorizontalAlignment::Left)
                     .margin(Thickness::new(-INSET, 0.0, 0.0, 0.0))
                     .content(copy_glyph()),
@@ -439,39 +431,22 @@ fn part_view(
 }
 
 /// One realized turn: keyed parts, so new activity appends children instead
-/// of replacing the item. `anchor` binds the last part that has a button of
-/// its own (see [`part_view`]).
+/// of replacing the item.
 pub fn item_view(
     item: &RenderedItem,
     expanded: &HashSet<String>,
     callbacks: &RowCallbacks,
     palette: Palette,
-    anchor: Option<&ElementRef<Button>>,
     width: Option<f64>,
 ) -> View {
-    let anchored = anchor.and_then(|_| {
-        item.parts.iter().rposition(|part| {
-            matches!(
-                part.kind,
-                PartKind::Input | PartKind::Tools | PartKind::Final
-            )
-        })
-    });
     let parts: Vec<KeyedView> = item
         .parts
         .iter()
-        .enumerate()
-        .map(|(index, part)| {
+        .map(|part| {
             KeyedView::new(
                 part.key.clone(),
                 StackPanel::new().spacing(tokens::spacing::XS).children((
-                    part_view(
-                        part,
-                        expanded.contains(&part.key),
-                        callbacks,
-                        palette,
-                        anchor.filter(|_| anchored == Some(index)),
-                    ),
+                    part_view(part, expanded.contains(&part.key), callbacks, palette),
                     if matches!(
                         part.kind,
                         PartKind::Input | PartKind::Progress | PartKind::Final
