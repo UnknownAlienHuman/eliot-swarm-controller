@@ -364,27 +364,27 @@ fn part_view(
         PartKind::Tools => {
             let toggle = callbacks.toggle_tools.clone();
             let key = part.key.clone();
-            // "Run command · Completed · ~0.3 s": the name, then the status
-            // (Running in the primary role) or the duration at the end.
-            let mut fields = part.plain.split(" · ");
+            // Name, status and duration (`chat::TOOL_FIELDS` apart): the
+            // name, then the status (Running in the primary role) or the
+            // duration at the end.
+            let mut fields = part.plain.split(crate::chat::TOOL_FIELDS);
             let name = fields.next().unwrap_or_default().to_owned();
             let status = fields.next().unwrap_or_default().to_owned();
             let duration = fields.next().unwrap_or_default().to_owned();
             let running = status == "Running";
             let trailing = match status.as_str() {
                 "Running" => "Running".to_owned(),
-                "Completed" => duration,
-                _ => status,
+                "Completed" => duration.clone(),
+                _ => status.clone(),
             };
-            let glyph = match name.as_str() {
-                "Run command" => crate::m3::glyph::TERMINAL,
-                edit if edit.starts_with("Edit") => crate::m3::glyph::EDIT,
+            let glyph = match part.label.as_str() {
+                "Command" => crate::m3::glyph::TERMINAL,
+                "Edit" => crate::m3::glyph::EDIT,
                 _ => crate::m3::glyph::TOOLS,
             };
             let row = crate::m3::tool_row(palette, running)
                 .automation_name(format!(
-                    "{} ({})",
-                    part.plain,
+                    "{name} · {status} · {duration} ({})",
                     if expanded { "expanded" } else { "collapsed" }
                 ))
                 .on_click(move || {
@@ -505,8 +505,12 @@ pub fn item_view(
             // A tool row is keyed by whether it runs: WinUI reads a button's
             // colors only when its template is applied, so a finished row
             // would keep the running tint.
-            let key = if matches!(part.kind, PartKind::Tools) && part.plain.contains(" · Running")
-            {
+            let running = format!(
+                "{}Running{}",
+                crate::chat::TOOL_FIELDS,
+                crate::chat::TOOL_FIELDS
+            );
+            let key = if matches!(part.kind, PartKind::Tools) && part.plain.contains(&running) {
                 format!("{}:running", part.key)
             } else {
                 part.key.clone()

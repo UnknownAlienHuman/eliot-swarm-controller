@@ -127,7 +127,14 @@ struct ToolRow {
     completed_ms: Option<i64>,
     paths: Vec<String>,
     paths_truncated: bool,
+    /// The command a command tool runs, as its adapter retained it
+    /// (`tool.started` `command`: redacted and bounded).
+    command: Option<String>,
 }
+
+/// Separates a tool row's name, status and duration in its part text (a
+/// command may contain any visible character).
+pub const TOOL_FIELDS: char = '\u{1f}';
 
 #[derive(Clone, Debug)]
 enum Activity {
@@ -217,6 +224,7 @@ impl TurnEntry {
                             + row.tool.len()
                             + row.status.as_ref().map_or(0, String::len)
                             + row.paths.iter().map(String::len).sum::<usize>()
+                            + row.command.as_ref().map_or(0, String::len)
                             + 32
                     })
                     .sum(),
@@ -264,6 +272,9 @@ impl TurnEntry {
                             .filter_map(serde_json::Value::as_str)
                             .any(|path| path.chars().count() > 1_024)
                 });
+        let command = data_str(event, "command")
+            .map(|command| command.replace(TOOL_FIELDS, " "))
+            .filter(|command| !command.trim().is_empty());
         let failed_now = done && status.as_deref().is_some_and(|status| !is_success(status));
         if let Some(&group) = self.item_groups.get(item_id)
             && let Some(Activity::Tools {
@@ -283,6 +294,9 @@ impl TurnEntry {
                     }
                     if !paths.is_empty() {
                         row.paths = paths;
+                    }
+                    if row.command.is_none() {
+                        row.command = command;
                     }
                     row.paths_truncated |= paths_truncated;
                     if status.is_some() || done {
@@ -309,6 +323,7 @@ impl TurnEntry {
             completed_ms: done.then_some(event.ts),
             paths,
             paths_truncated,
+            command,
         };
         if !matches!(self.activity.last(), Some(Activity::Tools { .. })) {
             self.activity.push(Activity::Tools {
@@ -1198,9 +1213,10 @@ impl Conversation {
                         ));
                     }
                     for row in rows {
-                        // An edit names its file ("Edited nav.rs"), as the
-                        // design's tool rows do; a command's text is not
-                        // retained, so it stays "Run command".
+                        // As the design's tool rows: a command shows its
+                        // first line ("cargo clippy -p swarm-desktop"), an
+                        // edit names its file ("Edited nav.rs"); the label
+                        // picks the glyph.
                         let file = |path: &str| {
                             std::path::Path::new(path)
                                 .file_name()
@@ -1208,15 +1224,25 @@ impl Conversation {
                                 .unwrap_or(path)
                                 .to_owned()
                         };
-                        let name = match (row.tool.as_str(), row.paths.as_slice()) {
-                            ("commandExecution", _) => "Run command".to_owned(),
-                            ("fileChange", []) => "Edit files".to_owned(),
-                            ("fileChange", [one]) => format!("Edited {}", file(one)),
-                            ("fileChange", [first, rest @ ..]) => {
-                                format!("Edited {} and {} more", file(first), rest.len())
-                            }
-                            (other, _) => other.to_owned(),
-                        };
+                        let first_line = row.command.as_deref().and_then(|command| {
+                            command.lines().map(str::trim).find(|line| !line.is_empty())
+                        });
+                        let (label, name) =
+                            match (row.tool.as_str(), row.paths.as_slice(), first_line) {
+                                (_, _, Some(line)) => ("Command", line.to_owned()),
+                                ("commandExecution", _, None) => {
+                                    ("Command", "Run command".to_owned())
+                                }
+                                ("fileChange", [], _) => ("Edit", "Edit files".to_owned()),
+                                ("fileChange", [one], _) => {
+                                    ("Edit", format!("Edited {}", file(one)))
+                                }
+                                ("fileChange", [first, rest @ ..], _) => (
+                                    "Edit",
+                                    format!("Edited {} and {} more", file(first), rest.len()),
+                                ),
+                                (other, _, None) => ("Tool", other.to_owned()),
+                            };
                         let status = match (row.done, row.status.as_deref()) {
                             (false, _) => "Running",
                             (true, Some(status)) if is_success(status) => "Completed",
@@ -1232,7 +1258,13 @@ impl Conversation {
                             || "duration unavailable".to_owned(),
                             |ms| format!("~{:.1} s", ms as f64 / 1_000.0),
                         );
-                        let mut detail = row.paths.clone();
+                        let mut detail: Vec<String> = row
+                            .command
+                            .iter()
+                            .flat_map(|command| command.lines())
+                            .map(str::to_owned)
+                            .collect();
+                        detail.extend(row.paths.iter().cloned());
                         if row.paths_truncated {
                             detail.push(
                                 "More changed paths were not retained in this card.".to_owned(),
@@ -1248,8 +1280,9 @@ impl Conversation {
                         parts.push(Part::new(
                             format!("tools:{}", row.item_id),
                             PartKind::Tools,
-                            "Tool".to_owned(),
-                            format!("{name} · {status} · {duration}"),
+                            label.to_owned(),
+                            [name.as_str(), status, duration.as_str()]
+                                .join(&TOOL_FIELDS.to_string()),
                             detail,
                         ));
                     }
