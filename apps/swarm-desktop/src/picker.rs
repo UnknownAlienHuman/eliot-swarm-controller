@@ -51,18 +51,18 @@ const MODEL_ORGS: [&str; 6] = [
 
 /// An effective model slug in short, for compact labels. One rule:
 /// - drop the route's `provider/` prefix (every segment up to the last
-///   `/`), a `:free` suffix and a `-preview` suffix;
+///   `/`) and a `:free` suffix;
 /// - then drop the first dash token when the next token starts with it
 ///   (`qwen-qwen4-max`) or it is a known organization ([`MODEL_ORGS`]).
 ///
 /// `nous/qwen-qwen4-max:free` reads `qwen4-max`,
-/// `kilo/baidu-ernie-5.5-flash-preview:free` reads `ernie-5.5-flash`;
+/// `kilo/baidu-ernie-5.5-flash-preview:free` reads `ernie-5.5-flash-preview`
+/// (a preview keeps its suffix, so it never shares a label with the stable model);
 /// `claude-haiku-5-5` and `gpt-6.2-sol` stay as they are. A slug with
 /// nothing left stays whole.
 pub fn model_short(slug: &str) -> &str {
     let name = slug.rsplit_once('/').map_or(slug, |(_, name)| name);
     let name = name.strip_suffix(":free").unwrap_or(name);
-    let name = name.strip_suffix("-preview").unwrap_or(name);
     let name = match name.split_once('-') {
         Some((first, rest))
             if !first.is_empty()
@@ -1101,7 +1101,10 @@ mod tests {
     fn model_short_reads_the_brief_examples() {
         for (slug, short) in [
             ("nous/qwen-qwen4-max:free", "qwen4-max"),
-            ("kilo/baidu-ernie-5.5-flash-preview:free", "ernie-5.5-flash"),
+            (
+                "kilo/baidu-ernie-5.5-flash-preview:free",
+                "ernie-5.5-flash-preview",
+            ),
             ("claude-haiku-5-5", "claude-haiku-5-5"),
             ("gpt-6.2-sol", "gpt-6.2-sol"),
         ] {
@@ -1124,6 +1127,9 @@ mod tests {
             ("kilo/", "kilo/"),
             (":free", ":free"),
             ("baidu", "baidu"),
+            ("", ""),
+            ("/", "/"),
+            ("модель-x", "модель-x"),
         ] {
             assert_eq!(model_short(slug), short, "{slug}");
         }
