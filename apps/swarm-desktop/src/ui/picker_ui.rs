@@ -23,6 +23,9 @@ const MANAGE_GROUP_ROWS: usize = 150;
 /// requests and the notice row, down to the composer.
 pub(super) const POPOVER_ROWS: i32 = 4;
 
+/// A popover starts this much smaller and settles to its size.
+const ENTRANCE_SCALE: f64 = 0.97;
+
 impl DesktopApp {
     /// A new task composer's first row, inside its card (Codex's): the
     /// project selector as a borderless chip, and the folder field for a
@@ -168,6 +171,11 @@ impl DesktopApp {
             Pop::Effort => self.effort_popover(context, palette),
             Pop::Usage => self.usage_popover(context, palette),
         };
+        // The design's entrance: a fade with the popover settling into
+        // place (Reactor's transitions take a duration only; the scale from
+        // its bottom stands in for the 4-DIP rise).
+        let entering = self.launch.entering;
+        let entrance = std::time::Duration::from_millis(tokens::motion::POPOVER_MS);
         Border::new()
             .grid_row(1)
             .grid_row_span(POPOVER_ROWS)
@@ -175,6 +183,10 @@ impl DesktopApp {
             .width(column)
             .max_width(tokens::layout::READING_WIDTH)
             .horizontal_alignment(HorizontalAlignment::Center)
+            .opacity(if entering { 0.0 } else { 1.0 })
+            .opacity_transition(Some(entrance))
+            .scale(Some(if entering { ENTRANCE_SCALE } else { 1.0 }))
+            .scale_transition(Some(entrance))
             .content(content)
     }
 

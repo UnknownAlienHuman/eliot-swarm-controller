@@ -72,6 +72,8 @@ pub(super) enum LaunchMsg {
     OpenModel,
     /// Close the open popover (a click outside it, Esc).
     Close,
+    /// The popover's first frame is drawn: let it settle in.
+    Entered,
     /// The pointer entered (true) or left the composer's message field,
     /// and whether a button was already down as it entered.
     ComposerPointer {
@@ -179,8 +181,14 @@ pub(super) struct Submission {
 }
 
 /// The new-task draft and its context.
+/// How long the popover's first frame stays before it settles in.
+const ENTRANCE_FRAME_MS: u64 = 16;
+
 #[derive(Default)]
 pub(super) struct LaunchState {
+    /// The open popover's first frame: drawn clear and lowered, it then
+    /// settles in (the design's 250 ms entrance).
+    pub(super) entering: bool,
     /// The selected project's profile allowlist (empty: any profile).
     pub(super) profiles: Vec<String>,
     pub(super) workspace: String,
@@ -508,6 +516,7 @@ impl DesktopApp {
             }
             LaunchMsg::OpenModel => self.open_popover(Pop::Model, context),
             LaunchMsg::Close => self.close_popover(),
+            LaunchMsg::Entered => self.launch.entering = false,
             LaunchMsg::ComposerPointer { over, pressed } => {
                 crate::shortcuts::set_composer_over(over);
                 if over && pressed {
@@ -739,6 +748,13 @@ impl DesktopApp {
             self.launch.preset = None;
         }
         self.launch.open = Some(pop);
+        // The entrance: one frame clear and lowered, then the transition.
+        self.launch.entering = true;
+        let _task = context.spawn_background(|cancel| {
+            let cancelled = || cancel.is_cancelled();
+            let _ = crate::feed::backoff(ENTRANCE_FRAME_MS, &cancelled);
+            Message::Launch(LaunchMsg::Entered)
+        });
         match pop {
             Pop::Model => {
                 self.launch.query.clear();
