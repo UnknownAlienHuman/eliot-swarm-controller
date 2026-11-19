@@ -92,6 +92,14 @@ pub enum Group {
 }
 
 impl Group {
+    /// The state filter's word for the group.
+    pub fn filter_label(self) -> &'static str {
+        match self {
+            Self::Stopped => "Stopped",
+            other => other.title(),
+        }
+    }
+
     pub fn title(self) -> &'static str {
         match self {
             Self::Attention => "Needs attention",
@@ -1121,11 +1129,54 @@ pub struct ProjectLive {
 pub struct Filter {
     pub group: Option<Group>,
     pub project: Option<ProjectRef>,
+    /// The search field's text: a row matches when its title, id, harness,
+    /// model or project contains it, case-insensitively (k195 P3-2).
+    pub text: String,
 }
+
+/// The states the Monitor's state filter offers, in its order (`None`:
+/// every state).
+pub const STATE_FILTERS: [Option<Group>; 5] = [
+    None,
+    Some(Group::Working),
+    Some(Group::Attention),
+    Some(Group::Idle),
+    Some(Group::Stopped),
+];
 
 impl Filter {
     pub fn is_active(&self) -> bool {
-        self.group.is_some() || self.project.is_some()
+        self.group.is_some() || self.project.is_some() || !self.text.trim().is_empty()
+    }
+
+    /// Whether `row`, in the project named `project`, matches the search
+    /// text (an empty search matches every row).
+    pub fn matches_text(&self, row: &MonitorRow, project: &str) -> bool {
+        let wanted = self.text.trim().to_lowercase();
+        if wanted.is_empty() {
+            return true;
+        }
+        [
+            row.title.as_str(),
+            row.id.as_str(),
+            row.harness.as_str(),
+            crate::picker::harness_label(&row.harness),
+            row.model.as_deref().unwrap_or_default(),
+            project,
+        ]
+        .iter()
+        .any(|field| field.to_lowercase().contains(&wanted))
+    }
+
+    /// Whether a recently stopped `row` stays under this filter: the state
+    /// filter is every state or Stopped, the project and the text match.
+    pub fn keeps_stopped(&self, row: &MonitorRow, project: &ProjectRef) -> bool {
+        self.group.is_none_or(|group| group == Group::Stopped)
+            && self
+                .project
+                .as_ref()
+                .is_none_or(|kept| kept.key == project.key)
+            && self.matches_text(row, &project.name)
     }
 
     /// The filter after a complete refresh (no failed read, no partial
@@ -1138,7 +1189,10 @@ impl Filter {
             return self.clone();
         }
         Self {
-            group: self.group.filter(|group| overview.counts.get(*group) > 0),
+            // Stopped Agents are not live counts: that filter stays.
+            group: self
+                .group
+                .filter(|group| *group == Group::Stopped || overview.counts.get(*group) > 0),
             project: self.project.as_ref().and_then(|project| {
                 overview
                     .projects
@@ -1146,6 +1200,7 @@ impl Filter {
                     .find(|live| live.project.key == project.key)
                     .map(|live| live.project.clone())
             }),
+            text: self.text.clone(),
         }
     }
 
@@ -1155,6 +1210,7 @@ impl Filter {
                 .project
                 .as_ref()
                 .is_none_or(|project| counted.project.key == project.key)
+            && self.matches_text(counted.row, &counted.project.name)
     }
 }
 
