@@ -505,7 +505,11 @@ of the explicitly selected release scope.
       and deduplicated; CPU and memory are bar charts with the latest value and a
       labelled scale. Only the actions that apply are offered, bound at click time
       to the Agent, generation and turn shown: Interrupt, Stop, Force stop
-      (confirmed inline), Resume and, for observe-only Agents, Detach.
+      (confirmed inline), Resume and, for observe-only Agents, Detach. A
+      search field (title, id, harness, model, project) and a state filter
+      (every state, Working, Needs attention, Idle, Stopped) narrow the list,
+      the recently stopped Agents included (k195 P3-2); the panel's
+      Monitor/Details switch highlights the pane shown, however it opened.
       (Refs #407)
 - [x] **D4 Launch context, profiles and automation settings.** A new task
       picks Auto, a profile from the daemon's sanitized `profile.list` summaries,
@@ -584,7 +588,16 @@ of the explicitly selected release scope.
       `commondir` and `HEAD`). The picker, Settings › Projects and the Monitor
       use the same names. A button in the sidebar's
       header hides it to a rail (show sidebar, New task, the Monitor with the
-      fleet's dot, Settings) for the session; Settings keeps its navigation. Running tasks stay on top, then newest first;
+      fleet's dot, Settings) for the session; Settings keeps its navigation.
+      Navigation works as in Codex (owner review 2026-11-19): the app title
+      goes home (the new-task view); a project's name opens the project (a
+      new task there, its tasks unfolded) and its chevron folds it; Back and
+      Forward (the header's arrows, Alt+←/→, the keyboard's Back and Forward
+      keys and the mouse's side buttons) walk the places visited: a
+      project's new task, a conversation, a Settings page. WinUI 3 takes
+      mouse input outside the thread's message queue, so the side buttons
+      come from a low-level mouse hook that only reads them over the
+      desktop's own foreground window. Running tasks stay on top, then newest first;
       stopped tasks last changed before today, and subprojects with nothing
       live and nothing from today, fold into "Show N older" (a project whose
       tasks are all older keeps its newest three in view), and `[desktop]
@@ -603,19 +616,33 @@ of the explicitly selected release scope.
       (Codex's effort popover: the route's effort steps, applied for the next
       turn, the model as "Requested model X" until a turn carries it, and
       "Change model…" into the picker filtered to that Agent's
-      route; one plain line instead when the harness keeps them), Send (which
-      steers the running turn, D10; a stopped or lost task's one Resume, with
-      the typed message once there is one), and Interrupt only while a turn
-      runs; a new task's composer is D9. Settings replaces the
+      route; one plain line instead when the harness keeps them), and one
+      trailing button as in Codex (owner review 2026-11-19): Send; while a
+      turn runs, Stop (a filled square; it interrupts that turn) with an
+      empty field and Steer once there is text (Enter steers too, D10); a
+      stopped or lost task's one Resume, with the typed message once there
+      is one. There is no separate Interrupt control. The usage ring beside
+      it is Material's determinate circular indicator; a new task's
+      composer is D9. Settings replaces the
       sidebar with its own navigation and shows one centred page of at most
-      840 DIPs (D9). One component system at Codex density with Material 3
-      color roles (owner reviews 2026-11-15 and 2026-11-16), every size from
-      one tokens module: corners 8 for controls and row highlights, 12 for
-      containers (cards, menus, popovers, Details sections, dialogs), 16 for
-      the composer, a circle only for the icon-only Send; heights 32 for
-      controls and rows, 36 for form rows, 28 for tasks under a project; four
-      type styles (20/600, 14/600, 14/400, 12/400); a 4/8 spacing grid;
-      16/20-DIP icons. One action pattern: filled primary (one per page),
+      840 DIPs (D9). One tactile Material 3 component system with Codex's
+      logic (owner reviews 2026-11-15, 2026-11-16 and 2026-11-19), every
+      size from one tokens module and every button from one Material
+      control template (Uno.Themes' Material styles and Material
+      Components' state layers as the pattern): a state layer in the
+      content color on hover (8 %) and press (10 %), a ripple from the
+      centre, a slight press scale on M3's emphasized motion, the FAB's key
+      and ambient shadows drawn under it (WinUI's ThemeShadow draws nothing
+      outside a popup without receivers), deeper on hover; the composer,
+      popovers and in-window menus lifted the same way. Shapes on the M3
+      scale: everything pressed is a pill (buttons, icon buttons, chips,
+      rows, segments, dropdowns; radius half the height), text fields 8,
+      containers 12, the composer 16, dialogs 28; touch-sized heights: 40
+      for controls and rows (the composer's round 40-DIP FAB included), 48
+      for form rows, 36 for tasks under a project; the M3 type roles in one
+      family (Segoe UI Variable), buttons in label-large (14/500); a 4/8
+      spacing grid; icons 16 beside a label, 20 alone in a button, 12 for a
+      dropdown's chevron, Stop a filled square. One action pattern: filled primary (one per page),
       outlined secondary, text tertiary, destructive text in the error color;
       orange and red appear only for the Full access warning and destructive
       actions. The Details panel has only a close button. (Refs #407)

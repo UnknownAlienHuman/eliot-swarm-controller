@@ -803,6 +803,7 @@ impl Component for DesktopApp {
                 search_ref: ElementRef::new(),
                 shortcuts: None,
                 sidebar_collapsed: false,
+                history: Default::default(),
             },
             launch: launch_ui::LaunchState {
                 workspace: input.workspace.to_string_lossy().into_owned(),
@@ -889,6 +890,7 @@ impl Component for DesktopApp {
             Message::Bulk(msg) => self.bulk_update(msg, context),
             Message::Reveal(item, path) => self.reveal_path(item, path),
         }
+        self.record_location();
         self.sync_dialog(context);
     }
 

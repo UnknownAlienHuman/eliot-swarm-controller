@@ -32,15 +32,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use windows_sys::Win32::Foundation::{LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
-use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetActiveWindow, GetKeyState, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_F, VK_K, VK_LEFT, VK_M, VK_N,
-    VK_OEM_COMMA, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP,
+    GetActiveWindow, GetKeyState, VK_BROWSER_BACK, VK_BROWSER_FORWARD, VK_CONTROL, VK_DOWN,
+    VK_ESCAPE, VK_F, VK_K, VK_LEFT, VK_M, VK_N, VK_OEM_COMMA, VK_RETURN, VK_RIGHT, VK_SHIFT,
+    VK_TAB, VK_UP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GetCursorPos, HC_ACTION, MSG, PM_REMOVE, SetWindowsHookExW, WH_GETMESSAGE,
-    WH_KEYBOARD, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_NCLBUTTONDOWN, WM_POINTERDOWN, WM_RBUTTONDOWN,
+    CallNextHookEx, GetCursorPos, GetForegroundWindow, GetWindowThreadProcessId, HC_ACTION, MSG,
+    MSLLHOOKSTRUCT, PM_REMOVE, SetWindowsHookExW, WH_GETMESSAGE, WH_KEYBOARD, WH_MOUSE_LL,
+    WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_NCLBUTTONDOWN, WM_POINTERDOWN, WM_RBUTTONDOWN,
+    WM_XBUTTONDOWN, WindowFromPoint, XBUTTON1, XBUTTON2,
 };
 
 /// A key of an open popover.
@@ -69,6 +73,10 @@ pub enum Shortcut {
     ModelPicker,
     /// Ctrl+, (comma).
     Settings,
+    /// Alt+←, the keyboard's Back key or the mouse's back button.
+    Back,
+    /// Alt+→, the keyboard's Forward key or the mouse's forward button.
+    Forward,
     /// A key while a popover is open (taken from the focused control).
     Popover(PopoverKey),
     /// Enter outside a popover, passed on to the focused control; carries
@@ -121,6 +129,16 @@ static PLAIN_ENTER: AtomicU8 = AtomicU8::new(0);
 static PLAIN_ENTER_MS: AtomicU64 = AtomicU64::new(0);
 /// How long a plain Enter may take to reach the composer's text change.
 const PLAIN_ENTER_MS_MAX: u64 = 1_500;
+/// The step of a press of the mouse's back (X1) or forward (X2) button:
+/// the button is in the high word of the low-level hook's `mouseData`.
+fn mouse_step(message: u32, mouse_data: u32) -> Option<Shortcut> {
+    let button = (mouse_data >> 16) as u16;
+    match message {
+        WM_XBUTTONDOWN if button == XBUTTON1 => Some(Shortcut::Back),
+        WM_XBUTTONDOWN if button == XBUTTON2 => Some(Shortcut::Forward),
+        _ => None,
+    }
+}
 
 /// Whether the text change being handled came from Enter without Shift
 /// (pressed within the last 1.5 s, no key since). Consumes it: one Enter
@@ -200,7 +218,22 @@ pub fn install() -> Result<Receiver<Shortcut>, String> {
             SetWindowsHookExW(WH_GETMESSAGE, Some(messages), std::ptr::null_mut(), thread),
         )
     };
-    if keys.is_null() || messages.is_null() {
+    // WinUI 3 takes mouse input outside the thread's message queue (the
+    // message hook sees keys and timers, never a click: observed live), so
+    // the mouse's back and forward buttons come from a low-level hook. It
+    // only reads X-button presses over this process's foreground window
+    // and passes every event on.
+    // SAFETY: `side_buttons` has the HOOKPROC signature; a low-level hook
+    // takes this module and runs on this thread's message loop.
+    let side = unsafe {
+        SetWindowsHookExW(
+            WH_MOUSE_LL,
+            Some(side_buttons),
+            GetModuleHandleW(std::ptr::null()),
+            0,
+        )
+    };
+    if keys.is_null() || messages.is_null() || side.is_null() {
         return Err(format!(
             "keyboard shortcuts not installed: {}",
             std::io::Error::last_os_error()
@@ -229,6 +262,16 @@ pub fn pointer_position() -> (f64, f64) {
 
 /// The chord of a key with the modifiers held now.
 fn chord(key: u16, ctrl: bool, shift: bool, alt: bool) -> Option<Shortcut> {
+    // Back and forward, as in every Windows app and browser.
+    match (key, ctrl, shift, alt) {
+        (VK_LEFT, false, false, true) | (VK_BROWSER_BACK, false, false, false) => {
+            return Some(Shortcut::Back);
+        }
+        (VK_RIGHT, false, false, true) | (VK_BROWSER_FORWARD, false, false, false) => {
+            return Some(Shortcut::Forward);
+        }
+        _ => {}
+    }
     if !ctrl || shift || alt {
         return None;
     }
@@ -299,8 +342,14 @@ unsafe extern "system" fn keyboard(code: i32, wparam: WPARAM, lparam: LPARAM) ->
             if (matches!(found, Shortcut::Popover(_)) && pressed) || first {
                 send(found);
             }
-            // Taken: neither the press nor the release reaches a control.
-            return 1;
+            // Alt+arrow goes on to the window: with the arrow taken, Windows
+            // would see Alt pressed and released alone and enter the
+            // system-menu mode, which takes the next keys and clicks
+            // (observed live). No control acts on Alt+arrow.
+            if !matches!(found, Shortcut::Back | Shortcut::Forward) {
+                // Taken: neither the press nor the release reaches a control.
+                return 1;
+            }
         }
         if pressed && !matches!(key, VK_CONTROL | VK_SHIFT) {
             let plain = key == VK_RETURN && !shift && !alt;
@@ -321,6 +370,33 @@ unsafe extern "system" fn keyboard(code: i32, wparam: WPARAM, lparam: LPARAM) ->
         }
     }
     // SAFETY: passes the message on unchanged (the hook handle is ignored).
+    unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
+}
+
+/// `LowLevelMouseProc`: `wparam` is the mouse message, `lparam` points at
+/// its `MSLLHOOKSTRUCT`. Steps only while this process's window is in
+/// front and under the pointer; never takes the event.
+unsafe extern "system" fn side_buttons(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code == HC_ACTION as i32 && lparam != 0 {
+        // SAFETY: for HC_ACTION the system passes a valid MSLLHOOKSTRUCT.
+        let event = unsafe { &*(lparam as *const MSLLHOOKSTRUCT) };
+        if let Some(step) = mouse_step(wparam as u32, event.mouseData) {
+            let ours = |window| {
+                let mut process = 0;
+                // SAFETY: reads the owner of a window handle (null is fine).
+                unsafe { GetWindowThreadProcessId(window, &mut process) };
+                // SAFETY: no arguments.
+                process == unsafe { GetCurrentProcessId() }
+            };
+            // SAFETY: plain reads of the foreground window and the window
+            // under the event's point.
+            let (front, under) = unsafe { (GetForegroundWindow(), WindowFromPoint(event.pt)) };
+            if ours(front) && ours(under) {
+                send(step);
+            }
+        }
+    }
+    // SAFETY: passes the event on unchanged.
     unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
 }
 

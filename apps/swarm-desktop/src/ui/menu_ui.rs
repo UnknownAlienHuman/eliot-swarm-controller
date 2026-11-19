@@ -1355,19 +1355,24 @@ impl DesktopApp {
                 .on_pointer_pressed(
                     context.callback(|_: PointerEventInfo| Message::Menu(MenuMsg::Closed)),
                 ),
-            m3::popover(palette)
-                .width(menu_width)
-                .horizontal_alignment(HorizontalAlignment::Left)
-                .vertical_alignment(VerticalAlignment::Top)
-                .margin(Thickness::new(left, top, 0.0, 0.0))
-                .automation_name(format!("Actions for {}", target.title()))
-                .content(
-                    ScrollViewer::new()
-                        .max_height(max_height)
-                        .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
-                        .automation_name(format!("Actions for {}", target.title()))
-                        .content(StackPanel::new().keyed_children(rows)),
-                ),
+            m3::lifted(
+                crate::theme::elevation::Level::Two,
+                tokens::radius::CONTAINER,
+                Grid::new()
+                    .width(menu_width)
+                    .horizontal_alignment(HorizontalAlignment::Left)
+                    .vertical_alignment(VerticalAlignment::Top)
+                    .margin(Thickness::new(left, top, 0.0, 0.0)),
+                m3::popover(palette)
+                    .automation_name(format!("Actions for {}", target.title()))
+                    .content(
+                        ScrollViewer::new()
+                            .max_height(max_height)
+                            .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                            .automation_name(format!("Actions for {}", target.title()))
+                            .content(StackPanel::new().keyed_children(rows)),
+                    ),
+            ),
         ))
     }
 
@@ -1519,7 +1524,7 @@ impl DesktopApp {
                                         None,
                                     ))),
                                 )
-                                .content(m3::icon(m3::glyph::CLOSE)),
+                                .content(m3::toolbar_icon(m3::glyph::CLOSE)),
                         )),
                 ),
         )
@@ -1562,7 +1567,7 @@ impl DesktopApp {
                         .height(tokens::height::CONTROL)
                         .automation_name(format!("Remove tag {}", index + 1))
                         .on_click(context.message(Message::Menu(MenuMsg::TagRemoved(index))))
-                        .content(m3::icon(m3::glyph::CLOSE))
+                        .content(m3::toolbar_icon(m3::glyph::CLOSE))
                 };
                 KeyedView::new(
                     format!("tag:{index}"),
@@ -1585,13 +1590,13 @@ impl DesktopApp {
                         .height(tokens::height::CONTROL)
                         .automation_name("Save tags")
                         .on_click(context.message(Message::Menu(MenuMsg::RenameCommitted)))
-                        .content(m3::icon(m3::glyph::CHECK)),
+                        .content(m3::toolbar_icon(m3::glyph::CHECK)),
                     m3::icon_button(palette)
                         .width(tokens::height::CONTROL)
                         .height(tokens::height::CONTROL)
                         .automation_name("Cancel tags")
                         .on_click(context.message(Message::Menu(MenuMsg::RenameCancelled)))
-                        .content(m3::icon(m3::glyph::CLOSE)),
+                        .content(m3::toolbar_icon(m3::glyph::CLOSE)),
                 )),
         ));
         StackPanel::new()
@@ -1643,14 +1648,14 @@ impl DesktopApp {
                     .height(tokens::height::CONTROL)
                     .automation_name(save)
                     .on_click(context.message(Message::Menu(MenuMsg::RenameCommitted)))
-                    .content(m3::icon(m3::glyph::CHECK)),
+                    .content(m3::toolbar_icon(m3::glyph::CHECK)),
                 m3::icon_button(palette)
                     .grid_column(2)
                     .width(tokens::height::CONTROL)
                     .height(tokens::height::CONTROL)
                     .automation_name(cancel)
                     .on_click(context.message(Message::Menu(MenuMsg::RenameCancelled)))
-                    .content(m3::icon(m3::glyph::CLOSE)),
+                    .content(m3::toolbar_icon(m3::glyph::CLOSE)),
             ))
     }
 

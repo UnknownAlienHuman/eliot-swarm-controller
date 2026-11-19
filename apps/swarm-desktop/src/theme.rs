@@ -32,13 +32,69 @@ pub mod typography {
     pub const TITLE_LARGE: TypeStyle = style(22.0, 600);
     pub const TITLE_MEDIUM: TypeStyle = style(16.0, 600);
     pub const BODY: TypeStyle = style(14.0, 400);
+    /// Button and chip labels (M3 label-large).
+    pub const LABEL_LARGE: TypeStyle = style(14.0, 500);
     pub const LABEL: TypeStyle = style(12.0, 500);
+}
+
+/// Material 3 elevation as drawn shadows: each level's key and ambient
+/// shadows (Material Components' `md-elevation` levels: offset, blur,
+/// spread and opacity of black), each blur drawn as three concentric
+/// translucent layers, so a WinUI element without `ThemeShadow` receivers
+/// still lifts off its surface.
+pub mod elevation {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Level {
+        Two,
+        Three,
+        Four,
+    }
+
+    /// One drawn layer: how far it spreads past the element, how far it
+    /// falls below it (DIPs) and its black's alpha (0–255).
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct Layer {
+        pub spread: f64,
+        pub offset: f64,
+        pub alpha: u8,
+    }
+
+    /// (offset, blur, spread, opacity) of the key and the ambient shadow.
+    fn shadows(level: Level) -> [(f64, f64, f64, f64); 2] {
+        match level {
+            Level::Two => [(1.0, 2.0, 0.0, 0.30), (2.0, 6.0, 2.0, 0.15)],
+            Level::Three => [(1.0, 3.0, 0.0, 0.30), (4.0, 8.0, 3.0, 0.15)],
+            Level::Four => [(2.0, 3.0, 0.0, 0.30), (6.0, 10.0, 4.0, 0.15)],
+        }
+    }
+
+    /// Steps that draw one blur.
+    const STEPS: u32 = 3;
+
+    pub fn layers(level: Level) -> Vec<Layer> {
+        let mut out = Vec::new();
+        for (offset, blur, spread, opacity) in shadows(level) {
+            for step in 0..STEPS {
+                // Half-DIP steps keep the layers on whole device pixels at
+                // 200 % scale.
+                let reach = (blur * f64::from(step) / f64::from(STEPS) * 2.0).round() / 2.0;
+                out.push(Layer {
+                    spread: spread + reach,
+                    offset,
+                    alpha: (opacity / f64::from(STEPS) * 255.0).round() as u8,
+                });
+            }
+        }
+        out
+    }
 }
 
 /// M3 state-layer opacities of the content color over a container.
 pub mod state {
     pub const HOVER: f64 = 0.08;
     pub const PRESSED: f64 = 0.10;
+    /// The ripple of a press at its start, fading on release.
+    pub const RIPPLE: f64 = 0.12;
     /// A disabled container: on-surface at this opacity.
     pub const DISABLED_CONTAINER: f64 = 0.12;
     /// Disabled content: on-surface at this opacity.
@@ -361,6 +417,11 @@ pub mod winui {
             self.role(|s| s.primary, ThemeBrush::AccentText)
         }
 
+        /// Content on a filled (primary) container: the Stop square.
+        pub fn on_primary(self) -> Brush {
+            self.role(|s| s.on_primary, ThemeBrush::PrimaryText)
+        }
+
         pub fn tertiary(self) -> Brush {
             self.role(|s| s.tertiary, ThemeBrush::AccentText)
         }
@@ -548,14 +609,36 @@ pub mod winui {
             }
         }
 
-        /// The composer's visible quota track, including low-quota attention.
-        pub fn quota_track(self, remaining: f64) -> Brush {
+        /// The composer's usage ring as Material's determinate circular
+        /// indicator: a text button whose `ProgressRing` takes its arc
+        /// (primary; warning under 20 % left, error under 5 %) and its track
+        /// (outline-variant, which reads on the composer in both schemes)
+        /// from this button's own resources, which
+        /// WinUI's ring template resolves before the application's.
+        pub fn usage_ring(self, remaining: f64) -> ResourceOverrides {
+            self.with(|s| {
+                let arc = Self::usage_tone(s, remaining);
+                Family::new(None, s.on_surface_variant)
+                    .overrides(s)
+                    .set("ProgressRingForegroundThemeBrush", color(arc))
+                    .set("ProgressRingBackgroundThemeBrush", color(s.outline_variant))
+            })
+        }
+
+        /// The share left in the usage ring's arc color once it is low,
+        /// else at lowered emphasis.
+        pub fn usage_label(self, remaining: f64) -> Option<Brush> {
+            let scheme = self.scheme?;
+            (remaining < 20.0).then(|| Brush::Solid(color(Self::usage_tone(scheme, remaining))))
+        }
+
+        fn usage_tone(s: &Scheme, remaining: f64) -> Rgb8 {
             if remaining < 5.0 {
-                self.error()
+                s.error
             } else if remaining < 20.0 {
-                self.warning()
+                s.warning
             } else {
-                self.outline_variant()
+                s.primary
             }
         }
 

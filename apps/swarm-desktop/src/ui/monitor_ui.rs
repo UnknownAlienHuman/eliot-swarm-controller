@@ -34,6 +34,10 @@ pub(super) enum MonitorMsg {
     ProjectsToggled,
     TechnicalToggled,
     PanelChosen(Panel),
+    /// The search field's text.
+    SearchChanged(String),
+    /// The state filter's choice (an index into `monitor::STATE_FILTERS`).
+    StateChosen(Option<usize>),
 }
 
 /// The panel's refresh chain and the Agent whose details it reads.
@@ -186,6 +190,17 @@ impl DesktopApp {
                 }
             }
             MonitorMsg::StoppedToggled => self.monitor.stopped_open = !self.monitor.stopped_open,
+            MonitorMsg::SearchChanged(text) => {
+                // A rebuilt field reports the text it already shows.
+                if self.monitor.filter.text != text {
+                    self.monitor.filter.text = text;
+                }
+            }
+            MonitorMsg::StateChosen(index) => {
+                if let Some(group) = index.and_then(|index| monitor::STATE_FILTERS.get(index)) {
+                    self.monitor.filter.group = *group;
+                }
+            }
             MonitorMsg::GroupFiltered(group) => {
                 let filter = &mut self.monitor.filter;
                 filter.group = (filter.group != Some(group)).then_some(group);
@@ -273,6 +288,45 @@ impl DesktopApp {
         }));
     }
 
+    /// The Monitor's search field and state filter (k195 P3-2): the text
+    /// matches a task's title, id, harness, model or project, live and
+    /// recently stopped; the state is every state or one group.
+    fn monitor_search(&self, context: &mut ViewContext<Self>) -> View {
+        let filter = &self.monitor.filter;
+        let selected = monitor::STATE_FILTERS
+            .iter()
+            .position(|group| *group == filter.group);
+        let labels: Vec<String> = monitor::STATE_FILTERS
+            .iter()
+            .map(|group| {
+                group
+                    .map_or("All states", monitor::Group::filter_label)
+                    .to_owned()
+            })
+            .collect();
+        Grid::new()
+            .columns([GridLength::STAR, GridLength::Auto])
+            .column_spacing(tokens::spacing::SM)
+            .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
+            .children((
+                TextBox::new()
+                    .text(filter.text.clone())
+                    .placeholder_text("Search tasks")
+                    .automation_name("Search the monitor")
+                    .on_text_changed(
+                        context.callback(|text| Message::Monitor(MonitorMsg::SearchChanged(text))),
+                    ),
+                ComboBox::new()
+                    .grid_column(1)
+                    .items_source(labels)
+                    .selected_index(selected)
+                    .automation_name("State filter")
+                    .on_selection_changed(context.callback(|index: Option<usize>| {
+                        Message::Monitor(MonitorMsg::StateChosen(index))
+                    })),
+            ))
+    }
+
     /// The panel's header: its title and the one close button.
     fn panel_header(
         &self,
@@ -294,9 +348,15 @@ impl DesktopApp {
                     [("Monitor", Panel::Monitor), ("Details", Panel::Details)]
                         .into_iter()
                         .map(|(label, panel)| {
+                            let selected = self.panel == panel;
+                            // Keyed by its selection: WinUI reads a button's
+                            // colors only when its template is applied, so
+                            // the highlight follows the pane only on a new
+                            // segment (k195 P2-5: it stayed on Details when
+                            // the sidebar opened the Monitor).
                             KeyedView::new(
-                                label,
-                                m3::segment(palette, self.panel == panel)
+                                format!("{label}:{selected}"),
+                                m3::segment(palette, selected)
                                     .is_enabled(
                                         panel != Panel::Details
                                             || self.monitor.selected.is_some()
@@ -826,6 +886,7 @@ impl DesktopApp {
         if data.read_at_ms.is_some() {
             items.extend(self.monitor_overview(&overview, context, palette));
         }
+        items.push(KeyedView::new("search", self.monitor_search(context)));
         let tree = data.tree(now);
         let focused = self
             .selected_agent_id()
@@ -849,11 +910,24 @@ impl DesktopApp {
                 )),
             ));
         }
-        let (sections, showing_loaded) = if filter.is_active() {
+        let (mut sections, showing_loaded) = if filter.is_active() {
             overview.list_for_filter(filter)
         } else {
             (tree.sections(), false)
         };
+        if filter.is_active() {
+            // A search or the Stopped state reaches the recently stopped
+            // Agents too (k195 P3-2: 190 of them were found by scrolling).
+            let rows: Vec<&MonitorRow> = data
+                .stopped
+                .iter()
+                .filter(|row| filter.keeps_stopped(row, &project_of(row)))
+                .collect();
+            sections.push(monitor::Section {
+                group: monitor::Group::Stopped,
+                rows,
+            });
+        }
         let no_rows = sections.iter().all(|section| section.rows.is_empty());
         if showing_loaded {
             let note = if no_rows {
@@ -873,7 +947,8 @@ impl DesktopApp {
                 continue;
             }
             if section.group == monitor::Group::Stopped {
-                let open = self.monitor.stopped_open;
+                // Search results are shown, not folded.
+                let open = self.monitor.stopped_open || filter.is_active();
                 let label = format!("{} ({top})", section.group.title());
                 items.push(KeyedView::new(
                     format!("section:stopped:{open}"),
@@ -932,7 +1007,7 @@ impl DesktopApp {
         }
         if data.read_at_ms.is_some() && no_rows && !showing_loaded {
             let none = if filter.is_active() {
-                "No live Agents match this filter."
+                "No Agents match this filter."
             } else {
                 "No Agents to show."
             };
