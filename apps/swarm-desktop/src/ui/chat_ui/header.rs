@@ -48,6 +48,7 @@ impl DesktopApp {
                         organization: None,
                         tags: Vec::new(),
                         organization_revision: None,
+                        model: detail.settings.effective_model.clone(),
                     })
                 });
                 if let Some(mut agent) = agent {
@@ -108,8 +109,9 @@ impl DesktopApp {
         }
     }
 
-    /// One line: the title, the status dot, a connection note when not live,
-    /// then the details toggle and the "…" menu.
+    /// One line: the title, the status dot, what runs the Agent (harness and
+    /// model) with a connection note when not live, then the details toggle
+    /// and the "…" menu.
     pub(super) fn header_view(
         &self,
         agent: &str,
@@ -128,6 +130,16 @@ impl DesktopApp {
             LiveStatus::Stopped(_) => "Live updates stopped",
             _ => "",
         };
+        // The harness and the model the daemon read back (`effective.model`).
+        let runs = detail.map(|detail| {
+            crate::picker::harness_model_label(
+                &detail.harness,
+                detail.settings.effective_model.as_deref(),
+            )
+        });
+        let runs_width = runs.as_ref().map_or(0.0, |_| {
+            tokens::layout::RUNS_LABEL_WIDTH + tokens::spacing::SM
+        });
         let menu: View = match detail {
             Some(detail) => {
                 let ended = matches!(
@@ -209,7 +221,8 @@ impl DesktopApp {
                         column.unwrap_or(tokens::layout::READING_WIDTH)
                             - 2.0 * tokens::height::CONTROL
                             - 4.0 * tokens::spacing::SM
-                            - tokens::layout::DOT,
+                            - tokens::layout::DOT
+                            - runs_width,
                     )
                     .vertical_alignment(VerticalAlignment::Center)
                     .text_trimming(TextTrimming::CharacterEllipsis)
@@ -224,9 +237,21 @@ impl DesktopApp {
                         )
                     ))
                     .content(m3::dot(palette.header_dot(tone))),
-                m3::secondary(note)
+                StackPanel::new()
                     .grid_column(2)
-                    .vertical_alignment(VerticalAlignment::Center),
+                    .orientation(Orientation::Horizontal)
+                    .spacing(tokens::spacing::SM)
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .children((
+                        runs.map_or_else(View::empty, |runs| {
+                            m3::secondary(runs)
+                                .max_width(tokens::layout::RUNS_LABEL_WIDTH)
+                                .text_trimming(TextTrimming::CharacterEllipsis)
+                                .vertical_alignment(VerticalAlignment::Center)
+                                .into()
+                        }),
+                        m3::secondary(note).vertical_alignment(VerticalAlignment::Center),
+                    )),
                 m3::icon_button(palette)
                     .grid_column(4)
                     .automation_name(if details_open {

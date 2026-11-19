@@ -2033,10 +2033,10 @@ impl DesktopApp {
     }
 
     /// A task row under its project: indented 24 DIPs per level, so its
-    /// title lines up with the project's label. One line: the title, the
-    /// worktree where the project spans several, and a state dot only for
-    /// a task that runs or needs attention. A manager with workers carries
-    /// its expand chevron in that indent.
+    /// title lines up with the project's label. One line: the title, its
+    /// harness and model, the worktree where the project spans several,
+    /// and a state dot only for a task that runs or needs attention. A
+    /// manager with workers carries its expand chevron in that indent.
     fn agent_row(
         &self,
         row: &Row,
@@ -2075,8 +2075,9 @@ impl DesktopApp {
         } else {
             View::empty()
         };
+        let runs = crate::picker::harness_model_label(&agent.harness, agent.model.as_deref());
         let mut name = format!(
-            "{title}, {}, Agent {}",
+            "{title}, {runs}, {}, Agent {}",
             eliot_core::api::agent_state_name(agent.state),
             agent.id
         );
@@ -2113,6 +2114,10 @@ impl DesktopApp {
             None
         };
         let over = self.menu.hovered.as_deref() == Some(agent.id.as_str()) || selected;
+        // What runs the task gives way to its quick action, as a Codex
+        // sidebar row's time does: the title keeps its width. The open
+        // task's header names it.
+        let shown_runs = if over && quick.is_some() { "" } else { &runs };
         let quick: View = if over {
             quick
                 .map(|(action, label, glyph)| {
@@ -2174,7 +2179,7 @@ impl DesktopApp {
                                 None,
                                 title,
                                 "",
-                                row_tag(&row_tag_text(agent), task_dot(palette, agent)),
+                                row_tag(shown_runs, &row_tag_text(agent), task_dot(palette, agent)),
                             )),
                         note,
                         Border::new().grid_column(2).content(actions),
@@ -2220,7 +2225,7 @@ impl DesktopApp {
         )
     }
 
-    /// A Recents row: the title and its dot, no tree.
+    /// A Recents row: the title, what runs it and its dot, no tree.
     fn recent_row(
         &self,
         agent: &UiAgent,
@@ -2228,13 +2233,19 @@ impl DesktopApp {
         palette: Palette,
     ) -> View {
         let label = self.agent_label(agent);
+        let runs = crate::picker::harness_model_label(&agent.harness, agent.model.as_deref());
         m3::sub_row(palette, false)
             .automation_name(format!(
-                "Recent: {label}, {}",
+                "Recent: {label}, {runs}, {}",
                 eliot_core::api::agent_state_name(agent.state)
             ))
             .on_click(context.message(Message::Shell(ShellMsg::AgentOpened(agent.clone()))))
-            .content(m3::row_content(None, &label, "", task_dot(palette, agent)))
+            .content(m3::row_content(
+                None,
+                &label,
+                "",
+                row_tag(&runs, "", task_dot(palette, agent)),
+            ))
     }
 
     /// The fleet in one calm row that is never cut off ("2 working · 1
@@ -2515,23 +2526,30 @@ fn detail_row(text: &str, error: Option<Brush>) -> View {
         .tooltip(text.to_owned())
 }
 
-/// A task row's quiet tag (its worktree folder, "archived") before its
-/// dot. It sits in the row's trailing cell so the title keeps the free
-/// width and trims with an ellipsis; a note column after an auto-sized
-/// title got no width at all and the tag never showed.
-fn row_tag(tag: &str, dot: View) -> View {
-    if tag.is_empty() {
-        return dot;
-    }
+/// A task row's trailing marks: what runs it (harness and model,
+/// [`crate::picker::harness_model_label`]; empty hides it), its quiet tag
+/// (its worktree folder, "archived") and its dot. They sit in the row's
+/// trailing cell so the title keeps the free width and trims with an
+/// ellipsis; a note column after an auto-sized title got no width at all
+/// and the tag never showed.
+fn row_tag(runs: &str, tag: &str, dot: View) -> View {
+    let quiet = |text: &str, width: f64| -> View {
+        if text.is_empty() {
+            return View::empty();
+        }
+        m3::secondary(text.to_owned())
+            .max_width(width)
+            .text_trimming(TextTrimming::CharacterEllipsis)
+            .vertical_alignment(VerticalAlignment::Center)
+            .into()
+    };
     StackPanel::new()
         .orientation(Orientation::Horizontal)
         .spacing(tokens::spacing::SM)
         .vertical_alignment(VerticalAlignment::Center)
         .children((
-            m3::secondary(tag.to_owned())
-                .max_width(tokens::layout::TREE_INDENT * 4.0)
-                .text_trimming(TextTrimming::CharacterEllipsis)
-                .vertical_alignment(VerticalAlignment::Center),
+            quiet(runs, tokens::layout::TREE_INDENT * 5.0),
+            quiet(tag, tokens::layout::TREE_INDENT * 4.0),
             dot,
         ))
 }
@@ -2581,6 +2599,7 @@ mod tests {
             organization: None,
             tags: Vec::new(),
             organization_revision: None,
+            model: None,
         }
     }
 

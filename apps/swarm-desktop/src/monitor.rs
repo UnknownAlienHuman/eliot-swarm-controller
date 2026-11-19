@@ -375,6 +375,8 @@ pub struct MonitorRow {
     pub parent: Option<String>,
     pub state: AgentState,
     pub harness: String,
+    /// The model the harness last reported ([`AgentSummary::model`]).
+    pub model: Option<String>,
     pub active_turn: Option<String>,
     pub activity: Option<NativeChildActivityState>,
     pub last_progress_at: Option<i64>,
@@ -449,6 +451,7 @@ impl MonitorRow {
             parent: summary.parent.clone(),
             state: summary.state,
             harness: summary.harness.clone(),
+            model: summary.model.clone(),
             active_turn: summary.active_turn.clone(),
             activity: summary.activity.as_ref().map(|activity| activity.state),
             last_progress_at: summary.last_progress_at,
@@ -2031,6 +2034,7 @@ mod tests {
                 organization: None,
                 tags: Vec::new(),
                 organization_revision: None,
+                model: None,
             },
             observation: None,
         };
@@ -2094,6 +2098,7 @@ mod tests {
             organization: None,
             tags: Vec::new(),
             organization_revision: None,
+            model: None,
         };
         let make_row = |usage: Option<TurnUsage>, usage_scope: Option<&str>| {
             MonitorRow::from_list(&AgentListRow {
@@ -2285,6 +2290,7 @@ mod tests {
                 organization: None,
                 tags: Vec::new(),
                 organization_revision: None,
+                model: None,
             },
             observation: None,
         }

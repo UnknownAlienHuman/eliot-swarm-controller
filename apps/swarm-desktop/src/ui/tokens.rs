@@ -103,6 +103,9 @@ pub mod layout {
     pub const FOLDER_WIDTH: f64 = 280.0;
     /// The indent of a task under its project (and per worker level).
     pub const TREE_INDENT: f64 = 24.0;
+    /// What runs an Agent (`Codex · qwen-qwen4-max`) at most in a Monitor
+    /// row or the conversation header; a longer label trims.
+    pub const RUNS_LABEL_WIDTH: f64 = 160.0;
     /// The composer's field grows with its text up to this height.
     pub const COMPOSER_MAX_HEIGHT: f64 = 200.0;
     /// A multiline source editor (TOML, JSON, a script).

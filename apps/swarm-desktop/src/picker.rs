@@ -38,6 +38,26 @@ pub fn harness_label(code: &str) -> &str {
     }
 }
 
+/// An effective model slug in short: the `provider/` prefix and a `:free`
+/// suffix dropped, the rest kept (`nous/qwen-qwen4-max:free` reads
+/// `qwen-qwen4-max`, `gpt-6.2-sol` stays as it is).
+pub fn model_short(slug: &str) -> &str {
+    let name = slug.split_once('/').map_or(slug, |(_, rest)| rest);
+    let name = name.strip_suffix(":free").unwrap_or(name);
+    if name.trim().is_empty() { slug } else { name }
+}
+
+/// What runs an Agent, as every list and header names it: the harness and,
+/// once the harness reported it, the short effective model
+/// (`Codex · qwen-qwen4-max`, `Claude Code · claude-opus-5-5`).
+pub fn harness_model_label(harness: &str, model: Option<&str>) -> String {
+    let harness = harness_label(harness);
+    match model.map(model_short) {
+        Some(model) => format!("{harness} · {model}"),
+        None => harness.to_owned(),
+    }
+}
+
 /// A catalogue provider in the owner's words.
 pub fn provider_label(provider: &str) -> String {
     match provider {
@@ -1047,6 +1067,40 @@ pub fn find<'a>(rows: &'a [Row], key: Option<&str>) -> Option<&'a Item> {
 mod tests {
     use super::*;
     use eliot_core::api::harness::{CATALOG_AVAILABLE, HARNESS_READ_TTL_MS};
+
+    #[test]
+    fn model_short_drops_provider_and_free_and_keeps_the_rest() {
+        for (slug, short) in [
+            ("nous/qwen-qwen4-max:free", "qwen-qwen4-max"),
+            (
+                "kilo/baidu-ernie-5.5-flash-preview:free",
+                "baidu-ernie-5.5-flash-preview",
+            ),
+            ("openrouter/meta-llama/llama-4:free", "meta-llama/llama-4"),
+            // `-free` is part of the name, not the `:free` route suffix.
+            (
+                "opencode/deepseek-v4.1-flash-free",
+                "deepseek-v4.1-flash-free",
+            ),
+            // The harnesses' ordinary models stay as they are.
+            ("gpt-6.2-sol", "gpt-6.2-sol"),
+            ("claude-opus-5-5", "claude-opus-5-5"),
+            // Nothing left to show keeps the slug.
+            ("kilo/", "kilo/"),
+            (":free", ":free"),
+        ] {
+            assert_eq!(model_short(slug), short, "{slug}");
+        }
+        assert_eq!(
+            harness_model_label("codex", Some("nous/qwen-qwen4-max:free")),
+            "Codex · qwen-qwen4-max"
+        );
+        assert_eq!(
+            harness_model_label("claude", Some("claude-haiku-5-5")),
+            "Claude Code · claude-haiku-5-5"
+        );
+        assert_eq!(harness_model_label("codex", None), "Codex");
+    }
 
     fn harness(code: &str, installed: bool) -> HarnessEntry {
         HarnessEntry {
