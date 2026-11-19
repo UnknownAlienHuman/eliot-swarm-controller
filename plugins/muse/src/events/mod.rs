@@ -1439,9 +1439,12 @@ impl EventProcessor {
                     .await;
             }
             if self.status.failure.is_none() {
-                self.status.failure = Some(error.message.to_string());
+                self.status.failure = Some(*error.message);
             }
-            return Err(error);
+            return Err(Error::new(
+                "unknown",
+                "Buffered Muse event outcome is unresolved",
+            ));
         }
         Ok(())
     }
