@@ -34,7 +34,6 @@ use eliot_plugin::{
         paths_equal, register_native_process, rejected_control, unknown_control, unknown_snapshot,
         validate_binding, validate_identity, with_claimed_context, with_context_points,
     },
-    start_classification::SettledStartFailure,
 };
 use serde_json::{Value, json};
 use std::{
@@ -181,12 +180,9 @@ struct Initialized {
     instance_dir: String,
 }
 
-struct FailedStart {
-    agent_id: String,
-    generation: i64,
-    command_id: String,
-    outcome: SettledStartFailure,
-}
+/// One start already settled failed: the daemon retires this plugin
+/// process and never re-sends agent.start.
+struct FailedStart;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SessionPhase {
@@ -199,7 +195,6 @@ struct AgentSession {
     agent_id: String,
     generation: i64,
     start_command_id: String,
-    start_result: Option<Value>,
     phase: SessionPhase,
     session_id: Option<String>,
     native_scope: String,
@@ -445,15 +440,10 @@ impl MusePlugin {
             .map_err(|_| Error::new("internal", "Muse plugin manifest could not be encoded"))
     }
 
-    /// Retain a failed start exactly once: the same start command replays the
-    /// stored outcome without new native I/O, and any other start is refused.
-    fn retain_failed_start(&mut self, params: &AgentStartParams, error: Error) -> Error {
-        self.failed_start = Some(FailedStart {
-            agent_id: params.agent_id.clone(),
-            generation: params.generation,
-            command_id: params.command_id.clone(),
-            outcome: SettledStartFailure::Uncertain(error.clone()),
-        });
+    /// Settle a failed start: the settled marker refuses any second
+    /// agent.start, and the daemon retires this plugin process.
+    fn retain_failed_start(&mut self, error: Error) -> Error {
+        self.failed_start = Some(FailedStart);
         error
     }
 
@@ -468,16 +458,19 @@ impl MusePlugin {
         ));
         let error = eliot_plugin::session::classify_start_failure(error, "muse", "prepare");
         let value = eliot_plugin::session::failed_start_value(params, error);
-        self.failed_start = Some(FailedStart {
-            agent_id: params.agent_id.clone(),
-            generation: params.generation,
-            command_id: params.command_id.clone(),
-            outcome: SettledStartFailure::ProvenNoEffect(value.clone()),
-        });
+        self.failed_start = Some(FailedStart);
         value
     }
 
     async fn start(&mut self, raw: &Value, peer: &PeerClient) -> Result<Value> {
+        // The daemon sends agent.start exactly once per freshly spawned
+        // plugin process: a bound or settled plugin never starts again.
+        if self.session.is_some() || self.failed_start.is_some() {
+            return Err(Error::new(
+                "bad_state",
+                "Muse plugin already received agent.start",
+            ));
+        }
         let params: AgentStartParams = decode(raw, "Muse agent.start params are invalid")?;
         validate_identity(
             &params.agent_id,
@@ -485,43 +478,6 @@ impl MusePlugin {
             &params.command_id,
             "Muse",
         )?;
-        if let Some(session) = &self.session {
-            if session.agent_id == params.agent_id
-                && session.generation == params.generation
-                && session.start_command_id == params.command_id
-            {
-                return match session.phase {
-                    SessionPhase::Ready => session
-                        .start_result
-                        .clone()
-                        .ok_or_else(|| Error::new("unknown", "Muse start result was not retained")),
-                    SessionPhase::Unknown => Err(Error::new(
-                        "unknown",
-                        "Muse session/start outcome is unresolved; it will not be repeated",
-                    )),
-                    SessionPhase::Stopped => Err(Error::new(
-                        "bad_state",
-                        "Muse Agent generation has already stopped",
-                    )),
-                };
-            }
-            return Err(Error::new(
-                "stale_generation",
-                "Muse plugin is already bound to another Agent generation",
-            ));
-        }
-        if let Some(failed) = &self.failed_start {
-            if failed.agent_id == params.agent_id
-                && failed.generation == params.generation
-                && failed.command_id == params.command_id
-            {
-                return failed.outcome.replay();
-            }
-            return Err(Error::new(
-                "bad_state",
-                "Muse plugin already settled a different start command",
-            ));
-        }
         let initialized = self
             .initialized
             .as_ref()
@@ -711,7 +667,6 @@ impl MusePlugin {
         };
         let dispatched = self
             .dispatch_session_start(
-                &params,
                 session,
                 session_method,
                 params_value,
@@ -820,7 +775,6 @@ impl MusePlugin {
         session.session_id = Some(native_session.session_id.clone());
         let effort_verified = self
             .apply_start_effort(
-                &params,
                 &mut session,
                 &native_session,
                 initialized_native.effort.as_deref(),
@@ -834,7 +788,6 @@ impl MusePlugin {
         // `session/read` confirms both.
         let model_set = self
             .align_resume_model(
-                &params,
                 &mut session,
                 &native_session,
                 resume_subject.is_some(),
@@ -843,7 +796,6 @@ impl MusePlugin {
             .await?;
         let approval_set = self
             .align_resume_approval(
-                &params,
                 &mut session,
                 &native_session,
                 resume_subject.is_some(),
@@ -877,7 +829,7 @@ impl MusePlugin {
                         }
                         Err(error) => {
                             let error = discard_failed_start(&mut session, error).await;
-                            return Err(self.retain_failed_start(&params, error));
+                            return Err(self.retain_failed_start(error));
                         }
                     };
                 (
@@ -945,7 +897,7 @@ impl MusePlugin {
                 ),
             )
             .await;
-            return Err(self.retain_failed_start(&params, error));
+            return Err(self.retain_failed_start(error));
         }
         session = self
             .publish_start_ready(session, &native_session, &effective)
@@ -995,7 +947,6 @@ impl MusePlugin {
                 }),
             );
         }
-        session.start_result = Some(result.clone());
         self.session = Some(session);
         Ok(result)
     }

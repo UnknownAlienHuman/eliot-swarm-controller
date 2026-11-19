@@ -25,7 +25,6 @@ use eliot_plugin::{
         validate_binding, validate_identity, validate_source_plan, with_claimed_context,
         with_context_points,
     },
-    start_classification::SettledStartFailure,
 };
 use serde_json::{Value, json};
 use std::{
@@ -256,12 +255,9 @@ struct Initialized {
     store_root: String,
 }
 
-struct FailedStart {
-    agent_id: String,
-    generation: i64,
-    command_id: String,
-    outcome: SettledStartFailure,
-}
+/// One start already settled failed: the daemon retires this plugin
+/// process and never re-sends agent.start.
+struct FailedStart;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SessionPhase {
@@ -308,7 +304,6 @@ struct AgentSession {
     agent_id: String,
     generation: i64,
     start_command_id: String,
-    start_result: Option<Value>,
     phase: SessionPhase,
     session_id: Option<String>,
     native_scope: String,
@@ -374,13 +369,6 @@ struct ParsedStart {
     resume: Option<ResumeSubject>,
     swarm_executable: PathBuf,
     swarm_data_dir: PathBuf,
-}
-
-/// Outcome of start admission: a replayed start response, or a parsed
-/// request ready to launch.
-enum StartAdmission {
-    Replay(Result<Value>),
-    New(Box<ParsedStart>),
 }
 
 /// Outcome of start phase 4: either a created session ready for the
@@ -618,15 +606,10 @@ impl OpenCodePlugin {
             .map_err(|_| Error::new("internal", "OpenCode plugin manifest could not be encoded"))
     }
 
-    /// Retain a failed start exactly once: the same start command replays the
-    /// stored error without new native I/O, and any other start is refused.
-    fn retain_failed_start(&mut self, params: &AgentStartParams, error: Error) -> Error {
-        self.failed_start = Some(FailedStart {
-            agent_id: params.agent_id.clone(),
-            generation: params.generation,
-            command_id: params.command_id.clone(),
-            outcome: SettledStartFailure::Uncertain(error.clone()),
-        });
+    /// Settle a failed start: the settled marker refuses any second
+    /// agent.start, and the daemon retires this plugin process.
+    fn retain_failed_start(&mut self, error: Error) -> Error {
+        self.failed_start = Some(FailedStart);
         error
     }
 
@@ -771,12 +754,7 @@ impl OpenCodePlugin {
         let error =
             eliot_plugin::session::classify_start_failure(error, "opencode", phase.as_str());
         let value = eliot_plugin::session::failed_start_value(params, error);
-        self.failed_start = Some(FailedStart {
-            agent_id: params.agent_id.clone(),
-            generation: params.generation,
-            command_id: params.command_id.clone(),
-            outcome: SettledStartFailure::ProvenNoEffect(value.clone()),
-        });
+        self.failed_start = Some(FailedStart);
         value
     }
 
@@ -806,10 +784,7 @@ impl OpenCodePlugin {
 
     async fn start(&mut self, raw: &Value, peer: &PeerClient) -> Result<Value> {
         let _timing = crate::native::startup::Step::new("start_total");
-        let parsed = match self.parse_start_request(raw)? {
-            StartAdmission::Replay(outcome) => return outcome,
-            StartAdmission::New(parsed) => parsed,
-        };
+        let parsed = self.parse_start_request(raw)?;
         // One envelope for the whole dispatch: every pre-session phase
         // shares it, so a loaded cold start gets room without outliving the
         // daemon agent.start budget (which would settle the launch unknown
@@ -823,12 +798,12 @@ impl OpenCodePlugin {
             // one exception: an uncertain auth import (code `unknown`) means
             // the isolated credential store may already have been written and
             // reconciliation failed, so it stays unknown per the
-            // authentication contract and replays as an error.
+            // authentication contract and returns as an error.
             Err(failure) => {
                 if start_failure_is_proven_no_effect(failure.phase, &failure.error.code) {
                     return Ok(self.proven_no_effect_start(&parsed.params, failure));
                 }
-                return Err(self.retain_failed_start(&parsed.params, *failure.error));
+                return Err(self.retain_failed_start(*failure.error));
             }
         };
         let session = match self
@@ -858,10 +833,19 @@ impl OpenCodePlugin {
         }
     }
 
-    /// Start phase 1, admission: decode, replay guards, and frozen-profile
-    /// validation. Failures here retain nothing: a corrected start may retry.
-    fn parse_start_request(&self, raw: &Value) -> Result<StartAdmission> {
+    /// Start phase 1, admission: the once-only guard, decode and
+    /// frozen-profile validation. Failures here retain nothing: a corrected
+    /// start may retry.
+    fn parse_start_request(&self, raw: &Value) -> Result<Box<ParsedStart>> {
         let _timing = crate::native::startup::Step::new("frozen_admission");
+        // The daemon sends agent.start exactly once per freshly spawned
+        // plugin process: a bound or settled plugin never starts again.
+        if self.session.is_some() || self.failed_start.is_some() {
+            return Err(Error::new(
+                "bad_state",
+                "OpenCode plugin already received agent.start",
+            ));
+        }
         let params: AgentStartParams = decode(raw, "OpenCode agent.start params are invalid")?;
         validate_identity(
             &params.agent_id,
@@ -869,9 +853,6 @@ impl OpenCodePlugin {
             &params.command_id,
             "OpenCode",
         )?;
-        if let Some(replay) = self.start_replay_admission(&params)? {
-            return Ok(replay);
-        }
         let (initialized, profile) = self.start_prereqs(&params)?;
         let requested_mcp_policy = policy_from_snapshot(profile)?;
         let native_subagents = profile
@@ -939,7 +920,7 @@ impl OpenCodePlugin {
                 "active Swarm executable could not be resolved for the OpenCode Agent MCP",
             )
         })?;
-        Ok(StartAdmission::New(Box::new(ParsedStart {
+        Ok(Box::new(ParsedStart {
             params,
             native_subagents,
             requested_model,
@@ -963,49 +944,7 @@ impl OpenCodePlugin {
             resume,
             swarm_executable,
             swarm_data_dir,
-        })))
-    }
-
-    /// Start admission replays: the bound generation answers its own start
-    /// command without new native I/O; anything else is refused.
-    fn start_replay_admission(&self, params: &AgentStartParams) -> Result<Option<StartAdmission>> {
-        if let Some(session) = &self.session {
-            if session.agent_id == params.agent_id
-                && session.generation == params.generation
-                && session.start_command_id == params.command_id
-            {
-                return Ok(Some(StartAdmission::Replay(match session.phase {
-                    SessionPhase::Ready => session.start_result.clone().ok_or_else(|| {
-                        Error::new("unknown", "OpenCode start result was not retained")
-                    }),
-                    SessionPhase::Unknown => Err(Error::new(
-                        "unknown",
-                        "OpenCode session/start outcome is unresolved; it will not be repeated",
-                    )),
-                    SessionPhase::Stopped => Err(Error::new(
-                        "bad_state",
-                        "OpenCode Agent generation has already stopped",
-                    )),
-                })));
-            }
-            return Err(Error::new(
-                "stale_generation",
-                "OpenCode plugin is already bound to another Agent generation",
-            ));
-        }
-        if let Some(failed) = &self.failed_start {
-            if failed.agent_id == params.agent_id
-                && failed.generation == params.generation
-                && failed.command_id == params.command_id
-            {
-                return Ok(Some(StartAdmission::Replay(failed.outcome.replay())));
-            }
-            return Err(Error::new(
-                "bad_state",
-                "OpenCode plugin already settled a different start command",
-            ));
-        }
-        Ok(None)
+        }))
     }
 
     /// Start prerequisites: the plugin is initialized, the start carries no
@@ -1129,7 +1068,6 @@ impl OpenCodePlugin {
             agent_id: parsed.params.agent_id.clone(),
             generation: parsed.params.generation,
             start_command_id: parsed.params.command_id.clone(),
-            start_result: None,
             phase: SessionPhase::Unknown,
             session_id: None,
             native_scope: String::new(),
@@ -1472,7 +1410,6 @@ impl OpenCodePlugin {
         {
             return Err(self
                 .fail_created_start(
-                    &parsed.params,
                     session,
                     &created.id,
                     Error::new("profile_error", *error.message),
@@ -1529,7 +1466,6 @@ impl OpenCodePlugin {
             if let Err(error) = proof {
                 return Err(self
                     .fail_created_start(
-                        &parsed.params,
                         session,
                         &created.id,
                         Error::new("profile_error", *error.message),
@@ -1566,7 +1502,6 @@ impl OpenCodePlugin {
                 Ok(false) => {
                     return Err(self
                         .fail_created_start(
-                            &parsed.params,
                             session,
                             &created.id,
                             Error::new("profile_error", "OpenCode session deny ruleset is missing"),
@@ -1577,7 +1512,6 @@ impl OpenCodePlugin {
                 Err(error) => {
                     return Err(self
                         .fail_created_start(
-                            &parsed.params,
                             session,
                             &created.id,
                             Error::new("native_readback", *error.message),
@@ -1616,7 +1550,6 @@ impl OpenCodePlugin {
         {
             return Err(self
                 .fail_created_start(
-                    &parsed.params,
                     session,
                     &created.id,
                     Error::new(
@@ -1675,29 +1608,28 @@ impl OpenCodePlugin {
                 parsed.mcp_cloud_hostname.as_deref(),
             )
         {
-            return Err(self.fail_resume(&parsed, session, error, envelope).await);
+            return Err(self.fail_resume(session, error, envelope).await);
         }
         let deadline = phase_deadline(envelope, RPC_TIMEOUT);
-        let retained = match Self::resume_read_retained(&session, &resume.native_ref, deadline)
-            .await
-        {
-            Ok(retained) => retained,
-            // Proven absent: the retained session no longer exists, so
-            // there is nothing to resume and this generation created
-            // nothing. Any other read failure stays unknown: the retained
-            // session may still exist.
-            Err(error) if error.code == "not_found" => {
-                discard_unstarted(&mut session, envelope).await;
-                return Ok(self.proven_no_effect_start(
-                    &parsed.params,
-                    PhaseFailure {
-                        phase: StartPhase::ResumeRefused,
-                        error: Box::new(error),
-                    },
-                ));
-            }
-            Err(error) => return Err(self.fail_resume(&parsed, session, error, envelope).await),
-        };
+        let retained =
+            match Self::resume_read_retained(&session, &resume.native_ref, deadline).await {
+                Ok(retained) => retained,
+                // Proven absent: the retained session no longer exists, so
+                // there is nothing to resume and this generation created
+                // nothing. Any other read failure stays unknown: the retained
+                // session may still exist.
+                Err(error) if error.code == "not_found" => {
+                    discard_unstarted(&mut session, envelope).await;
+                    return Ok(self.proven_no_effect_start(
+                        &parsed.params,
+                        PhaseFailure {
+                            phase: StartPhase::ResumeRefused,
+                            error: Box::new(error),
+                        },
+                    ));
+                }
+                Err(error) => return Err(self.fail_resume(session, error, envelope).await),
+            };
         session.session_id = Some(retained.id.clone());
         // Catalogue membership proves before any native interrupt or
         // setter: the quiesce below aborts a running retained execution,
@@ -1756,7 +1688,7 @@ impl OpenCodePlugin {
             Err(error) if error.code == "unknown" => {
                 return Err(self.stash_resume_unknown(session, *error.message).await);
             }
-            Err(error) => return Err(self.fail_resume(&parsed, session, error, envelope).await),
+            Err(error) => return Err(self.fail_resume(session, error, envelope).await),
         };
         let context_bound = bind_context_hooks(&session.http, &retained.id, deadline).await;
         let effective = if context_bound {
@@ -1793,7 +1725,6 @@ impl OpenCodePlugin {
             },
             "effective": effective,
         });
-        session.start_result = Some(result.clone());
         self.session = Some(session);
         Ok(result)
     }
@@ -2568,10 +2499,9 @@ impl OpenCodePlugin {
     }
 
     /// Discard the server after a resume failure that wrote nothing and
-    /// retain the failure for replay.
+    /// settle the start failed.
     async fn fail_resume(
         &mut self,
-        parsed: &ParsedStart,
         mut session: AgentSession,
         error: Error,
         envelope: Instant,
@@ -2587,7 +2517,7 @@ impl OpenCodePlugin {
                 "resume-phase native readback or configuration failed or stayed unresolved",
             );
         }
-        self.retain_failed_start(&parsed.params, error)
+        self.retain_failed_start(error)
     }
 
     /// Stash a resume-ambiguous session as unknown: the server and stream
@@ -2612,7 +2542,6 @@ impl OpenCodePlugin {
     /// with the server still live. The create is never repeated.
     async fn fail_created_start(
         &mut self,
-        params: &AgentStartParams,
         mut session: AgentSession,
         native_ref: &str,
         error: Error,
@@ -2624,7 +2553,7 @@ impl OpenCodePlugin {
             let message = format!("{}; {kill_note}", error.message);
             let error = session.server.diagnostic_error(error.with_message(message));
             discard_created_start(&mut session, envelope).await;
-            return self.retain_failed_start(params, error);
+            return self.retain_failed_start(error);
         }
         // The known id was bound at create. Keep it with the live server
         // and stream for readback, without committing session.ready.
@@ -2633,7 +2562,7 @@ impl OpenCodePlugin {
         created_start_unknown(native_ref, &error.message, &kill_note)
     }
 
-    /// Start phase 5, readiness: publish `session.ready` and retain the
+    /// Start phase 5, readiness: publish `session.ready` and return the
     /// result. A lost acknowledgement stashes the known session as unknown.
     async fn ready_start_session(
         &mut self,
@@ -2682,7 +2611,6 @@ impl OpenCodePlugin {
             },
             "effective": effective,
         });
-        session.start_result = Some(result.clone());
         self.session = Some(session);
         Ok(result)
     }
