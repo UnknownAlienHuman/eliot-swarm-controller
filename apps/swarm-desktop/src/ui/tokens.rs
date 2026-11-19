@@ -139,8 +139,6 @@ pub mod layout {
     /// What runs an Agent (`Codex · qwen4-max`) at most in a Monitor row or
     /// the conversation header; a longer label trims.
     pub const RUNS_LABEL_WIDTH: f64 = 200.0;
-    /// A sidebar row's trailing note (a model, an age) at most.
-    pub const SIDEBAR_MODEL_WIDTH: f64 = 72.0;
     /// The composer's field grows with its text up to this height.
     pub const COMPOSER_MAX_HEIGHT: f64 = 200.0;
     /// The composer's field below its first line (the design's 44 DIP).

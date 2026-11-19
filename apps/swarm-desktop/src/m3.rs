@@ -556,11 +556,6 @@ pub fn text_chip(palette: Palette) -> Button {
     button(palette.row(false))
 }
 
-/// [`text_chip`] in the attention color.
-pub fn warning_text_chip(palette: Palette) -> Button {
-    button(palette.attention_row())
-}
-
 /// Read-only context: a 16-DIP icon and a caption in the muted role. No
 /// outline and no button, so it never reads as a control.
 pub fn meta(glyph: &str, label: &str) -> View {
@@ -574,26 +569,6 @@ pub fn meta(glyph: &str, label: &str) -> View {
                 .vertical_alignment(VerticalAlignment::Center)
                 .content(small_icon(glyph)),
             muted(label.to_owned(), style::CHIP)
-                .vertical_alignment(VerticalAlignment::Center)
-                .text_trimming(TextTrimming::CharacterEllipsis),
-        ))
-        .into()
-}
-
-/// [`meta`] with its label in `foreground` (Full access in the attention
-/// role).
-pub fn meta_tinted(glyph: &str, label: &str, foreground: Brush) -> View {
-    StackPanel::new()
-        .orientation(Orientation::Horizontal)
-        .spacing(6.0)
-        .vertical_alignment(VerticalAlignment::Center)
-        .automation_name(label.to_owned())
-        .children((
-            Border::new()
-                .vertical_alignment(VerticalAlignment::Center)
-                .content(small_icon(glyph)),
-            text(label.to_owned(), style::CHIP)
-                .foreground(foreground)
                 .vertical_alignment(VerticalAlignment::Center)
                 .text_trimming(TextTrimming::CharacterEllipsis),
         ))
@@ -769,7 +744,7 @@ pub fn bubble(palette: Palette, content: impl Into<View>, max_width: Option<f64>
         ))
         .padding(Thickness::xy(14.0, spacing::ROW))
         .horizontal_alignment(HorizontalAlignment::Right)
-        .max_width(max_width.unwrap_or(f64::INFINITY))
+        .max_width(max_width)
         .content(content)
 }
 
@@ -787,7 +762,7 @@ pub fn steer_bubble(palette: Palette, text_value: &str, max_width: Option<f64>) 
         ))
         .padding(Thickness::xy(14.0, spacing::ROW))
         .horizontal_alignment(HorizontalAlignment::Right)
-        .max_width(max_width.unwrap_or(f64::INFINITY))
+        .max_width(max_width)
         .content(
             body(format!("Steer: {text_value}"))
                 .foreground(palette.variant())

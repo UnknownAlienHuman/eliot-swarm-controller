@@ -297,28 +297,44 @@ fn part_view(
             .horizontal_alignment(HorizontalAlignment::Right)
             .max_width(tokens::layout::READING_WIDTH * tokens::layout::BUBBLE_SHARE)
             .children((
-                Border::new()
-                    .background(palette.container())
-                    .corner_radius(tokens::radius::CONTAINER)
-                    .padding(Thickness::xy(tokens::spacing::INSET, tokens::spacing::SM))
-                    .content(body_text(&part.plain, palette.text())),
+                crate::m3::bubble(palette, body_text(&part.plain, palette.text()), None),
                 copy_button("Copy message", palette, copy_message)
                     .horizontal_alignment(HorizontalAlignment::Right)
                     .margin(Thickness::new(0.0, 0.0, -INSET, 0.0))
                     .content(copy_glyph()),
             )),
-        // Interim notes stay quiet.
+        // A steered message stays in the turn it steered.
+        PartKind::Steer => Border::new()
+            .horizontal_alignment(HorizontalAlignment::Right)
+            .max_width(tokens::layout::READING_WIDTH * tokens::layout::BUBBLE_SHARE)
+            .automation_name(format!("Steered: {}", part.plain))
+            .content(crate::m3::steer_bubble(palette, &part.plain, None))
+            .into(),
+        // The assistant's interim notes read as its text.
         PartKind::Progress => StackPanel::new()
             .spacing(tokens::spacing::SM)
-            .opacity(theme::MUTED_OPACITY)
             .keyed_children(block_views(part, callbacks, palette)),
         PartKind::Tools => {
             let toggle = callbacks.toggle_tools.clone();
             let key = part.key.clone();
-            // A low-emphasis button rather than a ToggleButton: Reactor
-            // 0.100.0 themes only Buttons, so a checked toggle would show the
-            // system accent. The accessible name carries the state.
-            let header = crate::m3::row(palette, false)
+            // "Run command · Completed · ~0.3 s": the name, then the status
+            // (Running in the primary role) or the duration at the end.
+            let mut fields = part.plain.split(" · ");
+            let name = fields.next().unwrap_or_default().to_owned();
+            let status = fields.next().unwrap_or_default().to_owned();
+            let duration = fields.next().unwrap_or_default().to_owned();
+            let running = status == "Running";
+            let trailing = match status.as_str() {
+                "Running" => "Running".to_owned(),
+                "Completed" => duration,
+                _ => status,
+            };
+            let glyph = match name.as_str() {
+                "Run command" => crate::m3::glyph::TERMINAL,
+                "Edit files" => crate::m3::glyph::EDIT,
+                _ => crate::m3::glyph::TOOLS,
+            };
+            let row = crate::m3::tool_row(palette, running)
                 .automation_name(format!(
                     "{} ({})",
                     part.plain,
@@ -327,33 +343,30 @@ fn part_view(
                 .on_click(move || {
                     let _ = toggle.call((key.clone(), !expanded));
                 })
-                .content(crate::m3::row_content(
-                    Some(crate::m3::glyph::TOOLS),
-                    &part.plain,
-                    "",
-                    crate::m3::icon(if expanded {
-                        crate::m3::glyph::CHEVRON_DOWN
-                    } else {
-                        crate::m3::glyph::CHEVRON_RIGHT
-                    }),
+                .content(crate::m3::tool_content(
+                    glyph,
+                    &name,
+                    &trailing,
+                    running.then(|| palette.primary()),
                 ));
             let detail: View = if expanded {
-                StackPanel::new().spacing(tokens::spacing::XS).children((
-                    crate::m3::secondary(part.detail.join("\n"))
-                        .text_wrapping(TextWrapping::Wrap)
-                        .is_text_selection_enabled(true),
-                    path_actions(&part.key, &part.detail_paths, callbacks, palette),
-                ))
+                StackPanel::new()
+                    .spacing(tokens::spacing::XS)
+                    .margin(Thickness::xy(tokens::spacing::INSET, 0.0))
+                    .children((
+                        crate::m3::secondary(part.detail.join("\n"))
+                            .text_wrapping(TextWrapping::Wrap)
+                            .is_text_selection_enabled(true),
+                        path_actions(&part.key, &part.detail_paths, callbacks, palette),
+                    ))
+                    .into()
             } else {
                 View::empty()
             };
-            crate::m3::card(palette)
-                .padding(Thickness::uniform(tokens::spacing::XS))
-                .content(
-                    StackPanel::new()
-                        .spacing(tokens::spacing::XS)
-                        .children((header, detail)),
-                )
+            StackPanel::new()
+                .spacing(tokens::spacing::XS)
+                .children((row, detail))
+                .into()
         }
 
         // The answer: plain text on the surface; a label only when the
@@ -419,11 +432,8 @@ fn part_view(
                 action,
             ))
         }
-        PartKind::Notice => TextBlock::new()
-            .text(format!("{} · {}", part.label, part.plain))
-            .font_size(tokens::text::SECONDARY.size)
+        PartKind::Notice => crate::m3::secondary(format!("{} · {}", part.label, part.plain))
             .text_wrapping(TextWrapping::Wrap)
-            .opacity(theme::MUTED_OPACITY)
             .into(),
     }
 }

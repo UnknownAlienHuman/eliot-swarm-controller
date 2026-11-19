@@ -1659,18 +1659,6 @@ pub(super) fn starting_label(harness: Option<&str>) -> String {
     }
 }
 
-/// What a conversation's chip says the Agent was launched as: the harness
-/// for an ad-hoc launch (no internal `adhoc-*` name), else the preset and
-/// its harness.
-pub(super) fn launched_as(profile: &str, harness: &str) -> String {
-    let label = picker::harness_label(harness);
-    if profile == harness || profile.starts_with("adhoc-") {
-        label.to_owned()
-    } else {
-        format!("{profile} · {label}")
-    }
-}
-
 /// A running Agent's access chip: its frozen access level when the launch
 /// named one, else its profile's permissions.
 pub(super) fn agent_access_label(settings: &crate::configure::Settings) -> String {

@@ -65,6 +65,9 @@ pub const CHAT_KINDS: &[&str] = &[
     "request.opened",
     "request.closed",
     "request.resolved",
+    // A steer's acceptance names the turn it steers: its text joins that
+    // turn (the design's "Steer:" bubble).
+    "command.accepted",
 ];
 
 /// FNV-1a over bytes: content revision and Markdown cache key.
@@ -131,6 +134,11 @@ enum Activity {
     Message {
         key: String,
         text: String,
+    },
+    /// An input steered into the running turn (its command id): shown in
+    /// the turn where it was accepted.
+    Steer {
+        command: String,
     },
     Tools {
         key: String,
@@ -201,6 +209,7 @@ impl TurnEntry {
             .iter()
             .map(|entry| match entry {
                 Activity::Message { text, .. } => text.len(),
+                Activity::Steer { command } => command.len(),
                 Activity::Tools { rows, .. } => rows
                     .iter()
                     .map(|row| {
@@ -492,6 +501,8 @@ impl Invalidation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PartKind {
     Input,
+    /// An input steered into the running turn.
+    Steer,
     Progress,
     Tools,
     Final,
@@ -589,7 +600,28 @@ fn data_str<'a>(event: &'a Event, field: &str) -> Option<&'a str> {
         .filter(|value| !value.is_empty())
 }
 
+impl TurnEntry {
+    /// The commands whose input text this turn shows: the one that started
+    /// it, then every steer accepted into it.
+    fn commands(&self) -> impl Iterator<Item = &str> {
+        self.command_id
+            .as_deref()
+            .into_iter()
+            .chain(self.activity.iter().filter_map(|entry| match entry {
+                Activity::Steer { command } => Some(command.as_str()),
+                _ => None,
+            }))
+    }
+}
+
 impl Conversation {
+    /// Whether a resident turn shows `command`'s input.
+    fn references(&self, command: &str) -> bool {
+        self.turns
+            .values()
+            .any(|turn| turn.commands().any(|known| known == command))
+    }
+
     pub fn new(agent: &str) -> Self {
         Self {
             agent: agent.to_owned(),
@@ -635,13 +667,14 @@ impl Conversation {
         let mut invalidation = self.apply_events(events);
         self.coverage.cursor = cursor.max(self.applied_seq);
         self.apply_turns(turns);
-        self.inputs.retain(|command, _| {
-            self.local.contains(command)
-                || self
-                    .turns
-                    .values()
-                    .any(|turn| turn.command_id.as_deref() == Some(command))
-        });
+        let referenced: HashSet<String> = self
+            .inputs
+            .keys()
+            .filter(|command| self.local.contains(command) || self.references(command))
+            .cloned()
+            .collect();
+        self.inputs
+            .retain(|command, _| referenced.contains(command));
         self.pending_exact
             .retain(|command, _| self.local.iter().any(|known| known == command));
         invalidation.inputs = self.missing_inputs();
@@ -721,6 +754,21 @@ impl Conversation {
                     invalidation.turns = true;
                     invalidation.detail = true;
                 }
+                "command.accepted" if data_str(event, "verb") == Some("steer") => {
+                    if let Some(command) = data_str(event, "command_id") {
+                        let present = turn.activity.iter().any(|entry| {
+                            matches!(entry, Activity::Steer { command: known } if known == command)
+                        });
+                        if !present {
+                            turn.activity.push(Activity::Steer {
+                                command: command.to_owned(),
+                            });
+                        }
+                        if !self.inputs.contains_key(command) {
+                            invalidation.inputs.push(command.to_owned());
+                        }
+                    }
+                }
                 "turn.unknown" => {
                     turn.status = TurnStatus::Unknown;
                     invalidation.turns = true;
@@ -763,12 +811,16 @@ impl Conversation {
                 _ => {}
             }
         }
-        self.local.retain(|command| {
-            !self
-                .turns
-                .values()
-                .any(|turn| turn.command_id.as_deref() == Some(command))
-        });
+        let linked: HashSet<String> = self
+            .local
+            .iter()
+            .filter(|command| self.references(command))
+            .cloned()
+            .collect();
+        self.local.retain(|command| !linked.contains(command));
+        for command in &linked {
+            self.local_notes.remove(command);
+        }
         self.pending_exact
             .retain(|command, _| self.local.iter().any(|known| known == command));
         self.enforce_bounds();
@@ -826,11 +878,8 @@ impl Conversation {
         for (command, text) in inputs {
             // Replies for departed owners never load the budget: only a
             // waiting local input or a resident turn's command keeps text.
-            let wanted = self.local.iter().any(|known| known == &command)
-                || self
-                    .turns
-                    .values()
-                    .any(|turn| turn.command_id.as_deref() == Some(command.as_str()));
+            let wanted =
+                self.local.iter().any(|known| known == &command) || self.references(&command);
             if wanted {
                 self.inputs.insert(command, text);
             }
@@ -922,8 +971,9 @@ impl Conversation {
         let mut missing: Vec<String> = self
             .turns
             .values()
-            .filter_map(|turn| turn.command_id.clone())
-            .filter(|command| !self.inputs.contains_key(command))
+            .flat_map(TurnEntry::commands)
+            .filter(|command| !self.inputs.contains_key(*command))
+            .map(str::to_owned)
             .collect();
         missing.sort();
         missing.dedup();
@@ -948,11 +998,12 @@ impl Conversation {
     /// Input texts no resident turn and no waiting local input references.
     /// Auxiliary indexes leave with their owner instead of lingering.
     fn prune_inputs(&mut self) {
-        let mut keep: HashSet<&str> = self.local.iter().map(String::as_str).collect();
+        let mut keep: HashSet<String> = self.local.iter().cloned().collect();
         keep.extend(
             self.turns
                 .values()
-                .filter_map(|turn| turn.command_id.as_deref()),
+                .flat_map(TurnEntry::commands)
+                .map(str::to_owned),
         );
         self.inputs
             .retain(|command, _| keep.contains(command.as_str()));
@@ -1111,6 +1162,19 @@ impl Conversation {
                     PartKind::Progress,
                     "Assistant · progress".to_owned(),
                     text.clone(),
+                    Vec::new(),
+                )),
+                Activity::Steer { command } => parts.push(Part::new(
+                    format!("steer:{command}"),
+                    PartKind::Steer,
+                    "You · steered".to_owned(),
+                    match self.inputs.get(command) {
+                        Some(InputText::Loaded(text)) => text.clone(),
+                        Some(InputText::Unavailable(reason)) => {
+                            format!("(input text unavailable: {reason})")
+                        }
+                        None => "(loading input text…)".to_owned(),
+                    },
                     Vec::new(),
                 )),
                 Activity::Tools {

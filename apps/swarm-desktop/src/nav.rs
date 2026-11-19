@@ -612,7 +612,9 @@ pub struct Shown<'a> {
     pub only: Option<&'a dyn Fn(&UiAgent) -> bool>,
     /// The open Agent: it renders explicitly above the list, so sections
     /// skip its rows (no duplicate, no folding, no "Show N older" count).
-    pub pinned: Option<&'a str>,
+    /// The open Agent: it stays in view inside its own project (never
+    /// folded under Show older, never hoisted out).
+    pub open: Option<&'a str>,
 }
 
 struct Group<'a> {
@@ -1037,9 +1039,7 @@ pub fn sections(
             continue;
         };
         // A native observed child shows only nested under its parent
-        // conversation (collapsed), never as a task of its own. The open
-        // Agent renders explicitly above the list.
-        let pinned = shown.pinned == Some(agent.id.as_str());
+        // conversation (collapsed), never as a task of its own.
         let shows = match shown.only {
             Some(keep) => keep(agent) && !agent.native_child,
             None => {
@@ -1050,7 +1050,7 @@ pub fn sections(
                         .is_none_or(|parent| placements.get(parent) != Some(key))
             }
         };
-        if shows && !pinned {
+        if shows {
             group.top.push(agent);
         }
     }
@@ -1080,7 +1080,8 @@ pub fn sections(
             folding(&group.top, shown.today_start, true)
         };
         for agent in &group.top {
-            if folds.contains(agent.id.as_str()) && !unfolded {
+            let open = shown.open == Some(agent.id.as_str());
+            if folds.contains(agent.id.as_str()) && !unfolded && !open {
                 continue;
             }
             push(
@@ -1098,6 +1099,17 @@ pub fn sections(
         out.push(group.section);
     }
     out
+}
+
+/// A short age for a quiet task's row: "now", "5m", "2h", "3d".
+pub fn short_age(now_ms: i64, at_ms: i64) -> String {
+    let seconds = (now_ms - at_ms).max(0) / 1000;
+    match seconds {
+        0..60 => "now".to_owned(),
+        60..3_600 => format!("{}m", seconds / 60),
+        3_600..86_400 => format!("{}h", seconds / 3_600),
+        _ => format!("{}d", seconds / 86_400),
+    }
 }
 
 /// Apply `organization.changed` rows to the loaded Agents (the list and
@@ -1279,20 +1291,6 @@ pub fn recents<'a>(
     });
     recent.truncate(limit);
     recent
-}
-
-/// The sidebar's Recents: the newest tasks of collapsed projects (their
-/// group keys in `collapsed`), the ones the list above hides. Tasks folded
-/// under "Show N older" stay there, so Recents never repeats the list or
-/// brings back old runs.
-pub fn sidebar_recents<'a>(
-    agents: &'a [UiAgent],
-    collapsed: &HashSet<&str>,
-    limit: usize,
-) -> Vec<&'a UiAgent> {
-    recents(agents, limit, &|agent: &UiAgent| {
-        collapsed.contains(group_key(agent.organization.as_deref()).as_str())
-    })
 }
 
 /// The tag editor's fields as the tag set, one tag per field: each field
@@ -1606,10 +1604,6 @@ fn push(
     });
     if is_expanded {
         for child in children {
-            // The open Agent renders explicitly above the list.
-            if shown.pinned == Some(child.id.as_str()) {
-                continue;
-            }
             push(child, depth + 1, listed, shown, tree, seen, out);
         }
     }

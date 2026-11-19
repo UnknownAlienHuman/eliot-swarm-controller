@@ -991,6 +991,86 @@ impl DesktopApp {
 
     /// The main area for a conversation: the header, the transcript (or the
     /// empty state of a new task), pending requests and the composer.
+    /// The home screen (`Main.dc.html`): the greeting at 28/500 and three
+    /// suggestion cards under it, centred above the composer: continue the
+    /// last task, schedule an automation, and a prompt to review the open
+    /// pull requests (it fills the composer).
+    fn home_view(
+        &self,
+        greeting: String,
+        context: &mut ViewContext<Self>,
+        palette: Palette,
+    ) -> View {
+        const REVIEW: &str =
+            "Review the open pull requests in this repository and summarize what needs attention.";
+        let last = self
+            .nav
+            .agents
+            .iter()
+            .filter(|agent| !agent.native_child && !agent.archived)
+            .max_by_key(|agent| agent.updated_at)
+            .cloned();
+        let mut cards: Vec<KeyedView> = vec![KeyedView::new(
+            "review",
+            m3::suggestion(palette)
+                .automation_name("Review the open PRs")
+                .on_click(
+                    context.message(Message::Chat(ChatMsg::ComposerChanged(REVIEW.to_owned()))),
+                )
+                .content(m3::suggestion_content(
+                    palette,
+                    m3::glyph::LIST,
+                    "Review the open PRs",
+                )),
+        )];
+        cards.push(KeyedView::new(
+            "automation",
+            m3::suggestion(palette)
+                .grid_column(1)
+                .automation_name("Schedule an automation")
+                .on_click(context.message(Message::Shell(ShellMsg::SettingsPage(
+                    settings_ui::Page::Automations,
+                ))))
+                .content(m3::suggestion_content(
+                    palette,
+                    m3::glyph::AUTOMATION,
+                    "Schedule an automation",
+                )),
+        ));
+        if let Some(agent) = last {
+            cards.push(KeyedView::new(
+                format!("continue:{}", agent.id),
+                m3::suggestion(palette)
+                    .grid_column(2)
+                    .automation_name(format!(
+                        "Continue the last task: {}",
+                        self.agent_label(&agent)
+                    ))
+                    .on_click(context.message(Message::Shell(ShellMsg::AgentOpened(agent))))
+                    .content(m3::suggestion_content(
+                        palette,
+                        m3::glyph::CODE,
+                        "Continue the last task",
+                    )),
+            ));
+        }
+        StackPanel::new()
+            .grid_row(1)
+            .spacing(28.0)
+            .horizontal_alignment(HorizontalAlignment::Center)
+            .vertical_alignment(VerticalAlignment::Center)
+            .margin(Thickness::xy(tokens::spacing::XL, 0.0))
+            .children((
+                m3::page_title(greeting).horizontal_alignment(HorizontalAlignment::Center),
+                Grid::new()
+                    .width(tokens::layout::HOME_WIDTH)
+                    .columns([GridLength::STAR, GridLength::STAR, GridLength::STAR])
+                    .column_spacing(tokens::spacing::INSET)
+                    .keyed_children(cards),
+            ))
+            .into()
+    }
+
     pub(super) fn chat_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let agent = self.selected_agent_id();
         let column = self.reading_width();
@@ -1014,11 +1094,7 @@ impl DesktopApp {
                     Some(project) => format!("What should we build in {project}?"),
                     None => "What should we build?".to_owned(),
                 };
-                m3::page_title(line)
-                    .grid_row(1)
-                    .horizontal_alignment(HorizontalAlignment::Center)
-                    .vertical_alignment(VerticalAlignment::Center)
-                    .into()
+                self.home_view(line, context, palette)
             }
         };
         let pending = self.pending_view(column, context, palette);
@@ -1120,9 +1196,14 @@ impl DesktopApp {
     /// arranged in a slot wider than the viewport (off center), so the
     /// column gets an explicit width.
     fn reading_width(&self) -> Option<f64> {
+        self.column_width(tokens::layout::READING_WIDTH)
+    }
+
+    /// The column the main area gives: its width less the design's 32-DIP
+    /// side padding, at most `widest` (720 in a conversation, 760 at home).
+    pub(super) fn column_width(&self, widest: f64) -> Option<f64> {
         self.main_width().map(|width| {
-            (width - 2.0 * tokens::spacing::LG - tokens::spacing::MD)
-                .clamp(tokens::layout::MIN_COLUMN, tokens::layout::READING_WIDTH)
+            (width - 2.0 * tokens::spacing::XL).clamp(tokens::layout::MIN_COLUMN, widest)
         })
     }
 }

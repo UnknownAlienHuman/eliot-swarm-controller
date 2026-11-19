@@ -198,73 +198,77 @@ impl DesktopApp {
                 .content(m3::icon(m3::glyph::MORE)),
         };
         let details_open = self.panel == Panel::Details;
-        Grid::new()
+        // The status pill: the state in words, then what runs it, and the
+        // live feed's note when it is not following.
+        let state = detail.map_or(eliot_core::AgentState::Unknown, |detail| detail.state);
+        let mut pill = match state {
+            eliot_core::AgentState::Busy => "Working",
+            eliot_core::AgentState::Idle => "Idle",
+            eliot_core::AgentState::Waiting => "Waiting for you",
+            eliot_core::AgentState::Created | eliot_core::AgentState::Starting => "Starting",
+            eliot_core::AgentState::Stopped => "Stopped",
+            eliot_core::AgentState::Failed => "Failed",
+            eliot_core::AgentState::Lost => "Lost",
+            eliot_core::AgentState::Unknown => "Unknown",
+        }
+        .to_owned();
+        if let Some(runs) = &runs {
+            pill.push_str(&format!(" · {runs}"));
+        }
+        if !note.is_empty() {
+            pill.push_str(&format!(" · {note}"));
+        }
+        let _ = (column, runs_width);
+        // The design's header: a full-width 52-DIP bar on a hairline, the
+        // title at 15/500, the status pill, then Details and More.
+        Border::new()
             .grid_row(0)
-            .columns([
-                GridLength::Auto,
-                GridLength::Auto,
-                GridLength::Auto,
-                GridLength::STAR,
-                GridLength::Auto,
-                GridLength::Auto,
-            ])
-            .column_spacing(tokens::spacing::SM)
-            // On the reading column, so the title starts and the toolbar
-            // ends where the messages and the composer do.
-            .width(column)
-            .max_width(tokens::layout::READING_WIDTH)
-            .horizontal_alignment(HorizontalAlignment::Center)
-            .margin(Thickness::xy(0.0, tokens::spacing::SM))
-            .children((
-                m3::section_title(title.clone())
-                    .max_width(
-                        column.unwrap_or(tokens::layout::READING_WIDTH)
-                            - 2.0 * tokens::height::CONTROL
-                            - 4.0 * tokens::spacing::SM
-                            - tokens::layout::DOT
-                            - runs_width,
-                    )
-                    .vertical_alignment(VerticalAlignment::Center)
-                    .text_trimming(TextTrimming::CharacterEllipsis)
-                    .is_text_selection_enabled(true),
-                Border::new()
-                    .grid_column(1)
-                    .vertical_alignment(VerticalAlignment::Center)
-                    .automation_name(format!(
-                        "State: {}",
-                        eliot_core::api::agent_state_name(
-                            detail.map_or(eliot_core::AgentState::Unknown, |detail| detail.state)
-                        )
-                    ))
-                    .content(m3::dot(palette.header_dot(tone))),
-                StackPanel::new()
-                    .grid_column(2)
-                    .orientation(Orientation::Horizontal)
-                    .spacing(tokens::spacing::SM)
-                    .vertical_alignment(VerticalAlignment::Center)
-                    .children((
-                        runs.map_or_else(View::empty, |runs| {
-                            m3::secondary(runs)
-                                .max_width(tokens::layout::RUNS_LABEL_WIDTH)
-                                .text_trimming(TextTrimming::CharacterEllipsis)
-                                .vertical_alignment(VerticalAlignment::Center)
-                                .into()
-                        }),
-                        m3::secondary(note).vertical_alignment(VerticalAlignment::Center),
-                    )),
-                m3::icon_button(palette)
-                    .grid_column(4)
-                    .automation_name(if details_open {
-                        "Hide details"
-                    } else {
-                        "Show details"
-                    })
-                    .on_click(
-                        context.message(Message::Shell(ShellMsg::PanelToggled(Panel::Details))),
-                    )
-                    .content(m3::icon(m3::glyph::INFO)),
-                Border::new().grid_column(5).content(menu),
+            .height(tokens::height::HEADER)
+            .border_brush(palette.outline())
+            .border_thickness(Thickness::new(0.0, 0.0, 0.0, tokens::layout::HAIRLINE))
+            .padding(Thickness::new(
+                tokens::spacing::LG,
+                0.0,
+                tokens::spacing::MD,
+                0.0,
             ))
+            .content(
+                Grid::new()
+                    .columns([
+                        GridLength::Auto,
+                        GridLength::Auto,
+                        GridLength::STAR,
+                        GridLength::Auto,
+                        GridLength::Auto,
+                    ])
+                    .column_spacing(tokens::spacing::ROW)
+                    .children((
+                        m3::section_title(title.clone())
+                            .max_width(tokens::layout::READING_WIDTH)
+                            .vertical_alignment(VerticalAlignment::Center)
+                            .text_trimming(TextTrimming::CharacterEllipsis)
+                            .is_text_selection_enabled(true),
+                        Border::new()
+                            .grid_column(1)
+                            .vertical_alignment(VerticalAlignment::Center)
+                            .content(m3::status_pill(palette, tone, &pill)),
+                        m3::icon_button(palette)
+                            .grid_column(3)
+                            .automation_name(if details_open {
+                                "Hide details"
+                            } else {
+                                "Show details"
+                            })
+                            .on_click(
+                                context.message(Message::Shell(ShellMsg::PanelToggled(
+                                    Panel::Details,
+                                ))),
+                            )
+                            .content(m3::icon(m3::glyph::INFO)),
+                        Border::new().grid_column(4).content(menu),
+                    )),
+            )
+            .into()
     }
 
     /// The Force stop question above the composer, bound to the Agent and

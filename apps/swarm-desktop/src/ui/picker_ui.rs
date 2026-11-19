@@ -45,16 +45,17 @@ impl DesktopApp {
         } else {
             m3::glyph::FOLDER
         };
-        let chip = m3::text_chip(palette)
+        let chip = m3::chip(palette)
             .automation_name(format!(
                 "Project: {label} ({})",
                 if open { "list open" } else { "choose" }
             ))
             .on_click(context.message(Message::Launch(LaunchMsg::Toggle(Pop::Project))))
-            .content(chip_content(
-                glyph,
+            .content(m3::chip_content(
+                Some(glyph),
                 &label,
-                Some(tokens::layout::PROJECT_CHIP_WIDTH),
+                true,
+                tokens::layout::PROJECT_CHIP_WIDTH,
             ));
         let folder: View = if !self.launch.chat
             && (self.launch.custom_workspace || self.nav.projects.is_empty())
@@ -95,7 +96,12 @@ impl DesktopApp {
                 self.launch.choice.chip_name(auto_profile)
             ))
             .on_click(context.message(Message::Launch(LaunchMsg::Toggle(Pop::Model))))
-            .content(chip_content(glyph, &label, None));
+            .content(m3::chip_content(
+                Some(glyph),
+                &label,
+                true,
+                tokens::layout::PROJECT_CHIP_WIDTH,
+            ));
         let access: View = match &self.launch.choice {
             Choice::Model(_) => {
                 let access = self.launch.access();
@@ -104,16 +110,17 @@ impl DesktopApp {
                 Grid::new().keyed_children(vec![KeyedView::new(
                     format!("access:{}", access.wire()),
                     if full {
-                        m3::warning_text_chip(palette)
+                        m3::attention_chip(palette)
                     } else {
-                        m3::text_chip(palette)
+                        m3::chip(palette)
                     }
                     .automation_name(format!("Access: {}", access.label()))
                     .on_click(context.message(Message::Launch(LaunchMsg::Toggle(Pop::Access))))
-                    .content(chip_content(
-                        access_glyph(access),
+                    .content(m3::chip_content(
+                        Some(access_glyph(access)),
                         access.label(),
-                        None,
+                        false,
+                        tokens::layout::PROJECT_CHIP_WIDTH,
                     )),
                 )])
             }
@@ -129,10 +136,11 @@ impl DesktopApp {
                 },
             ),
         };
+        // The design: the access chip, then the model chip.
         StackPanel::new()
             .orientation(Orientation::Horizontal)
-            .spacing(tokens::spacing::SM)
-            .children((model, access))
+            .spacing(6.0)
+            .children((access, model))
     }
 
     /// The open popover in the reading column right above the composer
@@ -965,26 +973,6 @@ fn group_heading(
                     },
                 )),
         )
-}
-
-/// A chip's content: its icon, label (trimmed past `max_width`) and the ▾
-/// that says it opens.
-fn chip_content(glyph: &str, label: &str, max_width: Option<f64>) -> View {
-    let label = TextBlock::new()
-        .text(label.to_owned())
-        .vertical_alignment(VerticalAlignment::Center)
-        .text_trimming(TextTrimming::CharacterEllipsis);
-    StackPanel::new()
-        .orientation(Orientation::Horizontal)
-        .spacing(tokens::spacing::SM)
-        .children((
-            m3::icon(glyph),
-            match max_width {
-                Some(width) => label.max_width(width),
-                None => label,
-            },
-            m3::dropdown_chevron(),
-        ))
 }
 
 /// The label of a picker row's effort chip or segment: the short effort in

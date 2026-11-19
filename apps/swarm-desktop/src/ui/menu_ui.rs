@@ -114,8 +114,8 @@ pub(super) enum MenuMsg {
     /// (the highlight move that needs it).
     Reveal(u64),
     Chosen(Action),
-    Quick(UiAgent, Action),
-    TaskOpened(UiAgent),
+    /// A row's '…': its menu at the pointer.
+    Opened(Target),
     Hovered(Option<String>),
     RenameChanged(String),
     /// The tag editor's field at this index changed (the index past the
@@ -308,14 +308,11 @@ impl DesktopApp {
                 }
             }
             MenuMsg::Closed => self.close_menu(),
-            MenuMsg::TaskOpened(agent) => {
+            MenuMsg::Opened(target) => {
                 let (x, y) = crate::shortcuts::pointer_position();
-                self.menu_update(MenuMsg::Requested(Target::Agent(agent), x, y), context);
+                self.menu_update(MenuMsg::Requested(target, x, y), context);
             }
             MenuMsg::Hovered(agent) => self.menu.hovered = agent,
-            MenuMsg::Quick(agent, action) => {
-                self.menu_action(Target::Agent(agent), action, context)
-            }
             MenuMsg::Chosen(Action::More) => {
                 self.menu.more = !self.menu.more;
                 self.menu.highlight = None;
