@@ -41,7 +41,9 @@ effective native readback is reported separately; Eliot never fabricates a
 captures the selected names, optional shared Core `RouteBinding`, and configured
 `CapacityScope` values. The canonical Core DTOs own their field catalog. `None` means
 unlimited; `max_live = 0` disables that configured scope. These local workload limits
-do not describe OpenCodex account entitlement or vendor quota. Named native profiles may
+do not describe OpenCodex account entitlement or vendor quota, and neither does the
+ChatGPT account's `account/rateLimits/read`: `harness.quota` and routing report a
+proxied profile's quota `unknown` instead of the direct account's limits. Named native profiles may
 exercise profile/account caps; only an explicitly proxy-selected profile acquires a proxy route.
 
 ## Codex wiring and limits

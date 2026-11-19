@@ -24,6 +24,8 @@ use crate::ui::tokens;
 #[derive(Clone)]
 pub enum RenderedBlock {
     Rich(RichText),
+    /// Consecutive list item paragraphs: (depth, marker, text) each.
+    List(Vec<(usize, String, RichText)>),
     Heading(u8, String),
     Code(usize, String),
     Rule,
@@ -74,39 +76,88 @@ fn rich_inlines(inlines: &[Inline]) -> Vec<RichTextInline> {
         .collect()
 }
 
+/// The display blocks of one document: each paragraph its own text block
+/// (the part's spacing sets paragraphs apart, as Codex does), consecutive
+/// list items one list.
 fn render_doc(doc: &Doc) -> Vec<RenderedBlock> {
     let mut blocks = Vec::new();
-    let mut paragraphs: Vec<RichTextParagraph> = Vec::new();
     let mut code_index = 0;
-    let flush = |paragraphs: &mut Vec<RichTextParagraph>, blocks: &mut Vec<RenderedBlock>| {
-        if !paragraphs.is_empty() {
-            blocks.push(RenderedBlock::Rich(RichText::new(std::mem::take(
-                paragraphs,
-            ))));
-        }
-    };
     for block in &doc.blocks {
         match block {
-            Block::Paragraph(inlines) => {
-                paragraphs.push(RichTextParagraph::new(rich_inlines(inlines)))
+            Block::Paragraph(inlines) => blocks.push(RenderedBlock::Rich(
+                RichText::single_paragraph(rich_inlines(inlines)),
+            )),
+            Block::Item {
+                depth,
+                marker,
+                inlines,
+                opens,
+            } => {
+                let item = (
+                    *depth,
+                    marker.clone(),
+                    RichText::single_paragraph(rich_inlines(inlines)),
+                );
+                match blocks.last_mut() {
+                    Some(RenderedBlock::List(items)) if !opens => items.push(item),
+                    _ => blocks.push(RenderedBlock::List(vec![item])),
+                }
             }
             Block::Heading { level, text } => {
-                flush(&mut paragraphs, &mut blocks);
                 blocks.push(RenderedBlock::Heading(*level, text.clone()));
             }
             Block::Code { text, .. } => {
-                flush(&mut paragraphs, &mut blocks);
                 blocks.push(RenderedBlock::Code(code_index, text.clone()));
                 code_index += 1;
             }
-            Block::Rule => {
-                flush(&mut paragraphs, &mut blocks);
-                blocks.push(RenderedBlock::Rule);
-            }
+            Block::Rule => blocks.push(RenderedBlock::Rule),
         }
     }
-    flush(&mut paragraphs, &mut blocks);
     blocks
+}
+
+/// One selectable Markdown text block in the body role.
+fn rich_block(text: &RichText) -> RichTextBlock {
+    RichTextBlock::new()
+        .paragraphs(text.clone())
+        .font_size(tokens::text::BODY.size)
+        .text_wrapping(TextWrapping::Wrap)
+        .is_text_selection_enabled(true)
+}
+
+/// A list: one row per item paragraph, its marker in a fixed column and
+/// its text wrapping under itself (a hanging indent), each level one step
+/// in.
+fn list_view(items: &[(usize, String, RichText)]) -> View {
+    StackPanel::new()
+        .spacing(tokens::spacing::XS)
+        .keyed_children(
+            items
+                .iter()
+                .enumerate()
+                .map(|(index, (depth, marker, text))| {
+                    KeyedView::new(
+                        index,
+                        Grid::new()
+                            .margin(Thickness::new(
+                                tokens::layout::LIST_INDENT * (*depth as f64 + 0.5),
+                                0.0,
+                                0.0,
+                                0.0,
+                            ))
+                            .columns([
+                                GridLength::Pixel(tokens::layout::LIST_MARKER_WIDTH),
+                                GridLength::STAR,
+                            ])
+                            .children((
+                                TextBlock::new()
+                                    .text(marker.clone())
+                                    .font_size(tokens::text::BODY.size),
+                                rich_block(text).grid_column(1),
+                            )),
+                    )
+                }),
+        )
 }
 
 fn render_part(part: &Part, docs: &HashMap<u64, Doc>) -> RenderedPart {
@@ -189,6 +240,9 @@ pub struct RowCallbacks {
     pub hovered: Option<String>,
     /// The pointer entered (`true`) or left a part.
     pub hover: Callback<(String, bool)>,
+    /// Now (ms since the epoch): a running tool row counts its seconds
+    /// from its start.
+    pub now_ms: i64,
 }
 
 fn label(text: &str) -> TextBlock {
@@ -250,12 +304,8 @@ fn block_views(part: &RenderedPart, callbacks: &RowCallbacks, palette: Palette) 
         .enumerate()
         .map(|(index, block)| {
             let view: View = match block {
-                RenderedBlock::Rich(text) => RichTextBlock::new()
-                    .paragraphs(text.clone())
-                    .font_size(tokens::text::BODY.size)
-                    .text_wrapping(TextWrapping::Wrap)
-                    .is_text_selection_enabled(true)
-                    .into(),
+                RenderedBlock::Rich(text) => rich_block(text).into(),
+                RenderedBlock::List(items) => list_view(items),
                 RenderedBlock::Heading(level, text) => crate::m3::text(
                     text.clone(),
                     match level {
@@ -364,17 +414,23 @@ fn part_view(
         PartKind::Tools => {
             let toggle = callbacks.toggle_tools.clone();
             let key = part.key.clone();
-            // Name, status and duration (`chat::TOOL_FIELDS` apart): the
-            // name, then the status (Running in the primary role) or the
+            // Name, status, duration and start (`chat::TOOL_FIELDS`
+            // apart): the name, then the status with its elapsed seconds
+            // while it runs ("Running · 12 s", in the primary role) or the
             // duration at the end.
             let mut fields = part.plain.split(crate::chat::TOOL_FIELDS);
             let name = fields.next().unwrap_or_default().to_owned();
             let status = fields.next().unwrap_or_default().to_owned();
             let duration = fields.next().unwrap_or_default().to_owned();
+            let started = fields.next().and_then(|ms| ms.parse::<i64>().ok());
             let running = status == "Running";
-            let trailing = match status.as_str() {
-                "Running" => "Running".to_owned(),
-                "Completed" => duration.clone(),
+            let trailing = match (status.as_str(), started) {
+                ("Running", Some(started)) => format!(
+                    "Running \u{b7} {} s",
+                    (callbacks.now_ms - started).max(0) / 1_000
+                ),
+                ("Running", None) => "Running".to_owned(),
+                ("Completed", _) => duration.clone(),
                 _ => status.clone(),
             };
             let glyph = match part.label.as_str() {
@@ -384,7 +440,12 @@ fn part_view(
             };
             let row = crate::m3::tool_row(palette, running)
                 .automation_name(format!(
-                    "{name} · {status} · {duration} ({})",
+                    "{name} · {} ({})",
+                    if running {
+                        trailing.clone()
+                    } else {
+                        format!("{status} · {duration}")
+                    },
                     if expanded { "expanded" } else { "collapsed" }
                 ))
                 .on_click(move || {

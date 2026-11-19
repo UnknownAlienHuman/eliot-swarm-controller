@@ -6,8 +6,11 @@
 //! native `RichText` values. This is not a Markdown engine: paragraphs,
 //! emphasis, lists, quotes, headings, fenced code and links are mapped onto
 //! the controls Reactor 0.100.0 exposes; everything else stays readable text.
-//! Reactor exposes no font family, so code keeps its own block and Copy action
-//! but is not monospace, and inline code keeps its backticks.
+//! As Codex shows an answer, no Markdown marker stays visible: list items are
+//! their own blocks (the view gives them a hanging indent), and inline code
+//! drops its backticks. Reactor's runs carry only bold and italic (no font
+//! family or color, issue #407 §3), so inline code is set off in bold and a
+//! code block keeps its own block and Copy action without a monospace font.
 
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
@@ -38,8 +41,24 @@ pub enum Inline {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Block {
     Paragraph(Vec<Inline>),
-    Heading { level: u8, text: String },
-    Code { info: String, text: String },
+    /// One paragraph of a list item at its nesting `depth` (0 outermost):
+    /// its first paragraph carries the marker ("•", "3."), a later one an
+    /// empty marker, aligned with the item's text. `opens` marks the first
+    /// paragraph of an outermost list, so two lists in a row stay apart.
+    Item {
+        depth: usize,
+        marker: String,
+        inlines: Vec<Inline>,
+        opens: bool,
+    },
+    Heading {
+        level: u8,
+        text: String,
+    },
+    Code {
+        info: String,
+        text: String,
+    },
     Rule,
 }
 
@@ -100,9 +119,13 @@ fn prefix_at_boundary(text: &str, max: usize) -> &str {
 struct Builder {
     blocks: Vec<Block>,
     paragraph: Option<Vec<Inline>>,
+    /// The open paragraph's list item (depth, marker), when it is one.
+    paragraph_item: Option<(usize, String)>,
     bold: u32,
     italic: u32,
     lists: Vec<Option<u64>>,
+    /// An outermost list started and has no item paragraph yet.
+    list_opened: bool,
     item_marker: Option<String>,
     quote_depth: usize,
     heading: Option<(u8, String)>,
@@ -129,36 +152,58 @@ impl Builder {
             return;
         }
         let mut inlines = Vec::new();
-        let mut lead = String::new();
         if self.quote_depth > 0 {
-            lead.push_str(&"│ ".repeat(self.quote_depth));
-        }
-        if let Some(marker) = self.item_marker.take() {
-            let depth = self.lists.len().saturating_sub(1);
-            lead.push_str(&"\u{00A0}\u{00A0}\u{00A0}\u{00A0}".repeat(depth));
-            lead.push_str(&marker);
-        } else if !self.lists.is_empty() {
-            lead.push_str(&"\u{00A0}\u{00A0}\u{00A0}\u{00A0}".repeat(self.lists.len()));
-        }
-        if !lead.is_empty() {
             inlines.push(Inline::Text {
-                text: lead,
+                text: "│ ".repeat(self.quote_depth),
                 bold: false,
                 italic: false,
             });
         }
+        // Inside a list the paragraph is an item block: the first one
+        // carries the marker, a continuation aligns with its text.
+        self.paragraph_item = (!self.lists.is_empty()).then(|| {
+            (
+                self.lists.len() - 1,
+                self.item_marker.take().unwrap_or_default(),
+            )
+        });
         self.paragraph = Some(inlines);
     }
 
     fn close_paragraph(&mut self) {
+        let item = self.paragraph_item.take();
         if let Some(inlines) = self.paragraph.take()
             && !inlines.is_empty()
         {
-            self.push_block(Block::Paragraph(inlines));
+            let block = match item {
+                Some((depth, marker)) => Block::Item {
+                    depth,
+                    marker,
+                    inlines,
+                    opens: std::mem::take(&mut self.list_opened),
+                },
+                None => Block::Paragraph(inlines),
+            };
+            self.push_block(block);
         }
     }
 
+    /// Inline code, without its backticks: set off in bold where it joins
+    /// a paragraph (runs carry no font), plain inside a heading, link,
+    /// table cell or image text.
+    fn code_span(&mut self, code: &str) {
+        self.bold += 1;
+        self.write(code, false);
+        self.bold -= 1;
+    }
+
     fn text(&mut self, text: &str) {
+        self.write(text, true);
+    }
+
+    /// Text into the open construct; in a paragraph, a bare `http(s)` URL
+    /// becomes a link when `links` (as Codex links it), never inside code.
+    fn write(&mut self, text: &str, links: bool) {
         if let Some((_, code)) = self.code.as_mut() {
             code.push_str(text);
         } else if let Some((_, heading)) = self.heading.as_mut() {
@@ -173,11 +218,24 @@ impl Builder {
             self.open_paragraph();
             let (bold, italic) = (self.bold > 0, self.italic > 0);
             if let Some(inlines) = self.paragraph.as_mut() {
-                inlines.push(Inline::Text {
-                    text: text.to_owned(),
-                    bold,
-                    italic,
-                });
+                let segments = if links {
+                    bare_urls(text)
+                } else {
+                    vec![(false, text)]
+                };
+                for (url, segment) in segments {
+                    inlines.push(match url.then(|| safe_link(segment)).flatten() {
+                        Some(url) => Inline::Link {
+                            text: segment.to_owned(),
+                            url,
+                        },
+                        None => Inline::Text {
+                            text: segment.to_owned(),
+                            bold,
+                            italic,
+                        },
+                    });
+                }
             }
         }
     }
@@ -217,17 +275,18 @@ impl Builder {
             }
             Tag::List(start) => {
                 self.close_paragraph();
+                self.list_opened |= self.lists.is_empty();
                 self.lists.push(start);
             }
             Tag::Item => {
                 self.close_paragraph();
                 let marker = match self.lists.last_mut() {
                     Some(Some(next)) => {
-                        let marker = format!("{next}. ");
+                        let marker = format!("{next}.");
                         *next += 1;
                         marker
                     }
-                    _ => "• ".to_owned(),
+                    _ => "•".to_owned(),
                 };
                 self.item_marker = Some(marker);
             }
@@ -296,8 +355,11 @@ impl Builder {
                                 self.text(&format!(" ({destination})"));
                             }
                         }
-                        None if label == destination => self.text(&label),
-                        None => self.text(&format!("{label} ({destination})")),
+                        // A destination WinUI must not navigate (a file
+                        // path, a relative link) shows its label alone; the
+                        // message's file chips open referenced files, and
+                        // Copy message keeps the destination.
+                        None => self.text(&label),
                     }
                 }
             }
@@ -327,6 +389,56 @@ impl Builder {
     }
 }
 
+/// `text` split at bare `http://`/`https://` URLs, as `(is_url, part)` in
+/// order. A URL starts at a word boundary and ends before whitespace or an
+/// angle bracket or quote; trailing sentence punctuation (and a closing
+/// parenthesis it did not open) stays text.
+fn bare_urls(text: &str) -> Vec<(bool, &str)> {
+    let mut parts = Vec::new();
+    let mut rest = 0;
+    let mut from = 0;
+    while let Some(found) = text[from..].find("http") {
+        let start = from + found;
+        let tail = &text[start..];
+        let boundary = text[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|before| !before.is_alphanumeric());
+        if !boundary || !(tail.starts_with("http://") || tail.starts_with("https://")) {
+            from = start + "http".len();
+            continue;
+        }
+        let mut end = start
+            + tail
+                .find(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '"' | '\''))
+                .unwrap_or(tail.len());
+        loop {
+            let url = &text[start..end];
+            let trim = match url.chars().next_back() {
+                Some('.' | ',' | ';' | ':' | '!' | '?') => true,
+                Some(')') => url.matches('(').count() < url.matches(')').count(),
+                _ => false,
+            };
+            if !trim {
+                break;
+            }
+            end -= 1;
+        }
+        if text[start..end].len() > "https://".len() {
+            if rest < start {
+                parts.push((false, &text[rest..start]));
+            }
+            parts.push((true, &text[start..end]));
+            rest = end;
+        }
+        from = end.max(start + "http".len());
+    }
+    if rest < text.len() {
+        parts.push((false, &text[rest..]));
+    }
+    parts
+}
+
 fn heading_level(level: HeadingLevel) -> u8 {
     match level {
         HeadingLevel::H1 => 1,
@@ -350,7 +462,7 @@ pub fn parse(text: &str) -> Doc {
             Event::Start(tag) => builder.start(tag),
             Event::End(tag) => builder.end(tag),
             Event::Text(text) => builder.text(&text),
-            Event::Code(code) => builder.text(&format!("`{code}`")),
+            Event::Code(code) => builder.code_span(&code),
             Event::InlineMath(math) => builder.text(&format!("${math}$")),
             Event::DisplayMath(math) => builder.text(&format!("$${math}$$")),
             Event::Html(html) | Event::InlineHtml(html) => builder.text(&html),
@@ -361,7 +473,7 @@ pub fn parse(text: &str) -> Doc {
                 builder.close_paragraph();
                 builder.push_block(Block::Rule);
             }
-            Event::TaskListMarker(done) => builder.text(if done { "[x] " } else { "[ ] " }),
+            Event::TaskListMarker(done) => builder.text(if done { "☑ " } else { "☐ " }),
         }
     }
     builder.close_paragraph();

@@ -802,6 +802,7 @@ impl Component for DesktopApp {
                 show_archived: false,
                 search: shell_ui::Search::default(),
                 search_ref: ElementRef::new(),
+                found: Default::default(),
                 shortcuts: None,
                 sidebar_collapsed: false,
                 history: Default::default(),
@@ -825,6 +826,8 @@ impl Component for DesktopApp {
                 items: Rc::new(Vec::new()),
                 expanded: HashSet::new(),
                 hovered: None,
+                tool_running: false,
+                clock_armed: false,
                 composer_ref: ElementRef::new(),
                 pending_local: None,
                 waiting_label: None,
@@ -892,6 +895,7 @@ impl Component for DesktopApp {
         }
         self.record_location();
         self.sync_dialog(context);
+        self.arm_clock(context);
     }
 
     fn view(&self, _input: &DesktopInput, context: &mut ViewContext<Self>) -> View {

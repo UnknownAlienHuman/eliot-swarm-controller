@@ -849,6 +849,7 @@ pub(crate) fn list_params(
         harness: filter.harness,
         parent: filter.parent,
         root: filter.root,
+        query: None,
     })
 }
 

@@ -185,14 +185,44 @@ fn organization_roots(conn: &Connection, project: &str, archived: &str) -> Resul
 /// is one, else NULL for the no-project bucket. The projection's per-group
 /// totals and every `agent.list` row read this one expression, so a row
 /// never reads in a different group than the projection counts it.
-const ORGANIZATION_GROUP: &str = "CASE WHEN (a.chat = 1 AND o.project_link IS NOT NULL
+/// A legacy Agent whose retained project label is a checkout path groups
+/// under the registration of that exact path, without rewriting the
+/// retained label; two registrations on one path stay unplaced (ambiguous).
+fn organization_group() -> String {
+    let path = checkout_key_sql("a.project");
+    let checkout = checkout_key_sql("r.checkout");
+    format!(
+        "CASE WHEN (a.chat = 1 AND o.project_link IS NOT NULL
          AND EXISTS(SELECT 1 FROM project_registrations r WHERE r.id = o.project_link))
     THEN o.project_link
     WHEN (a.chat = 0
           AND EXISTS(SELECT 1 FROM project_registrations r WHERE r.id = a.project))
-    THEN a.project ELSE NULL END";
+    THEN a.project
+    WHEN (a.chat = 0 AND (SELECT COUNT(*) FROM project_registrations r
+          WHERE {checkout} = {path}) = 1)
+    THEN (SELECT r.id FROM project_registrations r WHERE {checkout} = {path})
+    ELSE NULL END"
+    )
+}
 
-/// One Agent's organization group ([`ORGANIZATION_GROUP`]), tags and overlay
+/// One normalized checkout path: a `\\?\` verbatim prefix dropped,
+/// backslashes as `/`, trailing separators trimmed, ASCII-lowercased
+/// (Windows compares paths case-insensitively; SQLite's `lower` folds ASCII
+/// only). [`checkout_key_sql`] is its SQL twin.
+fn checkout_key(path: &str) -> String {
+    path.replace(r"\\?\", "")
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase()
+}
+
+/// The SQL twin of [`checkout_key`] over one column expression: the group
+/// key and both member predicates normalize through it.
+fn checkout_key_sql(column: &str) -> String {
+    format!(r"lower(rtrim(replace(replace({column}, '\\?\', ''), '\', '/'), '/'))")
+}
+
+/// One Agent's organization group ([`organization_group`]), tags and overlay
 /// revision, for its `agent.list` row and its `organization.changed` event
 /// row. The revision is `None` when the Agent has no overlay row; a menu
 /// write carries that back as revision 0.
@@ -203,9 +233,10 @@ pub(super) fn agent_organization(
     let (group, raw_tags, revision): (Option<String>, Option<String>, Option<i64>) = conn
         .query_row(
             &format!(
-                "SELECT {ORGANIZATION_GROUP}, o.tags, o.revision
+                "SELECT {}, o.tags, o.revision
                  FROM agents a LEFT JOIN chat_organization o ON o.agent = a.id
-                 WHERE a.id = ?1"
+                 WHERE a.id = ?1",
+                organization_group()
             ),
             [agent],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -219,46 +250,93 @@ pub(super) fn agent_organization(
 }
 
 /// Project-scoped member predicate shared by the count and the page, equal
-/// to [`ORGANIZATION_GROUP`] `= ?1` in index-seekable form: members of a
-/// retained registration only; chats by their overlay link alone (a
-/// retained execution label never places a chat), every other Agent by its
-/// execution project.
-fn organization_project_members() -> &'static str {
-    "(EXISTS(SELECT 1 FROM project_registrations r WHERE r.id = ?1)
-      AND ((a.chat = 0 AND a.project = ?1) OR (a.chat = 1 AND o.project_link = ?1)))"
+/// to [`organization_group`] `= ?1`: members of a retained registration
+/// only; chats by their overlay link alone (a retained execution label
+/// never places a chat), every other Agent by its execution project, or by
+/// the registration of its exact legacy checkout path when the requested
+/// group's checkout owns that path uniquely. `?2` binds the group's
+/// normalized checkout key (empty without a registration, matching
+/// nothing: labels are nonblank).
+fn organization_project_members() -> String {
+    let path = checkout_key_sql("a.project");
+    format!(
+        "(EXISTS(SELECT 1 FROM project_registrations r WHERE r.id = ?1)
+      AND ((a.chat = 0 AND (a.project = ?1
+           OR (?2 <> '' AND {path} = ?2
+               AND (SELECT COUNT(*) FROM project_registrations r2
+                    WHERE {} = ?2) = 1)))
+        OR (a.chat = 1 AND o.project_link = ?1)))",
+        checkout_key_sql("r2.checkout")
+    )
 }
 
 /// Unplaced-bucket predicate shared by the count and the page, equal to
-/// [`ORGANIZATION_GROUP`] `IS NULL`: chats without a retained link (a chat
+/// [`organization_group`] `IS NULL`: chats without a retained link (a chat
 /// whose linked project was removed included) plus non-chat Agents whose
-/// execution project is not a retained registration.
-fn organization_unplaced_members() -> &'static str {
-    "((a.chat = 1 AND (o.project_link IS NULL
+/// execution project is neither a retained registration nor the exact
+/// checkout path of exactly one registration.
+fn organization_unplaced_members() -> String {
+    let path = checkout_key_sql("a.project");
+    format!(
+        "((a.chat = 1 AND (o.project_link IS NULL
         OR NOT EXISTS(SELECT 1 FROM project_registrations r WHERE r.id = o.project_link)))
-      OR (a.chat = 0 AND NOT EXISTS(SELECT 1 FROM project_registrations r WHERE r.id = a.project)))"
+      OR (a.chat = 0 AND NOT EXISTS(SELECT 1 FROM project_registrations r WHERE r.id = a.project)
+          AND (SELECT COUNT(*) FROM project_registrations r2
+               WHERE {} = {path}) <> 1))",
+        checkout_key_sql("r2.checkout")
+    )
 }
 
 /// Exact member total for one group through the same project-scoped
 /// predicates the page below uses, so a single-project read never
 /// aggregates the fleet.
-fn organization_count(conn: &Connection, project: Option<&str>, archived: &str) -> Result<usize> {
-    let sql = |predicate: &str| {
+fn organization_count(
+    conn: &Connection,
+    project: Option<&str>,
+    read: &GroupRead<'_>,
+) -> Result<usize> {
+    let archived = read.archived;
+    let sql = |predicate: &str, first: usize| {
         format!(
             "SELECT COUNT(*) FROM agents a LEFT JOIN chat_organization o ON o.agent = a.id
-             WHERE {archived} AND {predicate}",
+             WHERE {archived} AND {predicate}{}",
+            read.query_suffix(first)
         )
     };
     let total: i64 = match project {
-        Some(name) => conn
-            .query_row(&sql(organization_project_members()), [name], |row| {
-                row.get(0)
-            })
-            .map_err(sql_error)?,
-        None => conn
-            .query_row(&sql(organization_unplaced_members()), [], |row| row.get(0))
-            .map_err(sql_error)?,
+        Some(name) => {
+            let key = group_checkout_key(conn, name)?;
+            let mut statement = conn
+                .prepare(&sql(&organization_project_members(), 3))
+                .map_err(sql_error)?;
+            let mut params: Vec<rusqlite::types::Value> = vec![name.to_owned().into(), key.into()];
+            params.extend(read.query_params());
+            statement
+                .query_row(rusqlite::params_from_iter(params.iter()), |row| row.get(0))
+                .map_err(sql_error)?
+        }
+        None => {
+            let mut statement = conn
+                .prepare(&sql(&organization_unplaced_members(), 1))
+                .map_err(sql_error)?;
+            statement
+                .query_row(
+                    rusqlite::params_from_iter(read.query_params().iter()),
+                    |row| row.get(0),
+                )
+                .map_err(sql_error)?
+        }
     };
     Ok(total as usize)
+}
+
+/// The normalized checkout key of one group's registration, empty when the
+/// label has no retained registration (the legacy path arm then matches
+/// nothing).
+fn group_checkout_key(conn: &Connection, project: &str) -> Result<String> {
+    Ok(projects::project_registration_tx(conn, project)?
+        .map(|registration| checkout_key(&registration.checkout))
+        .unwrap_or_default())
 }
 
 /// What every group of one projection read shares: the archived
@@ -268,6 +346,30 @@ struct GroupRead<'a> {
     limits: &'a ScopeLimits,
     watermark: i64,
     now: i64,
+    /// The search (`chat.organization` `query`), or `None`.
+    query: Option<&'a str>,
+}
+
+impl GroupRead<'_> {
+    /// The member-search predicate tail after the scope and archived
+    /// predicates, its words bound to the numbered parameters `?first`
+    /// onward ([`Self::query_params`] in order); empty without a query.
+    /// Explicit numbers keep a later `?N` (the page `LIMIT`) from sharing
+    /// a bare placeholder's slot.
+    fn query_suffix(&self, first: usize) -> String {
+        let words = self.query_params().len();
+        if words == 0 {
+            return String::new();
+        }
+        format!(
+            " AND {}",
+            fleet::agent_search_predicate("a", (first..first + words).map(|n| format!("?{n}")))
+        )
+    }
+
+    fn query_params(&self) -> Vec<rusqlite::types::Value> {
+        self.query.map(fleet::search_words).unwrap_or_default()
+    }
 }
 
 /// One group page in response order with its exact per-group totals and
@@ -305,10 +407,11 @@ type OrgMemberRow = (
 fn organization_members(
     conn: &Connection,
     project: Option<&str>,
-    archived: &str,
+    read: &GroupRead<'_>,
     take: usize,
     members: &mut Vec<OrgMemberView>,
 ) -> Result<()> {
+    let archived = read.archived;
     let take = i64::try_from(take)
         .map_err(|_| Error::new("internal", "organization page bound is invalid"))?;
     let project_predicate = organization_project_members();
@@ -321,8 +424,9 @@ fn organization_members(
                         o.project_link, o.tags, o.continued_from
                  FROM agents a LEFT JOIN chat_organization o ON o.agent = a.id
                  WHERE {project_predicate}
-                   AND {archived}
-                 ORDER BY a.id LIMIT ?2",
+                   AND {archived}{}
+                 ORDER BY a.id LIMIT ?3",
+                read.query_suffix(4)
             ))
             .map_err(sql_error)?,
         None => conn
@@ -332,57 +436,45 @@ fn organization_members(
                         o.project_link, o.tags, o.continued_from
                  FROM agents a LEFT JOIN chat_organization o ON o.agent = a.id
                  WHERE {unplaced_predicate}
-                   AND {archived}
+                   AND {archived}{}
                  ORDER BY a.id LIMIT ?1",
+                read.query_suffix(2)
             ))
             .map_err(sql_error)?,
     };
-    let rows: Vec<OrgMemberRow> = match project {
-        Some(name) => statement
-            .query_map(params![name, take], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, Option<i64>>(4)?,
-                    row.get::<_, i64>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, bool>(7)?,
-                    row.get::<_, bool>(8)?,
-                    row.get::<_, bool>(9)?,
-                    row.get::<_, Option<String>>(10)?,
-                    row.get::<_, Option<String>>(11)?,
-                    row.get::<_, Option<String>>(12)?,
-                    row.get::<_, Option<String>>(13)?,
-                ))
-            })
-            .map_err(sql_error)?
-            .collect::<rusqlite::Result<_>>()
-            .map_err(sql_error)?,
-        None => statement
-            .query_map(params![take], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, Option<i64>>(4)?,
-                    row.get::<_, i64>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, bool>(7)?,
-                    row.get::<_, bool>(8)?,
-                    row.get::<_, bool>(9)?,
-                    row.get::<_, Option<String>>(10)?,
-                    row.get::<_, Option<String>>(11)?,
-                    row.get::<_, Option<String>>(12)?,
-                    row.get::<_, Option<String>>(13)?,
-                ))
-            })
-            .map_err(sql_error)?
-            .collect::<rusqlite::Result<_>>()
-            .map_err(sql_error)?,
+    // `?1` name, `?2` checkout key, `?3` page bound, search words from `?4`;
+    // the unplaced bucket binds `?1` page bound, words from `?2`.
+    let mut params: Vec<rusqlite::types::Value> = match project {
+        Some(name) => vec![
+            name.to_owned().into(),
+            group_checkout_key(conn, name)?.into(),
+            take.into(),
+        ],
+        None => vec![take.into()],
     };
+    params.extend(read.query_params());
+    let rows: Vec<OrgMemberRow> = statement
+        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, bool>(7)?,
+                row.get::<_, bool>(8)?,
+                row.get::<_, bool>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, Option<String>>(11)?,
+                row.get::<_, Option<String>>(12)?,
+                row.get::<_, Option<String>>(13)?,
+            ))
+        })
+        .map_err(sql_error)?
+        .collect::<rusqlite::Result<_>>()
+        .map_err(sql_error)?;
     for (
         num,
         generation,
@@ -476,6 +568,7 @@ impl Store {
             limits,
             watermark,
             now,
+            query: request.query.as_deref(),
         };
         if let Some(project) = request.project.as_deref() {
             return self.single_project_organization(
@@ -504,7 +597,7 @@ impl Store {
         if after.is_none_or(|after| after < project) {
             counts.insert(
                 Some(project.to_owned()),
-                organization_count(conn, Some(project), read.archived)?,
+                organization_count(conn, Some(project), read)?,
             );
             order.push(Some(project.to_owned()));
         }
@@ -539,20 +632,23 @@ impl Store {
         // Exact per-group totals without materializing rows: the key
         // expression mirrors the member queries below. Chats group by
         // their overlay link alone; a retained execution label never
-        // places a chat.
+        // places a chat. The search predicate matches the member pages.
         let mut counts: BTreeMap<Option<String>, usize> = BTreeMap::new();
         {
             let mut totals = conn
                 .prepare(&format!(
-                    "SELECT {ORGANIZATION_GROUP}, COUNT(*)
+                    "SELECT {}, COUNT(*)
                      FROM agents a LEFT JOIN chat_organization o ON o.agent = a.id
-                     WHERE {archived} GROUP BY 1",
+                     WHERE {archived}{} GROUP BY 1",
+                    organization_group(),
+                    read.query_suffix(1),
                 ))
                 .map_err(sql_error)?;
             let rows = totals
-                .query_map([], |row| {
-                    Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?))
-                })
+                .query_map(
+                    rusqlite::params_from_iter(read.query_params().iter()),
+                    |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?)),
+                )
                 .map_err(sql_error)?;
             for row in rows {
                 let (key, total) = row.map_err(sql_error)?;
@@ -623,7 +719,7 @@ impl Store {
             budget -= take;
             kept += take;
             let mut members = Vec::with_capacity(take);
-            organization_members(conn, key.as_deref(), page.read.archived, take, &mut members)?;
+            organization_members(conn, key.as_deref(), page.read, take, &mut members)?;
             response.groups.push(self.organization_group(
                 conn,
                 key,

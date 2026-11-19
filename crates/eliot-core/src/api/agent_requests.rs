@@ -148,6 +148,18 @@ pub struct AgentListRequest {
     /// descending, with a stable `(updated_at, id)` cursor).
     #[serde(default)]
     pub order: super::AgentListOrder,
+    /// Word search: every whitespace-separated word is an ASCII
+    /// case-insensitive substring of the Agent's `aN` id, retained name,
+    /// first-input preview, project label, execution directory or harness.
+    /// Nonblank; combined with the other filters by conjunction. Rows,
+    /// `total` and `state_totals` apply it alike, in either order.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "optional_text"
+    )]
+    #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
+    pub query: Option<String>,
 }
 
 impl Default for AgentListRequest {
@@ -165,6 +177,7 @@ impl Default for AgentListRequest {
             parent: None,
             root: None,
             order: super::AgentListOrder::default(),
+            query: None,
         }
     }
 }
@@ -207,6 +220,9 @@ impl AgentListRequest {
         if let Some(root) = &self.root {
             text(root)?;
             crate::parse_agent_id(root)?;
+        }
+        if let Some(query) = &self.query {
+            text(query)?;
         }
         limit(self.limit)
     }

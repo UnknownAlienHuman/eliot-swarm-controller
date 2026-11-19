@@ -132,8 +132,9 @@ struct ToolRow {
     command: Option<String>,
 }
 
-/// Separates a tool row's name, status and duration in its part text (a
-/// command may contain any visible character).
+/// Separates a tool row's name, status, duration and start (ms since the
+/// epoch, while it runs) in its part text (a command may contain any
+/// visible character).
 pub const TOOL_FIELDS: char = '\u{1f}';
 
 #[derive(Clone, Debug)]
@@ -1277,11 +1278,18 @@ impl Conversation {
                                     .to_owned(),
                             );
                         }
+                        // A running row carries its start, so the view
+                        // counts its elapsed seconds without a new revision.
+                        let started = row
+                            .started_ms
+                            .filter(|_| !row.done)
+                            .map(|ms| ms.to_string())
+                            .unwrap_or_default();
                         parts.push(Part::new(
                             format!("tools:{}", row.item_id),
                             PartKind::Tools,
                             label.to_owned(),
-                            [name.as_str(), status, duration.as_str()]
+                            [name.as_str(), status, duration.as_str(), started.as_str()]
                                 .join(&TOOL_FIELDS.to_string()),
                             detail,
                         ));

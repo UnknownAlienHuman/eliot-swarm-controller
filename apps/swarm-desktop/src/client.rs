@@ -580,6 +580,9 @@ pub async fn chat_organization(
             project: None,
             after: after.take(),
             archived,
+            // The headers count from the listed rows (k205), so a search
+            // reads every group as it is.
+            query: None,
         };
         request.validate()?;
         let reply: ChatOrganizationResponse =

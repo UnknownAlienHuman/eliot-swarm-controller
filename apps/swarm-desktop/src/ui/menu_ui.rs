@@ -385,6 +385,10 @@ impl DesktopApp {
                 self.load_agents(context, None);
                 // The group totals follow the archived filter too.
                 self.load_organization(context);
+                // An open search reads its matches again under the filter.
+                if !self.nav.search.query.trim().is_empty() {
+                    self.load_search(context, None);
+                }
             }
             MenuMsg::Done(what, outcome) => {
                 self.settle_mutation(

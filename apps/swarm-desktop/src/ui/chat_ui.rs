@@ -42,6 +42,8 @@ pub(super) enum ChatMsg {
     /// The pointer entered (`true`) or left a transcript part: its copy
     /// action shows while it is hovered.
     PartHovered(String, bool),
+    /// A second passed while a tool row runs: render its elapsed time.
+    ClockTick,
     CopyPart(String),
     CopyCode(String, usize),
     /// Send, Steer or Resume with the draft, bound when it was clicked.
@@ -112,6 +114,8 @@ const WINUI_TEXT_PADDING: f64 = 10.0;
 /// before a send scrolls the transcript to its end: the next render has
 /// realized the newest turn by then (ms).
 const FOLLOW_DELAY_MS: u64 = 60;
+/// A running tool row's elapsed time steps once a second.
+const CLOCK_TICK_MS: u64 = 1_000;
 /// The transcript viewer's automation id, which `crate::scroll_end` finds.
 const TRANSCRIPT_ID: &str = "ConversationTranscript";
 
@@ -341,6 +345,10 @@ pub(super) struct ChatState {
     pub(super) expanded: HashSet<String>,
     /// The transcript part under the pointer (its copy action shows).
     pub(super) hovered: Option<String>,
+    /// A tool row of the open conversation runs ([`DesktopApp::rebuild_items`]).
+    pub(super) tool_running: bool,
+    /// A clock tick is pending ([`DesktopApp::arm_clock`]).
+    pub(super) clock_armed: bool,
     /// A button of the latest turn, rendered outside the virtualized
     /// repeater so it always exists: opening a conversation focuses it, and
     /// WinUI brings a focused control into view (Reactor 0.100.0 exposes no
@@ -709,6 +717,7 @@ impl DesktopApp {
                     self.chat.loss = Some((agent, generation, words));
                 }
             }
+            ChatMsg::ClockTick => self.chat.clock_armed = false,
             ChatMsg::PartHovered(key, true) => self.chat.hovered = Some(key),
             // A late exit of the part just left must not hide the next one.
             ChatMsg::PartHovered(key, false) => {
