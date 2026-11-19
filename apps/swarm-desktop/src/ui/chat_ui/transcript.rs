@@ -34,6 +34,10 @@ impl DesktopApp {
             .unwrap_or_default();
         let rendered = self.chat.render_cache.render(&items, &self.chat.docs);
         self.chat.items = Rc::new(rendered);
+        self.chat.tool_running = items.iter().flat_map(|item| item.parts.iter()).any(|part| {
+            part.kind == crate::chat::PartKind::Tools
+                && part.text.split(crate::chat::TOOL_FIELDS).nth(1) == Some("Running")
+        });
         let live: HashSet<u64> = items
             .iter()
             .flat_map(|item| item.parts.iter())
@@ -44,6 +48,25 @@ impl DesktopApp {
 
     /// The transcript: "Load older" when more history exists, then every
     /// turn in the reading column.
+    /// Re-render once a second while the shown conversation has a running
+    /// tool row, so its elapsed seconds count up; nothing ticks once it
+    /// finishes, another screen shows, or the conversation closes.
+    pub(in crate::ui) fn arm_clock(&mut self, context: &ComponentContext<Self>) {
+        if self.chat.clock_armed
+            || !self.chat.tool_running
+            || self.main != Main::Conversation
+            || self.chat.convo.is_none()
+        {
+            return;
+        }
+        self.chat.clock_armed = true;
+        let _task = context.spawn_background(|cancel| {
+            let cancelled = || cancel.is_cancelled();
+            let _ = crate::feed::backoff(CLOCK_TICK_MS, &cancelled);
+            Message::Chat(ChatMsg::ClockTick)
+        });
+    }
+
     pub(super) fn transcript_view(
         &self,
         column: Option<f64>,
@@ -111,6 +134,7 @@ impl DesktopApp {
             toggle_tools: context.callback(|(key, expanded): (String, bool)| {
                 Message::Chat(ChatMsg::ToolsToggled(key, expanded))
             }),
+            now_ms: crate::handoff::now_ms(),
         };
         // Every resident turn is a plain keyed child (the resident bounds
         // cap them, `chat::MAX_RESIDENT_TURNS`): the anchored ScrollView

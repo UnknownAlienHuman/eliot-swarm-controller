@@ -146,6 +146,14 @@ pub mod layout {
     pub const NUMBER_WIDTH: f64 = 120.0;
     /// The composer's folder field (a new task outside the projects).
     pub const FOLDER_WIDTH: f64 = 280.0;
+    /// A worktree project's name at most in its sidebar row, so the
+    /// subproject beside it keeps the rest of the row.
+    pub const PROJECT_NAME_WIDTH: f64 = 104.0;
+    /// One nesting step of a Markdown list in an answer.
+    pub const LIST_INDENT: f64 = 20.0;
+    /// A Markdown list's marker column ("•", "12."): the item's text starts
+    /// after it and wraps under itself.
+    pub const LIST_MARKER_WIDTH: f64 = 22.0;
     /// A nested row's indent (a task under its project, a worker under its
     /// manager): its label starts under its parent's label.
     pub const TREE_INDENT: f64 = 28.0;

@@ -4004,6 +4004,7 @@ impl Router {
             harness: request.harness.clone(),
             parent: request.parent.clone(),
             root: request.root.clone(),
+            query: request.query.clone(),
         };
         let limit = request.limit;
         let observations = request.observations;

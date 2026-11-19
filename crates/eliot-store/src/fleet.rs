@@ -504,6 +504,11 @@ pub struct AgentListFilter {
     pub harness: Option<String>,
     pub parent: Option<String>,
     pub root: Option<String>,
+    /// Word search ([`agent_search_predicate`]) over the id, retained
+    /// name, first-input preview, project label, workspace and harness.
+    /// Rows, counts and state totals of both orders apply it alike; it
+    /// never rides an index.
+    pub query: Option<String>,
 }
 
 impl AgentListFilter {
@@ -536,8 +541,64 @@ impl AgentListFilter {
             require_filter_text(root)?;
             parse_agent_id(root)?;
         }
+        if let Some(query) = &self.query {
+            require_filter_text(query)?;
+        }
         Ok(())
     }
+}
+
+/// The `query` predicate over one Agent row (`alias` names the `agents`
+/// table), shared by `agent.list` and the organization projection so both
+/// surfaces match the same fields: the `aN` id, the retained name, the
+/// first-input preview (the oldest retained `send` text, capped at
+/// `core::api::AGENT_PREVIEW_CHARS` characters, a launch's linked first
+/// input included), the project label, the execution directory and the
+/// harness. Every whitespace-separated word must be contained, ASCII
+/// case-insensitively (`instr`, so `%` and `_` stay literal). `params`
+/// yields one placeholder per word (`?` or a numbered `?N`); the words are
+/// bound, never interpolated.
+pub(super) fn agent_search_predicate(
+    alias: &str,
+    params: impl IntoIterator<Item = String>,
+) -> String {
+    let haystack = format!(
+        "lower('a' || {alias}.id || ' ' || COALESCE({alias}.name, '') || ' ' || COALESCE(( \
+         SELECT substr(json_extract(c.args, '$.text'), 1, {preview}) FROM commands c \
+         WHERE c.target = {alias}.id AND c.verb = 'send' \
+         AND json_type(c.args, '$.text') = 'text' \
+         ORDER BY c.created_at, c.rowid LIMIT 1), '') || ' ' || {alias}.project || ' ' \
+         || COALESCE({alias}.workspace, '') || ' ' || {alias}.harness)",
+        preview = core::api::AGENT_PREVIEW_CHARS,
+    );
+    params
+        .into_iter()
+        .map(|param| format!("instr({haystack}, lower({param})) > 0"))
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
+/// The words of one search `query`, each bound to one placeholder of
+/// [`agent_search_predicate`].
+pub(super) fn search_words(query: &str) -> Vec<rusqlite::types::Value> {
+    query
+        .split_whitespace()
+        .map(|word| rusqlite::types::Value::from(word.to_owned()))
+        .collect()
+}
+
+/// Push the `query` predicate with bare placeholders and its bound words.
+fn push_search(
+    predicates: &mut Vec<String>,
+    params: &mut Vec<rusqlite::types::Value>,
+    query: &str,
+) {
+    let words = search_words(query);
+    predicates.push(agent_search_predicate(
+        "agents",
+        words.iter().map(|_| "?".to_owned()),
+    ));
+    params.extend(words);
 }
 
 /// One filtered, scope-checked fleet page: ordered summaries, the matching
@@ -644,6 +705,9 @@ fn agent_list_select_recent(
         predicates.push("agents.harness = ?".to_owned());
         params.push(rusqlite::types::Value::from(harness.clone()));
     }
+    if let Some(query) = &filter.query {
+        push_search(&mut predicates, &mut params, query);
+    }
     match filter.archived {
         core::api::ArchivedFilter::Exclude => {
             let held: &[i64] = custody.unwrap_or(&[]);
@@ -719,6 +783,7 @@ fn agent_list_select_recent(
         || filter.state.is_some()
         || filter.harness.is_some()
         || filter.states.is_some()
+        || filter.query.is_some()
         || caller.is_some();
     let table = if !count && !selective {
         "agents INDEXED BY agents_recent"
@@ -847,6 +912,9 @@ fn agent_list_select(
             rusqlite::types::Value::from(harness.clone()),
         );
         note_index("agents_list_harness", false);
+    }
+    if let Some(query) = &filter.query {
+        push_search(&mut predicates, &mut params, query);
     }
     // Archive never hides custody the owner must still resolve: an ended
     // Agent that lost control after it was archived stays listed while its

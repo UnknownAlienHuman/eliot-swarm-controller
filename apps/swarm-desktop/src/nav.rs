@@ -412,7 +412,7 @@ fn checkout_of<'a>(label: &str, checkouts: &'a [Checkout]) -> Option<&'a Checkou
 
 /// The no-project bucket's sidebar key ([`group_key`] of no group).
 pub const OTHER_LOCATIONS: &str = "other-locations";
-const NO_PROJECT_NAME: &str = "No project";
+pub const NO_PROJECT_NAME: &str = "No project";
 
 /// Resolve the Agent's repository and, independently, its verified workspace.
 fn agent_checkout<'a>(
@@ -562,9 +562,13 @@ pub struct Section {
     pub key: String,
     /// The group's project; `None` for the no-project bucket.
     pub project: Option<String>,
-    /// The registered checkout's place name ([`place_label`]), else the
-    /// project label; "No project" for the bucket.
+    /// The registered checkout's project name ([`place_of`]), else the
+    /// project label's; "No project" for the bucket.
     pub name: String,
+    /// A linked worktree's subproject name ([`place_of`]): the header
+    /// shows it beside the name, so sibling worktrees of one repository
+    /// never trim to the same text.
+    pub subproject: Option<String>,
     /// Where a new task in it starts: the registered checkout.
     pub checkout: String,
     pub checkouts: Vec<String>,
@@ -604,8 +608,6 @@ pub struct Shown<'a> {
     /// flat in their projects: no tree, no folding, no collapsing, and no
     /// project without a match.
     pub only: Option<&'a dyn Fn(&UiAgent) -> bool>,
-    /// The open Agent: it renders explicitly above the list, so sections
-    /// skip its rows (no duplicate, no folding, no "Show N older" count).
     /// The open Agent: it stays in view inside its own project (never
     /// folded under Show older, never hoisted out).
     pub open: Option<&'a str>,
@@ -620,13 +622,15 @@ struct Group<'a> {
 
 /// The sidebar's order of tasks: running first, then live, then ended
 /// (stopping a task is a change too, but not activity), each newest first;
-/// ties in id order (`a9` < `a10`).
+/// ties newest id first (`a10` before `a9`), the server's `recent` order,
+/// so a reconciliation that stamps one `updated_at` on many Agents still
+/// lists the newest first.
 fn task_order(a: &UiAgent, b: &UiAgent) -> std::cmp::Ordering {
     b.running()
         .cmp(&a.running())
         .then(a.ended().cmp(&b.ended()))
         .then(b.updated_at.cmp(&a.updated_at))
-        .then_with(|| (a.id.len(), &a.id).cmp(&(b.id.len(), &b.id)))
+        .then_with(|| (b.id.len(), &b.id).cmp(&(a.id.len(), &a.id)))
 }
 
 /// The tasks among `top` that fold under "Show N older": ended before
@@ -647,35 +651,53 @@ fn folding<'a>(top: &[&'a UiAgent], today_start: i64, keep_newest: bool) -> Hash
     folding
 }
 
-/// A group's name, start checkout and missing flag: the registered
-/// checkout's place name ([`place_label`]), else the label's.
+/// A group's place, start checkout and missing flag.
+struct GroupPlace {
+    name: String,
+    subproject: Option<String>,
+    checkout: String,
+    missing: bool,
+}
+
+/// A group's place: the registered checkout's project and subproject names
+/// ([`place_of`]), else the label's.
 fn group_place(
     project: Option<&str>,
     group: Option<&OrgGroupView>,
     checkouts: &[Checkout],
-) -> (String, String, bool) {
+) -> GroupPlace {
     let Some(project) = project else {
-        return (NO_PROJECT_NAME.to_owned(), String::new(), false);
+        return GroupPlace {
+            name: NO_PROJECT_NAME.to_owned(),
+            subproject: None,
+            checkout: String::new(),
+            missing: false,
+        };
     };
     match group.and_then(|group| group.registration.as_ref()) {
         Some(registration) => {
             let path = path_key(&registration.checkout);
-            let missing = checkouts
-                .iter()
-                .any(|checkout| checkout.missing && path_key(&checkout.path) == path);
-            (
-                place_label(&registration.checkout, checkouts),
-                registration.checkout.clone(),
-                missing,
-            )
+            let (name, subproject) = place_of(&registration.checkout, checkouts);
+            GroupPlace {
+                name,
+                subproject,
+                checkout: registration.checkout.clone(),
+                missing: checkouts
+                    .iter()
+                    .any(|checkout| checkout.missing && path_key(&checkout.path) == path),
+            }
         }
-        None => (
-            place_label(project, checkouts),
-            checkout_of(project, checkouts)
-                .map(|checkout| checkout.path.clone())
-                .unwrap_or_default(),
-            false,
-        ),
+        None => {
+            let (name, subproject) = place_of(project, checkouts);
+            GroupPlace {
+                name,
+                subproject,
+                checkout: checkout_of(project, checkouts)
+                    .map(|checkout| checkout.path.clone())
+                    .unwrap_or_default(),
+                missing: false,
+            }
+        }
     }
 }
 
@@ -798,11 +820,17 @@ pub fn sections(
         .filter_map(|group| group.project.as_deref())
         .collect();
     let section = |project: Option<&str>, group: Option<&OrgGroupView>| {
-        let (name, checkout, missing) = group_place(project, group, checkouts);
+        let GroupPlace {
+            name,
+            subproject,
+            checkout,
+            missing,
+        } = group_place(project, group, checkouts);
         Section {
             key: group_key(project),
             project: project.map(str::to_owned),
             name,
+            subproject,
             checkouts: if checkout.is_empty() {
                 Vec::new()
             } else {
@@ -949,14 +977,18 @@ pub fn sections(
         }
         group.top.sort_by(|a, b| task_order(a, b));
         let unfolded = shown.unfolded.contains(&group.section.key);
-        let folds = if filtered {
+        let mut folds = if filtered {
             HashSet::new()
         } else {
             folding(&group.top, shown.today_start, true)
         };
+        // The open task stays in view, so it is neither folded nor counted
+        // in "Show N older".
+        if let Some(open) = shown.open {
+            folds.remove(open);
+        }
         for agent in &group.top {
-            let open = shown.open == Some(agent.id.as_str());
-            if folds.contains(agent.id.as_str()) && !unfolded && !open {
+            if folds.contains(agent.id.as_str()) && !unfolded {
                 continue;
             }
             push(
@@ -1093,10 +1125,13 @@ pub fn registration_use(
     usage
 }
 
-/// Whether `agent` matches a search: every word of `query` appears,
-/// ignoring case, in its title, its project name or its harness.
+/// Whether `agent` matches a search locally: every word of `query`
+/// appears, ignoring case, in its id, title, project name or harness (the
+/// server's `agent.list` `query` also reads the first input, the project
+/// label and the folder).
 pub fn matches(agent: &UiAgent, project: &str, query: &str) -> bool {
-    let haystack = format!("{} {project} {}", agent.title, agent.harness).to_lowercase();
+    let haystack =
+        format!("{} {} {project} {}", agent.id, agent.title, agent.harness).to_lowercase();
     query
         .split_whitespace()
         .all(|word| haystack.contains(&word.to_lowercase()))
@@ -1105,19 +1140,15 @@ pub fn matches(agent: &UiAgent, project: &str, query: &str) -> bool {
 /// Most suggestions a search offers.
 pub const SEARCH_RESULTS: usize = 12;
 
-/// The tasks matching a search, running first then newest, as
-/// `(label, id)`: the label is the title, project and harness (unique: a
-/// repeated label also names its id). Empty for a blank query.
-pub fn search(listed: &[UiAgent], checkouts: &[Checkout], query: &str) -> Vec<(String, String)> {
-    if query.trim().is_empty() {
-        return Vec::new();
-    }
+/// A search's suggestions among the tasks it found, running first then
+/// newest, as `(label, id)`: the label is the title, project and harness
+/// (unique: a repeated label also names its id).
+pub fn search(found: &[UiAgent], checkouts: &[Checkout]) -> Vec<(String, String)> {
     let mut seen = HashSet::new();
-    let mut found: Vec<(&UiAgent, String)> = listed
+    let mut found: Vec<(&UiAgent, String)> = found
         .iter()
         .filter(|agent| seen.insert(agent.id.as_str()))
         .map(|agent| (agent, agent_place_label(agent, checkouts)))
-        .filter(|(agent, project)| matches(agent, project, query))
         .collect();
     found.sort_by(|(a, _), (b, _)| {
         b.running()

@@ -374,6 +374,12 @@ pub struct ChatOrganizationRequest {
     /// Archived rows stay hidden unless included or selected alone.
     #[serde(default)]
     pub archived: ArchivedFilter,
+    /// The `agent.list` `query` word search over each member. Nonblank. Member pages and every
+    /// group's `member_total` apply it, so header counts follow the search;
+    /// registered groups still read back their headers, with zero totals
+    /// when nothing matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
 }
 
 impl ChatOrganizationRequest {
@@ -383,6 +389,11 @@ impl ChatOrganizationRequest {
         }
         if let Some(after) = &self.after {
             validate_project_name(after, "params.after")?;
+        }
+        if let Some(query) = &self.query
+            && query.trim().is_empty()
+        {
+            return Err(Error::new("invalid", "organization query must be nonblank"));
         }
         Ok(())
     }

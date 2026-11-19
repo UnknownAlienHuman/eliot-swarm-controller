@@ -27,6 +27,7 @@ pub(super) async fn run_chat(
                 } else {
                     ArchivedFilter::Exclude
                 },
+                query: None,
             };
             request.validate().map_err(Failure::for_read)?;
             let response: ChatOrganizationResponse =

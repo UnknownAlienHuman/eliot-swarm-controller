@@ -69,6 +69,9 @@ pub(super) enum ShellMsg {
     /// The live and attention rows, fetched independently of the history
     /// page: merge them into the loaded Agents.
     AttentionLoaded(u64, Fallible<AgentPage>),
+    /// A sidebar-search page (`agent.list` with `query`): its read epoch,
+    /// the query it answers, whether it appends, and the page.
+    SearchLoaded(u64, String, bool, Fallible<AgentPage>),
     /// A sidebar row: open this Agent's conversation.
     AgentOpened(UiAgent),
     /// A project's new-task button: a new task in this checkout.
@@ -104,6 +107,8 @@ pub(super) enum ShellMsg {
     Back,
     Forward,
     MoreAgentsRequested,
+    /// The search's Show more row: the next page of the server's matches.
+    MoreSearchRequested,
     SettingsOpened,
     /// Open Settings at one page (the sidebar's Automations and Usage).
     SettingsPage(settings_ui::Page),
@@ -240,6 +245,9 @@ pub(super) struct ShellState {
     pub(super) show_archived: bool,
     pub(super) search: Search,
     pub(super) search_ref: ElementRef<AutoSuggestBox>,
+    /// The search's server rows: every matching Agent, beyond the loaded
+    /// pages.
+    pub(super) found: Found,
     /// Ctrl+N and Ctrl+K from the window's keyboard hook.
     pub(super) shortcuts: Option<Arc<Mutex<Receiver<Shortcut>>>>,
     /// The sidebar is hidden to its rail (this session).
@@ -265,6 +273,25 @@ pub(super) struct Search {
     pub(super) highlighted: Option<(String, String, u64)>,
     /// The Search row opened into its field (the row, Ctrl+K).
     pub(super) open: bool,
+}
+
+/// The server side of the sidebar search: the rows `agent.list` returned
+/// for `query` (its word search over the id, title, first input, project
+/// and folder of every Agent), the cursor and the matching total. The
+/// loaded history pages stay as they are underneath, so closing the search
+/// or toggling Show archived never drops them.
+#[derive(Clone, Debug, Default)]
+pub(super) struct Found {
+    /// The trimmed query these rows answer.
+    pub(super) query: String,
+    pub(super) rows: Vec<UiAgent>,
+    pub(super) next: Option<String>,
+    pub(super) total: usize,
+    /// A search read is in flight.
+    pub(super) loading: bool,
+    /// Tags search reads: a reply to an older read or a closed search is
+    /// dropped. Never reset, so a late reply cannot match a new read.
+    pub(super) epoch: u64,
 }
 
 impl DesktopApp {
@@ -505,8 +532,51 @@ impl DesktopApp {
                     }
                 }
             }
+            ShellMsg::SearchLoaded(epoch, query, append, page) => {
+                if epoch != self.nav.found.epoch {
+                    return;
+                }
+                self.nav.found.loading = false;
+                match page {
+                    Ok(page) => {
+                        let found = &mut self.nav.found;
+                        if found.query != query {
+                            found.rows = page.rows;
+                            found.next = page.next;
+                        } else if append {
+                            let seen: HashSet<&str> =
+                                found.rows.iter().map(|agent| agent.id.as_str()).collect();
+                            let rows: Vec<UiAgent> = page
+                                .rows
+                                .into_iter()
+                                .filter(|agent| !seen.contains(agent.id.as_str()))
+                                .collect();
+                            found.rows.extend(rows);
+                            found.next = page.next;
+                        } else {
+                            // A poll's first page refreshes the matches in
+                            // place and keeps the pages Show more added.
+                            merge_head_rows(&mut found.rows, page.rows);
+                            if found.rows.len() <= AGENT_PAGE {
+                                found.next = page.next;
+                            }
+                        }
+                        found.query = query;
+                        found.total = page.total;
+                        self.refresh_search();
+                    }
+                    Err(error) => self.alert(format!("Search not read: {error}")),
+                }
+            }
             ShellMsg::SidebarToggled => self.nav.sidebar_collapsed = !self.nav.sidebar_collapsed,
             ShellMsg::AgentOpened(agent) => {
+                // A match beyond the loaded pages joins them, so it stays in
+                // its project once the search closes.
+                if !self.nav.agents.iter().any(|listed| listed.id == agent.id)
+                    && self.nav.found.rows.iter().any(|found| found.id == agent.id)
+                {
+                    self.nav.agents.push(agent.clone());
+                }
                 self.close_popover();
                 self.chat.opened_from_search = false;
                 if self.main != Main::Conversation {
@@ -595,6 +665,11 @@ impl DesktopApp {
             ShellMsg::MoreAgentsRequested => {
                 if let Some(after) = self.nav.agents_next.clone() {
                     self.load_agents(context, Some(after));
+                }
+            }
+            ShellMsg::MoreSearchRequested => {
+                if let Some(after) = self.nav.found.next.clone() {
+                    self.load_search(context, Some(after));
                 }
             }
             ShellMsg::SettingsOpened => self.open_settings(None, context),
@@ -704,6 +779,7 @@ impl DesktopApp {
                     self.focus_search(SEARCH_FOCUS_TRIES, context);
                 } else {
                     self.nav.search = Search::default();
+                    self.clear_found();
                     self.refresh_search();
                 }
             }
@@ -719,6 +795,13 @@ impl DesktopApp {
                     .any(|(label, _)| *label == text)
                 {
                     self.nav.search.query = text;
+                    // The server searches every Agent, not just the loaded
+                    // pages; the loaded matches show until it answers.
+                    if self.nav.search.query.trim().is_empty() {
+                        self.clear_found();
+                    } else {
+                        self.load_search(context, None);
+                    }
                     self.refresh_search();
                 }
             }
@@ -816,6 +899,14 @@ impl DesktopApp {
                 // arbiter's admission or refusal.
                 if self.preferences_loaded && !self.nav.agents_loading {
                     self.refresh_head(context);
+                }
+                // An open search re-reads its first page too, so a match
+                // changing state while it is shown is not stale.
+                if self.preferences_loaded
+                    && !self.nav.found.loading
+                    && !self.nav.search.query.trim().is_empty()
+                {
+                    self.load_search(context, None);
                 }
                 if self.preferences_loaded {
                     self.load_organization(context);
@@ -1053,6 +1144,10 @@ impl DesktopApp {
 
     /// [`Self::place_title`] over checkouts already built.
     pub(super) fn place_title_in(&self, label: &str, checkouts: &[Checkout]) -> String {
+        // A chat outside every project names that, never a blank folder.
+        if label.trim().is_empty() {
+            return nav::NO_PROJECT_NAME.to_owned();
+        }
         let (_, subproject) = nav::place_of(label, checkouts);
         let project = self.project_title_in(label, checkouts);
         match subproject {
@@ -1120,7 +1215,7 @@ impl DesktopApp {
             .any(|checkout| !checkout.missing && nav::path_key(&checkout.path) == key)
     }
 
-    /// The listed or fetched Agent with this id.
+    /// The listed, fetched or found Agent with this id.
     pub(super) fn find_agent(&self, id: &str) -> Option<&UiAgent> {
         let branch_children = self.nav.branches.values().flat_map(|branch| match branch {
             Branch::Loaded { children, .. } => children.as_slice(),
@@ -1130,6 +1225,7 @@ impl DesktopApp {
             .agents
             .iter()
             .chain(branch_children)
+            .chain(&self.nav.found.rows)
             .find(|agent| agent.id == id)
     }
 
@@ -1150,10 +1246,78 @@ impl DesktopApp {
             .map_or_else(|| agent.to_owned(), |row| row.title.clone())
     }
 
-    /// Recompute the search suggestions from the listed Agents.
+    /// Recompute the search suggestions from what the search found.
     fn refresh_search(&mut self) {
-        self.nav.search.results =
-            nav::search(&self.nav.agents, &self.checkouts(), &self.nav.search.query);
+        let checkouts = self.checkouts();
+        let found = self.search_found(&checkouts);
+        self.nav.search.results = nav::search(&found, &checkouts);
+    }
+
+    /// What the search shows: the server's matches for the typed query
+    /// (every Agent, beyond the loaded pages) and the loaded rows matching
+    /// it locally, which show at once while the server reads; the server's
+    /// row first, one per id. Server rows answering an older query stay
+    /// only where they match locally. Empty without a query.
+    pub(super) fn search_found(&self, checkouts: &[Checkout]) -> Vec<UiAgent> {
+        let query = self.nav.search.query.trim();
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let answered = self.nav.found.query == query;
+        let local =
+            |agent: &UiAgent| nav::matches(agent, &nav::agent_place_label(agent, checkouts), query);
+        let mut seen = HashSet::new();
+        self.nav
+            .found
+            .rows
+            .iter()
+            .filter(|agent| answered || local(agent))
+            .chain(self.nav.agents.iter().filter(|agent| local(agent)))
+            .filter(|agent| seen.insert(agent.id.as_str()))
+            .cloned()
+            .collect()
+    }
+
+    /// Forget the server's search rows; a read still in flight is dropped.
+    fn clear_found(&mut self) {
+        self.nav.found = Found {
+            epoch: self.nav.found.epoch + 1,
+            ..Found::default()
+        };
+    }
+
+    /// One page of the server's sidebar search (`agent.list` with `query`,
+    /// newest first, the archived filter as the list shows it): a first
+    /// page refreshes the matches, `after` appends the next. The loaded
+    /// history is never touched.
+    pub(super) fn load_search(&mut self, context: &ComponentContext<Self>, after: Option<String>) {
+        let query = self.nav.search.query.trim().to_owned();
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        if query.is_empty() {
+            return;
+        }
+        let append = after.is_some();
+        self.nav.found.epoch += 1;
+        self.nav.found.loading = true;
+        let epoch = self.nav.found.epoch;
+        let archived = self.nav.show_archived.then_some("include");
+        let request = AgentListRequest {
+            after,
+            limit: AGENT_PAGE,
+            order: AgentListOrder::Recent,
+            query: Some(query.clone()),
+            ..Default::default()
+        };
+        let _task = context.spawn_background(move |_| {
+            Message::Shell(ShellMsg::SearchLoaded(
+                epoch,
+                query,
+                append,
+                load_agents_blocking(&data_dir, &request, archived),
+            ))
+        });
     }
 
     /// Put the keyboard in the search box; from Settings, close them first.
@@ -1748,11 +1912,13 @@ impl DesktopApp {
         let fleet = Fleet::of(&self.nav.agents);
         let query = self.nav.search.query.trim().to_owned();
         let checkouts = self.checkouts();
-        let keep = |agent: &UiAgent| {
-            query.is_empty()
-                || nav::matches(agent, &nav::agent_place_label(agent, &checkouts), &query)
-        };
         let filtered = !query.is_empty();
+        // A search lists what it found (the server's matches across every
+        // Agent, plus the loaded rows matching while it reads), flat in
+        // their projects.
+        let found = self.search_found(&checkouts);
+        let listed: &[UiAgent] = if filtered { &found } else { &self.nav.agents };
+        let keep = |_: &UiAgent| true;
         let open = self.selected_agent_id();
         let shown = Shown {
             branches: &self.nav.branches,
@@ -1763,7 +1929,7 @@ impl DesktopApp {
             only: filtered.then_some(&keep as &dyn Fn(&UiAgent) -> bool),
             open: open.as_deref(),
         };
-        let sections = nav::sections(&self.nav.agents, &self.nav.organization, &checkouts, &shown);
+        let sections = nav::sections(listed, &self.nav.organization, &checkouts, &shown);
 
         let caption = if filtered {
             "Matching tasks"
@@ -1815,7 +1981,7 @@ impl DesktopApp {
             ));
         }
         if sections.is_empty() {
-            let empty = if self.nav.agents_loading {
+            let empty = if self.nav.agents_loading || (filtered && self.nav.found.loading) {
                 "Loading…"
             } else if filtered {
                 "No matching tasks. Clear the search to see all."
@@ -1831,9 +1997,17 @@ impl DesktopApp {
                 .prefs
                 .display_name(&format!("project:{}", section.key))
                 .map_or_else(|| section.name.clone(), str::to_owned);
+            // A renamed worktree shows the owner's name for it.
+            let subproject = section.subproject.as_deref().map(|subproject| {
+                nav::subproject_key(&section.checkout, &checkouts)
+                    .and_then(|key| self.prefs.display_name(&format!("project:{key}")))
+                    .unwrap_or(subproject)
+                    .to_owned()
+            });
             let place = Place {
                 key: &section.key,
                 name: &name,
+                subproject: subproject.as_deref(),
                 checkout: &section.checkout,
                 checkouts: &section.checkouts,
                 collapsed: section.collapsed,
@@ -1889,22 +2063,34 @@ impl DesktopApp {
                 ));
             }
         }
-        if !filtered
-            && self.nav.agents.len() < self.nav.agents_total
-            && self.nav.agents_next.is_some()
-        {
+        // Show more pages the list shown: the server's matches while
+        // searching, the recent history otherwise.
+        let (loaded, total, more, loading, message) = if filtered {
+            (
+                self.nav.found.rows.len(),
+                self.nav.found.total,
+                self.nav.found.query == query && self.nav.found.next.is_some(),
+                self.nav.found.loading,
+                ShellMsg::MoreSearchRequested,
+            )
+        } else {
+            (
+                self.nav.agents.len(),
+                self.nav.agents_total,
+                self.nav.agents_next.is_some(),
+                self.nav.agents_loading,
+                ShellMsg::MoreAgentsRequested,
+            )
+        };
+        if more && loaded < total {
             items.push(KeyedView::new(
-                "more",
+                format!("more:{filtered}"),
                 m3::sub_row(palette, false)
-                    .is_enabled(!self.nav.agents_loading)
-                    .on_click(context.message(Message::Shell(ShellMsg::MoreAgentsRequested)))
+                    .is_enabled(!loading)
+                    .on_click(context.message(Message::Shell(message)))
                     .content(m3::task_content(
                         1,
-                        &format!(
-                            "Show more ({} of {})",
-                            self.nav.agents.len(),
-                            self.nav.agents_total
-                        ),
+                        &format!("Show more ({loaded} of {total})"),
                         true,
                         View::empty(),
                     )),
@@ -2012,10 +2198,11 @@ impl DesktopApp {
         };
         KeyedView::new(
             format!(
-                "project:{}:{}:{}:{}:{}:{}",
+                "project:{}:{}:{}:{}:{}:{}:{}",
                 place.key,
                 place.collapsed,
                 place.name,
+                place.subproject.unwrap_or_default(),
                 place.running,
                 place.missing,
                 self.menu.renaming.is_some()
@@ -2037,6 +2224,11 @@ impl DesktopApp {
         palette: Palette,
     ) -> View {
         let name = place.name;
+        // The full place, for the tooltip and the accessible name.
+        let full = match place.subproject {
+            Some(subproject) => format!("{name} › {subproject}"),
+            None => name.to_owned(),
+        };
         let count: View = if place.missing {
             m3::secondary("missing")
                 .foreground(palette.attention())
@@ -2048,7 +2240,7 @@ impl DesktopApp {
         };
         let kind = "project";
         let mut label = format!(
-            "{name}, {kind}, {}",
+            "{full}, {kind}, {}",
             if place.collapsed {
                 "collapsed"
             } else {
@@ -2080,8 +2272,8 @@ impl DesktopApp {
             } else {
                 toggle.clone()
             }))
-            .content(m3::project_content(name, count))
-            .tooltip(name.to_owned());
+            .content(m3::project_content(name, place.subproject, count))
+            .tooltip(full);
         // On hover: fold, then one '…' at the rows' fixed place; a missing
         // folder offers its one-click removal instead.
         let hover_key = format!("project:{}", place.key);
@@ -2509,6 +2701,8 @@ struct Place<'a> {
     /// `org:<project>`, or the no-project bucket's key.
     key: &'a str,
     name: &'a str,
+    /// A linked worktree's subproject, beside the name.
+    subproject: Option<&'a str>,
     /// Where a new task in it starts.
     checkout: &'a str,
     checkouts: &'a [String],

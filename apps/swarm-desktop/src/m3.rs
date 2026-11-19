@@ -449,8 +449,28 @@ pub fn nav_content(glyph: &str, label: &str, hint: &str) -> View {
 }
 
 /// A project row's content: the folder, the name at 14/500 and a trailing
-/// view (its count).
-pub fn project_content(name: &str, trailing: View) -> View {
+/// view (its count). A linked worktree's subproject follows the name in
+/// the muted caption ("eliot-swarm… › a786 sidebar fixes"): the name trims
+/// first, at most [`layout::PROJECT_NAME_WIDTH`], so sibling worktrees of
+/// one repository never trim to the same text.
+pub fn project_content(name: &str, subproject: Option<&str>, trailing: View) -> View {
+    let title = text(name.to_owned(), style::BUTTON)
+        .vertical_alignment(VerticalAlignment::Center)
+        .text_trimming(TextTrimming::CharacterEllipsis);
+    let label: View = match subproject {
+        Some(subproject) => Grid::new()
+            .grid_column(1)
+            .columns([GridLength::Auto, GridLength::STAR])
+            .column_spacing(spacing::XS)
+            .children((
+                title.max_width(layout::PROJECT_NAME_WIDTH),
+                secondary(format!("› {subproject}"))
+                    .grid_column(1)
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .text_trimming(TextTrimming::CharacterEllipsis),
+            )),
+        None => title.grid_column(1).into(),
+    };
     Grid::new()
         .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
         .column_spacing(spacing::ROW)
@@ -458,10 +478,7 @@ pub fn project_content(name: &str, trailing: View) -> View {
             Border::new()
                 .vertical_alignment(VerticalAlignment::Center)
                 .content(icon(glyph::FOLDER)),
-            text(name.to_owned(), style::BUTTON)
-                .grid_column(1)
-                .vertical_alignment(VerticalAlignment::Center)
-                .text_trimming(TextTrimming::CharacterEllipsis),
+            label,
             Border::new()
                 .grid_column(2)
                 .vertical_alignment(VerticalAlignment::Center)

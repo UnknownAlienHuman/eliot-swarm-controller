@@ -289,6 +289,11 @@ adds the switch's `continued_from` pointer).
   event-watermark readback. Clients never repeat Git discovery or grouping.
   Chats group by their overlay link alone; a legacy chat that still carries
   an execution project reads in the no-project bucket until attached.
+  A non-chat Agent groups by its execution project when that is a retained
+  registration, else by the registration of its exact retained checkout
+  path (normalized separators, verbatim prefix and case); the retained
+  label is never rewritten, and a path two registrations share stays in
+  the no-project bucket.
 - `chat.attach` moves chats under a retained project; `chat.detach` returns
   them to the no-project bucket. `chat.tag` replaces tag groups. Every write
   advances each written link's revision; a write carrying the revision it

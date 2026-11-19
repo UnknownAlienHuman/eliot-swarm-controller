@@ -549,7 +549,14 @@ takes the previous page's `next_after`, and a truncated page sets
 `groups_truncated` with the cursor for the next page. Member pages and totals
 apply the default `agent.list` archived visibility and the same group key as
 its `organization` field, so a listed row is counted in the group it reads
-in. A registered group carries its header in the same read: the manager (with
+in. Optional `query` applies the `agent.list` search haystack to member
+pages and every group's `member_total` alike, so header counts follow the
+search; registered groups still read back their headers with zero totals
+when nothing matches. A legacy Agent whose retained project label is a
+checkout path groups under the registration of that exact path (verbatim
+prefix, separators, trailing separator and case normalized), without
+rewriting the label; a path two registrations share stays unplaced.
+A registered group carries its header in the same read: the manager (with
 its managed worktree `branch`), the assignment, `needs_assignment`, and its
 exact team `totals` and project slot use (`capacity`), the numbers
 `project.overview` reports for it, so the desktop sidebar reads every header
@@ -871,7 +878,15 @@ the retained execution directory in `workspace`; full records stay available thr
 `agent.get`. Optional `state`,
 `project`, `project_scope`, `harness`, `parent` and `root` filters are exact
 indexed matches: wrong types and unknown state names are `invalid`, and a
-filter never matches silently. `project_scope` matches the effective
+filter never matches silently. Optional `query` is a word search: every
+whitespace-separated word must be an ASCII case-insensitive substring of the
+`aN` id, the retained `name`, the first-input `preview`, the project label,
+the `workspace` path or the harness (`agent_search_predicate` in
+[`fleet.rs`](../../crates/eliot-store/src/fleet.rs)); rows, `total` and
+`state_totals` apply it alike, combined with the other filters by
+conjunction, in either order with the same cursors. It rides no index: a
+searched page scans the fleet once under the Store lock.
+`project_scope` matches the effective
 authorization scope (`COALESCE(project_scope, project)`), the namespace
 `swarm.reparent` and `swarm.handoff` compare, so one read reaches legacy rows
 (matched through their project label) and registered rows with the same scope;
@@ -895,9 +910,20 @@ the live and attention rows (`busy`, `starting`, `waiting`, plus the needs-atten
 states `waiting`, `failed`, `lost`, `unknown`) arrive on their own state-filtered page,
 and the first recent page is re-read and merged into the loaded history even after
 `Show more`. Older pages append, deduplicated by id, so a launch while the desktop is
-open appears without a manual refresh. The open Agent renders explicitly above the list,
-outside folding and page counts; within each project the design order still applies,
-and children render in child-ID order whatever the fetch order.
+open appears without a manual refresh. The open Agent stays in place in its project
+section, never folded under (nor counted in) `Show N older`; one opened from a search
+beyond the loaded pages joins them, and the open row is kept when it ages out of the
+newest page. Within each project the design order applies, ties on `updated_at`
+break newest ID first as the server orders them, and children render in child-ID
+order whatever the fetch order. The sidebar search sends `query` to `agent.list`
+(newest first, the list's archived filter) and lists the server's matches flat in
+their projects, with the loaded rows that match locally shown while the read is in
+flight; `Show more` pages the matches, and an open search re-reads its first page on
+every poll. The unfiltered history keeps its loaded pages underneath, so closing the
+search never drops them. Project headers count working tasks from the listed rows,
+so the desktop reads `chat.organization` without `query`. A linked worktree's header
+shows the repository name trimmed first, then its subproject, on one row, so sibling
+worktrees never trim to the same text.
 `swarm ls`/`swarm top` default to `order: "recent"` for humans; `--json` and an
 `id`-form `--after aN` cursor keep the ID order unless `--order` is explicit.
 
@@ -1863,7 +1889,12 @@ group table, never substrings: a depleted `Gemini 4 Argon weekly` bucket
 skips Argon models but never a Hydrogen model, and an unrecognized label
 such as `Model group` applies to no model (reported as unmapped, so callers
 stay `unknown`). An omitted model has no group membership. Account limits
-require a verified route. Console spend budgets constrain their covered
+require a verified route, and a reader whose account is not the route's
+reports none: a Codex profile on an adopted proxy (`route_binding`) is
+refused before any reader starts, because `account/rateLimits/read`
+describes the signed-in ChatGPT account whatever provider the route selects,
+so its quota stays `unknown` (a failed read with that reason) and never skips
+the proxied route. Console spend budgets constrain their covered
 route or exact model, and Console's Go counters remain separate. For Codex
 only the primary bucket's explicit limit state
 settles exhaustion (`spendControlReached`, a non-null

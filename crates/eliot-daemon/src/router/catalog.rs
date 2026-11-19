@@ -417,7 +417,7 @@ impl Router {
         // `harness.quota` see identical facts, and it is never cached.
         // Unavailable quota stays `unknown` via the existing projection,
         // never 0.
-        if let Some(note) = catalog::external_quota_route(&harness, &route.environment) {
+        if let Some(note) = catalog::external_quota_route(&harness, &profile, &route.environment) {
             let mut response = eliot_core::api::HarnessQuotaResponse {
                 harness: harness.clone(),
                 scope,
@@ -1004,7 +1004,17 @@ fn muse_catalog_note(default: Option<&str>) -> String {
 /// `harness.quota` share one decision. The one native fact it cannot see
 /// stays in the plugin: user settings that select an external route (Claude
 /// `settings.json`) are still refused by the Claude reader itself.
-pub(crate) fn external_quota_route(harness: &str, environment: &Value) -> Option<&'static str> {
+///
+/// A Codex profile on an adopted proxy (`route_binding`) is such a route:
+/// Codex's `account/rateLimits/read` reports the signed-in ChatGPT account
+/// whatever provider the session uses, so its limits never describe the
+/// proxy route (a free proxied model was refused as exhausted while the
+/// ChatGPT weekly window was full).
+pub(crate) fn external_quota_route(
+    harness: &str,
+    profile: &Value,
+    environment: &Value,
+) -> Option<&'static str> {
     // Claude matches its reader's lookup: exact on non-Windows, ASCII
     // case-insensitive on Windows.
     let present = |name: &str| {
@@ -1018,6 +1028,15 @@ pub(crate) fn external_quota_route(harness: &str, environment: &Value) -> Option
             })
     };
     match harness {
+        "codex"
+            if profile
+                .get("route_binding")
+                .is_some_and(|binding| !binding.is_null()) =>
+        {
+            Some(
+                "Codex profile routes through an adopted proxy; ChatGPT account limits would describe the direct route",
+            )
+        }
         "claude"
             if CLAUDE_EXTERNAL_ROUTE_MARKERS
                 .iter()
