@@ -1217,38 +1217,6 @@ pub struct ProjectRef {
     pub name: String,
 }
 
-/// Live Agents of one scope (the fleet or one project) by group.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct LiveCounts {
-    pub working: usize,
-    pub attention: usize,
-    pub idle: usize,
-}
-
-impl LiveCounts {
-    pub fn get(self, group: Group) -> usize {
-        match group {
-            Group::Working => self.working,
-            Group::Attention => self.attention,
-            Group::Idle => self.idle,
-            Group::UnparentedSubagents | Group::Stopped => 0,
-        }
-    }
-
-    pub fn total(self) -> usize {
-        self.working + self.attention + self.idle
-    }
-
-    fn add(&mut self, group: Group) {
-        match group {
-            Group::Working => self.working += 1,
-            Group::Attention => self.attention += 1,
-            Group::Idle => self.idle += 1,
-            Group::UnparentedSubagents | Group::Stopped => {}
-        }
-    }
-}
-
 /// One Agent the overview counts: its row, its own live group and its
 /// project.
 #[derive(Clone, Debug)]
@@ -1258,19 +1226,11 @@ pub struct Counted<'a> {
     pub project: ProjectRef,
 }
 
-/// One project of the overview and its live Agents.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ProjectLive {
-    pub project: ProjectRef,
-    pub counts: LiveCounts,
-}
-
-/// What the list below the overview is narrowed to: one live group, one
-/// project (matched by key), or both.
+/// What the list below the overview is narrowed to: the state the owner
+/// chose (kept while no Agent is in it: the list says so) and the search.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Filter {
     pub group: Option<Group>,
-    pub project: Option<ProjectRef>,
     /// The search field's text: a row matches when its title, id, harness,
     /// model or project contains it, case-insensitively (k195 P3-2).
     pub text: String,
@@ -1287,7 +1247,7 @@ pub const STATE_FILTERS: [Option<Group>; 4] = [
 
 impl Filter {
     pub fn is_active(&self) -> bool {
-        self.group.is_some() || self.project.is_some() || !self.text.trim().is_empty()
+        self.group.is_some() || !self.text.trim().is_empty()
     }
 
     /// Whether `row`, in the project named `project`, matches the search
@@ -1310,59 +1270,23 @@ impl Filter {
     }
 
     /// Whether a recently stopped `row` stays under this filter: the state
-    /// filter is every state or Stopped, the project and the text match.
+    /// filter is every state or Stopped and the text matches.
     pub fn keeps_stopped(&self, row: &MonitorRow, project: &ProjectRef) -> bool {
         self.group.is_none_or(|group| group == Group::Stopped)
-            && self
-                .project
-                .as_ref()
-                .is_none_or(|kept| kept.key == project.key)
             && self.matches_text(row, &project.name)
-    }
-
-    /// The filter after a complete refresh (no failed read, no partial
-    /// count): a group with no live Agent and a project with none are
-    /// cleared, each on its own, so a kept group and a kept project stay
-    /// combined even when nothing matches both; a kept project takes its
-    /// current name. A partial overview keeps the filter as it is.
-    pub fn reconciled(&self, overview: &Overview) -> Self {
-        if overview.partial {
-            return self.clone();
-        }
-        Self {
-            // Stopped Agents are not live counts: that filter stays.
-            group: self
-                .group
-                .filter(|group| *group == Group::Stopped || overview.counts.get(*group) > 0),
-            project: self.project.as_ref().and_then(|project| {
-                overview
-                    .projects
-                    .iter()
-                    .find(|live| live.project.key == project.key)
-                    .map(|live| live.project.clone())
-            }),
-            text: self.text.clone(),
-        }
     }
 
     fn keeps(&self, counted: &Counted) -> bool {
         self.group.is_none_or(|group| counted.group == group)
-            && self
-                .project
-                .as_ref()
-                .is_none_or(|project| counted.project.key == project.key)
             && self.matches_text(counted.row, &counted.project.name)
     }
 }
 
-/// The Monitor overview at one instant: the counted rows, the fleet's
-/// counts, its projects (most working first, then most live) and how many
-/// live Agents the bounded read left out.
+/// The Monitor overview at one instant: the counted rows and whether the
+/// bounded read left live Agents out.
 #[derive(Clone, Debug)]
 pub struct Overview<'a> {
     pub rows: Vec<Counted<'a>>,
-    pub counts: LiveCounts,
-    pub projects: Vec<ProjectLive>,
     /// A live state holds more Agents than the read returned (its
     /// `state_totals` count exceeds its rows): every count is partial.
     /// Those totals include native children the chart leaves out, so no
@@ -1573,8 +1497,7 @@ impl Monitor {
     /// The overview: every shown controlled Agent in a live group, by its
     /// own state (workers nested under a row included, native subagents
     /// not, as the sidebar's fleet line counts them), with its project from
-    /// `project_of` (the sidebar's name). The headline, the state bar, the
-    /// project rows and a filtered list all read these same rows.
+    /// `project_of` (the sidebar's name), which a filtered list reads.
     pub fn overview(
         &self,
         now_ms: i64,
@@ -1592,45 +1515,13 @@ impl Monitor {
                 })
             })
             .collect();
-        let mut counts = LiveCounts::default();
-        let mut projects: Vec<ProjectLive> = Vec::new();
-        for counted in &rows {
-            counts.add(counted.group);
-            let index = match projects
-                .iter()
-                .position(|project| project.project.key == counted.project.key)
-            {
-                Some(index) => index,
-                None => {
-                    projects.push(ProjectLive {
-                        project: counted.project.clone(),
-                        counts: LiveCounts::default(),
-                    });
-                    projects.len() - 1
-                }
-            };
-            projects[index].counts.add(counted.group);
-        }
-        projects.sort_by(|a, b| {
-            b.counts
-                .working
-                .cmp(&a.counts.working)
-                .then_with(|| b.counts.total().cmp(&a.counts.total()))
-                .then_with(|| a.project.name.cmp(&b.project.name))
-                .then_with(|| a.project.key.cmp(&b.project.key))
-        });
         // A live state with more Agents than the bounded read returned,
         // including one with no rows in the page at all.
         let partial = self.counts.iter().any(|count| {
             count.state != AgentState::Stopped
                 && count.total.is_some_and(|total| total > count.shown)
         });
-        Overview {
-            rows,
-            counts,
-            projects,
-            partial,
-        }
+        Overview { rows, partial }
     }
 
     pub fn apply(&mut self, snapshot: MonitorSnapshot) {
@@ -1857,11 +1748,14 @@ fn list_request(state: AgentState, limit: usize, observations: bool) -> AgentLis
     }
 }
 
+/// The live Agents, archived ones included: archiving hides a task from the
+/// sidebar list, not from what is running (the fleet line counts them too).
 fn fleet_request() -> AgentListRequest {
     AgentListRequest {
         states: Some(ROW_STATES.to_vec()),
         limit: FLEET_ROWS,
         observations: true,
+        archived: eliot_core::api::ArchivedFilter::Include,
         ..Default::default()
     }
 }

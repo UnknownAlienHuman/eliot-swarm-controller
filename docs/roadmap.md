@@ -469,13 +469,15 @@ of the explicitly selected release scope.
       selected-Agent details stay visible on reopen and failed refreshes, with
       inline read errors and a timestamp when cached data is older than one
       refresh interval. Each refresh reads `agent.list` once
-      across live states with observations and `state_totals` (the exact
+      across live states, archived ones included (the fleet line counts
+      them), with observations and `state_totals` (the exact
       count of each persisted lifecycle state in the caller's scope, native
       observed children included), alongside selected-Agent identity, usage
       and diagnosis. At most four
       reads run concurrently. The pane follows `Conversation.dc.html`:
       Monitor and Details tabs with the close button, a pill search field
-      and a connected state filter (All, Working, Attention, Idle). The
+      and a connected state filter (All, Working, Attention, Idle) that
+      stays as chosen while no Agent is in that state. The
       list groups Needs
       attention (waiting, failed,
       lost, a controlled Agent in `unknown`, or an open `x.user.agent.attention`

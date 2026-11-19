@@ -73,19 +73,9 @@ impl DesktopApp {
                 }
                 self.monitor.refreshing = false;
                 if let Some(snapshot) = snapshot {
+                    // The state filter stays as the owner chose it, even
+                    // while no Agent is in that state.
                     self.monitor.data.apply(*snapshot);
-                    // A filter whose group or project has no live Agent
-                    // left is cleared after a complete refresh.
-                    if self.monitor.data.errors.is_empty() {
-                        let checkouts = self.checkouts();
-                        let project_of = |row: &MonitorRow| self.monitor_project(row, &checkouts);
-                        let overview = self
-                            .monitor
-                            .data
-                            .overview(crate::handoff::now_ms(), &project_of);
-                        let filter = self.monitor.filter.reconciled(&overview);
-                        self.monitor.filter = filter;
-                    }
                     // The next read waits on its own worker: a timer message
                     // would render the whole window for nothing.
                     self.read_monitor(monitor::PERIOD_MS, context);
