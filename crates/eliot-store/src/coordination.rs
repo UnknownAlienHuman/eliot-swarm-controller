@@ -111,13 +111,15 @@ const ATTENTION_WAKING_THREAD_SQL: &str = "COALESCE(m.thread, '') LIKE 'attentio
                OR json_extract(e.data, '$.data.reason') = 'children_unattended')
     )";
 
-/// A claimed notice: the pending count for the generic notice text and the
-/// recipient generation the notice command must bind.
+/// A claimed notice: the pending count for the generic notice text, the
+/// recipient generation the notice command must bind, and an optional direct
+/// wake body when unread self-registered completion digests fit in the `send`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NoticeClaim {
     pub kind: NoticeKind,
     pub count: i64,
     pub generation: i64,
+    pub inline_text: Option<String>,
 }
 
 /// Durable notice state for one recipient.
@@ -1820,7 +1822,7 @@ impl Store {
         // non-advisory attention thread in this mailbox, so an unchanged
         // unread incident set cannot wake the recipient again until new
         // evidence arrives on a new thread.
-        if pending.kind() == NoticeKind::Mail {
+        let inline_text = if pending.kind() == NoticeKind::Mail {
             db!(tx.execute(
                 "INSERT OR IGNORE INTO attention_wakes(recipient, thread, woken_at)
                  SELECT DISTINCT ?1, m.thread, ?2 FROM messages m
@@ -1829,12 +1831,16 @@ impl Store {
                    AND COALESCE(m.thread, '') NOT LIKE 'attention-%-advisory'",
                 params![num, now],
             ));
-        }
+            inline_self_digest_wake_tx(&tx, &agent, num, notice_command, count)?
+        } else {
+            None
+        };
         commit_transaction(tx, &self.write_faulted)?;
         Ok(Some(NoticeClaim {
             kind: pending.kind(),
             count,
             generation: agent.generation,
+            inline_text,
         }))
     }
 
@@ -1849,9 +1855,110 @@ impl Store {
              WHERE recipient = ?1 AND open_notice_command = ?2",
             params![num, notice_command],
         ));
+        db!(tx.execute(
+            "UPDATE messages SET presentation_command = NULL
+             WHERE recipient = ?1 AND presentation_command = ?2 AND presented_at IS NULL",
+            params![num, notice_command],
+        ));
         commit_transaction(tx, &self.write_faulted)?;
         Ok(())
     }
+}
+
+/// Inline unread completion digests registered by `agent` at its current
+/// generation when they fit in the wake `send` budget (`MAX_EVENT_BYTES`),
+/// binding `presentation_command` so `turn.started` of that wake marks them
+/// read without a separate `mail.inbox`/`mail.ack` round trip.
+fn inline_self_digest_wake_tx(
+    tx: &Transaction<'_>,
+    agent: &Agent,
+    num: i64,
+    notice_command: &str,
+    total_unread: i64,
+) -> Result<Option<String>> {
+    let expected_requester = format!("agent:{}:{}", agent.id, agent.generation);
+    let mut statement = tx
+        .prepare(
+            "SELECT d.id, m.delivery_id, m.thread, m.text
+             FROM messages m
+             JOIN completion_digests d
+               ON d.delivered_mail_id = m.delivery_id
+              AND d.parent = m.recipient
+             WHERE m.recipient = ?1
+               AND m.read_at IS NULL
+               AND m.sender = 'owner'
+               AND m.recipient_generation = ?2
+               AND d.requester = ?3
+             ORDER BY m.id ASC",
+        )
+        .map_err(sql_error)?;
+    let rows = statement
+        .query_map(params![num, agent.generation, expected_requester], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(sql_error)?;
+    let mut candidates = Vec::new();
+    for row in rows {
+        let (digest_id, delivery_id, thread, text) = row.map_err(sql_error)?;
+        if thread.as_deref() == Some(digest_thread(&digest_id).as_str()) {
+            candidates.push((delivery_id, text));
+        }
+    }
+    drop(statement);
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let mut inlined_ids = Vec::new();
+    let mut inlined_texts = Vec::new();
+    let mut current_len: usize = 0;
+    for (delivery_id, text) in candidates {
+        if text.trim().is_empty() {
+            continue;
+        }
+        let sep_len = if inlined_texts.is_empty() { 0 } else { 2 };
+        let remaining_unread = total_unread.saturating_sub((inlined_ids.len() + 1) as i64);
+        let suffix_len = if remaining_unread > 0 {
+            format!("\n\n{remaining_unread} unread: mail.inbox, then mail.ack").len()
+        } else {
+            0
+        };
+        if current_len
+            .saturating_add(sep_len)
+            .saturating_add(text.len())
+            .saturating_add(suffix_len)
+            > MAX_EVENT_BYTES
+        {
+            break;
+        }
+        current_len = current_len
+            .saturating_add(sep_len)
+            .saturating_add(text.len());
+        inlined_ids.push(delivery_id);
+        inlined_texts.push(text);
+    }
+    if inlined_ids.is_empty() {
+        return Ok(None);
+    }
+    for delivery_id in &inlined_ids {
+        db!(tx.execute(
+            "UPDATE messages SET presentation_command = ?1
+             WHERE delivery_id = ?2 AND recipient = ?3 AND read_at IS NULL",
+            params![notice_command, delivery_id, num],
+        ));
+    }
+    let mut body = inlined_texts.join("\n\n");
+    let remaining_unread = total_unread.saturating_sub(inlined_ids.len() as i64);
+    if remaining_unread > 0 {
+        body.push_str(&format!(
+            "\n\n{remaining_unread} unread: mail.inbox, then mail.ack"
+        ));
+    }
+    Ok(Some(body))
 }
 
 /// Resolve the pending proof inside the claim transaction: mail counts

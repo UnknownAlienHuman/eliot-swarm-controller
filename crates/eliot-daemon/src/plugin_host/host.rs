@@ -2159,6 +2159,7 @@ fn plugin_command_args(command: &Command) -> Result<Value> {
     match command.verb.as_str() {
         "send" => {
             args.remove("notice_kind");
+            args.remove("inline_digest");
         }
         "configure" => {
             // The model/effort overlay rides to the plugin verbatim: the

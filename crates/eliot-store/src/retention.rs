@@ -669,10 +669,14 @@ pub(super) fn delete_commands_tx<'a>(
 ) -> rusqlite::Result<i64> {
     let mut clear = tx
         .prepare("UPDATE mail_notices SET open_notice_command=NULL WHERE open_notice_command=?1")?;
+    let mut clear_messages = tx.prepare(
+        "UPDATE messages SET presentation_command=NULL WHERE presentation_command=?1 AND presented_at IS NULL",
+    )?;
     let mut delete = tx.prepare("DELETE FROM commands WHERE id=?1")?;
     let mut deleted = 0;
     for id in ids {
         clear.execute([id])?;
+        clear_messages.execute([id])?;
         deleted += delete.execute([id])? as i64;
     }
     Ok(deleted)

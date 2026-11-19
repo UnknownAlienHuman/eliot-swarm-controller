@@ -367,7 +367,7 @@ impl SwarmWaitResponse {
 
 /// Cut `text` to at most `bound` bytes on a UTF-8 boundary. Returns the kept
 /// prefix and whether anything was cut.
-fn truncate_bytes(text: &str, bound: usize) -> (String, bool) {
+pub(crate) fn truncate_bytes(text: &str, bound: usize) -> (String, bool) {
     if text.len() <= bound {
         return (text.to_owned(), false);
     }

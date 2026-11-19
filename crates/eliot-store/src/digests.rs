@@ -1282,6 +1282,8 @@ mod tests {
             .expect("claim")
             .expect("digest mail wakes");
         assert_eq!(claim.count, 1);
+        // Owner-registered digest uses the generic count wake, not inline body.
+        assert_eq!(claim.inline_text, None);
         // Advisory attention mail never wakes; digest mail must not share it.
         let advisory = MailSendRequest {
             id: ulid::Ulid::new().to_string(),
@@ -1293,5 +1295,205 @@ mod tests {
         };
         let _ = advisory;
         let _ = WaitTurnRef::new("a1", 1, "t1");
+    }
+
+    #[test]
+    fn self_registered_digest_inlines_wake_body_and_marks_read_on_turn_started() {
+        use eliot_core::{
+            NativeEvent, SourceBatch, SubmitCommand,
+            api::{MailInboxRequest, MailReadRequest},
+        };
+
+        let mut store = open_store();
+        let now = now_ms();
+        let manager = ready_agent(&mut store, "p", now);
+        let peer = ready_agent(&mut store, "p", now);
+        let id = ulid::Ulid::new().to_string();
+        let req = digest_request(&id, &manager);
+        store
+            .digest_register(&format!("agent:{manager}:1"), &req, &[false], now)
+            .expect("register self digest");
+        let text = eliot_core::api::digest_text(
+            &id,
+            &manager,
+            "all",
+            &[
+                eliot_core::api::WaitEntryResult::new("turn", "a2/1/t-worker", "succeeded")
+                    .with_turn("a2", 1, "t-worker")
+                    .with_final_text("worker answer", 1024),
+            ],
+        );
+        let thread = eliot_core::api::digest_thread(&id);
+        let mail = MailSendRequest {
+            id: id.clone(),
+            to: vec![manager.clone()],
+            mode: eliot_core::api::MailMode::Queue,
+            text: text.clone(),
+            thread: Some(thread),
+            reply_to_delivery: None,
+        };
+        let sent = store
+            .mail_send_digest_delivery("owner", &mail, MailLimits::default(), now)
+            .expect("digest mail");
+        let digest_delivery = sent.value.deliveries[0].delivery_id.clone();
+
+        // Also deliver an ordinary peer message so we verify only the inlined
+        // digest is marked read on turn.started.
+        let peer_mail = store
+            .mail_send(
+                &format!("agent:{peer}:1"),
+                &MailSendRequest {
+                    id: ulid::Ulid::new().to_string(),
+                    to: vec![manager.clone()],
+                    mode: eliot_core::api::MailMode::Queue,
+                    text: "separate peer message".to_owned(),
+                    thread: None,
+                    reply_to_delivery: None,
+                },
+                MailLimits::default(),
+                now + 1,
+            )
+            .expect("peer mail");
+        let peer_delivery = peer_mail.value.deliveries[0].delivery_id.clone();
+
+        // Release cleans up presentation_command if submit never happens.
+        let aborted_notice = ulid::Ulid::new().to_string();
+        let aborted = store
+            .notice_claim(
+                &manager,
+                &aborted_notice,
+                crate::NoticePending::Mail,
+                now + 2,
+            )
+            .expect("claim")
+            .expect("claim present");
+        let inline = aborted.inline_text.expect("inline wake body");
+        assert!(inline.contains(&text));
+        assert!(inline.contains("1 unread: mail.inbox, then mail.ack"));
+        store
+            .notice_release(&manager, &aborted_notice)
+            .expect("release");
+        let read_after_release = store
+            .mail_read(
+                "owner",
+                &MailReadRequest {
+                    agent: Some(manager.clone()),
+                    delivery_id: digest_delivery.clone(),
+                },
+                now + 3,
+            )
+            .expect("read");
+        assert_eq!(read_after_release.presentation_command, None);
+        assert_eq!(read_after_release.read_at, None);
+
+        // Unrelated send turn.started must not mark the digest read.
+        let unrelated_id = ulid::Ulid::new().to_string();
+        let mut unrelated = SubmitCommand::new(unrelated_id.clone(), "send");
+        unrelated.target = Some(manager.clone());
+        unrelated.expected_generation = Some(1);
+        unrelated.args = json!({"text": "unrelated"});
+        store
+            .submit("owner", unrelated, now + 4)
+            .expect("submit unrelated");
+        store.dispatch(&unrelated_id, now + 4).expect("dispatch");
+        store
+            .put_batch(
+                SourceBatch {
+                    batch_id: ulid::Ulid::new().to_string(),
+                    agent_id: manager.clone(),
+                    generation: 1,
+                    source: "stream".to_owned(),
+                    events: vec![
+                        NativeEvent {
+                            ts: None,
+                            kind: "turn.started".to_owned(),
+                            native_id: ulid::Ulid::new().to_string(),
+                            data: json!({"command_id": unrelated_id, "turn_id": "t-unrelated"}),
+                        },
+                        NativeEvent {
+                            ts: None,
+                            kind: "turn.completed".to_owned(),
+                            native_id: ulid::Ulid::new().to_string(),
+                            data: json!({"command_id": unrelated_id, "turn_id": "t-unrelated", "status": "completed"}),
+                        },
+                    ],
+                    cursor: None,
+                },
+                now + 5,
+            )
+            .expect("unrelated turn");
+        let still_unread = store
+            .mail_read(
+                "owner",
+                &MailReadRequest {
+                    agent: Some(manager.clone()),
+                    delivery_id: digest_delivery.clone(),
+                },
+                now + 5,
+            )
+            .expect("read");
+        assert_eq!(still_unread.read_at, None);
+
+        // Claim the digest wake, submit + dispatch + turn.started.
+        let notice_id = ulid::Ulid::new().to_string();
+        let claim = store
+            .notice_claim(&manager, &notice_id, crate::NoticePending::Mail, now + 6)
+            .expect("claim")
+            .expect("claim present");
+        let wake_text = claim.inline_text.expect("inline wake body");
+        let mut wake_send = SubmitCommand::new(notice_id.clone(), "send");
+        wake_send.target = Some(manager.clone());
+        wake_send.expected_generation = Some(1);
+        wake_send.args = json!({"text": wake_text, "notice_kind": "mail"});
+        store
+            .submit("owner", wake_send, now + 6)
+            .expect("submit wake");
+        store.dispatch(&notice_id, now + 6).expect("dispatch wake");
+        store
+            .put_batch(
+                SourceBatch {
+                    batch_id: ulid::Ulid::new().to_string(),
+                    agent_id: manager.clone(),
+                    generation: 1,
+                    source: "stream".to_owned(),
+                    events: vec![NativeEvent {
+                        ts: None,
+                        kind: "turn.started".to_owned(),
+                        native_id: ulid::Ulid::new().to_string(),
+                        data: json!({"command_id": notice_id, "turn_id": "t-wake"}),
+                    }],
+                    cursor: None,
+                },
+                now + 7,
+            )
+            .expect("wake turn.started");
+
+        let presented = store
+            .mail_read(
+                "owner",
+                &MailReadRequest {
+                    agent: Some(manager.clone()),
+                    delivery_id: digest_delivery,
+                },
+                now + 7,
+            )
+            .expect("read digest");
+        assert_eq!(presented.presented_at, Some(now + 7));
+        assert_eq!(presented.read_at, Some(now + 7));
+        assert_eq!(
+            presented.presentation_command.as_deref(),
+            Some(notice_id.as_str())
+        );
+
+        let inbox = store
+            .mail_inbox(
+                &format!("agent:{manager}:1"),
+                &MailInboxRequest::default(),
+                now + 7,
+            )
+            .expect("inbox");
+        assert_eq!(inbox.deliveries.len(), 1);
+        assert_eq!(inbox.deliveries[0].delivery_id, peer_delivery);
+        assert_eq!(inbox.deliveries[0].read_at, None);
     }
 }

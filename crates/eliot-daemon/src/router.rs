@@ -56,14 +56,14 @@ use eliot_core::{
         EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse,
         GitFetchDefinitionArgs, GitView, HarnessDoctorRequest, HarnessDoctorResponse,
         HeavyAgentTotals, HeavyEpisodeView, MAX_OBSERVATION_PAGE_BYTES, MAX_SWARM_WAIT_MS,
-        MAX_SWARM_WAIT_TARGETS, MAX_WAIT_FRAME_BYTES, MaintenanceRunRequest,
-        MaintenanceRunResponse, NotifyDefinitionArgs, ObservationPage, ObservationQuery,
-        ObservationView, ObserveHeavyRequest, ObserveHeavyResponse, ProcessPageCursor,
-        ProjectDiscoverRequest, ProjectRegistrationView, ProviderClearHoldRequest,
-        ProviderHoldsRequest, RuleGetRequest, RuleStateView, SWITCH_BLANK_SCOPE_ARG,
-        SWITCH_PROJECT_REVISION_ARG, ShutdownMode, SourceState, SwarmWaitRequest,
-        SwarmWaitResponse, TimerGetRequest, TimerStateView, TurnGetRequest, UsageScopeView,
-        UsageSummaryRequest, WaitEntryResult, WorkerTaskHealth,
+        MAX_SWARM_WAIT_TARGETS, MAX_WAIT_FINAL_TEXT_BYTES, MAX_WAIT_FRAME_BYTES,
+        MaintenanceRunRequest, MaintenanceRunResponse, NotifyDefinitionArgs, ObservationPage,
+        ObservationQuery, ObservationView, ObserveHeavyRequest, ObserveHeavyResponse,
+        ProcessPageCursor, ProjectDiscoverRequest, ProjectRegistrationView,
+        ProviderClearHoldRequest, ProviderHoldsRequest, RuleGetRequest, RuleStateView,
+        SWITCH_BLANK_SCOPE_ARG, SWITCH_PROJECT_REVISION_ARG, ShutdownMode, SourceState,
+        SwarmWaitRequest, SwarmWaitResponse, TimerGetRequest, TimerStateView, TurnGetRequest,
+        UsageScopeView, UsageSummaryRequest, WaitEntryResult, WorkerTaskHealth, fair_excerpt_cap,
     },
 };
 use eliot_plugin::{MAX_EVENT_BYTES, sync::LockExt};
@@ -294,6 +294,24 @@ struct PendingEntry {
     leaf: String,
     bound: Option<usize>,
     command_unknown: bool,
+    excerpt_allowed: bool,
+}
+
+/// Digest options for one wait snapshot; the default is a plain wait.
+#[derive(Clone, Copy, Default)]
+struct WaitScope<'a> {
+    /// Registration-time mask: masked entries read `not_visible`.
+    hidden: Option<&'a [bool]>,
+    /// Mailbox whose live scope gates each turn identity and excerpt.
+    excerpt_recipient: Option<&'a str>,
+    /// Fair water-fill excerpts instead of the first-come frame budget.
+    fair_budget: bool,
+}
+
+/// In-memory unknown marks captured before a snapshot's Store guard.
+struct UnknownMarks {
+    causes: HashMap<String, String>,
+    memory: Vec<String>,
 }
 
 impl Router {
@@ -3173,6 +3191,22 @@ impl Router {
             command.outcome = Some(json!({"code": "unknown", "cause": cause}));
             command.turn_id = None;
         }
+        if command.verb == "send"
+            && let Some(args) = command.args.as_object_mut()
+            && (args.get("inline_digest").and_then(Value::as_bool) == Some(true)
+                || (args.get("notice_kind").and_then(Value::as_str) == Some("mail")
+                    && args
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| text.starts_with("Eliot completion digest "))))
+        {
+            args.remove("inline_digest");
+            args.insert(
+                "text".to_owned(),
+                Value::String("[redacted: inline completion digest]".to_owned()),
+            );
+            args.insert("redacted".to_owned(), Value::Bool(true));
+        }
     }
 
     async fn agent_discover(&self, params: &Value, principal: &Principal) -> Result<Value> {
@@ -4377,45 +4411,90 @@ impl Router {
         principal: &Principal,
         mailbox: Option<&str>,
     ) -> Result<WaitSnapshot> {
-        // Capture the in-memory unknown marks before terminal-cache
-        // eviction: an uncertainty check must still see a marker whose
-        // command already settled, mirroring the old per-entry order (check
-        // first, evict while masking). Masking below uses the post-clear
-        // ids, also like before.
-        let unknown_causes: HashMap<String, String> =
-            self.inner.unknown_causes.lock_recover().clone();
-        self.clear_terminal_unknown_cache().await;
-        let memory_unknown = self.unknown_ids();
+        let marks = self.wait_unknown_marks().await;
         let store = self.inner.store.lock().await;
+        Self::wait_snapshot_locked(
+            &store,
+            request,
+            principal,
+            mailbox,
+            WaitScope::default(),
+            &marks,
+        )
+    }
+
+    /// Capture the in-memory unknown marks before terminal-cache eviction:
+    /// an uncertainty check must still see a marker whose command already
+    /// settled, mirroring the old per-entry order (check first, evict while
+    /// masking). Masking uses the post-clear ids, also like before. Taken
+    /// before the snapshot's Store guard, so the guarded part never awaits.
+    async fn wait_unknown_marks(&self) -> UnknownMarks {
+        let causes = self.inner.unknown_causes.lock_recover().clone();
+        self.clear_terminal_unknown_cache().await;
+        UnknownMarks {
+            causes,
+            memory: self.unknown_ids(),
+        }
+    }
+
+    /// Snapshot every frozen entry inside the caller's Store guard with
+    /// optional registration-time masking, delivery-time recipient scope
+    /// checking and fair water-fill excerpt budgeting ([`WaitScope`]).
+    /// Out-of-recipient-scope entries keep their status only, with no turn
+    /// identity or `final_text` excerpt. Synchronous, so a caller can keep
+    /// the same guard through a write that depends on the authorization.
+    fn wait_snapshot_locked(
+        store: &eliot_store::Store,
+        request: &SwarmWaitRequest,
+        principal: &Principal,
+        mailbox: Option<&str>,
+        scope: WaitScope<'_>,
+        marks: &UnknownMarks,
+    ) -> Result<WaitSnapshot> {
+        let WaitScope {
+            hidden,
+            excerpt_recipient,
+            fair_budget,
+        } = scope;
+        let unknown_causes = &marks.causes;
+        let recipient_principal = match excerpt_recipient {
+            Some(recipient_id) => store
+                .get_agent(recipient_id)?
+                .map(|agent| Principal::Agent {
+                    id: agent.id,
+                    generation: agent.generation,
+                }),
+            None => None,
+        };
         let mut pending: Vec<PendingEntry> = Vec::with_capacity(request.total());
         let mut bounds: Vec<BoundTurn> = Vec::new();
         let mut watch_agents: HashSet<String> = HashSet::new();
         let watch_commands: HashSet<String> = request.commands.iter().cloned().collect();
-        for id in &request.commands {
+        let leaf_entry = |kind: &'static str, id: String, leaf: String| PendingEntry {
+            kind,
+            id,
+            leaf,
+            bound: None,
+            command_unknown: false,
+            excerpt_allowed: false,
+        };
+        for (idx, id) in request.commands.iter().enumerate() {
+            if hidden.is_some_and(|mask| mask.get(idx).copied().unwrap_or(false)) {
+                pending.push(leaf_entry("command", id.clone(), "not_visible".to_owned()));
+                continue;
+            }
             let command = match store.get_command(id)? {
                 Some(command) => command,
                 None => {
-                    pending.push(PendingEntry {
-                        kind: "command",
-                        id: id.clone(),
-                        leaf: "not_found".to_owned(),
-                        bound: None,
-                        command_unknown: false,
-                    });
+                    pending.push(leaf_entry("command", id.clone(), "not_found".to_owned()));
                     continue;
                 }
             };
             if let Err(error) =
-                crate::router::hierarchy::authorize_command_read(&store, principal, &command)
+                crate::router::hierarchy::authorize_command_read(store, principal, &command)
             {
                 if error.code == "not_allowed" {
-                    pending.push(PendingEntry {
-                        kind: "command",
-                        id: id.clone(),
-                        leaf: "not_visible".to_owned(),
-                        bound: None,
-                        command_unknown: false,
-                    });
+                    pending.push(leaf_entry("command", id.clone(), "not_visible".to_owned()));
                     continue;
                 }
                 return Err(error);
@@ -4423,6 +4502,12 @@ impl Router {
             if let Some(target) = command.target.as_deref() {
                 watch_agents.insert(target.to_owned());
             }
+            let mut excerpt_allowed = match excerpt_recipient {
+                None => true,
+                Some(_) => recipient_principal.as_ref().is_some_and(|rp| {
+                    crate::router::hierarchy::authorize_command_read(store, rp, &command).is_ok()
+                }),
+            };
             // Uncertain commands are terminal unknown, never still running.
             // This mirrors the command readback masking without mutating the
             // row.
@@ -4434,26 +4519,36 @@ impl Router {
                 command.turn_id.as_deref(),
             ) {
                 if let Err(error) = crate::router::hierarchy::authorize_agent_read(
-                    &store,
+                    store,
                     principal,
                     target,
                     Some(generation),
                 ) {
                     if error.code == "not_allowed" {
-                        pending.push(PendingEntry {
-                            kind: "command",
-                            id: id.clone(),
-                            leaf: if command_unknown {
+                        pending.push(leaf_entry(
+                            "command",
+                            id.clone(),
+                            if command_unknown {
                                 "unknown".to_owned()
                             } else {
                                 "not_visible".to_owned()
                             },
-                            bound: None,
-                            command_unknown: false,
-                        });
+                        ));
                         continue;
                     }
                     return Err(error);
+                }
+                if excerpt_recipient.is_some() {
+                    excerpt_allowed = excerpt_allowed
+                        && recipient_principal.as_ref().is_some_and(|rp| {
+                            crate::router::hierarchy::authorize_agent_read(
+                                store,
+                                rp,
+                                target,
+                                Some(generation),
+                            )
+                            .is_ok()
+                        });
                 }
                 match store.get_turn(target, generation, turn_id)? {
                     Some(turn) => {
@@ -4470,24 +4565,19 @@ impl Router {
                             leaf: String::new(),
                             bound: Some(bounds.len() - 1),
                             command_unknown,
+                            excerpt_allowed,
                         });
                     }
                     // A command bound to a missing turn reads unknown, never
                     // still running.
-                    None => pending.push(PendingEntry {
-                        kind: "command",
-                        id: id.clone(),
-                        leaf: "unknown".to_owned(),
-                        bound: None,
-                        command_unknown: false,
-                    }),
+                    None => pending.push(leaf_entry("command", id.clone(), "unknown".to_owned())),
                 }
                 continue;
             }
-            pending.push(PendingEntry {
-                kind: "command",
-                id: id.clone(),
-                leaf: if command_unknown {
+            pending.push(leaf_entry(
+                "command",
+                id.clone(),
+                if command_unknown {
                     "unknown".to_owned()
                 } else {
                     match command.state {
@@ -4501,30 +4591,39 @@ impl Router {
                     }
                     .to_owned()
                 },
-                bound: None,
-                command_unknown: false,
-            });
+            ));
         }
-        for turn_ref in &request.turns {
+        for (t_idx, turn_ref) in request.turns.iter().enumerate() {
             let id = turn_ref.canonical_id();
+            let idx = request.commands.len() + t_idx;
+            if hidden.is_some_and(|mask| mask.get(idx).copied().unwrap_or(false)) {
+                pending.push(leaf_entry("turn", id, "not_visible".to_owned()));
+                continue;
+            }
             if let Err(error) = crate::router::hierarchy::authorize_agent_read(
-                &store,
+                store,
                 principal,
                 &turn_ref.agent,
                 Some(turn_ref.generation),
             ) {
                 if error.code == "not_allowed" {
-                    pending.push(PendingEntry {
-                        kind: "turn",
-                        id,
-                        leaf: "not_visible".to_owned(),
-                        bound: None,
-                        command_unknown: false,
-                    });
+                    pending.push(leaf_entry("turn", id, "not_visible".to_owned()));
                     continue;
                 }
                 return Err(error);
             }
+            let excerpt_allowed = match excerpt_recipient {
+                None => true,
+                Some(_) => recipient_principal.as_ref().is_some_and(|rp| {
+                    crate::router::hierarchy::authorize_agent_read(
+                        store,
+                        rp,
+                        &turn_ref.agent,
+                        Some(turn_ref.generation),
+                    )
+                    .is_ok()
+                }),
+            };
             match store.get_turn(&turn_ref.agent, turn_ref.generation, &turn_ref.turn_id)? {
                 Some(turn) => {
                     watch_agents.insert(turn_ref.agent.clone());
@@ -4540,15 +4639,10 @@ impl Router {
                         leaf: String::new(),
                         bound: Some(bounds.len() - 1),
                         command_unknown: false,
+                        excerpt_allowed,
                     });
                 }
-                None => pending.push(PendingEntry {
-                    kind: "turn",
-                    id,
-                    leaf: "not_found".to_owned(),
-                    bound: None,
-                    command_unknown: false,
-                }),
+                None => pending.push(leaf_entry("turn", id, "not_found".to_owned())),
             }
         }
         // Mask turns whose commands never proved native completion, in the
@@ -4562,7 +4656,7 @@ impl Router {
         }
         for ((agent, generation), turn_ids) in &groups {
             let masked =
-                store.turns_with_unknown_commands(agent, *generation, turn_ids, &memory_unknown)?;
+                store.turns_with_unknown_commands(agent, *generation, turn_ids, &marks.memory)?;
             for bound in bounds.iter_mut() {
                 if bound.agent == *agent
                     && bound.generation == *generation
@@ -4577,10 +4671,32 @@ impl Router {
             Some(_) => Some(store.mail_mailbox_high_water(&principal_name(principal), None)?),
             None => None,
         };
-        drop(store);
-        // Bounded retained `final_text` for completed bound turns, request
-        // order, within one response frame budget. A withheld tail marks
-        // `truncated` without its body.
+        let fair_cap = if fair_budget {
+            let text_lens: Vec<usize> = pending
+                .iter()
+                .filter_map(|entry| {
+                    if !entry.excerpt_allowed {
+                        return None;
+                    }
+                    let bound = &bounds[entry.bound?];
+                    if bound.turn.state != TurnState::Completed {
+                        return None;
+                    }
+                    let text = bound.turn.final_text.as_deref()?;
+                    (!text.is_empty()).then_some(text.len().min(MAX_WAIT_FINAL_TEXT_BYTES))
+                })
+                .collect();
+            if text_lens.is_empty() {
+                usize::MAX
+            } else {
+                fair_excerpt_cap(&text_lens, MAX_WAIT_FRAME_BYTES)
+            }
+        } else {
+            0
+        };
+        // Bounded retained `final_text` for completed bound turns within one
+        // response frame budget. A withheld tail marks `truncated` without its
+        // body. Entries outside recipient scope emit status-only results.
         let mut remaining = MAX_WAIT_FRAME_BYTES;
         let mut results = Vec::with_capacity(pending.len());
         for entry in pending {
@@ -4589,18 +4705,29 @@ impl Router {
                 continue;
             };
             let bound = &bounds[index];
-            let mut result =
-                WaitEntryResult::new(entry.kind, entry.id, Self::turn_entry_status(&bound.turn))
-                    .with_turn(bound.agent.clone(), bound.generation, bound.turn_id.clone());
-            result.resolution_source = bound.turn.resolution_source;
-            if entry.command_unknown {
-                result.status = "unknown".to_owned();
+            let status = if entry.command_unknown {
+                "unknown".to_owned()
+            } else {
+                Self::turn_entry_status(&bound.turn).to_owned()
+            };
+            if !entry.excerpt_allowed {
+                results.push(WaitEntryResult::new(entry.kind, entry.id, status));
+                continue;
             }
+            let mut result = WaitEntryResult::new(entry.kind, entry.id, status).with_turn(
+                bound.agent.clone(),
+                bound.generation,
+                bound.turn_id.clone(),
+            );
+            result.resolution_source = bound.turn.resolution_source;
             if bound.turn.state == TurnState::Completed
                 && let Some(text) = bound.turn.final_text.as_deref()
             {
-                result = result.with_final_text(text, remaining);
-                remaining -= result.final_text.as_ref().map_or(0, String::len);
+                let budget = if fair_budget { fair_cap } else { remaining };
+                result = result.with_final_text(text, budget);
+                if !fair_budget {
+                    remaining -= result.final_text.as_ref().map_or(0, String::len);
+                }
             }
             results.push(result);
         }

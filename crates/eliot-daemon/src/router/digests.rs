@@ -7,13 +7,16 @@
 //! queued mail (and its generic wake); the thread is `completion-*`, never
 //! `attention-*`, and no attention event is emitted.
 
-use super::{Principal, Router, principal_name};
+use super::{
+    Principal, Router, UnknownMarks, WaitScope, coordination::decode_coordination_request,
+    principal_name,
+};
 use crate::common::now_ms;
 use eliot_core::{
     Error, Result,
     api::{
-        MailSendRequest, MailSendResponse, SwarmDigestRequest, SwarmDigestResponse,
-        SwarmWaitRequest, WaitEntryResult, digest_mode_completed, digest_text, digest_thread,
+        MailSendRequest, SwarmDigestRequest, SwarmDigestResponse, SwarmWaitRequest,
+        WaitEntryResult, digest_mode_completed, digest_text, digest_thread,
     },
 };
 use eliot_plugin::sync::LockExt;
@@ -79,16 +82,40 @@ fn wait_request_for_row(row: &DigestRow) -> SwarmWaitRequest {
     SwarmWaitRequest::new(row.commands.clone(), turns, row.mode.clone(), 0)
 }
 
+/// Delivery-time results inside the caller's Store guard: the persisted
+/// registration mask plus the recipient's live scope over each entry.
+fn digest_results_locked(
+    store: &eliot_store::Store,
+    row: &DigestRow,
+    marks: &UnknownMarks,
+) -> Result<Vec<WaitEntryResult>> {
+    let scope = WaitScope {
+        hidden: Some(&row.hidden),
+        excerpt_recipient: Some(&row.parent),
+        fair_budget: true,
+    };
+    Router::wait_snapshot_locked(
+        store,
+        &wait_request_for_row(row),
+        &Principal::Owner,
+        None,
+        scope,
+        marks,
+    )
+    .map(|snapshot| snapshot.results)
+}
+
+#[cfg(test)]
 fn masked_results(results: Vec<WaitEntryResult>, hidden: &[bool]) -> Vec<WaitEntryResult> {
     results
         .into_iter()
         .enumerate()
-        .map(|(i, mut entry)| {
+        .map(|(i, entry)| {
             if hidden.get(i).copied().unwrap_or(false) {
-                entry.status = "not_visible".to_owned();
-                entry.resolution_source = None;
+                WaitEntryResult::new(entry.kind, entry.id, "not_visible")
+            } else {
+                entry
             }
-            entry
         })
         .collect()
 }
@@ -165,29 +192,53 @@ impl Router {
         // Freeze visibility with the caller's scope: entries outside scope
         // read `not_visible` now and stay masked at delivery.
         let wait_request = wait_request_for_digest(&request);
-        let snapshot = self
-            .wait_snapshot(&wait_request, principal, None)
-            .await?
-            .results;
-        let hidden: Vec<bool> = snapshot
-            .iter()
-            .map(|entry| entry.status == "not_visible")
-            .collect();
         let requester = principal_name(principal);
-        let now = now_ms();
-        let row = {
+        let marks = self.wait_unknown_marks().await;
+        let (row, snapshot) = {
             let mut store = self.inner.store.lock().await;
-            store
-                .digest_register(&requester, &request, &hidden, now)?
-                .row
+            let scope = WaitScope {
+                hidden: None,
+                excerpt_recipient: Some(&request.to),
+                fair_budget: true,
+            };
+            let mut snapshot =
+                Self::wait_snapshot_locked(&store, &wait_request, principal, None, scope, &marks)?
+                    .results;
+            let hidden: Vec<bool> = snapshot
+                .iter()
+                .map(|entry| entry.status == "not_visible")
+                .collect();
+            let row = store
+                .digest_register(&requester, &request, &hidden, now_ms())?
+                .row;
+            if let Some(mail_id) = row.delivered_mail_id.clone() {
+                let results = digest_results_locked(&store, &row, &marks)?;
+                let response = delivered_response(&row, mail_id, results)?;
+                request.validate_response(&response)?;
+                return serde_json::to_value(response).map_err(|_| {
+                    Error::new("internal", "swarm.digest response could not be encoded")
+                });
+            }
+            // A retry keeps the first admitted mask: an entry hidden then
+            // stays hidden even after it moves into scope, so the persisted
+            // mask applies before any excerpt is budgeted.
+            if row.hidden != hidden {
+                let scope = WaitScope {
+                    hidden: Some(&row.hidden),
+                    ..scope
+                };
+                snapshot = Self::wait_snapshot_locked(
+                    &store,
+                    &wait_request,
+                    principal,
+                    None,
+                    scope,
+                    &marks,
+                )?
+                .results;
+            }
+            (row, snapshot)
         };
-        if let Some(mail_id) = row.delivered_mail_id.clone() {
-            let results = self.digest_owner_results(&row).await?;
-            let response = delivered_response(&row, mail_id, results)?;
-            request.validate_response(&response)?;
-            return serde_json::to_value(response)
-                .map_err(|_| Error::new("internal", "swarm.digest response could not be encoded"));
-        }
         if digest_mode_completed(request.mode.as_str(), &snapshot) {
             match self.deliver_digest(&row.id).await {
                 Ok(Some(response)) => {
@@ -213,76 +264,58 @@ impl Router {
             .map_err(|_| Error::new("internal", "swarm.digest response could not be encoded"))
     }
 
-    async fn digest_owner_results(&self, row: &DigestRow) -> Result<Vec<WaitEntryResult>> {
-        let wait_request = wait_request_for_row(row);
-        let owner = Principal::Owner;
-        let results = self
-            .wait_snapshot(&wait_request, &owner, None)
-            .await?
-            .results;
-        Ok(masked_results(results, &row.hidden))
-    }
-
     /// Deliver one pending digest when its mode condition holds. Returns
     /// `Some` when delivered (or already delivered), `None` when still
     /// pending. Reuses the digest id as the mail id for restart safety.
+    ///
+    /// One Store guard spans the recipient-scope authorization and the mail
+    /// insert (which commits the delivered mark in its own transaction): no
+    /// reparent can land between them, so an answer reaches the recipient
+    /// only while it has scope over that worker at commit. Only the wake that
+    /// follows the committed mail runs after the guard.
     pub(super) async fn deliver_digest(
         &self,
         digest_id: &str,
     ) -> Result<Option<SwarmDigestResponse>> {
-        let row: DigestRow = {
-            let store = self.inner.store.lock().await;
-            match store.get_completion_digest(digest_id)? {
-                Some(row) => row,
-                None => {
-                    return Err(Error::new("internal", "digest registration disappeared"));
-                }
+        let marks = self.wait_unknown_marks().await;
+        let (row, results, mail, change) = {
+            let mut store = self.inner.store.lock().await;
+            let row = store
+                .get_completion_digest(digest_id)?
+                .ok_or_else(|| Error::new("internal", "digest registration disappeared"))?;
+            let results = digest_results_locked(&store, &row, &marks)?;
+            if let Some(mail_id) = row.delivered_mail_id.clone() {
+                return Ok(Some(delivered_response(&row, mail_id, results)?));
             }
-        };
-        if let Some(mail_id) = row.delivered_mail_id.clone() {
-            let results = self.digest_owner_results(&row).await?;
-            return Ok(Some(delivered_response(&row, mail_id, results)?));
-        }
-        let results = self.digest_owner_results(&row).await?;
-        if !digest_mode_completed(row.mode.as_str(), &results) {
-            return Ok(None);
-        }
-        let text = digest_text(&row.id, &row.parent, &row.mode, &results);
-        let thread = digest_thread(&row.id);
-        let mail = MailSendRequest {
-            id: row.id.clone(),
-            to: vec![row.parent.clone()],
-            mode: eliot_core::api::MailMode::Queue,
-            text,
-            thread: Some(thread),
-            reply_to_delivery: None,
-        };
-        let mail_value = serde_json::to_value(&mail)
-            .map_err(|_| Error::new("internal", "digest mail could not be encoded"))?;
-        let owner = Principal::Owner;
-        let reply = match self.mail_send_impl(&mail_value, &owner, true).await {
-            Ok(reply) => reply,
-            Err(error) => {
-                // A retained binding means the mail already exists (possibly
-                // acked and pruned since): treat as delivered without a
-                // second row. Anything else stays pending for retry.
-                if error.code == "mailbox_full" {
-                    return Err(error);
-                }
-                return Err(error);
+            if !digest_mode_completed(row.mode.as_str(), &results) {
+                return Ok(None);
             }
+            let mail = MailSendRequest {
+                id: row.id.clone(),
+                to: vec![row.parent.clone()],
+                mode: eliot_core::api::MailMode::Queue,
+                text: digest_text(&row.id, &row.parent, &row.mode, &results),
+                thread: Some(digest_thread(&row.id)),
+                reply_to_delivery: None,
+            };
+            let mail: MailSendRequest = decode_coordination_request(
+                &serde_json::to_value(&mail)
+                    .map_err(|_| Error::new("internal", "digest mail could not be encoded"))?,
+                &self.inner.secrets,
+                "mail.send",
+                MailSendRequest::validate,
+            )?;
+            let change =
+                self.mail_send_locked(&mut store, &principal_name(&Principal::Owner), &mail, true)?;
+            (row, results, mail, change)
         };
-        let mail_response: MailSendResponse = serde_json::from_value(reply)
-            .map_err(|_| Error::new("internal", "digest mail response is invalid"))?;
-        let delivery_id = mail_response
+        let delivery_id = self
+            .mail_send_finish(&mail, change)
+            .await?
             .deliveries
             .first()
-            .map(|d| d.delivery_id.clone())
+            .map(|delivery| delivery.delivery_id.clone())
             .ok_or_else(|| Error::new("internal", "digest mail delivered nothing"))?;
-        {
-            let mut store = self.inner.store.lock().await;
-            store.mark_digest_delivered(&row.id, &delivery_id, now_ms())?;
-        }
         self.signal_progress();
         Ok(Some(delivered_response(&row, delivery_id, results)?))
     }
@@ -408,14 +441,24 @@ mod tests {
     #[test]
     fn digest_masks_scope_without_widening_reads() {
         let mut visible = vec![
-            WaitEntryResult::new("command", "c1", "succeeded"),
-            WaitEntryResult::new("command", "c2", "failed"),
+            WaitEntryResult::new("command", "c1", "succeeded")
+                .with_turn("a1", 1, "t1")
+                .with_final_text("ok", 1024),
+            WaitEntryResult::new("command", "c2", "failed")
+                .with_turn("a2", 1, "t2")
+                .with_final_text("secret out of scope", 1024),
         ];
         visible[1].resolution_source = Some(eliot_core::TurnResolutionSource::Owner);
         let masked = masked_results(visible, &[false, true]);
         assert_eq!(masked[0].status, "succeeded");
+        assert_eq!(masked[0].final_text.as_deref(), Some("ok"));
         assert_eq!(masked[1].status, "not_visible");
         assert_eq!(masked[1].resolution_source, None);
+        assert_eq!(masked[1].agent, None);
+        assert_eq!(masked[1].generation, None);
+        assert_eq!(masked[1].turn_id, None);
+        assert_eq!(masked[1].final_text, None);
+        assert!(!masked[1].truncated);
         // Owner recomputation never clears a registration-time mask.
         let masked = masked_results(masked, &[false, true]);
         assert_eq!(masked[1].status, "not_visible");
@@ -528,5 +571,775 @@ mod tests {
         });
         let req: SwarmDigestRequest = serde_json::from_value(example).unwrap();
         req.validate().unwrap();
+    }
+
+    fn test_router() -> Router {
+        use crate::bus::Bus;
+        use std::path::PathBuf;
+        use tokio::sync::Mutex as AsyncMutex;
+
+        let store = eliot_store::Store::open(std::path::Path::new(":memory:")).unwrap();
+        Router::new(
+            PathBuf::from("synthetic-data-root"),
+            "owner-credential".to_owned(),
+            std::sync::Arc::new(AsyncMutex::new(store)),
+            Bus::new(16),
+        )
+    }
+
+    async fn spawn_ready_with_control(
+        router: &Router,
+        project: &str,
+        parent: Option<String>,
+        control: &str,
+    ) -> String {
+        use eliot_core::{NativeEvent, SourceBatch, SubmitCommand};
+
+        let mut store = router.inner.store.lock().await;
+        let now = now_ms();
+        let launch_id = ulid::Ulid::new().to_string();
+        let mut args = json!({
+            "project": project,
+            "workspace": "synthetic-workspace",
+            "harness": "codex",
+            "profile": "fixture",
+            "profile_snapshot": {"control": control},
+        });
+        if let Some(parent_id) = parent {
+            args["parent"] = json!(parent_id);
+        }
+        let admission = store
+            .submit(
+                "owner",
+                SubmitCommand {
+                    id: launch_id.clone(),
+                    target: None,
+                    selector: None,
+                    verb: "launch".to_owned(),
+                    args,
+                    expected_generation: Some(0),
+                    expected_turn_id: None,
+                    request_id: None,
+                    probe: false,
+                },
+                now,
+            )
+            .expect("admit launch");
+        let agent = admission.command.target.expect("launch target");
+        store.dispatch(&launch_id, now).expect("dispatch launch");
+        crate::test_support::install_fixture_sources(&mut store, &agent, &launch_id, 1, now);
+        store
+            .put_batch(
+                SourceBatch {
+                    batch_id: ulid::Ulid::new().to_string(),
+                    agent_id: agent.clone(),
+                    generation: 1,
+                    source: "stream".to_owned(),
+                    events: vec![NativeEvent {
+                        ts: None,
+                        kind: "session.ready".to_owned(),
+                        native_id: ulid::Ulid::new().to_string(),
+                        data: json!({"command_id": launch_id}),
+                    }],
+                    cursor: None,
+                },
+                now,
+            )
+            .expect("session ready");
+        store
+            .settle(&launch_id, eliot_core::CommandState::Applied, None, now)
+            .expect("settle");
+        drop(store);
+        router
+            .inner
+            .plugin_host
+            .mark_generation_controlled_for_test(&agent, 1);
+        agent
+    }
+
+    async fn submit_worker_send(router: &Router, worker: &str) -> String {
+        use eliot_core::SubmitCommand;
+
+        let mut store = router.inner.store.lock().await;
+        let now = now_ms();
+        let send_id = ulid::Ulid::new().to_string();
+        let mut send = SubmitCommand::new(send_id.clone(), "send");
+        send.target = Some(worker.to_owned());
+        send.expected_generation = Some(1);
+        send.args = json!({"text": "compute"});
+        store.submit("owner", send, now).expect("submit worker");
+        store.dispatch(&send_id, now).expect("dispatch");
+        send_id
+    }
+
+    async fn complete_worker_turn(
+        router: &Router,
+        worker: &str,
+        send_id: &str,
+        turn_id: &str,
+        final_text: &str,
+    ) {
+        use eliot_core::{NativeEvent, SourceBatch};
+
+        let mut store = router.inner.store.lock().await;
+        let now = now_ms();
+        store
+            .put_batch(
+                SourceBatch {
+                    batch_id: ulid::Ulid::new().to_string(),
+                    agent_id: worker.to_owned(),
+                    generation: 1,
+                    source: "stream".to_owned(),
+                    events: vec![
+                        NativeEvent {
+                            ts: None,
+                            kind: "turn.started".to_owned(),
+                            native_id: ulid::Ulid::new().to_string(),
+                            data: json!({"command_id": send_id, "turn_id": turn_id}),
+                        },
+                        NativeEvent {
+                            ts: None,
+                            kind: "turn.completed".to_owned(),
+                            native_id: ulid::Ulid::new().to_string(),
+                            data: json!({
+                                "command_id": send_id,
+                                "turn_id": turn_id,
+                                "status": "completed",
+                                "final_text": final_text,
+                            }),
+                        },
+                    ],
+                    cursor: None,
+                },
+                now,
+            )
+            .expect("complete worker");
+    }
+
+    #[tokio::test]
+    async fn self_digest_wake_carries_answers_and_marks_read_on_turn_started() {
+        use eliot_core::{NativeEvent, SourceBatch, api::MailInboxResponse};
+
+        let router = test_router();
+        let manager = spawn_ready_with_control(&router, "app", None, "tree").await;
+        let worker = spawn_ready_with_control(&router, "app", Some(manager.clone()), "self").await;
+        let worker_send_id = submit_worker_send(&router, &worker).await;
+        complete_worker_turn(&router, &worker, &worker_send_id, "t-w1", "result is 4").await;
+
+        let digest_id = ulid::Ulid::new().to_string();
+        let manager_principal = Principal::Agent {
+            id: manager.clone(),
+            generation: 1,
+        };
+        let reply: SwarmDigestResponse = serde_json::from_value(
+            router
+                .swarm_digest(
+                    &json!({
+                        "id": digest_id,
+                        "to": manager,
+                        "mode": "all",
+                        "commands": [worker_send_id],
+                        "turns": []
+                    }),
+                    &manager_principal,
+                )
+                .await
+                .expect("register and deliver digest"),
+        )
+        .expect("decode digest response");
+        assert_eq!(reply.state, "delivered");
+
+        // offer_notice after the digest mail commit submitted the wake `send` directly
+        // with the digest body (including agent, turn_id, final_text, truncated)
+        // for the recipient's turn, while ordinary command.get readback redacts it.
+        let open_notice_id = {
+            let store = router.inner.store.lock().await;
+            store
+                .notice_state(&manager)
+                .expect("notice state")
+                .expect("notice claimed")
+                .open_notice_command
+                .expect("open notice command")
+        };
+        let notice_cmd = {
+            let store = router.inner.store.lock().await;
+            store
+                .get_command(&open_notice_id)
+                .expect("get command")
+                .expect("notice command exists")
+        };
+        let wake_text = notice_cmd
+            .args
+            .get("text")
+            .and_then(Value::as_str)
+            .expect("wake text");
+        assert!(wake_text.contains(&format!("agent {worker}, turn_id t-w1, truncated=false")));
+        assert!(wake_text.contains("result is 4"));
+
+        let readback: eliot_core::Command = serde_json::from_value(
+            router
+                .command_get(&json!({"id": open_notice_id}), &Principal::Owner)
+                .await
+                .expect("command.get"),
+        )
+        .expect("decode command");
+        assert_eq!(
+            readback.args.get("redacted").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            !readback
+                .args
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .contains("result is 4")
+        );
+
+        // Simulating plugin turn.started on the wake command marks the digest read.
+        {
+            let mut store = router.inner.store.lock().await;
+            let now = now_ms();
+            store
+                .dispatch(&open_notice_id, now)
+                .expect("dispatch notice");
+            store
+                .put_batch(
+                    SourceBatch {
+                        batch_id: ulid::Ulid::new().to_string(),
+                        agent_id: manager.clone(),
+                        generation: 1,
+                        source: "stream".to_owned(),
+                        events: vec![NativeEvent {
+                            ts: None,
+                            kind: "turn.started".to_owned(),
+                            native_id: ulid::Ulid::new().to_string(),
+                            data: json!({"command_id": open_notice_id, "turn_id": "t-mgr-wake"}),
+                        }],
+                        cursor: None,
+                    },
+                    now,
+                )
+                .expect("turn.started marks digest read");
+        }
+
+        let inbox: MailInboxResponse = serde_json::from_value(
+            router
+                .mail_inbox(&json!({}), &manager_principal)
+                .await
+                .expect("inbox"),
+        )
+        .expect("decode inbox");
+        assert!(inbox.deliveries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn owner_digest_keeps_status_only_for_out_of_scope_workers() {
+        use eliot_core::api::MailInboxResponse;
+
+        let router = test_router();
+        let recipient = spawn_ready_with_control(&router, "app", None, "tree").await;
+        let in_scope =
+            spawn_ready_with_control(&router, "app", Some(recipient.clone()), "self").await;
+        let out_of_scope = spawn_ready_with_control(&router, "other", None, "self").await;
+
+        let c_in = submit_worker_send(&router, &in_scope).await;
+        let c_out = submit_worker_send(&router, &out_of_scope).await;
+        complete_worker_turn(&router, &in_scope, &c_in, "t-in", "visible answer").await;
+        complete_worker_turn(
+            &router,
+            &out_of_scope,
+            &c_out,
+            "t-out",
+            "cross-scope secret",
+        )
+        .await;
+
+        let digest_id = ulid::Ulid::new().to_string();
+        let reply: SwarmDigestResponse = serde_json::from_value(
+            router
+                .swarm_digest(
+                    &json!({
+                        "id": digest_id,
+                        "to": recipient,
+                        "mode": "all",
+                        "commands": [c_in, c_out],
+                        "turns": []
+                    }),
+                    &Principal::Owner,
+                )
+                .await
+                .expect("owner digest"),
+        )
+        .expect("decode digest");
+        assert_eq!(reply.state, "delivered");
+        assert_eq!(reply.results[0].status, "succeeded");
+        assert_eq!(
+            reply.results[0].final_text.as_deref(),
+            Some("visible answer")
+        );
+        assert_eq!(reply.results[1].status, "succeeded");
+        assert_eq!(reply.results[1].agent, None);
+        assert_eq!(reply.results[1].turn_id, None);
+        assert_eq!(reply.results[1].final_text, None);
+        assert!(!reply.results[1].truncated);
+
+        let inbox: MailInboxResponse = serde_json::from_value(
+            router
+                .mail_inbox(
+                    &json!({}),
+                    &Principal::Agent {
+                        id: recipient.clone(),
+                        generation: 1,
+                    },
+                )
+                .await
+                .expect("inbox"),
+        )
+        .expect("decode inbox");
+        assert_eq!(inbox.deliveries.len(), 1);
+        let body = &inbox.deliveries[0].text;
+        assert!(body.contains("visible answer"));
+        assert!(body.contains(&format!("- command {c_out}: succeeded\n")));
+        assert!(!body.contains("cross-scope secret"));
+        assert!(!body.contains(&out_of_scope));
+        assert!(!body.contains("t-out"));
+    }
+
+    #[tokio::test]
+    async fn reparented_worker_before_completion_delivers_status_only() {
+        use eliot_core::api::MailInboxResponse;
+
+        let router = test_router();
+        let manager = spawn_ready_with_control(&router, "app", None, "tree").await;
+        let new_parent = spawn_ready_with_control(&router, "app", None, "tree").await;
+        let stayed = spawn_ready_with_control(&router, "app", Some(manager.clone()), "self").await;
+        let moved = spawn_ready_with_control(&router, "app", Some(manager.clone()), "self").await;
+
+        let c_stayed = submit_worker_send(&router, &stayed).await;
+        let c_moved = submit_worker_send(&router, &moved).await;
+        complete_worker_turn(&router, &stayed, &c_stayed, "t-stay", "stayed answer").await;
+
+        let digest_id = ulid::Ulid::new().to_string();
+        let manager_principal = Principal::Agent {
+            id: manager.clone(),
+            generation: 1,
+        };
+        let pending: SwarmDigestResponse = serde_json::from_value(
+            router
+                .swarm_digest(
+                    &json!({
+                        "id": digest_id,
+                        "to": manager,
+                        "mode": "all",
+                        "commands": [c_stayed, c_moved],
+                        "turns": []
+                    }),
+                    &manager_principal,
+                )
+                .await
+                .expect("register pending digest"),
+        )
+        .expect("decode pending");
+        assert_eq!(pending.state, "pending");
+
+        // Owner reparents `moved` away before completion.
+        router
+            .swarm_reparent(
+                &json!({
+                    "id": ulid::Ulid::new().to_string(),
+                    "agent": moved,
+                    "expected_generation": 1,
+                    "parent": new_parent,
+                    "parent_generation": 1,
+                }),
+                &Principal::Owner,
+            )
+            .await
+            .expect("reparent away");
+
+        // Before `moved` finishes, `deliver_digest` still sees `still_running`.
+        assert!(
+            router
+                .deliver_digest(&digest_id)
+                .await
+                .expect("poll")
+                .is_none()
+        );
+
+        complete_worker_turn(&router, &moved, &c_moved, "t-moved", "moved secret answer").await;
+        let delivered = router
+            .deliver_digest(&digest_id)
+            .await
+            .expect("deliver")
+            .expect("digest completed");
+        assert_eq!(
+            delivered.results[0].final_text.as_deref(),
+            Some("stayed answer")
+        );
+        assert_eq!(delivered.results[1].status, "succeeded");
+        assert_eq!(delivered.results[1].agent, None);
+        assert_eq!(delivered.results[1].turn_id, None);
+        assert_eq!(delivered.results[1].final_text, None);
+
+        // Mark wake not read yet since we didn't emit turn.started; read inbox.
+        let inbox: MailInboxResponse = serde_json::from_value(
+            router
+                .mail_inbox(&json!({}), &manager_principal)
+                .await
+                .expect("inbox"),
+        )
+        .expect("decode inbox");
+        assert_eq!(inbox.deliveries.len(), 1);
+        let body = &inbox.deliveries[0].text;
+        assert!(body.contains("stayed answer"));
+        assert!(body.contains(&format!("- command {c_moved}: succeeded\n")));
+        assert!(!body.contains("moved secret answer"));
+        assert!(!body.contains("t-moved"));
+    }
+
+    #[tokio::test]
+    async fn reparented_recipient_wake_command_redacts_excerpts_from_new_parent() {
+        let router = test_router();
+        let manager = spawn_ready_with_control(&router, "app", None, "tree").await;
+        let worker = spawn_ready_with_control(&router, "app", Some(manager.clone()), "self").await;
+        let foreign_parent = spawn_ready_with_control(&router, "app", None, "tree").await;
+
+        let c_worker = submit_worker_send(&router, &worker).await;
+        complete_worker_turn(&router, &worker, &c_worker, "t-w", "private worker answer").await;
+
+        let manager_principal = Principal::Agent {
+            id: manager.clone(),
+            generation: 1,
+        };
+        router
+            .swarm_digest(
+                &json!({
+                    "id": ulid::Ulid::new().to_string(),
+                    "to": manager,
+                    "mode": "all",
+                    "commands": [c_worker],
+                    "turns": []
+                }),
+                &manager_principal,
+            )
+            .await
+            .expect("digest");
+
+        let open_notice_id = {
+            let store = router.inner.store.lock().await;
+            store
+                .notice_state(&manager)
+                .expect("notice state")
+                .expect("notice claimed")
+                .open_notice_command
+                .expect("open notice")
+        };
+
+        // Reparent the recipient under `foreign_parent` (`worker` moves too, or
+        // suppose `foreign_parent` is a separate manager who now owns `manager`).
+        router
+            .swarm_reparent(
+                &json!({
+                    "id": ulid::Ulid::new().to_string(),
+                    "agent": manager,
+                    "expected_generation": 1,
+                    "parent": foreign_parent,
+                    "parent_generation": 1,
+                }),
+                &Principal::Owner,
+            )
+            .await
+            .expect("reparent recipient");
+
+        let readback: eliot_core::Command = serde_json::from_value(
+            router
+                .command_get(
+                    &json!({"id": open_notice_id}),
+                    &Principal::Agent {
+                        id: foreign_parent,
+                        generation: 1,
+                    },
+                )
+                .await
+                .expect("foreign parent reads wake command"),
+        )
+        .expect("decode command");
+        let text = readback
+            .args
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        assert!(!text.contains("private worker answer"));
+        assert_eq!(
+            readback.args.get("redacted").and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn digest_shares_budget_fairly_so_fifth_short_answer_never_disappears() {
+        use eliot_core::api::{MAX_WAIT_FINAL_TEXT_BYTES, MailInboxResponse};
+
+        let router = test_router();
+        let manager = spawn_ready_with_control(&router, "app", None, "tree").await;
+        let big = "a".repeat(MAX_WAIT_FINAL_TEXT_BYTES);
+        let mut cmds = Vec::new();
+        for idx in 0..4 {
+            let w = spawn_ready_with_control(&router, "app", Some(manager.clone()), "self").await;
+            let c = submit_worker_send(&router, &w).await;
+            complete_worker_turn(&router, &w, &c, &format!("t-{idx}"), &big).await;
+            cmds.push(c);
+        }
+        let w5 = spawn_ready_with_control(&router, "app", Some(manager.clone()), "self").await;
+        let c5 = submit_worker_send(&router, &w5).await;
+        complete_worker_turn(&router, &w5, &c5, "t-5", "fifth short answer").await;
+        cmds.push(c5);
+
+        let manager_principal = Principal::Agent {
+            id: manager.clone(),
+            generation: 1,
+        };
+        let reply: SwarmDigestResponse = serde_json::from_value(
+            router
+                .swarm_digest(
+                    &json!({
+                        "id": ulid::Ulid::new().to_string(),
+                        "to": manager,
+                        "mode": "all",
+                        "commands": cmds,
+                        "turns": []
+                    }),
+                    &manager_principal,
+                )
+                .await
+                .expect("digest"),
+        )
+        .expect("decode");
+        assert_eq!(
+            reply.results[4].final_text.as_deref(),
+            Some("fifth short answer")
+        );
+        assert!(!reply.results[4].truncated);
+
+        let inbox: MailInboxResponse = serde_json::from_value(
+            router
+                .mail_inbox(&json!({}), &manager_principal)
+                .await
+                .expect("inbox"),
+        )
+        .expect("decode inbox");
+        assert_eq!(inbox.deliveries.len(), 1);
+        assert!(inbox.deliveries[0].text.contains("fifth short answer"));
+    }
+
+    #[tokio::test]
+    async fn digest_delivers_when_worker_answer_contains_nul_bytes() {
+        use eliot_core::api::MailInboxResponse;
+
+        let router = test_router();
+        let manager = spawn_ready_with_control(&router, "app", None, "tree").await;
+        let worker = spawn_ready_with_control(&router, "app", Some(manager.clone()), "self").await;
+        let c = submit_worker_send(&router, &worker).await;
+        complete_worker_turn(&router, &worker, &c, "t-nul", "alpha\0omega").await;
+
+        let manager_principal = Principal::Agent {
+            id: manager.clone(),
+            generation: 1,
+        };
+        let reply: SwarmDigestResponse = serde_json::from_value(
+            router
+                .swarm_digest(
+                    &json!({
+                        "id": ulid::Ulid::new().to_string(),
+                        "to": manager,
+                        "mode": "all",
+                        "commands": [c],
+                        "turns": []
+                    }),
+                    &manager_principal,
+                )
+                .await
+                .expect("digest with NUL delivers instead of blocking"),
+        )
+        .expect("decode");
+        assert_eq!(reply.state, "delivered");
+
+        let inbox: MailInboxResponse = serde_json::from_value(
+            router
+                .mail_inbox(&json!({}), &manager_principal)
+                .await
+                .expect("inbox"),
+        )
+        .expect("decode inbox");
+        assert_eq!(inbox.deliveries.len(), 1);
+        assert!(!inbox.deliveries[0].text.contains('\0'));
+        assert!(inbox.deliveries[0].text.contains("alpha\\0omega"));
+    }
+
+    /// Steps the deliverer one Store critical section at a time (tokio's
+    /// Mutex hands the guard over in FIFO order) and reparents the worker in
+    /// each gap. An answer may reach the former parent only when its mail
+    /// committed before the reparent; a reparent that lands between the
+    /// recipient-scope check and the mail insert must never leak it.
+    #[tokio::test]
+    async fn reparent_in_any_lock_gap_never_delivers_answer_to_former_parent() {
+        use eliot_core::api::{MailInboxRequest, MailInboxResponse, ReparentRequest};
+
+        const SECRET: &str = "former parent must not see this";
+        for gap in 1..=4 {
+            let router = test_router();
+            let manager = spawn_ready_with_control(&router, "app", None, "tree").await;
+            let new_parent = spawn_ready_with_control(&router, "app", None, "tree").await;
+            let moved =
+                spawn_ready_with_control(&router, "app", Some(manager.clone()), "self").await;
+            let c_moved = submit_worker_send(&router, &moved).await;
+            let manager_principal = Principal::Agent {
+                id: manager.clone(),
+                generation: 1,
+            };
+            let digest_id = ulid::Ulid::new().to_string();
+            let pending: SwarmDigestResponse = serde_json::from_value(
+                router
+                    .swarm_digest(
+                        &json!({
+                            "id": digest_id,
+                            "to": manager,
+                            "mode": "all",
+                            "commands": [c_moved],
+                            "turns": []
+                        }),
+                        &manager_principal,
+                    )
+                    .await
+                    .expect("register pending digest"),
+            )
+            .expect("decode pending");
+            assert_eq!(pending.state, "pending");
+            complete_worker_turn(&router, &moved, &c_moved, "t-moved", SECRET).await;
+
+            let mut guard = router.inner.store.lock().await;
+            let deliverer = tokio::spawn({
+                let router = router.clone();
+                let digest_id = digest_id.clone();
+                async move { router.deliver_digest(&digest_id).await }
+            });
+            // The deliverer queues on the held guard; each handover lets it
+            // run exactly one critical section before the guard returns here.
+            tokio::task::yield_now().await;
+            for _ in 0..gap {
+                drop(guard);
+                guard = router.inner.store.lock().await;
+            }
+            let inbox_request: MailInboxRequest = serde_json::from_value(json!({})).unwrap();
+            let committed_before_reparent = !guard
+                .mail_inbox(
+                    &principal_name(&manager_principal),
+                    &inbox_request,
+                    now_ms(),
+                )
+                .expect("inbox in gap")
+                .deliveries
+                .is_empty();
+            let reparent: ReparentRequest = serde_json::from_value(json!({
+                "id": ulid::Ulid::new().to_string(),
+                "agent": moved,
+                "expected_generation": 1,
+                "parent": new_parent,
+                "parent_generation": 1,
+            }))
+            .unwrap();
+            let change = guard
+                .reparent("owner", &reparent, now_ms())
+                .expect("reparent in gap");
+            router.publish_locked(&change.events);
+            drop(guard);
+            deliverer
+                .await
+                .expect("join deliverer")
+                .expect("deliver digest");
+
+            let inbox: MailInboxResponse = serde_json::from_value(
+                router
+                    .mail_inbox(&json!({}), &manager_principal)
+                    .await
+                    .expect("inbox"),
+            )
+            .expect("decode inbox");
+            assert_eq!(inbox.deliveries.len(), 1, "gap {gap}");
+            let body = &inbox.deliveries[0].text;
+            if !committed_before_reparent {
+                assert!(!body.contains(SECRET), "gap {gap}: answer crossed scope");
+                assert!(
+                    !body.contains("t-moved"),
+                    "gap {gap}: turn identity crossed"
+                );
+                assert!(body.contains(&format!("- command {c_moved}: succeeded\n")));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_retry_keeps_registration_mask_for_worker_moved_into_scope() {
+        let router = test_router();
+        let manager = spawn_ready_with_control(&router, "app", None, "tree").await;
+        let other_parent = spawn_ready_with_control(&router, "app", None, "tree").await;
+        let running = spawn_ready_with_control(&router, "app", Some(manager.clone()), "self").await;
+        let hidden =
+            spawn_ready_with_control(&router, "app", Some(other_parent.clone()), "self").await;
+        let c_running = submit_worker_send(&router, &running).await;
+        let c_hidden = submit_worker_send(&router, &hidden).await;
+
+        let manager_principal = Principal::Agent {
+            id: manager.clone(),
+            generation: 1,
+        };
+        let params = json!({
+            "id": ulid::Ulid::new().to_string(),
+            "to": manager,
+            "mode": "all",
+            "commands": [c_hidden, c_running],
+            "turns": []
+        });
+        let first: SwarmDigestResponse = serde_json::from_value(
+            router
+                .swarm_digest(&params, &manager_principal)
+                .await
+                .expect("register digest"),
+        )
+        .expect("decode first");
+        assert_eq!(first.state, "pending");
+        assert_eq!(first.results[0].status, "not_visible");
+
+        // The hidden worker moves into the manager's scope and completes
+        // while the other worker keeps the digest pending.
+        router
+            .swarm_reparent(
+                &json!({
+                    "id": ulid::Ulid::new().to_string(),
+                    "agent": hidden,
+                    "expected_generation": 1,
+                    "parent": manager,
+                    "parent_generation": 1,
+                }),
+                &Principal::Owner,
+            )
+            .await
+            .expect("reparent into scope");
+        complete_worker_turn(&router, &hidden, &c_hidden, "t-hidden", "masked answer").await;
+
+        let retry: SwarmDigestResponse = serde_json::from_value(
+            router
+                .swarm_digest(&params, &manager_principal)
+                .await
+                .expect("retry digest"),
+        )
+        .expect("decode retry");
+        assert_eq!(retry.state, "pending");
+        assert_eq!(retry.results[0].status, "not_visible");
+        assert_eq!(retry.results[0].agent, None);
+        assert_eq!(retry.results[0].turn_id, None);
+        assert_eq!(retry.results[0].final_text, None);
+        assert_eq!(retry.results[1].status, "still_running");
     }
 }

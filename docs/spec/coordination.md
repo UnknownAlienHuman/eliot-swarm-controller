@@ -359,8 +359,21 @@ last presentation, skips the one-minute cooldown once, so an answer to an
 Agent's own question wakes it at once; the open-notice, busy, pending-input
 and unknown gates still apply.
 The notice is an ordinary owner `send` bound to the recipient's current
-generation and carrying only the unread count at claim time. It never contains
-the body or marks it read. Unknown notice is not blindly retried;
+generation and carrying only the unread count at claim time; ordinary mail
+notices never contain the body or mark it read. An unread completion digest
+registered by the recipient Agent itself at its current generation
+(`agent:<recipient>:<generation>`) is the explicit exception (the registrant
+is already the recipient and holds command/read scope over the digest): when
+it fits within the wake budget (`MAX_EVENT_BYTES`, 64 KiB), the wake `send`
+shows the digest body directly to the recipient's own turn (appending
+`N unread: mail.inbox, then mail.ack` when uninlined unread mail remains) and
+binds `presentation_command` so `turn.started` of that wake stamps both
+`presented_at` and `read_at` on the inlined digest delivery, while ordinary
+command readback (`command.get`/`command.children`) redacts `args.text` so no
+other principal can read excerpt text through the wake command. If it does not
+fit, or the registrant differs (for
+example Owner or an earlier generation), the wake falls back to the generic
+count notice and leaves `read_at` unset until `mail.ack`. Unknown notice is not blindly retried;
 provider hold, pending request, current unknown gate and drain suppress new wake.
 A busy, waiting or input-pending mail recipient suppresses a new mail wake:
 a current-generation `send` already accepted, queued, dispatched or unknown
@@ -409,7 +422,15 @@ parent result when a captured child set satisfies `all`/`any`. The digest mail i
 the digest registration id, so a reconnect or restart replays the same mail id and
 the existing mail stable effect identity makes the retry a no-op. The thread is
 `completion-<id-prefix>` (never `attention-*`, never `-advisory`), the body lists
-every frozen entry outcome, and no attention event is emitted: a successful
+every frozen entry outcome with its turn identity once, `truncated` and a fairly
+allocated bounded `final_text` excerpt for authorized completed bound turns
+(entries outside registration-time scope stay `not_visible`, also on a retry
+after they move into scope; entries where the recipient lacks scope at
+delivery—including Owner-registered digests and workers reparented away before
+completion—deliver status-only, the scope recheck and the mail insert sharing
+one Store lock; NUL bytes are escaped as `\0` before budgeting) within
+`MAX_MAIL_TEXT_BYTES` (32 KiB) with a batch-wide excerpt reserve (see
+[api](api.md#waiting)), and no attention event is emitted: a successful
 completion stays distinct from an attention incident. Registration ids share the
 public write-id namespace: every public write path (`mail.send`, `mail.ack`,
 `var.set` and groups, commands, generic writes, claims, cleanup, handoff,
