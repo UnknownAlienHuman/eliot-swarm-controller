@@ -153,6 +153,10 @@ struct CapturedAgent {
     children_revision: Option<i64>,
     manager_progress_at: Option<i64>,
     code_progress: Option<CodeProgressState>,
+    /// Latest of the last worktree write or commit and the active turn's
+    /// start: `no_code_progress` measures its window from here, so a turn
+    /// that has not written yet is judged only after the window elapses.
+    code_basis_at: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize)]

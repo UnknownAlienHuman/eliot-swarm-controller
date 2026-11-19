@@ -202,6 +202,11 @@ pub(super) async fn capture_agent(
         (None, Some(started)) => Some(started),
         (None, None) => None,
     };
+    let code_basis_at = code_progress
+        .last_code_progress_at
+        .into_iter()
+        .chain(turn_started_at)
+        .max();
     let now = now_ms();
     let progress_age_ms = progress_basis_at
         .and_then(|at| now.checked_sub(at))
@@ -231,6 +236,7 @@ pub(super) async fn capture_agent(
         children_revision,
         manager_progress_at,
         code_progress: Some(code_progress),
+        code_basis_at,
     }))
 }
 

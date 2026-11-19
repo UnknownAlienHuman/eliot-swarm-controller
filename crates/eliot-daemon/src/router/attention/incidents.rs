@@ -621,12 +621,14 @@ pub(super) fn desired_incident(
         && captured.source_healthy == Some(true)
         && captured.agent.active_turn.is_some()
         && captured.agent.pending.is_empty()
-        && matches!(
-            &captured.code_progress,
-            Some(cp) if cp.available && cp.last_code_progress_at.is_none()
-                || cp.last_code_progress_at
-                    .is_some_and(|at| now_ms().checked_sub(at).is_some_and(|age| age >= threshold_ms))
-        )
+        && captured
+            .code_progress
+            .as_ref()
+            .is_some_and(|cp| cp.available)
+        && captured
+            .code_basis_at
+            .and_then(|at| now_ms().checked_sub(at))
+            .is_some_and(|age| age >= threshold_ms)
     {
         let activity = "no_code_progress".to_owned();
         return Some((
