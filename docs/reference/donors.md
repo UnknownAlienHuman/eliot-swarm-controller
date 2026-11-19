@@ -52,6 +52,26 @@ that actually extracts code; do not install all these projects as dependencies.
 | L6 MCP stdio | **Dependency:** official [`rmcp` 3.9.0](https://crates.io/crates/rmcp/3.9.0); Apache-2.0; MSRV 1.88; crate download verified with Rust 1.99.1. | Use the SDK directly; no source copied. |
 | L6 HTTP origin authentication | **Dependency:** [`jsonwebtoken` 11.1.0](https://crates.io/crates/jsonwebtoken/11.1.0), MIT, MSRV 1.88, inspected 2026-11-07 with pinned Rust 1.99.1. Reuse the already-locked `aws-lc-rs` backend and `reqwest` 0.13.5; PEM features are disabled. | Verify the signed Cloudflare Access application assertion with fixed configured issuer/JWKS/AUD and bounded refresh. Reuse rmcp request extensions and sessions. No copied crypto, OAuth implementation, new service or identity registry. |
 
+## Desktop Material controls (k202, 2026-11-19)
+
+**Pattern only**, no code copied and no dependency added: the button template,
+shapes, elevation and motion in `apps/swarm-desktop/src/app_resources/templates.rs`,
+`theme::elevation` and `ui::tokens`.
+
+- [material-web](https://github.com/material-components/material-web) (`main`),
+  Apache-2.0: the elevation levels of `elevation/internal/_elevation.scss` (key
+  shadow at 0.30, ambient at 0.15; levels 2–4 offsets, blurs and spreads),
+  checked against the file on 2026-11-19. The 8 % and 10 % state layers were
+  already the desktop's (`theme::state`); the emphasized and
+  emphasized-decelerate curves and the short/medium durations follow the M3
+  motion tokens as published, not re-checked against source this round.
+- [Uno.Themes](https://github.com/unoplatform/Uno.Themes) (`master`), Apache-2.0
+  (license checked 2026-11-19): the pattern of Material styles as WinUI control
+  templates over lightweight-styling keys. Its XAML is not imported: the
+  desktop's templates read its own button families' keys.
+- WinUI's `ThemeShadow` was tried first and draws nothing outside a popup
+  without receivers (observed live), so shadows are drawn layers.
+
 ## Provider quota pattern (k92, inspected 2026-11-16)
 
 OpenCodex release 2.84.0, local source
