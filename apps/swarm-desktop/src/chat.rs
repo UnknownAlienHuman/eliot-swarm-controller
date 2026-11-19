@@ -1244,11 +1244,17 @@ impl Conversation {
                                 ),
                                 (other, _, None) => ("Tool", other.to_owned()),
                             };
-                        let status = match (row.done, row.status.as_deref()) {
-                            (false, _) => "Running",
-                            (true, Some(status)) if is_success(status) => "Completed",
-                            (true, Some(status)) => status,
-                            (true, None) => "Finished · result not reported",
+                        // A tool the turn ended without hearing the end of
+                        // (a stop, a failure) no longer runs.
+                        let status = match (row.done, row.status.as_deref(), &turn.status) {
+                            (false, _, TurnStatus::Running) => "Running",
+                            (false, _, TurnStatus::Completed(Some(TurnOutcome::Interrupted))) => {
+                                "Interrupted"
+                            }
+                            (false, _, _) => "Ended · result not reported",
+                            (true, Some(status), _) if is_success(status) => "Completed",
+                            (true, Some(status), _) => status,
+                            (true, None, _) => "Finished · result not reported",
                         };
                         let elapsed = row
                             .started_ms
@@ -1282,7 +1288,7 @@ impl Conversation {
                         // counts its elapsed seconds without a new revision.
                         let started = row
                             .started_ms
-                            .filter(|_| !row.done)
+                            .filter(|_| status == "Running")
                             .map(|ms| ms.to_string())
                             .unwrap_or_default();
                         parts.push(Part::new(
@@ -1551,5 +1557,19 @@ pub fn file_references(text: &str) -> Vec<String> {
             }
         }
     }
+    // A bare name that a longer reference in the same text ends with
+    // ("notes.py" beside "src/notes.py") is that file, not one at the
+    // workspace root: one chip.
+    let longer: Vec<String> = paths
+        .iter()
+        .filter(|path| path.contains(['/', '\\']))
+        .map(|path| path.replace('\\', "/").to_lowercase())
+        .collect();
+    paths.retain(|path| {
+        path.contains(['/', '\\']) || {
+            let tail = format!("/{}", path.to_lowercase());
+            !longer.iter().any(|long| long.ends_with(&tail))
+        }
+    });
     paths
 }

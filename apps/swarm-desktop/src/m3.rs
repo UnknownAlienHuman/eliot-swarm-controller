@@ -853,8 +853,8 @@ pub fn composer_card(palette: Palette, place: Grid, content: impl Into<View>) ->
 }
 
 /// The header's status pill: 24 DIPs, the tone's container, a 6-DIP dot
-/// and a caption.
-pub fn status_pill(palette: Palette, tone: StatusTone, label: &str) -> View {
+/// and a caption trimmed at `label_width`.
+pub fn status_pill(palette: Palette, tone: StatusTone, label: &str, label_width: f64) -> View {
     let (container, on) = palette.status_chip(tone);
     Border::new()
         .height(height::BADGE)
@@ -876,7 +876,7 @@ pub fn status_pill(palette: Palette, tone: StatusTone, label: &str) -> View {
                     text(label.to_owned(), style::CAPTION)
                         .foreground(on)
                         .vertical_alignment(VerticalAlignment::Center)
-                        .max_width(layout::RUNS_LABEL_WIDTH)
+                        .max_width(label_width)
                         .text_trimming(TextTrimming::CharacterEllipsis),
                 )),
         )

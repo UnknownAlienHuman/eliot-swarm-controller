@@ -550,9 +550,12 @@ impl Store {
             )
             .optional()
             .map_err(sql_error)?;
+        // No Git source row yet: the daemon opens it while preparing the
+        // generation, before the Agent starts, so nothing was read yet. A
+        // failed read marks the row's health instead.
         let Some((health, last_store_seq)) = source else {
             return Ok(core::api::WorkSummaryView::unavailable(
-                "git_unavailable",
+                "pending",
                 turn_counts,
             ));
         };

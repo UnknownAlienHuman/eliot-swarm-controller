@@ -821,13 +821,15 @@ impl DesktopApp {
             ShellMsg::SearchChanged(text) => {
                 self.nav.search.text = text.clone();
                 // WinUI writes the suggestion reached with the arrows into
-                // the box: that is not a new query.
-                if !self
-                    .nav
-                    .search
-                    .results
-                    .iter()
-                    .any(|(label, _)| *label == text)
+                // the box: that is not a new query, nor is the query itself
+                // written back after an open (`open_found`).
+                if text != self.nav.search.query
+                    && !self
+                        .nav
+                        .search
+                        .results
+                        .iter()
+                        .any(|(label, _)| *label == text)
                 {
                     self.nav.search.query = text;
                     // The server searches every Agent, not just the loaded
@@ -1117,6 +1119,9 @@ impl DesktopApp {
 
     /// Open the Agent a search found.
     fn open_found(&mut self, id: &str, context: &ComponentContext<Self>) {
+        // The box shows the query again, not the suggestion WinUI wrote
+        // into it when the arrows reached it.
+        self.nav.search.text = self.nav.search.query.clone();
         if let Some(agent) = self.find_agent(id).cloned() {
             self.nav.selection.select_agent(Some(agent.id.clone()));
             self.shell_update(ShellMsg::AgentOpened(agent), context);
@@ -1504,17 +1509,27 @@ impl DesktopApp {
         });
     }
 
-    /// The main area's width from the window width, the sidebar (or the
-    /// Settings navigation in its place) and the open panel, or None until
-    /// the first size observation.
+    /// The main area's width from the window width, the sidebar (its rail
+    /// when hidden, the Settings navigation in its place) and the open
+    /// panel, or None until the first size observation.
     pub(super) fn main_width(&self) -> Option<f64> {
         let panel = if self.panel_shown() {
             tokens::layout::PANEL_WIDTH
         } else {
             0.0
         };
-        self.window_width
-            .map(|width| width - tokens::layout::SIDEBAR_WIDTH - panel)
+        let side = if self.rail_shown() {
+            RAIL_WIDTH
+        } else {
+            tokens::layout::SIDEBAR_WIDTH
+        };
+        self.window_width.map(|width| width - side - panel)
+    }
+
+    /// Tasks hide the sidebar to its rail; Settings always shows its
+    /// navigation.
+    fn rail_shown(&self) -> bool {
+        self.nav.sidebar_collapsed && self.main != Main::Settings && !self.startup_error
     }
 
     /// The right panel belongs to the conversation: Settings shows two
@@ -1824,7 +1839,7 @@ impl DesktopApp {
         };
         // Settings always shows its navigation; tasks may hide the sidebar
         // to its rail.
-        let rail = self.nav.sidebar_collapsed && self.main != Main::Settings && !self.startup_error;
+        let rail = self.rail_shown();
         let mut columns = vec![
             GridLength::Pixel(if rail {
                 RAIL_WIDTH

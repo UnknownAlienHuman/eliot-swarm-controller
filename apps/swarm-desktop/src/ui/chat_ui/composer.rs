@@ -13,6 +13,17 @@ const USAGE_WIDTH: f64 = 320.0;
 const USAGE_ROWS: usize = 3;
 /// The effort popover's least width (its steps set the rest).
 const EFFORT_MIN_WIDTH: f64 = 300.0;
+/// Below this composer width the hint before the buttons is left out.
+const HINT_MIN_WIDTH: f64 = 560.0;
+/// What the composer's bottom row takes besides the chip labels: the card's
+/// padding (16 + 12), the row's gap (8), the usage ring and the FAB 10
+/// apart (32 + 10 + 36), the + button and its gap (32 + 6), and a chip's
+/// padding, gap and chevron (10 + 6 + 12 + 10).
+const BOTTOM_ROW_CHROME: f64 = 190.0;
+/// Home's access chip beside the model chip, with its gap.
+const ACCESS_CHIP: f64 = 112.0;
+/// The narrowest a chip's label trims to.
+const MIN_CHIP_LABEL: f64 = 80.0;
 
 impl DesktopApp {
     /// What Send (the button, or Enter) does now: retry the unresolved
@@ -74,9 +85,30 @@ impl DesktopApp {
             _ if running || reading == Some(RowMode::Running) => "Type to steer the running turn",
             _ => "Send a follow-up",
         };
+        let widest = if home {
+            tokens::layout::HOME_WIDTH
+        } else {
+            tokens::layout::READING_WIDTH
+        };
+        // Home's composer takes the home column (760), a conversation's its
+        // reading column (720).
+        let width = if home {
+            self.column_width(widest)
+        } else {
+            column
+        };
+        // A narrow composer drops its hint and trims its chips' labels to
+        // the room left, so the buttons and the chevrons stay whole.
+        let hint = width.is_none_or(|width| width >= HINT_MIN_WIDTH);
+        let label = |others: f64| {
+            width.map_or(tokens::layout::PROJECT_CHIP_WIDTH, |width| {
+                (width - BOTTOM_ROW_CHROME - others)
+                    .clamp(MIN_CHIP_LABEL, tokens::layout::PROJECT_CHIP_WIDTH)
+            })
+        };
         let chips: View = match (agent.as_deref(), detail) {
-            (None, _) => self.composer_chips(context, palette),
-            (Some(_), Some(detail)) => self.model_chip(detail, context, palette),
+            (None, _) => self.composer_chips(label(ACCESS_CHIP), context, palette),
+            (Some(_), Some(detail)) => self.model_chip(detail, label(0.0), context, palette),
             (Some(_), None) => View::empty(),
         };
         let retry = agent
@@ -102,11 +134,6 @@ impl DesktopApp {
             },
             (None, _) => Primary::Start,
         };
-        let widest = if home {
-            tokens::layout::HOME_WIDTH
-        } else {
-            tokens::layout::READING_WIDTH
-        };
         let popover = self.launch.open.is_some();
         View::component::<Composer>(ComposerInput {
             palette,
@@ -127,14 +154,9 @@ impl DesktopApp {
             chips,
             usage: self.usage_indicator(context, palette),
             primary,
+            hint,
             enabled: !self.submitting(),
-            // Home's composer takes the home column (760), a conversation's
-            // its reading column (720).
-            width: if home {
-                self.column_width(widest)
-            } else {
-                column
-            },
+            width,
             widest,
             agent,
             send: context.forward(),
@@ -146,6 +168,7 @@ impl DesktopApp {
     fn model_chip(
         &self,
         detail: &UiDetail,
+        label_width: f64,
         context: &mut ViewContext<Self>,
         palette: Palette,
     ) -> View {
@@ -170,12 +193,7 @@ impl DesktopApp {
                 if open { "open" } else { "change" }
             ))
             .on_click(context.callback(|()| Message::Launch(LaunchMsg::Toggle(Pop::Effort))))
-            .content(m3::chip_content(
-                None,
-                &label,
-                true,
-                tokens::layout::PROJECT_CHIP_WIDTH,
-            ))
+            .content(m3::chip_content(None, &label, true, label_width))
     }
 
     /// The open Agent and its detail when the popovers act on it (not a
@@ -682,6 +700,9 @@ pub(in crate::ui) struct ComposerInput {
     chips: View,
     usage: View,
     primary: Primary,
+    /// The hint before the trailing buttons ("Enter to send"), left out
+    /// of a narrow composer.
+    hint: bool,
     /// No submission is in flight.
     enabled: bool,
     width: Option<f64>,
@@ -962,14 +983,17 @@ fn composer_actions(
         }
         _ => "Enter to send",
     };
+    let hint: View = if input.hint && !hint.is_empty() {
+        m3::secondary(hint)
+            .vertical_alignment(VerticalAlignment::Center)
+            .into()
+    } else {
+        View::empty()
+    };
     StackPanel::new()
         .orientation(Orientation::Horizontal)
         .spacing(tokens::spacing::ROW)
-        .children((
-            m3::secondary(hint).vertical_alignment(VerticalAlignment::Center),
-            input.usage.clone(),
-            primary,
-        ))
+        .children((hint, input.usage.clone(), primary))
 }
 
 /// Files attached in the composer: one outlined chip each (file glyph,

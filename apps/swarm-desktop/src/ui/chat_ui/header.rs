@@ -216,6 +216,13 @@ impl DesktopApp {
             pill,
             menu,
             details_open: self.panel == Panel::Details,
+            widths: self.main_width().map_or(
+                (
+                    tokens::layout::READING_WIDTH,
+                    tokens::layout::RUNS_LABEL_WIDTH,
+                ),
+                header_widths,
+            ),
             send: context.forward(),
         })
     }
@@ -303,7 +310,28 @@ pub(super) struct HeaderInput {
     /// shown, not active).
     menu: Option<Vec<MenuItem>>,
     details_open: bool,
+    /// The widest the title and the pill's label take ([`header_widths`]).
+    widths: (f64, f64),
     send: Callback<Message>,
+}
+
+/// The narrowest a title trims to; the pill's label trims after it.
+const MIN_TITLE: f64 = 96.0;
+/// The narrowest the pill's label trims to.
+const MIN_PILL_LABEL: f64 = 64.0;
+
+/// The widest the header's title and status-pill label take in a main area
+/// `main` DIPs wide: the reading width and the pill's full label when they
+/// fit; a narrow window trims the title first, then the label, so the two
+/// actions always keep their room.
+fn header_widths(main: f64) -> (f64, f64) {
+    let chrome = tokens::spacing::LG + tokens::spacing::MD + 2.0 * tokens::spacing::ROW;
+    let pill_chrome = tokens::layout::BADGE_DOT + 6.0 + 2.0 * tokens::spacing::ROW;
+    let actions = 2.0 * tokens::height::CONTROL + tokens::spacing::ROW_GAP;
+    let room = main - chrome - pill_chrome - actions;
+    let label = (room - MIN_TITLE).clamp(MIN_PILL_LABEL, tokens::layout::RUNS_LABEL_WIDTH);
+    let title = (room - label).clamp(MIN_TITLE, tokens::layout::READING_WIDTH);
+    (title, label)
 }
 
 /// One line: the title, the status pill, then the details toggle and the
@@ -350,7 +378,9 @@ impl Component for Header {
                 .content(m3::icon(m3::glyph::MORE)),
         };
         // The design's header: a full-width 52-DIP bar on a hairline, the
-        // title at 15/500, the status pill, then Details and More.
+        // title at 15/500, the status pill, then Details and More. The
+        // actions take their own column, so a narrow window trims the title
+        // and then the pill's label, never the actions.
         Border::new()
             .grid_row(0)
             .height(tokens::height::HEADER)
@@ -364,24 +394,34 @@ impl Component for Header {
             ))
             .content(
                 Grid::new()
-                    .columns([GridLength::Auto, GridLength::Auto, GridLength::STAR])
+                    .columns([GridLength::STAR, GridLength::Auto])
                     .column_spacing(tokens::spacing::ROW)
                     .children((
-                        m3::section_title(input.title.clone())
-                            .max_width(tokens::layout::READING_WIDTH)
-                            .vertical_alignment(VerticalAlignment::Center)
-                            .text_trimming(TextTrimming::CharacterEllipsis)
-                            .is_text_selection_enabled(true),
-                        Border::new()
-                            .grid_column(1)
-                            .vertical_alignment(VerticalAlignment::Center)
-                            .content(m3::status_pill(palette, input.tone, &input.pill)),
+                        Grid::new()
+                            .columns([GridLength::Auto, GridLength::Auto])
+                            .column_spacing(tokens::spacing::ROW)
+                            .horizontal_alignment(HorizontalAlignment::Left)
+                            .children((
+                                m3::section_title(input.title.clone())
+                                    .max_width(input.widths.0)
+                                    .vertical_alignment(VerticalAlignment::Center)
+                                    .text_trimming(TextTrimming::CharacterEllipsis)
+                                    .is_text_selection_enabled(true),
+                                Border::new()
+                                    .grid_column(1)
+                                    .vertical_alignment(VerticalAlignment::Center)
+                                    .content(m3::status_pill(
+                                        palette,
+                                        input.tone,
+                                        &input.pill,
+                                        input.widths.1,
+                                    )),
+                            )),
                         // Details and More, 2 DIPs apart at the right end.
                         StackPanel::new()
-                            .grid_column(2)
+                            .grid_column(1)
                             .orientation(Orientation::Horizontal)
                             .spacing(tokens::spacing::ROW_GAP)
-                            .horizontal_alignment(HorizontalAlignment::Right)
                             .vertical_alignment(VerticalAlignment::Center)
                             .children((
                                 m3::icon_button(palette)
