@@ -2122,7 +2122,7 @@ fn live_session_snapshot(
 /// exact requested turn. The CLI has no turn-status query: the reader's own
 /// records are the native read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TurnEvidence {
+pub(crate) enum TurnEvidence {
     /// Bound turn, no `result` yet, healthy source and a live process.
     Running,
     /// The exact turn's `result` record mapped to a universal status.
@@ -2141,7 +2141,7 @@ impl TurnEvidence {
     }
 }
 
-fn exact_turn_evidence(
+pub(crate) fn exact_turn_evidence(
     params: &AgentSnapshotParams,
     status: &EventStatus,
     process_exited: bool,

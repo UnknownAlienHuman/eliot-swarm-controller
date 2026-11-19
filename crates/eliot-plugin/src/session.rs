@@ -944,6 +944,26 @@ impl StreamSource<'_> {
         Err(error)
     }
 
+    /// Commit one turn-bound `message.completed`. A valid native message
+    /// whose encoded data exceeds the persisted-event bound is not persisted:
+    /// it becomes one acknowledged `message` coverage gap, so the turn's
+    /// native outcome, its exact-turn evidence and later facts survive.
+    /// Returns whether the message was committed.
+    pub async fn commit_message(&mut self, native_id: String, data: Value) -> Result<bool> {
+        if serde_json::to_vec(&data).map_or(true, |bytes| bytes.len() > MAX_EVENT_BYTES) {
+            let reason = format!(
+                "{} completed message exceeded the persisted-event bound",
+                self.harness
+            );
+            self.families = &["message"];
+            self.record_coverage_gap(&reason).await?;
+            return Ok(false);
+        }
+        self.commit_event("message.completed", native_id, data)
+            .await?;
+        Ok(true)
+    }
+
     /// Record a native loss reported by the adapter.
     pub async fn record_gap(&mut self, reason: &str) -> Result<()> {
         self.record_gap_until(reason, Instant::now() + EVENT_DEADLINE)

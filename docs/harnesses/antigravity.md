@@ -142,7 +142,10 @@ turn, `cancelled` settles an interrupt, `refusal` fails it, and any other
 stop reason is a native protocol gap. Assistant text is accumulated from
 `agent_message_chunk` updates carrying text blocks only (other content
 blocks contribute no text), bounded at 256 KiB, then
-`final_text_unavailable:"event_budget"`; thought and user chunks are
+`final_text_unavailable:"event_budget"`. A reply within that budget but over the
+persisted-event bound records one `message` coverage gap instead of
+`message.completed` and the same marker; the turn still completes with its
+`stopReason`. Thought and user chunks are
 bookkeeping. A normal completion with no assistant text at all keeps its
 native `stopReason` but carries
 `final_text_unavailable:"empty_native_response"` (see Facts and recovery),
@@ -374,7 +377,9 @@ drain buffered stdout first. Unknown input/result is not retried.
 For the exact active turn, `agent.snapshot` names its `turn_evidence`. The
 turn is running while its fenced `session/prompt` awaits the reply on a
 healthy stream and a live process. It is terminal from that reply (ACP
-`cancelled` reads as universal `interrupted`). It is lost when the observed
+`cancelled` reads as universal `interrupted`; `native_status` keeps the raw
+`stopReason`), retained before its facts are projected so a failed write costs
+only that fact. It is lost when the observed
 process exit drained stdout without a reply. A gap or a lost stream proves
 none of these, so the daemon monitor settles the turn `unknown` after its
 bounded reads.

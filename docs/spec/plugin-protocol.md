@@ -184,7 +184,9 @@ the universal vocabulary (`completed`, `interrupted`, `failed`) and keeps the na
 word in `native_status`. A stream adapter with no native turn-status query (Claude,
 Antigravity) reads its own owned reader: a bound turn without its terminal record, on
 a healthy source and a live process, is running; the exact terminal record is
-terminal. When the owned process exit is observed after its output fully drained
+terminal. The adapter retains that record's bounded facts (universal status and raw
+native status) before projecting them, so a failed later write does not erase the
+evidence. When the owned process exit is observed after its output fully drained
 with no terminal for the exact turn, the snapshot reports `state: "lost"`,
 `process_exited: true`, no active turn and a non-terminal `last_turn`. A declared
 source gap or lost stream is not evidence.
@@ -389,7 +391,10 @@ A source row's `open|closed` lifecycle, health and latest historical gap are ind
 A gap neither closes the source nor changes its owner or health automatically.
 An adapter may report a family-scoped observation-coverage gap (for example,
 bounded tool telemetry) without declaring the separately associated native
-turn outcome or later input unavailable. This requires a canonical gap ACK;
+turn outcome or later input unavailable. A valid native message whose
+`message.completed` data exceeds the persisted-event bound is one such `message`
+gap ([`StreamSource::commit_message`](../../crates/eliot-plugin/src/session.rs)):
+the turn keeps running and its terminal carries `final_text_unavailable`. This requires a canonical gap ACK;
 an unresolved gap/batch ACK still fences admission. Session/turn identity loss,
 unproven delivery and transport loss cannot use this coverage-only path, and
 it never clears existing uncertainty or replays a missing fact.

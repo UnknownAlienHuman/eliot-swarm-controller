@@ -1049,38 +1049,35 @@ impl Session {
         let mut last_turn = serde_json::to_value(last).map_err(|_| {
             Error::new("internal", "Antigravity turn snapshot could not be encoded")
         })?;
-        // The universal status vocabulary names ACP `cancelled` `interrupted`.
+        // The universal status vocabulary names ACP `cancelled` `interrupted`;
+        // `native_status` keeps the raw `stopReason`.
         if last_turn["status"] == "cancelled" {
             last_turn["status"] = json!("interrupted");
-            last_turn["native_status"] = json!("cancelled");
         }
-        // Exact-turn facts from the ACP stream itself: ACP has no turn-status
-        // read, so the fenced `session/prompt` call and its reply are the
-        // native evidence.
         let evidence = params.turn_id.as_deref().and_then(|turn_id| {
-            if let Some(last) = last.filter(|last| last.turn_id == turn_id) {
-                return (last.terminal && last.command_id == params.command_id)
-                    .then_some(TurnEvidence::Terminal);
-            }
-            if state.prompt_outstanding(&params.command_id, turn_id)
-                && self.ready
-                && !state.stopped
-                && !process_exited
-            {
-                return Some(TurnEvidence::Running);
-            }
-            // All stdout was consumed after the observed exit and no
-            // `session/prompt` reply settled the prepared turn.
-            (process_exited
-                && self.task.as_ref().is_none_or(JoinHandle::is_finished)
-                && !state.stopped
-                && state.pending_is(&params.command_id, turn_id))
-            .then_some(TurnEvidence::Exited)
+            exact_turn_evidence(
+                &state,
+                &params.command_id,
+                turn_id,
+                self.ready && !state.stopped && !process_exited,
+                process_exited && self.task.as_ref().is_none_or(JoinHandle::is_finished),
+            )
         });
         match evidence {
             Some(TurnEvidence::Running) => {
                 last_turn = json!({"command_id": params.command_id, "turn_id": params.turn_id,
                     "status": "running", "terminal": false});
+            }
+            Some(TurnEvidence::Terminal) => {
+                // The exact reply ended the turn, even when a later write of
+                // its projection failed: the session waits for input, or its
+                // process has since ended.
+                status = if state.stopped || process_exited {
+                    "terminal"
+                } else {
+                    "idle"
+                };
+                active_turn = None;
             }
             Some(TurnEvidence::Exited) => {
                 status = "lost";
@@ -1088,7 +1085,7 @@ impl Session {
                 last_turn = json!({"command_id": params.command_id, "turn_id": params.turn_id,
                     "status": "lost", "terminal": false});
             }
-            Some(TurnEvidence::Terminal) | None => {}
+            None => {}
         }
         Ok(
             json!({"agent_id": self.agent, "generation": self.generation, "command_id": params.command_id,
@@ -1229,7 +1226,7 @@ impl Session {
 
 /// What the ACP stream and process waiter proved about the exact turn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TurnEvidence {
+pub(crate) enum TurnEvidence {
     /// The fenced `session/prompt` awaits its reply on a healthy stream.
     Running,
     /// The exact turn's `session/prompt` reply settled it.
@@ -1246,6 +1243,32 @@ impl TurnEvidence {
             Self::Exited => "process exit with drained acp stream and no session/prompt reply",
         }
     }
+}
+
+/// Exact-turn facts from the ACP stream itself: ACP has no turn-status read,
+/// so the fenced `session/prompt` call and its retained reply are the native
+/// evidence. `live`: ready, not stopped, no observed exit. `drained_exit`:
+/// the exit was observed and all stdout was consumed.
+pub(crate) fn exact_turn_evidence(
+    state: &events::State,
+    command_id: &str,
+    turn_id: &str,
+    live: bool,
+    drained_exit: bool,
+) -> Option<TurnEvidence> {
+    if let Some(last) = state
+        .last_turn
+        .as_ref()
+        .filter(|last| last.turn_id == turn_id)
+    {
+        return (last.terminal && last.command_id == command_id).then_some(TurnEvidence::Terminal);
+    }
+    if live && state.prompt_outstanding(command_id, turn_id) {
+        return Some(TurnEvidence::Running);
+    }
+    // No `session/prompt` reply settled the prepared turn before the exit.
+    (drained_exit && !state.stopped && state.pending_is(command_id, turn_id))
+        .then_some(TurnEvidence::Exited)
 }
 
 pub(crate) fn unknown_steer(command_id: &str, turn_id: &str, reason: &str) -> Value {

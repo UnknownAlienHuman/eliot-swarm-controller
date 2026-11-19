@@ -299,7 +299,10 @@ Unavailable/malformed individual counters stay null
 (other valid counters are retained), and no valid native counters means
 the corresponding fact is omitted — never blocks or gaps the terminal.
 Callbacks own missing permission/question decisions; hooks never mirror the same
-lifecycle. Assistant messages remain individually bounded. Aggregate terminal text
+lifecycle. Assistant messages remain individually bounded: one over the
+persisted-event bound is an acknowledged `message` coverage gap for that message
+alone, latches `final_text_unavailable`, and leaves the turn running on a healthy
+source. Aggregate terminal text
 and retained `last_turn` use the shared `MAX_EVENT_BYTES` budget: overflow drops
 the aggregate and latches `final_text_unavailable="event_budget"` without changing
 the native terminal status or interrupting bounded message events. A partial prefix

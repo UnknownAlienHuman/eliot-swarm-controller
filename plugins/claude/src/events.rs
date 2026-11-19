@@ -1586,19 +1586,18 @@ impl EventProcessor {
         if let Some(model) = observed_model {
             data["model"] = Value::String(model);
         }
-        if serde_json::to_vec(&data).map_or(usize::MAX, |bytes| bytes.len()) > MAX_EVENT_BYTES {
-            self.final_text = None;
-            self.final_text_unavailable = true;
-            return self
-                .record_gap("Claude completed message exceeded the persisted-event bound")
-                .await;
-        }
         self.message_seq = self.message_seq.saturating_add(1);
         let session_id = self.status.session_id.as_deref().unwrap_or_default();
         let native_id = format!("claude:{session_id}:{turn_id}:message:{}", self.message_seq);
-        self.accumulate_final_text(&text);
-        self.commit_event("message.completed", native_id, data)
-            .await
+        if self.stream_source().commit_message(native_id, data).await? {
+            self.accumulate_final_text(&text);
+        } else {
+            // Only this message is lost: the turn keeps running and its
+            // terminal text can no longer be the full reply.
+            self.final_text = None;
+            self.final_text_unavailable = true;
+        }
+        Ok(())
     }
 
     /// Commit `tool.started` for the main-thread `tool_use` blocks of one
@@ -3619,6 +3618,91 @@ mod tests {
         processor.status.ready = true;
         processor.status.session_id = Some("test-session".to_owned());
         processor
+    }
+
+    #[tokio::test]
+    async fn oversized_assistant_message_is_one_message_gap_and_the_turn_keeps_running() {
+        use crate::host::{TurnEvidence, exact_turn_evidence};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let (host_io, plugin_io) = tokio::io::duplex(64 * 1024);
+        let (read, write) = tokio::io::split(plugin_io);
+        let mut peer = Peer::from_io(read, write);
+        let client = peer.client();
+        let peer_task = tokio::spawn(async move { while peer.next_request().await.is_some() {} });
+        let mut processor = ready_processor();
+        processor.host = client.clone();
+        processor.sink = eliot_plugin::CommitSink::new(client, "test-credential".to_owned());
+        processor.status.active_command_id = Some("send-1".to_owned());
+        processor.status.active_turn_id = Some("turn-1".to_owned());
+        let assistant = |text: &str| {
+            json!({"type":"assistant", "parent_tool_use_id":null, "session_id":"test-session",
+                "message":{"model":"claude-haiku-5-5", "content":[{"type":"text","text":text}]}})
+        };
+        let params = eliot_plugin::AgentSnapshotParams {
+            agent_id: "test-agent".to_owned(),
+            generation: 1,
+            command_id: "send-1".to_owned(),
+            turn_id: Some("turn-1".to_owned()),
+        };
+        let (read, mut write) = tokio::io::split(host_io);
+        let mut reader = BufReader::new(read);
+        // The in-memory host canonically acknowledges every gap and batch.
+        let mut host = async |expected: &str| {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let request: eliot_plugin::RpcRequest = serde_json::from_str(&line).unwrap();
+            assert_eq!(request.method, expected);
+            let result = if expected == "source.gap" {
+                json!({"gap_id": request.params["gap_id"], "seq": 1})
+            } else {
+                json!({"first_seq": 2, "last_seq": 2, "cursor": null})
+            };
+            let response = json!({"jsonrpc":"2.0", "id":request.id, "result":result});
+            write
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .unwrap();
+            request.params
+        };
+
+        // One valid native message over the 64 KiB persisted-event bound.
+        let oversized = assistant(&"x".repeat(MAX_EVENT_BYTES + 1));
+        let (result, gap) = tokio::join!(processor.process_record(oversized), host("source.gap"));
+        result.unwrap();
+        assert_eq!(gap["families"], json!(["message"]));
+        assert!(!processor.status.source_unknown);
+        assert!(processor.status.failure.is_none());
+        assert!(processor.final_text_unavailable);
+        assert_eq!(
+            exact_turn_evidence(&params, &processor.status, false),
+            Some(TurnEvidence::Running)
+        );
+
+        // Later events keep projecting on the same turn.
+        let (result, batch) = tokio::join!(
+            processor.process_record(assistant("after")),
+            host("events.put")
+        );
+        result.unwrap();
+        assert_eq!(batch["events"][0]["kind"], "message.completed");
+        assert_eq!(batch["events"][0]["data"]["text"], "after");
+        let terminal = json!({"type":"result", "terminal_reason":"completed",
+            "session_id":"test-session"});
+        let (result, batch) = tokio::join!(processor.process_record(terminal), host("events.put"));
+        result.unwrap();
+        let data = &batch["events"][0]["data"];
+        assert_eq!(batch["events"][0]["kind"], "turn.completed");
+        assert_eq!(data["outcome"], "success");
+        assert_eq!(data["turn_id"], "turn-1");
+        // The partial text is never presented as the full reply.
+        assert!(data.get("final_text").is_none());
+        assert!(data["final_text_unavailable"].is_string());
+        assert_eq!(
+            exact_turn_evidence(&params, &processor.status, false),
+            Some(TurnEvidence::Terminal)
+        );
+        peer_task.abort();
     }
 
     #[test]
