@@ -299,7 +299,11 @@ Unavailable/malformed individual counters stay null
 (other valid counters are retained), and no valid native counters means
 the corresponding fact is omitted — never blocks or gaps the terminal.
 Callbacks own missing permission/question decisions; hooks never mirror the same
-lifecycle. Assistant messages remain individually bounded. Aggregate terminal text
+lifecycle. Assistant messages remain individually bounded: one over the
+persisted-event bound is an acknowledged `message` coverage gap for that message
+alone, latches `final_text_unavailable`, and leaves the turn running on a healthy
+source. A message within the bound joins the aggregate before its write, so a
+definitely rejected write never shortens the reply. Aggregate terminal text
 and retained `last_turn` use the shared `MAX_EVENT_BYTES` budget: overflow drops
 the aggregate and latches `final_text_unavailable="event_budget"` without changing
 the native terminal status or interrupting bounded message events. A partial prefix
@@ -307,6 +311,16 @@ is never reported as the full reply; the latch resets only at exact turn activat
 Terminal event data and snapshots retain the same bounded text or unavailable fact.
 Distinguish content blocks/tool ids within a message instead of deduplicating all
 blocks by message id.
+
+For the exact active turn, `agent.snapshot` names its `turn_evidence` from the
+owned stream-json reader and process waiter. The turn is running while it has no
+`result` on a healthy source and a live process. It is terminal from the exact
+`result` (universal status, native `terminal_reason` as `native_status`). That
+terminal is published before its `turn.completed` write resolves, so a racing send
+sees the finished turn; it carries `write_pending` until the write commits or fails.
+It is lost when the observed exit drained stdout without a `result`. A declared gap or
+a lost stream proves none of these, so the daemon monitor settles the turn
+`unknown` after its bounded reads; the transcript is not read for this.
 
 Transcript JSONL is later observe/recovery data with file identity/offset where valid,
 not a parallel live producer. No proven replay cursor means gap + exact current

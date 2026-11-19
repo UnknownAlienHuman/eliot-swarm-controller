@@ -70,11 +70,22 @@ pub(crate) struct EventStatus {
 pub(crate) struct TurnFacts {
     pub command_id: String,
     pub turn_id: String,
+    /// Universal terminal status (`completed`, `interrupted` or `failed`);
+    /// absent while non-terminal or when the native reason maps to no
+    /// known outcome.
     pub status: Option<String>,
+    /// The native `result.terminal_reason`, redacted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_status: Option<String>,
     pub final_text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub final_text_unavailable: Option<String>,
     pub terminal: bool,
+    /// The terminal is published before its own `turn.completed` write
+    /// resolves (a send racing the terminal must see the finished turn);
+    /// true until that write commits or fails, so recovery never races it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub write_pending: bool,
 }
 
 pub(crate) struct EventConfig {
@@ -232,6 +243,17 @@ fn claude_outcome(reason: &str) -> &'static str {
             }
         }
     }
+}
+
+/// The universal terminal status of a canonical outcome; `unknown` has none.
+fn universal_status(outcome: &str) -> Option<String> {
+    match outcome {
+        "success" => Some("completed"),
+        "interrupted" => Some("interrupted"),
+        "failure" => Some("failed"),
+        _ => None,
+    }
+    .map(str::to_owned)
 }
 
 /// Classify the original terminal reason first, then redact for persistence:
@@ -1569,19 +1591,20 @@ impl EventProcessor {
         if let Some(model) = observed_model {
             data["model"] = Value::String(model);
         }
-        if serde_json::to_vec(&data).map_or(usize::MAX, |bytes| bytes.len()) > MAX_EVENT_BYTES {
-            self.final_text = None;
-            self.final_text_unavailable = true;
-            return self
-                .record_gap("Claude completed message exceeded the persisted-event bound")
-                .await;
-        }
         self.message_seq = self.message_seq.saturating_add(1);
         let session_id = self.status.session_id.as_deref().unwrap_or_default();
         let native_id = format!("claude:{session_id}:{turn_id}:message:{}", self.message_seq);
+        // The reply text is the native fact, not the write: accumulate it
+        // (bounded) before the commit, so a definitely rejected message
+        // never leaves a later terminal presenting only the remaining text.
         self.accumulate_final_text(&text);
-        self.commit_event("message.completed", native_id, data)
-            .await
+        if !self.stream_source().commit_message(native_id, data).await? {
+            // Only this message is lost: the turn keeps running and its
+            // terminal text can no longer be the full reply.
+            self.final_text = None;
+            self.final_text_unavailable = true;
+        }
+        Ok(())
     }
 
     /// Commit `tool.started` for the main-thread `tool_use` blocks of one
@@ -3127,13 +3150,15 @@ impl EventProcessor {
         // Publish the observed terminal BEFORE the commit resolves: the host
         // may snapshot as soon as it receives the batch, and a control
         // racing the terminal must see the finished turn (same order as the
-        // association path, which binds active before its own commit). A
-        // failed commit still latches source_unknown with this terminal.
+        // association path, which binds active before its own commit). It
+        // stays `write_pending` until the commit resolves; a failed commit
+        // keeps this terminal as the turn's evidence.
         let session_turn_id = turn_id.clone();
         self.status.last_turn = Some(TurnFacts {
             command_id,
             turn_id,
-            status: Some(terminal_reason),
+            status: universal_status(outcome),
+            native_status: Some(terminal_reason),
             final_text: data
                 .get("final_text")
                 .and_then(Value::as_str)
@@ -3143,6 +3168,7 @@ impl EventProcessor {
                 .and_then(Value::as_str)
                 .map(str::to_owned),
             terminal: true,
+            write_pending: true,
         });
         self.status.active_turn_id = None;
         self.status.active_command_id = None;
@@ -3153,7 +3179,12 @@ impl EventProcessor {
         self.tool_coverage_gap_reported = false;
         self.tool_use_tracking_fenced = false;
         self.publish_now();
-        self.commit_event("turn.completed", native_id, data).await?;
+        let committed = self.commit_event("turn.completed", native_id, data).await;
+        if let Some(last) = self.status.last_turn.as_mut() {
+            last.write_pending = false;
+        }
+        self.publish_now();
+        committed?;
         // Session-scoped tokens/cost commit as their own `session.usage`
         // fact after the accepted terminal, so session scope and turn scope
         // can never be confused.
@@ -3315,12 +3346,14 @@ impl EventProcessor {
                 command_id,
                 turn_id,
                 status: None,
+                native_status: None,
                 final_text: None,
                 final_text_unavailable: text_status
                     .get("final_text_unavailable")
                     .and_then(Value::as_str)
                     .map(str::to_owned),
                 terminal: false,
+                write_pending: false,
             });
         }
         if let Some(pending) = self.pending_turn.take() {
@@ -3364,9 +3397,9 @@ impl EventProcessor {
     }
 
     async fn record_coverage_gap(&mut self, reason: &str, families: &[&str]) -> Result<()> {
-        let mut source = self.stream_source();
-        source.families = families;
-        source.record_coverage_gap(reason).await
+        self.stream_source()
+            .record_coverage_gap(reason, families)
+            .await
     }
 
     /// The shared stream-commit half of this processor.
@@ -3600,6 +3633,207 @@ mod tests {
         processor.status.ready = true;
         processor.status.session_id = Some("test-session".to_owned());
         processor
+    }
+
+    /// The in-memory host on a wired processor's peer: reads one request
+    /// and answers it with a canonical ACK or a definite rejection.
+    struct TestHost {
+        reader: tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+        write: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        peer_task: tokio::task::JoinHandle<()>,
+    }
+
+    impl TestHost {
+        async fn read(&mut self, expected: &str) -> eliot_plugin::RpcRequest {
+            use tokio::io::AsyncBufReadExt;
+            let mut line = String::new();
+            self.reader.read_line(&mut line).await.unwrap();
+            let request: eliot_plugin::RpcRequest = serde_json::from_str(&line).unwrap();
+            assert_eq!(request.method, expected);
+            request
+        }
+
+        async fn reply(&mut self, request: &eliot_plugin::RpcRequest, accept: bool) {
+            use tokio::io::AsyncWriteExt;
+            let response = if !accept {
+                json!({"jsonrpc":"2.0", "id":request.id, "error":{"code":-32000,
+                    "message":"rejected by the Store", "data":{"code":"rejected"}}})
+            } else if request.method == "source.gap" {
+                json!({"jsonrpc":"2.0", "id":request.id,
+                    "result":{"gap_id": request.params["gap_id"], "seq": 1}})
+            } else {
+                json!({"jsonrpc":"2.0", "id":request.id,
+                    "result":{"first_seq": 2, "last_seq": 2, "cursor": null}})
+            };
+            self.write
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+
+        async fn answer(&mut self, expected: &str, accept: bool) -> Value {
+            let request = self.read(expected).await;
+            self.reply(&request, accept).await;
+            request.params
+        }
+    }
+
+    /// A ready processor bound to `send-1`/`turn-1` whose commits reach the
+    /// returned in-memory host.
+    fn wired_processor() -> (EventProcessor, TestHost) {
+        let (host_io, plugin_io) = tokio::io::duplex(64 * 1024);
+        let (read, write) = tokio::io::split(plugin_io);
+        let mut peer = Peer::from_io(read, write);
+        let client = peer.client();
+        let peer_task = tokio::spawn(async move { while peer.next_request().await.is_some() {} });
+        let mut processor = ready_processor();
+        processor.host = client.clone();
+        processor.sink = eliot_plugin::CommitSink::new(client, "test-credential".to_owned());
+        processor.status.active_command_id = Some("send-1".to_owned());
+        processor.status.active_turn_id = Some("turn-1".to_owned());
+        let (read, write) = tokio::io::split(host_io);
+        let host = TestHost {
+            reader: tokio::io::BufReader::new(read),
+            write,
+            peer_task,
+        };
+        (processor, host)
+    }
+
+    fn assistant_record(text: &str) -> Value {
+        json!({"type":"assistant", "parent_tool_use_id":null, "session_id":"test-session",
+            "message":{"model":"claude-haiku-5-5", "content":[{"type":"text","text":text}]}})
+    }
+
+    fn completed_result() -> Value {
+        json!({"type":"result", "terminal_reason":"completed", "session_id":"test-session"})
+    }
+
+    fn turn_snapshot_params() -> eliot_plugin::AgentSnapshotParams {
+        eliot_plugin::AgentSnapshotParams {
+            agent_id: "test-agent".to_owned(),
+            generation: 1,
+            command_id: "send-1".to_owned(),
+            turn_id: Some("turn-1".to_owned()),
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_assistant_message_is_one_message_gap_and_the_turn_keeps_running() {
+        use crate::host::{TurnEvidence, exact_turn_evidence};
+
+        let (mut processor, mut host) = wired_processor();
+        let params = turn_snapshot_params();
+
+        // One valid native message over the 64 KiB persisted-event bound.
+        let oversized = assistant_record(&"x".repeat(MAX_EVENT_BYTES + 1));
+        let (result, gap) = tokio::join!(
+            processor.process_record(oversized),
+            host.answer("source.gap", true)
+        );
+        result.unwrap();
+        assert_eq!(gap["families"], json!(["message"]));
+        assert!(!processor.status.source_unknown);
+        assert!(processor.status.failure.is_none());
+        assert!(processor.final_text_unavailable);
+        assert_eq!(
+            exact_turn_evidence(&params, &processor.status, false),
+            Some(TurnEvidence::Running)
+        );
+
+        // Later events keep projecting on the same turn.
+        let (result, batch) = tokio::join!(
+            processor.process_record(assistant_record("after")),
+            host.answer("events.put", true)
+        );
+        result.unwrap();
+        assert_eq!(batch["events"][0]["kind"], "message.completed");
+        assert_eq!(batch["events"][0]["data"]["text"], "after");
+        let (result, batch) = tokio::join!(
+            processor.process_record(completed_result()),
+            host.answer("events.put", true)
+        );
+        result.unwrap();
+        let data = &batch["events"][0]["data"];
+        assert_eq!(batch["events"][0]["kind"], "turn.completed");
+        assert_eq!(data["outcome"], "success");
+        assert_eq!(data["turn_id"], "turn-1");
+        // The partial text is never presented as the full reply.
+        assert!(data.get("final_text").is_none());
+        assert!(data["final_text_unavailable"].is_string());
+        assert_eq!(
+            exact_turn_evidence(&params, &processor.status, false),
+            Some(TurnEvidence::Terminal)
+        );
+        host.peer_task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_terminal_published_before_its_write_resolves_is_marked_pending() {
+        use crate::host::{TurnEvidence, exact_turn_evidence};
+
+        let (mut processor, mut host) = wired_processor();
+        let params = turn_snapshot_params();
+        let mut published = processor.status_tx.subscribe();
+        let writing = async {
+            let request = host.read("events.put").await;
+            assert_eq!(request.params["events"][0]["kind"], "turn.completed");
+            // A snapshot taken while the write is in flight sees the finished
+            // turn (a racing send must), marked pending for the monitor.
+            let status = published.borrow_and_update().clone();
+            assert!(status.active_turn_id.is_none());
+            assert_eq!(
+                exact_turn_evidence(&params, &status, false),
+                Some(TurnEvidence::Terminal)
+            );
+            let turn = serde_json::to_value(status.last_turn.as_ref().unwrap()).unwrap();
+            assert_eq!(turn["write_pending"], true);
+            // The write is definitely rejected.
+            host.reply(&request, false).await;
+        };
+        let (result, ()) = tokio::join!(processor.process_record(completed_result()), writing);
+        assert_eq!(
+            result.unwrap_err().failure_where.as_deref(),
+            Some("plugin.events.put")
+        );
+        // Resolved: the retained terminal is the turn's evidence again.
+        let status = published.borrow_and_update().clone();
+        let turn = serde_json::to_value(status.last_turn.as_ref().unwrap()).unwrap();
+        assert!(turn.get("write_pending").is_none());
+        assert_eq!(turn["status"], "completed");
+        assert_eq!(
+            exact_turn_evidence(&params, &status, false),
+            Some(TurnEvidence::Terminal)
+        );
+        host.peer_task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_definitely_rejected_message_still_counts_toward_the_final_text() {
+        let (mut processor, mut host) = wired_processor();
+        let (result, _) = tokio::join!(
+            processor.process_record(assistant_record("first ")),
+            host.answer("events.put", false)
+        );
+        assert_eq!(
+            result.unwrap_err().failure_where.as_deref(),
+            Some("plugin.events.put")
+        );
+        let (result, _) = tokio::join!(
+            processor.process_record(assistant_record("second")),
+            host.answer("events.put", true)
+        );
+        result.unwrap();
+        let (result, batch) = tokio::join!(
+            processor.process_record(completed_result()),
+            host.answer("events.put", true)
+        );
+        result.unwrap();
+        let data = &batch["events"][0]["data"];
+        assert_eq!(batch["events"][0]["kind"], "turn.completed");
+        // The full reply, never only the text after the rejected write.
+        assert_eq!(data["final_text"], "first second");
+        host.peer_task.abort();
     }
 
     #[test]

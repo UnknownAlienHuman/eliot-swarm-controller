@@ -179,10 +179,18 @@ the requested binding returns an unknown snapshot. When an exact-turn snapshot
 obtains fresh native evidence, it reports the Agent, generation, command, native
 scope/reference, session state, active native turn, and the exact turn's
 status and terminal flag. `turn_evidence` names the native read that established the
-facts. An idle session alone does not establish the turn's outcome.
-The attention monitor applies its bounded active-turn recovery only to adapters
-that return native `turn_evidence` for these snapshots (currently Codex, Muse, and
-OpenCode).
+facts. An idle session alone does not establish the turn's outcome. The status uses
+the universal vocabulary (`completed`, `interrupted`, `failed`) and keeps the native
+word in `native_status`. A stream adapter with no native turn-status query (Claude,
+Antigravity) reads its own owned reader: a bound turn without its terminal record, on
+a healthy source and a live process, is running; the exact terminal record is
+terminal. The adapter retains that record's bounded facts (universal status and raw
+native status) before writing anything for it, so a failed later write does not erase
+the evidence. A terminal the adapter exposes before its own terminal write resolves
+carries `last_turn.write_pending: true` until that write commits or fails. When the owned process exit is observed after its output fully drained
+with no terminal for the exact turn, the snapshot reports `state: "lost"`,
+`process_exited: true`, no active turn and a non-terminal `last_turn`. A declared
+source gap or lost stream is not evidence.
 
 For SEND, the same `agent.command` effect carries the FIFO `next_input` items claimed
 from existing command rows, plus the effective configuration overlay when one
@@ -384,7 +392,11 @@ A source row's `open|closed` lifecycle, health and latest historical gap are ind
 A gap neither closes the source nor changes its owner or health automatically.
 An adapter may report a family-scoped observation-coverage gap (for example,
 bounded tool telemetry) without declaring the separately associated native
-turn outcome or later input unavailable. This requires a canonical gap ACK;
+turn outcome or later input unavailable. A valid native message whose
+`message.completed` data exceeds the persisted-event bound is one such `message`
+gap ([`StreamSource::commit_message`](../../crates/eliot-plugin/src/session.rs)):
+the turn keeps running and its terminal carries `final_text_unavailable`. A gap
+naming only `message` never starts turn recovery. This requires a canonical gap ACK;
 an unresolved gap/batch ACK still fences admission. Session/turn identity loss,
 unproven delivery and transport loss cannot use this coverage-only path, and
 it never clears existing uncertainty or replays a missing fact.
@@ -595,12 +607,15 @@ turn evidence is committed before retirement; retirement never manufactures
 confirms its owned plugin exit and drains the plugin reader before its existing
 generation-fenced loss settlement. Without a committed terminal turn, the running
 turn becomes `unknown`; completed turns remain completed. For an active turn
-with a committed native source gap, stale health, or source closure, the daemon's attention
-monitor makes at most four read-only snapshot attempts with backoff. Fresh
-evidence that the exact turn is still running keeps it open for the next sweep.
-The Store rechecks the generation, native subject, turn, and source episode
-before committing `turn.completed` from a proven terminal or `turn.unknown`
-after four inconclusive reads. It retains the source gap and settles only that
+with a committed native source gap (other than a `message`-only coverage gap), stale
+health, or source closure, the daemon's attention
+monitor makes at most four read-only snapshot attempts with backoff, for every
+adapter. Fresh evidence that the exact turn is still running, or a terminal marked
+`write_pending`, keeps it open for the next sweep: recovery never races the adapter's
+own terminal write. The Store rechecks the generation, native subject, turn, and source episode
+before committing `turn.completed` from a proven terminal, `turn.unknown` with
+`native_exit_without_session_terminal` at once from a lost readback, or
+`turn.unknown` after four inconclusive reads. It retains the source gap and settles only that
 turn. Later facts cannot reopen it. Retiring or duplicate
 exit observations cannot settle a newer generation and never authorize replay.
 An event owner closing before the tail barrier or a drain deadline expiring is

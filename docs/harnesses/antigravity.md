@@ -142,7 +142,10 @@ turn, `cancelled` settles an interrupt, `refusal` fails it, and any other
 stop reason is a native protocol gap. Assistant text is accumulated from
 `agent_message_chunk` updates carrying text blocks only (other content
 blocks contribute no text), bounded at 256 KiB, then
-`final_text_unavailable:"event_budget"`; thought and user chunks are
+`final_text_unavailable:"event_budget"`. A reply within that budget but over the
+persisted-event bound records one `message` coverage gap instead of
+`message.completed` and the same marker; the turn still completes with its
+`stopReason`. Thought and user chunks are
 bookkeeping. A normal completion with no assistant text at all keeps its
 native `stopReason` but carries
 `final_text_unavailable:"empty_native_response"` (see Facts and recovery),
@@ -371,6 +374,17 @@ There is no replay cursor/history API. Snapshots expose retained stream
 facts, not a native history poll. Loss means an explicit gap. Do not
 replay conversation history or infer success from silence/process exit;
 drain buffered stdout first. Unknown input/result is not retried.
+For the exact active turn, `agent.snapshot` names its `turn_evidence`. The
+turn is running while its fenced `session/prompt` awaits the reply on a
+healthy stream and a live process. It is terminal from that reply (ACP
+`cancelled` reads as universal `interrupted`; `native_status` keeps the raw
+`stopReason`), retained with its exact binding before any write for it, even
+`turn.started` when the reply is the turn's first fact, so a failed write costs only
+that fact. The snapshot reads the same state lock the reply's writes hold, so it
+never sees a terminal mid-write. It is lost when the observed
+process exit drained stdout without a reply. A gap or a lost stream proves
+none of these, so the daemon monitor settles the turn `unknown` after its
+bounded reads.
 
 ## Session MCP servers (managed Agents)
 

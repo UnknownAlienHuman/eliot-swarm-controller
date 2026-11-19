@@ -40,7 +40,7 @@ pub use rules::{
     TimerSlotAdmission, TimerSlotCommit,
 };
 pub use scripts::ScriptRunAdmission;
-pub use turn_recovery::ActiveTurnRecovery;
+pub use turn_recovery::{ActiveTurnRecovery, RecoveredTurn};
 pub use usage::ResolvedUsageScope;
 
 use eliot_core::api::{HeavySummaryView, SessionGrowthView, agent_state_name};

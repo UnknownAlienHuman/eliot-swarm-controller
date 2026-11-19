@@ -9,6 +9,18 @@ pub struct ActiveTurnRecovery {
     muse_projection_gap: bool,
 }
 
+/// The daemon monitor's readback result for one active turn.
+#[derive(Debug)]
+pub enum RecoveredTurn {
+    /// A proven native terminal in `turn.completed` data shape.
+    Terminal(Value),
+    /// The owned native process exited and its drained stream held no
+    /// terminal for the exact turn.
+    NativeExited,
+    /// The bounded reads proved nothing.
+    Inconclusive,
+}
+
 impl Store {
     pub fn active_turn_recovery(&self, agent: &Agent) -> Result<Option<ActiveTurnRecovery>> {
         active_turn_recovery(&self.connection, agent)
@@ -20,11 +32,11 @@ impl Store {
         &mut self,
         captured: &Agent,
         binding: &ActiveTurnRecovery,
-        terminal: Option<Value>,
+        outcome: RecoveredTurn,
         now: i64,
     ) -> Result<Vec<Event>> {
         self.ensure_writer_healthy()?;
-        let result = self.settle_recovered_turn_inner(captured, binding, terminal, now);
+        let result = self.settle_recovered_turn_inner(captured, binding, outcome, now);
         self.fault_on_persistence_error(&result);
         result
     }
@@ -33,7 +45,7 @@ impl Store {
         &mut self,
         captured: &Agent,
         binding: &ActiveTurnRecovery,
-        terminal: Option<Value>,
+        outcome: RecoveredTurn,
         now: i64,
     ) -> Result<Vec<Event>> {
         let agent_num = parse_agent_id(&captured.id)?;
@@ -52,18 +64,24 @@ impl Store {
             return Ok(Vec::new());
         }
 
-        let (kind, mut data) = if let Some(mut terminal) = terminal {
-            if binding.muse_projection_gap {
-                terminal[core::VIEW_RECOVERY_MARKER_FIELD] = json!(core::VIEW_RECOVERY_READBACK);
+        let (kind, mut data) = match outcome {
+            RecoveredTurn::Terminal(mut terminal) => {
+                if binding.muse_projection_gap {
+                    terminal[core::VIEW_RECOVERY_MARKER_FIELD] =
+                        json!(core::VIEW_RECOVERY_READBACK);
+                }
+                ("turn.completed", terminal)
             }
-            ("turn.completed", terminal)
-        } else {
-            let reason = if binding.muse_projection_gap {
-                core::MUSE_VIEW_UNKNOWN_REASON_PREFIX
-            } else {
-                "Native snapshot did not prove the turn outcome within the recovery budget"
-            };
-            ("turn.unknown", json!({"reason": reason}))
+            unknown => {
+                let reason = if binding.muse_projection_gap {
+                    core::MUSE_VIEW_UNKNOWN_REASON_PREFIX
+                } else if matches!(unknown, RecoveredTurn::NativeExited) {
+                    "native_exit_without_session_terminal"
+                } else {
+                    "Native snapshot did not prove the turn outcome within the recovery budget"
+                };
+                ("turn.unknown", json!({"reason": reason}))
+            }
         };
         data["command_id"] = json!(binding.command_id);
         data["turn_id"] = json!(binding.turn_id);
@@ -166,6 +184,9 @@ fn active_turn_recovery(
     let Some((command_id, start_seq)) = command else {
         return Ok(None);
     };
+    // Turn or source loss starts recovery. A gap naming only `message` is
+    // coverage-only (one unpersisted message): the turn's outcome still
+    // arrives on its healthy source, so it never starts outcome settlement.
     let trigger: Option<(i64, Option<String>)> = connection
         .query_row(
             "SELECT e.seq, json_extract(e.data, '$.reason')
@@ -182,7 +203,8 @@ fn active_turn_recovery(
                  SELECT 1 FROM source_owners o
                  WHERE o.agent = s.agent AND o.generation = s.generation AND o.source = s.source
                  AND o.family IN ('session', 'turn', 'message', 'tool', 'request')
-                 AND (e.kind != 'source.gap' OR o.family IN (SELECT value FROM json_each(e.data, '$.families')))
+                 AND (e.kind != 'source.gap' OR (o.family != 'message'
+                     AND o.family IN (SELECT value FROM json_each(e.data, '$.families'))))
              )
              AND NOT EXISTS (
                  SELECT 1 FROM events ok INDEXED BY events_agent

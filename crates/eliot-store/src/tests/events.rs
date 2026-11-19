@@ -417,6 +417,71 @@ fn local_user_event_atomic_commit_rejects_mismatch_and_leaves_unknown() {
 }
 
 #[test]
+fn message_only_coverage_gap_never_starts_turn_recovery() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let (agent, _, _, _) = ready_muse_agent(
+        &mut store,
+        "message-gap",
+        "muse-test",
+        "message-gap-ws",
+        now,
+    );
+    let send = send_request(&agent, 1, "long reply");
+    let send_id = send.id.clone();
+    store.submit("owner", send, now + 4).expect("admit send");
+    store.dispatch(&send_id, now + 5).expect("dispatch send");
+    let turn_id = format!("turn-{send_id}");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: format!("message-gap-{send_id}-started"),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "turn.started".to_owned(),
+                    native_id: format!("message-gap-{send_id}:started"),
+                    data: json!({"command_id": send_id, "turn_id": turn_id.clone()}),
+                }],
+                cursor: None,
+            },
+            now + 6,
+        )
+        .expect("commit turn started");
+    let gap = |id: &str, families: &[&str]| SourceGap {
+        gap_id: format!("{id}-{send_id}"),
+        agent_id: agent.clone(),
+        generation: 1,
+        source: "stream".to_owned(),
+        families: families.iter().map(|family| (*family).to_owned()).collect(),
+        reason: "completed message exceeded the persisted-event bound".to_owned(),
+        from: None,
+        to: None,
+    };
+    // One unpersisted message: the live turn's outcome still arrives on
+    // its healthy source, so no recovery episode (and no budget) exists.
+    store
+        .record_source_gap(gap("message", &["message"]), now + 7)
+        .expect("record message coverage gap");
+    let captured = store.get_agent(&agent).unwrap().unwrap();
+    assert_eq!(captured.active_turn.as_deref(), Some(turn_id.as_str()));
+    assert_eq!(store.active_turn_recovery(&captured).unwrap(), None);
+    // A gap that also names another turn-bound family still starts one.
+    let tool = store
+        .record_source_gap(gap("tool", &["message", "tool"]), now + 8)
+        .expect("record tool coverage gap");
+    let recovery = store.active_turn_recovery(&captured).unwrap().unwrap();
+    assert_eq!(recovery.turn_id, turn_id);
+    let events = store
+        .settle_recovered_turn(&captured, &recovery, RecoveredTurn::Inconclusive, now + 9)
+        .unwrap();
+    assert_eq!(events[0].kind, "turn.unknown");
+    assert_eq!(events[0].data["source_event_seq"], tool.value.seq);
+}
+
+#[test]
 fn projection_gap_turn_unknown_settles_once_without_resurrection() {
     let mut store = Store::open(Path::new(":memory:")).expect("open store");
     let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
@@ -476,12 +541,12 @@ fn projection_gap_turn_unknown_settles_once_without_resurrection() {
     stale.generation += 1;
     assert!(
         store
-            .settle_recovered_turn(&stale, &recovery, None, now + 7)
+            .settle_recovered_turn(&stale, &recovery, RecoveredTurn::Inconclusive, now + 7)
             .unwrap()
             .is_empty()
     );
     let events = store
-        .settle_recovered_turn(&captured, &recovery, None, now + 7)
+        .settle_recovered_turn(&captured, &recovery, RecoveredTurn::Inconclusive, now + 7)
         .unwrap();
     assert_eq!(events[0].kind, "turn.unknown");
     assert_eq!(events[0].source, "daemon");
@@ -492,7 +557,7 @@ fn projection_gap_turn_unknown_settles_once_without_resurrection() {
     );
     assert!(
         store
-            .settle_recovered_turn(&captured, &recovery, None, now + 7)
+            .settle_recovered_turn(&captured, &recovery, RecoveredTurn::Inconclusive, now + 7)
             .unwrap()
             .is_empty()
     );

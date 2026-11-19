@@ -86,6 +86,10 @@ pub(crate) struct TurnFacts {
     pub command_id: String,
     pub turn_id: String,
     pub status: String,
+    /// The raw ACP `stopReason` of the terminal `session/prompt` reply.
+    pub native_status: String,
+    /// Empty while no bounded reply text is known; never presented as one.
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub final_text: String,
     pub terminal: bool,
 }
@@ -440,6 +444,24 @@ impl State {
 
     pub fn active_turn(&self) -> Option<&str> {
         self.pending.as_ref().map(|p| p.turn.as_str())
+    }
+
+    /// True while `turn_id` is the exact prepared turn of `command_id`.
+    pub fn pending_is(&self, command_id: &str, turn_id: &str) -> bool {
+        self.pending
+            .as_ref()
+            .is_some_and(|pending| pending.command == command_id && pending.turn == turn_id)
+    }
+
+    /// True while the exact turn's fenced `session/prompt` call awaits its
+    /// terminal reply on a healthy stream.
+    pub fn prompt_outstanding(&self, command_id: &str, turn_id: &str) -> bool {
+        self.fenced_guard.is_some()
+            && self.pending_is(command_id, turn_id)
+            && self.failure.is_none()
+            && !self.source_unknown
+            && !self.batch_unknown
+            && !self.writes_blocked
     }
 
     pub fn contains_secret(&self, text: &str) -> bool {
@@ -1680,6 +1702,22 @@ impl State {
         if restriction.is_some() {
             status = "failed";
         }
+        // The reply answers the fenced `session/prompt` of the exact prepared
+        // turn: it is that turn's native terminal evidence. Retain its bound
+        // status and raw stopReason before any write (even `turn.started`),
+        // so a failed write costs only its own fact and the exact-turn
+        // snapshot still proves the outcome.
+        let native_status = self.policy.redact_text(&result.stop_reason);
+        if let Some(pending) = self.pending.as_ref() {
+            self.last_turn = Some(TurnFacts {
+                command_id: pending.command.clone(),
+                turn_id: pending.turn.clone(),
+                status: status.to_owned(),
+                native_status: native_status.clone(),
+                final_text: String::new(),
+                terminal: true,
+            });
+        }
         // A terminal response alone suffices: no intermediate update is
         // required, matching the old stream-json rule.
         self.associate().await?;
@@ -1706,9 +1744,9 @@ impl State {
         // terminal commit, without a command binding.
         self.close_pending_requests(Some(&turn)).await?;
         let text = self.policy.redact_text(&self.text_accum);
-        let truncated = self.text_truncated;
+        let mut truncated = self.text_truncated;
         let mut data = json!({"command_id": command, "turn_id": turn,
-            "status": status, "outcome": outcome, "native_status": result.stop_reason});
+            "status": status, "outcome": outcome, "native_status": native_status});
         if let Some(restriction) = restriction {
             eliot_plugin::session::attach_failure_origin(
                 &mut data,
@@ -1735,13 +1773,18 @@ impl State {
         }
         self.policy.redact_values(&mut data);
         if !text.is_empty() && !truncated {
-            self.commit(
-                "message.completed",
+            let id = event_id(
+                &self.conversation,
                 &turn,
                 "response",
-                json!({"command_id": command, "turn_id": turn, "text": text}),
-            )
-            .await?;
+                "message.completed",
+                "agy",
+                "Antigravity",
+            )?;
+            let mut message = json!({"command_id": command, "turn_id": turn, "text": text});
+            self.policy.redact_values(&mut message);
+            // A reply over the persisted-event bound costs only itself.
+            truncated = !self.source().commit_message(id, message).await?;
         }
         if truncated {
             data["final_text_unavailable"] = json!("event_budget");
@@ -1774,13 +1817,9 @@ impl State {
             None if !failed && !truncated => text,
             None => String::new(),
         };
-        self.last_turn = Some(TurnFacts {
-            command_id: command,
-            turn_id: turn.clone(),
-            status: status.to_owned(),
-            final_text,
-            terminal: true,
-        });
+        if let Some(last) = self.last_turn.as_mut() {
+            last.final_text = final_text;
+        }
         self.settlement = Some((turn, status.to_owned()));
         self.clear_fenced();
         self.pending = None;
@@ -1911,9 +1950,7 @@ impl State {
     }
 
     async fn record_coverage_gap(&mut self, reason: &str, families: &[&str]) -> Result<()> {
-        let mut source = self.source();
-        source.families = families;
-        source.record_coverage_gap(reason).await
+        self.source().record_coverage_gap(reason, families).await
     }
 
     fn source(&mut self) -> StreamSource<'_> {
@@ -2725,6 +2762,127 @@ mod tests {
             );
             finish(tasks).await;
         }
+    }
+
+    fn chunk(text: &str) -> Value {
+        json!({"sessionId":"session-1", "update":{
+            "sessionUpdate":"agent_message_chunk", "content":{"type":"text","text":text}}})
+    }
+
+    #[tokio::test]
+    async fn a_reply_over_the_event_bound_costs_only_its_message() {
+        use crate::session::{TurnEvidence, exact_turn_evidence};
+
+        let (mut state, mut commits, tasks) = state_with_commits();
+        let association = state.prepare("command-1".into(), "turn-1".into()).unwrap();
+        let prompt: PromptResult =
+            serde_json::from_value(json!({"stopReason":"end_turn"})).unwrap();
+        // 96 KiB: above the 64 KiB persisted-event bound, inside the 256 KiB
+        // turn text budget.
+        let (result, terminal) = tokio::join!(
+            async {
+                for _ in 0..3 {
+                    state.update(&chunk(&"x".repeat(32 * 1024))).await?;
+                }
+                state.settle_prompt(&prompt).await
+            },
+            async {
+                next_commit(&mut commits, "turn.started")
+                    .await
+                    .1
+                    .send(())
+                    .unwrap();
+                ack_gap(&mut commits, &["message"]).await;
+                let (terminal, ack) = next_commit(&mut commits, "turn.completed").await;
+                ack.send(()).unwrap();
+                terminal
+            }
+        );
+        result.unwrap();
+        association.await.unwrap().unwrap();
+        let data = &terminal["data"];
+        assert_eq!(data["status"], "completed");
+        assert_eq!(data["outcome"], "success");
+        assert_eq!(data["native_status"], "end_turn");
+        assert_eq!(data["final_text_unavailable"], "event_budget");
+        assert!(data.get("final_text").is_none());
+        assert!(!state.source_unknown);
+        assert!(state.failure.is_none());
+        let last = state.last_turn.as_ref().unwrap();
+        assert_eq!(last.native_status, "end_turn");
+        assert!(last.final_text.is_empty());
+        assert_eq!(
+            exact_turn_evidence(&state, "command-1", "turn-1", true, false),
+            Some(TurnEvidence::Terminal)
+        );
+        // The live session takes the next prompt.
+        state.prepare("command-2".into(), "turn-2".into()).unwrap();
+        finish(tasks).await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_terminal_projection_keeps_the_retained_reply_as_evidence() {
+        use crate::session::{TurnEvidence, exact_turn_evidence};
+
+        let (mut state, mut commits, tasks) = state_with_commits();
+        let _association = state.prepare("command-1".into(), "turn-1".into()).unwrap();
+        let prompt: PromptResult =
+            serde_json::from_value(json!({"stopReason":"end_turn"})).unwrap();
+        let settle = async {
+            state.update(&chunk("PONG")).await.unwrap();
+            state.complete_prompt(&prompt).await;
+        };
+        tokio::join!(settle, async {
+            for kind in ["turn.started", "message.completed"] {
+                next_commit(&mut commits, kind).await.1.send(()).unwrap();
+            }
+            // The host vanishes before acknowledging the terminal write.
+            let _unacknowledged = next_commit(&mut commits, "turn.completed").await;
+            tasks[1].abort();
+        });
+        assert!(state.source_unknown);
+        assert!(state.failure.is_some());
+        let last = state.last_turn.as_ref().unwrap();
+        assert!(last.terminal);
+        assert_eq!(last.status, "completed");
+        assert_eq!(last.native_status, "end_turn");
+        // The exact reply still proves the turn's outcome to the monitor.
+        assert_eq!(
+            exact_turn_evidence(&state, "command-1", "turn-1", false, false),
+            Some(TurnEvidence::Terminal)
+        );
+        assert_eq!(
+            exact_turn_evidence(&state, "command-2", "turn-1", false, false),
+            None
+        );
+        finish(tasks).await;
+    }
+
+    #[tokio::test]
+    async fn a_terminal_reply_that_arrives_first_is_retained_before_turn_started() {
+        use crate::session::{TurnEvidence, exact_turn_evidence};
+
+        let (mut state, mut commits, tasks) = state_with_commits();
+        let _association = state.prepare("command-1".into(), "turn-1".into()).unwrap();
+        let prompt: PromptResult =
+            serde_json::from_value(json!({"stopReason":"cancelled"})).unwrap();
+        // The direct reply is the first fact: its own turn.started write is
+        // never acknowledged.
+        tokio::join!(state.complete_prompt(&prompt), async {
+            let _unacknowledged = next_commit(&mut commits, "turn.started").await;
+            tasks[1].abort();
+        });
+        assert!(state.source_unknown);
+        let last = state.last_turn.as_ref().unwrap();
+        assert!(last.terminal);
+        assert_eq!(last.status, "cancelled");
+        assert_eq!(last.native_status, "cancelled");
+        // The reply's bound facts still prove the exact turn to the monitor.
+        assert_eq!(
+            exact_turn_evidence(&state, "command-1", "turn-1", false, false),
+            Some(TurnEvidence::Terminal)
+        );
+        finish(tasks).await;
     }
 
     #[tokio::test]

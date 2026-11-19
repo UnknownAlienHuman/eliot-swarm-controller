@@ -1,5 +1,5 @@
 use super::{
-    BatchCommit, ProjectRegistrationInput, RuleCatchUpAction, RuleCatchUpAdmission,
+    BatchCommit, ProjectRegistrationInput, RecoveredTurn, RuleCatchUpAction, RuleCatchUpAdmission,
     RuleCursorOutcome, RuleDefinitionInput, RuleEventAdmission, Store, contains_secret_marker,
 };
 use eliot_core::api::{
