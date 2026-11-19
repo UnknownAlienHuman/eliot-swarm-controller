@@ -491,7 +491,8 @@ of the explicitly selected release scope.
       zeros; a failed or lost one only when measured), or, while a
       `no_code_progress` report is open, "Working without writing code for
       14m" in the attention color; a running sidebar task shows the same work
-      line under its title. Why it ended or
+      line under its title, and a task with an open report its words in the
+      attention color (k210: the Monitor's reports, one read). Why it ended or
       the task it runs under is in its tooltip and accessible name; native
       observed children nest collapsed under
       their parent row and read as their activity, or "Ended with parent".

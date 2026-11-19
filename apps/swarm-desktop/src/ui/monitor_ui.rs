@@ -13,7 +13,6 @@ use crate::ui::chat_ui::DraftAction;
 
 #[derive(Clone, Debug)]
 pub(super) enum MonitorMsg {
-    RefreshDue(u64),
     MonitorLoaded(u64, Option<Box<MonitorSnapshot>>),
     /// A monitor row: open its conversation and its details.
     RowOpened(String),
@@ -50,6 +49,9 @@ pub(super) struct MonitorState {
     /// What the list is narrowed to (a group, a project, or both).
     pub(super) filter: Filter,
     pub(super) technical_open: bool,
+    /// The sidebar's read of attention reports is running (only while the
+    /// panel, and so its refresh, is closed).
+    pub(super) sidebar_reading: bool,
 }
 
 /// A group's tone in the Monitor's charts and list dots.
@@ -65,11 +67,6 @@ fn group_tone(group: Group) -> StatusTone {
 impl DesktopApp {
     pub(super) fn monitor_update(&mut self, msg: MonitorMsg, context: &ComponentContext<Self>) {
         match msg {
-            MonitorMsg::RefreshDue(epoch) => {
-                if epoch == self.monitor.epoch && self.panel != Panel::Closed {
-                    self.start_monitor(context);
-                }
-            }
             MonitorMsg::MonitorLoaded(epoch, snapshot) => {
                 if epoch != self.monitor.epoch || self.panel == Panel::Closed {
                     return;
@@ -89,10 +86,9 @@ impl DesktopApp {
                         let filter = self.monitor.filter.reconciled(&overview);
                         self.monitor.filter = filter;
                     }
-                    self.monitor.task = Some(context.spawn_background(move |cancel| {
-                        feed::backoff(monitor::PERIOD_MS, &|| cancel.is_cancelled());
-                        Message::Monitor(MonitorMsg::RefreshDue(epoch))
-                    }));
+                    // The next read waits on its own worker: a timer message
+                    // would render the whole window for nothing.
+                    self.read_monitor(monitor::PERIOD_MS, context);
                 }
             }
             MonitorMsg::RowOpened(id) => {
@@ -206,6 +202,11 @@ impl DesktopApp {
 
     /// Read while the panel is open, keeping the last successful data visible.
     pub(super) fn start_monitor(&mut self, context: &ComponentContext<Self>) {
+        self.read_monitor(0, context);
+    }
+
+    /// One refresh after `delay_ms` (the next one is planned when it lands).
+    fn read_monitor(&mut self, delay_ms: u64, context: &ComponentContext<Self>) {
         if let Some(task) = self.monitor.task.take() {
             task.cancel();
         }
@@ -229,6 +230,9 @@ impl DesktopApp {
         self.monitor.refreshing = true;
         self.monitor.task = Some(context.spawn_background(move |cancel| {
             let cancelled = || cancel.is_cancelled();
+            if delay_ms > 0 && !feed::backoff(delay_ms, &cancelled) {
+                return Message::Monitor(MonitorMsg::MonitorLoaded(epoch, None));
+            }
             let snapshot = client::block_on(async {
                 // A cancelled epoch may still have an IPC read in flight.
                 let _guard = refresh_gate.lock().await;
@@ -351,17 +355,18 @@ impl DesktopApp {
     /// One row, and below it (when `nest`) its children's toggle (workers
     /// and subagents, collapsed by default) and, when open, their rows one
     /// step in (recursively: a child may have its own). `selected` is the
-    /// open Agent's id, drawn as the selection.
+    /// open Agent's id, drawn as the selection. `now` is the snapshot's
+    /// read time, so the entries change only with a snapshot.
     #[allow(clippy::too_many_arguments)]
-    fn monitor_rows(
+    fn monitor_entries(
         &self,
         row: &MonitorRow,
         depth: usize,
         tree: Option<&Tree>,
         selected: Option<&str>,
-        context: &mut ViewContext<Self>,
+        now: i64,
         palette: Palette,
-        rows: &mut Vec<KeyedView>,
+        entries: &mut Vec<monitor_view::MonitorEntry>,
     ) {
         let data = &self.monitor.data;
         let indent = depth as f64 * tokens::layout::TREE_INDENT;
@@ -375,7 +380,6 @@ impl DesktopApp {
             .map(|parent| (parent, self.agent_title(parent)))
             .filter(|(id, title)| title != id)
             .map(|(_, title)| title);
-        let now = crate::handoff::now_ms();
         let incident = data
             .incident(row)
             .filter(|_| row.state != eliot_core::AgentState::Stopped);
@@ -431,40 +435,23 @@ impl DesktopApp {
                     attention: false,
                 }),
         };
-        let resume = row.resumable().then(|| {
-            context.message(Message::Monitor(MonitorMsg::ResumeRequested(
-                row.id.clone(),
-                row.generation,
-            )))
-        });
         let quiet = row.quiet(now);
-        let elapsed = quiet.label();
-        let elapsed_words = quiet.words();
         let group = row.group(data.incident(row));
-        rows.push(KeyedView::new(
-            format!("row:{}:{}", row.id, selected == Some(row.id.as_str())),
-            Border::new()
-                .margin(Thickness::new(indent, 0.0, 0.0, 0.0))
-                .content(monitor_view::list_row(
-                    row,
-                    monitor_view::RowLook {
-                        title: &title,
-                        elapsed: &elapsed,
-                        elapsed_words: &elapsed_words,
-                        dot: palette.chart_fill(group_tone(group)),
-                        selected: selected == Some(row.id.as_str()),
-                        working: group == monitor::Group::Working || no_code.is_some(),
-                        line,
-                    },
-                    note.as_ref(),
-                    monitor_view::RowActions {
-                        open: context
-                            .message(Message::Monitor(MonitorMsg::RowOpened(row.id.clone()))),
-                        resume: resume.map(|resume| (resume, !self.submitting())),
-                    },
-                    palette,
-                )),
-        ));
+        entries.push(monitor_view::MonitorEntry::Row(Box::new(
+            monitor_view::RowEntry {
+                row: row.clone(),
+                title: title.clone(),
+                elapsed: quiet.label(),
+                elapsed_words: quiet.words(),
+                dot: palette.chart_fill(group_tone(group)),
+                selected: selected == Some(row.id.as_str()),
+                working: group == monitor::Group::Working || no_code.is_some(),
+                line,
+                note,
+                resume: row.resumable().then(|| !self.submitting()),
+                indent,
+            },
+        )));
         let Some(tree) = tree else {
             return;
         };
@@ -473,41 +460,23 @@ impl DesktopApp {
             return;
         }
         let open = self.monitor.expanded.contains(&row.id);
-        let label = tree.children_label(&row.id);
-        rows.push(KeyedView::new(
-            format!("children:{}:{open}", row.id),
-            m3::sub_row(palette, false)
-                .margin(Thickness::new(indent, 0.0, 0.0, 0.0))
-                .automation_name(format!(
-                    "{label} of {title} ({})",
-                    if open { "shown" } else { "hidden" }
-                ))
-                .on_click(
-                    context.message(Message::Monitor(MonitorMsg::ChildrenToggled(
-                        row.id.clone(),
-                    ))),
-                )
-                .content(m3::row_content(
-                    Some(if open {
-                        m3::glyph::CHEVRON_DOWN
-                    } else {
-                        m3::glyph::CHEVRON_RIGHT
-                    }),
-                    &label,
-                    "",
-                    View::empty(),
-                )),
-        ));
+        entries.push(monitor_view::MonitorEntry::Children {
+            id: row.id.clone(),
+            label: tree.children_label(&row.id),
+            title,
+            open,
+            indent,
+        });
         if open {
             for child in children {
-                self.monitor_rows(
+                self.monitor_entries(
                     child,
                     depth + 1,
                     Some(tree),
                     selected,
-                    context,
+                    now,
                     palette,
-                    rows,
+                    entries,
                 );
             }
         }
@@ -516,9 +485,15 @@ impl DesktopApp {
     /// The monitor: the overview, then Needs attention, Working, Idle and a
     /// collapsed Recently stopped, workers and subagents under their
     /// parent's row; under a filter the chart's loaded Agents are listed flat.
+    /// The sections and rows are their own component
+    /// ([`monitor_view::MonitorList`]), redrawn only when a snapshot or a
+    /// choice changes them.
     pub(super) fn monitor_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let data = &self.monitor.data;
         let now = crate::handoff::now_ms();
+        // The rows' ages and incidents as of the last read, so they change
+        // only with a snapshot.
+        let read_at = data.read_at_ms.unwrap_or(now);
         let checkouts = self.checkouts();
         let project_of = |row: &MonitorRow| self.monitor_project(row, &checkouts);
         let overview = data.overview(now, &project_of);
@@ -545,7 +520,7 @@ impl DesktopApp {
             "search",
             self.monitor_search(context, palette),
         ));
-        let tree = data.tree(now);
+        let tree = data.tree(read_at);
         // The open task is selected in its own group (the design has no
         // separate "current" block).
         let focused = self
@@ -582,61 +557,37 @@ impl DesktopApp {
             ));
         }
         let nest = (!filter.is_active()).then_some(&tree);
+        let mut entries = Vec::new();
         for section in &sections {
             let top = section.rows.len();
             if top == 0 {
                 continue;
             }
+            // The design's group label: "Working · 2" (its top-level rows;
+            // nested workers fold under their task).
+            let label = format!("{} · {top}", section.group.title());
             if section.group == monitor::Group::Stopped {
                 // Search results are shown, not folded.
                 let open = self.monitor.stopped_open || filter.is_active();
-                let label = format!("{} · {top}", section.group.title());
-                items.push(KeyedView::new(
-                    format!("section:stopped:{open}"),
-                    m3::sub_row(palette, false)
-                        .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
-                        .automation_name(format!(
-                            "{label} ({})",
-                            if open { "shown" } else { "hidden" }
-                        ))
-                        .on_click(context.message(Message::Monitor(MonitorMsg::StoppedToggled)))
-                        .content(m3::row_content(
-                            Some(if open {
-                                m3::glyph::CHEVRON_DOWN
-                            } else {
-                                m3::glyph::CHEVRON_RIGHT
-                            }),
-                            &label,
-                            "",
-                            View::empty(),
-                        )),
-                ));
+                entries.push(monitor_view::MonitorEntry::Stopped(label, open));
                 if !open {
                     continue;
                 }
             } else {
-                // The design's group label: "Working · 2" (its top-level
-                // rows; nested workers fold under their task).
-                let label = format!("{} · {top}", section.group.title());
-                items.push(KeyedView::new(
+                entries.push(monitor_view::MonitorEntry::Section(
                     format!("section:{:?}", section.group),
-                    m3::muted(label, tokens::text::LABEL).margin(Thickness::new(
-                        tokens::spacing::ROW,
-                        6.0,
-                        0.0,
-                        0.0,
-                    )),
+                    label,
                 ));
             }
             for row in &section.rows {
-                self.monitor_rows(
+                self.monitor_entries(
                     row,
                     0,
                     nest,
                     focused.as_deref(),
-                    context,
+                    read_at,
                     palette,
-                    &mut items,
+                    &mut entries,
                 );
             }
         }
@@ -646,8 +597,21 @@ impl DesktopApp {
             } else {
                 "No Agents to show."
             };
-            items.push(KeyedView::new("none", m3::secondary(none)));
+            entries.push(monitor_view::MonitorEntry::Note(none.to_owned()));
         }
+        items.push(KeyedView::new(
+            "list",
+            View::component::<monitor_view::MonitorList>(monitor_view::MonitorListInput {
+                entries,
+                palette,
+                open: context.callback(|id| Message::Monitor(MonitorMsg::RowOpened(id))),
+                resume: context.callback(|(id, generation)| {
+                    Message::Monitor(MonitorMsg::ResumeRequested(id, generation))
+                }),
+                children: context.callback(|id| Message::Monitor(MonitorMsg::ChildrenToggled(id))),
+                stopped: context.callback(|()| Message::Monitor(MonitorMsg::StoppedToggled)),
+            }),
+        ));
         Grid::new()
             .rows([GridLength::Auto, GridLength::STAR])
             .children((

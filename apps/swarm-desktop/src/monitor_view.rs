@@ -25,6 +25,7 @@ fn small(text: impl Into<String>) -> TextBlock {
 /// What a list row says beyond its state: why a lost or failed Agent ended
 /// (from its loss origin), what an Agent that needs attention needs, or the
 /// task a top-level worker runs under.
+#[derive(Clone, PartialEq)]
 pub enum RowNote {
     Ended(String),
     Attention(String),
@@ -60,6 +61,7 @@ pub struct RowLook<'a> {
 
 /// A row's second line ([`crate::monitor::work_line`]), what a screen
 /// reader hears for it, and whether it is in the attention tone.
+#[derive(Clone, PartialEq)]
 pub struct RowLine {
     pub text: String,
     pub words: String,
@@ -558,4 +560,191 @@ pub fn resource_views(monitor: &Monitor, id: &str, palette: Palette) -> Vec<Keye
         )),
     }
     views
+}
+
+/// One entry of the Monitor list, computed by the window from the last
+/// snapshot (at its read time, not the clock's), so the list
+/// ([`MonitorList`]) is redrawn only when a snapshot or a choice changes it.
+#[derive(Clone, PartialEq)]
+pub enum MonitorEntry {
+    /// A group's label ("Working · 2") and its key.
+    Section(String, String),
+    /// Recently stopped's toggle: its label and whether it is open.
+    Stopped(String, bool),
+    Row(Box<RowEntry>),
+    /// A row's children (workers and subagents) toggle.
+    Children {
+        id: String,
+        label: String,
+        title: String,
+        open: bool,
+        indent: f64,
+    },
+    /// The closing line ("No Agents to show.").
+    Note(String),
+}
+
+/// One Agent row of the Monitor list: what [`list_row`] draws.
+#[derive(Clone, PartialEq)]
+pub struct RowEntry {
+    pub row: MonitorRow,
+    pub title: String,
+    pub elapsed: String,
+    pub elapsed_words: String,
+    pub dot: Brush,
+    pub selected: bool,
+    pub working: bool,
+    pub line: Option<RowLine>,
+    pub note: Option<RowNote>,
+    /// Resume for a resumable row: whether it is enabled.
+    pub resume: Option<bool>,
+    pub indent: f64,
+}
+
+/// The Monitor list's input: its entries and the callbacks (each from a
+/// captureless mapper, so equal across window renders).
+#[derive(Clone, PartialEq)]
+pub struct MonitorListInput {
+    pub entries: Vec<MonitorEntry>,
+    pub palette: Palette,
+    /// Open a row's conversation and details.
+    pub open: Callback<String>,
+    /// Resume a row (its Agent and the generation shown).
+    pub resume: Callback<(String, i64)>,
+    /// Show or hide a row's children.
+    pub children: Callback<String>,
+    /// Show or hide Recently stopped.
+    pub stopped: Callback<()>,
+}
+
+/// The Monitor's sections and rows as their own component: a window render
+/// for anything but a snapshot or a Monitor choice compares equal and
+/// leaves the list as it is.
+pub struct MonitorList;
+
+impl Component for MonitorList {
+    type Input = MonitorListInput;
+    type Message = ();
+
+    fn create(_input: &MonitorListInput, _context: &ComponentContext<Self>) -> Self {
+        Self
+    }
+
+    fn view(&self, input: &MonitorListInput, _context: &mut ViewContext<Self>) -> View {
+        let entries: Vec<KeyedView> = input
+            .entries
+            .iter()
+            .map(|entry| entry_view(entry, input))
+            .collect();
+        StackPanel::new()
+            .spacing(tokens::spacing::ROW)
+            .keyed_children(entries)
+    }
+}
+
+fn chevron(open: bool) -> &'static str {
+    if open {
+        crate::m3::glyph::CHEVRON_DOWN
+    } else {
+        crate::m3::glyph::CHEVRON_RIGHT
+    }
+}
+
+fn entry_view(entry: &MonitorEntry, input: &MonitorListInput) -> KeyedView {
+    let palette = input.palette;
+    match entry {
+        MonitorEntry::Section(key, label) => KeyedView::new(
+            key.clone(),
+            crate::m3::muted(label.clone(), tokens::text::LABEL).margin(Thickness::new(
+                tokens::spacing::ROW,
+                6.0,
+                0.0,
+                0.0,
+            )),
+        ),
+        MonitorEntry::Stopped(label, open) => KeyedView::new(
+            format!("section:stopped:{open}"),
+            crate::m3::sub_row(palette, false)
+                .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
+                .automation_name(format!(
+                    "{label} ({})",
+                    if *open { "shown" } else { "hidden" }
+                ))
+                .on_click(input.stopped.clone())
+                .content(crate::m3::row_content(
+                    Some(chevron(*open)),
+                    label,
+                    "",
+                    View::empty(),
+                )),
+        ),
+        MonitorEntry::Row(entry) => {
+            let id = entry.row.id.clone();
+            let open = input.open.clone();
+            let resume = entry.resume.map(|enabled| {
+                let (resume, id, generation) =
+                    (input.resume.clone(), id.clone(), entry.row.generation);
+                (
+                    Callback::new(move |()| {
+                        let _ = resume.call((id.clone(), generation));
+                    }),
+                    enabled,
+                )
+            });
+            let open_id = id.clone();
+            KeyedView::new(
+                format!("row:{id}:{}", entry.selected),
+                Border::new()
+                    .margin(Thickness::new(entry.indent, 0.0, 0.0, 0.0))
+                    .content(list_row(
+                        &entry.row,
+                        RowLook {
+                            title: &entry.title,
+                            elapsed: &entry.elapsed,
+                            elapsed_words: &entry.elapsed_words,
+                            dot: entry.dot,
+                            selected: entry.selected,
+                            working: entry.working,
+                            line: entry.line.clone(),
+                        },
+                        entry.note.as_ref(),
+                        RowActions {
+                            open: Callback::new(move |()| {
+                                let _ = open.call(open_id.clone());
+                            }),
+                            resume,
+                        },
+                        palette,
+                    )),
+            )
+        }
+        MonitorEntry::Children {
+            id,
+            label,
+            title,
+            open,
+            indent,
+        } => {
+            let (children, id) = (input.children.clone(), id.clone());
+            KeyedView::new(
+                format!("children:{id}:{open}"),
+                crate::m3::sub_row(palette, false)
+                    .margin(Thickness::new(*indent, 0.0, 0.0, 0.0))
+                    .automation_name(format!(
+                        "{label} of {title} ({})",
+                        if *open { "shown" } else { "hidden" }
+                    ))
+                    .on_click(move || {
+                        let _ = children.call(id.clone());
+                    })
+                    .content(crate::m3::row_content(
+                        Some(chevron(*open)),
+                        label,
+                        "",
+                        View::empty(),
+                    )),
+            )
+        }
+        MonitorEntry::Note(text) => KeyedView::new("none", crate::m3::secondary(text.clone())),
+    }
 }

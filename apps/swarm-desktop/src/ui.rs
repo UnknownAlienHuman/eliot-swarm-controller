@@ -808,6 +808,7 @@ impl Component for DesktopApp {
                 shortcuts: None,
                 sidebar_collapsed: false,
                 history: Default::default(),
+                batch: None,
             },
             launch: launch_ui::LaunchState {
                 workspace: input
@@ -831,9 +832,6 @@ impl Component for DesktopApp {
                 render_cache: RenderCache::default(),
                 items: Rc::new(Vec::new()),
                 expanded: HashSet::new(),
-                hovered: None,
-                tool_running: false,
-                clock_armed: false,
                 composer_ref: ElementRef::new(),
                 pending_local: None,
                 waiting_label: None,
@@ -901,7 +899,6 @@ impl Component for DesktopApp {
         }
         self.record_location();
         self.sync_dialog(context);
-        self.arm_clock(context);
     }
 
     fn view(&self, _input: &DesktopInput, context: &mut ViewContext<Self>) -> View {

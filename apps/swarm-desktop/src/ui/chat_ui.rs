@@ -39,11 +39,6 @@ pub(super) enum ChatMsg {
     /// The newest turn was scrolled into view, or why not (epoch).
     FollowLatest(u64, Result<(), String>),
     ToolsToggled(String, bool),
-    /// The pointer entered (`true`) or left a transcript part: its copy
-    /// action shows while it is hovered.
-    PartHovered(String, bool),
-    /// A second passed while a tool row runs: render its elapsed time.
-    ClockTick,
     CopyPart(String),
     CopyCode(String, usize),
     /// Send, Steer or Resume with the draft, bound when it was clicked.
@@ -114,8 +109,6 @@ const WINUI_TEXT_PADDING: f64 = 10.0;
 /// before a send scrolls the transcript to its end: the next render has
 /// realized the newest turn by then (ms).
 const FOLLOW_DELAY_MS: u64 = 60;
-/// A running tool row's elapsed time steps once a second.
-const CLOCK_TICK_MS: u64 = 1_000;
 /// The transcript viewer's automation id, which `crate::scroll_end` finds.
 const TRANSCRIPT_ID: &str = "ConversationTranscript";
 
@@ -343,16 +336,6 @@ pub(super) struct ChatState {
     pub(super) render_cache: RenderCache,
     pub(super) items: Rc<Vec<Rc<RenderedItem>>>,
     pub(super) expanded: HashSet<String>,
-    /// The transcript part under the pointer (its copy action shows).
-    pub(super) hovered: Option<String>,
-    /// A tool row of the open conversation runs ([`DesktopApp::rebuild_items`]).
-    pub(super) tool_running: bool,
-    /// A clock tick is pending ([`DesktopApp::arm_clock`]).
-    pub(super) clock_armed: bool,
-    /// A button of the latest turn, rendered outside the virtualized
-    /// repeater so it always exists: opening a conversation focuses it, and
-    /// WinUI brings a focused control into view (Reactor 0.100.0 exposes no
-    /// ScrollViewer offset or ChangeView).
     /// The composer, focused again after input is admitted, a launch and New.
     pub(super) composer_ref: ElementRef<TextBox>,
     pub(super) pending_local: Option<(String, String, String)>,
@@ -715,14 +698,6 @@ impl DesktopApp {
                         .filter(monitor::restart_loss)
                         .map(|_| monitor::RESTART_LOSS_WORDS.to_owned());
                     self.chat.loss = Some((agent, generation, words));
-                }
-            }
-            ChatMsg::ClockTick => self.chat.clock_armed = false,
-            ChatMsg::PartHovered(key, true) => self.chat.hovered = Some(key),
-            // A late exit of the part just left must not hide the next one.
-            ChatMsg::PartHovered(key, false) => {
-                if self.chat.hovered.as_deref() == Some(key.as_str()) {
-                    self.chat.hovered = None;
                 }
             }
             ChatMsg::CopyPart(key) => {
@@ -1106,8 +1081,12 @@ impl DesktopApp {
             Some(agent) => self.header_view(agent, column, context, palette),
             None => View::empty(),
         };
-        let body: View = match agent {
-            Some(_) => self.transcript_view(column, context, palette),
+        // The transcript stays in place without an open Agent too, so the
+        // conversation just left is removed over later frames, not at once
+        // (`views::Transcript`); the start or home screen covers it.
+        let transcript = self.transcript_view(column, context, palette);
+        let cover: View = match agent {
+            Some(_) => View::empty(),
             // The start is being submitted: the message and what happens
             // now, at once (no empty pause after Send).
             None if self.launch.starting.is_some() => {
@@ -1125,6 +1104,7 @@ impl DesktopApp {
                 self.home_view(line, context, palette)
             }
         };
+        let body = View::fragment((transcript, cover));
         let pending = self.pending_view(column, context, palette);
         let alert: View = match (&self.chat.confirm_force, &self.alert) {
             (Some((bound, title)), _) => {

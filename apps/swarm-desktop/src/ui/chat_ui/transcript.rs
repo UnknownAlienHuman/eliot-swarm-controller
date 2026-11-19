@@ -33,11 +33,24 @@ impl DesktopApp {
             .map(Conversation::items)
             .unwrap_or_default();
         let rendered = self.chat.render_cache.render(&items, &self.chat.docs);
-        self.chat.items = Rc::new(rendered);
-        self.chat.tool_running = items.iter().flat_map(|item| item.parts.iter()).any(|part| {
-            part.kind == crate::chat::PartKind::Tools
-                && part.text.split(crate::chat::TOOL_FIELDS).nth(1) == Some("Running")
-        });
+        // An unchanged conversation keeps the list it had, so the
+        // transcript's input compares equal and nothing is redrawn.
+        let unchanged = rendered.len() == self.chat.items.len()
+            && rendered
+                .iter()
+                .zip(self.chat.items.iter())
+                .all(|(new, old)| {
+                    new.key == old.key
+                        && new.parts.len() == old.parts.len()
+                        && new
+                            .parts
+                            .iter()
+                            .zip(&old.parts)
+                            .all(|(new, old)| Rc::ptr_eq(new, old))
+                });
+        if !unchanged {
+            self.chat.items = Rc::new(rendered);
+        }
         let live: HashSet<u64> = items
             .iter()
             .flat_map(|item| item.parts.iter())
@@ -46,56 +59,38 @@ impl DesktopApp {
         self.chat.docs.retain(|hash, _| live.contains(hash));
     }
 
-    /// The transcript: "Load older" when more history exists, then every
-    /// turn in the reading column.
-    /// Re-render once a second while the shown conversation has a running
-    /// tool row, so its elapsed seconds count up; nothing ticks once it
-    /// finishes, another screen shows, or the conversation closes.
-    pub(in crate::ui) fn arm_clock(&mut self, context: &ComponentContext<Self>) {
-        if self.chat.clock_armed
-            || !self.chat.tool_running
-            || self.main != Main::Conversation
-            || self.chat.convo.is_none()
-        {
-            return;
-        }
-        self.chat.clock_armed = true;
-        let _task = context.spawn_background(|cancel| {
-            let cancelled = || cancel.is_cancelled();
-            let _ = crate::feed::backoff(CLOCK_TICK_MS, &cancelled);
-            Message::Chat(ChatMsg::ClockTick)
-        });
-    }
-
+    /// The transcript ([`views::Transcript`]): "Load older" when more
+    /// history exists, then every turn in the reading column. It is its own
+    /// component: a window render compares its input and redraws it only
+    /// when the conversation, its expanded rows, the column or the palette
+    /// changed.
     pub(super) fn transcript_view(
         &self,
         column: Option<f64>,
         context: &mut ViewContext<Self>,
         palette: Palette,
     ) -> View {
+        let conversation = self.selected_agent_id().unwrap_or_default();
+        let open = !conversation.is_empty();
         // Not while the first read is in flight: its coverage is not known.
         let loading = matches!(self.chat.live, LiveStatus::Loading);
-        let load_older: View = match self.chat.convo.as_ref() {
-            Some(convo) if convo.coverage().can_load_older() && !self.chat.items.is_empty() => {
-                m3::text_button(palette)
-                    .is_enabled(!loading)
-                    .horizontal_alignment(HorizontalAlignment::Center)
-                    .margin(Thickness::new(0.0, 0.0, 0.0, tokens::spacing::MD))
-                    .on_click(context.message(Message::Chat(ChatMsg::LoadOlderRequested)))
-                    .content(m3::label("Load older messages"))
-            }
-            _ => View::empty(),
-        };
-        let empty: View = if self.chat.items.is_empty() {
-            m3::secondary(match self.chat.live {
-                LiveStatus::Loading => "Loading…",
-                _ => "No messages yet.",
+        let load_older = self
+            .chat
+            .convo
+            .as_ref()
+            .filter(|convo| {
+                open && convo.coverage().can_load_older() && !self.chat.items.is_empty()
             })
-            .horizontal_alignment(HorizontalAlignment::Center)
-            .into()
-        } else {
-            View::empty()
-        };
+            .map(|_| {
+                (
+                    !loading,
+                    context.callback(|()| Message::Chat(ChatMsg::LoadOlderRequested)),
+                )
+            });
+        let empty = (open && self.chat.items.is_empty()).then_some(match self.chat.live {
+            LiveStatus::Loading => "Loading…",
+            _ => "No messages yet.",
+        });
         let workspace = self
             .chat
             .detail
@@ -107,16 +102,14 @@ impl DesktopApp {
             .revealed
             .clone()
             .filter(|(item, _)| item.starts_with(&path_scope));
+        // Every callback comes from a captureless mapper, so it compares
+        // equal from one window render to the next.
         let callbacks = RowCallbacks {
             open_path: context.callback(|(key, path)| Message::Reveal(key, path)),
             path_scope,
             path_failure,
             workspace,
             copy_part: context.callback(|value| Message::Chat(ChatMsg::CopyPart(value))),
-            hovered: self.chat.hovered.clone(),
-            hover: context.callback(|(key, over): (String, bool)| {
-                Message::Chat(ChatMsg::PartHovered(key, over))
-            }),
             copy_code: context.callback(|(key, index): (String, usize)| {
                 Message::Chat(ChatMsg::CopyCode(key, index))
             }),
@@ -134,41 +127,18 @@ impl DesktopApp {
             toggle_tools: context.callback(|(key, expanded): (String, bool)| {
                 Message::Chat(ChatMsg::ToolsToggled(key, expanded))
             }),
-            now_ms: crate::handoff::now_ms(),
         };
-        // Every resident turn is a plain keyed child (the resident bounds
-        // cap them, `chat::MAX_RESIDENT_TURNS`): the anchored ScrollView
-        // below lays them all out at once, so nothing is realized late
-        // while scrolling and nothing waits to be measured after an open.
-        let expanded = Rc::new(self.chat.expanded.clone());
-        let turns: Vec<KeyedView> = self
-            .chat
-            .items
-            .iter()
-            .map(|item| {
-                KeyedView::new(
-                    item.key.clone(),
-                    views::item_view(item, &expanded, &callbacks, palette, column),
-                )
-            })
-            .collect();
-        // The app's one ScrollView: its implicit style anchors it at the
-        // far (bottom) edge (`app_resources::styles_xaml`), so it opens at
-        // the newest turn and stays there while earlier turns are measured
-        // or new activity arrives, with no scroll after the first frame.
-        ScrollView::new()
-            .grid_row(1)
-            .vertical_scroll_bar_visibility(ScrollingScrollBarVisibility::Auto)
-            .automation_name("Conversation")
-            .automation_id(TRANSCRIPT_ID)
-            .content(
-                StackPanel::new()
-                    .width(column)
-                    .max_width(tokens::layout::READING_WIDTH)
-                    .horizontal_alignment(HorizontalAlignment::Center)
-                    .margin(Thickness::xy(0.0, tokens::spacing::MD))
-                    .children((load_older, empty, StackPanel::new().keyed_children(turns))),
-            )
+        View::component::<views::Transcript>(views::TranscriptInput {
+            conversation,
+            items: views::Shared(Rc::clone(&self.chat.items)),
+            expanded: Rc::new(self.chat.expanded.clone()),
+            callbacks: Rc::new(callbacks),
+            palette,
+            column,
+            load_older,
+            empty,
+            automation_id: TRANSCRIPT_ID,
+        })
     }
 
     /// Pending requests of the open Agent: what it asks, and the answers.

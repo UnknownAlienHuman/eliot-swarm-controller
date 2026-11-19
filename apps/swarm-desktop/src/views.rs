@@ -8,6 +8,12 @@
 //! cached per part key + content revision: an unchanged part hands Reactor
 //! the same `RichText`, so its native block is not recreated and a selection
 //! inside it survives updates to other parts.
+//!
+//! The transcript, each part and a running tool row's seconds are Reactor
+//! components ([`Transcript`], [`PartView`], [`Elapsed`]): Reactor 0.100.0
+//! re-renders the whole window for every message, but a component whose
+//! `Input` compares equal is skipped, so a sidebar refresh, a Monitor tick
+//! or the one-second clock never rebuilds the conversation.
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -223,8 +229,9 @@ impl RenderCache {
     }
 }
 
-/// Callbacks a realized row needs; cloned into the virtual source.
-#[derive(Clone)]
+/// What every part is drawn with: the callbacks (each made from a
+/// captureless mapper, so equal across renders) and the path context.
+#[derive(Clone, PartialEq)]
 pub struct RowCallbacks {
     pub copy_part: Callback<String>,
     pub open_path: Callback<(String, String)>,
@@ -236,13 +243,6 @@ pub struct RowCallbacks {
     pub pick_model: Option<Callback<()>>,
     pub copy_code: Callback<(String, usize)>,
     pub toggle_tools: Callback<(String, bool)>,
-    /// The part under the pointer: its copy actions show.
-    pub hovered: Option<String>,
-    /// The pointer entered (`true`) or left a part.
-    pub hover: Callback<(String, bool)>,
-    /// Now (ms since the epoch): a running tool row counts its seconds
-    /// from its start.
-    pub now_ms: i64,
 }
 
 fn label(text: &str) -> TextBlock {
@@ -267,14 +267,8 @@ const INSET: f64 = (tokens::height::CONTROL - tokens::icon::ROW) / 2.0;
 /// otherwise the same place holds a keyboard stop whose glyph shows only
 /// with keyboard focus ([`crate::m3::reveal_button`]). Never a permanently
 /// visible icon.
-fn copy_button(
-    name: &str,
-    part: &str,
-    callbacks: &RowCallbacks,
-    palette: Palette,
-    callback: impl Fn() + 'static,
-) -> View {
-    if callbacks.hovered.as_deref() == Some(part) {
+fn copy_button(name: &str, hovered: bool, palette: Palette, callback: impl Fn() + 'static) -> View {
+    if hovered {
         crate::m3::icon_button(palette)
             .automation_name(name.to_owned())
             .on_click(callback)
@@ -292,7 +286,12 @@ fn copy_glyph() -> View {
     crate::m3::icon(crate::m3::glyph::COPY)
 }
 
-fn block_views(part: &RenderedPart, callbacks: &RowCallbacks, palette: Palette) -> Vec<KeyedView> {
+fn block_views(
+    part: &RenderedPart,
+    callbacks: &RowCallbacks,
+    hovered: bool,
+    palette: Palette,
+) -> Vec<KeyedView> {
     let Some(blocks) = part.blocks.as_ref() else {
         return vec![KeyedView::new(
             "plain",
@@ -345,15 +344,9 @@ fn block_views(part: &RenderedPart, callbacks: &RowCallbacks, palette: Palette) 
                         Border::new()
                             .horizontal_alignment(HorizontalAlignment::Left)
                             .margin(Thickness::new(-INSET, 0.0, 0.0, 0.0))
-                            .content(copy_button(
-                                "Copy code",
-                                &part.key,
-                                callbacks,
-                                palette,
-                                move || {
-                                    let _ = copy.call((key.clone(), code_index));
-                                },
-                            )),
+                            .content(copy_button("Copy code", hovered, palette, move || {
+                                let _ = copy.call((key.clone(), code_index));
+                            })),
                     ))
                 }
                 RenderedBlock::Rule => crate::m3::divider(palette).into(),
@@ -370,6 +363,7 @@ fn block_views(part: &RenderedPart, callbacks: &RowCallbacks, palette: Palette) 
 fn part_view(
     part: &RenderedPart,
     expanded: bool,
+    hovered: bool,
     callbacks: &RowCallbacks,
     palette: Palette,
 ) -> View {
@@ -393,13 +387,7 @@ fn part_view(
                 Border::new()
                     .horizontal_alignment(HorizontalAlignment::Right)
                     .margin(Thickness::new(0.0, 0.0, -INSET, 0.0))
-                    .content(copy_button(
-                        "Copy message",
-                        &part.key,
-                        callbacks,
-                        palette,
-                        copy_message,
-                    )),
+                    .content(copy_button("Copy message", hovered, palette, copy_message)),
             )),
         // A steered message stays in the turn it steered.
         PartKind::Steer => Border::new()
@@ -410,7 +398,7 @@ fn part_view(
         // The assistant's interim notes read as its text.
         PartKind::Progress => StackPanel::new()
             .spacing(tokens::spacing::SM)
-            .keyed_children(block_views(part, callbacks, palette)),
+            .keyed_children(block_views(part, callbacks, hovered, palette)),
         PartKind::Tools => {
             let toggle = callbacks.toggle_tools.clone();
             let key = part.key.clone();
@@ -424,14 +412,18 @@ fn part_view(
             let duration = fields.next().unwrap_or_default().to_owned();
             let started = fields.next().and_then(|ms| ms.parse::<i64>().ok());
             let running = status == "Running";
-            let trailing = match (status.as_str(), started) {
-                ("Running", Some(started)) => format!(
-                    "Running \u{b7} {} s",
-                    (callbacks.now_ms - started).max(0) / 1_000
-                ),
-                ("Running", None) => "Running".to_owned(),
-                ("Completed", _) => duration.clone(),
-                _ => status.clone(),
+            // A running row counts its seconds in its own component
+            // ([`Elapsed`]): the tick redraws that caption only.
+            let trailing: View = match (status.as_str(), started) {
+                ("Running", Some(started_ms)) => View::component::<Elapsed>(ElapsedInput {
+                    started_ms,
+                    palette,
+                }),
+                ("Running", None) => {
+                    crate::m3::tool_caption(status.clone(), Some(palette.primary())).into()
+                }
+                ("Completed", _) => crate::m3::tool_caption(duration.clone(), None).into(),
+                _ => crate::m3::tool_caption(status.clone(), None).into(),
             };
             let glyph = match part.label.as_str() {
                 "Command" => crate::m3::glyph::TERMINAL,
@@ -442,7 +434,7 @@ fn part_view(
                 .automation_name(format!(
                     "{name} · {} ({})",
                     if running {
-                        trailing.clone()
+                        status.clone()
                     } else {
                         format!("{status} · {duration}")
                     },
@@ -451,12 +443,7 @@ fn part_view(
                 .on_click(move || {
                     let _ = toggle.call((key.clone(), !expanded));
                 })
-                .content(crate::m3::tool_content(
-                    glyph,
-                    &name,
-                    &trailing,
-                    running.then(|| palette.primary()),
-                ));
+                .content(crate::m3::tool_content(glyph, &name, trailing));
             let detail: View = if expanded {
                 StackPanel::new()
                     .spacing(tokens::spacing::XS)
@@ -487,17 +474,11 @@ fn part_view(
                 note,
                 StackPanel::new()
                     .spacing(tokens::spacing::SM)
-                    .keyed_children(block_views(part, callbacks, palette)),
+                    .keyed_children(block_views(part, callbacks, hovered, palette)),
                 Border::new()
                     .horizontal_alignment(HorizontalAlignment::Left)
                     .margin(Thickness::new(-INSET, 0.0, 0.0, 0.0))
-                    .content(copy_button(
-                        "Copy message",
-                        &part.key,
-                        callbacks,
-                        palette,
-                        copy_message,
-                    )),
+                    .content(copy_button("Copy message", hovered, palette, copy_message)),
             ))
         }
         PartKind::Working => StackPanel::new().spacing(tokens::spacing::XS).children((
@@ -550,73 +531,405 @@ fn part_view(
     }
 }
 
-/// One realized turn: keyed parts, so new activity appends children instead
-/// of replacing the item.
-pub fn item_view(
-    item: &RenderedItem,
-    expanded: &HashSet<String>,
-    callbacks: &RowCallbacks,
-    palette: Palette,
-    width: Option<f64>,
-) -> View {
-    let parts: Vec<KeyedView> = item
-        .parts
+/// An `Rc` compared by identity: a component input whose content is rebuilt
+/// only on a real change ([`RenderCache`]) compares in O(1).
+pub struct Shared<T>(pub Rc<T>);
+
+impl<T> Clone for Shared<T> {
+    fn clone(&self) -> Self {
+        Self(Rc::clone(&self.0))
+    }
+}
+
+impl<T> PartialEq for Shared<T> {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// Parts built in the first frame of a newly shown conversation: enough to
+/// fill the window at its end, where the anchored transcript opens.
+const FIRST_PARTS: usize = 30;
+/// Older parts added per later frame until every resident part is built.
+const GROW_PARTS: usize = 40;
+/// Parts of a conversation just left removed per later frame: Reactor
+/// 0.100.0 tears a subtree down node by node, and 588 parts at once held
+/// the window for 1.7 s.
+const DRAIN_PARTS: usize = 10;
+/// Between two of those frames: input and painting run in between.
+const STEP_DELAY_MS: u64 = 15;
+
+/// The transcript's input: the resident turns (rebuilt only when the
+/// conversation changes) and what they are drawn with. A window render for
+/// anything else (the sidebar refresh, a Monitor tick, typing) compares
+/// equal and leaves the transcript as it is.
+#[derive(Clone, PartialEq)]
+pub struct TranscriptInput {
+    /// The open Agent ("" for none): another one is built from its end
+    /// again, and the one it replaces is removed over later frames.
+    pub conversation: String,
+    pub items: Shared<Vec<Rc<RenderedItem>>>,
+    pub expanded: Rc<HashSet<String>>,
+    pub callbacks: Rc<RowCallbacks>,
+    pub palette: Palette,
+    pub column: Option<f64>,
+    /// "Load older messages" when more history exists: enabled, and its
+    /// callback.
+    pub load_older: Option<(bool, Callback<()>)>,
+    /// The line shown without turns ("Loading…", "No messages yet.").
+    pub empty: Option<&'static str>,
+    pub automation_id: &'static str,
+}
+
+/// A conversation that was left: drawn as it was (hidden, so its parts
+/// are kept, not rebuilt) until its parts are removed.
+struct Leaving {
+    /// Its container's key.
+    serial: u64,
+    input: TranscriptInput,
+    /// Its oldest parts already removed (or never built).
+    gone: usize,
+    parts: usize,
+}
+
+/// Build more of the shown conversation, or remove more of the left ones.
+#[derive(Clone, Copy, Debug)]
+pub enum TranscriptStep {
+    /// The conversation (its serial) the next older parts were planned
+    /// for.
+    Grow(u64),
+    Drain,
+}
+
+/// The conversation's transcript: its own component, so it renders only
+/// when its input changes. A newly shown conversation builds its newest
+/// parts first and the older ones over the next frames (the transcript is
+/// anchored at its end, so they arrive above the window's view); the one
+/// it replaces is removed over later frames too.
+pub struct Transcript {
+    /// Counts the conversations shown: each one's container key.
+    serial: u64,
+    /// The conversation's first turns arrived.
+    filled: bool,
+    /// The oldest resident parts not built yet.
+    hidden: usize,
+    /// The input last drawn.
+    shown: TranscriptInput,
+    /// Conversations left, the latest first.
+    leaving: Vec<Leaving>,
+}
+
+fn part_count(items: &[Rc<RenderedItem>]) -> usize {
+    items.iter().map(|item| item.parts.len()).sum()
+}
+
+fn step_later(step: TranscriptStep, context: &ComponentContext<Transcript>) {
+    let _task = context.spawn_background(move |cancel| {
+        let _ = crate::feed::backoff(STEP_DELAY_MS, &|| cancel.is_cancelled());
+        step
+    });
+}
+
+impl Transcript {
+    fn settle(&mut self, input: &TranscriptInput, context: &ComponentContext<Self>) {
+        if input.conversation != self.shown.conversation {
+            let left = std::mem::replace(&mut self.shown, input.clone());
+            let parts = part_count(&left.items.0);
+            if parts > self.hidden {
+                if self.leaving.is_empty() {
+                    step_later(TranscriptStep::Drain, context);
+                }
+                self.leaving.insert(
+                    0,
+                    Leaving {
+                        serial: self.serial,
+                        input: left,
+                        gone: self.hidden,
+                        parts,
+                    },
+                );
+            }
+            self.serial += 1;
+            self.filled = false;
+            self.hidden = 0;
+        }
+        self.shown = input.clone();
+        if self.filled || input.items.0.is_empty() {
+            return;
+        }
+        self.filled = true;
+        self.hidden = part_count(&input.items.0).saturating_sub(FIRST_PARTS);
+        if self.hidden > 0 {
+            step_later(TranscriptStep::Grow(self.serial), context);
+        }
+    }
+}
+
+impl Component for Transcript {
+    type Input = TranscriptInput;
+    type Message = TranscriptStep;
+
+    fn create(input: &TranscriptInput, context: &ComponentContext<Self>) -> Self {
+        let mut transcript = Self {
+            serial: 0,
+            filled: false,
+            hidden: 0,
+            shown: input.clone(),
+            leaving: Vec::new(),
+        };
+        transcript.settle(input, context);
+        transcript
+    }
+
+    fn input_changed(&mut self, input: &TranscriptInput, context: &ComponentContext<Self>) {
+        self.settle(input, context);
+    }
+
+    fn update(&mut self, step: TranscriptStep, context: &ComponentContext<Self>) {
+        match step {
+            TranscriptStep::Grow(serial) => {
+                if serial != self.serial || self.hidden == 0 {
+                    return;
+                }
+                self.hidden = self.hidden.saturating_sub(GROW_PARTS);
+                if self.hidden > 0 {
+                    step_later(step, context);
+                }
+            }
+            TranscriptStep::Drain => {
+                if let Some(oldest) = self.leaving.last_mut() {
+                    oldest.gone += DRAIN_PARTS;
+                    if oldest.gone >= oldest.parts {
+                        self.leaving.pop();
+                    }
+                }
+                if !self.leaving.is_empty() {
+                    step_later(step, context);
+                }
+            }
+        }
+    }
+
+    fn view(&self, input: &TranscriptInput, _context: &mut ViewContext<Self>) -> View {
+        let palette = input.palette;
+        let load_older: View = match &input.load_older {
+            Some((enabled, load)) if self.hidden == 0 => crate::m3::text_button(palette)
+                .is_enabled(*enabled)
+                .horizontal_alignment(HorizontalAlignment::Center)
+                .margin(Thickness::new(0.0, 0.0, 0.0, tokens::spacing::MD))
+                .on_click(load.clone())
+                .content(crate::m3::label("Load older messages")),
+            _ => View::empty(),
+        };
+        let empty: View = match input.empty {
+            Some(line) => crate::m3::secondary(line)
+                .horizontal_alignment(HorizontalAlignment::Center)
+                .into(),
+            None => View::empty(),
+        };
+        // One container per conversation, keyed by its serial: the shown one
+        // first, then the ones left (zero height, transparent and clipped),
+        // so a switch inserts the new one in front and moves nothing.
+        let mut conversations = vec![KeyedView::new(
+            self.serial,
+            StackPanel::new().keyed_children(turn_views(input, self.hidden)),
+        )];
+        conversations.extend(self.leaving.iter().map(|left| {
+            KeyedView::new(
+                left.serial,
+                StackPanel::new()
+                    .height(0.0)
+                    .opacity(0.0)
+                    .keyed_children(turn_views(&left.input, left.gone)),
+            )
+        }));
+        // The app's one ScrollView: its implicit style anchors it at the
+        // far (bottom) edge (`app_resources::styles_xaml`), so it opens at
+        // the newest turn and stays there while earlier turns are built or
+        // new activity arrives, with no scroll after the first frame.
+        ScrollView::new()
+            .grid_row(1)
+            .vertical_scroll_bar_visibility(ScrollingScrollBarVisibility::Auto)
+            .automation_name("Conversation")
+            .automation_id(input.automation_id)
+            .content(
+                StackPanel::new()
+                    .width(input.column)
+                    .max_width(tokens::layout::READING_WIDTH)
+                    .horizontal_alignment(HorizontalAlignment::Center)
+                    .margin(Thickness::xy(0.0, tokens::spacing::MD))
+                    .children((
+                        load_older,
+                        empty,
+                        StackPanel::new().keyed_children(conversations),
+                    )),
+            )
+    }
+}
+
+/// The turns of one conversation, its oldest `skip` parts left out; each
+/// part its own [`PartView`].
+fn turn_views(input: &TranscriptInput, skip: usize) -> Vec<KeyedView> {
+    // A tool row is keyed by whether it runs: WinUI reads a button's colors
+    // only when its template is applied, so a finished row would keep the
+    // running tint.
+    let running = format!(
+        "{}Running{}",
+        crate::chat::TOOL_FIELDS,
+        crate::chat::TOOL_FIELDS
+    );
+    let mut skip = skip;
+    input
+        .items
+        .0
         .iter()
-        .map(|part| {
-            // A tool row is keyed by whether it runs: WinUI reads a button's
-            // colors only when its template is applied, so a finished row
-            // would keep the running tint.
-            let running = format!(
-                "{}Running{}",
-                crate::chat::TOOL_FIELDS,
-                crate::chat::TOOL_FIELDS
-            );
-            let key = if matches!(part.kind, PartKind::Tools) && part.plain.contains(&running) {
-                format!("{}:running", part.key)
-            } else {
-                part.key.clone()
-            };
-            let body = StackPanel::new().spacing(tokens::spacing::XS).children((
-                part_view(part, expanded.contains(&part.key), callbacks, palette),
-                // The assistant's files are actions; the owner's own
-                // message only names them.
-                if matches!(part.kind, PartKind::Progress | PartKind::Final) {
-                    path_actions(&part.key, &part.file_paths, callbacks, palette)
-                } else {
-                    View::empty()
-                },
-            ));
-            // A message with Copy is a hover area: its actions show while
-            // the pointer is over it (a late exit does not hide the next).
-            let view: View = if matches!(
-                part.kind,
-                PartKind::Input | PartKind::Progress | PartKind::Final
-            ) {
-                let (enter, leave) = (callbacks.hover.clone(), callbacks.hover.clone());
-                let (over, out) = (part.key.clone(), part.key.clone());
-                Border::new()
-                    .background(Brush::Solid(Color::transparent()))
-                    .on_pointer_entered(move |_: PointerEventInfo| {
-                        let _ = enter.call((over.clone(), true));
-                    })
-                    .on_pointer_exited(move |_: PointerEventInfo| {
-                        let _ = leave.call((out.clone(), false));
-                    })
-                    .content(body)
-            } else {
-                body
-            };
-            KeyedView::new(key, view)
+        .filter_map(|item| {
+            if skip >= item.parts.len() {
+                skip -= item.parts.len();
+                return None;
+            }
+            let shown = &item.parts[skip..];
+            skip = 0;
+            let parts: Vec<KeyedView> = shown
+                .iter()
+                .map(|part| {
+                    let key = if part.kind == PartKind::Tools && part.plain.contains(&running) {
+                        format!("{}:running", part.key)
+                    } else {
+                        part.key.clone()
+                    };
+                    KeyedView::new(
+                        key,
+                        View::component::<PartView>(PartInput {
+                            part: Shared(Rc::clone(part)),
+                            expanded: input.expanded.contains(&part.key),
+                            callbacks: Rc::clone(&input.callbacks),
+                            palette: input.palette,
+                        }),
+                    )
+                })
+                .collect();
+            // A turn takes the reading column's width explicitly: a short
+            // turn's bubble still reaches the right edge.
+            Some(KeyedView::new(
+                item.key.clone(),
+                StackPanel::new()
+                    .width(input.column)
+                    .spacing(tokens::spacing::SM)
+                    .margin(Thickness::new(0.0, 0.0, 0.0, tokens::spacing::LG))
+                    .keyed_children(parts),
+            ))
         })
-        .collect();
-    // An ItemsRepeater arranges a turn at its content width, so the turn
-    // takes the reading column's width explicitly: a short turn's bubble
-    // still reaches the right edge.
-    StackPanel::new()
-        .width(width)
-        .spacing(tokens::spacing::SM)
-        .margin(Thickness::new(0.0, 0.0, 0.0, tokens::spacing::LG))
-        .keyed_children(parts)
+        .collect()
+}
+
+/// One part's input: the rendered part (replaced only on a new revision)
+/// and how it is drawn.
+#[derive(Clone, PartialEq)]
+pub struct PartInput {
+    pub part: Shared<RenderedPart>,
+    pub expanded: bool,
+    pub callbacks: Rc<RowCallbacks>,
+    pub palette: Palette,
+}
+
+/// One transcript part as its own component: a transcript render rebuilds
+/// only the parts whose input changed, and the pointer over a message shows
+/// its copy actions without leaving the part.
+pub struct PartView {
+    /// The pointer is over the part: its copy actions show.
+    hovered: bool,
+}
+
+impl Component for PartView {
+    type Input = PartInput;
+    /// The pointer entered (`true`) or left the part.
+    type Message = bool;
+
+    fn create(_input: &PartInput, _context: &ComponentContext<Self>) -> Self {
+        Self { hovered: false }
+    }
+
+    fn update(&mut self, over: bool, _context: &ComponentContext<Self>) {
+        self.hovered = over;
+    }
+
+    fn view(&self, input: &PartInput, context: &mut ViewContext<Self>) -> View {
+        let part = &*input.part.0;
+        let (callbacks, palette) = (&*input.callbacks, input.palette);
+        let body = StackPanel::new().spacing(tokens::spacing::XS).children((
+            part_view(part, input.expanded, self.hovered, callbacks, palette),
+            // The assistant's files are actions; the owner's own message
+            // only names them.
+            if matches!(part.kind, PartKind::Progress | PartKind::Final) {
+                path_actions(&part.key, &part.file_paths, callbacks, palette)
+            } else {
+                View::empty()
+            },
+        ));
+        // A message with Copy is a hover area: its actions show while the
+        // pointer is over it.
+        if matches!(
+            part.kind,
+            PartKind::Input | PartKind::Progress | PartKind::Final
+        ) {
+            Border::new()
+                .background(Brush::Solid(Color::transparent()))
+                .on_pointer_entered(context.callback(|_: PointerEventInfo| true))
+                .on_pointer_exited(context.callback(|_: PointerEventInfo| false))
+                .content(body)
+        } else {
+            body
+        }
+    }
+}
+
+/// Between two redraws of a running tool row's seconds.
+const ELAPSED_TICK_MS: u64 = 1_000;
+
+/// A running tool row's start and the palette its caption takes.
+#[derive(Clone, PartialEq)]
+pub struct ElapsedInput {
+    pub started_ms: i64,
+    pub palette: Palette,
+}
+
+/// "Running · 12 s": its own one-second clock, so the tick redraws this
+/// caption only, never the transcript or the window around it.
+pub struct Elapsed {
+    now_ms: i64,
+}
+
+fn tick_later(context: &ComponentContext<Elapsed>) {
+    let _task = context.spawn_background(|cancel| {
+        let _ = crate::feed::backoff(ELAPSED_TICK_MS, &|| cancel.is_cancelled());
+    });
+}
+
+impl Component for Elapsed {
+    type Input = ElapsedInput;
+    type Message = ();
+
+    fn create(_input: &ElapsedInput, context: &ComponentContext<Self>) -> Self {
+        tick_later(context);
+        Self {
+            now_ms: crate::handoff::now_ms(),
+        }
+    }
+
+    fn update(&mut self, (): (), context: &ComponentContext<Self>) {
+        self.now_ms = crate::handoff::now_ms();
+        tick_later(context);
+    }
+
+    fn view(&self, input: &ElapsedInput, _context: &mut ViewContext<Self>) -> View {
+        let seconds = (self.now_ms - input.started_ms).max(0) / 1_000;
+        crate::m3::tool_caption(
+            format!("Running \u{b7} {seconds} s"),
+            Some(input.palette.primary()),
+        )
+        .into()
+    }
 }
 
 /// Most file chips one message shows before "+N more".

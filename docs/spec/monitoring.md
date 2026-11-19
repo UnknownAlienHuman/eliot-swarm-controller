@@ -791,7 +791,7 @@ A busy Agent whose tool and message activity continues but whose worktree has ha
 - retires as soon as a write or commit lands (last_code_progress_at advances);
 - reuses the existing attention machinery: a bounded incident per Agent/generation, no new timer service.
 
-The report carries `code_progress_at` (that window's start) and the turn's `tool_calls` and `messages`, so an agent actively using tools but not writing code is clearly distinguished from an idle one. The desktop shows the open report on the Agent's Monitor row and in Details ("Working without writing code for 14m") until the daemon retires it.
+The report carries `code_progress_at` (that window's start) and the turn's `tool_calls` and `messages`, so an agent actively using tools but not writing code is clearly distinguished from an idle one. The desktop shows the open report on the Agent's Monitor row, its sidebar row and in Details ("Working without writing code for 14m") until the daemon retires it. The sidebar reads the Monitor's reports: the panel's refresh reads them while it is open, the sidebar's refresh runs the same incremental read while it is closed, never both.
 
 ## Restart reconciliation
 
