@@ -1572,7 +1572,7 @@ impl DesktopApp {
                     "none",
                     m3::secondary("No setting matches. Try another word.")
                         .text_wrapping(TextWrapping::Wrap)
-                        .margin(Thickness::new(tokens::spacing::INSET, 0.0, 0.0, 0.0)),
+                        .margin(Thickness::xy(tokens::spacing::ROW, 0.0)),
                 ));
             }
             for (page, name) in found {
@@ -1613,7 +1613,7 @@ impl DesktopApp {
                         .on_click(
                             context.message(Message::Settings(SettingsMsg::PageSelected(*page))),
                         )
-                        .content(m3::icon_label(page.glyph(), page.label())),
+                        .content(m3::nav_content(page.glyph(), page.label(), "")),
                 ));
             }
         }
@@ -1841,12 +1841,7 @@ impl DesktopApp {
     }
 }
 
-/// A settings navigation group label: secondary text at the rows' inset.
-fn nav_label(text: &str) -> TextBlock {
-    m3::section_label(text).margin(Thickness::new(
-        tokens::spacing::INSET,
-        tokens::spacing::MD,
-        0.0,
-        tokens::spacing::XS,
-    ))
+/// A settings navigation group label: the sidebar's section row.
+fn nav_label(text: &str) -> View {
+    m3::section_row(text)
 }

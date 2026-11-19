@@ -2406,26 +2406,31 @@ impl DesktopApp {
             .children((top, bottom))
     }
 
-    /// Settings in the sidebar's place (the Codex settings navigation): a
-    /// Back row, a Search field that finds settings across the pages, then
-    /// the pages in their groups.
+    /// Settings in the sidebar's place (the Codex settings navigation), on
+    /// the sidebar's rows: a Back row, the pill search field that finds
+    /// settings across the pages, then the pages under section labels.
     fn settings_nav(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let pad = SIDEBAR_PADDING;
         let top = StackPanel::new()
             .margin(Thickness::new(pad, tokens::spacing::SM, pad, 0.0))
-            .spacing(tokens::spacing::XS)
+            .spacing(tokens::spacing::SM)
             .children((
                 m3::row(palette, false)
                     .automation_name("Back to tasks")
                     .on_click(context.message(Message::Shell(ShellMsg::SettingsClosed)))
-                    .content(m3::icon_label(m3::glyph::BACK, "Back to tasks")),
-                m3::field()
-                    .text(self.settings.query.clone())
-                    .placeholder_text("Search settings")
-                    .automation_name("Search settings")
-                    .on_text_changed(
-                        context.callback(|text| Message::Shell(ShellMsg::SettingsSearch(text))),
-                    ),
+                    .content(m3::nav_content(m3::glyph::BACK, "Back to tasks", "")),
+                // On the sidebar the field takes the container tone (the
+                // tonal one would vanish into it).
+                m3::search_field(
+                    palette.container(),
+                    TextBox::new()
+                        .text(self.settings.query.clone())
+                        .placeholder_text("Search settings")
+                        .automation_name("Search settings")
+                        .on_text_changed(
+                            context.callback(|text| Message::Shell(ShellMsg::SettingsSearch(text))),
+                        ),
+                ),
             ));
         let rows = self.settings_rows(context, palette);
         Grid::new()
@@ -2438,6 +2443,7 @@ impl DesktopApp {
                     .content(
                         StackPanel::new()
                             .margin(Thickness::new(pad, 0.0, pad, pad))
+                            .spacing(tokens::spacing::ROW_GAP)
                             .keyed_children(rows),
                     ),
             ))

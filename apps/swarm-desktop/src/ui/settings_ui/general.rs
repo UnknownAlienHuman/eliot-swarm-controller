@@ -17,7 +17,7 @@ fn theme_note(choice: ThemeChoice) -> &'static str {
 
 /// A theme's swatch: its sidebar, surface and selection side by side on
 /// the card corner, its primary as a dot (System shows Light and Dark).
-fn swatch(choice: ThemeChoice) -> View {
+fn swatch(choice: ThemeChoice, palette: Palette) -> View {
     let half = |theme: crate::theme::Theme, column: i32| {
         let roles = theme.roles();
         Grid::new()
@@ -51,6 +51,8 @@ fn swatch(choice: ThemeChoice) -> View {
         .width(48.0)
         .height(24.0)
         .corner_radius(6.0)
+        .border_brush(palette.outline())
+        .border_thickness(Thickness::uniform(tokens::layout::HAIRLINE))
         .vertical_alignment(VerticalAlignment::Center)
         .content(body)
 }
@@ -86,7 +88,7 @@ impl DesktopApp {
                                 ])
                                 .column_spacing(tokens::spacing::INSET)
                                 .children((
-                                    swatch(choice),
+                                    swatch(choice, palette),
                                     m3::text(choice.label(), tokens::text::BUTTON)
                                         .grid_column(1)
                                         .vertical_alignment(VerticalAlignment::Center),

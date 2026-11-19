@@ -272,7 +272,7 @@ impl DesktopApp {
             })
             .collect();
         StackPanel::new().spacing(tokens::spacing::ROW).children((
-            m3::search_field(palette, field),
+            m3::search_field(palette.tonal(), field),
             m3::segmented(palette, segments),
         ))
     }

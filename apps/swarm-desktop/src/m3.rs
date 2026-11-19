@@ -145,10 +145,7 @@ pub fn section_title(value: impl Into<String>) -> TextBlock {
 /// A section label ("Projects", "Chats"): 12/500 muted, on a 32-DIP row at
 /// the rows' inset, 12 DIPs below the group above.
 pub fn section_label(value: impl Into<String>) -> TextBlock {
-    muted(value, style::LABEL)
-        .automation_heading_level(AutomationHeadingLevel::Level3)
-        .height(height::CONTROL)
-        .vertical_alignment(VerticalAlignment::Center)
+    muted(value, style::LABEL).automation_heading_level(AutomationHeadingLevel::Level3)
 }
 
 /// The sidebar's section label row: the label at the rows' content edge.
@@ -590,14 +587,14 @@ pub fn pane_tab_label(label: &str) -> View {
 
 /// The search field of a pane: a 32-DIP pill in the tonal tone, a 16-DIP
 /// icon and a borderless field (13 DIPs) 8 DIPs after it.
-pub fn search_field(palette: Palette, field: TextBox) -> View {
+pub fn search_field(fill: Brush, field: TextBox) -> View {
     // WinUI's text box insets its text by 10 DIPs; the margin puts the text
     // 8 DIPs after the icon, as the design does.
     const TEXT_BOX_INSET: f64 = 10.0;
     Border::new()
         .height(height::CONTROL)
         .corner_radius(radius::PILL)
-        .background(palette.tonal())
+        .background(fill)
         .padding(Thickness::new(spacing::INSET, 0.0, spacing::XS, 0.0))
         .content(
             Grid::new()
@@ -605,13 +602,8 @@ pub fn search_field(palette: Palette, field: TextBox) -> View {
                 .column_spacing(spacing::SM - TEXT_BOX_INSET)
                 .children((
                     Border::new()
-                        .opacity(1.0)
                         .vertical_alignment(VerticalAlignment::Center)
-                        .content(
-                            Border::new()
-                                .vertical_alignment(VerticalAlignment::Center)
-                                .content(small_icon(glyph::SEARCH)),
-                        ),
+                        .content(small_icon(glyph::SEARCH)),
                     field
                         .grid_column(1)
                         .background(Brush::Solid(Color::transparent()))
