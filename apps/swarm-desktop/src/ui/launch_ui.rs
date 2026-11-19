@@ -72,6 +72,12 @@ pub(super) enum LaunchMsg {
     OpenModel,
     /// Close the open popover (a click outside it, Esc).
     Close,
+    /// The composer's + button: choose files to attach.
+    AttachRequested,
+    /// Remove one attached file (its path) from the composer.
+    AttachmentRemoved(String),
+    /// The New worktree chip: ask for a new worktree for this task.
+    WorktreeToggled,
     /// The popover's first frame is drawn: let it settle in.
     Entered,
     /// The pointer entered (true) or left the composer's message field,
@@ -189,6 +195,12 @@ pub(super) struct LaunchState {
     /// The open popover's first frame: drawn clear and lowered, it then
     /// settles in (the design's 250 ms entrance).
     pub(super) entering: bool,
+    /// Files attached in the composer, for the composer they were attached
+    /// in (`NEW_TASK` or the open Agent's id).
+    pub(super) attachments: Option<(String, Vec<String>)>,
+    /// The next task asks for a new worktree (where the project would
+    /// otherwise share its checkout).
+    pub(super) worktree: bool,
     /// The selected project's profile allowlist (empty: any profile).
     pub(super) profiles: Vec<String>,
     pub(super) workspace: String,
@@ -516,6 +528,45 @@ impl DesktopApp {
             }
             LaunchMsg::OpenModel => self.open_popover(Pop::Model, context),
             LaunchMsg::Close => self.close_popover(),
+            LaunchMsg::AttachRequested => {
+                self.close_popover();
+                match crate::file_dialog::pick_files("Attach files") {
+                    Ok(picked) if !picked.is_empty() => {
+                        let target = self.composer_target();
+                        let mut files = self
+                            .launch
+                            .attachments
+                            .take()
+                            .filter(|(owner, _)| *owner == target)
+                            .map(|(_, files)| files)
+                            .unwrap_or_default();
+                        for path in picked {
+                            if !files.contains(&path) {
+                                files.push(path);
+                            }
+                        }
+                        if files.len() > crate::attachments::MAX {
+                            files.truncate(crate::attachments::MAX);
+                            self.set_status(format!(
+                                "A message carries at most {} files.",
+                                crate::attachments::MAX
+                            ));
+                        }
+                        self.launch.attachments = Some((target, files));
+                    }
+                    Ok(_) => {}
+                    Err(error) => self.alert(error),
+                }
+            }
+            LaunchMsg::AttachmentRemoved(path) => {
+                if let Some((_, files)) = self.launch.attachments.as_mut() {
+                    files.retain(|file| *file != path);
+                    if files.is_empty() {
+                        self.launch.attachments = None;
+                    }
+                }
+            }
+            LaunchMsg::WorktreeToggled => self.launch.worktree = !self.launch.worktree,
             LaunchMsg::Entered => self.launch.entering = false,
             LaunchMsg::ComposerPointer { over, pressed } => {
                 crate::shortcuts::set_composer_over(over);
@@ -1138,6 +1189,7 @@ impl DesktopApp {
             self.alert("Describe the task first.");
             return;
         }
+        let text = crate::attachments::compose(&text, self.attached_to(NEW_TASK_COMPOSER));
         if !self.launch.chat && self.launch.workspace.trim().is_empty() {
             self.alert("Choose a project, a folder, or No project (chat).");
             return;
@@ -1145,6 +1197,8 @@ impl DesktopApp {
         self.close_popover();
         let place = if self.launch.chat {
             client::LaunchPlace::Chat
+        } else if self.worktree_chip() == WorktreeChip::Toggle(true) {
+            client::LaunchPlace::Worktree(self.launch.workspace.clone())
         } else {
             client::LaunchPlace::Workspace(self.launch.workspace.clone())
         };
@@ -1175,6 +1229,7 @@ impl DesktopApp {
         // The composer empties at once; the revision stays, so a retry of
         // an unconfirmed start reuses its mutation id.
         self.launch.launch_text.clear();
+        self.clear_attached(NEW_TASK_COMPOSER);
         self.set_status(format!("Launching ({mutation_id})…"));
         let _task = context.spawn_background(move |_| {
             Message::Launch(LaunchMsg::LaunchSubmitted(client::block_on(async {
@@ -1694,5 +1749,68 @@ pub(super) fn access_label(permissions: Option<&str>) -> String {
         Some("read-only") => "Read only".to_owned(),
         Some("workspace-write") => "Workspace write".to_owned(),
         Some(other) => other.replace(['-', '_'], " "),
+    }
+}
+
+/// The new task composer's key for its attached files.
+pub(super) const NEW_TASK_COMPOSER: &str = "new-task";
+
+/// How the composer shows where a new task works.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum WorktreeChip {
+    /// A chat, or no folder yet.
+    Hidden,
+    /// The project prepares a worktree for every task (its `workspace =
+    /// "worktree"`, the default for a registered project): a fixed fact.
+    Fixed,
+    /// The folder is shared unless a new worktree is asked for (on).
+    Toggle(bool),
+}
+
+impl DesktopApp {
+    /// The composer files attach to: the open Agent's, else the new task's.
+    pub(super) fn composer_target(&self) -> String {
+        self.selected_agent_id()
+            .unwrap_or_else(|| NEW_TASK_COMPOSER.to_owned())
+    }
+
+    /// The files attached in `target`'s composer.
+    pub(super) fn attached_to(&self, target: &str) -> &[String] {
+        match &self.launch.attachments {
+            Some((owner, files)) if owner == target => files,
+            _ => &[],
+        }
+    }
+
+    /// The message carrying `target`'s attachments went out.
+    pub(super) fn clear_attached(&mut self, target: &str) {
+        if self
+            .launch
+            .attachments
+            .as_ref()
+            .is_some_and(|(owner, _)| owner == target)
+        {
+            self.launch.attachments = None;
+        }
+    }
+
+    /// Where the next task works, as the daemon decides it: a registered
+    /// project prepares a worktree per top-level task unless its settings
+    /// share the checkout; any other folder is shared unless asked.
+    pub(super) fn worktree_chip(&self) -> WorktreeChip {
+        if self.launch.chat || self.launch.workspace.trim().is_empty() {
+            return WorktreeChip::Hidden;
+        }
+        let key = nav::path_key(&self.launch.workspace);
+        let registered = self
+            .nav
+            .projects
+            .iter()
+            .any(|project| nav::path_key(&project.workspace) == key);
+        if registered && !self.settings.shares_checkout(&self.launch.workspace) {
+            WorktreeChip::Fixed
+        } else {
+            WorktreeChip::Toggle(self.launch.worktree)
+        }
     }
 }

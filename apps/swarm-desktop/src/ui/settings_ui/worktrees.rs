@@ -207,7 +207,7 @@ impl DesktopApp {
                     rows.push(KeyedView::new(
                         "items",
                         ScrollViewer::new()
-                            .max_height(240.0)
+                            .max_height(tokens::layout::DIALOG_LIST_MAX_HEIGHT)
                             .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
                             .content(
                                 StackPanel::new()
@@ -324,7 +324,7 @@ impl DesktopApp {
                 m3::text_button(palette).element_ref(&self.dialog.close).automation_name("Cancel cleanup")
                     .on_click(context.message(Message::Settings(SettingsMsg::CleanupConfirmed(false)))).content(m3::label("Cancel")),
                 m3::destructive(palette).element_ref(&self.dialog.primary).is_enabled(!self.settings.cleanup_busy && !selected.is_empty()).automation_name("Confirm Remove")
-                    .on_click(context.message(Message::Settings(SettingsMsg::CleanupConfirmed(true)))).content(m3::label("Remove"))), 420.0)
+                    .on_click(context.message(Message::Settings(SettingsMsg::CleanupConfirmed(true)))).content(m3::label("Remove"))), tokens::layout::DIALOG_WIDTH)
     }
 
     /// Worktrees & cleanup (Codex's Worktrees page as the pattern): where

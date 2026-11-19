@@ -131,7 +131,7 @@ impl DesktopApp {
                                     on,
                                 ))
                             }))
-                            .content(TextBlock::new().text(profile.clone())),
+                            .content(m3::body(profile.clone())),
                     )
                 })
                 .collect();
@@ -181,7 +181,7 @@ impl DesktopApp {
                     ),
                     m3::destructive(palette)
                         .margin(Thickness::new(
-                            tokens::layout::LABEL_WIDTH + tokens::spacing::SM,
+                            tokens::layout::FIELD_INDENT,
                             tokens::spacing::XS,
                             0.0,
                             0.0,

@@ -94,6 +94,10 @@ impl DesktopApp {
             path_failure,
             workspace,
             copy_part: context.callback(|value| Message::Chat(ChatMsg::CopyPart(value))),
+            hovered: self.chat.hovered.clone(),
+            hover: context.callback(|(key, over): (String, bool)| {
+                Message::Chat(ChatMsg::PartHovered(key, over))
+            }),
             copy_code: context.callback(|(key, index): (String, usize)| {
                 Message::Chat(ChatMsg::CopyCode(key, index))
             }),
@@ -405,6 +409,7 @@ pub(super) fn starting_view(
     column: Option<f64>,
     palette: Palette,
 ) -> View {
+    let (shown, files) = crate::attachments::split(text);
     StackPanel::new()
         .grid_row(1)
         .width(column)
@@ -414,19 +419,25 @@ pub(super) fn starting_view(
         .margin(Thickness::xy(0.0, tokens::spacing::MD))
         .spacing(tokens::spacing::SM)
         .children((
-            Border::new()
+            // The owner's message as the transcript will show it: the
+            // bubble, and attached files as chips under it.
+            StackPanel::new()
+                .spacing(tokens::spacing::XS)
                 .horizontal_alignment(HorizontalAlignment::Right)
                 .max_width(tokens::layout::READING_WIDTH * tokens::layout::BUBBLE_SHARE)
-                .background(palette.container())
-                .corner_radius(tokens::radius::CONTAINER)
-                .padding(Thickness::xy(tokens::spacing::INSET, tokens::spacing::SM))
-                .automation_name(format!("You: {text}"))
-                .content(
-                    TextBlock::new()
-                        .text(text.to_owned())
-                        .foreground(palette.text())
-                        .text_wrapping(TextWrapping::Wrap),
-                ),
+                .automation_name(format!("You: {shown}"))
+                .children((
+                    m3::bubble(
+                        palette,
+                        m3::body(shown.to_owned()).text_wrapping(TextWrapping::Wrap),
+                        None,
+                    ),
+                    if files.is_empty() {
+                        View::empty()
+                    } else {
+                        views::attached_chips(&files, palette)
+                    },
+                )),
             StackPanel::new()
                 .spacing(tokens::spacing::XS)
                 .automation_name(label.to_owned())

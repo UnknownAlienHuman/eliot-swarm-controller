@@ -1417,7 +1417,7 @@ impl DesktopApp {
                     .on_click(context.message(Message::Menu(MenuMsg::Confirmed(true))))
                     .content(m3::label(button)),
             ),
-            420.0,
+            tokens::layout::DIALOG_WIDTH,
         )
     }
 
@@ -1472,7 +1472,7 @@ impl DesktopApp {
             title,
             status,
             close,
-            420.0,
+            tokens::layout::DIALOG_WIDTH,
         )
     }
 

@@ -76,10 +76,42 @@ impl DesktopApp {
         } else {
             View::empty()
         };
+        // The design's second chip: where the task works.
+        let worktree: View = match self.worktree_chip() {
+            launch_ui::WorktreeChip::Hidden => View::empty(),
+            launch_ui::WorktreeChip::Fixed => m3::fixed_chip(
+                palette,
+                false,
+                Some(m3::glyph::WORKTREE),
+                "New worktree",
+                "New worktree: this project starts each task in its own worktree",
+            )
+            .tooltip("This project starts each task in its own worktree."),
+            launch_ui::WorktreeChip::Toggle(on) => {
+                // Keyed by state: a chip's colors apply when it is created.
+                Grid::new().keyed_children(vec![KeyedView::new(
+                    format!("worktree:{on}"),
+                    m3::chip(palette)
+                        .resource_overrides(palette.toggle_chip(on))
+                        .automation_name(if on {
+                            "New worktree (on): the task works in a new worktree"
+                        } else {
+                            "New worktree (off): the task works in this folder"
+                        })
+                        .on_click(context.message(Message::Launch(LaunchMsg::WorktreeToggled)))
+                        .content(m3::chip_content(
+                            Some(m3::glyph::WORKTREE),
+                            "New worktree",
+                            false,
+                            tokens::layout::PROJECT_CHIP_WIDTH,
+                        )),
+                )])
+            }
+        };
         StackPanel::new()
             .orientation(Orientation::Horizontal)
-            .spacing(tokens::spacing::SM)
-            .children((chip, folder))
+            .spacing(6.0)
+            .children((chip, worktree, folder))
     }
 
     /// The composer's bottom-left chips for a new task: the model chip
@@ -127,17 +159,28 @@ impl DesktopApp {
                     )),
                 )])
             }
-            // A preset (or Auto's pick) carries its own permissions.
-            _ => m3::meta(
-                m3::glyph::SHIELD,
-                &match self.launch.profile() {
-                    Some(profile) => format!(
-                        "{} (preset)",
-                        launch_ui::access_label(profile.permissions.as_deref())
-                    ),
+            // A preset (or Auto's pick) carries its own permissions: an
+            // outlined chip that is not a control (Full access in the
+            // attention tone, as the design shows it).
+            _ => {
+                let permissions = self
+                    .launch
+                    .profile()
+                    .and_then(|profile| profile.permissions.as_deref());
+                let label = match self.launch.profile() {
+                    Some(_) => launch_ui::access_label(permissions),
                     None => "Access from the preset".to_owned(),
-                },
-            ),
+                };
+                let full = permissions == Some("danger-full-access");
+                m3::fixed_chip(
+                    palette,
+                    full,
+                    Some(m3::glyph::SHIELD),
+                    &label,
+                    &format!("Access: {label}, set by the preset"),
+                )
+                .tooltip("Set by the preset.")
+            }
         };
         // The design: the access chip, then the model chip.
         StackPanel::new()

@@ -22,7 +22,6 @@ mod access;
 mod advanced;
 mod automations;
 mod cloud_mcp;
-mod folder;
 mod general;
 mod models;
 mod projects;
@@ -465,6 +464,24 @@ impl SettingsState {
 
     fn busy(&self) -> bool {
         self.reading || self.saving.is_some()
+    }
+
+    /// Whether the read `[projects]` entry for `checkout` shares its
+    /// checkout (`workspace = "shared"`) instead of a worktree per task.
+    pub(super) fn shares_checkout(&self, checkout: &str) -> bool {
+        let key = crate::nav::path_key(checkout);
+        self.base
+            .get(&Section::Projects)
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+            .any(|(_, project)| {
+                project
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .is_some_and(|path| crate::nav::path_key(path) == key)
+                    && project.get("workspace").and_then(Value::as_str) == Some("shared")
+            })
     }
 
     /// A typed change on `page`: the sequence its pause carries.
@@ -1124,28 +1141,30 @@ impl DesktopApp {
                     Default::default()
                 };
             }
-            SettingsMsg::ProjectBrowse => match folder::pick() {
-                Ok(Some(path)) => {
-                    let profiles = self.known_profiles();
-                    let s = &mut self.settings;
-                    let id = model::project_id_for_folder(&s.projects, &path);
-                    match model::add_project(&mut s.projects, &id, &path, &profiles) {
-                        Ok(()) => {
-                            s.project_open = Some(id);
-                            self.autosave(Page::Projects, context);
-                        }
-                        Err(error) => {
-                            s.notes.insert(Page::Projects, Note::error(error));
+            SettingsMsg::ProjectBrowse => {
+                match crate::file_dialog::pick_folder("Add a project: choose its checkout folder") {
+                    Ok(Some(path)) => {
+                        let profiles = self.known_profiles();
+                        let s = &mut self.settings;
+                        let id = model::project_id_for_folder(&s.projects, &path);
+                        match model::add_project(&mut s.projects, &id, &path, &profiles) {
+                            Ok(()) => {
+                                s.project_open = Some(id);
+                                self.autosave(Page::Projects, context);
+                            }
+                            Err(error) => {
+                                s.notes.insert(Page::Projects, Note::error(error));
+                            }
                         }
                     }
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.settings
+                            .notes
+                            .insert(Page::Projects, Note::error(error));
+                    }
                 }
-                Ok(None) => {}
-                Err(error) => {
-                    self.settings
-                        .notes
-                        .insert(Page::Projects, Note::error(error));
-                }
-            },
+            }
             SettingsMsg::CloudField(index, text) => {
                 if let Some((key, _)) = model::CLOUD_FIELDS.get(index)
                     && model::cloud_field(&s.cloud, key) != text
@@ -1621,7 +1640,7 @@ impl DesktopApp {
     }
 
     /// The shown Settings page: its title, then its groups, in one centred
-    /// column of at most 840 DIPs with the 24-DIP page padding.
+    /// column of at most 720 DIPs with the 24-DIP page padding.
     pub(super) fn settings_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let page = self.settings_page;
         let body: View = if self.settings.loaded {

@@ -435,6 +435,10 @@ impl StatusTone {
 }
 
 #[cfg(windows)]
+/// A quota window with less than this share left (percent) reads in the
+/// attention color.
+pub const QUOTA_LOW: f64 = 20.0;
+
 pub mod winui {
     //! The roles as WinUI brushes, and as theme resource overrides for real
     //! `Button`s, the one control that takes Reactor `ResourceOverrides` in
@@ -681,6 +685,39 @@ pub mod winui {
             })
         }
 
+        /// The outline of a chip in the attention tone (Full access).
+        pub fn attention_outline(self) -> Brush {
+            self.role(
+                |r| r.attention.mix(r.surface, 0.55),
+                ThemeBrush::SystemCritical,
+            )
+        }
+
+        /// A chip that switches something on (New worktree): the chip's
+        /// outline at rest, the selected role while on.
+        pub fn toggle_chip(self, on: bool) -> ResourceOverrides {
+            self.with(|r| {
+                Family {
+                    outline: Some(r.border),
+                    ..if on {
+                        Family::new(Some(r.selected), r.text)
+                    } else {
+                        Family::new(None, r.variant)
+                    }
+                }
+                .overrides(r)
+            })
+        }
+
+        /// A steered message: the selected role at half strength on the
+        /// surface, so it never reads as an input field.
+        pub fn steer(self) -> Brush {
+            self.role(
+                |r| r.surface.mix(r.selected, 0.5),
+                ThemeBrush::CardBackground,
+            )
+        }
+
         /// A chip in the attention color (Full access in the composer).
         pub fn attention_chip(self) -> ResourceOverrides {
             self.with(|r| {
@@ -749,7 +786,7 @@ pub mod winui {
         /// WinUI's ring template resolves before the application's.
         pub fn usage_ring(self, remaining: f64) -> ResourceOverrides {
             self.with(|r| {
-                let arc = if remaining < 20.0 {
+                let arc = if remaining < super::QUOTA_LOW {
                     r.attention
                 } else {
                     r.primary

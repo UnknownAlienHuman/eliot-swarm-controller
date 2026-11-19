@@ -48,9 +48,9 @@ fn swatch(choice: ThemeChoice, palette: Palette) -> View {
         other => half(other.theme(false), 0),
     };
     Border::new()
-        .width(48.0)
-        .height(24.0)
-        .corner_radius(6.0)
+        .width(tokens::layout::SWATCH_WIDTH)
+        .height(tokens::layout::SWATCH_HEIGHT)
+        .corner_radius(tokens::radius::SWATCH)
         .border_brush(palette.outline())
         .border_thickness(Thickness::uniform(tokens::layout::HAIRLINE))
         .vertical_alignment(VerticalAlignment::Center)

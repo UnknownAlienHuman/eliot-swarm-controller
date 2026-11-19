@@ -3,25 +3,25 @@ use super::*;
 impl DesktopApp {
     pub(super) fn cloud_section(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let enabled = model::cloud_enabled(&self.settings.cloud);
+        // An on/off setting is a switch (as General's), keyed by state.
         let switch = Grid::new().keyed_children(vec![KeyedView::new(
             format!("cloud:{enabled}"),
-            CheckBox::new()
-                .is_checked(enabled)
+            ToggleSwitch::new()
+                .is_on(enabled)
+                .width(tokens::layout::SWITCH_WIDTH)
                 .automation_name("Cloud MCP configured")
-                .on_is_checked_changed(
+                .on_toggled(
                     context.callback(|on: bool| Message::Settings(SettingsMsg::CloudEnabled(on))),
-                )
-                .content(m3::label("Configured")),
-        )]);
-        let mut rows: Vec<KeyedView> = vec![
-            KeyedView::new("enabled", m3::form_row("Cloud MCP", switch, None)),
-            KeyedView::new(
-                "help",
-                m3::help(
-                    "Serve Swarm's MCP endpoint through a Cloudflare tunnel behind Cloudflare Access. The daemon applies a change at its next start.",
                 ),
+        )]);
+        let mut rows: Vec<KeyedView> = vec![KeyedView::new(
+            "enabled",
+            m3::setting_row(
+                "Cloud MCP",
+                "Serve Swarm's MCP endpoint through a Cloudflare tunnel behind Cloudflare Access. The daemon applies a change at its next start.",
+                switch,
             ),
-        ];
+        )];
         if enabled {
             rows.extend(
                 model::CLOUD_FIELDS
@@ -45,6 +45,6 @@ impl DesktopApp {
                     }),
             );
         }
-        m3::group(palette, rows)
+        m3::settings_card(palette, rows)
     }
 }

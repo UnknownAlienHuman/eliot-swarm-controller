@@ -51,6 +51,12 @@ pub mod glyph {
     pub const NEW_TASK: &str = "\u{E710}";
     pub const SEARCH: &str = "\u{E721}";
     pub const FOLDER: &str = "\u{E8B7}";
+    /// A file (an attachment, a file the answer names): Segoe Fluent
+    /// Document.
+    pub const FILE: &str = "\u{F000}";
+    /// A worktree (New worktree, Settings › Worktrees): Segoe Fluent's
+    /// fork.
+    pub const WORKTREE: &str = "\u{EA3C}";
     pub const SETTINGS: &str = "\u{E713}";
     /// A filled square (Segoe Fluent E978): the outline Stop glyph read as
     /// a check box (owner review 2026-11-19).
@@ -88,7 +94,6 @@ pub mod glyph {
     pub const OPEN_FOLDER: &str = "\u{E838}";
     pub const KEYBOARD: &str = "\u{E765}";
     pub const ROUTING: &str = "\u{E8AB}";
-    pub const WORKTREE: &str = "\u{E8F1}";
     pub const CLOUD: &str = "\u{E753}";
     pub const CODE: &str = "\u{E943}";
     /// Manage models (OpenCode's sliders button): Segoe Fluent Equalizer.
@@ -509,6 +514,59 @@ pub fn attention_chip(palette: Palette) -> Button {
     chip(palette).resource_overrides(palette.attention_chip())
 }
 
+/// A fact shown as a chip but not a control (a preset's access, a project
+/// that always takes a worktree): the chip's outline and label, no state
+/// layer. Full access is its label alone in the attention tone, as the
+/// design draws it (Reactor 0.100.0 sets no icon color outside a button).
+pub fn fixed_chip(
+    palette: Palette,
+    attention: bool,
+    glyph: Option<&str>,
+    label: &str,
+    name: &str,
+) -> View {
+    let outline = if attention {
+        palette.attention_outline()
+    } else {
+        palette.border()
+    };
+    let mut label_view = text(label.to_owned(), style::CHIP)
+        .vertical_alignment(VerticalAlignment::Center)
+        .max_width(layout::PROJECT_CHIP_WIDTH)
+        .text_trimming(TextTrimming::CharacterEllipsis);
+    if attention {
+        label_view = label_view.foreground(palette.attention());
+    }
+    let mut parts: Vec<KeyedView> = Vec::new();
+    if let Some(glyph) = glyph.filter(|_| !attention) {
+        parts.push(KeyedView::new("icon", small_icon(glyph)));
+    }
+    parts.push(KeyedView::new("label", label_view));
+    Border::new()
+        .automation_name(name.to_owned())
+        .height(height::CHIP)
+        .corner_radius(radius::CHIP)
+        .border_brush(outline)
+        .border_thickness(Thickness::uniform(layout::HAIRLINE))
+        .padding(Thickness::xy(spacing::ROW, 0.0))
+        .vertical_alignment(VerticalAlignment::Center)
+        .content(
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(6.0)
+                .vertical_alignment(VerticalAlignment::Center)
+                .keyed_children(parts),
+        )
+}
+
+/// A transcript action (Copy) that shows only while its message is under
+/// the pointer: there it is an icon button; elsewhere this keyboard stop
+/// keeps its place and shows its glyph only while it has keyboard focus
+/// (the implicit `HyperlinkButton` style in `app_resources`).
+pub fn reveal_button() -> HyperlinkButton {
+    HyperlinkButton::new()
+}
+
 /// A chip's content: an optional 16-DIP icon, the 13-DIP label (trimmed at
 /// `max`), an optional chevron, 6 DIPs apart.
 pub fn chip_content(glyph: Option<&str>, label: &str, chevron: bool, max: f64) -> View {
@@ -536,24 +594,6 @@ pub fn chip_content(glyph: Option<&str>, label: &str, chevron: bool, max: f64) -
 /// text color, a state layer on hover, no outline.
 pub fn text_chip(palette: Palette) -> Button {
     button(palette.row(false))
-}
-
-/// Read-only context: a 16-DIP icon and a caption in the muted role. No
-/// outline and no button, so it never reads as a control.
-pub fn meta(glyph: &str, label: &str) -> View {
-    StackPanel::new()
-        .orientation(Orientation::Horizontal)
-        .spacing(6.0)
-        .vertical_alignment(VerticalAlignment::Center)
-        .automation_name(label.to_owned())
-        .children((
-            Border::new()
-                .vertical_alignment(VerticalAlignment::Center)
-                .content(small_icon(glyph)),
-            muted(label.to_owned(), style::CHIP)
-                .vertical_alignment(VerticalAlignment::Center)
-                .text_trimming(TextTrimming::CharacterEllipsis),
-        ))
 }
 
 /// One segment of a segmented button (see [`segmented`]): 28 DIPs, the
@@ -720,12 +760,12 @@ pub fn bubble(palette: Palette, content: impl Into<View>, max_width: Option<f64>
         .content(content)
 }
 
-/// A steered message: outlined in the placeholder tone instead of filled,
-/// "Steer:" before the text, in the variant tone.
+/// A steered message: the user's bubble shape filled with the selected
+/// role at half strength, its "Steer" label over the text (the design's
+/// dashed outline has no Reactor stroke; a solid one reads as a field).
 pub fn steer_bubble(palette: Palette, text_value: &str, max_width: Option<f64>) -> View {
     Border::new()
-        .border_brush(palette.muted())
-        .border_thickness(Thickness::uniform(layout::HAIRLINE))
+        .background(palette.steer())
         .corner_radius(CornerRadius::new(
             radius::BUBBLE,
             radius::BUBBLE,
@@ -736,10 +776,12 @@ pub fn steer_bubble(palette: Palette, text_value: &str, max_width: Option<f64>) 
         .horizontal_alignment(HorizontalAlignment::Right)
         .max_width(max_width)
         .content(
-            body(format!("Steer: {text_value}"))
-                .foreground(palette.variant())
-                .text_wrapping(TextWrapping::Wrap)
-                .is_text_selection_enabled(true),
+            StackPanel::new().spacing(2.0).children((
+                muted("Steer", style::LABEL),
+                body(text_value.to_owned())
+                    .text_wrapping(TextWrapping::Wrap)
+                    .is_text_selection_enabled(true),
+            )),
         )
 }
 
@@ -883,16 +925,6 @@ pub fn help(text: impl Into<String>) -> TextBlock {
             0.0,
             spacing::SM,
         ))
-}
-
-/// Rows in one card (tonal, the container corner).
-pub fn group(palette: Palette, rows: Vec<KeyedView>) -> View {
-    Border::new()
-        .background(palette.tonal())
-        .corner_radius(radius::CONTAINER)
-        .padding(Thickness::xy(spacing::MD, spacing::SM))
-        .vertical_alignment(VerticalAlignment::Top)
-        .content(StackPanel::new().keyed_children(rows))
 }
 
 /// A list of selectable rows in one card: the rows reach 8 DIPs from the

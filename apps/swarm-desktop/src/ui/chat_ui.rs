@@ -39,6 +39,9 @@ pub(super) enum ChatMsg {
     /// The newest turn was scrolled into view, or why not (epoch).
     FollowLatest(u64, Result<(), String>),
     ToolsToggled(String, bool),
+    /// The pointer entered (`true`) or left a transcript part: its copy
+    /// action shows while it is hovered.
+    PartHovered(String, bool),
     CopyPart(String),
     CopyCode(String, usize),
     /// Send, Steer or Resume with the draft, bound when it was clicked.
@@ -338,6 +341,8 @@ pub(super) struct ChatState {
     pub(super) items: Rc<Vec<Rc<RenderedItem>>>,
     pub(super) items_revision: u64,
     pub(super) expanded: HashSet<String>,
+    /// The transcript part under the pointer (its copy action shows).
+    pub(super) hovered: Option<String>,
     /// A button of the latest turn, rendered outside the virtualized
     /// repeater so it always exists: opening a conversation focuses it, and
     /// WinUI brings a focused control into view (Reactor 0.100.0 exposes no
@@ -705,6 +710,13 @@ impl DesktopApp {
                     self.chat.loss = Some((agent, generation, words));
                 }
             }
+            ChatMsg::PartHovered(key, true) => self.chat.hovered = Some(key),
+            // A late exit of the part just left must not hide the next one.
+            ChatMsg::PartHovered(key, false) => {
+                if self.chat.hovered.as_deref() == Some(key.as_str()) {
+                    self.chat.hovered = None;
+                }
+            }
             ChatMsg::CopyPart(key) => {
                 let text = self
                     .chat
@@ -740,6 +752,8 @@ impl DesktopApp {
                 }
                 let agent_id = action.agent().to_owned();
                 let text = profiles::normalize_newlines(self.chat.drafts.get(&agent_id));
+                // Attached files ride the message as its closing block.
+                let text = crate::attachments::compose(&text, self.attached_to(&agent_id));
                 // A plain Resume needs no text; Send and Steer do.
                 let blank = text.trim().is_empty();
                 if blank && !matches!(action, DraftAction::Resume { .. }) {
@@ -801,6 +815,7 @@ impl DesktopApp {
                 // At once: the composer empties (same revision, so a retry
                 // keeps this id) and the message shows with what it waits for.
                 self.chat.drafts.ack(&agent_id, revision);
+                self.clear_attached(&agent_id);
                 if !blank
                     && let Some(convo) = self.chat.convo.as_mut()
                     && convo.agent() == agent_id

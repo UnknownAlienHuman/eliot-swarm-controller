@@ -997,6 +997,33 @@ pub fn styles_xaml() -> String {
            <Setter Property=\"SystemBackdrop\" Value=\"{{x:Null}}\"/>\
            <Setter Property=\"CornerRadius\" Value=\"{container}\"/>\
          </Style>\
+         <Style TargetType=\"HyperlinkButton\">\
+           <Setter Property=\"Width\" Value=\"{min}\"/>\
+           <Setter Property=\"Height\" Value=\"{min}\"/>\
+           <Setter Property=\"Padding\" Value=\"0\"/>\
+           <Setter Property=\"CornerRadius\" Value=\"{pill}\"/>\
+           <Setter Property=\"Background\" Value=\"Transparent\"/>\
+           <Setter Property=\"Foreground\" Value=\"{{ThemeResource TextFillColorSecondaryBrush}}\"/>\
+           <Setter Property=\"UseSystemFocusVisuals\" Value=\"True\"/>\
+           <Setter Property=\"Template\"><Setter.Value>\
+             <ControlTemplate TargetType=\"HyperlinkButton\">\
+               <Grid Background=\"{{TemplateBinding Background}}\" CornerRadius=\"{{TemplateBinding CornerRadius}}\">\
+                 <VisualStateManager.VisualStateGroups>\
+                   <VisualStateGroup x:Name=\"FocusStates\">\
+                     <VisualState x:Name=\"Focused\">\
+                       <VisualState.Setters>\
+                         <Setter Target=\"ContentPresenter.Opacity\" Value=\"1\"/>\
+                       </VisualState.Setters>\
+                     </VisualState>\
+                     <VisualState x:Name=\"Unfocused\"/>\
+                     <VisualState x:Name=\"PointerFocused\"/>\
+                   </VisualStateGroup>\
+                 </VisualStateManager.VisualStateGroups>\
+                 <ContentPresenter x:Name=\"ContentPresenter\" Opacity=\"0\" Content=\"{{TemplateBinding Content}}\" Foreground=\"{{TemplateBinding Foreground}}\" HorizontalAlignment=\"Center\" VerticalAlignment=\"Center\"/>\
+               </Grid>\
+             </ControlTemplate>\
+           </Setter.Value></Setter>\
+         </Style>\
          </ResourceDictionary>"
     )
 }

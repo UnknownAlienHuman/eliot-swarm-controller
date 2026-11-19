@@ -305,7 +305,7 @@ impl DesktopApp {
         // row's label column and gap). Where the field's column is
         // narrower than the list, the list ends at the card's right edge
         // instead, so it is never cut off. The layer behind it closes it.
-        let field_left = tokens::layout::LABEL_WIDTH + tokens::spacing::SM;
+        let field_left = tokens::layout::FIELD_INDENT;
         let left = match self.settings_column_width() {
             Some(column) => {
                 let inner = column - 2.0 * tokens::spacing::MD;

@@ -19,6 +19,8 @@ mod config_view;
 #[cfg(windows)]
 mod configure;
 #[cfg(windows)]
+mod file_dialog;
+#[cfg(windows)]
 mod m3;
 #[cfg(windows)]
 mod monitor_view;
@@ -33,6 +35,8 @@ mod ui;
 #[cfg(windows)]
 mod views;
 
+#[cfg_attr(not(windows), allow(dead_code))]
+mod attachments;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod chat;
 #[cfg_attr(not(windows), allow(dead_code))]

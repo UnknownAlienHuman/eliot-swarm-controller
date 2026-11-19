@@ -115,6 +115,18 @@ impl DesktopApp {
             (Some(_), Some(detail)) => self.model_chip(detail, context, palette),
             (Some(_), None) => View::empty(),
         };
+        // The design: + (attach files), then the chips, 6 DIPs apart.
+        let chips = StackPanel::new()
+            .orientation(Orientation::Horizontal)
+            .spacing(6.0)
+            .children((
+                m3::icon_button(palette)
+                    .automation_name("Attach files")
+                    .on_click(context.message(Message::Launch(LaunchMsg::AttachRequested)))
+                    .content(m3::icon(m3::glyph::NEW_TASK))
+                    .tooltip("Attach files"),
+                chips,
+            ));
         let bottom = Grid::new()
             .columns([GridLength::STAR, GridLength::Auto])
             .column_spacing(tokens::spacing::SM)
@@ -126,12 +138,20 @@ impl DesktopApp {
                     .grid_column(1)
                     .content(self.composer_actions(agent, context, palette)),
             ));
-        // Home: the project chip above the field.
+        // Home: the project and worktree chips above the field; attached
+        // files as chips over it.
         let mut rows: Vec<KeyedView> = Vec::new();
         if home {
             rows.push(KeyedView::new(
                 "project",
                 self.composer_project_row(context, palette),
+            ));
+        }
+        let attached = self.attached_to(&self.composer_target()).to_vec();
+        if !attached.is_empty() {
+            rows.push(KeyedView::new(
+                format!("attached:{}", attached.len()),
+                attachment_chips(&attached, context, palette),
             ));
         }
         rows.push(KeyedView::new("field", field));
@@ -630,10 +650,33 @@ impl DesktopApp {
         }
     }
 
+    /// Whether the harness account's limits govern the composer's target:
+    /// `Some(false)` when its preset runs through a proxy (another
+    /// provider's limits apply), `None` when the preset is not known.
+    fn own_account(&self) -> Option<(bool, Option<String>)> {
+        let summary = match self.selected_agent_id() {
+            Some(_) => {
+                let name = &self.chat.detail.as_ref()?.settings.profile;
+                self.launch
+                    .profile_summaries
+                    .iter()
+                    .find(|profile| &profile.name == name)?
+            }
+            None => match &self.launch.choice {
+                // An ad-hoc harness runs on its own account.
+                crate::picker::Choice::Model(_) => return Some((true, None)),
+                _ => self.launch.profile()?,
+            },
+        };
+        Some((summary.proxy.is_none(), summary.proxy.clone()))
+    }
+
     /// Codex's usage indicator beside Send: the tightest quota window of
     /// the composer's harness as a small ring and the share left; it opens
-    /// the usage popover over the composer. Nothing when the harness
-    /// reports no quota.
+    /// the usage popover over the composer. The attention color only for a
+    /// real reading under the threshold on the account the task runs on; a
+    /// neutral outline ring when that is not known or another provider's
+    /// limits apply. Nothing when the harness reports no quota.
     fn usage_indicator(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let Some(harness) = self.composer_harness() else {
             return View::empty();
@@ -647,33 +690,64 @@ impl DesktopApp {
         let label = crate::picker::harness_label(&harness);
         let open = self.launch.open == Some(Pop::Usage);
         let remaining = window.remaining as f64;
-        Button::new()
-            .resource_overrides(palette.usage_ring(remaining))
-            .style(ButtonStyle::Subtle)
-            .width(tokens::height::CONTROL)
-            .height(tokens::height::CONTROL)
-            .automation_name(format!(
-                "Usage: {label}, {} {}% left ({})",
-                window.name(),
-                window.remaining,
-                if open { "open" } else { "show limits" }
-            ))
-            .on_click(context.message(Message::Launch(LaunchMsg::Toggle(Pop::Usage))))
-            .content(
-                // Reactor 0.100.0 has no brush setters on the ring: its arc
-                // and track come from this button's resources
-                // (`Palette::usage_ring`).
-                ProgressRing::new()
-                    .is_indeterminate(false)
-                    .minimum(0.0)
-                    .maximum(100.0)
-                    .value(remaining)
-                    .width(tokens::layout::USAGE_RING)
-                    .height(tokens::layout::USAGE_RING)
-                    .horizontal_alignment(HorizontalAlignment::Center)
-                    .vertical_alignment(VerticalAlignment::Center),
-            )
-            .tooltip(format!("{} {}% left", window.name(), window.remaining))
+        let (applies, note) = match self.own_account() {
+            Some((true, _)) => (
+                true,
+                format!("{} {}% left", window.name(), window.remaining),
+            ),
+            Some((false, proxy)) => (
+                false,
+                format!(
+                    "{label} limits don't apply here: this preset runs through {}",
+                    proxy.as_deref().unwrap_or("a proxy")
+                ),
+            ),
+            None => (
+                false,
+                format!("Not known whether {label} limits apply here"),
+            ),
+        };
+        let ring: View = if applies {
+            // Reactor 0.100.0 has no brush setters on the ring: its arc and
+            // track come from this button's resources (`usage_ring`).
+            ProgressRing::new()
+                .is_indeterminate(false)
+                .minimum(0.0)
+                .maximum(100.0)
+                .value(remaining)
+                .width(tokens::layout::USAGE_RING)
+                .height(tokens::layout::USAGE_RING)
+                .horizontal_alignment(HorizontalAlignment::Center)
+                .vertical_alignment(VerticalAlignment::Center)
+                .into()
+        } else {
+            Border::new()
+                .width(tokens::layout::USAGE_RING)
+                .height(tokens::layout::USAGE_RING)
+                .corner_radius(tokens::layout::USAGE_RING / 2.0)
+                .border_brush(palette.outline())
+                .border_thickness(Thickness::uniform(tokens::layout::USAGE_RING_STROKE))
+                .horizontal_alignment(HorizontalAlignment::Center)
+                .vertical_alignment(VerticalAlignment::Center)
+                .into()
+        };
+        // Keyed by whether the reading applies: the ring's colors come from
+        // the button's resources, read when its template is applied.
+        Grid::new().keyed_children(vec![KeyedView::new(
+            format!("usage:{applies}:{}", remaining < crate::theme::QUOTA_LOW),
+            Button::new()
+                .resource_overrides(palette.usage_ring(if applies { remaining } else { 100.0 }))
+                .style(ButtonStyle::Subtle)
+                .width(tokens::height::CONTROL)
+                .height(tokens::height::CONTROL)
+                .automation_name(format!(
+                    "Usage: {label}, {note} ({})",
+                    if open { "open" } else { "show limits" }
+                ))
+                .on_click(context.message(Message::Launch(LaunchMsg::Toggle(Pop::Usage))))
+                .content(ring)
+                .tooltip(note),
+        )])
     }
 }
 
@@ -687,4 +761,47 @@ fn resumable(detail: &UiDetail) -> bool {
             | eliot_core::AgentState::Lost
     ) && detail.active_turn.is_none()
         && !detail.observe_only
+}
+
+/// Files attached in the composer: one outlined chip each (file glyph,
+/// name, the full path in its tooltip); a click removes it.
+fn attachment_chips(
+    files: &[String],
+    context: &mut ViewContext<DesktopApp>,
+    palette: Palette,
+) -> View {
+    let chips: Vec<KeyedView> = files
+        .iter()
+        .map(|path| {
+            let name = crate::attachments::file_name(path);
+            KeyedView::new(
+                path.clone(),
+                m3::chip(palette)
+                    .automation_name(format!("Remove attached file {name}"))
+                    .on_click(
+                        context
+                            .message(Message::Launch(LaunchMsg::AttachmentRemoved(path.clone()))),
+                    )
+                    .content(
+                        StackPanel::new()
+                            .orientation(Orientation::Horizontal)
+                            .spacing(6.0)
+                            .children((
+                                m3::chip_content(
+                                    Some(m3::glyph::FILE),
+                                    name,
+                                    false,
+                                    tokens::layout::PROJECT_CHIP_WIDTH,
+                                ),
+                                m3::small_icon(m3::glyph::CLOSE),
+                            )),
+                    )
+                    .tooltip(path.clone()),
+            )
+        })
+        .collect();
+    StackPanel::new()
+        .orientation(Orientation::Horizontal)
+        .spacing(6.0)
+        .keyed_children(chips)
 }

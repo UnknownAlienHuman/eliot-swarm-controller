@@ -600,38 +600,43 @@ of the explicitly selected release scope.
       click opens it. The conversation has a one-line header (title, status
       dot, details toggle, a "…" menu for Hand off/Switch, Move under another
       task, Resume, Detach, Stop and Force stop); coverage, ids and readback live in
-      the details panel. The composer of a conversation carries its project,
-      harness and access as plain read-only text, the model-and-effort chip
-      (Codex's effort popover: the route's effort steps, applied for the next
-      turn, the model as "Requested model X" until a turn carries it, and
-      "Change model…" into the picker filtered to that Agent's
-      route; one plain line instead when the harness keeps them), and one
-      trailing button as in Codex (owner review 2026-11-19): Send; while a
-      turn runs, Stop (a filled square; it interrupts that turn) with an
-      empty field and Steer once there is text (Enter steers too, D10); a
-      stopped or lost task's one Resume, with the typed message once there
-      is one. There is no separate Interrupt control. The usage ring beside
-      it is Material's determinate circular indicator; a new task's
-      composer is D9. Settings replaces the
-      sidebar with its own navigation and shows one centred page of at most
-      840 DIPs (D9). One tactile Material 3 component system with Codex's
+      the details panel. The composer of a conversation carries + (attach files)
+      and the model-and-effort chip (Codex's effort popover: the route's effort
+      steps, applied for the next turn, the model as "Requested model X" until a
+      turn carries it, and "Change model…" into the picker filtered to that
+      Agent's route; one plain line instead when the harness keeps them), and
+      one trailing button as in Codex (owner review 2026-11-19): Send; while a
+      turn runs, Stop (a rounded square; it interrupts that turn) with an empty
+      field and Steer once there is text (Enter steers too, D10); a stopped or
+      lost task's one Resume, with the typed message once there is one. There is
+      no separate Interrupt control. The usage ring beside it is Material's
+      determinate circular indicator, in the attention color only when a real
+      reading of the account the task runs on has less than 20 % left; where the
+      preset runs through a proxy, or that is not known, it is a neutral outline
+      ring. A steered message reads as "Steer" over its text in the user's
+      bubble shape, filled with the selected role at half strength. Copy under a
+      message shows only while the message is under the pointer or the action
+      has keyboard focus. A new task's composer is D9. Settings replaces the
+      sidebar with its own navigation and shows one centred page of at most 720
+      DIPs (D9). One tactile Material 3 component system with Codex's
       logic (owner reviews 2026-11-15, 2026-11-16 and 2026-11-19), every
       size from one tokens module and every button from one Material
       control template (Uno.Themes' Material styles and Material
       Components' state layers as the pattern): a state layer in the
-      content color on hover (8 %) and press (10 %), a ripple from the
-      centre, a slight press scale on M3's emphasized motion, the FAB's key
-      and ambient shadows drawn under it (WinUI's ThemeShadow draws nothing
-      outside a popup without receivers), deeper on hover; the composer,
-      popovers and in-window menus lifted the same way. Shapes on the M3
-      scale: everything pressed is a pill (buttons, icon buttons, chips,
-      rows, segments, dropdowns; radius half the height), text fields 8,
-      containers 12, the composer 16, dialogs 28; touch-sized heights: 40
-      for controls and rows (the composer's round 40-DIP FAB included), 48
-      for form rows, 36 for tasks under a project; the M3 type roles in one
-      family (Segoe UI Variable), buttons in label-large (14/500); a 4/8
-      spacing grid; icons 16 beside a label, 20 alone in a button, 12 for a
-      dropdown's chevron, Stop a filled square. One action pattern: filled primary (one per page),
+      content color on hover (8 %) and press (12 %), a ripple from the press
+      point, a slight press scale on M3's emphasized motion (150 ms for states,
+      250 ms for a popover's entrance), the FAB's key and ambient shadows drawn
+      under it (WinUI's ThemeShadow draws nothing outside a popup without
+      receivers), deeper on hover; the composer, popovers and in-window menus
+      lifted the same way (elevation 0 to 3). Shapes: everything pressed is a
+      pill (buttons, icon buttons, chips, rows, segments, dropdowns; radius half
+      the height), cards and tool rows 12, the composer 20, dialogs 28. The
+      approved design's density (2026-11-19): rows and controls 32, chips 28,
+      the FAB 36, the header 52, form rows 40; the sidebar 264, the Monitor pane
+      320, the conversation column 720, a nested task 28 in; the type scale
+      28/16/15/14/13/12 in one family (Segoe UI Variable), buttons 14/500; a
+      4-DIP grid; icons 18 in rows and icon buttons, 16 in chips, 14 for a
+      dropdown's chevron, Stop a rounded square. One action pattern: filled primary (one per page),
       outlined secondary, text tertiary, destructive text in the error color;
       orange and red appear only for the Full access warning and destructive
       actions. The Details panel has only a close button. (Refs #407)
@@ -665,8 +670,17 @@ of the explicitly selected release scope.
 - [x] **D9 A desktop you can work in.** Owner review 2026-11-16, the Codex,
       OpenCode and Antigravity apps as references. A new task's composer has
       no profiles: one card holds the project selector (a searchable project
-      list and "Other folder…") as its first row, "Describe a task…", then the
-      model chip (`Harness · Model · effort`), the access chip and Send. The model chip
+      list and "Other folder…") and the New worktree chip as its first row (a
+      fixed fact where the project prepares a worktree for every task, its
+      `workspace = "worktree"`; a switch that sends `worktree` where the folder
+      is shared), "Ask Eliot Swarm to do anything", then + (attach files), the
+      access chip (a preset's access is an outlined chip that is not a control,
+      Full access in the attention tone), the model chip (`Harness · Model ·
+      effort`) and Send. Attached files travel as the message's closing block,
+      `Attached files:` and one `- <absolute path>` line each (the daemon's
+      input is text; the agent reads the files); the transcript shows that block
+      under the owner's bubble as file chips, and files an answer names as chips
+      under it. The model chip
       (Ctrl+M) opens OpenCode's picker pattern fed by `models.catalog` (k76a):
       a search over harnesses, providers and models; Auto with Swarm's pick
       and reason; Favorites and Recent (`[desktop]` `favorite_models` /

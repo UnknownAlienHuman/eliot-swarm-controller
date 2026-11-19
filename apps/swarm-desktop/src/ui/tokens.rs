@@ -11,6 +11,8 @@
 /// Shape: full for everything pressed (half the height), 12 for cards and
 /// tool rows, 20 for the composer, 28 for dialogs.
 pub mod radius {
+    /// A theme swatch's corner.
+    pub const SWATCH: f64 = 6.0;
     /// A 32-DIP control, row or selection: full.
     pub const PILL: f64 = super::height::CONTROL / 2.0;
     /// A 28-DIP chip or segment: full.
@@ -126,6 +128,18 @@ pub mod layout {
     pub const SETTINGS_WIDTH: f64 = 720.0;
     /// The label column of every form.
     pub const LABEL_WIDTH: f64 = 200.0;
+    /// Where a form's controls start: past the label column and its gap
+    /// (a note or check under a field lines up with the field).
+    pub const FIELD_INDENT: f64 = LABEL_WIDTH + super::spacing::SM;
+    /// The narrow label column of a path line (an automation's paths).
+    pub const PATH_LABEL_WIDTH: f64 = 96.0;
+    /// A confirmation dialog's width.
+    pub const DIALOG_WIDTH: f64 = 420.0;
+    /// A list of items inside a dialog before it scrolls.
+    pub const DIALOG_LIST_MAX_HEIGHT: f64 = 240.0;
+    /// A theme's swatch in Settings › Appearance.
+    pub const SWATCH_WIDTH: f64 = 48.0;
+    pub const SWATCH_HEIGHT: f64 = 24.0;
     /// An enum dropdown ("low", "never", a role).
     pub const ENUM_WIDTH: f64 = 200.0;
     /// A number box.
@@ -189,4 +203,6 @@ pub mod layout {
     pub const RING: f64 = 16.0;
     /// The composer's usage ring.
     pub const USAGE_RING: f64 = 22.0;
+    /// The neutral usage ring's stroke (the progress ring's track).
+    pub const USAGE_RING_STROKE: f64 = 2.0;
 }

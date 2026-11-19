@@ -171,10 +171,7 @@ pub(super) fn path_row(
 /// A list item about a path whose lines wrap (a cleanup item): the whole
 /// item opens the path, as [`path_row`] does, at the height of its lines.
 pub(super) fn path_item(palette: Palette, name: &str, content: View, open: Callback<()>) -> View {
-    Button::new()
-        .resource_overrides(palette.row(false))
-        .horizontal_alignment(HorizontalAlignment::Stretch)
-        .horizontal_content_alignment(HorizontalAlignment::Stretch)
+    m3::row(palette, false)
         .automation_name(format!("Open {name} in Explorer"))
         .on_click(open)
         .content(
@@ -212,8 +209,7 @@ pub(super) fn path_link(palette: Palette, path: &str, open: Callback<()>) -> Vie
                 .margin(Thickness::xy(tokens::spacing::XS, 0.0))
                 .children((
                     m3::icon(m3::glyph::OPEN_FOLDER),
-                    TextBlock::new()
-                        .text(shown.to_owned())
+                    m3::text(shown.to_owned(), tokens::text::BODY)
                         .vertical_alignment(VerticalAlignment::Center)
                         .text_trimming(TextTrimming::CharacterEllipsis),
                 )),

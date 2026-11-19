@@ -507,6 +507,9 @@ pub enum LaunchTarget {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LaunchPlace {
     Workspace(String),
+    /// The workspace, in a new worktree prepared for this task (`worktree`
+    /// with an empty value: the daemon names the standard branch).
+    Worktree(String),
     Chat,
 }
 
@@ -756,6 +759,9 @@ fn launch_args(target: LaunchTarget, place: &LaunchPlace, text: Option<String>) 
     }
     let mut args = match place {
         LaunchPlace::Workspace(workspace) => serde_json::json!({ "workspace": workspace }),
+        LaunchPlace::Worktree(workspace) => {
+            serde_json::json!({ "workspace": workspace, "worktree": "" })
+        }
         LaunchPlace::Chat => serde_json::json!({ "chat": true }),
     };
     match target {

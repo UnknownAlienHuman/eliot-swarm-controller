@@ -108,13 +108,13 @@ impl DesktopApp {
                 format!("role:{role}"),
                 StackPanel::new().spacing(tokens::spacing::SM).children((
                     m3::section_heading(headline, supporting, None),
-                    m3::group(palette, rows),
+                    m3::settings_card(palette, rows),
                 )),
             ));
         }
         groups.push(KeyedView::new(
             "new-role",
-            m3::group(
+            m3::settings_card(
                 palette,
                 vec![KeyedView::new(
                     "new-role",

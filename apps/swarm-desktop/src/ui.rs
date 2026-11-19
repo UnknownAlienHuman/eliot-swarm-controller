@@ -825,6 +825,7 @@ impl Component for DesktopApp {
                 items: Rc::new(Vec::new()),
                 items_revision: 0,
                 expanded: HashSet::new(),
+                hovered: None,
                 composer_ref: ElementRef::new(),
                 pending_local: None,
                 waiting_label: None,
