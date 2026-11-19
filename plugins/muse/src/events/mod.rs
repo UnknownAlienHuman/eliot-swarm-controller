@@ -1424,6 +1424,11 @@ impl EventProcessor {
             }
         };
         if let Err(error) = result {
+            // The host settles a definite write rejection. Preserve its
+            // structured error instead of inventing an unknown outcome.
+            if error.failure_where.as_deref() == Some("plugin.events.put") {
+                return Err(error);
+            }
             self.status.source_unknown = true;
             if !self.gap_reported
                 && !self.writes_blocked
@@ -1434,12 +1439,9 @@ impl EventProcessor {
                     .await;
             }
             if self.status.failure.is_none() {
-                self.status.failure = Some(*error.message);
+                self.status.failure = Some(error.message.to_string());
             }
-            return Err(Error::new(
-                "unknown",
-                "Buffered Muse event outcome is unresolved",
-            ));
+            return Err(error);
         }
         Ok(())
     }
