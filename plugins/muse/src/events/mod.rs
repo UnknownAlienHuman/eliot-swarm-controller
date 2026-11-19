@@ -1424,6 +1424,11 @@ impl EventProcessor {
             }
         };
         if let Err(error) = result {
+            // The host settles a definite write rejection. Preserve its
+            // structured error instead of inventing an unknown outcome.
+            if error.failure_where.as_deref() == Some("plugin.events.put") {
+                return Err(error);
+            }
             self.status.source_unknown = true;
             if !self.gap_reported
                 && !self.writes_blocked

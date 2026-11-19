@@ -13,6 +13,7 @@
 //! readback; no substitution is ever made for an unavailable requested model.
 
 use eliot_core as core;
+use eliot_plugin::session::split_provider_model;
 use eliot_plugin::sync::LockExt;
 use serde_json::{Map, Value, json};
 use std::path::{Path, PathBuf};
@@ -35,24 +36,6 @@ fn discovery_remaining(deadline: Instant) -> core::Result<Duration> {
 
 pub(crate) fn adhoc_profile_name(harness: &str) -> String {
     format!("{ADHOC_PROFILE_PREFIX}{harness}")
-}
-
-fn split_provider_model(model: &str) -> Option<(&str, &str)> {
-    // First-slash split like profiles: nested ids such as
-    // `openrouter/stealth/crouton-alpha` are allowed; a `#variant` suffix,
-    // empty segments and controls are not.
-    let (provider, id) = model.split_once('/')?;
-    if provider.is_empty()
-        || id.is_empty()
-        || id.starts_with('/')
-        || id.ends_with('/')
-        || model.contains('#')
-        || model.contains(char::is_control)
-        || model.chars().any(char::is_whitespace)
-    {
-        return None;
-    }
-    Some((provider, id))
 }
 
 pub(crate) fn validate_adhoc_harness(harness: &str) -> core::Result<String> {
