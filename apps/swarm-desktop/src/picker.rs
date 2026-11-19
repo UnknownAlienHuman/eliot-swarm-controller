@@ -38,6 +38,55 @@ pub fn harness_label(code: &str) -> &str {
     }
 }
 
+/// Organization prefixes a model route puts before the model's own name
+/// (`baidu-ernie-…`); [`model_short`] drops them.
+const MODEL_ORGS: [&str; 6] = [
+    "baidu",
+    "meta",
+    "google",
+    "openai",
+    "anthropic",
+    "mistralai",
+];
+
+/// An effective model slug in short, for compact labels. One rule:
+/// - drop the route's `provider/` prefix (every segment up to the last
+///   `/`) and a `:free` suffix;
+/// - then drop the first dash token when the next token starts with it
+///   (`qwen-qwen4-max`) or it is a known organization ([`MODEL_ORGS`]).
+///
+/// `nous/qwen-qwen4-max:free` reads `qwen4-max`,
+/// `kilo/baidu-ernie-5.5-flash-preview:free` reads `ernie-5.5-flash-preview`
+/// (a preview keeps its suffix, so it never shares a label with the stable model);
+/// `claude-haiku-5-5` and `gpt-6.2-sol` stay as they are. A slug with
+/// nothing left stays whole.
+pub fn model_short(slug: &str) -> &str {
+    let name = slug.rsplit_once('/').map_or(slug, |(_, name)| name);
+    let name = name.strip_suffix(":free").unwrap_or(name);
+    let name = match name.split_once('-') {
+        Some((first, rest))
+            if !first.is_empty()
+                && !rest.is_empty()
+                && (rest.starts_with(first) || MODEL_ORGS.contains(&first)) =>
+        {
+            rest
+        }
+        _ => name,
+    };
+    if name.trim().is_empty() { slug } else { name }
+}
+
+/// What runs an Agent, as the Monitor rows and the conversation header name
+/// it: the harness and, once the harness reported it, the short effective
+/// model (`Codex · qwen4-max`, `Claude Code · claude-opus-5-5`).
+pub fn harness_model_label(harness: &str, model: Option<&str>) -> String {
+    let harness = harness_label(harness);
+    match model.map(model_short) {
+        Some(model) => format!("{harness} · {model}"),
+        None => harness.to_owned(),
+    }
+}
+
 /// A catalogue provider in the owner's words.
 pub fn provider_label(provider: &str) -> String {
     match provider {
@@ -1047,6 +1096,53 @@ pub fn find<'a>(rows: &'a [Row], key: Option<&str>) -> Option<&'a Item> {
 mod tests {
     use super::*;
     use eliot_core::api::harness::{CATALOG_AVAILABLE, HARNESS_READ_TTL_MS};
+
+    #[test]
+    fn model_short_reads_the_brief_examples() {
+        for (slug, short) in [
+            ("nous/qwen-qwen4-max:free", "qwen4-max"),
+            (
+                "kilo/baidu-ernie-5.5-flash-preview:free",
+                "ernie-5.5-flash-preview",
+            ),
+            ("claude-haiku-5-5", "claude-haiku-5-5"),
+            ("gpt-6.2-sol", "gpt-6.2-sol"),
+        ] {
+            assert_eq!(model_short(slug), short, "{slug}");
+        }
+    }
+
+    #[test]
+    fn model_short_keeps_a_name_it_cannot_shorten() {
+        for (slug, short) in [
+            // `-free` is part of the name, not the `:free` route suffix.
+            (
+                "opencode/deepseek-v4.1-flash-free",
+                "deepseek-v4.1-flash-free",
+            ),
+            // A route nested under a provider keeps the model's own name.
+            ("openrouter/meta-llama/llama-4:free", "llama-4"),
+            ("muse-spark-1.3-contributor", "muse-spark-1.3-contributor"),
+            // Nothing left to show keeps the slug.
+            ("kilo/", "kilo/"),
+            (":free", ":free"),
+            ("baidu", "baidu"),
+            ("", ""),
+            ("/", "/"),
+            ("модель-x", "модель-x"),
+        ] {
+            assert_eq!(model_short(slug), short, "{slug}");
+        }
+        assert_eq!(
+            harness_model_label("codex", Some("nous/qwen-qwen4-max:free")),
+            "Codex · qwen4-max"
+        );
+        assert_eq!(
+            harness_model_label("claude", Some("claude-haiku-5-5")),
+            "Claude Code · claude-haiku-5-5"
+        );
+        assert_eq!(harness_model_label("codex", None), "Codex");
+    }
 
     fn harness(code: &str, installed: bool) -> HarnessEntry {
         HarnessEntry {

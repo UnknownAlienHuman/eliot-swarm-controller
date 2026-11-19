@@ -159,6 +159,7 @@ impl DesktopApp {
                                 organization: None,
                                 tags: Vec::new(),
                                 organization_revision: None,
+                                model: row.model.clone(),
                             })
                     });
                 if let Some(agent) = agent {

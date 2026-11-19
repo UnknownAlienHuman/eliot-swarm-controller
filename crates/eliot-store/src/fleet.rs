@@ -348,6 +348,20 @@ impl Store {
             .map_err(sql_error)?;
         let (organization, tags, organization_revision) =
             organization::agent_organization(&self.connection, record.id)?;
+        // The retained `effective.model` of the row already read (the value
+        // `agent.get`/`agent.result` return), so the list needs no extra read.
+        let model = record
+            .effective
+            .as_deref()
+            .map(decode_json)
+            .transpose()?
+            .and_then(|effective| {
+                effective
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .filter(|model| !model.trim().is_empty());
         Ok(AgentSummary {
             archived: record.archived,
             chat: record.chat,
@@ -393,6 +407,7 @@ impl Store {
             organization,
             tags,
             organization_revision,
+            model,
         })
     }
 

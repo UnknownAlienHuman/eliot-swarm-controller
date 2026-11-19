@@ -80,6 +80,9 @@ pub struct UiAgent {
     /// The overlay link revision the row's placement and tags were read
     /// with (`None` for no overlay row); a menu write carries it back.
     pub organization_revision: Option<i64>,
+    /// The model the harness last reported ([`AgentSummary::model`]);
+    /// `None` until it reports one.
+    pub model: Option<String>,
 }
 
 impl UiAgent {
@@ -106,6 +109,7 @@ impl UiAgent {
             organization: summary.organization.clone(),
             tags: summary.tags.clone(),
             organization_revision: summary.organization_revision,
+            model: summary.model.clone(),
         }
     }
 
@@ -1679,6 +1683,7 @@ mod tests {
             organization: None,
             tags: Vec::new(),
             organization_revision: None,
+            model: None,
         }
     }
 
@@ -2768,6 +2773,7 @@ mod tests {
             organization: None,
             tags: Vec::new(),
             organization_revision: None,
+            model: None,
         }
     }
 

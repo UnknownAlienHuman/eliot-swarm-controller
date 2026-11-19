@@ -516,6 +516,7 @@ fn summary() -> AgentSummary {
         organization: None,
         tags: Vec::new(),
         organization_revision: None,
+        model: None,
     }
 }
 

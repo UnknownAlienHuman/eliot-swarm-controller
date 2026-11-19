@@ -53,7 +53,7 @@ pub struct RowLook<'a> {
 }
 
 /// One Monitor list row: the status dot in its chart color, the title, the
-/// harness and how long it has been quiet, on one line; a second line only
+/// harness and model and how long it has been quiet, on one line; a second line only
 /// says why it needs attention or ended (or the task it runs under). Its
 /// measures live in Details, which the row opens with the conversation;
 /// Resume sits beside it.
@@ -65,7 +65,7 @@ pub fn list_row(
     palette: Palette,
 ) -> View {
     let status = row.status_words();
-    let harness = crate::picker::harness_label(&row.harness);
+    let harness = crate::picker::harness_model_label(&row.harness, row.model.as_deref());
     let (note_line, note_name): (Option<View>, String) = match note {
         Some(RowNote::Ended(text)) => (
             Some(
@@ -109,8 +109,10 @@ pub fn list_row(
                 .text(look.title.to_owned())
                 .vertical_alignment(VerticalAlignment::Center)
                 .text_trimming(TextTrimming::CharacterEllipsis),
-            crate::m3::secondary(harness.to_owned())
+            crate::m3::secondary(harness.clone())
                 .grid_column(2)
+                .max_width(tokens::layout::RUNS_LABEL_WIDTH)
+                .text_trimming(TextTrimming::CharacterEllipsis)
                 .vertical_alignment(VerticalAlignment::Center),
             crate::m3::secondary(look.elapsed.to_owned())
                 .grid_column(3)

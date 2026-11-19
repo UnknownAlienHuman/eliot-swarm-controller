@@ -918,7 +918,11 @@ Agent `name` when one was set, its frozen `profile` name, and `preview`, the
 first 256 characters ([`AGENT_PREVIEW_CHARS`](../../crates/eliot-core/src/api/agent_views.rs))
 of its oldest retained `send` text, a launch's linked first input included,
 read by one indexed seek per row. Each is omitted when absent; the scope that
-lists a row may already read that command through `command.get`. When the newest terminal turn
+lists a row may already read that command through `command.get`. `model` is the
+model the harness last reported for the generation, the Agent row's retained
+`effective.model` that `agent.get` and `agent.result` return, taken from the row
+the page already reads; it is omitted until the harness reports one, and the
+desktop labels an Agent by harness and this model. When the newest terminal turn
 carries no native turn usage, the summary `usage` falls back to the
 generation's latest retained `session.usage` snapshot (cumulative
 input/output/cache counters only, never a derived total) with

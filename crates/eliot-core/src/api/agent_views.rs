@@ -124,6 +124,12 @@ pub struct AgentSummary {
     /// as its expected revision. Trailing field; absent on old payloads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub organization_revision: Option<i64>,
+    /// The model the harness last reported for this generation: the
+    /// Agent's retained `effective.model`, as `agent.get` and
+    /// `agent.result` read it back. Absent until the harness reports one.
+    /// Trailing field; absent on old wire payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 impl AgentSummary {
@@ -146,6 +152,7 @@ impl AgentSummary {
             &self.profile,
             &self.preview,
             &self.repo_common_dir,
+            &self.model,
         ]
         .into_iter()
         .flatten()
