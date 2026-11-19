@@ -351,11 +351,6 @@ impl Store {
         }
     }
 
-    /// Bounded pending registrations, oldest first.
-    pub fn pending_completion_digests(&self, limit: usize) -> Result<Vec<DigestRow>> {
-        self.pending_completion_digests_after(None, limit)
-    }
-
     /// Bounded pending registrations after a keyset cursor, oldest first.
     /// `after` is the last examined `(created_at, id)`; `None` starts at the
     /// oldest row. The driver advances the cursor past every examined row and
@@ -1135,10 +1130,6 @@ mod tests {
             .expect("wrapped page");
         assert_eq!(wrapped.len(), 50);
         assert_eq!(wrapped[0].id, ids[0]);
-        // The legacy oldest-first entry point keeps its contract.
-        let legacy = store.pending_completion_digests(50).expect("legacy page");
-        assert_eq!(legacy.len(), 50);
-        assert_eq!(legacy[0].id, ids[0]);
     }
 
     #[test]

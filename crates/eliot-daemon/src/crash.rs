@@ -17,7 +17,10 @@
 //! `daemon.panicked` marker into `daemon.status` and deletes it; plugin
 //! error settlement reads only the exact owned plugin's stderr pipe.
 
-use eliot_core::{SecretPolicy, api::CrashMarker};
+use eliot_core::{
+    SecretPolicy,
+    api::{CrashMarker, truncate_bytes},
+};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -88,14 +91,6 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn bound_text(text: &str, limit: usize) -> String {
-    let mut end = text.len().min(limit);
-    while !text.is_char_boundary(end) {
-        end = end.saturating_sub(1);
-    }
-    text[..end].to_owned()
-}
-
 fn capture(code: &str, info: &std::panic::PanicHookInfo<'_>, policy: &SecretPolicy) -> CrashMarker {
     let location = info
         .location()
@@ -110,16 +105,18 @@ fn capture(code: &str, info: &std::panic::PanicHookInfo<'_>, policy: &SecretPoli
     let backtrace = format!("{}", std::backtrace::Backtrace::force_capture());
     CrashMarker {
         code: code.to_owned(),
-        thread: bound_text(&policy.redact_text(thread), CrashMarker::MAX_THREAD_CHARS),
-        location: bound_text(
+        thread: truncate_bytes(&policy.redact_text(thread), CrashMarker::MAX_THREAD_CHARS).0,
+        location: truncate_bytes(
             &policy.redact_text(&location),
             CrashMarker::MAX_LOCATION_CHARS,
-        ),
+        )
+        .0,
         message: "panic payload omitted (unclassified)".to_owned(),
-        backtrace: bound_text(
+        backtrace: truncate_bytes(
             &policy.redact_text(&backtrace),
             CrashMarker::MAX_BACKTRACE_CHARS,
-        ),
+        )
+        .0,
         timestamp: now_ms(),
     }
 }
@@ -205,10 +202,10 @@ pub(crate) fn load_previous_crash(data_root: &Path, policy: &SecretPolicy) -> Op
     markers.pop().map(|mut marker| {
         marker.message = policy.redact_text(&marker.message);
         marker.backtrace = policy.redact_text(&marker.backtrace);
-        marker.thread = bound_text(&marker.thread, CrashMarker::MAX_THREAD_CHARS);
-        marker.location = bound_text(&marker.location, CrashMarker::MAX_LOCATION_CHARS);
-        marker.message = bound_text(&marker.message, CrashMarker::MAX_MESSAGE_CHARS);
-        marker.backtrace = bound_text(&marker.backtrace, CrashMarker::MAX_BACKTRACE_CHARS);
+        marker.thread = truncate_bytes(&marker.thread, CrashMarker::MAX_THREAD_CHARS).0;
+        marker.location = truncate_bytes(&marker.location, CrashMarker::MAX_LOCATION_CHARS).0;
+        marker.message = truncate_bytes(&marker.message, CrashMarker::MAX_MESSAGE_CHARS).0;
+        marker.backtrace = truncate_bytes(&marker.backtrace, CrashMarker::MAX_BACKTRACE_CHARS).0;
         marker
     })
 }

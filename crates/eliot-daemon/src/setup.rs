@@ -164,7 +164,7 @@ pub(crate) fn build_environment(
     agent: &str,
     target_generation: i64,
 ) -> Result<Vec<(OsString, OsString)>> {
-    if !valid_agent_id(agent) || target_generation <= 0 {
+    if eliot_core::parse_agent_id(agent).is_err() || target_generation <= 0 {
         return Err(invalid(
             "setup requires an exact Agent and positive target generation",
         ));
@@ -211,7 +211,9 @@ fn check_environment(environment: &[(OsString, OsString)]) -> Result<()> {
             return Err(invalid("setup environment contains a repeated name"));
         }
         if name == "ELIOT_AGENT_ID" {
-            agent = value.to_str().is_some_and(valid_agent_id);
+            agent = value
+                .to_str()
+                .is_some_and(|value| eliot_core::parse_agent_id(value).is_ok());
         } else if name == "ELIOT_AGENT_GENERATION" {
             generation = value
                 .to_str()
@@ -229,13 +231,6 @@ fn check_environment(environment: &[(OsString, OsString)]) -> Result<()> {
         ));
     }
     Ok(())
-}
-
-fn valid_agent_id(value: &str) -> bool {
-    value
-        .strip_prefix('a')
-        .and_then(|value| value.parse::<i64>().ok())
-        .is_some_and(|id| id > 0 && format!("a{id}") == value)
 }
 
 pub(crate) fn canonical_directory(path: &Path) -> Result<PathBuf> {

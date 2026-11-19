@@ -1,5 +1,5 @@
 //! OpenCodex 2.84.0 vendor-probes-oauth.ts: pattern only, no copied source.
-use eliot_core::Result;
+use eliot_core::{Result, api::CLAUDE_EXTERNAL_ROUTE_MARKERS};
 use eliot_plugin::quota as q;
 use serde_json::Value;
 use std::{ffi::OsStr, path::Path};
@@ -15,22 +15,11 @@ fn env_value<'a>(environment: &'a Value, name: &str) -> Option<&'a str> {
 /// Refuse user settings that select an external route: the daemon already
 /// refuses external provider routes from the frozen environment (see
 /// `router::catalog::external_quota_route`), but only this reader sees the
-/// native `settings.json`, so settings-selected routes are reported here.
-const EXTERNAL_SETTINGS_MARKERS: &[&str] = &[
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "ANTHROPIC_BASE_URL",
-    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
-    "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
-    "CLAUDE_CODE_USE_BEDROCK",
-    "CLAUDE_CODE_USE_VERTEX",
-    "CLAUDE_CODE_USE_FOUNDRY",
-    "CLAUDE_CODE_USE_MANTLE",
-];
-
+/// native `settings.json`, so settings-selected routes are reported here
+/// using the core-owned marker list shared with the daemon guard.
 fn require_native_oauth_settings(settings: &Value) -> Result<()> {
     let settings_env = &settings["env"];
-    if EXTERNAL_SETTINGS_MARKERS
+    if CLAUDE_EXTERNAL_ROUTE_MARKERS
         .iter()
         .any(|marker| env_value(settings_env, marker).is_some_and(|text| !text.is_empty()))
         || env_value(settings_env, "CLAUDE_CONFIG_DIR").is_some()

@@ -378,8 +378,19 @@ pub enum AgentOrigin {
 }
 
 /// Frozen command scope of an Agent principal, from its profile `control`.
+/// Variants are declared in ascending authority order; `Ord` is that rank.
 #[derive(
-    schemars::JsonSchema, Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize,
+    schemars::JsonSchema,
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum AgentControl {

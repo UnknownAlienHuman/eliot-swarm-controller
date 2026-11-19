@@ -856,10 +856,7 @@ fn admit_launch_tx(
     };
     let project_scope = (scope != project).then_some(&scope);
     let harness = required_string(&request.args, "harness")?;
-    if !matches!(
-        harness.as_str(),
-        "codex" | "muse" | "claude" | "opencode" | "antigravity"
-    ) {
+    if !eliot_core::api::is_supported_harness(&harness) {
         return Err(Error::new(
             "unsupported",
             format!("unsupported launch harness {harness}"),
@@ -1202,10 +1199,7 @@ fn admit_resume_tx(
     if let Some(path) = &agent.workspace {
         workspace::require_managed_path_ready(tx, path)?;
     }
-    if !matches!(
-        agent.harness.as_str(),
-        "codex" | "muse" | "claude" | "opencode" | "antigravity"
-    ) {
+    if !eliot_core::api::is_supported_harness(&agent.harness) {
         return Err(Error::new(
             "unsupported",
             "resume is only supported for Codex, Muse, Claude, OpenCode, or Antigravity Agents with a retained native subject",

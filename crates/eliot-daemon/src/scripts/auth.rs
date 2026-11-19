@@ -1,7 +1,9 @@
 use crate::common::secure_eq;
-use eliot_core::{Error, Result, api::ProjectRegistrationView};
+use eliot_core::{
+    Error, Result,
+    api::{ProjectRegistrationView, inference::sha256_hex},
+};
 use eliot_plugin::sync::LockExt;
-use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     fmt,
@@ -146,10 +148,6 @@ pub(crate) fn random_256_bit_token() -> String {
         chunk.copy_from_slice(&random_bytes[..take]);
     }
     lower_hex(&bytes)
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    lower_hex(&Sha256::digest(bytes))
 }
 
 fn lower_hex(bytes: &[u8]) -> String {

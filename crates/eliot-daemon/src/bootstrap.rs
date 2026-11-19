@@ -7,7 +7,7 @@ use std::{
 
 use eliot_core::{
     Error, Result, SecretPolicy,
-    api::{ProjectDiscoverResponse, ProjectRegistrationView},
+    api::{ProjectDiscoverResponse, ProjectRegistrationView, SUPPORTED_HARNESSES},
 };
 use eliot_store::{ProjectRegistrationInput, Store};
 use serde_json::{Value, json};
@@ -351,7 +351,7 @@ fn installed_default_profiles(
     deadline: std::time::Instant,
 ) -> serde_json::Map<String, Value> {
     let mut profiles = serde_json::Map::new();
-    for harness in crate::adhoc::SUPPORTED_HARNESSES {
+    for harness in SUPPORTED_HARNESSES {
         if *harness == "muse" {
             let Some(cmd) = muse_cmd.clone() else {
                 continue;

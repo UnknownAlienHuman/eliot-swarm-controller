@@ -6,8 +6,9 @@
 
 use super::{MODE_OPEN, Principal, Router, catalog, now_ms, require_owner};
 use eliot_core::api::{
-    HARNESS_READ_TTL_MS, HarnessCandidate, HarnessEntry, HarnessModelsResponse,
-    HarnessQuotaResponse, ModelsCatalogEntry, ModelsCatalogFailure,
+    CLAUDE_EXTERNAL_ROUTE_MARKERS, HARNESS_READ_TTL_MS, HarnessCandidate, HarnessEntry,
+    HarnessModelsResponse, HarnessQuotaResponse, ModelsCatalogEntry, ModelsCatalogFailure,
+    SUPPORTED_HARNESSES,
 };
 use eliot_core::{Error, Result};
 use eliot_plugin::sync::LockExt;
@@ -39,7 +40,7 @@ impl Router {
             crate::adhoc::blocking_discovery(deadline, move || {
                 let claude_candidates = crate::adhoc::discover_claude_candidates(deadline);
                 let mut harnesses = Vec::new();
-                for harness in crate::adhoc::SUPPORTED_HARNESSES {
+                for harness in SUPPORTED_HARNESSES {
                     let entry = if *harness == "claude" {
                         crate::adhoc::claude_installation(&claude_candidates)
                     } else {
@@ -998,11 +999,10 @@ fn muse_catalog_note(default: Option<&str>) -> String {
 
 /// Universal external-route quota guard: a frozen profile that selects an
 /// external provider route must never report CLI/keyring quota measured for
-/// another route. The marker lists moved here from the Claude and
-/// Antigravity plugins (whose readers now report only native facts); the
-/// daemon refuses before spawning any reader, so routing and `harness.quota`
-/// share one decision. The one native fact it cannot see stays in the
-/// plugin: user settings that select an external route (Claude
+/// another route. Claude's markers are the core list shared with the Claude
+/// reader; the daemon refuses before spawning any reader, so routing and
+/// `harness.quota` share one decision. The one native fact it cannot see
+/// stays in the plugin: user settings that select an external route (Claude
 /// `settings.json`) are still refused by the Claude reader itself.
 pub(crate) fn external_quota_route(harness: &str, environment: &Value) -> Option<&'static str> {
     // Claude matches its reader's lookup: exact on non-Windows, ASCII
@@ -1019,19 +1019,9 @@ pub(crate) fn external_quota_route(harness: &str, environment: &Value) -> Option
     };
     match harness {
         "claude"
-            if [
-                "ANTHROPIC_API_KEY",
-                "ANTHROPIC_AUTH_TOKEN",
-                "ANTHROPIC_BASE_URL",
-                "CLAUDE_CODE_USE_ANTHROPIC_AWS",
-                "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
-                "CLAUDE_CODE_USE_BEDROCK",
-                "CLAUDE_CODE_USE_VERTEX",
-                "CLAUDE_CODE_USE_FOUNDRY",
-                "CLAUDE_CODE_USE_MANTLE",
-            ]
-            .iter()
-            .any(|marker| present(marker)) =>
+            if CLAUDE_EXTERNAL_ROUTE_MARKERS
+                .iter()
+                .any(|marker| present(marker)) =>
         {
             Some(
                 "Claude profile route is external or ambiguous; CLI OAuth quota would describe an unverified route",

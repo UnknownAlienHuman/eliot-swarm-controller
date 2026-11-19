@@ -1680,7 +1680,7 @@ impl Router {
         let oid = String::from_utf8(parsed.stdout)
             .map_err(|_| Error::new("branch_read_failed", "branch tip is not Unicode"))?;
         let oid = oid.trim().to_owned();
-        if oid.len() != 40 || !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        if !eliot_core::api::is_git_oid(&oid) {
             return Err(Error::new(
                 "branch_read_failed",
                 "branch tip is not an object id",

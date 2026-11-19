@@ -30,10 +30,6 @@ struct ProjectCommandBinding {
     workspace_target_generation: Option<i64>,
 }
 
-struct ProjectRegistrationRow {
-    view: core::api::ProjectRegistrationView,
-}
-
 impl Store {
     /// Add or replace one owner-approved project registration. A changed
     /// registration receives a fresh monotonic revision so admitted commands
@@ -145,7 +141,7 @@ impl Store {
     ) -> Result<Option<core::api::ProjectRegistrationView>> {
         require_project_owner(principal)?;
         require_nonempty(id, "project id")?;
-        Ok(load_project_registration(&self.connection, id)?.map(|row| row.view))
+        load_project_registration(&self.connection, id)
     }
 
     pub fn list_project_registrations(
@@ -170,7 +166,7 @@ pub(super) fn project_registration_tx(
     id: &str,
 ) -> Result<Option<core::api::ProjectRegistrationView>> {
     require_nonempty(id, "project id")?;
-    Ok(load_project_registration(connection, id)?.map(|row| row.view))
+    load_project_registration(connection, id)
 }
 
 /// Store-side rule authorization used by the rule transaction before it
@@ -186,8 +182,7 @@ pub(super) fn validate_project_rule_admission_tx(
         return Ok(None);
     };
     let registration = load_project_registration(tx, &project_id)?
-        .ok_or_else(|| Error::new("not_allowed", "project registration is absent"))?
-        .view;
+        .ok_or_else(|| Error::new("not_allowed", "project registration is absent"))?;
     project_binding_for_agent_tx(tx, &registration, target_agent, generation, action)?;
     Ok(Some(registration))
 }
@@ -201,8 +196,7 @@ pub(super) fn validate_project_rule_launch_action_tx(
         return Ok(None);
     };
     let registration = load_project_registration(tx, &project_id)?
-        .ok_or_else(|| Error::new("not_allowed", "project registration is absent"))?
-        .view;
+        .ok_or_else(|| Error::new("not_allowed", "project registration is absent"))?;
     validate_project_launch_args(&registration, args)?;
     Ok(Some(registration))
 }
@@ -225,8 +219,7 @@ pub(super) fn validate_project_resume_action_tx(
         ));
     }
     let registration = load_project_registration(tx, &project_id)?
-        .ok_or_else(|| Error::new("not_allowed", "project registration is absent"))?
-        .view;
+        .ok_or_else(|| Error::new("not_allowed", "project registration is absent"))?;
     if has_linked_input {
         require_project_registration_action(&registration, "send")?;
     }
@@ -265,8 +258,7 @@ pub(super) fn validate_git_fetch_intent_tx(
         ));
     }
     let registration = load_project_registration(tx, &frozen.repository)?
-        .ok_or_else(|| Error::new("not_allowed", "git.fetch repository is not registered"))?
-        .view;
+        .ok_or_else(|| Error::new("not_allowed", "git.fetch repository is not registered"))?;
     registration
         .validate()
         .map_err(|_| Error::new("source_integrity", "stored project registration is invalid"))?;
@@ -330,8 +322,7 @@ pub(super) fn capture_project_command_binding_tx(
         });
     }
     let registration = load_project_registration(tx, &project_id)?
-        .ok_or_else(|| Error::new("not_allowed", "project registration is absent"))?
-        .view;
+        .ok_or_else(|| Error::new("not_allowed", "project registration is absent"))?;
     let binding = if let Some(target) = command.target {
         if command.verb == "launch" {
             validate_project_launch_args(&registration, command.args)?;
@@ -393,8 +384,7 @@ pub(super) fn validate_project_command_dispatch_tx(
         .and_then(|encoded| serde_json::from_str::<ProjectCommandBinding>(encoded).ok())
         .ok_or_else(|| Error::new("not_allowed", "project command has no valid frozen binding"))?;
     let registration = load_project_registration(tx, &project_id)?
-        .ok_or_else(|| Error::new("not_allowed", "project registration was removed"))?
-        .view;
+        .ok_or_else(|| Error::new("not_allowed", "project registration was removed"))?;
     if binding.registration_revision != registration.revision {
         return Err(Error::new(
             "not_allowed",
@@ -750,10 +740,7 @@ fn project_start_input_binding_tx(
         agent.generation == old_generation
             && agent.is_terminal()
             && agent.active_turn.is_none()
-            && matches!(
-                agent.harness.as_str(),
-                "codex" | "muse" | "claude" | "opencode" | "antigravity"
-            )
+            && core::api::is_supported_harness(&agent.harness)
             && agent
                 .native_scope
                 .as_deref()
@@ -1013,20 +1000,20 @@ fn upsert_project_registration_tx(
     input: &ProjectRegistrationInput,
 ) -> Result<core::api::ProjectRegistrationView> {
     if let Some(existing) = load_project_registration(tx, &input.id)? {
-        if existing.view.checkout == input.checkout
-            && existing.view.repo_common_dir == input.repo_common_dir
-            && existing.view.git == input.git
-            && existing.view.profiles == input.profiles
-            && existing.view.actions == input.actions
-            && existing.view.interpreters == input.interpreters
-            && existing.view.run_env == input.run_env
+        if existing.checkout == input.checkout
+            && existing.repo_common_dir == input.repo_common_dir
+            && existing.git == input.git
+            && existing.profiles == input.profiles
+            && existing.actions == input.actions
+            && existing.interpreters == input.interpreters
+            && existing.run_env == input.run_env
         {
-            return Ok(existing.view);
+            return Ok(existing);
         }
         let changed = tx
             .execute(
                 "DELETE FROM project_registrations WHERE id = ?1 AND revision = ?2",
-                params![input.id, existing.view.revision],
+                params![input.id, existing.revision],
             )
             .map_err(sql_error)?;
         if changed != 1 {
@@ -1058,7 +1045,6 @@ fn upsert_project_registration_tx(
     )
     .map_err(sql_error)?;
     load_project_registration(tx, &input.id)?
-        .map(|row| row.view)
         .ok_or_else(|| Error::new("internal", "upserted project registration disappeared"))
 }
 
@@ -1094,7 +1080,7 @@ fn list_project_registrations_tx(
         .map_err(sql_error)?;
     let mut registrations = Vec::new();
     for row in rows {
-        registrations.push(row.map_err(sql_error)?.view);
+        registrations.push(row.map_err(sql_error)?);
     }
     Ok(registrations)
 }
@@ -1102,7 +1088,7 @@ fn list_project_registrations_tx(
 fn load_project_registration(
     connection: &Connection,
     id: &str,
-) -> Result<Option<ProjectRegistrationRow>> {
+) -> Result<Option<core::api::ProjectRegistrationView>> {
     connection
         .query_row(
             "SELECT revision, id, checkout, repo_common_dir, profiles, actions, interpreters, run_env, git
@@ -1128,7 +1114,7 @@ fn ensure_project_registration_bytes(
 
 fn project_registration_from_row(
     row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<ProjectRegistrationRow> {
+) -> rusqlite::Result<core::api::ProjectRegistrationView> {
     let revision: i64 = row.get(0)?;
     let id: String = row.get(1)?;
     let checkout: String = row.get(2)?;
@@ -1192,19 +1178,17 @@ fn project_registration_from_row(
             })
         })
         .transpose()?;
-    Ok(ProjectRegistrationRow {
-        view: core::api::ProjectRegistrationView {
-            id,
-            checkout,
-            repo_common_dir,
-            git,
-            profiles,
-            actions,
-            interpreters,
-            run_env,
-            revision,
-            origin: None,
-            checkouts: Vec::new(),
-        },
+    Ok(core::api::ProjectRegistrationView {
+        id,
+        checkout,
+        repo_common_dir,
+        git,
+        profiles,
+        actions,
+        interpreters,
+        run_env,
+        revision,
+        origin: None,
+        checkouts: Vec::new(),
     })
 }

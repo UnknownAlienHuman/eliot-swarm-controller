@@ -4,11 +4,16 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub fn inference_sha256(bytes: &[u8]) -> String {
+/// Lowercase hexadecimal SHA-256, shared by every digest boundary.
+pub fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+pub fn inference_sha256(bytes: &[u8]) -> String {
+    sha256_hex(bytes)
 }
 
 pub const INFERENCE_PROFILE: &str = "memory-text-v1";

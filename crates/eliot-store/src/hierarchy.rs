@@ -368,14 +368,6 @@ pub(super) fn control_from_snapshot(snapshot: &Value) -> Result<String> {
     }
 }
 
-fn control_rank(control: AgentControl) -> u8 {
-    match control {
-        AgentControl::Slf => 0,
-        AgentControl::Tree => 1,
-        AgentControl::Project => 2,
-    }
-}
-
 /// The exception to the Store admission guard that a launch
 /// `profile_snapshot` must not carry a dispatch-derived
 /// `native_store_binding`: an authenticated nonterminal Agent launching its own
@@ -409,7 +401,7 @@ pub(super) fn admission_allows_carried_parent_binding(
     let child_control =
         control_from_snapshot(args.get("profile_snapshot").unwrap_or(&Value::Null))?;
     let child_control = AgentControl::parse(&child_control)?;
-    if control_rank(child_control) > control_rank(parent.control) {
+    if child_control > parent.control {
         return Ok(false);
     }
     if !args

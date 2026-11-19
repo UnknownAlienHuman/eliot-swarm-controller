@@ -9,13 +9,6 @@ pub(crate) fn redact_value(value: &mut Value, secrets: &[String]) -> bool {
     SecretPolicy::new(secrets).redact_values(value)
 }
 
-pub(crate) fn redact_error(error: Error, secrets: &[String]) -> Error {
-    // The boundary behind every persisted outcome, event and log record:
-    // redacted message, origin evidence and stderr tails, normalized
-    // `where`, every bound re-applied.
-    error.sanitized(&SecretPolicy::new(secrets))
-}
-
 fn take_diagnostics(value: &mut Value) -> Vec<StderrDiagnostic> {
     let Some(raw) = value
         .as_object_mut()

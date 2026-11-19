@@ -73,14 +73,6 @@ pub(super) fn authorize_agent_submit(
     Ok(())
 }
 
-fn control_rank(control: AgentControl) -> u8 {
-    match control {
-        AgentControl::Slf => 0,
-        AgentControl::Tree => 1,
-        AgentControl::Project => 2,
-    }
-}
-
 /// Snapshot keys that may differ between an allow-listed child and its
 /// parent: a cheaper worker/reviewer model (and its effort, plus the
 /// daemon-resolved `daemon_model`) is the point of the allow-list,
@@ -283,7 +275,7 @@ pub(super) fn check_agent_launch_authority(
             ));
         }
     };
-    if control_rank(child_control) > control_rank(parent.control) {
+    if child_control > parent.control {
         return Err(Error::new(
             "not_allowed",
             "child control exceeds its parent's frozen control",
