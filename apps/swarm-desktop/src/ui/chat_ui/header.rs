@@ -110,13 +110,13 @@ impl DesktopApp {
         }
     }
 
-    /// One line: the title, the status dot, what runs the Agent (harness and
-    /// model) with a connection note when not live, then the details toggle
-    /// and the "…" menu.
+    /// The conversation's header ([`Header`]): the window reads what it
+    /// says (the title, the state with what runs the Agent and the live
+    /// feed's note, the "…" entries); the header draws it, and a window
+    /// render that changes none of it leaves the header as it is.
     pub(super) fn header_view(
         &self,
         agent: &str,
-        column: Option<f64>,
         context: &mut ViewContext<Self>,
         palette: Palette,
     ) -> View {
@@ -149,67 +149,47 @@ impl DesktopApp {
                     crate::picker::harness_model_label(&row.harness, row.model.as_deref())
                 })
             });
-        let runs_width = runs.as_ref().map_or(0.0, |_| {
-            tokens::layout::RUNS_LABEL_WIDTH + tokens::spacing::SM
-        });
-        let menu: View = match detail {
-            Some(detail) => {
-                let ended = matches!(
-                    detail.state,
-                    eliot_core::AgentState::Stopped
-                        | eliot_core::AgentState::Failed
-                        | eliot_core::AgentState::Lost
-                );
-                let controllable = !detail.observe_only;
-                let task = self
-                    .find_agent(agent)
-                    .map(|agent| menu_ui::Target::Agent(agent.clone()));
-                let mut items: Vec<MenuItem> = task
-                    .as_ref()
-                    .map(|target| {
-                        self.menu_entries(target)
-                            .into_iter()
-                            .filter(|(action, _, _, _)| *action != menu_ui::Action::More)
-                            .map(|(_, label, _, _)| MenuItem::item(label.clone(), label))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let mut more = vec![MenuItem::item("details", MENU_DETAILS)];
-                if !self.submitting() {
-                    more.push(MenuItem::item("handoff", MENU_HANDOFF));
-                    if detail.observe_only {
-                        more.push(MenuItem::item("detach", MENU_DETACH));
-                    }
-                    if controllable && !ended {
-                        more.push(MenuItem::item("force", MENU_FORCE));
-                    }
+        let menu = detail.map(|detail| {
+            let ended = matches!(
+                detail.state,
+                eliot_core::AgentState::Stopped
+                    | eliot_core::AgentState::Failed
+                    | eliot_core::AgentState::Lost
+            );
+            let controllable = !detail.observe_only;
+            let task = self
+                .find_agent(agent)
+                .map(|agent| menu_ui::Target::Agent(agent.clone()));
+            let mut items: Vec<MenuItem> = task
+                .as_ref()
+                .map(|target| {
+                    self.menu_entries(target)
+                        .into_iter()
+                        .filter(|(action, _, _, _)| *action != menu_ui::Action::More)
+                        .map(|(_, label, _, _)| MenuItem::item(label.clone(), label))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut more = vec![MenuItem::item("details", MENU_DETAILS)];
+            if !self.submitting() {
+                more.push(MenuItem::item("handoff", MENU_HANDOFF));
+                if detail.observe_only {
+                    more.push(MenuItem::item("detach", MENU_DETACH));
                 }
-                if let Some(target) = &task {
-                    more.extend(
-                        self.developer_entries(target)
-                            .into_iter()
-                            .map(|(_, label, _, _)| MenuItem::item(label.clone(), label)),
-                    );
+                if controllable && !ended {
+                    more.push(MenuItem::item("force", MENU_FORCE));
                 }
-                items.push(MenuItem::submenu("more", "More", more));
-                m3::icon_button(palette)
-                    .automation_name("More actions")
-                    .content(m3::icon(m3::glyph::MORE))
-                    .menu(Menu::new(
-                        items,
-                        // Capture-free, so the callback keeps one identity
-                        // across renders: Reactor 0.100.0 re-sends a menu
-                        // whose callback changed, replacing the native
-                        // MenuFlyout and dropping a click on the open one.
-                        context.callback(|label: String| Message::Chat(ChatMsg::AgentMenu(label))),
-                    ))
             }
-            None => m3::icon_button(palette)
-                .is_enabled(false)
-                .automation_name("More actions")
-                .content(m3::icon(m3::glyph::MORE)),
-        };
-        let details_open = self.panel == Panel::Details;
+            if let Some(target) = &task {
+                more.extend(
+                    self.developer_entries(target)
+                        .into_iter()
+                        .map(|(_, label, _, _)| MenuItem::item(label.clone(), label)),
+                );
+            }
+            items.push(MenuItem::submenu("more", "More", more));
+            items
+        });
         // The status pill: the state in words, then what runs it, and the
         // live feed's note when it is not following.
         let mut pill = match state {
@@ -229,56 +209,15 @@ impl DesktopApp {
         if !note.is_empty() {
             pill.push_str(&format!(" · {note}"));
         }
-        let _ = (column, runs_width);
-        // The design's header: a full-width 52-DIP bar on a hairline, the
-        // title at 15/500, the status pill, then Details and More.
-        Border::new()
-            .grid_row(0)
-            .height(tokens::height::HEADER)
-            .border_brush(palette.outline())
-            .border_thickness(Thickness::new(0.0, 0.0, 0.0, tokens::layout::HAIRLINE))
-            .padding(Thickness::new(
-                tokens::spacing::LG,
-                0.0,
-                tokens::spacing::MD,
-                0.0,
-            ))
-            .content(
-                Grid::new()
-                    .columns([GridLength::Auto, GridLength::Auto, GridLength::STAR])
-                    .column_spacing(tokens::spacing::ROW)
-                    .children((
-                        m3::section_title(title.clone())
-                            .max_width(tokens::layout::READING_WIDTH)
-                            .vertical_alignment(VerticalAlignment::Center)
-                            .text_trimming(TextTrimming::CharacterEllipsis)
-                            .is_text_selection_enabled(true),
-                        Border::new()
-                            .grid_column(1)
-                            .vertical_alignment(VerticalAlignment::Center)
-                            .content(m3::status_pill(palette, tone, &pill)),
-                        // Details and More, 2 DIPs apart at the right end.
-                        StackPanel::new()
-                            .grid_column(2)
-                            .orientation(Orientation::Horizontal)
-                            .spacing(tokens::spacing::ROW_GAP)
-                            .horizontal_alignment(HorizontalAlignment::Right)
-                            .vertical_alignment(VerticalAlignment::Center)
-                            .children((
-                                m3::icon_button(palette)
-                                    .automation_name(if details_open {
-                                        "Hide details"
-                                    } else {
-                                        "Show details"
-                                    })
-                                    .on_click(context.message(Message::Shell(
-                                        ShellMsg::PanelToggled(Panel::Details),
-                                    )))
-                                    .content(m3::icon(m3::glyph::INFO)),
-                                menu,
-                            )),
-                    )),
-            )
+        View::component::<Header>(HeaderInput {
+            palette,
+            title,
+            tone,
+            pill,
+            menu,
+            details_open: self.panel == Panel::Details,
+            send: context.forward(),
+        })
     }
 
     /// The Force stop question above the composer, bound to the Agent and
@@ -345,6 +284,117 @@ impl DesktopApp {
                                         ChatMsg::ForceStopAnswered(true),
                                     )))
                                     .content(m3::label("Force stop")),
+                            )),
+                    )),
+            )
+    }
+}
+
+/// What the conversation's header shows, read by the window
+/// ([`DesktopApp::header_view`]).
+#[derive(Clone, PartialEq)]
+pub(super) struct HeaderInput {
+    palette: Palette,
+    title: String,
+    tone: StatusTone,
+    /// The state in words, what runs the Agent, the live feed's note.
+    pill: String,
+    /// The "…" entries; `None` while the detail is read (the button is
+    /// shown, not active).
+    menu: Option<Vec<MenuItem>>,
+    details_open: bool,
+    send: Callback<Message>,
+}
+
+/// One line: the title, the status pill, then the details toggle and the
+/// "…" menu, as its own component. Its controls go to the window.
+pub(super) struct Header {
+    send: Callback<Message>,
+}
+
+impl Component for Header {
+    type Input = HeaderInput;
+    type Message = Message;
+
+    fn create(input: &HeaderInput, _context: &ComponentContext<Self>) -> Self {
+        Self {
+            send: input.send.clone(),
+        }
+    }
+
+    fn input_changed(&mut self, input: &HeaderInput, _context: &ComponentContext<Self>) {
+        self.send = input.send.clone();
+    }
+
+    fn update(&mut self, message: Message, _context: &ComponentContext<Self>) {
+        let _ = self.send.call(message);
+    }
+
+    fn view(&self, input: &HeaderInput, context: &mut ViewContext<Self>) -> View {
+        let palette = input.palette;
+        let menu: View = match &input.menu {
+            Some(items) => m3::icon_button(palette)
+                .automation_name("More actions")
+                .content(m3::icon(m3::glyph::MORE))
+                .menu(Menu::new(
+                    items.clone(),
+                    // Capture-free, so the callback keeps one identity
+                    // across renders: Reactor 0.100.0 re-sends a menu
+                    // whose callback changed, replacing the native
+                    // MenuFlyout and dropping a click on the open one.
+                    context.callback(|label: String| Message::Chat(ChatMsg::AgentMenu(label))),
+                )),
+            None => m3::icon_button(palette)
+                .is_enabled(false)
+                .automation_name("More actions")
+                .content(m3::icon(m3::glyph::MORE)),
+        };
+        // The design's header: a full-width 52-DIP bar on a hairline, the
+        // title at 15/500, the status pill, then Details and More.
+        Border::new()
+            .grid_row(0)
+            .height(tokens::height::HEADER)
+            .border_brush(palette.outline())
+            .border_thickness(Thickness::new(0.0, 0.0, 0.0, tokens::layout::HAIRLINE))
+            .padding(Thickness::new(
+                tokens::spacing::LG,
+                0.0,
+                tokens::spacing::MD,
+                0.0,
+            ))
+            .content(
+                Grid::new()
+                    .columns([GridLength::Auto, GridLength::Auto, GridLength::STAR])
+                    .column_spacing(tokens::spacing::ROW)
+                    .children((
+                        m3::section_title(input.title.clone())
+                            .max_width(tokens::layout::READING_WIDTH)
+                            .vertical_alignment(VerticalAlignment::Center)
+                            .text_trimming(TextTrimming::CharacterEllipsis)
+                            .is_text_selection_enabled(true),
+                        Border::new()
+                            .grid_column(1)
+                            .vertical_alignment(VerticalAlignment::Center)
+                            .content(m3::status_pill(palette, input.tone, &input.pill)),
+                        // Details and More, 2 DIPs apart at the right end.
+                        StackPanel::new()
+                            .grid_column(2)
+                            .orientation(Orientation::Horizontal)
+                            .spacing(tokens::spacing::ROW_GAP)
+                            .horizontal_alignment(HorizontalAlignment::Right)
+                            .vertical_alignment(VerticalAlignment::Center)
+                            .children((
+                                m3::icon_button(palette)
+                                    .automation_name(if input.details_open {
+                                        "Hide details"
+                                    } else {
+                                        "Show details"
+                                    })
+                                    .on_click(context.message(Message::Shell(
+                                        ShellMsg::PanelToggled(Panel::Details),
+                                    )))
+                                    .content(m3::icon(m3::glyph::INFO)),
+                                menu,
                             )),
                     )),
             )

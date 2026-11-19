@@ -170,8 +170,8 @@ impl QueueOffer {
 pub(super) enum Dismissed {
     /// No queue notice was open.
     Nothing,
-    /// No intent can exist for the draft: it is back in the composer.
-    Returned,
+    /// No intent can exist for the draft: it goes back to the composer.
+    Returned(String),
     /// Queue it may have committed this intent: the draft waits, watched,
     /// until the intent reads back or the daemon reports it missing.
     Resolving { intent: String, key: String },
@@ -206,8 +206,6 @@ pub(super) struct LaunchState {
     pub(super) workspace: String,
     /// The folder field is shown (a path outside the registered projects).
     pub(super) custom_workspace: bool,
-    pub(super) launch_text: String,
-    pub(super) launch_rev: u64,
     /// "No project (chat)": the next task launches as a chat.
     pub(super) chat: bool,
     /// The start being submitted: its text and what it says while the
@@ -331,12 +329,7 @@ impl LaunchState {
                 self.watched.push((intent.clone(), offer.text));
                 Dismissed::Resolving { intent, key }
             }
-            None => {
-                if self.launch_text.is_empty() {
-                    self.launch_text = offer.text;
-                }
-                Dismissed::Returned
-            }
+            None => Dismissed::Returned(offer.text),
         }
     }
 
@@ -1184,7 +1177,7 @@ impl DesktopApp {
                 return;
             }
         };
-        let text = profiles::normalize_newlines(&self.launch.launch_text);
+        let text = profiles::normalize_newlines(self.chat.drafts.borrow().text(None));
         if text.trim().is_empty() {
             self.alert("Describe the task first.");
             return;
@@ -1211,10 +1204,10 @@ impl DesktopApp {
             workspace: self.launch.workspace.clone(),
             project: self.launch_project_id(),
         };
-        let key = format!("launch:{target:?}:{place:?}:{}", self.launch.launch_rev);
+        let launch_rev = self.chat.drafts.borrow().launch_rev();
+        let key = format!("launch:{target:?}:{place:?}:{launch_rev}");
         let mutation_id = self.ledger.id_for(&key);
         self.in_flight_key = Some(key);
-        let launch_rev = self.launch.launch_rev;
         self.alert = None;
         self.launch.queue_offer = None;
         self.launch.submission = Some(Submission {
@@ -1228,7 +1221,7 @@ impl DesktopApp {
         self.launch.starting = Some((text.clone(), starting_label(submitted.harness.as_deref())));
         // The composer empties at once; the revision stays, so a retry of
         // an unconfirmed start reuses its mutation id.
-        self.launch.launch_text.clear();
+        self.chat.drafts.borrow_mut().clear_launch();
         self.clear_attached(NEW_TASK_COMPOSER);
         self.set_status(format!("Launching ({mutation_id})…"));
         let _task = context.spawn_background(move |_| {
@@ -1280,9 +1273,11 @@ impl DesktopApp {
                 let label = starting.map(|(_, label)| label);
                 // The first prompt rode the launch admission; it is never
                 // sent again. Clear only the submitted draft.
-                if self.launch.launch_rev == outcome.launch_rev {
-                    self.launch.launch_text.clear();
+                let mut drafts = self.chat.drafts.borrow_mut();
+                if drafts.launch_rev() == outcome.launch_rev {
+                    drafts.clear_launch();
                 }
+                drop(drafts);
                 if let Some(linked) = outcome.linked_command.clone() {
                     self.chat.pending_local =
                         Some((outcome.agent.clone(), linked.clone(), outcome.text.clone()));
@@ -1404,9 +1399,11 @@ impl DesktopApp {
                 // The queued intent carries the text now; it comes back if
                 // the arbiter refuses the intent.
                 if let Some(offer) = offer {
-                    if offer.launch_rev == self.launch.launch_rev {
-                        self.launch.launch_text.clear();
+                    let mut drafts = self.chat.drafts.borrow_mut();
+                    if offer.launch_rev == drafts.launch_rev() {
+                        drafts.clear_launch();
                     }
+                    drop(drafts);
                     self.launch.watched.push((intent.id.clone(), offer.text));
                 }
                 self.alert = None;
@@ -1437,10 +1434,8 @@ impl DesktopApp {
             Err(error) => {
                 // A definite refusal: no intent exists, so the draft goes
                 // back to an empty composer.
-                if let Some(offer) = self.launch.queue_offer.take()
-                    && self.launch.launch_text.is_empty()
-                {
-                    self.launch.launch_text = offer.text;
+                if let Some(offer) = self.launch.queue_offer.take() {
+                    self.chat.drafts.borrow_mut().restore_launch(offer.text);
                 }
                 self.alert(format!("Not queued: {}", error.user_message()));
             }
@@ -1453,7 +1448,10 @@ impl DesktopApp {
     pub(super) fn dismiss_queue_notice(&mut self, context: &ComponentContext<Self>) {
         match self.launch.dismiss_queue_offer() {
             Dismissed::Nothing => {}
-            Dismissed::Returned => self.set_status("The refused launch is back in the composer."),
+            Dismissed::Returned(text) => {
+                self.chat.drafts.borrow_mut().restore_launch(text);
+                self.set_status("The refused launch is back in the composer.");
+            }
             Dismissed::Resolving { intent, key } => {
                 // The watched entry carries the id now; a later Queue it of
                 // a returned draft takes a fresh one.
@@ -1483,9 +1481,7 @@ impl DesktopApp {
                 continue;
             };
             let (_, text) = self.launch.watched.remove(index);
-            if self.launch.launch_text.is_empty() {
-                self.launch.launch_text = text;
-            }
+            self.chat.drafts.borrow_mut().restore_launch(text);
             self.alert(format!(
                 "Launch {id} was never queued; its text is back in the composer."
             ));
@@ -1517,9 +1513,7 @@ impl DesktopApp {
                 }
                 LaunchIntentState::Rejected => {
                     let (_, text) = self.launch.watched.remove(index);
-                    if self.launch.launch_text.is_empty() {
-                        self.launch.launch_text = text;
-                    }
+                    self.chat.drafts.borrow_mut().restore_launch(text);
                     let reason = intent
                         .reason
                         .as_ref()
@@ -1555,10 +1549,8 @@ impl DesktopApp {
     /// (with the same draft revision, so a retry reuses the mutation id),
     /// unless the owner already typed something new.
     fn restore_launch_text(&mut self, starting: Option<(String, String)>) {
-        if let Some((text, _)) = starting
-            && self.launch.launch_text.is_empty()
-        {
-            self.launch.launch_text = text;
+        if let Some((text, _)) = starting {
+            self.chat.drafts.borrow_mut().restore_launch(text);
         }
     }
 

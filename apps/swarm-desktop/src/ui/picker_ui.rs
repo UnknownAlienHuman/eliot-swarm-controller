@@ -53,7 +53,7 @@ impl DesktopApp {
                 "Project: {label} ({})",
                 if open { "list open" } else { "choose" }
             ))
-            .on_click(context.message(Message::Launch(LaunchMsg::Toggle(Pop::Project))))
+            .on_click(context.callback(|()| Message::Launch(LaunchMsg::Toggle(Pop::Project))))
             .content(m3::chip_content(
                 Some(glyph),
                 &label,
@@ -98,7 +98,9 @@ impl DesktopApp {
                         } else {
                             "New worktree (off): the task works in this folder"
                         })
-                        .on_click(context.message(Message::Launch(LaunchMsg::WorktreeToggled)))
+                        .on_click(
+                            context.callback(|()| Message::Launch(LaunchMsg::WorktreeToggled)),
+                        )
                         .content(m3::chip_content(
                             Some(m3::glyph::WORKTREE),
                             "New worktree",
@@ -130,7 +132,7 @@ impl DesktopApp {
                 "Model: {} (Ctrl+M)",
                 self.launch.choice.chip_name(auto_profile)
             ))
-            .on_click(context.message(Message::Launch(LaunchMsg::Toggle(Pop::Model))))
+            .on_click(context.callback(|()| Message::Launch(LaunchMsg::Toggle(Pop::Model))))
             .content(m3::chip_content(
                 Some(glyph),
                 &label,
@@ -150,7 +152,9 @@ impl DesktopApp {
                         m3::chip(palette)
                     }
                     .automation_name(format!("Access: {}", access.label()))
-                    .on_click(context.message(Message::Launch(LaunchMsg::Toggle(Pop::Access))))
+                    .on_click(
+                        context.callback(|()| Message::Launch(LaunchMsg::Toggle(Pop::Access))),
+                    )
                     .content(m3::chip_content(
                         Some(access_glyph(access)),
                         access.label(),

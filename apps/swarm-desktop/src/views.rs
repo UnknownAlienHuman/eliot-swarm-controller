@@ -547,6 +547,16 @@ impl<T> PartialEq for Shared<T> {
     }
 }
 
+thread_local! {
+    static NO_ITEMS: Rc<Vec<Rc<RenderedItem>>> = Rc::new(Vec::new());
+}
+
+/// The transcript's items without a conversation: one list, so it compares
+/// equal from one window render to the next.
+pub fn no_items() -> Shared<Vec<Rc<RenderedItem>>> {
+    NO_ITEMS.with(|items| Shared(Rc::clone(items)))
+}
+
 /// Parts built in the first frame of a newly shown conversation: enough to
 /// fill the window at its end, where the anchored transcript opens.
 const FIRST_PARTS: usize = 30;
