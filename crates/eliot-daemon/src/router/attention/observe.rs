@@ -202,11 +202,6 @@ pub(super) async fn capture_agent(
         (None, Some(started)) => Some(started),
         (None, None) => None,
     };
-    let code_basis_at = code_progress
-        .last_code_progress_at
-        .into_iter()
-        .chain(turn_started_at)
-        .max();
     let now = now_ms();
     let progress_age_ms = progress_basis_at
         .and_then(|at| now.checked_sub(at))
@@ -236,7 +231,7 @@ pub(super) async fn capture_agent(
         children_revision,
         manager_progress_at,
         code_progress: Some(code_progress),
-        code_basis_at,
+        turn_started_at,
     }))
 }
 
@@ -413,6 +408,16 @@ pub(super) fn build_report(
         eliot_store::ActiveToolCoverage::Clear => ("clear".to_owned(), Some(0)),
         eliot_store::ActiveToolCoverage::Active { count } => ("active".to_owned(), Some(count)),
     };
+    // Turn counts exist only while a turn is open (a recovery after the
+    // turn ended carries none, never a zero).
+    let (code_progress_at, tool_calls, messages) = match (kind, &captured.code_progress) {
+        (IncidentKind::CodeProgress, Some(code)) if captured.agent.active_turn.is_some() => (
+            super::incidents::code_progress_basis(captured),
+            Some(code.tool_calls),
+            Some(code.messages),
+        ),
+        _ => (None, None, None),
+    };
     let (last_model_progress_at, progress_basis_at, progress_age_ms) =
         if kind == IncidentKind::ChildrenUnattended {
             let at = captured.manager_progress_at;
@@ -457,6 +462,9 @@ pub(super) fn build_report(
         process_observation,
         native_status,
         trigger_event_seq,
+        code_progress_at,
+        tool_calls,
+        messages,
     }
 }
 

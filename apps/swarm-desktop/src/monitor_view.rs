@@ -50,14 +50,28 @@ pub struct RowLook<'a> {
     pub dot: Brush,
     /// The open Agent's row.
     pub selected: bool,
-    /// In the Working group: its trailing word is the model.
+    /// In the Working group (or working without writing code): its
+    /// trailing word is the model.
     pub working: bool,
+    /// The second line: the work line, or the attention sentence of an
+    /// Agent working without writing code.
+    pub line: Option<RowLine>,
+}
+
+/// A row's second line ([`crate::monitor::work_line`]), what a screen
+/// reader hears for it, and whether it is in the attention tone.
+pub struct RowLine {
+    pub text: String,
+    pub words: String,
+    pub attention: bool,
 }
 
 /// One Monitor list row (`Conversation.dc.html`'s `mrow`): the status dot
 /// in its group's color, the title and one trailing word: what it needs
 /// (in the attention color), the model it works on, or how long it has
-/// been quiet. Why it ended or the task it runs under stay in its tooltip
+/// been quiet. A live controlled Agent adds its work line under them
+/// (a two-line row), or, working without writing code, that sentence in
+/// the attention color. Why it ended or the task it runs under stay in its tooltip
 /// and accessible name; its measures live in Details, which the row opens
 /// with the conversation; Resume sits beside it.
 pub fn list_row(
@@ -85,25 +99,66 @@ pub fn list_row(
         )),
         _ => crate::m3::secondary(look.elapsed.to_owned()),
     };
-    let content = Grid::new()
-        .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
-        .column_spacing(tokens::spacing::ROW)
-        .children((
-            crate::m3::dot(look.dot),
-            crate::m3::text(look.title.to_owned(), tokens::text::CHIP)
+    let title = crate::m3::text(look.title.to_owned(), tokens::text::CHIP)
+        .vertical_alignment(VerticalAlignment::Center)
+        .text_trimming(TextTrimming::CharacterEllipsis);
+    let trailing = trailing
+        .grid_column(1)
+        .max_width(tokens::layout::MONITOR_TRAILING_WIDTH)
+        .text_trimming(TextTrimming::CharacterEllipsis)
+        .vertical_alignment(VerticalAlignment::Center);
+    // The work line runs under the title and the trailing word, one line,
+    // trimmed to the row; its whole text is in the tooltip and the name.
+    let (text_column, line_name, line_tip): (View, String, String) = match &look.line {
+        None => (
+            Grid::new()
                 .grid_column(1)
-                .vertical_alignment(VerticalAlignment::Center)
-                .text_trimming(TextTrimming::CharacterEllipsis),
-            trailing
-                .grid_column(2)
-                .max_width(tokens::layout::MONITOR_TRAILING_WIDTH)
-                .text_trimming(TextTrimming::CharacterEllipsis)
-                .vertical_alignment(VerticalAlignment::Center),
-        ));
-    let tooltip = format!("{} · {status} · {harness}{note_name}", look.title);
-    let button = crate::m3::row(palette, look.selected)
+                .columns([GridLength::STAR, GridLength::Auto])
+                .column_spacing(tokens::spacing::ROW)
+                .children((title, trailing)),
+            String::new(),
+            String::new(),
+        ),
+        Some(line) => {
+            let text = crate::m3::text(line.text.clone(), tokens::text::CAPTION)
+                .text_trimming(TextTrimming::CharacterEllipsis);
+            let text = if line.attention {
+                text.foreground(palette.attention())
+            } else {
+                text.foreground(palette.muted())
+            };
+            (
+                StackPanel::new()
+                    .grid_column(1)
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .children((
+                        Grid::new()
+                            .columns([GridLength::STAR, GridLength::Auto])
+                            .column_spacing(tokens::spacing::ROW)
+                            .children((title, trailing)),
+                        text,
+                    )),
+                format!(", {}", line.words),
+                format!(" · {}", line.text),
+            )
+        }
+    };
+    let content = Grid::new()
+        .columns([GridLength::Auto, GridLength::STAR])
+        .column_spacing(tokens::spacing::ROW)
+        .children((crate::m3::dot(look.dot), text_column));
+    let tooltip = format!("{} · {status} · {harness}{note_name}{line_tip}", look.title);
+    let button = crate::m3::row(palette, look.selected);
+    let button = if look.line.is_some() {
+        button
+            .height(tokens::height::TWO_LINE_ROW)
+            .min_height(tokens::height::TWO_LINE_ROW)
+    } else {
+        button
+    };
+    let button = button
         .automation_name(format!(
-            "{}, {status}, {harness}, {}{note_name}",
+            "{}, {status}, {harness}, {}{note_name}{line_name}",
             look.title, look.elapsed_words
         ))
         .on_click(actions.open)

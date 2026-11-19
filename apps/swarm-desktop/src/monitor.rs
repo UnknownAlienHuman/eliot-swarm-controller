@@ -32,7 +32,7 @@ use std::pin::Pin;
 
 use eliot_core::api::{
     AgentGetResponse, AgentListRequest, AgentListResponse, AgentListRow, DiagnoseResponse,
-    ObservationView, ProcessStatsView, UsageSummaryResponse, stats_coverage_name,
+    ObservationView, ProcessStatsView, UsageSummaryResponse, WorkSummaryView, stats_coverage_name,
 };
 use eliot_core::{AgentState, NativeChildActivityState};
 use futures_util::StreamExt;
@@ -117,6 +117,182 @@ impl Group {
 pub struct Incident {
     pub incident_id: String,
     pub reason: String,
+    /// A `no_code_progress` report's basis: the later of the last write or
+    /// commit and the turn's start (ms since the epoch).
+    pub code_progress_at: Option<i64>,
+}
+
+impl Incident {
+    /// The Agent works without writing code (`no_code_progress`).
+    pub fn no_code(&self) -> bool {
+        self.reason == NO_CODE_PROGRESS
+    }
+
+    /// What the report says, in words: "Working without writing code for
+    /// 14m" for `no_code_progress`, else the reason's words.
+    pub fn words(&self, now_ms: i64) -> String {
+        if !self.no_code() {
+            return attention_words(&self.reason);
+        }
+        match self.code_progress_at {
+            Some(at) => match crate::nav::short_age(now_ms, at).as_str() {
+                "now" => "Working without writing code".to_owned(),
+                age => format!("Working without writing code for {age}"),
+            },
+            None => "Working without writing code".to_owned(),
+        }
+    }
+}
+
+/// The attention reason of an Agent that works without writing code
+/// (`docs/spec/monitoring.md`, "Git-aware attention: no_code_progress").
+pub const NO_CODE_PROGRESS: &str = "no_code_progress";
+
+/// How long ago, as the sidebar says it: "just now", "3m ago", "2h ago".
+fn ago(now_ms: i64, at_ms: i64) -> String {
+    match crate::nav::short_age(now_ms, at_ms).as_str() {
+        "now" => "just now".to_owned(),
+        age => format!("{age} ago"),
+    }
+}
+
+/// Why the daemon could not measure an Agent's code work, in words
+/// ([`WorkSummaryView::reason`]): the reason, never a zero count.
+pub fn work_reason_words(reason: &str) -> String {
+    match reason {
+        "no_workspace" => "No folder to watch".to_owned(),
+        "pending" => "Git not read yet".to_owned(),
+        "git_unavailable" => "Git status unavailable".to_owned(),
+        "cap_exceeded" => "Too many changes to count".to_owned(),
+        "partial_status" => "Git status incomplete".to_owned(),
+        "no_base_oid" => "No base commit to compare with".to_owned(),
+        "unborn_head" => "No commit in this checkout yet".to_owned(),
+        "invalid_oid" => "Git reported an invalid commit".to_owned(),
+        "diverged_from_base" => "Branch left its base commit".to_owned(),
+        "unavailable" => "Code work not measured".to_owned(),
+        other => format!("Code work not measured ({})", other.replace('_', " ")),
+    }
+}
+
+/// The latest write or commit: which it was, and when.
+fn last_code(work: &WorkSummaryView) -> Option<(&'static str, i64)> {
+    match (work.last_write_at, work.last_commit_at) {
+        (Some(write), Some(commit)) if commit > write => Some(("committed", commit)),
+        (Some(write), _) => Some(("wrote", write)),
+        (None, Some(commit)) => Some(("committed", commit)),
+        (None, None) => None,
+    }
+}
+
+/// The parts of a measured work line: lines, files, commits (only when
+/// there are some, so the line stays short) and the latest write.
+fn work_parts(work: &WorkSummaryView, now_ms: i64) -> Vec<String> {
+    let (insertions, deletions, files, commits) = (
+        work.insertions.unwrap_or_default(),
+        work.deletions.unwrap_or_default(),
+        work.files_changed.unwrap_or_default(),
+        work.commits_ahead.unwrap_or_default(),
+    );
+    let last = last_code(work).map(|(verb, at)| format!("{verb} {}", ago(now_ms, at)));
+    if insertions == 0 && deletions == 0 && files == 0 && commits == 0 {
+        let mut parts = vec!["No code changes yet".to_owned()];
+        parts.extend(last);
+        return parts;
+    }
+    let mut parts = vec![
+        format!(
+            "+{} \u{2212}{}",
+            group(insertions as i64),
+            group(deletions as i64)
+        ),
+        eliot_core::count_words(files, "file", "files"),
+    ];
+    if commits > 0 {
+        parts.push(eliot_core::count_words(commits, "commit", "commits"));
+    }
+    parts.extend(last);
+    parts
+}
+
+/// The compact work line of a row (`docs/spec/monitoring.md`, "Git-aware
+/// work summary"): "+120 −30 · 4 files · 2 commits · wrote 3m ago", or why
+/// Git could not be measured, never zeros.
+pub fn work_line(work: &WorkSummaryView, now_ms: i64) -> String {
+    if !work.available {
+        return work_reason_words(work.reason.as_deref().unwrap_or("unavailable"));
+    }
+    work_parts(work, now_ms).join(" · ")
+}
+
+/// [`work_line`] in words, for a row's accessible name.
+pub fn work_words(work: &WorkSummaryView, now_ms: i64) -> String {
+    if !work.available {
+        return format!(
+            "code work: {}",
+            work_reason_words(work.reason.as_deref().unwrap_or("unavailable"))
+        );
+    }
+    let insertions = work.insertions.unwrap_or_default();
+    let deletions = work.deletions.unwrap_or_default();
+    let mut parts = work_parts(work, now_ms);
+    if parts.first().is_some_and(|first| first.starts_with('+')) {
+        parts[0] = format!("{insertions} lines added, {deletions} removed");
+    }
+    format!("code work: {}", parts.join(", "))
+}
+
+/// The Details pane's work summary: commits ahead of the base, files and
+/// lines, the last write and commit, and this turn's tool calls and
+/// messages; why instead of the Git counts when they could not be measured.
+pub fn work_detail_lines(work: &WorkSummaryView, now_ms: i64) -> Vec<String> {
+    let mut lines = Vec::new();
+    if work.available {
+        let count = |value: Option<u64>| value.unwrap_or_default();
+        lines.push(format!(
+            "{} ahead of its base",
+            eliot_core::count_words(count(work.commits_ahead), "commit", "commits")
+        ));
+        lines.push(format!(
+            "{} changed · +{} \u{2212}{} lines",
+            eliot_core::count_words(count(work.files_changed), "file", "files"),
+            group(count(work.insertions) as i64),
+            group(count(work.deletions) as i64)
+        ));
+        lines.push(match work.last_write_at {
+            Some(at) => format!("Last write {} ({})", ago(now_ms, at), clock(at)),
+            None => "No write seen yet".to_owned(),
+        });
+        lines.push(match work.last_commit_at {
+            Some(at) => format!("Last commit {} ({})", ago(now_ms, at), clock(at)),
+            None => "No commit yet".to_owned(),
+        });
+    } else {
+        lines.push(work_reason_words(
+            work.reason.as_deref().unwrap_or("unavailable"),
+        ));
+    }
+    lines.push(match (work.tool_calls, work.messages) {
+        (Some(tools), Some(messages)) => format!(
+            "This turn: {} · {}",
+            eliot_core::count_words(tools, "tool call", "tool calls"),
+            eliot_core::count_words(messages, "message", "messages")
+        ),
+        _ => "No turn running".to_owned(),
+    });
+    lines
+}
+
+/// A local time of day, with the date when it is not today.
+fn clock(at_ms: i64) -> String {
+    let Some(at) = chrono::DateTime::from_timestamp_millis(at_ms) else {
+        return "time unknown".to_owned();
+    };
+    let at = at.with_timezone(&chrono::Local);
+    if at.date_naive() == chrono::Local::now().date_naive() {
+        at.format("%H:%M").to_string()
+    } else {
+        at.format("%b %-d, %H:%M").to_string()
+    }
 }
 
 /// An attention reason code in words.
@@ -412,6 +588,9 @@ pub struct MonitorRow {
     pub project_scope: Option<String>,
     /// A chat without a project (listed under Chats, not a project).
     pub chat: bool,
+    /// The Git-aware work summary ([`AgentSummary::work`]); `None` on an
+    /// older daemon.
+    pub work: Option<WorkSummaryView>,
 }
 
 /// `1234567` as `1,234,567`.
@@ -476,6 +655,7 @@ impl MonitorRow {
             project: summary.project.clone(),
             project_scope: summary.project_scope.clone(),
             chat: summary.chat,
+            work: summary.work.clone(),
         }
     }
 
@@ -809,6 +989,8 @@ pub struct AttentionReport {
     /// `incident` or `recovery`.
     pub phase: String,
     pub reason: String,
+    /// A `no_code_progress` report's basis ([`Incident::code_progress_at`]).
+    pub code_progress_at: Option<i64>,
 }
 
 impl AttentionReport {
@@ -829,6 +1011,9 @@ impl AttentionReport {
             incident_id: text("incident_id")?,
             phase: text("phase")?,
             reason: text("reason").unwrap_or_default(),
+            code_progress_at: report
+                .get("code_progress_at")
+                .and_then(serde_json::Value::as_i64),
         })
     }
 }
@@ -1305,6 +1490,7 @@ impl Monitor {
                         Incident {
                             incident_id: report.incident_id,
                             reason: report.reason,
+                            code_progress_at: report.code_progress_at,
                         },
                     );
                 }

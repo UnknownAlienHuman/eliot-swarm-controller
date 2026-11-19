@@ -81,6 +81,10 @@ pub struct UiAgent {
     /// The model the harness last reported ([`AgentSummary::model`]);
     /// `None` until it reports one.
     pub model: Option<String>,
+    /// The Git-aware work summary ([`AgentSummary::work`]): the running
+    /// row's work line. `None` on an older daemon and for synthetic rows.
+    /// Boxed: rows travel inside messages.
+    pub work: Option<Box<eliot_core::api::WorkSummaryView>>,
 }
 
 impl UiAgent {
@@ -108,6 +112,7 @@ impl UiAgent {
             tags: summary.tags.clone(),
             organization_revision: summary.organization_revision,
             model: summary.model.clone(),
+            work: summary.work.clone().map(Box::new),
         }
     }
 

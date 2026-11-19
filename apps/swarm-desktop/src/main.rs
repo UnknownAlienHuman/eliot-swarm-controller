@@ -80,7 +80,9 @@ mod worktrees;
 #[derive(clap::Parser)]
 #[command(name = "swarm-desktop", version, about = "Eliot desktop companion")]
 pub(crate) struct DesktopArgs {
-    /// Open and register this Git checkout; defaults to the working directory.
+    /// Open and register this Git checkout. Without it nothing is
+    /// registered: the folder the desktop was started from is never a
+    /// project by accident.
     #[arg(long, value_name = "PATH")]
     workspace: Option<std::path::PathBuf>,
 }
@@ -91,18 +93,19 @@ fn main() {
     let args = DesktopArgs::parse();
     let workspace = args
         .workspace
-        .map_or_else(std::env::current_dir, Ok)
-        .and_then(std::fs::canonicalize)
-        .and_then(|path| {
-            if path.is_dir() {
-                Ok(path)
-            } else {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "workspace must be a directory",
-                ))
-            }
-        });
+        .map(|workspace| {
+            std::fs::canonicalize(workspace).and_then(|path| {
+                if path.is_dir() {
+                    Ok(path)
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "workspace must be a directory",
+                    ))
+                }
+            })
+        })
+        .transpose();
     let result = workspace
         .map_err(|error| error.to_string())
         .and_then(ui::run);

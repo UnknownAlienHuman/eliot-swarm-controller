@@ -49,6 +49,7 @@ impl DesktopApp {
                         tags: Vec::new(),
                         organization_revision: None,
                         model: detail.settings.effective_model.clone(),
+                        work: None,
                     })
                 });
                 if let Some(mut agent) = agent {

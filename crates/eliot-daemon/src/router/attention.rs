@@ -153,10 +153,9 @@ struct CapturedAgent {
     children_revision: Option<i64>,
     manager_progress_at: Option<i64>,
     code_progress: Option<CodeProgressState>,
-    /// Latest of the last worktree write or commit and the active turn's
-    /// start: `no_code_progress` measures its window from here, so a turn
-    /// that has not written yet is judged only after the window elapses.
-    code_basis_at: Option<i64>,
+    /// The active turn's start: a turn's code progress is measured from
+    /// it when the worktree has no later write or commit.
+    turn_started_at: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -188,6 +187,15 @@ struct AttentionReport {
     native_status: NativeStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     trigger_event_seq: Option<i64>,
+    /// `no_code_progress` only: when the turn last made code progress (the
+    /// later of the last write or commit and the turn's start), and the
+    /// turn's tool calls and messages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code_progress_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    messages: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]

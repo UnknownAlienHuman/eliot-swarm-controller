@@ -35,6 +35,7 @@ pub fn reason_words(code: &str) -> String {
         "daemon_restart" => "Interrupted by a Swarm restart",
         "root_exited" => "The agent app exited unexpectedly",
         "no_progress" => "No progress for a while",
+        "no_code_progress" => "Working without writing code",
         "source_unhealthy" => "Lost contact with its agent app",
         "children_unattended" => "Its subagents are unattended",
         "failure" | "failed" | "agent.failed" => "The Agent could not finish",
