@@ -2033,10 +2033,11 @@ impl DesktopApp {
     }
 
     /// A task row under its project: indented 24 DIPs per level, so its
-    /// title lines up with the project's label. One line: the title, its
-    /// harness and model, the worktree where the project spans several,
-    /// and a state dot only for a task that runs or needs attention. A
-    /// manager with workers carries its expand chevron in that indent.
+    /// title lines up with the project's label. One line: the title (at
+    /// least 60% of the row), its short model, the worktree where the
+    /// project spans several, and a state dot only for a task that runs or
+    /// needs attention. A manager with workers carries its expand chevron
+    /// in that indent. Its accessible name says "Harness · model" in full.
     fn agent_row(
         &self,
         row: &Row,
@@ -2114,10 +2115,15 @@ impl DesktopApp {
             None
         };
         let over = self.menu.hovered.as_deref() == Some(agent.id.as_str()) || selected;
-        // What runs the task gives way to its quick action, as a Codex
-        // sidebar row's time does: the title keeps its width. The open
-        // task's header names it.
-        let shown_runs = if over && quick.is_some() { "" } else { &runs };
+        // The model gives way to the quick action, as a Codex sidebar
+        // row's time does: the title keeps its width. The open task's
+        // header names it.
+        let shows_quick = over && quick.is_some();
+        let shown_model = if shows_quick { "" } else { row_model(agent) };
+        let text_width = row_text_width(
+            (row.depth as f64 + 1.0) * indent,
+            1 + usize::from(shows_quick),
+        );
         let quick: View = if over {
             quick
                 .map(|(action, label, glyph)| {
@@ -2179,7 +2185,12 @@ impl DesktopApp {
                                 None,
                                 title,
                                 "",
-                                row_tag(shown_runs, &row_tag_text(agent), task_dot(palette, agent)),
+                                row_tag(
+                                    shown_model,
+                                    &row_tag_text(agent),
+                                    task_dot(palette, agent),
+                                    text_width,
+                                ),
                             )),
                         note,
                         Border::new().grid_column(2).content(actions),
@@ -2225,7 +2236,7 @@ impl DesktopApp {
         )
     }
 
-    /// A Recents row: the title, what runs it and its dot, no tree.
+    /// A Recents row: the title, its short model and its dot, no tree.
     fn recent_row(
         &self,
         agent: &UiAgent,
@@ -2244,7 +2255,12 @@ impl DesktopApp {
                 None,
                 &label,
                 "",
-                row_tag(&runs, "", task_dot(palette, agent)),
+                row_tag(
+                    row_model(agent),
+                    "",
+                    task_dot(palette, agent),
+                    row_text_width(0.0, 0),
+                ),
             ))
     }
 
@@ -2526,42 +2542,94 @@ fn detail_row(text: &str, error: Option<Brush>) -> View {
         .tooltip(text.to_owned())
 }
 
-/// A task row's trailing marks: what runs it (harness and model,
-/// [`crate::picker::harness_model_label`]; empty hides it), its quiet tag
-/// (its worktree folder, "archived") and its dot. They sit in the row's
-/// trailing cell so the title keeps the free width and trims with an
-/// ellipsis; a note column after an auto-sized title got no width at all
-/// and the tag never showed.
-fn row_tag(runs: &str, tag: &str, dot: View) -> View {
-    let quiet = |text: &str, width: f64| -> View {
-        if text.is_empty() {
-            return View::empty();
+/// The share of a sidebar row's text width its trailing marks take at
+/// most: the title keeps at least 60% of it.
+const TRAILING_SHARE: f64 = 0.4;
+
+/// The text width of a sidebar row (inside its inset) that starts `indent`
+/// DIPs in, with `actions` buttons beside it: the sidebar less its padding,
+/// the indent, the actions and the row's inset on both sides.
+fn row_text_width(indent: f64, actions: usize) -> f64 {
+    tokens::layout::SIDEBAR_WIDTH
+        - 2.0 * SIDEBAR_PADDING
+        - indent
+        - actions as f64 * tokens::height::SUB_ROW
+        - 2.0 * tokens::spacing::INSET
+}
+
+/// The widths of a sidebar row's trailing model and tag (0: not shown) in a
+/// row of `text_width`, with or without its dot. The trailing cell (the gap
+/// before it included) never takes more than [`TRAILING_SHARE`] of the
+/// row, so the title keeps the rest; the model trims past
+/// [`tokens::layout::SIDEBAR_MODEL_WIDTH`], and a model and a tag share
+/// what is left.
+fn trailing_widths(model: bool, tag: bool, dot: bool, text_width: f64) -> (f64, f64) {
+    let gap = tokens::spacing::SM;
+    let mut budget = text_width * TRAILING_SHARE - gap;
+    if dot {
+        budget -= tokens::layout::DOT + gap;
+    }
+    let budget = budget.max(0.0);
+    let model_cap = tokens::layout::SIDEBAR_MODEL_WIDTH;
+    match (model, tag) {
+        (true, true) => {
+            let shared = ((budget - gap) / 2.0).max(0.0);
+            let model_width = shared.min(model_cap);
+            (model_width, (budget - gap - model_width).max(0.0))
         }
-        m3::secondary(text.to_owned())
-            .max_width(width)
-            .text_trimming(TextTrimming::CharacterEllipsis)
-            .vertical_alignment(VerticalAlignment::Center)
-            .into()
-    };
+        (true, false) => (budget.min(model_cap), 0.0),
+        (false, true) => (0.0, budget),
+        (false, false) => (0.0, 0.0),
+    }
+}
+
+/// A sidebar row's trailing marks: the Agent's short model
+/// ([`crate::picker::model_short`], no harness word; empty hides it), its
+/// quiet tag (its worktree folder, "archived") and its dot, sized by
+/// [`trailing_widths`]. They sit in the row's trailing cell so the title
+/// keeps the free width and trims with an ellipsis; a note column after an
+/// auto-sized title got no width at all and the tag never showed.
+fn row_tag(model: &str, tag: &str, dot: Option<View>, text_width: f64) -> View {
+    let (model_width, tag_width) = trailing_widths(
+        !model.is_empty(),
+        !tag.is_empty(),
+        dot.is_some(),
+        text_width,
+    );
+    let mut parts = Vec::new();
+    for (key, text, width) in [("model", model, model_width), ("tag", tag, tag_width)] {
+        if !text.is_empty() && width > 0.0 {
+            parts.push(KeyedView::new(
+                key,
+                m3::secondary(text.to_owned())
+                    .max_width(width)
+                    .text_trimming(TextTrimming::CharacterEllipsis)
+                    .vertical_alignment(VerticalAlignment::Center),
+            ));
+        }
+    }
+    if let Some(dot) = dot {
+        parts.push(KeyedView::new("dot", dot));
+    }
     StackPanel::new()
         .orientation(Orientation::Horizontal)
         .spacing(tokens::spacing::SM)
         .vertical_alignment(VerticalAlignment::Center)
-        .children((
-            quiet(runs, tokens::layout::TREE_INDENT * 5.0),
-            quiet(tag, tokens::layout::TREE_INDENT * 4.0),
-            dot,
-        ))
+        .keyed_children(parts)
+}
+
+/// The short model a sidebar row shows ("" until the harness reports one).
+fn row_model(agent: &UiAgent) -> &str {
+    agent
+        .model
+        .as_deref()
+        .map_or("", crate::picker::model_short)
 }
 
 /// A task's state dot, only while it runs or needs attention: a calm
 /// list carries no marks.
-fn task_dot(palette: Palette, agent: &UiAgent) -> View {
-    if agent.running() || agent.needs_attention() {
-        m3::list_dot(palette, agent.state)
-    } else {
-        View::empty()
-    }
+fn task_dot(palette: Palette, agent: &UiAgent) -> Option<View> {
+    (agent.running() || agent.needs_attention()).then(|| m3::list_dot(palette, agent.state))
 }
 
 /// The start of the local day, in ms since the epoch.
@@ -2624,5 +2692,41 @@ mod tests {
         // A repeated poll with the same rows never duplicates.
         merge_head_rows(&mut loaded, vec![row("a2", "new"), row("a3", "three")]);
         assert_eq!(ids(&loaded).len(), 3);
+    }
+
+    #[test]
+    fn sidebar_titles_keep_sixty_percent_and_models_stay_short() {
+        let gap = tokens::spacing::SM;
+        assert_eq!(row_text_width(tokens::layout::TREE_INDENT, 1), 188.0);
+        for depth in 0..4 {
+            for actions in 0..3 {
+                let width =
+                    row_text_width((depth as f64 + 1.0) * tokens::layout::TREE_INDENT, actions);
+                for (model, tag, dot) in [
+                    (true, false, false),
+                    (true, true, false),
+                    (true, true, true),
+                    (false, true, true),
+                    (true, false, true),
+                ] {
+                    let (model_width, tag_width) = trailing_widths(model, tag, dot, width);
+                    assert!(model_width <= tokens::layout::SIDEBAR_MODEL_WIDTH);
+                    let parts = [model_width, tag_width]
+                        .into_iter()
+                        .filter(|width| *width > 0.0)
+                        .count()
+                        + usize::from(dot);
+                    let trailing = model_width
+                        + tag_width
+                        + if dot { tokens::layout::DOT } else { 0.0 }
+                        + gap * parts.saturating_sub(1) as f64
+                        + gap;
+                    assert!(
+                        trailing <= width * TRAILING_SHARE + 1e-9,
+                        "depth {depth}, actions {actions}: {trailing} of {width}"
+                    );
+                }
+            }
+        }
     }
 }
