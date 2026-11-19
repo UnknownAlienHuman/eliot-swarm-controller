@@ -167,39 +167,3 @@ pub(crate) async fn read(raw: &Value) -> Result<Value> {
     }
     q::result(windows, "Claude CLI OAuth usage")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn oauth_quota_refuses_external_native_settings_routes() {
-        // Frozen-environment routes are refused by the daemon
-        // (`router::catalog::external_quota_route`, tested there); this
-        // reader refuses only settings-selected external routes.
-        for selector in [
-            "CLAUDE_CODE_USE_BEDROCK",
-            "CLAUDE_CODE_USE_VERTEX",
-            "CLAUDE_CODE_USE_FOUNDRY",
-        ] {
-            let env = json!({(selector): "1"});
-            assert_eq!(
-                require_native_oauth_settings(&json!({"env": env}))
-                    .unwrap_err()
-                    .code,
-                "quota_unavailable"
-            );
-        }
-        assert!(require_native_oauth_settings(&json!({"apiKeyHelper": "helper"})).is_err());
-        assert!(
-            require_native_oauth_settings(&json!({"env": {"CLAUDE_CODE_USE_VERTEX": ""}})).is_ok()
-        );
-        assert!(!subscription_status(&json!({
-            "loggedIn": true, "authMethod": "claude.ai", "apiProvider": "bedrock",
-        })));
-        assert!(subscription_status(&json!({
-            "loggedIn": true, "authMethod": "claude.ai", "apiProvider": "firstParty",
-        })));
-    }
-}

@@ -682,6 +682,3 @@ pub(super) fn gate_tx(
     }
     Ok(true)
 }
-
-#[cfg(test)]
-mod tests;

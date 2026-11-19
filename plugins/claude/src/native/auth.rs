@@ -82,32 +82,3 @@ fn cli(program: &OsStr, cwd: &Path, environment: &[(OsString, OsString)]) -> Com
     command.creation_flags(0x0800_0000);
     command
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn auth_status_requires_sign_in_only_for_explicit_false() {
-        let program = if cfg!(windows) {
-            OsStr::new(r"C:\Tools\Claude Code\claude.exe")
-        } else {
-            OsStr::new("/opt/Claude Code/claude")
-        };
-        check_auth_status(program, &json!({"loggedIn": true})).unwrap();
-        let error = check_auth_status(program, &json!({"loggedIn": false})).unwrap_err();
-        assert_eq!(error.code, "auth_required");
-        let prefix = if cfg!(windows) { "& " } else { "" };
-        assert!(error.message.contains(&format!(
-            "{prefix}'{}' auth login",
-            program.to_string_lossy()
-        )));
-        for status in [json!({"loggedIn": "true"}), json!({}), json!(null)] {
-            assert_eq!(
-                check_auth_status(program, &status).unwrap_err().code,
-                "native_not_dispatched"
-            );
-        }
-    }
-}

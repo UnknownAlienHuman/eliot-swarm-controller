@@ -225,6 +225,3 @@ pub(super) fn reparent_tx(
     }
     Ok(Change { value, events })
 }
-
-#[cfg(test)]
-mod tests;

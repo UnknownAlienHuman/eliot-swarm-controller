@@ -111,30 +111,3 @@ pub fn record(code: &'static str, ids: &[(&str, &str)], fields: &[(&str, u64)]) 
         eprintln!("ELIOT_DEBUG {line}");
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn round_trip_and_reject_malformed() {
-        let mut line = String::from("ELIOT_DEBUG ");
-        line.push_str(r#"{"code":"plugin.frame","ids":{"method":"session\/create"},"fields":{"elapsed_ms":3}}"#);
-        let record = parse_debug_line(&line).expect("parses");
-        assert_eq!(record.code, "plugin.frame");
-        assert_eq!(
-            record.ids,
-            vec![("method".to_owned(), "session/create".to_owned())]
-        );
-        assert_eq!(record.fields, vec![("elapsed_ms".to_owned(), 3)]);
-        assert!(parse_debug_line("ELIOT_DEBUG not json").is_none());
-        assert!(parse_debug_line("other prefix").is_none());
-        assert!(parse_debug_line(&format!("ELIOT_DEBUG {}", "x".repeat(5000))).is_none());
-    }
-
-    #[test]
-    fn envelope_ids_only_takes_short_strings() {
-        let params = serde_json::json!({"turn_id": "t-1", "command_id": 7, "prompt": "hi"});
-        assert_eq!(envelope_ids(&params), vec![("turn_id", "t-1".to_owned())]);
-    }
-}

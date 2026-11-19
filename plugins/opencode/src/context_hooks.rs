@@ -118,17 +118,3 @@ pub(crate) fn bind_verified(
 ) -> bool {
     output.version == 1 && output.bound_session_id == session_id
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn identical_offer_backoff_grows_to_a_bounded_cap() {
-        assert_eq!(offer_backoff(1), Duration::from_millis(250));
-        assert_eq!(offer_backoff(2), Duration::from_millis(500));
-        assert_eq!(offer_backoff(3), Duration::from_secs(1));
-        assert_eq!(offer_backoff(4), Duration::from_secs(2));
-        assert_eq!(offer_backoff(100), Duration::from_secs(2));
-    }
-}

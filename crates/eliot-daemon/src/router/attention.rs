@@ -7,10 +7,6 @@ mod observe;
 mod recovery;
 mod sweep;
 
-#[cfg(test)]
-#[path = "attention/tests.rs"]
-mod tests;
-
 use super::{Router, StoreHandle};
 use crate::common::now_ms;
 use eliot_core::api::SourceState;

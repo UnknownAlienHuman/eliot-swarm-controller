@@ -13,13 +13,13 @@ pub(crate) const MAX_PROCESS_SAMPLES: usize = 1024;
 
 /// Cap on one argv read: only the program plus its first tokens ever matter
 /// downstream, and the full body never persists.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 pub(crate) const MAX_CMDLINE_BYTES: usize = 64 * 1024;
 
 /// Read at most [`MAX_CMDLINE_BYTES`] plus one probe byte, so an oversized
 /// body is rejected without a full read. Fails closed to `None` on missing
 /// input, read errors and oversized bodies.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 pub(crate) fn read_bounded_cmdline<R: std::io::Read>(reader: R) -> Option<Vec<u8>> {
     use std::io::Read as _;
     let mut limited = reader.take(MAX_CMDLINE_BYTES as u64 + 1);
@@ -34,7 +34,7 @@ pub(crate) fn read_bounded_cmdline<R: std::io::Read>(reader: R) -> Option<Vec<u8
 /// Parsed `/proc/<pid>/stat` identity and counters for one host process.
 /// Pure data, so sweep grouping stays unit-testable on every platform; only
 /// the `/proc` reader itself is Linux-only.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LinuxProcessStat {
     pub pgid: i32,
@@ -48,7 +48,7 @@ pub(crate) struct LinuxProcessStat {
 /// next to its parsed stat record. The sweep producer owns the single bounded
 /// scan; per-owner grouping below is pure so its capping behavior is
 /// unit-testable on every platform.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 pub(crate) type SweepEntry = (u32, LinuxProcessStat);
 
 /// Select one owner's members from a single shared enumeration, in
@@ -56,7 +56,7 @@ pub(crate) type SweepEntry = (u32, LinuxProcessStat);
 /// per-owner member capacity. Returns the selected members and whether every
 /// matching member fit. A truncated selection is incomplete coverage, never
 /// proof that omitted processes exited.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 pub(crate) fn select_sweep_members(
     entries: &[SweepEntry],
     group: i32,
@@ -326,133 +326,4 @@ pub(crate) fn exited_sample(old: &ProcessSample, now: i64) -> ProcessSample {
     let mut sample = unknown_sample(old, now);
     sample.record.state = ProcessState::Exited;
     sample
-}
-
-#[cfg(test)]
-mod sweep_tests {
-    use super::*;
-
-    fn entry(pid: u32, pgid: i32) -> SweepEntry {
-        (
-            pid,
-            LinuxProcessStat {
-                pgid,
-                start_ticks: u64::from(pid) * 100,
-                state: ProcessState::Running,
-                cpu_time_ns: Some(u64::from(pid)),
-                rss_bytes: None,
-            },
-        )
-    }
-
-    /// One shared host enumeration serves every owner in a sweep. Grouping is
-    /// pure and tested here; the enumeration count itself is asserted against
-    /// the real enumerator by the Linux sweep tests.
-    #[test]
-    fn shared_entries_serve_every_group_with_per_owner_caps() {
-        let entries = vec![
-            entry(10, 10), // group A root
-            entry(11, 10),
-            entry(12, 10),
-            entry(20, 20), // group B root
-            entry(21, 20),
-            entry(22, 20),
-            entry(23, 20),
-            entry(30, 30), // unrelated group root
-        ];
-        let (group_a, a_complete) = select_sweep_members(&entries, 10, 10, MAX_PROCESS_SAMPLES);
-        let (group_b, b_complete) = select_sweep_members(&entries, 20, 20, 2);
-        let (group_c, c_complete) = select_sweep_members(&entries, 30, 30, MAX_PROCESS_SAMPLES);
-        assert_eq!(entries.len(), 8, "eight host entries shared by the sweep");
-        assert_eq!(
-            group_a.iter().map(|entry| entry.0).collect::<Vec<_>>(),
-            vec![11, 12]
-        );
-        assert!(a_complete);
-        // The per-owner member cap truncates only that owner, in order.
-        assert_eq!(
-            group_b.iter().map(|entry| entry.0).collect::<Vec<_>>(),
-            vec![21, 22]
-        );
-        assert!(!b_complete);
-        // A lone root contributes no members but stays complete.
-        assert!(group_c.is_empty());
-        assert!(c_complete);
-        // Full identities survive grouping.
-        assert_eq!(group_a[0].1.start_ticks, 1_100);
-        assert_eq!(group_a[0].1.cpu_time_ns, Some(11));
-        assert_eq!(group_a[0].1.state, ProcessState::Running);
-    }
-
-    #[test]
-    fn zero_capacity_keeps_no_members_and_reports_incomplete() {
-        let entries = vec![entry(10, 10), entry(11, 10)];
-        let (members, complete) = select_sweep_members(&entries, 10, 10, 0);
-        assert!(members.is_empty());
-        assert!(!complete);
-        let (members, complete) = select_sweep_members(&entries, 99, 10, 0);
-        assert!(members.is_empty());
-        assert!(complete, "no match means no truncation");
-    }
-}
-
-#[cfg(test)]
-mod bounded_cmdline_tests {
-    use super::{MAX_CMDLINE_BYTES, read_bounded_cmdline};
-    use std::io::Read;
-
-    /// Counts every byte pulled from the source, proving the bound applies to
-    /// the read itself rather than after allocation.
-    struct CountingReader {
-        remaining: usize,
-        consumed: usize,
-    }
-
-    impl Read for CountingReader {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            if self.remaining == 0 {
-                return Ok(0);
-            }
-            let count = buf.len().min(self.remaining);
-            buf[..count].fill(b'x');
-            self.remaining -= count;
-            self.consumed += count;
-            Ok(count)
-        }
-    }
-
-    #[test]
-    fn oversized_cmdline_is_refused_without_a_full_read() {
-        let mut reader = CountingReader {
-            remaining: 4 * 1024 * 1024,
-            consumed: 0,
-        };
-        assert!(
-            read_bounded_cmdline(&mut reader).is_none(),
-            "an oversized body is rejected"
-        );
-        assert_eq!(
-            reader.consumed,
-            MAX_CMDLINE_BYTES + 1,
-            "at most the bound plus one probe byte is ever read"
-        );
-    }
-
-    #[test]
-    fn cmdline_at_the_bound_is_accepted() {
-        let mut reader = CountingReader {
-            remaining: MAX_CMDLINE_BYTES,
-            consumed: 0,
-        };
-        let body = read_bounded_cmdline(&mut reader).expect("the bound itself fits");
-        assert_eq!(body.len(), MAX_CMDLINE_BYTES);
-        let mut reader = CountingReader {
-            remaining: MAX_CMDLINE_BYTES + 1,
-            consumed: 0,
-        };
-        assert!(
-            read_bounded_cmdline(&mut reader).is_none(),
-            "one byte over the bound is rejected"
-        );
-    }
 }

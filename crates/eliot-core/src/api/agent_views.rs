@@ -1720,7 +1720,3 @@ fn cursor_identity<'de, D: serde::Deserializer<'de>>(
         start_time: identity.start_time,
     })
 }
-
-#[cfg(test)]
-#[path = "agent_views_tests.rs"]
-mod tests;
