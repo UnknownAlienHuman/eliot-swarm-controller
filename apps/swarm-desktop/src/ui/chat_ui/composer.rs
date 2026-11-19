@@ -176,10 +176,14 @@ impl DesktopApp {
         context: &mut ViewContext<Self>,
         palette: Palette,
     ) -> View {
-        let model = detail.settings.next_model().unwrap_or("Default model");
+        let full = detail.settings.next_model().unwrap_or("Default model");
+        // The chip names the model as the header does ("qwen4-max · high");
+        // its accessible name keeps the full id.
+        let model = full;
         let effort = detail.settings.next_effort();
         let label = format!(
-            "{model} · {}",
+            "{} · {}",
+            crate::picker::model_short(full),
             effort.map_or("default effort", effort_label)
         );
         let name = format!(

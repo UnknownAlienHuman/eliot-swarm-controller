@@ -1054,6 +1054,11 @@ impl DesktopApp {
                     )),
             ));
         }
+        // The design's cards keep their width (a third of the home column);
+        // with no last task to continue, the two left stay centred.
+        let gap = tokens::spacing::INSET;
+        let card = (tokens::layout::HOME_WIDTH - 2.0 * gap) / 3.0;
+        let count = cards.len();
         StackPanel::new()
             .grid_row(1)
             .spacing(28.0)
@@ -1063,9 +1068,10 @@ impl DesktopApp {
             .children((
                 m3::page_title(greeting).horizontal_alignment(HorizontalAlignment::Center),
                 Grid::new()
-                    .width(tokens::layout::HOME_WIDTH)
-                    .columns([GridLength::STAR, GridLength::STAR, GridLength::STAR])
-                    .column_spacing(tokens::spacing::INSET)
+                    .width(count as f64 * card + count.saturating_sub(1) as f64 * gap)
+                    .horizontal_alignment(HorizontalAlignment::Center)
+                    .columns(vec![GridLength::STAR; count])
+                    .column_spacing(gap)
                     .keyed_children(cards),
             ))
     }

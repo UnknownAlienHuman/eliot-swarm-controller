@@ -330,7 +330,7 @@ fn part_view(
             };
             let glyph = match name.as_str() {
                 "Run command" => crate::m3::glyph::TERMINAL,
-                "Edit files" => crate::m3::glyph::EDIT,
+                edit if edit.starts_with("Edit") => crate::m3::glyph::EDIT,
                 _ => crate::m3::glyph::TOOLS,
             };
             let row = crate::m3::tool_row(palette, running)
@@ -448,14 +448,22 @@ pub fn item_view(
         .parts
         .iter()
         .map(|part| {
+            // A tool row is keyed by whether it runs: WinUI reads a button's
+            // colors only when its template is applied, so a finished row
+            // would keep the running tint.
+            let key = if matches!(part.kind, PartKind::Tools) && part.plain.contains(" · Running")
+            {
+                format!("{}:running", part.key)
+            } else {
+                part.key.clone()
+            };
             KeyedView::new(
-                part.key.clone(),
+                key,
                 StackPanel::new().spacing(tokens::spacing::XS).children((
                     part_view(part, expanded.contains(&part.key), callbacks, palette),
-                    if matches!(
-                        part.kind,
-                        PartKind::Input | PartKind::Progress | PartKind::Final
-                    ) {
+                    // The assistant's files are actions; the owner's own
+                    // message only names them.
+                    if matches!(part.kind, PartKind::Progress | PartKind::Final) {
                         path_actions(&part.key, &part.file_paths, callbacks, palette)
                     } else {
                         View::empty()

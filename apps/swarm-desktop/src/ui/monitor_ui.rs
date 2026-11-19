@@ -509,28 +509,11 @@ impl DesktopApp {
             self.monitor_search(context, palette),
         ));
         let tree = data.tree(now);
+        // The open task is selected in its own group (the design has no
+        // separate "current" block).
         let focused = self
             .selected_agent_id()
             .or_else(|| self.monitor.selected.clone());
-        if !filter.is_active()
-            && let Some(row) = focused.as_deref().and_then(|id| data.row(id))
-        {
-            let mut current = Vec::new();
-            self.monitor_rows(row, 0, Some(&tree), None, context, palette, &mut current);
-            items.push(KeyedView::new(
-                "current-task",
-                StackPanel::new().spacing(tokens::spacing::XS).children((
-                    m3::section_label("Current task").margin(Thickness::new(
-                        tokens::spacing::INSET,
-                        tokens::spacing::SM,
-                        0.0,
-                        0.0,
-                    )),
-                    StackPanel::new().keyed_children(current),
-                    m3::divider(palette),
-                )),
-            ));
-        }
         let (mut sections, showing_loaded) = if filter.is_active() {
             overview.list_for_filter(filter)
         } else {

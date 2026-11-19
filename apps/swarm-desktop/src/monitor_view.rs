@@ -79,9 +79,10 @@ pub fn list_row(
         Some(RowNote::Attention(text)) => {
             crate::m3::text(text.clone(), tokens::text::CAPTION).foreground(palette.attention())
         }
-        _ if look.working => {
-            crate::m3::secondary(row.model.clone().unwrap_or_else(|| harness.clone()))
-        }
+        _ if look.working => crate::m3::secondary(row.model.as_deref().map_or_else(
+            || harness.clone(),
+            |model| crate::picker::model_short(model).to_owned(),
+        )),
         _ => crate::m3::secondary(look.elapsed.to_owned()),
     };
     let content = Grid::new()
@@ -480,7 +481,7 @@ pub fn resource_views(monitor: &Monitor, id: &str, palette: Palette) -> Vec<Keye
                     rss_scale,
                     format!("scale 0–{}", bytes_label(Some(rss_scale as u64))),
                     "sum over the Agent's sampled processes, not host memory share".to_owned(),
-                    palette.attention(),
+                    palette.primary(),
                     palette,
                 ),
             ));

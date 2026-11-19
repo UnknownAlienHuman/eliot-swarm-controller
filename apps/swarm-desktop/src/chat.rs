@@ -1198,10 +1198,24 @@ impl Conversation {
                         ));
                     }
                     for row in rows {
-                        let name = match row.tool.as_str() {
-                            "commandExecution" => "Run command",
-                            "fileChange" => "Edit files",
-                            other => other,
+                        // An edit names its file ("Edited nav.rs"), as the
+                        // design's tool rows do; a command's text is not
+                        // retained, so it stays "Run command".
+                        let file = |path: &str| {
+                            std::path::Path::new(path)
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or(path)
+                                .to_owned()
+                        };
+                        let name = match (row.tool.as_str(), row.paths.as_slice()) {
+                            ("commandExecution", _) => "Run command".to_owned(),
+                            ("fileChange", []) => "Edit files".to_owned(),
+                            ("fileChange", [one]) => format!("Edited {}", file(one)),
+                            ("fileChange", [first, rest @ ..]) => {
+                                format!("Edited {} and {} more", file(first), rest.len())
+                            }
+                            (other, _) => other.to_owned(),
                         };
                         let status = match (row.done, row.status.as_deref()) {
                             (false, _) => "Running",

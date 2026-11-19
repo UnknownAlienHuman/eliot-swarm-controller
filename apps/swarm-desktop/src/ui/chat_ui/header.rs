@@ -234,13 +234,7 @@ impl DesktopApp {
             ))
             .content(
                 Grid::new()
-                    .columns([
-                        GridLength::Auto,
-                        GridLength::Auto,
-                        GridLength::STAR,
-                        GridLength::Auto,
-                        GridLength::Auto,
-                    ])
+                    .columns([GridLength::Auto, GridLength::Auto, GridLength::STAR])
                     .column_spacing(tokens::spacing::ROW)
                     .children((
                         m3::section_title(title.clone())
@@ -252,20 +246,26 @@ impl DesktopApp {
                             .grid_column(1)
                             .vertical_alignment(VerticalAlignment::Center)
                             .content(m3::status_pill(palette, tone, &pill)),
-                        m3::icon_button(palette)
-                            .grid_column(3)
-                            .automation_name(if details_open {
-                                "Hide details"
-                            } else {
-                                "Show details"
-                            })
-                            .on_click(
-                                context.message(Message::Shell(ShellMsg::PanelToggled(
-                                    Panel::Details,
-                                ))),
-                            )
-                            .content(m3::icon(m3::glyph::INFO)),
-                        Border::new().grid_column(4).content(menu),
+                        // Details and More, 2 DIPs apart at the right end.
+                        StackPanel::new()
+                            .grid_column(2)
+                            .orientation(Orientation::Horizontal)
+                            .spacing(tokens::spacing::ROW_GAP)
+                            .horizontal_alignment(HorizontalAlignment::Right)
+                            .vertical_alignment(VerticalAlignment::Center)
+                            .children((
+                                m3::icon_button(palette)
+                                    .automation_name(if details_open {
+                                        "Hide details"
+                                    } else {
+                                        "Show details"
+                                    })
+                                    .on_click(context.message(Message::Shell(
+                                        ShellMsg::PanelToggled(Panel::Details),
+                                    )))
+                                    .content(m3::icon(m3::glyph::INFO)),
+                                menu,
+                            )),
                     )),
             )
     }

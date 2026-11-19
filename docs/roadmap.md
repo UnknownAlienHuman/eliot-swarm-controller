@@ -471,34 +471,21 @@ of the explicitly selected release scope.
       count of each persisted lifecycle state in the caller's scope, native
       observed children included), alongside selected-Agent identity, usage
       and diagnosis. At most four
-      reads run concurrently. The panel opens on an overview drawn from that
-      same read: a state bar split in proportion to the live groups (Working in
-      primary, Needs attention in error, Idle in outline-variant), a legend
-      with their counts ("5 working · 1 needs attention · 3 idle"), and the
-      live Agents by project under the sidebar's project names, on one scale,
-      most working first, six rows then "N more projects". A segment, legend
-      item or project row filters the list to exactly the Agents it counts
-      (the filter shows as a chip with ×, one chip per line; a second click
-      clears it, and a complete refresh clears a group or project that has no
-      live Agent left, each on its own), by pointer or keyboard, each with an
-      accessible name ("Working: 5 of 9"); under High Contrast each segment
-      also carries its group's glyph. Every count takes nested workers by
-      their own state and never native subagents, so headline, bar, project
-      rows and the list's sections agree: a parent whose worker needs
-      attention stays in its own section and names the worker on its row.
-      When a live state's `state_totals` count exceeds its rows, the chart
-      says only that its counts are partial (those totals include native
-      children it leaves out, so it claims no number). The list groups Needs
+      reads run concurrently. The pane follows `Conversation.dc.html`:
+      Monitor and Details tabs with the close button, a pill search field
+      and a connected state filter (All, Working, Attention, Idle). The
+      list groups Needs
       attention (waiting, failed,
       lost, a controlled Agent in `unknown`, or an open `x.user.agent.attention`
       report read incrementally from the journal), Working, Idle and a collapsed
       Recently stopped (last 24 hours, its rows read every tenth refresh). Each
-      Agent is one row (status dot in its group's color, title, harness, and
-      for a working Agent the time since its last progress, the daemon's
-      `last_progress_at` over turns, messages, tools and requests, or "no
-      progress yet"; for any other the time since its record changed), with
-      a second line only for why it
-      needs attention or ended; native observed children nest collapsed under
+      Agent is one row under its group's label ("Working · 2"): status dot in
+      its group's color, title and one trailing word: what it needs, in the
+      attention color; for a working Agent its model; else how long it has
+      been quiet (the daemon's `last_progress_at` over turns, messages, tools
+      and requests, or the time since its record changed). Why it ended or
+      the task it runs under is in its tooltip and accessible name; native
+      observed children nest collapsed under
       their parent row and read as their activity, or "Ended with parent".
       Details carry what a row leaves out: what it does now, its tokens and
       CPU time, the daemon-reported sample age and TTL, coverage and clock
@@ -508,10 +495,9 @@ of the explicitly selected release scope.
       and deduplicated; CPU and memory are bar charts with the latest value and a
       labelled scale. Only the actions that apply are offered, bound at click time
       to the Agent, generation and turn shown: Interrupt, Stop, Force stop
-      (confirmed inline), Resume and, for observe-only Agents, Detach. A
-      search field (title, id, harness, model, project) and a state filter
-      (every state, Working, Needs attention, Idle, Stopped) narrow the list,
-      the recently stopped Agents included (k195 P3-2); the panel's
+      (confirmed inline), Resume and, for observe-only Agents, Detach. The
+      search (title, id, harness, model, project) narrows the list, the
+      recently stopped Agents included (k195 P3-2); the panel's
       Monitor/Details switch highlights the pane shown, however it opened.
       (Refs #407)
 - [x] **D4 Launch context, profiles and automation settings.** A new task
@@ -571,10 +557,10 @@ of the explicitly selected release scope.
       one tonal New task row (Ctrl+N), Search tasks (Ctrl+K: title, project and
       harness, through WinUI's AutoSuggestBox), Automations and Usage,
       collapsible projects with their Agents nested (manager, then workers,
-      collapsed), Recents, a fleet line that opens the monitor and says what
+      collapsed), a fleet line that opens the monitor and says what
       is live in at most two counts, so it is never cut off ("2 working · 1
       needs attention", "12 idle", "All quiet" when nothing is; every count
-      is its accessible name and the Monitor's legend), a separate "N need attention" row that lists Agents waiting
+      is its accessible name), a separate "N need attention" row that lists Agents waiting
       on a request, failed or lost ones, and controlled Agents in `unknown`
       (observe-only native children never count), and Settings. A project is a repository
       and nests one level (k142): Project → Subprojects (its linked worktrees) →
@@ -776,8 +762,7 @@ of the explicitly selected release scope.
       Swarm workers and observed native subagents nest under their parent in
       the monitor, collapsed, with their count and states ("22 workers · 2
       working"); a worker that needs attention is named on its parent's
-      row, which stays in its own section. Recents lists the newest top-level tasks
-      of collapsed projects, one per title; older tasks stay under "Show N
+      row, which stays in its own section. Older tasks stay under "Show N
       older" and chats under Chats. Delete
       follows the Store (stopped or failed trees, once drained); a lost task
       offers Resume or Archive instead. Bulk actions (k142) ask once, naming

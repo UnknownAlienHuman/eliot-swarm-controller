@@ -200,6 +200,23 @@ pub fn dot(fill: Brush) -> View {
 /// around it. Reactor 0.100.0's `FontIcon` has no font size (WinUI draws 20
 /// DIPs), so a `Viewbox` scales it.
 fn icon_sized(glyph: &str, size: f64) -> View {
+    // Stop is the composer's rounded square at the icons' optical weight
+    // (the font's solid square outweighs the stroke icons beside it).
+    if glyph == glyph::STOP {
+        return Border::new()
+            .width(size)
+            .height(size)
+            .vertical_alignment(VerticalAlignment::Center)
+            .content(
+                Border::new()
+                    .width(icon_size::STOP - 2.0)
+                    .height(icon_size::STOP - 2.0)
+                    .corner_radius(radius::STOP)
+                    .background(palette().text())
+                    .horizontal_alignment(HorizontalAlignment::Center)
+                    .vertical_alignment(VerticalAlignment::Center),
+            );
+    }
     Viewbox::new()
         .width(size)
         .height(size)
