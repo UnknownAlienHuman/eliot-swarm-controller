@@ -655,7 +655,7 @@ rotation or log loss leaves the unadmitted ID `not_found`.
 
 ## Storage
 
-Use bundled SQLite, WAL, synchronous FULL, one writer and bounded read queries. An
+Use bundled SQLite (built with `SQLITE_DEFAULT_MEMSTATUS=0`, set in `.cargo/config.toml`: its process-wide memory-statistics mutex otherwise serializes every allocation), WAL, synchronous FULL, one writer and bounded read queries. An
 uncertain commit outcome blocks new writes/dispatch and never repeats the external
 cause. Agent deletion also fences the writer if rollback cannot be verified. The SQL below
 is a compact view of current table shapes, not a migration script or a requirement to
