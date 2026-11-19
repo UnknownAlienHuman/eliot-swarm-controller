@@ -87,7 +87,7 @@ fn group_glyph(group: Group) -> &'static str {
 /// A group's mark in the legend: its chart-colored dot, or its glyph under
 /// High Contrast (the same one its bar segment shows).
 fn group_mark(palette: Palette, group: Group) -> View {
-    if palette.scheme().is_none() {
+    if palette.roles().is_none() {
         m3::icon(group_glyph(group))
     } else {
         m3::dot(palette.chart_fill(group_tone(group)))
@@ -549,11 +549,11 @@ impl DesktopApp {
 
         // Under High Contrast the glyph buttons have their own space,
         // even when the corresponding proportional segment is very small.
-        let marked = palette.scheme().is_none();
+        let marked = palette.roles().is_none();
         let bar_height = tokens::layout::STATE_BAR;
         let bar = if segments.is_empty() {
             // Nothing live: the empty track.
-            m3::bar_segment(palette.well(), bar_height)
+            m3::bar_segment(palette.container(), bar_height)
         } else if marked {
             let plot = m3::stacked_bar(
                 segments
@@ -879,7 +879,7 @@ impl DesktopApp {
                     format!("Some reads failed: {}", data.errors.join("; ")),
                     tokens::text::BODY,
                 )
-                .foreground(palette.error())
+                .foreground(palette.attention())
                 .text_wrapping(TextWrapping::Wrap),
             ));
         }
@@ -1093,7 +1093,7 @@ impl DesktopApp {
             sections.push(KeyedView::new(
                 "read-errors",
                 m3::secondary(format!("Some reads failed: {}", errors.join(" · ")))
-                    .foreground(palette.error())
+                    .foreground(palette.attention())
                     .text_wrapping(TextWrapping::Wrap),
             ));
         }

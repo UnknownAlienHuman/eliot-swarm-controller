@@ -78,7 +78,7 @@ pub fn list_row(
         Some(RowNote::Attention(text)) => (
             Some(
                 crate::m3::text(text.clone(), tokens::text::SECONDARY)
-                    .foreground(palette.error())
+                    .foreground(palette.attention())
                     .text_trimming(TextTrimming::CharacterEllipsis)
                     .into(),
             ),
@@ -261,7 +261,7 @@ fn chart_card(
                 None => Border::new()
                     .height(tokens::layout::PLOT_STUB)
                     .opacity(theme::MUTED_OPACITY)
-                    .background(palette.outline_variant()),
+                    .background(palette.outline()),
             };
             KeyedView::new(
                 index,
@@ -523,7 +523,7 @@ pub fn resource_views(monitor: &Monitor, id: &str, palette: Palette) -> Vec<Keye
                     rss_scale,
                     format!("scale 0–{}", bytes_label(Some(rss_scale as u64))),
                     "sum over the Agent's sampled processes, not host memory share".to_owned(),
-                    palette.tertiary(),
+                    palette.attention(),
                     palette,
                 ),
             ));

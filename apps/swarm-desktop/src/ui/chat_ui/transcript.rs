@@ -127,9 +127,12 @@ impl DesktopApp {
         let keys = Rc::clone(&self.chat.items);
         // A palette or width change re-realises the rows in the new colors
         // and at the new column width.
-        let palette_code = palette
-            .scheme()
-            .map_or(0, |scheme| 1 + u64::from(scheme.dark));
+        let palette_code = palette.roles().map_or(0, |roles| {
+            1 + crate::theme::Theme::ALL
+                .iter()
+                .position(|theme| *theme == roles.theme)
+                .unwrap_or_default() as u64
+        });
         let width_code = column.map_or(0, |width| width.round() as u64);
         // A toggle in an older virtualized turn must re-realize its card too.
         let expansion_code = self
@@ -234,7 +237,7 @@ impl DesktopApp {
                                 .content(m3::label("Answer")),
                         ));
                     }
-                    let (fill, on) = palette.attention();
+                    let (fill, on) = palette.status_chip(crate::theme::StatusTone::Attention);
                     KeyedView::new(
                         key,
                         Border::new()
@@ -414,14 +417,14 @@ pub(super) fn starting_view(
             Border::new()
                 .horizontal_alignment(HorizontalAlignment::Right)
                 .max_width(tokens::layout::READING_WIDTH * tokens::layout::BUBBLE_SHARE)
-                .background(palette.bubble())
+                .background(palette.container())
                 .corner_radius(tokens::radius::CONTAINER)
                 .padding(Thickness::xy(tokens::spacing::INSET, tokens::spacing::SM))
                 .automation_name(format!("You: {text}"))
                 .content(
                     TextBlock::new()
                         .text(text.to_owned())
-                        .foreground(palette.on_bubble())
+                        .foreground(palette.text())
                         .text_wrapping(TextWrapping::Wrap),
                 ),
             StackPanel::new()

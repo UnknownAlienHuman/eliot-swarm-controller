@@ -174,11 +174,12 @@ const ATTENTION_STATES: [eliot_core::AgentState; 6] = [
     eliot_core::AgentState::Unknown,
 ];
 
+/// WinUI's own templates and the title bar take the theme's polarity.
 fn window_theme(choice: ThemeChoice) -> WindowTheme {
     match choice {
         ThemeChoice::System => WindowTheme::System,
-        ThemeChoice::Light => WindowTheme::Light,
-        ThemeChoice::Dark => WindowTheme::Dark,
+        other if other.theme(false).dark() => WindowTheme::Dark,
+        _ => WindowTheme::Light,
     }
 }
 
@@ -196,8 +197,10 @@ impl Appearance {
         }
     }
 
-    pub(super) fn palette(&self) -> theme::winui::Palette {
-        theme::winui::Palette::new(self.dark, self.high_contrast)
+    /// The palette of `choice` on this window (System follows its
+    /// observed Light/Dark scheme).
+    pub(super) fn palette(&self, choice: ThemeChoice) -> theme::winui::Palette {
+        theme::winui::Palette::new(choice.theme(self.dark), self.high_contrast)
     }
 }
 
@@ -272,7 +275,9 @@ impl DesktopApp {
             ShellMsg::DaemonReady(result) => match result {
                 Ok((discovered, read)) => {
                     self.startup_error = false;
+                    let before = self.palette();
                     self.prefs = crate::settings::Preferences::from_reply(&read);
+                    self.palette_changed(before, context);
                     self.nav.collapsed = self.prefs.collapsed.iter().cloned().collect();
                     self.launch_preferences_loaded();
                     self.preferred_window = crate::settings::window(&read);
@@ -618,13 +623,7 @@ impl DesktopApp {
                 let before = self.palette();
                 self.appearance.dark = scheme == ColorScheme::Dark;
                 self.appearance.high_contrast = crate::accessibility::high_contrast_on();
-                if self.palette() != before {
-                    // The palette-keyed tree is rebuilt with new controls
-                    // (an empty search box among them).
-                    self.nav.search = Search::default();
-                    self.apply_scheme();
-                    self.reprime_fields(context);
-                }
+                self.palette_changed(before, context);
                 // The first observation colors the title bar even when the
                 // palette is the starting one.
                 self.sync_title_bar();
@@ -651,9 +650,12 @@ impl DesktopApp {
                 self.watch_high_contrast(context);
             }
             ShellMsg::ThemeChosen(theme) => {
+                let before = self.palette();
                 self.prefs.theme = theme;
                 self.prefs_rev += 1;
                 self.save_preferences(context);
+                // A theme of the same polarity raises no scheme change.
+                self.palette_changed(before, context);
             }
             ShellMsg::StartupChosen(startup) => {
                 self.prefs.startup = startup;
@@ -824,8 +826,23 @@ impl DesktopApp {
 
     /// Write the shown scheme's M3 roles at the application root (removed
     /// under High Contrast), before the palette-keyed tree is rebuilt.
+    /// Rebuild with the new palette when it differs from `before`.
+    pub(super) fn palette_changed(
+        &mut self,
+        before: theme::winui::Palette,
+        context: &ComponentContext<Self>,
+    ) {
+        if self.palette() != before {
+            // The palette-keyed tree is rebuilt with new controls (an empty
+            // search box among them).
+            self.nav.search = Search::default();
+            self.apply_scheme();
+            self.reprime_fields(context);
+        }
+    }
+
     fn apply_scheme(&mut self) {
-        if let Err(error) = crate::app_resources::apply_scheme(self.palette().scheme()) {
+        if let Err(error) = crate::app_resources::apply_scheme(self.palette().roles()) {
             self.set_status(format!("WinUI M3 resources not applied: {error}"));
         }
         self.sync_title_bar();
@@ -840,7 +857,7 @@ impl DesktopApp {
         if self.title_bar == Some(palette) {
             return;
         }
-        match crate::app_resources::apply_title_bar(palette.scheme()) {
+        match crate::app_resources::apply_title_bar(palette.roles()) {
             Ok(()) => self.title_bar = Some(palette),
             Err(error) => self.set_status(format!("Title bar colors not applied: {error}")),
         }
@@ -1574,7 +1591,7 @@ impl DesktopApp {
         // the new palette. Keying the tree by palette rebuilds the native
         // controls on a scheme switch (rare) so every button takes the new
         // overrides; all view state is model-bound and is redrawn as it was.
-        let palette_key = match palette.scheme() {
+        let palette_key = match palette.roles() {
             None => "high-contrast",
             Some(scheme) if scheme.dark => "dark",
             Some(_) => "light",
@@ -1761,7 +1778,7 @@ impl DesktopApp {
         {
             items.push(KeyedView::new(
                 format!("organization-error:{error}"),
-                detail_row(error, Some(palette.error())),
+                detail_row(error, Some(palette.attention())),
             ));
         }
         // The open Agent, explicitly above the list: visible even when it
@@ -2078,7 +2095,7 @@ impl DesktopApp {
                 ))
         } else if place.missing {
             m3::secondary("missing")
-                .foreground(palette.error())
+                .foreground(palette.attention())
                 .vertical_alignment(VerticalAlignment::Center)
                 .into()
         } else {

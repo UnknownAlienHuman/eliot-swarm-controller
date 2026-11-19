@@ -284,7 +284,7 @@ impl DesktopApp {
             .max_width(tokens::layout::READING_WIDTH)
             .horizontal_alignment(HorizontalAlignment::Center)
             .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
-            .background(palette.error_container())
+            .background(palette.attention_container())
             .corner_radius(tokens::radius::CONTAINER)
             .padding(Thickness::uniform(tokens::spacing::MD))
             .content(
@@ -297,7 +297,7 @@ impl DesktopApp {
                             .vertical_alignment(VerticalAlignment::Center)
                             .children((
                                 m3::section_title(format!("Force stop {title}?"))
-                                    .foreground(palette.on_error_container())
+                                    .foreground(palette.attention())
                                     .text_trimming(TextTrimming::CharacterEllipsis),
                                 m3::text(
                                     format!(
@@ -306,7 +306,7 @@ impl DesktopApp {
                                     ),
                                     tokens::text::SECONDARY,
                                 )
-                                .foreground(palette.on_error_container())
+                                .foreground(palette.attention())
                                 .text_wrapping(TextWrapping::Wrap),
                             )),
                         StackPanel::new()

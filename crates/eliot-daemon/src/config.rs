@@ -404,6 +404,10 @@ impl RoutingConfig {
 enum DesktopTheme {
     Light,
     Dark,
+    Amoled,
+    Purple,
+    Neon,
+    Matrix,
     #[default]
     System,
 }

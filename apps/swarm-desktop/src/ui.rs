@@ -367,7 +367,7 @@ struct DesktopApp {
 impl DesktopApp {
     /// The active M3 palette (system colors under High Contrast).
     fn palette(&self) -> theme::winui::Palette {
-        self.appearance.palette()
+        self.appearance.palette(self.prefs.theme)
     }
 
     fn submitting(&self) -> bool {
@@ -846,7 +846,7 @@ impl Component for DesktopApp {
             revealed: None,
         };
         // Before the first controls exist (see `app_resources::install`).
-        if let Err(error) = crate::app_resources::install(app.palette().scheme()) {
+        if let Err(error) = crate::app_resources::install(app.palette().roles()) {
             app.status = format!("WinUI M3 resources not applied: {error}");
         }
         if let Ok(data_dir) = app.data_dir.clone() {

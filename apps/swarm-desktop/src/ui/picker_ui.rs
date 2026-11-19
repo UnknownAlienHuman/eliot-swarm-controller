@@ -249,7 +249,7 @@ impl DesktopApp {
                         ))
                         .children((
                             m3::secondary(text.clone())
-                                .foreground(palette.error())
+                                .foreground(palette.attention())
                                 .vertical_alignment(VerticalAlignment::Center)
                                 .text_wrapping(TextWrapping::Wrap),
                             m3::text_button(palette)
@@ -316,6 +316,7 @@ impl DesktopApp {
             .automation_name("Models")
             .content(StackPanel::new().keyed_children(items));
         m3::lifted(
+            palette,
             crate::theme::elevation::Level::Two,
             tokens::radius::CONTAINER,
             Grid::new()
@@ -469,7 +470,7 @@ impl DesktopApp {
             Border::new()
                 .height(tokens::height::CHIP)
                 .corner_radius(tokens::height::CHIP / 2.0)
-                .background(palette.well())
+                .background(palette.container())
                 .vertical_alignment(VerticalAlignment::Center)
                 .content(
                     StackPanel::new()
@@ -485,7 +486,7 @@ impl DesktopApp {
             Border::new()
                 .height(tokens::height::CHIP)
                 .corner_radius(tokens::height::CHIP / 2.0)
-                .background(palette.well())
+                .background(palette.container())
                 .vertical_alignment(VerticalAlignment::Center)
                 .content(chip_text(label, &name).opacity(theme::MUTED_OPACITY))
         } else {
@@ -525,7 +526,7 @@ impl DesktopApp {
         Border::new()
             .corner_radius(tokens::radius::PILL)
             .background(if highlighted {
-                palette.highlight()
+                palette.selected()
             } else {
                 Brush::Solid(Color::transparent())
             })
@@ -564,8 +565,8 @@ impl DesktopApp {
                 .text_wrapping(TextWrapping::Wrap);
             let (title, description) = if warn {
                 (
-                    title.foreground(palette.warning()),
-                    description.foreground(palette.warning()),
+                    title.foreground(palette.attention()),
+                    description.foreground(palette.attention()),
                 )
             } else {
                 (title, description)
@@ -574,7 +575,7 @@ impl DesktopApp {
             let icon = m3::icon(access_glyph(access));
             let row = Button::new()
                 .resource_overrides(if warn {
-                    palette.warning_row()
+                    palette.attention_row()
                 } else {
                     palette.row(false)
                 })
@@ -620,7 +621,7 @@ impl DesktopApp {
                 Border::new()
                     .corner_radius(tokens::radius::PILL)
                     .background(if highlighted {
-                        palette.highlight()
+                        palette.selected()
                     } else {
                         Brush::Solid(Color::transparent())
                     })
@@ -631,6 +632,7 @@ impl DesktopApp {
             ));
         }
         m3::lifted(
+            palette,
             crate::theme::elevation::Level::Two,
             tokens::radius::CONTAINER,
             Grid::new()
@@ -668,7 +670,7 @@ impl DesktopApp {
                     Border::new()
                         .corner_radius(tokens::radius::PILL)
                         .background(if highlighted {
-                            palette.highlight()
+                            palette.selected()
                         } else {
                             Brush::Solid(Color::transparent())
                         })
@@ -701,6 +703,7 @@ impl DesktopApp {
                 context.callback(|text| Message::Launch(LaunchMsg::ProjectQuery(text))),
             );
         m3::lifted(
+            palette,
             crate::theme::elevation::Level::Two,
             tokens::radius::CONTAINER,
             Grid::new()
@@ -858,6 +861,7 @@ impl DesktopApp {
                 context.callback(|text| Message::Launch(LaunchMsg::ManageQuery(text))),
             );
         m3::lifted(
+            palette,
             crate::theme::elevation::Level::Two,
             tokens::radius::CONTAINER,
             Grid::new()

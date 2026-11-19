@@ -1,115 +1,130 @@
-//! The desktop's one shape, height, type, spacing and icon scale (owner
-//! review 2026-11-16 of the #530 build: "rounded in one place and square in
-//! another, huge in one place and tiny in another, the space is used
-//! inefficiently").
+//! The desktop's one size scale: the approved design (owner, 2026-11-19),
+//! `System.dc.html` of the eliot-design board. Codex layout and logic,
+//! Material 3 tactile style, compact desktop density, one 4-DIP grid.
 //!
-//! Every corner radius, control height, font size and weight, icon size and
-//! spacing value of the views comes from this module; `app_resources`
-//! writes the same values into the WinUI control styles, so a TextBox,
-//! ComboBox, menu or dialog takes them without a per-control property.
-//! Density is compact, as in the Codex app (32-DIP controls and rows, which
-//! is also WinUI's own default control height); color stays the Material 3
-//! roles of [`crate::theme`]. M3 shape tokens are themeable, so M3's pill
-//! buttons become the 8-DIP control shape here.
-//!
-//! The M3 type-scale names map onto the four styles: headline and
-//! title-large are [`text::PAGE_TITLE`], title-medium and title-small
-//! [`text::SECTION_TITLE`], body-large and body-medium [`text::BODY`],
-//! label-large (buttons, chips) [`text::BUTTON`], body-small and the small
-//! labels [`text::SECONDARY`]; one family, the system's Segoe UI Variable.
+//! Every corner radius, height, type role, spacing, icon size, width and
+//! motion duration of the views comes from this module; `app_resources`
+//! writes the same values into the WinUI control styles. Touch comfort
+//! comes from hit areas, never from bigger visuals; tactility is the
+//! state layers, ripple, elevation and motion of `crate::theme`.
 
-/// Corner radii, the Material 3 shape scale: everything pressed is a pill,
-/// everything typed into is a small rounded rectangle, containers are
-/// medium, the composer large and dialogs extra-large.
+/// Shape: full for everything pressed (half the height), 12 for cards and
+/// tool rows, 20 for the composer, 28 for dialogs.
 pub mod radius {
-    /// Everything pressed: buttons, icon buttons, chips, segments,
-    /// dropdowns, list and navigation selection: M3 full, half the control
-    /// height. (WinUI clamps an oversized radius per axis, so a larger
-    /// value draws a wide button as an ellipse: observed live.) A shorter
-    /// pill uses half its own height.
+    /// A 32-DIP control, row or selection: full.
     pub const PILL: f64 = super::height::CONTROL / 2.0;
-    /// Text fields (M3 small).
-    pub const FIELD: f64 = 8.0;
-    /// Containers: cards, menus, popovers, the Details sections, message
-    /// bubbles and code blocks (M3 medium).
+    /// A 28-DIP chip or segment: full.
+    pub const CHIP: f64 = super::height::CHIP / 2.0;
+    /// The 36-DIP FAB: a circle.
+    pub const FAB: f64 = super::height::FAB / 2.0;
+    /// The header's 24-DIP status pill: full.
+    pub const BADGE: f64 = super::height::BADGE / 2.0;
+    /// Cards, tool rows, suggestion cards, menus and popovers, the
+    /// Details sections, code blocks.
     pub const CONTAINER: f64 = 12.0;
-    /// The composer (M3 large).
-    pub const COMPOSER: f64 = 16.0;
-    /// Dialogs (M3 extra-large).
+    /// Text fields that are not pills (forms, source editors).
+    pub const FIELD: f64 = 12.0;
+    /// The composer.
+    pub const COMPOSER: f64 = 20.0;
+    /// Dialogs.
     pub const DIALOG: f64 = 28.0;
-    /// The Stop square inside it (Material's stop icon).
+    /// A message bubble's corners, and the corner by its sender.
+    pub const BUBBLE: f64 = 18.0;
+    pub const BUBBLE_TAIL: f64 = 4.0;
+    /// The Stop square inside the FAB.
     pub const STOP: f64 = 3.0;
-    /// Check boxes keep the M3 default corner.
+    /// Check boxes keep the M3 corner.
     pub const CHECK_BOX: f64 = 2.0;
 }
 
-/// Heights in DIPs (Material density, touch-sized).
+/// Heights in DIPs: Material 3's desktop density, as compact as Codex.
 pub mod height {
-    /// Every control (button, chip, text field, dropdown, number box) and
-    /// every list or navigation row: Material's 40-DIP button, touch-sized.
-    pub const CONTROL: f64 = 40.0;
-    /// A form row: its label and its 40-DIP control.
-    pub const FORM_ROW: f64 = 48.0;
-    /// A sidebar sub-row: a task under its project, Recents and "No tasks".
-    pub const SUB_ROW: f64 = 36.0;
-    /// A picker row with a supporting line under its title (the move
-    /// picker's tasks).
-    pub const TWO_LINE_ROW: f64 = 56.0;
-    /// A compact chip inside a row: the model picker's effort chip and the
-    /// highlighted row's effort segment.
-    pub const CHIP: f64 = 24.0;
-    /// The composer's trailing button (Send, Stop, Steer): Material's small
-    /// FAB, a touch-sized circle.
-    pub const FAB: f64 = 40.0;
+    /// Buttons, fields, every list and nav row, nested ones included.
+    pub const CONTROL: f64 = 32.0;
+    /// A sidebar row under its project (same height as every row).
+    pub const SUB_ROW: f64 = CONTROL;
+    /// Chips and segments.
+    pub const CHIP: f64 = 28.0;
+    /// The composer's Send, Stop and Steer.
+    pub const FAB: f64 = 36.0;
+    /// The conversation header.
+    pub const HEADER: f64 = 52.0;
+    /// The sidebar's title row.
+    pub const TITLE_ROW: f64 = 40.0;
+    /// The header's status pill.
+    pub const BADGE: f64 = 24.0;
+    /// A form row: its label and its 32-DIP control.
+    pub const FORM_ROW: f64 = 40.0;
+    /// A picker row with a supporting line under its title.
+    pub const TWO_LINE_ROW: f64 = 48.0;
 }
 
-/// Native aliases of the shared Material 3 type scale.
+/// The design's type roles.
 pub mod text {
     pub use crate::theme::typography::{
-        BODY, LABEL as SECONDARY, LABEL_LARGE as BUTTON, TITLE_LARGE as PAGE_TITLE,
-        TITLE_MEDIUM as SECTION_TITLE, TypeStyle,
+        BODY, BUTTON, CAPTION, CAPTION as SECONDARY, CHIP, HEADER, HEADER as SECTION_TITLE,
+        HERO, HERO as PAGE_TITLE, LABEL, TITLE, TypeStyle,
     };
 }
 
-/// The 4/8 spacing grid in DIPs.
+/// The 4-DIP grid in DIPs.
 pub mod spacing {
+    /// Between rows in the sidebar.
+    pub const ROW_GAP: f64 = 2.0;
     /// The half step: stacked text lines.
     pub const XS: f64 = 4.0;
-    /// Inside a group: between rows, a glyph and its label, buttons.
+    /// Inside a group: between chips, a glyph and its label.
     pub const SM: f64 = 8.0;
-    /// The content inset of a control or row (a button label's sides, a
-    /// row's icon or text from its highlight edge).
+    /// A row's inset from its pill and the gap from its icon to its label
+    /// ("every sidebar row starts its icon at 10 DIP inside an 8-DIP
+    /// gutter").
+    pub const ROW: f64 = 10.0;
+    /// The content inset of a control, card or menu.
     pub const INSET: f64 = 12.0;
     /// Between groups.
     pub const MD: f64 = 16.0;
-    /// Page padding.
+    /// The conversation's side padding, page padding.
     pub const LG: f64 = 24.0;
+    /// The main area's side padding.
+    pub const XL: f64 = 32.0;
 }
 
-/// Icon sizes in DIPs, all Segoe Fluent Icons (one stroke family): 16 next
-/// to a label, 20 alone in a button, 12 for a dropdown's chevron.
+/// Icon sizes in DIPs, all Segoe Fluent Icons (one stroke family).
 pub mod icon {
-    /// In rows, chips and buttons with a label.
-    pub const ROW: f64 = 16.0;
-    /// Alone in a button: icon buttons, the headers' tools, the composer's
-    /// trailing button.
-    pub const TOOLBAR: f64 = 20.0;
-    /// A dropdown's chevron (WinUI's ComboBox draws it at 12).
-    pub const CHEVRON: f64 = 12.0;
-    /// The Stop square in the composer's trailing button.
-    pub const STOP: f64 = 14.0;
+    /// In rows and icon buttons.
+    pub const ROW: f64 = 18.0;
+    /// In chips, tool rows and fields.
+    pub const SMALL: f64 = 16.0;
+    /// A chip's or row's chevron.
+    pub const CHEVRON: f64 = 14.0;
+    /// The Stop square in the FAB.
+    pub const STOP: f64 = 12.0;
+}
+
+/// The design's motion: emphasized easing, 150 ms for states, 250 ms for a
+/// popover's entrance (a fade and a 4-DIP rise).
+pub mod motion {
+    pub const STATE_MS: u64 = 150;
+    pub const POPOVER_MS: u64 = 250;
+    pub const POPOVER_RISE: f64 = 4.0;
 }
 
 /// Widths and the few fixed sizes of the shell.
 pub mod layout {
     /// The sidebar, and the Settings navigation that replaces it.
-    pub const SIDEBAR_WIDTH: f64 = 280.0;
-    /// The Details and monitor panel.
-    pub const PANEL_WIDTH: f64 = 360.0;
-    /// The conversation's reading column and the composer.
-    pub const READING_WIDTH: f64 = 760.0;
+    pub const SIDEBAR_WIDTH: f64 = 264.0;
+    /// The sidebar's side gutter.
+    pub const SIDEBAR_GUTTER: f64 = 8.0;
+    /// The sidebar's top and bottom padding.
+    pub const SIDEBAR_PADDING: f64 = 12.0;
+    /// The Monitor and Details pane.
+    pub const PANEL_WIDTH: f64 = 320.0;
+    /// The conversation's column and its composer.
+    pub const READING_WIDTH: f64 = 720.0;
+    /// The home screen's composer and suggestions.
+    pub const HOME_WIDTH: f64 = 760.0;
     /// The Settings content, centred.
-    pub const SETTINGS_WIDTH: f64 = 840.0;
+    pub const SETTINGS_WIDTH: f64 = 720.0;
     /// The label column of every form.
     pub const LABEL_WIDTH: f64 = 200.0;
     /// An enum dropdown ("low", "never", a role).
@@ -118,15 +133,18 @@ pub mod layout {
     pub const NUMBER_WIDTH: f64 = 120.0;
     /// The composer's folder field (a new task outside the projects).
     pub const FOLDER_WIDTH: f64 = 280.0;
-    /// The indent of a task under its project (and per worker level).
-    pub const TREE_INDENT: f64 = 24.0;
+    /// A nested row's indent (a task under its project, a worker under its
+    /// manager): its label starts under its parent's label.
+    pub const TREE_INDENT: f64 = 28.0;
     /// What runs an Agent (`Codex · qwen4-max`) at most in a Monitor row or
     /// the conversation header; a longer label trims.
-    pub const RUNS_LABEL_WIDTH: f64 = 160.0;
-    /// A sidebar row's short model (`qwen4-max`) at most; it trims past it.
-    pub const SIDEBAR_MODEL_WIDTH: f64 = 80.0;
+    pub const RUNS_LABEL_WIDTH: f64 = 200.0;
+    /// A sidebar row's trailing note (a model, an age) at most.
+    pub const SIDEBAR_MODEL_WIDTH: f64 = 72.0;
     /// The composer's field grows with its text up to this height.
     pub const COMPOSER_MAX_HEIGHT: f64 = 200.0;
+    /// The composer's field below its first line (the design's 44 DIP).
+    pub const COMPOSER_MIN_HEIGHT: f64 = 44.0;
     /// A multiline source editor (TOML, JSON, a script).
     pub const SOURCE_MIN_HEIGHT: f64 = 240.0;
     pub const SOURCE_MAX_HEIGHT: f64 = 420.0;
@@ -134,8 +152,10 @@ pub mod layout {
     pub const DIALOG_MAX_HEIGHT: f64 = 520.0;
     /// A dropdown inside the hand-off dialog.
     pub const DIALOG_PICKER_WIDTH: f64 = 136.0;
-    /// A status dot.
+    /// A status dot in a row.
     pub const DOT: f64 = 8.0;
+    /// The dot of the header's status pill.
+    pub const BADGE_DOT: f64 = 6.0;
     /// Dividers.
     pub const HAIRLINE: f64 = 1.0;
     /// The indeterminate progress bar of a running turn.
@@ -147,7 +167,7 @@ pub mod layout {
     pub const PLOT_GAP: f64 = 1.0;
     /// The Monitor's state bar, a project's bar, and the surface gap
     /// between two segments of a stacked bar.
-    pub const STATE_BAR: f64 = 12.0;
+    pub const STATE_BAR: f64 = 8.0;
     /// A High Contrast state filter button has room for its glyph.
     pub const STATE_FILTER_HEIGHT: f64 = 20.0;
     pub const STATE_FILTER_MIN_WIDTH: f64 = 24.0;
@@ -164,9 +184,7 @@ pub mod layout {
     /// First window client size; the user resizes freely after.
     pub const WINDOW_WIDTH: f64 = 1440.0;
     pub const WINDOW_HEIGHT: f64 = 900.0;
-    /// The model picker above the composer: the widest catalogue name
-    /// (about 230 DIPs, "Gemini 3.1 Pro Preview Custom Tools") still fits
-    /// beside the highlighted row's six-step effort segment and star.
+    /// The model picker above the composer.
     pub const PICKER_WIDTH: f64 = 600.0;
     /// The composer's project chip trims a long project name past this
     /// width.
@@ -178,12 +196,10 @@ pub mod layout {
     /// The check column of a popover row.
     pub const CHECK_COLUMN: f64 = 16.0;
     /// A switch's pill: WinUI's ToggleSwitch template keeps a 154-DIP
-    /// content area after it (a StaticResource minimum), so a bare switch
-    /// is sized to the pill and ends flush with its row.
+    /// content area after it, so a bare switch is sized to the pill.
     pub const SWITCH_WIDTH: f64 = 40.0;
     /// A quota ring (Models & Usage).
     pub const RING: f64 = 16.0;
-    /// The composer's usage ring (Material's determinate circular
-    /// indicator at the icon size of a toolbar).
-    pub const USAGE_RING: f64 = 20.0;
+    /// The composer's usage ring.
+    pub const USAGE_RING: f64 = 22.0;
 }

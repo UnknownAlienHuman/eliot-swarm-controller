@@ -1048,7 +1048,7 @@ impl DesktopApp {
                     .max_width(tokens::layout::READING_WIDTH)
                     .horizontal_alignment(HorizontalAlignment::Center)
                     .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
-                    .background(palette.card())
+                    .background(palette.tonal())
                     .corner_radius(tokens::radius::CONTAINER)
                     .padding(Thickness::new(
                         tokens::spacing::MD,

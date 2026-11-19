@@ -89,7 +89,7 @@ impl DesktopApp {
                                     &note,
                                     if missing {
                                         m3::secondary("missing")
-                                            .foreground(palette.error())
+                                            .foreground(palette.attention())
                                             .vertical_alignment(VerticalAlignment::Center)
                                             .into()
                                     } else {

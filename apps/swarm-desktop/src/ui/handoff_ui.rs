@@ -1139,7 +1139,7 @@ impl DesktopApp {
                 .spacing(tokens::spacing::XS)
                 .vertical_alignment(VerticalAlignment::Center)
                 .children((
-                    small(refusal.clone()).foreground(palette.error()),
+                    small(refusal.clone()).foreground(palette.attention()),
                     small(summary),
                 )),
             None => small(summary)
@@ -1286,7 +1286,7 @@ fn child_preview(command: &Command) -> String {
 
 /// Options under a radio button line up with its label (WinUI's 20-DIP
 /// radio glyph and its 8-DIP gap).
-const RADIO_INDENT: f64 = tokens::icon::TOOLBAR + tokens::spacing::SM;
+const RADIO_INDENT: f64 = tokens::icon::ROW + tokens::spacing::SM;
 
 fn heading(text: &str) -> TextBlock {
     m3::section_title(text.to_owned()).margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))

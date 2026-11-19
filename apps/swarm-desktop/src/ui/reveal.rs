@@ -261,7 +261,7 @@ impl DesktopApp {
     pub(super) fn reveal_note(&self, item: &str, palette: Palette) -> View {
         match &self.revealed {
             Some((failed, note)) if failed == item => m3::secondary(note.clone())
-                .foreground(palette.error())
+                .foreground(palette.attention())
                 .text_wrapping(TextWrapping::Wrap)
                 .is_text_selection_enabled(true)
                 .into(),

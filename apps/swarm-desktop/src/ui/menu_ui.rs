@@ -1326,7 +1326,7 @@ impl DesktopApp {
             .enumerate()
             .map(|(index, (action, label, glyph, destructive))| {
                 let text = if destructive {
-                    m3::body(label.clone()).foreground(palette.error())
+                    m3::body(label.clone()).foreground(palette.attention())
                 } else {
                     m3::body(label.clone())
                 };
@@ -1356,6 +1356,7 @@ impl DesktopApp {
                     context.callback(|_: PointerEventInfo| Message::Menu(MenuMsg::Closed)),
                 ),
             m3::lifted(
+                palette,
                 crate::theme::elevation::Level::Two,
                 tokens::radius::CONTAINER,
                 Grid::new()
@@ -1434,7 +1435,7 @@ impl DesktopApp {
         let title = format!("Stop and delete “{}”", self.agent_label(&removal.agent));
         let status: View = match &removal.error {
             Some(error) => m3::body(error.clone())
-                .foreground(palette.error())
+                .foreground(palette.attention())
                 .text_wrapping(TextWrapping::Wrap)
                 .is_text_selection_enabled(true)
                 .into(),
@@ -1494,7 +1495,7 @@ impl DesktopApp {
                 .max_width(tokens::layout::READING_WIDTH)
                 .horizontal_alignment(HorizontalAlignment::Center)
                 .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
-                .background(palette.card())
+                .background(palette.tonal())
                 .corner_radius(tokens::radius::CONTAINER)
                 .padding(Thickness::new(
                     tokens::spacing::MD,

@@ -67,7 +67,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use windows_sys::core::BOOL;
 
 use crate::theme::elevation::Level;
-use crate::theme::{Rgb8, Scheme, state};
+use crate::theme::{Rgb8, Roles, Theme, state};
 use crate::ui::tokens::{height, radius, spacing};
 
 /// A theme resource value.
@@ -92,7 +92,7 @@ fn layer(color: Rgb8, opacity: f64) -> Value {
 }
 
 /// A brush WinUI draws as nothing.
-fn clear(s: &Scheme) -> Value {
+fn clear(s: &Roles) -> Value {
     Value::Brush(s.surface, 0)
 }
 
@@ -111,8 +111,9 @@ fn every(keys: &[&'static str], value: Value) -> Vec<(&'static str, Value)> {
 }
 
 /// The WinUI keys this window sets for one color scheme, with their values.
-pub fn entries(s: &Scheme) -> Vec<(&'static str, Value)> {
+pub fn entries(s: &Roles) -> Vec<(&'static str, Value)> {
     let mut all = accent(s);
+    all.extend(lift(s));
     all.extend(buttons(s));
     all.extend(lists(s));
     all.extend(text_field(s));
@@ -122,8 +123,31 @@ pub fn entries(s: &Scheme) -> Vec<(&'static str, Value)> {
     all
 }
 
+/// The brushes of the templates' drawn lift (`templates::LIFT_KEY` and
+/// friends): each shadow layer at its share of the theme's key and ambient
+/// opacity, the ring of the true-black themes, the night themes' glow.
+fn lift(s: &Roles) -> Vec<(&'static str, Value)> {
+    use crate::theme::Lift;
+    use crate::theme::elevation::STEPS;
+    let black = Rgb8::new(0, 0, 0);
+    let share = |opacity: f64| layer(black, opacity / STEPS as f64);
+    let (key, ambient, ring) = match s.lift {
+        Lift::Shadow { key, ambient } => (share(key), share(ambient), clear(s)),
+        Lift::Ring(color) => (clear(s), clear(s), opaque(color)),
+    };
+    let glow = s.glow.map_or(clear(s), |glow| {
+        layer(glow.color, glow.alpha / STEPS as f64)
+    });
+    vec![
+        (templates::LIFT_KEY, key),
+        (templates::LIFT_AMBIENT, ambient),
+        (templates::LIFT_RING, ring),
+        (templates::GLOW, glow),
+    ]
+}
+
 /// The accent ramp and accent fills (checked boxes, progress, selection).
-fn accent(s: &Scheme) -> Vec<(&'static str, Value)> {
+fn accent(s: &Roles) -> Vec<(&'static str, Value)> {
     let [dark3, dark2, dark1, light1, light2, light3] = s.accent_ramp;
     vec![
         // Older brushes and templates read these colors.
@@ -167,14 +191,14 @@ fn accent(s: &Scheme) -> Vec<(&'static str, Value)> {
         ("ProgressRingForegroundThemeBrush", opaque(s.primary)),
         (
             "ProgressRingBackgroundThemeBrush",
-            opaque(s.surface_container_highest),
+            opaque(s.container),
         ),
         // The M3 focus indicator: secondary, on the surface.
-        ("FocusStrokeColorOuter", Value::Color(s.secondary)),
+        ("FocusStrokeColorOuter", Value::Color(s.primary)),
         ("FocusStrokeColorInner", Value::Color(s.surface)),
-        ("FocusStrokeColorOuterBrush", opaque(s.secondary)),
+        ("FocusStrokeColorOuterBrush", opaque(s.primary)),
         ("FocusStrokeColorInnerBrush", opaque(s.surface)),
-        ("SystemControlFocusVisualPrimaryBrush", opaque(s.secondary)),
+        ("SystemControlFocusVisualPrimaryBrush", opaque(s.primary)),
         ("SystemControlFocusVisualSecondaryBrush", opaque(s.surface)),
     ]
 }
@@ -182,7 +206,7 @@ fn accent(s: &Scheme) -> Vec<(&'static str, Value)> {
 /// Buttons without a family (inside dialogs): the M3 text button, and
 /// WinUI's AccentButtonStyle as the M3 filled button. The shape is the
 /// button's style.
-fn buttons(s: &Scheme) -> Vec<(&'static str, Value)> {
+fn buttons(s: &Roles) -> Vec<(&'static str, Value)> {
     let mut all = vec![
         ("ButtonBackground", clear(s)),
         (
@@ -193,7 +217,7 @@ fn buttons(s: &Scheme) -> Vec<(&'static str, Value)> {
         ("ButtonBackgroundDisabled", clear(s)),
         (
             "ButtonForegroundDisabled",
-            layer(s.on_surface, state::DISABLED_CONTENT),
+            layer(s.text, state::DISABLED_CONTENT),
         ),
         ("AccentButtonBackground", opaque(s.primary)),
         (
@@ -206,11 +230,11 @@ fn buttons(s: &Scheme) -> Vec<(&'static str, Value)> {
         ),
         (
             "AccentButtonBackgroundDisabled",
-            layer(s.on_surface, state::DISABLED_CONTAINER),
+            layer(s.text, state::DISABLED_CONTAINER),
         ),
         (
             "AccentButtonForegroundDisabled",
-            layer(s.on_surface, state::DISABLED_CONTENT),
+            layer(s.text, state::DISABLED_CONTENT),
         ),
     ];
     all.extend(every(
@@ -243,17 +267,15 @@ fn buttons(s: &Scheme) -> Vec<(&'static str, Value)> {
 
 /// List selection: the secondary-container row with a primary indicator,
 /// and on-surface state layers on hover and press.
-fn lists(s: &Scheme) -> Vec<(&'static str, Value)> {
-    let selected_hover = s
-        .secondary_container
-        .mix(s.on_secondary_container, state::HOVER);
-    let selected_pressed = s
-        .secondary_container
-        .mix(s.on_secondary_container, state::PRESSED);
+fn lists(s: &Roles) -> Vec<(&'static str, Value)> {
+    let selected_hover = s.selected
+        .mix(s.text, state::HOVER);
+    let selected_pressed = s.selected
+        .mix(s.text, state::PRESSED);
     let mut all = vec![
         (
             "ListViewItemBackgroundSelected",
-            opaque(s.secondary_container),
+            opaque(s.selected),
         ),
         (
             "ListViewItemBackgroundSelectedPointerOver",
@@ -265,11 +287,11 @@ fn lists(s: &Scheme) -> Vec<(&'static str, Value)> {
         ),
         (
             "ListViewItemBackgroundPointerOver",
-            layer(s.on_surface, state::HOVER),
+            layer(s.text, state::HOVER),
         ),
         (
             "ListViewItemBackgroundPressed",
-            layer(s.on_surface, state::PRESSED),
+            layer(s.text, state::PRESSED),
         ),
     ];
     all.extend(every(
@@ -278,7 +300,7 @@ fn lists(s: &Scheme) -> Vec<(&'static str, Value)> {
             "ListViewItemForegroundSelectedPointerOver",
             "ListViewItemForegroundSelectedPressed",
         ],
-        opaque(s.on_secondary_container),
+        opaque(s.text),
     ));
     all.extend(every(
         &[
@@ -293,38 +315,38 @@ fn lists(s: &Scheme) -> Vec<(&'static str, Value)> {
 
 /// The text box as an M3 outlined text field: no fill, an outline that
 /// darkens on hover and becomes a 2-DIP primary line when focused.
-fn text_field(s: &Scheme) -> Vec<(&'static str, Value)> {
+fn text_field(s: &Roles) -> Vec<(&'static str, Value)> {
     let mut all = vec![
-        ("TextControlBorderBrush", opaque(s.outline)),
-        ("TextControlBorderBrushPointerOver", opaque(s.on_surface)),
+        ("TextControlBorderBrush", opaque(s.border)),
+        ("TextControlBorderBrushPointerOver", opaque(s.text)),
         ("TextControlBorderBrushFocused", opaque(s.primary)),
         (
             "TextControlBorderBrushDisabled",
-            layer(s.on_surface, state::DISABLED_CONTAINER),
+            layer(s.text, state::DISABLED_CONTAINER),
         ),
-        ("TextControlElevationBorderBrush", opaque(s.outline)),
+        ("TextControlElevationBorderBrush", opaque(s.border)),
         ("TextControlElevationBorderFocusedBrush", opaque(s.primary)),
         (
             "TextControlForegroundDisabled",
-            layer(s.on_surface, state::DISABLED_CONTENT),
+            layer(s.text, state::DISABLED_CONTENT),
         ),
         (
             "TextControlPlaceholderForegroundDisabled",
-            layer(s.on_surface, state::DISABLED_CONTENT),
+            layer(s.text, state::DISABLED_CONTENT),
         ),
-        ("TextControlHeaderForeground", opaque(s.on_surface_variant)),
+        ("TextControlHeaderForeground", opaque(s.variant)),
         (
             "TextControlHeaderForegroundDisabled",
-            layer(s.on_surface, state::DISABLED_CONTENT),
+            layer(s.text, state::DISABLED_CONTENT),
         ),
         ("TextControlSelectionHighlightColor", opaque(s.primary)),
         (
             "TextControlButtonBackgroundPointerOver",
-            layer(s.on_surface, state::HOVER),
+            layer(s.text, state::HOVER),
         ),
         (
             "TextControlButtonBackgroundPressed",
-            layer(s.on_surface, state::PRESSED),
+            layer(s.text, state::PRESSED),
         ),
         ("TextControlBorderThemeThickness", uniform(1.0)),
         ("TextControlBorderThemeThicknessFocused", uniform(2.0)),
@@ -348,7 +370,7 @@ fn text_field(s: &Scheme) -> Vec<(&'static str, Value)> {
             "TextControlForegroundPointerOver",
             "TextControlForegroundFocused",
         ],
-        opaque(s.on_surface),
+        opaque(s.text),
     ));
     all.extend(every(
         &[
@@ -359,69 +381,67 @@ fn text_field(s: &Scheme) -> Vec<(&'static str, Value)> {
             "TextControlButtonForegroundPointerOver",
             "TextControlButtonForegroundPressed",
         ],
-        opaque(s.on_surface_variant),
+        opaque(s.variant),
     ));
     all
 }
 
 /// The combo box as an M3 exposed dropdown menu: the outlined field, and a
 /// menu on surface-container whose selected item is secondary-container.
-fn dropdown(s: &Scheme) -> Vec<(&'static str, Value)> {
-    let selected_hover = s
-        .secondary_container
-        .mix(s.on_secondary_container, state::HOVER);
-    let selected_pressed = s
-        .secondary_container
-        .mix(s.on_secondary_container, state::PRESSED);
+fn dropdown(s: &Roles) -> Vec<(&'static str, Value)> {
+    let selected_hover = s.selected
+        .mix(s.text, state::HOVER);
+    let selected_pressed = s.selected
+        .mix(s.text, state::PRESSED);
     let mut all = vec![
-        ("ComboBoxBorderBrush", opaque(s.outline)),
-        ("ComboBoxBorderBrushPointerOver", opaque(s.on_surface)),
+        ("ComboBoxBorderBrush", opaque(s.border)),
+        ("ComboBoxBorderBrushPointerOver", opaque(s.text)),
         ("ComboBoxBorderBrushPressed", opaque(s.primary)),
         (
             "ComboBoxBorderBrushDisabled",
-            layer(s.on_surface, state::DISABLED_CONTAINER),
+            layer(s.text, state::DISABLED_CONTAINER),
         ),
         ("ComboBoxBackgroundBorderBrushFocused", opaque(s.primary)),
-        ("ComboBoxBackgroundBorderBrushUnfocused", opaque(s.outline)),
+        ("ComboBoxBackgroundBorderBrushUnfocused", opaque(s.border)),
         ("ComboBoxBorderThemeThickness", uniform(1.0)),
         (
             "ComboBoxForegroundDisabled",
-            layer(s.on_surface, state::DISABLED_CONTENT),
+            layer(s.text, state::DISABLED_CONTENT),
         ),
         (
             "ComboBoxPlaceHolderForegroundDisabled",
-            layer(s.on_surface, state::DISABLED_CONTENT),
+            layer(s.text, state::DISABLED_CONTENT),
         ),
-        ("ComboBoxHeaderForeground", opaque(s.on_surface_variant)),
+        ("ComboBoxHeaderForeground", opaque(s.variant)),
         (
             "ComboBoxHeaderForegroundDisabled",
-            layer(s.on_surface, state::DISABLED_CONTENT),
+            layer(s.text, state::DISABLED_CONTENT),
         ),
         (
             "ComboBoxDropDownBackgroundPointerOver",
-            layer(s.on_surface, state::HOVER),
+            layer(s.text, state::HOVER),
         ),
         (
             "ComboBoxDropDownBackgroundPointerPressed",
-            layer(s.on_surface, state::PRESSED),
+            layer(s.text, state::PRESSED),
         ),
         (
             "ComboBoxFocusedDropDownBackgroundPointerOver",
-            layer(s.on_surface, state::HOVER),
+            layer(s.text, state::HOVER),
         ),
         (
             "ComboBoxFocusedDropDownBackgroundPointerPressed",
-            layer(s.on_surface, state::PRESSED),
+            layer(s.text, state::PRESSED),
         ),
-        ("ComboBoxDropDownBackground", opaque(s.surface_container)),
-        ("ComboBoxDropDownForeground", opaque(s.on_surface)),
+        ("ComboBoxDropDownBackground", opaque(s.tonal)),
+        ("ComboBoxDropDownForeground", opaque(s.text)),
         (
             "ComboBoxItemBackgroundPointerOver",
-            layer(s.on_surface, state::HOVER),
+            layer(s.text, state::HOVER),
         ),
         (
             "ComboBoxItemBackgroundPressed",
-            layer(s.on_surface, state::PRESSED),
+            layer(s.text, state::PRESSED),
         ),
         (
             "ComboBoxItemBackgroundSelectedPointerOver",
@@ -433,11 +453,11 @@ fn dropdown(s: &Scheme) -> Vec<(&'static str, Value)> {
         ),
         (
             "ComboBoxItemForegroundDisabled",
-            layer(s.on_surface, state::DISABLED_CONTENT),
+            layer(s.text, state::DISABLED_CONTENT),
         ),
         (
             "ComboBoxItemForegroundSelectedDisabled",
-            layer(s.on_surface, state::DISABLED_CONTENT),
+            layer(s.text, state::DISABLED_CONTENT),
         ),
     ];
     all.extend(every(
@@ -477,7 +497,7 @@ fn dropdown(s: &Scheme) -> Vec<(&'static str, Value)> {
             "ComboBoxItemForegroundPressed",
             "ComboBoxItemForegroundPointerOver",
         ],
-        opaque(s.on_surface),
+        opaque(s.text),
     ));
     all.extend(every(
         &[
@@ -487,14 +507,14 @@ fn dropdown(s: &Scheme) -> Vec<(&'static str, Value)> {
             "ComboBoxPlaceHolderForegroundFocused",
             "ComboBoxPlaceHolderForegroundFocusedPressed",
         ],
-        opaque(s.on_surface_variant),
+        opaque(s.variant),
     ));
     all.extend(every(
         &[
             "ComboBoxItemBackgroundSelected",
             "ComboBoxItemBackgroundSelectedUnfocused",
         ],
-        opaque(s.secondary_container),
+        opaque(s.selected),
     ));
     all.extend(every(
         &[
@@ -503,7 +523,7 @@ fn dropdown(s: &Scheme) -> Vec<(&'static str, Value)> {
             "ComboBoxItemForegroundSelectedPressed",
             "ComboBoxItemForegroundSelectedPointerOver",
         ],
-        opaque(s.on_secondary_container),
+        opaque(s.text),
     ));
     all
 }
@@ -512,14 +532,14 @@ fn dropdown(s: &Scheme) -> Vec<(&'static str, Value)> {
 /// on-surface-variant ring or box at rest, primary when selected (a primary
 /// ring with a primary dot; a primary box with an on-primary check), the
 /// label in on-surface, disabled at 38% on-surface.
-fn selection_controls(s: &Scheme) -> Vec<(&'static str, Value)> {
-    let disabled = layer(s.on_surface, state::DISABLED_CONTENT);
+fn selection_controls(s: &Roles) -> Vec<(&'static str, Value)> {
+    let disabled = layer(s.text, state::DISABLED_CONTENT);
     let mut all = vec![
         ("RadioButtonForegroundDisabled", disabled),
         ("RadioButtonOuterEllipseStrokeDisabled", disabled),
         ("RadioButtonOuterEllipseCheckedStrokeDisabled", disabled),
         ("RadioButtonCheckGlyphFillDisabled", disabled),
-        ("RadioButtonsHeaderForeground", opaque(s.on_surface_variant)),
+        ("RadioButtonsHeaderForeground", opaque(s.variant)),
         ("CheckBoxForegroundUncheckedDisabled", disabled),
         ("CheckBoxForegroundCheckedDisabled", disabled),
         ("CheckBoxForegroundIndeterminateDisabled", disabled),
@@ -550,7 +570,7 @@ fn selection_controls(s: &Scheme) -> Vec<(&'static str, Value)> {
             "CheckBoxForegroundIndeterminatePointerOver",
             "CheckBoxForegroundIndeterminatePressed",
         ],
-        opaque(s.on_surface),
+        opaque(s.text),
     ));
     all.extend(every(
         &[
@@ -561,7 +581,7 @@ fn selection_controls(s: &Scheme) -> Vec<(&'static str, Value)> {
             "CheckBoxCheckBackgroundStrokeUncheckedPointerOver",
             "CheckBoxCheckBackgroundStrokeUncheckedPressed",
         ],
-        opaque(s.on_surface_variant),
+        opaque(s.variant),
     ));
     all.extend(every(
         &[
@@ -667,7 +687,7 @@ fn selection_controls(s: &Scheme) -> Vec<(&'static str, Value)> {
 /// Switches in M3 switch roles: selected, a primary track with an
 /// on-primary handle; unselected, a surface-container-highest track with an
 /// outline border and an outline handle; disabled at 12% / 38% on-surface.
-fn switches(s: &Scheme) -> Vec<(&'static str, Value)> {
+fn switches(s: &Roles) -> Vec<(&'static str, Value)> {
     let mut all = every(
         &[
             "ToggleSwitchFillOn",
@@ -693,7 +713,7 @@ fn switches(s: &Scheme) -> Vec<(&'static str, Value)> {
             "ToggleSwitchFillOffPointerOver",
             "ToggleSwitchFillOffPressed",
         ],
-        opaque(s.surface_container_highest),
+        opaque(s.container),
     ));
     all.extend(every(
         &[
@@ -704,7 +724,7 @@ fn switches(s: &Scheme) -> Vec<(&'static str, Value)> {
             "ToggleSwitchKnobFillOffPointerOver",
             "ToggleSwitchKnobFillOffPressed",
         ],
-        opaque(s.outline),
+        opaque(s.border),
     ));
     all.extend(every(
         &[
@@ -712,14 +732,14 @@ fn switches(s: &Scheme) -> Vec<(&'static str, Value)> {
             "ToggleSwitchStrokeOffDisabled",
             "ToggleSwitchStrokeOnDisabled",
         ],
-        layer(s.on_surface, state::DISABLED_CONTAINER),
+        layer(s.text, state::DISABLED_CONTAINER),
     ));
     all.extend(every(
         &[
             "ToggleSwitchKnobFillOffDisabled",
             "ToggleSwitchKnobFillOnDisabled",
         ],
-        layer(s.on_surface, state::DISABLED_CONTENT),
+        layer(s.text, state::DISABLED_CONTENT),
     ));
     all.push(("ToggleSwitchFillOffDisabled", clear(s)));
     all
@@ -730,49 +750,49 @@ fn switches(s: &Scheme) -> Vec<(&'static str, Value)> {
 /// inverse-surface; the control corner for every control template that
 /// reads `ControlCornerRadius` and the container corner for the popups
 /// that read `OverlayCornerRadius` (flyouts, the combo-box list).
-fn overlays(s: &Scheme) -> Vec<(&'static str, Value)> {
+fn overlays(s: &Roles) -> Vec<(&'static str, Value)> {
     let mut all = vec![
-        ("MenuFlyoutPresenterBackground", opaque(s.surface_container)),
-        ("MenuFlyoutPresenterBorderBrush", opaque(s.outline_variant)),
-        ("MenuFlyoutSeparatorBackground", opaque(s.outline_variant)),
+        ("MenuFlyoutPresenterBackground", opaque(s.tonal)),
+        ("MenuFlyoutPresenterBorderBrush", opaque(s.outline)),
+        ("MenuFlyoutSeparatorBackground", opaque(s.outline)),
         (
             "MenuFlyoutItemBackgroundPointerOver",
-            layer(s.on_surface, state::HOVER),
+            layer(s.text, state::HOVER),
         ),
         (
             "MenuFlyoutItemBackgroundPressed",
-            layer(s.on_surface, state::PRESSED),
+            layer(s.text, state::PRESSED),
         ),
         (
             "MenuFlyoutSubItemBackgroundPointerOver",
-            layer(s.on_surface, state::HOVER),
+            layer(s.text, state::HOVER),
         ),
         (
             "MenuFlyoutSubItemBackgroundPressed",
-            layer(s.on_surface, state::PRESSED),
+            layer(s.text, state::PRESSED),
         ),
         (
             "MenuFlyoutSubItemBackgroundSubMenuOpened",
-            layer(s.on_surface, state::HOVER),
+            layer(s.text, state::HOVER),
         ),
         (
             "MenuFlyoutItemForegroundDisabled",
-            layer(s.on_surface, state::DISABLED_CONTENT),
+            layer(s.text, state::DISABLED_CONTENT),
         ),
         (
             "MenuFlyoutSubItemForegroundDisabled",
-            layer(s.on_surface, state::DISABLED_CONTENT),
+            layer(s.text, state::DISABLED_CONTENT),
         ),
         (
             "MenuFlyoutSubItemChevronDisabled",
-            layer(s.on_surface, state::DISABLED_CONTENT),
+            layer(s.text, state::DISABLED_CONTENT),
         ),
-        ("ContentDialogBackground", opaque(s.surface_container_high)),
-        ("ContentDialogTopOverlay", opaque(s.surface_container_high)),
-        ("ContentDialogForeground", opaque(s.on_surface)),
+        ("ContentDialogBackground", opaque(s.container)),
+        ("ContentDialogTopOverlay", opaque(s.container)),
+        ("ContentDialogForeground", opaque(s.text)),
         (
             "ContentDialogContentForegroundBrush",
-            opaque(s.on_surface_variant),
+            opaque(s.variant),
         ),
         // The M3 scrim: black at 32%.
         (
@@ -780,8 +800,8 @@ fn overlays(s: &Scheme) -> Vec<(&'static str, Value)> {
             Value::Brush(Rgb8::new(0, 0, 0), alpha(0.32)),
         ),
         ("ContentDialogBorderWidth", uniform(0.0)),
-        ("ToolTipBackground", opaque(s.inverse_surface)),
-        ("ToolTipForeground", opaque(s.inverse_on_surface)),
+        ("ToolTipBackground", opaque(s.text)),
+        ("ToolTipForeground", opaque(s.surface)),
         ("ControlCornerRadius", Value::Radius(radius::FIELD)),
         ("OverlayCornerRadius", Value::Radius(radius::CONTAINER)),
     ];
@@ -807,7 +827,7 @@ fn overlays(s: &Scheme) -> Vec<(&'static str, Value)> {
             "MenuFlyoutSubItemForegroundPressed",
             "MenuFlyoutSubItemForegroundSubMenuOpened",
         ],
-        opaque(s.on_surface),
+        opaque(s.text),
     ));
     all.extend(every(
         &[
@@ -817,7 +837,7 @@ fn overlays(s: &Scheme) -> Vec<(&'static str, Value)> {
             "MenuFlyoutSubItemChevronPressed",
             "MenuFlyoutSubItemChevronSubMenuOpened",
         ],
-        opaque(s.on_surface_variant),
+        opaque(s.variant),
     ));
     all
 }
@@ -832,7 +852,7 @@ const XAML_ROOT: &str = "<ResourceDictionary \
 
 /// The roles of one scheme as one dictionary of XAML. Keys are fixed identifiers and values
 /// numbers or hex colors, so nothing in it needs escaping.
-pub fn dictionary_xaml(scheme: &Scheme) -> String {
+pub fn dictionary_xaml(scheme: &Roles) -> String {
     let mut xaml = String::from(XAML_ROOT);
     for (key, value) in entries(scheme) {
         let _ = match value {
@@ -884,78 +904,71 @@ pub fn dictionary_xaml(scheme: &Scheme) -> String {
 /// control's built-in style underneath, so every control keeps its states
 /// and focus visuals.
 pub fn styles_xaml() -> String {
-    use templates::{Lift, Look, PRESS_SMALL, PRESS_WIDE, button};
-    let (pill, field, container, dialog, check) = (
+    use templates::{Lift, Look, button};
+    let (pill, field, container, dialog, check, fab_radius) = (
         radius::PILL,
         radius::FIELD,
         radius::CONTAINER,
         radius::DIALOG,
         radius::CHECK_BOX,
+        radius::FAB,
     );
     // Menu items are control-height rows: WinUI pads them from a
     // StaticResource (11,9,11,10), so only a style sets their height.
     let (min, inset) = (height::CONTROL, spacing::INSET);
-    // Labelled buttons, rows, chips and segments; icon buttons; the
-    // composer's raised FAB (M3 levels 3 and 4); the dialog's primary.
-    let labelled = button(Look {
-        lift: None,
-        keys: "Button",
-        press: PRESS_WIDE,
-    });
-    let icon = button(Look {
-        lift: None,
-        keys: "Button",
-        press: PRESS_SMALL,
-    });
-    let fab = button(Look {
-        lift: Some(Lift {
-            rest: Level::Three,
-            hover: Level::Four,
-        }),
-        keys: "Button",
-        press: PRESS_SMALL,
-    });
-    let accent = button(Look {
-        lift: None,
-        keys: "AccentButton",
-        press: PRESS_WIDE,
-    });
-    let template = |xaml: &str| {
-        format!("<Setter Property=\"Template\"><Setter.Value>{xaml}</Setter.Value></Setter>")
+    let template = |look: Look| {
+        format!(
+            "<Setter Property=\"Template\"><Setter.Value>{}</Setter.Value></Setter>",
+            button(look)
+        )
     };
-    let (labelled, icon, fab, accent) = (
-        template(&labelled),
-        template(&icon),
-        template(&fab),
-        template(&accent),
-    );
+    // Rows, chips, segments and labelled buttons: flat pills (the design's
+    // rows change only their state layer). Icon buttons: flat circles.
+    let flat = template(Look {
+        lift: Lift::Flat,
+        press: 1.0,
+        radius: pill,
+    });
+    // The FAB: level 1 at rest, 2 under the pointer, a press to 0.94.
+    let fab = template(Look {
+        lift: Lift::Fab,
+        press: 0.94,
+        radius: fab_radius,
+    });
+    // Card pressables (suggestion cards, tool rows): the card corner,
+    // lifting to level 1 under the pointer, a press to 0.97.
+    let card = template(Look {
+        lift: Lift::Hover,
+        press: 0.97,
+        radius: container,
+    });
     format!(
         "{XAML_ROOT}\
          <Style TargetType=\"Button\">\
            <Setter Property=\"CornerRadius\" Value=\"{pill}\"/>\
            <Setter Property=\"Padding\" Value=\"{inset},0,{inset},0\"/>\
            <Setter Property=\"MinHeight\" Value=\"{min}\"/>\
-           {labelled}\
+           {flat}\
          </Style>\
          <Style x:Key=\"SubtleButtonStyle\" TargetType=\"Button\">\
            <Setter Property=\"CornerRadius\" Value=\"{pill}\"/>\
            <Setter Property=\"Padding\" Value=\"0\"/>\
-           {icon}\
+           {flat}\
          </Style>\
          <Style x:Key=\"TextBlockButtonStyle\" TargetType=\"Button\">\
-           <Setter Property=\"CornerRadius\" Value=\"{pill}\"/>\
+           <Setter Property=\"CornerRadius\" Value=\"{fab_radius}\"/>\
            <Setter Property=\"Padding\" Value=\"0\"/>\
            <Setter Property=\"BorderThickness\" Value=\"0\"/>\
            <Setter Property=\"HorizontalContentAlignment\" Value=\"Center\"/>\
            <Setter Property=\"VerticalContentAlignment\" Value=\"Center\"/>\
            {fab}\
          </Style>\
-         <Style x:Key=\"AccentButtonStyle\" TargetType=\"Button\" \
-                BasedOn=\"{{StaticResource AccentButtonStyle}}\">\
-           <Setter Property=\"CornerRadius\" Value=\"{pill}\"/>\
+         <Style x:Key=\"AccentButtonStyle\" TargetType=\"Button\">\
+           <Setter Property=\"CornerRadius\" Value=\"{container}\"/>\
            <Setter Property=\"Padding\" Value=\"{inset},0,{inset},0\"/>\
            <Setter Property=\"MinHeight\" Value=\"{min}\"/>\
-           {accent}\
+           <Setter Property=\"BorderThickness\" Value=\"0\"/>\
+           {card}\
          </Style>\
          <Style TargetType=\"TextBox\">\
            <Setter Property=\"CornerRadius\" Value=\"{field}\"/>\
@@ -999,7 +1012,7 @@ pub fn styles_xaml() -> String {
 /// `XamlControlsResources` and before the first controls are created
 /// (Reactor's `on_launched` installs those resources, then mounts the
 /// component), so every control resolves these from its first template.
-pub fn install(scheme: Option<&Scheme>) -> Result<(), String> {
+pub fn install(scheme: Option<&Roles>) -> Result<(), String> {
     native(|own| {
         insert_parsed(own, &styles_xaml())?;
         write_scheme(own, scheme)
@@ -1010,7 +1023,7 @@ pub fn install(scheme: Option<&Scheme>) -> Result<(), String> {
 /// (`None`) so WinUI's system colors apply. The window rebuilds its
 /// controls on a scheme change (the palette-keyed tree), and the new
 /// controls resolve the new values.
-pub fn apply_scheme(scheme: Option<&Scheme>) -> Result<(), String> {
+pub fn apply_scheme(scheme: Option<&Roles>) -> Result<(), String> {
     native(|own| write_scheme(own, scheme))
 }
 
@@ -1025,12 +1038,12 @@ fn native(work: impl FnOnce(&OwnEntries) -> windows_core::Result<()>) -> Result<
     run().map_err(|error| format!("{error} ({:#010X})", error.code().0))
 }
 
-fn write_scheme(own: &OwnEntries, scheme: Option<&Scheme>) -> windows_core::Result<()> {
+fn write_scheme(own: &OwnEntries, scheme: Option<&Roles>) -> windows_core::Result<()> {
     match scheme {
         Some(scheme) => insert_parsed(own, &dictionary_xaml(scheme)),
         None => {
             // The keys are the same for both schemes.
-            for (key, _) in entries(Scheme::of(false)) {
+            for (key, _) in entries(Theme::Light.roles()) {
                 let key: IInspectable = IReference::<HSTRING>::from(key).into();
                 if own.HasKey(&key)? {
                     own.Remove(&key)?;
@@ -1205,22 +1218,22 @@ impl From<Rgb8> for UiColor {
 /// on-surface text, M3 state layers on the caption buttons, on-surface-variant
 /// text while the window is inactive. Windows keeps its own close-button
 /// hover and press colors.
-pub fn title_bar_colors(s: &Scheme) -> [(usize, Rgb8); 12] {
-    let hover = s.surface.mix(s.on_surface, state::HOVER);
-    let pressed = s.surface.mix(s.on_surface, state::PRESSED);
+pub fn title_bar_colors(s: &Roles) -> [(usize, Rgb8); 12] {
+    let hover = s.surface.mix(s.text, state::HOVER);
+    let pressed = s.surface.mix(s.text, state::PRESSED);
     [
         (7, s.surface),             // put_BackgroundColor
         (9, s.surface),             // put_ButtonBackgroundColor
-        (11, s.on_surface),         // put_ButtonForegroundColor
+        (11, s.text),         // put_ButtonForegroundColor
         (13, hover),                // put_ButtonHoverBackgroundColor
-        (15, s.on_surface),         // put_ButtonHoverForegroundColor
+        (15, s.text),         // put_ButtonHoverForegroundColor
         (17, s.surface),            // put_ButtonInactiveBackgroundColor
-        (19, s.on_surface_variant), // put_ButtonInactiveForegroundColor
+        (19, s.variant), // put_ButtonInactiveForegroundColor
         (21, pressed),              // put_ButtonPressedBackgroundColor
-        (23, s.on_surface),         // put_ButtonPressedForegroundColor
-        (27, s.on_surface),         // put_ForegroundColor
+        (23, s.text),         // put_ButtonPressedForegroundColor
+        (27, s.text),         // put_ForegroundColor
         (32, s.surface),            // put_InactiveBackgroundColor
-        (34, s.on_surface_variant), // put_InactiveForegroundColor
+        (34, s.variant), // put_InactiveForegroundColor
     ]
 }
 
@@ -1236,7 +1249,7 @@ pub fn title_bar_colors(s: &Scheme) -> [(usize, Rgb8); 12] {
 /// `Microsoft.Internal.FrameworkUdk.dll`, `AppWindow.GetFromWindowId`, then
 /// the `AppWindowTitleBar` color properties (supported for the default
 /// title bar on Windows 11).
-pub fn apply_title_bar(scheme: Option<&Scheme>) -> Result<(), String> {
+pub fn apply_title_bar(scheme: Option<&Roles>) -> Result<(), String> {
     let hwnd = own_window().ok_or("the window is not shown yet")?;
     #[cfg(target_env = "msvc")]
     set_window_icon(hwnd);
@@ -1261,7 +1274,7 @@ pub fn apply_title_bar(scheme: Option<&Scheme>) -> Result<(), String> {
                 .into_iter()
                 .map(|(slot, color)| (slot, Some(IReference::from(UiColor::from(color)))))
                 .collect(),
-            None => title_bar_colors(Scheme::of(false))
+            None => title_bar_colors(Theme::Light.roles())
                 .into_iter()
                 .map(|(slot, _)| (slot, None))
                 .collect(),

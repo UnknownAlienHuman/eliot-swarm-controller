@@ -1049,7 +1049,9 @@ daemon (including limits and retention), automation, mail, cloud_mcp, desktop,
 accounts and proxies.
 Rules/scripts remain files owned by their existing APIs; settings references and
 automation policy do not create a second executor. Desktop preferences use
-`[desktop]`: `theme` (`system`, `light`, `dark`), `window` (`width`/`height`, at least
+`[desktop]`: `theme` (`system`, `light`, `dark`, `amoled`, `purple`, `neon`,
+`matrix`: the desktop's six palettes, `system` following Windows between
+light and dark), `window` (`width`/`height`, at least
 640 by 480), `startup` (`new_task`, or `last_conversation` to reopen the most
 recently active Agent's conversation), `last_access` (`ask`, `auto` or `full`), and
 these bounded lists: `favorite_models` (`{harness, model, effort?}`), `recent_models`

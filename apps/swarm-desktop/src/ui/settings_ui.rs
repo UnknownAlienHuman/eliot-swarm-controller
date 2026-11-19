@@ -884,7 +884,9 @@ impl DesktopApp {
                         // A choice made after this read was issued (or still
                         // being written) wins over the read.
                         if !self.prefs_saving && self.prefs_rev == self.settings.read_prefs_rev {
+                            let before = self.palette();
                             self.prefs = crate::settings::Preferences::from_reply(&read);
+                            self.palette_changed(before, context);
                         }
                         self.take_profiles(&read);
                         let automation_changed = self.settings.base.get(&Section::Automation)
@@ -1736,7 +1738,7 @@ impl DesktopApp {
             return View::empty();
         };
         let text = if note.error {
-            m3::text(note.text.clone(), tokens::text::SECONDARY).foreground(palette.error())
+            m3::text(note.text.clone(), tokens::text::SECONDARY).foreground(palette.attention())
         } else {
             m3::secondary(note.text.clone())
         }
@@ -1760,7 +1762,7 @@ impl DesktopApp {
     fn read_error(&self, error: &str, context: &mut ViewContext<Self>, palette: Palette) -> View {
         StackPanel::new().spacing(tokens::spacing::SM).children((
             m3::body(error.to_owned())
-                .foreground(palette.error())
+                .foreground(palette.attention())
                 .text_wrapping(TextWrapping::Wrap)
                 .is_text_selection_enabled(true),
             self.settings
@@ -1807,7 +1809,7 @@ impl DesktopApp {
             .text_wrapping(TextWrapping::Wrap)
             .is_text_selection_enabled(true);
         let note_text = if note.error {
-            note_text.foreground(palette.error())
+            note_text.foreground(palette.attention())
         } else {
             note_text
         };

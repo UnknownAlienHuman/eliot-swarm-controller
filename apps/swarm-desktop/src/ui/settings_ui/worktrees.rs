@@ -32,7 +32,7 @@ impl DesktopApp {
             parts.push(KeyedView::new(
                 format!("error:{error}"),
                 m3::body(error.clone())
-                    .foreground(palette.error())
+                    .foreground(palette.attention())
                     .text_wrapping(TextWrapping::Wrap)
                     .is_text_selection_enabled(true),
             ));
@@ -375,7 +375,7 @@ impl DesktopApp {
                         "Managed worktrees could not be read: {}",
                         crate::state::plain_error(error)
                     ))
-                    .foreground(palette.error())
+                    .foreground(palette.attention())
                     .text_wrapping(TextWrapping::Wrap)
                     .is_text_selection_enabled(true),
                 ));

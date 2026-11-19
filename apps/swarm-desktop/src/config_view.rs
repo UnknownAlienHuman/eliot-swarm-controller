@@ -24,7 +24,7 @@ fn small(text: impl Into<String>) -> TextBlock {
 /// A failure note: the secondary size at full emphasis in the error color.
 fn error_note(text: impl Into<String>, palette: Palette) -> TextBlock {
     crate::m3::text(text, tokens::text::SECONDARY)
-        .foreground(palette.error())
+        .foreground(palette.attention())
         .text_wrapping(TextWrapping::Wrap)
         .is_text_selection_enabled(true)
 }

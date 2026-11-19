@@ -212,7 +212,7 @@ fn block_views(part: &RenderedPart, callbacks: &RowCallbacks, palette: Palette) 
     let Some(blocks) = part.blocks.as_ref() else {
         return vec![KeyedView::new(
             "plain",
-            body_text(&part.plain, palette.on_surface()),
+            body_text(&part.plain, palette.text()),
         )];
     };
     blocks
@@ -229,10 +229,8 @@ fn block_views(part: &RenderedPart, callbacks: &RowCallbacks, palette: Palette) 
                 RenderedBlock::Heading(level, text) => crate::m3::text(
                     text.clone(),
                     match level {
-                        1 => theme::typography::DISPLAY,
-                        2 => theme::typography::HEADLINE,
-                        3 => tokens::text::PAGE_TITLE,
-                        _ => tokens::text::SECTION_TITLE,
+                        1 => theme::typography::TITLE,
+                        _ => theme::typography::HEADER,
                     },
                 )
                 .text_wrapping(TextWrapping::Wrap)
@@ -249,7 +247,7 @@ fn block_views(part: &RenderedPart, callbacks: &RowCallbacks, palette: Palette) 
                     let code_index = *code_index;
                     StackPanel::new().spacing(tokens::spacing::XS).children((
                         Border::new()
-                            .background(palette.raised())
+                            .background(palette.composer())
                             .corner_radius(tokens::radius::CONTAINER)
                             .padding(Thickness::uniform(tokens::spacing::MD))
                             .content(
@@ -300,10 +298,10 @@ fn part_view(
             .max_width(tokens::layout::READING_WIDTH * tokens::layout::BUBBLE_SHARE)
             .children((
                 Border::new()
-                    .background(palette.bubble())
+                    .background(palette.container())
                     .corner_radius(tokens::radius::CONTAINER)
                     .padding(Thickness::xy(tokens::spacing::INSET, tokens::spacing::SM))
-                    .content(body_text(&part.plain, palette.on_bubble())),
+                    .content(body_text(&part.plain, palette.text())),
                 copy_button("Copy message", palette, copy_message)
                     .horizontal_alignment(HorizontalAlignment::Right)
                     .margin(Thickness::new(0.0, 0.0, -INSET, 0.0))
@@ -416,7 +414,7 @@ fn part_view(
                     .font_size(tokens::text::BODY.size)
                     .text_wrapping(TextWrapping::Wrap)
                     .is_text_selection_enabled(true)
-                    .foreground(palette.error()),
+                    .foreground(palette.attention()),
                 label(&part.detail.join(" · ")),
                 action,
             ))
@@ -499,7 +497,7 @@ fn path_actions(part: &str, paths: &[String], callbacks: &RowCallbacks, palette:
                 let open = callbacks.open_path.clone();
                 let note = match &callbacks.path_failure {
                     Some((failed, note)) if failed == &item => crate::m3::secondary(note.clone())
-                        .foreground(palette.error())
+                        .foreground(palette.attention())
                         .text_wrapping(TextWrapping::Wrap)
                         .is_text_selection_enabled(true)
                         .into(),

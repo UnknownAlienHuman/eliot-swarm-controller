@@ -120,14 +120,14 @@ pub fn section_label(value: impl Into<String>) -> TextBlock {
 /// (call `.content(..)`).
 pub fn card(palette: Palette) -> Border {
     Border::new()
-        .background(palette.card())
+        .background(palette.tonal())
         .corner_radius(radius::CONTAINER)
         .padding(Thickness::uniform(spacing::MD))
 }
 
 /// A card on the sidebar-toned panel: surface-container-high.
 pub fn card_high(palette: Palette) -> Border {
-    card(palette).background(palette.card_high())
+    card(palette).background(palette.container())
 }
 
 /// The status dot of an Agent state in a list; empty for states that need
@@ -167,7 +167,7 @@ pub fn icon(glyph: &str) -> View {
 
 /// The icon of toolbar buttons (the conversation and panel headers).
 pub fn toolbar_icon(glyph: &str) -> View {
-    icon_sized(glyph, icon_size::TOOLBAR)
+    icon_sized(glyph, icon_size::ROW)
 }
 
 /// Icon and label side by side: a labelled button, chip or row.
@@ -200,12 +200,21 @@ pub fn dropdown_chevron() -> View {
 /// cannot add). `place` is the grid that sizes and places them (a
 /// popover's width and alignment), so the shadow follows the view.
 pub fn lifted(
+    palette: Palette,
     level: crate::theme::elevation::Level,
     radius: f64,
     place: Grid,
     view: impl Into<View>,
 ) -> View {
-    let mut cells: Vec<KeyedView> = crate::theme::elevation::layers(level)
+    // The theme's lift: shadows in black, or the true-black themes' ring.
+    let Some(roles) = palette.roles() else {
+        return place.keyed_children(vec![KeyedView::new("content", view.into())]);
+    };
+    let tint = match roles.lift {
+        crate::theme::Lift::Shadow { .. } => crate::theme::Rgb8::new(0, 0, 0),
+        crate::theme::Lift::Ring(color) => color,
+    };
+    let mut cells: Vec<KeyedView> = crate::theme::elevation::layers(level, roles.lift)
         .into_iter()
         .enumerate()
         .map(|(index, layer)| {
@@ -219,7 +228,7 @@ pub fn lifted(
                         -layer.spread,
                         -layer.offset - layer.spread,
                     ))
-                    .background(Brush::Solid(Color::argb(layer.alpha, 0, 0, 0))),
+                    .background(Brush::Solid(Color::argb(layer.alpha, tint.r, tint.g, tint.b))),
             )
         })
         .collect();
@@ -255,7 +264,7 @@ pub fn destructive(palette: Palette) -> Button {
 
 /// A text button on an error container (on-error-container).
 pub fn error_text_button(palette: Palette) -> Button {
-    button(palette.error_text_button())
+    button(palette.destructive())
 }
 
 /// A square icon button (`.content(icon(..))` or `toolbar_icon(..)` last).
@@ -279,7 +288,7 @@ pub fn send_button(palette: Palette) -> Button {
 /// Send's glyph: Codex's up arrow, optically centred in the circle (the
 /// paper plane leans right of the centre).
 pub fn send_icon() -> View {
-    icon_sized(glyph::ARROW_UP, icon_size::TOOLBAR)
+    icon_sized(glyph::ARROW_UP, icon_size::ROW)
 }
 
 /// Stop's mark: Material's filled stop square in the button's content
@@ -374,7 +383,7 @@ pub fn text_chip(palette: Palette) -> Button {
 
 /// [`text_chip`] in the warning color (Full access).
 pub fn warning_text_chip(palette: Palette) -> Button {
-    button(palette.warning_row())
+    button(palette.attention_row())
 }
 
 /// Read-only context (an open Agent's project, harness, access; a preset's
@@ -426,7 +435,7 @@ pub fn segmented(palette: Palette, segments: Vec<KeyedView>) -> View {
     Border::new()
         .height(height::CONTROL)
         .corner_radius(radius::PILL)
-        .background(palette.well())
+        .background(palette.container())
         .horizontal_alignment(HorizontalAlignment::Left)
         .content(
             StackPanel::new()
@@ -529,7 +538,7 @@ pub fn help(text: impl Into<String>) -> TextBlock {
 /// Rows in one card (surface-container-low, the container corner).
 pub fn group(palette: Palette, rows: Vec<KeyedView>) -> View {
     Border::new()
-        .background(palette.card())
+        .background(palette.tonal())
         .corner_radius(radius::CONTAINER)
         .padding(Thickness::xy(spacing::MD, spacing::SM))
         .vertical_alignment(VerticalAlignment::Top)
@@ -540,7 +549,7 @@ pub fn group(palette: Palette, rows: Vec<KeyedView>) -> View {
 /// card's edges, so their highlight keeps an even inset.
 pub fn list(palette: Palette, rows: Vec<KeyedView>) -> View {
     Border::new()
-        .background(palette.card())
+        .background(palette.tonal())
         .corner_radius(radius::CONTAINER)
         .padding(Thickness::uniform(spacing::SM))
         .vertical_alignment(VerticalAlignment::Top)
@@ -631,7 +640,7 @@ pub fn bar_glyph_button(overrides: ResourceOverrides) -> Button {
 pub fn divider(palette: Palette) -> Border {
     Border::new()
         .height(layout::HAIRLINE)
-        .background(palette.outline_variant())
+        .background(palette.outline())
 }
 
 /// A settings page's header (the Codex settings pages): the title, its
@@ -698,7 +707,7 @@ pub fn settings_card(palette: Palette, rows: Vec<KeyedView>) -> View {
         children.push(row);
     }
     Border::new()
-        .background(palette.card())
+        .background(palette.tonal())
         .corner_radius(radius::CONTAINER)
         .padding(Thickness::xy(spacing::MD, spacing::XS))
         .vertical_alignment(VerticalAlignment::Top)
@@ -724,8 +733,8 @@ pub fn link_content(label: &str) -> View {
 /// corner).
 pub fn popover(palette: Palette) -> Border {
     Border::new()
-        .background(palette.popover())
-        .border_brush(palette.outline_variant())
+        .background(palette.composer())
+        .border_brush(palette.outline())
         .border_thickness(Thickness::uniform(layout::HAIRLINE))
         .corner_radius(radius::CONTAINER)
         .padding(Thickness::uniform(spacing::XS))
@@ -734,7 +743,7 @@ pub fn popover(palette: Palette) -> Border {
 /// A small outlined badge ("default").
 pub fn badge(palette: Palette, text: &str) -> View {
     Border::new()
-        .border_brush(palette.outline_variant())
+        .border_brush(palette.outline())
         .border_thickness(Thickness::uniform(layout::HAIRLINE))
         .corner_radius(radius::PILL)
         .padding(Thickness::xy(spacing::XS, 0.0))

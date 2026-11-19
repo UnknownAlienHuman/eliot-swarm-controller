@@ -325,7 +325,7 @@ impl DesktopApp {
             parts.push(KeyedView::new(
                 format!("note:{}", namespace.label),
                 m3::secondary(note)
-                    .foreground(palette.error())
+                    .foreground(palette.attention())
                     .text_wrapping(TextWrapping::Wrap)
                     .is_text_selection_enabled(true),
             ));
@@ -376,7 +376,7 @@ impl DesktopApp {
             lines.push(KeyedView::new(
                 "reason",
                 m3::secondary(reason.to_owned())
-                    .foreground(palette.error())
+                    .foreground(palette.attention())
                     .text_wrapping(TextWrapping::Wrap)
                     .is_text_selection_enabled(true),
             ));
@@ -485,7 +485,7 @@ impl DesktopApp {
             lines.push(KeyedView::new(
                 "run-line",
                 if line.error {
-                    text.foreground(palette.error())
+                    text.foreground(palette.attention())
                 } else {
                     text
                 },
@@ -660,7 +660,7 @@ impl DesktopApp {
             rows.push(KeyedView::new(
                 "error",
                 m3::body(error.clone())
-                    .foreground(palette.error())
+                    .foreground(palette.attention())
                     .text_wrapping(TextWrapping::Wrap),
             ));
         }

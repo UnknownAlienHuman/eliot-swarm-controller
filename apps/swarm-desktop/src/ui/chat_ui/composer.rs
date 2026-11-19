@@ -148,7 +148,7 @@ impl DesktopApp {
         let rows = vec![GridLength::Auto; first + 2];
         let card = Border::new()
             // The composer: surface-container-high, its own 16-DIP corner.
-            .background(palette.raised())
+            .background(palette.composer())
             .corner_radius(tokens::radius::COMPOSER)
             .padding(Thickness::uniform(tokens::spacing::SM))
             .content(
@@ -169,6 +169,7 @@ impl DesktopApp {
                 tokens::spacing::LG,
             ))
             .content(m3::lifted(
+                palette,
                 crate::theme::elevation::Level::Two,
                 tokens::radius::COMPOSER,
                 Grid::new(),
@@ -181,7 +182,7 @@ impl DesktopApp {
     fn agent_context(&self, detail: &UiDetail, palette: Palette) -> View {
         let access = launch_ui::agent_access_label(&detail.settings);
         let access: View = if access == crate::settings::Access::Full.label() {
-            m3::meta_tinted(m3::glyph::WARNING, &access, palette.warning())
+            m3::meta_tinted(m3::glyph::WARNING, &access, palette.attention())
         } else {
             m3::meta(m3::glyph::SHIELD, &access)
         };
@@ -341,7 +342,7 @@ impl DesktopApp {
                     "Effort levels not read: {}",
                     crate::state::plain_error(error)
                 ))
-                .foreground(palette.error())
+                .foreground(palette.attention())
                 .text_wrapping(TextWrapping::Wrap),
                 m3::text_button(palette)
                     .automation_name("Retry reading effort levels")
@@ -415,6 +416,7 @@ impl DesktopApp {
             m3::secondary("←→ effort   Enter apply   Esc close").into()
         };
         m3::lifted(
+            palette,
             crate::theme::elevation::Level::Two,
             tokens::radius::CONTAINER,
             Grid::new()
@@ -493,6 +495,7 @@ impl DesktopApp {
             })
             .collect();
         m3::lifted(
+            palette,
             crate::theme::elevation::Level::Two,
             tokens::radius::CONTAINER,
             Grid::new()
