@@ -769,6 +769,30 @@ set cannot generate further wakes until new evidence arrives on a new thread.
 Retained pre-fix subject copies (bare attention threads with no bound
 incident event) never wake.
 
+### Git-aware work summary
+
+The Git monitor computes a bounded per-Agent work summary exposed as `WorkSummaryView` ([observe.rs](../../crates/eliot-core/src/api/observe.rs)) on `agent get`, `agent stats` and the `swarm ls` WORK column.
+
+WorkSummaryView carries, for one Agent generation versus its frozen base_oid:
+- commits_ahead: commits ahead of base_oid;
+- files_changed, insertions, deletions: git diff --numstat base_oid..HEAD across committed plus dirty work, plus bounded dirty/untracked path coverage;
+- last_write_at: time of the last worktree write (from validated file.changed attribution or a dirty/digest change);
+- last_commit_at: time of the last commit (from git.committed events or HEAD movement);
+- tool_calls, messages: counts in the current turn.
+
+When Git or a cap prevents observation, `available` is false with a reason and every Git counter is null, never a fake zero; only `tool_calls` and `messages` may still be present.
+
+The work probe runs inside the ordinary Git probe: only after the workspace watcher reports a change, at most once per 2 s per workspace, under the probe's read deadline. It adds `merge-base --is-ancestor`, `rev-list --count` and one `diff --numstat` against `base_oid`, and hashes dirty files with bounded untracked coverage (512 KiB per file, 4 MiB in total). Past a cap the summary is `unavailable`, not partial.
+
+### Git-aware attention: no_code_progress
+
+A busy Agent whose tool and message activity continues but whose worktree has had no write and no commit for daemon.attention_suspicion_secs gets a distinct no_code_progress diagnostic (IncidentKind::CodeProgress). It is a diagnostic, never a verdict:
+- suppressed for read-only and audit profiles (is_read_only_or_audit_profile) and for Agents without a worktree;
+- retires as soon as a write or commit lands (last_code_progress_at advances);
+- reuses the existing attention machinery: a bounded incident per Agent/generation, no new timer service.
+
+The report carries the work summary's tool/message turn counts so an agent actively using tools but not writing code is clearly distinguished from an idle one.
+
 ## Restart reconciliation
 
 Callbacks and timers only enqueue stable keys. Deduplicated reconciliation reads Store
