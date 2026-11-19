@@ -475,3 +475,10 @@ the CLI's own
 model weekly buckets and `limits[kind=weekly_scoped]`, never account identity.
 Missing credentials, expiry and provider failures remain supported error states
 with explicit origin. No refresh, login, model turn or inference probe is attempted.
+
+Native frame budget: the inbound stream-json frame cap is 8 MiB
+(`MAX_FRAME_BYTES` in `plugins/claude/src/native/client.rs`). A `user` record carrying a
+Read tool's image result was observed live at 1,346,894 bytes (2026-11-19) and ended a 1 MiB
+stream with `frame_oversized`; Claude accepts images up to 5 MB (about 6.7 MB as base64), so 8 MiB
+covers one such result plus its envelope. A larger frame still ends the session with an explicit
+`source.gap`. Outbound frames keep the 1 MiB preflight.
