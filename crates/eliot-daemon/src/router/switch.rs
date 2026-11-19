@@ -57,6 +57,7 @@ impl Router {
             change
         };
         self.signal_progress();
+        self.signal_launch_arbitration();
         serde_json::to_value(change.value)
             .map_err(|_| Error::new("internal", "cannot encode switch"))
     }
@@ -244,6 +245,7 @@ impl Router {
                     self.publish_locked(&change.events);
                 }
                 self.signal_progress();
+                self.signal_launch_arbitration();
                 return;
             }
         };
@@ -287,6 +289,7 @@ impl Router {
             result
         };
         self.signal_progress();
+        self.signal_launch_arbitration();
         if let Ok(change) = result
             && let Some(handoff) = change.value.handoff
         {

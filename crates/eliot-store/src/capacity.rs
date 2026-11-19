@@ -458,6 +458,73 @@ pub(super) fn reserve_tx(
     set_reservation_generation_tx(tx, id, None, generation)
 }
 
+/// Whether `agent` occupies any scope in `blocked_scopes` under the current
+/// capacity policy, used by the fair launch arbiter so a later project in the
+/// same pass cannot claim a shared scope freed while an earlier project was blocked.
+pub(super) fn agent_uses_any_scope_tx(
+    tx: &Transaction<'_>,
+    agent: &Agent,
+    generation: i64,
+    policy: Option<&PolicyLoader>,
+    blocked_scopes: &std::collections::HashSet<String>,
+) -> Result<bool> {
+    if blocked_scopes.is_empty() || agent.observe_only {
+        return Ok(false);
+    }
+    let id = parse_agent_id(&agent.id)?;
+    for scope in scopes(agent)? {
+        if scope.max_live.is_some()
+            && !CapacityScope::is_daemon_owned(&scope.scope)
+            && blocked_scopes.contains(&scope.scope)
+        {
+            return Ok(true);
+        }
+    }
+    if let Some(load) = policy {
+        let limits = load()?;
+        if limits.global.is_some() && blocked_scopes.contains(&CapacityScope::global_scope()) {
+            return Ok(true);
+        }
+        if let Some(project_limits) = limits.projects.get(&agent.project) {
+            if project_limits.project.is_some()
+                && blocked_scopes.contains(&CapacityScope::project_scope(&agent.project))
+            {
+                return Ok(true);
+            }
+            if launch_queue::effective_manager_limit(tx, &agent.project, project_limits)?.is_some()
+                && blocked_scopes.contains(&CapacityScope::manager_assignment_scope(&agent.project))
+                && assignment_usage(tx, &agent.project, Some((id, generation)))?.1
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+pub(super) fn reject_if_uses_blocked_scope_tx(
+    tx: &Transaction<'_>,
+    target: Option<&str>,
+    policy: Option<&PolicyLoader>,
+    blocked_scopes: &std::collections::HashSet<String>,
+) -> Result<()> {
+    if blocked_scopes.is_empty() {
+        return Ok(());
+    }
+    let Some(target) = target else {
+        return Ok(());
+    };
+    let agent = load_agent_by_num(tx, parse_agent_id(target)?)?
+        .ok_or_else(|| Error::new("internal", "admitted queued launch Agent disappeared"))?;
+    if agent_uses_any_scope_tx(tx, &agent, 1, policy, blocked_scopes)? {
+        return Err(Error::new(
+            "arbitration_retry",
+            "blocked capacity scope became available during arbitration pass",
+        ));
+    }
+    Ok(())
+}
+
 /// Reservations belonging to the current assignment, including the staged
 /// successor's slot during transfer. Managed launch and resume can reserve
 /// before dispatch installs the new generation. The candidate is evaluated by

@@ -162,6 +162,10 @@ struct RouterInner {
     /// every change; reads never bump it. Startup performs no sweep: the
     /// restart marks every owned session lost, so nothing is eligible.
     goal_reconcile: watch::Sender<u64>,
+    /// Bumped when queued launch arbitration inputs change (enqueued intent,
+    /// budget, settings, assignment, hold clear, or admitted slot) so `stop`
+    /// acceptance never wakes arbitration ahead of committed `capacity.released`.
+    launch_arbitration: watch::Sender<u64>,
 }
 
 struct RunWorkerHandle {
@@ -325,6 +329,7 @@ impl Router {
         let (progress, _) = watch::channel(0_u64);
         let (run_cancellation, _) = watch::channel(false);
         let (goal_reconcile, _) = watch::channel(0_u64);
+        let (launch_arbitration, _) = watch::channel(0_u64);
         let monitoring = Monitoring::new(Arc::clone(&store), bus.clone(), Arc::clone(&secrets));
         let workspaces = WorkspaceManager::new(
             data_root.clone(),
@@ -384,6 +389,7 @@ impl Router {
                 digest_poll_cursor: Mutex::new(None),
                 digest_sweep_end: Mutex::new(None),
                 goal_reconcile,
+                launch_arbitration,
             }),
         }
     }
@@ -644,6 +650,16 @@ impl Router {
 
     pub(crate) fn progress_receiver(&self) -> watch::Receiver<u64> {
         self.inner.progress.subscribe()
+    }
+
+    pub(crate) fn launch_arbitration_receiver(&self) -> watch::Receiver<u64> {
+        self.inner.launch_arbitration.subscribe()
+    }
+
+    pub(crate) fn signal_launch_arbitration(&self) {
+        self.inner.launch_arbitration.send_modify(|value| {
+            *value = value.wrapping_add(1);
+        });
     }
 
     pub(crate) fn monitoring(&self) -> Monitoring {
@@ -2654,6 +2670,7 @@ impl Router {
             change
         };
         self.signal_progress();
+        self.signal_launch_arbitration();
         serde_json::to_value(change.value)
             .map_err(|_| Error::new("internal", "provider correction could not be encoded"))
     }
@@ -2993,6 +3010,7 @@ impl Router {
         now: i64,
     ) -> Result<Option<TimerSlotAdmission>> {
         let scheduled_at_ms = slot.scheduled_at_ms;
+        let was_arbitrated = arbitration.is_some();
         let admission = {
             let mut store = self.inner.store.lock().await;
             if let Some(admission) = store.replay_timer_slot(principal, state, scheduled_at_ms)? {
@@ -3031,6 +3049,9 @@ impl Router {
         }
         if admission.is_new {
             self.signal_progress();
+            if was_arbitrated {
+                self.signal_launch_arbitration();
+            }
         }
         Ok(Some(admission))
     }

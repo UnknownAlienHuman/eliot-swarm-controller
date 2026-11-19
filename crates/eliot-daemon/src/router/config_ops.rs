@@ -219,6 +219,9 @@ impl Router {
         if pause_changed || !events.is_empty() {
             self.signal_progress();
         }
+        if reply.saved && !request.dry_run {
+            self.signal_launch_arbitration();
+        }
         // The save committed above: a response that fails local validation
         // is an unknown effect, never a pre-admission rejection.
         request

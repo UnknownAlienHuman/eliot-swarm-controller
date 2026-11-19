@@ -507,8 +507,11 @@ linked initial sends, and starting, running or unknown native turns. Counting st
 at `max_busy` and excludes completed history. A terminal turn releases the slot;
 process liveness by itself does not establish completion. Store checks the cursor,
 all applicable capacity bounds and provider holds in the normal launch transaction.
-A full scope keeps the due slot available for the next arbitration pass. An
-already-dispatched or unknown command retains its reservation until verified closure.
+A full scope keeps the due slot available for the next arbitration pass. Capacity waits
+re-arbitrate on committed `capacity.released` (not on `stop` acceptance), and a
+`capacity_unavailable` probe neither advances the rotation cursor nor lets a later
+project in the same pass claim a slot on the blocked shared scope ahead of the waiting
+project. An already-dispatched or unknown command retains its reservation until verified closure.
 
 The `launch` action submits the existing ordinary launch command with flat fields. An
 explicit `profile` or a routing `role` may be supplied; they are mutually exclusive.
