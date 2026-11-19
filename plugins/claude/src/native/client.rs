@@ -20,8 +20,8 @@ use eliot_core::{Error, Result, SecretPolicy, StderrSnapshot, StderrSource};
 use eliot_plugin::{
     StderrView,
     native_transport::{
-        DEFAULT_MAX_NATIVE_FRAME_BYTES, NativeChild, NativeLabels, NativeLaunch, NativeWriter,
-        PendingCalls, PumpAction, PumpMode, StreamState, encode_frame, spawn_pumped,
+        NativeChild, NativeLabels, NativeLaunch, NativeWriter, PendingCalls, PumpAction, PumpMode,
+        StreamState, encode_frame, spawn_pumped,
     },
 };
 
@@ -61,6 +61,14 @@ pub(crate) struct ClaudeProcess {
     stream: watch::Receiver<StreamState>,
 }
 
+/// Inbound Claude stream-json frame cap. On 2026-11-19 (ctl10, a809) a
+/// `user` record carrying a Read tool's screenshot result was 1,346,894
+/// bytes against the 1 MiB default and ended the stream (`frame_oversized`,
+/// turn `unknown`). Claude accepts images up to 5 MB, about 6.7 MB as
+/// base64, so 8 MiB covers one such result plus its envelope. Anything
+/// larger stays an explicit oversized gap.
+const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+
 impl ClaudeProcess {
     pub async fn spawn(launch: NativeLaunch, policy: SecretPolicy) -> Result<Self> {
         // JSON-RPC: keep nonblocking routing; a pending reply must never
@@ -71,7 +79,7 @@ impl ClaudeProcess {
             LABELS,
             ID_PREFIX,
             PumpMode::LossyOverflow,
-            DEFAULT_MAX_NATIVE_FRAME_BYTES,
+            MAX_FRAME_BYTES,
             OVERSIZED_KNOWN_METHODS,
             classify_claude_frame,
             None,
