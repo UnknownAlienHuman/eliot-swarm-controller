@@ -78,11 +78,19 @@ pub(super) fn authorize_agent_submit(
 /// daemon-resolved `daemon_model`) is the point of the allow-list,
 /// `child_profiles` governs the next hop rather than this launch,
 /// `native_subagents` governs the child's own session rather than this
-/// launch, and `control` is checked separately as equal or narrower.
+/// launch, `control` is checked separately as equal or narrower, and
+/// `native_launch_metadata` is command-bound launch metadata stamped on the
+/// parent at dispatch (replaced on child dispatch, never profile policy).
 fn ignored_child_snapshot_key(key: &str) -> bool {
     matches!(
         key,
-        "model" | "effort" | "daemon_model" | "child_profiles" | "native_subagents" | "control"
+        "model"
+            | "effort"
+            | "daemon_model"
+            | "child_profiles"
+            | "native_subagents"
+            | "control"
+            | "native_launch_metadata"
     )
 }
 
@@ -986,6 +994,13 @@ mod tests {
             {"scope": "account:shared", "max_live": 1},
         ]);
         child_snapshot_within_parent(&matching, "worker", &parent, "manager").unwrap();
+        let mut parent_with_launch_metadata = parent.clone();
+        parent_with_launch_metadata["native_launch_metadata"] = json!({
+            "command_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "data": {"servers": [], "plugins": []},
+        });
+        child_snapshot_within_parent(&matching, "worker", &parent_with_launch_metadata, "manager")
+            .unwrap();
         // Any other difference rejects: harness, permissions, approval
         // policy, MCP, pass_env, scratch, or the inherited bindings.
         for (key, value) in [
