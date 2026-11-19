@@ -66,8 +66,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 use windows_sys::core::BOOL;
 
+use crate::theme::elevation::Level;
 use crate::theme::{Rgb8, Scheme, state};
-use crate::ui::tokens::{elevation, height, radius, spacing};
+use crate::ui::tokens::{height, radius, spacing};
 
 /// A theme resource value.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -781,7 +782,7 @@ fn overlays(s: &Scheme) -> Vec<(&'static str, Value)> {
         ("ContentDialogBorderWidth", uniform(0.0)),
         ("ToolTipBackground", opaque(s.inverse_surface)),
         ("ToolTipForeground", opaque(s.inverse_on_surface)),
-        ("ControlCornerRadius", Value::Radius(radius::CONTROL)),
+        ("ControlCornerRadius", Value::Radius(radius::FIELD)),
         ("OverlayCornerRadius", Value::Radius(radius::CONTAINER)),
     ];
     all.extend(every(
@@ -883,54 +884,87 @@ pub fn dictionary_xaml(scheme: &Scheme) -> String {
 /// control's built-in style underneath, so every control keeps its states
 /// and focus visuals.
 pub fn styles_xaml() -> String {
-    let (control, container, circle, check) = (
-        radius::CONTROL,
+    use templates::{Lift, Look, PRESS_SMALL, PRESS_WIDE, button};
+    let (pill, field, container, dialog, check) = (
+        radius::PILL,
+        radius::FIELD,
         radius::CONTAINER,
-        radius::CIRCLE,
+        radius::DIALOG,
         radius::CHECK_BOX,
     );
     // Menu items are control-height rows: WinUI pads them from a
     // StaticResource (11,9,11,10), so only a style sets their height.
     let (min, inset) = (height::CONTROL, spacing::INSET);
-    // The composer's trailing button: Material's raised FAB (M3 levels 3
-    // and 4 as ThemeShadow depth).
-    let fab = templates::button(Some(templates::Lift {
-        rest: elevation::LEVEL3,
-        hover: elevation::LEVEL4,
-    }));
+    // Labelled buttons, rows, chips and segments; icon buttons; the
+    // composer's raised FAB (M3 levels 3 and 4); the dialog's primary.
+    let labelled = button(Look {
+        lift: None,
+        keys: "Button",
+        press: PRESS_WIDE,
+    });
+    let icon = button(Look {
+        lift: None,
+        keys: "Button",
+        press: PRESS_SMALL,
+    });
+    let fab = button(Look {
+        lift: Some(Lift {
+            rest: Level::Three,
+            hover: Level::Four,
+        }),
+        keys: "Button",
+        press: PRESS_SMALL,
+    });
+    let accent = button(Look {
+        lift: None,
+        keys: "AccentButton",
+        press: PRESS_WIDE,
+    });
+    let template = |xaml: &str| {
+        format!("<Setter Property=\"Template\"><Setter.Value>{xaml}</Setter.Value></Setter>")
+    };
+    let (labelled, icon, fab, accent) = (
+        template(&labelled),
+        template(&icon),
+        template(&fab),
+        template(&accent),
+    );
     format!(
         "{XAML_ROOT}\
          <Style TargetType=\"Button\">\
-           <Setter Property=\"CornerRadius\" Value=\"{control}\"/>\
+           <Setter Property=\"CornerRadius\" Value=\"{pill}\"/>\
            <Setter Property=\"Padding\" Value=\"{inset},0,{inset},0\"/>\
            <Setter Property=\"MinHeight\" Value=\"{min}\"/>\
+           {labelled}\
          </Style>\
          <Style x:Key=\"SubtleButtonStyle\" TargetType=\"Button\">\
-           <Setter Property=\"CornerRadius\" Value=\"{control}\"/>\
+           <Setter Property=\"CornerRadius\" Value=\"{pill}\"/>\
            <Setter Property=\"Padding\" Value=\"0\"/>\
+           {icon}\
          </Style>\
          <Style x:Key=\"TextBlockButtonStyle\" TargetType=\"Button\">\
-           <Setter Property=\"CornerRadius\" Value=\"{circle}\"/>\
+           <Setter Property=\"CornerRadius\" Value=\"{pill}\"/>\
            <Setter Property=\"Padding\" Value=\"0\"/>\
            <Setter Property=\"BorderThickness\" Value=\"0\"/>\
            <Setter Property=\"HorizontalContentAlignment\" Value=\"Center\"/>\
            <Setter Property=\"VerticalContentAlignment\" Value=\"Center\"/>\
-           <Setter Property=\"Template\"><Setter.Value>{fab}</Setter.Value></Setter>\
+           {fab}\
          </Style>\
          <Style x:Key=\"AccentButtonStyle\" TargetType=\"Button\" \
                 BasedOn=\"{{StaticResource AccentButtonStyle}}\">\
-           <Setter Property=\"CornerRadius\" Value=\"{control}\"/>\
+           <Setter Property=\"CornerRadius\" Value=\"{pill}\"/>\
            <Setter Property=\"Padding\" Value=\"{inset},0,{inset},0\"/>\
            <Setter Property=\"MinHeight\" Value=\"{min}\"/>\
+           {accent}\
          </Style>\
          <Style TargetType=\"TextBox\">\
-           <Setter Property=\"CornerRadius\" Value=\"{control}\"/>\
+           <Setter Property=\"CornerRadius\" Value=\"{field}\"/>\
            <Setter Property=\"MinHeight\" Value=\"{min}\"/>\
            <Setter Property=\"IsTextPredictionEnabled\" Value=\"False\"/>\
            <Setter Property=\"IsSpellCheckEnabled\" Value=\"False\"/>\
          </Style>\
          <Style TargetType=\"ComboBox\">\
-           <Setter Property=\"CornerRadius\" Value=\"{control}\"/>\
+           <Setter Property=\"CornerRadius\" Value=\"{pill}\"/>\
            <Setter Property=\"MinHeight\" Value=\"{min}\"/>\
          </Style>\
          <Style TargetType=\"CheckBox\">\
@@ -942,7 +976,7 @@ pub fn styles_xaml() -> String {
            <Setter Property=\"MinWidth\" Value=\"0\"/>\
          </Style>\
          <Style TargetType=\"ContentDialog\">\
-           <Setter Property=\"CornerRadius\" Value=\"{container}\"/>\
+           <Setter Property=\"CornerRadius\" Value=\"{dialog}\"/>\
          </Style>\
          <Style TargetType=\"MenuFlyoutItem\">\
            <Setter Property=\"Padding\" Value=\"{inset},0,{inset},0\"/>\

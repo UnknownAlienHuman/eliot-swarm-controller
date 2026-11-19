@@ -168,7 +168,12 @@ impl DesktopApp {
                 0.0,
                 tokens::spacing::LG,
             ))
-            .content(card)
+            .content(m3::lifted(
+                crate::theme::elevation::Level::Two,
+                tokens::radius::COMPOSER,
+                Grid::new(),
+                card,
+            ))
     }
 
     /// The open Agent's project, harness and access: read-only, so plain
@@ -228,7 +233,7 @@ impl DesktopApp {
                             .text(label)
                             .vertical_alignment(VerticalAlignment::Center)
                             .text_trimming(TextTrimming::CharacterEllipsis),
-                        m3::icon(m3::glyph::CHEVRON_DOWN),
+                        m3::dropdown_chevron(),
                     )),
             )
     }
@@ -409,26 +414,31 @@ impl DesktopApp {
         } else {
             m3::secondary("←→ effort   Enter apply   Esc close").into()
         };
-        m3::popover(palette)
-            .min_width(EFFORT_MIN_WIDTH)
-            .horizontal_alignment(HorizontalAlignment::Left)
-            .automation_name("Model and effort")
-            .content(
-                StackPanel::new()
-                    .spacing(tokens::spacing::SM)
-                    .margin(Thickness::uniform(tokens::spacing::SM))
-                    .children((
-                        header,
-                        steps,
-                        if note.is_empty() {
-                            View::empty()
-                        } else {
-                            m3::secondary(note).text_wrapping(TextWrapping::Wrap).into()
-                        },
-                        hints,
-                        change_model,
-                    )),
-            )
+        m3::lifted(
+            crate::theme::elevation::Level::Two,
+            tokens::radius::CONTAINER,
+            Grid::new()
+                .min_width(EFFORT_MIN_WIDTH)
+                .horizontal_alignment(HorizontalAlignment::Left),
+            m3::popover(palette)
+                .automation_name("Model and effort")
+                .content(
+                    StackPanel::new()
+                        .spacing(tokens::spacing::SM)
+                        .margin(Thickness::uniform(tokens::spacing::SM))
+                        .children((
+                            header,
+                            steps,
+                            if note.is_empty() {
+                                View::empty()
+                            } else {
+                                m3::secondary(note).text_wrapping(TextWrapping::Wrap).into()
+                            },
+                            hints,
+                            change_model,
+                        )),
+                ),
+        )
     }
 
     /// Codex's usage popover over the composer: where the usage comes from,
@@ -482,11 +492,13 @@ impl DesktopApp {
                 )
             })
             .collect();
-        m3::popover(palette)
-            .width(USAGE_WIDTH)
-            .horizontal_alignment(HorizontalAlignment::Right)
-            .automation_name("Usage")
-            .content(
+        m3::lifted(
+            crate::theme::elevation::Level::Two,
+            tokens::radius::CONTAINER,
+            Grid::new()
+                .width(USAGE_WIDTH)
+                .horizontal_alignment(HorizontalAlignment::Right),
+            m3::popover(palette).automation_name("Usage").content(
                 StackPanel::new().spacing(tokens::spacing::XS).children((
                     StackPanel::new()
                         .margin(Thickness::new(
@@ -512,7 +524,8 @@ impl DesktopApp {
                             m3::icon(m3::glyph::CHEVRON_RIGHT),
                         )),
                 )),
-            )
+            ),
+        )
     }
 
     /// The one trailing button, as in Codex: Send; while a turn runs, Stop

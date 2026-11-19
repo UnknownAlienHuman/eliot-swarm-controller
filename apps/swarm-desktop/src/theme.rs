@@ -32,7 +32,87 @@ pub mod typography {
     pub const TITLE_LARGE: TypeStyle = style(22.0, 600);
     pub const TITLE_MEDIUM: TypeStyle = style(16.0, 600);
     pub const BODY: TypeStyle = style(14.0, 400);
+    /// Button and chip labels (M3 label-large).
+    pub const LABEL_LARGE: TypeStyle = style(14.0, 500);
     pub const LABEL: TypeStyle = style(12.0, 500);
+}
+
+/// Material 3 elevation as drawn shadows: each level's key and ambient
+/// shadows (Material Components' `md-elevation` levels: offset, blur,
+/// spread and opacity of black), each blur drawn as three concentric
+/// translucent layers, so a WinUI element without `ThemeShadow` receivers
+/// still lifts off its surface.
+pub mod elevation {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Level {
+        Two,
+        Three,
+        Four,
+    }
+
+    /// One drawn layer: how far it spreads past the element, how far it
+    /// falls below it (DIPs) and its black's alpha (0–255).
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct Layer {
+        pub spread: f64,
+        pub offset: f64,
+        pub alpha: u8,
+    }
+
+    /// (offset, blur, spread, opacity) of the key and the ambient shadow.
+    fn shadows(level: Level) -> [(f64, f64, f64, f64); 2] {
+        match level {
+            Level::Two => [(1.0, 2.0, 0.0, 0.30), (2.0, 6.0, 2.0, 0.15)],
+            Level::Three => [(1.0, 3.0, 0.0, 0.30), (4.0, 8.0, 3.0, 0.15)],
+            Level::Four => [(2.0, 3.0, 0.0, 0.30), (6.0, 10.0, 4.0, 0.15)],
+        }
+    }
+
+    /// Steps that draw one blur.
+    const STEPS: u32 = 3;
+
+    pub fn layers(level: Level) -> Vec<Layer> {
+        let mut out = Vec::new();
+        for (offset, blur, spread, opacity) in shadows(level) {
+            for step in 0..STEPS {
+                // Half-DIP steps keep the layers on whole device pixels at
+                // 200 % scale.
+                let reach = (blur * f64::from(step) / f64::from(STEPS) * 2.0).round() / 2.0;
+                out.push(Layer {
+                    spread: spread + reach,
+                    offset,
+                    alpha: (opacity / f64::from(STEPS) * 255.0).round() as u8,
+                });
+            }
+        }
+        out
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn higher_levels_reach_further_and_fall_lower() {
+            let reach = |level| {
+                layers(level)
+                    .iter()
+                    .map(|layer| layer.spread + layer.offset)
+                    .fold(0.0, f64::max)
+            };
+            let levels = [Level::Two, Level::Three, Level::Four];
+            for pair in levels.windows(2) {
+                assert!(reach(pair[0]) < reach(pair[1]), "{pair:?}");
+            }
+            // Each shadow keeps its total opacity across its steps.
+            let total: u32 = layers(Level::Three)
+                .iter()
+                .map(|layer| u32::from(layer.alpha))
+                .sum();
+            // 30 % key and 15 % ambient, give or take the rounding.
+            assert!((f64::from(total) - 0.45 * 255.0).abs() <= 3.0, "{total}");
+        }
+    }
 }
 
 /// M3 state-layer opacities of the content color over a container.
@@ -558,7 +638,8 @@ pub mod winui {
         /// The composer's usage ring as Material's determinate circular
         /// indicator: a text button whose `ProgressRing` takes its arc
         /// (primary; warning under 20 % left, error under 5 %) and its track
-        /// (secondary-container) from this button's own resources, which
+        /// (outline-variant, which reads on the composer in both schemes)
+        /// from this button's own resources, which
         /// WinUI's ring template resolves before the application's.
         pub fn usage_ring(self, remaining: f64) -> ResourceOverrides {
             self.with(|s| {
@@ -566,10 +647,7 @@ pub mod winui {
                 Family::new(None, s.on_surface_variant)
                     .overrides(s)
                     .set("ProgressRingForegroundThemeBrush", color(arc))
-                    .set(
-                        "ProgressRingBackgroundThemeBrush",
-                        color(s.secondary_container),
-                    )
+                    .set("ProgressRingBackgroundThemeBrush", color(s.outline_variant))
             })
         }
 

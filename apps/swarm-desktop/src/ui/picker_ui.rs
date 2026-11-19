@@ -304,7 +304,7 @@ impl DesktopApp {
             .height(tokens::height::CONTROL)
             .automation_name("Manage models")
             .on_click(context.message(Message::Launch(LaunchMsg::ManageOpened)))
-            .content(m3::icon(m3::glyph::SLIDERS))
+            .content(m3::toolbar_icon(m3::glyph::SLIDERS))
             .tooltip("Manage models");
         let search = Grid::new()
             .columns([GridLength::STAR, GridLength::Auto])
@@ -315,20 +315,26 @@ impl DesktopApp {
             .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
             .automation_name("Models")
             .content(StackPanel::new().keyed_children(items));
-        m3::popover(palette)
-            .width(tokens::layout::PICKER_WIDTH)
-            .horizontal_alignment(HorizontalAlignment::Left)
-            .content(StackPanel::new().spacing(tokens::spacing::XS).children((
-                search,
-                list,
-                m3::divider(palette),
-                m3::secondary(PICKER_HINTS).margin(Thickness::new(
-                    tokens::spacing::SM,
-                    0.0,
-                    tokens::spacing::SM,
-                    tokens::spacing::XS,
-                )),
-            )))
+        m3::lifted(
+            crate::theme::elevation::Level::Two,
+            tokens::radius::CONTAINER,
+            Grid::new()
+                .width(tokens::layout::PICKER_WIDTH)
+                .horizontal_alignment(HorizontalAlignment::Left),
+            m3::popover(palette).content(StackPanel::new().spacing(tokens::spacing::XS).children(
+                (
+                    search,
+                    list,
+                    m3::divider(palette),
+                    m3::secondary(PICKER_HINTS).margin(Thickness::new(
+                        tokens::spacing::SM,
+                        0.0,
+                        tokens::spacing::SM,
+                        tokens::spacing::XS,
+                    )),
+                ),
+            )),
+        )
     }
 
     /// One choosable row (OpenCode's): the check, the full model name and an
@@ -462,7 +468,7 @@ impl DesktopApp {
                     .collect();
             Border::new()
                 .height(tokens::height::CHIP)
-                .corner_radius(tokens::radius::CONTROL)
+                .corner_radius(tokens::height::CHIP / 2.0)
                 .background(palette.well())
                 .vertical_alignment(VerticalAlignment::Center)
                 .content(
@@ -478,7 +484,7 @@ impl DesktopApp {
         } {
             Border::new()
                 .height(tokens::height::CHIP)
-                .corner_radius(tokens::radius::CONTROL)
+                .corner_radius(tokens::height::CHIP / 2.0)
                 .background(palette.well())
                 .vertical_alignment(VerticalAlignment::Center)
                 .content(chip_text(label, &name).opacity(theme::MUTED_OPACITY))
@@ -499,7 +505,7 @@ impl DesktopApp {
                 .on_click(
                     context.message(Message::Launch(LaunchMsg::PickerFavorite(item.key.clone()))),
                 )
-                .content(m3::icon(glyph))
+                .content(m3::toolbar_icon(glyph))
         } else {
             View::empty()
         };
@@ -517,7 +523,7 @@ impl DesktopApp {
                 ),
             ]);
         Border::new()
-            .corner_radius(tokens::radius::CONTROL)
+            .corner_radius(tokens::radius::PILL)
             .background(if highlighted {
                 palette.highlight()
             } else {
@@ -612,7 +618,7 @@ impl DesktopApp {
                     refused.is_some()
                 ),
                 Border::new()
-                    .corner_radius(tokens::radius::CONTROL)
+                    .corner_radius(tokens::radius::PILL)
                     .background(if highlighted {
                         palette.highlight()
                     } else {
@@ -624,10 +630,14 @@ impl DesktopApp {
                     .content(row),
             ));
         }
-        m3::popover(palette)
-            .width(tokens::layout::MENU_WIDTH)
-            .horizontal_alignment(HorizontalAlignment::Left)
-            .content(StackPanel::new().keyed_children(rows))
+        m3::lifted(
+            crate::theme::elevation::Level::Two,
+            tokens::radius::CONTAINER,
+            Grid::new()
+                .width(tokens::layout::MENU_WIDTH)
+                .horizontal_alignment(HorizontalAlignment::Left),
+            m3::popover(palette).content(StackPanel::new().keyed_children(rows)),
+        )
     }
 
     /// The project list: a search field, the registered projects (name and
@@ -656,7 +666,7 @@ impl DesktopApp {
                 KeyedView::new(
                     format!("{checkout}:{highlighted}:{selected}"),
                     Border::new()
-                        .corner_radius(tokens::radius::CONTROL)
+                        .corner_radius(tokens::radius::PILL)
                         .background(if highlighted {
                             palette.highlight()
                         } else {
@@ -690,10 +700,13 @@ impl DesktopApp {
             .on_text_changed(
                 context.callback(|text| Message::Launch(LaunchMsg::ProjectQuery(text))),
             );
-        m3::popover(palette)
-            .width(tokens::layout::MENU_WIDTH)
-            .horizontal_alignment(HorizontalAlignment::Left)
-            .content(
+        m3::lifted(
+            crate::theme::elevation::Level::Two,
+            tokens::radius::CONTAINER,
+            Grid::new()
+                .width(tokens::layout::MENU_WIDTH)
+                .horizontal_alignment(HorizontalAlignment::Left),
+            m3::popover(palette).content(
                 StackPanel::new().spacing(tokens::spacing::XS).children((
                     search,
                     ScrollViewer::new()
@@ -701,7 +714,8 @@ impl DesktopApp {
                         .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
                         .content(StackPanel::new().keyed_children(rows)),
                 )),
-            )
+            ),
+        )
     }
 }
 
@@ -829,7 +843,7 @@ impl DesktopApp {
                     .vertical_alignment(VerticalAlignment::Top)
                     .automation_name("Back to the model selector")
                     .on_click(context.message(Message::Launch(LaunchMsg::ManageClosed)))
-                    .content(m3::icon(m3::glyph::BACK)),
+                    .content(m3::toolbar_icon(m3::glyph::BACK)),
                 StackPanel::new().grid_column(1).children((
                     m3::section_title("Manage models"),
                     m3::secondary("Customize which models appear in the model selector"),
@@ -843,10 +857,13 @@ impl DesktopApp {
             .on_text_changed(
                 context.callback(|text| Message::Launch(LaunchMsg::ManageQuery(text))),
             );
-        m3::popover(palette)
-            .width(tokens::layout::PICKER_WIDTH)
-            .horizontal_alignment(HorizontalAlignment::Left)
-            .content(
+        m3::lifted(
+            crate::theme::elevation::Level::Two,
+            tokens::radius::CONTAINER,
+            Grid::new()
+                .width(tokens::layout::PICKER_WIDTH)
+                .horizontal_alignment(HorizontalAlignment::Left),
+            m3::popover(palette).content(
                 StackPanel::new().spacing(tokens::spacing::SM).children((
                     header,
                     search,
@@ -856,7 +873,8 @@ impl DesktopApp {
                         .automation_name("Model groups")
                         .content(StackPanel::new().keyed_children(rows)),
                 )),
-            )
+            ),
+        )
     }
 }
 
@@ -961,7 +979,7 @@ fn chip_content(glyph: &str, label: &str, max_width: Option<f64>) -> View {
                 Some(width) => label.max_width(width),
                 None => label,
             },
-            m3::icon(m3::glyph::CHEVRON_DOWN),
+            m3::dropdown_chevron(),
         ))
 }
 

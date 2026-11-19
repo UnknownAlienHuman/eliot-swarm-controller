@@ -25,7 +25,9 @@ pub mod glyph {
     pub const NEW_TASK: &str = "\u{E70F}";
     pub const FOLDER: &str = "\u{E8B7}";
     pub const SETTINGS: &str = "\u{E713}";
-    pub const STOP: &str = "\u{E71A}";
+    /// A filled square (Segoe Fluent E978): the outline Stop glyph read as
+    /// a check box (owner review 2026-11-19).
+    pub const STOP: &str = "\u{E978}";
     pub const MORE: &str = "\u{E712}";
     pub const INFO: &str = "\u{E946}";
     pub const CLOSE: &str = "\u{E711}";
@@ -182,9 +184,47 @@ pub fn icon_label(glyph: &str, label: &str) -> View {
         ))
 }
 
-/// A button's label.
+/// A button's label (M3 label-large).
 pub fn label(value: &str) -> TextBlock {
-    TextBlock::new().text(value.to_owned())
+    text(value.to_owned(), style::BUTTON)
+}
+
+/// A dropdown's chevron (a chip or field that opens a list).
+pub fn dropdown_chevron() -> View {
+    icon_sized(glyph::CHEVRON_DOWN, icon_size::CHEVRON)
+}
+
+/// `view` lifted off its surface at `level`: Material's key and ambient
+/// shadows drawn under it on a corner of `radius` (WinUI's `ThemeShadow`
+/// draws nothing outside a popup without receivers, which Reactor 0.100.0
+/// cannot add). `place` is the grid that sizes and places them (a
+/// popover's width and alignment), so the shadow follows the view.
+pub fn lifted(
+    level: crate::theme::elevation::Level,
+    radius: f64,
+    place: Grid,
+    view: impl Into<View>,
+) -> View {
+    let mut cells: Vec<KeyedView> = crate::theme::elevation::layers(level)
+        .into_iter()
+        .enumerate()
+        .map(|(index, layer)| {
+            KeyedView::new(
+                format!("shadow:{index}"),
+                Border::new()
+                    .corner_radius(radius + layer.spread)
+                    .margin(Thickness::new(
+                        -layer.spread,
+                        layer.offset - layer.spread,
+                        -layer.spread,
+                        -layer.offset - layer.spread,
+                    ))
+                    .background(Brush::Solid(Color::argb(layer.alpha, 0, 0, 0))),
+            )
+        })
+        .collect();
+    cells.push(KeyedView::new("content", view.into()));
+    place.keyed_children(cells)
 }
 
 fn button(overrides: ResourceOverrides) -> Button {
@@ -377,7 +417,7 @@ pub fn segment(palette: Palette, selected: bool) -> Button {
 /// The content of a segment: its label (the fill marks the selection, so
 /// the segments keep their widths when it moves).
 pub fn segment_label(label: &str) -> View {
-    TextBlock::new().text(label.to_owned()).into()
+    self::label(label).into()
 }
 
 /// A segmented button: the segments on one filled track of the control
@@ -385,7 +425,7 @@ pub fn segment_label(label: &str) -> View {
 pub fn segmented(palette: Palette, segments: Vec<KeyedView>) -> View {
     Border::new()
         .height(height::CONTROL)
-        .corner_radius(radius::CONTROL)
+        .corner_radius(radius::PILL)
         .background(palette.well())
         .horizontal_alignment(HorizontalAlignment::Left)
         .content(
@@ -463,7 +503,7 @@ pub fn field_button_content(value: &str) -> View {
             Border::new()
                 .grid_column(1)
                 .vertical_alignment(VerticalAlignment::Center)
-                .content(icon_sized(glyph::CHEVRON_DOWN, icon_size::CHEVRON)),
+                .content(dropdown_chevron()),
         ))
 }
 
@@ -696,7 +736,7 @@ pub fn badge(palette: Palette, text: &str) -> View {
     Border::new()
         .border_brush(palette.outline_variant())
         .border_thickness(Thickness::uniform(layout::HAIRLINE))
-        .corner_radius(radius::CONTROL)
+        .corner_radius(radius::PILL)
         .padding(Thickness::xy(spacing::XS, 0.0))
         .vertical_alignment(VerticalAlignment::Center)
         .content(secondary(text.to_owned()))
@@ -707,7 +747,7 @@ pub fn status_ring(status: Brush) -> View {
     Border::new()
         .width(layout::RING)
         .height(layout::RING)
-        .corner_radius(radius::CONTROL)
+        .corner_radius(radius::PILL)
         .border_thickness(Thickness::uniform(2.0))
         .border_brush(status)
         .vertical_alignment(VerticalAlignment::Center)

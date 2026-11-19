@@ -14,46 +14,47 @@
 //!
 //! The M3 type-scale names map onto the four styles: headline and
 //! title-large are [`text::PAGE_TITLE`], title-medium and title-small
-//! [`text::SECTION_TITLE`], body-large, body-medium and the labels
-//! [`text::BODY`], body-small [`text::SECONDARY`].
+//! [`text::SECTION_TITLE`], body-large and body-medium [`text::BODY`],
+//! label-large (buttons, chips) [`text::BUTTON`], body-small and the small
+//! labels [`text::SECONDARY`]; one family, the system's Segoe UI Variable.
 
-/// Corner radii: three values, the one circle and the M3 check box.
+/// Corner radii, the Material 3 shape scale: everything pressed is a pill,
+/// everything typed into is a small rounded rectangle, containers are
+/// medium, the composer large and dialogs extra-large.
 pub mod radius {
-    /// Every control and row highlight: buttons, chips, text fields,
-    /// dropdowns, list and navigation selection.
-    pub const CONTROL: f64 = 8.0;
-    /// Containers: cards, menus, the Details sections, dialogs, message
-    /// bubbles and code blocks.
+    /// Everything pressed: buttons, icon buttons, chips, segments,
+    /// dropdowns, list and navigation selection: M3 full, half the control
+    /// height. (WinUI clamps an oversized radius per axis, so a larger
+    /// value draws a wide button as an ellipse: observed live.) A shorter
+    /// pill uses half its own height.
+    pub const PILL: f64 = super::height::CONTROL / 2.0;
+    /// Text fields (M3 small).
+    pub const FIELD: f64 = 8.0;
+    /// Containers: cards, menus, popovers, the Details sections, message
+    /// bubbles and code blocks (M3 medium).
     pub const CONTAINER: f64 = 12.0;
-    /// The composer.
+    /// The composer (M3 large).
     pub const COMPOSER: f64 = 16.0;
-    /// The only circle: the composer's trailing button (half its side).
-    pub const CIRCLE: f64 = super::height::FAB / 2.0;
+    /// Dialogs (M3 extra-large).
+    pub const DIALOG: f64 = 28.0;
     /// The Stop square inside it (Material's stop icon).
     pub const STOP: f64 = 3.0;
     /// Check boxes keep the M3 default corner.
     pub const CHECK_BOX: f64 = 2.0;
 }
 
-/// Material 3 elevation levels as `ThemeShadow` depth in DIPs (levels 3
-/// and 4: the FAB at rest and under the pointer).
-pub mod elevation {
-    pub const LEVEL3: f64 = 6.0;
-    pub const LEVEL4: f64 = 8.0;
-}
-
-/// Heights in DIPs (compact density).
+/// Heights in DIPs (Material density, touch-sized).
 pub mod height {
     /// Every control (button, chip, text field, dropdown, number box) and
-    /// every list or navigation row.
-    pub const CONTROL: f64 = 32.0;
-    /// A form row: its label and its 32-DIP control.
-    pub const FORM_ROW: f64 = 36.0;
+    /// every list or navigation row: Material's 40-DIP button, touch-sized.
+    pub const CONTROL: f64 = 40.0;
+    /// A form row: its label and its 40-DIP control.
+    pub const FORM_ROW: f64 = 48.0;
     /// A sidebar sub-row: a task under its project, Recents and "No tasks".
-    pub const SUB_ROW: f64 = 28.0;
+    pub const SUB_ROW: f64 = 36.0;
     /// A picker row with a supporting line under its title (the move
     /// picker's tasks).
-    pub const TWO_LINE_ROW: f64 = 48.0;
+    pub const TWO_LINE_ROW: f64 = 56.0;
     /// A compact chip inside a row: the model picker's effort chip and the
     /// highlighted row's effort segment.
     pub const CHIP: f64 = 24.0;
@@ -65,8 +66,8 @@ pub mod height {
 /// Native aliases of the shared Material 3 type scale.
 pub mod text {
     pub use crate::theme::typography::{
-        BODY, LABEL as SECONDARY, TITLE_LARGE as PAGE_TITLE, TITLE_MEDIUM as SECTION_TITLE,
-        TypeStyle,
+        BODY, LABEL as SECONDARY, LABEL_LARGE as BUTTON, TITLE_LARGE as PAGE_TITLE,
+        TITLE_MEDIUM as SECTION_TITLE, TypeStyle,
     };
 }
 
@@ -85,11 +86,13 @@ pub mod spacing {
     pub const LG: f64 = 24.0;
 }
 
-/// Icon sizes in DIPs, all Segoe Fluent Icons (one stroke family).
+/// Icon sizes in DIPs, all Segoe Fluent Icons (one stroke family): 16 next
+/// to a label, 20 alone in a button, 12 for a dropdown's chevron.
 pub mod icon {
     /// In rows, chips and buttons with a label.
     pub const ROW: f64 = 16.0;
-    /// In toolbars: the conversation and panel headers.
+    /// Alone in a button: icon buttons, the headers' tools, the composer's
+    /// trailing button.
     pub const TOOLBAR: f64 = 20.0;
     /// A dropdown's chevron (WinUI's ComboBox draws it at 12).
     pub const CHEVRON: f64 = 12.0;

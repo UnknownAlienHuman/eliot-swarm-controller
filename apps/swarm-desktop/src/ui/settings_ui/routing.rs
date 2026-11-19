@@ -59,20 +59,20 @@ impl DesktopApp {
                             .on_click(context.message(Message::Settings(
                                 SettingsMsg::RoutingMoved(role.clone(), index, true),
                             )))
-                            .content(m3::icon(m3::glyph::ARROW_UP)),
+                            .content(m3::toolbar_icon(m3::glyph::ARROW_UP)),
                         m3::icon_button(palette)
                             .is_enabled(!last)
                             .automation_name(format!("Move {name} later in {role}"))
                             .on_click(context.message(Message::Settings(
                                 SettingsMsg::RoutingMoved(role.clone(), index, false),
                             )))
-                            .content(m3::icon(m3::glyph::ARROW_DOWN)),
+                            .content(m3::toolbar_icon(m3::glyph::ARROW_DOWN)),
                         m3::icon_button(palette)
                             .automation_name(format!("Remove {name} from {role}"))
                             .on_click(context.message(Message::Settings(
                                 SettingsMsg::RoutingRemoved(role.clone(), index),
                             )))
-                            .content(m3::icon(m3::glyph::CLOSE)),
+                            .content(m3::toolbar_icon(m3::glyph::CLOSE)),
                     ));
                 rows.push(KeyedView::new(
                     format!("{role}:{index}:{name}:{first}:{last}"),

@@ -3,9 +3,14 @@
 //! container takes the button's own background, border and corner; a
 //! state layer in the content color fades in on hover (8 %) and press
 //! (10 %); a ripple in the content color grows from the centre on press
-//! and fades on release; a raised button lifts a `ThemeShadow` and lifts
-//! it further on hover; the press scales the button down a little, and
-//! every change runs on M3's motion tokens.
+//! and fades on release; a raised button casts a soft shadow that deepens
+//! on hover; the press scales the button down a little, and every change
+//! runs on M3's motion tokens.
+//!
+//! WinUI's `ThemeShadow` draws nothing outside a popup unless code adds
+//! receivers (observed live; a style cannot), so the shadow is drawn
+//! here: [`crate::theme::elevation`]'s key and ambient layers, each a few
+//! concentric translucent pills under the container.
 //!
 //! The colors stay the lightweight-styling keys WinUI's own button
 //! template reads (`ButtonBackground`, `ButtonForeground`,
@@ -14,7 +19,7 @@
 //! it. Values are fixed numbers and identifiers, so nothing here needs
 //! escaping.
 
-use crate::theme::state;
+use crate::theme::{elevation, state};
 
 /// M3 motion: the emphasized and emphasized-decelerate curves as WinUI
 /// key splines (cubic-bezier(0.2, 0, 0, 1) and (0.05, 0.7, 0.1, 1)).
@@ -27,15 +32,38 @@ pub(super) const SHORT3: u32 = 150;
 pub(super) const MEDIUM1: u32 = 250;
 pub(super) const MEDIUM2: u32 = 300;
 
-/// How far a press scales a button down (a tactile press).
-const PRESS_SCALE: f64 = 0.94;
+/// How far a press scales a button down (a tactile press): a compact
+/// button or chip, and a wide row or labelled button, which would travel
+/// too far at the same scale.
+pub(super) const PRESS_SMALL: f64 = 0.92;
+pub(super) const PRESS_WIDE: f64 = 0.98;
 
-/// A button's elevation in DIPs of `ThemeShadow` depth: at rest and under
-/// the pointer (M3 levels 3 and 4 for the FAB); `None` is a flat button.
+/// A raised button's elevation at rest and under the pointer (M3 levels 3
+/// and 4 for the FAB); `None` is a flat button.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct Lift {
-    pub rest: f64,
-    pub hover: f64,
+    pub rest: elevation::Level,
+    pub hover: elevation::Level,
+}
+
+/// One elevation level's shadow as a named group of pills under the
+/// container (the FAB's circle grown by each layer's spread).
+fn shadow(name: &str, level: elevation::Level, opacity: f64) -> String {
+    let mut out =
+        format!("<Grid x:Name=\"{name}\" Opacity=\"{opacity}\" IsHitTestVisible=\"False\">");
+    for layer in elevation::layers(level) {
+        let (spread, dy) = (layer.spread, layer.offset);
+        out += &format!(
+            "<Border CornerRadius=\"{radius}\" Margin=\"{left},{top},{left},{bottom}\" \
+               Background=\"#{alpha:02X}000000\"/>",
+            left = -spread,
+            top = dy - spread,
+            bottom = -dy - spread,
+            alpha = layer.alpha,
+            radius = crate::ui::tokens::radius::PILL + spread,
+        );
+    }
+    out + "</Grid>"
 }
 
 /// One key-spline animation of `property` on `target` to `to`.
@@ -85,8 +113,21 @@ fn scale(to: f64, ms: u32, spline: &str) -> String {
     animate("Press", "ScaleX", to, ms, spline) + &animate("Press", "ScaleY", to, ms, spline)
 }
 
-/// The Material button template; `lift` makes it raised.
-pub(super) fn button(lift: Option<Lift>) -> String {
+/// What differs between the desktop's buttons.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Look {
+    /// Raised (the FAB), or flat.
+    pub lift: Option<Lift>,
+    /// The key prefix of the Disabled colors: `Button`, or `AccentButton`
+    /// for the style based on WinUI's AccentButtonStyle.
+    pub keys: &'static str,
+    /// The press scale.
+    pub press: f64,
+}
+
+/// The Material button template.
+pub(super) fn button(look: Look) -> String {
+    let Look { lift, keys, press } = look;
     let hover_layer = state::HOVER;
     let press_layer = state::PRESSED;
     let ripple_peak = state::RIPPLE;
@@ -106,11 +147,20 @@ pub(super) fn button(lift: Option<Lift>) -> String {
         + &set("Ripple", "Opacity", ripple_peak)
         + &grow("RippleScale", "ScaleX", 0.0, 1.0, MEDIUM2, DECELERATE)
         + &grow("RippleScale", "ScaleY", 0.0, 1.0, MEDIUM2, DECELERATE)
-        + &scale(PRESS_SCALE, SHORT2, EMPHASIZED);
-    let mut disabled = resource("Container", "Background", "ButtonBackgroundDisabled")
-        + &resource("Container", "BorderBrush", "ButtonBorderBrushDisabled")
-        + &resource("Content", "Foreground", "ButtonForegroundDisabled")
-        + &set("StateLayer", "Opacity", 0.0);
+        + &scale(press, SHORT2, EMPHASIZED);
+    let mut disabled = resource(
+        "Container",
+        "Background",
+        &format!("{keys}BackgroundDisabled"),
+    ) + &resource(
+        "Container",
+        "BorderBrush",
+        &format!("{keys}BorderBrushDisabled"),
+    ) + &resource(
+        "Content",
+        "Foreground",
+        &format!("{keys}ForegroundDisabled"),
+    ) + &set("StateLayer", "Opacity", 0.0);
     let shadows = match lift {
         Some(Lift { rest, hover }) => {
             // The press settles back to the resting depth (M3: pressed is
@@ -118,16 +168,7 @@ pub(super) fn button(lift: Option<Lift>) -> String {
             pressed += &animate("HoverShadow", "Opacity", 0.0, SHORT2, EMPHASIZED);
             disabled += &set("RestShadow", "Opacity", 0.0);
             disabled += &set("HoverShadow", "Opacity", 0.0);
-            format!(
-                "<Border x:Name=\"RestShadow\" Translation=\"0,0,{rest}\" \
-                   CornerRadius=\"{{TemplateBinding CornerRadius}}\" \
-                   Background=\"{{TemplateBinding Background}}\">\
-                   <Border.Shadow><ThemeShadow/></Border.Shadow></Border>\
-                 <Border x:Name=\"HoverShadow\" Opacity=\"0\" Translation=\"0,0,{hover}\" \
-                   CornerRadius=\"{{TemplateBinding CornerRadius}}\" \
-                   Background=\"{{TemplateBinding Background}}\">\
-                   <Border.Shadow><ThemeShadow/></Border.Shadow></Border>"
-            )
+            shadow("RestShadow", rest, 1.0) + &shadow("HoverShadow", hover, 0.0)
         }
         None => String::new(),
     };
@@ -185,18 +226,22 @@ mod tests {
         for lift in [
             None,
             Some(Lift {
-                rest: 6.0,
-                hover: 12.0,
+                rest: elevation::Level::Three,
+                hover: elevation::Level::Four,
             }),
         ] {
-            let xaml = button(lift);
+            let xaml = button(Look {
+                lift,
+                keys: "Button",
+                press: PRESS_SMALL,
+            });
             for state in ["Normal", "PointerOver", "Pressed", "Disabled"] {
                 assert!(xaml.contains(&format!("x:Name=\"{state}\"")), "{state}");
             }
             assert!(xaml.starts_with("<ControlTemplate "));
             assert!(xaml.ends_with("</ControlTemplate>"));
             assert_eq!(
-                xaml.matches("<ThemeShadow/>").count(),
+                xaml.matches("Shadow\" Opacity=").count(),
                 if lift.is_some() { 2 } else { 0 }
             );
             // WinUI refuses two animations of one property in a storyboard.
