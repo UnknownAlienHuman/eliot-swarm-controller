@@ -39,6 +39,8 @@ pub mod typography {
 pub mod state {
     pub const HOVER: f64 = 0.08;
     pub const PRESSED: f64 = 0.10;
+    /// The ripple of a press at its start, fading on release.
+    pub const RIPPLE: f64 = 0.12;
     /// A disabled container: on-surface at this opacity.
     pub const DISABLED_CONTAINER: f64 = 0.12;
     /// Disabled content: on-surface at this opacity.
@@ -361,6 +363,11 @@ pub mod winui {
             self.role(|s| s.primary, ThemeBrush::AccentText)
         }
 
+        /// Content on a filled (primary) container: the Stop square.
+        pub fn on_primary(self) -> Brush {
+            self.role(|s| s.on_primary, ThemeBrush::PrimaryText)
+        }
+
         pub fn tertiary(self) -> Brush {
             self.role(|s| s.tertiary, ThemeBrush::AccentText)
         }
@@ -548,14 +555,38 @@ pub mod winui {
             }
         }
 
-        /// The composer's visible quota track, including low-quota attention.
-        pub fn quota_track(self, remaining: f64) -> Brush {
+        /// The composer's usage ring as Material's determinate circular
+        /// indicator: a text button whose `ProgressRing` takes its arc
+        /// (primary; warning under 20 % left, error under 5 %) and its track
+        /// (secondary-container) from this button's own resources, which
+        /// WinUI's ring template resolves before the application's.
+        pub fn usage_ring(self, remaining: f64) -> ResourceOverrides {
+            self.with(|s| {
+                let arc = Self::usage_tone(s, remaining);
+                Family::new(None, s.on_surface_variant)
+                    .overrides(s)
+                    .set("ProgressRingForegroundThemeBrush", color(arc))
+                    .set(
+                        "ProgressRingBackgroundThemeBrush",
+                        color(s.secondary_container),
+                    )
+            })
+        }
+
+        /// The share left in the usage ring's arc color once it is low,
+        /// else at lowered emphasis.
+        pub fn usage_label(self, remaining: f64) -> Option<Brush> {
+            let scheme = self.scheme?;
+            (remaining < 20.0).then(|| Brush::Solid(color(Self::usage_tone(scheme, remaining))))
+        }
+
+        fn usage_tone(s: &Scheme, remaining: f64) -> Rgb8 {
             if remaining < 5.0 {
-                self.error()
+                s.error
             } else if remaining < 20.0 {
-                self.warning()
+                s.warning
             } else {
-                self.outline_variant()
+                s.primary
             }
         }
 

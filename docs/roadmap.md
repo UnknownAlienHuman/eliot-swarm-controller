@@ -612,10 +612,14 @@ of the explicitly selected release scope.
       (Codex's effort popover: the route's effort steps, applied for the next
       turn, the model as "Requested model X" until a turn carries it, and
       "Change model…" into the picker filtered to that Agent's
-      route; one plain line instead when the harness keeps them), Send (which
-      steers the running turn, D10; a stopped or lost task's one Resume, with
-      the typed message once there is one), and Interrupt only while a turn
-      runs; a new task's composer is D9. Settings replaces the
+      route; one plain line instead when the harness keeps them), and one
+      trailing button as in Codex (owner review 2026-11-19): Send; while a
+      turn runs, Stop (a filled square; it interrupts that turn) with an
+      empty field and Steer once there is text (Enter steers too, D10); a
+      stopped or lost task's one Resume, with the typed message once there
+      is one. There is no separate Interrupt control. The usage ring beside
+      it is Material's determinate circular indicator; a new task's
+      composer is D9. Settings replaces the
       sidebar with its own navigation and shows one centred page of at most
       840 DIPs (D9). One component system at Codex density with Material 3
       color roles (owner reviews 2026-11-15 and 2026-11-16), every size from

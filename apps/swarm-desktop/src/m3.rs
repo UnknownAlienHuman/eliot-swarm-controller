@@ -25,7 +25,6 @@ pub mod glyph {
     pub const NEW_TASK: &str = "\u{E70F}";
     pub const FOLDER: &str = "\u{E8B7}";
     pub const SETTINGS: &str = "\u{E713}";
-    pub const SEND: &str = "\u{E724}";
     pub const STOP: &str = "\u{E71A}";
     pub const MORE: &str = "\u{E712}";
     pub const INFO: &str = "\u{E946}";
@@ -227,11 +226,33 @@ pub fn icon_button(palette: Palette) -> Button {
         .style(ButtonStyle::Subtle)
 }
 
-/// The composer's icon-only Send: the one circle, filled.
+/// The composer's trailing button (Send, Stop, Steer): the one circle,
+/// filled and raised (`ButtonStyle::TextLink`'s Material template).
 pub fn send_button(palette: Palette) -> Button {
-    button(palette.filled())
-        .width(height::CONTROL)
+    Button::new()
+        .resource_overrides(palette.filled())
+        .width(height::FAB)
+        .height(height::FAB)
         .style(ButtonStyle::TextLink)
+}
+
+/// Send's glyph: Codex's up arrow, optically centred in the circle (the
+/// paper plane leans right of the centre).
+pub fn send_icon() -> View {
+    icon_sized(glyph::ARROW_UP, icon_size::TOOLBAR)
+}
+
+/// Stop's mark: Material's filled stop square in the button's content
+/// color (Segoe Fluent's Stop glyph is an outline, read as a check box).
+pub fn stop_mark(palette: Palette) -> View {
+    Border::new()
+        .width(icon_size::STOP)
+        .height(icon_size::STOP)
+        .corner_radius(radius::STOP)
+        .background(palette.on_primary())
+        .horizontal_alignment(HorizontalAlignment::Center)
+        .vertical_alignment(VerticalAlignment::Center)
+        .into()
 }
 
 /// A list or navigation row: full width, the selection in

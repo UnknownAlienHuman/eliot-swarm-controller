@@ -50,8 +50,8 @@ impl DesktopApp {
     /// The one composer, one rounded card. A new task: the project chip as
     /// the card's first row, then the field and the model and access
     /// chips. An open Agent: its project, harness and access as plain
-    /// read-only text, the field, then the model-and-effort chip. Usage,
-    /// Interrupt (only while a turn runs) and Send or Resume sit at the
+    /// read-only text, the field, then the model-and-effort chip. Usage
+    /// and the one trailing button (Send, Stop, Steer or Resume) sit at the
     /// right.
     pub(super) fn composer_view(
         &self,
@@ -515,8 +515,9 @@ impl DesktopApp {
             )
     }
 
-    /// Send (steering the running turn), or Resume for a stopped Agent, with
-    /// Interrupt while a turn runs. An unresolved submission shows Retry
+    /// The one trailing button, as in Codex: Send; while a turn runs, Stop
+    /// (it interrupts that turn) with an empty field and Steer with text;
+    /// Resume for a stopped Agent. An unresolved submission shows Retry
     /// instead, resubmitting its saved identity. Each is bound now, from
     /// the detail on screen. A stopped Agent has one Resume: the filled
     /// button while the field is empty, the Send arrow (resume with the
@@ -528,7 +529,6 @@ impl DesktopApp {
         palette: Palette,
     ) -> View {
         let detail = self.chat.detail.as_ref();
-        let active_turn = detail.and_then(|detail| detail.active_turn.clone());
         let draft_blank = self.composer_text().trim().is_empty();
         let enabled = !self.submitting();
         let primary: View = match (agent.clone(), detail) {
@@ -559,12 +559,15 @@ impl DesktopApp {
                         .is_enabled(enabled)
                         .automation_name("Resume with this message (Enter)")
                         .on_click(resume)
-                        .content(m3::icon(m3::glyph::SEND))
+                        .content(m3::send_icon())
                         .tooltip("Resume with this message")
                 }
             }
             (Some(agent), detail) => {
-                let steer = detail
+                // Codex's one trailing button: while a turn runs, Stop with
+                // an empty field (it interrupts that turn) and Steer once
+                // there is text; otherwise Send.
+                let running = detail
                     .filter(|detail| !detail.observe_only)
                     .and_then(|detail| {
                         detail
@@ -572,43 +575,44 @@ impl DesktopApp {
                             .as_deref()
                             .map(|turn| BoundAction::turn_control(&agent, detail.generation, turn))
                     });
-                let (tip, action) = match steer {
-                    Some(bound) => ("Steer the running turn", DraftAction::Steer(bound)),
-                    None => ("Send", DraftAction::Send { agent }),
-                };
-                m3::send_button(palette)
-                    .is_enabled(enabled && !draft_blank)
-                    .automation_name(format!("{tip} (Enter)"))
-                    .on_click(context.message(Message::Chat(ChatMsg::DraftRequested(action))))
-                    .content(m3::icon(m3::glyph::SEND))
-                    .tooltip(tip)
+                match running {
+                    Some(bound) if draft_blank => m3::send_button(palette)
+                        .is_enabled(enabled)
+                        .automation_name("Stop the running turn")
+                        .on_click(
+                            context.message(Message::Chat(ChatMsg::InterruptRequested(bound))),
+                        )
+                        .content(m3::stop_mark(palette))
+                        .tooltip("Stop"),
+                    Some(bound) => m3::send_button(palette)
+                        .is_enabled(enabled)
+                        .automation_name("Steer the running turn (Enter)")
+                        .on_click(context.message(Message::Chat(ChatMsg::DraftRequested(
+                            DraftAction::Steer(bound),
+                        ))))
+                        .content(m3::send_icon())
+                        .tooltip("Steer"),
+                    None => m3::send_button(palette)
+                        .is_enabled(enabled && !draft_blank)
+                        .automation_name("Send (Enter)")
+                        .on_click(context.message(Message::Chat(ChatMsg::DraftRequested(
+                            DraftAction::Send { agent },
+                        ))))
+                        .content(m3::send_icon())
+                        .tooltip("Send"),
+                }
             }
             (None, _) => m3::send_button(palette)
                 .is_enabled(enabled && !draft_blank)
                 .automation_name("Start task (Enter)")
                 .on_click(context.message(Message::Launch(LaunchMsg::LaunchRequested)))
-                .content(m3::icon(m3::glyph::SEND))
+                .content(m3::send_icon())
                 .tooltip("Send"),
-        };
-        let turn_actions: View = match (agent.as_deref(), detail, active_turn.as_deref()) {
-            (Some(agent), Some(detail), Some(turn)) if !detail.observe_only => {
-                let bound = BoundAction::turn_control(agent, detail.generation, turn);
-                m3::text_button(palette)
-                    .is_enabled(enabled)
-                    .automation_name("Interrupt the running turn")
-                    .on_click(context.message(Message::Chat(ChatMsg::InterruptRequested(bound))))
-                    .content(m3::icon_label(m3::glyph::STOP, "Interrupt"))
-            }
-            _ => View::empty(),
         };
         StackPanel::new()
             .orientation(Orientation::Horizontal)
             .spacing(tokens::spacing::SM)
-            .children((
-                self.usage_indicator(context, palette),
-                turn_actions,
-                primary,
-            ))
+            .children((self.usage_indicator(context, palette), primary))
     }
 
     /// The harness the composer talks to: the open Agent's, else the new
@@ -643,7 +647,15 @@ impl DesktopApp {
         };
         let label = crate::picker::harness_label(&harness);
         let open = self.launch.open == Some(Pop::Usage);
-        m3::text_button(palette)
+        let remaining = window.remaining as f64;
+        let share = m3::secondary(format!("{}%", window.remaining))
+            .vertical_alignment(VerticalAlignment::Center);
+        let share = match palette.usage_label(remaining) {
+            Some(tone) => share.foreground(tone).opacity(1.0),
+            None => share,
+        };
+        Button::new()
+            .resource_overrides(palette.usage_ring(remaining))
             .height(tokens::height::CONTROL)
             .automation_name(format!(
                 "Usage: {label}, {} {}% left ({})",
@@ -657,28 +669,18 @@ impl DesktopApp {
                     .orientation(Orientation::Horizontal)
                     .spacing(tokens::spacing::XS)
                     .children((
-                        // A scoped native track stays visible at this small size.
-                        // Reactor 0.100.0 exposes the ring value, but no brush setters.
-                        Border::new()
-                            .width(20.0)
-                            .height(20.0)
-                            .corner_radius(10.0)
-                            .border_thickness(Thickness::uniform(1.5))
-                            .border_brush(palette.quota_track(window.remaining as f64))
-                            .vertical_alignment(VerticalAlignment::Center)
-                            .content(
-                                ProgressRing::new()
-                                    .is_indeterminate(false)
-                                    .minimum(0.0)
-                                    .maximum(100.0)
-                                    .value(window.remaining as f64)
-                                    .width(16.0)
-                                    .height(16.0)
-                                    .horizontal_alignment(HorizontalAlignment::Center)
-                                    .vertical_alignment(VerticalAlignment::Center),
-                            ),
-                        m3::secondary(format!("{}%", window.remaining))
+                        // Reactor 0.100.0 has no brush setters on the ring:
+                        // its arc and track come from this button's
+                        // resources (`Palette::usage_ring`).
+                        ProgressRing::new()
+                            .is_indeterminate(false)
+                            .minimum(0.0)
+                            .maximum(100.0)
+                            .value(remaining)
+                            .width(tokens::layout::USAGE_RING)
+                            .height(tokens::layout::USAGE_RING)
                             .vertical_alignment(VerticalAlignment::Center),
+                        share,
                     )),
             )
     }

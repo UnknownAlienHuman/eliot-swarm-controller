@@ -27,10 +27,19 @@ pub mod radius {
     pub const CONTAINER: f64 = 12.0;
     /// The composer.
     pub const COMPOSER: f64 = 16.0;
-    /// The only circle: the icon-only Send button (half its side).
-    pub const CIRCLE: f64 = super::height::CONTROL / 2.0;
+    /// The only circle: the composer's trailing button (half its side).
+    pub const CIRCLE: f64 = super::height::FAB / 2.0;
+    /// The Stop square inside it (Material's stop icon).
+    pub const STOP: f64 = 3.0;
     /// Check boxes keep the M3 default corner.
     pub const CHECK_BOX: f64 = 2.0;
+}
+
+/// Material 3 elevation levels as `ThemeShadow` depth in DIPs (levels 3
+/// and 4: the FAB at rest and under the pointer).
+pub mod elevation {
+    pub const LEVEL3: f64 = 6.0;
+    pub const LEVEL4: f64 = 8.0;
 }
 
 /// Heights in DIPs (compact density).
@@ -48,6 +57,9 @@ pub mod height {
     /// A compact chip inside a row: the model picker's effort chip and the
     /// highlighted row's effort segment.
     pub const CHIP: f64 = 24.0;
+    /// The composer's trailing button (Send, Stop, Steer): Material's small
+    /// FAB, a touch-sized circle.
+    pub const FAB: f64 = 40.0;
 }
 
 /// Native aliases of the shared Material 3 type scale.
@@ -81,6 +93,8 @@ pub mod icon {
     pub const TOOLBAR: f64 = 20.0;
     /// A dropdown's chevron (WinUI's ComboBox draws it at 12).
     pub const CHEVRON: f64 = 12.0;
+    /// The Stop square in the composer's trailing button.
+    pub const STOP: f64 = 14.0;
 }
 
 /// Widths and the few fixed sizes of the shell.
@@ -166,4 +180,7 @@ pub mod layout {
     pub const SWITCH_WIDTH: f64 = 40.0;
     /// A quota ring (Models & Usage).
     pub const RING: f64 = 16.0;
+    /// The composer's usage ring (Material's determinate circular
+    /// indicator at the icon size of a toolbar).
+    pub const USAGE_RING: f64 = 20.0;
 }

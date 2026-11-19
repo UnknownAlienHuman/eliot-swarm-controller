@@ -51,6 +51,8 @@
 //! these calls are declared; Reactor's own bindings are crate-private.
 #![allow(unsafe_code)]
 
+mod templates;
+
 use std::ffi::c_void;
 use std::fmt::Write as _;
 
@@ -65,7 +67,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use windows_sys::core::BOOL;
 
 use crate::theme::{Rgb8, Scheme, state};
-use crate::ui::tokens::{height, radius, spacing};
+use crate::ui::tokens::{elevation, height, radius, spacing};
 
 /// A theme resource value.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -890,6 +892,12 @@ pub fn styles_xaml() -> String {
     // Menu items are control-height rows: WinUI pads them from a
     // StaticResource (11,9,11,10), so only a style sets their height.
     let (min, inset) = (height::CONTROL, spacing::INSET);
+    // The composer's trailing button: Material's raised FAB (M3 levels 3
+    // and 4 as ThemeShadow depth).
+    let fab = templates::button(Some(templates::Lift {
+        rest: elevation::LEVEL3,
+        hover: elevation::LEVEL4,
+    }));
     format!(
         "{XAML_ROOT}\
          <Style TargetType=\"Button\">\
@@ -904,6 +912,10 @@ pub fn styles_xaml() -> String {
          <Style x:Key=\"TextBlockButtonStyle\" TargetType=\"Button\">\
            <Setter Property=\"CornerRadius\" Value=\"{circle}\"/>\
            <Setter Property=\"Padding\" Value=\"0\"/>\
+           <Setter Property=\"BorderThickness\" Value=\"0\"/>\
+           <Setter Property=\"HorizontalContentAlignment\" Value=\"Center\"/>\
+           <Setter Property=\"VerticalContentAlignment\" Value=\"Center\"/>\
+           <Setter Property=\"Template\"><Setter.Value>{fab}</Setter.Value></Setter>\
          </Style>\
          <Style x:Key=\"AccentButtonStyle\" TargetType=\"Button\" \
                 BasedOn=\"{{StaticResource AccentButtonStyle}}\">\

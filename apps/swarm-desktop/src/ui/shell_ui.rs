@@ -2134,10 +2134,9 @@ impl DesktopApp {
             .content(m3::row_content(Some(m3::glyph::FOLDER), name, "", badge))
             // A worktree registration's name trims in the sidebar width.
             .tooltip(name.to_owned());
-        let toggle: View = Grid::new()
+        let toggle = Grid::new()
             .columns([GridLength::Auto, GridLength::STAR])
-            .children((fold, open))
-            .into();
+            .children((fold, open));
         let action = if place.key == nav::OTHER_LOCATIONS {
             View::empty()
         } else if place.missing {
