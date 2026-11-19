@@ -18,7 +18,6 @@ use eliot_plugin::{
         validate_source_plan, with_claimed_context, with_context_points,
     },
     skill,
-    start_classification::SettledStartFailure,
 };
 use serde_json::{Value, json};
 use std::{
@@ -56,14 +55,10 @@ struct Initialized {
 }
 
 struct FailedStart {
-    agent_id: String,
-    generation: i64,
-    command_id: String,
-    outcome: SettledStartFailure,
-    /// Retained with the exact start binding after native exit and output drain;
-    /// retirement does not depend on delivery of the start RPC response.
-    /// Proven-no-effect starts never spawn, so this stays false for them:
-    /// the daemon retires the plugin on the failed value instead.
+    /// Retained after native exit and output drain; retirement does not
+    /// depend on delivery of the start RPC response. Proven-no-effect
+    /// starts never spawn, so this stays false for them: the daemon
+    /// retires the plugin on the failed value instead.
     endpoint_exited: bool,
 }
 
@@ -165,7 +160,6 @@ struct AgentSession {
     agent_id: String,
     generation: i64,
     start_command_id: String,
-    start_result: Option<Value>,
     phase: SessionPhase,
     session_id: Option<String>,
     native_scope: String,
@@ -611,13 +605,10 @@ async fn respond_deferred(client: &PeerClient, request_id: Value, result: Result
 
 impl ClaudePlugin {
     /// Called only after native exit and reader cleanup succeeded. Keep this
-    /// exact binding until the host loop retires, even if its RPC reply is late.
-    fn retain_exited_start(&mut self, params: &AgentStartParams, error: Error) -> Error {
+    /// exited-start latch until the host loop retires, even if its RPC reply
+    /// is late.
+    fn retain_exited_start(&mut self, error: Error) -> Error {
         self.failed_start = Some(FailedStart {
-            agent_id: params.agent_id.clone(),
-            generation: params.generation,
-            command_id: params.command_id.clone(),
-            outcome: SettledStartFailure::Uncertain(error.clone()),
             endpoint_exited: true,
         });
         error
@@ -631,10 +622,6 @@ impl ClaudePlugin {
     fn retain_proven_no_effect_start(&mut self, params: &AgentStartParams, error: Error) -> Value {
         let value = eliot_plugin::session::failed_start_value(params, error);
         self.failed_start = Some(FailedStart {
-            agent_id: params.agent_id.clone(),
-            generation: params.generation,
-            command_id: params.command_id.clone(),
-            outcome: SettledStartFailure::ProvenNoEffect(value.clone()),
             endpoint_exited: false,
         });
         value
@@ -788,48 +775,6 @@ impl ClaudePlugin {
         }
         serde_json::to_value(claude_manifest())
             .map_err(|_| Error::new("internal", "Claude plugin manifest could not be encoded"))
-    }
-
-    /// Replay a retained start outcome, or refuse a conflicting generation.
-    /// `None` means this is a fresh start that proceeds to spawn.
-    fn replay_start(&self, params: &AgentStartParams) -> Option<Result<Value>> {
-        if let Some(session) = &self.session {
-            if session.agent_id == params.agent_id
-                && session.generation == params.generation
-                && session.start_command_id == params.command_id
-            {
-                return Some(match session.phase {
-                    SessionPhase::Ready => session.start_result.clone().ok_or_else(|| {
-                        Error::new("unknown", "Claude start result was not retained")
-                    }),
-                    SessionPhase::Unknown => Err(Error::new(
-                        "unknown",
-                        "Claude session outcome is unresolved; it will not be repeated",
-                    )),
-                    SessionPhase::Stopped => Err(Error::new(
-                        "bad_state",
-                        "Claude Agent generation has already stopped",
-                    )),
-                });
-            }
-            return Some(Err(Error::new(
-                "stale_generation",
-                "Claude plugin is already bound to another Agent generation",
-            )));
-        }
-        if let Some(failed) = &self.failed_start {
-            if failed.agent_id == params.agent_id
-                && failed.generation == params.generation
-                && failed.command_id == params.command_id
-            {
-                return Some(failed.outcome.replay());
-            }
-            return Some(Err(Error::new(
-                "bad_state",
-                "Claude plugin already settled a different start command",
-            )));
-        }
-        None
     }
 
     /// Validate the frozen profile and freeze the start inputs. No spawn yet:
@@ -1046,12 +991,7 @@ impl ClaudePlugin {
     /// stays alive through termination+drain (suppressed, so no readiness or
     /// input can commit), then closes: closing first drops the frame queue
     /// and a late trailing record overflows even with a confirmed child exit.
-    async fn fail_unregistered_start(
-        &mut self,
-        mut session: AgentSession,
-        params: &AgentStartParams,
-        error: Error,
-    ) -> Error {
+    async fn fail_unregistered_start(&mut self, mut session: AgentSession, error: Error) -> Error {
         if let Some(cleanup) = Self::rollback_uncommitted_session(&mut session).await {
             self.session = Some(session);
             let message = format!(
@@ -1061,22 +1001,17 @@ impl ClaudePlugin {
             return contextual_error(error, "unknown", message);
         }
         let error = session.native_client.diagnostic_error(error);
-        self.retain_exited_start(params, error)
+        self.retain_exited_start(error)
     }
 
-    /// Discard a failed start and retain its error for replays. A start
+    /// Discard a failed start and latch its native exit. A start
     /// whose cleanup is unconfirmed is `unknown`: the session is kept
     /// instead of dropped (like `fail_unregistered_start`). The event
     /// consumer stays alive through termination+drain (suppressed, so no
     /// readiness or input can commit), then closes. PR284's exact CI cause
     /// was dropped by `.is_err()`, so the close-before-drain race is
     /// source-proven but exact CI causality is not fully proven.
-    async fn reject_start(
-        &mut self,
-        mut session: AgentSession,
-        params: &AgentStartParams,
-        error: Error,
-    ) -> Error {
+    async fn reject_start(&mut self, mut session: AgentSession, error: Error) -> Error {
         if let Some(cleanup) = Self::rollback_uncommitted_session(&mut session).await {
             session.phase = SessionPhase::Unknown;
             self.session = Some(session);
@@ -1095,7 +1030,7 @@ impl ClaudePlugin {
             error
         };
         let error = session.native_client.diagnostic_error(error);
-        self.retain_exited_start(params, error)
+        self.retain_exited_start(error)
     }
 
     /// Run `initialize` and check the effective profile BEFORE readiness: on
@@ -1107,7 +1042,6 @@ impl ClaudePlugin {
     async fn read_effective_profile(
         &mut self,
         session: AgentSession,
-        params: &AgentStartParams,
         plan: &StartPlan,
     ) -> Result<(AgentSession, Value)> {
         let callback_id = session.events.hook_callback_id().to_owned();
@@ -1132,7 +1066,7 @@ impl ClaudePlugin {
             // recode unknown as rejected.
             Err(error) => {
                 return Err(self
-                    .reject_start(session, params, setter_error(error, "initialize"))
+                    .reject_start(session, setter_error(error, "initialize"))
                     .await);
             }
         };
@@ -1142,7 +1076,6 @@ impl ClaudePlugin {
                 return Err(self
                     .reject_start(
                         session,
-                        params,
                         Error::new(
                             "profile_error",
                             "Claude initialize readback did not match its envelope",
@@ -1164,7 +1097,6 @@ impl ClaudePlugin {
             return Err(self
                 .reject_start(
                     session,
-                    params,
                     Error::new(
                         "profile_error",
                         "Claude effective model or session state did not match the frozen profile",
@@ -1189,7 +1121,7 @@ impl ClaudePlugin {
             {
                 Ok(mode) => effective_mode = mode,
                 Err(error) => {
-                    return Err(self.reject_start(session, params, error).await);
+                    return Err(self.reject_start(session, error).await);
                 }
             }
         }
@@ -1197,7 +1129,6 @@ impl ClaudePlugin {
             return Err(self
                 .reject_start(
                     session,
-                    params,
                     Error::new(
                         "profile_error",
                         "Claude initialize did not apply the registered PreToolUse callback",
@@ -1306,12 +1237,12 @@ impl ClaudePlugin {
             },
             "effective": effective,
         });
-        session.start_result = Some(result.clone());
         self.session = Some(session);
         Ok(result)
     }
 
     async fn start(&mut self, raw: &Value, peer: &PeerClient) -> Result<Value> {
+        self.guard_start()?;
         let params: AgentStartParams = decode(raw, "Claude agent.start params are invalid")?;
         validate_identity(
             &params.agent_id,
@@ -1319,9 +1250,6 @@ impl ClaudePlugin {
             &params.command_id,
             "Claude",
         )?;
-        if let Some(replay) = self.replay_start(&params) {
-            return replay;
-        }
         // Every failure before the native CLI is spawned proves no native
         // effect exists, so it settles as a definite failed start (never
         // unknown) with a typed reason. Failures at or after spawn keep
@@ -1360,12 +1288,24 @@ impl ClaudePlugin {
         )
         .await
         {
-            return Err(self.fail_unregistered_start(session, &params, error).await);
+            return Err(self.fail_unregistered_start(session, error).await);
         }
 
-        let (session, effective) = self.read_effective_profile(session, &params, &plan).await?;
+        let (session, effective) = self.read_effective_profile(session, &plan).await?;
         self.commit_readiness(session, &params, &plan, effective)
             .await
+    }
+
+    /// The daemon sends agent.start exactly once per freshly spawned plugin
+    /// process: a bound or settled plugin never starts again.
+    fn guard_start(&self) -> Result<()> {
+        if self.session.is_some() || self.failed_start.is_some() {
+            return Err(Error::new(
+                "bad_state",
+                "Claude plugin already received agent.start",
+            ));
+        }
+        Ok(())
     }
 
     async fn command(&mut self, request: &RpcRequest) -> DispatchOutcome {
@@ -2487,7 +2427,6 @@ async fn launch_session(
         agent_id: params.agent_id.clone(),
         generation: params.generation,
         start_command_id: params.command_id.clone(),
-        start_result: None,
         phase: SessionPhase::Unknown,
         session_id: None,
         native_scope: claude_scope(plan.config_dir.as_deref()),

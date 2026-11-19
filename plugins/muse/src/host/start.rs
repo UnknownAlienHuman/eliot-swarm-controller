@@ -242,7 +242,6 @@ pub(super) async fn spawn_owned_session(
         agent_id: params.agent_id.clone(),
         generation: params.generation,
         start_command_id: params.command_id.clone(),
-        start_result: None,
         phase: SessionPhase::Unknown,
         session_id: None,
         native_scope: String::new(),
@@ -274,7 +273,6 @@ impl MusePlugin {
     /// unknown instead of retrying the dispatch.
     pub(super) async fn dispatch_session_start(
         &mut self,
-        params: &AgentStartParams,
         mut session: AgentSession,
         session_method: &str,
         params_value: Value,
@@ -300,14 +298,14 @@ impl MusePlugin {
                 };
                 let error = contextual_error(error, code, message);
                 let error = discard_failed_start(&mut session, error).await;
-                Err(self.retain_failed_start(params, error))
+                Err(self.retain_failed_start(error))
             }
             Err(error) if native_no_write(&error.code) => {
                 let message = format!("Muse {session_method} was not dispatched");
                 let code = error.code.clone();
                 let error = contextual_error(error, code, message);
                 let error = discard_failed_start(&mut session, error).await;
-                Err(self.retain_failed_start(params, error))
+                Err(self.retain_failed_start(error))
             }
             Err(error) => {
                 let error = contextual_error(
@@ -317,7 +315,7 @@ impl MusePlugin {
                         "Muse {session_method} may have changed native state; it will not be repeated"
                     ),
                 );
-                let error = self.retain_failed_start(params, error);
+                let error = self.retain_failed_start(error);
                 self.session = Some(session);
                 Err(error)
             }
@@ -396,7 +394,6 @@ impl MusePlugin {
 
     pub(super) async fn apply_start_effort(
         &mut self,
-        params: &AgentStartParams,
         session: &mut AgentSession,
         native_session: &NativeSession,
         requested_effort: Option<&str>,
@@ -439,14 +436,14 @@ impl MusePlugin {
                         ),
                     )
                     .await;
-                    return Err(self.retain_failed_start(params, error));
+                    return Err(self.retain_failed_start(error));
                 }
                 Err(error) if native_no_write(&error.code) => {
                     let message = "Muse session/setReasoningEffort was not dispatched".to_owned();
                     let code = error.code.clone();
                     let error =
                         discard_failed_start(session, contextual_error(error, code, message)).await;
-                    return Err(self.retain_failed_start(params, error));
+                    return Err(self.retain_failed_start(error));
                 }
                 Err(error) => {
                     let error = discard_failed_start(
@@ -458,7 +455,7 @@ impl MusePlugin {
                         ),
                     )
                     .await;
-                    return Err(self.retain_failed_start(params, error));
+                    return Err(self.retain_failed_start(error));
                 }
             };
             let effort_ack: NativeSessionSetReasoningEffortResult =
@@ -473,7 +470,7 @@ impl MusePlugin {
                             ),
                         )
                         .await;
-                        return Err(self.retain_failed_start(params, error));
+                        return Err(self.retain_failed_start(error));
                     }
                 };
             if effort_ack.command_id != effort_command || effort_ack.status != "accepted" {
@@ -485,7 +482,7 @@ impl MusePlugin {
                     ),
                 )
                 .await;
-                return Err(self.retain_failed_start(params, error));
+                return Err(self.retain_failed_start(error));
             }
             let effective_effort = match read_effective_reasoning_effort(
                 &session.native_client,
@@ -496,7 +493,7 @@ impl MusePlugin {
                 Ok(effort) => effort,
                 Err(error) => {
                     let error = discard_failed_start(session, error).await;
-                    return Err(self.retain_failed_start(params, error));
+                    return Err(self.retain_failed_start(error));
                 }
             };
             effort_verified = effective_effort.as_deref() == Some(effort);
@@ -507,7 +504,6 @@ impl MusePlugin {
 
     pub(super) async fn align_resume_model(
         &mut self,
-        params: &AgentStartParams,
         session: &mut AgentSession,
         native_session: &NativeSession,
         resuming: bool,
@@ -553,14 +549,14 @@ impl MusePlugin {
                         ),
                     )
                     .await;
-                    return Err(self.retain_failed_start(params, error));
+                    return Err(self.retain_failed_start(error));
                 }
                 Err(error) if native_no_write(&error.code) => {
                     let message = "Muse session/setModel was not dispatched".to_owned();
                     let code = error.code.clone();
                     let error =
                         discard_failed_start(session, contextual_error(error, code, message)).await;
-                    return Err(self.retain_failed_start(params, error));
+                    return Err(self.retain_failed_start(error));
                 }
                 Err(error) => {
                     let error = discard_failed_start(
@@ -572,7 +568,7 @@ impl MusePlugin {
                         ),
                     )
                     .await;
-                    return Err(self.retain_failed_start(params, error));
+                    return Err(self.retain_failed_start(error));
                 }
             };
             let model_ack: NativeSessionSetModelResult =
@@ -587,7 +583,7 @@ impl MusePlugin {
                             ),
                         )
                         .await;
-                        return Err(self.retain_failed_start(params, error));
+                        return Err(self.retain_failed_start(error));
                     }
                 };
             if model_ack.command_id != model_command || model_ack.status != "accepted" {
@@ -599,7 +595,7 @@ impl MusePlugin {
                     ),
                 )
                 .await;
-                return Err(self.retain_failed_start(params, error));
+                return Err(self.retain_failed_start(error));
             }
             setters_ran = true;
         }
@@ -609,7 +605,6 @@ impl MusePlugin {
 
     pub(super) async fn align_resume_approval(
         &mut self,
-        params: &AgentStartParams,
         session: &mut AgentSession,
         native_session: &NativeSession,
         resuming: bool,
@@ -655,14 +650,14 @@ impl MusePlugin {
                         ),
                     )
                     .await;
-                    return Err(self.retain_failed_start(params, error));
+                    return Err(self.retain_failed_start(error));
                 }
                 Err(error) if native_no_write(&error.code) => {
                     let message = "Muse session/setApprovalMode was not dispatched".to_owned();
                     let code = error.code.clone();
                     let error =
                         discard_failed_start(session, contextual_error(error, code, message)).await;
-                    return Err(self.retain_failed_start(params, error));
+                    return Err(self.retain_failed_start(error));
                 }
                 Err(error) => {
                     let error = discard_failed_start(
@@ -674,7 +669,7 @@ impl MusePlugin {
                         ),
                     )
                     .await;
-                    return Err(self.retain_failed_start(params, error));
+                    return Err(self.retain_failed_start(error));
                 }
             };
             let approval_ack: NativeSessionSetApprovalModeResult =
@@ -689,7 +684,7 @@ impl MusePlugin {
                             ),
                         )
                         .await;
-                        return Err(self.retain_failed_start(params, error));
+                        return Err(self.retain_failed_start(error));
                     }
                 };
             if approval_ack.command_id != approval_command
@@ -704,7 +699,7 @@ impl MusePlugin {
                     ),
                 )
                 .await;
-                return Err(self.retain_failed_start(params, error));
+                return Err(self.retain_failed_start(error));
             }
             setters_ran = true;
         }

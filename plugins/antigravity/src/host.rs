@@ -28,7 +28,9 @@ pub(crate) const TIMEOUT: Duration = Duration::from_secs(30);
 struct Plugin {
     initialized: Option<InitializeParams>,
     session: Option<Session>,
-    start: Option<(Value, Result<Value>)>,
+    /// Set once the start reaches its pre-spawn latch; the daemon sends
+    /// agent.start exactly once per plugin process and never replays it.
+    start: Option<()>,
 }
 
 enum DispatchOutcome {
@@ -463,16 +465,13 @@ impl Plugin {
             .ok_or_else(|| not_initialized("Antigravity"))?;
         let credential = initialized.credential.clone();
         let instance_dir = PathBuf::from(&initialized.instance_dir);
-        let identity = serde_json::to_value(&params)
-            .map_err(|_| Error::new("internal", "Could not encode Antigravity start binding"))?;
-        if let Some((previous, outcome)) = &self.start {
-            if previous != &identity {
-                return Err(Error::new(
-                    "source_integrity",
-                    "Antigravity start identity or inputs changed after dispatch",
-                ));
-            }
-            return outcome.clone();
+        // The daemon sends agent.start exactly once per freshly spawned
+        // plugin process: a bound or settled plugin never starts again.
+        if self.session.is_some() || self.start.is_some() {
+            return Err(Error::new(
+                "bad_state",
+                "Antigravity plugin already received agent.start",
+            ));
         }
         let hooks = HookServer::bind().await?;
         // Stage the dedicated hook-discovery root before planning: it is the
@@ -507,16 +506,10 @@ impl Plugin {
             crate::profile::Plan::new(&params, &credential, hooks.token(), hook_config.root())?;
         let mcp_config = crate::mcp::prepare(&mut plan, &params, &instance_dir)
             .map_err(|error| error.with_code("native_not_dispatched"))?;
-        // Latch before creating a native conversation. Any failure after spawn
-        // is retained; this generation never starts a second process on retry.
-        self.start = Some((
-            identity.clone(),
-            Err(Error::new(
-                "unknown",
-                "Antigravity start is unresolved; it will not be replayed",
-            )),
-        ));
-        let result = match Session::spawn(
+        // Latch before creating a native conversation: this generation
+        // never starts a second process on retry.
+        self.start = Some(());
+        match Session::spawn(
             &params,
             &plan,
             peer,
@@ -559,8 +552,6 @@ impl Plugin {
                 }
             }
             Err(error) => Err(error),
-        };
-        self.start = Some((identity, result.clone()));
-        result
+        }
     }
 }
