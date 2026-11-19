@@ -488,8 +488,16 @@ pub fn project_content(name: &str, subproject: Option<&str>, trailing: View) -> 
 
 /// A nested row's content: indented `depth` steps of 28 DIPs, so its title
 /// starts under its parent's label; ended tasks in the variant tone; a
-/// trailing view (a dot, an age).
-pub fn task_content(depth: usize, title: &str, ended: bool, trailing: View) -> View {
+/// trailing view (a dot, an age). A running task's work line goes under
+/// the title in the muted caption, one line, trimmed (the row is then
+/// [`height::TWO_LINE_ROW`] tall).
+pub fn task_content(
+    depth: usize,
+    title: &str,
+    ended: bool,
+    trailing: View,
+    line: Option<String>,
+) -> View {
     let title = TextBlock::new()
         .text(title.to_owned())
         .vertical_alignment(VerticalAlignment::Center)
@@ -498,6 +506,15 @@ pub fn task_content(depth: usize, title: &str, ended: bool, trailing: View) -> V
         title.foreground(palette().variant())
     } else {
         title
+    };
+    let text: View = match line {
+        Some(line) => StackPanel::new()
+            .vertical_alignment(VerticalAlignment::Center)
+            .children((
+                title,
+                secondary(line).text_trimming(TextTrimming::CharacterEllipsis),
+            )),
+        None => title.into(),
     };
     Grid::new()
         .margin(Thickness::new(
@@ -509,7 +526,7 @@ pub fn task_content(depth: usize, title: &str, ended: bool, trailing: View) -> V
         .columns([GridLength::STAR, GridLength::Auto])
         .column_spacing(spacing::ROW)
         .children((
-            title,
+            text,
             Border::new()
                 .grid_column(1)
                 .vertical_alignment(VerticalAlignment::Center)

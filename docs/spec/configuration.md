@@ -63,8 +63,9 @@ probe). Agent and Run callers keep their inherited identity and dispatch directl
 they never probe Owner-only readiness or start a daemon with Owner authority.
 The desktop starts the sibling `swarm.exe` and waits for daemon readiness before
 loading settings. `swarm-desktop --workspace PATH` opens and registers that checkout;
-without the flag it opens the working directory. A later launch in a different
-checkout registers that workspace through the same machine-author settings writer.
+without the flag it registers nothing: the folder it was started from never becomes
+a project implicitly. A later launch in a different checkout registers that
+workspace through the same machine-author settings writer.
 
 ```text
 <data_dir>/
@@ -759,7 +760,7 @@ registration ID independently of its execution workspace and authorization scope
 Child launches inherit the parent's recorded project and authorization scope.
 Workspace inventory is read-only. Daemon startup performs no project
 discovery. Registration runs through an explicit Owner open (`project.discover`),
-an Owner launch in the checkout, or the desktop's workspace checkout.
+an Owner launch in the checkout, or the desktop's `--workspace` checkout.
 `path` names the canonical
 Git checkout; `profiles` and `actions` are explicit allowlists over existing global
 profiles and implemented actions. Missing or empty allowlists deny all.

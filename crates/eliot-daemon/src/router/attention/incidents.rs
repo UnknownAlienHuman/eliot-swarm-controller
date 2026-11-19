@@ -615,6 +615,9 @@ pub(super) fn desired_incident(
         ));
     }
     let threshold_ms = i64::try_from(suspicion_window.as_millis()).ok()?;
+    // Working without writing code: activity continues (a silent turn is
+    // `no_progress` below) while neither a write nor a commit landed for
+    // the window since the turn started (`docs/spec/monitoring.md`).
     if !is_read_only_or_audit_profile(&captured.agent)
         && captured.agent.workspace.is_some()
         && captured.agent.state == AgentState::Busy
@@ -622,13 +625,13 @@ pub(super) fn desired_incident(
         && captured.agent.active_turn.is_some()
         && captured.agent.pending.is_empty()
         && captured
-            .code_progress
-            .as_ref()
-            .is_some_and(|cp| cp.available)
-        && captured
-            .code_basis_at
-            .and_then(|at| now_ms().checked_sub(at))
-            .is_some_and(|age| age >= threshold_ms)
+            .progress_age_ms
+            .is_some_and(|age| age < threshold_ms)
+        && code_progress_basis(captured).is_some_and(|at| {
+            now_ms()
+                .checked_sub(at)
+                .is_some_and(|age| age >= threshold_ms)
+        })
     {
         let activity = "no_code_progress".to_owned();
         return Some((
@@ -662,6 +665,20 @@ pub(super) fn desired_incident(
         },
         activity_classification(captured, suspicion_window),
     ))
+}
+
+/// When the active turn last made code progress: the later of the
+/// worktree's last write or commit and the turn's start. `None` while Git
+/// cannot tell (no basis is invented).
+pub(super) fn code_progress_basis(captured: &CapturedAgent) -> Option<i64> {
+    let code = captured.code_progress.as_ref()?;
+    if !code.available && code.last_code_progress_at.is_none() {
+        return None;
+    }
+    code.last_code_progress_at
+        .into_iter()
+        .chain(captured.turn_started_at)
+        .max()
 }
 
 pub(super) fn child_attention_activity(

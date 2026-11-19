@@ -248,7 +248,8 @@ enum Message {
 /// `window_title` and `window_visuals`).
 #[derive(Clone)]
 struct DesktopInput {
-    workspace: PathBuf,
+    /// `--workspace`, when given.
+    workspace: Option<PathBuf>,
     close_window: CloseWindow,
 }
 
@@ -281,9 +282,10 @@ impl CloseWindow {
 }
 
 struct DesktopApp {
-    /// The checkout the window was opened for (`--workspace` or the working
-    /// directory); it is registered through `project.discover` at start.
-    opened_workspace: PathBuf,
+    /// The checkout named by `--workspace`; it is registered through
+    /// `project.discover` at start. Without the flag nothing is registered
+    /// (the launch folder never becomes a project implicitly).
+    opened_workspace: Option<PathBuf>,
     data_dir: Fallible<PathBuf>,
     /// The latest status, shown in the details panel.
     status: String,
@@ -808,7 +810,11 @@ impl Component for DesktopApp {
                 history: Default::default(),
             },
             launch: launch_ui::LaunchState {
-                workspace: input.workspace.to_string_lossy().into_owned(),
+                workspace: input
+                    .workspace
+                    .as_ref()
+                    .map(|workspace| workspace.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
                 ..Default::default()
             },
             chat: chat_ui::ChatState {
@@ -908,7 +914,7 @@ impl Component for DesktopApp {
 /// closing the window disconnects the UI, never the Agent. Afterwards the
 /// last observed window size persists once into `[desktop]`, only when it
 /// differs from the saved value.
-pub fn run(workspace: PathBuf) -> Result<(), String> {
+pub fn run(workspace: Option<PathBuf>) -> Result<(), String> {
     let close_window = CloseWindow::default();
     let result = App::run_component::<DesktopApp>(DesktopInput {
         workspace,

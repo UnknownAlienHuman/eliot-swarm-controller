@@ -1496,7 +1496,8 @@ impl DesktopApp {
     }
 
     /// Start the daemon when needed (Owner only, the sibling `swarm.exe`),
-    /// register the opened checkout, then read the settings.
+    /// register the checkout `--workspace` named (only that: registering a
+    /// project is the owner's explicit act), then read the settings.
     pub(super) fn start_connection(&self, data_dir: PathBuf, context: &ComponentContext<Self>) {
         let workspace = self.opened_workspace.clone();
         let _task = context.spawn_background(move |_| {
@@ -1507,16 +1508,20 @@ impl DesktopApp {
                     })?
                     .with_file_name("swarm.exe");
                 eliot_daemon::startup::ensure_running(&data_dir, &executable).await?;
-                let request = eliot_core::api::ProjectDiscoverRequest {
-                    workspace: workspace.to_string_lossy().into_owned(),
-                };
-                request.validate()?;
-                let reply: eliot_core::api::ProjectDiscoverResponse =
-                    eliot_daemon::client_call_typed(&data_dir, "project.discover", &request)
-                        .await?;
-                request.validate_response(&reply)?;
+                let mut discovered = None;
+                if let Some(workspace) = workspace {
+                    let request = eliot_core::api::ProjectDiscoverRequest {
+                        workspace: workspace.to_string_lossy().into_owned(),
+                    };
+                    request.validate()?;
+                    let reply: eliot_core::api::ProjectDiscoverResponse =
+                        eliot_daemon::client_call_typed(&data_dir, "project.discover", &request)
+                            .await?;
+                    request.validate_response(&reply)?;
+                    discovered = reply.project.map(|project| project.checkout);
+                }
                 let read = config_client::read_settings(&data_dir).await?;
-                Ok((reply.project.map(|project| project.checkout), read))
+                Ok((discovered, read))
             })
             .map_err(|error: eliot_core::Error| error.to_string());
             Message::Shell(ShellMsg::DaemonReady(result))
@@ -2059,7 +2064,7 @@ impl DesktopApp {
                                 section.key.clone(),
                             ))),
                         )
-                        .content(m3::task_content(1, &label, true, View::empty())),
+                        .content(m3::task_content(1, &label, true, View::empty(), None)),
                 ));
             }
         }
@@ -2093,6 +2098,7 @@ impl DesktopApp {
                         &format!("Show more ({loaded} of {total})"),
                         true,
                         View::empty(),
+                        None,
                     )),
             ));
         }
@@ -2344,12 +2350,12 @@ impl DesktopApp {
         hover_area(hover_key, row_with_actions(row, actions), context)
     }
 
-    /// A task row under its project: indented 24 DIPs per level, so its
-    /// title lines up with the project's label. One line: the title (at
-    /// least 60% of the row), its short model, the worktree where the
-    /// project spans several, and a state dot only for a task that runs or
-    /// needs attention. A manager with workers carries its expand chevron
-    /// in that indent. Its accessible name says "Harness · model" in full.
+    /// A task row under its project: indented 28 DIPs per level, so its
+    /// title lines up with the project's label: the title and a state dot
+    /// only for a task that runs or needs attention, else its age. A
+    /// running task adds its work line under the title. A manager with
+    /// workers shows its expand chevron among the hover actions. Its
+    /// accessible name says "Harness · model" in full.
     fn agent_row(
         &self,
         row: &Row,
@@ -2372,6 +2378,17 @@ impl DesktopApp {
         if let Some(note) = &row.note {
             name.push_str(&format!(", {note}"));
         }
+        // A running task's work line (`docs/spec/monitoring.md`, Git-aware
+        // work summary): whether it writes code, at a glance.
+        let now = crate::handoff::now_ms();
+        let work = agent
+            .work
+            .as_ref()
+            .filter(|_| agent.running() && !agent.native_child);
+        if let Some(work) = work {
+            name.push_str(&format!(", {}", crate::monitor::work_words(work, now)));
+        }
+        let line = work.map(|work| crate::monitor::work_line(work, now));
         // A live task shows its dot (working, attention); a quiet one its
         // age, its title in the variant tone.
         let dot = task_dot(palette, agent);
@@ -2427,10 +2444,24 @@ impl DesktopApp {
         } else {
             trailing
         };
-        let row_button = m3::sub_row(palette, selected)
+        let row_button = m3::sub_row(palette, selected);
+        let row_button = if line.is_some() {
+            row_button
+                .height(tokens::height::TWO_LINE_ROW)
+                .min_height(tokens::height::TWO_LINE_ROW)
+        } else {
+            row_button
+        };
+        let row_button = row_button
             .automation_name(name)
             .on_click(context.message(Message::Shell(ShellMsg::AgentOpened(agent.clone()))))
-            .content(m3::task_content(row.depth + 1, title, quiet, trailing));
+            .content(m3::task_content(
+                row.depth + 1,
+                title,
+                quiet,
+                trailing,
+                line,
+            ));
         hover_area(hover_key, row_with_actions(row_button, actions), context)
     }
 

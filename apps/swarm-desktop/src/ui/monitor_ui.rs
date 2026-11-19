@@ -129,6 +129,7 @@ impl DesktopApp {
                                 tags: Vec::new(),
                                 organization_revision: None,
                                 model: row.model.clone(),
+                                work: row.work.clone().map(Box::new),
                             })
                     });
                 if let Some(agent) = agent {
@@ -374,16 +375,24 @@ impl DesktopApp {
             .map(|parent| (parent, self.agent_title(parent)))
             .filter(|(id, title)| title != id)
             .map(|(_, title)| title);
-        // The second line: why a lost or failed Agent ended, as its
-        // conversation says; else why it needs attention (its open report,
-        // the first worker that needs you, or its own state); else the task
-        // it runs under.
+        let now = crate::handoff::now_ms();
+        let incident = data
+            .incident(row)
+            .filter(|_| row.state != eliot_core::AgentState::Stopped);
+        // Working without writing code says so on the row's second line,
+        // in the attention tone; the trailing word stays the model.
+        let no_code = incident.filter(|incident| incident.no_code());
+        // The note: why a lost or failed Agent ended, as its conversation
+        // says; else why it needs attention (its open report, the first
+        // worker that needs you, or its own state); else the task it runs
+        // under.
         let note = if row.resumable() {
             data.loss_words(row).map(monitor_view::RowNote::Ended)
+        } else if no_code.is_some() {
+            None
         } else {
-            data.incident(row)
-                .filter(|_| row.state != eliot_core::AgentState::Stopped)
-                .map(|incident| monitor::attention_words(&incident.reason))
+            incident
+                .map(|incident| incident.words(now))
                 .or_else(|| {
                     tree.filter(|_| !data.needs_attention(row))
                         .and_then(|tree| tree.worker_attention_words(&row.id))
@@ -391,17 +400,39 @@ impl DesktopApp {
                 .map(monitor_view::RowNote::Attention)
         }
         .or_else(|| {
-            data.needs_attention(row)
+            (no_code.is_none() && data.needs_attention(row))
                 .then(|| monitor_view::RowNote::Attention(row.status_words().to_owned()))
         })
         .or_else(|| parent.map(monitor_view::RowNote::Under));
+        // The second line: the attention sentence, else the work line of a
+        // controlled Agent that has not stopped (`docs/spec/monitoring.md`,
+        // Git-aware work summary).
+        let line = match no_code {
+            Some(incident) => {
+                let text = incident.words(now);
+                Some(monitor_view::RowLine {
+                    words: format!("needs attention: {text}"),
+                    text,
+                    attention: true,
+                })
+            }
+            None => row
+                .work
+                .as_ref()
+                .filter(|_| !row.native_child && row.state != eliot_core::AgentState::Stopped)
+                .map(|work| monitor_view::RowLine {
+                    text: monitor::work_line(work, now),
+                    words: monitor::work_words(work, now),
+                    attention: false,
+                }),
+        };
         let resume = row.resumable().then(|| {
             context.message(Message::Monitor(MonitorMsg::ResumeRequested(
                 row.id.clone(),
                 row.generation,
             )))
         });
-        let quiet = row.quiet(crate::handoff::now_ms());
+        let quiet = row.quiet(now);
         let elapsed = quiet.label();
         let elapsed_words = quiet.words();
         let group = row.group(data.incident(row));
@@ -417,7 +448,8 @@ impl DesktopApp {
                         elapsed_words: &elapsed_words,
                         dot: palette.chart_fill(group_tone(group)),
                         selected: selected == Some(row.id.as_str()),
-                        working: group == monitor::Group::Working,
+                        working: group == monitor::Group::Working || no_code.is_some(),
+                        line,
                     },
                     note.as_ref(),
                     monitor_view::RowActions {
@@ -757,6 +789,31 @@ impl DesktopApp {
             spoken_section(palette, "Summary", &agent_lines, &agent_spoken),
         ));
 
+        // Whether it writes code: the Git-aware work summary of this
+        // generation (`agent.get`, else the Monitor's row), and an open
+        // `no_code_progress` report in the attention tone.
+        let row = data
+            .row(&id)
+            .filter(|row| generation.is_none_or(|generation| row.generation == generation));
+        let work = read
+            .and_then(|read| read.agent.work.as_ref())
+            .or_else(|| row.and_then(|row| row.work.as_ref()));
+        let no_code = row
+            .filter(|row| row.state != eliot_core::AgentState::Stopped)
+            .and_then(|row| data.incident(row))
+            .filter(|incident| incident.no_code());
+        if work.is_some() || no_code.is_some() {
+            let now = crate::handoff::now_ms();
+            sections.push(KeyedView::new(
+                "work",
+                work_section(
+                    palette,
+                    no_code.map(|incident| incident.words(now)),
+                    &work.map_or_else(Vec::new, |work| monitor::work_detail_lines(work, now)),
+                ),
+            ));
+        }
+
         // Where it works: its project's checkout and, on a worktree, that
         // worktree; each row opens in Explorer.
         // `project` on the wire is the registration ID, not a path: the
@@ -967,6 +1024,32 @@ fn state_label(state: eliot_core::AgentState) -> &'static str {
 /// in body text.
 fn section(palette: Palette, title: &str, lines: &[String]) -> View {
     spoken_section(palette, title, lines, lines)
+}
+
+/// The Code work card: an open `no_code_progress` report in the attention
+/// tone ("Working without writing code for 14m"), then the work summary.
+fn work_section(palette: Palette, attention: Option<String>, lines: &[String]) -> View {
+    let attention: View = match attention {
+        Some(text) => m3::body(text)
+            .foreground(palette.attention())
+            .text_wrapping(TextWrapping::Wrap)
+            .is_text_selection_enabled(true)
+            .into(),
+        None => View::empty(),
+    };
+    let body: View = if lines.is_empty() {
+        View::empty()
+    } else {
+        m3::body(lines.join("\n"))
+            .text_wrapping(TextWrapping::Wrap)
+            .is_text_selection_enabled(true)
+            .into()
+    };
+    m3::card_high(palette).content(StackPanel::new().spacing(tokens::spacing::SM).children((
+        m3::section_title("Code work"),
+        attention,
+        body,
+    )))
 }
 
 /// [`section`] whose lines a screen reader hears as `spoken` (the efforts

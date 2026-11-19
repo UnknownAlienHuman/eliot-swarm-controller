@@ -786,12 +786,12 @@ The work probe runs inside the ordinary Git probe: only after the workspace watc
 
 ### Git-aware attention: no_code_progress
 
-A busy Agent whose tool and message activity continues but whose worktree has had no write and no commit for `daemon.attention_suspicion_secs`, counted from the later of its last write or commit and the active turn's start, gets a distinct no_code_progress diagnostic (IncidentKind::CodeProgress). It is a diagnostic, never a verdict:
+A busy Agent whose tool and message activity continues but whose worktree has had no write and no commit for daemon.attention_suspicion_secs gets a distinct no_code_progress diagnostic (IncidentKind::CodeProgress). The window counts from the later of the last write or commit and the active turn's start, so a new turn is never reported at once; a turn with no activity for the window is no_progress instead. It is a diagnostic, never a verdict:
 - suppressed for read-only and audit profiles (is_read_only_or_audit_profile) and for Agents without a worktree;
 - retires as soon as a write or commit lands (last_code_progress_at advances);
 - reuses the existing attention machinery: a bounded incident per Agent/generation, no new timer service.
 
-The report carries the work summary's tool/message turn counts so an agent actively using tools but not writing code is clearly distinguished from an idle one.
+The report carries `code_progress_at` (that window's start) and the turn's `tool_calls` and `messages`, so an agent actively using tools but not writing code is clearly distinguished from an idle one. The desktop shows the open report on the Agent's Monitor row and in Details ("Working without writing code for 14m") until the daemon retires it.
 
 ## Restart reconciliation
 

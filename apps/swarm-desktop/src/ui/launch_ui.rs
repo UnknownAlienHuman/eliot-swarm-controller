@@ -1718,6 +1718,7 @@ impl LaunchOutcome {
             tags: Vec::new(),
             organization_revision: None,
             model: None,
+            work: None,
         }
     }
 }
