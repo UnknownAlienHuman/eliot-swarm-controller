@@ -40,16 +40,18 @@ struct ClientInner {
     closed: Mutex<Option<Error>>,
     closed_signal: watch::Sender<()>,
     reader_closed: AtomicBool,
-    /// Decoded `events.put` frames that carry an exact turn's terminal fact.
-    /// Each entry lives as long as its request's mark (see `TerminalWrite`).
+    /// Decoded `events.put` frames that carry an exact turn's native
+    /// `turn.completed`. Each entry lives as long as its request's mark (see
+    /// `TerminalWrite`).
     terminal_writes: std::sync::Mutex<Vec<Weak<TerminalWrite>>>,
 }
 
-/// One `events.put` frame carrying `turn.completed`/`turn.unknown` for exact
-/// turns. The mark travels with the request from decode until intake asks
-/// for the next request, so it covers queueing, the Store wait and the
-/// commit. Dropping it (finished, refused, or never consumed because the
-/// connection closed) clears it.
+/// One `events.put` frame carrying `turn.completed` for exact turns. The mark
+/// travels with the request from decode until intake asks for the next
+/// request, so it covers queueing, the Store wait and the commit. Dropping it
+/// (finished, refused, or never consumed because the connection closed)
+/// clears it. Recovery defers while it is set only to avoid a needless
+/// `unknown`: a terminal that commits after a recovery settlement resolves it.
 struct TerminalWrite {
     agent_id: String,
     generation: i64,
@@ -174,12 +176,7 @@ impl PluginClient {
         let turn_ids: Vec<String> = params["events"]
             .as_array()?
             .iter()
-            .filter(|event| {
-                matches!(
-                    event["kind"].as_str(),
-                    Some("turn.completed" | "turn.unknown")
-                )
-            })
+            .filter(|event| event["kind"] == "turn.completed")
             .filter_map(|event| event["data"]["turn_id"].as_str().map(str::to_owned))
             .collect();
         if turn_ids.is_empty() {

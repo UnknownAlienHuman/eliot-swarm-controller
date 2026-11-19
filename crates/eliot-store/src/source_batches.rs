@@ -681,9 +681,29 @@ impl Store {
                     native_event,
                 )?;
             }
+            // The adapter's own terminal for a turn recovery settled
+            // `unknown` is evidence: it resolves that turn instead of being
+            // refused as inactive.
+            let resolves_recovered = !observed
+                && turn_recovery::resolves_recovered_turn_tx(
+                    &tx,
+                    &projection,
+                    agent_num,
+                    batch.generation,
+                    native_event,
+                )?;
             let (next, effects) = if observed {
                 observer_live::persist_turn_fact(&tx, &projection, native_event)?;
                 (projection.clone(), Vec::new())
+            } else if resolves_recovered {
+                (
+                    projection.clone(),
+                    vec![core::resolve_recovered_turn(
+                        &projection,
+                        native_event,
+                        now,
+                    )?],
+                )
             } else {
                 core::apply(&projection, native_event, now)?
             };
@@ -731,6 +751,17 @@ impl Store {
                 &next,
             )?;
             command_events.extend(effects);
+            if resolves_recovered {
+                provider_events.push(turn_recovery::insert_native_resolution_tx(
+                    &tx,
+                    agent_num,
+                    batch.generation,
+                    native_event,
+                    stored.seq,
+                    cause.clone(),
+                    now,
+                )?);
+            }
             if let Some(cause) = cause.as_ref() {
                 for mut event in hold_events {
                     annotate_new_event_cause_tx(&tx, &mut event, cause.clone())?;

@@ -378,7 +378,8 @@ For the exact active turn, `agent.snapshot` names its `turn_evidence`. The
 turn is running while its fenced `session/prompt` awaits the reply on a
 healthy stream and a live process. It is terminal from that reply (ACP
 `cancelled` reads as universal `interrupted`; `native_status` keeps the raw
-`stopReason`), retained with its exact binding before any write for it, even
+`stopReason`, and a missing reply keeps its `final_text_unavailable` marker, so a
+recovered terminal carries it too), retained with its exact binding before any write for it, even
 `turn.started` when the reply is the turn's first fact, so a failed write costs only
 that fact. The snapshot reads the same state lock the reply's writes hold, so it
 never sees a terminal mid-write. A read waiting on that lock holds the Agent's one

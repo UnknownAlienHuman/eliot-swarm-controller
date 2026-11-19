@@ -160,6 +160,7 @@ authorize a later force-stop of the conflicting Job.
 | exact turn start | busy with captured active turn |
 | first request / last resolved request | waiting / busy |
 | exact active turn terminal result | idle, clear that turn's pending requests |
+| exact native terminal of a turn the monitor settled unknown (same live generation and send) | that turn takes the native outcome, `turn.resolved` with `resolution_source=native`; projection unchanged |
 | normal session end / fatal error / proven loss | stopped / failed / lost |
 | restart of an idle generation with a retained native session, prior owned exit and reader drain proven, no unsettled work | stopped, `agent.stopped {reason: owned_exit_before_restart}` |
 | restart of a remaining live generation | lost, open turn and dispatched effects become unknown |

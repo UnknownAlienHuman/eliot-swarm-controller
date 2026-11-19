@@ -1490,6 +1490,23 @@ for both direct turn entries and command entries bound to that turn.
 `agent.list` carries the newest terminal turn's marker as `last_resolution_source`.
 Wait and list report an Owner-asserted success as `unknown`.
 
+An adapter's own exact-turn terminal is evidence, so it also resolves a turn. When
+`turn.completed` arrives for a turn that the daemon's
+[attention monitor](plugin-protocol.md#translation-and-normalization) settled
+`unknown` in the same live generation, bound to the same send, the Store commits it in
+that `events.put` transaction instead of refusing it as inactive. The turn takes the
+terminal's native status, outcome, final text and usage and reads back as a native
+completion (no source marker). Beside the stored native event, a `turn.resolved` event
+carries `resolution_source=native`, the turn, the send and the native event's
+sequence. The Agent projection and command rows are untouched, and nothing is replayed
+or re-run. This happens at most once and only for that settlement: a terminal for
+another turn, send or generation, for a turn the Owner or an earlier terminal already
+resolved, or for an unknown that came from loss, stop or the adapter itself (or whose
+settlement event has expired) is refused as before. Consumers see the same
+unknown-to-terminal transition as after an Owner resolution: the unknown-turn send gate
+opens and wakes queued sends, and unsatisfied waits and digests read the native
+outcome. A wait or digest already answered with `unknown` is not re-delivered.
+
 When an upgraded terminal row lacks retained evidence of either native completion
 or an Owner assertion, its source and reported outcome are both `unknown`. The
 stored status is retained on the turn for inspection. Native completions omit the
