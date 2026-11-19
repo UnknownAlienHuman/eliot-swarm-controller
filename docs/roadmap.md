@@ -584,7 +584,16 @@ of the explicitly selected release scope.
       `commondir` and `HEAD`). The picker, Settings › Projects and the Monitor
       use the same names. A button in the sidebar's
       header hides it to a rail (show sidebar, New task, the Monitor with the
-      fleet's dot, Settings) for the session; Settings keeps its navigation. Running tasks stay on top, then newest first;
+      fleet's dot, Settings) for the session; Settings keeps its navigation.
+      Navigation works as in Codex (owner review 2026-11-19): the app title
+      goes home (the new-task view); a project's name opens the project (a
+      new task there, its tasks unfolded) and its chevron folds it; Back and
+      Forward (the header's arrows, Alt+←/→, the keyboard's Back and Forward
+      keys and the mouse's side buttons) walk the places visited: a
+      project's new task, a conversation, a Settings page. WinUI 3 takes
+      mouse input outside the thread's message queue, so the side buttons
+      come from a low-level mouse hook that only reads them over the
+      desktop's own foreground window. Running tasks stay on top, then newest first;
       stopped tasks last changed before today, and subprojects with nothing
       live and nothing from today, fold into "Show N older" (a project whose
       tasks are all older keeps its newest three in view), and `[desktop]

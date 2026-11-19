@@ -20,6 +20,19 @@ pub(super) enum Main {
     Settings,
 }
 
+/// A place Back and Forward return to (Codex's history): the new-task
+/// view in a project, a conversation, a Settings page.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Location {
+    /// The new-task view: its project's checkout, or a chat with no project.
+    Home {
+        checkout: String,
+        chat: bool,
+    },
+    Agent(String),
+    Settings(settings_ui::Page),
+}
+
 /// The optional right panel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Panel {
@@ -60,7 +73,10 @@ pub(super) enum ShellMsg {
     AgentOpened(UiAgent),
     /// A project's new-task button: a new task in this checkout.
     ProjectPicked(String),
-    /// A project row: collapse or expand the project (its section key).
+    /// A project's name: open the project (a new task in its checkout,
+    /// its tasks unfolded). Carries the checkout and the section key.
+    ProjectOpened(String, String),
+    /// A project's chevron: collapse or expand the project (its section key).
     ProjectToggled(String),
     /// A project's "Show N older" row: unfold or fold its older tasks.
     OlderToggled(String),
@@ -80,7 +96,11 @@ pub(super) enum ShellMsg {
     /// The shortcut watcher stopped (window closing): nothing to do.
     ShortcutsEnded,
     RefreshRequested,
+    /// The new-task view (the app title, New task, Ctrl+N).
     NewTask,
+    /// One step back or forward through the places visited.
+    Back,
+    Forward,
     MoreAgentsRequested,
     SettingsOpened,
     /// Open Settings at one page (the sidebar's Automations and Usage).
@@ -127,9 +147,6 @@ const PRIME_RETRY_MS: u64 = 16;
 const SIDEBAR_PADDING: f64 = tokens::spacing::SM;
 /// The hidden sidebar: a rail of icon buttons, one control wide.
 const RAIL_WIDTH: f64 = tokens::height::CONTROL + 2.0 * SIDEBAR_PADDING;
-/// Segoe Fluent Icons ClosePane and OpenPane: hide and show the sidebar.
-const GLYPH_HIDE_SIDEBAR: &str = "\u{E89F}";
-const GLYPH_SHOW_SIDEBAR: &str = "\u{E8A0}";
 /// Rows in Recents.
 const RECENTS: usize = 8;
 /// Focus attempts for Ctrl+K, and the wait between them: right after a
@@ -224,6 +241,8 @@ pub(super) struct ShellState {
     pub(super) shortcuts: Option<Arc<Mutex<Receiver<Shortcut>>>>,
     /// The sidebar is hidden to its rail (this session).
     pub(super) sidebar_collapsed: bool,
+    /// The places visited, for Back and Forward.
+    pub(super) history: crate::history::History<Location>,
 }
 
 /// The sidebar search: what the box shows, what was typed and the
@@ -500,6 +519,15 @@ impl DesktopApp {
                     self.new_task(context);
                 }
             }
+            ShellMsg::ProjectOpened(checkout, key) => {
+                if self.can_launch_here(&checkout) {
+                    self.pick_project(&checkout);
+                    self.new_task(context);
+                }
+                if self.nav.collapsed.remove(&key) {
+                    self.collapsed_projects_changed(context);
+                }
+            }
             ShellMsg::ExpandToggled(id, expand) => {
                 if expand {
                     self.nav.expanded.insert(id.clone());
@@ -555,6 +583,8 @@ impl DesktopApp {
                 }
             }
             ShellMsg::NewTask => self.new_task(context),
+            ShellMsg::Back => self.step(false, context),
+            ShellMsg::Forward => self.step(true, context),
             ShellMsg::MoreAgentsRequested => {
                 if let Some(after) = self.nav.agents_next.clone() {
                     self.load_agents(context, Some(after));
@@ -708,6 +738,8 @@ impl DesktopApp {
                     }
                     _ if self.dialog_kind() != 0 => {}
                     Shortcut::NewTask => self.new_task(context),
+                    Shortcut::Back => self.step(false, context),
+                    Shortcut::Forward => self.step(true, context),
                     Shortcut::Search => self.focus_search(SEARCH_FOCUS_TRIES, context),
                     Shortcut::Settings => self.open_settings(None, context),
                     Shortcut::ModelPicker => {
@@ -826,6 +858,86 @@ impl DesktopApp {
             self.main = Main::Settings;
             self.reprime_fields(context);
             self.settings_entered(reopened, context);
+        }
+    }
+
+    /// Where the owner is now, for Back and Forward (nothing while the
+    /// daemon is not reached).
+    pub(super) fn location(&self) -> Option<Location> {
+        if self.startup_error {
+            return None;
+        }
+        Some(match self.main {
+            Main::Settings => Location::Settings(self.settings_page),
+            Main::Conversation => match self.selected_agent_id() {
+                Some(agent) => Location::Agent(agent),
+                // A folder being typed is no place yet.
+                None => Location::Home {
+                    checkout: if self.launch.custom_workspace {
+                        String::new()
+                    } else {
+                        self.launch.workspace.clone()
+                    },
+                    chat: self.launch.chat,
+                },
+            },
+        })
+    }
+
+    /// Keep the place shown now in the history (after every update, so
+    /// every way of getting somewhere counts: a row, a search, a menu, a
+    /// shortcut, archiving the open chat).
+    pub(super) fn record_location(&mut self) {
+        if let Some(place) = self.location() {
+            self.nav.history.visit(place);
+        }
+    }
+
+    /// One step back (or forward) through the places visited. A task that
+    /// is gone from the lists is skipped.
+    fn step(&mut self, forward: bool, context: &ComponentContext<Self>) {
+        loop {
+            let place = if forward {
+                self.nav.history.forward()
+            } else {
+                self.nav.history.back()
+            };
+            let Some(place) = place else {
+                return;
+            };
+            if self.go_to(&place, context) {
+                return;
+            }
+            self.nav.history.forget(&place);
+        }
+    }
+
+    /// Show `place`; false when it no longer exists.
+    fn go_to(&mut self, place: &Location, context: &ComponentContext<Self>) -> bool {
+        match place {
+            Location::Home { checkout, chat } => {
+                self.new_task(context);
+                if *chat {
+                    self.launch_update(
+                        LaunchMsg::ProjectChosen(launch_ui::CHAT_PROJECT.to_owned()),
+                        context,
+                    );
+                } else if self.can_launch_here(checkout) {
+                    self.pick_project(checkout);
+                }
+                true
+            }
+            Location::Agent(id) => match self.find_agent(id).cloned() {
+                Some(agent) => {
+                    self.shell_update(ShellMsg::AgentOpened(agent), context);
+                    true
+                }
+                None => false,
+            },
+            Location::Settings(page) => {
+                self.open_settings(Some(*page), context);
+                true
+            }
         }
     }
 
@@ -1478,21 +1590,41 @@ impl DesktopApp {
     /// and Settings at the bottom. Section labels are secondary text.
     fn sidebar_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let pad = SIDEBAR_PADDING;
-        // The app name, and the button that hides the sidebar to its rail.
+        // The app name goes home (the new-task view); Back and Forward
+        // walk the places visited (Codex's title bar arrows); the last
+        // button hides the sidebar to its rail.
         let header = Grid::new()
-            .columns([GridLength::STAR, GridLength::Auto])
+            .columns([
+                GridLength::STAR,
+                GridLength::Auto,
+                GridLength::Auto,
+                GridLength::Auto,
+            ])
             .margin(Thickness::new(pad, tokens::spacing::SM, pad, 0.0))
             .children((
-                m3::section_title("Eliot Swarm")
-                    .height(tokens::height::CONTROL)
-                    .margin(Thickness::new(tokens::spacing::INSET, 0.0, 0.0, 0.0))
-                    .vertical_alignment(VerticalAlignment::Center),
+                m3::text_chip(palette)
+                    .horizontal_alignment(HorizontalAlignment::Left)
+                    .automation_name("Eliot Swarm: home")
+                    .on_click(context.message(Message::Shell(ShellMsg::NewTask)))
+                    .content(m3::section_title("Eliot Swarm"))
+                    .tooltip("Home (Ctrl+N)"),
                 m3::icon_button(palette)
                     .grid_column(1)
-                    .height(tokens::height::CONTROL)
+                    .is_enabled(self.nav.history.can_back())
+                    .automation_name("Back (Alt+Left)")
+                    .on_click(context.message(Message::Shell(ShellMsg::Back)))
+                    .content(m3::icon(m3::glyph::BACK)),
+                m3::icon_button(palette)
+                    .grid_column(2)
+                    .is_enabled(self.nav.history.can_forward())
+                    .automation_name("Forward (Alt+Right)")
+                    .on_click(context.message(Message::Shell(ShellMsg::Forward)))
+                    .content(m3::icon(m3::glyph::FORWARD)),
+                m3::icon_button(palette)
+                    .grid_column(3)
                     .automation_name("Hide sidebar")
                     .on_click(context.message(Message::Shell(ShellMsg::SidebarToggled)))
-                    .content(m3::icon(GLYPH_HIDE_SIDEBAR)),
+                    .content(m3::icon(m3::glyph::HIDE_SIDEBAR)),
             ));
         let search = AutoSuggestBox::new()
             .element_ref(&self.nav.search_ref)
@@ -1965,30 +2097,47 @@ impl DesktopApp {
         if place.missing {
             label.push_str(", folder missing");
         }
-        let row = m3::row(palette, selected);
         let height = tokens::height::CONTROL;
-        let toggle = row
-            .automation_name(label)
+        // The chevron folds the project; its name opens it (Codex: a new
+        // task in that project, its tasks in view). The few places with no
+        // one checkout only fold.
+        let toggle_msg = Message::Shell(ShellMsg::ProjectToggled(place.key.to_owned()));
+        let opens = place.key != nav::OTHER_LOCATIONS && self.can_launch_here(place.checkout);
+        let fold = m3::icon_button(palette)
             .is_enabled(!filtered)
-            .on_click(context.message(Message::Shell(ShellMsg::ProjectToggled(
-                place.key.to_owned(),
-            ))))
-            .content(
-                Grid::new()
-                    .columns([GridLength::Auto, GridLength::STAR])
-                    .column_spacing(tokens::spacing::SM)
-                    .children((
-                        m3::icon(chevron),
-                        Border::new().grid_column(1).content(m3::row_content(
-                            Some(m3::glyph::FOLDER),
-                            name,
-                            "",
-                            badge,
-                        )),
-                    )),
-            )
+            .automation_name(format!(
+                "{} {name}",
+                if place.collapsed {
+                    "Expand"
+                } else {
+                    "Collapse"
+                }
+            ))
+            .on_click(context.message(toggle_msg.clone()))
+            .content(m3::icon(chevron));
+        let open = m3::row(palette, selected)
+            .grid_column(1)
+            .automation_name(if opens {
+                format!("Open {label}")
+            } else {
+                label
+            })
+            .is_enabled(opens || !filtered)
+            .on_click(context.message(if opens {
+                Message::Shell(ShellMsg::ProjectOpened(
+                    place.checkout.to_owned(),
+                    place.key.to_owned(),
+                ))
+            } else {
+                toggle_msg
+            }))
+            .content(m3::row_content(Some(m3::glyph::FOLDER), name, "", badge))
             // A worktree registration's name trims in the sidebar width.
             .tooltip(name.to_owned());
+        let toggle: View = Grid::new()
+            .columns([GridLength::Auto, GridLength::STAR])
+            .children((fold, open))
+            .into();
         let action = if place.key == nav::OTHER_LOCATIONS {
             View::empty()
         } else if place.missing {
@@ -2327,7 +2476,7 @@ impl DesktopApp {
             .spacing(tokens::spacing::XS)
             .children((
                 button(
-                    GLYPH_SHOW_SIDEBAR,
+                    m3::glyph::SHOW_SIDEBAR,
                     "Show sidebar".to_owned(),
                     Message::Shell(ShellMsg::SidebarToggled),
                 ),

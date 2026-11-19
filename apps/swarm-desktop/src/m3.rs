@@ -31,6 +31,10 @@ pub mod glyph {
     pub const INFO: &str = "\u{E946}";
     pub const CLOSE: &str = "\u{E711}";
     pub const BACK: &str = "\u{E72B}";
+    pub const FORWARD: &str = "\u{E72A}";
+    /// Segoe Fluent ClosePane and OpenPane: hide and show the sidebar.
+    pub const HIDE_SIDEBAR: &str = "\u{E89F}";
+    pub const SHOW_SIDEBAR: &str = "\u{E8A0}";
     pub const CHEVRON_RIGHT: &str = "\u{E76C}";
     pub const CHEVRON_DOWN: &str = "\u{E70D}";
     pub const ARROW_DOWN: &str = "\u{E74B}";
