@@ -74,21 +74,8 @@ are excluded from logs, recordings and plugin state.
 
 An initial plugin may declare:
 
-```json
-{
-  "name": "codex",
-  "version": "0.1.0",
-  "protocol": "eliot-plugin/1",
-  "harness_version": "installed version",
-  "available": true,
-  "mode": "per_agent",
-  "verbs": ["launch", "send", "stop"],
-  "child_verbs": [],
-  "features": {"start_requires_input": false, "native_children": false},
-  "sources": {"controlled": {"session": "stream", "turn": "stream", "message": "stream"}},
-  "proxy": "none"
-}
-```
+The [`PluginManifest`](../../crates/eliot-plugin/src/protocol.rs) DTO owns the manifest
+field catalog.
 
 `proxy` remains a string capability. "none" remains valid for direct native
 adapters (for example direct Codex). A controlled Codex profile with an adopted Responses route
@@ -335,7 +322,7 @@ emits no diagnostics.
 | --- | --- |
 | `events.put` | stable batch id, agent/generation/source, complete bounded normalized native-record batch, optional exclusive cursor; returns committed seq range/cursor |
 | `source.state` | private readback of source state, derived `observer_ready`, all current family owners, latest gap, batch acknowledgement, and latest handoff digest/ack |
-| `source.health` | `SourceHealthUpdate {agent_id,generation,source,health}`; returns the same four-field update after commit |
+| `source.health` | [`SourceHealthUpdate`](../../crates/eliot-core/src/lib.rs) request; returns the same four-field update after commit |
 | `source.gap` | stable gap id, owned families, reason and optional from/to cursor; commits one gap boundary |
 | `source.handoff` | `SourceHandoff` request; atomically returns `SourceHandoffAck` after commit |
 | `process.put` | credential, agent_id, generation, pid, role; returns the OS-verified `ProcessRecord`, not plugin-authoritative process lifecycle |
@@ -415,17 +402,10 @@ establish live source health.
 
 The typed handoff contract is:
 
-```text
-SourceHandoff {
-  agent_id:String, generation:i64, source:String, families:Vec<String>,
-  successor:String, mechanism:String, cursor:Option<String>, gap:Option<SourceHandoffGap>
-}
-SourceHandoffGap { gap_id:String, reason:String, from:Option<String>, to:Option<String> }
-SourceHandoffAck {
-  agent_id:String, generation:i64, source:String, families:Vec<String>,
-  successor:String, mechanism:String, cursor:Option<String>, gap_id:Option<String>, seq:i64
-}
-```
+The [`SourceHandoff`](../../crates/eliot-core/src/source_handoff.rs),
+[`SourceHandoffGap`](../../crates/eliot-core/src/source_handoff.rs) and
+[`SourceHandoffAck`](../../crates/eliot-core/src/source_handoff.rs) DTOs own the
+typed handoff field catalog.
 
 `seq` is positive and is the committed `source.handoff` event sequence; it is independent
 of the predecessor's `last_store_seq`. For a gap-backed handoff, `0 < gap_seq < ack.seq`.

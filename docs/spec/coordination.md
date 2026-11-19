@@ -313,13 +313,8 @@ existing settings. The wire contract is [Chat organization](api.md#chat-organiza
 
 A stable Agent owns its mailbox. One row is one concrete recipient delivery:
 
-```text
-Message {
-  id, delivery_id, sender, sender_generation?, recipient, recipient_generation,
-  thread?, reply_to_delivery?, mode, text, content_digest,
-  admitted_at, presented_at?, presentation_command?, read_at?
-}
-```
+The [`MailDelivery`](../../crates/eliot-core/src/api/coordination.rs) DTO owns the
+mailbox delivery field catalog.
 
 Standalone recipient deliveries use `<write-id>/<recipient-agent>` identifiers.
 Admitted [`mail.send` rule children](automation.md#actions-are-commands) use

@@ -155,13 +155,8 @@ Rules read committed events in bounded pages. Matching/rendering use the event-t
 `subject` stored with the event, not a later Agent row. A rule has one current definition
 and at most one retiring definition:
 
-```text
-RuleState {
-  principal, rule, revision, current_definition, current_cursor,
-  retiring_revision?, retiring_definition?, retiring_cursor?, retire_through?,
-  enabled, paused_reason?, updated_at
-}
-```
+The [`RuleStateView`](../../crates/eliot-core/src/api/reads.rs) DTO owns the public
+rule-state field catalog.
 
 New rule: start at current event high-water H. Semantic edit: atomically retire the old
 definition through H and start the new definition after H. While retirement remains,
