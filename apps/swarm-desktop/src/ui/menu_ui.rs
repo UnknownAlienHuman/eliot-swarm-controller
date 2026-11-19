@@ -1193,7 +1193,7 @@ impl DesktopApp {
                         } else {
                             format!("Tags: {}…", agent.tags.join(", "))
                         },
-                        m3::glyph::RENAME,
+                        m3::glyph::TAG,
                         false,
                     ));
                 }
@@ -1340,7 +1340,7 @@ impl DesktopApp {
                     button.content(
                         StackPanel::new()
                             .orientation(Orientation::Horizontal)
-                            .spacing(tokens::spacing::SM)
+                            .spacing(tokens::spacing::ROW)
                             .children((m3::icon(glyph), text)),
                     ),
                 )

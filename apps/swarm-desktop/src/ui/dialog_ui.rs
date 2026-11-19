@@ -32,7 +32,7 @@ pub(super) fn surface(
                 .automation_name(title.clone())
                 .content(
                     StackPanel::new().spacing(tokens::spacing::MD).children((
-                        m3::section_title(title).text_wrapping(TextWrapping::Wrap),
+                        m3::text(title, tokens::text::TITLE).text_wrapping(TextWrapping::Wrap),
                         ScrollViewer::new()
                             .max_height(tokens::layout::DIALOG_MAX_HEIGHT)
                             .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)

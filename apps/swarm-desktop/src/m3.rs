@@ -101,6 +101,8 @@ pub mod glyph {
     /// Resume a lost task: Segoe Fluent Play.
     pub const RESUME: &str = "\u{E768}";
     pub const RENAME: &str = "\u{E8AC}";
+    /// Tags: Segoe Fluent Tag.
+    pub const TAG: &str = "\u{E8EC}";
     /// Review: Segoe Fluent BulletedList.
     pub const LIST: &str = "\u{E8FD}";
 }
