@@ -427,7 +427,8 @@ allocated bounded `final_text` excerpt for authorized completed bound turns
 (entries outside registration-time scope stay `not_visible`, also on a retry
 after they move into scope; entries where the recipient lacks scope at
 delivery—including Owner-registered digests and workers reparented away before
-completion—deliver status-only, the scope recheck and the mail insert sharing
+completion—deliver status-only, rendered by request position without the id or
+any turn identity, the scope recheck and the mail insert sharing
 one Store lock; NUL bytes are escaped as `\0` before budgeting) within
 `MAX_MAIL_TEXT_BYTES` (32 KiB) with a batch-wide excerpt reserve (see
 [api](api.md#waiting)), and no attention event is emitted: a successful

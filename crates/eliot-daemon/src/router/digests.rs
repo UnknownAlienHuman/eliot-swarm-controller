@@ -900,7 +900,8 @@ mod tests {
         assert_eq!(inbox.deliveries.len(), 1);
         let body = &inbox.deliveries[0].text;
         assert!(body.contains("visible answer"));
-        assert!(body.contains(&format!("- command {c_out}: succeeded\n")));
+        assert!(body.contains("- command #2: succeeded\n"));
+        assert!(!body.contains(&c_out));
         assert!(!body.contains("cross-scope secret"));
         assert!(!body.contains(&out_of_scope));
         assert!(!body.contains("t-out"));
@@ -993,9 +994,139 @@ mod tests {
         assert_eq!(inbox.deliveries.len(), 1);
         let body = &inbox.deliveries[0].text;
         assert!(body.contains("stayed answer"));
-        assert!(body.contains(&format!("- command {c_moved}: succeeded\n")));
+        assert!(body.contains("- command #2: succeeded\n"));
+        assert!(!body.contains(&c_moved));
         assert!(!body.contains("moved secret answer"));
         assert!(!body.contains("t-moved"));
+    }
+
+    #[tokio::test]
+    async fn owner_registered_turn_masked_before_delivery_renders_position_not_identity() {
+        use eliot_core::{NativeEvent, SourceBatch, api::MailInboxResponse};
+
+        let router = test_router();
+        let recipient = spawn_ready_with_control(&router, "app", None, "tree").await;
+        let new_parent = spawn_ready_with_control(&router, "app", None, "tree").await;
+        let worker =
+            spawn_ready_with_control(&router, "other", Some(recipient.clone()), "self").await;
+        let send_id = submit_worker_send(&router, &worker).await;
+        // Start the turn so the registration stays pending on still_running.
+        {
+            let mut store = router.inner.store.lock().await;
+            store
+                .put_batch(
+                    SourceBatch {
+                        batch_id: ulid::Ulid::new().to_string(),
+                        agent_id: worker.clone(),
+                        generation: 1,
+                        source: "stream".to_owned(),
+                        events: vec![NativeEvent {
+                            ts: None,
+                            kind: "turn.started".to_owned(),
+                            native_id: ulid::Ulid::new().to_string(),
+                            data: json!({"command_id": send_id, "turn_id": "t-turn"}),
+                        }],
+                        cursor: None,
+                    },
+                    now_ms(),
+                )
+                .expect("start worker turn");
+        }
+        let turn_ref = format!("{worker}/1/t-turn");
+
+        let digest_id = ulid::Ulid::new().to_string();
+        let params = json!({
+            "id": digest_id,
+            "to": recipient,
+            "mode": "all",
+            "commands": [],
+            "turns": [{"agent": worker, "generation": 1, "turn_id": "t-turn"}]
+        });
+        let pending: SwarmDigestResponse = serde_json::from_value(
+            router
+                .swarm_digest(&params, &Principal::Owner)
+                .await
+                .expect("owner registers explicit turn digest"),
+        )
+        .expect("decode pending");
+        // The registration readback is the Owner's own scope: full identity.
+        assert_eq!(pending.results[0].id, turn_ref);
+        assert_eq!(pending.state, "pending");
+        assert_eq!(pending.results[0].status, "still_running");
+
+        // The worker moves out of the recipient's scope before delivery.
+        router
+            .swarm_reparent(
+                &json!({
+                    "id": ulid::Ulid::new().to_string(),
+                    "agent": worker,
+                    "expected_generation": 1,
+                    "parent": new_parent,
+                    "parent_generation": 1,
+                }),
+                &Principal::Owner,
+            )
+            .await
+            .expect("reparent away");
+        {
+            let mut store = router.inner.store.lock().await;
+            store
+                .put_batch(
+                    SourceBatch {
+                        batch_id: ulid::Ulid::new().to_string(),
+                        agent_id: worker.clone(),
+                        generation: 1,
+                        source: "stream".to_owned(),
+                        events: vec![NativeEvent {
+                            ts: None,
+                            kind: "turn.completed".to_owned(),
+                            native_id: ulid::Ulid::new().to_string(),
+                            data: json!({
+                                "command_id": send_id,
+                                "turn_id": "t-turn",
+                                "status": "completed",
+                                "final_text": "scope-bound answer",
+                            }),
+                        }],
+                        cursor: None,
+                    },
+                    now_ms(),
+                )
+                .expect("complete worker turn");
+        }
+        let delivered = router
+            .deliver_digest(&digest_id)
+            .await
+            .expect("deliver")
+            .expect("digest completed");
+        // The RPC response keeps the caller's original id, status-only.
+        assert_eq!(delivered.results[0].id, turn_ref);
+        assert_eq!(delivered.results[0].status, "succeeded");
+        assert_eq!(delivered.results[0].agent, None);
+        assert_eq!(delivered.results[0].generation, None);
+        assert_eq!(delivered.results[0].turn_id, None);
+        assert_eq!(delivered.results[0].final_text, None);
+
+        let inbox: MailInboxResponse = serde_json::from_value(
+            router
+                .mail_inbox(
+                    &json!({}),
+                    &Principal::Agent {
+                        id: recipient.clone(),
+                        generation: 1,
+                    },
+                )
+                .await
+                .expect("inbox"),
+        )
+        .expect("decode inbox");
+        assert_eq!(inbox.deliveries.len(), 1);
+        let body = &inbox.deliveries[0].text;
+        assert!(body.contains("- turn #1: succeeded"));
+        assert!(!body.contains(&worker));
+        assert!(!body.contains("t-turn"));
+        assert!(!body.contains(&turn_ref));
+        assert!(!body.contains("scope-bound answer"));
     }
 
     #[tokio::test]
@@ -1274,7 +1405,8 @@ mod tests {
                     !body.contains("t-moved"),
                     "gap {gap}: turn identity crossed"
                 );
-                assert!(body.contains(&format!("- command {c_moved}: succeeded\n")));
+                assert!(body.contains("- command #1: succeeded\n"));
+                assert!(!body.contains(&c_moved), "gap {gap}: command id crossed");
             }
         }
     }
