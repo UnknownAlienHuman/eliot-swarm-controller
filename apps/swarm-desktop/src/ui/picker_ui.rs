@@ -120,7 +120,14 @@ impl DesktopApp {
     /// (`Harness · Model · effort`) and the access level, borderless (Full
     /// access as warning text, Codex's); a preset's access is read-only
     /// text.
-    pub(super) fn composer_chips(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+    /// Home's access and model chips; the model's label trims at
+    /// `label_width` (the composer's room).
+    pub(super) fn composer_chips(
+        &self,
+        label_width: f64,
+        context: &mut ViewContext<Self>,
+        palette: Palette,
+    ) -> View {
         let auto_profile = self.launch.auto_profile();
         let label = self.launch.choice.chip_label(auto_profile);
         let glyph = match self.launch.choice {
@@ -133,12 +140,7 @@ impl DesktopApp {
                 self.launch.choice.chip_name(auto_profile)
             ))
             .on_click(context.callback(|()| Message::Launch(LaunchMsg::Toggle(Pop::Model))))
-            .content(m3::chip_content(
-                Some(glyph),
-                &label,
-                true,
-                tokens::layout::PROJECT_CHIP_WIDTH,
-            ));
+            .content(m3::chip_content(Some(glyph), &label, true, label_width));
         let access: View = match &self.launch.choice {
             Choice::Model(_) => {
                 let access = self.launch.access();

@@ -216,6 +216,9 @@ impl DesktopApp {
             pill,
             menu,
             details_open: self.panel == Panel::Details,
+            title_width: self
+                .main_width()
+                .map_or(tokens::layout::READING_WIDTH, title_width),
             send: context.forward(),
         })
     }
@@ -303,7 +306,25 @@ pub(super) struct HeaderInput {
     /// shown, not active).
     menu: Option<Vec<MenuItem>>,
     details_open: bool,
+    /// The title's widest ([`title_width`]).
+    title_width: f64,
     send: Callback<Message>,
+}
+
+/// The narrowest a title trims to before the pill is cut instead.
+const MIN_TITLE: f64 = 96.0;
+
+/// The header title's widest in a main area `main` DIPs wide: the reading
+/// width, less in a narrow window so the status pill (at its widest label)
+/// and the two actions keep their room beside it.
+fn title_width(main: f64) -> f64 {
+    let chrome = tokens::spacing::LG + tokens::spacing::MD + 2.0 * tokens::spacing::ROW;
+    let pill = tokens::layout::RUNS_LABEL_WIDTH
+        + tokens::layout::BADGE_DOT
+        + 6.0
+        + 2.0 * tokens::spacing::ROW;
+    let actions = 2.0 * tokens::height::CONTROL + tokens::spacing::ROW_GAP;
+    (main - chrome - pill - actions).clamp(MIN_TITLE, tokens::layout::READING_WIDTH)
 }
 
 /// One line: the title, the status pill, then the details toggle and the
@@ -350,7 +371,9 @@ impl Component for Header {
                 .content(m3::icon(m3::glyph::MORE)),
         };
         // The design's header: a full-width 52-DIP bar on a hairline, the
-        // title at 15/500, the status pill, then Details and More.
+        // title at 15/500, the status pill, then Details and More. The
+        // actions take their own column, so a narrow window trims the title
+        // (and at worst cuts the pill), never the actions.
         Border::new()
             .grid_row(0)
             .height(tokens::height::HEADER)
@@ -364,24 +387,29 @@ impl Component for Header {
             ))
             .content(
                 Grid::new()
-                    .columns([GridLength::Auto, GridLength::Auto, GridLength::STAR])
+                    .columns([GridLength::STAR, GridLength::Auto])
                     .column_spacing(tokens::spacing::ROW)
                     .children((
-                        m3::section_title(input.title.clone())
-                            .max_width(tokens::layout::READING_WIDTH)
-                            .vertical_alignment(VerticalAlignment::Center)
-                            .text_trimming(TextTrimming::CharacterEllipsis)
-                            .is_text_selection_enabled(true),
-                        Border::new()
-                            .grid_column(1)
-                            .vertical_alignment(VerticalAlignment::Center)
-                            .content(m3::status_pill(palette, input.tone, &input.pill)),
+                        Grid::new()
+                            .columns([GridLength::Auto, GridLength::Auto])
+                            .column_spacing(tokens::spacing::ROW)
+                            .horizontal_alignment(HorizontalAlignment::Left)
+                            .children((
+                                m3::section_title(input.title.clone())
+                                    .max_width(input.title_width)
+                                    .vertical_alignment(VerticalAlignment::Center)
+                                    .text_trimming(TextTrimming::CharacterEllipsis)
+                                    .is_text_selection_enabled(true),
+                                Border::new()
+                                    .grid_column(1)
+                                    .vertical_alignment(VerticalAlignment::Center)
+                                    .content(m3::status_pill(palette, input.tone, &input.pill)),
+                            )),
                         // Details and More, 2 DIPs apart at the right end.
                         StackPanel::new()
-                            .grid_column(2)
+                            .grid_column(1)
                             .orientation(Orientation::Horizontal)
                             .spacing(tokens::spacing::ROW_GAP)
-                            .horizontal_alignment(HorizontalAlignment::Right)
                             .vertical_alignment(VerticalAlignment::Center)
                             .children((
                                 m3::icon_button(palette)

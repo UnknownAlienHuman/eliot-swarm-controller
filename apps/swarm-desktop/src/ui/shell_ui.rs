@@ -1504,17 +1504,27 @@ impl DesktopApp {
         });
     }
 
-    /// The main area's width from the window width, the sidebar (or the
-    /// Settings navigation in its place) and the open panel, or None until
-    /// the first size observation.
+    /// The main area's width from the window width, the sidebar (its rail
+    /// when hidden, the Settings navigation in its place) and the open
+    /// panel, or None until the first size observation.
     pub(super) fn main_width(&self) -> Option<f64> {
         let panel = if self.panel_shown() {
             tokens::layout::PANEL_WIDTH
         } else {
             0.0
         };
-        self.window_width
-            .map(|width| width - tokens::layout::SIDEBAR_WIDTH - panel)
+        let side = if self.rail_shown() {
+            RAIL_WIDTH
+        } else {
+            tokens::layout::SIDEBAR_WIDTH
+        };
+        self.window_width.map(|width| width - side - panel)
+    }
+
+    /// Tasks hide the sidebar to its rail; Settings always shows its
+    /// navigation.
+    fn rail_shown(&self) -> bool {
+        self.nav.sidebar_collapsed && self.main != Main::Settings && !self.startup_error
     }
 
     /// The right panel belongs to the conversation: Settings shows two
@@ -1824,7 +1834,7 @@ impl DesktopApp {
         };
         // Settings always shows its navigation; tasks may hide the sidebar
         // to its rail.
-        let rail = self.nav.sidebar_collapsed && self.main != Main::Settings && !self.startup_error;
+        let rail = self.rail_shown();
         let mut columns = vec![
             GridLength::Pixel(if rail {
                 RAIL_WIDTH
