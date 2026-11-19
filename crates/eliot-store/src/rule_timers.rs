@@ -591,6 +591,14 @@ impl Store {
                 match admission {
                     Ok((admitted_parent, admitted_child, admitted_events)) => {
                         if let Some(arbitration) = &arbitration {
+                            if admitted_child.command.verb == "launch" {
+                                capacity::reject_if_uses_blocked_scope_tx(
+                                    &tx,
+                                    admitted_child.command.target.as_deref(),
+                                    policy,
+                                    &arbitration.blocked_scopes,
+                                )?;
+                            }
                             crate::launch_queue::advance_cursor(&tx, &arbitration.project)?;
                         }
                         parent = Some(admitted_parent);

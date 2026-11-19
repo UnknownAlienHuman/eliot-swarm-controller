@@ -40,6 +40,7 @@ pub(crate) const RULE_EVENT_PAGE_SIZE: usize = 128;
 const TIMER_PAGE_SIZE: usize = 128;
 const RULE_CHILD_RECOVERY_PAGE_SIZE: usize = 1_000;
 const RULE_RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
+const MAX_ARBITRATION_RETRIES: usize = 8;
 // Temporary priority changes can reorder fresh heads. Older heads use a
 // stable project ring so repeated priority changes cannot keep overtaking them.
 const PRIORITY_WAIT_LIMIT_MS: i64 = 30_000;
@@ -1018,6 +1019,7 @@ async fn run_global_rules_inner(
     // Register before the first high-water read so no event can fall between them.
     let mut events = router.subscribe_rule_events();
     let mut progress = router.progress_receiver();
+    let mut arbitration = router.launch_arbitration_receiver();
     router.note_automation_task_running("rule_worker");
     let mut watcher = match reload::RuleWatcher::watch(&data_root) {
         Ok(watcher) => Some(watcher),
@@ -1045,6 +1047,7 @@ async fn run_global_rules_inner(
     let mut max_event_backlog = initial_max_event_backlog;
     let mut last_applied_inputs = None;
     let mut recover_rule_children = true;
+    let mut arbitrate_launches = true;
     match crate::config::load_automation_config(&data_root) {
         Ok(config) => {
             max_event_backlog = config.max_event_backlog;
@@ -1144,7 +1147,16 @@ async fn run_global_rules_inner(
                 }
             }
 
-            if !reconcile_due_timers(&router, "owner", &mut rules, now_ms()).await? {
+            let arbitrate_now = std::mem::take(&mut arbitrate_launches);
+            if !reconcile_due_timers_with_arbitration(
+                &router,
+                "owner",
+                &mut rules,
+                now_ms(),
+                arbitrate_now,
+            )
+            .await?
+            {
                 join_cleanup_task(cleanup_task).await;
                 return Ok(RuleWorkerExit::AdmissionClosed);
             }
@@ -1194,14 +1206,25 @@ async fn run_global_rules_inner(
                 }
                 recover_rule_children = true;
             }
+            changed = arbitration.changed() => {
+                if changed.is_err() {
+                    join_cleanup_task(cleanup_task).await;
+                    return Ok(RuleWorkerExit::Exited);
+                }
+                arbitrate_launches = true;
+            }
             received = events.recv() => match received {
                 Ok(event) => {
                     router.note_unknown(std::slice::from_ref(&event));
                     recover_rule_children = true;
+                    if event_wakes_launch_arbitration(&event) {
+                        arbitrate_launches = true;
+                    }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
                     router.clear_terminal_unknown_cache().await;
                     recover_rule_children = true;
+                    arbitrate_launches = true;
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     join_cleanup_task(cleanup_task).await;
@@ -1211,6 +1234,7 @@ async fn run_global_rules_inner(
             _ = reconcile.tick() => {
                 reload_requested = true;
                 cleanup_requested = true;
+                arbitrate_launches = true;
             },
             _ = async {
                 if let Some(watcher) = &mut watcher {
@@ -1218,15 +1242,23 @@ async fn run_global_rules_inner(
                 } else {
                     std::future::pending::<()>().await;
                 }
-            } => reload_requested = true,
-            _ = wait_project_rule_watchers(&mut project_watchers) => reload_requested = true,
+            } => {
+                reload_requested = true;
+                arbitrate_launches = true;
+            },
+            _ = wait_project_rule_watchers(&mut project_watchers) => {
+                reload_requested = true;
+                arbitrate_launches = true;
+            },
             _ = async {
                 if let Some(wait) = timer_wait {
                     tokio::time::sleep(wait).await;
                 } else {
                     std::future::pending::<()>().await;
                 }
-            } => {},
+            } => {
+                arbitrate_launches = true;
+            },
             completed = async {
                 match cleanup_task.as_mut() {
                     Some(task) => Some(task.await),
@@ -1260,7 +1292,11 @@ async fn run_global_rules_inner(
             recover_rule_children = false;
         }
         for rule in &mut rules {
-            if let Some(timer) = &mut rule.timer {
+            if let Some(timer) = &mut rule.timer
+                && (arbitrate_launches
+                    || reload_requested
+                    || !is_assignment_timer_rule(&rule.definition))
+            {
                 timer.blocked = false;
             }
         }
@@ -1827,134 +1863,250 @@ fn initial_next_due_at(schedule: &TimerSchedule, registration_now: i64) -> Resul
     }
 }
 
+fn is_assignment_timer_rule(definition: &RuleDefinition) -> bool {
+    definition
+        .evaluate_timer()
+        .is_ok_and(|action| action.args.get("assignment").is_some())
+}
+
+fn event_wakes_launch_arbitration(event: &Event) -> bool {
+    matches!(
+        event.kind.as_str(),
+        "capacity.released" | "provider.hold_cleared" | "project.transferred"
+    )
+}
+
 async fn reconcile_due_timers(
     router: &Router,
     principal: &str,
     rules: &mut [ActiveRule],
     now: i64,
 ) -> Result<bool> {
+    reconcile_due_timers_with_arbitration(router, principal, rules, now, true).await
+}
+
+async fn reconcile_due_timers_with_arbitration(
+    router: &Router,
+    principal: &str,
+    rules: &mut [ActiveRule],
+    now: i64,
+    arbitrate_launches: bool,
+) -> Result<bool> {
+    struct TimerHead {
+        index: usize,
+        state: TimerStateView,
+        route: Option<String>,
+        retained_wait: Option<eliot_store::TimerWait>,
+    }
+
     enum Head {
-        Timer(usize, TimerStateView, Option<String>),
+        Timer(Box<TimerHead>),
         Interactive(Box<eliot_store::PendingLaunch>),
     }
 
-    let mut after = None;
-    let mut deferred_timers = Vec::new();
-    let mut heads = std::collections::BTreeMap::<String, (i64, Head)>::new();
-    let (cursor, priorities, intents) = if principal == "owner" {
-        router.launch_arbitration().await?
-    } else {
-        Default::default()
-    };
-    // Store returns intents in commit order within each millisecond.
-    for intent in intents {
-        heads
-            .entry(intent.view.project.clone())
-            .or_insert_with(|| (intent.created_at, Head::Interactive(Box::new(intent))));
-    }
-    loop {
-        let page = router
-            .list_due_rule_timers(principal, after.as_deref(), now, TIMER_PAGE_SIZE)
-            .await?;
-        let Some(last) = page.last() else { break };
-        after = Some(last.id.clone());
-        for state in page {
-            let index = rules
-                .iter()
-                .position(|rule| {
-                    rule.principal == principal
-                        && rule
-                            .timer
-                            .as_ref()
-                            .is_some_and(|timer| timer.state.id == state.id)
-                })
-                .ok_or_else(|| {
-                    Error::new("source_integrity", "stored timer has no loaded definition")
-                })?;
-            if !state.enabled
-                || rules[index]
-                    .timer
-                    .as_ref()
-                    .is_some_and(|timer| timer.blocked)
-            {
-                continue;
-            }
-            let assignment = (principal == "owner")
-                .then(|| rules[index].definition.evaluate_timer())
-                .and_then(std::result::Result::ok)
-                .filter(|action| action.args.get("assignment").is_some());
-            if let Some(action) = assignment {
-                if router.rule_has_open_actions(principal, &state.id).await? {
-                    deferred_timers.push(index);
+    for attempt in 0..MAX_ARBITRATION_RETRIES {
+        let mut after = None;
+        let mut deferred_timers = Vec::new();
+        let mut heads = std::collections::BTreeMap::<String, (i64, Head)>::new();
+        let (cursor, priorities, intents) = if principal == "owner" && arbitrate_launches {
+            router.launch_arbitration().await?
+        } else {
+            Default::default()
+        };
+        // Store returns intents in commit order within each millisecond.
+        for intent in intents {
+            heads
+                .entry(intent.view.project.clone())
+                .or_insert_with(|| (intent.created_at, Head::Interactive(Box::new(intent))));
+        }
+        loop {
+            let page = router
+                .list_due_rule_timers(principal, after.as_deref(), now, TIMER_PAGE_SIZE)
+                .await?;
+            let Some(last) = page.last() else { break };
+            after = Some(last.id.clone());
+            for state in page {
+                let index = rules
+                    .iter()
+                    .position(|rule| {
+                        rule.principal == principal
+                            && rule
+                                .timer
+                                .as_ref()
+                                .is_some_and(|timer| timer.state.id == state.id)
+                    })
+                    .ok_or_else(|| {
+                        Error::new("source_integrity", "stored timer has no loaded definition")
+                    })?;
+                if !state.enabled
+                    || rules[index]
+                        .timer
+                        .as_ref()
+                        .is_some_and(|timer| timer.blocked)
+                {
                     continue;
                 }
-                let retained = router.arbitration_timer_wait(&state).await?;
-                let route = retained.as_ref().and_then(|(_, wait)| wait.route.clone());
-                let project = match router.queued_launch_project(&action).await {
-                    Ok(project) => project,
-                    Err(error) => {
-                        if error.code != "workspace_unavailable" {
-                            crate::logging::record(
-                                &router.secret_policy_snapshot(),
-                                "assignment.project_wait",
-                                &[("rule", &state.id)],
-                                Some(&error),
-                            );
-                        }
-                        retained.map(|(project, _)| project).unwrap_or_else(|| {
-                            action.args["workspace"]
-                                .as_str()
-                                .unwrap_or_default()
-                                .to_owned()
-                        })
+                let assignment = (principal == "owner")
+                    .then(|| rules[index].definition.evaluate_timer())
+                    .and_then(std::result::Result::ok)
+                    .filter(|action| action.args.get("assignment").is_some());
+                if let Some(action) = assignment {
+                    if !arbitrate_launches {
+                        continue;
                     }
-                };
-                let due = state.next_due_at.unwrap_or(now);
-                match heads.entry(project) {
-                    std::collections::btree_map::Entry::Vacant(entry) => {
-                        entry.insert((due, Head::Timer(index, state, route)));
+                    if router.rule_has_open_actions(principal, &state.id).await? {
+                        deferred_timers.push(index);
+                        continue;
                     }
-                    std::collections::btree_map::Entry::Occupied(mut entry) => {
-                        if due < entry.get().0 {
-                            if let (_, Head::Timer(previous, _, _)) =
-                                entry.insert((due, Head::Timer(index, state, route)))
-                            {
-                                deferred_timers.push(previous);
+                    let retained = router.arbitration_timer_wait(&state).await?;
+                    let retained_wait = retained.as_ref().map(|(_, wait)| wait);
+                    let route = retained_wait.and_then(|wait| wait.route.clone());
+                    let wait_copy = retained_wait.map(|wait| eliot_store::TimerWait {
+                        reason: wait.reason.clone(),
+                        route: wait.route.clone(),
+                    });
+                    let project = match router.queued_launch_project(&action).await {
+                        Ok(project) => project,
+                        Err(error) => {
+                            if error.code != "workspace_unavailable" {
+                                crate::logging::record(
+                                    &router.secret_policy_snapshot(),
+                                    "assignment.project_wait",
+                                    &[("rule", &state.id)],
+                                    Some(&error),
+                                );
                             }
-                        } else {
-                            deferred_timers.push(index);
+                            retained.map(|(project, _)| project).unwrap_or_else(|| {
+                                action.args["workspace"]
+                                    .as_str()
+                                    .unwrap_or_default()
+                                    .to_owned()
+                            })
+                        }
+                    };
+                    let due = state.next_due_at.unwrap_or(now);
+                    let timer_head = || {
+                        Head::Timer(Box::new(TimerHead {
+                            index,
+                            state,
+                            route,
+                            retained_wait: wait_copy,
+                        }))
+                    };
+                    match heads.entry(project) {
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert((due, timer_head()));
+                        }
+                        std::collections::btree_map::Entry::Occupied(mut entry) => {
+                            if due < entry.get().0 {
+                                if let (_, Head::Timer(previous)) =
+                                    entry.insert((due, timer_head()))
+                                {
+                                    deferred_timers.push(previous.index);
+                                }
+                            } else {
+                                deferred_timers.push(index);
+                            }
                         }
                     }
-                }
-            } else if !reconcile_timer(router, &mut rules[index], state, now, None).await? {
-                return Ok(false);
-            }
-        }
-    }
-    for index in deferred_timers {
-        if let Some(timer) = rules[index].timer.as_mut() {
-            timer.blocked = true;
-        }
-    }
-    let mut heads = heads.into_iter().collect::<Vec<_>>();
-    heads.sort_by_cached_key(|(project, (due, _))| {
-        arbitration_order(project, *due, now, cursor.as_deref(), &priorities)
-    });
-    for (project, (_, head)) in heads {
-        match head {
-            Head::Interactive(intent) => router.try_launch_intent(&intent).await?,
-            Head::Timer(index, state, route) => {
-                let arb = eliot_store::ArbitratedTimer {
-                    project,
-                    route,
-                    wait: None,
-                };
-                if !reconcile_timer(router, &mut rules[index], state, now, Some(arb)).await? {
-                    return Ok(false);
+                } else if attempt == 0 {
+                    match reconcile_timer(router, &mut rules[index], state, now, None).await? {
+                        TimerReconcileOutcome::AdmissionClosed => return Ok(false),
+                        TimerReconcileOutcome::Continue
+                        | TimerReconcileOutcome::CapacityWait(_)
+                        | TimerReconcileOutcome::RetryPass => {}
+                    }
                 }
             }
         }
+        for &index in &deferred_timers {
+            if let Some(timer) = rules[index].timer.as_mut() {
+                timer.blocked = true;
+            }
+        }
+        if heads.is_empty() {
+            return Ok(true);
+        }
+        let mut heads = heads.into_iter().collect::<Vec<_>>();
+        heads.sort_by_cached_key(|(project, (due, _))| {
+            arbitration_order(project, *due, now, cursor.as_deref(), &priorities)
+        });
+        let mut blocked_scopes = std::collections::HashSet::new();
+        let mut attempted_assignments = Vec::new();
+        let mut retry_pass = false;
+        for (project, (_, head)) in heads {
+            match head {
+                Head::Interactive(intent) => {
+                    if intent.view.reason.as_ref().is_some_and(|reason| {
+                        reason.code == "capacity_unavailable"
+                            && blocked_scopes.contains(&reason.scope)
+                    }) {
+                        continue;
+                    }
+                    match router
+                        .try_launch_intent_in_pass(&intent, &blocked_scopes)
+                        .await?
+                    {
+                        crate::router::launch_queue::LaunchArbitrationAttempt::CapacityWait(
+                            scope,
+                        ) => {
+                            blocked_scopes.insert(scope);
+                        }
+                        crate::router::launch_queue::LaunchArbitrationAttempt::RetryPass => {
+                            retry_pass = true;
+                            break;
+                        }
+                        crate::router::launch_queue::LaunchArbitrationAttempt::Admitted
+                        | crate::router::launch_queue::LaunchArbitrationAttempt::Other => {}
+                    }
+                }
+                Head::Timer(timer_head) => {
+                    let TimerHead {
+                        index,
+                        state,
+                        route,
+                        retained_wait,
+                    } = *timer_head;
+                    attempted_assignments.push(index);
+                    if retained_wait.as_ref().is_some_and(|wait| {
+                        wait.reason.code == "capacity_unavailable"
+                            && blocked_scopes.contains(&wait.reason.scope)
+                    }) {
+                        if let Some(timer) = rules[index].timer.as_mut() {
+                            timer.blocked = true;
+                        }
+                        continue;
+                    }
+                    let arb = eliot_store::ArbitratedTimer {
+                        project,
+                        route,
+                        wait: None,
+                        blocked_scopes: blocked_scopes.clone(),
+                    };
+                    match reconcile_timer(router, &mut rules[index], state, now, Some(arb)).await? {
+                        TimerReconcileOutcome::AdmissionClosed => return Ok(false),
+                        TimerReconcileOutcome::CapacityWait(scope) => {
+                            blocked_scopes.insert(scope);
+                        }
+                        TimerReconcileOutcome::RetryPass => {
+                            retry_pass = true;
+                            break;
+                        }
+                        TimerReconcileOutcome::Continue => {}
+                    }
+                }
+            }
+        }
+        if !retry_pass {
+            return Ok(true);
+        }
+        for index in attempted_assignments.into_iter().chain(deferred_timers) {
+            if let Some(timer) = rules[index].timer.as_mut() {
+                timer.blocked = false;
+            }
+        }
     }
+    router.signal_launch_arbitration();
     Ok(true)
 }
 
@@ -1981,13 +2133,20 @@ fn arbitration_order(
     )
 }
 
+enum TimerReconcileOutcome {
+    Continue,
+    CapacityWait(String),
+    RetryPass,
+    AdmissionClosed,
+}
+
 async fn reconcile_timer(
     router: &Router,
     rule: &mut ActiveRule,
     state: TimerStateView,
     now: i64,
     mut arbitration: Option<eliot_store::ArbitratedTimer>,
-) -> Result<bool> {
+) -> Result<TimerReconcileOutcome> {
     let Some(timer) = rule.timer.as_mut() else {
         return Err(Error::new(
             "source_integrity",
@@ -2004,12 +2163,12 @@ async fn reconcile_timer(
         timer.armed_due_at_ms = timer.state.next_due_at;
     }
     if !timer.state.enabled || timer.blocked {
-        return Ok(true);
+        return Ok(TimerReconcileOutcome::Continue);
     }
 
     let (scheduled_at_ms, next_due_at_ms, action, skip_code, skip_capacity_message, armed_slot) =
         match timer_decision(timer, now)? {
-            TimerDecision::NotDue => return Ok(true),
+            TimerDecision::NotDue => return Ok(TimerReconcileOutcome::Continue),
             TimerDecision::Skip {
                 scheduled_at_ms,
                 next_due_at_ms,
@@ -2034,7 +2193,7 @@ async fn reconcile_timer(
                     timer.state = admission.state;
                     timer.blocked = admission.blocked;
                     timer.armed_due_at_ms = timer.state.next_due_at.filter(|due| *due > now);
-                    return Ok(true);
+                    return Ok(TimerReconcileOutcome::Continue);
                 }
 
                 // A per-assignment briefs failure (for example a missing
@@ -2133,7 +2292,7 @@ async fn reconcile_timer(
                 }
                 if let Some(code) = assignment_unavailable {
                     if !router.rule_firings_open() {
-                        return Ok(false);
+                        return Ok(TimerReconcileOutcome::AdmissionClosed);
                     }
                     (
                         scheduled_at_ms,
@@ -2169,7 +2328,9 @@ async fn reconcile_timer(
                                 None,
                             )
                         }
-                        Err(_error) if !router.rule_firings_open() => return Ok(false),
+                        Err(_error) if !router.rule_firings_open() => {
+                            return Ok(TimerReconcileOutcome::AdmissionClosed);
+                        }
                         Err(error) => return Err(error),
                     }
                 }
@@ -2183,7 +2344,13 @@ async fn reconcile_timer(
         skip_code,
         skip_capacity_message,
     };
-    let Some(admission) = router
+    let was_arbitrated = arbitration.is_some();
+    let prepared_capacity_scope = arbitration
+        .as_ref()
+        .and_then(|arb| arb.wait.as_ref())
+        .filter(|wait| wait.code == "capacity_unavailable")
+        .map(|wait| wait.scope.clone());
+    let admission = match router
         .commit_rule_timer_slot(
             &rule.principal,
             rule.project.as_ref(),
@@ -2192,9 +2359,14 @@ async fn reconcile_timer(
             arbitration,
             now,
         )
-        .await?
-    else {
-        return Ok(false);
+        .await
+    {
+        Ok(Some(admission)) => admission,
+        Ok(None) => return Ok(TimerReconcileOutcome::AdmissionClosed),
+        Err(error) if error.code == "arbitration_retry" => {
+            return Ok(TimerReconcileOutcome::RetryPass);
+        }
+        Err(error) => return Err(error),
     };
     timer.state = admission.state;
     timer.blocked = admission.blocked;
@@ -2205,7 +2377,21 @@ async fn reconcile_timer(
     } else {
         timer.state.next_due_at.filter(|due| *due > now)
     };
-    Ok(true)
+    if was_arbitrated && timer.blocked {
+        let capacity_scope = match prepared_capacity_scope {
+            Some(scope) => Some(scope),
+            None => router
+                .arbitration_timer_wait(&timer.state)
+                .await?
+                .map(|(_, wait)| wait.reason)
+                .filter(|reason| reason.code == "capacity_unavailable")
+                .map(|reason| reason.scope),
+        };
+        if let Some(scope) = capacity_scope {
+            return Ok(TimerReconcileOutcome::CapacityWait(scope));
+        }
+    }
+    Ok(TimerReconcileOutcome::Continue)
 }
 
 fn timer_decision(timer: &ActiveTimer, now: i64) -> Result<TimerDecision> {

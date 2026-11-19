@@ -50,6 +50,7 @@ impl Router {
             store.enqueue_launch(&caller, &original, request, &project, remote, now_ms())?
         };
         self.signal_progress();
+        self.signal_launch_arbitration();
         encode(view)
     }
 
@@ -98,6 +99,7 @@ impl Router {
             store.set_manager_budget(&principal_name(principal), &request, &limits, now_ms())?
         };
         self.signal_progress();
+        self.signal_launch_arbitration();
         encode(view)
     }
 
@@ -200,7 +202,11 @@ impl Router {
             .await
     }
 
-    pub(crate) async fn try_launch_intent(&self, intent: &PendingLaunch) -> Result<()> {
+    pub(crate) async fn try_launch_intent_in_pass(
+        &self,
+        intent: &PendingLaunch,
+        blocked_scopes: &HashSet<String>,
+    ) -> Result<LaunchArbitrationAttempt> {
         let principal = if intent.principal == "owner" {
             Principal::Owner
         } else {
@@ -244,6 +250,7 @@ impl Router {
                 intent,
                 prepared.request,
                 prepared.workspace,
+                blocked_scopes,
                 now_ms(),
             )?;
             self.publish_locked(&admission.events);
@@ -254,9 +261,18 @@ impl Router {
             Ok(admission) => {
                 self.schedule_admission(&admission);
                 self.signal_progress();
+                self.signal_launch_arbitration();
+                Ok(LaunchArbitrationAttempt::Admitted)
             }
-            Err(error) if error.code == "unavailable" && !self.rule_firings_open() => {}
+            Err(error) if error.code == "arbitration_retry" => {
+                Ok(LaunchArbitrationAttempt::RetryPass)
+            }
+            Err(error) if error.code == "unavailable" && !self.rule_firings_open() => {
+                Ok(LaunchArbitrationAttempt::Other)
+            }
             Err(error) if let Some(wait) = TimerWait::from_error(&error, route.clone()) => {
+                let capacity_scope =
+                    (wait.reason.code == "capacity_unavailable").then(|| wait.reason.scope.clone());
                 if intent.view.reason.as_ref() != Some(&wait.reason) || intent.route != route {
                     self.inner.store.lock().await.note_launch_wait(
                         intent,
@@ -265,6 +281,10 @@ impl Router {
                         false,
                     )?;
                 }
+                Ok(match capacity_scope {
+                    Some(scope) => LaunchArbitrationAttempt::CapacityWait(scope),
+                    None => LaunchArbitrationAttempt::Other,
+                })
             }
             Err(error) if eliot_core::is_deterministic_pre_admission_rejection(&error.code) => {
                 self.inner.store.lock().await.note_launch_wait(
@@ -278,6 +298,7 @@ impl Router {
                     true,
                 )?;
                 self.signal_progress();
+                Ok(LaunchArbitrationAttempt::Other)
             }
             Err(error) => {
                 let mut store = self.inner.store.lock().await;
@@ -298,10 +319,17 @@ impl Router {
                     );
                     store.note_launch_wait(intent, reason, route.as_deref(), false)?;
                 }
+                Ok(LaunchArbitrationAttempt::Other)
             }
         }
-        Ok(())
     }
+}
+
+pub(crate) enum LaunchArbitrationAttempt {
+    Admitted,
+    CapacityWait(String),
+    RetryPass,
+    Other,
 }
 
 pub(crate) fn checked_route(request: &SubmitCommand, previous: Option<&str>) -> Result<String> {

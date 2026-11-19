@@ -73,6 +73,7 @@ impl Router {
             self.schedule_command(id.clone(), None);
         }
         self.signal_progress();
+        self.signal_launch_arbitration();
         encode_assignment(change.value)
     }
 
@@ -97,6 +98,7 @@ impl Router {
         let change = store.claim_project_manager(&principal_name(principal), &request, now_ms())?;
         self.publish_locked(&change.events);
         self.signal_progress();
+        self.signal_launch_arbitration();
         encode_assignment(change.value)
     }
 
@@ -111,6 +113,7 @@ impl Router {
             store.release_project_manager(&principal_name(principal), &request, now_ms())?;
         self.publish_locked(&change.events);
         self.signal_progress();
+        self.signal_launch_arbitration();
         encode_assignment(change.value)
     }
 
@@ -222,6 +225,7 @@ impl Router {
             }
         }
         self.signal_progress();
+        self.signal_launch_arbitration();
         encode_assignment(change.value)
     }
 }

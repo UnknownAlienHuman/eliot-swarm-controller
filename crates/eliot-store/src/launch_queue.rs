@@ -34,6 +34,7 @@ pub struct ArbitratedTimer {
     pub project: String,
     pub route: Option<String>,
     pub wait: Option<LaunchWaitReason>,
+    pub blocked_scopes: std::collections::HashSet<String>,
 }
 
 pub struct TimerWait {
@@ -285,6 +286,7 @@ impl Store {
         intent: &PendingLaunch,
         mut request: SubmitCommand,
         preparation: Option<WorkspacePreparationInput>,
+        blocked_scopes: &std::collections::HashSet<String>,
         now: i64,
     ) -> Result<Admission> {
         self.ensure_writer_healthy()?;
@@ -329,6 +331,12 @@ impl Store {
                     "queued launch command id already exists",
                 ));
             }
+            capacity::reject_if_uses_blocked_scope_tx(
+                &tx,
+                admission.command.target.as_deref(),
+                self.capacity_policy.as_deref(),
+                blocked_scopes,
+            )?;
             if let Some((rowid, remote)) = previous.zip(intent.remote.as_ref()) {
                 annotate_remote_submission(&tx, &mut admission, remote, rowid)?;
             }
