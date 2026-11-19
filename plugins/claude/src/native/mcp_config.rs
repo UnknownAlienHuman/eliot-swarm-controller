@@ -1,11 +1,14 @@
 use std::{
-    ffi::{OsStr, OsString},
+    ffi::OsString,
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
 };
 
 use eliot_core::{Error, Result};
+use eliot_plugin::native_cli::{
+    WORKER_SWARM_MCP_SERVER_NAME, require_agent_mcp_root, worker_swarm_mcp_args,
+};
 use serde_json::json;
 
 /// One private Claude CLI config file for an owned native session.
@@ -22,40 +25,13 @@ impl ClaudeMcpConfigFile {
         agent_id: &str,
         generation: i64,
     ) -> Result<PathBuf> {
-        let expected_generation = generation.to_string();
-        let matches_agent = unique_environment_value(environment, "ELIOT_AGENT_ID")
-            .and_then(OsStr::to_str)
-            == Some(agent_id);
-        let matches_generation = unique_environment_value(environment, "ELIOT_AGENT_GENERATION")
-            .and_then(OsStr::to_str)
-            == Some(expected_generation.as_str());
-        let has_token = matches!(
-            unique_environment_value(environment, "ELIOT_AGENT_TOKEN"),
-            Some(token) if !token.is_empty()
-        );
-
-        if agent_id.trim().is_empty()
-            || generation <= 0
-            || !matches_agent
-            || !matches_generation
-            || !has_token
-        {
-            return Err(Error::new(
-                "not_allowed",
-                "Claude MCP requires the matching inherited Agent generation identity",
-            ));
-        }
-
-        unique_environment_value(environment, "ELIOT_HOME")
-            .and_then(OsStr::to_str)
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute() && path.is_dir())
-            .ok_or_else(|| {
-                Error::new(
-                    "not_allowed",
-                    "Claude MCP requires the explicit Eliot data root",
-                )
-            })
+        require_agent_mcp_root(
+            environment,
+            agent_id,
+            generation,
+            "Claude MCP requires the matching inherited Agent generation identity",
+            "Claude MCP requires the explicit Eliot data root",
+        )
     }
 
     /// Write only public executable/data-root arguments. Agent authentication
@@ -89,9 +65,9 @@ impl ClaudeMcpConfigFile {
             .ok_or_else(|| Error::new("invalid", "Claude MCP data-root path is not UTF-8"))?;
         let config = json!({
             "mcpServers": {
-                "eliot-swarm": {
+                WORKER_SWARM_MCP_SERVER_NAME: {
                     "command": command,
-                    "args": ["--data-dir", data_dir, "mcp", "--require-agent"]
+                    "args": worker_swarm_mcp_args(data_dir)
                 }
             }
         });
@@ -125,16 +101,4 @@ impl Drop for ClaudeMcpConfigFile {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
     }
-}
-
-fn unique_environment_value<'a>(
-    environment: &'a [(OsString, OsString)],
-    name: &str,
-) -> Option<&'a OsStr> {
-    let mut matches = environment
-        .iter()
-        .filter(|(key, _)| key.to_string_lossy().eq_ignore_ascii_case(name))
-        .map(|(_, value)| value.as_os_str());
-    let value = matches.next()?;
-    matches.next().is_none().then_some(value)
 }

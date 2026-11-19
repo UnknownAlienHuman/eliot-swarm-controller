@@ -2,28 +2,27 @@
 //!
 //! The plugin runs its frozen snapshot `cmd` with `models --standalone`
 //! (observed `opencode models --standalone`, opencode 2.2.7): no session, no turn and no
-//! inference. donor: `plugins/antigravity/src/native/models.rs`
-//! (`run_models`) for the bounded child pattern (exact argv, stdin null,
-//! piped stdout with an output cap, stderr discarded, kill-and-reap under a
-//! deadline, static error strings). The daemon owns one reader Job per
+//! inference. The bounded child mechanics (exact argv, stdin null, piped
+//! stdout with an output cap, stderr discarded, kill-and-reap under a
+//! deadline, static error strings) live in
+//! `eliot_plugin::native_cli::run_bounded_utf8`. The daemon owns one reader Job per
 //! invocation and confirms family closure before returning its result. The
 //! installed `--help` documents `models --standalone` as a read-only surface;
 //! `GET /openapi.json` of `opencode serve` describes the per-session
 //! `GET /api/model` inventory instead, which needs a live session and is
 //! therefore not the catalogue reader.
 
-use std::{ffi::OsStr, path::Path, process::Stdio};
+use std::{ffi::OsStr, path::Path};
 
 use super::apply_environment;
 use eliot_core::api::harness::native_model_display_name;
 use eliot_core::{Error, Result};
-use eliot_plugin::native_lifecycle::kill_and_reap;
+/// Maximum model id bytes, mirroring `MAX_HARNESS_MODEL_ID_BYTES` in Core;
+/// shared with the other catalogue readers through `eliot-plugin`.
+pub(crate) use eliot_plugin::native_cli::MAX_MODEL_ID_BYTES;
+use eliot_plugin::native_cli::{BoundedReadLabels, run_bounded_utf8, valid_model_id};
 use serde_json::Value;
-use tokio::{
-    io::AsyncReadExt,
-    process::Command,
-    time::{Instant, timeout_at},
-};
+use tokio::{process::Command, time::Instant};
 
 /// Keep the private server under the reader Job, never the background service.
 pub(crate) fn models_argv() -> [&'static str; 2] {
@@ -36,9 +35,6 @@ pub(crate) const MAX_MODELS_BYTES: usize = 512 * 1024;
 
 /// Maximum catalogue ids, mirroring `MAX_HARNESS_MODELS` in Core.
 pub(crate) const MAX_MODELS: usize = 1024;
-
-/// Maximum model id bytes, mirroring `MAX_HARNESS_MODEL_ID_BYTES` in Core.
-pub(crate) const MAX_MODEL_ID_BYTES: usize = 256;
 
 /// Exact argv for the model metadata read: `api model.list --standalone`. The
 /// same read-only native surface as `models --standalone` (no shared server, no
@@ -105,76 +101,19 @@ pub(crate) async fn run_model_metadata(
     context: &ReaderContext<'_>,
 ) -> Result<Vec<NativeModelMetadata>> {
     let mut command = context.command(program);
-    command
-        .args(model_list_argv())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    let mut child = command
-        .spawn()
-        .map_err(|_| Error::new("native_spawn", "OpenCode model.list could not start"))?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| Error::new("native_spawn", "OpenCode model.list could not start"))?;
-    let mut buffer = Vec::new();
-    let read = async {
-        let mut limited = (&mut stdout).take((MAX_MODEL_LIST_BYTES + 1) as u64);
-        limited.read_to_end(&mut buffer).await
-    };
-    match timeout_at(deadline, read).await {
-        Err(_) => {
-            kill_and_reap(&mut child).await;
-            return Err(Error::new(
-                "native_spawn",
-                "OpenCode model.list did not finish before its deadline",
-            ));
-        }
-        Ok(Err(_)) => {
-            kill_and_reap(&mut child).await;
-            return Err(Error::new(
-                "native_readback",
-                "OpenCode model.list metadata was unreadable",
-            ));
-        }
-        Ok(Ok(_)) => {}
-    }
-    if buffer.len() > MAX_MODEL_LIST_BYTES {
-        kill_and_reap(&mut child).await;
-        return Err(Error::new(
-            "native_readback",
-            "OpenCode model.list metadata was unreadable",
-        ));
-    }
-    let status = match timeout_at(deadline, child.wait()).await {
-        Err(_) => {
-            kill_and_reap(&mut child).await;
-            return Err(Error::new(
-                "native_spawn",
-                "OpenCode model.list did not finish before its deadline",
-            ));
-        }
-        Ok(Err(_)) => {
-            return Err(Error::new(
-                "native_readback",
-                "OpenCode model.list metadata was unreadable",
-            ));
-        }
-        Ok(Ok(status)) => status,
-    };
-    if !status.success() {
-        return Err(Error::new(
-            "native_readback",
-            "OpenCode model.list did not return a catalogue",
-        ));
-    }
-    let text = String::from_utf8(buffer).map_err(|_| {
-        Error::new(
-            "native_readback",
-            "OpenCode model.list metadata was unreadable",
-        )
-    })?;
+    command.args(model_list_argv());
+    let text = run_bounded_utf8(
+        command,
+        MAX_MODEL_LIST_BYTES,
+        deadline,
+        &BoundedReadLabels {
+            start: "OpenCode model.list could not start",
+            deadline: "OpenCode model.list did not finish before its deadline",
+            unreadable: "OpenCode model.list metadata was unreadable",
+            status: "OpenCode model.list did not return a catalogue",
+        },
+    )
+    .await?;
     parse_model_list_output(&text)
 }
 
@@ -219,11 +158,9 @@ pub(crate) fn parse_model_list_output(text: &str) -> Result<Vec<NativeModelMetad
         let (Some(provider), Some(id)) = (provider, id) else {
             continue;
         };
-        if provider.len() + id.len() + 1 > MAX_MODEL_ID_BYTES
-            || provider.chars().any(char::is_control)
-            || id.chars().any(char::is_control)
-            || provider.chars().any(char::is_whitespace)
-            || id.chars().any(char::is_whitespace)
+        if !valid_model_id(provider)
+            || !valid_model_id(id)
+            || provider.len() + id.len() + 1 > MAX_MODEL_ID_BYTES
         {
             continue;
         }
@@ -283,72 +220,19 @@ pub(crate) async fn run_models(
     context: &ReaderContext<'_>,
 ) -> Result<Vec<String>> {
     let mut command = context.command(program);
-    command
-        .args(models_argv())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    let mut child = command
-        .spawn()
-        .map_err(|_| Error::new("native_spawn", "OpenCode models could not start"))?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| Error::new("native_spawn", "OpenCode models could not start"))?;
-    let mut buffer = Vec::new();
-    let read = async {
-        let mut limited = (&mut stdout).take((MAX_MODELS_BYTES + 1) as u64);
-        limited.read_to_end(&mut buffer).await
-    };
-    match timeout_at(deadline, read).await {
-        Err(_) => {
-            kill_and_reap(&mut child).await;
-            return Err(Error::new(
-                "native_spawn",
-                "OpenCode models did not finish before its deadline",
-            ));
-        }
-        Ok(Err(_)) => {
-            kill_and_reap(&mut child).await;
-            return Err(Error::new(
-                "native_readback",
-                "OpenCode models metadata was unreadable",
-            ));
-        }
-        Ok(Ok(_)) => {}
-    }
-    if buffer.len() > MAX_MODELS_BYTES {
-        kill_and_reap(&mut child).await;
-        return Err(Error::new(
-            "native_readback",
-            "OpenCode models metadata was unreadable",
-        ));
-    }
-    let status = match timeout_at(deadline, child.wait()).await {
-        Err(_) => {
-            kill_and_reap(&mut child).await;
-            return Err(Error::new(
-                "native_spawn",
-                "OpenCode models did not finish before its deadline",
-            ));
-        }
-        Ok(Err(_)) => {
-            return Err(Error::new(
-                "native_readback",
-                "OpenCode models metadata was unreadable",
-            ));
-        }
-        Ok(Ok(status)) => status,
-    };
-    if !status.success() {
-        return Err(Error::new(
-            "native_readback",
-            "OpenCode models did not return a catalogue",
-        ));
-    }
-    let text = String::from_utf8(buffer)
-        .map_err(|_| Error::new("native_readback", "OpenCode models metadata was unreadable"))?;
+    command.args(models_argv());
+    let text = run_bounded_utf8(
+        command,
+        MAX_MODELS_BYTES,
+        deadline,
+        &BoundedReadLabels {
+            start: "OpenCode models could not start",
+            deadline: "OpenCode models did not finish before its deadline",
+            unreadable: "OpenCode models metadata was unreadable",
+            status: "OpenCode models did not return a catalogue",
+        },
+    )
+    .await?;
     parse_models_output(&text)
 }
 
@@ -365,10 +249,7 @@ pub(crate) fn parse_models_output(text: &str) -> Result<Vec<String>> {
         if line.trim().is_empty() {
             continue;
         }
-        if line.len() > MAX_MODEL_ID_BYTES
-            || line.chars().any(char::is_control)
-            || line.chars().any(char::is_whitespace)
-        {
+        if !valid_model_id(line) {
             return Err(Error::new(
                 "source_integrity",
                 "OpenCode models catalogue is malformed",

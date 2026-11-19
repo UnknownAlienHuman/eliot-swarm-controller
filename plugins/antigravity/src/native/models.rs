@@ -2,27 +2,22 @@
 //!
 //! The plugin runs its frozen snapshot `cmd` with the exact argv `models`
 //! (observed `agy models`, agy 1.5.9): no session, no turn and no inference.
-//! donor: `plugins/opencode/src/native/auth.rs` (`run_list`) for the bounded
-//! child pattern (exact argv, stdin null, piped stdout with an output cap,
-//! stderr discarded, kill-and-reap under a deadline, static error strings).
+//! The bounded child mechanics (exact argv, stdin null, piped stdout with an
+//! output cap, stderr discarded, kill-and-reap under a deadline, static
+//! error strings) live in `eliot_plugin::native_cli::run_bounded_utf8`.
 //! The child environment overlays the mapped launch variables onto the
 //! inherited plugin environment, the same construction as the launch path
 //! (see `crate::profile::reader_environment`).
 
 use std::{
     ffi::{OsStr, OsString},
-    process::Stdio,
     time::Duration,
 };
 
 use eliot_core::api::{HarnessModelEntry, harness::native_model_display_name};
 use eliot_core::{Error, Result};
-use eliot_plugin::native_lifecycle::kill_and_reap;
-use tokio::{
-    io::AsyncReadExt,
-    process::Command,
-    time::{Instant, timeout_at},
-};
+use eliot_plugin::native_cli::{BoundedReadLabels, run_bounded_utf8, valid_model_id};
+use tokio::{process::Command, time::Instant};
 
 /// Exact argv for the catalogue child: `models`, nothing else.
 pub(crate) fn models_argv() -> [&'static str; 1] {
@@ -39,9 +34,6 @@ pub(crate) const MAX_MODELS_BYTES: usize = 64 * 1024;
 /// Maximum catalogue ids, mirroring `MAX_HARNESS_MODELS` in Core.
 pub(crate) const MAX_MODELS: usize = 1024;
 
-/// Maximum model id bytes, mirroring `MAX_HARNESS_MODEL_ID_BYTES` in Core.
-pub(crate) const MAX_MODEL_ID_BYTES: usize = 256;
-
 /// Run the frozen native exe with exact argv `models` and return its entries
 /// in wire order. Bounded by `deadline` and [`MAX_MODELS_BYTES`];
 /// stderr is discarded like every other helper, so failures are static typed
@@ -54,75 +46,19 @@ pub(crate) async fn run_models(
     let mut command = Command::new(program);
     command
         .args(models_argv())
-        .envs(environment.iter().map(|(name, value)| (name, value)))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    let mut child = command
-        .spawn()
-        .map_err(|_| Error::new("native_spawn", "Antigravity models could not start"))?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| Error::new("native_spawn", "Antigravity models could not start"))?;
-    let mut buffer = Vec::new();
-    let read = async {
-        let mut limited = (&mut stdout).take((MAX_MODELS_BYTES + 1) as u64);
-        limited.read_to_end(&mut buffer).await
-    };
-    match timeout_at(deadline, read).await {
-        Err(_) => {
-            kill_and_reap(&mut child).await;
-            return Err(Error::new(
-                "native_spawn",
-                "Antigravity models did not finish before its deadline",
-            ));
-        }
-        Ok(Err(_)) => {
-            kill_and_reap(&mut child).await;
-            return Err(Error::new(
-                "native_readback",
-                "Antigravity models metadata was unreadable",
-            ));
-        }
-        Ok(Ok(_)) => {}
-    }
-    if buffer.len() > MAX_MODELS_BYTES {
-        kill_and_reap(&mut child).await;
-        return Err(Error::new(
-            "native_readback",
-            "Antigravity models metadata was unreadable",
-        ));
-    }
-    let status = match timeout_at(deadline, child.wait()).await {
-        Err(_) => {
-            kill_and_reap(&mut child).await;
-            return Err(Error::new(
-                "native_spawn",
-                "Antigravity models did not finish before its deadline",
-            ));
-        }
-        Ok(Err(_)) => {
-            return Err(Error::new(
-                "native_readback",
-                "Antigravity models metadata was unreadable",
-            ));
-        }
-        Ok(Ok(status)) => status,
-    };
-    if !status.success() {
-        return Err(Error::new(
-            "native_readback",
-            "Antigravity models did not return a catalogue",
-        ));
-    }
-    let text = String::from_utf8(buffer).map_err(|_| {
-        Error::new(
-            "native_readback",
-            "Antigravity models metadata was unreadable",
-        )
-    })?;
+        .envs(environment.iter().map(|(name, value)| (name, value)));
+    let text = run_bounded_utf8(
+        command,
+        MAX_MODELS_BYTES,
+        deadline,
+        &BoundedReadLabels {
+            start: "Antigravity models could not start",
+            deadline: "Antigravity models did not finish before its deadline",
+            unreadable: "Antigravity models metadata was unreadable",
+            status: "Antigravity models did not return a catalogue",
+        },
+    )
+    .await?;
     parse_models_output(&text)
 }
 
@@ -138,11 +74,7 @@ pub(crate) fn parse_models_output(text: &str) -> Result<Vec<HarnessModelEntry>> 
         let Some((id, name)) = line.split_once('\t') else {
             continue;
         };
-        if id.is_empty()
-            || id.len() > MAX_MODEL_ID_BYTES
-            || id.chars().any(char::is_control)
-            || id.chars().any(char::is_whitespace)
-        {
+        if !valid_model_id(id) {
             return Err(Error::new(
                 "source_integrity",
                 "Antigravity models catalogue is malformed",

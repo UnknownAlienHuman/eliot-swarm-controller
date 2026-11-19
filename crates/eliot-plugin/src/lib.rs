@@ -1,6 +1,7 @@
 mod bounded_file;
 pub mod debug;
 mod file_identity;
+pub mod native_cli;
 pub mod native_lifecycle;
 pub mod native_stdio;
 pub mod native_transport;

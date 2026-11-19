@@ -1,11 +1,12 @@
 use std::{
-    ffi::{OsStr, OsString},
+    ffi::OsString,
     path::{Path, PathBuf},
 };
 
 use eliot_core::{Error, Result, SecretPolicy};
 use eliot_plugin::{
     AgentStartParams,
+    native_cli::{WORKER_SWARM_MCP_SERVER_NAME, require_agent_mcp_root, worker_swarm_mcp_args},
     native_transport::NativeLaunch,
     session::{
         TargetEnvironment, optional_profile_text, parse_resume_subject, target_environment,
@@ -58,44 +59,20 @@ pub(crate) struct SwarmMcp {
 }
 
 impl SwarmMcp {
-    pub(crate) const SERVER_NAME: &str = "eliot-swarm";
+    pub(crate) const SERVER_NAME: &str = WORKER_SWARM_MCP_SERVER_NAME;
 
     fn require(
         environment: &[(OsString, OsString)],
         agent_id: &str,
         generation: i64,
     ) -> Result<Self> {
-        let expected_generation = generation.to_string();
-        let matches_agent = unique_environment_value(environment, "ELIOT_AGENT_ID")
-            .and_then(OsStr::to_str)
-            == Some(agent_id);
-        let matches_generation = unique_environment_value(environment, "ELIOT_AGENT_GENERATION")
-            .and_then(OsStr::to_str)
-            == Some(expected_generation.as_str());
-        let has_token = matches!(
-            unique_environment_value(environment, "ELIOT_AGENT_TOKEN"),
-            Some(token) if !token.is_empty()
-        );
-        if agent_id.trim().is_empty()
-            || generation <= 0
-            || !matches_agent
-            || !matches_generation
-            || !has_token
-        {
-            return Err(Error::new(
-                "not_allowed",
-                "Antigravity MCP requires the matching inherited Agent generation identity",
-            ));
-        }
-        let data_dir = unique_environment_value(environment, "ELIOT_HOME")
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute() && path.is_dir())
-            .ok_or_else(|| {
-                Error::new(
-                    "not_allowed",
-                    "Antigravity MCP requires the Agent-bound Eliot data root",
-                )
-            })?;
+        let data_dir = require_agent_mcp_root(
+            environment,
+            agent_id,
+            generation,
+            "Antigravity MCP requires the matching inherited Agent generation identity",
+            "Antigravity MCP requires the Agent-bound Eliot data root",
+        )?;
         let command = std::env::current_exe().map_err(|_| {
             Error::new(
                 "platform_io",
@@ -128,22 +105,10 @@ impl SwarmMcp {
         Ok(json!({
             "name": self.name,
             "command": command,
-            "args": ["--data-dir", data_dir, "mcp", "--require-agent"],
+            "args": worker_swarm_mcp_args(data_dir),
             "env": [],
         }))
     }
-}
-
-fn unique_environment_value<'a>(
-    environment: &'a [(OsString, OsString)],
-    name: &str,
-) -> Option<&'a OsStr> {
-    let mut matches = environment
-        .iter()
-        .filter(|(key, _)| key.to_string_lossy().eq_ignore_ascii_case(name))
-        .map(|(_, value)| value.as_os_str());
-    let value = matches.next()?;
-    matches.next().is_none().then_some(value)
 }
 
 #[cfg(windows)]

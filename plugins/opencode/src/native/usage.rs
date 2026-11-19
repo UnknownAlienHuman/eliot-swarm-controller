@@ -1,8 +1,8 @@
 //! Read-only OpenCode Console usage limits through the installed native
-//! operation (`donor: plugins/opencode/src/native/models.rs` for the
-//! bounded child pattern: exact argv, stdin null, piped stdout with an
-//! output cap, stderr discarded, kill-and-reap under a deadline, static
-//! error strings).
+//! operation. The bounded child mechanics (exact argv, stdin null, piped
+//! stdout with an output cap, stderr discarded, kill-and-reap under a
+//! deadline, static error strings) live in
+//! `eliot_plugin::native_cli::run_bounded_utf8`.
 //!
 //! Vendor behavior (pinned v2.2.7, anomalyco/opencode `fedc6f2`):
 //! - `packages/protocol/src/groups/usage.ts`: `experimental.usage.limits`
@@ -35,16 +35,12 @@
 //! spend share of its dollar limit. Entries without usable numbers are
 //! skipped, never zero-filled.
 
-use std::{ffi::OsStr, process::Stdio, time::Duration};
+use std::{ffi::OsStr, time::Duration};
 
 use eliot_core::{Error, Result};
-use eliot_plugin::native_lifecycle::kill_and_reap;
+use eliot_plugin::native_cli::{BoundedReadLabels, run_bounded_utf8};
 use serde_json::{Value, json};
-use tokio::{
-    io::AsyncReadExt,
-    process::Command,
-    time::{Instant, timeout_at},
-};
+use tokio::{process::Command, time::Instant};
 
 /// Exact argv for the native usage-limits read: `api
 /// experimental.usage.limits --standalone`. Read-only (no session, no turn,
@@ -102,12 +98,7 @@ pub(crate) async fn run_usage_limits(
     deadline: Instant,
 ) -> Result<Option<UsageInfo>> {
     let mut command = Command::new(program);
-    command
-        .args(usage_limits_argv())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
+    command.args(usage_limits_argv());
     if let Some(environment) = environment {
         for (key, value) in environment {
             if let Some(value) = value.as_str() {
@@ -115,70 +106,18 @@ pub(crate) async fn run_usage_limits(
             }
         }
     }
-    let mut child = command
-        .spawn()
-        .map_err(|_| Error::new("native_spawn", "OpenCode usage.limits could not start"))?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| Error::new("native_spawn", "OpenCode usage.limits could not start"))?;
-    let mut buffer = Vec::new();
-    let read = async {
-        let mut limited = (&mut stdout).take((MAX_USAGE_BYTES + 1) as u64);
-        limited.read_to_end(&mut buffer).await
-    };
-    match timeout_at(deadline, read).await {
-        Err(_) => {
-            kill_and_reap(&mut child).await;
-            return Err(Error::new(
-                "native_spawn",
-                "OpenCode usage.limits did not finish before its deadline",
-            ));
-        }
-        Ok(Err(_)) => {
-            kill_and_reap(&mut child).await;
-            return Err(Error::new(
-                "native_readback",
-                "OpenCode usage.limits output was unreadable",
-            ));
-        }
-        Ok(Ok(_)) => {}
-    }
-    if buffer.len() > MAX_USAGE_BYTES {
-        kill_and_reap(&mut child).await;
-        return Err(Error::new(
-            "native_readback",
-            "OpenCode usage.limits output was unreadable",
-        ));
-    }
-    let status = match timeout_at(deadline, child.wait()).await {
-        Err(_) => {
-            kill_and_reap(&mut child).await;
-            return Err(Error::new(
-                "native_spawn",
-                "OpenCode usage.limits did not finish before its deadline",
-            ));
-        }
-        Ok(Err(_)) => {
-            return Err(Error::new(
-                "native_readback",
-                "OpenCode usage.limits output was unreadable",
-            ));
-        }
-        Ok(Ok(status)) => status,
-    };
-    if !status.success() {
-        return Err(Error::new(
-            "native_readback",
-            "OpenCode usage.limits did not return usage",
-        ));
-    }
-    let text = String::from_utf8(buffer).map_err(|_| {
-        Error::new(
-            "native_readback",
-            "OpenCode usage.limits output was unreadable",
-        )
-    })?;
+    let text = run_bounded_utf8(
+        command,
+        MAX_USAGE_BYTES,
+        deadline,
+        &BoundedReadLabels {
+            start: "OpenCode usage.limits could not start",
+            deadline: "OpenCode usage.limits did not finish before its deadline",
+            unreadable: "OpenCode usage.limits output was unreadable",
+            status: "OpenCode usage.limits did not return usage",
+        },
+    )
+    .await?;
     parse_usage_limits_output(&text)
 }
 
