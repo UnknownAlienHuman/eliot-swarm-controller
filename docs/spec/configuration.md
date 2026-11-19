@@ -1052,11 +1052,17 @@ automation policy do not create a second executor. Desktop preferences use
 `[desktop]`: `theme` (`system`, `light`, `dark`), `window` (`width`/`height`, at least
 640 by 480), `startup` (`new_task`, or `last_conversation` to reopen the most
 recently active Agent's conversation), `last_access` (`ask`, `auto` or `full`), and
-the bounded preference lists (`favorite_models`, `recent_models`, `collapsed_projects`,
-`model_visibility`, `collapsed_model_groups`, and `display_names`). The
-`MAX_DESKTOP_*` constants in
-[`config.rs`](../../crates/eliot-daemon/src/config.rs) own their numeric field
-limits; the desktop section owns their closed vocabularies and semantics.
+these bounded lists: `favorite_models` (`{harness, model, effort?}`), `recent_models`
+(most-recent-first `{harness, model, effort?}`), `collapsed_projects` (the sidebar's
+project keys), `model_visibility` (the picker's "Manage models" choices:
+`{harness, model, visible}` or `{harness, provider, visible}`; a model entry overrides
+its provider's entry, and a model without either is shown), `collapsed_model_groups`
+(collapsed picker group keys, `<harness>` or `<harness>/<provider>`) and
+`display_names` (`{key, name}`: `key` is `project:<sidebar project key>` or
+`agent:<Agent id>`, `name` is the owner's display name; it renames what the sidebar
+shows and changes no project registration or Agent record). The `MAX_DESKTOP_*`
+constants in [`config.rs`](../../crates/eliot-daemon/src/config.rs) own the list and
+name-length bounds.
 Picker strings are stored verbatim: harness and access values must match their
 closed vocabularies exactly. Model ids, provider names, collapsed project and group
 keys and display-name keys are 1–256 bytes, and effort is 1–128 bytes; these reject
