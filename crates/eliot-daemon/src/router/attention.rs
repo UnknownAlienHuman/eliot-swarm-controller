@@ -398,7 +398,7 @@ async fn inspect_agent(
                 recovery_due: true,
                 ..
             }
-    ) && recovery::recover_active_turn(router, &captured).await?
+    ) && recovery::recover_active_turn(router, &captured, suspicion_window).await?
     {
         return Ok(());
     }

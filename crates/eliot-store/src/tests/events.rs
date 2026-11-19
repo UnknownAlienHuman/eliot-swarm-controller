@@ -482,6 +482,80 @@ fn message_only_coverage_gap_never_starts_turn_recovery() {
 }
 
 #[test]
+fn recovered_terminal_too_large_for_its_event_keeps_why_the_reply_is_missing() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let (agent, _, _, _) = ready_muse_agent(
+        &mut store,
+        "oversized-recovery",
+        "muse-test",
+        "oversized-recovery-ws",
+        now,
+    );
+    let send = send_request(&agent, 1, "long reply");
+    let send_id = send.id.clone();
+    store.submit("owner", send, now + 4).expect("admit send");
+    store.dispatch(&send_id, now + 5).expect("dispatch send");
+    let turn_id = format!("turn-{send_id}");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: format!("oversized-recovery-{send_id}-started"),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "turn.started".to_owned(),
+                    native_id: format!("oversized-recovery-{send_id}:started"),
+                    data: json!({"command_id": send_id, "turn_id": turn_id.clone()}),
+                }],
+                cursor: None,
+            },
+            now + 6,
+        )
+        .expect("commit turn started");
+    store
+        .record_source_gap(
+            SourceGap {
+                gap_id: format!("turn-{send_id}"),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                families: vec!["turn".to_owned()],
+                reason: "turn source lost".to_owned(),
+                from: None,
+                to: None,
+            },
+            now + 7,
+        )
+        .expect("record turn gap");
+    let captured = store.get_agent(&agent).unwrap().unwrap();
+    let recovery = store.active_turn_recovery(&captured).unwrap().unwrap();
+    let terminal = json!({
+        "status": "completed",
+        "outcome": TurnOutcome::Success,
+        "native_status": "completed",
+        "final_text": "x".repeat(eliot_core::limits::MAX_EVENT_BYTES),
+        "turn_evidence": "native turn read",
+    });
+    let events = store
+        .settle_recovered_turn(
+            &captured,
+            &recovery,
+            RecoveredTurn::Terminal(terminal),
+            now + 8,
+        )
+        .unwrap();
+    assert_eq!(events[0].kind, "turn.completed");
+    assert!(events[0].data.get("final_text").is_none());
+    assert_eq!(events[0].data["final_text_unavailable"], "event_budget");
+    let turn = store.get_turn(&agent, 1, &turn_id).unwrap().unwrap();
+    assert_eq!(turn.outcome, Some(TurnOutcome::Success));
+    assert_eq!(turn.final_text, None);
+}
+
+#[test]
 fn projection_gap_turn_unknown_settles_once_without_resurrection() {
     let mut store = Store::open(Path::new(":memory:")).expect("open store");
     let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");

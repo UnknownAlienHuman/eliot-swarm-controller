@@ -3,6 +3,7 @@ use eliot_plugin::protocol::{
     DecodeErrorKind, EncodeErrorKind, PrivateIncoming as Incoming, decode_private_frame,
     encode_private_frame, valid_private_id,
 };
+use eliot_plugin::sync::LockExt;
 use eliot_plugin::{MAX_FRAME_BYTES, RpcError, RpcRequest, RpcResponse};
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
@@ -10,7 +11,7 @@ use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     sync::{
-        Arc,
+        Arc, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
@@ -39,6 +40,20 @@ struct ClientInner {
     closed: Mutex<Option<Error>>,
     closed_signal: watch::Sender<()>,
     reader_closed: AtomicBool,
+    /// Decoded `events.put` frames that carry an exact turn's terminal fact.
+    /// Each entry lives as long as its request's mark (see `TerminalWrite`).
+    terminal_writes: std::sync::Mutex<Vec<Weak<TerminalWrite>>>,
+}
+
+/// One `events.put` frame carrying `turn.completed`/`turn.unknown` for exact
+/// turns. The mark travels with the request from decode until intake asks
+/// for the next request, so it covers queueing, the Store wait and the
+/// commit. Dropping it (finished, refused, or never consumed because the
+/// connection closed) clears it.
+struct TerminalWrite {
+    agent_id: String,
+    generation: i64,
+    turn_ids: Vec<String>,
 }
 
 struct Outbound {
@@ -57,7 +72,9 @@ enum WriterMessage {
 
 pub(crate) struct PluginConnection {
     client: PluginClient,
-    requests: mpsc::Receiver<RpcRequest>,
+    requests: mpsc::Receiver<(RpcRequest, Option<Arc<TerminalWrite>>)>,
+    /// The terminal-write mark of the request intake is serving.
+    serving: Option<Arc<TerminalWrite>>,
 }
 
 /// A request whose frame has been written and whose correlated response is
@@ -86,6 +103,7 @@ impl PluginConnection {
             closed: Mutex::new(None),
             closed_signal,
             reader_closed: AtomicBool::new(false),
+            terminal_writes: std::sync::Mutex::new(Vec::new()),
         });
         let client = PluginClient {
             inner: Arc::clone(&inner),
@@ -97,6 +115,7 @@ impl PluginConnection {
         Self {
             client,
             requests: request_rx,
+            serving: None,
         }
     }
 
@@ -104,8 +123,13 @@ impl PluginConnection {
         self.client.clone()
     }
 
+    /// Intake asks for the next request only after it finished the previous
+    /// one, so the previous request's terminal write has committed or failed.
     pub(crate) async fn next_request(&mut self) -> Option<RpcRequest> {
-        self.requests.recv().await
+        self.serving = None;
+        let (request, mark) = self.requests.recv().await?;
+        self.serving = mark;
+        Some(request)
     }
 }
 
@@ -122,6 +146,54 @@ impl PluginClient {
     /// Transport EOF/framing failure, never a native session/command outcome.
     pub(crate) fn reader_closed(&self) -> bool {
         self.inner.reader_closed.load(Ordering::Acquire)
+    }
+
+    /// Whether the plugin's own terminal write for this exact turn reached
+    /// the host and intake has not finished it yet.
+    pub(crate) fn terminal_write_in_flight(
+        &self,
+        agent_id: &str,
+        generation: i64,
+        turn_id: &str,
+    ) -> bool {
+        self.inner
+            .terminal_writes
+            .lock_recover()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .any(|write| {
+                write.agent_id == agent_id
+                    && write.generation == generation
+                    && write.turn_ids.iter().any(|id| id == turn_id)
+            })
+    }
+
+    /// Mark a decoded `events.put` frame that carries exact-turn terminals.
+    /// Live marks are bounded by the request queue plus the one being served.
+    fn mark_terminal_write(&self, params: &Value) -> Option<Arc<TerminalWrite>> {
+        let turn_ids: Vec<String> = params["events"]
+            .as_array()?
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event["kind"].as_str(),
+                    Some("turn.completed" | "turn.unknown")
+                )
+            })
+            .filter_map(|event| event["data"]["turn_id"].as_str().map(str::to_owned))
+            .collect();
+        if turn_ids.is_empty() {
+            return None;
+        }
+        let mark = Arc::new(TerminalWrite {
+            agent_id: params["agent_id"].as_str()?.to_owned(),
+            generation: params["generation"].as_i64()?,
+            turn_ids,
+        });
+        let mut writes = self.inner.terminal_writes.lock_recover();
+        writes.retain(|write| write.strong_count() > 0);
+        writes.push(Arc::downgrade(&mark));
+        Some(mark)
     }
 
     /// Enqueue one host request and return only after the writer confirms the
@@ -510,8 +582,11 @@ async fn writer_loop<W>(
     .await;
 }
 
-async fn reader_loop<R>(reader: R, requests: mpsc::Sender<RpcRequest>, client: PluginClient)
-where
+async fn reader_loop<R>(
+    reader: R,
+    requests: mpsc::Sender<(RpcRequest, Option<Arc<TerminalWrite>>)>,
+    client: PluginClient,
+) where
     R: AsyncRead + Unpin,
 {
     let mut reader = FramedRead::new(
@@ -528,7 +603,14 @@ where
                     Ok(Incoming::Request(request)) => {
                         let id = request.id.clone();
                         let is_event_commit = request.method == "events.put";
-                        let response_error = match requests.try_send(request) {
+                        // Marked at decode, before queueing: a refused frame
+                        // drops its mark with the returned request.
+                        let mark = if is_event_commit {
+                            client.mark_terminal_write(&request.params)
+                        } else {
+                            None
+                        };
+                        let response_error = match requests.try_send((request, mark)) {
                             Ok(()) => None,
                             Err(mpsc::error::TrySendError::Full(_)) => Some(
                                 Error::new("busy", "plugin request queue is full")
@@ -968,5 +1050,74 @@ mod tests {
             }
             assert!(client.reader_closed());
         }
+    }
+
+    #[tokio::test]
+    async fn exact_turn_terminal_write_is_in_flight_from_decode_until_intake_finishes() {
+        let (host, peer) = duplex(16 * 1024);
+        let (reader, writer) = split(host);
+        let mut connection = PluginConnection::new(reader, writer);
+        let client = connection.client();
+        let (_peer_read, mut peer_write) = split(peer);
+        let frame = |id: &str, kind: &str, turn: &str| {
+            let request = json!({"jsonrpc":"2.0", "id":id, "method":"events.put", "params":{
+                "credential":"fixture", "agent_id":"a1", "generation":1, "source":"stream",
+                "batch_id":id, "events":[{"kind":kind, "native_id":id,
+                    "data":{"command_id":"send-1", "turn_id":turn}}]}});
+            format!("{request}\n")
+        };
+        let in_flight = |turn: &str| client.terminal_write_in_flight("a1", 1, turn);
+        let wait_marked = |turn: &'static str| {
+            let client = client.clone();
+            async move {
+                let until = Instant::now() + Duration::from_secs(5);
+                while !client.terminal_write_in_flight("a1", 1, turn) {
+                    assert!(Instant::now() < until, "{turn} was never marked");
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+        };
+        for (id, kind, turn) in [
+            ("p-1", "message.completed", "turn-1"),
+            ("p-2", "turn.completed", "turn-0"),
+            ("p-3", "turn.completed", "turn-1"),
+        ] {
+            peer_write
+                .write_all(frame(id, kind, turn).as_bytes())
+                .await
+                .unwrap();
+        }
+        // Decoded and queued behind other requests: already in flight.
+        wait_marked("turn-1").await;
+        assert!(in_flight("turn-0"));
+        // Only the exact Agent generation and turn match.
+        assert!(!client.terminal_write_in_flight("a1", 2, "turn-1"));
+        assert!(!client.terminal_write_in_flight("a2", 1, "turn-1"));
+        assert!(!in_flight("turn-9"));
+        assert_eq!(connection.next_request().await.unwrap().id, json!("p-1"));
+        assert_eq!(connection.next_request().await.unwrap().id, json!("p-2"));
+        assert!(in_flight("turn-0") && in_flight("turn-1"));
+        // Intake moved on from turn-0's write; turn-1's is being served.
+        assert_eq!(connection.next_request().await.unwrap().id, json!("p-3"));
+        assert!(!in_flight("turn-0"));
+        assert!(in_flight("turn-1"));
+        // Asking for the next request means turn-1's write finished.
+        assert!(
+            timeout_at(
+                Instant::now() + Duration::from_millis(50),
+                connection.next_request()
+            )
+            .await
+            .is_err()
+        );
+        assert!(!in_flight("turn-1"));
+        // A queued write that intake never serves clears with its connection.
+        peer_write
+            .write_all(frame("p-4", "turn.unknown", "turn-2").as_bytes())
+            .await
+            .unwrap();
+        wait_marked("turn-2").await;
+        drop(connection);
+        assert!(!in_flight("turn-2"));
     }
 }

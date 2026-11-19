@@ -30,7 +30,24 @@ fn can_recover_active_turn(agent: &Agent, sources: &[SourceState]) -> bool {
         })
 }
 
-pub(super) async fn recover_active_turn(router: &Router, captured: &CapturedAgent) -> Result<bool> {
+/// A `busy` read (the Agent's one snapshot slot or its queue is occupied,
+/// possibly by a read waiting on this turn's own terminal write) proves
+/// nothing and spends no read: it defers to the next sweep while the turn
+/// has committed progress within the attention suspicion window. Past that
+/// window a busy read counts like any inconclusive one, so a source that
+/// stays busy still settles.
+fn defers_busy_read(captured: &CapturedAgent, suspicion_window: Duration) -> bool {
+    let window_ms = i64::try_from(suspicion_window.as_millis()).unwrap_or(i64::MAX);
+    captured
+        .progress_basis_at
+        .is_some_and(|at| now_ms().saturating_sub(at) < window_ms)
+}
+
+pub(super) async fn recover_active_turn(
+    router: &Router,
+    captured: &CapturedAgent,
+    suspicion_window: Duration,
+) -> Result<bool> {
     let agent = &captured.agent;
     if !can_recover_active_turn(agent, &captured.source_states) {
         return Ok(false);
@@ -69,20 +86,26 @@ pub(super) async fn recover_active_turn(router: &Router, captured: &CapturedAgen
             .plugin_host
             .probe_snapshot(agent, Some((&current.command_id, &current.turn_id)))
             .await;
-        if let Ok(snapshot) = snapshot {
-            match readback(agent, &current.command_id, &current.turn_id, &snapshot) {
-                Readback::Running => return Ok(false),
-                Readback::Terminal(mut terminal) => {
-                    router.secret_policy_snapshot().redact_values(&mut terminal);
-                    return settle(router, agent, &current, RecoveredTurn::Terminal(terminal))
-                        .await;
+        match snapshot {
+            Ok(snapshot) => {
+                match readback(agent, &current.command_id, &current.turn_id, &snapshot) {
+                    Readback::Running => return Ok(false),
+                    Readback::Terminal(mut terminal) => {
+                        router.secret_policy_snapshot().redact_values(&mut terminal);
+                        return settle(router, agent, &current, RecoveredTurn::Terminal(terminal))
+                            .await;
+                    }
+                    // No terminal can follow a drained exit: settle at once.
+                    Readback::Exited => {
+                        return settle(router, agent, &current, RecoveredTurn::NativeExited).await;
+                    }
+                    Readback::Inconclusive => {}
                 }
-                // No terminal can follow a drained exit: settle at once.
-                Readback::Exited => {
-                    return settle(router, agent, &current, RecoveredTurn::NativeExited).await;
-                }
-                Readback::Inconclusive => {}
             }
+            Err(error) if error.code == "busy" && defers_busy_read(captured, suspicion_window) => {
+                return Ok(false);
+            }
+            Err(_) => {}
         }
         binding = Some(current);
     }
@@ -99,6 +122,17 @@ async fn settle(
     outcome: RecoveredTurn,
 ) -> Result<bool> {
     let mut store = router.inner.store.lock().await;
+    // The adapter's own terminal write for this exact turn reached the host
+    // and intake has not finished it: that write commits the turn, or its
+    // failure clears the mark for the next sweep. Checked under the Store
+    // lock, so a write that already committed fails the Store recheck.
+    if router
+        .inner
+        .plugin_host
+        .terminal_write_in_flight(agent, &binding.turn_id)
+    {
+        return Ok(false);
+    }
     let events = store.settle_recovered_turn(agent, binding, outcome, now_ms())?;
     if events.is_empty() {
         return Ok(false);
@@ -183,6 +217,11 @@ fn readback(agent: &Agent, command_id: &str, turn_id: &str, snapshot: &Value) ->
         "final_text": turn["final_text"].as_str(),
         "turn_evidence": evidence,
     });
+    // The adapter saw the reply but it exceeded the event bound: the
+    // recovered terminal keeps that reason, as the adapter's own write does.
+    if turn["final_text_unavailable"].as_str() == Some("event_budget") {
+        data["final_text_unavailable"] = json!("event_budget");
+    }
     if let Some(message) = turn["native_error"]
         .as_str()
         .or_else(|| turn["native_error"]["message"].as_str())
@@ -195,6 +234,14 @@ fn readback(agent: &Agent, command_id: &str, turn_id: &str, snapshot: &Value) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugin_host::{PluginClient, PluginConnection};
+    use crate::router::tests::{result_fixture, router};
+    use eliot_core::{Error, SourceGap, TurnState};
+    use std::sync::atomic::Ordering;
+    use tokio::io::AsyncWriteExt;
+    use tokio::time::Instant;
+
+    const WINDOW: Duration = Duration::from_secs(900);
 
     fn stale_turn_source() -> SourceState {
         SourceState {
@@ -318,5 +365,152 @@ mod tests {
             panic!("terminal readback");
         };
         assert_eq!(data["outcome"], json!(TurnOutcome::Success));
+    }
+
+    #[test]
+    fn a_recovered_oversized_reply_keeps_its_unavailable_reason() {
+        let agent = busy_agent("claude");
+        let terminal = snapshot(
+            "idle",
+            Value::Null,
+            json!({"command_id":"send-1","turn_id":"turn-1","status":"completed",
+                "native_status":"success","terminal":true,
+                "final_text_unavailable":"event_budget"}),
+            "stream-json result",
+        );
+        let Readback::Terminal(data) = read(&agent, &terminal) else {
+            panic!("terminal readback");
+        };
+        assert_eq!(data["final_text_unavailable"], "event_budget");
+        assert!(data["final_text"].is_null());
+    }
+
+    /// A busy Agent whose `turn-1` has a committed turn-source gap.
+    async fn gapped_turn(router: &Router) -> (String, String) {
+        let mut store = router.inner.store.lock().await;
+        let (agent, send_id) = result_fixture(&mut store);
+        store
+            .record_source_gap(
+                SourceGap {
+                    gap_id: ulid::Ulid::new().to_string(),
+                    agent_id: agent.clone(),
+                    generation: 1,
+                    source: "stream".to_owned(),
+                    families: vec!["turn".to_owned()],
+                    reason: "fixture turn source gap".to_owned(),
+                    from: None,
+                    to: None,
+                },
+                now_ms(),
+            )
+            .unwrap();
+        (agent, send_id)
+    }
+
+    async fn capture(router: &Router, agent: &str) -> CapturedAgent {
+        super::super::capture_agent(router, agent, 1, WINDOW)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn turn_state(router: &Router, agent: &str) -> TurnState {
+        let store = router.inner.store.lock().await;
+        store.get_turn(agent, 1, "turn-1").unwrap().unwrap().state
+    }
+
+    fn closed_client() -> PluginClient {
+        PluginConnection::new(tokio::io::empty(), tokio::io::sink()).client()
+    }
+
+    #[tokio::test]
+    async fn busy_reads_defer_without_spending_the_budget_until_progress_is_stale() {
+        let router = router();
+        let (agent, _) = gapped_turn(&router).await;
+        let reads = router
+            .inner
+            .plugin_host
+            .test_snapshot_runtime(&agent, closed_client(), || {
+                Err(Error::new(
+                    "busy",
+                    "Agent status snapshot is already in flight",
+                ))
+            });
+        let mut captured = capture(&router, &agent).await;
+        // Committed progress within the window: one busy read defers.
+        assert!(
+            !recover_active_turn(&router, &captured, WINDOW)
+                .await
+                .unwrap()
+        );
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+        assert_eq!(turn_state(&router, &agent).await, TurnState::Running);
+        // No committed progress through the window: busy reads count, so a
+        // source that stays busy still settles after the bounded reads.
+        captured.progress_basis_at = Some(now_ms() - 901_000);
+        assert!(
+            recover_active_turn(&router, &captured, WINDOW)
+                .await
+                .unwrap()
+        );
+        assert_eq!(reads.load(Ordering::Relaxed), 5);
+        assert_eq!(turn_state(&router, &agent).await, TurnState::Unknown);
+    }
+
+    #[tokio::test]
+    async fn no_settlement_while_the_turn_terminal_write_is_in_flight() {
+        let router = router();
+        let (agent, send_id) = gapped_turn(&router).await;
+        let (host_io, peer_io) = tokio::io::duplex(16 * 1024);
+        let (host_read, host_write) = tokio::io::split(host_io);
+        let mut connection = PluginConnection::new(host_read, host_write);
+        let client = connection.client();
+        // A drained-exit readback settles at once, without retry delays.
+        let lost = json!({
+            "agent_id": agent, "generation": 1, "command_id": send_id,
+            "state": "lost", "process_exited": true, "active_turn": null,
+            "native_scope": "fixture-scope", "native_ref": format!("fixture-ref-{agent}"),
+            "last_turn": {"command_id": send_id, "turn_id": "turn-1",
+                "status": "lost", "terminal": false},
+            "turn_evidence": "native exit before result",
+        });
+        let reads =
+            router
+                .inner
+                .plugin_host
+                .test_snapshot_runtime(&agent, client.clone(), move || Ok(lost.clone()));
+        // The adapter's own turn.completed reached the host, queued for intake.
+        let (_peer_read, mut peer_write) = tokio::io::split(peer_io);
+        let frame = json!({"jsonrpc":"2.0", "id":"p-1", "method":"events.put", "params":{
+            "credential":"fixture", "agent_id":agent, "generation":1, "source":"stream",
+            "batch_id":"p-1", "events":[{"kind":"turn.completed", "native_id":"p-1",
+                "data":{"command_id":send_id, "turn_id":"turn-1", "status":"completed"}}]}});
+        peer_write
+            .write_all(format!("{frame}\n").as_bytes())
+            .await
+            .unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        while !client.terminal_write_in_flight(&agent, 1, "turn-1") {
+            assert!(Instant::now() < until, "terminal write was never marked");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let captured = capture(&router, &agent).await;
+        assert!(
+            !recover_active_turn(&router, &captured, WINDOW)
+                .await
+                .unwrap()
+        );
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+        assert_eq!(turn_state(&router, &agent).await, TurnState::Running);
+        // Intake finished that write without committing it: the next sweep
+        // settles from the same readback.
+        assert_eq!(connection.next_request().await.unwrap().id, json!("p-1"));
+        drop(connection);
+        assert!(
+            recover_active_turn(&router, &captured, WINDOW)
+                .await
+                .unwrap()
+        );
+        assert_eq!(turn_state(&router, &agent).await, TurnState::Unknown);
     }
 }

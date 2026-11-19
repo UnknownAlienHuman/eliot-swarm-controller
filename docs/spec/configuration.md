@@ -631,9 +631,11 @@ attention_suspicion_secs = 900
 ```
 
 It defaults to 900 seconds and must be a positive signed 64-bit integer whose
-millisecond value fits in `i64`. This setting only controls when a busy Agent
+millisecond value fits in `i64`. This setting controls when a busy Agent
 with a healthy native source and no known request/tool activity is diagnosed;
-source-health failures are diagnosed promptly regardless of this window.
+source-health failures are diagnosed promptly regardless of this window. The
+same window bounds how long a `busy` recovery snapshot read may defer settling a
+turn whose source is unhealthy ([plugin protocol](plugin-protocol.md)).
 
 Observe-what-matters thresholds are optional:
 

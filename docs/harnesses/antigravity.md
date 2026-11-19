@@ -381,7 +381,10 @@ healthy stream and a live process. It is terminal from that reply (ACP
 `stopReason`), retained with its exact binding before any write for it, even
 `turn.started` when the reply is the turn's first fact, so a failed write costs only
 that fact. The snapshot reads the same state lock the reply's writes hold, so it
-never sees a terminal mid-write. It is lost when the observed
+never sees a terminal mid-write. A read waiting on that lock holds the Agent's one
+snapshot slot, so the monitor's other reads return `busy` and defer, and the
+in-flight terminal write fences settlement (shared rules in the
+[plugin protocol](../spec/plugin-protocol.md)). It is lost when the observed
 process exit drained stdout without a reply. A gap or a lost stream proves
 none of these, so the daemon monitor settles the turn `unknown` after its
 bounded reads.
