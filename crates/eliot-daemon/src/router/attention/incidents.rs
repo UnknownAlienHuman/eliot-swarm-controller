@@ -760,7 +760,3 @@ fn digest_id(parts: &[impl AsRef<str>]) -> String {
         .collect::<String>();
     format!("attention-{hex}")
 }
-
-#[cfg(test)]
-#[path = "incidents/tests.rs"]
-mod tests;

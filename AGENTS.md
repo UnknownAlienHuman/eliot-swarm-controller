@@ -23,8 +23,8 @@ runtime or tooling. Select the next unchecked increment in the roadmap.
 5. Runtime qualification uses actual installed vendor agents through Swarm on real tasks,
    not synthetic/fake execution, test harness loops, or test edits. **Prove each change
    live** on a private daemon; that live proof is the priority evidence.
-   - Local `cargo test` runs are allowed and useful: the touched crates, or the workspace
-     for a shared DTO change. They never replace the live proof.
+   - The repository has no test suite (owner decision, 2026-11-19): Cargo, Clippy and
+     the live project are the checks. Do not add tests back.
    - Do not build test frameworks or fake harnesses as detours.
    - CI enforces static validation only (formatting, warnings-denied Clippy, locked
      all-targets compilation). It runs on Linux **on demand** after a major stage, such as

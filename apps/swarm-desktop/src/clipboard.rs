@@ -105,37 +105,3 @@ pub fn set_text(text: &str) -> Result<(), String> {
         close(None)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_failed_close_never_replaces_the_captured_error() {
-        // #647: the operation's error is captured before cleanup;
-        // the close result is then checked without replacing it.
-        assert_eq!(close_outcome(None, Ok(())), Ok(()));
-        assert_eq!(
-            close_outcome(None, Err("close".to_owned())),
-            Err("close".to_owned())
-        );
-        assert_eq!(
-            close_outcome(Some("op".to_owned()), Ok(())),
-            Err("op".to_owned())
-        );
-        assert_eq!(
-            close_outcome(Some("op".to_owned()), Err("close".to_owned())),
-            Err("op; close".to_owned())
-        );
-    }
-
-    #[test]
-    fn copy_without_a_window_leaves_the_clipboard_alone() {
-        // #647: the unit-test process shows no WinUI window, so there is
-        // no valid clipboard owner and the copy must refuse before
-        // opening the clipboard (never after clearing it).
-        assert!(crate::app_resources::own_window().is_none());
-        let error = set_text("sentinel").expect_err("no owner window in tests");
-        assert!(error.contains("left alone"), "{error}");
-    }
-}

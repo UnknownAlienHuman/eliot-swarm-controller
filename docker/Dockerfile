@@ -8,10 +8,7 @@ ENV CARGO_HOME=/home/swarm/.cargo CARGO_TARGET_DIR=/target RUSTUP_TOOLCHAIN=1.99
 COPY --chown=10001:10001 . .
 USER 10001:10001
 # Exercise the Linux platform as the same unprivileged UID as the runtime.
-RUN cargo build --locked -p eliot -p eliot-daemon -p eliot-plugin-opencode --all-targets \
-    && cargo test --locked -p eliot-daemon --lib platform:: \
-    && cargo test --locked -p eliot-plugin-opencode --lib native::client::tests \
-    && cargo test --locked -p eliot --bin swarm
+RUN cargo build --locked -p eliot -p eliot-daemon -p eliot-plugin-opencode --all-targets
 
 FROM debian:bookworm-slim@sha256:c67e92c8099ba22853ab4cfda7cfb494d253d6012ca82dee98ba8976772af018 AS runtime-base
 RUN apt-get update \

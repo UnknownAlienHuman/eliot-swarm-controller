@@ -648,22 +648,3 @@ pub(crate) fn read_var_value_file(path: &Path) -> Result<String, Failure> {
     }
     String::from_utf8(bytes).map_err(|_| Failure::new(2, "value file must be UTF-8"))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn inbox_deadline_plans_zero_wait_and_rejects_overflow() {
-        let (deadline, waited) = inbox_deadline(None).expect("no wait reads once");
-        assert!(deadline.is_none());
-        assert!(!waited);
-        let (deadline, waited) = inbox_deadline(Some(0)).expect("zero wait reads once");
-        assert!(deadline.is_none());
-        assert!(waited, "an empty zero-wait read reports a timeout");
-        let (deadline, waited) = inbox_deadline(Some(5)).expect("small wait has a deadline");
-        assert!(deadline.unwrap() > Instant::now());
-        assert!(waited);
-        assert!(inbox_deadline(Some(u64::MAX)).is_err());
-    }
-}

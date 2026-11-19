@@ -230,22 +230,3 @@ fn encode_assignment(value: impl serde::Serialize) -> Result<Value> {
     serde_json::to_value(value)
         .map_err(|_| Error::new("internal", "assignment result could not be encoded"))
 }
-
-/// Manager launches mint a standard worktree (`<project>/<agent>-manager`)
-/// finalized with the admitted Agent ID. All standard names are lowercase
-/// ASCII, so case-insensitive filesystems keep them distinct. Retries of the
-/// same launch ID read back the retained preparation instead of preparing a
-/// second worktree.
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn manager_naming_hint_carries_project_and_task() {
-        let hint = serde_json::json!({"project": "Atlas", "task": "manager"});
-        assert_eq!(hint["project"], "Atlas");
-        assert_eq!(hint["task"], "manager");
-        assert_eq!(
-            eliot_core::standard_branch("Atlas", "a7", "manager"),
-            "atlas/a7-manager"
-        );
-    }
-}

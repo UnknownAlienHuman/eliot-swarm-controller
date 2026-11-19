@@ -717,6 +717,3 @@ fn ready_destination_tx(tx: &Connection, launch: &Command) -> Result<Agent> {
     }
     Ok(destination)
 }
-
-#[cfg(test)]
-mod tests;

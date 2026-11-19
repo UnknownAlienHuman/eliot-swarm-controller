@@ -6200,20 +6200,3 @@ fn turn_state_name(state: TurnState) -> &'static str {
         TurnState::Unknown => "unknown",
     }
 }
-
-#[cfg(test)]
-mod tests;
-
-#[cfg(test)]
-mod timer_tests;
-
-#[cfg(test)]
-mod git_fetch_tests;
-
-#[cfg(test)]
-mod git_workspace_fence_tests;
-#[cfg(test)]
-mod resolution_tests;
-
-#[cfg(test)]
-mod goals_tests;

@@ -70,24 +70,3 @@ fn read_capped(reader: impl Read, max_bytes: usize) -> Result<Vec<u8>, BoundedFi
     }
     Ok(bytes)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::Cursor;
-
-    #[test]
-    fn bounded_file_rejects_nonregular_inputs_and_reads_only_one_byte_past_the_limit() {
-        let mut reader = Cursor::new(b"complete content");
-        assert!(matches!(
-            read_capped(&mut reader, 8),
-            Err(BoundedFileError::TooLarge)
-        ));
-        assert_eq!(reader.position(), 9);
-        assert!(matches!(read_capped(&b"12345678"[..], 8), Ok(bytes) if bytes.len() == 8));
-        assert!(matches!(
-            read_regular_file(&std::env::temp_dir(), 8),
-            Err(BoundedFileError::Io(error)) if error.kind() == io::ErrorKind::InvalidInput
-        ));
-    }
-}

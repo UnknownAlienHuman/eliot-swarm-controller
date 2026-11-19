@@ -1039,6 +1039,3 @@ fn decode_child_registration(value: &str) -> Result<ChildRegistration> {
 fn decode_child_registration_ack(value: &str) -> Result<ChildRegistrationAck> {
     serde_json::from_str(value).map_err(|error| Error::new("internal", error.to_string()))
 }
-
-#[cfg(test)]
-mod tests;

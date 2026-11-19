@@ -38,34 +38,3 @@ pub(crate) fn apply_environment(
         command.envs(environment.iter().map(|(name, value)| (name, value)));
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::apply_environment;
-    use std::ffi::OsString;
-
-    #[test]
-    fn local_provider_processes_disable_project_config_and_strip_explicit_overrides() {
-        let environment = [
-            ("OPENCODE_CONFIG", "file"),
-            ("opencode_config_content", "inline"),
-            ("OPENCODE_CONFIG_DIR", "directory"),
-            ("OPENCODE_CONFIG_PROJECT_DISABLE", "0"),
-            ("LOCAL_API_KEY", "sample-value"),
-        ]
-        .map(|(name, value)| (OsString::from(name), OsString::from(value)));
-        let mut command = tokio::process::Command::new("opencode");
-        apply_environment(&mut command, &environment, true);
-        let vars = command.as_std().get_envs().collect::<Vec<_>>();
-        assert_eq!(vars.len(), 2);
-        assert!(vars.contains(&("LOCAL_API_KEY".as_ref(), Some("sample-value".as_ref()))));
-        assert!(vars.contains(&(
-            "OPENCODE_CONFIG_PROJECT_DISABLE".as_ref(),
-            Some("1".as_ref())
-        )));
-
-        let mut cloud = tokio::process::Command::new("opencode");
-        apply_environment(&mut cloud, &environment, false);
-        assert_eq!(cloud.as_std().get_envs().count(), environment.len());
-    }
-}

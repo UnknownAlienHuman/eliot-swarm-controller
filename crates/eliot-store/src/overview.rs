@@ -1,7 +1,5 @@
 //! Committed fleet, assignment and observation queries for project overview.
 mod page;
-#[cfg(test)]
-mod tests;
 
 use super::*;
 use eliot_core::api::{

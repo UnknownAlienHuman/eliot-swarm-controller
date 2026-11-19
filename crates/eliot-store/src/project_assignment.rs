@@ -995,7 +995,3 @@ pub(super) fn authorize_coordination(
     } = effect_context(conn, principal, "coordination", &Value::Null, target)?;
     enforce_agent(conn, principal, caller.as_ref(), target.as_ref(), &projects)
 }
-
-#[cfg(test)]
-#[path = "project_assignment_tests.rs"]
-mod tests;

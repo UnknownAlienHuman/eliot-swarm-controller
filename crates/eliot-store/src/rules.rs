@@ -3020,7 +3020,3 @@ fn load_retained_rule_event_action(
         is_new: false,
     }))
 }
-
-#[cfg(test)]
-#[path = "rules_tests.rs"]
-mod tests;

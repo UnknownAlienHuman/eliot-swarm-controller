@@ -11,8 +11,7 @@ docker exec eliot swarm status
 ```
 
 The Rust 1.99.1 build stage compiles locked all-targets `eliot`, `eliot-daemon` and
-`eliot-plugin-opencode`, then runs Linux platform, OpenCode HTTP and CLI unit tests
-as UID/GID 10001. The runtime
+`eliot-plugin-opencode` as UID/GID 10001. The runtime
 contains the debug branch binary without debug symbols, Git and native CLIs, with no Rust toolchain. All
 processes run as UID/GID 10001. Docker initializes an empty named data volume from
 the image's owned mode-0700 `/data`; the daemon creates a mode-0600 Unix socket and

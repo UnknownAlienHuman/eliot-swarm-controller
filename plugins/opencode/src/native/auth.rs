@@ -755,32 +755,3 @@ pub(crate) async fn quota_credential(
 ) -> Result<String> {
     quota_credential_for(profile, environment, "opencode-go").await
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Canonical-store children isolate exactly the config home: owner
-    /// config, plugins, and MCP servers never load, while the canonical data
-    /// home (and therefore the credential store) stays inherited.
-    #[test]
-    fn canonical_children_override_only_the_config_home() {
-        let dir = std::env::temp_dir().join("eliot-opencode-auth-test");
-        let selector = IntegrationSelector::new("opencode-go").expect("selector");
-        let transfer = AuthTransfer {
-            program: OsStr::new("opencode"),
-            selector: &selector,
-            workspace: &dir,
-            export_environment: &[],
-            canonical_config_home: &dir,
-            import_environment: &[],
-            isolated_config_home: &dir,
-            isolated_data_home: &dir,
-            reuse_existing: false,
-        };
-        let env = canonical_env(&transfer);
-        assert_eq!(env.len(), 1, "exactly one override: {env:?}");
-        assert_eq!(env[0].0, "XDG_CONFIG_HOME");
-        assert_eq!(env[0].1, dir.as_os_str());
-    }
-}
