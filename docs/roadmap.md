@@ -485,11 +485,19 @@ of the explicitly selected release scope.
       its group's color, title and one trailing word: what it needs, in the
       attention color; for a working Agent its model; else how long it has
       been quiet (the daemon's `last_progress_at` over turns, messages, tools
-      and requests, or the time since its record changed). Why it ended or
+      and requests, or the time since its record changed). A live controlled
+      Agent adds its Git-aware work line under them (k209: "+120 −30 · 4 files
+      · 2 commits · wrote 3m ago", or why Git could not be measured, never
+      zeros; a failed or lost one only when measured), or, while a
+      `no_code_progress` report is open, "Working without writing code for
+      14m" in the attention color; a running sidebar task shows the same work
+      line under its title. Why it ended or
       the task it runs under is in its tooltip and accessible name; native
       observed children nest collapsed under
       their parent row and read as their activity, or "Ended with parent".
-      Details carry what a row leaves out: what it does now, its tokens and
+      Details carry what a row leaves out: its Code work (commits ahead of
+      the base, files and lines, last write and commit, this turn's tool calls
+      and messages), what it does now, its tokens and
       CPU time, the daemon-reported sample age and TTL, coverage and clock
       regression. CPU is core-equivalent
       and differenced only between samples of matching process identities; a
