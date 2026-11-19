@@ -224,8 +224,13 @@ fn escape_mail_text(text: &str) -> std::borrow::Cow<'_, str> {
 
 /// One status line naming the entry's turn identity once. A turn entry's id
 /// already is `agent/generation/turn_id`, so only a command entry adds its
-/// bound `agent` and `turn_id`.
-fn digest_entry_line(entry: &WaitEntryResult, truncated: bool) -> String {
+/// bound `agent` and `turn_id`. An entry outside the recipient's scope carries
+/// no turn binding; its line names the entry by request position only, never
+/// printing the id (which itself holds the turn identity).
+fn digest_entry_line(entry: &WaitEntryResult, position: usize, truncated: bool) -> String {
+    if entry.agent.is_none() {
+        return format!("- {} #{}: {}", entry.kind, position + 1, entry.status);
+    }
     let id = escape_mail_text(&entry.id);
     let (Some(agent), Some(turn_id)) = (entry.agent.as_deref(), entry.turn_id.as_deref()) else {
         return format!("- {} {id}: {}", entry.kind, entry.status);
@@ -283,9 +288,10 @@ pub fn fair_excerpt_cap(lengths: &[usize], usable: usize) -> usize {
 ///
 /// Budget: header, footer and every status line come first, except that
 /// [`DIGEST_EXCERPT_RESERVE_BYTES`] (or the whole answer demand when smaller)
-/// stays reserved for excerpts across the batch. Lines that do not fit beside
-/// that reserve are cut from the tail with an explicit count; the kept
-/// entries then share every remaining byte by fair water-fill.
+/// stays reserved for excerpts across the batch. Answer-bearing entries are
+/// selected first, then status-only entries fill the remaining line budget in
+/// request order; the kept entries render in request order with an explicit
+/// cut count and share every remaining byte by fair water-fill.
 pub fn digest_text(id: &str, to: &str, mode: &str, results: &[WaitEntryResult]) -> String {
     let id = escape_mail_text(id);
     let to = escape_mail_text(to);
@@ -310,35 +316,82 @@ pub fn digest_text(id: &str, to: &str, mode: &str, results: &[WaitEntryResult]) 
     let line_lens: Vec<usize> = results
         .iter()
         .zip(&texts)
-        .map(|(entry, text)| digest_entry_line(entry, text.is_none() && entry.truncated).len())
+        .enumerate()
+        .map(|(i, (entry, text))| {
+            digest_entry_line(entry, i, text.is_none() && entry.truncated).len()
+        })
         .collect();
     let demand: usize = texts.iter().flatten().map(|text| text.len() + 1).sum();
     let reserve = demand.min(DIGEST_EXCERPT_RESERVE_BYTES);
     let fixed = header.len() + 1 + footer.len();
     let all_lines: usize = line_lens.iter().map(|len| len + 1).sum();
-    let kept = if fixed + all_lines + reserve <= MAX_MAIL_TEXT_BYTES {
-        results.len()
-    } else {
-        let marker = digest_cut_marker(results.len()).len() + 1;
-        let budget = MAX_MAIL_TEXT_BYTES.saturating_sub(fixed + marker + reserve);
+    let mut kept = vec![true; results.len()];
+    let mut used_lines = all_lines;
+    if fixed + all_lines + reserve > MAX_MAIL_TEXT_BYTES {
+        kept.fill(false);
         let mut used = 0;
-        line_lens
-            .iter()
-            .take_while(|len| {
-                used += *len + 1;
-                used <= budget
-            })
-            .count()
-    };
-    let marker = (kept < results.len()).then(|| digest_cut_marker(results.len() - kept));
-    let used = fixed
-        + line_lens[..kept].iter().map(|len| len + 1).sum::<usize>()
-        + marker.as_ref().map_or(0, |marker| marker.len() + 1);
+        let select = |kept: &mut [bool],
+                      used: &mut usize,
+                      indices: &mut dyn Iterator<Item = usize>,
+                      budget: usize| {
+            for i in indices {
+                if kept[i] {
+                    continue;
+                }
+                let cost = line_lens[i] + 1;
+                if *used + cost <= budget {
+                    *used += cost;
+                    kept[i] = true;
+                }
+            }
+        };
+        // The cut marker counts only the entries it drops, so the first
+        // pass budgets the largest possible marker and a second pass spends
+        // what the smaller final marker frees.
+        let wide = MAX_MAIL_TEXT_BYTES
+            .saturating_sub(fixed + digest_cut_marker(results.len()).len() + 1 + reserve);
+        select(
+            &mut kept,
+            &mut used,
+            &mut (0..results.len()).filter(|&i| texts[i].is_some()),
+            wide,
+        );
+        select(
+            &mut kept,
+            &mut used,
+            &mut (0..results.len()).filter(|&i| texts[i].is_none()),
+            wide,
+        );
+        let dropped = kept.iter().filter(|&&keep| !keep).count();
+        let narrow = MAX_MAIL_TEXT_BYTES
+            .saturating_sub(fixed + digest_cut_marker(dropped).len() + 1 + reserve);
+        // Answer-bearing entries take the line budget first, so a wall of
+        // long status-only identities can never drop the only answer.
+        select(
+            &mut kept,
+            &mut used,
+            &mut (0..results.len()).filter(|&i| texts[i].is_some()),
+            narrow,
+        );
+        select(
+            &mut kept,
+            &mut used,
+            &mut (0..results.len()).filter(|&i| texts[i].is_none()),
+            narrow,
+        );
+        used_lines = used;
+    }
+    let kept_count = kept.iter().filter(|&&keep| keep).count();
+    let marker =
+        (kept_count < results.len()).then(|| digest_cut_marker(results.len() - kept_count));
+    let used = fixed + used_lines + marker.as_ref().map_or(0, |marker| marker.len() + 1);
     let available = MAX_MAIL_TEXT_BYTES.saturating_sub(used);
-    let text_lens: Vec<usize> = texts[..kept]
+    let text_lens: Vec<usize> = texts
         .iter()
-        .flatten()
-        .map(|text| text.len())
+        .zip(&kept)
+        .filter(|(_, keep)| **keep)
+        .filter_map(|(text, _)| text.as_deref())
+        .map(str::len)
         .collect();
     let cap = if text_lens.is_empty() {
         usize::MAX
@@ -348,17 +401,20 @@ pub fn digest_text(id: &str, to: &str, mode: &str, results: &[WaitEntryResult]) 
         fair_excerpt_cap(&text_lens, available - text_lens.len())
     };
     let mut body = format!("{header}\n");
-    for (entry, text) in results[..kept].iter().zip(&texts[..kept]) {
+    for (i, (entry, text)) in results.iter().zip(&texts).enumerate() {
+        if !kept[i] {
+            continue;
+        }
         match text.as_deref() {
             Some(text) => {
                 let (excerpt, cut) = truncate_bytes(text, cap);
-                body.push_str(&digest_entry_line(entry, entry.truncated || cut));
+                body.push_str(&digest_entry_line(entry, i, entry.truncated || cut));
                 if !excerpt.is_empty() {
                     body.push('\n');
                     body.push_str(&excerpt);
                 }
             }
-            None => body.push_str(&digest_entry_line(entry, entry.truncated)),
+            None => body.push_str(&digest_entry_line(entry, i, entry.truncated)),
         }
         body.push('\n');
     }
@@ -453,8 +509,10 @@ mod tests {
         ];
         let text = digest_text("D1", "a3", "all", &results);
         assert!(text.starts_with("Eliot completion digest D1 for a3"));
-        assert!(text.contains("- command c1: succeeded"));
-        assert!(text.contains("- turn a1/1/t1: failed"));
+        assert!(text.contains("- command #1: succeeded"));
+        assert!(text.contains("- turn #2: failed"));
+        assert!(!text.contains("c1"));
+        assert!(!text.contains("a1/1/t1"));
         assert!(text.contains("not an attention incident"));
         assert!(!text.contains("agent.attention"));
         assert!(!text.contains("attention-"));
@@ -466,6 +524,7 @@ mod tests {
         let results: Vec<WaitEntryResult> = (0..256)
             .map(|i| {
                 WaitEntryResult::new("command", format!("c{i}-{}", "x".repeat(200)), "succeeded")
+                    .with_turn(format!("a{}", 1_000_000 + i), 1, format!("t{i}"))
             })
             .collect();
         let text = digest_text("D1", "a3", "all", &results);
@@ -526,6 +585,9 @@ mod tests {
         assert!(text.len() <= MAX_MAIL_TEXT_BYTES);
         assert!(text.contains("before\\0after"));
         assert!(text.contains("\\0"));
+        // The escaped NUL flood is cut to the fair cap; the mail bound alone
+        // no longer proves the escape ran before budgeting.
+        assert!(text.contains("- command c1: succeeded (agent a1, turn_id t1, truncated=true)"));
 
         let mail = MailSendRequest {
             id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
@@ -594,6 +656,62 @@ mod tests {
         )));
         for i in 0..kept {
             assert!(text.contains(&format!("answer {i:03}")), "answer {i}");
+        }
+    }
+
+    #[test]
+    fn digest_text_masks_out_of_scope_turn_identity_by_position() {
+        // Owner-registered explicit turns: the worker leaves the recipient's
+        // scope before delivery, so the entry loses its turn binding while
+        // the id keeps the caller's original agent/generation/turn_id.
+        let results = vec![
+            WaitEntryResult::new("turn", "a7/2/t-secret", "succeeded")
+                .with_turn("a7", 2, "t-secret")
+                .with_final_text("visible answer", 1024),
+            WaitEntryResult::new("turn", "a9/4/t-moved", "succeeded"),
+            WaitEntryResult::new("command", "c-hidden", "not_visible"),
+        ];
+        let text = digest_text("D1", "a1", "all", &results);
+        assert!(text.contains("- turn a7/2/t-secret: succeeded (truncated=false)\nvisible answer"));
+        assert!(text.contains("- turn #2: succeeded"));
+        assert!(text.contains("- command #3: not_visible"));
+        assert!(!text.contains("a9"));
+        assert!(!text.contains("t-moved"));
+        assert!(!text.contains("c-hidden"));
+        assert!(text.len() <= MAX_MAIL_TEXT_BYTES);
+    }
+
+    #[test]
+    fn digest_text_answer_bearing_entry_survives_status_only_overflow() {
+        // 255 long status-only identities fill the status budget before the
+        // only answer-bearing entry at the tail; selection must keep it.
+        let mut results: Vec<WaitEntryResult> = (0..MAX_SWARM_WAIT_TARGETS - 1)
+            .map(|i| {
+                WaitEntryResult::new("command", format!("c{i}-{}", "x".repeat(200)), "succeeded")
+                    .with_turn(format!("a{}", 1_000_000 + i), 1, format!("t{i}"))
+            })
+            .collect();
+        results.push(
+            WaitEntryResult::new("command", "c-answer", "succeeded")
+                .with_turn("a1", 1, "t1")
+                .with_final_text("the only answer", 1024),
+        );
+        let text = digest_text("D1", "a1", "all", &results);
+        assert!(text.len() <= MAX_MAIL_TEXT_BYTES);
+        assert!(text.contains(
+            "- command c-answer: succeeded (agent a1, turn_id t1, truncated=false)\nthe only answer"
+        ));
+        let kept = text.matches("\n- command ").count();
+        assert!(kept > 1 && kept < MAX_SWARM_WAIT_TARGETS);
+        assert!(text.contains(&format!(
+            "... {} more entries truncated to the mail text bound",
+            MAX_SWARM_WAIT_TARGETS - kept
+        )));
+        // The kept entries render in request order: the answer entry last.
+        let answer_line = text.find("- command c-answer").unwrap();
+        for i in 0..kept - 1 {
+            let line = text.find(&format!("- command c{i}-")).unwrap();
+            assert!(line < answer_line, "entry {i} precedes the answer");
         }
     }
 

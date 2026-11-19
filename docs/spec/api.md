@@ -1692,14 +1692,20 @@ as settled honest outcomes), the daemon delivers exactly one coalesced `mail.sen
 (queue) result to the parent: mail id is the digest id, thread is
 `completion-<id-prefix>`, and the body lists every entry outcome with its turn
 identity once (a turn entry's id is `agent/generation/turn_id`; a command entry
-adds `agent` and `turn_id`), `truncated` and a fairly allocated bounded
-`final_text` excerpt for authorized completed bound turns within
+adds `agent` and `turn_id`); an entry without a turn binding (outside the
+recipient's scope, or `not_visible`) is named by its request position only
+(`- turn #3: succeeded`), never printing the id, while the response keeps the
+caller's original id. Answer-bearing entries carry `truncated` and a fairly
+allocated bounded `final_text` excerpt for authorized completed bound turns within
 `MAX_MAIL_TEXT_BYTES` (32 KiB), with NUL escaped (`\0`) before budgeting so one
 answer never blocks the digest and earlier answers never starve later ones. A
 quarter of that bound (or the whole answer demand when smaller) stays reserved
-for excerpts across the batch; status lines that do not fit beside it are cut
-from the tail with an explicit `... N more entries truncated` line, so a full
-batch of long identities never spends the bound before any answer;
+for excerpts across the batch; answer-bearing entries take the status-line
+budget first and status-only entries fill what remains in request order, so a
+wall of long status-only identities can never drop the only answer. The kept
+entries render in request order and the rest are cut with an explicit
+`... N more entries truncated` line, so a full batch of long identities never
+spends the bound before any answer;
 `SwarmDigestResponse.results`
 uses `WaitEntryResult` with `not_visible` entries completely masked and
 out-of-recipient-scope entries reduced to status-only. Same id plus same
