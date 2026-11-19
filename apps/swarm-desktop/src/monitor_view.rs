@@ -69,7 +69,9 @@ pub struct RowLine {
 /// One Monitor list row (`Conversation.dc.html`'s `mrow`): the status dot
 /// in its group's color, the title and one trailing word: what it needs
 /// (in the attention color), the model it works on, or how long it has
-/// been quiet. Why it ended or the task it runs under stay in its tooltip
+/// been quiet. A live controlled Agent adds its work line under them
+/// (a two-line row), or, working without writing code, that sentence in
+/// the attention color. Why it ended or the task it runs under stay in its tooltip
 /// and accessible name; its measures live in Details, which the row opens
 /// with the conversation; Resume sits beside it.
 pub fn list_row(

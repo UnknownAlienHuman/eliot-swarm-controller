@@ -408,8 +408,10 @@ pub(super) fn build_report(
         eliot_store::ActiveToolCoverage::Clear => ("clear".to_owned(), Some(0)),
         eliot_store::ActiveToolCoverage::Active { count } => ("active".to_owned(), Some(count)),
     };
+    // Turn counts exist only while a turn is open (a recovery after the
+    // turn ended carries none, never a zero).
     let (code_progress_at, tool_calls, messages) = match (kind, &captured.code_progress) {
-        (IncidentKind::CodeProgress, Some(code)) => (
+        (IncidentKind::CodeProgress, Some(code)) if captured.agent.active_turn.is_some() => (
             super::incidents::code_progress_basis(captured),
             Some(code.tool_calls),
             Some(code.messages),

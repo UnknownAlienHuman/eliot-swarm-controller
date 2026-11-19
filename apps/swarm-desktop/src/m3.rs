@@ -488,9 +488,9 @@ pub fn project_content(name: &str, subproject: Option<&str>, trailing: View) -> 
 
 /// A nested row's content: indented `depth` steps of 28 DIPs, so its title
 /// starts under its parent's label; ended tasks in the variant tone; a
-/// trailing view (a dot, an age). A running task's work line goes under
-/// the title in the muted caption, one line, trimmed (the row is then
-/// [`height::TWO_LINE_ROW`] tall).
+/// trailing view (a dot, an age). A running task's work line runs under
+/// the title and the trailing mark in the muted caption, one line, trimmed
+/// (the row is then [`height::TWO_LINE_ROW`] tall).
 pub fn task_content(
     depth: usize,
     title: &str,
@@ -507,31 +507,29 @@ pub fn task_content(
     } else {
         title
     };
-    let text: View = match line {
-        Some(line) => StackPanel::new()
-            .vertical_alignment(VerticalAlignment::Center)
-            .children((
-                title,
-                secondary(line).text_trimming(TextTrimming::CharacterEllipsis),
-            )),
-        None => title.into(),
-    };
-    Grid::new()
-        .margin(Thickness::new(
-            layout::TREE_INDENT * depth as f64,
-            0.0,
-            0.0,
-            0.0,
-        ))
+    let indent = Thickness::new(layout::TREE_INDENT * depth as f64, 0.0, 0.0, 0.0);
+    let top = Grid::new()
         .columns([GridLength::STAR, GridLength::Auto])
-        .column_spacing(spacing::ROW)
-        .children((
-            text,
+        .column_spacing(spacing::ROW);
+    let top = |title: TextBlock, trailing: View| {
+        top.children((
+            title,
             Border::new()
                 .grid_column(1)
                 .vertical_alignment(VerticalAlignment::Center)
                 .content(trailing),
         ))
+    };
+    match line {
+        Some(line) => StackPanel::new()
+            .margin(indent)
+            .vertical_alignment(VerticalAlignment::Center)
+            .children((
+                top(title, trailing),
+                secondary(line).text_trimming(TextTrimming::CharacterEllipsis),
+            )),
+        None => Border::new().margin(indent).content(top(title, trailing)),
+    }
 }
 
 /// A chip: 28 DIPs, outlined in the border tone (`.content(chip_content(..))`
