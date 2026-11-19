@@ -498,11 +498,6 @@ pub mod winui {
             self.role(|r| r.tonal, ThemeBrush::CardBackground)
         }
 
-        /// A running tool row.
-        pub fn running(self) -> Brush {
-            self.role(|r| r.running, ThemeBrush::CardBackground)
-        }
-
         /// The container role: the user's bubble, a plot well, a track.
         pub fn container(self) -> Brush {
             self.role(|r| r.container, ThemeBrush::CardBackground)
@@ -612,14 +607,6 @@ pub mod winui {
             }
         }
 
-        /// The same fill as a button family: a clickable bar segment.
-        pub fn chart_button(self, tone: StatusTone) -> ResourceOverrides {
-            self.with(|r| {
-                let (fill, on) = Self::chart_roles(tone)(r);
-                Family::new(Some(fill), on).overrides(r)
-            })
-        }
-
         /// Container and content of a status chip.
         pub fn status_chip(self, tone: StatusTone) -> (Brush, Brush) {
             match self.roles {
@@ -637,11 +624,6 @@ pub mod winui {
         /// Filled: the one main action of a page, the FAB.
         pub fn filled(self) -> ResourceOverrides {
             self.with(|r| Family::new(Some(r.primary), r.on_primary).overrides(r))
-        }
-
-        /// Tonal: a secondary action that should still read as a button.
-        pub fn tonal_button(self) -> ResourceOverrides {
-            self.with(|r| Family::new(Some(r.selected), r.text).overrides(r))
         }
 
         /// Outlined: in the primary color with the outline.
@@ -723,21 +705,6 @@ pub mod winui {
             })
         }
 
-        /// A segment of a connected (outlined) segmented button.
-        pub fn outlined_segment(self, selected: bool) -> ResourceOverrides {
-            self.with(|r| {
-                Family {
-                    outline: Some(r.border),
-                    ..if selected {
-                        Family::new(Some(r.selected), r.text)
-                    } else {
-                        Family::new(None, r.variant)
-                    }
-                }
-                .overrides(r)
-            })
-        }
-
         /// A field that opens a list (the preset Model field): the chip's
         /// outline with the text color.
         pub fn field_button(self) -> ResourceOverrides {
@@ -792,12 +759,6 @@ pub mod winui {
                     .set("ProgressRingForegroundThemeBrush", color(arc))
                     .set("ProgressRingBackgroundThemeBrush", color(r.outline))
             })
-        }
-
-        /// The share left beside the ring once it is low, else `None`.
-        pub fn usage_label(self, remaining: f64) -> Option<Brush> {
-            let roles = self.roles?;
-            (remaining < 20.0).then(|| Brush::Solid(color(roles.attention)))
         }
 
         fn with(self, build: impl FnOnce(&Roles) -> ResourceOverrides) -> ResourceOverrides {

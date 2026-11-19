@@ -166,7 +166,6 @@ impl DesktopApp {
                     .spacing(tokens::spacing::SM)
                     .keyed_children(rows),
             ))
-            .into()
     }
 
     /// The open Agent's model-and-effort chip: the next turn's values; it

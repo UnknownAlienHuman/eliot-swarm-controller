@@ -1068,7 +1068,6 @@ impl DesktopApp {
                     .column_spacing(tokens::spacing::INSET)
                     .keyed_children(cards),
             ))
-            .into()
     }
 
     pub(super) fn chat_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {

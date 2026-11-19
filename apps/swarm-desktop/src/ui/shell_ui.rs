@@ -2527,7 +2527,6 @@ fn hover_area(key: String, view: impl Into<View>, context: &mut ViewContext<Desk
             context.callback(|_: PointerEventInfo| Message::Menu(MenuMsg::Hovered(None))),
         )
         .content(view)
-        .into()
 }
 
 /// A full-width row with its actions over its trailing end (the pill
@@ -2565,7 +2564,6 @@ fn nested_note(text: &str, depth: usize, tone: Option<Brush>) -> View {
             0.0,
         ))
         .content(note)
-        .into()
 }
 
 /// Merge head or attention rows into the loaded list: replace known ids,

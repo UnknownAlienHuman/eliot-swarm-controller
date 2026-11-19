@@ -70,9 +70,7 @@ pub mod glyph {
     pub const COPY: &str = "\u{E8C8}";
     pub const MODEL: &str = "\u{E945}";
     pub const SHIELD: &str = "\u{EA18}";
-    pub const PROFILE: &str = "\u{E77B}";
     pub const PULSE: &str = "\u{E9D9}";
-    pub const PAUSE: &str = "\u{E769}";
     pub const TOOLS: &str = "\u{E90F}";
     /// A command run: Segoe Fluent CommandPrompt.
     pub const TERMINAL: &str = "\u{E756}";
@@ -93,8 +91,6 @@ pub mod glyph {
     pub const WORKTREE: &str = "\u{E8F1}";
     pub const CLOUD: &str = "\u{E753}";
     pub const CODE: &str = "\u{E943}";
-    /// Appearance: Segoe Fluent Color.
-    pub const PALETTE: &str = "\u{E790}";
     /// Manage models (OpenCode's sliders button): Segoe Fluent Equalizer.
     pub const SLIDERS: &str = "\u{E9E9}";
     pub const CHAT: &str = "\u{E8BD}";
@@ -166,7 +162,6 @@ pub fn section_row(value: &str) -> View {
                 .automation_heading_level(AutomationHeadingLevel::Level3)
                 .vertical_alignment(VerticalAlignment::Center),
         )
-        .into()
 }
 
 /// A card on the surface: the tonal tone, the container corner (call
@@ -302,11 +297,6 @@ fn button(overrides: ResourceOverrides) -> Button {
 /// Filled: the one main action of a page.
 pub fn filled(palette: Palette) -> Button {
     button(palette.filled())
-}
-
-/// Tonal: a secondary action that still reads as a button.
-pub fn tonal(palette: Palette) -> Button {
-    button(palette.tonal_button())
 }
 
 /// Outlined (Validate, Reload, Duplicate, Add).
@@ -456,7 +446,6 @@ pub fn project_content(name: &str, trailing: View) -> View {
                 .vertical_alignment(VerticalAlignment::Center)
                 .content(trailing),
         ))
-        .into()
 }
 
 /// A nested row's content: indented `depth` steps of 28 DIPs, so its title
@@ -488,29 +477,6 @@ pub fn task_content(depth: usize, title: &str, ended: bool, trailing: View) -> V
                 .vertical_alignment(VerticalAlignment::Center)
                 .content(trailing),
         ))
-        .into()
-}
-
-/// A list row (the Monitor's): 13 DIPs, a dot, the title and a trailing
-/// caption.
-pub fn list_row_content(dot_fill: Brush, title: &str, note: &str, note_tone: Brush) -> View {
-    Grid::new()
-        .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
-        .column_spacing(spacing::ROW)
-        .children((
-            dot(dot_fill),
-            text(title.to_owned(), style::CHIP)
-                .grid_column(1)
-                .vertical_alignment(VerticalAlignment::Center)
-                .text_trimming(TextTrimming::CharacterEllipsis),
-            text(note.to_owned(), style::CAPTION)
-                .grid_column(2)
-                .foreground(note_tone)
-                .vertical_alignment(VerticalAlignment::Center)
-                .max_width(layout::RUNS_LABEL_WIDTH)
-                .text_trimming(TextTrimming::CharacterEllipsis),
-        ))
-        .into()
 }
 
 /// A chip: 28 DIPs, outlined in the border tone (`.content(chip_content(..))`
@@ -572,7 +538,6 @@ pub fn meta(glyph: &str, label: &str) -> View {
                 .vertical_alignment(VerticalAlignment::Center)
                 .text_trimming(TextTrimming::CharacterEllipsis),
         ))
-        .into()
 }
 
 /// One segment of a segmented button (see [`segmented`]): 28 DIPs, the
@@ -606,7 +571,6 @@ pub fn segmented(palette: Palette, segments: Vec<KeyedView>) -> View {
                 .orientation(Orientation::Horizontal)
                 .keyed_children(segments),
         )
-        .into()
 }
 
 /// A pane tab (Monitor, Details): a 32-DIP pill, the selection in the
@@ -655,7 +619,6 @@ pub fn search_field(palette: Palette, field: TextBox) -> View {
                         .vertical_alignment(VerticalAlignment::Center),
                 )),
         )
-        .into()
 }
 
 /// A tool row: 32 DIPs, the card corner, tonal (running: the running
@@ -699,7 +662,6 @@ pub fn tool_content(glyph: &str, label: &str, trailing: &str, tone: Option<Brush
                 .vertical_alignment(VerticalAlignment::Center)
                 .content(icon_sized(glyph::CHEVRON_RIGHT, icon_size::CHEVRON)),
         ))
-        .into()
 }
 
 /// A suggestion card (home): the card corner, tonal, lifting under the
@@ -728,7 +690,6 @@ pub fn suggestion_content(palette: Palette, glyph: &str, label: &str) -> View {
                 .vertical_alignment(VerticalAlignment::Center)
                 .text_trimming(TextTrimming::CharacterEllipsis),
         ))
-        .into()
 }
 
 /// A message bubble: the user's in the container role, right-aligned with
@@ -769,7 +730,6 @@ pub fn steer_bubble(palette: Palette, text_value: &str, max_width: Option<f64>) 
                 .text_wrapping(TextWrapping::Wrap)
                 .is_text_selection_enabled(true),
         )
-        .into()
 }
 
 /// The composer card: the composer role, the 20-DIP corner, lifted to
@@ -821,7 +781,6 @@ pub fn status_pill(palette: Palette, tone: StatusTone, label: &str) -> View {
                         .text_trimming(TextTrimming::CharacterEllipsis),
                 )),
         )
-        .into()
 }
 
 /// A text field (the application's text-box style).
@@ -894,7 +853,6 @@ pub fn field_button_content(value: &str) -> View {
                 .vertical_alignment(VerticalAlignment::Center)
                 .content(dropdown_chevron()),
         ))
-        .into()
 }
 
 /// A dropdown sized for an enum value.
@@ -924,7 +882,6 @@ pub fn group(palette: Palette, rows: Vec<KeyedView>) -> View {
         .padding(Thickness::xy(spacing::MD, spacing::SM))
         .vertical_alignment(VerticalAlignment::Top)
         .content(StackPanel::new().keyed_children(rows))
-        .into()
 }
 
 /// A list of selectable rows in one card: the rows reach 8 DIPs from the
@@ -940,7 +897,6 @@ pub fn list(palette: Palette, rows: Vec<KeyedView>) -> View {
                 .spacing(spacing::ROW_GAP)
                 .keyed_children(rows),
         )
-        .into()
 }
 
 /// A section title with its supporting line and an optional action on the
@@ -968,59 +924,6 @@ pub fn section_heading(title: &str, supporting: &str, action: Option<View>) -> V
                 .vertical_alignment(VerticalAlignment::Center)
                 .content(action.unwrap_or_else(View::empty)),
         ))
-        .into()
-}
-
-/// A stacked bar (the Monitor's state bar and its project bars): each
-/// `(count, key, segment)` on a star column proportional to its count, a
-/// 2-DIP gap between segments, then `rest` left empty, so bars drawn on one
-/// scale compare by length. A segment with no count takes no column. Give
-/// each segment a [`bar_segment`] or a [`bar_button`] of the bar's height.
-pub fn stacked_bar(segments: Vec<(usize, String, View)>, rest: usize, height: f64) -> View {
-    let mut columns = Vec::new();
-    let mut cells: Vec<KeyedView> = Vec::new();
-    for (count, key, segment) in segments.into_iter().filter(|(count, ..)| *count > 0) {
-        cells.push(KeyedView::new(
-            key,
-            Border::new()
-                .grid_column(columns.len() as i32)
-                .content(segment),
-        ));
-        columns.push(GridLength::Star(count as f64));
-    }
-    if rest > 0 {
-        columns.push(GridLength::Star(rest as f64));
-    }
-    Grid::new()
-        .height(height)
-        .columns(columns)
-        .column_spacing(layout::BAR_GAP)
-        .keyed_children(cells)
-}
-
-/// One drawn segment of a [`stacked_bar`]: `fill` with rounded ends.
-pub fn bar_segment(fill: Brush, height: f64) -> View {
-    Border::new()
-        .height(height)
-        .corner_radius(height / 2.0)
-        .background(fill)
-        .into()
-}
-
-/// A clickable segment of a [`stacked_bar`] in its fill's button family
-/// (`Palette::chart_button`). Give it an accessible name.
-pub fn bar_button(overrides: ResourceOverrides, height: f64) -> Button {
-    Button::new()
-        .resource_overrides(overrides)
-        .style(ButtonStyle::Subtle)
-        .height(height)
-        .min_height(height)
-        .horizontal_alignment(HorizontalAlignment::Stretch)
-}
-
-/// A High Contrast chart filter, sized independently of the fill.
-pub fn bar_glyph_button(overrides: ResourceOverrides) -> Button {
-    bar_button(overrides, layout::STATE_FILTER_HEIGHT).min_width(layout::STATE_FILTER_MIN_WIDTH)
 }
 
 /// A hairline divider in the outline role.
@@ -1046,7 +949,6 @@ pub fn page_header(title: &str, subtitle: &str, action: Option<View>) -> View {
                 .vertical_alignment(VerticalAlignment::Bottom)
                 .content(action.unwrap_or_else(View::empty)),
         ))
-        .into()
 }
 
 /// The title above a settings card ("Permissions").
@@ -1082,7 +984,6 @@ pub fn setting_row(title: &str, description: &str, control: View) -> View {
                 .vertical_alignment(VerticalAlignment::Center)
                 .content(control),
         ))
-        .into()
 }
 
 /// Settings rows in one card, a hairline between rows.
@@ -1100,7 +1001,6 @@ pub fn settings_card(palette: Palette, rows: Vec<KeyedView>) -> View {
         .padding(Thickness::xy(spacing::MD, spacing::XS))
         .vertical_alignment(VerticalAlignment::Top)
         .content(StackPanel::new().keyed_children(children))
-        .into()
 }
 
 /// The content of a link-style text button ("Open config.toml ↗"): the
@@ -1114,7 +1014,6 @@ pub fn link_content(label: &str) -> View {
             text(label.to_owned(), style::BUTTON).vertical_alignment(VerticalAlignment::Center),
             small_icon(glyph::EXTERNAL),
         ))
-        .into()
 }
 
 /// A popover or in-window menu: the composer role, the container corner,
@@ -1137,7 +1036,6 @@ pub fn badge(palette: Palette, text: &str) -> View {
         .padding(Thickness::xy(spacing::SM, 0.0))
         .vertical_alignment(VerticalAlignment::Center)
         .content(secondary(text.to_owned()))
-        .into()
 }
 
 /// A colored outline marks the quota band, including at zero remaining.

@@ -308,8 +308,7 @@ fn part_view(
             .horizontal_alignment(HorizontalAlignment::Right)
             .max_width(tokens::layout::READING_WIDTH * tokens::layout::BUBBLE_SHARE)
             .automation_name(format!("Steered: {}", part.plain))
-            .content(crate::m3::steer_bubble(palette, &part.plain, None))
-            .into(),
+            .content(crate::m3::steer_bubble(palette, &part.plain, None)),
         // The assistant's interim notes read as its text.
         PartKind::Progress => StackPanel::new()
             .spacing(tokens::spacing::SM)
@@ -359,14 +358,12 @@ fn part_view(
                             .is_text_selection_enabled(true),
                         path_actions(&part.key, &part.detail_paths, callbacks, palette),
                     ))
-                    .into()
             } else {
                 View::empty()
             };
             StackPanel::new()
                 .spacing(tokens::spacing::XS)
                 .children((row, detail))
-                .into()
         }
 
         // The answer: plain text on the surface; a label only when the

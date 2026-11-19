@@ -63,7 +63,7 @@ pub mod height {
 pub mod text {
     pub use crate::theme::typography::{
         BODY, BUTTON, CAPTION, CAPTION as SECONDARY, CHIP, HEADER, HEADER as SECTION_TITLE, HERO,
-        HERO as PAGE_TITLE, LABEL, TITLE, TypeStyle,
+        LABEL, TITLE, TypeStyle,
     };
 }
 
@@ -106,7 +106,6 @@ pub mod icon {
 pub mod motion {
     pub const STATE_MS: u64 = 150;
     pub const POPOVER_MS: u64 = 250;
-    pub const POPOVER_RISE: f64 = 4.0;
 }
 
 /// Widths and the few fixed sizes of the shell.
@@ -163,18 +162,6 @@ pub mod layout {
     pub const PLOT_STUB: f64 = 2.0;
     /// The gap between two chart bars.
     pub const PLOT_GAP: f64 = 1.0;
-    /// The Monitor's state bar, a project's bar, and the surface gap
-    /// between two segments of a stacked bar.
-    pub const STATE_BAR: f64 = 8.0;
-    /// A High Contrast state filter button has room for its glyph.
-    pub const STATE_FILTER_HEIGHT: f64 = 20.0;
-    pub const STATE_FILTER_MIN_WIDTH: f64 = 24.0;
-    pub const PROJECT_BAR: f64 = 8.0;
-    pub const BAR_GAP: f64 = 2.0;
-    /// A Monitor project row: its name and count over its bar.
-    pub const PROJECT_ROW: f64 = 44.0;
-    /// The longest label of a Monitor filter chip.
-    pub const FILTER_CHIP_TEXT: f64 = 200.0;
     /// The user's message bubble takes at most this share of the column.
     pub const BUBBLE_SHARE: f64 = 0.8;
     /// The narrowest content column.

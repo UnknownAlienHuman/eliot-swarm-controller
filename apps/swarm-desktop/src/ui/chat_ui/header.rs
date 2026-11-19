@@ -268,7 +268,6 @@ impl DesktopApp {
                         Border::new().grid_column(4).content(menu),
                     )),
             )
-            .into()
     }
 
     /// The Force stop question above the composer, bound to the Agent and

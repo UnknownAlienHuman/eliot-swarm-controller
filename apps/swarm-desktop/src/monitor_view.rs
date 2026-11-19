@@ -101,12 +101,11 @@ pub fn list_row(
             GridLength::Auto,
             GridLength::Auto,
         ])
-        .column_spacing(tokens::spacing::SM)
+        .column_spacing(tokens::spacing::ROW)
         .children((
             crate::m3::dot(look.dot),
-            TextBlock::new()
+            crate::m3::text(look.title.to_owned(), tokens::text::CHIP)
                 .grid_column(1)
-                .text(look.title.to_owned())
                 .vertical_alignment(VerticalAlignment::Center)
                 .text_trimming(TextTrimming::CharacterEllipsis),
             crate::m3::secondary(harness.clone())
