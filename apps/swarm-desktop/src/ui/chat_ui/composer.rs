@@ -64,10 +64,12 @@ impl DesktopApp {
         let home = agent.is_none();
         let running =
             detail.is_some_and(|detail| detail.active_turn.is_some() && !detail.observe_only);
+        let reading = self.reading_row();
         let placeholder = match detail.filter(|_| !home) {
             None if home => "Ask Eliot Swarm to do anything",
             Some(detail) if resumable(detail) => "Type a message to resume and continue…",
-            _ if running => "Type to steer the running turn",
+            None if reading == Some(RowMode::Resume) => "Type a message to resume and continue…",
+            _ if running || reading == Some(RowMode::Running) => "Type to steer the running turn",
             _ => "Send a follow-up",
         };
         let field = TextBox::new()
@@ -533,6 +535,7 @@ impl DesktopApp {
         let detail = self.chat.detail.as_ref();
         let draft_blank = self.composer_text().trim().is_empty();
         let enabled = !self.submitting();
+        let reading = self.reading_row();
         let primary: View = match (agent.clone(), detail) {
             // The unresolved draft's explicit Retry: resubmits the saved
             // action, body, ledger key and mutation id, whatever the Agent
@@ -565,6 +568,16 @@ impl DesktopApp {
                         .tooltip("Resume with this message")
                 }
             }
+            // While the detail is read, the row's button in its final
+            // place, not yet active.
+            (Some(_), None) if reading == Some(RowMode::Resume) => m3::filled(palette)
+                .is_enabled(false)
+                .automation_name("Resume")
+                .content(m3::label("Resume")),
+            (Some(_), None) if reading == Some(RowMode::Running) => m3::send_button(palette)
+                .is_enabled(false)
+                .automation_name("Stop the running turn")
+                .content(m3::stop_mark(palette)),
             (Some(agent), detail) => {
                 // Codex's one trailing button: while a turn runs, Stop with
                 // an empty field (it interrupts that turn) and Steer once
@@ -615,6 +628,8 @@ impl DesktopApp {
         let hint = match (agent.as_deref(), detail) {
             (Some(agent), _) if self.chat.pending_retry.contains_key(agent) => "",
             (Some(_), Some(detail)) if resumable(detail) => "Enter resumes",
+            (Some(_), None) if reading == Some(RowMode::Resume) => "Enter resumes",
+            (Some(_), None) if reading == Some(RowMode::Running) => "Stop the turn",
             (Some(_), Some(detail)) if detail.active_turn.is_some() && !detail.observe_only => {
                 if draft_blank {
                     "Stop the turn"
@@ -753,6 +768,34 @@ impl DesktopApp {
 
 /// A stopped, failed or lost Agent that Resume starts again (not while a
 /// turn is recorded as running, never an observe-only Agent).
+/// What an open task's composer offers while its detail is still read,
+/// taken from its sidebar row ([`DesktopApp::reading_row`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowMode {
+    Resume,
+    Running,
+}
+
+impl DesktopApp {
+    /// While the open task's detail is read, the mode its sidebar row
+    /// implies: the card keeps the shape it will have (Resume for an ended
+    /// task, Stop for a working one), so an open never flashes another.
+    fn reading_row(&self) -> Option<RowMode> {
+        if self.chat.detail.is_some() {
+            return None;
+        }
+        let row = self.find_agent(&self.selected_agent_id()?)?;
+        match row.state {
+            _ if row.native_child => None,
+            eliot_core::AgentState::Stopped
+            | eliot_core::AgentState::Failed
+            | eliot_core::AgentState::Lost => Some(RowMode::Resume),
+            eliot_core::AgentState::Busy => Some(RowMode::Running),
+            _ => None,
+        }
+    }
+}
+
 fn resumable(detail: &UiDetail) -> bool {
     matches!(
         detail.state,

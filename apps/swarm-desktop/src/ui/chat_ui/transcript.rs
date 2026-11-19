@@ -1,30 +1,26 @@
 use super::*;
 
 impl DesktopApp {
-    /// Bring the newest turn into view after the next render.
-    /// Bring the newest turn into view: scroll the transcript to its end
-    /// (`crate::scroll_end`), again as the virtualized earlier turns are
-    /// measured and the end moves, then hand typing to the composer.
-    pub(super) fn follow_latest(&self, context: &ComponentContext<Self>) {
+    /// Hand typing to the composer once the conversation is drawn; after a
+    /// send (`scroll`), first scroll the transcript to its end
+    /// (`crate::scroll_end`) in case it was read further up. An opened
+    /// conversation needs no scroll: the transcript is anchored at its end.
+    pub(super) fn follow_latest(&self, scroll: bool, context: &ComponentContext<Self>) {
         let epoch = self.chat.epoch;
         let _task = context.spawn_background(move |cancel| {
             let cancelled = || cancel.is_cancelled();
-            let mut outcome = Err("the transcript was not realized".to_owned());
-            for delay in FOLLOW_PASSES_MS {
-                // False: the conversation was left while waiting.
-                if !feed::backoff(delay, &cancelled) {
-                    break;
-                }
-                let Some(window) = crate::app_resources::own_window() else {
-                    outcome = Err("the window was not found".to_owned());
-                    continue;
-                };
-                outcome = match crate::scroll_end::scroll_to_end(window, TRANSCRIPT_ID) {
+            // False: the conversation was left while waiting.
+            if !feed::backoff(FOLLOW_DELAY_MS, &cancelled) || !scroll {
+                return Message::Chat(ChatMsg::FollowLatest(epoch, Ok(())));
+            }
+            let outcome = match crate::app_resources::own_window() {
+                None => Err("the window was not found".to_owned()),
+                Some(window) => match crate::scroll_end::scroll_to_end(window, TRANSCRIPT_ID) {
                     Ok(Some(_)) => Ok(()),
                     Ok(None) => Err("the transcript was not realized".to_owned()),
                     Err(error) => Err(error),
-                };
-            }
+                },
+            };
             Message::Chat(ChatMsg::FollowLatest(epoch, outcome))
         });
     }
@@ -37,7 +33,6 @@ impl DesktopApp {
             .map(Conversation::items)
             .unwrap_or_default();
         let rendered = self.chat.render_cache.render(&items, &self.chat.docs);
-        self.chat.items_revision = views::key_revision(&rendered);
         self.chat.items = Rc::new(rendered);
         let live: HashSet<u64> = items
             .iter()
@@ -55,13 +50,17 @@ impl DesktopApp {
         context: &mut ViewContext<Self>,
         palette: Palette,
     ) -> View {
+        // Not while the first read is in flight: its coverage is not known.
+        let loading = matches!(self.chat.live, LiveStatus::Loading);
         let load_older: View = match self.chat.convo.as_ref() {
-            Some(convo) if convo.coverage().can_load_older() => m3::text_button(palette)
-                .is_enabled(!matches!(self.chat.live, LiveStatus::Loading))
-                .horizontal_alignment(HorizontalAlignment::Center)
-                .margin(Thickness::new(0.0, 0.0, 0.0, tokens::spacing::MD))
-                .on_click(context.message(Message::Chat(ChatMsg::LoadOlderRequested)))
-                .content(m3::label("Load older messages")),
+            Some(convo) if convo.coverage().can_load_older() && !self.chat.items.is_empty() => {
+                m3::text_button(palette)
+                    .is_enabled(!loading)
+                    .horizontal_alignment(HorizontalAlignment::Center)
+                    .margin(Thickness::new(0.0, 0.0, 0.0, tokens::spacing::MD))
+                    .on_click(context.message(Message::Chat(ChatMsg::LoadOlderRequested)))
+                    .content(m3::label("Load older messages"))
+            }
             _ => View::empty(),
         };
         let empty: View = if self.chat.items.is_empty() {
@@ -85,9 +84,6 @@ impl DesktopApp {
             .revealed
             .clone()
             .filter(|(item, _)| item.starts_with(&path_scope));
-        let path_code = path_failure.as_ref().map_or(0, |(item, note)| {
-            crate::chat::text_hash(item) ^ crate::chat::text_hash(note)
-        });
         let callbacks = RowCallbacks {
             open_path: context.callback(|(key, path)| Message::Reveal(key, path)),
             path_scope,
@@ -116,49 +112,29 @@ impl DesktopApp {
                 Message::Chat(ChatMsg::ToolsToggled(key, expanded))
             }),
         };
-        // Every turn but the latest is virtualized; the latest is a plain
-        // child that always exists.
-        let earlier = self.chat.items.len().saturating_sub(1);
+        // Every resident turn is a plain keyed child (the resident bounds
+        // cap them, `chat::MAX_RESIDENT_TURNS`): the anchored ScrollView
+        // below lays them all out at once, so nothing is realized late
+        // while scrolling and nothing waits to be measured after an open.
         let expanded = Rc::new(self.chat.expanded.clone());
-        let latest: View = match self.chat.items.last() {
-            Some(item) => StackPanel::new().keyed_children(vec![KeyedView::new(
-                item.key.clone(),
-                views::item_view(item, &expanded, &callbacks, palette, column),
-            )]),
-            None => View::empty(),
-        };
-        let items = Rc::clone(&self.chat.items);
-        let keys = Rc::clone(&self.chat.items);
-        // A palette or width change re-realises the rows in the new colors
-        // and at the new column width.
-        let palette_code = palette.roles().map_or(0, |roles| {
-            1 + crate::theme::Theme::ALL
-                .iter()
-                .position(|theme| *theme == roles.theme)
-                .unwrap_or_default() as u64
-        });
-        let width_code = column.map_or(0, |width| width.round() as u64);
-        // A toggle in an older virtualized turn must re-realize its card too.
-        let expansion_code = self
+        let turns: Vec<KeyedView> = self
             .chat
-            .expanded
+            .items
             .iter()
-            .fold(0, |code, key| code ^ crate::chat::text_hash(key));
-        let source = VirtualSource::new(
-            self.chat
-                .items_revision
-                .wrapping_mul(3)
-                .wrapping_add(palette_code)
-                .wrapping_add(expansion_code)
-                .wrapping_add(path_code)
-                .wrapping_add(width_code.wrapping_mul(0x9E37_79B9)),
-            earlier,
-            move |index| keys[index].key.clone(),
-            move |index| views::item_view(&items[index], &expanded, &callbacks, palette, column),
-        );
-        ScrollViewer::new()
+            .map(|item| {
+                KeyedView::new(
+                    item.key.clone(),
+                    views::item_view(item, &expanded, &callbacks, palette, column),
+                )
+            })
+            .collect();
+        // The app's one ScrollView: its implicit style anchors it at the
+        // far (bottom) edge (`app_resources::styles_xaml`), so it opens at
+        // the newest turn and stays there while earlier turns are measured
+        // or new activity arrives, with no scroll after the first frame.
+        ScrollView::new()
             .grid_row(1)
-            .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+            .vertical_scroll_bar_visibility(ScrollingScrollBarVisibility::Auto)
             .automation_name("Conversation")
             .automation_id(TRANSCRIPT_ID)
             .content(
@@ -167,12 +143,7 @@ impl DesktopApp {
                     .max_width(tokens::layout::READING_WIDTH)
                     .horizontal_alignment(HorizontalAlignment::Center)
                     .margin(Thickness::xy(0.0, tokens::spacing::MD))
-                    .children((
-                        load_older,
-                        empty,
-                        ItemsRepeater::new().virtual_source(source),
-                        latest,
-                    )),
+                    .children((load_older, empty, StackPanel::new().keyed_children(turns))),
             )
     }
 

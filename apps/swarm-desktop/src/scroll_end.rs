@@ -1,12 +1,12 @@
-//! Scroll a named WinUI `ScrollViewer` to its end through UI Automation's
-//! scroll pattern (k195 P2-4: a conversation opened at the top).
+//! Scroll the transcript to its end through UI Automation's scroll
+//! pattern, after a send (the transcript was perhaps read further up).
 //!
-//! Reactor 0.100.0 has no scroll offset or element access on a
-//! `ScrollViewer`, and WinUI 3 has no static path from the window to its
-//! elements; focusing the transcript's last button brought nothing into view
-//! (observed live). WinUI's `ScrollViewerAutomationPeer` implements
-//! `IScrollProvider`, so the transcript's viewer, found by its automation id
-//! under this process's window, takes `SetScrollPercent(NoScroll, 100)`.
+//! Reactor 0.100.0 has no scroll offset or element access on a scroller,
+//! and WinUI 3 has no static path from the window to its elements. The
+//! transcript is a WinUI `ScrollView` whose inner `ScrollPresenter` peer
+//! implements `IScrollProvider`: the first element of the transcript's
+//! subtree (found by its automation id under this process's window) that
+//! offers the pattern takes `SetScrollPercent(NoScroll, 100)`.
 //!
 //! The UI Automation client interfaces are not in `windows-sys`; the three
 //! used here are declared by hand with the slots and ids of
@@ -25,10 +25,10 @@ use windows_sys::Win32::Foundation::{HWND, SysAllocString, SysFreeString};
 use windows_sys::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
 };
-use windows_sys::Win32::System::Variant::{VARIANT, VT_BSTR};
+use windows_sys::Win32::System::Variant::{VARIANT, VT_BOOL, VT_BSTR};
 use windows_sys::Win32::UI::Accessibility::{
-    CUIAutomation, TreeScope_Descendants, UIA_AutomationIdPropertyId, UIA_ScrollPatternId,
-    UIA_ScrollPatternNoScroll,
+    CUIAutomation, TreeScope_Descendants, TreeScope_Subtree, UIA_AutomationIdPropertyId,
+    UIA_IsScrollPatternAvailablePropertyId, UIA_ScrollPatternId, UIA_ScrollPatternNoScroll,
 };
 
 type Out = *mut *mut c_void;
@@ -108,10 +108,10 @@ impl Drop for Bstr {
     }
 }
 
-/// Scroll the viewer with automation id `id` under `window` to its end.
-/// `Ok(Some(percent))` is its vertical position afterwards (100 at the
-/// end, -1 when it does not scroll); `Ok(None)` means no such viewer is
-/// realized yet.
+/// Scroll the scroller with automation id `id` under `window` (or the
+/// first scroller inside it) to its end. `Ok(Some(percent))` is its
+/// vertical position afterwards (100 at the end, -1 when it does not
+/// scroll); `Ok(None)` means no such scroller is realized yet.
 pub fn scroll_to_end(window: HWND, id: &str) -> Result<Option<f64>, String> {
     let fail = |what: &str, hr: HRESULT| format!("{what} failed ({:#010X})", hr.0);
     // SAFETY: initializes COM for this worker thread; an earlier apartment
@@ -164,6 +164,40 @@ pub fn scroll_to_end(window: HWND, id: &str) -> Result<Option<f64>, String> {
             root.as_raw(),
             TreeScope_Descendants,
             condition.as_raw(),
+            &mut raw,
+        )
+    };
+    if hr.is_err() {
+        return Err(fail("FindFirst", hr));
+    }
+    // SAFETY: on success `raw` is null (not found) or one owned element.
+    let Some(named): Option<Element> = (unsafe { owned(raw) }) else {
+        return Ok(None);
+    };
+    // The named element or the first element under it with the pattern.
+    let mut value = VARIANT::default();
+    value.Anonymous.Anonymous.vt = VT_BOOL;
+    value.Anonymous.Anonymous.Anonymous.boolVal = -1;
+    let mut raw = std::ptr::null_mut();
+    // SAFETY: slot 23 of IUIAutomation is CreatePropertyCondition.
+    let hr = unsafe {
+        (a.create_property_condition)(
+            automation.as_raw(),
+            UIA_IsScrollPatternAvailablePropertyId,
+            value,
+            &mut raw,
+        )
+    };
+    // SAFETY: on success `raw` is one owned IUIAutomationCondition.
+    let scrolls: IUnknown =
+        unsafe { owned(raw) }.ok_or_else(|| fail("CreatePropertyCondition", hr))?;
+    let mut raw = std::ptr::null_mut();
+    // SAFETY: slot 5 of IUIAutomationElement is FindFirst.
+    let hr = unsafe {
+        (named.vtable().find_first)(
+            named.as_raw(),
+            TreeScope_Subtree,
+            scrolls.as_raw(),
             &mut raw,
         )
     };

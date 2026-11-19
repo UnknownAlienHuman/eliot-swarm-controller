@@ -108,11 +108,10 @@ const MENU_FORCE: &str = "Force stop…";
 /// WinUI's own left text padding inside a TextBox
 /// (`TextControlThemePadding`, 10,5,6,6).
 const WINUI_TEXT_PADDING: f64 = 10.0;
-/// Follow-latest retries while the newest turn is not realized yet.
-/// When the transcript is scrolled to its end after an open or a send:
-/// once it is realized, then as the virtualized earlier turns are
-/// measured and push the end down (ms, each after the previous).
-const FOLLOW_PASSES_MS: [u64; 3] = [60, 250, 600];
+/// Delay before the composer takes focus after an open or a send, and
+/// before a send scrolls the transcript to its end: the next render has
+/// realized the newest turn by then (ms).
+const FOLLOW_DELAY_MS: u64 = 60;
 /// The transcript viewer's automation id, which `crate::scroll_end` finds.
 const TRANSCRIPT_ID: &str = "ConversationTranscript";
 
@@ -339,7 +338,6 @@ pub(super) struct ChatState {
     pub(super) docs: HashMap<u64, Doc>,
     pub(super) render_cache: RenderCache,
     pub(super) items: Rc<Vec<Rc<RenderedItem>>>,
-    pub(super) items_revision: u64,
     pub(super) expanded: HashSet<String>,
     /// The transcript part under the pointer (its copy action shows).
     pub(super) hovered: Option<String>,
@@ -427,7 +425,7 @@ impl DesktopApp {
             );
         }
         self.rebuild_items();
-        self.follow_latest(context);
+        self.follow_latest(true, context);
         let blank = snapshot.text.trim().is_empty();
         self.spawn_draft(
             snapshot.action,
@@ -519,8 +517,9 @@ impl DesktopApp {
                         self.rebuild_items();
                         self.check_waiting_inputs(context);
                         if first_load {
-                            // Opened at the newest turn, like a chat.
-                            self.follow_latest(context);
+                            // The transcript opens at its newest turn by
+                            // its anchor; typing goes to the composer.
+                            self.follow_latest(false, context);
                         }
                         self.set_status("Retained history loaded; following live events.");
                         self.follow_next(Next::Wake { after: cursor }, context);
@@ -834,7 +833,7 @@ impl DesktopApp {
                     );
                 }
                 self.rebuild_items();
-                self.follow_latest(context);
+                self.follow_latest(true, context);
                 self.spawn_draft(
                     action,
                     mutation_id,

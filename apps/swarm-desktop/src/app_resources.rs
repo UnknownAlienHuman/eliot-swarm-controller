@@ -936,6 +936,9 @@ pub fn styles_xaml() -> String {
         press: 0.97,
         radius: container,
     });
+    // The transcript is the app's only ScrollView: anchored at its far
+    // (bottom) edge, WinUI keeps it at the end while it is there and the
+    // content grows, so a conversation opens at its newest turn.
     format!(
         "{XAML_ROOT}\
          <Style TargetType=\"Button\">\
@@ -984,6 +987,9 @@ pub fn styles_xaml() -> String {
          </Style>\
          <Style TargetType=\"ContentDialog\">\
            <Setter Property=\"CornerRadius\" Value=\"{dialog}\"/>\
+         </Style>\
+         <Style TargetType=\"ScrollView\">\
+           <Setter Property=\"VerticalAnchorRatio\" Value=\"1\"/>\
          </Style>\
          <Style TargetType=\"MenuFlyoutItem\">\
            <Setter Property=\"Padding\" Value=\"{inset},0,{inset},0\"/>\

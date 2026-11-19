@@ -121,9 +121,14 @@ impl DesktopApp {
     ) -> View {
         let title = self.agent_title(agent);
         let detail = self.chat.detail.as_ref();
-        let tone = detail.map_or(StatusTone::Neutral, |detail| {
-            StatusTone::of_state(detail.state)
-        });
+        // While its detail is read, the sidebar row's state and model stand
+        // in, so opening a task never flashes "Unknown".
+        let row = self.find_agent(agent);
+        let known = detail
+            .map(|detail| detail.state)
+            .or(row.map(|row| row.state));
+        let tone = known.map_or(StatusTone::Neutral, StatusTone::of_state);
+        let state = known.unwrap_or(eliot_core::AgentState::Unknown);
         let note = match &self.chat.live {
             LiveStatus::Stale(_) => "Catching up…",
             LiveStatus::Reconnecting { .. } => "Reconnecting…",
@@ -131,12 +136,18 @@ impl DesktopApp {
             _ => "",
         };
         // The harness and the model the daemon read back (`effective.model`).
-        let runs = detail.map(|detail| {
-            crate::picker::harness_model_label(
-                &detail.harness,
-                detail.settings.effective_model.as_deref(),
-            )
-        });
+        let runs = detail
+            .map(|detail| {
+                crate::picker::harness_model_label(
+                    &detail.harness,
+                    detail.settings.effective_model.as_deref(),
+                )
+            })
+            .or_else(|| {
+                row.map(|row| {
+                    crate::picker::harness_model_label(&row.harness, row.model.as_deref())
+                })
+            });
         let runs_width = runs.as_ref().map_or(0.0, |_| {
             tokens::layout::RUNS_LABEL_WIDTH + tokens::spacing::SM
         });
@@ -200,7 +211,6 @@ impl DesktopApp {
         let details_open = self.panel == Panel::Details;
         // The status pill: the state in words, then what runs it, and the
         // live feed's note when it is not following.
-        let state = detail.map_or(eliot_core::AgentState::Unknown, |detail| detail.state);
         let mut pill = match state {
             eliot_core::AgentState::Busy => "Working",
             eliot_core::AgentState::Idle => "Idle",

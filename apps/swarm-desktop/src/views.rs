@@ -554,14 +554,6 @@ pub fn item_view(
         .keyed_children(parts)
 }
 
-/// Order-sensitive hash of the item keys: Reactor's `key_revision` must
-/// change exactly when the key list changes.
-pub fn key_revision(items: &[Rc<RenderedItem>]) -> u64 {
-    items.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, item| {
-        (hash ^ text_hash(&item.key)).wrapping_mul(0x0100_0000_01b3)
-    })
-}
-
 /// Most file chips one message shows before "+N more".
 const FILE_CHIPS: usize = 6;
 

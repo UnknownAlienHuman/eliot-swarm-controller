@@ -823,7 +823,6 @@ impl Component for DesktopApp {
                 docs: HashMap::new(),
                 render_cache: RenderCache::default(),
                 items: Rc::new(Vec::new()),
-                items_revision: 0,
                 expanded: HashSet::new(),
                 hovered: None,
                 composer_ref: ElementRef::new(),

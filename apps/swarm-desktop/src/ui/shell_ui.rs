@@ -1001,7 +1001,6 @@ impl DesktopApp {
         self.chat.detail = None;
         self.chat.live = LiveStatus::Idle;
         self.chat.items = Rc::new(Vec::new());
-        self.chat.items_revision = 0;
         if self.panel == Panel::Details {
             self.close_panel();
         }
