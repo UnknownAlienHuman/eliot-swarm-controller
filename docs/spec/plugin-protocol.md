@@ -612,8 +612,17 @@ health, or source closure, the daemon's attention
 monitor makes at most four read-only snapshot attempts with backoff, for every
 adapter. Fresh evidence that the exact turn is still running, or a terminal marked
 `write_pending`, keeps it open for the next sweep: recovery never races the adapter's
-own terminal write. The Store rechecks the generation, native subject, turn, and source episode
-before committing `turn.completed` from a proven terminal, `turn.unknown` with
+own terminal write. A `busy` read (the Agent's snapshot slot or queue is occupied)
+proves nothing and spends no attempt: it also defers to the next sweep while the turn
+has committed progress within `daemon.attention_suspicion_secs`. After that window a
+busy read counts as inconclusive, so a source that stays busy still settles. The host
+marks an `events.put` frame carrying this exact turn's `turn.completed`/`turn.unknown`
+from decode until intake finishes it. While such a write is marked, no recovered
+outcome settles the turn (checked under the Store lock). The adapter's write commits
+the turn, or its failure clears the mark for the next sweep. The Store rechecks the generation, native subject, turn, and source episode
+before committing `turn.completed` from a proven terminal (keeping
+`final_text_unavailable` when the adapter reported it or the recovered text exceeds
+the event bound), `turn.unknown` with
 `native_exit_without_session_terminal` at once from a lost readback, or
 `turn.unknown` after four inconclusive reads. It retains the source gap and settles only that
 turn. Later facts cannot reopen it. Retiring or duplicate

@@ -1082,6 +1082,67 @@ impl PluginHost {
         result.map_err(|error| diagnose_error(error, &stderr, &credentials))
     }
 
+    /// Whether this Agent generation's own terminal write for the exact turn
+    /// reached the host and intake has not finished it. Shared recovery
+    /// never settles a turn while it is, for every adapter.
+    pub(crate) fn terminal_write_in_flight(&self, agent: &Agent, turn_id: &str) -> bool {
+        let key = AgentKey {
+            id: agent.id.clone(),
+            generation: agent.generation,
+        };
+        self.state
+            .running
+            .lock_recover()
+            .get(&key)
+            .is_some_and(|entry| {
+                entry
+                    .client
+                    .terminal_write_in_flight(&agent.id, agent.generation, turn_id)
+            })
+    }
+
+    /// Install an owned runtime whose snapshot reads `answer` replies to and
+    /// whose plugin connection is `client`. Test-only.
+    #[cfg(test)]
+    pub(crate) fn test_snapshot_runtime(
+        &self,
+        agent: &str,
+        client: PluginClient,
+        answer: impl Fn() -> Result<Value> + Send + 'static,
+    ) -> Arc<AtomicUsize> {
+        let (sender, mut receiver) = mpsc::channel(16);
+        let stderr = eliot_plugin::spawn_stderr(
+            tokio::io::empty(),
+            Arc::new(SecretPolicy::new([] as [&str; 0])),
+        )
+        .view();
+        self.state.running.lock_recover().insert(
+            AgentKey {
+                id: agent.to_owned(),
+                generation: 1,
+            },
+            RuntimeEntry {
+                sender,
+                client,
+                start_command_id: String::new(),
+                verbs: HashSet::new(),
+                stderr,
+                source_credentials: Arc::from([]),
+            },
+        );
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&reads);
+        tokio::spawn(async move {
+            while let Some(message) = receiver.recv().await {
+                if let RuntimeMessage::Snapshot { reply, .. } = message {
+                    counted.fetch_add(1, Ordering::Relaxed);
+                    let _ = reply.send(answer());
+                }
+            }
+        });
+        reads
+    }
+
     /// Turn-snapshot attempts so far. Test-only: proves a replayed
     /// resolution returns its stored response without native I/O.
     #[cfg(test)]
