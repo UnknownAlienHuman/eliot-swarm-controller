@@ -451,17 +451,19 @@ of the explicitly selected release scope.
       covers turns against the limit, whether creation is still retained, the
       retention floor and evictions; "Load older" pages turns only.
       Markdown renders in native `RichTextBlock` controls (http/https links only;
-      HTML literal) with Copy message and Copy code. A virtualized turn list keeps
-      stable keys and bounded resident turns and bytes. Live events follow a
+      HTML literal) with Copy message and Copy code. The turn list keeps
+      stable keys and bounded resident turns and bytes; every resident turn is
+      laid out (an ItemsRepeater under the anchored viewer left turns
+      unrealized). Live events follow a
       committed `events.bounds` cursor: a limit-1 wake with an explicit `wait_ms`,
       then drains from `next`. A lag or `history_gap` marks the view stale and
-      rereads it; transport failures back off and resnapshot. Reactor 0.100.0
-      has no scroll offset or `ViewChanged`, so the view neither auto-follows the
-      bottom nor shows a "N new" jump button it could not hide at the bottom;
-      opening a conversation or sending scrolls the transcript to its end
-      through UI Automation's scroll pattern (the viewer found by its
-      automation id), in a few passes as the virtualized turns are measured
-      (k195 P2-4: focusing its last button brought nothing into view). (Refs #407)
+      rereads it; transport failures back off and resnapshot. The transcript is a
+      WinUI `ScrollView` anchored at its far edge (`VerticalAnchorRatio` 1): it
+      opens at the newest turn and follows new activity while it is at the end,
+      and keeps its place when read further up. Reactor 0.100.0 has no scroll
+      offset, so there is no "N new" jump button; a send scrolls the transcript
+      to its end through UI Automation's scroll pattern (its inner scroller,
+      found under the transcript's automation id). (Refs #407)
 - [x] **D3 Swarm monitor.** An openable monitor panel uses one demand-driven
       refresh chain, active only while open. The last successful fleet and
       selected-Agent details stay visible on reopen and failed refreshes, with
