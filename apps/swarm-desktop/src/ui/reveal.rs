@@ -227,7 +227,7 @@ pub(super) fn path_button(palette: Palette, name: &str, open: Callback<()>) -> V
     m3::icon_button(palette)
         .automation_name(format!("Open {name} in Explorer"))
         .on_click(open)
-        .content(m3::toolbar_icon(m3::glyph::OPEN_FOLDER))
+        .content(m3::icon(m3::glyph::OPEN_FOLDER))
         .tooltip(TOOLTIP)
 }
 

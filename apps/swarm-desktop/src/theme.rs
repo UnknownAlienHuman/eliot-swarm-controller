@@ -570,9 +570,7 @@ pub mod winui {
         pub fn dot(self, tone: StatusTone) -> Option<Brush> {
             let pick: fn(&Roles) -> Rgb8 = match tone {
                 StatusTone::Active => |r| r.primary,
-                StatusTone::Attention | StatusTone::Failed | StatusTone::Unknown => {
-                    |r| r.attention
-                }
+                StatusTone::Attention | StatusTone::Failed | StatusTone::Unknown => |r| r.attention,
                 StatusTone::Pending => |r| r.muted,
                 StatusTone::Ready | StatusTone::Neutral => return None,
             };
@@ -752,9 +750,10 @@ pub mod winui {
             })
         }
 
-        /// A suggestion card on the home screen: the tonal tone.
+        /// A suggestion card on the home screen: the tonal tone, its icon
+        /// (the content color) in the primary role.
         pub fn suggestion(self) -> ResourceOverrides {
-            self.with(|r| Family::new(Some(r.tonal), r.text).overrides(r))
+            self.with(|r| Family::new(Some(r.tonal), r.primary).overrides(r))
         }
 
         /// A tool row: tonal, or the running tint while it runs.

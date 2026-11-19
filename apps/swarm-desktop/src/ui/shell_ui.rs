@@ -1630,18 +1630,18 @@ impl DesktopApp {
                     .is_enabled(self.nav.history.can_back())
                     .automation_name("Back (Alt+Left)")
                     .on_click(context.message(Message::Shell(ShellMsg::Back)))
-                    .content(m3::toolbar_icon(m3::glyph::BACK)),
+                    .content(m3::icon(m3::glyph::BACK)),
                 m3::icon_button(palette)
                     .grid_column(2)
                     .is_enabled(self.nav.history.can_forward())
                     .automation_name("Forward (Alt+Right)")
                     .on_click(context.message(Message::Shell(ShellMsg::Forward)))
-                    .content(m3::toolbar_icon(m3::glyph::FORWARD)),
+                    .content(m3::icon(m3::glyph::FORWARD)),
                 m3::icon_button(palette)
                     .grid_column(3)
                     .automation_name("Hide sidebar")
                     .on_click(context.message(Message::Shell(ShellMsg::SidebarToggled)))
-                    .content(m3::toolbar_icon(m3::glyph::HIDE_SIDEBAR)),
+                    .content(m3::icon(m3::glyph::HIDE_SIDEBAR)),
             ));
         let search = AutoSuggestBox::new()
             .element_ref(&self.nav.search_ref)
@@ -1757,7 +1757,7 @@ impl DesktopApp {
                         .height(tokens::height::SUB_ROW)
                         .vertical_alignment(VerticalAlignment::Bottom)
                         .automation_name("Actions for all projects")
-                        .content(m3::toolbar_icon(m3::glyph::MORE))
+                        .content(m3::icon(m3::glyph::MORE))
                         .menu(Menu::new(
                             items,
                             // Capture-free: one identity across renders.
@@ -2131,7 +2131,7 @@ impl DesktopApp {
                 }
             ))
             .on_click(context.message(toggle_msg.clone()))
-            .content(m3::toolbar_icon(chevron));
+            .content(m3::icon(chevron));
         let open = m3::row(palette, selected)
             .grid_column(1)
             .automation_name(if opens {
@@ -2179,7 +2179,7 @@ impl DesktopApp {
                     },
                     name.to_owned(),
                 ))))
-                .content(m3::toolbar_icon(m3::glyph::DELETE))
+                .content(m3::icon(m3::glyph::DELETE))
         } else {
             m3::icon_button(palette)
                 .grid_column(1)
@@ -2190,7 +2190,7 @@ impl DesktopApp {
                 .on_click(context.message(Message::Shell(ShellMsg::ProjectPicked(
                     place.checkout.to_owned(),
                 ))))
-                .content(m3::toolbar_icon(m3::glyph::NEW_TASK))
+                .content(m3::icon(m3::glyph::NEW_TASK))
         };
         Grid::new()
             .columns([GridLength::STAR, GridLength::Auto])
@@ -2237,7 +2237,7 @@ impl DesktopApp {
                     agent.id.clone(),
                     !row.expanded,
                 ))))
-                .content(m3::toolbar_icon(glyph))
+                .content(m3::icon(glyph))
         } else {
             View::empty()
         };
@@ -2299,7 +2299,7 @@ impl DesktopApp {
                         .on_click(
                             context.message(Message::Menu(MenuMsg::Quick(agent.clone(), action))),
                         )
-                        .content(m3::toolbar_icon(glyph))
+                        .content(m3::icon(glyph))
                         .tooltip(label)
                 })
                 .unwrap_or_else(View::empty)
@@ -2315,7 +2315,7 @@ impl DesktopApp {
                     .height(tokens::height::SUB_ROW)
                     .automation_name(format!("Actions for {title}"))
                     .on_click(context.message(Message::Menu(MenuMsg::TaskOpened(agent.clone()))))
-                    .content(m3::toolbar_icon(m3::glyph::MORE))
+                    .content(m3::icon(m3::glyph::MORE))
                     .tooltip("Task actions"),
             ));
         Border::new()
@@ -2485,7 +2485,7 @@ impl DesktopApp {
                 .height(tokens::height::CONTROL)
                 .automation_name(name)
                 .on_click(context.message(message))
-                .content(m3::toolbar_icon(glyph))
+                .content(m3::icon(glyph))
         };
         let top = StackPanel::new()
             .margin(Thickness::new(pad, tokens::spacing::SM, pad, 0.0))

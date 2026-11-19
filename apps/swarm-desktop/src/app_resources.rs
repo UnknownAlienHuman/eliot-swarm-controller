@@ -66,7 +66,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 use windows_sys::core::BOOL;
 
-use crate::theme::elevation::Level;
 use crate::theme::{Rgb8, Roles, Theme, state};
 use crate::ui::tokens::{height, radius, spacing};
 
@@ -171,6 +170,14 @@ fn accent(s: &Roles) -> Vec<(&'static str, Value)> {
             "AccentFillColorSelectedTextBackgroundBrush",
             opaque(s.primary),
         ),
+        // Text without its own brush takes the theme's text roles.
+        ("TextFillColorPrimaryBrush", opaque(s.text)),
+        ("TextFillColorSecondaryBrush", opaque(s.variant)),
+        ("TextFillColorTertiaryBrush", opaque(s.muted)),
+        (
+            "TextFillColorDisabledBrush",
+            layer(s.text, state::DISABLED_CONTENT),
+        ),
         ("AccentTextFillColorPrimaryBrush", opaque(s.primary)),
         ("AccentTextFillColorSecondaryBrush", opaque(s.primary)),
         (
@@ -189,10 +196,7 @@ fn accent(s: &Roles) -> Vec<(&'static str, Value)> {
         // The Usage page's quota rings: WinUI's ProgressRing reads its own
         // key (the Windows accent otherwise), and its track.
         ("ProgressRingForegroundThemeBrush", opaque(s.primary)),
-        (
-            "ProgressRingBackgroundThemeBrush",
-            opaque(s.container),
-        ),
+        ("ProgressRingBackgroundThemeBrush", opaque(s.container)),
         // The M3 focus indicator: secondary, on the surface.
         ("FocusStrokeColorOuter", Value::Color(s.primary)),
         ("FocusStrokeColorInner", Value::Color(s.surface)),
@@ -268,15 +272,10 @@ fn buttons(s: &Roles) -> Vec<(&'static str, Value)> {
 /// List selection: the secondary-container row with a primary indicator,
 /// and on-surface state layers on hover and press.
 fn lists(s: &Roles) -> Vec<(&'static str, Value)> {
-    let selected_hover = s.selected
-        .mix(s.text, state::HOVER);
-    let selected_pressed = s.selected
-        .mix(s.text, state::PRESSED);
+    let selected_hover = s.selected.mix(s.text, state::HOVER);
+    let selected_pressed = s.selected.mix(s.text, state::PRESSED);
     let mut all = vec![
-        (
-            "ListViewItemBackgroundSelected",
-            opaque(s.selected),
-        ),
+        ("ListViewItemBackgroundSelected", opaque(s.selected)),
         (
             "ListViewItemBackgroundSelectedPointerOver",
             opaque(selected_hover),
@@ -389,10 +388,8 @@ fn text_field(s: &Roles) -> Vec<(&'static str, Value)> {
 /// The combo box as an M3 exposed dropdown menu: the outlined field, and a
 /// menu on surface-container whose selected item is secondary-container.
 fn dropdown(s: &Roles) -> Vec<(&'static str, Value)> {
-    let selected_hover = s.selected
-        .mix(s.text, state::HOVER);
-    let selected_pressed = s.selected
-        .mix(s.text, state::PRESSED);
+    let selected_hover = s.selected.mix(s.text, state::HOVER);
+    let selected_pressed = s.selected.mix(s.text, state::PRESSED);
     let mut all = vec![
         ("ComboBoxBorderBrush", opaque(s.border)),
         ("ComboBoxBorderBrushPointerOver", opaque(s.text)),
@@ -790,10 +787,7 @@ fn overlays(s: &Roles) -> Vec<(&'static str, Value)> {
         ("ContentDialogBackground", opaque(s.container)),
         ("ContentDialogTopOverlay", opaque(s.container)),
         ("ContentDialogForeground", opaque(s.text)),
-        (
-            "ContentDialogContentForegroundBrush",
-            opaque(s.variant),
-        ),
+        ("ContentDialogContentForegroundBrush", opaque(s.variant)),
         // The M3 scrim: black at 32%.
         (
             "ContentDialogSmokeFill",
@@ -915,7 +909,7 @@ pub fn styles_xaml() -> String {
     );
     // Menu items are control-height rows: WinUI pads them from a
     // StaticResource (11,9,11,10), so only a style sets their height.
-    let (min, inset) = (height::CONTROL, spacing::INSET);
+    let (min, inset, row) = (height::CONTROL, spacing::INSET, spacing::ROW);
     let template = |look: Look| {
         format!(
             "<Setter Property=\"Template\"><Setter.Value>{}</Setter.Value></Setter>",
@@ -946,7 +940,7 @@ pub fn styles_xaml() -> String {
         "{XAML_ROOT}\
          <Style TargetType=\"Button\">\
            <Setter Property=\"CornerRadius\" Value=\"{pill}\"/>\
-           <Setter Property=\"Padding\" Value=\"{inset},0,{inset},0\"/>\
+           <Setter Property=\"Padding\" Value=\"{row},0,{row},0\"/>\
            <Setter Property=\"MinHeight\" Value=\"{min}\"/>\
            {flat}\
          </Style>\
@@ -1222,17 +1216,17 @@ pub fn title_bar_colors(s: &Roles) -> [(usize, Rgb8); 12] {
     let hover = s.surface.mix(s.text, state::HOVER);
     let pressed = s.surface.mix(s.text, state::PRESSED);
     [
-        (7, s.surface),             // put_BackgroundColor
-        (9, s.surface),             // put_ButtonBackgroundColor
-        (11, s.text),         // put_ButtonForegroundColor
-        (13, hover),                // put_ButtonHoverBackgroundColor
-        (15, s.text),         // put_ButtonHoverForegroundColor
-        (17, s.surface),            // put_ButtonInactiveBackgroundColor
+        (7, s.surface),  // put_BackgroundColor
+        (9, s.surface),  // put_ButtonBackgroundColor
+        (11, s.text),    // put_ButtonForegroundColor
+        (13, hover),     // put_ButtonHoverBackgroundColor
+        (15, s.text),    // put_ButtonHoverForegroundColor
+        (17, s.surface), // put_ButtonInactiveBackgroundColor
         (19, s.variant), // put_ButtonInactiveForegroundColor
-        (21, pressed),              // put_ButtonPressedBackgroundColor
-        (23, s.text),         // put_ButtonPressedForegroundColor
-        (27, s.text),         // put_ForegroundColor
-        (32, s.surface),            // put_InactiveBackgroundColor
+        (21, pressed),   // put_ButtonPressedBackgroundColor
+        (23, s.text),    // put_ButtonPressedForegroundColor
+        (27, s.text),    // put_ForegroundColor
+        (32, s.surface), // put_InactiveBackgroundColor
         (34, s.variant), // put_InactiveForegroundColor
     ]
 }

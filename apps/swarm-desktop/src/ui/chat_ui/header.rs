@@ -182,7 +182,7 @@ impl DesktopApp {
                 items.push(MenuItem::submenu("more", "More", more));
                 m3::icon_button(palette)
                     .automation_name("More actions")
-                    .content(m3::toolbar_icon(m3::glyph::MORE))
+                    .content(m3::icon(m3::glyph::MORE))
                     .menu(Menu::new(
                         items,
                         // Capture-free, so the callback keeps one identity
@@ -195,7 +195,7 @@ impl DesktopApp {
             None => m3::icon_button(palette)
                 .is_enabled(false)
                 .automation_name("More actions")
-                .content(m3::toolbar_icon(m3::glyph::MORE)),
+                .content(m3::icon(m3::glyph::MORE)),
         };
         let details_open = self.panel == Panel::Details;
         Grid::new()
@@ -262,7 +262,7 @@ impl DesktopApp {
                     .on_click(
                         context.message(Message::Shell(ShellMsg::PanelToggled(Panel::Details))),
                     )
-                    .content(m3::toolbar_icon(m3::glyph::INFO)),
+                    .content(m3::icon(m3::glyph::INFO)),
                 Border::new().grid_column(5).content(menu),
             ))
     }
@@ -315,7 +315,7 @@ impl DesktopApp {
                             .spacing(tokens::spacing::SM)
                             .vertical_alignment(VerticalAlignment::Center)
                             .children((
-                                m3::error_text_button(palette)
+                                m3::destructive(palette)
                                     .automation_name("Cancel force stop")
                                     .on_click(context.message(Message::Chat(
                                         ChatMsg::ForceStopAnswered(false),

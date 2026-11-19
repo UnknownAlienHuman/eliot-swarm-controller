@@ -62,8 +62,8 @@ pub mod height {
 /// The design's type roles.
 pub mod text {
     pub use crate::theme::typography::{
-        BODY, BUTTON, CAPTION, CAPTION as SECONDARY, CHIP, HEADER, HEADER as SECTION_TITLE,
-        HERO, HERO as PAGE_TITLE, LABEL, TITLE, TypeStyle,
+        BODY, BUTTON, CAPTION, CAPTION as SECONDARY, CHIP, HEADER, HEADER as SECTION_TITLE, HERO,
+        HERO as PAGE_TITLE, LABEL, TITLE, TypeStyle,
     };
 }
 

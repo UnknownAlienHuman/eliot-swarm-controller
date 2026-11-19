@@ -379,7 +379,7 @@ impl DesktopApp {
                     .on_click(
                         context.message(Message::Shell(ShellMsg::PanelToggled(Panel::Closed))),
                     )
-                    .content(m3::toolbar_icon(m3::glyph::CLOSE)),
+                    .content(m3::icon(m3::glyph::CLOSE)),
             ))
     }
 

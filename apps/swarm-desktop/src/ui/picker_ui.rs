@@ -304,7 +304,7 @@ impl DesktopApp {
             .height(tokens::height::CONTROL)
             .automation_name("Manage models")
             .on_click(context.message(Message::Launch(LaunchMsg::ManageOpened)))
-            .content(m3::toolbar_icon(m3::glyph::SLIDERS))
+            .content(m3::icon(m3::glyph::SLIDERS))
             .tooltip("Manage models");
         let search = Grid::new()
             .columns([GridLength::STAR, GridLength::Auto])
@@ -506,7 +506,7 @@ impl DesktopApp {
                 .on_click(
                     context.message(Message::Launch(LaunchMsg::PickerFavorite(item.key.clone()))),
                 )
-                .content(m3::toolbar_icon(glyph))
+                .content(m3::icon(glyph))
         } else {
             View::empty()
         };
@@ -846,7 +846,7 @@ impl DesktopApp {
                     .vertical_alignment(VerticalAlignment::Top)
                     .automation_name("Back to the model selector")
                     .on_click(context.message(Message::Launch(LaunchMsg::ManageClosed)))
-                    .content(m3::toolbar_icon(m3::glyph::BACK)),
+                    .content(m3::icon(m3::glyph::BACK)),
                 StackPanel::new().grid_column(1).children((
                     m3::section_title("Manage models"),
                     m3::secondary("Customize which models appear in the model selector"),

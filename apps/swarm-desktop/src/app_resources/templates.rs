@@ -177,8 +177,13 @@ pub(super) fn button(look: Look) -> String {
         }
         out
     };
-    let mut pressed = animate("StateLayer", "Opacity", state::PRESSED, PRESS_MS, EMPHASIZED)
-        + &set("Ripple", "Opacity", state::RIPPLE)
+    let mut pressed = animate(
+        "StateLayer",
+        "Opacity",
+        state::PRESSED,
+        PRESS_MS,
+        EMPHASIZED,
+    ) + &set("Ripple", "Opacity", state::RIPPLE)
         + &grow("RippleScale", "ScaleX", 0.0, 1.0, RIPPLE_MS, DECELERATE)
         + &grow("RippleScale", "ScaleY", 0.0, 1.0, RIPPLE_MS, DECELERATE);
     if press < 1.0 {
