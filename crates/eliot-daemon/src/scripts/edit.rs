@@ -158,9 +158,13 @@ pub(crate) fn list(
     let (root_index, offset) = request.position()?;
     let project = registration.map(|r| r.id.clone());
     let registrations = registration.map(std::slice::from_ref).unwrap_or_default();
-    let mut root = match root_for(data_root, registrations, project.as_deref())
-        .and_then(|root| Directory::open(&root))
-    {
+    let path = root_for(data_root, registrations, project.as_deref());
+    // A root that does not exist holds no scripts; it is not unreadable.
+    let missing = path.as_ref().is_ok_and(|path| {
+        std::fs::symlink_metadata(path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    });
+    let mut root = match path.and_then(|root| Directory::open(&root)) {
         Ok(pinned) => {
             let mut entries = Vec::new();
             let mut scanned = 0;
@@ -186,8 +190,8 @@ pub(crate) fn list(
         }
         Err(_) => ScriptRootView {
             project,
-            available: false,
-            reason: Some("script root unavailable or unsafe".to_owned()),
+            available: missing,
+            reason: (!missing).then(|| "script root unavailable or unsafe".to_owned()),
             entries: Vec::new(),
             truncated: false,
         },

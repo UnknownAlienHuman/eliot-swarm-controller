@@ -16,10 +16,16 @@ impl DesktopApp {
         // What Auto picks right now, from the saved policy.
         if let Some(Ok(decision)) = &self.launch.preview {
             let (headline, skipped) = model::decision_lines(decision);
-            let now = std::iter::once(format!(
-                "Right now Auto {}.",
-                headline.replacen("Routing picks", "picks", 1)
-            ))
+            // "Right now Auto picks qwen-dev: …" or "Right now no profile
+            // is available."
+            let now = std::iter::once(match headline.strip_prefix("Routing picks ") {
+                Some(pick) => format!("Right now Auto picks {pick}."),
+                None => {
+                    let mut chars = headline.chars();
+                    let first = chars.next().map(|c| c.to_lowercase().to_string());
+                    format!("Right now {}{}.", first.unwrap_or_default(), chars.as_str())
+                }
+            })
             .chain(skipped)
             .collect::<Vec<_>>()
             .join("\n");
