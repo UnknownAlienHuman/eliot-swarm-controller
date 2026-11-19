@@ -83,6 +83,14 @@ impl Router {
         } else {
             None
         };
+        let remote_registration = if matches!(principal, Principal::RemoteManager { .. }) {
+            let store = self.inner.store.lock().await;
+            let project = super::remote_manager::remote_project(&store, principal)?
+                .ok_or_else(|| Error::new("internal", "remote launch without a project"))?;
+            store.get_project_registration("owner", &project)?
+        } else {
+            None
+        };
         let candidates = crate::config::routing_candidates(&self.inner.data_root, &role)?;
         // An unconfigured child default preserves the established inherited
         // profile path. An explicitly configured role is always intersected.
@@ -116,6 +124,7 @@ impl Router {
                     request,
                     &name,
                     parent.as_ref(),
+                    remote_registration.as_ref(),
                     &mut quota_status,
                     &mut preflight,
                 )
@@ -161,6 +170,7 @@ impl Router {
         request: &SubmitCommand,
         name: &str,
         parent: Option<&Agent>,
+        remote_registration: Option<&eliot_core::api::ProjectRegistrationView>,
         quota_status: &mut RouteQuotaStatus,
         preflight: &mut RoutePreflight,
     ) -> Result<std::result::Result<(String, Value), RouteSkipReason>> {
@@ -179,6 +189,14 @@ impl Router {
             return Ok(Err(RouteSkipReason::Unauthorized));
         }
         if let Principal::ProjectRule { registration } = principal
+            && !registration
+                .profiles
+                .iter()
+                .any(|approved| approved == name)
+        {
+            return Ok(Err(RouteSkipReason::Unauthorized));
+        }
+        if let Some(registration) = remote_registration
             && !registration
                 .profiles
                 .iter()

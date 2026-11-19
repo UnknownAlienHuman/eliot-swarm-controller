@@ -43,9 +43,8 @@ pub(super) fn authorize_remote_submit(
     principal: &Principal,
     request: &mut SubmitCommand,
 ) -> Result<()> {
-    let Some(project) = remote_project(store, principal)? else {
-        return Ok(());
-    };
+    let project = remote_project(store, principal)?
+        .ok_or_else(|| Error::new("internal", "remote submit without a remote principal"))?;
     if !REMOTE_MANAGER_VERBS.contains(&request.verb.as_str()) {
         return Err(Error::new(
             "not_allowed",
@@ -69,12 +68,18 @@ pub(super) fn authorize_remote_submit(
                 "a remote manager launches root Agents of its project",
             ));
         }
-        if !args.contains_key("workspace") {
-            let registration = store
-                .get_project_registration("owner", &project)?
-                .ok_or_else(|| {
-                    Error::new("not_allowed", "remote manager project is unregistered")
-                })?;
+        let registration = store
+            .get_project_registration("owner", &project)?
+            .ok_or_else(|| Error::new("not_allowed", "remote manager project is unregistered"))?;
+        if let Some(profile) = args.get("profile").and_then(Value::as_str)
+            && !registration.profiles.iter().any(|p| p == profile)
+        {
+            return Err(Error::new(
+                "not_allowed",
+                "a remote manager launches root Agents with the project's approved profiles",
+            ));
+        }
+        if matches!(args.get("workspace"), None | Some(Value::Null)) {
             args.insert("workspace".to_owned(), Value::String(registration.checkout));
         }
         return Ok(());
