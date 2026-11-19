@@ -77,6 +77,13 @@ impl Store {
             events.push(event);
         }
         let view = compute_git_view(&tx, agent_num, generation, snapshot)?;
+        let work_changed = update_git_work_state(
+            &tx,
+            snapshot,
+            baseline.as_ref(),
+            &view.undelivered,
+            &attributed,
+        )?;
         persist_git_observation_events(
             &tx,
             agent_num,
@@ -119,7 +126,7 @@ impl Store {
             }
         }
         // Irrelevant global events advance `through` but need no durable cursor write.
-        if !scanned.events.is_empty() || !events.is_empty() {
+        if !scanned.events.is_empty() || !events.is_empty() || work_changed {
             db!(tx.execute(
                 "UPDATE source_state SET cursor = ?1, last_store_seq = COALESCE(?2, last_store_seq), updated_at = ?3
                  WHERE agent = ?4 AND generation = ?5 AND source = 'git'",
@@ -288,6 +295,384 @@ struct GitView {
     data: Value,
     changed: bool,
     undelivered: Vec<GitCommit>,
+}
+
+/// Code-progress snapshot read by automatic attention without launching Git.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodeProgressState {
+    pub available: bool,
+    pub last_code_progress_at: Option<i64>,
+    pub tool_calls: u64,
+    pub messages: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GitWorkStateRow {
+    base_oid: Option<String>,
+    commits_ahead: Option<i64>,
+    files_changed: Option<i64>,
+    insertions: Option<i64>,
+    deletions: Option<i64>,
+    diff_digest: Option<String>,
+    dirty_digest: Option<String>,
+    work_available: bool,
+    work_error: Option<String>,
+    last_write_at: Option<i64>,
+    last_commit_at: Option<i64>,
+}
+
+fn load_git_work_state(
+    connection: &Connection,
+    workspace: &str,
+) -> Result<Option<GitWorkStateRow>> {
+    connection
+        .query_row(
+            "SELECT base_oid, commits_ahead, files_changed, insertions, deletions,
+                    diff_digest, dirty_digest, work_available, work_error,
+                    last_write_at, last_commit_at
+             FROM git_work_state WHERE workspace = ?1",
+            [workspace],
+            |row| {
+                Ok(GitWorkStateRow {
+                    base_oid: row.get(0)?,
+                    commits_ahead: row.get(1)?,
+                    files_changed: row.get(2)?,
+                    insertions: row.get(3)?,
+                    deletions: row.get(4)?,
+                    diff_digest: row.get(5)?,
+                    dirty_digest: row.get(6)?,
+                    work_available: row.get::<_, i64>(7)? != 0,
+                    work_error: row.get(8)?,
+                    last_write_at: row.get(9)?,
+                    last_commit_at: row.get(10)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(sql_error)
+}
+
+fn to_i64_counter(value: Option<u64>) -> Result<Option<i64>> {
+    value
+        .map(|count| {
+            i64::try_from(count).map_err(|_| Error::new("invalid", "Git work counter overflows"))
+        })
+        .transpose()
+}
+
+fn to_u64_counter(value: Option<i64>) -> Option<u64> {
+    value.and_then(|count| u64::try_from(count).ok())
+}
+
+fn update_git_work_state(
+    tx: &Transaction<'_>,
+    snapshot: &GitSnapshot,
+    baseline: Option<&GitBaseline>,
+    undelivered: &[GitCommit],
+    attributed: &[&FileChangeHint],
+) -> Result<bool> {
+    let prior = load_git_work_state(tx, &snapshot.workspace)?;
+    let work = snapshot.work.as_ref();
+    let work_available = work.is_some_and(|w| w.available);
+    let work_error = if work_available {
+        None
+    } else {
+        Some(
+            work.and_then(|w| w.error.as_deref())
+                .unwrap_or("unavailable")
+                .to_owned(),
+        )
+    };
+    let commits_ahead = work.filter(|w| w.available).and_then(|w| w.commits_ahead);
+    let files_changed = work.filter(|w| w.available).and_then(|w| w.files_changed);
+    let insertions = work.filter(|w| w.available).and_then(|w| w.insertions);
+    let deletions = work.filter(|w| w.available).and_then(|w| w.deletions);
+    let diff_digest = work.and_then(|w| w.diff_digest.clone());
+    let dirty_digest = work.and_then(|w| w.dirty_digest.clone());
+    let has_changes = work.is_some_and(|w| w.has_changes);
+
+    let hint_write_ts = attributed.iter().map(|hint| hint.ts).max();
+    let dirty_write = !snapshot.dirty.is_empty()
+        && work.is_some()
+        && dirty_digest.is_some()
+        && prior.as_ref().and_then(|row| row.dirty_digest.as_ref()) != dirty_digest.as_ref();
+    let diff_write = has_changes
+        && work.is_some()
+        && diff_digest.is_some()
+        && prior.as_ref().and_then(|row| row.diff_digest.as_ref()) != diff_digest.as_ref();
+    let observed_write_ts = if let Some(hint_ts) = hint_write_ts {
+        Some(hint_ts)
+    } else if dirty_write || diff_write {
+        Some(snapshot.observed_at)
+    } else {
+        None
+    };
+    let last_write_at = match (
+        prior.as_ref().and_then(|row| row.last_write_at),
+        observed_write_ts,
+    ) {
+        (Some(prev), Some(curr)) => Some(prev.max(curr)),
+        (prev, curr) => curr.or(prev),
+    };
+
+    let head_moved = baseline.is_some_and(|old| old.head != snapshot.head);
+    let commit_landed = !undelivered.is_empty()
+        || (head_moved && commits_ahead.is_some_and(|count| count > 0))
+        || (baseline.is_none() && commits_ahead.is_some_and(|count| count > 0))
+        || (head_moved && snapshot.base_oid.is_none());
+    let last_commit_at = if commits_ahead == Some(0) {
+        None
+    } else if commit_landed {
+        Some(
+            prior
+                .as_ref()
+                .and_then(|row| row.last_commit_at)
+                .map_or(snapshot.observed_at, |prev| prev.max(snapshot.observed_at)),
+        )
+    } else {
+        prior.as_ref().and_then(|row| row.last_commit_at)
+    };
+
+    let next = GitWorkStateRow {
+        base_oid: snapshot.base_oid.clone(),
+        commits_ahead: to_i64_counter(commits_ahead)?,
+        files_changed: to_i64_counter(files_changed)?,
+        insertions: to_i64_counter(insertions)?,
+        deletions: to_i64_counter(deletions)?,
+        diff_digest,
+        dirty_digest,
+        work_available,
+        work_error,
+        last_write_at,
+        last_commit_at,
+    };
+    if prior.as_ref() == Some(&next) {
+        return Ok(false);
+    }
+    db!(tx.execute(
+        "INSERT INTO git_work_state(
+             workspace, base_oid, commits_ahead, files_changed, insertions, deletions,
+             diff_digest, dirty_digest, work_available, work_error,
+             last_write_at, last_commit_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+         ON CONFLICT(workspace) DO UPDATE SET
+             base_oid = excluded.base_oid,
+             commits_ahead = excluded.commits_ahead,
+             files_changed = excluded.files_changed,
+             insertions = excluded.insertions,
+             deletions = excluded.deletions,
+             diff_digest = excluded.diff_digest,
+             dirty_digest = excluded.dirty_digest,
+             work_available = excluded.work_available,
+             work_error = excluded.work_error,
+             last_write_at = excluded.last_write_at,
+             last_commit_at = excluded.last_commit_at,
+             updated_at = excluded.updated_at",
+        params![
+            snapshot.workspace,
+            next.base_oid,
+            next.commits_ahead,
+            next.files_changed,
+            next.insertions,
+            next.deletions,
+            next.diff_digest,
+            next.dirty_digest,
+            i64::from(next.work_available),
+            next.work_error,
+            next.last_write_at,
+            next.last_commit_at,
+            snapshot.observed_at,
+        ],
+    ));
+    Ok(true)
+}
+
+fn turn_activity_counts(
+    connection: &Connection,
+    agent_num: i64,
+    generation: i64,
+    active_turn: Option<&str>,
+) -> Result<Option<(u64, u64)>> {
+    let Some(turn_id) = active_turn else {
+        return Ok(None);
+    };
+    let counts: Option<(i64, i64)> = connection
+        .query_row(
+            "SELECT tool_calls, messages FROM turns
+             WHERE agent = ?1 AND generation = ?2 AND turn_id = ?3",
+            params![agent_num, generation, turn_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    Ok(counts.map(|(tools, messages)| {
+        (
+            u64::try_from(tools.max(0)).unwrap_or(0),
+            u64::try_from(messages.max(0)).unwrap_or(0),
+        )
+    }))
+}
+
+impl Store {
+    pub fn work_summary(
+        &self,
+        agent: &str,
+        generation: i64,
+        workspace: Option<&str>,
+        active_turn: Option<&str>,
+    ) -> Result<core::api::WorkSummaryView> {
+        let agent_num = parse_agent_id(agent)?;
+        self.work_summary_by_num(agent_num, generation, workspace, active_turn)
+    }
+
+    pub(super) fn work_summary_by_num(
+        &self,
+        agent_num: i64,
+        generation: i64,
+        workspace: Option<&str>,
+        active_turn: Option<&str>,
+    ) -> Result<core::api::WorkSummaryView> {
+        let turn_counts =
+            turn_activity_counts(&self.connection, agent_num, generation, active_turn)?;
+        let Some(workspace) = workspace else {
+            return Ok(core::api::WorkSummaryView::unavailable(
+                "no_workspace",
+                turn_counts,
+            ));
+        };
+        let source: Option<(String, Option<i64>)> = self
+            .connection
+            .query_row(
+                "SELECT health, last_store_seq FROM source_state
+                 WHERE agent = ?1 AND generation = ?2 AND source = 'git'",
+                params![agent_num, generation],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        let Some((health, last_store_seq)) = source else {
+            return Ok(core::api::WorkSummaryView::unavailable(
+                "git_unavailable",
+                turn_counts,
+            ));
+        };
+        if matches!(health.as_str(), "error" | "stale") {
+            return Ok(core::api::WorkSummaryView::unavailable(
+                "git_unavailable",
+                turn_counts,
+            ));
+        }
+        if last_store_seq.is_none() {
+            return Ok(core::api::WorkSummaryView::unavailable(
+                "pending",
+                turn_counts,
+            ));
+        }
+        let Some(row) = load_git_work_state(&self.connection, workspace)? else {
+            return Ok(core::api::WorkSummaryView::unavailable(
+                "pending",
+                turn_counts,
+            ));
+        };
+        if !row.work_available {
+            return Ok(core::api::WorkSummaryView::unavailable(
+                row.work_error.unwrap_or_else(|| "unavailable".to_owned()),
+                turn_counts,
+            ));
+        }
+        let (Some(commits_ahead), Some(files_changed), Some(insertions), Some(deletions)) = (
+            to_u64_counter(row.commits_ahead),
+            to_u64_counter(row.files_changed),
+            to_u64_counter(row.insertions),
+            to_u64_counter(row.deletions),
+        ) else {
+            return Ok(core::api::WorkSummaryView::unavailable(
+                "unavailable",
+                turn_counts,
+            ));
+        };
+        Ok(core::api::WorkSummaryView {
+            available: true,
+            reason: None,
+            commits_ahead: Some(commits_ahead),
+            files_changed: Some(files_changed),
+            insertions: Some(insertions),
+            deletions: Some(deletions),
+            last_write_at: row.last_write_at,
+            last_commit_at: row.last_commit_at,
+            tool_calls: turn_counts.map(|(tools, _)| tools),
+            messages: turn_counts.map(|(_, msgs)| msgs),
+        })
+    }
+
+    pub fn code_progress_state(
+        &self,
+        agent: &str,
+        generation: i64,
+        workspace: Option<&str>,
+        active_turn: Option<&str>,
+    ) -> Result<CodeProgressState> {
+        let agent_num = parse_agent_id(agent)?;
+        let (tool_calls, messages) =
+            turn_activity_counts(&self.connection, agent_num, generation, active_turn)?
+                .unwrap_or((0, 0));
+        let Some(workspace) = workspace else {
+            return Ok(CodeProgressState {
+                available: false,
+                last_code_progress_at: None,
+                tool_calls,
+                messages,
+            });
+        };
+        let source: Option<(String, String, Option<i64>)> = self
+            .connection
+            .query_row(
+                "SELECT state, health, last_store_seq FROM source_state
+                 WHERE agent = ?1 AND generation = ?2 AND source = 'git'",
+                params![agent_num, generation],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        let Some((state, health, last_store_seq)) = source else {
+            return Ok(CodeProgressState {
+                available: false,
+                last_code_progress_at: None,
+                tool_calls,
+                messages,
+            });
+        };
+        if state != "open" || !matches!(health.as_str(), "ok" | "slow") || last_store_seq.is_none()
+        {
+            return Ok(CodeProgressState {
+                available: false,
+                last_code_progress_at: None,
+                tool_calls,
+                messages,
+            });
+        }
+        let Some(row) = load_git_work_state(&self.connection, workspace)? else {
+            return Ok(CodeProgressState {
+                available: false,
+                last_code_progress_at: None,
+                tool_calls,
+                messages,
+            });
+        };
+        let available = row.work_available
+            || (row.work_error.as_deref() == Some("no_base_oid") && row.dirty_digest.is_some());
+        let last_code_progress_at = row
+            .last_write_at
+            .into_iter()
+            .chain(row.last_commit_at)
+            .max();
+        Ok(CodeProgressState {
+            available,
+            last_code_progress_at,
+            tool_calls,
+            messages,
+        })
+    }
 }
 
 /// The canonical persisted `git.changed` representation: the full snapshot

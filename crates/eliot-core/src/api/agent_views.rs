@@ -2,7 +2,8 @@
 //! Store authorization and the exact workspace target remain Router decisions.
 
 use super::{
-    GitView, HeavySummaryView, ObservationView, ScriptInterpreter, SessionGrowthView, StatsCoverage,
+    GitView, HeavySummaryView, ObservationView, ScriptInterpreter, SessionGrowthView,
+    StatsCoverage, WorkSummaryView,
 };
 use crate::{
     Agent, AgentEdit, AgentState, CommandState, Error, NativeChildActivity,
@@ -130,6 +131,10 @@ pub struct AgentSummary {
     /// Trailing field; absent on old wire payloads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Bounded Git work and current-turn activity summary for the Agent
+    /// generation. Trailing field; absent on old wire payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work: Option<WorkSummaryView>,
 }
 
 impl AgentSummary {
@@ -229,6 +234,9 @@ impl AgentSummary {
         }
         if let Some(growth) = &self.session_growth {
             growth.validate()?;
+        }
+        if let Some(work) = &self.work {
+            work.validate()?;
         }
         if let Some(group) = &self.organization {
             super::organization::validate_project_name(group, "Agent summary organization")?;
@@ -396,6 +404,10 @@ pub struct AgentGetResponse {
     /// field; absent on old wire payloads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_growth: Option<SessionGrowthView>,
+    /// Bounded Git work and current-turn activity summary for the Agent
+    /// generation. Trailing field; absent on old wire payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work: Option<WorkSummaryView>,
 }
 
 /// Retained model/effort overlay readback for one Agent generation. The
@@ -558,6 +570,10 @@ pub struct AgentStatsResponse {
     /// field; absent on old wire payloads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_growth: Option<SessionGrowthView>,
+    /// Bounded Git work and current-turn activity summary for the Agent
+    /// generation. Trailing field; absent on old wire payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work: Option<WorkSummaryView>,
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]

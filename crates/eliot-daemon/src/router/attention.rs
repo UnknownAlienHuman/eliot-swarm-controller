@@ -11,6 +11,7 @@ use super::{Router, StoreHandle};
 use crate::common::now_ms;
 use eliot_core::api::SourceState;
 use eliot_core::{Agent, AgentState, Result};
+use eliot_store::CodeProgressState;
 use incidents::{
     activity_context, child_attention_activity, deliver_active_incident, desired_incident,
     freeze_loss_report, freeze_report, incident_id, loss_incident_id, loss_report_already_complete,
@@ -41,6 +42,7 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(15);
 enum IncidentKind {
     SourceUnhealthy,
     NoProgress,
+    CodeProgress,
     ChildrenUnattended,
 }
 
@@ -49,6 +51,7 @@ impl IncidentKind {
         match self {
             Self::SourceUnhealthy => "source_unhealthy",
             Self::NoProgress => "no_progress",
+            Self::CodeProgress => "no_code_progress",
             Self::ChildrenUnattended => "children_unattended",
         }
     }
@@ -149,6 +152,7 @@ struct CapturedAgent {
     children: eliot_store::NativeChildrenAttention,
     children_revision: Option<i64>,
     manager_progress_at: Option<i64>,
+    code_progress: Option<CodeProgressState>,
 }
 
 #[derive(Clone, Debug, Serialize)]

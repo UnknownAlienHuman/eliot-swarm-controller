@@ -118,6 +118,7 @@ pub(super) async fn capture_agent(
         turn_command_id,
         tool_coverage,
         manager_progress_at,
+        code_progress,
     ) = {
         let store = router.inner.store.lock().await;
         let Some(agent) = store.get_agent(agent_id)? else {
@@ -175,6 +176,12 @@ pub(super) async fn capture_agent(
             (Some(_), _) => eliot_store::ActiveToolCoverage::Unknown,
             (None, _) => eliot_store::ActiveToolCoverage::Unknown,
         };
+        let code_progress = store.code_progress_state(
+            &agent.id,
+            generation,
+            agent.workspace.as_deref(),
+            agent.active_turn.as_deref(),
+        )?;
         (
             agent,
             source_states,
@@ -185,6 +192,7 @@ pub(super) async fn capture_agent(
             turn_command_id,
             tool_coverage,
             manager_progress_at,
+            code_progress,
         )
     };
     let turn_started_at = turn.and_then(|turn| turn.started_at);
@@ -222,6 +230,7 @@ pub(super) async fn capture_agent(
         children,
         children_revision,
         manager_progress_at,
+        code_progress: Some(code_progress),
     }))
 }
 

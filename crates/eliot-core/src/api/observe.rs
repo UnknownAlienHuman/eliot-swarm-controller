@@ -430,3 +430,141 @@ impl HarnessDoctorRequest {
 pub struct HarnessDoctorResponse {
     pub harnesses: Vec<DoctorHarnessEntry>,
 }
+
+/// Bounded per-Agent work summary covering Git progress versus frozen `base_oid`
+/// (commits ahead, changed files, insertions and deletions across committed and
+/// dirty work, last write and commit times) and current-turn tool/message counts.
+/// When Git or caps prevent observation, `available` is `false` with `reason`
+/// and all Git counters stay `None` — never a fake zero.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkSummaryView {
+    pub available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commits_ahead: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files_changed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insertions: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deletions: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_write_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_commit_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub messages: Option<u64>,
+}
+
+impl WorkSummaryView {
+    pub fn unavailable(reason: impl Into<String>, turn_counts: Option<(u64, u64)>) -> Self {
+        let (tool_calls, messages) = match turn_counts {
+            Some((tools, msgs)) => (Some(tools), Some(msgs)),
+            None => (None, None),
+        };
+        Self {
+            available: false,
+            reason: Some(reason.into()),
+            commits_ahead: None,
+            files_changed: None,
+            insertions: None,
+            deletions: None,
+            last_write_at: None,
+            last_commit_at: None,
+            tool_calls,
+            messages,
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.available {
+            if self.reason.is_some() {
+                return Err(Error::new(
+                    "invalid",
+                    "available work summary must not carry an unavailable reason",
+                ));
+            }
+            if self.commits_ahead.is_none()
+                || self.files_changed.is_none()
+                || self.insertions.is_none()
+                || self.deletions.is_none()
+            {
+                return Err(Error::new(
+                    "invalid",
+                    "available work summary requires Git counters",
+                ));
+            }
+        } else {
+            let Some(reason) = &self.reason else {
+                return Err(Error::new(
+                    "invalid",
+                    "unavailable work summary requires a reason",
+                ));
+            };
+            text(reason, "work reason")?;
+            if self.commits_ahead.is_some()
+                || self.files_changed.is_some()
+                || self.insertions.is_some()
+                || self.deletions.is_some()
+                || self.last_write_at.is_some()
+                || self.last_commit_at.is_some()
+            {
+                return Err(Error::new(
+                    "invalid",
+                    "unavailable work summary must not report Git counters",
+                ));
+            }
+        }
+        if self.last_write_at.is_some_and(|ts| ts < 0)
+            || self.last_commit_at.is_some_and(|ts| ts < 0)
+        {
+            return Err(Error::new("invalid", "work summary timestamp is invalid"));
+        }
+        if self.tool_calls.is_some() != self.messages.is_some() {
+            return Err(Error::new(
+                "invalid",
+                "work summary turn activity requires both tool_calls and messages",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Whether an Agent runs under a read-only or audit profile where no code
+/// writes are expected (suppresses `no_code_progress` attention).
+pub fn is_read_only_or_audit_profile(agent: &crate::Agent) -> bool {
+    let snapshot_read_only = [&agent.profile_snapshot]
+        .into_iter()
+        .chain(agent.effective.as_ref())
+        .any(|obj| {
+            obj.get("permissions").and_then(Value::as_str) == Some("read-only")
+                || obj.get("permission_mode").and_then(Value::as_str) == Some("plan")
+                || obj.get("mode").and_then(Value::as_str) == Some("plan")
+                || obj.get("collaboration_mode").and_then(Value::as_str) == Some("plan")
+        });
+    if snapshot_read_only {
+        return true;
+    }
+    if agent
+        .profile_choice
+        .as_ref()
+        .is_some_and(|choice| choice.role.eq_ignore_ascii_case("audit"))
+    {
+        return true;
+    }
+    let tokens: Vec<String> = agent
+        .profile
+        .split(['-', '_', ' '])
+        .filter(|part| !part.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    tokens
+        .iter()
+        .any(|token| token == "audit" || token == "readonly")
+        || tokens
+            .windows(2)
+            .any(|pair| pair[0] == "read" && pair[1] == "only")
+}

@@ -234,6 +234,38 @@ pub(crate) fn growth_cell(growth: Option<&eliot_core::api::SessionGrowthView>) -
     }
 }
 
+/// Compact Git-aware work cell for agent tables.
+pub(crate) fn work_cell(summary: &eliot_core::api::AgentSummary) -> String {
+    let Some(work) = &summary.work else {
+        return "-".to_owned();
+    };
+    if !work.available {
+        return format!(
+            "unavailable: {}",
+            work.reason.as_deref().unwrap_or("unavailable")
+        );
+    }
+    let mut parts = Vec::new();
+    parts.push(format!(
+        "+{}/-{}",
+        work.insertions.unwrap_or(0),
+        work.deletions.unwrap_or(0)
+    ));
+    parts.push(format!("{} files", work.files_changed.unwrap_or(0)));
+    if let Some(commits) = work.commits_ahead {
+        parts.push(format!("{} commits", commits));
+    }
+    if let Some(last_write) = work.last_write_at {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as i64)
+            .unwrap_or(0);
+        let age = now.saturating_sub(last_write);
+        parts.push(format!("last write {}s", age / 1000));
+    }
+    parts.join(", ")
+}
+
 pub(crate) async fn run_usage(
     UsageArgs {
         agent,
@@ -867,7 +899,7 @@ pub(crate) fn print_agent_table(response: &AgentListResponse, with_observations:
         );
     } else {
         println!(
-            "{:<6} {:<4} {:<22} {:<14} {:<9} {:<12} {:<6} {:<11} {:<11} {:<6}",
+            "{:<6} {:<4} {:<22} {:<14} {:<9} {:<12} {:<6} {:<11} {:<11} {:<6} {:<22}",
             "ID",
             "GEN",
             "STATE",
@@ -877,7 +909,8 @@ pub(crate) fn print_agent_table(response: &AgentListResponse, with_observations:
             "AGE",
             "LAST_OUT",
             "USAGE",
-            "SEEN"
+            "SEEN",
+            "WORK"
         );
     }
     let now_ms = std::time::SystemTime::now()
@@ -928,7 +961,7 @@ pub(crate) fn print_agent_table(response: &AgentListResponse, with_observations:
                     .filter(|age| *age >= 0),
             );
             println!(
-                "{:<6} {:<4} {:<22} {:<14} {:<9} {:<12} {:<6} {:<11} {:<11} {:<6}",
+                "{:<6} {:<4} {:<22} {:<14} {:<9} {:<12} {:<6} {:<11} {:<11} {:<6} {:<22}",
                 truncate_cell(&summary.id, 6),
                 summary.generation,
                 truncate_cell(&summary.display_state(), 22),
@@ -939,6 +972,7 @@ pub(crate) fn print_agent_table(response: &AgentListResponse, with_observations:
                 outcome,
                 fleet_usage_cell(summary),
                 seen,
+                truncate_cell(&work_cell(summary), 22),
             );
         }
     }

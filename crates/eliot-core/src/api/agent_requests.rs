@@ -52,6 +52,10 @@ impl AgentGetRequest {
                 .session_growth
                 .as_ref()
                 .is_some_and(|growth| growth.validate().is_err())
+            || reply
+                .work
+                .as_ref()
+                .is_some_and(|work| work.validate().is_err())
             || reply.source_states.iter().any(|source| {
                 source.agent_id != self.id
                     || source.generation < 0
@@ -502,6 +506,10 @@ impl AgentStatsRequest {
                 .session_growth
                 .as_ref()
                 .is_some_and(|growth| growth.validate().is_err())
+            || reply
+                .work
+                .as_ref()
+                .is_some_and(|work| work.validate().is_err())
         {
             return Err(invalid_response());
         }
