@@ -83,18 +83,9 @@ restore readback and credentials/release.
 
 ## Agent
 
-```text
-Agent {
-  id, generation, name?, project, parent?, root, depth,
-  origin: eliot|native|external,
-  harness, profile, profile_snapshot,
-  native_scope?, native_ref?, workspace?, workspace_phase?, branch?, base_ref?, base_oid?,
-  state, active_turn?, stalled_since?, last_progress_at?,
-  pending, goal?, effective?, labels,
-  control: self|tree|project, observe_only, own_identity, token?,
-  created_at, updated_at
-}
-```
+The [`Agent`](../../crates/eliot-core/src/lib.rs) and
+[`AgentSummary`](../../crates/eliot-core/src/api/agent_views.rs) DTOs own the public
+Agent field catalog.
 
 Snapshots contain bounded nonsecret values and admitted file references, not resolved
 secrets. External Agents are observe-only until exact control attach. Native children
@@ -325,18 +316,11 @@ gaps.
 
 ## Events and authoritative sources
 
-```text
-Event { seq?, ts, kind, family?, agent?, generation?, source,
-        native_id?, cursor?, payload_digest?, cause?, subject?, data }
-NativeEvent { kind, native_id, data, ts?:i64 }
-SourceOwner { agent, generation, family, source, mechanism }
-SourceState {
-  agent, generation, source, state: open|closed, health: ok|slow|stale|error,
-  cursor?, last_store_seq?, last_batch_id?, last_batch_digest?,
-  last_batch_first_seq?, last_batch_last_seq?,
-  gap_id?, gap_digest?, gap_from?, gap_to?, gap_seq?
-}
-```
+The [`Event`](../../crates/eliot-core/src/lib.rs),
+[`NativeEvent`](../../crates/eliot-core/src/lib.rs),
+[`SourceOwner`](../../crates/eliot-core/src/api/agent_views.rs) and
+[`SourceState`](../../crates/eliot-core/src/api/agent_views.rs) DTOs own the event
+and source field catalog.
 
 `NativeEvent.ts` is optional original native Unix epoch milliseconds. `None` is omitted
 from the wire and preserves the legacy semantic digest and ingestion-time `Event.ts`;
@@ -482,13 +466,7 @@ turn.
 
 ## Commands and narrow gates
 
-```text
-Command {
-  id, principal, method, payload_digest, target?, selector?,
-  expected_generation?, generation?, parent_command?, link_kind?, ordinal?,
-  turn_id?, request_id?, verb, args, origin, cause?,
-  state, outcome?, created_at, updated_at
-}
+The [`Command`](../../crates/eliot-core/src/lib.rs) DTO owns the command field catalog.
 state = accepted -> [queued ->] dispatched -> applied|rejected|failed|unknown
         accepted|queued -> cancelled
 ```
