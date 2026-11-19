@@ -1350,6 +1350,7 @@ impl Monitoring {
             base_oid: base_oid.map(ToOwned::to_owned),
             committed_paths: Vec::new(),
             base_complete: false,
+            work: None,
         };
         loop {
             let mut store = self.inner.store.lock().await;

@@ -203,8 +203,9 @@ pub(super) fn persist_turn_fact(
         db!(tx.execute(
             "UPDATE turns SET state = ?1, status = ?2, outcome = COALESCE(?3, outcome),
                               native_status = COALESCE(?4, native_status),
-                              final_text = ?5, started_at = ?6, completed_at = ?7
-             WHERE agent = ?8 AND generation = ?9 AND turn_id = ?10",
+                              final_text = ?5, started_at = ?6, completed_at = ?7,
+                              messages = messages + ?8
+             WHERE agent = ?9 AND generation = ?10 AND turn_id = ?11",
             params![
                 turn_state_name(turn.state),
                 turn.status,
@@ -213,6 +214,7 @@ pub(super) fn persist_turn_fact(
                 turn.final_text,
                 turn.started_at,
                 turn.completed_at,
+                i64::from(event.kind == "message.completed"),
                 id,
                 agent.generation,
                 turn_id

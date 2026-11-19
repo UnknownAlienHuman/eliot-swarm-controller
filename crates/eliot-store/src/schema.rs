@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 66;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 67;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -1566,6 +1566,34 @@ impl Store {
             tx.execute_batch(
                 "ALTER TABLE chat_organization ADD COLUMN continued_from TEXT;
                  INSERT INTO schema_migrations(version) VALUES (66);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 67 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE turns ADD COLUMN tool_calls INTEGER NOT NULL DEFAULT 0 CHECK(tool_calls >= 0);
+                 ALTER TABLE turns ADD COLUMN messages INTEGER NOT NULL DEFAULT 0 CHECK(messages >= 0);
+                 CREATE TABLE IF NOT EXISTS git_work_state (
+                     workspace TEXT PRIMARY KEY,
+                     base_oid TEXT,
+                     commits_ahead INTEGER,
+                     files_changed INTEGER,
+                     insertions INTEGER,
+                     deletions INTEGER,
+                     diff_digest TEXT,
+                     dirty_digest TEXT,
+                     work_available INTEGER NOT NULL DEFAULT 0 CHECK(work_available IN (0, 1)),
+                     work_error TEXT,
+                     last_write_at INTEGER,
+                     last_commit_at INTEGER,
+                     updated_at INTEGER NOT NULL
+                 );
+                 INSERT INTO schema_migrations(version) VALUES (67);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;

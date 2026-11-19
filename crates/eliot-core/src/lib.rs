@@ -270,6 +270,27 @@ pub struct GitBaseline {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitWorkProbe {
+    pub available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commits_ahead: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files_changed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insertions: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deletions: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dirty_digest: Option<String>,
+    #[serde(default)]
+    pub has_changes: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitSnapshot {
     pub workspace: String,
     pub head: Option<String>,
@@ -287,6 +308,8 @@ pub struct GitSnapshot {
     pub committed_paths: Vec<String>,
     #[serde(default)]
     pub base_complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work: Option<GitWorkProbe>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

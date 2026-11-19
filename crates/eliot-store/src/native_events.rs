@@ -124,6 +124,20 @@ pub(super) fn persist_effects(
             }
         }
     }
+    if native_event.kind == "tool.started"
+        && let Some(turn_id) = native_event
+            .data
+            .get("turn_id")
+            .and_then(Value::as_str)
+            .or(next_agent.active_turn.as_deref())
+    {
+        db!(tx.execute(
+            "UPDATE turns SET tool_calls = tool_calls + 1
+             WHERE agent = ?1 AND generation = ?2 AND turn_id = ?3
+               AND state = 'running'",
+            params![agent_num, generation, turn_id],
+        ));
+    }
     Ok((command_events, provider_events))
 }
 
@@ -581,7 +595,7 @@ fn persist_message_completed(
     }
     let changed = tx
         .execute(
-            "UPDATE turns SET final_text = ?1
+            "UPDATE turns SET final_text = ?1, messages = messages + 1
              WHERE agent = ?2 AND generation = ?3 AND turn_id = ?4
                AND state = 'running'",
             params![text, agent_num, generation, turn_id],

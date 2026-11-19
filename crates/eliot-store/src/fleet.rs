@@ -336,6 +336,12 @@ impl Store {
         let heavy = self.heavy_rollup(&id, record.generation)?;
         let session_growth =
             self.session_growth_view(&record.harness, &id, record.generation, growth_thresholds)?;
+        let work = Some(self.work_summary_by_num(
+            record.id,
+            record.generation,
+            record.workspace.as_deref(),
+            record.active_turn.as_deref(),
+        )?);
         let preview = self.first_input_preview(record.id)?;
         let repo_common_dir = self
             .connection
@@ -408,6 +414,7 @@ impl Store {
             tags,
             organization_revision,
             model,
+            work,
         })
     }
 

@@ -5,12 +5,14 @@
 //! manager owns ordinary scoped execution and cancellation serialization.
 
 use crate::platform::{OwnedChild, is_reparse_point};
-use eliot_core::{Error, GitBaseline, GitCommit, GitPathStatus, GitSnapshot, Result};
+use eliot_core::{Error, GitBaseline, GitCommit, GitPathStatus, GitSnapshot, GitWorkProbe, Result};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
     ffi::OsString,
     fs,
+    io::Read,
     path::{Component, Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -27,6 +29,10 @@ const INPUT_BYTES: usize = 32 * 1024;
 const CONFIG_PAIRS: usize = 256;
 const CONFIG_BYTES: usize = 16 * 1024;
 const HISTORY_COMMITS: usize = 64;
+const WORK_DIFF_MAX_FILES: usize = 1_000;
+const WORK_UNTRACKED_MAX_BYTES_PER_FILE: u64 = 512 * 1024;
+const WORK_UNTRACKED_MAX_TOTAL_BYTES: u64 = 4 * 1024 * 1024;
+const WORK_MAX_COMMITS_AHEAD: u64 = 10_000;
 const PROBE_TIME: Duration = Duration::from_secs(15);
 const CLEANUP_TIME: Duration = Duration::from_secs(2);
 const STATUS_ARGS: &[&str] = &[
@@ -249,6 +255,17 @@ impl GitProbe {
                 deadline,
             )
             .await?;
+        let work = self
+            .work_probe(
+                &root,
+                base_oid,
+                status.head.as_deref(),
+                &status.dirty,
+                complete,
+                &overrides,
+                deadline,
+            )
+            .await?;
         // Do not clear attribution from a poll that crossed a checkout/index/status
         // change. The history commands themselves use immutable object IDs.
         let final_index = self
@@ -283,6 +300,7 @@ impl GitProbe {
             base_oid: base_oid.map(str::to_owned),
             committed_paths,
             base_complete,
+            work: Some(work),
         })
     }
 
@@ -539,6 +557,258 @@ impl GitProbe {
                 .collect(),
             true,
         ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn work_probe(
+        &self,
+        root: &Path,
+        base: Option<&str>,
+        head: Option<&str>,
+        dirty: &[GitPathStatus],
+        complete: bool,
+        overrides: &[(String, String)],
+        deadline: Instant,
+    ) -> Result<GitWorkProbe> {
+        let unavailable_work =
+            |error: &str, dirty_digest: Option<String>, has_changes: bool| GitWorkProbe {
+                available: false,
+                error: Some(error.to_owned()),
+                commits_ahead: None,
+                files_changed: None,
+                insertions: None,
+                deletions: None,
+                diff_digest: None,
+                dirty_digest,
+                has_changes,
+            };
+        if !complete {
+            return Ok(unavailable_work("partial_status", None, !dirty.is_empty()));
+        }
+        let dirty_result = dirty_worktree_digest(root, dirty);
+        let dirty_digest = dirty_result.as_ref().ok().map(|(digest, _)| digest.clone());
+        let Some(base) = base else {
+            return Ok(unavailable_work(
+                "no_base_oid",
+                dirty_digest,
+                !dirty.is_empty(),
+            ));
+        };
+        let Some(head) = head else {
+            return Ok(unavailable_work(
+                "unborn_head",
+                dirty_digest,
+                !dirty.is_empty(),
+            ));
+        };
+        if !is_oid(base) || !is_oid(head) {
+            return Ok(unavailable_work(
+                "invalid_oid",
+                dirty_digest,
+                !dirty.is_empty(),
+            ));
+        }
+        let (dirty_digest, untracked_lines) = match dirty_result {
+            Ok(value) => value,
+            Err(reason) => {
+                return Ok(unavailable_work(reason, None, !dirty.is_empty()));
+            }
+        };
+        let read_deadline = deadline
+            .checked_sub(Duration::from_secs(2))
+            .unwrap_or(deadline);
+        let commits_ahead = if head == base {
+            0_u64
+        } else {
+            let ancestor = match self
+                .run(
+                    root,
+                    &["merge-base", "--is-ancestor", base, head],
+                    overrides,
+                    &[],
+                    read_deadline,
+                )
+                .await
+            {
+                Ok(output) => output,
+                Err(error) if error.code == "git_leaf_fence_unavailable" => return Err(error),
+                Err(_) => {
+                    return Ok(unavailable_work(
+                        "git_unavailable",
+                        Some(dirty_digest),
+                        !dirty.is_empty(),
+                    ));
+                }
+            };
+            if ancestor.code != 0 {
+                return Ok(unavailable_work(
+                    "diverged_from_base",
+                    Some(dirty_digest),
+                    !dirty.is_empty(),
+                ));
+            }
+            let max_arg = format!("--max-count={}", WORK_MAX_COMMITS_AHEAD + 1);
+            let range = format!("{base}..{head}");
+            let count_out = match self
+                .run(
+                    root,
+                    &["rev-list", "--count", &max_arg, &range, "--"],
+                    overrides,
+                    &[],
+                    read_deadline,
+                )
+                .await
+            {
+                Ok(output) if output.code == 0 => output,
+                Err(error) if error.code == "git_leaf_fence_unavailable" => return Err(error),
+                _ => {
+                    return Ok(unavailable_work(
+                        "git_unavailable",
+                        Some(dirty_digest),
+                        !dirty.is_empty(),
+                    ));
+                }
+            };
+            let count_text = match std::str::from_utf8(&count_out.stdout) {
+                Ok(text) => text.trim(),
+                Err(_) => {
+                    return Ok(unavailable_work(
+                        "git_unavailable",
+                        Some(dirty_digest),
+                        !dirty.is_empty(),
+                    ));
+                }
+            };
+            let Ok(count) = count_text.parse::<u64>() else {
+                return Ok(unavailable_work(
+                    "git_unavailable",
+                    Some(dirty_digest),
+                    !dirty.is_empty(),
+                ));
+            };
+            if count > WORK_MAX_COMMITS_AHEAD {
+                return Ok(unavailable_work(
+                    "cap_exceeded",
+                    Some(dirty_digest),
+                    !dirty.is_empty(),
+                ));
+            }
+            count
+        };
+        let diff_out = match self
+            .run(
+                root,
+                &[
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--numstat",
+                    "--no-renames",
+                    "-z",
+                    base,
+                    "--",
+                ],
+                overrides,
+                &[],
+                read_deadline,
+            )
+            .await
+        {
+            Ok(output) if output.code == 0 => output,
+            Err(error) if error.code == "git_leaf_fence_unavailable" => return Err(error),
+            _ => {
+                return Ok(unavailable_work(
+                    "git_unavailable",
+                    Some(dirty_digest),
+                    !dirty.is_empty() || commits_ahead > 0,
+                ));
+            }
+        };
+        let mut changed_paths = BTreeSet::new();
+        let mut insertions = 0_u64;
+        let mut deletions = 0_u64;
+        let mut diff_hasher = Sha256::new();
+        let records = match nul_records(&diff_out.stdout) {
+            Ok(records) => records,
+            Err(_) => {
+                return Ok(unavailable_work(
+                    "git_unavailable",
+                    Some(dirty_digest),
+                    !dirty.is_empty() || commits_ahead > 0,
+                ));
+            }
+        };
+        for record in records {
+            let mut parts = record.splitn(3, '\t');
+            let (Some(added), Some(removed), Some(raw_path)) =
+                (parts.next(), parts.next(), parts.next())
+            else {
+                return Ok(unavailable_work(
+                    "git_unavailable",
+                    Some(dirty_digest),
+                    !dirty.is_empty() || commits_ahead > 0,
+                ));
+            };
+            let Ok(path) = git_path(raw_path) else {
+                return Ok(unavailable_work(
+                    "git_unavailable",
+                    Some(dirty_digest),
+                    !dirty.is_empty() || commits_ahead > 0,
+                ));
+            };
+            if changed_paths.insert(path.clone()) && changed_paths.len() > WORK_DIFF_MAX_FILES {
+                return Ok(unavailable_work("cap_exceeded", Some(dirty_digest), true));
+            }
+            if added != "-" {
+                let Ok(value) = added.parse::<u64>() else {
+                    return Ok(unavailable_work(
+                        "git_unavailable",
+                        Some(dirty_digest),
+                        true,
+                    ));
+                };
+                insertions = insertions.saturating_add(value);
+            }
+            if removed != "-" {
+                let Ok(value) = removed.parse::<u64>() else {
+                    return Ok(unavailable_work(
+                        "git_unavailable",
+                        Some(dirty_digest),
+                        true,
+                    ));
+                };
+                deletions = deletions.saturating_add(value);
+            }
+            hash_digest_part(&mut diff_hasher, b"diff");
+            hash_digest_part(&mut diff_hasher, path.as_bytes());
+            hash_digest_part(&mut diff_hasher, added.as_bytes());
+            hash_digest_part(&mut diff_hasher, removed.as_bytes());
+        }
+        for (path, lines) in untracked_lines {
+            if !changed_paths.contains(&path) {
+                changed_paths.insert(path.clone());
+                if changed_paths.len() > WORK_DIFF_MAX_FILES {
+                    return Ok(unavailable_work("cap_exceeded", Some(dirty_digest), true));
+                }
+                insertions = insertions.saturating_add(lines);
+                hash_digest_part(&mut diff_hasher, b"untracked");
+                hash_digest_part(&mut diff_hasher, path.as_bytes());
+                hash_digest_part(&mut diff_hasher, &lines.to_le_bytes());
+            }
+        }
+        let files_changed = changed_paths.len() as u64;
+        let diff_digest = hex_digest(diff_hasher.finalize().as_slice());
+        Ok(GitWorkProbe {
+            available: true,
+            error: None,
+            commits_ahead: Some(commits_ahead),
+            files_changed: Some(files_changed),
+            insertions: Some(insertions),
+            deletions: Some(deletions),
+            diff_digest: Some(diff_digest),
+            dirty_digest: Some(dirty_digest),
+            has_changes: files_changed > 0 || !dirty.is_empty(),
+        })
     }
 
     /// Read actual workspace identity without masking it with frozen bindings.
@@ -1250,4 +1520,115 @@ fn null_device() -> &'static str {
 
 fn unavailable(message: &str) -> Error {
     Error::new("unavailable", message)
+}
+
+fn dirty_worktree_digest(
+    root: &Path,
+    dirty: &[GitPathStatus],
+) -> std::result::Result<(String, BTreeMap<String, u64>), &'static str> {
+    if dirty.len() > WORK_DIFF_MAX_FILES {
+        return Err("cap_exceeded");
+    }
+    let mut hasher = Sha256::new();
+    let mut untracked_lines = BTreeMap::new();
+    let mut total_bytes = 0_u64;
+    for entry in dirty {
+        hash_digest_part(&mut hasher, b"entry");
+        hash_digest_part(&mut hasher, entry.path.as_bytes());
+        hash_digest_part(&mut hasher, entry.status.as_bytes());
+        if let Some(orig) = &entry.original_path {
+            hash_digest_part(&mut hasher, orig.as_bytes());
+        }
+        let mut current = root.to_path_buf();
+        let parts: Vec<&str> = entry.path.split('/').collect();
+        let mut missing = false;
+        for (index, part) in parts.iter().enumerate() {
+            current.push(part);
+            let is_last = index + 1 == parts.len();
+            match fs::symlink_metadata(&current) {
+                Ok(meta) => {
+                    let link = meta.file_type().is_symlink() || is_reparse_point(&meta);
+                    if !is_last {
+                        if link || !meta.is_dir() {
+                            return Err("unavailable");
+                        }
+                        continue;
+                    }
+                    if link {
+                        let target = fs::read_link(&current).map_err(|_| "unavailable")?;
+                        hash_digest_part(&mut hasher, b"symlink");
+                        hash_digest_part(&mut hasher, target.to_string_lossy().as_bytes());
+                        if entry.status == "??" {
+                            untracked_lines.insert(entry.path.clone(), 0);
+                        }
+                    } else if meta.is_file() {
+                        let len = meta.len();
+                        if len > WORK_UNTRACKED_MAX_BYTES_PER_FILE
+                            || total_bytes.saturating_add(len) > WORK_UNTRACKED_MAX_TOTAL_BYTES
+                        {
+                            return Err("cap_exceeded");
+                        }
+                        let file = fs::File::open(&current).map_err(|_| "unavailable")?;
+                        let remaining = WORK_UNTRACKED_MAX_TOTAL_BYTES - total_bytes;
+                        let max_read = WORK_UNTRACKED_MAX_BYTES_PER_FILE.min(remaining);
+                        let mut bytes = Vec::with_capacity(len.min(max_read) as usize);
+                        file.take(max_read.saturating_add(1))
+                            .read_to_end(&mut bytes)
+                            .map_err(|_| "unavailable")?;
+                        if bytes.len() as u64 > max_read {
+                            return Err("cap_exceeded");
+                        }
+                        total_bytes = total_bytes.saturating_add(bytes.len() as u64);
+                        let content_hash = Sha256::digest(&bytes);
+                        hash_digest_part(&mut hasher, b"file");
+                        hash_digest_part(&mut hasher, &(bytes.len() as u64).to_le_bytes());
+                        hash_digest_part(&mut hasher, content_hash.as_slice());
+                        if entry.status == "??" {
+                            let lines = if bytes.contains(&0) {
+                                0
+                            } else {
+                                count_text_lines(&bytes)
+                            };
+                            untracked_lines.insert(entry.path.clone(), lines);
+                        }
+                    } else {
+                        hash_digest_part(&mut hasher, b"other");
+                        if entry.status == "??" {
+                            untracked_lines.insert(entry.path.clone(), 0);
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    missing = true;
+                    break;
+                }
+                Err(_) => return Err("unavailable"),
+            }
+        }
+        if missing {
+            hash_digest_part(&mut hasher, b"missing");
+        }
+    }
+    Ok((hex_digest(hasher.finalize().as_slice()), untracked_lines))
+}
+
+fn count_text_lines(bytes: &[u8]) -> u64 {
+    if bytes.is_empty() {
+        return 0;
+    }
+    let newlines = bytes.iter().filter(|byte| **byte == b'\n').count() as u64;
+    if bytes.ends_with(b"\n") {
+        newlines
+    } else {
+        newlines.saturating_add(1)
+    }
+}
+
+fn hash_digest_part(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }

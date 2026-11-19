@@ -7,7 +7,7 @@ use super::{
     observe::{build_report, child_capture_is_current, process_observation, source_is_unhealthy},
 };
 use crate::common::now_ms;
-use eliot_core::api::agent_state_name;
+use eliot_core::api::{agent_state_name, is_read_only_or_audit_profile};
 use eliot_core::{Agent, AgentState, Error, Result};
 use sha2::{Digest, Sha256};
 use std::{
@@ -442,6 +442,30 @@ fn incident_condition_cleared(
                 .is_some_and(|turn_id| key.turn_id.as_deref() != Some(turn_id));
             waiting || idle || turn_changed
         }
+        IncidentKind::CodeProgress => {
+            if captured.agent.state == AgentState::Stopped {
+                return true;
+            }
+            let progressed = captured
+                .code_progress
+                .as_ref()
+                .and_then(|cp| cp.last_code_progress_at)
+                .is_some_and(|at| at > incident.baseline_progress_at.unwrap_or(0));
+            if progressed {
+                return true;
+            }
+            if captured.source_healthy != Some(true) {
+                return false;
+            }
+            let idle =
+                captured.agent.state == AgentState::Idle && captured.agent.active_turn.is_none();
+            let turn_changed = captured
+                .agent
+                .active_turn
+                .as_deref()
+                .is_some_and(|turn_id| key.turn_id.as_deref() != Some(turn_id));
+            idle || turn_changed
+        }
     }
 }
 
@@ -588,6 +612,31 @@ pub(super) fn desired_incident(
                 turn_id: None,
             },
             activity_context(captured),
+        ));
+    }
+    let threshold_ms = i64::try_from(suspicion_window.as_millis()).ok()?;
+    if !is_read_only_or_audit_profile(&captured.agent)
+        && captured.agent.workspace.is_some()
+        && captured.agent.state == AgentState::Busy
+        && captured.source_healthy == Some(true)
+        && captured.agent.active_turn.is_some()
+        && captured.agent.pending.is_empty()
+        && matches!(
+            &captured.code_progress,
+            Some(cp) if cp.available && cp.last_code_progress_at.is_none()
+                || cp.last_code_progress_at
+                    .is_some_and(|at| now_ms().checked_sub(at).is_some_and(|age| age >= threshold_ms))
+        )
+    {
+        let activity = "no_code_progress".to_owned();
+        return Some((
+            IncidentKey {
+                agent: captured.agent.id.clone(),
+                generation: captured.agent.generation,
+                kind: IncidentKind::CodeProgress,
+                turn_id: captured.agent.active_turn.clone(),
+            },
+            activity,
         ));
     }
     let threshold_ms = i64::try_from(suspicion_window.as_millis()).ok()?;

@@ -3625,7 +3625,7 @@ impl Router {
         };
         // Heavy-work and growth readbacks stay advisory: a degraded journal
         // never fails the Agent view.
-        let (heavy, session_growth) = {
+        let (heavy, session_growth, work) = {
             let growth = self.inner.observe.lock_recover().growth;
             let store = self.inner.store.lock().await;
             (
@@ -3635,6 +3635,14 @@ impl Router {
                 store
                     .session_growth_view(&agent.harness, &agent.id, agent.generation, &growth)
                     .unwrap_or(None),
+                store
+                    .work_summary(
+                        &agent.id,
+                        agent.generation,
+                        agent.workspace.as_deref(),
+                        agent.active_turn.as_deref(),
+                    )
+                    .ok(),
             )
         };
         // Current model/effort overlay for `swarm show`: the latest
@@ -3679,6 +3687,7 @@ impl Router {
             config,
             heavy,
             session_growth,
+            work,
         })
         .map_err(|_| Error::new("internal", "Agent view could not be encoded"))
     }
@@ -3873,7 +3882,7 @@ impl Router {
         };
         // Heavy-work and growth readbacks stay advisory: a degraded journal
         // never fails the Agent view.
-        let (heavy, session_growth) = {
+        let (heavy, session_growth, work) = {
             let growth = self.inner.observe.lock_recover().growth;
             let store = self.inner.store.lock().await;
             (
@@ -3883,6 +3892,14 @@ impl Router {
                 store
                     .session_growth_view(&agent.harness, &agent.id, agent.generation, &growth)
                     .unwrap_or(None),
+                store
+                    .work_summary(
+                        &agent.id,
+                        agent.generation,
+                        agent.workspace.as_deref(),
+                        agent.active_turn.as_deref(),
+                    )
+                    .ok(),
             )
         };
         serde_json::to_value(AgentStatsResponse {
@@ -3892,6 +3909,7 @@ impl Router {
             session_usage,
             heavy,
             session_growth,
+            work,
         })
         .map_err(|_| Error::new("internal", "stats view could not be encoded"))
     }
