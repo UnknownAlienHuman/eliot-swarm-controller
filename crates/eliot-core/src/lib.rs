@@ -73,7 +73,7 @@ pub use observe::{
     split_windows_command_line, unwrap_shell_command, verified_harness,
 };
 pub use presentation::{count_words, origin_words, reason_message, reason_words};
-pub use remote_call::{RemoteCallContext, RemoteIdentity};
+pub use remote_call::{RemoteCallContext, RemoteIdentity, validate_remote_manager_instance};
 pub use routing::{
     CapacityScope, ProviderHold, ProviderHoldState, ProviderRestriction, ProviderRestrictionKind,
     RouteBinding, RouteQuotaStatus, RouteSkip, RouteSkipReason, RoutingDecision,

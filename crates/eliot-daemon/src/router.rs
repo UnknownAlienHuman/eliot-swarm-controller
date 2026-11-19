@@ -18,6 +18,7 @@ pub(crate) mod launch_queue;
 mod organization;
 mod overview;
 mod project_assignment;
+mod remote_manager;
 mod resolution;
 mod routing;
 mod rules;
@@ -185,6 +186,12 @@ enum Principal {
     },
     Run {
         run_command_id: String,
+    },
+    /// A verified cloud MCP call through a configured delegated grant. Its
+    /// authority is the project its current assignment names, never Owner.
+    RemoteManager {
+        instance: String,
+        grant_revision: i64,
     },
 }
 struct EventFilter {
@@ -851,6 +858,12 @@ impl Router {
     ) -> Result<Value> {
         let mut request: CommandSubmitRequest =
             eliot_core::api::discovery::decode_params(params.clone())?;
+        // A delegated remote manager passes its own narrow gate first, so no
+        // verb-specific path below sees it with a wider shape.
+        if matches!(principal, Principal::RemoteManager { .. }) {
+            let store = self.inner.store.lock().await;
+            remote_manager::authorize_remote_submit(&store, principal, &mut request)?;
+        }
         if request.verb == "git.fetch" {
             return self.submit_git_fetch(request, principal, remote).await;
         }
@@ -2096,7 +2109,10 @@ impl Router {
         principal: &Principal,
         request: &SubmitCommand,
     ) -> Result<bool> {
-        if !matches!(principal, Principal::Owner) {
+        if !matches!(
+            principal,
+            Principal::Owner | Principal::RemoteManager { .. }
+        ) {
             return Ok(false);
         }
         if request.args.get("parent").is_some() {
@@ -3246,7 +3262,8 @@ impl Router {
             }
             Principal::Run { .. }
             | Principal::ProjectRule { .. }
-            | Principal::MemoryInference { .. } => {
+            | Principal::MemoryInference { .. }
+            | Principal::RemoteManager { .. } => {
                 return Err(Error::new(
                     "not_allowed",
                     "heavy work needs the owner or an Agent principal",
@@ -3925,7 +3942,8 @@ impl Router {
                 }
                 Principal::Run { .. }
                 | Principal::ProjectRule { .. }
-                | Principal::MemoryInference { .. } => {
+                | Principal::MemoryInference { .. }
+                | Principal::RemoteManager { .. } => {
                     return Err(Error::new(
                         "not_allowed",
                         "usage summary needs the owner or an Agent principal",
@@ -3984,6 +4002,31 @@ impl Router {
                     })?;
                     store.list_agent_summaries_scoped(
                         &caller,
+                        &filter,
+                        request.after.as_deref(),
+                        limit,
+                        now_ms(),
+                        &self.inner.observe.lock_recover().growth,
+                    )?
+                }
+                Principal::RemoteManager { .. } => {
+                    let project = remote_manager::remote_project(&store, principal)?
+                        .ok_or_else(|| Error::new("internal", "remote list without a project"))?;
+                    if filter
+                        .project
+                        .as_deref()
+                        .is_some_and(|other| other != project)
+                    {
+                        return Err(Error::new(
+                            "not_allowed",
+                            "Agent list is outside the remote manager's project",
+                        ));
+                    }
+                    let filter = AgentListFilter {
+                        project: Some(project),
+                        ..filter
+                    };
+                    store.list_agent_summaries(
                         &filter,
                         request.after.as_deref(),
                         limit,
@@ -4281,7 +4324,7 @@ impl Router {
                     "Run credentials may call only command.get",
                 ));
             }
-            Principal::ProjectRule { .. } => {
+            Principal::ProjectRule { .. } | Principal::RemoteManager { .. } => {
                 return Err(Error::new(
                     "not_allowed",
                     "project rule authority cannot wait on tasks",
@@ -6881,6 +6924,10 @@ fn principal_name(principal: &Principal) -> String {
         Principal::Agent { id, generation } => format!("agent:{id}:{generation}"),
         Principal::ProjectRule { registration } => format!("project:{}", registration.id),
         Principal::Run { run_command_id, .. } => format!("run:{run_command_id}"),
+        Principal::RemoteManager {
+            instance,
+            grant_revision,
+        } => format!("remote:{instance}:{grant_revision}"),
     }
 }
 

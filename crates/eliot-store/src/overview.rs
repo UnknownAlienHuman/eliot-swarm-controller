@@ -154,6 +154,11 @@ fn read_fleet(conn: &Connection, limits: &ScopeLimits) -> Result<(FleetTotals, O
             ),
             [],
         )?,
+        remote_manager_total: count(
+            conn,
+            "SELECT COUNT(*) FROM project_assignments WHERE remote_instance IS NOT NULL",
+            [],
+        )?,
         worker_total: count(
             conn,
             &format!(

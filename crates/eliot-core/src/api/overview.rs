@@ -339,8 +339,14 @@ pub struct FleetTotals {
     pub queued_work: usize,
     #[schemars(description = "Capacity holders retained in lost, stopped or failed.")]
     pub retained_unknown: usize,
+    #[schemars(description = "Local manager Agents holding a project assignment.")]
     #[serde(default)]
     pub manager_total: usize,
+    #[schemars(
+        description = "Delegated remote manager grants holding a project assignment; never Agents, PIDs or capacity holders."
+    )]
+    #[serde(default)]
+    pub remote_manager_total: usize,
     #[serde(default)]
     pub worker_total: usize,
     #[serde(default)]

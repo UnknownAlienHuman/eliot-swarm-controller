@@ -21,6 +21,32 @@ pub struct RemoteCallContext {
     pub call_id: String,
     pub mcp_request_id: Option<Value>,
     pub expires_at: u64,
+    /// Delegated remote manager grant selected by the connector URL that the
+    /// owner configured. Absent means the default Owner mode. Never selected by
+    /// tool arguments and never a credential: Access stays the authentication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manager: Option<String>,
+}
+
+/// Syntax of a delegated remote manager grant instance: the `[cloud_mcp.managers]`
+/// key and the connector URL's `manager` query value. Lowercase ASCII letters,
+/// digits and `-`, starting with a letter or digit, at most 64 bytes, so the
+/// `remote:<instance>:<revision>` principal stays unambiguous.
+pub fn validate_remote_manager_instance(instance: &str) -> Result<()> {
+    let valid = !instance.is_empty()
+        && instance.len() <= 64
+        && instance
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !instance.starts_with('-');
+    if valid {
+        Ok(())
+    } else {
+        Err(Error::new(
+            "invalid",
+            "remote manager instance must be 1-64 lowercase letters, digits or '-'",
+        ))
+    }
 }
 
 impl RemoteCallContext {
@@ -41,6 +67,10 @@ impl RemoteCallContext {
             })
         {
             return Err(Error::new("not_allowed", "invalid remote call context"));
+        }
+        if let Some(manager) = &self.manager {
+            validate_remote_manager_instance(manager)
+                .map_err(|_| Error::new("not_allowed", "invalid remote call context"))?;
         }
         Ok(())
     }

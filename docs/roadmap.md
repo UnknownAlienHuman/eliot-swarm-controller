@@ -109,6 +109,12 @@ Checked layers record delivered increments, not full crash/load qualification.
   detaches and tags under the link revision it read; a capacity refusal offers Queue
   it, and a lost Queue it reply resolves its intent before the draft returns.
   Legacy path labels stay in the no-project bucket; history is not reinterpreted.
+- [x] **6. Remote delegated managers.** A cloud MCP connector URL with
+  `?manager=<instance>` selects a configured `[cloud_mcp.managers]` grant bound to
+  the verified Access subject. The Owner assigns it to one project through the
+  existing assignment epoch (schema v67). Its calls carry that project's manager
+  scope, never Owner, and admission and dispatch recheck the assignment. Owner mode
+  stays the default.
 
 ## L0 — Archive and smallest workspace
 

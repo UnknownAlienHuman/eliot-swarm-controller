@@ -70,6 +70,20 @@ impl Store {
         read_assignment(&self.connection, project)
     }
 
+    /// The registered project a delegated remote manager principal currently
+    /// manages, read from its assignment. `None` for every other principal;
+    /// a remote principal without a current assignment is refused, so a
+    /// released, transferred or re-keyed grant loses its project scope.
+    pub fn remote_manager_project(&self, principal: &str) -> Result<Option<String>> {
+        self.ensure_committed_reads()?;
+        match remote_principal(principal)? {
+            Some((instance, revision)) => {
+                current_remote_project(&self.connection, instance, revision).map(Some)
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Whether a worktree path is currently bound to a project manager
     /// assignment. Cleanup planning and worktree removal both refuse bound
     /// paths; release unbinds them.
@@ -85,14 +99,52 @@ impl Store {
         now: i64,
     ) -> Result<Change<ProjectAssignmentResult>> {
         request.validate()?;
+        refuse_remote_caller(principal)?;
         let write = AssignmentWrite::new(&request.id, CLAIM, principal, request, now)?;
         self.change_project_assignment(write, |tx| {
             let (registration, caller) = authorize_project(tx, principal, &request.project)?;
             let (id, generation) = match (&request.manager, &caller) {
-                (Some(ProjectManagerIdentity::Remote { .. }), _) => {
+                (
+                    Some(ProjectManagerIdentity::Remote {
+                        instance,
+                        grant_revision,
+                    }),
+                    None,
+                ) => {
+                    let current = read_assignment(tx, &request.project)?;
+                    if current.manager.is_some() {
+                        return Ok((
+                            assignment_result(current, ProjectAssignmentOutcome::Occupied),
+                            Vec::new(),
+                        ));
+                    }
+                    let held: Option<String> = tx
+                        .query_row(
+                            "SELECT project FROM project_assignments WHERE remote_instance = ?1",
+                            [instance],
+                            |row| row.get(0),
+                        )
+                        .optional()
+                        .map_err(sql_error)?;
+                    if held.is_some() {
+                        return Err(Error::new(
+                            "not_allowed",
+                            "a remote manager grant holds at most one project assignment",
+                        ));
+                    }
+                    write_remote_assignment(tx, &current, instance, *grant_revision)?;
+                    return Ok((
+                        assignment_result(
+                            read_assignment(tx, &request.project)?,
+                            ProjectAssignmentOutcome::Claimed,
+                        ),
+                        Vec::new(),
+                    ));
+                }
+                (Some(ProjectManagerIdentity::Remote { .. }), Some(_)) => {
                     return Err(Error::new(
-                        "unsupported",
-                        "remote manager grants are not supported",
+                        "not_allowed",
+                        "only the Owner assigns a remote manager grant",
                     ));
                 }
                 (Some(ProjectManagerIdentity::Local { agent, generation }), _) => {
@@ -269,6 +321,7 @@ impl Store {
         now: i64,
     ) -> Result<Change<ProjectAssignmentResult>> {
         request.validate()?;
+        refuse_remote_caller(principal)?;
         let write = AssignmentWrite::new(&request.id, RELEASE, principal, request, now)?;
         self.change_project_assignment(write, |tx| {
             let (_, caller) = authorize_project(tx, principal, &request.project)?;
@@ -355,6 +408,20 @@ fn authorize_project(
     principal: &str,
     project: &str,
 ) -> Result<(core::api::ProjectRegistrationView, Option<Agent>)> {
+    // A remote manager reads only its own project. Claim and release refuse
+    // remote callers before they get here, so `None` never grants it the
+    // Owner's assignment writes.
+    if let Some((instance, revision)) = remote_principal(principal)? {
+        if current_remote_project(conn, instance, revision)? != project {
+            return Err(Error::new(
+                "not_allowed",
+                "assignment is outside the remote manager's project",
+            ));
+        }
+        let registration = projects::project_registration_tx(conn, project)?
+            .ok_or_else(|| Error::new("not_found", "project registration was not found"))?;
+        return Ok((registration, None));
+    }
     let caller = match hierarchy::parse_caller(conn, principal)? {
         hierarchy::Caller::Owner => None,
         hierarchy::Caller::Agent { num, .. } => {
@@ -433,7 +500,18 @@ pub(super) fn read_assignment(conn: &Connection, project: &str) -> Result<Projec
         .optional()
         .map_err(sql_error)?
         .unwrap_or_default();
-    let (manager, state) = if let Some((num, generation)) = num.zip(generation) {
+    let remote = load_remote(conn, project)?;
+    let (manager, state) = if let Some((instance, grant_revision)) = remote {
+        // A remote grant has no local process to observe: it stays active
+        // until the Owner releases or reassigns it.
+        (
+            Some(ProjectManagerIdentity::Remote {
+                instance,
+                grant_revision,
+            }),
+            ProjectAssignmentState::Active,
+        )
+    } else if let Some((num, generation)) = num.zip(generation) {
         let state = match state.as_deref() {
             Some("unknown") => ProjectAssignmentState::Blocked,
             Some("accepted" | "queued" | "dispatched") => ProjectAssignmentState::Starting,
@@ -482,10 +560,134 @@ pub(super) fn write_next_assignment(
          ON CONFLICT(project) DO UPDATE SET manager=excluded.manager,
              manager_generation=excluded.manager_generation, epoch=excluded.epoch,
              revision=excluded.revision, start_command=excluded.start_command,
+             remote_instance=NULL, remote_revision=NULL,
              workspace_path=CASE WHEN excluded.manager IS NOT NULL THEN workspace_path END,
              workspace_adopted=CASE WHEN excluded.manager IS NULL THEN 0 ELSE workspace_adopted END",
         params![current.project,manager,generation,epoch,revision,start],
     ));
+    Ok(())
+}
+
+/// Assign a delegated remote manager grant: the same row, epoch and revision
+/// advance as a local manager, with no local manager, workspace or start.
+fn write_remote_assignment(
+    tx: &Transaction<'_>,
+    current: &ProjectAssignment,
+    instance: &str,
+    grant_revision: i64,
+) -> Result<()> {
+    write_next_assignment(tx, current, None, None)?;
+    db!(tx.execute(
+        "UPDATE project_assignments SET remote_instance=?1, remote_revision=?2 WHERE project=?3",
+        params![instance, grant_revision, current.project],
+    ));
+    Ok(())
+}
+
+fn load_remote(conn: &Connection, project: &str) -> Result<Option<(String, i64)>> {
+    conn.query_row(
+        "SELECT remote_instance, remote_revision FROM project_assignments
+         WHERE project=?1 AND remote_instance IS NOT NULL",
+        [project],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+    .map_err(sql_error)
+}
+
+/// `remote:<instance>:<grant revision>`, the Router's principal name for a
+/// delegated remote manager call. Any other principal is `None`.
+pub(super) fn remote_principal(principal: &str) -> Result<Option<(&str, i64)>> {
+    let Some(rest) = principal.strip_prefix("remote:") else {
+        return Ok(None);
+    };
+    let invalid = || Error::new("not_allowed", "remote manager principal is invalid");
+    let (instance, revision) = rest.split_once(':').ok_or_else(invalid)?;
+    core::validate_remote_manager_instance(instance).map_err(|_| invalid())?;
+    let revision = revision
+        .parse::<i64>()
+        .ok()
+        .filter(|revision| *revision > 0)
+        .ok_or_else(invalid)?;
+    Ok(Some((instance, revision)))
+}
+
+fn refuse_remote_caller(principal: &str) -> Result<()> {
+    if remote_principal(principal)?.is_some() {
+        return Err(Error::new(
+            "not_allowed",
+            "a remote manager cannot change project assignments",
+        ));
+    }
+    Ok(())
+}
+
+/// The project whose current assignment names this exact grant revision.
+fn current_remote_project(conn: &Connection, instance: &str, revision: i64) -> Result<String> {
+    conn.query_row(
+        "SELECT project FROM project_assignments WHERE remote_instance=?1 AND remote_revision=?2",
+        params![instance, revision],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(sql_error)?
+    .ok_or_else(|| {
+        Error::new(
+            "not_allowed",
+            "remote manager grant has no current project assignment",
+        )
+    })
+}
+
+/// Delegated remote manager authority, checked when a command is admitted
+/// and again immediately before dispatch: its current assignment names the
+/// grant revision, and the command launches a root Agent of that project or
+/// controls an existing non-chat Agent there. Owner mode never reaches here.
+fn enforce_remote(
+    conn: &Connection,
+    principal: &str,
+    verb: &str,
+    target: Option<i64>,
+) -> Result<()> {
+    let Some((instance, revision)) = remote_principal(principal)? else {
+        return Ok(());
+    };
+    let project = current_remote_project(conn, instance, revision)?;
+    if !core::api::REMOTE_MANAGER_VERBS.contains(&verb) {
+        return Err(Error::new(
+            "not_allowed",
+            "a remote manager may launch, send, steer, interrupt or stop only",
+        ));
+    }
+    let agent = target
+        .map(|num| load_agent_by_num(conn, num))
+        .transpose()?
+        .flatten()
+        .ok_or_else(|| {
+            Error::new(
+                "not_allowed",
+                "a remote manager command needs an Agent of its project",
+            )
+        })?;
+    if agent.project != project || agent.chat || agent.observe_only {
+        return Err(Error::new(
+            "not_allowed",
+            "command is outside the remote manager's project",
+        ));
+    }
+    if verb == "launch" {
+        let registration = projects::project_registration_tx(conn, &project)?
+            .ok_or_else(|| Error::new("not_allowed", "remote manager project is unregistered"))?;
+        if agent.parent.is_some()
+            || !registration.actions.iter().any(|action| action == "launch")
+            || !registration.profiles.contains(&agent.profile)
+        {
+            return Err(Error::new(
+                "not_allowed",
+                "a remote manager launches root Agents with the project's approved profiles",
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -634,6 +836,9 @@ struct Binding {
     epoch: i64,
     manager: Option<i64>,
     generation: Option<i64>,
+    /// `remote:<instance>:<revision>` of a delegated remote manager.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    remote: Option<String>,
 }
 
 struct EffectContext {
@@ -687,11 +892,14 @@ fn effect_context(
             && !projects.iter().any(|b: &Binding| b.project == project)
             && let Some((manager, generation, epoch, _)) = load_row(conn, project)?
         {
+            let remote = load_remote(conn, project)?
+                .map(|(instance, revision)| format!("remote:{instance}:{revision}"));
             projects.push(Binding {
                 project: project.to_owned(),
                 epoch,
                 manager,
                 generation,
+                remote,
             });
         }
     }
@@ -717,7 +925,10 @@ fn enforce_agent(
     hierarchy::parse_caller(conn, principal)?;
     project_transfer::fence(conn, principal, "coordination", Some(caller), None)?;
     for binding in bindings {
-        let eligible = if let Some((num, generation)) = binding.manager.zip(binding.generation) {
+        let eligible = if binding.remote.is_some() {
+            // A remote manager has no Agent row: its team is the project.
+            caller.project == binding.project && target.is_none_or(|a| a.project == binding.project)
+        } else if let Some((num, generation)) = binding.manager.zip(binding.generation) {
             let manager = format_agent_id(num);
             let registration = projects::project_registration_tx(conn, &binding.project)?;
             registration.is_some()
@@ -751,6 +962,20 @@ fn enforce_launch(
     target: Option<&Agent>,
     bindings: &[Binding],
 ) -> Result<()> {
+    if verb == "launch"
+        && let Some(agent) = target
+        && agent.parent.is_none()
+        && let Some(binding) = bindings
+            .iter()
+            .find(|binding| binding.project == agent.project)
+        && let Some(remote) = &binding.remote
+        && remote != principal
+    {
+        return Err(Error::new(
+            "assignment_occupied",
+            "project has a remote manager; only it starts new root Agents",
+        ));
+    }
     if matches!(verb, "launch" | "resume")
         && let Some(agent) = target
         && let Some(binding) = bindings
@@ -772,6 +997,7 @@ pub(super) fn capture_binding(
     tx: &Transaction<'_>,
     command: &CommandInsert<'_>,
 ) -> Result<Option<String>> {
+    enforce_remote(tx, command.principal, command.verb, command.target)?;
     let EffectContext {
         mut projects,
         caller,
@@ -912,6 +1138,12 @@ pub(super) fn check_dispatch(conn: &Connection, command: &CommandRecord) -> Resu
             }
         }
     }
+    enforce_remote(
+        conn,
+        &command.command.principal,
+        &command.command.verb,
+        command.target,
+    )?;
     let EffectContext {
         projects,
         caller,

@@ -350,10 +350,50 @@ is created for a remote caller.
 
 The private owner credential authenticates the bridge's typed
 [`RemoteCallContext`](../../crates/eliot-core/src/remote_call.rs) to Router. Router
-revalidates its configured issuer/AUD, expiry and RPC call-id binding, applies the
-existing Owner authority, and echoes the context with the RPC result; HTTP tool
-results expose it as `structuredContent.remote_call`. This is provenance for the
-existing owner-only app, not additional roles or per-user permissions. Standard
+revalidates its configured issuer/AUD, expiry and RPC call-id binding and echoes the
+context with the RPC result; HTTP tool results expose it as
+`structuredContent.remote_call`. Two modes share that path:
+
+- **Owner mode** (default): the connector URL is `https://<hostname>/mcp`. Router
+  applies the existing Owner authority; the context is provenance for the owner-only
+  app, not a role or per-user permission.
+- **Delegated mode**: the connector URL is `https://<hostname>/mcp?manager=<instance>`,
+  naming a grant configured in [`[cloud_mcp.managers]`](configuration.md#later-configuration-example).
+  The origin refuses any other query. The grant travels as
+  `RemoteCallContext.manager`; it is selected only by the URL the owner configures,
+  never by tool arguments, and it is not a credential. Router requires the grant's
+  configured subject to equal the verified Access subject and authenticates the call
+  as that grant (`remote:<instance>:<revision>`), never as Owner. A stateful SDK
+  session keeps the grant it was initialized with; a request naming another grant
+  or Owner mode on it is forbidden like another subject. Delegated sessions get no
+  owner-event notifications.
+
+A delegated grant manages exactly the project whose current
+[assignment](#project-manager-assignments) names that instance and revision. The
+Owner assigns it with `project.assignment.claim` and
+`manager: {kind: "remote", instance, grant_revision}`; the revision must match the
+configured one. One grant holds at most one project. Owner release or reassignment
+revokes it; a grant without a current assignment is refused on every call. The
+binding lives in the Store, so a stateless reconnect, session or token expiry and a
+daemon restart keep it. The grant may call `api.identity`, `api.methods`, `api.help`,
+`command.submit`, `command.get`, `agent.get`, `agent.list`, `agent.result` and
+`project.assignment.get`. Reads stay inside its project, and `agent.list` is
+filtered to it. It may submit `launch`, `send`, `steer`, `interrupt` and `stop`
+([`REMOTE_MANAGER_VERBS`](../../crates/eliot-core/src/api/project_assignment.rs)).
+A launch starts a root Agent of the project with one of its approved profiles and
+requires the project's `launch` action. An omitted workspace is the registered
+checkout, and top-level worktree policy applies as for Owner launches. Every other
+command targets one existing non-chat Agent of the project. Store admission checks
+the grant's current assignment, the project and the profile in the transaction that
+persists the command. Dispatch rechecks them, and the retained assignment epoch,
+immediately before any native or workspace effect, including for queued commands. A
+cross-project command is refused before any effect. In a remote-managed project
+only that grant starts new root Agents. Agents of the project coordinate as its
+team. Remote grants are not Agents: they create no PID, slot or capacity holder, and
+`project.overview` counts them as `fleet.remote_manager_total` apart from local
+`manager_total`.
+
+Standard
 `command.submit` admission persists the context in the existing command cause and
 every associated new admission event (including `agent.created`)
 before commit and publication. Direct, live-rule, catch-up and script admission use
@@ -489,9 +529,12 @@ latest record, including its current workspace and start command ID when present
 A confirmed preparation failure or cancellation leaves a vacant record. An
 unknown preparation reads as blocked, with the outcome on the start command.
 Owner release revokes that assignment at its epoch and retains the preparation
-receipt and unknown outcome. Remote assignment is
-unsupported. CLI callers use `swarm project assignment get|claim|launch|release`.
-An explicit Owner claim supplies the Agent ID and generation. A scoped claim
+receipt and unknown outcome. The Owner may also assign a configured delegated
+remote manager grant ([MCP StreamableHTTP server](#mcp-streamablehttp-server));
+project transfer to or from a remote grant is unsupported, so the Owner releases and
+reassigns instead. CLI callers use `swarm project assignment get|claim|launch|release`.
+An explicit Owner claim supplies the Agent ID and generation, or
+`--remote <instance> --grant-revision <n>` for a remote grant. A scoped claim
 omits the manager to select the caller. The project action
 `project.assignment.claim` grants self-claim under the configured profile allowlist.
 For transfer, use `swarm project transfer <project> --revision <revision> begin|launch|commit|cancel`.

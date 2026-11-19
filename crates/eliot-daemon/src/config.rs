@@ -680,6 +680,53 @@ struct CloudMcpSettings {
     hostname: String,
     access_team_name: String,
     access_audience_tag: String,
+    /// Delegated remote manager grants keyed by instance. Absent keeps the
+    /// endpoint in its default Owner mode.
+    #[serde(default)]
+    managers: BTreeMap<String, RemoteManagerSettings>,
+}
+
+/// One delegated remote manager grant: the verified Access subject allowed to
+/// use the instance and the grant revision a project assignment names.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteManagerSettings {
+    subject: String,
+    revision: i64,
+}
+
+fn validate_remote_managers(
+    managers: &BTreeMap<String, RemoteManagerSettings>,
+) -> core::Result<()> {
+    for (instance, grant) in managers {
+        core::validate_remote_manager_instance(instance).map_err(|_| {
+            core::Error::new(
+                "profile_error",
+                format!(
+                    "[cloud_mcp.managers.{instance}] needs 1-64 lowercase letters, digits or '-'"
+                ),
+            )
+        })?;
+        if grant.subject.is_empty()
+            || grant.subject.len() > 512
+            || grant.subject.chars().any(char::is_control)
+            || grant.subject.trim() != grant.subject
+        {
+            return Err(core::Error::new(
+                "profile_error",
+                format!(
+                    "[cloud_mcp.managers.{instance}] subject must be the verified Access subject"
+                ),
+            ));
+        }
+        if grant.revision < 1 {
+            return Err(core::Error::new(
+                "profile_error",
+                format!("[cloud_mcp.managers.{instance}] revision must be positive"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Store-size threshold for the unbounded-retention advisory: `daemon.status`
@@ -1590,6 +1637,7 @@ pub(crate) fn load_cloud_mcp_config(
     let Some(settings) = config.cloud_mcp else {
         return Ok(None);
     };
+    validate_remote_managers(&settings.managers)?;
     let http_mcp_executable = std::env::current_exe().map_err(|_| {
         core::Error::new(
             "platform_io",
@@ -1622,6 +1670,26 @@ pub fn load_cloud_access_config(data_root: &Path) -> core::Result<(String, Strin
         format!("https://{}.cloudflareaccess.com", config.access_team_name),
         config.access_audience_tag,
     ))
+}
+
+/// The configured delegated remote manager grant for `instance` as its
+/// verified Access subject and grant revision, read on every remote call
+/// like the Access binding. `None` when cloud MCP or the instance is absent.
+pub(crate) fn load_remote_manager_grant(
+    data_root: &Path,
+    instance: &str,
+) -> core::Result<Option<(String, i64)>> {
+    let Some((config, _)) = read_config(data_root)? else {
+        return Ok(None);
+    };
+    let Some(settings) = config.cloud_mcp else {
+        return Ok(None);
+    };
+    validate_remote_managers(&settings.managers)?;
+    Ok(settings
+        .managers
+        .get(instance)
+        .map(|grant| (grant.subject.clone(), grant.revision)))
 }
 
 pub(crate) fn load_mail_config(data_root: &Path) -> core::Result<MailConfig> {

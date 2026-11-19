@@ -90,7 +90,8 @@ The snapshot exposes no child PID and does not create a local Agent, fake
 cloud-Agent PID, persistence table, or generic service registry.
 
 Cloudflare Access authenticates the remote caller and forwards its signed assertion.
-The HTTP verifier binds the verified subject to the SDK session and carries nonsecret
+The HTTP verifier binds the verified subject, and the delegated grant selected by
+the connector URL's `manager` query, to the SDK session and carries nonsecret
 connection/call provenance through the existing authenticated Router path, as owned
 by [the API](api.md#mcp-streamablehttp-server). It does not derive identity from
 `clientInfo` or process metadata. The process module owns custody, not an OAuth or

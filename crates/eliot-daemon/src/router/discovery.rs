@@ -367,6 +367,8 @@ fn visible(method: &Method, principal: &Principal) -> bool {
     match principal {
         Principal::Owner => true,
         Principal::Agent { .. } => !method.owner_only,
+        // The RPC gate above already narrowed this principal to its methods.
+        Principal::RemoteManager { .. } => true,
         // These principals have no discovery RPC authority. Keep the helper
         // conservative even when used internally; do not broaden their gate.
         Principal::Run { .. }
@@ -423,6 +425,18 @@ impl Router {
                     principal:"agent".to_owned(), agent_id:Some(id.clone()), generation:Some(*generation),
                     allowed_scopes:vec!["global".to_owned(), format!("project:{}", agent.project_scope()), format!("mailbox:{id}")],
                     limits:"Variables default to your project. Global variables are read-only for Agents; other-project variables reject. agent.list follows your frozen control scope (self, subtree, or project); event visibility is self-scoped. Mail send addresses concrete Agents; mailbox reads/acks are self-only. Agent control/read visibility and approved child profiles remain checked at the existing authority boundaries.".to_owned(),
+                })
+            }
+            Principal::RemoteManager { instance, grant_revision } => {
+                let project = {
+                    let store = self.inner.store.lock().await;
+                    super::remote_manager::remote_project(&store, principal)?
+                }
+                .ok_or_else(|| Error::new("internal", "remote identity without a project"))?;
+                Ok(IdentityResponse {
+                    principal: "remote_manager".to_owned(), agent_id: None, generation: None,
+                    allowed_scopes: vec![format!("project:{project}")],
+                    limits: format!("Delegated remote manager grant {instance} (revision {grant_revision}) for project {project}: launch root Agents with the project's approved profiles, and send, steer, interrupt or stop that project's Agents; reads stay inside the project. The current project assignment is checked at admission and again before dispatch; Owner methods are refused."),
                 })
             }
             _ => Err(Error::new("not_allowed", "principal has no discovery authority")),

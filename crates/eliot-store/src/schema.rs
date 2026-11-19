@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 66;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 67;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -1566,6 +1566,26 @@ impl Store {
             tx.execute_batch(
                 "ALTER TABLE chat_organization ADD COLUMN continued_from TEXT;
                  INSERT INTO schema_migrations(version) VALUES (66);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 67 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            // A delegated remote manager grant holds a project assignment
+            // through the same row, epoch and revision as a local manager.
+            // It is never an Agent: the local manager columns stay NULL. One
+            // grant instance holds at most one project.
+            tx.execute_batch(
+                "ALTER TABLE project_assignments ADD COLUMN remote_instance TEXT;
+                 ALTER TABLE project_assignments ADD COLUMN remote_revision INTEGER
+                     CHECK(remote_revision IS NULL OR remote_revision > 0);
+                 CREATE UNIQUE INDEX project_assignments_remote
+                     ON project_assignments(remote_instance) WHERE remote_instance IS NOT NULL;
+                 INSERT INTO schema_migrations(version) VALUES (67);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;

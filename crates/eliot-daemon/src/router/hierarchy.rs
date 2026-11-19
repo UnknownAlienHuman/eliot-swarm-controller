@@ -506,6 +506,10 @@ pub(super) fn authorize_command_read(
     principal: &Principal,
     command: &Command,
 ) -> Result<()> {
+    if matches!(principal, Principal::RemoteManager { .. }) {
+        let target = command.target.as_deref().ok_or_else(not_allowed_scope)?;
+        return super::remote_manager::authorize_remote_agent_read(store, principal, target);
+    }
     match authorize_command_read_self(principal, command) {
         Ok(()) => Ok(()),
         Err(error) => {
@@ -529,6 +533,9 @@ pub(super) fn authorize_agent_read(
     id: &str,
     generation: Option<i64>,
 ) -> Result<()> {
+    if matches!(principal, Principal::RemoteManager { .. }) {
+        return super::remote_manager::authorize_remote_agent_read(store, principal, id);
+    }
     match authorize_agent_read_self(principal, id, generation) {
         Ok(()) => Ok(()),
         Err(error) => {

@@ -1505,10 +1505,16 @@ pub(crate) enum ProjectAssignmentCommand {
     /// Claim as the current Agent, or explicitly name an Agent as Owner.
     Claim {
         project: String,
-        #[arg(long, requires = "generation")]
+        #[arg(long, requires = "generation", conflicts_with = "remote")]
         agent: Option<String>,
         #[arg(long, requires = "agent", value_parser = clap::value_parser!(i64).range(1..))]
         generation: Option<i64>,
+        /// As Owner, assign a configured `[cloud_mcp.managers]` grant instance.
+        #[arg(long, requires = "grant_revision")]
+        remote: Option<String>,
+        /// The configured revision of the `--remote` grant.
+        #[arg(long, requires = "remote", value_parser = clap::value_parser!(i64).range(1..))]
+        grant_revision: Option<i64>,
     },
     /// Reserve and launch the manager using an approved profile.
     Launch {

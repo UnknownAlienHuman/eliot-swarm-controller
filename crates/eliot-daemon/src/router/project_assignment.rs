@@ -1,8 +1,8 @@
 use super::*;
 use eliot_core::api::{
     ProjectAssignmentClaimRequest, ProjectAssignmentGetRequest, ProjectAssignmentLaunchRequest,
-    ProjectAssignmentReleaseRequest, ProjectTransferAction, ProjectTransferOutcome,
-    ProjectTransferRequest, discovery::decode_params,
+    ProjectAssignmentReleaseRequest, ProjectManagerIdentity, ProjectTransferAction,
+    ProjectTransferOutcome, ProjectTransferRequest, discovery::decode_params,
 };
 
 impl Router {
@@ -93,6 +93,24 @@ impl Router {
         principal: &Principal,
     ) -> Result<Value> {
         let request: ProjectAssignmentClaimRequest = decode_params(params.clone())?;
+        request.validate()?;
+        // The Owner assigns a delegated grant only as configured: the same
+        // instance and revision the cloud MCP calls will authenticate with.
+        if let Some(ProjectManagerIdentity::Remote {
+            instance,
+            grant_revision,
+        }) = &request.manager
+        {
+            require_owner(principal)?;
+            let configured =
+                crate::config::load_remote_manager_grant(&self.inner.data_root, instance)?;
+            if configured.as_ref().map(|(_, revision)| revision) != Some(grant_revision) {
+                return Err(Error::new(
+                    "not_found",
+                    "remote manager grant revision is not configured in [cloud_mcp.managers]",
+                ));
+            }
+        }
         let mut store = self.inner.store.lock().await;
         let change = store.claim_project_manager(&principal_name(principal), &request, now_ms())?;
         self.publish_locked(&change.events);

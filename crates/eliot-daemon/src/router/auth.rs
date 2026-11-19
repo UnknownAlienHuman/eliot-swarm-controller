@@ -121,6 +121,35 @@ impl Router {
                                 "remote context is expired or has a different Access binding",
                             ));
                         }
+                        // Delegated mode: the connector URL selected a grant.
+                        // It must be configured for this verified subject;
+                        // the call then carries that grant, never Owner.
+                        if let Some(instance) = remote.manager {
+                            let (subject, grant_revision) =
+                                crate::config::load_remote_manager_grant(
+                                    &self.inner.data_root,
+                                    &instance,
+                                )?
+                                .ok_or_else(|| {
+                                    Error::new(
+                                        "not_allowed",
+                                        "remote manager grant is not configured",
+                                    )
+                                })?;
+                            if !secure_eq(&subject, &remote.identity.subject) {
+                                return Err(Error::new(
+                                    "not_allowed",
+                                    "remote manager grant belongs to another Access subject",
+                                ));
+                            }
+                            return Ok((
+                                Principal::RemoteManager {
+                                    instance,
+                                    grant_revision,
+                                },
+                                payload,
+                            ));
+                        }
                     }
                     Ok((Principal::Owner, payload))
                 } else {
@@ -233,6 +262,14 @@ pub(super) fn authorize_rpc_method(principal: &Principal, method: &str) -> Resul
         return Err(Error::new(
             "not_allowed",
             "inference requires a Memory principal",
+        ));
+    }
+    if matches!(principal, Principal::RemoteManager { .. })
+        && !super::remote_manager::REMOTE_MANAGER_METHODS.contains(&method)
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "a delegated remote manager may manage only its project's Agents",
         ));
     }
     if matches!(principal, Principal::Run { .. }) && method != "command.get" {

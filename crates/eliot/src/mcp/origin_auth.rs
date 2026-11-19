@@ -45,6 +45,8 @@ struct Keys {
 }
 struct Session {
     identity: RemoteIdentity,
+    /// Delegated grant selected by the connector URL at initialization.
+    manager: Option<String>,
     connection_id: String,
     lease: Arc<SessionLease>,
     slot: Arc<SessionSlot>,
@@ -316,10 +318,15 @@ impl OriginAuth {
         Ok(claims)
     }
 
-    pub async fn authenticate(
+    /// Verify the Access assertion and bind the delegated grant `manager`
+    /// (the connector URL's `manager` query value, `None` for Owner mode).
+    /// A stateful session keeps the grant it was initialized with: a request
+    /// naming another grant on that session is forbidden like another subject.
+    pub async fn authenticate_for(
         &self,
         headers: &mut HeaderMap,
         method: &Method,
+        manager: Option<String>,
     ) -> Result<VerifiedRequest, StatusCode> {
         let values = headers
             .get_all("cf-access-jwt-assertion")
@@ -365,7 +372,7 @@ impl OriginAuth {
                 return Err(StatusCode::NOT_FOUND);
             }
             let session = sessions.get_mut(id).ok_or(StatusCode::NOT_FOUND)?;
-            if session.identity != identity {
+            if session.identity != identity || session.manager != manager {
                 return Err(StatusCode::FORBIDDEN);
             }
             if session.lease.current_authorization().is_none() {
@@ -410,6 +417,7 @@ impl OriginAuth {
             call_id: ulid::Ulid::new().to_string(),
             mcp_request_id: None,
             expires_at: claims.exp,
+            manager,
         };
         context.validate().map_err(|_| StatusCode::UNAUTHORIZED)?;
         // Refresh the addressed session before reaping, so a valid renewed
@@ -527,6 +535,7 @@ impl OriginAuth {
                 id.to_owned(),
                 Session {
                     identity: request.context.identity.clone(),
+                    manager: request.context.manager.clone(),
                     connection_id: request.context.connection_id.clone(),
                     lease: request.lease.clone(),
                     slot,

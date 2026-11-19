@@ -159,7 +159,7 @@ impl Router {
                     "Run credentials may call only command.get",
                 ));
             }
-            Principal::ProjectRule { .. } => {
+            Principal::ProjectRule { .. } | Principal::RemoteManager { .. } => {
                 return Err(Error::new(
                     "not_allowed",
                     "project rule authority cannot register a digest",

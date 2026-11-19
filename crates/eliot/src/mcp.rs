@@ -167,9 +167,12 @@ impl ServerHandler for EliotMcpHandler {
             .get::<axum::http::request::Parts>()
             .and_then(|parts| parts.extensions.get::<origin_auth::VerifiedRequest>())
             .cloned();
+        // Owner events go only to Owner-mode sessions; a delegated grant
+        // reads its own project instead.
         if self.notify_owner_events
             && let Some(verified) = verified
             && verified.context.session_id.is_some()
+            && verified.context.manager.is_none()
             && !self.notify_spawned.swap(true, Ordering::SeqCst)
         {
             spawn_owner_notify_task(

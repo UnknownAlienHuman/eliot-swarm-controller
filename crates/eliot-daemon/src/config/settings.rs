@@ -825,6 +825,7 @@ fn validate_candidate(source: &str) -> core::Result<()> {
             access_audience_tag: cloud.access_audience_tag.clone(),
         };
         crate::cloud_mcp::validate_config(&settings)?;
+        super::validate_remote_managers(&cloud.managers)?;
     }
     Ok(())
 }

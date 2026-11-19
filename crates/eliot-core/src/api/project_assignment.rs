@@ -4,6 +4,10 @@ use serde::{Deserialize, Serialize};
 
 pub const PROJECT_ASSIGNMENT_CLAIM_ACTION: &str = "project.assignment.claim";
 
+/// Command verbs a delegated remote manager may submit, each to a root
+/// launch or an existing non-chat Agent of its assigned project.
+pub const REMOTE_MANAGER_VERBS: [&str; 5] = ["launch", "send", "steer", "interrupt", "stop"];
+
 #[derive(Clone, Debug, PartialEq, Eq, JsonSchema, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProjectManagerIdentity {
@@ -113,14 +117,34 @@ impl ProjectAssignmentGetRequest {
 impl ProjectAssignmentClaimRequest {
     pub fn validate(&self) -> Result<()> {
         validate_name(&self.project, "params.project")?;
-        if let Some(ProjectManagerIdentity::Local { agent, generation }) = &self.manager {
-            parse_agent_id(agent)?;
-            if *generation < 1 {
-                return Err(Error::invalid_field(
-                    "params.manager.generation",
-                    "positive generation",
-                ));
+        match &self.manager {
+            Some(ProjectManagerIdentity::Local { agent, generation }) => {
+                parse_agent_id(agent)?;
+                if *generation < 1 {
+                    return Err(Error::invalid_field(
+                        "params.manager.generation",
+                        "positive generation",
+                    ));
+                }
             }
+            Some(ProjectManagerIdentity::Remote {
+                instance,
+                grant_revision,
+            }) => {
+                crate::validate_remote_manager_instance(instance).map_err(|_| {
+                    Error::invalid_field(
+                        "params.manager.instance",
+                        "1-64 lowercase letters, digits or '-'",
+                    )
+                })?;
+                if *grant_revision < 1 {
+                    return Err(Error::invalid_field(
+                        "params.manager.grant_revision",
+                        "positive grant revision",
+                    ));
+                }
+            }
+            None => {}
         }
         Ok(())
     }

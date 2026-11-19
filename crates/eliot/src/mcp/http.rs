@@ -191,9 +191,13 @@ async fn serve_mcp(
     mut request: Request<axum::body::Body>,
 ) -> Response<axum::body::Body> {
     let method = request.method().clone();
+    let manager = match delegated_manager(request.uri()) {
+        Ok(manager) => manager,
+        Err(status) => return rejected(status),
+    };
     let verified: VerifiedRequest = match state
         .auth
-        .authenticate(request.headers_mut(), &method)
+        .authenticate_for(request.headers_mut(), &method, manager)
         .await
     {
         Ok(verified) => verified,
@@ -235,6 +239,20 @@ async fn serve_mcp(
         }
         Err(error) => match error {},
     }
+}
+
+/// The delegated remote manager grant selected by the connector URL
+/// (`/mcp?manager=<instance>`), or `None` for the default Owner mode. Any
+/// other query is refused: the grant is never read from tool arguments.
+fn delegated_manager(uri: &axum::http::Uri) -> Result<Option<String>, axum::http::StatusCode> {
+    let Some(query) = uri.query() else {
+        return Ok(None);
+    };
+    let instance = query
+        .strip_prefix("manager=")
+        .filter(|instance| eliot_core::validate_remote_manager_instance(instance).is_ok())
+        .ok_or(axum::http::StatusCode::BAD_REQUEST)?;
+    Ok(Some(instance.to_owned()))
 }
 
 fn rejected(status: axum::http::StatusCode) -> Response<axum::body::Body> {

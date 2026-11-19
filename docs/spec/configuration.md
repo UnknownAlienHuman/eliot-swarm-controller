@@ -685,6 +685,24 @@ access_audience_tag = "000000000000000000000000000000000000000000000000000000000
 `access_audience_tag` a 64-character hexadecimal tag. These example identifiers
 are placeholders, not a usable tunnel configuration.
 
+Optional delegated remote manager grants enable
+[delegated mode](api.md#mcp-streamablehttp-server); without them the endpoint stays
+in Owner mode:
+
+```toml
+[cloud_mcp.managers.atlas]
+subject = "verified-access-subject" # the Access `sub` allowed to use this grant
+revision = 1
+```
+
+Each key is the grant instance named by the connector URL
+`https://<hostname>/mcp?manager=<instance>`: 1-64 lowercase letters, digits or `-`.
+`subject` is the verified Access subject, and `revision` is a positive grant
+revision. Router reads the grants on every remote call, like the Access binding. A
+removed grant, another subject or a changed revision is refused at once. A changed
+revision also no longer matches its project assignment until the Owner reassigns it.
+The grant is a scope selector, not a secret: Access remains the authentication.
+
 The implemented unread mailbox bounds are a root-level mail table:
 
 ```toml

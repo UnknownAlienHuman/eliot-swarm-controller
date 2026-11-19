@@ -28,13 +28,24 @@ pub(super) async fn run(
             project,
             agent,
             generation,
+            remote,
+            grant_revision,
         } => {
+            let local = agent
+                .zip(generation)
+                .map(|(agent, generation)| ProjectManagerIdentity::Local { agent, generation });
+            let remote = remote
+                .zip(grant_revision)
+                .map(
+                    |(instance, grant_revision)| ProjectManagerIdentity::Remote {
+                        instance,
+                        grant_revision,
+                    },
+                );
             let request = ProjectAssignmentClaimRequest {
                 id: mutation_id(id)?,
                 project,
-                manager: agent
-                    .zip(generation)
-                    .map(|(agent, generation)| ProjectManagerIdentity::Local { agent, generation }),
+                manager: local.or(remote),
             };
             call(data_dir, "project.assignment.claim", &request).await?
         }
