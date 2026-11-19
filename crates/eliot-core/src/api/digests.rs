@@ -335,6 +335,9 @@ pub fn digest_text(id: &str, to: &str, mode: &str, results: &[WaitEntryResult]) 
                       indices: &mut dyn Iterator<Item = usize>,
                       budget: usize| {
             for i in indices {
+                if kept[i] {
+                    continue;
+                }
                 let cost = line_lens[i] + 1;
                 if *used + cost <= budget {
                     *used += cost;
