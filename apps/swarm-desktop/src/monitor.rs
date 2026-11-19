@@ -1442,7 +1442,19 @@ impl Monitor {
 
     /// The open attention report of a row's current generation.
     pub fn incident(&self, row: &MonitorRow) -> Option<&Incident> {
-        self.incidents.get(&(row.id.clone(), row.generation))
+        self.incident_of(&row.id, row.generation)
+    }
+
+    /// The open attention report of one Agent generation (the sidebar's
+    /// rows read the Monitor's reports through this).
+    pub fn incident_of(&self, agent: &str, generation: i64) -> Option<&Incident> {
+        self.incidents.get(&(agent.to_owned(), generation))
+    }
+
+    /// Apply attention reports read outside a refresh: the sidebar reads
+    /// them on its own cadence while the panel (and its refresh) is closed.
+    pub fn apply_attention(&mut self, read: AttentionRead) {
+        self.take_attention(read);
     }
 
     /// A controlled row that needs the owner itself (its own section would
@@ -1789,7 +1801,7 @@ enum Read {
 /// `ATTENTION_SCAN_PAGES` reads per refresh. A backlog larger than that
 /// continues from where this refresh stopped, so a busy journal never holds
 /// a refresh for thousands of calls.
-async fn read_attention(
+pub async fn read_attention(
     data_dir: &Path,
     cursor: Option<i64>,
     now_ms: i64,

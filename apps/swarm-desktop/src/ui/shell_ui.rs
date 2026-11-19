@@ -69,6 +69,9 @@ pub(super) enum ShellMsg {
     /// The live and attention rows, fetched independently of the history
     /// page: merge them into the loaded Agents.
     AttentionLoaded(u64, Fallible<AgentPage>),
+    /// The Monitor's attention reports, read on the sidebar's cadence
+    /// while the panel is closed (the cursor the read started from).
+    AttentionReports(Option<i64>, Fallible<monitor::AttentionRead>),
     /// A sidebar-search page (`agent.list` with `query`): its read epoch,
     /// the query it answers, whether it appends, and the page.
     SearchLoaded(u64, String, bool, Fallible<AgentPage>),
@@ -530,6 +533,16 @@ impl DesktopApp {
                     Err(error) => {
                         self.alert(format!("Agents not read: {error}"));
                     }
+                }
+            }
+            ShellMsg::AttentionReports(cursor, read) => {
+                self.monitor.sidebar_reading = false;
+                // An open panel's refresh owns the cursor meanwhile.
+                if self.panel == Panel::Closed
+                    && self.monitor.data.attention_cursor == cursor
+                    && let Ok(read) = read
+                {
+                    self.monitor.data.apply_attention(read);
                 }
             }
             ShellMsg::SearchLoaded(epoch, query, append, page) => {
@@ -1693,6 +1706,40 @@ impl DesktopApp {
             ))
         });
         self.load_attention(context);
+        self.load_attention_reports(context);
+    }
+
+    /// The Monitor's attention reports for the sidebar's rows: while the
+    /// panel is open its refresh reads them; while it is closed the
+    /// sidebar's refresh runs the same read into the same state, so one
+    /// read is ever in flight.
+    fn load_attention_reports(&mut self, context: &ComponentContext<Self>) {
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        if self.panel != Panel::Closed || self.monitor.sidebar_reading {
+            return;
+        }
+        self.monitor.sidebar_reading = true;
+        let cursor = self.monitor.data.attention_cursor;
+        let _task = context.spawn_background(move |cancel| {
+            let cancelled = || cancel.is_cancelled();
+            let read = client::block_on(monitor::read_attention(
+                &data_dir,
+                cursor,
+                crate::handoff::now_ms(),
+                &cancelled,
+            ));
+            Message::Shell(ShellMsg::AttentionReports(cursor, read))
+        });
+    }
+
+    /// The open attention report of a sidebar row's Agent (the Monitor's).
+    fn reported(&self, agent: &UiAgent) -> Option<&monitor::Incident> {
+        self.monitor
+            .data
+            .incident_of(&agent.id, agent.generation)
+            .filter(|_| !agent.native_child && agent.state != eliot_core::AgentState::Stopped)
     }
 
     /// The window: sidebar, main area and the optional right panel.
@@ -1921,7 +1968,7 @@ impl DesktopApp {
             .margin(Thickness::xy(gutter, 0.0))
             .keyed_children(nav);
 
-        let fleet = Fleet::of(&self.nav.agents);
+        let fleet = Fleet::of(&self.nav.agents, |agent| self.reported(agent).is_some());
         let query = self.nav.search.query.trim().to_owned();
         let checkouts = self.checkouts();
         let filtered = !query.is_empty();
@@ -2385,20 +2432,32 @@ impl DesktopApp {
         if let Some(note) = &row.note {
             name.push_str(&format!(", {note}"));
         }
-        // A running task's work line (`docs/spec/monitoring.md`, Git-aware
-        // work summary): whether it writes code, at a glance.
+        // What needs attention, as the Monitor's row says it (its open
+        // report, e.g. working without writing code), else a running
+        // task's work line (`docs/spec/monitoring.md`, Git-aware work
+        // summary): whether it writes code, at a glance.
         let now = crate::handoff::now_ms();
+        let reported = self.reported(agent).map(|incident| incident.words(now));
         let work = agent
             .work
             .as_ref()
-            .filter(|_| agent.running() && !agent.native_child);
-        if let Some(work) = work {
+            .filter(|_| reported.is_none() && agent.running() && !agent.native_child);
+        if let Some(words) = &reported {
+            name.push_str(&format!(", needs attention: {words}"));
+        } else if let Some(work) = work {
             name.push_str(&format!(", {}", crate::monitor::work_words(work, now)));
         }
-        let line = work.map(|work| crate::monitor::work_line(work, now));
-        // A live task shows its dot (working, attention); a quiet one its
-        // age, its title in the variant tone.
-        let dot = task_dot(palette, agent);
+        let line = reported
+            .map(|words| (words, true))
+            .or_else(|| work.map(|work| (crate::monitor::work_line(work, now), false)));
+        // A live task shows its dot (working, attention: a reported one in
+        // the attention tone); a quiet one its age, its title in the
+        // variant tone.
+        let dot = if line.as_ref().is_some_and(|(_, attention)| *attention) {
+            palette.dot(StatusTone::Attention).map(m3::dot)
+        } else {
+            task_dot(palette, agent)
+        };
         let quiet = dot.is_none();
         let trailing: View = dot.unwrap_or_else(|| {
             m3::secondary(nav::short_age(crate::handoff::now_ms(), agent.updated_at)).into()
@@ -2555,7 +2614,7 @@ impl DesktopApp {
     /// bottom the Monitor (with the fleet's most urgent dot) and Settings.
     fn rail_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let pad = SIDEBAR_PADDING;
-        let fleet = Fleet::of(&self.nav.agents);
+        let fleet = Fleet::of(&self.nav.agents, |agent| self.reported(agent).is_some());
         let summary = fleet.summary(self.nav.agents_total, self.nav.archived);
         let tone = if fleet.attention > 0 {
             Some(StatusTone::Attention)

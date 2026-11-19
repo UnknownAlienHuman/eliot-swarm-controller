@@ -1256,11 +1256,17 @@ pub struct Fleet {
 }
 
 impl Fleet {
-    pub fn of(agents: &[UiAgent]) -> Self {
+    /// The counts of `agents`; one with an open attention report
+    /// (`reported`, the Monitor's) needs attention, as in the Monitor.
+    pub fn of(agents: &[UiAgent], reported: impl Fn(&UiAgent) -> bool) -> Self {
         let mut seen = HashSet::new();
         let mut fleet = Self::default();
         for agent in agents {
             if !seen.insert(agent.id.as_str()) {
+                continue;
+            }
+            if !agent.needs_attention() && reported(agent) {
+                fleet.attention += 1;
                 continue;
             }
             fleet.running += usize::from(agent.running());

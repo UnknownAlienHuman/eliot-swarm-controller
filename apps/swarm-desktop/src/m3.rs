@@ -496,7 +496,7 @@ pub fn task_content(
     title: &str,
     ended: bool,
     trailing: View,
-    line: Option<String>,
+    line: Option<(String, bool)>,
 ) -> View {
     let title = TextBlock::new()
         .text(title.to_owned())
@@ -521,13 +521,20 @@ pub fn task_content(
         ))
     };
     match line {
-        Some(line) => StackPanel::new()
-            .margin(indent)
-            .vertical_alignment(VerticalAlignment::Center)
-            .children((
-                top(title, trailing),
-                secondary(line).text_trimming(TextTrimming::CharacterEllipsis),
-            )),
+        // The second line: the work line, or what needs attention in the
+        // attention tone (as the Monitor's row says it).
+        Some((line, attention)) => {
+            let line = secondary(line).text_trimming(TextTrimming::CharacterEllipsis);
+            let line = if attention {
+                line.foreground(palette().attention())
+            } else {
+                line
+            };
+            StackPanel::new()
+                .margin(indent)
+                .vertical_alignment(VerticalAlignment::Center)
+                .children((top(title, trailing), line))
+        }
         None => Border::new().margin(indent).content(top(title, trailing)),
     }
 }
@@ -716,13 +723,20 @@ pub fn tool_row(palette: Palette, running: bool) -> Button {
         .horizontal_content_alignment(HorizontalAlignment::Stretch)
 }
 
-/// A tool row's content: a 16-DIP icon, the 13-DIP label, a trailing
-/// caption (a duration; the status in `tone` while it runs) and a chevron.
-pub fn tool_content(glyph: &str, label: &str, trailing: &str, tone: Option<Brush>) -> View {
-    let trailing = text(trailing.to_owned(), style::CAPTION)
+/// A tool row's trailing caption: a duration, or the status in `tone`
+/// while it runs.
+pub fn tool_caption(trailing: String, tone: Option<Brush>) -> TextBlock {
+    text(trailing, style::CAPTION).foreground(tone.unwrap_or_else(|| palette().muted()))
+}
+
+/// A tool row's content: a 16-DIP icon, the 13-DIP label, the trailing
+/// caption ([`tool_caption`], or a component that keeps its own running
+/// seconds) and a chevron.
+pub fn tool_content(glyph: &str, label: &str, trailing: View) -> View {
+    let trailing = Border::new()
         .grid_column(2)
-        .vertical_alignment(VerticalAlignment::Center);
-    let trailing = trailing.foreground(tone.unwrap_or_else(|| palette().muted()));
+        .vertical_alignment(VerticalAlignment::Center)
+        .content(trailing);
     Grid::new()
         .columns([
             GridLength::Auto,
