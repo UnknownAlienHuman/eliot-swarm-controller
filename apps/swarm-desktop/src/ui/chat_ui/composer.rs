@@ -1,6 +1,9 @@
+use std::cell::RefCell;
+
 use super::*;
 use crate::configure::locked_words;
 use crate::picker::{effort_label, effort_name};
+use crate::state::Drafts;
 use eliot_core::api::{HarnessModelsResponse, ModelsCatalogResponse};
 use launch_ui::Pop;
 
@@ -41,18 +44,17 @@ impl DesktopApp {
     }
 
     pub(in crate::ui) fn composer_text(&self) -> String {
-        match self.selected_agent_id() {
-            Some(agent) => self.chat.drafts.get(&agent).to_owned(),
-            None => self.launch.launch_text.clone(),
-        }
+        self.chat
+            .drafts
+            .borrow()
+            .text(self.selected_agent_id().as_deref())
+            .to_owned()
     }
 
-    /// The one composer, one rounded card. A new task: the project chip as
-    /// the card's first row, then the field and the model and access
-    /// chips. An open Agent: its project, harness and access as plain
-    /// read-only text, the field, then the model-and-effort chip. Usage
-    /// and the one trailing button (Send, Stop, Steer or Resume) sit at the
-    /// right.
+    /// The one composer ([`Composer`]): the window binds what the card
+    /// shows (its trailing button, chips, usage ring and attachments);
+    /// the composer draws it and owns its text, so a keystroke redraws
+    /// the card alone.
     pub(super) fn composer_view(
         &self,
         column: Option<f64>,
@@ -72,122 +74,71 @@ impl DesktopApp {
             _ if running || reading == Some(RowMode::Running) => "Type to steer the running turn",
             _ => "Send a follow-up",
         };
-        let field = TextBox::new()
-            .element_ref(&self.chat.composer_ref)
-            .text(self.primed(&self.composer_text()).to_owned())
-            .placeholder_text(placeholder)
-            .automation_name("Message")
-            .background(Brush::Solid(Color::transparent()))
-            .border_thickness(Thickness::uniform(0.0))
-            .accepts_return(true)
-            .text_wrapping(TextWrapping::Wrap)
-            .min_height(tokens::layout::COMPOSER_MIN_HEIGHT)
-            .max_height(tokens::layout::COMPOSER_MAX_HEIGHT)
-            .on_text_changed(
-                context.callback(|value| Message::Chat(ChatMsg::ComposerChanged(value))),
-            );
-        // WinUI's text box insets its text: the margin starts the text at
-        // the card's 16-DIP inset, where the chips start.
-        let mut field_cells = vec![KeyedView::new(
-            "field",
-            Border::new()
-                .margin(Thickness::new(-WINUI_TEXT_PADDING, 0.0, 0.0, 0.0))
-                .content(field),
-        )];
-        // A click into the field closes an open popover. WinUI's text box
-        // keeps its presses and its mouse input never reaches the window's
-        // hooks (observed live), so while a popover is open a clear layer
-        // over the field takes the press, closes it and focuses the field.
-        if self.launch.open.is_some() && self.launch.preset.is_none() {
-            field_cells.push(KeyedView::new(
-                "dismiss",
-                Border::new()
-                    .background(Brush::Solid(Color::transparent()))
-                    .on_pointer_pressed(context.callback(|_: PointerEventInfo| {
-                        Message::Launch(LaunchMsg::ComposerPointer {
-                            over: true,
-                            pressed: true,
-                        })
-                    })),
-            ));
-        }
-        let field = Grid::new().keyed_children(field_cells);
         let chips: View = match (agent.as_deref(), detail) {
             (None, _) => self.composer_chips(context, palette),
             (Some(_), Some(detail)) => self.model_chip(detail, context, palette),
             (Some(_), None) => View::empty(),
         };
-        // The design: + (attach files), then the chips, 6 DIPs apart.
-        let chips = StackPanel::new()
-            .orientation(Orientation::Horizontal)
-            .spacing(6.0)
-            .children((
-                m3::icon_button(palette)
-                    .automation_name("Attach files")
-                    .on_click(context.message(Message::Launch(LaunchMsg::AttachRequested)))
-                    .content(m3::icon(m3::glyph::NEW_TASK))
-                    .tooltip("Attach files"),
-                chips,
-            ));
-        let bottom = Grid::new()
-            .columns([GridLength::STAR, GridLength::Auto])
-            .column_spacing(tokens::spacing::SM)
-            .children((
-                Border::new()
-                    .vertical_alignment(VerticalAlignment::Center)
-                    .content(chips),
-                Border::new()
-                    .grid_column(1)
-                    .content(self.composer_actions(agent, context, palette)),
-            ));
-        // Home: the project and worktree chips above the field; attached
-        // files as chips over it.
-        let mut rows: Vec<KeyedView> = Vec::new();
-        if home {
-            rows.push(KeyedView::new(
-                "project",
-                self.composer_project_row(context, palette),
-            ));
-        }
-        let attached = self.attached_to(&self.composer_target()).to_vec();
-        if !attached.is_empty() {
-            rows.push(KeyedView::new(
-                format!("attached:{}", attached.len()),
-                attachment_chips(&attached, context, palette),
-            ));
-        }
-        rows.push(KeyedView::new("field", field));
-        rows.push(KeyedView::new("bottom", bottom));
-        let width = if home {
+        let retry = agent
+            .as_ref()
+            .is_some_and(|agent| self.chat.pending_retry.contains_key(agent));
+        let primary = match (agent.clone(), detail) {
+            (Some(agent), _) if retry => Primary::Retry(agent),
+            (Some(agent), Some(detail)) if resumable(detail) => {
+                Primary::Resume(agent, detail.generation)
+            }
+            (Some(_), None) if reading == Some(RowMode::Resume) => Primary::ReadingResume,
+            (Some(_), None) if reading == Some(RowMode::Running) => Primary::ReadingRunning,
+            (Some(agent), detail) => Primary::Turn {
+                running: detail
+                    .filter(|detail| !detail.observe_only)
+                    .and_then(|detail| {
+                        detail
+                            .active_turn
+                            .as_deref()
+                            .map(|turn| BoundAction::turn_control(&agent, detail.generation, turn))
+                    }),
+                agent,
+            },
+            (None, _) => Primary::Start,
+        };
+        let widest = if home {
             tokens::layout::HOME_WIDTH
         } else {
             tokens::layout::READING_WIDTH
         };
-        // Home's composer takes the home column (760), a conversation's
-        // its reading column (720).
-        let column = if home {
-            self.column_width(width)
-        } else {
-            column
-        };
-        Border::new()
-            .grid_row(5)
-            .width(column)
-            .max_width(width)
-            .horizontal_alignment(HorizontalAlignment::Center)
-            .margin(Thickness::new(
-                0.0,
-                tokens::spacing::INSET,
-                0.0,
-                if home { 28.0 } else { tokens::spacing::LG },
-            ))
-            .content(m3::composer_card(
-                palette,
-                Grid::new(),
-                StackPanel::new()
-                    .spacing(tokens::spacing::SM)
-                    .keyed_children(rows),
-            ))
+        let popover = self.launch.open.is_some();
+        View::component::<Composer>(ComposerInput {
+            palette,
+            drafts: views::Shared(Rc::clone(&self.chat.drafts)),
+            version: self.chat.drafts.borrow().version(),
+            primed: self.fields_primed,
+            placeholder,
+            field: self.chat.composer_ref.clone(),
+            popover,
+            dismiss: popover && self.launch.preset.is_none(),
+            retry,
+            project: if home {
+                self.composer_project_row(context, palette)
+            } else {
+                View::empty()
+            },
+            attached: self.attached_to(&self.composer_target()).to_vec(),
+            chips,
+            usage: self.usage_indicator(context, palette),
+            primary,
+            enabled: !self.submitting(),
+            // Home's composer takes the home column (760), a conversation's
+            // its reading column (720).
+            width: if home {
+                self.column_width(widest)
+            } else {
+                column
+            },
+            widest,
+            agent,
+            send: context.forward(),
+        })
     }
 
     /// The open Agent's model-and-effort chip: the next turn's values; it
@@ -218,7 +169,7 @@ impl DesktopApp {
                 "Model and effort: {name} ({})",
                 if open { "open" } else { "change" }
             ))
-            .on_click(context.message(Message::Launch(LaunchMsg::Toggle(Pop::Effort))))
+            .on_click(context.callback(|()| Message::Launch(LaunchMsg::Toggle(Pop::Effort))))
             .content(m3::chip_content(
                 None,
                 &label,
@@ -519,136 +470,6 @@ impl DesktopApp {
         )
     }
 
-    /// The one trailing button, as in Codex: Send; while a turn runs, Stop
-    /// (it interrupts that turn) with an empty field and Steer with text;
-    /// Resume for a stopped Agent. An unresolved submission shows Retry
-    /// instead, resubmitting its saved identity. Each is bound now, from
-    /// the detail on screen. A stopped Agent has one Resume: the filled
-    /// button while the field is empty, the Send arrow (resume with the
-    /// message) once it has text.
-    fn composer_actions(
-        &self,
-        agent: Option<String>,
-        context: &mut ViewContext<Self>,
-        palette: Palette,
-    ) -> View {
-        let detail = self.chat.detail.as_ref();
-        let draft_blank = self.composer_text().trim().is_empty();
-        let enabled = !self.submitting();
-        let reading = self.reading_row();
-        let primary: View = match (agent.clone(), detail) {
-            // The unresolved draft's explicit Retry: resubmits the saved
-            // action, body, ledger key and mutation id, whatever the Agent
-            // state has become since. It needs no new text.
-            (Some(agent), _) if self.chat.pending_retry.contains_key(&agent) => m3::filled(palette)
-                .is_enabled(enabled)
-                .automation_name("Retry (Enter)")
-                .on_click(context.message(Message::Chat(ChatMsg::RetryPending(agent))))
-                .content(m3::label("Retry"))
-                .tooltip("Retry with the same id"),
-            (Some(agent), Some(detail)) if resumable(detail) => {
-                let resume = context.message(Message::Chat(ChatMsg::DraftRequested(
-                    DraftAction::Resume {
-                        agent,
-                        generation: detail.generation,
-                    },
-                )));
-                if draft_blank {
-                    m3::filled(palette)
-                        .is_enabled(enabled)
-                        .automation_name("Resume")
-                        .on_click(resume)
-                        .content(m3::label("Resume"))
-                } else {
-                    m3::send_button(palette)
-                        .is_enabled(enabled)
-                        .automation_name("Resume with this message (Enter)")
-                        .on_click(resume)
-                        .content(m3::send_icon())
-                        .tooltip("Resume with this message")
-                }
-            }
-            // While the detail is read, the row's button in its final
-            // place, not yet active.
-            (Some(_), None) if reading == Some(RowMode::Resume) => m3::filled(palette)
-                .is_enabled(false)
-                .automation_name("Resume")
-                .content(m3::label("Resume")),
-            (Some(_), None) if reading == Some(RowMode::Running) => m3::send_button(palette)
-                .is_enabled(false)
-                .automation_name("Stop the running turn")
-                .content(m3::stop_mark(palette)),
-            (Some(agent), detail) => {
-                // Codex's one trailing button: while a turn runs, Stop with
-                // an empty field (it interrupts that turn) and Steer once
-                // there is text; otherwise Send.
-                let running = detail
-                    .filter(|detail| !detail.observe_only)
-                    .and_then(|detail| {
-                        detail
-                            .active_turn
-                            .as_deref()
-                            .map(|turn| BoundAction::turn_control(&agent, detail.generation, turn))
-                    });
-                match running {
-                    Some(bound) if draft_blank => m3::send_button(palette)
-                        .is_enabled(enabled)
-                        .automation_name("Stop the running turn")
-                        .on_click(
-                            context.message(Message::Chat(ChatMsg::InterruptRequested(bound))),
-                        )
-                        .content(m3::stop_mark(palette))
-                        .tooltip("Stop"),
-                    Some(bound) => m3::send_button(palette)
-                        .is_enabled(enabled)
-                        .automation_name("Steer the running turn (Enter)")
-                        .on_click(context.message(Message::Chat(ChatMsg::DraftRequested(
-                            DraftAction::Steer(bound),
-                        ))))
-                        .content(m3::send_icon())
-                        .tooltip("Steer"),
-                    None => m3::send_button(palette)
-                        .is_enabled(enabled && !draft_blank)
-                        .automation_name("Send (Enter)")
-                        .on_click(context.message(Message::Chat(ChatMsg::DraftRequested(
-                            DraftAction::Send { agent },
-                        ))))
-                        .content(m3::send_icon())
-                        .tooltip("Send"),
-                }
-            }
-            (None, _) => m3::send_button(palette)
-                .is_enabled(enabled && !draft_blank)
-                .automation_name("Start task (Enter)")
-                .on_click(context.message(Message::Launch(LaunchMsg::LaunchRequested)))
-                .content(m3::send_icon())
-                .tooltip("Send"),
-        };
-        // The design's hint before the ring and the FAB.
-        let hint = match (agent.as_deref(), detail) {
-            (Some(agent), _) if self.chat.pending_retry.contains_key(agent) => "",
-            (Some(_), Some(detail)) if resumable(detail) => "Enter resumes",
-            (Some(_), None) if reading == Some(RowMode::Resume) => "Enter resumes",
-            (Some(_), None) if reading == Some(RowMode::Running) => "Stop the turn",
-            (Some(_), Some(detail)) if detail.active_turn.is_some() && !detail.observe_only => {
-                if draft_blank {
-                    "Stop the turn"
-                } else {
-                    "Enter steers the running turn"
-                }
-            }
-            _ => "Enter to send",
-        };
-        StackPanel::new()
-            .orientation(Orientation::Horizontal)
-            .spacing(tokens::spacing::ROW)
-            .children((
-                m3::secondary(hint).vertical_alignment(VerticalAlignment::Center),
-                self.usage_indicator(context, palette),
-                primary,
-            ))
-    }
-
     /// The harness the composer talks to: the open Agent's, else the new
     /// task's choice (a preset's or Auto's pick included).
     fn composer_harness(&self) -> Option<String> {
@@ -759,7 +580,7 @@ impl DesktopApp {
                     "Usage: {label}, {note} ({})",
                     if open { "open" } else { "show limits" }
                 ))
-                .on_click(context.message(Message::Launch(LaunchMsg::Toggle(Pop::Usage))))
+                .on_click(context.callback(|()| Message::Launch(LaunchMsg::Toggle(Pop::Usage))))
                 .content(ring)
                 .tooltip(note),
         )])
@@ -806,11 +627,356 @@ fn resumable(detail: &UiDetail) -> bool {
         && !detail.observe_only
 }
 
+/// The composer's trailing button, bound by the window from the detail on
+/// screen ([`DesktopApp::composer_view`]); the draft decides between its
+/// forms (Stop or Steer, Resume or Resume with the message).
+#[derive(Clone, Debug, PartialEq)]
+pub(in crate::ui) enum Primary {
+    /// The unresolved submission's Retry (its Agent): it resubmits the
+    /// saved action, body, ledger key and mutation id, whatever the Agent
+    /// state has become since, and needs no new text.
+    Retry(String),
+    /// Resume the stopped Agent at this generation.
+    Resume(String, i64),
+    /// While the detail is read, the row's button in its final place, not
+    /// yet active.
+    ReadingResume,
+    ReadingRunning,
+    /// An open Agent: Stop with an empty field and Steer with text while
+    /// this turn runs; Send otherwise.
+    Turn {
+        agent: String,
+        running: Option<BoundAction>,
+    },
+    /// The new task's Start.
+    Start,
+}
+
+/// The composer's input. The text is not in it: the composer reads the
+/// shared drafts, and `version` counts the window's changes to them. The
+/// views the window builds here (`project`, `chips`, `usage`) take only
+/// captureless callbacks, so they compare equal from one window render to
+/// the next and a render for anything else leaves the composer as it is.
+#[derive(Clone, PartialEq)]
+pub(in crate::ui) struct ComposerInput {
+    palette: Palette,
+    /// The open Agent (`None`: the new task).
+    agent: Option<String>,
+    drafts: views::Shared<RefCell<Drafts>>,
+    version: u64,
+    /// False for the render that re-creates the editors empty
+    /// ([`DesktopApp::reprime_fields`]).
+    primed: bool,
+    placeholder: &'static str,
+    field: ElementRef<TextBox>,
+    /// A popover is open: typing closes it, in the window.
+    popover: bool,
+    /// The clear layer over the field that takes a press and closes the
+    /// popover (not for a preset's picker in Settings).
+    dismiss: bool,
+    /// An unresolved submission: an edit abandons it, in the window.
+    retry: bool,
+    /// Home's project and worktree chips above the field.
+    project: View,
+    attached: Vec<String>,
+    chips: View,
+    usage: View,
+    primary: Primary,
+    /// No submission is in flight.
+    enabled: bool,
+    width: Option<f64>,
+    widest: f64,
+    send: Callback<Message>,
+}
+
+/// The one composer, one rounded card, as its own component. A new task:
+/// the project chip as the card's first row, then the field and the model
+/// and access chips. An open Agent: the field, then the model-and-effort
+/// chip. Usage and the one trailing button (Send, Stop, Steer or Resume)
+/// sit at the right. A keystroke is stored here and redraws this card
+/// only; an edit that also concerns the window (Enter's line break, an
+/// open popover, an unresolved submission) and every control go to the
+/// window.
+pub(in crate::ui) struct Composer {
+    input: ComposerInput,
+}
+
+impl Composer {
+    /// Store an edit that concerns nothing but the text; `false` when the
+    /// window handles it (`ChatMsg::ComposerChanged`).
+    fn store(&self, text: &str) -> bool {
+        let input = &self.input;
+        let agent = input.agent.as_deref();
+        let mut drafts = input.drafts.0.borrow_mut();
+        let previous = drafts.text(agent);
+        // The echo of a text the window set (a clear after Send, a
+        // restore) is no edit: the draft revision stays.
+        if text == previous {
+            return true;
+        }
+        if input.popover || input.retry || enter_send_text(previous, text).is_some() {
+            return false;
+        }
+        // Every edit spends an earlier plain Enter, as in the window.
+        let _ = crate::shortcuts::take_plain_enter();
+        // Kept exactly as the TextBox reports it: a normalized copy would
+        // differ, be written back, and move the caret (or end an IME
+        // composition). Line endings are normalized at submission.
+        drafts.typed(agent, text.to_owned());
+        true
+    }
+}
+
+impl Component for Composer {
+    type Input = ComposerInput;
+    type Message = Message;
+
+    fn create(input: &ComposerInput, _context: &ComponentContext<Self>) -> Self {
+        Self {
+            input: input.clone(),
+        }
+    }
+
+    fn input_changed(&mut self, input: &ComposerInput, _context: &ComponentContext<Self>) {
+        self.input = input.clone();
+    }
+
+    fn update(&mut self, message: Message, _context: &ComponentContext<Self>) {
+        if let Message::Chat(ChatMsg::ComposerChanged(text)) = &message
+            && self.store(text)
+        {
+            return;
+        }
+        let _ = self.input.send.call(message);
+    }
+
+    fn view(&self, input: &ComposerInput, context: &mut ViewContext<Self>) -> View {
+        let palette = input.palette;
+        let text = input
+            .drafts
+            .0
+            .borrow()
+            .text(input.agent.as_deref())
+            .to_owned();
+        let blank = text.trim().is_empty();
+        let field = TextBox::new()
+            .element_ref(&input.field)
+            .text(if input.primed { text } else { String::new() })
+            .placeholder_text(input.placeholder)
+            .automation_name("Message")
+            .background(Brush::Solid(Color::transparent()))
+            .border_thickness(Thickness::uniform(0.0))
+            .accepts_return(true)
+            .text_wrapping(TextWrapping::Wrap)
+            .min_height(tokens::layout::COMPOSER_MIN_HEIGHT)
+            .max_height(tokens::layout::COMPOSER_MAX_HEIGHT)
+            .on_text_changed(
+                context.callback(|value| Message::Chat(ChatMsg::ComposerChanged(value))),
+            );
+        // WinUI's text box insets its text: the margin starts the text at
+        // the card's 16-DIP inset, where the chips start.
+        let mut field_cells = vec![KeyedView::new(
+            "field",
+            Border::new()
+                .margin(Thickness::new(-WINUI_TEXT_PADDING, 0.0, 0.0, 0.0))
+                .content(field),
+        )];
+        // A click into the field closes an open popover. WinUI's text box
+        // keeps its presses and its mouse input never reaches the window's
+        // hooks (observed live), so while a popover is open a clear layer
+        // over the field takes the press, closes it and focuses the field.
+        if input.dismiss {
+            field_cells.push(KeyedView::new(
+                "dismiss",
+                Border::new()
+                    .background(Brush::Solid(Color::transparent()))
+                    .on_pointer_pressed(context.callback(|_: PointerEventInfo| {
+                        Message::Launch(LaunchMsg::ComposerPointer {
+                            over: true,
+                            pressed: true,
+                        })
+                    })),
+            ));
+        }
+        let field = Grid::new().keyed_children(field_cells);
+        // The design: + (attach files), then the chips, 6 DIPs apart.
+        let chips = StackPanel::new()
+            .orientation(Orientation::Horizontal)
+            .spacing(6.0)
+            .children((
+                m3::icon_button(palette)
+                    .automation_name("Attach files")
+                    .on_click(context.message(Message::Launch(LaunchMsg::AttachRequested)))
+                    .content(m3::icon(m3::glyph::NEW_TASK))
+                    .tooltip("Attach files"),
+                input.chips.clone(),
+            ));
+        let bottom = Grid::new()
+            .columns([GridLength::STAR, GridLength::Auto])
+            .column_spacing(tokens::spacing::SM)
+            .children((
+                Border::new()
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .content(chips),
+                Border::new()
+                    .grid_column(1)
+                    .content(composer_actions(input, blank, context)),
+            ));
+        // Home: the project and worktree chips above the field; attached
+        // files as chips over it.
+        let home = input.agent.is_none();
+        let mut rows: Vec<KeyedView> = Vec::new();
+        if home {
+            rows.push(KeyedView::new("project", input.project.clone()));
+        }
+        if !input.attached.is_empty() {
+            rows.push(KeyedView::new(
+                format!("attached:{}", input.attached.len()),
+                attachment_chips(&input.attached, context, palette),
+            ));
+        }
+        rows.push(KeyedView::new("field", field));
+        rows.push(KeyedView::new("bottom", bottom));
+        Border::new()
+            .grid_row(5)
+            .width(input.width)
+            .max_width(input.widest)
+            .horizontal_alignment(HorizontalAlignment::Center)
+            .margin(Thickness::new(
+                0.0,
+                tokens::spacing::INSET,
+                0.0,
+                if home { 28.0 } else { tokens::spacing::LG },
+            ))
+            .content(m3::composer_card(
+                palette,
+                Grid::new(),
+                StackPanel::new()
+                    .spacing(tokens::spacing::SM)
+                    .keyed_children(rows),
+            ))
+    }
+}
+
+/// The one trailing button, as in Codex: Send; while a turn runs, Stop
+/// (it interrupts that turn) with an empty field and Steer with text;
+/// Resume for a stopped Agent. An unresolved submission shows Retry
+/// instead, resubmitting its saved identity. Each is bound by the window
+/// from the detail on screen. A stopped Agent has one Resume: the filled
+/// button while the field is empty, the Send arrow (resume with the
+/// message) once it has text.
+fn composer_actions(
+    input: &ComposerInput,
+    draft_blank: bool,
+    context: &mut ViewContext<Composer>,
+) -> View {
+    let (palette, enabled) = (input.palette, input.enabled);
+    let primary: View = match &input.primary {
+        Primary::Retry(agent) => m3::filled(palette)
+            .is_enabled(enabled)
+            .automation_name("Retry (Enter)")
+            .on_click(context.message(Message::Chat(ChatMsg::RetryPending(agent.clone()))))
+            .content(m3::label("Retry"))
+            .tooltip("Retry with the same id"),
+        Primary::Resume(agent, generation) => {
+            let resume = context.message(Message::Chat(ChatMsg::DraftRequested(
+                DraftAction::Resume {
+                    agent: agent.clone(),
+                    generation: *generation,
+                },
+            )));
+            if draft_blank {
+                m3::filled(palette)
+                    .is_enabled(enabled)
+                    .automation_name("Resume")
+                    .on_click(resume)
+                    .content(m3::label("Resume"))
+            } else {
+                m3::send_button(palette)
+                    .is_enabled(enabled)
+                    .automation_name("Resume with this message (Enter)")
+                    .on_click(resume)
+                    .content(m3::send_icon())
+                    .tooltip("Resume with this message")
+            }
+        }
+        Primary::ReadingResume => m3::filled(palette)
+            .is_enabled(false)
+            .automation_name("Resume")
+            .content(m3::label("Resume")),
+        Primary::ReadingRunning => m3::send_button(palette)
+            .is_enabled(false)
+            .automation_name("Stop the running turn")
+            .content(m3::stop_mark(palette)),
+        // Codex's one trailing button: while a turn runs, Stop with an
+        // empty field (it interrupts that turn) and Steer once there is
+        // text; otherwise Send.
+        Primary::Turn { agent, running } => match running {
+            Some(bound) if draft_blank => m3::send_button(palette)
+                .is_enabled(enabled)
+                .automation_name("Stop the running turn")
+                .on_click(
+                    context.message(Message::Chat(ChatMsg::InterruptRequested(bound.clone()))),
+                )
+                .content(m3::stop_mark(palette))
+                .tooltip("Stop"),
+            Some(bound) => m3::send_button(palette)
+                .is_enabled(enabled)
+                .automation_name("Steer the running turn (Enter)")
+                .on_click(context.message(Message::Chat(ChatMsg::DraftRequested(
+                    DraftAction::Steer(bound.clone()),
+                ))))
+                .content(m3::send_icon())
+                .tooltip("Steer"),
+            None => m3::send_button(palette)
+                .is_enabled(enabled && !draft_blank)
+                .automation_name("Send (Enter)")
+                .on_click(context.message(Message::Chat(ChatMsg::DraftRequested(
+                    DraftAction::Send {
+                        agent: agent.clone(),
+                    },
+                ))))
+                .content(m3::send_icon())
+                .tooltip("Send"),
+        },
+        Primary::Start => m3::send_button(palette)
+            .is_enabled(enabled && !draft_blank)
+            .automation_name("Start task (Enter)")
+            .on_click(context.message(Message::Launch(LaunchMsg::LaunchRequested)))
+            .content(m3::send_icon())
+            .tooltip("Send"),
+    };
+    // The design's hint before the ring and the FAB.
+    let hint = match &input.primary {
+        Primary::Retry(_) => "",
+        Primary::Resume(..) | Primary::ReadingResume => "Enter resumes",
+        Primary::ReadingRunning => "Stop the turn",
+        Primary::Turn {
+            running: Some(_), ..
+        } => {
+            if draft_blank {
+                "Stop the turn"
+            } else {
+                "Enter steers the running turn"
+            }
+        }
+        _ => "Enter to send",
+    };
+    StackPanel::new()
+        .orientation(Orientation::Horizontal)
+        .spacing(tokens::spacing::ROW)
+        .children((
+            m3::secondary(hint).vertical_alignment(VerticalAlignment::Center),
+            input.usage.clone(),
+            primary,
+        ))
+}
+
 /// Files attached in the composer: one outlined chip each (file glyph,
 /// name, the full path in its tooltip); a click removes it.
 fn attachment_chips(
     files: &[String],
-    context: &mut ViewContext<DesktopApp>,
+    context: &mut ViewContext<Composer>,
     palette: Palette,
 ) -> View {
     let chips: Vec<KeyedView> = files

@@ -116,7 +116,10 @@ impl DesktopApp {
                 );
                 // Bound to the submitting Agent and draft revision, not
                 // to whatever conversation is open now.
-                self.chat.drafts.ack(&outcome.agent, outcome.draft_rev);
+                self.chat
+                    .drafts
+                    .borrow_mut()
+                    .ack(&outcome.agent, outcome.draft_rev);
                 let harness = self
                     .chat
                     .detail
@@ -188,10 +191,11 @@ impl DesktopApp {
                     return;
                 }
                 let agent = failure.action.agent().to_owned();
-                let restored =
-                    self.chat
-                        .drafts
-                        .restore(&agent, failure.text.clone(), failure.revision);
+                let restored = self.chat.drafts.borrow_mut().restore(
+                    &agent,
+                    failure.text.clone(),
+                    failure.revision,
+                );
                 self.rebuild_items();
                 if crate::state::uncertain(&failure.error) {
                     // Keep the exact unresolved identity with the draft so
@@ -204,7 +208,7 @@ impl DesktopApp {
                         retain_retry(
                             &mut self.chat.pending_retry,
                             &mut self.ledger,
-                            &self.chat.drafts,
+                            &self.chat.drafts.borrow(),
                             &agent,
                             PendingRetry {
                                 action: failure.action.clone(),

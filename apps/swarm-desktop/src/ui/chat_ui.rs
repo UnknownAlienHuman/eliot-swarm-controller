@@ -156,7 +156,7 @@ pub(super) fn abandon_retry(
 pub(super) fn retain_retry(
     pending: &mut HashMap<String, PendingRetry>,
     ledger: &mut crate::state::MutationLedger,
-    drafts: &DraftStore,
+    drafts: &Drafts,
     agent: &str,
     snapshot: PendingRetry,
 ) {
@@ -352,7 +352,8 @@ pub(super) struct ChatState {
     /// turn is not followed by moving focus.
     pub(super) opened_from_search: bool,
     // Mutations.
-    pub(super) drafts: DraftStore,
+    /// The composer's text, shared with the composer component.
+    pub(super) drafts: Rc<std::cell::RefCell<Drafts>>,
     /// Unconfirmed submission identity per Agent, retried verbatim by
     /// Retry (or the next identical Send) instead of rederiving a fresh
     /// mutation id. Bounded, and abandoned on draft edits and Agent removal.
@@ -372,7 +373,7 @@ impl DesktopApp {
     /// saved identity is unretryable and its ledger key must be released.
     /// Every draft edit goes through here so no stale snapshot survives it.
     fn store_draft_text(&mut self, agent: &str, text: String) {
-        self.chat.drafts.set(agent, text);
+        self.chat.drafts.borrow_mut().set(Some(agent), text);
         abandon_retry(&mut self.chat.pending_retry, &mut self.ledger, agent);
     }
 
@@ -397,7 +398,10 @@ impl DesktopApp {
         // The saved revision, so the composer empties and a later Send of
         // new text mints fresh identity.
         let agent_id = agent.to_owned();
-        self.chat.drafts.ack(&agent_id, snapshot.revision);
+        self.chat
+            .drafts
+            .borrow_mut()
+            .ack(&agent_id, snapshot.revision);
         if !snapshot.text.trim().is_empty()
             && let Some(convo) = self.chat.convo.as_mut()
             && convo.agent() == agent_id
@@ -463,8 +467,7 @@ impl DesktopApp {
                 if let Some(agent) = self.selected_agent_id() {
                     self.store_draft_text(&agent, text);
                 } else {
-                    self.launch.launch_text = text;
-                    self.launch.launch_rev = self.launch.launch_rev.wrapping_add(1);
+                    self.chat.drafts.borrow_mut().set(None, text);
                 }
             }
             ChatMsg::AnswerUnchanged => {}
@@ -734,7 +737,8 @@ impl DesktopApp {
                     return;
                 }
                 let agent_id = action.agent().to_owned();
-                let text = profiles::normalize_newlines(self.chat.drafts.get(&agent_id));
+                let text =
+                    profiles::normalize_newlines(self.chat.drafts.borrow().text(Some(&agent_id)));
                 // Attached files ride the message as its closing block.
                 let text = crate::attachments::compose(&text, self.attached_to(&agent_id));
                 // A plain Resume needs no text; Send and Steer do.
@@ -750,7 +754,7 @@ impl DesktopApp {
                     ));
                     return;
                 }
-                let revision = self.chat.drafts.revision(&agent_id);
+                let revision = self.chat.drafts.borrow().revision(&agent_id);
                 // An unconfirmed submission at this revision is retried
                 // with its saved action, body, ledger key and mutation id,
                 // whatever is requested now: a reselected action (Resume
@@ -797,7 +801,7 @@ impl DesktopApp {
                 self.set_status(format!("{what} ({mutation_id})…"));
                 // At once: the composer empties (same revision, so a retry
                 // keeps this id) and the message shows with what it waits for.
-                self.chat.drafts.ack(&agent_id, revision);
+                self.chat.drafts.borrow_mut().ack(&agent_id, revision);
                 self.clear_attached(&agent_id);
                 if !blank
                     && let Some(convo) = self.chat.convo.as_mut()
@@ -1074,17 +1078,46 @@ impl DesktopApp {
             ))
     }
 
+    /// The Settings page is drawn here too, over the transcript component,
+    /// which stays mounted: Settings leaves the conversation, and the
+    /// transcript removes its parts over later frames, as when another
+    /// conversation opens (`views::Transcript`), instead of tearing them all
+    /// down in one frame. Back to tasks builds it again from its end.
     pub(super) fn chat_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
-        let agent = self.selected_agent_id();
         let column = self.reading_width();
+        let transcript = self.transcript_view(column, context, palette);
+        if self.main == Main::Settings {
+            let page = Border::new()
+                .grid_row(1)
+                .background(palette.surface())
+                .content(self.settings_view(context, palette));
+            return Grid::new()
+                .rows([
+                    GridLength::Auto,
+                    GridLength::STAR,
+                    GridLength::Auto,
+                    GridLength::Auto,
+                    GridLength::Auto,
+                    GridLength::Auto,
+                ])
+                .children((
+                    View::empty(),
+                    View::fragment((transcript, page)),
+                    View::empty(),
+                    View::empty(),
+                    View::empty(),
+                    View::empty(),
+                    View::empty(),
+                ));
+        }
+        let agent = self.selected_agent_id();
         let header: View = match agent.as_deref() {
-            Some(agent) => self.header_view(agent, column, context, palette),
+            Some(agent) => self.header_view(agent, context, palette),
             None => View::empty(),
         };
         // The transcript stays in place without an open Agent too, so the
         // conversation just left is removed over later frames, not at once
         // (`views::Transcript`); the start or home screen covers it.
-        let transcript = self.transcript_view(column, context, palette);
         let cover: View = match agent {
             Some(_) => View::empty(),
             // The start is being submitted: the message and what happens

@@ -91,6 +91,92 @@ impl DraftStore {
     }
 }
 
+/// The composer's text: each Agent's draft, and the new task's text with
+/// its revision (part of a launch's ledger key). The window and its
+/// composer share it: the composer stores a keystroke itself
+/// ([`Drafts::typed`]) and redraws alone, without a window render; every
+/// change the window makes counts in [`Drafts::version`], so the
+/// composer's input differs afterwards and it redraws too.
+#[derive(Clone, Debug, Default)]
+pub struct Drafts {
+    agents: DraftStore,
+    launch_text: String,
+    launch_rev: u64,
+    version: u64,
+}
+
+impl Drafts {
+    /// Changes made by the window (every change but [`Self::typed`]).
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// One Agent's draft, or the new task's text (`None`).
+    pub fn text(&self, agent: Option<&str>) -> &str {
+        match agent {
+            Some(agent) => self.agents.get(agent),
+            None => &self.launch_text,
+        }
+    }
+
+    /// The composer stored an edit: a new revision, `version` unchanged
+    /// (the composer redraws itself).
+    pub fn typed(&mut self, agent: Option<&str>, text: String) {
+        match agent {
+            Some(agent) => {
+                self.agents.set(agent, text);
+            }
+            None => {
+                self.launch_text = text;
+                self.launch_rev = self.launch_rev.wrapping_add(1);
+            }
+        }
+    }
+
+    /// The window replaced the text, bumping its revision.
+    pub fn set(&mut self, agent: Option<&str>, text: String) {
+        self.typed(agent, text);
+        self.version += 1;
+    }
+
+    /// One Agent's draft revision ([`DraftStore::revision`]).
+    pub fn revision(&self, agent: &str) -> u64 {
+        self.agents.revision(agent)
+    }
+
+    /// [`DraftStore::restore`].
+    pub fn restore(&mut self, agent: &str, text: String, submitted: u64) -> bool {
+        self.version += 1;
+        self.agents.restore(agent, text, submitted)
+    }
+
+    /// [`DraftStore::ack`].
+    pub fn ack(&mut self, agent: &str, submitted: u64) -> bool {
+        self.version += 1;
+        self.agents.ack(agent, submitted)
+    }
+
+    /// The new task's text revision.
+    pub fn launch_rev(&self) -> u64 {
+        self.launch_rev
+    }
+
+    /// Give text back to an empty new-task composer; its revision stays.
+    pub fn restore_launch(&mut self, text: String) {
+        if self.launch_text.is_empty() {
+            self.launch_text = text;
+            self.version += 1;
+        }
+    }
+
+    /// Empty the new-task composer; its revision stays, so a retry of an
+    /// unconfirmed start reuses its mutation id.
+    pub fn clear_launch(&mut self) {
+        self.launch_text.clear();
+        self.version += 1;
+    }
+}
+
 /// One mutation id per user action. The first click mints a ULID; a retry of
 /// the same action key reuses it, so the daemon can deduplicate instead of
 /// admitting a second effect. Completed actions release their key.

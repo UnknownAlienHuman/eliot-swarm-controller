@@ -69,6 +69,7 @@ mod reveal;
 mod scripts_ui;
 mod settings_ui;
 mod shell_ui;
+mod sidebar_ui;
 pub(crate) mod tokens;
 
 use automation_ui::AutomationMsg;
@@ -99,7 +100,7 @@ use crate::nav::{self, UiAgent};
 use crate::profiles;
 use crate::reparent;
 use crate::scripts;
-use crate::state::{BoundAction, DraftStore, MutationLedger, Selection};
+use crate::state::{BoundAction, Drafts, MutationLedger, Selection};
 use crate::theme;
 use crate::views::{self, RenderCache, RenderedItem, RowCallbacks};
 
@@ -797,6 +798,7 @@ impl Component for DesktopApp {
                 agents_total: 0,
                 archived: nav::Archived::default(),
                 agents_loading: false,
+                paging: false,
                 list_epoch: 0,
                 pending_select: None,
                 collapsed: HashSet::new(),
@@ -838,7 +840,7 @@ impl Component for DesktopApp {
                 inputs_checking: false,
                 launches: HashMap::new(),
                 opened_from_search: false,
-                drafts: DraftStore::default(),
+                drafts: Rc::default(),
                 pending_retry: HashMap::new(),
                 answers: HashMap::new(),
                 confirm_force: None,

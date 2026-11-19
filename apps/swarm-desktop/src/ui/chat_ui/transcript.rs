@@ -70,7 +70,11 @@ impl DesktopApp {
         context: &mut ViewContext<Self>,
         palette: Palette,
     ) -> View {
-        let conversation = self.selected_agent_id().unwrap_or_default();
+        // Settings leaves the conversation as New task does.
+        let conversation = match self.main {
+            Main::Conversation => self.selected_agent_id().unwrap_or_default(),
+            Main::Settings => String::new(),
+        };
         let open = !conversation.is_empty();
         // Not while the first read is in flight: its coverage is not known.
         let loading = matches!(self.chat.live, LiveStatus::Loading);
@@ -130,7 +134,11 @@ impl DesktopApp {
         };
         View::component::<views::Transcript>(views::TranscriptInput {
             conversation,
-            items: views::Shared(Rc::clone(&self.chat.items)),
+            items: if open {
+                views::Shared(Rc::clone(&self.chat.items))
+            } else {
+                views::no_items()
+            },
             expanded: Rc::new(self.chat.expanded.clone()),
             callbacks: Rc::new(callbacks),
             palette,

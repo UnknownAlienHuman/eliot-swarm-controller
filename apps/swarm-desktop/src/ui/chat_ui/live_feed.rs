@@ -281,8 +281,7 @@ impl DesktopApp {
                 self.launch.access = Some(submitted.access);
                 self.launch.chat = submitted.chat;
                 self.launch.workspace = submitted.workspace;
-                self.launch.launch_text = text;
-                self.launch.launch_rev = self.launch.launch_rev.wrapping_add(1);
+                self.chat.drafts.borrow_mut().set(None, text);
                 self.update(Message::Launch(LaunchMsg::LaunchRequested), context);
             }
             _ => {
