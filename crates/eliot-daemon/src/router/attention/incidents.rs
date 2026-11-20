@@ -668,11 +668,13 @@ pub(super) fn desired_incident(
 }
 
 /// When the active turn last made code progress: the later of the
-/// worktree's last write or commit and the turn's start. `None` while Git
-/// cannot tell (no basis is invented).
+/// worktree's last write or commit and the turn's start. `None` unless the
+/// current Git observation is usable: an unavailable probe (for example a
+/// capped digest) keeps the last measured write time as history, but that
+/// time says nothing about writes since, so no basis is invented from it.
 pub(super) fn code_progress_basis(captured: &CapturedAgent) -> Option<i64> {
     let code = captured.code_progress.as_ref()?;
-    if !code.available && code.last_code_progress_at.is_none() {
+    if !code.available {
         return None;
     }
     code.last_code_progress_at
