@@ -1208,9 +1208,10 @@ row links directly to Routing; reordering candidates uses the same immediate wri
 
 ## Profile section
 
-The `profiles` section of `settings.read`/`settings.save` carries the verbatim
-`[profiles.*]` tables in file order, with the file revision. Every other section stays
-server-side. Profiles resolve from `config.toml` at launch admission (above), so a saved
+The `profiles` section of `settings.read`/`settings.save` carries the `[profiles.*]`
+tables as JSON, under the file revision like every other section; the desktop renders
+its TOML source view from that value and parses the edited view back before saving.
+Profiles resolve from `config.toml` at launch admission (above), so a saved
 file is what the next launch uses; running or queued work keeps its frozen snapshot, and
 only a successful `configure` changes a live Agent's next-turn model/effort. Daemon
 settings loaded once at startup (`[daemon]` worker limits and `[mail]`) still require a
