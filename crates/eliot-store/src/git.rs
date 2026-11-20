@@ -352,6 +352,27 @@ fn load_git_work_state(
         .map_err(sql_error)
 }
 
+/// One short Store fact about a workspace's committed Git work, for a
+/// handoff brief: counts when the latest observation is available, the
+/// recorded reason otherwise.
+pub(super) fn work_fact(connection: &Connection, workspace: &str) -> Result<String> {
+    let count = |value: Option<i64>| value.map_or_else(|| "?".to_owned(), |n| n.to_string());
+    Ok(match load_git_work_state(connection, workspace)? {
+        None => "not observed yet".to_owned(),
+        Some(row) if !row.work_available => format!(
+            "unavailable ({})",
+            row.work_error.as_deref().unwrap_or("unavailable")
+        ),
+        Some(row) => format!(
+            "{} files changed, +{}/-{}, {} commits ahead of the base",
+            count(row.files_changed),
+            count(row.insertions),
+            count(row.deletions),
+            count(row.commits_ahead),
+        ),
+    })
+}
+
 fn to_i64_counter(value: Option<u64>) -> Result<Option<i64>> {
     value
         .map(|count| {
