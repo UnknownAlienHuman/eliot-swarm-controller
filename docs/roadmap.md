@@ -43,9 +43,10 @@ extends an existing owner (Goal, assignment, handoff, routing, usage); no task
 engine, second scheduler or critic loop.
 
 - [x] **A1 Useful check feedback.** A Goal check's stdout and stderr both reach
-      the bounded observation, digest and continuation, labelled and with
+      the bounded observation and continuation, each labelled with its own
       completeness; the continuation marks it as diagnostic data and never asks
-      for a rerun to read the log. Exit/unknown semantics unchanged.
+      for a rerun to read the log. The no-progress digest, exit and unknown
+      semantics are unchanged.
 - [ ] **A2 Exact brief and required sources.** The launch/send brief carries the
       result, required reading, write area, explicit limits and the check; named
       sources are delivered with path and version or their absence is explicit;

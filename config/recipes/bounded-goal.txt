@@ -1,9 +1,12 @@
 # Recipe 3: bounded Eliot-mode goal with automatic on-idle driving.
-# Replace AGENT with the agent id, then run as one command (--check consumes
-# the rest of the line, so it goes last). The daemon rounds automatically on
-# the next idle event; no manual `goal round` is needed. `git --version` is a
-# portable exit-0 placeholder: replace it with your project's check command,
-# which must exit 0 when the goal holds. Verify with: goal show AGENT
+# Replace AGENT with the agent id and the check with the command that proves
+# the wanted effect, then run as one command (--check consumes the rest of
+# the line, so it goes last). The daemon rounds automatically on the next idle
+# event; no manual `goal round` is needed. Verify with: goal show AGENT
+#
+# The check must exit 0 exactly when the goal holds, and should say why it
+# failed: both its stdout and its stderr reach the Agent's next continuation
+# (bounded, beginning and end kept). Prefer the project's own required command
+# for the changed package, as below, over a placeholder that always passes.
 # The agent must be launched with a native adapter profile (for example codex-luna).
-# CI never runs this against a fake profile.
-goal set AGENT --text keep-green --max-rounds 5 --check git --version
+goal set AGENT --text "Make the changed package build without warnings." --max-rounds 5 --check cargo clippy --locked -p eliot-daemon --all-targets -- -D warnings

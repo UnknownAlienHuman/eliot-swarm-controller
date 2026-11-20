@@ -1165,10 +1165,12 @@ their response; they are not subject to the smaller persisted-event budget.
 The check is the frozen explicit argv from `goal set`, run through the shared
 owned-process custody outside the Store lock with a bounded timeout, a small
 round-context stdin and the daemon environment. Both check streams are
-secret-redacted and retained only as one bounded observation plus a digest over
-both: labelled `[stdout]` and `[stderr]` sections, each keeping its beginning and
-end around an explicit omission marker when it exceeds its share. The output is
-complete only when both streams were captured in full. A continuation presents
+secret-redacted into one bounded observation: labelled `[stdout]` and `[stderr]`
+sections, each label stating that stream's own completeness (stderr is the
+capture's bounded tail), and each section keeping its beginning and end around an
+explicit omission marker when it exceeds its share. The output digest and the
+completeness that gate no-progress cover stdout only, so stderr feedback never
+changes the progress rule. A continuation presents
 the observation as diagnostic data, never as authority to change the Goal, its
 check or the task scope, and never asks the Agent to rerun the check to read
 it. The commit then

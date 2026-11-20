@@ -1344,8 +1344,8 @@ fn goal_check_result(outcome: ProcessOutcome, policy: &SecretPolicy) -> Result<G
 /// A completed capture is a result only with a definite exit code. A
 /// check killed by a signal (Unix exit code `None`) is an unknown outcome:
 /// it commits nothing, same as timeout/cancel. Both streams feed the
-/// observation and the digest, so a reason the check writes only to stderr
-/// reaches the next continuation.
+/// observation, so a reason the check writes only to stderr reaches the
+/// next continuation.
 fn goal_completed_check_result(
     stdout: &[u8],
     stdout_complete: bool,
@@ -1359,25 +1359,43 @@ fn goal_completed_check_result(
             "goal check has no exit code; its outcome is unknown",
         ));
     };
+    // The no-progress digest and completeness stay on stdout, as before:
+    // stderr is the bounded tail the capture keeps, so it is diagnostic
+    // feedback for the Agent, labelled with its own completeness.
+    let digest = sha256_hex(stdout);
     let stdout = policy.redact_text(&String::from_utf8_lossy(stdout));
     let stderr_text = policy.redact_text(&stderr.text);
-    let stderr_complete = !stderr.truncated && stderr.eof && !stderr.read_error;
-    let mut digest_input = stdout.clone().into_bytes();
-    digest_input.extend_from_slice(b"\0stderr\0");
-    digest_input.extend_from_slice(stderr_text.as_bytes());
+    let stderr_label = if stderr.read_error || !stderr.eof {
+        "[stderr, incomplete]\n"
+    } else if stderr.truncated {
+        "[stderr, last part only]\n"
+    } else {
+        "[stderr]\n"
+    };
+    let stdout_label = if stdout_complete {
+        "[stdout]\n"
+    } else {
+        "[stdout, incomplete]\n"
+    };
     Ok(GoalCheckResult {
         exit_code: Some(exit_code),
-        output_complete: stdout_complete && stderr_complete,
-        output_digest: Some(sha256_hex(&digest_input)),
-        observation: check_observation(&stdout, &stderr_text, MAX_GOAL_OBSERVATION_BYTES),
+        output_complete: stdout_complete,
+        output_digest: Some(digest),
+        observation: check_observation(
+            [
+                (stdout_label, stdout.as_str()),
+                (stderr_label, stderr_text.as_str()),
+            ],
+            MAX_GOAL_OBSERVATION_BYTES,
+        ),
     })
 }
 
 /// Both labelled streams within `bound` bytes. A stream over its share keeps
 /// its beginning and end around an explicit omission marker; a short stream
 /// leaves its unused share to the other.
-fn check_observation(stdout: &str, stderr: &str, bound: usize) -> Option<String> {
-    let streams: Vec<(&str, &str)> = [("[stdout]\n", stdout), ("[stderr]\n", stderr)]
+fn check_observation(streams: [(&str, &str); 2], bound: usize) -> Option<String> {
+    let streams: Vec<(&str, &str)> = streams
         .into_iter()
         .filter(|(_, text)| !text.trim().is_empty())
         .collect();
