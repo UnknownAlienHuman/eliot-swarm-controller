@@ -468,7 +468,21 @@ same key in the global Owner principal namespace. A matching `event.cause.rule` 
 alone grants no cleanup authority; project rules with the same name remain separate.
 The completion rule stops only that captured Agent/generation,
 releasing native live capacity after custody closes. Native `data.cause` is not a match
-authority. Assigned Agents own one brief; they are retired after their terminal turn.
+authority. Assigned Agents own one brief. Without `goal` that is one-turn work,
+retired after its terminal turn. With `goal = { check = [...], max_rounds, max_turns,
+max_without_progress, check_timeout_ms }` it is Goal-owned work: the launch freezes
+the brief's Goal (text naming the brief, the check run in the Agent's workspace), and
+the admission transaction installs it bound to the generation that launch starts,
+before any native dispatch. The ordinary Goal loop then rounds on idle. When that Goal
+completes or blocks, its round commit emits `goal.changed {status, reason}` carrying
+the launch's cause, and the generated completion rule matches `goal.changed` instead
+of `turn.completed`. Store authorizes the retirement through the same launch-ancestry
+check, and refuses a `turn.completed`-caused retirement while that generation's
+assignment Goal is still open, so switching an assignment between modes never cuts a
+running Goal. Like any cadence-less Goal, an assignment Goal needs `max_turns` or
+`max_rounds`. A cleared assignment Goal retires nothing; the Owner stops that Agent. A
+handoff of an assignment Goal does not carry the launch cause to the destination, whose
+Goal is then ordinary.
 When the assignment sets `cleanup_on_retire = true` (default false), the
 applied stop also cleans that Agent's build, temp and managed-worktree
 artifacts inline in the stop worker: same authority check, same quiescence

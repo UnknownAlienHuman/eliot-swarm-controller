@@ -581,6 +581,7 @@ impl Router {
             if let Some(admission) = &result.admission {
                 self.publish_locked(&admission.events);
             }
+            self.publish_locked(&result.events);
             result
         };
         if let Some(admission) = &result.admission {

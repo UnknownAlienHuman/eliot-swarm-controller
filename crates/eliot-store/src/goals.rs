@@ -167,6 +167,9 @@ pub struct GoalRoundCommitResult {
     pub view: GoalView,
     pub admission: Option<Admission>,
     pub response: GoalRoundResponse,
+    /// Committed facts of the round itself (an assignment Goal's terminal
+    /// `goal.changed`); the continuation's events stay on `admission`.
+    pub events: Vec<Event>,
 }
 
 impl GoalRoundCommitResult {
@@ -190,6 +193,7 @@ impl GoalRoundCommitResult {
             view: response.view.clone(),
             admission: None,
             response,
+            events: Vec::new(),
         })
     }
 }
@@ -398,6 +402,11 @@ struct GoalStatePersist {
     /// does not skip the final check. Absent otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_continuation_command_id: Option<String>,
+    /// The launch cause of a Goal installed by a Goal-owned folder
+    /// assignment. Its terminal `goal.changed` carries this cause, so the
+    /// assignment's completion rule retires exactly that Agent generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    assignment_cause: Option<core::EventCause>,
 }
 
 struct GoalRow {
@@ -530,6 +539,10 @@ pub(super) fn transfer_goal_tx(
         .map_or(Some(1), |row| row.revision.checked_add(1))
         .ok_or_else(|| Error::new("bad_state", "Goal revision overflow"))?;
     source.state.status = GoalStatus::Paused;
+    // The assignment launch cause names the source Agent's launch: the
+    // destination was not launched by the assignment, so its Goal is not
+    // assignment-owned and never claims that Agent's retirement.
+    source.state.assignment_cause = None;
     source.state.counters.last_observation = source
         .state
         .counters
@@ -1034,6 +1047,7 @@ impl Store {
                 cadence_anchor_ms: definition.cadence_ms.map(|_| now),
                 last_committed_slot: None,
                 last_continuation_command_id: None,
+                assignment_cause: row.state.assignment_cause.clone(),
             };
             db!(tx.execute(
                 "UPDATE goals SET generation = ?1, revision = ?2, definition = ?3,
@@ -1068,6 +1082,7 @@ impl Store {
             cadence_anchor_ms: definition.cadence_ms.map(|_| now),
             last_committed_slot: None,
             last_continuation_command_id: None,
+            assignment_cause: None,
         };
         db!(tx.execute(
             "INSERT INTO goals(agent, mode, generation, revision, definition,
@@ -1196,6 +1211,7 @@ impl Store {
                 cadence_anchor_ms: row.state.cadence_anchor_ms,
                 last_committed_slot: row.state.last_committed_slot,
                 last_continuation_command_id: None,
+                assignment_cause: row.state.assignment_cause.clone(),
             };
             update_goal_state_tx(&tx, agent_num, mode, row.revision, &state, now)?;
             let updated = load_goal_row(&tx, agent_num, mode)?
@@ -1309,6 +1325,7 @@ impl Store {
             cadence_anchor_ms: row.state.cadence_anchor_ms,
             last_committed_slot: row.state.last_committed_slot,
             last_continuation_command_id: row.state.last_continuation_command_id.clone(),
+            assignment_cause: row.state.assignment_cause.clone(),
         };
         update_goal_state_tx(&tx, agent_num, &row.mode, row.revision, &state, now)?;
         commit_transaction(tx, &self.write_faulted)?;
@@ -1365,6 +1382,7 @@ impl Store {
                     cadence_anchor_ms: row.state.cadence_anchor_ms,
                     last_committed_slot: row.state.last_committed_slot,
                     last_continuation_command_id: row.state.last_continuation_command_id.clone(),
+                    assignment_cause: row.state.assignment_cause.clone(),
                 };
                 update_goal_state_tx(&tx, agent_num, mode, row.revision, &state, now)?;
                 commit_transaction(tx, &self.write_faulted)?;
@@ -1879,6 +1897,28 @@ impl Store {
                 row.revision,
             ],
         ));
+        let mut events = Vec::new();
+        if let (Some(cause), Some((status, reason))) = (
+            state.assignment_cause.clone(),
+            match &outcome {
+                GoalCommitOutcome::Completed => Some(("completed", None)),
+                GoalCommitOutcome::Blocked { reason } => Some(("blocked", Some(reason.clone()))),
+                GoalCommitOutcome::Continued { .. } => None,
+            },
+        ) {
+            events.push(insert_daemon_event_input(
+                &tx,
+                DaemonEventInput::new(
+                    now,
+                    "goal.changed",
+                    "goal",
+                    Some(agent_num),
+                    Some(commit.expected_generation),
+                    json!({"status": status, "reason": reason}),
+                )
+                .with_cause(cause),
+            )?);
+        }
         let row = load_goal_row(&tx, agent_num, &commit.mode)?
             .ok_or_else(|| Error::new("internal", "goal disappeared after round"))?;
         let view = goal_view_on(&tx, &self.goal_holder, row)?;
@@ -1915,6 +1955,7 @@ impl Store {
             view,
             admission,
             response,
+            events,
         })
     }
 }
@@ -2544,4 +2585,63 @@ fn count_agent_commands(
     connection
         .query_row(&sql, params![agent_num, generation], |row| row.get(0))
         .map_err(sql_error)
+}
+
+/// Install the Goal frozen into a Goal-owned assignment launch, bound to the
+/// generation that launch starts, in the admission transaction and so before
+/// any native dispatch.
+pub(super) fn install_assignment_goal_tx(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    generation: i64,
+    definition: &GoalDefinition,
+    cause: core::EventCause,
+    now: i64,
+) -> Result<()> {
+    definition.validate()?;
+    definition.require_auto_bound()?;
+    let state = GoalStatePersist {
+        transferred_turns: 0,
+        status: GoalStatus::Active,
+        paused_reason: None,
+        blocked_reason: None,
+        counters: GoalCounters::default(),
+        cadence_anchor_ms: None,
+        last_committed_slot: None,
+        last_continuation_command_id: None,
+        assignment_cause: Some(cause),
+    };
+    db!(tx.execute(
+        "INSERT INTO goals(agent, mode, generation, revision, definition,
+             state, last_round_key, updated_at)
+         VALUES (?1, ?2, ?3, 1, ?4, ?5, NULL, ?6)",
+        params![
+            agent_num,
+            GoalMode::Eliot.as_str(),
+            generation,
+            encode_json(definition)?,
+            encode_json(&state)?,
+            now,
+        ],
+    ));
+    Ok(())
+}
+
+/// Whether this Agent generation's Goal was installed by a Goal-owned
+/// assignment and has not completed, blocked or been cleared: its work is
+/// still open, so a completed turn must not retire it.
+pub(super) fn assignment_goal_open(
+    connection: &Connection,
+    agent_num: i64,
+    generation: i64,
+) -> Result<bool> {
+    let Some(row) = load_goal_row(connection, agent_num, GoalMode::Eliot.as_str())? else {
+        return Ok(false);
+    };
+    Ok(row.generation == generation
+        && row.state.assignment_cause.is_some()
+        && !matches!(
+            row.state.status,
+            GoalStatus::Completed | GoalStatus::Blocked | GoalStatus::Cleared
+        ))
 }

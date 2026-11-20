@@ -16,6 +16,9 @@ struct AssignmentLaunch {
     brief: String,
     previous: Option<String>,
     max_busy: u64,
+    /// The brief's frozen Goal for Goal-owned work.
+    #[serde(default)]
+    goal: Option<core::api::GoalDefinition>,
 }
 
 fn validate_key(key: &str) -> Result<()> {
@@ -146,8 +149,20 @@ impl Store {
         let Some((kind, Some(event_agent), Some(event_generation), Some(cause))) = event else {
             return Ok(false);
         };
-        if kind != "turn.completed" || event_agent != agent_num || event_generation != generation {
+        if event_agent != agent_num || event_generation != generation {
             return Ok(false);
+        }
+        match kind.as_str() {
+            // One-turn work retires on its completed turn, unless a
+            // Goal-owned assignment Goal still owns this generation's work.
+            "turn.completed" => {
+                if goals::assignment_goal_open(&self.connection, agent_num, generation)? {
+                    return Ok(false);
+                }
+            }
+            // Goal-owned work retires on its Goal's terminal fact.
+            "goal.changed" => {}
+            _ => return Ok(false),
         }
         let cause: core::EventCause = serde_json::from_str(&cause)
             .map_err(|_| Error::new("source_integrity", "event cause is malformed"))?;
@@ -234,14 +249,16 @@ impl Store {
 
 /// Called inside ordinary launch admission. Its cursor update rolls back with
 /// any later hold/capacity/command failure, and is visible only after commit.
+/// Commit the assignment cursor with the launch admission. Returns the
+/// brief's frozen Goal and its launch cause for Goal-owned work.
 pub(super) fn commit_cursor_tx(
     tx: &Transaction<'_>,
     principal: &str,
     request: &SubmitCommand,
     now: i64,
-) -> Result<()> {
+) -> Result<Option<(core::api::GoalDefinition, core::EventCause)>> {
     let Some(value) = request.args.get("assignment") else {
-        return Ok(());
+        return Ok(None);
     };
     if principal != "owner" {
         return Err(Error::new(
@@ -298,5 +315,13 @@ pub(super) fn commit_cursor_tx(
         ],
     )
     .map_err(sql_error)?;
-    Ok(())
+    Ok(launch.goal.map(|goal| {
+        let cause = core::EventCause {
+            command_id: request.id.clone(),
+            rule: Some(format!("assignment-{}", launch.key)),
+            depth: 1,
+            remote_call: None,
+        };
+        (goal, cause)
+    }))
 }

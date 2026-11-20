@@ -1571,7 +1571,7 @@ async fn process_rule_cursor(
                 no_match_through = None;
                 continue;
             }
-            if event.kind == "turn.completed"
+            if matches!(event.kind.as_str(), "turn.completed" | "goal.changed")
                 && let Some(key) = assignment_cleanup_key(
                     &rule.principal,
                     rule.project.is_some(),

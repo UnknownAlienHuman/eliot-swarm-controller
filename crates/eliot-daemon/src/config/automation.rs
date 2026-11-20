@@ -57,6 +57,11 @@ pub(crate) struct AssignmentConfig {
     /// the completion rule still retires the Agents already running.
     #[serde(default = "default_assignment_enabled")]
     pub(crate) enabled: bool,
+    /// Goal-owned work: each brief's Agent keeps working under this check
+    /// and retires when its Goal completes or blocks, not on its first
+    /// completed turn. Absent keeps one-turn work.
+    #[serde(default)]
+    pub(crate) goal: Option<core::api::AssignmentGoal>,
 }
 
 impl Default for AutomationConfig {
@@ -106,6 +111,14 @@ impl AutomationConfig {
                 ));
             }
             validate_routing_role(&assignment.role)?;
+            if let Some(goal) = &assignment.goal {
+                goal.validate().map_err(|error| {
+                    core::Error::new(
+                        "profile_error",
+                        format!("config.toml: automation assignment goal: {}", error.message),
+                    )
+                })?;
+            }
         }
         self.run = normalize_run_grant(
             &self.run.interpreters,

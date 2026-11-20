@@ -48,7 +48,7 @@ pub(crate) fn load(data_root: &Path) -> Result<RuleSnapshot> {
         for (key, assignment) in config.assignments {
             let id = format!("assignment-{key}");
             let toml = format!(
-                "[[rule]]\nid = {}\nenabled = {}\non = {{ every = {} }}\ndo = [{{ action = 'launch', workspace = {}, role = {}, assignment = {{ key = {}, folder = {}, max_busy = {} }} }}]\n",
+                "[[rule]]\nid = {}\nenabled = {}\non = {{ every = {} }}\ndo = [{{ action = 'launch', workspace = {}, role = {}, assignment = {{ key = {}, folder = {}, max_busy = {}{} }} }}]\n",
                 quote_toml(&id),
                 assignment.enabled,
                 quote_toml(&assignment.interval),
@@ -57,15 +57,23 @@ pub(crate) fn load(data_root: &Path) -> Result<RuleSnapshot> {
                 quote_toml(&key),
                 quote_toml(&assignment.folder),
                 assignment.max_busy,
+                assignment.goal.as_ref().map(goal_toml).unwrap_or_default(),
             );
             definitions.extend(definition::load(toml.as_bytes())?);
             // Assigned Agents own one brief. Use the existing event-rule stop
-            // action to retire the exact generation after its terminal turn,
-            // freeing configured live capacity for the next timer launch.
-            // The rule processor additionally verifies Store launch ancestry;
-            // this cause label alone is not enough to authorize cleanup.
+            // action to retire the exact generation when its work ends:
+            // after its terminal turn for one-turn work, or when its Goal
+            // completes or blocks for Goal-owned work. This frees configured
+            // live capacity for the next timer launch. The rule processor
+            // additionally verifies Store launch ancestry; this cause label
+            // alone is not enough to authorize cleanup.
+            let ending = if assignment.goal.is_some() {
+                "goal.changed"
+            } else {
+                "turn.completed"
+            };
             let completion = format!(
-                "[[rule]]\nid = {}\non = {{ event = 'turn.completed', match = {{ 'event.cause.rule' = {} }} }}\ndo = [{{ action = 'stop', target = '${{event.agent}}', expected_generation = '${{event.generation}}' }}]\n",
+                "[[rule]]\nid = {}\non = {{ event = '{ending}', match = {{ 'event.cause.rule' = {} }} }}\ndo = [{{ action = 'stop', target = '${{event.agent}}', expected_generation = '${{event.generation}}' }}]\n",
                 quote_toml(&format!("{id}.complete")),
                 quote_toml(&id),
             );
@@ -74,6 +82,28 @@ pub(crate) fn load(data_root: &Path) -> Result<RuleSnapshot> {
         snapshot = from_definitions(definitions)?;
     }
     Ok(snapshot)
+}
+
+/// The inline `goal` table of a Goal-owned assignment launch action.
+fn goal_toml(goal: &eliot_core::api::AssignmentGoal) -> String {
+    let check = goal
+        .check
+        .iter()
+        .map(|argument| quote_toml(argument))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut fields = vec![format!("check = [{check}]")];
+    for (name, value) in [
+        ("check_timeout_ms", goal.check_timeout_ms),
+        ("max_turns", goal.max_turns),
+        ("max_rounds", goal.max_rounds),
+        ("max_without_progress", goal.max_without_progress),
+    ] {
+        if let Some(value) = value {
+            fields.push(format!("{name} = {value}"));
+        }
+    }
+    format!(", goal = {{ {} }}", fields.join(", "))
 }
 
 fn quote_toml(value: &str) -> String {

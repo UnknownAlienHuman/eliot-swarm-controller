@@ -48,6 +48,16 @@ pub(crate) async fn prepare(
     let (brief, text) = next_brief(&root, status.cursor.as_deref())?;
     let previous = status.cursor;
 
+    // Goal-owned work freezes the brief's Goal into the launch, so Store
+    // installs it with the Agent before any native dispatch.
+    let goal = assignment
+        .get("goal")
+        .map(|goal| {
+            serde_json::from_value::<eliot_core::api::AssignmentGoal>(goal.clone())
+                .map_err(|_| Error::new("invalid", "assignment goal is invalid"))
+                .map(|goal| goal.definition(&brief))
+        })
+        .transpose()?;
     request.args["text"] = Value::String(text);
     request.args["assignment"] = serde_json::json!({
         "key": key,
@@ -55,6 +65,11 @@ pub(crate) async fn prepare(
         "previous": previous,
         "max_busy": max_busy,
     });
+    if let Some(goal) = goal {
+        goal.validate()?;
+        request.args["assignment"]["goal"] = serde_json::to_value(goal)
+            .map_err(|_| Error::new("invalid", "assignment goal cannot be encoded"))?;
+    }
     request.validate()?;
     Ok(request)
 }

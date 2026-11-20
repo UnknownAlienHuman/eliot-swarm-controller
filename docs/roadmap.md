@@ -55,7 +55,7 @@ engine, second scheduler or critic loop.
       change with the task's starting point and allowed paths; a trusted
       check-wrapper can report a scope violation that blocks the ordinary
       continuation; changes to the checker's own inputs are reviewed separately.
-- [ ] **A4 Assignment owns completion.** A brief-queue assignment declares one
+- [x] **A4 Assignment owns completion.** A brief-queue assignment declares one
       turn or Goal-owned work before dispatch; Goal-owned work retires on the
       Goal's terminal state, not on the first `turn.completed`.
 - [ ] **A5 Honest no-progress.** The Goal fingerprint reuses the Git monitor's
