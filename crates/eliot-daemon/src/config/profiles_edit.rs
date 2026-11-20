@@ -1,7 +1,7 @@
 //! Profile-section safety and the `profile.list` summaries of the
 //! `[profiles.*]` tables in `config.toml`.
 //!
-//! Owning contract: docs/spec/configuration.md "Profile editing". Profiles
+//! Owning contract: docs/spec/configuration.md "Profile section". Profiles
 //! are resolved from the file at every launch admission, so a saved file is
 //! what the next launch uses; running Agents keep their frozen snapshots.
 //!

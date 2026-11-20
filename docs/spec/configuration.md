@@ -1217,7 +1217,7 @@ only a successful `configure` changes a live Agent's next-turn model/effort. Dae
 settings loaded once at startup (`[daemon]` worker limits and `[mail]`) still require a
 restart after the save.
 
-The section is withheld (`settings.read` returns `not_allowed`) when the file is not
+The whole `settings.read` is refused (`not_allowed`) when the file is not
 valid TOML, when profiles are defined outside `[profiles.*]` tables, when the profile
 text contains a value the daemon's secret policy knows, or when the profiles fail the
 daemon's strict field and URL validation (unknown fields and credential-bearing URLs are
