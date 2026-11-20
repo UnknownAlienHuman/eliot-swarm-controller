@@ -93,6 +93,8 @@ struct AssignmentActionDefinition {
     key: String,
     folder: String,
     max_busy: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    goal: Option<eliot_core::api::AssignmentGoal>,
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
@@ -1179,6 +1181,11 @@ fn submit_launch_command(
             "folder": assignment.folder,
             "max_busy": assignment.max_busy,
         });
+        if let Some(goal) = &assignment.goal {
+            goal.validate()?;
+            command.args["assignment"]["goal"] = serde_json::to_value(goal)
+                .map_err(|_| Error::new("invalid", "assignment goal cannot be encoded"))?;
+        }
     }
     if let Some(text) = text {
         command.args["text"] = Value::String(text);

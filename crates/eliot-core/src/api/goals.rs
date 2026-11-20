@@ -85,6 +85,47 @@ impl GoalStatus {
     }
 }
 
+/// Goal-owned work for a folder assignment. The brief's Agent keeps working
+/// under this check until its Goal completes or blocks, and only then
+/// retires. The check runs in the Agent's own workspace.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssignmentGoal {
+    pub check: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_timeout_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_turns: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rounds: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_without_progress: Option<i64>,
+}
+
+impl AssignmentGoal {
+    /// The Goal frozen for one selected brief.
+    pub fn definition(&self, brief: &str) -> GoalDefinition {
+        GoalDefinition {
+            text: format!(
+                "Finish the assigned brief {brief}. The Goal check decides when it is done."
+            ),
+            check: self.check.clone(),
+            check_cwd: None,
+            check_timeout_ms: self
+                .check_timeout_ms
+                .unwrap_or(DEFAULT_GOAL_CHECK_TIMEOUT_MS),
+            max_turns: self.max_turns,
+            max_rounds: self.max_rounds,
+            max_without_progress: self.max_without_progress,
+            cadence_ms: None,
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.definition("brief.md").validate()
+    }
+}
+
 /// Frozen Goal inputs. Any change advances the Goal revision.
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
