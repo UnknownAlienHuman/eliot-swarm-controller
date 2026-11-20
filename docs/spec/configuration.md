@@ -1099,9 +1099,15 @@ project authority after a newer settings save. Automation saves update the
 under the Store writer before acknowledgement.
 Before publishing an Owner save that removes project registrations, the daemon
 checks each removed registration under the same Store lock used by Agent admission.
-The check covers the checkout, verified linked worktrees, retained managed-worktree
-identity, and unsettled activity. A registration in use refuses the entire save with
-`project_in_use` and leaves the settings revision and registrations intact.
+The check covers the registration's own unsettled commands and every Agent that
+belongs to it: an Agent whose execution project is the registration ID, or, for a
+legacy label that names no registration, whose label equals the registration's
+checkout under the platform's checkout-key rule. Only those Agents count while they
+are live, hold unsettled activity or retained unknown commands. An Agent of another
+registration never counts, even when its workspace lies under this checkout, so a
+parent folder registration is not blocked by its nested projects. A registration in
+use refuses the entire save with `project_in_use` and leaves the settings revision
+and registrations intact.
 The desktop's one-click removal of a missing checkout uses the project registration
 candidate in `cleanup.plan` and `cleanup.apply`, which rechecks absence and usage
 while holding the Store lock.
