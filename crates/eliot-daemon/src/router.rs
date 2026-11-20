@@ -28,6 +28,7 @@ pub(crate) use attention::run_attention;
 use auth::{authorize_command, authorize_rpc_method};
 pub(crate) use coordination::run_mail_reoffer;
 pub(crate) use digests::run_completion_digest;
+use eliot_core::{is_attachment_verb, is_start_verb, is_user_event_verb};
 pub(crate) use goals::{real_goal_check, run_goal_driver};
 
 use crate::{
@@ -754,8 +755,7 @@ impl Router {
                 let Some(command) = store.get_command(&id)? else {
                     continue;
                 };
-                if command.state != CommandState::Accepted
-                    || !matches!(command.verb.as_str(), "launch" | "resume")
+                if command.state != CommandState::Accepted || !is_start_verb(command.verb.as_str())
                 {
                     continue;
                 }
@@ -897,7 +897,7 @@ impl Router {
         {
             return Ok(result);
         }
-        if matches!(request.verb.as_str(), "notify" | "emit")
+        if is_user_event_verb(request.verb.as_str())
             && let Err(error) = Self::validate_user_event_request(&request)
         {
             let mut retry = replay_request.clone();
@@ -1822,7 +1822,7 @@ impl Router {
         request: &mut SubmitCommand,
         principal: &Principal,
     ) -> Result<()> {
-        if matches!(request.verb.as_str(), "attach" | "detach") {
+        if is_attachment_verb(request.verb.as_str()) {
             require_owner(principal)?;
         }
         if request.verb == "worktree.remove" {
@@ -5466,7 +5466,7 @@ fn rule_admission_dispatch_plan(
             .map(|linked| linked.id.clone());
         return Some((command.id.clone(), linked_id));
     }
-    if matches!(command.verb.as_str(), "launch" | "resume")
+    if is_start_verb(command.verb.as_str())
         && command.state == CommandState::Applied
         && let Some(linked) = &admission.linked_command
         && matches!(linked.state, CommandState::Accepted | CommandState::Queued)

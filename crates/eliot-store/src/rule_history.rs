@@ -1,6 +1,7 @@
 //! Bounded, explicit replay over retained rule history.
 
 use super::*;
+use eliot_core::is_start_verb;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
@@ -947,7 +948,7 @@ pub(crate) fn gate_rule_action_dispatch_tx(
             let predecessor = load_command_record(tx, &row.0)?.ok_or_else(|| {
                 Error::new("source_integrity", "rule-action predecessor disappeared")
             })?;
-            if matches!(predecessor.command.verb.as_str(), "launch" | "resume") {
+            if is_start_verb(predecessor.command.verb.as_str()) {
                 let retained = retained_action_admission(tx, predecessor.command)?;
                 if let Some(linked_send) = retained.linked_command {
                     match linked_send.state {

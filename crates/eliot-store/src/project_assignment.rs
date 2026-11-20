@@ -4,6 +4,7 @@ use eliot_core::api::{
     ProjectAssignmentLaunchRequest, ProjectAssignmentOutcome, ProjectAssignmentReleaseRequest,
     ProjectAssignmentResult, ProjectAssignmentState, ProjectManagerIdentity,
 };
+use eliot_core::is_start_verb;
 
 const CLAIM: &str = PROJECT_ASSIGNMENT_CLAIM_ACTION;
 const LAUNCH: &str = "project.assignment.launch";
@@ -743,7 +744,7 @@ fn enforce_launch(
     target: Option<&Agent>,
     bindings: &[Binding],
 ) -> Result<()> {
-    if matches!(verb, "launch" | "resume")
+    if is_start_verb(verb)
         && let Some(agent) = target
         && let Some(binding) = bindings
             .iter()

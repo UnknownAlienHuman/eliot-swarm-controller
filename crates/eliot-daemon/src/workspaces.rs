@@ -10,6 +10,7 @@ use crate::{
     setup,
     workspace_git::WorkspaceGit,
 };
+use eliot_core::is_start_verb;
 use eliot_core::{
     Agent, Command as CoreCommand, CommandState, Error, Result, SecretPolicy, SubmitCommand,
     WorkspaceCancelOutcome, WorkspaceCreationOutcome, WorkspacePhase, WorkspacePreparation,
@@ -1283,7 +1284,7 @@ impl WorkspaceManager {
             .get_agent(target)?
             .ok_or_else(|| problem("not_found", "workspace Agent was not found"))?;
         if preparation.start_command_id != id
-            || !matches!(command.verb.as_str(), "launch" | "resume")
+            || !is_start_verb(command.verb.as_str())
             || !matches!(
                 command.state,
                 CommandState::Accepted | CommandState::Queued | CommandState::Unknown

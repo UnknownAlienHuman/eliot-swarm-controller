@@ -1,4 +1,5 @@
 use super::*;
+use eliot_core::{is_attachment_verb, is_start_verb, is_user_event_verb};
 
 impl Store {
     pub(super) fn settle_inner(
@@ -49,7 +50,7 @@ impl Store {
                 .map_err(sql_error)?;
             if state != CommandState::Failed
                 || record.state != CommandState::Dispatched
-                || !matches!(record.command.verb.as_str(), "launch" | "resume")
+                || !is_start_verb(record.command.verb.as_str())
                 || agent.generation != generation
                 || agent.state != AgentState::Starting
                 || has_processes
@@ -116,7 +117,7 @@ impl Store {
             context::settle_send_claims_tx(&tx, &record, state, now, &mut events)?;
         }
 
-        if matches!(record.command.verb.as_str(), "attach" | "detach") {
+        if is_attachment_verb(record.command.verb.as_str()) {
             observer::settle_failure(&tx, &record.command, now, &mut events)?;
         }
 
@@ -232,7 +233,7 @@ impl Store {
                 .map_err(sql_error)?;
             let record = load_command_record(&tx, command_id)?
                 .ok_or_else(|| Error::new("not_found", "user-event command was not found"))?;
-            if !matches!(record.command.verb.as_str(), "notify" | "emit") {
+            if !is_user_event_verb(record.command.verb.as_str()) {
                 return Err(Error::new("invalid", "not a local user-event command"));
             }
             if record.target.is_some() || record.command.generation.is_some() {
@@ -709,8 +710,7 @@ fn check_settle_verb_guards(
             .map_err(|_| Error::new("invalid", "applied git.fetch readback is malformed"))?;
         outcome.validate_for(&frozen)?;
     }
-    if matches!(record.command.verb.as_str(), "attach" | "detach") && state == CommandState::Applied
-    {
+    if is_attachment_verb(record.command.verb.as_str()) && state == CommandState::Applied {
         return Err(Error::new(
             "not_allowed",
             "observer commands require exact observer settlement",
@@ -859,7 +859,7 @@ fn release_settle_capacity(
             false,
         )?;
     } else if matches!(state, CommandState::Rejected | CommandState::Failed)
-        && matches!(record.command.verb.as_str(), "launch" | "resume")
+        && is_start_verb(record.command.verb.as_str())
     {
         // A dispatched Rejected start never dispatched native I/O, so its
         // slot is released immediately. A dispatched Failed start carries the
@@ -920,7 +920,7 @@ fn apply_settle_agent_transition(
             workspace::persist_workspace(tx, &old_workspace, &workspace)?;
             events.push(workspace::workspace_event(tx, &workspace, now)?);
         }
-    } else if matches!(record.command.verb.as_str(), "launch" | "resume")
+    } else if is_start_verb(record.command.verb.as_str())
         && matches!(state, CommandState::Rejected | CommandState::Failed)
     {
         if let (Some(agent_num), Some(generation)) = (target, generation) {
@@ -1018,7 +1018,7 @@ fn restore_resume_workspace_marker_tx(
     let previous_start = load_command_record(tx, previous_start_id)?
         .ok_or_else(|| Error::new("source_integrity", "resume prior start command is missing"))?;
     if previous_start.target != Some(agent_num)
-        || !matches!(previous_start.command.verb.as_str(), "launch" | "resume")
+        || !is_start_verb(previous_start.command.verb.as_str())
         || previous_start.command.generation != Some(old_generation)
         || !matches!(
             previous_start.state,

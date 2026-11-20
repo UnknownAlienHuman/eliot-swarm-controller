@@ -3,7 +3,7 @@ use super::{
     CommandSubmitRequest, CommandSubmitResponse, DaemonShutdownRequest, DaemonShutdownResponse,
     ShutdownMode,
 };
-use crate::{CommandState, Error, Result};
+use crate::{CommandState, Error, Result, is_start_verb};
 
 impl CommandSubmitRequest {
     pub fn validate_response(&self, response: &CommandSubmitResponse) -> Result<()> {
@@ -46,7 +46,7 @@ impl CommandSubmitRequest {
         {
             return Err(binding_mismatch());
         }
-        let has_linked_input = matches!(self.verb.as_str(), "launch" | "resume")
+        let has_linked_input = is_start_verb(self.verb.as_str())
             && self
                 .args
                 .get("text")

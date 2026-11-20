@@ -1,4 +1,5 @@
 use super::*;
+use eliot_core::is_start_verb;
 
 impl Store {
     /// Install the PluginHost-validated manifest source plan for a Starting
@@ -77,7 +78,7 @@ impl Store {
             .ok_or_else(|| Error::new("not_found", "plugin start command was not found"))?;
         if record.state != CommandState::Dispatched
             || record.target != Some(agent_num)
-            || !matches!(record.command.verb.as_str(), "launch" | "resume")
+            || !is_start_verb(record.command.verb.as_str())
             || record.command.generation != Some(generation)
         {
             return Err(Error::new(

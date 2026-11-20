@@ -2,7 +2,7 @@
 //! bindings, hydration and effect settlement remain in the Router and Store.
 
 use super::{DrainReport, StatusBlocker};
-use crate::{CommandState, Error, Result};
+use crate::{CommandState, Error, Result, is_coordination_verb, is_user_event_verb};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -58,7 +58,7 @@ impl CommandSubmitRequest {
                 "git.fetch is targetless and has no Agent bindings",
             ));
         }
-        if matches!(self.verb.as_str(), "notify" | "emit")
+        if is_user_event_verb(self.verb.as_str())
             && (self.target.is_some()
                 || self.expected_generation.is_some()
                 || self.expected_turn_id.is_some()
@@ -70,7 +70,7 @@ impl CommandSubmitRequest {
                 "notify/emit are targetless and have no Agent bindings",
             ));
         }
-        if matches!(self.verb.as_str(), "mail.send" | "var.set")
+        if is_coordination_verb(self.verb.as_str())
             && (self.target.is_some()
                 || self.expected_generation.is_some()
                 || self.expected_turn_id.is_some()

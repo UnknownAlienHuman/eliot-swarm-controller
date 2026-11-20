@@ -1,5 +1,6 @@
 use super::lifecycle::cancel_unstarted_resume_input_tx;
 use super::*;
+use eliot_core::is_start_verb;
 
 const WORKSPACE_COLUMNS: &str = "agent, target_generation, start_command_id, project, repo_path,
     repo_common_dir, requested_branch, base_ref, base_oid, worktree_path, frozen_setup,
@@ -961,7 +962,7 @@ pub(super) fn preparation_command(
     let agent = load_agent_by_num(connection, parse_agent_id(&workspace.agent)?)?
         .ok_or_else(|| Error::new("not_found", "workspace Agent was not found"))?;
     if command.target != Some(parse_agent_id(&workspace.agent)?)
-        || !matches!(command.command.verb.as_str(), "launch" | "resume")
+        || !is_start_verb(command.command.verb.as_str())
         || agent.generation.checked_add(1) != Some(workspace.target_generation)
         || command.command.generation != Some(agent.generation)
         || agent.active_turn.is_some()

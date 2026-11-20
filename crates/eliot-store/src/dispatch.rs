@@ -1,4 +1,5 @@
 use super::*;
+use eliot_core::{is_attachment_verb, is_request_reply_verb};
 
 mod targetless;
 
@@ -35,7 +36,7 @@ fn dispatch_target_tx(tx: &Transaction<'_>, command: &CommandRecord) -> Result<(
         }
     }
     let command_generation = command.command.generation.unwrap_or(agent.generation);
-    if !matches!(command.command.verb.as_str(), "attach" | "detach") {
+    if !is_attachment_verb(command.command.verb.as_str()) {
         observer::require_controlled(&agent)?;
     }
     if matches!(command.command.verb.as_str(), "launch" | "send" | "steer") {
@@ -831,7 +832,7 @@ fn dispatch_control_tx(
             "control command no longer targets the exact active turn",
         ));
     }
-    if matches!(command.command.verb.as_str(), "approve" | "deny" | "answer") {
+    if is_request_reply_verb(command.command.verb.as_str()) {
         let request_id = command.command.request_id.as_deref().ok_or_else(|| {
             Error::new(
                 "source_integrity",

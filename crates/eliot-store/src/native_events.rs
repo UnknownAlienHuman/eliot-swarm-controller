@@ -1,4 +1,5 @@
 use super::*;
+use eliot_core::{is_request_reply_verb, is_start_verb};
 
 pub(super) struct PendingCommandEvent {
     pub(super) command_id: String,
@@ -447,7 +448,7 @@ fn persist_request_resolved(
             "request.resolved unexpectedly carries open-request details",
         ));
     }
-    if !matches!(command.command.verb.as_str(), "approve" | "deny" | "answer")
+    if !is_request_reply_verb(command.command.verb.as_str())
         || command.command.request_id.as_deref() != Some(request_id)
         || command.command.turn_id.as_deref() != Some(turn_id)
         || !matches!(
@@ -826,7 +827,7 @@ pub(super) fn verified_native_event_cause_tx(
         };
         let bound = command.target == Some(agent_num)
             && command.command.generation == Some(generation)
-            && matches!(command.command.verb.as_str(), "launch" | "resume")
+            && is_start_verb(command.command.verb.as_str())
             && matches!(
                 command.state,
                 CommandState::Dispatched | CommandState::Unknown
@@ -977,7 +978,7 @@ fn verified_request_reply_cause_tx(
     };
     let bound = command.target == Some(agent_num)
         && command.command.generation == Some(generation)
-        && matches!(command.command.verb.as_str(), "approve" | "deny" | "answer")
+        && is_request_reply_verb(command.command.verb.as_str())
         && command.command.request_id.as_deref() == Some(request_id)
         && command.command.turn_id.as_deref() == Some(turn_id)
         && matches!(

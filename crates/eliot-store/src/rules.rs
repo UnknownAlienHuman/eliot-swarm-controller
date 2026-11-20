@@ -4,6 +4,7 @@
 //! event cursor, action accounting, and the parent/child admission transaction.
 
 use super::*;
+use eliot_core::{is_coordination_verb, is_request_reply_verb, is_start_verb, is_user_event_verb};
 
 #[path = "rule_history.rs"]
 mod rule_history;
@@ -1026,7 +1027,7 @@ fn validate_project_rule_action_tx(
         super::projects::capture_project_command_binding_tx(tx, &command)?;
         return Ok(None);
     }
-    if matches!(request.verb.as_str(), "notify" | "emit") {
+    if is_user_event_verb(request.verb.as_str()) {
         if rule_project_id(principal)?.is_none() {
             return Ok(None);
         }
@@ -1035,7 +1036,7 @@ fn validate_project_rule_action_tx(
         super::projects::capture_project_command_binding_tx(tx, &command)?;
         return Ok(None);
     }
-    if matches!(request.verb.as_str(), "mail.send" | "var.set") {
+    if is_coordination_verb(request.verb.as_str()) {
         if rule_project_id(principal)?.is_none() {
             return Ok(None);
         }
@@ -1724,16 +1725,16 @@ fn valid_event_rule_action_request(request: &SubmitCommand) -> bool {
     if request.verb == "git.fetch" {
         return valid_targetless_git_fetch_request(request);
     }
-    if matches!(request.verb.as_str(), "notify" | "emit") {
+    if is_user_event_verb(request.verb.as_str()) {
         return valid_targetless_user_event_request(request);
     }
-    if matches!(request.verb.as_str(), "mail.send" | "var.set") {
+    if is_coordination_verb(request.verb.as_str()) {
         return valid_targetless_coordination_request(request);
     }
     if request.verb == "inject" {
         return valid_inject_request(request);
     }
-    let reply = matches!(request.verb.as_str(), "approve" | "deny" | "answer");
+    let reply = is_request_reply_verb(request.verb.as_str());
     if request.verb != "steer" && !reply {
         return valid_rule_action_request(request, true);
     }
@@ -1809,7 +1810,7 @@ fn valid_targetless_rule_run_request(request: &SubmitCommand) -> bool {
 
 fn valid_targetless_user_event_request(request: &SubmitCommand) -> bool {
     request.validate().is_ok()
-        && matches!(request.verb.as_str(), "notify" | "emit")
+        && is_user_event_verb(request.verb.as_str())
         && request.target.is_none()
         && request.expected_generation.is_none()
         && request.expected_turn_id.is_none()
@@ -1820,7 +1821,7 @@ fn valid_targetless_user_event_request(request: &SubmitCommand) -> bool {
 
 fn valid_targetless_coordination_request(request: &SubmitCommand) -> bool {
     request.validate().is_ok()
-        && matches!(request.verb.as_str(), "mail.send" | "var.set")
+        && is_coordination_verb(request.verb.as_str())
         && request.target.is_none()
         && request.expected_generation.is_none()
         && request.expected_turn_id.is_none()
@@ -2207,7 +2208,7 @@ fn rule_action_binding_error(event: &StoredRuleTrigger, request: &SubmitCommand)
             "interrupt" | "steer" | "approve" | "deny" | "answer"
         ) || (request.verb == "inject" && request.args["point"] == "turn_safe_point"))
             && request.expected_turn_id.as_deref() != event.turn_id.as_deref())
-        || (matches!(request.verb.as_str(), "approve" | "deny" | "answer")
+        || (is_request_reply_verb(request.verb.as_str())
             && (event.kind != "request.opened"
                 || request.request_id.as_deref() != event.request_id.as_deref()))
     {
@@ -2716,7 +2717,7 @@ pub(super) fn retained_action_admission(
     connection: &Connection,
     command: Command,
 ) -> Result<Admission> {
-    let linked_command = if matches!(command.verb.as_str(), "launch" | "resume") {
+    let linked_command = if is_start_verb(command.verb.as_str()) {
         load_linked_command(connection, &command.id)?
     } else {
         None
