@@ -17,13 +17,14 @@ use eliot_core::{ContextItem, Error, FailureOrigin, InjectPoint, McpPolicy, Resu
 use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
     MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
-    protocol::{AgentModelsParams, ModelListParams, ModelListPart},
+    protocol::{AgentModelsParams, ModelListParams, ModelListPart, stream_sources},
     session::{
-        ResumeSubject, TargetEnvironment, decode, ensure_dedicated_reader, ensure_reader_harness,
-        native_no_write, not_initialized, optional_profile_text, parse_resume_subject, paths_equal,
-        register_native_process, split_provider_model, target_environment, unknown_snapshot,
-        validate_binding, validate_identity, validate_source_plan, with_claimed_context,
-        with_context_points,
+        ResumeSubject, TargetEnvironment, attach_reply_diagnostics, begin_stop, decode,
+        ensure_dedicated_reader, ensure_reader_harness, initialize_fields_valid, native_no_write,
+        not_initialized, optional_profile_text, parse_resume_subject, paths_equal,
+        register_native_process, required_native_cmd, split_provider_model, target_environment,
+        unknown_snapshot, validate_binding, validate_identity, validate_source_plan,
+        with_claimed_context, with_context_points,
     },
 };
 use serde_json::{Value, json};
@@ -519,55 +520,37 @@ impl OpenCodePlugin {
         let Some(session) = self.session.as_ref() else {
             return result;
         };
-        match result {
-            Err(error) => Err(session.server.diagnostic_error(error)),
-            Ok(mut value) => {
-                if request.method == "agent.snapshot"
-                    || value
-                        .get("state")
+        // The attached error names the plugin method and the value's own
+        // reason: an empty harness tail stays honest (empty text), but the
+        // outcome still says which plugin method produced it and with what
+        // reason.
+        attach_reply_diagnostics(
+            result,
+            &request.method,
+            "OpenCode",
+            |error| session.server.diagnostic_error(error),
+            |value| {
+                Error::new(
+                    "unknown",
+                    value
+                        .get("reason")
                         .and_then(Value::as_str)
-                        .is_some_and(|state| matches!(state, "unknown" | "rejected" | "failed"))
-                {
-                    // The attached error names the plugin method and the
-                    // value's own reason: an empty harness tail stays honest
-                    // (empty text), but the outcome still says which plugin
-                    // method produced it and with what reason.
-                    let context = Error::new(
-                        "unknown",
-                        value
-                            .get("reason")
-                            .and_then(Value::as_str)
-                            .filter(|reason| !reason.trim().is_empty())
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| {
-                                format!("OpenCode {} produced an uncertain outcome", request.method)
-                            }),
-                    )
-                    .with_where(format!("plugin.opencode.command.{}", request.method));
-                    let diagnostics =
-                        serde_json::to_value(session.server.diagnostic_error(context)).map_err(
-                            |_| Error::new("internal", "OpenCode diagnostics could not be encoded"),
-                        )?;
-                    if let Some(tails) = diagnostics
-                        .get("diagnostics")
-                        .filter(|tails| !tails.is_null())
-                    {
-                        value["diagnostics"] = tails.clone();
-                    }
-                }
-                Ok(value)
-            }
-        }
+                        .filter(|reason| !reason.trim().is_empty())
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| {
+                            format!("OpenCode {} produced an uncertain outcome", request.method)
+                        }),
+                )
+                .with_where(format!("plugin.opencode.command.{}", request.method))
+            },
+        )
     }
 
     fn initialize(&mut self, raw: &Value) -> Result<Value> {
         let params: InitializeParams =
             decode(raw, "OpenCode plugin initialize params are invalid")?;
         let store_root = params.store_root.clone().unwrap_or_default();
-        if params.protocol != "eliot-plugin/1"
-            || params.instance_dir.trim().is_empty()
-            || params.credential.trim().is_empty()
-            || params.credential.len() > eliot_plugin::protocol::MAX_CREDENTIAL_BYTES
+        if !initialize_fields_valid(&params)
             || params.store_root.is_none()
             || !Path::new(&store_root).is_absolute()
             || store_root.trim().is_empty()
@@ -617,16 +600,10 @@ impl OpenCodePlugin {
         let params: ModelListParams = decode(raw, "OpenCode model.list params are invalid")?;
         let snapshot = &params.profile;
         ensure_reader_harness(snapshot, "opencode", "OpenCode", "model.list")?;
-        let program = snapshot
-            .get("cmd")
-            .and_then(Value::as_str)
-            .filter(|cmd| !cmd.trim().is_empty())
-            .ok_or_else(|| {
-                Error::new(
-                    "profile_error",
-                    "OpenCode model.list requires a discovered native cmd",
-                )
-            })?;
+        let program = required_native_cmd(
+            snapshot,
+            "OpenCode model.list requires a discovered native cmd",
+        )?;
         let initialized = self
             .initialized
             .as_ref()
@@ -3662,25 +3639,15 @@ impl OpenCodePlugin {
             params.generation,
             "OpenCode",
         )?;
-        if session.phase == SessionPhase::Stopped
-            && session.stop_command_id.as_deref() == Some(params.command_id.as_str())
-        {
+        // Latch once before native I/O. An uncertain close is never replayed.
+        if begin_stop(
+            &mut session.stop_command_id,
+            session.phase == SessionPhase::Stopped,
+            &params.command_id,
+            "OpenCode",
+        )? {
             return Ok(json!({"state": "applied"}));
         }
-        if let Some(existing) = &session.stop_command_id {
-            if existing != &params.command_id {
-                return Err(Error::new(
-                    "source_integrity",
-                    "OpenCode stop command id changed after dispatch",
-                ));
-            }
-            return Err(Error::new(
-                "unknown",
-                "OpenCode stop outcome is unresolved and will not be repeated",
-            ));
-        }
-        // Latch once before native I/O. An uncertain close is never replayed.
-        session.stop_command_id = Some(params.command_id.clone());
         let session = self
             .session
             .as_mut()
@@ -4730,40 +4697,33 @@ pub(crate) fn opencode_scope(data_dir: &Path) -> String {
 }
 
 fn opencode_manifest() -> PluginManifest {
-    let controlled = BTreeMap::from([
-        ("message".to_owned(), "stream".to_owned()),
-        ("request".to_owned(), "stream".to_owned()),
-        ("session".to_owned(), "stream".to_owned()),
-        ("turn".to_owned(), "stream".to_owned()),
-    ]);
-    PluginManifest {
-        name: "opencode".to_owned(),
-        version: env!("CARGO_PKG_VERSION").to_owned(),
-        protocol: "eliot-plugin/1".to_owned(),
-        harness_version: "2.2.7".to_owned(),
-        available: true,
-        mode: "per_agent".to_owned(),
-        verbs: vec![
-            "launch".to_owned(),
-            "resume".to_owned(),
-            "send".to_owned(),
-            "configure".to_owned(),
-            "models".to_owned(),
-            "steer".to_owned(),
-            "interrupt".to_owned(),
-            "approve".to_owned(),
-            "deny".to_owned(),
-            "answer".to_owned(),
-            "stop".to_owned(),
+    PluginManifest::per_agent(
+        "opencode",
+        env!("CARGO_PKG_VERSION"),
+        "2.2.7",
+        &[
+            "launch",
+            "resume",
+            "send",
+            "configure",
+            "models",
+            "steer",
+            "interrupt",
+            "approve",
+            "deny",
+            "answer",
+            "stop",
         ],
-        child_verbs: Vec::new(),
-        features: eliot_plugin::protocol::ManifestFeatures {
+        eliot_plugin::protocol::ManifestFeatures {
             discover: false,
             observe: false,
             start_requires_input: false,
             native_children: false,
         },
-        sources: BTreeMap::from([("controlled".to_owned(), controlled)]),
-        proxy: "none".to_owned(),
-    }
+        BTreeMap::from([(
+            "controlled".to_owned(),
+            stream_sources(&["message", "request", "session", "turn"]),
+        )]),
+        "none",
+    )
 }

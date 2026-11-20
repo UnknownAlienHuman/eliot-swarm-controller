@@ -21,6 +21,8 @@ use eliot_core::{
 use serde_json::{Map, Value, json};
 use tokio::time::Instant;
 
+use crate::protocol::{AgentCommandParams, InitializeParams, MAX_CREDENTIAL_BYTES};
+
 /// Fill only missing origin/location from a machine-owned error code. A
 /// no-effect verdict says nothing about the layer that caused the failure.
 pub fn classify_start_failure(mut error: Error, harness: &str, phase: &str) -> Error {
@@ -616,6 +618,133 @@ pub fn rejected_control(reason: &str) -> Value {
 /// A control reply whose native outcome is unresolved.
 pub fn unknown_control(reason: &str) -> Value {
     json!({"state": "unknown", "reason": reason})
+}
+
+/// The shared `initialize` identity check: exact protocol, a non-empty
+/// private instance directory, and a bounded non-empty credential. Each
+/// adapter adds its own extra checks and error message.
+pub fn initialize_fields_valid(params: &InitializeParams) -> bool {
+    params.protocol == "eliot-plugin/1"
+        && !params.instance_dir.trim().is_empty()
+        && !params.credential.trim().is_empty()
+        && params.credential.len() <= MAX_CREDENTIAL_BYTES
+}
+
+/// Stop latch for one Agent. `stopped` is the session phase, `latch` the
+/// retained stop command id. Returns `Ok(true)` for the exact repeat of an
+/// applied stop (answer `applied`), `Ok(false)` after latching this command
+/// before any native I/O, and an error for a different or unresolved stop.
+pub fn begin_stop(
+    latch: &mut Option<String>,
+    stopped: bool,
+    command_id: &str,
+    harness: &str,
+) -> Result<bool> {
+    if stopped && latch.as_deref() == Some(command_id) {
+        return Ok(true);
+    }
+    if let Some(existing) = latch {
+        if existing != command_id {
+            return Err(Error::new(
+                "source_integrity",
+                format!("{harness} stop command id changed after dispatch"),
+            ));
+        }
+        return Err(Error::new(
+            "unknown",
+            format!("{harness} stop outcome is unresolved and will not be repeated"),
+        ));
+    }
+    *latch = Some(command_id.to_owned());
+    Ok(false)
+}
+
+/// The captured `(turn_id, request_id)` a request reply must carry.
+pub fn request_reply_ids<'a>(
+    params: &'a AgentCommandParams,
+    harness: &str,
+) -> Result<(&'a str, &'a str)> {
+    let turn_id = params
+        .turn_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            Error::new(
+                "stale_turn",
+                format!("{harness} request reply needs its captured turn id"),
+            )
+        })?;
+    let request_id = params
+        .request_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            Error::new(
+                "not_found",
+                format!("{harness} request reply needs its captured request id"),
+            )
+        })?;
+    Ok((turn_id, request_id))
+}
+
+/// The applied reply for one request decision.
+pub fn request_reply_applied(command_id: &str, request_id: &str, turn_id: &str) -> Value {
+    json!({
+        "state": "applied",
+        "command_id": command_id,
+        "request_id": request_id,
+        "turn_id": turn_id,
+    })
+}
+
+/// Reply diagnostics: a failed call gets the native tail on its error. A
+/// snapshot, or a reply whose state is `unknown`, `rejected` or `failed`,
+/// gets the tail attached as `diagnostics`. `diagnose` maps an error through
+/// the adapter's native client; `context` builds the error whose tail is
+/// read for a successful reply.
+pub fn attach_reply_diagnostics(
+    result: Result<Value>,
+    method: &str,
+    harness: &str,
+    diagnose: impl FnOnce(Error) -> Error,
+    context: impl FnOnce(&Value) -> Error,
+) -> Result<Value> {
+    match result {
+        Err(error) => Err(diagnose(error)),
+        Ok(mut value) => {
+            if method == "agent.snapshot"
+                || value
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .is_some_and(|state| matches!(state, "unknown" | "rejected" | "failed"))
+            {
+                let diagnostics =
+                    serde_json::to_value(diagnose(context(&value))).map_err(|_| {
+                        Error::new(
+                            "internal",
+                            format!("{harness} diagnostics could not be encoded"),
+                        )
+                    })?;
+                if let Some(tails) = diagnostics
+                    .get("diagnostics")
+                    .filter(|tails| !tails.is_null())
+                {
+                    value["diagnostics"] = tails.clone();
+                }
+            }
+            Ok(value)
+        }
+    }
+}
+
+/// The frozen native command in a profile snapshot, or `profile_error` with
+/// the adapter's own `message`.
+pub fn required_native_cmd<'a>(snapshot: &'a Value, message: &str) -> Result<&'a str> {
+    snapshot
+        .get("cmd")
+        .and_then(Value::as_str)
+        .filter(|cmd| !cmd.trim().is_empty())
+        .ok_or_else(|| Error::new("profile_error", message))
 }
 
 /// Register the owned native process as the `harness` role under this

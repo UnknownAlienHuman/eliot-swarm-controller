@@ -16,7 +16,8 @@ use eliot_plugin::{
     session::{
         EVENT_DEADLINE, MessageCommit, StreamSource, approval_reply_args, attach_final_text,
         attach_final_text_unavailable, is_blank_native_text, native_no_write, next_input_outcomes,
-        rejected_control, request_event_id, unknown_control, with_claimed_context,
+        rejected_control, request_event_id, request_reply_applied, unknown_control,
+        with_claimed_context,
     },
 };
 use serde::Serialize;
@@ -2938,12 +2939,7 @@ impl EventProcessor {
             )));
         }
         self.pending_requests.remove(request_id);
-        Ok(json!({
-            "state": "applied",
-            "command_id": command_id,
-            "request_id": request_id,
-            "turn_id": turn_id,
-        }))
+        Ok(request_reply_applied(command_id, request_id, turn_id))
     }
 
     /// Close every retained ask of one finished turn (or of the stopped

@@ -28,11 +28,13 @@ use eliot_core::{
 use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
     MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
-    protocol::MAX_CREDENTIAL_BYTES,
+    protocol::stream_sources,
     session::{
-        decode, ensure_dedicated_reader, ensure_reader_harness, native_no_write, not_initialized,
-        paths_equal, register_native_process, rejected_control, unknown_control, unknown_snapshot,
-        validate_binding, validate_identity, with_claimed_context, with_context_points,
+        attach_reply_diagnostics, begin_stop, decode, ensure_dedicated_reader,
+        ensure_reader_harness, initialize_fields_valid, native_no_write, not_initialized,
+        paths_equal, register_native_process, rejected_control, request_reply_ids,
+        required_native_cmd, unknown_control, unknown_snapshot, validate_binding,
+        validate_identity, with_claimed_context, with_context_points,
     },
 };
 use serde_json::{Value, json};
@@ -382,40 +384,18 @@ impl MusePlugin {
         let Some(session) = self.session.as_ref() else {
             return result;
         };
-        match result {
-            Err(error) => Err(session.native_client.diagnostic_error(error)),
-            Ok(mut value) => {
-                if request.method == "agent.snapshot"
-                    || value
-                        .get("state")
-                        .and_then(Value::as_str)
-                        .is_some_and(|state| matches!(state, "unknown" | "rejected" | "failed"))
-                {
-                    let diagnostics = serde_json::to_value(
-                        session
-                            .native_client
-                            .diagnostic_error(Error::new("unknown", "")),
-                    )
-                    .map_err(|_| Error::new("internal", "Muse diagnostics could not be encoded"))?;
-                    if let Some(tails) = diagnostics
-                        .get("diagnostics")
-                        .filter(|tails| !tails.is_null())
-                    {
-                        value["diagnostics"] = tails.clone();
-                    }
-                }
-                Ok(value)
-            }
-        }
+        attach_reply_diagnostics(
+            result,
+            &request.method,
+            "Muse",
+            |error| session.native_client.diagnostic_error(error),
+            |_| Error::new("unknown", ""),
+        )
     }
 
     fn initialize(&mut self, raw: &Value) -> Result<Value> {
         let params: InitializeParams = decode(raw, "Muse plugin initialize params are invalid")?;
-        if params.protocol != "eliot-plugin/1"
-            || params.instance_dir.trim().is_empty()
-            || params.credential.trim().is_empty()
-            || params.credential.len() > MAX_CREDENTIAL_BYTES
-        {
+        if !initialize_fields_valid(&params) {
             return Err(Error::new(
                 "invalid",
                 "Muse plugin initialize requires protocol, private instance directory, and credential",
@@ -1854,26 +1834,7 @@ impl MusePlugin {
             params.generation,
             "Muse",
         )?;
-        let turn_id = params
-            .turn_id
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| {
-                Error::new(
-                    "stale_turn",
-                    "Muse request reply needs its captured turn id",
-                )
-            })?;
-        let request_id = params
-            .request_id
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| {
-                Error::new(
-                    "not_found",
-                    "Muse request reply needs its captured request id",
-                )
-            })?;
+        let (turn_id, request_id) = request_reply_ids(&params, "Muse")?;
         match session
             .events
             .reply_request(
@@ -1999,27 +1960,17 @@ impl MusePlugin {
             params.generation,
             "Muse",
         )?;
-        if session.phase == SessionPhase::Stopped
-            && session.stop_command_id.as_deref() == Some(params.command_id.as_str())
-        {
-            return Ok(json!({"state": "applied"}));
-        }
-        if let Some(existing) = &session.stop_command_id {
-            if existing != &params.command_id {
-                return Err(Error::new(
-                    "source_integrity",
-                    "Muse stop command id changed after dispatch",
-                ));
-            }
-            return Err(Error::new(
-                "unknown",
-                "Muse stop outcome is unresolved and will not be repeated",
-            ));
-        }
         // Latch once before native I/O. The router owns interrupt/wait and
         // daemon force custody; this adapter only performs the graceful
         // native close and verifies the event/source drain.
-        session.stop_command_id = Some(params.command_id.clone());
+        if begin_stop(
+            &mut session.stop_command_id,
+            session.phase == SessionPhase::Stopped,
+            &params.command_id,
+            "Muse",
+        )? {
+            return Ok(json!({"state": "applied"}));
+        }
         let session = self
             .session
             .as_mut()
@@ -2237,16 +2188,8 @@ impl MusePlugin {
         let profile: Value = decode(raw, "Muse model.list params are invalid")?;
         let snapshot = profile.get("profile").unwrap_or(&profile);
         ensure_reader_harness(snapshot, "muse", "Muse", "model.list")?;
-        let program = snapshot
-            .get("cmd")
-            .and_then(Value::as_str)
-            .filter(|cmd| !cmd.trim().is_empty())
-            .ok_or_else(|| {
-                Error::new(
-                    "profile_error",
-                    "Muse model.list requires a discovered native cmd",
-                )
-            })?;
+        let program =
+            required_native_cmd(snapshot, "Muse model.list requires a discovered native cmd")?;
         let cwd = std::env::current_dir()
             .map_err(|_| Error::new("internal", "Muse model.list could not read its cwd"))?;
         let deadline = Instant::now() + RPC_TIMEOUT;
@@ -2340,16 +2283,8 @@ impl MusePlugin {
         let params = eliot_plugin::quota::decode(raw)?;
         let snapshot = &params.profile;
         ensure_reader_harness(snapshot, "muse", "Muse", "quota.read")?;
-        let program = snapshot
-            .get("cmd")
-            .and_then(Value::as_str)
-            .filter(|cmd| !cmd.trim().is_empty())
-            .ok_or_else(|| {
-                Error::new(
-                    "profile_error",
-                    "Muse quota.read requires a discovered native cmd",
-                )
-            })?;
+        let program =
+            required_native_cmd(snapshot, "Muse quota.read requires a discovered native cmd")?;
         let cwd = std::env::current_dir()
             .map_err(|_| Error::new("internal", "Muse quota.read could not read its cwd"))?;
         let deadline = Instant::now() + RPC_TIMEOUT;
@@ -3147,43 +3082,35 @@ pub(crate) fn new_command_id() -> String {
 }
 
 fn muse_manifest() -> PluginManifest {
-    let controlled = BTreeMap::from([
-        ("message".to_owned(), "stream".to_owned()),
-        ("request".to_owned(), "stream".to_owned()),
-        ("session".to_owned(), "stream".to_owned()),
-        ("tool".to_owned(), "stream".to_owned()),
-        ("turn".to_owned(), "stream".to_owned()),
-    ]);
-    PluginManifest {
-        name: "muse".to_owned(),
-        version: env!("CARGO_PKG_VERSION").to_owned(),
-        protocol: "eliot-plugin/1".to_owned(),
-        harness_version: "1.4.0".to_owned(),
-        available: true,
-        mode: "per_agent".to_owned(),
-        verbs: vec![
-            "launch".to_owned(),
-            "resume".to_owned(),
-            "send".to_owned(),
-            "configure".to_owned(),
-            "steer".to_owned(),
-            "interrupt".to_owned(),
-            "approve".to_owned(),
-            "deny".to_owned(),
-            "answer".to_owned(),
-            "inject".to_owned(),
-            "stop".to_owned(),
+    PluginManifest::per_agent(
+        "muse",
+        env!("CARGO_PKG_VERSION"),
+        "1.4.0",
+        &[
+            "launch",
+            "resume",
+            "send",
+            "configure",
+            "steer",
+            "interrupt",
+            "approve",
+            "deny",
+            "answer",
+            "inject",
+            "stop",
         ],
-        child_verbs: Vec::new(),
-        features: eliot_plugin::protocol::ManifestFeatures {
+        eliot_plugin::protocol::ManifestFeatures {
             discover: false,
             observe: false,
             start_requires_input: false,
             native_children: true,
         },
-        sources: BTreeMap::from([("controlled".to_owned(), controlled)]),
-        proxy: "none".to_owned(),
-    }
+        BTreeMap::from([(
+            "controlled".to_owned(),
+            stream_sources(&["message", "request", "session", "tool", "turn"]),
+        )]),
+        "none",
+    )
 }
 
 /// Native arguments for `muse serve`. Full access passes `--disable-sandbox`

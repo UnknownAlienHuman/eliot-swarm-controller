@@ -148,6 +148,43 @@ pub struct ManifestFeatures {
     pub observe: bool,
 }
 
+impl PluginManifest {
+    /// The manifest of a per-Agent native adapter: protocol `eliot-plugin/1`,
+    /// available, no child verbs. Each adapter passes its own name, package
+    /// version, pinned harness version, verbs, features, sources and proxy.
+    pub fn per_agent(
+        name: &str,
+        version: &str,
+        harness_version: &str,
+        verbs: &[&str],
+        features: ManifestFeatures,
+        sources: BTreeMap<String, BTreeMap<String, String>>,
+        proxy: &str,
+    ) -> Self {
+        Self {
+            name: name.to_owned(),
+            version: version.to_owned(),
+            protocol: "eliot-plugin/1".to_owned(),
+            harness_version: harness_version.to_owned(),
+            available: true,
+            mode: "per_agent".to_owned(),
+            verbs: verbs.iter().map(|verb| (*verb).to_owned()).collect(),
+            child_verbs: Vec::new(),
+            features,
+            sources,
+            proxy: proxy.to_owned(),
+        }
+    }
+}
+
+/// One stream-family source map: every listed family streams.
+pub fn stream_sources(families: &[&str]) -> BTreeMap<String, String> {
+    families
+        .iter()
+        .map(|family| ((*family).to_owned(), "stream".to_owned()))
+        .collect()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProfileStoreParams {

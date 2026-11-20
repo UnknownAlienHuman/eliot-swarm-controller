@@ -12,7 +12,7 @@ use eliot_plugin::{
         EVENT_DEADLINE, MessageCommit, StreamSource, attach_final_text, attach_native_error,
         attach_provider_restriction, event_id as shared_event_id, native_no_write,
         next_input_outcomes, redact_request_details_for_commit, rejected_control, request_event_id,
-        unknown_control,
+        request_reply_applied, unknown_control,
     },
 };
 use serde::Serialize;
@@ -2064,12 +2064,11 @@ impl EventProcessor {
                 entry.reply_command_id = Some(command_id.to_owned());
                 entry.reply_native_command_id = None;
             }
-            return Ok(json!({
-                "state": "applied",
-                "command_id": command_id,
-                "request_id": request.id,
-                "turn_id": request.turn_id,
-            }));
+            return Ok(request_reply_applied(
+                command_id,
+                &request.id,
+                &request.turn_id,
+            ));
         }
         let Some(capture) = capture else {
             if let Some(entry) = self.pending_requests.get_mut(request_id) {
