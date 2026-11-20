@@ -563,8 +563,6 @@ impl Router {
             "workspace.list" => self.workspace_list(&params, &principal).await,
             "project.discover" => self.project_discover(&params, &principal).await,
             "profile.list" => self.profile_list(&params, &principal).await,
-            "config.profiles.read" => self.config_profiles_read(&params, &principal).await,
-            "config.profiles.save" => self.config_profiles_save(&params, &principal).await,
             "settings.read" => self.settings_read(&params, &principal).await,
             "settings.save" => self.settings_save(&params, &principal).await,
             "routing.preview" => self.routing_preview(&params, &principal).await,

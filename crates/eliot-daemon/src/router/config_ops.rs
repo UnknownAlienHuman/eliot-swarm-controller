@@ -1,19 +1,19 @@
 //! Owner configuration screens' RPCs: the sanitized profile list, the
-//! `[profiles.*]` source read and its validated save, and the rule list.
+//! settings read and save, and the rule list.
 //!
 //! Profiles resolve from `config.toml` at every launch admission against a
 //! revision-keyed validated snapshot, so these reads report exactly what the
-//! next launch will use; file validation runs once per content revision. The save
-//! delegates to `config::profiles_edit`, which reuses the launch parser and
-//! resolution. `rule.list` pages the stored rule states of one namespace with
+//! next launch will use; file validation runs once per content revision.
+//! `profile.list` delegates to `config::profiles_edit`, which reuses the launch
+//! parser and resolution. `rule.list` pages the stored rule states of one namespace with
 //! their canonical definitions and timer states; it changes nothing.
 use super::{PAGE_MAX, Principal, Router, require_owner, rule_principal};
 use eliot_core::{
     Error, Result, SecretPolicy,
     api::{
-        ProfileListRequest, ProfilesReadRequest, ProfilesSaveRequest, ProjectRegistrationView,
-        RuleListEntry, RuleListRequest, RuleListResponse, ScriptListRequest, ScriptReadRequest,
-        ScriptSaveRequest, SettingsReadRequest, SettingsSaveRequest,
+        ProfileListRequest, ProjectRegistrationView, RuleListEntry, RuleListRequest,
+        RuleListResponse, ScriptListRequest, ScriptReadRequest, ScriptSaveRequest,
+        SettingsReadRequest, SettingsSaveRequest,
     },
 };
 use serde_json::Value;
@@ -80,42 +80,6 @@ impl Router {
         let reply = crate::config::profiles_edit::list(&self.inner.data_root, &policy)?;
         request.validate_response(&reply)?;
         encode(&reply, "profile list")
-    }
-
-    pub(super) async fn config_profiles_read(
-        &self,
-        params: &Value,
-        principal: &Principal,
-    ) -> Result<Value> {
-        require_owner(principal)?;
-        let request: ProfilesReadRequest =
-            eliot_core::api::discovery::decode_params(params.clone())?;
-        request.validate()?;
-        let policy = self.secret_policy_snapshot();
-        let reply = crate::config::profiles_edit::read(&self.inner.data_root, &policy)?;
-        request.validate_response(&reply)?;
-        encode(&reply, "profile source")
-    }
-
-    pub(super) async fn config_profiles_save(
-        &self,
-        params: &Value,
-        principal: &Principal,
-    ) -> Result<Value> {
-        require_owner(principal)?;
-        let request: ProfilesSaveRequest =
-            eliot_core::api::discovery::decode_params(params.clone())?;
-        request.validate()?;
-        let policy = self.secret_policy_snapshot();
-        let mut store = self.inner.store.lock().await;
-        let reply = crate::config::profiles_edit::save(
-            &self.inner.data_root,
-            &mut store,
-            &request,
-            &policy,
-        )?;
-        request.validate_response(&reply)?;
-        encode(&reply, "profile save")
     }
 
     pub(super) async fn settings_read(

@@ -1086,7 +1086,7 @@ The API reuses the profile editor's bounded source, SHA-256 revision, selected-s
 splice, strict parser, secret checks, dry run and atomic private-file replacement.
 Unselected sections keep their bytes and semantic values. A stale revision is
 `conflict`; invalid or secret-bearing drafts never replace the file. Unsupported
-later-layer fields fail validation. Legacy `config.profiles.*` uses this same writer.
+later-layer fields fail validation.
 Every proxy is validated independently, including unused routes. Candidate projects
 resolve to canonical Git identities before both dry-run success and publication; a
 candidate that cannot be resolved, such as a missing folder, is refused as `invalid`,
@@ -1206,52 +1206,24 @@ it derives a valid, collision-free ID from the folder name and immediately saves
 only the projects section through that same revision-checked writer. The Auto model
 row links directly to Routing; reordering candidates uses the same immediate writer.
 
-## Legacy profile-only editing (`config.profiles.*`)
+## Profile section
 
-`settings.save` is the primary editing path and covers every section; `config.profiles.*`
-is the legacy profile-only path over the same writer (see
-[unified settings](#unified-settings)). Launch admission resolves its profile from
-`config.toml` at admission (above), so the saved file is what the next launch uses and
-running or queued work keeps its frozen snapshot; only a successful `configure` changes
-a live Agent's next-turn model/effort. Daemon settings loaded once at startup (`[daemon]`
-worker limits and `[mail]`) still require a restart after the save (see [unified
-settings](#unified-settings)).
+The `profiles` section of `settings.read`/`settings.save` carries the verbatim
+`[profiles.*]` tables in file order, with the file revision. Every other section stays
+server-side. Profiles resolve from `config.toml` at launch admission (above), so a saved
+file is what the next launch uses; running or queued work keeps its frozen snapshot, and
+only a successful `configure` changes a live Agent's next-turn model/effort. Daemon
+settings loaded once at startup (`[daemon]` worker limits and `[mail]`) still require a
+restart after the save.
 
-
-`config.profiles.read` returns the file revision (lowercase hex SHA-256 of its bytes)
-and the verbatim text of the `[profiles.*]` table blocks in file order. Every other
-section stays server-side. Comment and blank lines that end a profile block and precede
-another section belong to that section. The source is withheld (`editable=false` with a
-reason) when the file is not valid TOML, when profiles are defined outside
-`[profiles.*]` tables, when the profile text contains a value the daemon's secret
-policy knows, or when the profiles fail the daemon's strict field and URL
-validation (unknown fields and credential-bearing URLs are never handed to the
-editor as safe source). Profile sections carry environment and credential names, never values.
-
-[`config.profiles.save`](../../crates/eliot-daemon/src/config/profiles_edit.rs) takes
-the full replacement text for those blocks, the revision it was read from, and
-`dry_run`. It accepts a draft only when all of these hold:
-
-- the draft holds only `[profiles.*]` tables;
-- splicing it in place of the old blocks keeps the text of every other section in
-  place (only boundary newlines may be added) and every non-profile value unchanged;
-- the strict config parser, launch-time resolution of every profile (including child
-  profiles and route binding) and project validation accept the result, within the
-  128 KiB bound;
-- the file still has the expected revision, otherwise `conflict`.
-
-A draft carrying the redaction marker fails request validation (`invalid`). A known
-secret value, in the raw text or in any decoded value, is `not_allowed`. A dry run
-stops after validation. A save rechecks the revision immediately before it writes a
-private temporary file in the data directory and renames it over `config.toml`. Only
-saves inside one daemon are serialized, so an external writer in the instant between
-that recheck and the rename can still be overwritten. A failure after the rename
-reports `unknown`, never "unchanged". The draft keeps the file's line ending. A
-leading UTF-8 BOM is preserved outside the profile blocks and is never handed
-to the editor. An identical result writes nothing. An invalid draft is never written, so the file keeps
-its last valid revision and the editor keeps the draft. The daemon keeps one revision-keyed validated snapshot per router: an admission
-whose file revision matches reuses it, and any byte change re-reads and re-validates,
-so the saved file is still what the next launch uses.
+The section is withheld (`settings.read` returns `not_allowed`) when the file is not
+valid TOML, when profiles are defined outside `[profiles.*]` tables, when the profile
+text contains a value the daemon's secret policy knows, or when the profiles fail the
+daemon's strict field and URL validation (unknown fields and credential-bearing URLs are
+never handed to the editor). Profile sections carry environment and credential names,
+never values. The daemon keeps one revision-keyed validated snapshot per router: an
+admission whose file revision matches reuses it, and any byte change re-reads and
+re-validates, so the saved file is still what the next launch uses.
 
 ## Frozen files
 

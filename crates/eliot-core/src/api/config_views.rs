@@ -3,12 +3,11 @@
 //!
 //! `profile.list` is a sanitized summary for launch pickers: names, harness,
 //! model/effort, authority and route names, never values of secrets or
-//! environment. `config.profiles.read` returns the source text of the
-//! `[profiles.*]` sections only; every other section of `config.toml`
-//! (accounts, proxies, projects, cloud MCP, daemon, automation, mail) stays
-//! server-side. `config.profiles.save` replaces exactly those sections after
-//! the daemon's own parser and launch resolution accept the result, guarded
-//! by the file revision the editor started from. `rule.list` pages the
+//! environment. `settings.read` and `settings.save` are the owner paths that
+//! carry `[profiles.*]` source, alongside the other settings sections; a save
+//! is accepted only after the daemon's own parser and launch resolution accept
+//! the result, guarded by the file revision the editor started from.
+//! `rule.list` pages the
 //! stored rule states with their canonical definitions and timer states.
 
 use serde::{Deserialize, Serialize};
@@ -127,115 +126,6 @@ pub struct ProfileListResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub profiles: Vec<ProfileSummary>,
-}
-
-/// Request for `config.profiles.read`. Empty object.
-#[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProfilesReadRequest {}
-
-impl ProfilesReadRequest {
-    pub fn validate(&self) -> Result<()> {
-        Ok(())
-    }
-
-    pub fn validate_response(&self, reply: &ProfilesReadResponse) -> Result<()> {
-        validate_revision(&reply.revision)?;
-        match (&reply.source, reply.editable) {
-            (Some(source), true) => {
-                if source.len() > MAX_PROFILES_SOURCE_BYTES || source.contains(REDACTION_MARKER) {
-                    return Err(Error::new(
-                        "invalid",
-                        "profile source is oversized or carries a redaction marker",
-                    ));
-                }
-            }
-            (None, false) if reply.reason.is_some() => {}
-            _ => {
-                return Err(Error::new(
-                    "invalid",
-                    "profile source is returned exactly when it is editable; otherwise a reason is given",
-                ));
-            }
-        }
-        Ok(())
-    }
-}
-
-/// Response for `config.profiles.read`: the `[profiles.*]` sections only.
-#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProfilesReadResponse {
-    #[serde(default)]
-    pub revision: Option<String>,
-    /// Verbatim profile sections in file order, when editable.
-    #[serde(default)]
-    pub source: Option<String>,
-    pub editable: bool,
-    /// Why the source is withheld (invalid file, profiles defined outside
-    /// `[profiles.*]` tables, a known secret value present, strict field and
-    /// URL validation failed).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-}
-
-/// Request for `config.profiles.save`.
-#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProfilesSaveRequest {
-    /// Descriptive Owner client source; authority still comes from authentication.
-    #[serde(default)]
-    pub client: SettingsClientSource,
-    /// Revision the draft was edited from; absent only when the file did
-    /// not exist. A different current revision is `conflict`.
-    #[serde(default)]
-    pub expected_revision: Option<String>,
-    /// Replacement text for all `[profiles.*]` sections.
-    pub source: String,
-    /// Validate with the daemon's parser and launch resolution only.
-    #[serde(default)]
-    pub dry_run: bool,
-}
-
-impl ProfilesSaveRequest {
-    pub fn validate(&self) -> Result<()> {
-        validate_revision(&self.expected_revision)?;
-        if self.source.len() > MAX_PROFILES_SOURCE_BYTES {
-            return Err(Error::new("invalid", "profile source exceeds 128 KiB"));
-        }
-        if self.source.contains(REDACTION_MARKER) {
-            return Err(Error::new(
-                "invalid",
-                "profile source carries a redaction marker; secrets are never saved through this path",
-            ));
-        }
-        Ok(())
-    }
-
-    pub fn validate_response(&self, reply: &ProfilesSaveResponse) -> Result<()> {
-        validate_revision(&reply.revision)?;
-        if self.dry_run && reply.saved {
-            return Err(Error::new("invalid", "a dry run must not save"));
-        }
-        if reply.saved && reply.revision.is_none() {
-            return Err(Error::new(
-                "invalid",
-                "a saved file must carry its revision",
-            ));
-        }
-        Ok(())
-    }
-}
-
-/// Response for `config.profiles.save`.
-#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProfilesSaveResponse {
-    /// True when the file was replaced (or already held exactly this text).
-    pub saved: bool,
-    /// Current file revision after the call.
-    #[serde(default)]
-    pub revision: Option<String>,
-    /// Profile names in the accepted source.
-    pub profiles: Vec<String>,
 }
 
 /// A complete, allowlisted section of the unified settings document.
