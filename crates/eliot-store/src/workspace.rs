@@ -1524,7 +1524,7 @@ impl Store {
                 || !agent.is_terminal()
                 || agent.active_turn.is_some()
                 || has_pending_resume_tx(&tx, agent_num, old_generation, command_id)?
-                || has_in_flight_stop_tx(&tx, agent_num, old_generation)?
+                || stop_fences_resume_tx(&tx, agent_num, old_generation)?
             {
                 return Err(Error::new(
                     "bad_state",

@@ -177,10 +177,10 @@ fn dispatch_resume_tx(
             "another pending resume targets this Agent generation",
         ));
     }
-    if has_in_flight_stop_tx(tx, agent_num, old_generation)? {
+    if stop_fences_resume_tx(tx, agent_num, old_generation)? {
         return Err(Error::new(
             "bad_state",
-            "a dispatched or unknown Stop still targets this Agent generation",
+            "a dispatched Stop, or an unknown Stop without proven owned exit, still targets this Agent generation",
         ));
     }
     let native_scope = agent

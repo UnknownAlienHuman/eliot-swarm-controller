@@ -670,17 +670,34 @@ fn has_pending_resume_tx(
     .map_err(sql_error)
 }
 
+/// Whether a `dispatched` and whether an `unknown` stop target this generation.
+fn open_stops_tx(tx: &Transaction<'_>, agent: i64, generation: i64) -> Result<(bool, bool)> {
+    tx.query_row(
+        "SELECT
+             EXISTS(SELECT 1 FROM commands WHERE target = ?1 AND generation = ?2
+                    AND verb = 'stop' AND state = 'dispatched'),
+             EXISTS(SELECT 1 FROM commands WHERE target = ?1 AND generation = ?2
+                    AND verb = 'stop' AND state = 'unknown')",
+        params![agent, generation],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .map_err(sql_error)
+}
+
+/// A dispatched or unknown stop fences native control of its generation.
 fn has_in_flight_stop_tx(tx: &Transaction<'_>, agent: i64, generation: i64) -> Result<bool> {
-    for state in ["dispatched", "unknown"] {
-        for id in command_ids_in_state(tx, agent, generation, state)? {
-            let command = load_command(tx, &id)?
-                .ok_or_else(|| Error::new("source_integrity", "pending command disappeared"))?;
-            if command.verb == "stop" {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
+    let (dispatched, unknown) = open_stops_tx(tx, agent, generation)?;
+    Ok(dispatched || unknown)
+}
+
+/// Resume is fenced by a dispatched stop, and by an unknown stop until the
+/// stopped generation's owned exit and reader drain are proven. After that
+/// proof the old session can no longer act; the stop itself stays unknown and
+/// is never reissued.
+fn stop_fences_resume_tx(tx: &Transaction<'_>, agent: i64, generation: i64) -> Result<bool> {
+    let (dispatched, unknown) = open_stops_tx(tx, agent, generation)?;
+    Ok(dispatched
+        || (unknown && !capacity::has_owned_exit_and_reader_drain_tx(tx, agent, generation)?))
 }
 
 impl Store {

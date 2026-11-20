@@ -179,7 +179,10 @@ An open stop/transition is a command beside the observed state, not another stat
 machine. Generation transition blocks ordinary turn work. A stop in `dispatched`
 or `unknown` fences sends, active-turn injection, turn controls, and native
 configuration for its generation. Its own interrupt is the only turn control
-that can dispatch during the stop. Terminal settlement cancels undispatched work,
+that can dispatch during the stop. Resume of the terminal generation is fenced by
+a `dispatched` stop, and by an `unknown` stop until that generation's owned exit
+and reader drain are proven; after that proof Resume may open the next generation
+while the stop stays `unknown` and is never reissued. Terminal settlement cancels undispatched work,
 revokes token/own identity, releases claims and pauses Goals atomically.
 
 The handoff brief gate preserves withheld successor SENDs across automatic native loss

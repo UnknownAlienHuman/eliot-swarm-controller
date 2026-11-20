@@ -1244,10 +1244,10 @@ fn admit_resume_tx(
             "a pending resume already targets this Agent generation",
         ));
     }
-    if has_in_flight_stop_tx(tx, agent_num, agent.generation)? {
+    if stop_fences_resume_tx(tx, agent_num, agent.generation)? {
         return Err(Error::new(
             "bad_state",
-            "a dispatched or unknown Stop still targets this Agent generation",
+            "a dispatched Stop, or an unknown Stop without proven owned exit, still targets this Agent generation",
         ));
     }
     if [&agent.native_scope, &agent.native_ref]
