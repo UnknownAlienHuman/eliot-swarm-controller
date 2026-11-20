@@ -291,57 +291,7 @@ impl Store {
                 DaemonEventInput::new(now, kind, "user", None, None, data),
             )?);
             let outcome = json!({"kind": kind, "seq": events[0].seq});
-            validate_settle_outcome(CommandState::Applied, &Some(outcome.clone()))?;
-            check_settle_verb_guards(
-                &tx,
-                &record,
-                CommandState::Applied,
-                &Some(outcome.clone()),
-                command_id,
-            )?;
-            if !core::command_transition_allowed(record.state, CommandState::Applied) {
-                return Err(Error::new(
-                    "bad_state",
-                    "command state transition is not allowed for ordinary settlement",
-                ));
-            }
-            let target = record.target;
-            let generation = record.command.generation;
-            update_command_state(
-                &tx,
-                command_id,
-                CommandState::Applied,
-                Some(&outcome),
-                None,
-                now,
-            )?;
-            events.push(insert_daemon_command_event(
-                &tx,
-                now,
-                "command.applied",
-                target,
-                generation,
-                command_id,
-                json!({"command_id": command_id, "state": "applied", "outcome": outcome}),
-            )?);
-            release_settle_capacity(
-                &tx,
-                &record,
-                CommandState::Applied,
-                command_id,
-                false,
-                now,
-                &mut events,
-            )?;
-            apply_settle_agent_transition(
-                &tx,
-                &record,
-                CommandState::Applied,
-                command_id,
-                false,
-                now,
-                &mut events,
-            )?;
+            settle_applied_tx(&tx, &record, command_id, outcome, now, &mut events)?;
             let record = load_command_record(&tx, command_id)?
                 .ok_or_else(|| Error::new("internal", "settled command disappeared"))?;
             commit_transaction(tx, &self.write_faulted)?;
@@ -466,57 +416,7 @@ impl Store {
                 DaemonEventInput::new(now, kind, "user", Some(agent_num), Some(generation), data),
             )?);
             let outcome = json!({"kind": kind, "seq": events[0].seq});
-            validate_settle_outcome(CommandState::Applied, &Some(outcome.clone()))?;
-            check_settle_verb_guards(
-                &tx,
-                &record,
-                CommandState::Applied,
-                &Some(outcome.clone()),
-                command_id,
-            )?;
-            if !core::command_transition_allowed(record.state, CommandState::Applied) {
-                return Err(Error::new(
-                    "bad_state",
-                    "command state transition is not allowed for ordinary settlement",
-                ));
-            }
-            let target = record.target;
-            let command_generation = record.command.generation;
-            update_command_state(
-                &tx,
-                command_id,
-                CommandState::Applied,
-                Some(&outcome),
-                None,
-                now,
-            )?;
-            events.push(insert_daemon_command_event(
-                &tx,
-                now,
-                "command.applied",
-                target,
-                command_generation,
-                command_id,
-                json!({"command_id": command_id, "state": "applied", "outcome": outcome}),
-            )?);
-            release_settle_capacity(
-                &tx,
-                &record,
-                CommandState::Applied,
-                command_id,
-                false,
-                now,
-                &mut events,
-            )?;
-            apply_settle_agent_transition(
-                &tx,
-                &record,
-                CommandState::Applied,
-                command_id,
-                false,
-                now,
-                &mut events,
-            )?;
+            settle_applied_tx(&tx, &record, command_id, outcome, now, &mut events)?;
             let record = load_command_record(&tx, command_id)?
                 .ok_or_else(|| Error::new("internal", "settled command disappeared"))?;
             commit_transaction(tx, &self.write_faulted)?;
@@ -593,60 +493,10 @@ impl Store {
                 return Err(Error::new("internal", "mail effect did not fan out"));
             }
             let outcome = json!({"deliveries": response.deliveries});
-            validate_settle_outcome(CommandState::Applied, &Some(outcome.clone()))?;
-            check_settle_verb_guards(
-                &tx,
-                &record,
-                CommandState::Applied,
-                &Some(outcome.clone()),
-                command_id,
-            )?;
-            if !core::command_transition_allowed(record.state, CommandState::Applied) {
-                return Err(Error::new(
-                    "bad_state",
-                    "command state transition is not allowed for ordinary settlement",
-                ));
-            }
-            let target = record.target;
-            let generation = record.command.generation;
-            update_command_state(
-                &tx,
-                command_id,
-                CommandState::Applied,
-                Some(&outcome),
-                None,
-                now,
-            )?;
             // Bodyless delivery facts lead the settlement batch in row order,
             // so recipient long-polls wake on rule mail too.
             let mut events = mail_events;
-            events.push(insert_daemon_command_event(
-                &tx,
-                now,
-                "command.applied",
-                target,
-                generation,
-                command_id,
-                json!({"command_id": command_id, "state": "applied", "outcome": outcome}),
-            )?);
-            release_settle_capacity(
-                &tx,
-                &record,
-                CommandState::Applied,
-                command_id,
-                false,
-                now,
-                &mut events,
-            )?;
-            apply_settle_agent_transition(
-                &tx,
-                &record,
-                CommandState::Applied,
-                command_id,
-                false,
-                now,
-                &mut events,
-            )?;
+            settle_applied_tx(&tx, &record, command_id, outcome, now, &mut events)?;
             let record = load_command_record(&tx, command_id)?
                 .ok_or_else(|| Error::new("internal", "settled command disappeared"))?;
             commit_transaction(tx, &self.write_faulted)?;
@@ -727,58 +577,8 @@ impl Store {
             )?;
             let outcome = serde_json::to_value(&response)
                 .map_err(|_| Error::new("internal", "variable outcome cannot be encoded"))?;
-            validate_settle_outcome(CommandState::Applied, &Some(outcome.clone()))?;
-            check_settle_verb_guards(
-                &tx,
-                &record,
-                CommandState::Applied,
-                &Some(outcome.clone()),
-                command_id,
-            )?;
-            if !core::command_transition_allowed(record.state, CommandState::Applied) {
-                return Err(Error::new(
-                    "bad_state",
-                    "command state transition is not allowed for ordinary settlement",
-                ));
-            }
-            let target = record.target;
-            let generation = record.command.generation;
             let mut events = vec![event];
-            update_command_state(
-                &tx,
-                command_id,
-                CommandState::Applied,
-                Some(&outcome),
-                None,
-                now,
-            )?;
-            events.push(insert_daemon_command_event(
-                &tx,
-                now,
-                "command.applied",
-                target,
-                generation,
-                command_id,
-                json!({"command_id": command_id, "state": "applied", "outcome": outcome}),
-            )?);
-            release_settle_capacity(
-                &tx,
-                &record,
-                CommandState::Applied,
-                command_id,
-                false,
-                now,
-                &mut events,
-            )?;
-            apply_settle_agent_transition(
-                &tx,
-                &record,
-                CommandState::Applied,
-                command_id,
-                false,
-                now,
-                &mut events,
-            )?;
+            settle_applied_tx(&tx, &record, command_id, outcome, now, &mut events)?;
             let record = load_command_record(&tx, command_id)?
                 .ok_or_else(|| Error::new("internal", "settled command disappeared"))?;
             commit_transaction(tx, &self.write_faulted)?;
@@ -805,6 +605,65 @@ fn rule_mail_delivery_prefix(command: &Command) -> Result<String> {
     entropy[6..].copy_from_slice(&digest[..10]);
     let id = Ulid::from_parts(admitted_at, u128::from_be_bytes(entropy));
     Ok(format!("rule:{id}"))
+}
+
+/// Applied settlement tail shared by the targetless rule commits: validate
+/// the outcome and verb guards, move the command to Applied, append its
+/// `command.applied` fact, then release capacity and apply the Agent
+/// transition. The caller owns the transaction and has already appended any
+/// leading events into `events`.
+fn settle_applied_tx(
+    tx: &Transaction<'_>,
+    record: &CommandRecord,
+    command_id: &str,
+    outcome: Value,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<()> {
+    let outcome = Some(outcome);
+    validate_settle_outcome(CommandState::Applied, &outcome)?;
+    check_settle_verb_guards(tx, record, CommandState::Applied, &outcome, command_id)?;
+    if !core::command_transition_allowed(record.state, CommandState::Applied) {
+        return Err(Error::new(
+            "bad_state",
+            "command state transition is not allowed for ordinary settlement",
+        ));
+    }
+    update_command_state(
+        tx,
+        command_id,
+        CommandState::Applied,
+        outcome.as_ref(),
+        None,
+        now,
+    )?;
+    events.push(insert_daemon_command_event(
+        tx,
+        now,
+        "command.applied",
+        record.target,
+        record.command.generation,
+        command_id,
+        json!({"command_id": command_id, "state": "applied", "outcome": outcome}),
+    )?);
+    release_settle_capacity(
+        tx,
+        record,
+        CommandState::Applied,
+        command_id,
+        false,
+        now,
+        events,
+    )?;
+    apply_settle_agent_transition(
+        tx,
+        record,
+        CommandState::Applied,
+        command_id,
+        false,
+        now,
+        events,
+    )
 }
 
 fn validate_settle_outcome(state: CommandState, outcome: &Option<Value>) -> Result<()> {

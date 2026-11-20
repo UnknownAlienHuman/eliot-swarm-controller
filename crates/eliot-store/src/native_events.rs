@@ -473,17 +473,40 @@ fn persist_request_resolved(
             "request.resolved remains in the next Agent projection",
         ));
     }
+    settle_pending_request_tx(
+        tx,
+        agent_num,
+        generation,
+        request_id,
+        turn_id,
+        "request.resolved",
+        "resolution",
+    )?;
+    Ok(())
+}
+
+/// Settle one exact pending request as resolved: the durable row must still
+/// be `pending` under this turn binding, and exactly one row must flip.
+fn settle_pending_request_tx(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    generation: i64,
+    request_id: &str,
+    turn_id: &str,
+    event: &str,
+    stored_detail: &str,
+) -> Result<()> {
     let Some((existing, state)) = load_pending_request(tx, agent_num, generation, request_id)?
     else {
         return Err(Error::new(
             "source_integrity",
-            "request.resolved references no durable pending request",
+            format!("{event} references no durable pending request"),
         ));
     };
     if state != "pending" || existing.turn_id.as_str() != turn_id {
         return Err(Error::new(
             "source_integrity",
-            "request.resolved does not match its durable pending binding",
+            format!("{event} does not match its durable pending binding"),
         ));
     }
     let changed = tx
@@ -497,7 +520,7 @@ fn persist_request_resolved(
     if changed != 1 {
         return Err(Error::new(
             "source_integrity",
-            "pending request changed before resolution was stored",
+            format!("pending request changed before {stored_detail} was stored"),
         ));
     }
     Ok(())
@@ -530,33 +553,15 @@ fn persist_request_closed(
             "request.closed is not an exact pending-request cleanup",
         ));
     }
-    let Some((existing, state)) = load_pending_request(tx, agent_num, generation, request_id)?
-    else {
-        return Err(Error::new(
-            "source_integrity",
-            "request.closed references no durable pending request",
-        ));
-    };
-    if state != "pending" || existing.turn_id.as_str() != turn_id {
-        return Err(Error::new(
-            "source_integrity",
-            "request.closed does not match its durable pending binding",
-        ));
-    }
-    let changed = tx
-        .execute(
-            "UPDATE pending_requests SET state = 'resolved'
-             WHERE agent = ?1 AND generation = ?2 AND request_id = ?3
-               AND turn_id = ?4 AND state = 'pending'",
-            params![agent_num, generation, request_id, turn_id],
-        )
-        .map_err(sql_error)?;
-    if changed != 1 {
-        return Err(Error::new(
-            "source_integrity",
-            "pending request changed before native cleanup was stored",
-        ));
-    }
+    settle_pending_request_tx(
+        tx,
+        agent_num,
+        generation,
+        request_id,
+        turn_id,
+        "request.closed",
+        "native cleanup",
+    )?;
     Ok(())
 }
 
