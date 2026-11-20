@@ -940,6 +940,13 @@ so a removed delivery admitted with a skew-bounded write id reads
 read paths; a retried ack over it succeeds as already acked. An unset
 `mail_days` disables mail pruning.
 
+Prune exited child process rows with the event cutoff: one bounded batch per pass of
+`processes` rows with `state = 'exited'`, `role = 'child'` and `updated_at` older than the
+`events_days` window, oldest change first. Plugin and harness rows, running or unknown
+rows, and every generation still holding a capacity reservation are never pruned; the
+owned-exit proof and restart custody read those. An unset `events_days` disables this
+pruning.
+
 ## Explicit Agent tree presentation and removal
 
 `archived` is a durable presentation flag independent of lifecycle state; archiving

@@ -32,6 +32,7 @@ pub struct MaintenanceRunResponse {
     pub writes_deleted: i64,
     pub mail_deleted: i64,
     pub digests_deleted: i64,
+    pub processes_deleted: i64,
 }
 
 impl MaintenanceRunResponse {
@@ -43,6 +44,7 @@ impl MaintenanceRunResponse {
             ("writes_deleted", self.writes_deleted),
             ("mail_deleted", self.mail_deleted),
             ("digests_deleted", self.digests_deleted),
+            ("processes_deleted", self.processes_deleted),
         ] {
             if value < 0 {
                 return Err(Error::new(

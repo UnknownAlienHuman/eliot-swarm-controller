@@ -1,6 +1,6 @@
 //! Bounded physical retention: expired event-prefix pruning, atomic
-//! command/child-set cleanup, and acknowledged-mail pruning through the one
-//! Store writer.
+//! command/child-set cleanup, exited child process pruning, and
+//! acknowledged-mail pruning through the one Store writer.
 //!
 //! Owning contract: docs/spec/core.md#retention. Deletion is silent (no events
 //! are emitted) and never replays an effect: event pruning stays below every
@@ -49,6 +49,7 @@ pub struct RetentionReport {
     pub writes_deleted: i64,
     pub mail_deleted: i64,
     pub digests_deleted: i64,
+    pub processes_deleted: i64,
 }
 
 struct SubtreeMember {
@@ -164,6 +165,11 @@ impl Store {
             Some(cutoff) => self.prune_delivered_digests(cutoff)?,
             None => 0,
         };
+        // Same cutoff as events: exited process rows are diagnostic history.
+        let processes_deleted = match events_cutoff {
+            Some(cutoff) => self.prune_exited_processes(cutoff)?,
+            None => 0,
+        };
         Ok(RetentionReport {
             events_deleted,
             pruned_through,
@@ -171,6 +177,7 @@ impl Store {
             writes_deleted,
             mail_deleted,
             digests_deleted,
+            processes_deleted,
         })
     }
 
@@ -362,6 +369,34 @@ impl Store {
                  SELECT id FROM completion_digests
                  WHERE delivered_at IS NOT NULL AND delivered_at <= ?1
                  ORDER BY delivered_at, id LIMIT ?2
+             )",
+            params![cutoff, MAX_PAGE_ENTRIES as i64],
+        ));
+        commit_transaction(tx, &self.write_faulted)?;
+        Ok(deleted as i64)
+    }
+
+    /// Delete one bounded batch of exited child process rows whose last changed
+    /// fact is older than the events cutoff, oldest change first. Only
+    /// `role = 'child'` matches: plugin and harness rows stay, since the
+    /// owned-exit proof and restart custody read their exited witnesses. Live
+    /// rows (`running`/`unknown`) never match. Generations that still hold a
+    /// capacity reservation are excluded, because restart custody reads their
+    /// whole recorded set. Deletion is silent and never replays a process.
+    fn prune_exited_processes(&mut self, cutoff: i64) -> Result<i64> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        let deleted = db!(tx.execute(
+            "DELETE FROM processes WHERE rowid IN (
+                 SELECT rowid FROM processes
+                 WHERE state = 'exited' AND role = 'child' AND updated_at < ?1
+                   AND owner NOT IN (
+                       SELECT 'agent:a' || id || '#' || capacity_generation
+                       FROM agents WHERE capacity_generation IS NOT NULL
+                   )
+                 ORDER BY updated_at LIMIT ?2
              )",
             params![cutoff, MAX_PAGE_ENTRIES as i64],
         ));
