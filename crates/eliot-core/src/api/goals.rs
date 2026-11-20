@@ -121,8 +121,12 @@ impl AssignmentGoal {
         }
     }
 
+    /// Assignment Goals drive automatically on idle, so they need a turn or
+    /// round budget like any cadence-less Goal.
     pub fn validate(&self) -> Result<()> {
-        self.definition("brief.md").validate()
+        let definition = self.definition("brief.md");
+        definition.validate()?;
+        definition.require_auto_bound()
     }
 }
 

@@ -539,6 +539,10 @@ pub(super) fn transfer_goal_tx(
         .map_or(Some(1), |row| row.revision.checked_add(1))
         .ok_or_else(|| Error::new("bad_state", "Goal revision overflow"))?;
     source.state.status = GoalStatus::Paused;
+    // The assignment launch cause names the source Agent's launch: the
+    // destination was not launched by the assignment, so its Goal is not
+    // assignment-owned and never claims that Agent's retirement.
+    source.state.assignment_cause = None;
     source.state.counters.last_observation = source
         .state
         .counters
@@ -2595,6 +2599,7 @@ pub(super) fn install_assignment_goal_tx(
     now: i64,
 ) -> Result<()> {
     definition.validate()?;
+    definition.require_auto_bound()?;
     let state = GoalStatePersist {
         transferred_turns: 0,
         status: GoalStatus::Active,

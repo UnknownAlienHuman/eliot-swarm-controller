@@ -479,7 +479,10 @@ the launch's cause, and the generated completion rule matches `goal.changed` ins
 of `turn.completed`. Store authorizes the retirement through the same launch-ancestry
 check, and refuses a `turn.completed`-caused retirement while that generation's
 assignment Goal is still open, so switching an assignment between modes never cuts a
-running Goal. A cleared assignment Goal retires nothing; the Owner stops that Agent.
+running Goal. Like any cadence-less Goal, an assignment Goal needs `max_turns` or
+`max_rounds`. A cleared assignment Goal retires nothing; the Owner stops that Agent. A
+handoff of an assignment Goal does not carry the launch cause to the destination, whose
+Goal is then ordinary.
 When the assignment sets `cleanup_on_retire = true` (default false), the
 applied stop also cleans that Agent's build, temp and managed-worktree
 artifacts inline in the stop worker: same authority check, same quiescence
