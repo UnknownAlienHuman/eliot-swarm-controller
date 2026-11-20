@@ -85,7 +85,9 @@ const MAX_INSTRUCTION_BYTES: usize = 2048;
 
 /// The send, steer and inject texts the source received after its task
 /// command, oldest first, each with its principal and verb. They carry the
-/// limits and clarifications that summaries lose.
+/// limits and clarifications that summaries lose. A Goal's own
+/// continuations are Swarm-generated, not instructions, and never crowd out
+/// a principal's limit.
 fn later_instructions(
     tx: &Transaction<'_>,
     request: &HandoffRequest,
@@ -97,6 +99,10 @@ fn later_instructions(
              WHERE target = ?1 AND id <> ?2
                AND verb IN ('send', 'steer', 'inject')
                AND state NOT IN ('rejected', 'cancelled')
+               AND NOT EXISTS (
+                   SELECT 1 FROM writes w WHERE w.method = 'goal.round'
+                     AND json_extract(w.result, '$.continuation_id') = commands.id
+               )
                AND created_at >= (SELECT created_at FROM commands WHERE id = ?2)
              ORDER BY created_at DESC, rowid DESC LIMIT ?3",
         )

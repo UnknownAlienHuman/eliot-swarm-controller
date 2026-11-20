@@ -757,7 +757,7 @@ The first successor input is one bounded handoff brief, admitted as ordinary `se
 to B's exact generation. It contains the original task text from the named retained
 command; the later send/steer/inject texts A received after it, oldest first, each with
 its principal and verb, because those carry the limits and clarifications a summary
-loses; Store facts about A (workspace and its Git work, Goal status and last check
+loses (A's Goal continuations are excluded: they are Swarm-generated, not instructions); Store facts about A (workspace and its Git work, Goal status and last check
 exit, open or unknown commands of the handed-off generation), labelled as recorded by
 Swarm; A's latest retained final output (exact turn binding, or an explicit absence),
 labelled as model output Swarm did not verify; and pointers to A/generation/command/turn
