@@ -4,10 +4,10 @@ use eliot_core::{Error, Result};
 use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
     Peer, PeerClient, PluginManifest, RpcRequest,
-    protocol::{MAX_CREDENTIAL_BYTES, ManifestFeatures},
+    protocol::{ManifestFeatures, stream_sources},
     session::{
-        decode, ensure_dedicated_reader, ensure_reader_harness, not_initialized, validate_binding,
-        validate_identity,
+        decode, ensure_dedicated_reader, ensure_reader_harness, initialize_fields_valid,
+        not_initialized, required_native_cmd, validate_binding, validate_identity,
     },
 };
 use serde_json::{Value, json};
@@ -340,16 +340,10 @@ impl Plugin {
         let profile: Value = decode(raw, "Antigravity model.list params are invalid")?;
         let snapshot = profile.get("profile").unwrap_or(&profile);
         ensure_reader_harness(snapshot, "antigravity", "Antigravity", "model.list")?;
-        let program = snapshot
-            .get("cmd")
-            .and_then(Value::as_str)
-            .filter(|cmd| !cmd.trim().is_empty())
-            .ok_or_else(|| {
-                Error::new(
-                    "profile_error",
-                    "Antigravity model.list requires a frozen native cmd",
-                )
-            })?;
+        let program = required_native_cmd(
+            snapshot,
+            "Antigravity model.list requires a frozen native cmd",
+        )?;
         let environment = crate::profile::reader_environment(snapshot)?;
         // The catalogue errors are static typed strings (stderr is discarded,
         // like every other helper), so there is no native text to redact.
@@ -382,11 +376,7 @@ impl Plugin {
 
     fn initialize(&mut self, raw: &Value) -> Result<Value> {
         let params: InitializeParams = decode(raw, "Invalid Antigravity initialization")?;
-        if params.protocol != "eliot-plugin/1"
-            || params.instance_dir.trim().is_empty()
-            || params.credential.trim().is_empty()
-            || params.credential.len() > MAX_CREDENTIAL_BYTES
-        {
+        if !initialize_fields_valid(&params) {
             return Err(Error::new(
                 "invalid",
                 "Antigravity requires protocol, private instance directory and credential",
@@ -411,14 +401,11 @@ impl Plugin {
         } else {
             self.initialized = Some(params);
         }
-        let manifest = PluginManifest {
-            name: "antigravity".into(),
-            version: env!("CARGO_PKG_VERSION").into(),
-            protocol: "eliot-plugin/1".into(),
-            harness_version: "1.5.2".into(),
-            available: true,
-            mode: "per_agent".into(),
-            verbs: [
+        let manifest = PluginManifest::per_agent(
+            "antigravity",
+            env!("CARGO_PKG_VERSION"),
+            "1.5.2",
+            &[
                 "launch",
                 "resume",
                 "send",
@@ -428,25 +415,16 @@ impl Plugin {
                 "approve",
                 "deny",
                 "stop",
-            ]
-            .map(str::to_owned)
-            .to_vec(),
-            child_verbs: vec![],
-            proxy: "none".into(),
-            features: ManifestFeatures {
+            ],
+            ManifestFeatures {
                 start_requires_input: false,
                 native_children: false,
                 discover: false,
                 observe: false,
             },
-            sources: BTreeMap::from([(
-                "controlled".into(),
-                FAMILIES
-                    .iter()
-                    .map(|f| (f.to_string(), "stream".into()))
-                    .collect(),
-            )]),
-        };
+            BTreeMap::from([("controlled".into(), stream_sources(FAMILIES))]),
+            "none",
+        );
         serde_json::to_value(manifest)
             .map_err(|_| Error::new("internal", "Could not encode Antigravity manifest"))
     }

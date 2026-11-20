@@ -28,13 +28,15 @@ use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, DiscoverParams,
     InitializeParams, MAX_EVENT_BYTES, MAX_TEXT_BYTES, ObserverAttachParams, ObserverDetachParams,
     ObserverSnapshotParams, Peer, PeerClient, PluginManifest, RpcRequest,
-    protocol::{MAX_CREDENTIAL_BYTES, ProfileStoreParams},
+    protocol::{ProfileStoreParams, stream_sources},
     session::{
-        decode, ensure_dedicated_reader, ensure_reader_harness, is_passed_env, is_secret_name,
+        attach_reply_diagnostics, begin_stop, decode, ensure_dedicated_reader,
+        ensure_reader_harness, initialize_fields_valid, is_passed_env, is_secret_name,
         native_no_write, not_initialized, optional_profile_text, parse_resume_subject, paths_equal,
-        register_native_process, rejected_control, target_environment as shared_target_environment,
-        unknown_control, unknown_snapshot, validate_binding, validate_identity,
-        validate_source_plan, with_claimed_context, with_context_points,
+        register_native_process, rejected_control, request_reply_ids,
+        target_environment as shared_target_environment, unknown_control, unknown_snapshot,
+        validate_binding, validate_identity, validate_source_plan, with_claimed_context,
+        with_context_points,
     },
     skill,
     start_classification::SettledStartFailure,
@@ -578,42 +580,18 @@ impl CodexPlugin {
         let Some(session) = self.session.as_ref() else {
             return result;
         };
-        match result {
-            Err(error) => Err(session.native_client.diagnostic_error(error)),
-            Ok(mut value) => {
-                if request.method == "agent.snapshot"
-                    || value
-                        .get("state")
-                        .and_then(Value::as_str)
-                        .is_some_and(|state| matches!(state, "unknown" | "rejected" | "failed"))
-                {
-                    let diagnostics = serde_json::to_value(
-                        session
-                            .native_client
-                            .diagnostic_error(Error::new("unknown", "")),
-                    )
-                    .map_err(|_| {
-                        Error::new("internal", "Codex diagnostics could not be encoded")
-                    })?;
-                    if let Some(tails) = diagnostics
-                        .get("diagnostics")
-                        .filter(|tails| !tails.is_null())
-                    {
-                        value["diagnostics"] = tails.clone();
-                    }
-                }
-                Ok(value)
-            }
-        }
+        attach_reply_diagnostics(
+            result,
+            &request.method,
+            "Codex",
+            |error| session.native_client.diagnostic_error(error),
+            |_| Error::new("unknown", ""),
+        )
     }
 
     fn initialize(&mut self, raw: &Value) -> Result<Value> {
         let params: InitializeParams = decode(raw, "Codex plugin initialize params are invalid")?;
-        if params.protocol != "eliot-plugin/1"
-            || params.instance_dir.trim().is_empty()
-            || params.credential.trim().is_empty()
-            || params.credential.len() > MAX_CREDENTIAL_BYTES
-        {
+        if !initialize_fields_valid(&params) {
             return Err(Error::new(
                 "invalid",
                 "Codex plugin initialize requires protocol, private instance directory, and credential",
@@ -2403,26 +2381,7 @@ impl CodexPlugin {
             params.generation,
             "Codex",
         )?;
-        let turn_id = params
-            .turn_id
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| {
-                Error::new(
-                    "stale_turn",
-                    "Codex request reply needs its captured turn id",
-                )
-            })?;
-        let request_id = params
-            .request_id
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| {
-                Error::new(
-                    "not_found",
-                    "Codex request reply needs its captured request id",
-                )
-            })?;
+        let (turn_id, request_id) = request_reply_ids(&params, "Codex")?;
         match session
             .events
             .reply_request(
@@ -2624,27 +2583,17 @@ impl CodexPlugin {
             params.generation,
             "Codex",
         )?;
-        if session.phase == SessionPhase::Stopped
-            && session.stop_command_id.as_deref() == Some(params.command_id.as_str())
-        {
-            return Ok(json!({"state": "applied"}));
-        }
-        if let Some(existing) = &session.stop_command_id {
-            if existing != &params.command_id {
-                return Err(Error::new(
-                    "source_integrity",
-                    "Codex stop command id changed after dispatch",
-                ));
-            }
-            return Err(Error::new(
-                "unknown",
-                "Codex stop outcome is unresolved and will not be repeated",
-            ));
-        }
         // Latch once before native I/O. The router owns interrupt/wait and
         // daemon force custody; this adapter only performs the graceful
         // native close and verifies the event/source drain.
-        session.stop_command_id = Some(params.command_id.clone());
+        if begin_stop(
+            &mut session.stop_command_id,
+            session.phase == SessionPhase::Stopped,
+            &params.command_id,
+            "Codex",
+        )? {
+            return Ok(json!({"state": "applied"}));
+        }
         let session = self
             .session
             .as_mut()
@@ -3253,49 +3202,41 @@ pub(crate) fn native_scope(codex_home: &str) -> String {
 }
 
 fn codex_manifest() -> PluginManifest {
-    let controlled = BTreeMap::from([
-        ("message".to_owned(), "stream".to_owned()),
-        ("request".to_owned(), "stream".to_owned()),
-        ("session".to_owned(), "stream".to_owned()),
-        ("tool".to_owned(), "stream".to_owned()),
-        ("turn".to_owned(), "stream".to_owned()),
-    ]);
     let observed = BTreeMap::from([
         ("message".to_owned(), "native_read".to_owned()),
         ("session".to_owned(), "native_read".to_owned()),
         ("tool".to_owned(), "native_read".to_owned()),
         ("turn".to_owned(), "native_read".to_owned()),
     ]);
-    PluginManifest {
-        name: "codex".to_owned(),
-        version: env!("CARGO_PKG_VERSION").to_owned(),
-        protocol: "eliot-plugin/1".to_owned(),
-        harness_version: "0.161.0".to_owned(),
-        available: true,
-        mode: "per_agent".to_owned(),
-        verbs: vec![
-            "launch".to_owned(),
-            "resume".to_owned(),
-            "send".to_owned(),
-            "steer".to_owned(),
-            "interrupt".to_owned(),
-            "approve".to_owned(),
-            "deny".to_owned(),
-            "answer".to_owned(),
-            "inject".to_owned(),
-            "stop".to_owned(),
+    PluginManifest::per_agent(
+        "codex",
+        env!("CARGO_PKG_VERSION"),
+        "0.161.0",
+        &[
+            "launch",
+            "resume",
+            "send",
+            "steer",
+            "interrupt",
+            "approve",
+            "deny",
+            "answer",
+            "inject",
+            "stop",
         ],
-        child_verbs: Vec::new(),
-        features: eliot_plugin::protocol::ManifestFeatures {
+        eliot_plugin::protocol::ManifestFeatures {
             discover: true,
             observe: true,
             start_requires_input: false,
             native_children: true,
         },
-        sources: BTreeMap::from([
-            ("controlled".to_owned(), controlled),
+        BTreeMap::from([
+            (
+                "controlled".to_owned(),
+                stream_sources(&["message", "request", "session", "tool", "turn"]),
+            ),
             ("observed".to_owned(), observed),
         ]),
-        proxy: "responses".to_owned(),
-    }
+        "responses",
+    )
 }

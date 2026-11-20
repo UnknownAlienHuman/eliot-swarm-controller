@@ -10,11 +10,12 @@ use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
     MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
     native_transport::NativeLaunch,
-    protocol::MAX_CREDENTIAL_BYTES,
+    protocol::stream_sources,
     session::{
-        self, contextual_error, decode, ensure_dedicated_reader, native_no_write, not_initialized,
+        self, attach_reply_diagnostics, begin_stop, contextual_error, decode,
+        ensure_dedicated_reader, initialize_fields_valid, native_no_write, not_initialized,
         optional_profile_text, parse_resume_subject, register_native_process, rejected_control,
-        unknown_control, unknown_snapshot, validate_binding, validate_identity,
+        request_reply_ids, unknown_control, unknown_snapshot, validate_binding, validate_identity,
         validate_source_plan, with_claimed_context, with_context_points,
     },
     skill,
@@ -702,33 +703,13 @@ impl ClaudePlugin {
         let Some(session) = self.session.as_ref() else {
             return result;
         };
-        match result {
-            Err(error) => Err(session.native_client.diagnostic_error(error)),
-            Ok(mut value) => {
-                if method == "agent.snapshot"
-                    || value
-                        .get("state")
-                        .and_then(Value::as_str)
-                        .is_some_and(|state| matches!(state, "unknown" | "rejected" | "failed"))
-                {
-                    let diagnostics = serde_json::to_value(
-                        session
-                            .native_client
-                            .diagnostic_error(Error::new("unknown", "")),
-                    )
-                    .map_err(|_| {
-                        Error::new("internal", "Claude diagnostics could not be encoded")
-                    })?;
-                    if let Some(tails) = diagnostics
-                        .get("diagnostics")
-                        .filter(|tails| !tails.is_null())
-                    {
-                        value["diagnostics"] = tails.clone();
-                    }
-                }
-                Ok(value)
-            }
-        }
+        attach_reply_diagnostics(
+            result,
+            method,
+            "Claude",
+            |error| session.native_client.diagnostic_error(error),
+            |_| Error::new("unknown", ""),
+        )
     }
 
     async fn model_list(&self, raw: &Value) -> Result<Value> {
@@ -746,11 +727,7 @@ impl ClaudePlugin {
 
     fn initialize(&mut self, raw: &Value) -> Result<Value> {
         let params: InitializeParams = decode(raw, "Claude plugin initialize params are invalid")?;
-        if params.protocol != "eliot-plugin/1"
-            || params.instance_dir.trim().is_empty()
-            || params.credential.trim().is_empty()
-            || params.credential.len() > MAX_CREDENTIAL_BYTES
-        {
+        if !initialize_fields_valid(&params) {
             return Err(Error::new(
                 "invalid",
                 "Claude plugin initialize requires protocol, private instance directory, and credential",
@@ -1806,26 +1783,7 @@ impl ClaudePlugin {
                 "Claude session or event source outcome is unresolved",
             ));
         }
-        let turn_id = params
-            .turn_id
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| {
-                Error::new(
-                    "stale_turn",
-                    "Claude request reply needs its captured turn id",
-                )
-            })?;
-        let request_id = params
-            .request_id
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| {
-                Error::new(
-                    "not_found",
-                    "Claude request reply needs its captured request id",
-                )
-            })?;
+        let (turn_id, request_id) = request_reply_ids(&params, "Claude")?;
         // The event task owns no transport client: the native decision
         // travels on this call, serialized behind queued frames.
         let native = session.native_client.clone();
@@ -1896,25 +1854,15 @@ impl ClaudePlugin {
             params.generation,
             "Claude",
         )?;
-        if session.phase == SessionPhase::Stopped
-            && session.stop_command_id.as_deref() == Some(params.command_id.as_str())
-        {
+        // Latch once before native I/O. An uncertain cancel is never replayed.
+        if begin_stop(
+            &mut session.stop_command_id,
+            session.phase == SessionPhase::Stopped,
+            &params.command_id,
+            "Claude",
+        )? {
             return Ok(json!({"state": "applied"}));
         }
-        if let Some(existing) = &session.stop_command_id {
-            if existing != &params.command_id {
-                return Err(Error::new(
-                    "source_integrity",
-                    "Claude stop command id changed after dispatch",
-                ));
-            }
-            return Err(Error::new(
-                "unknown",
-                "Claude stop outcome is unresolved and will not be repeated",
-            ));
-        }
-        // Latch once before native I/O. An uncertain cancel is never replayed.
-        session.stop_command_id = Some(params.command_id.clone());
         let session = self
             .session
             .as_mut()
@@ -2630,41 +2578,33 @@ fn native_subagents_argv(deny: bool) -> Vec<OsString> {
 }
 
 fn claude_manifest() -> PluginManifest {
-    let controlled = BTreeMap::from([
-        ("message".to_owned(), "stream".to_owned()),
-        ("request".to_owned(), "stream".to_owned()),
-        ("session".to_owned(), "stream".to_owned()),
-        ("tool".to_owned(), "stream".to_owned()),
-        ("turn".to_owned(), "stream".to_owned()),
-    ]);
-    PluginManifest {
-        name: "claude".to_owned(),
-        version: env!("CARGO_PKG_VERSION").to_owned(),
-        protocol: "eliot-plugin/1".to_owned(),
-        harness_version: "2.1.278".to_owned(),
-        available: true,
-        mode: "per_agent".to_owned(),
-        verbs: vec![
-            "launch".to_owned(),
-            "resume".to_owned(),
-            "send".to_owned(),
-            "configure".to_owned(),
-            "steer".to_owned(),
-            "interrupt".to_owned(),
-            "approve".to_owned(),
-            "deny".to_owned(),
-            "stop".to_owned(),
+    PluginManifest::per_agent(
+        "claude",
+        env!("CARGO_PKG_VERSION"),
+        "2.1.278",
+        &[
+            "launch",
+            "resume",
+            "send",
+            "configure",
+            "steer",
+            "interrupt",
+            "approve",
+            "deny",
+            "stop",
         ],
-        child_verbs: Vec::new(),
-        features: eliot_plugin::protocol::ManifestFeatures {
+        eliot_plugin::protocol::ManifestFeatures {
             start_requires_input: false,
             native_children: false,
             discover: false,
             observe: false,
         },
-        sources: BTreeMap::from([("controlled".to_owned(), controlled)]),
-        proxy: "none".to_owned(),
-    }
+        BTreeMap::from([(
+            "controlled".to_owned(),
+            stream_sources(&["message", "request", "session", "tool", "turn"]),
+        )]),
+        "none",
+    )
 }
 
 /// Session and turn uuids: the 128-bit ULID rendered as 8-4-4-4-12 hex for

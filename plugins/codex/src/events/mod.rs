@@ -16,7 +16,7 @@ use eliot_plugin::{
         EVENT_DEADLINE, MessageCommit, StreamSource, attach_final_text as shared_attach_final_text,
         attach_native_error as shared_attach_native_error, attach_provider_restriction,
         event_id as shared_event_id, native_no_write, next_input_outcomes, rejected_control,
-        unknown_control,
+        request_reply_applied, unknown_control,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -1012,12 +1012,11 @@ impl EventProcessor {
                     entry.reply_state = NativeReplyState::Written;
                     entry.reply_command_id = Some(command_id.to_owned());
                 }
-                Ok(json!({
-                    "state": "applied",
-                    "command_id": command_id,
-                    "request_id": request.id,
-                    "turn_id": request.turn_id,
-                }))
+                Ok(request_reply_applied(
+                    command_id,
+                    &request.id,
+                    &request.turn_id,
+                ))
             }
             Err(error) if native_no_write(&error.code) => {
                 if let Some(entry) = self.pending_requests.get_mut(request_id) {
