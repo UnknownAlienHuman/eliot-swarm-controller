@@ -25,11 +25,12 @@ use eliot_core::{Error, Result, SecretPolicy, StderrSnapshot, StderrSource};
 use eliot_plugin::{
     StderrView,
     native_transport::{
-        DEFAULT_MAX_NATIVE_FRAME_BYTES, NativeChild, NativeLabels, NativeLaunch, NativeStreamFault,
-        NativeWriter, PendingCalls, PendingGuard, PumpAction, PumpMode, encode_frame, spawn_pumped,
+        DEFAULT_MAX_NATIVE_FRAME_BYTES, NativeChild, NativeLabels, NativeLaunch, NativeRpcError,
+        NativeStreamFault, NativeWriter, OutboundNotification, OutboundRequest, OutboundResponse,
+        OutboundResult, PendingCalls, PendingGuard, PumpAction, PumpMode, encode_frame,
+        spawn_pumped,
     },
 };
-use serde::Serialize;
 use serde_json::Value;
 use tokio::{
     sync::{mpsc, watch},
@@ -150,44 +151,6 @@ const OVERSIZED_KNOWN_METHODS: &[&str] = &[
     "session/cancel",
     "session/close",
 ];
-
-#[derive(Serialize)]
-struct OutboundRequest<'a> {
-    jsonrpc: &'static str,
-    id: String,
-    method: &'a str,
-    params: Value,
-}
-
-#[derive(Serialize)]
-struct OutboundNotification<'a> {
-    jsonrpc: &'static str,
-    method: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    params: Option<Value>,
-}
-
-#[derive(Serialize)]
-struct OutboundResponse {
-    jsonrpc: &'static str,
-    id: Value,
-    error: NativeRpcError,
-}
-
-/// One agent-to-client success answer. The id is written verbatim:
-/// JSON-RPC ids are not necessarily strings.
-#[derive(Serialize)]
-struct OutboundResult {
-    jsonrpc: &'static str,
-    id: Value,
-    result: Value,
-}
-
-#[derive(Serialize)]
-struct NativeRpcError {
-    code: i64,
-    message: &'static str,
-}
 
 impl AgyProcess {
     pub async fn spawn(launch: NativeLaunch, policy: SecretPolicy) -> Result<Self> {

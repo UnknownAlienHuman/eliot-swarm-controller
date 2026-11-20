@@ -22,7 +22,8 @@ use eliot_core::{Error, Result, SecretPolicy, StderrSnapshot, StderrSource};
 
 use crate::StderrView;
 use crate::native_transport::{
-    NativeChild, NativeLabels, NativeWriter, PendingCalls, PumpAction, PumpMode, encode_frame,
+    NativeChild, NativeLabels, NativeRpcError, NativeWriter, OutboundNotification, OutboundRequest,
+    OutboundResponse, OutboundResult, PendingCalls, PumpAction, PumpMode, encode_frame,
     spawn_pumped,
 };
 use std::sync::Arc;
@@ -105,42 +106,6 @@ pub struct StdioProcess<C> {
     client: StdioClient<C>,
     frames: Option<mpsc::Receiver<NativeFrame>>,
     stream: watch::Receiver<StreamState>,
-}
-
-#[derive(Serialize)]
-struct OutboundRequest<'a> {
-    jsonrpc: &'static str,
-    id: String,
-    method: &'a str,
-    params: Value,
-}
-
-#[derive(Serialize)]
-struct OutboundNotification<'a> {
-    jsonrpc: &'static str,
-    method: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    params: Option<Value>,
-}
-
-#[derive(Serialize)]
-struct OutboundResponse {
-    jsonrpc: &'static str,
-    id: Value,
-    error: NativeRpcError,
-}
-
-#[derive(Serialize)]
-struct OutboundResultResponse {
-    jsonrpc: &'static str,
-    id: Value,
-    result: Value,
-}
-
-#[derive(Serialize)]
-struct NativeRpcError {
-    code: i64,
-    message: &'static str,
 }
 
 #[derive(serde::Deserialize)]
@@ -413,7 +378,7 @@ impl<C: NativeStdioConfig> StdioClient<C> {
     ) -> Result<()> {
         let encoded = encode_frame(
             C::SERVER,
-            &OutboundResultResponse {
+            &OutboundResult {
                 jsonrpc: "2.0",
                 id,
                 result,

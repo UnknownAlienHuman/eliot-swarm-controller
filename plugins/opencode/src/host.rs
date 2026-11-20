@@ -293,6 +293,51 @@ fn native_io_blocked(session: &AgentSession) -> bool {
     session.resources_proved_closed || session.stop_end_ack_proved
 }
 
+/// Identity gate and retained-session binding shared by snapshot and stop.
+fn retained_session<'a>(
+    slot: &'a mut Option<AgentSession>,
+    agent_id: &str,
+    generation: i64,
+    command_id: &str,
+) -> Result<&'a mut AgentSession> {
+    validate_identity(agent_id, generation, command_id, "OpenCode")?;
+    let session = slot
+        .as_mut()
+        .ok_or_else(|| Error::new("not_found", "OpenCode Agent session is not retained"))?;
+    validate_binding(
+        &session.agent_id,
+        session.generation,
+        agent_id,
+        generation,
+        "OpenCode",
+    )?;
+    Ok(session)
+}
+
+/// Live command gate: the bound session must be Ready with native I/O open.
+fn ready_session<'a>(
+    slot: &'a mut Option<AgentSession>,
+    params: &AgentCommandParams,
+) -> Result<&'a mut AgentSession> {
+    let session = slot
+        .as_mut()
+        .ok_or_else(|| Error::new("bad_state", "OpenCode Agent session has not started"))?;
+    validate_binding(
+        &session.agent_id,
+        session.generation,
+        &params.agent_id,
+        params.generation,
+        "OpenCode",
+    )?;
+    if session.phase != SessionPhase::Ready || native_io_blocked(session) {
+        return Err(Error::new(
+            "unknown",
+            "OpenCode session or event source outcome is unresolved",
+        ));
+    }
+    Ok(session)
+}
+
 struct AgentSession {
     agent_id: String,
     generation: i64,
@@ -2655,23 +2700,7 @@ impl OpenCodePlugin {
     /// readback, so a retried configure after an uncertain outcome is
     /// idempotent.
     async fn configure_command(&mut self, params: AgentCommandParams) -> Result<Value> {
-        let session = self
-            .session
-            .as_mut()
-            .ok_or_else(|| Error::new("bad_state", "OpenCode Agent session has not started"))?;
-        validate_binding(
-            &session.agent_id,
-            session.generation,
-            &params.agent_id,
-            params.generation,
-            "OpenCode",
-        )?;
-        if session.phase != SessionPhase::Ready || native_io_blocked(session) {
-            return Err(Error::new(
-                "unknown",
-                "OpenCode session or event source outcome is unresolved",
-            ));
-        }
+        let session = ready_session(&mut self.session, &params)?;
         // Pre-write validation failures reject with proof of no effect
         // (nothing has been written yet), so the settings lane stays free.
         // Only an ambiguous outcome at or after the first write is unknown.
@@ -2840,23 +2869,7 @@ impl OpenCodePlugin {
     }
 
     async fn send_command(&mut self, params: AgentCommandParams) -> Result<Value> {
-        let session = self
-            .session
-            .as_mut()
-            .ok_or_else(|| Error::new("bad_state", "OpenCode Agent session has not started"))?;
-        validate_binding(
-            &session.agent_id,
-            session.generation,
-            &params.agent_id,
-            params.generation,
-            "OpenCode",
-        )?;
-        if session.phase != SessionPhase::Ready || native_io_blocked(session) {
-            return Err(Error::new(
-                "unknown",
-                "OpenCode session or event source outcome is unresolved",
-            ));
-        }
+        let session = ready_session(&mut self.session, &params)?;
         let text = Self::admit_send_command(session, &params).await?;
         let command_id = params.command_id;
         // One deadline for admission plus association: the HTTP 200 only
@@ -3002,23 +3015,7 @@ impl OpenCodePlugin {
     /// turn on the stream); `false` re-checks the gate — a finished turn is
     /// stale, a still-active one contradicts the server and stays unknown.
     async fn interrupt_command(&mut self, params: AgentCommandParams) -> Result<Value> {
-        let session = self
-            .session
-            .as_mut()
-            .ok_or_else(|| Error::new("bad_state", "OpenCode Agent session has not started"))?;
-        validate_binding(
-            &session.agent_id,
-            session.generation,
-            &params.agent_id,
-            params.generation,
-            "OpenCode",
-        )?;
-        if session.phase != SessionPhase::Ready || native_io_blocked(session) {
-            return Err(Error::new(
-                "unknown",
-                "OpenCode session or event source outcome is unresolved",
-            ));
-        }
+        let session = ready_session(&mut self.session, &params)?;
         let command_id = params.command_id;
         let turn_id = params.turn_id;
         let Some(turn_id) = turn_id else {
@@ -3129,23 +3126,7 @@ impl OpenCodePlugin {
     /// anything unproven latches the session unknown so no later send
     /// dispatches behind the unresolved input.
     async fn steer_command(&mut self, params: AgentCommandParams) -> Result<Value> {
-        let session = self
-            .session
-            .as_mut()
-            .ok_or_else(|| Error::new("bad_state", "OpenCode Agent session has not started"))?;
-        validate_binding(
-            &session.agent_id,
-            session.generation,
-            &params.agent_id,
-            params.generation,
-            "OpenCode",
-        )?;
-        if session.phase != SessionPhase::Ready || native_io_blocked(session) {
-            return Err(Error::new(
-                "unknown",
-                "OpenCode session or event source outcome is unresolved",
-            ));
-        }
+        let session = ready_session(&mut self.session, &params)?;
         let command_id = params.command_id;
         let turn_id = params.turn_id;
         let text = match params.args.get("text").and_then(Value::as_str) {
@@ -3331,23 +3312,7 @@ impl OpenCodePlugin {
     /// Reply to one exact retained native request. The event task stages
     /// the choice against the current offer and performs the native write.
     async fn reply_command(&mut self, params: AgentCommandParams) -> Result<Value> {
-        let session = self
-            .session
-            .as_mut()
-            .ok_or_else(|| Error::new("bad_state", "OpenCode Agent session has not started"))?;
-        validate_binding(
-            &session.agent_id,
-            session.generation,
-            &params.agent_id,
-            params.generation,
-            "OpenCode",
-        )?;
-        if session.phase != SessionPhase::Ready || native_io_blocked(session) {
-            return Err(Error::new(
-                "unknown",
-                "OpenCode session or event source outcome is unresolved",
-            ));
-        }
+        let session = ready_session(&mut self.session, &params)?;
         let (Some(turn_id), Some(request_id)) = (
             params.turn_id,
             params.request_id.filter(|id| !id.is_empty()),
@@ -3393,22 +3358,11 @@ impl OpenCodePlugin {
     async fn snapshot(&mut self, raw: &Value) -> Result<Value> {
         let params: AgentSnapshotParams =
             decode(raw, "OpenCode agent.snapshot params are invalid")?;
-        validate_identity(
+        let session = retained_session(
+            &mut self.session,
             &params.agent_id,
             params.generation,
             &params.command_id,
-            "OpenCode",
-        )?;
-        let session = self
-            .session
-            .as_mut()
-            .ok_or_else(|| Error::new("not_found", "OpenCode Agent session is not retained"))?;
-        validate_binding(
-            &session.agent_id,
-            session.generation,
-            &params.agent_id,
-            params.generation,
-            "OpenCode",
         )?;
         let event_status = match session.events.current_status().await {
             Ok(status) => status,
@@ -3622,22 +3576,11 @@ impl OpenCodePlugin {
 
     async fn stop(&mut self, raw: &Value) -> Result<Value> {
         let params: AgentStopParams = decode(raw, "OpenCode agent.stop params are invalid")?;
-        validate_identity(
+        let session = retained_session(
+            &mut self.session,
             &params.agent_id,
             params.generation,
             &params.command_id,
-            "OpenCode",
-        )?;
-        let session = self
-            .session
-            .as_mut()
-            .ok_or_else(|| Error::new("not_found", "OpenCode Agent session is not retained"))?;
-        validate_binding(
-            &session.agent_id,
-            session.generation,
-            &params.agent_id,
-            params.generation,
-            "OpenCode",
         )?;
         // Latch once before native I/O. An uncertain close is never replayed.
         if begin_stop(
