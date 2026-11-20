@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 67;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 68;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -1594,6 +1594,21 @@ impl Store {
                      updated_at INTEGER NOT NULL
                  );
                  INSERT INTO schema_migrations(version) VALUES (67);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 68 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            // Exited child pruning seeks the oldest rows first; the partial
+            // index holds only that set, not live, plugin or harness rows.
+            tx.execute_batch(
+                "CREATE INDEX processes_exited_child_updated ON processes(updated_at)
+                     WHERE state = 'exited' AND role = 'child';
+                 INSERT INTO schema_migrations(version) VALUES (68);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;

@@ -226,7 +226,8 @@ Job observation.
 
 Unchanged process observations still validate generation, source, ownership and
 the full process identity, but do not rewrite process or source rows. Their durable
-`updated_at` records the last changed process fact; the monitor retains each
+`updated_at` records the last changed process fact; exited child rows older than the
+event retention window are pruned ([core](core.md#retention)); the monitor retains each
 accepted sample and its freshness in memory. Process read views overlay the cached
 sample timestamp only when identity, owner, role, state and exit code still match
 the durable record, never advancing it past an actual accepted sample. Restart

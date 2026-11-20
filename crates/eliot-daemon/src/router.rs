@@ -4895,6 +4895,7 @@ impl Router {
             writes_deleted: report.writes_deleted,
             mail_deleted: report.mail_deleted,
             digests_deleted: report.digests_deleted,
+            processes_deleted: report.processes_deleted,
         };
         request.validate_response(&response)?;
         serde_json::to_value(response)

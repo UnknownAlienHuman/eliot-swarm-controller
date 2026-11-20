@@ -148,6 +148,7 @@ pub(crate) struct Counts {
     pub(crate) writes: u64,
     pub(crate) mail: u64,
     pub(crate) digests: u64,
+    pub(crate) processes: u64,
 }
 
 pub(crate) fn record_counts(
@@ -239,6 +240,7 @@ fn encode_record(
             "writes": counts.writes,
             "mail": counts.mail,
             "digests": counts.digests,
+            "processes": counts.processes,
         });
     }
     if let Some(detail) = detail

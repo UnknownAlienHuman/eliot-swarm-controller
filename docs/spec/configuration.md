@@ -603,8 +603,8 @@ retention.mail_days = 30
 All three windows are optional positive integer days; each defaults to unset,
 which disables pruning for that side. A daemon without retention settings
 deletes nothing; set a window to prune expired history for that side. Daemon
-maintenance periodically prunes expired event history, closed command/child
-sets and acknowledged mail older than `mail_days` through the Store writer;
+maintenance periodically prunes expired event history (with exited child process
+rows), closed command/child sets and acknowledged mail older than `mail_days` through the Store writer;
 see the [Core retention contract](core.md#retention). Command and write
 bindings always outlive the 24-hour retry window plus the 5-minute allowed
 clock-skew margin regardless of `commands_days`, so a pruned id resubmits as
