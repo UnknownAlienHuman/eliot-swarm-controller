@@ -43,7 +43,7 @@ use crate::{
 use eliot_core::{
     Agent, AgentOrigin, AgentState, Command, CommandState, Error, Event, FrozenScriptContext,
     FrozenScriptRun, NativeStoreBinding, Result, RunDefinitionArgs, ScriptProcessResult,
-    SecretPolicy, SubmitCommand, Turn, TurnOutcome, TurnState, WorkspacePhase,
+    SecretPolicy, SessionUsage, SubmitCommand, Turn, TurnOutcome, TurnState, WorkspacePhase,
     WorkspacePreparationInput,
     api::{
         AgentConfigView, AgentDiscoverRequest, AgentEditsRequest, AgentEditsResponse,
@@ -3618,10 +3618,7 @@ impl Router {
                     .map_err(|_| Error::new("internal", "source state view is invalid"))
             })
             .collect::<Result<Vec<_>>>()?;
-        let session_usage = {
-            let store = self.inner.store.lock().await;
-            store.get_session_usage(&agent.id, agent.generation)?
-        };
+        let session_usage = self.session_usage(&agent).await?;
         // Heavy-work and growth readbacks stay advisory: a degraded journal
         // never fails the Agent view.
         let (heavy, session_growth, work) = {
@@ -3689,6 +3686,11 @@ impl Router {
             work,
         })
         .map_err(|_| Error::new("internal", "Agent view could not be encoded"))
+    }
+
+    async fn session_usage(&self, agent: &Agent) -> Result<Option<SessionUsage>> {
+        let store = self.inner.store.lock().await;
+        store.get_session_usage(&agent.id, agent.generation)
     }
 
     async fn observation_view(&self, agent: &Agent) -> ObservationView {
@@ -3875,10 +3877,7 @@ impl Router {
             ));
         }
         let observation = self.observation_view(&agent).await;
-        let session_usage = {
-            let store = self.inner.store.lock().await;
-            store.get_session_usage(&agent.id, agent.generation)?
-        };
+        let session_usage = self.session_usage(&agent).await?;
         // Heavy-work and growth readbacks stay advisory: a degraded journal
         // never fails the Agent view.
         let (heavy, session_growth, work) = {
