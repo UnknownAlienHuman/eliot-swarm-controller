@@ -46,7 +46,7 @@ pub(super) fn authorize_agent_submit(
     ) {
         return Err(Error::new(
             "not_allowed",
-            "managed Agent credentials cannot launch another Agent",
+            format!("managed Agent credentials cannot submit {}", request.verb),
         ));
     }
     if request.selector.is_some() {

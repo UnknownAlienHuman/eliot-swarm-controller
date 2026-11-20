@@ -720,8 +720,9 @@ advisory, so a read failure never reads back as an unset policy. See
 threshold, and [monitoring](monitoring.md#views) for the advisory.
 
 `maintenance.run` is owner-only and accepts an empty object. It reloads the
-daemon retention settings and runs the same bounded retention epochs as the
-hourly tick (same row and time budgets, same drain rule), returning the Core
+daemon retention settings and runs one bounded retention epoch (the hourly
+tick's row and time budgets), so it returns inside the client call deadline; a
+larger backlog continues on the hourly tick. It returns the Core
 [`MaintenanceRunResponse`](../../crates/eliot-core/src/api/maintenance.rs)
 pruned counts and the retained-event watermark `pruned_through`. A rejected
 settings reload fails the call instead of pruning under stale windows. The
