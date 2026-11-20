@@ -933,7 +933,9 @@ impl Router {
                 .iter()
                 .position(|entry| entry.cursor() == cursor)
                 .map(|index| index + 1)
-                .unwrap_or(0),
+                .ok_or_else(|| {
+                    Error::new("invalid", eliot_core::api::CATALOG_CURSOR_STALE_MESSAGE)
+                })?,
         };
         let page: Vec<eliot_core::api::ModelsCatalogEntry> =
             filtered.into_iter().skip(start).take(limit).collect();

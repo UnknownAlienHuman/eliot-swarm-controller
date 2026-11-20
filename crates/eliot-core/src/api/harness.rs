@@ -593,9 +593,19 @@ pub const MAX_CATALOG_QUERY_BYTES: usize = 128;
 pub const MAX_CATALOG_LIMIT: usize = 100;
 /// Default `models.catalog` page size.
 pub const DEFAULT_CATALOG_LIMIT: usize = 50;
-/// Maximum models returned in one `models.catalog` page is the page limit;
-/// the aggregated catalogue behind the page is bounded by the per-harness cap.
+/// Maximum models in one `models.catalog` response (a validation bound on a
+/// single page). A listing spans pages, so it has no total bound here.
 pub const MAX_CATALOG_MODELS: usize = 1024;
+/// Message of the `invalid` error for an `after` cursor that is no longer in
+/// the listing (the models changed between pages). The daemon never serves
+/// page one for such a cursor; the caller restarts from the first page.
+pub const CATALOG_CURSOR_STALE_MESSAGE: &str =
+    "catalogue cursor is no longer in the listing; restart from the first page";
+
+/// Whether `error` is the stale-cursor rejection of `models.catalog`.
+pub fn catalog_cursor_is_stale(error: &Error) -> bool {
+    error.code == "invalid" && error.message.as_str() == CATALOG_CURSOR_STALE_MESSAGE
+}
 
 /// Availability of one catalogue model: `available` (provider quota supports
 /// it and no hold covers it), `held` (a provider hold covers its harness
