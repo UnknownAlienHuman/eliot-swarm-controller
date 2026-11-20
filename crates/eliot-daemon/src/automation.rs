@@ -180,13 +180,7 @@ pub(crate) async fn initialize_global_rules(
             .await
         {
             Ok(rules) => (rules, from_file),
-            Err(error)
-                if !prior.is_empty()
-                    && matches!(
-                        error.code.as_str(),
-                        "frame_too_large" | "invalid" | "secret_in_payload" | "unsupported"
-                    ) =>
-            {
+            Err(error) if !prior.is_empty() && rejected_reload(&error) => {
                 report_rejected_reload(policy, &snapshot.inputs, &error, &mut notices)?;
                 let saved = reload::from_processing(&prior)?;
                 (
@@ -325,13 +319,7 @@ async fn initialize_project_namespace(
     .await;
     let rules = match rules_result {
         Ok(rules) => rules,
-        Err(error)
-            if !prior.is_empty()
-                && matches!(
-                    error.code.as_str(),
-                    "frame_too_large" | "invalid" | "secret_in_payload" | "unsupported"
-                ) =>
-        {
+        Err(error) if !prior.is_empty() && rejected_reload(&error) => {
             report_rejected_reload(policy, &snapshot.inputs, &error, &mut notices)?;
             let saved = reload::from_processing(&prior)?;
             apply_global_rule_snapshot(
@@ -766,12 +754,7 @@ async fn attempt_reload_snapshot(
             }
             Ok(Some((updated, deferred)))
         }
-        Err(error)
-            if matches!(
-                error.code.as_str(),
-                "frame_too_large" | "invalid" | "secret_in_payload" | "unsupported"
-            ) =>
-        {
+        Err(error) if rejected_reload(&error) => {
             report_rejected_reload(reporter.policy, &snapshot.inputs, &error, reporter.notices)?;
             Ok(None)
         }
@@ -2595,4 +2578,13 @@ pub(crate) async fn prepare_rule_catch_up_actions(
     }
     actions.sort_by_key(|action| action.event_seq);
     Ok(actions)
+}
+
+/// A definite refusal of a rules-file edit: the reload is rejected and the
+/// prior rules keep running. Any other error is a real reload failure.
+fn rejected_reload(error: &Error) -> bool {
+    matches!(
+        error.code.as_str(),
+        "frame_too_large" | "invalid" | "not_allowed" | "secret_in_payload" | "unsupported"
+    )
 }

@@ -519,7 +519,9 @@ Native dispatch requires the exact ready preparation and command, with target
 generation equal to current + 1, in the same transaction that advances the fence.
 Unknown creation accepts exact fully initialized worktree readback and may return the
 still-undispatched command to accepted. Absent/partial/conflicting readback stays
-unknown. This never authorizes repeating `worktree add`. Unknown setup retains its
+unknown. This never authorizes repeating `worktree add`. A creation whose branch or
+worktree registration already exists while its marker proves no Git write was reserved
+is `failed` (`workspace_target_exists`), not unknown. Unknown setup retains its
 index and cannot authorize another spawn. Restart leaves setup-ready/completed entries
 intact; a resumed ready worktree retains its completed setup index and only revalidates
 its retained identity before native dispatch.

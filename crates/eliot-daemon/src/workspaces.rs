@@ -408,6 +408,12 @@ impl WorkspaceManager {
                                     }
                                 }
                             }
+                            Err(error)
+                                if error.code == "already_exists"
+                                    && self.git_write_never_dispatched(&slot, &current).await? =>
+                            {
+                                target_exists_refusal(&error)
+                            }
                             Err(_) => git.inspect(&current).await,
                         }
                     };
@@ -1299,6 +1305,29 @@ impl WorkspaceManager {
         Ok(Some((agent, preparation)))
     }
 
+    /// Whether this creating preparation's Store marker still says no Git
+    /// write was dispatched. Read under the slot gate, which every Git write
+    /// reservation holds, so no reservation can be in progress.
+    async fn git_write_never_dispatched(
+        &self,
+        slot: &Slot,
+        expected: &WorkspacePreparation,
+    ) -> Result<bool> {
+        let _gate = slot.gate.clone().lock_owned().await;
+        let store = self.inner.store.lock().await;
+        let actual = store
+            .get_workspace(&expected.agent)?
+            .ok_or_else(|| problem("not_found", "workspace preparation disappeared"))?;
+        require_same(expected, &actual)?;
+        Ok(actual.phase == WorkspacePhase::Creating
+            && actual
+                .outcome
+                .as_ref()
+                .and_then(|outcome| outcome.get("native_git_write_dispatched"))
+                .and_then(Value::as_bool)
+                == Some(false))
+    }
+
     async fn require_current(
         &self,
         expected: &WorkspacePreparation,
@@ -1922,9 +1951,28 @@ fn removal_unknown(code: &str) -> WorkspaceRemovalOutcome {
     }
 }
 
+const WORKSPACE_TARGET_EXISTS: &str = "workspace_target_exists";
+
+/// A creation refused before any Git write because its branch or worktree
+/// registration already exists elsewhere: definite, not unknown.
+fn target_exists_refusal(error: &Error) -> WorkspaceCreationOutcome {
+    WorkspaceCreationOutcome::Failed {
+        code: WORKSPACE_TARGET_EXISTS.to_owned(),
+        message: error.message.to_string(),
+        failure_where: Some("daemon.workspace.create.preflight".to_owned()),
+        origin: Some(eliot_core::FailureOrigin::Swarm),
+        origin_evidence: Some(
+            "the target already existed and this preparation dispatched no Git write".to_owned(),
+        ),
+    }
+}
+
 fn safe_creation(outcome: WorkspaceCreationOutcome) -> WorkspaceCreationOutcome {
     match outcome {
         verified @ WorkspaceCreationOutcome::Verified { .. } => verified,
+        refused if matches!(&refused, WorkspaceCreationOutcome::Failed { code, .. } if code == WORKSPACE_TARGET_EXISTS) => {
+            refused
+        }
         WorkspaceCreationOutcome::Failed { .. } => WorkspaceCreationOutcome::Failed {
             code: "workspace_creation_failed".to_owned(),
             message: "workspace creation readback proved no created subject".to_owned(),

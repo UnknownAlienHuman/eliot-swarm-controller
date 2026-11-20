@@ -116,9 +116,10 @@ pub(crate) fn store_file_sizes(data_root: &Path) -> (u64, u64) {
 }
 
 /// Owner-triggered pass (`maintenance.run`): reload the daemon retention
-/// settings, then run the same bounded epochs as the hourly tick. A rejected
-/// reload fails the call so the owner fixes the config instead of pruning
-/// under stale windows.
+/// settings, then run one bounded epoch, so the call returns inside the
+/// client deadline; a larger backlog continues on the hourly tick. A
+/// rejected reload fails the call so the owner fixes the config instead of
+/// pruning under stale windows.
 pub(crate) async fn run_now(
     store: &Mutex<Store>,
     data_root: &Path,
@@ -126,14 +127,19 @@ pub(crate) async fn run_now(
     now: i64,
 ) -> Result<RetentionReport> {
     let config = config::load_daemon_config(data_root)?;
-    run_epochs(store, &config.retention, policy, now, || false).await
+    let mut epochs = 0;
+    run_epochs(store, &config.retention, policy, now, move || {
+        epochs += 1;
+        epochs > 1
+    })
+    .await
 }
 
 /// Run bounded retention epochs until an epoch drains or a budget runs out:
 /// the shared body of the hourly tick and the owner-triggered pass. Totals
 /// sum every epoch; `pruned_through` is the last epoch's watermark.
 /// `stop_requested` is checked at the top of every epoch; the tick wires it
-/// to daemon shutdown, the RPC path never stops early.
+/// to daemon shutdown, the RPC path stops after its first epoch.
 pub(crate) async fn run_epochs(
     store: &Mutex<Store>,
     retention: &config::RetentionConfig,
