@@ -216,7 +216,7 @@ impl Router {
         store.inference_credential(
             method,
             &request,
-            &inference_sha256(record.credential.as_bytes()),
+            &sha256_hex(record.credential.as_bytes()),
             &response,
             now_ms(),
         )
@@ -297,9 +297,7 @@ impl Router {
                 != format!("inference-credential-{}.json", record.operation_id)
             || !store
                 .inference_token_hash(&record.client_id, record.token_version)?
-                .is_some_and(|hash| {
-                    secure_eq(&hash, &inference_sha256(record.credential.as_bytes()))
-                })
+                .is_some_and(|hash| secure_eq(&hash, &sha256_hex(record.credential.as_bytes())))
         {
             return Err(unknown());
         }
@@ -592,7 +590,7 @@ impl Router {
             self.inner.store.lock().await.inference_success(
                 client,
                 &request.id,
-                &inference_sha256(&exact),
+                &sha256_hex(&exact),
                 exact.len(),
                 &output.session_id,
             )?;
@@ -707,9 +705,7 @@ impl Router {
             &self.artifact(&request.call_id, "result"),
             MAX_INFERENCE_RESULT,
         )?;
-        if call.result_bytes != Some(bytes.len())
-            || inference_sha256(&bytes) != request.result_sha256
-        {
+        if call.result_bytes != Some(bytes.len()) || sha256_hex(&bytes) != request.result_sha256 {
             return Err(unknown());
         }
         if request.offset > bytes.len() {

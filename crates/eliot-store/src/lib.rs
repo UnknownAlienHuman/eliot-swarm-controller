@@ -42,7 +42,7 @@ pub use scripts::ScriptRunAdmission;
 pub use turn_recovery::{ActiveTurnRecovery, RecoveredTurn};
 pub use usage::ResolvedUsageScope;
 
-use eliot_core::api::{HeavySummaryView, SessionGrowthView, agent_state_name};
+use eliot_core::api::{HeavySummaryView, SessionGrowthView, agent_state_name, is_git_oid};
 use eliot_core::limits::{MAX_COMMAND_ID_BYTES, MAX_EVENT_BYTES, MAX_FRAME_BYTES, MAX_TEXT_BYTES};
 use eliot_core::{
     self as core, Agent, AgentControl, AgentEdit, AgentState, BatchAck, Command, CommandState,
@@ -3095,7 +3095,7 @@ fn validate_git_path(path: &str) -> Result<()> {
 }
 
 fn validate_git_oid(oid: &str) -> Result<()> {
-    if !matches!(oid.len(), 40 | 64) || !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if !is_git_oid(oid) {
         return Err(Error::new(
             "invalid",
             "Git object id must be a full SHA-1 or SHA-256 hex id",

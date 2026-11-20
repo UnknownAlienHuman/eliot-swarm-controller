@@ -64,6 +64,7 @@ use eliot_core::{
         SWITCH_BLANK_SCOPE_ARG, SWITCH_PROJECT_REVISION_ARG, ShutdownMode, SourceState,
         SwarmWaitRequest, SwarmWaitResponse, TimerGetRequest, TimerStateView, TurnGetRequest,
         UsageScopeView, UsageSummaryRequest, WaitEntryResult, WorkerTaskHealth, fair_excerpt_cap,
+        is_supported_harness,
     },
 };
 use eliot_plugin::{MAX_EVENT_BYTES, sync::LockExt};
@@ -6606,10 +6607,7 @@ fn install_frozen_profile(
     snapshot: Value,
     require_snapshot_harness: bool,
 ) -> Result<()> {
-    if !matches!(
-        harness,
-        "codex" | "muse" | "claude" | "opencode" | "antigravity"
-    ) {
+    if !is_supported_harness(harness) {
         return Err(Error::new(
             "unsupported",
             format!("unsupported launch harness {harness}"),

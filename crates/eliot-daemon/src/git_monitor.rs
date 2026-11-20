@@ -5,6 +5,7 @@
 //! manager owns ordinary scoped execution and cancellation serialization.
 
 use crate::platform::{OwnedChild, is_reparse_point};
+use eliot_core::api::is_git_oid;
 use eliot_core::{Error, GitBaseline, GitCommit, GitPathStatus, GitSnapshot, GitWorkProbe, Result};
 use sha2::{Digest, Sha256};
 use std::{
@@ -396,12 +397,12 @@ impl GitProbe {
         let Some(head) = head else {
             return Ok((Vec::new(), false, baseline.head.is_some()));
         };
-        if !is_oid(head) {
+        if !is_git_oid(head) {
             return Err(unavailable("Git HEAD is malformed"));
         }
         let mut gap = false;
         let range = if let Some(previous) = baseline.head.as_deref() {
-            if !is_oid(previous) {
+            if !is_git_oid(previous) {
                 return Err(unavailable("stored Git baseline is malformed"));
             }
             let ancestor = self
@@ -450,7 +451,7 @@ impl GitProbe {
             )
             .await?;
         let ids = nul_records(&output)?;
-        if ids.iter().any(|oid| !is_oid(oid)) {
+        if ids.iter().any(|oid| !is_git_oid(oid)) {
             return Err(unavailable("Git history contains a malformed object id"));
         }
         let mut complete = ids.len() <= HISTORY_COMMITS;
@@ -516,7 +517,7 @@ impl GitProbe {
         let (Some(base), Some(head)) = (base, head) else {
             return Ok((Vec::new(), false));
         };
-        if !is_oid(base) || !is_oid(head) {
+        if !is_git_oid(base) || !is_git_oid(head) {
             return Err(unavailable(
                 "committed-path comparison requires exact object ids",
             ));
@@ -601,7 +602,7 @@ impl GitProbe {
                 !dirty.is_empty(),
             ));
         };
-        if !is_oid(base) || !is_oid(head) {
+        if !is_git_oid(base) || !is_git_oid(head) {
             return Ok(unavailable_work(
                 "invalid_oid",
                 dirty_digest,
@@ -1210,7 +1211,7 @@ fn parse_status(bytes: &[u8]) -> Result<Status> {
     let mut renamed_from = BTreeSet::new();
     while let Some(record) = records.next() {
         if let Some(oid) = record.strip_prefix("# branch.oid ") {
-            if seen_head || (oid != "(initial)" && !is_oid(oid)) {
+            if seen_head || (oid != "(initial)" && !is_git_oid(oid)) {
                 return Err(unavailable("Git branch header is malformed"));
             }
             seen_head = true;
@@ -1296,7 +1297,7 @@ fn parse_index(bytes: &[u8]) -> Result<BTreeMap<String, bool>> {
             .split_once('\t')
             .ok_or_else(|| unavailable("Git index record is malformed"))?;
         let fields: Vec<_> = metadata.split(' ').collect();
-        if fields.len() != 4 || fields[0].len() != 1 || !is_oid(fields[2]) {
+        if fields.len() != 4 || fields[0].len() != 1 || !is_git_oid(fields[2]) {
             return Err(unavailable("Git index metadata is malformed"));
         }
         if fields[1] == "160000" {
@@ -1351,10 +1352,6 @@ fn parse_filter_attributes(bytes: &[u8], expected: &BTreeSet<String>) -> Result<
         }
     }
     Ok(affected)
-}
-
-pub(crate) fn is_oid(oid: &str) -> bool {
-    matches!(oid.len(), 40 | 64) && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn related_path(left: &str, right: &str) -> bool {
