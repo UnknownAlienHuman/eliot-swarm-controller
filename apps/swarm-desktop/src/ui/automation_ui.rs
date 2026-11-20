@@ -1083,11 +1083,16 @@ fn settle_timer_run(
     parent: Command,
     cancelled: &dyn Fn() -> bool,
 ) -> Fallible<(Command, Vec<Command>)> {
-    const POLL_MS: u64 = 1_000;
-    const MAX_POLLS: usize = 120;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
     let mut parent = parent;
-    for _ in 0..MAX_POLLS {
-        if parent.state.is_terminal() {
+    loop {
+        if cancelled() {
+            return Err("stopped waiting; the run goes on in Swarm".to_owned());
+        }
+        if parent.state == CommandState::Unknown {
+            return Err("the run's outcome is unknown; waiting for resolution.".to_owned());
+        }
+        let open = if parent.state.is_terminal() {
             let children = client::block_on(client::command_children(data_dir, &parent.id))
                 .map_err(|error| error.to_string())?;
             if children.iter().all(|child| child.state.is_terminal()) {
@@ -1099,19 +1104,40 @@ fn settle_timer_run(
             {
                 return Err("an action's outcome is unknown; waiting for resolution.".to_owned());
             }
+            Some(
+                children
+                    .into_iter()
+                    .filter(|child| !child.state.is_terminal())
+                    .map(|child| child.id)
+                    .take(eliot_core::api::MAX_SWARM_WAIT_TARGETS)
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            None
+        };
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "still {} after two minutes (command {})",
+                format!("{:?}", parent.state).to_lowercase(),
+                parent.id
+            ));
         }
-        if parent.state == CommandState::Unknown {
-            return Err("the run's outcome is unknown; waiting for resolution.".to_owned());
+        match open {
+            None => {
+                if let Some(settled) = super::wait_slice(data_dir, &parent.id, deadline)? {
+                    parent = settled;
+                }
+            }
+            Some(open) => {
+                let slice = (tokio::time::Instant::now() + super::SETTLE_SLICE).min(deadline);
+                let settled = client::block_on(client::wait_commands(data_dir, open, slice))
+                    .map_err(|error| error.to_string())?;
+                if settled {
+                    // A turn-bound action reads terminal by its turn first;
+                    // let its own row settle before reading the children again.
+                    feed::backoff(200, cancelled);
+                }
+            }
         }
-        if !feed::backoff(POLL_MS, cancelled) {
-            return Err("stopped waiting; the run goes on in Swarm".to_owned());
-        }
-        parent = client::block_on(client::read_command(data_dir, &parent.id))
-            .map_err(|error| error.to_string())?;
     }
-    Err(format!(
-        "still {} after two minutes (command {})",
-        format!("{:?}", parent.state).to_lowercase(),
-        parent.id
-    ))
 }

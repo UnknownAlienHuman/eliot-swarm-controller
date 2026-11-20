@@ -38,7 +38,7 @@ pub use daemon::{
     CallTimings, DaemonStartupFailure, MAX_RPC_FRAME_BYTES, client_call, client_call_measured,
     client_call_typed, client_call_with_agent_identity, client_call_with_owner_credential,
     daemon_connect_hint, daemon_failure_since, last_daemon_failure, last_daemon_phase,
-    require_agent_identity, run,
+    require_agent_identity, run, wait_command, wait_terminal,
 };
 pub use platform::data_dir::{persist_selected_root, resolve_data_dir, resolve_selected_root};
 pub use router::discovery::is_mutation_id_method;

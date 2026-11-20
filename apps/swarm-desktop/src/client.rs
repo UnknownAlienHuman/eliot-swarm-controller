@@ -485,6 +485,26 @@ pub async fn read_command(data_dir: &Path, id: &str) -> Result<Command> {
     Ok(command)
 }
 
+/// Server-side wait until one retained command is terminal; its record, or
+/// `None` when `deadline` passes first.
+pub async fn wait_command(
+    data_dir: &Path,
+    id: &str,
+    deadline: tokio::time::Instant,
+) -> Result<Option<Command>> {
+    eliot_daemon::wait_command(data_dir, &CommandGetRequest::new(id), deadline).await
+}
+
+/// Server-side wait (`swarm.wait`) until every listed command is terminal;
+/// false when `deadline` passes first.
+pub async fn wait_commands(
+    data_dir: &Path,
+    ids: Vec<String>,
+    deadline: tokio::time::Instant,
+) -> Result<bool> {
+    eliot_daemon::wait_terminal(data_dir, ids, Vec::new(), deadline).await
+}
+
 /// What a launch freezes: a stored profile, or the Owner ad-hoc snapshot
 /// of one harness with optional model/effort (absent = native default) and
 /// access level (`ask`/`auto`/`full`; absent = the harness's safe defaults).

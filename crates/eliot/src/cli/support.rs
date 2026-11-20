@@ -254,27 +254,23 @@ pub(crate) async fn wait_call<T>(
     }
 }
 
+/// Wait server-side until the command is terminal and return its record. A
+/// command bound to a turn completes only when that turn does. The deadline
+/// is a timeout; a known terminal error keeps its contract exit code.
 pub(crate) async fn wait_for_command(
     data_dir: &Path,
     command_id: &str,
     deadline: Instant,
 ) -> Result<CoreCommand, Failure> {
     let params = CommandGetRequest::new(command_id);
-    params.validate().map_err(Failure::readback)?;
-    loop {
-        let command: CoreCommand = wait_call(
-            eliot_daemon::client_call_typed(data_dir, "command.get", &params),
-            deadline,
-        )
-        .await?;
-        params
-            .validate_response(&command)
-            .map_err(Failure::readback)?;
-        if command_state_result(&command)? {
-            return Ok(command);
-        }
-        sleep_before_deadline(deadline).await?;
-    }
+    let command = wait_call(
+        eliot_daemon::wait_command(data_dir, &params, deadline),
+        deadline,
+    )
+    .await?
+    .ok_or_else(Failure::timeout)?;
+    command_state_result(&command)?;
+    Ok(command)
 }
 
 pub(crate) async fn wait_for_turn(
@@ -282,44 +278,25 @@ pub(crate) async fn wait_for_turn(
     command_id: &str,
     deadline: Instant,
 ) -> Result<CoreTurn, Failure> {
-    let command_params = CommandGetRequest::new(command_id);
-    command_params.validate().map_err(Failure::readback)?;
-    let (agent, generation, turn_id) = loop {
-        let command: CoreCommand = wait_call(
-            eliot_daemon::client_call_typed(data_dir, "command.get", &command_params),
-            deadline,
-        )
-        .await?;
-        command_params
-            .validate_response(&command)
-            .map_err(Failure::readback)?;
-        command_state_result(&command)?;
-        if let Some(turn_id) = command.turn_id {
-            let agent = command
-                .target
-                .ok_or_else(|| Failure::new(4, "command readback binding is invalid"))?;
-            let generation = command
-                .generation
-                .ok_or_else(|| Failure::new(4, "command readback binding is invalid"))?;
-            break (agent, generation, turn_id);
-        }
-        sleep_before_deadline(deadline).await?;
+    // The wait ends when the command fails or its bound turn settles.
+    let command = wait_for_command(data_dir, command_id, deadline).await?;
+    let (Some(agent), Some(generation), Some(turn_id)) =
+        (command.target, command.generation, command.turn_id)
+    else {
+        return Err(Failure::new(4, "command readback binding is invalid"));
     };
-
     let params = TurnGetRequest::new(agent, generation, turn_id);
     params.validate().map_err(Failure::readback)?;
-    loop {
-        let turn: CoreTurn = wait_call(
-            eliot_daemon::client_call_typed(data_dir, "turn.get", &params),
-            deadline,
-        )
-        .await?;
-        params.validate_response(&turn).map_err(Failure::readback)?;
-        match turn.state {
-            TurnState::Completed => return Ok(turn),
-            TurnState::Unknown => return Err(Failure::new(4, "turn outcome is unknown")),
-            TurnState::Running => sleep_before_deadline(deadline).await?,
-        }
+    let turn: CoreTurn = wait_call(
+        eliot_daemon::client_call_typed(data_dir, "turn.get", &params),
+        deadline,
+    )
+    .await?;
+    params.validate_response(&turn).map_err(Failure::readback)?;
+    match turn.state {
+        TurnState::Completed => Ok(turn),
+        TurnState::Unknown => Err(Failure::new(4, "turn outcome is unknown")),
+        TurnState::Running => Err(Failure::timeout()),
     }
 }
 

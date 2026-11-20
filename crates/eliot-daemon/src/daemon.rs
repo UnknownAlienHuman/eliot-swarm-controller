@@ -7,9 +7,12 @@ use crate::{
     restart_capacity,
     router::Router,
 };
+use eliot_core::api::{
+    CommandGetRequest, MAX_SWARM_WAIT_MS, SwarmWaitRequest, SwarmWaitResponse, WaitTurnRef,
+};
 use eliot_core::{
-    Error, MAX_STDERR_DIAGNOSTIC_BYTES, Result, SecretPolicy, StderrDiagnostic,
-    bound_stderr_diagnostics,
+    Command, CommandState, Error, MAX_STDERR_DIAGNOSTIC_BYTES, Result, SecretPolicy,
+    StderrDiagnostic, bound_stderr_diagnostics,
 };
 use eliot_plugin::{RpcError, RpcRequest, RpcResponse};
 use futures_util::{SinkExt, StreamExt};
@@ -1129,6 +1132,61 @@ pub async fn client_call_typed<P: Serialize + ?Sized, R: DeserializeOwned>(
     let params = serde_json::to_value(params)
         .map_err(|_| Error::new("invalid", "daemon RPC parameters could not be serialized"))?;
     decode_client_result(method, client_call(data_dir, method, params).await)
+}
+
+/// Wait server-side (`swarm.wait`, mode `all`) until every listed command and
+/// turn is terminal, in slices of at most the server limit. Returns false when
+/// `deadline` passes first. A command bound to a turn waits for that turn, as
+/// `swarm.wait` defines. Callers read the record back themselves.
+pub async fn wait_terminal(
+    data_dir: &Path,
+    commands: Vec<String>,
+    turns: Vec<WaitTurnRef>,
+    deadline: Instant,
+) -> Result<bool> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        let wait_ms = u64::try_from(remaining.as_millis())
+            .unwrap_or(u64::MAX)
+            .min(MAX_SWARM_WAIT_MS);
+        let request = SwarmWaitRequest::new(commands.clone(), turns.clone(), "all", wait_ms);
+        request.validate()?;
+        let reply: SwarmWaitResponse = client_call_typed(data_dir, "swarm.wait", &request).await?;
+        request.validate_response(&reply)?;
+        if reply.completed {
+            return Ok(true);
+        }
+    }
+}
+
+/// Pause before re-waiting when `swarm.wait` reported a turn-bound command
+/// complete by its turn while the command row itself still reads open.
+const SETTLE_LAG: Duration = Duration::from_millis(200);
+
+/// Wait server-side until one command is terminal (unknown included), then
+/// return its record; `None` when `deadline` passes first.
+pub async fn wait_command(
+    data_dir: &Path,
+    request: &CommandGetRequest,
+    deadline: Instant,
+) -> Result<Option<Command>> {
+    request.validate()?;
+    while wait_terminal(data_dir, vec![request.id.clone()], Vec::new(), deadline).await? {
+        let command: Command = client_call_typed(data_dir, "command.get", request).await?;
+        request.validate_response(&command)?;
+        if !matches!(
+            command.state,
+            CommandState::Accepted | CommandState::Queued | CommandState::Dispatched
+        ) {
+            return Ok(Some(command));
+        }
+        tokio::time::sleep(SETTLE_LAG.min(deadline.saturating_duration_since(Instant::now())))
+            .await;
+    }
+    Ok(None)
 }
 
 fn decode_client_result<R: DeserializeOwned>(method: &str, result: Result<Value>) -> Result<R> {
