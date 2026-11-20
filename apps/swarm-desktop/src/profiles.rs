@@ -127,43 +127,63 @@ pub fn normalize_newlines(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
-/// Header table path of a line (`[a.b]`), `None` otherwise. Mirrors the
+/// A table header line: its dotted path, and whether it is an
+/// array-of-tables entry (`[[a.b]]`) rather than a table (`[a.b]`).
+struct Header {
+    path: Vec<String>,
+    array: bool,
+}
+
+impl Header {
+    /// The header line for `path` with this header's bracket kind.
+    fn line(&self, path: &[&str]) -> String {
+        let joined = path.join(".");
+        if self.array {
+            format!("[[{joined}]]\n")
+        } else {
+            format!("[{joined}]\n")
+        }
+    }
+}
+
+/// Header of a line (`[a.b]` or `[[a.b]]`), `None` otherwise. Mirrors the
 /// daemon's rule: only whitespace or a comment may follow the bracket.
-fn header_path(line: &str) -> Option<Vec<String>> {
+fn header_path(line: &str) -> Option<Header> {
     let trimmed = line.trim();
-    let (inner, rest) = if let Some(body) = trimmed.strip_prefix("[[") {
-        body.split_once("]]")?
+    let (array, inner, rest) = if let Some(body) = trimmed.strip_prefix("[[") {
+        let (inner, rest) = body.split_once("]]")?;
+        (true, inner, rest)
     } else {
-        trimmed.strip_prefix('[')?.split_once(']')?
+        let (inner, rest) = trimmed.strip_prefix('[')?.split_once(']')?;
+        (false, inner, rest)
     };
     let rest = rest.trim_start();
     if !(rest.is_empty() || rest.starts_with('#')) || inner.trim().is_empty() {
         return None;
     }
-    Some(
-        inner
-            .split('.')
-            .map(|segment| {
-                segment
-                    .trim()
-                    .trim_matches('"')
-                    .trim_matches('\'')
-                    .to_owned()
-            })
-            .collect(),
-    )
+    let path = inner
+        .split('.')
+        .map(|segment| {
+            segment
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_owned()
+        })
+        .collect();
+    Some(Header { path, array })
 }
 
 /// Profile names in draft order.
 pub fn profile_names(draft: &str) -> Vec<String> {
     let mut names = Vec::new();
     for line in draft.lines() {
-        if let Some(path) = header_path(line)
-            && path.len() == 2
-            && path[0] == "profiles"
-            && !names.contains(&path[1])
+        if let Some(header) = header_path(line)
+            && header.path.len() == 2
+            && header.path[0] == "profiles"
+            && !names.contains(&header.path[1])
         {
-            names.push(path[1].clone());
+            names.push(header.path[1].clone());
         }
     }
     names
@@ -174,10 +194,11 @@ fn block_range(draft: &str, name: &str) -> Option<(usize, usize, usize)> {
     let mut offset = 0;
     let mut header: Option<(usize, usize)> = None;
     for line in draft.split_inclusive('\n') {
-        if let Some(path) = header_path(line) {
+        if let Some(parsed) = header_path(line) {
             if let Some((start, body)) = header {
                 return Some((start, body, offset));
             }
+            let path = &parsed.path;
             if path.len() == 2 && path[0] == "profiles" && path[1] == name {
                 header = Some((offset, offset + line.len()));
             }
@@ -302,16 +323,13 @@ pub fn duplicate(draft: &str, from: &str, to: &str) -> Result<String, String> {
     let mut copied = String::new();
     let mut inside = false;
     for line in draft.split_inclusive('\n') {
-        if let Some(path) = header_path(line) {
+        if let Some(header) = header_path(line) {
+            let path = &header.path;
             inside = path.len() >= 2 && path[0] == "profiles" && path[1] == from;
             if inside {
-                let rest: Vec<&str> = path[2..].iter().map(String::as_str).collect();
-                let header = if rest.is_empty() {
-                    format!("[profiles.{to}]\n")
-                } else {
-                    format!("[profiles.{to}.{}]\n", rest.join("."))
-                };
-                copied.push_str(&header);
+                let mut renamed = vec!["profiles", to];
+                renamed.extend(path[2..].iter().map(String::as_str));
+                copied.push_str(&header.line(&renamed));
                 continue;
             }
         }
