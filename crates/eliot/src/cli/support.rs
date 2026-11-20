@@ -261,20 +261,15 @@ pub(crate) async fn wait_for_command(
 ) -> Result<CoreCommand, Failure> {
     let params = CommandGetRequest::new(command_id);
     params.validate().map_err(Failure::readback)?;
-    loop {
-        let command: CoreCommand = wait_call(
-            eliot_daemon::client_call_typed(data_dir, "command.get", &params),
-            deadline,
-        )
-        .await?;
-        params
-            .validate_response(&command)
-            .map_err(Failure::readback)?;
-        if command_state_result(&command)? {
-            return Ok(command);
-        }
-        sleep_before_deadline(deadline).await?;
+    let command: CoreCommand = wait_call(
+        eliot_daemon::wait_command(data_dir, &params, deadline),
+        deadline,
+    )
+    .await?;
+    if command_state_result(&command)? {
+        return Ok(command);
     }
+    Err(Failure::timeout())
 }
 
 pub(crate) async fn wait_for_turn(
@@ -308,18 +303,15 @@ pub(crate) async fn wait_for_turn(
 
     let params = TurnGetRequest::new(agent, generation, turn_id);
     params.validate().map_err(Failure::readback)?;
-    loop {
-        let turn: CoreTurn = wait_call(
-            eliot_daemon::client_call_typed(data_dir, "turn.get", &params),
-            deadline,
-        )
-        .await?;
-        params.validate_response(&turn).map_err(Failure::readback)?;
-        match turn.state {
-            TurnState::Completed => return Ok(turn),
-            TurnState::Unknown => return Err(Failure::new(4, "turn outcome is unknown")),
-            TurnState::Running => sleep_before_deadline(deadline).await?,
-        }
+    let turn: CoreTurn = wait_call(
+        eliot_daemon::wait_turn(data_dir, &params, deadline),
+        deadline,
+    )
+    .await?;
+    match turn.state {
+        TurnState::Completed => Ok(turn),
+        TurnState::Unknown => Err(Failure::new(4, "turn outcome is unknown")),
+        TurnState::Running => Err(Failure::timeout()),
     }
 }
 

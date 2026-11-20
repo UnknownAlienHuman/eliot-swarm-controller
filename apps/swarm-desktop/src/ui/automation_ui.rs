@@ -1084,10 +1084,14 @@ fn settle_timer_run(
     cancelled: &dyn Fn() -> bool,
 ) -> Fallible<(Command, Vec<Command>)> {
     const POLL_MS: u64 = 1_000;
-    const MAX_POLLS: usize = 120;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
     let mut parent = parent;
-    for _ in 0..MAX_POLLS {
+    loop {
+        if cancelled() {
+            return Err("stopped waiting; the run goes on in Swarm".to_owned());
+        }
         if parent.state.is_terminal() {
+            // The action children are read back here, not waited on by id.
             let children = client::block_on(client::command_children(data_dir, &parent.id))
                 .map_err(|error| error.to_string())?;
             if children.iter().all(|child| child.state.is_terminal()) {
@@ -1103,15 +1107,21 @@ fn settle_timer_run(
         if parent.state == CommandState::Unknown {
             return Err("the run's outcome is unknown; waiting for resolution.".to_owned());
         }
-        if !feed::backoff(POLL_MS, cancelled) {
-            return Err("stopped waiting; the run goes on in Swarm".to_owned());
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "still {} after two minutes (command {})",
+                format!("{:?}", parent.state).to_lowercase(),
+                parent.id
+            ));
         }
-        parent = client::block_on(client::read_command(data_dir, &parent.id))
-            .map_err(|error| error.to_string())?;
+        if parent.state.is_terminal() {
+            // Children still settling: pause before reading them again.
+            feed::backoff(POLL_MS, cancelled);
+        } else {
+            let slice =
+                (tokio::time::Instant::now() + std::time::Duration::from_secs(1)).min(deadline);
+            parent = client::block_on(client::wait_command(data_dir, &parent.id, slice))
+                .map_err(|error| error.to_string())?;
+        }
     }
-    Err(format!(
-        "still {} after two minutes (command {})",
-        format!("{:?}", parent.state).to_lowercase(),
-        parent.id
-    ))
 }

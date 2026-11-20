@@ -485,6 +485,16 @@ pub async fn read_command(data_dir: &Path, id: &str) -> Result<Command> {
     Ok(command)
 }
 
+/// Server-side wait until one retained command settles or `deadline` passes;
+/// returns its readback (settled, or still open at the deadline).
+pub async fn wait_command(
+    data_dir: &Path,
+    id: &str,
+    deadline: tokio::time::Instant,
+) -> Result<Command> {
+    eliot_daemon::wait_command(data_dir, &CommandGetRequest::new(id), deadline).await
+}
+
 /// What a launch freezes: a stored profile, or the Owner ad-hoc snapshot
 /// of one harness with optional model/effort (absent = native default) and
 /// access level (`ask`/`auto`/`full`; absent = the harness's safe defaults).

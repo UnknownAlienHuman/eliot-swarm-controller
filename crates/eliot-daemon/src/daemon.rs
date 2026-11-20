@@ -7,9 +7,13 @@ use crate::{
     restart_capacity,
     router::Router,
 };
+use eliot_core::api::{
+    CommandGetRequest, MAX_SWARM_WAIT_MS, SwarmWaitRequest, SwarmWaitResponse, TurnGetRequest,
+    WaitTurnRef,
+};
 use eliot_core::{
-    Error, MAX_STDERR_DIAGNOSTIC_BYTES, Result, SecretPolicy, StderrDiagnostic,
-    bound_stderr_diagnostics,
+    Command, CommandState, Error, MAX_STDERR_DIAGNOSTIC_BYTES, Result, SecretPolicy,
+    StderrDiagnostic, Turn, TurnState, bound_stderr_diagnostics,
 };
 use eliot_plugin::{RpcError, RpcRequest, RpcResponse};
 use futures_util::{SinkExt, StreamExt};
@@ -1129,6 +1133,100 @@ pub async fn client_call_typed<P: Serialize + ?Sized, R: DeserializeOwned>(
     let params = serde_json::to_value(params)
         .map_err(|_| Error::new("invalid", "daemon RPC parameters could not be serialized"))?;
     decode_client_result(method, client_call(data_dir, method, params).await)
+}
+
+/// Pause before re-waiting when `swarm.wait` reports completion but the
+/// record still reads open (a bound turn settled before its command row).
+const SETTLE_LAG: Duration = Duration::from_millis(200);
+
+/// Terminal per `swarm.wait` (every state but accepted, queued and
+/// dispatched). Unknown is settled: waiting on it cannot end sooner.
+fn command_settled(state: CommandState) -> bool {
+    matches!(
+        state,
+        CommandState::Applied
+            | CommandState::Rejected
+            | CommandState::Failed
+            | CommandState::Cancelled
+            | CommandState::Unknown
+    )
+}
+
+/// One `swarm.wait` call over the captured entries, bounded by its own
+/// server limit and `deadline`. Returns whether the mode condition completed.
+async fn swarm_wait_slice(
+    data_dir: &Path,
+    commands: Vec<String>,
+    turns: Vec<WaitTurnRef>,
+    deadline: Instant,
+) -> Result<bool> {
+    let remaining = u64::try_from(
+        deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX);
+    let request = SwarmWaitRequest::new(commands, turns, "all", remaining.min(MAX_SWARM_WAIT_MS));
+    request.validate()?;
+    let reply: SwarmWaitResponse = client_call_typed(data_dir, "swarm.wait", &request).await?;
+    request.validate_response(&reply)?;
+    Ok(reply.completed)
+}
+
+/// Wait server-side (`swarm.wait`) until one command is terminal or
+/// `deadline` passes, then read the full record back once it completes.
+/// Returns the readback: terminal, or still open when the deadline ended the
+/// wait. Callers decide the exit or message; the outcome stays the daemon's.
+pub async fn wait_command(
+    data_dir: &Path,
+    request: &CommandGetRequest,
+    deadline: Instant,
+) -> Result<Command> {
+    request.validate()?;
+    loop {
+        let completed =
+            swarm_wait_slice(data_dir, vec![request.id.clone()], Vec::new(), deadline).await?;
+        if !completed && Instant::now() < deadline {
+            continue;
+        }
+        let command: Command = client_call_typed(data_dir, "command.get", request).await?;
+        request.validate_response(&command)?;
+        if command_settled(command.state) || Instant::now() >= deadline {
+            return Ok(command);
+        }
+        tokio::time::sleep(SETTLE_LAG.min(deadline.saturating_duration_since(Instant::now())))
+            .await;
+    }
+}
+
+/// Wait server-side (`swarm.wait`) until one turn leaves `Running` or
+/// `deadline` passes, then read the full record back. Same contract as
+/// [`wait_command`].
+pub async fn wait_turn(
+    data_dir: &Path,
+    request: &TurnGetRequest,
+    deadline: Instant,
+) -> Result<Turn> {
+    request.validate()?;
+    let entry = WaitTurnRef::new(
+        request.agent.clone(),
+        request.generation,
+        request.turn_id.clone(),
+    );
+    loop {
+        let completed =
+            swarm_wait_slice(data_dir, Vec::new(), vec![entry.clone()], deadline).await?;
+        if !completed && Instant::now() < deadline {
+            continue;
+        }
+        let turn: Turn = client_call_typed(data_dir, "turn.get", request).await?;
+        request.validate_response(&turn)?;
+        if turn.state != TurnState::Running || Instant::now() >= deadline {
+            return Ok(turn);
+        }
+        tokio::time::sleep(SETTLE_LAG.min(deadline.saturating_duration_since(Instant::now())))
+            .await;
+    }
 }
 
 fn decode_client_result<R: DeserializeOwned>(method: &str, result: Result<Value>) -> Result<R> {

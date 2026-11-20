@@ -666,52 +666,56 @@ fn request_summary(details: &serde_json::Value) -> String {
         .to_owned()
 }
 
-/// Poll one retained command (bounded, cancellable) until it is terminal.
-/// The outcome stays the daemon's; this only reads it.
+/// Wait (bounded, cancellable) until one retained command is terminal. The
+/// wait is server-side `swarm.wait` in one-second slices, so a closed window
+/// stops it within about a second. The outcome stays the daemon's; this only
+/// reads it.
 fn settle_command(
     data_dir: &Path,
     id: &str,
-    max_polls: usize,
+    max_seconds: u64,
     cancelled: &dyn Fn() -> bool,
 ) -> Fallible<Command> {
-    const POLL_MS: u64 = 1_000;
-    let mut command =
-        client::block_on(client::read_command(data_dir, id)).map_err(|error| error.to_string())?;
-    for _ in 0..max_polls {
-        if scripts::is_terminal(command.state) {
-            return Ok(command);
-        }
-        if !feed::backoff(POLL_MS, cancelled) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(max_seconds);
+    loop {
+        if cancelled() {
             return Err(format!(
                 "stopped waiting; command {id} continues in the daemon"
             ));
         }
-        command = client::block_on(client::read_command(data_dir, id))
+        let slice = (tokio::time::Instant::now() + SETTLE_SLICE).min(deadline);
+        let command = client::block_on(client::wait_command(data_dir, id, slice))
             .map_err(|error| error.to_string())?;
+        if scripts::is_terminal(command.state) {
+            return Ok(command);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "command {id} still {} after {max_seconds}s; its outcome stays with the daemon",
+                format!("{:?}", command.state).to_lowercase()
+            ));
+        }
     }
-    if scripts::is_terminal(command.state) {
-        return Ok(command);
-    }
-    Err(format!(
-        "command {id} still {} after {max_polls}s; its outcome stays with the daemon",
-        format!("{:?}", command.state).to_lowercase()
-    ))
 }
+
+/// Longest server-side wait per slice while a settle loop watches a command.
+/// Bounds how long a closed window waits before the loop sees cancellation.
+const SETTLE_SLICE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Follow a `timer.run` command to its Run child and wait (bounded,
 /// cancellable) until that command is terminal. The timeout, custody and
 /// unknown outcome are the daemon's; this only reads them.
 fn settle_run(data_dir: &Path, parent: Command, cancelled: &dyn Fn() -> bool) -> Fallible<Command> {
-    const POLL_MS: u64 = 1_000;
-    const MAX_POLLS: usize = 15 * 60;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15 * 60);
     let mut watched = parent;
-    for _ in 0..MAX_POLLS {
+    loop {
         if cancelled() {
             return Err(
                 "stopped waiting (window closed or cancelled); the Run continues in the daemon"
                     .to_owned(),
             );
         }
+        // The parent-to-Run hop is a readback of its children, not a wait.
         if watched.verb != "run" {
             let children = client::block_on(client::command_children(data_dir, &watched.id))
                 .map_err(|error| error.to_string())?;
@@ -720,24 +724,21 @@ fn settle_run(data_dir: &Path, parent: Command, cancelled: &dyn Fn() -> bool) ->
                 continue;
             }
         }
-        if scripts::is_terminal(watched.state) && watched.verb == "run" {
+        // A refused or settled timer occurrence without a Run child ends here too.
+        if scripts::is_terminal(watched.state) {
             return Ok(watched);
         }
-        if scripts::is_terminal(watched.state) && watched.verb != "run" {
-            // A refused or settled timer occurrence without a Run child.
-            return Ok(watched);
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "still {} after 15 minutes; the outcome stays with the daemon (command {})",
+                format!("{:?}", watched.state).to_lowercase(),
+                watched.id
+            ));
         }
-        if !feed::backoff(POLL_MS, cancelled) {
-            continue;
-        }
-        watched = client::block_on(client::read_command(data_dir, &watched.id))
+        let slice = (tokio::time::Instant::now() + SETTLE_SLICE).min(deadline);
+        watched = client::block_on(client::wait_command(data_dir, &watched.id, slice))
             .map_err(|error| error.to_string())?;
     }
-    Err(format!(
-        "still {} after 15 minutes; the outcome stays with the daemon (command {})",
-        format!("{:?}", watched.state).to_lowercase(),
-        watched.id
-    ))
 }
 
 fn submit_note(reply: &CommandSubmitResponse) -> String {
