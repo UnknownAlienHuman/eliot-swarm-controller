@@ -155,6 +155,27 @@ enum SessionPhase {
     Stopped,
 }
 
+/// Identity gate and retained-session binding shared by snapshot and stop.
+fn retained_session<'a>(
+    slot: &'a mut Option<AgentSession>,
+    agent_id: &str,
+    generation: i64,
+    command_id: &str,
+) -> Result<&'a mut AgentSession> {
+    validate_identity(agent_id, generation, command_id, "Claude")?;
+    let session = slot
+        .as_mut()
+        .ok_or_else(|| Error::new("not_found", "Claude Agent session is not retained"))?;
+    validate_binding(
+        &session.agent_id,
+        session.generation,
+        agent_id,
+        generation,
+        "Claude",
+    )?;
+    Ok(session)
+}
+
 struct AgentSession {
     agent_id: String,
     generation: i64,
@@ -1807,22 +1828,11 @@ impl ClaudePlugin {
 
     async fn snapshot(&mut self, raw: &Value) -> Result<Value> {
         let params: AgentSnapshotParams = decode(raw, "Claude agent.snapshot params are invalid")?;
-        validate_identity(
+        let session = retained_session(
+            &mut self.session,
             &params.agent_id,
             params.generation,
             &params.command_id,
-            "Claude",
-        )?;
-        let session = self
-            .session
-            .as_mut()
-            .ok_or_else(|| Error::new("not_found", "Claude Agent session is not retained"))?;
-        validate_binding(
-            &session.agent_id,
-            session.generation,
-            &params.agent_id,
-            params.generation,
-            "Claude",
         )?;
         // PR1 has no live native session poll: the snapshot is the committed
         // stream position (session/turn bindings plus the latest terminal
@@ -1837,22 +1847,11 @@ impl ClaudePlugin {
 
     async fn stop(&mut self, raw: &Value) -> Result<Value> {
         let params: AgentStopParams = decode(raw, "Claude agent.stop params are invalid")?;
-        validate_identity(
+        let session = retained_session(
+            &mut self.session,
             &params.agent_id,
             params.generation,
             &params.command_id,
-            "Claude",
-        )?;
-        let session = self
-            .session
-            .as_mut()
-            .ok_or_else(|| Error::new("not_found", "Claude Agent session is not retained"))?;
-        validate_binding(
-            &session.agent_id,
-            session.generation,
-            &params.agent_id,
-            params.generation,
-            "Claude",
         )?;
         // Latch once before native I/O. An uncertain cancel is never replayed.
         if begin_stop(

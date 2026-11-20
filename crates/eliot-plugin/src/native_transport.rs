@@ -1534,6 +1534,46 @@ pub fn native_frame_channel<Frame>() -> (mpsc::Sender<Frame>, mpsc::Receiver<Fra
     mpsc::channel(NATIVE_EVENT_QUEUE)
 }
 
+/// Outbound JSON-RPC envelopes shared by every native stdio client (the
+/// JSON-RPC host and the Antigravity ACP client write the same frames).
+#[derive(Serialize)]
+pub struct OutboundRequest<'a> {
+    pub jsonrpc: &'static str,
+    pub id: String,
+    pub method: &'a str,
+    pub params: Value,
+}
+
+#[derive(Serialize)]
+pub struct OutboundNotification<'a> {
+    pub jsonrpc: &'static str,
+    pub method: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<Value>,
+}
+
+#[derive(Serialize)]
+pub struct OutboundResponse {
+    pub jsonrpc: &'static str,
+    pub id: Value,
+    pub error: NativeRpcError,
+}
+
+/// One agent-to-client success answer. The id is written verbatim:
+/// JSON-RPC ids are not necessarily strings.
+#[derive(Serialize)]
+pub struct OutboundResult {
+    pub jsonrpc: &'static str,
+    pub id: Value,
+    pub result: Value,
+}
+
+#[derive(Serialize)]
+pub struct NativeRpcError {
+    pub code: i64,
+    pub message: &'static str,
+}
+
 pub fn encode_frame(server: &'static str, message: &impl Serialize) -> Result<String> {
     let encoded = serde_json::to_string(message).map_err(|_| {
         Error::new(
