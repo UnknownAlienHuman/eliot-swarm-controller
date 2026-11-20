@@ -1,9 +1,8 @@
 //! Workspace Git identity and command preparation. Only the manager executes
 //! mutations, under its durable cancellation/spawn gate and ordinary custody.
 
-use crate::git_monitor::{
-    GitBinding, GitProbe, canonical_root, git_path_argument, is_oid, reject_links,
-};
+use crate::git_monitor::{GitBinding, GitProbe, canonical_root, git_path_argument, reject_links};
+use eliot_core::api::is_git_oid;
 use eliot_core::{
     Error, Result, WorkspaceCreationOutcome, WorkspacePhase, WorkspacePreparation,
     WorkspaceRemovalOutcome,
@@ -207,7 +206,7 @@ impl WorkspaceGit {
                 deadline,
             )
             .await?;
-        if !is_oid(&base_oid) {
+        if !is_git_oid(&base_oid) {
             return Err(problem(
                 "source_integrity",
                 "resolved workspace base is not a full commit id",
@@ -655,7 +654,7 @@ impl WorkspaceGit {
         subject: &Subject,
         deadline: Instant,
     ) -> Result<()> {
-        if !is_oid(&preparation.base_oid) || !is_oid(&subject.head) {
+        if !is_git_oid(&preparation.base_oid) || !is_git_oid(&subject.head) {
             return Err(problem(
                 "source_integrity",
                 "workspace merge identity is malformed",
@@ -747,7 +746,7 @@ impl WorkspaceGit {
         preparation: &WorkspacePreparation,
         deadline: Instant,
     ) -> Result<Repository> {
-        if !is_oid(&preparation.base_oid) {
+        if !is_git_oid(&preparation.base_oid) {
             return Err(problem(
                 "invalid",
                 "workspace preparation omitted its exact frozen base",
@@ -849,7 +848,8 @@ impl WorkspaceGit {
                 deadline,
             )
             .await?;
-        if branch != full_ref || !is_oid(&head) || entry.head.as_deref() != Some(head.as_str()) {
+        if branch != full_ref || !is_git_oid(&head) || entry.head.as_deref() != Some(head.as_str())
+        {
             return Err(problem(
                 "source_integrity",
                 "workspace HEAD, branch, or registration disagree",
@@ -984,7 +984,7 @@ impl WorkspaceGit {
                         deadline,
                     )
                     .await?;
-                if !is_oid(&oid) {
+                if !is_git_oid(&oid) {
                     return Err(problem(
                         "source_integrity",
                         "workspace branch object id is malformed",
@@ -1033,7 +1033,7 @@ impl WorkspaceGit {
                         ));
                     }
                 } else if let Some(head) = field.strip_prefix("HEAD ") {
-                    if !is_oid(head) || entry.head.replace(head.to_owned()).is_some() {
+                    if !is_git_oid(head) || entry.head.replace(head.to_owned()).is_some() {
                         return Err(problem(
                             "source_integrity",
                             "worktree registry HEAD is malformed",
