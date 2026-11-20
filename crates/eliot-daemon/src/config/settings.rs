@@ -336,11 +336,7 @@ pub(crate) fn require_project_unused(store: &Store, id: &str, path: &str) -> cor
     let checkout = registration
         .as_ref()
         .map_or(path, |row| row.checkout.as_str());
-    let common = registration
-        .as_ref()
-        .map(|row| row.repo_common_dir.as_str());
-    let linked = common.map_or_else(Vec::new, crate::workspace_git::registration_linked_paths);
-    if store.project_in_use(id, checkout, common, &linked)? {
+    if store.project_in_use(id, checkout)? {
         return Err(core::Error::new(
             "project_in_use",
             "an Agent or unsettled command still uses the registration",

@@ -21,7 +21,6 @@ use tokio::{
 };
 
 mod readback;
-pub(crate) use readback::registration_linked_paths;
 
 const READ_TIME: Duration = Duration::from_secs(15);
 /// Shared Git command budget for a project readback.

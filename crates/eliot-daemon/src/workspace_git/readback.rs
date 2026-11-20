@@ -129,20 +129,6 @@ impl WorkspaceGit {
     }
 }
 
-/// The Store lock spans this filesystem read and the usage check at callers.
-/// Managed worktrees also have a retained common directory in Store.
-pub(crate) fn registration_linked_paths(common_dir: &str) -> Vec<String> {
-    canonical_root(common_dir).map_or_else(
-        |_| Vec::new(),
-        |common| {
-            linked_checkouts(&common)
-                .into_iter()
-                .filter_map(|repo| path_text(&repo.root).ok())
-                .collect()
-        },
-    )
-}
-
 fn main_checkout(common: &Path, checkout: &Path) -> Option<Repository> {
     if !matches!(fs::symlink_metadata(common.join("commondir")), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
     {

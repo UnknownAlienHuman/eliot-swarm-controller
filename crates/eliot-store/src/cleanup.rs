@@ -484,15 +484,14 @@ impl Store {
     }
 
     /// A missing checkout can still belong to a current workspace, or to a
-    /// terminal Agent with unsettled activity. The Store holds the complete
-    /// fleet here, including rows outside an inventory page.
-    pub fn project_in_use(
-        &self,
-        id: &str,
-        path: &str,
-        common_dir: Option<&str>,
-        linked_checkouts: &[String],
-    ) -> Result<bool> {
+    /// terminal Agent with unsettled activity. An Agent belongs to the
+    /// registration only through its execution project: the registration ID,
+    /// or, for a legacy label that names no registration, the registration's
+    /// exact checkout under the platform's checkout-key rule. Agents of another
+    /// registration never count, even when their workspace lies under this
+    /// checkout. The Store holds the complete fleet here, including rows
+    /// outside an inventory page.
+    pub fn project_in_use(&self, id: &str, path: &str) -> Result<bool> {
         let pending = self
             .connection
             .query_row(
@@ -505,20 +504,11 @@ impl Store {
         if pending {
             return Ok(true);
         }
-        let path = cleanup_path(path);
-        let common_dir = common_dir.map(cleanup_path);
-        let linked: Vec<_> = linked_checkouts
-            .iter()
-            .map(|path| cleanup_path(path))
-            .collect();
-        let uses_checkout = |location: &str| {
-            let location = cleanup_path(location);
-            location.starts_with(&path) || linked.iter().any(|root| location.starts_with(root))
-        };
-        let mut query = self.connection.prepare(
-            "SELECT a.project, a.workspace, w.repo_path, w.worktree_path, w.repo_common_dir
-               FROM agents a LEFT JOIN workspaces w
-                 ON w.agent=a.id AND w.target_generation=a.generation AND w.phase!='removed'
+        let checkout = cleanup_path(path);
+        let mut query = self
+            .connection
+            .prepare(
+                "SELECT a.project FROM agents a
               WHERE a.state NOT IN ('stopped','failed')
                  OR EXISTS(SELECT 1 FROM source_state s WHERE s.agent=a.id
                             AND s.state='open' AND s.source NOT IN ('daemon','os','git','workspace_process'))
@@ -527,22 +517,26 @@ impl Store {
                  OR EXISTS(SELECT 1 FROM processes p WHERE p.state!='exited'
                             AND p.owner IN ('agent:a'||a.id||'#'||a.generation,
                                             'workspace:a'||a.id||'#'||a.generation))",
-        ).map_err(sql_error)?;
+            )
+            .map_err(sql_error)?;
+        let mut registered = self
+            .connection
+            .prepare("SELECT EXISTS(SELECT 1 FROM project_registrations WHERE id=?1)")
+            .map_err(sql_error)?;
         let mut rows = query.query([]).map_err(sql_error)?;
         while let Some(row) = rows.next().map_err(sql_error)? {
             let project: String = row.get(0).map_err(sql_error)?;
-            if project == id || uses_checkout(&project) {
+            if project == id {
                 return Ok(true);
             }
-            let workspace_common: Option<String> = row.get(4).map_err(sql_error)?;
-            if common_dir.is_some() && workspace_common.as_deref().map(cleanup_path) == common_dir {
-                return Ok(true);
+            if cleanup_path(&project) != checkout {
+                continue;
             }
-            for column in [1, 2, 3] {
-                let location: Option<String> = row.get(column).map_err(sql_error)?;
-                if location.as_deref().is_some_and(uses_checkout) {
-                    return Ok(true);
-                }
+            let names_registration: bool = registered
+                .query_row([&project], |row| row.get(0))
+                .map_err(sql_error)?;
+            if !names_registration {
+                return Ok(true);
             }
         }
         Ok(false)
