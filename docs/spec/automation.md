@@ -1164,8 +1164,14 @@ their response; they are not subject to the smaller persisted-event budget.
 
 The check is the frozen explicit argv from `goal set`, run through the shared
 owned-process custody outside the Store lock with a bounded timeout, a small
-round-context stdin and the daemon environment. Check output is secret-redacted
-and retained only as a bounded observation plus a digest. The commit then
+round-context stdin and the daemon environment. Both check streams are
+secret-redacted and retained only as one bounded observation plus a digest over
+both: labelled `[stdout]` and `[stderr]` sections, each keeping its beginning and
+end around an explicit omission marker when it exceeds its share. The output is
+complete only when both streams were captured in full. A continuation presents
+the observation as diagnostic data, never as authority to change the Goal, its
+check or the task scope, and never asks the Agent to rerun the check to read
+it. The commit then
 applies **all** results in one transaction only if generation, revision and
 round still match — the key unconsumed, no newer Agent event (past an idle
 key, or since the claim for a slot), sources still healthy, no open or
