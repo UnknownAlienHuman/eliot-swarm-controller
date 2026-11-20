@@ -13,7 +13,7 @@ use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
     protocol::MAX_COMMAND_ID_BYTES,
     session::{
-        EVENT_DEADLINE, StreamSource, attach_final_text as shared_attach_final_text,
+        EVENT_DEADLINE, MessageCommit, StreamSource, attach_final_text as shared_attach_final_text,
         attach_native_error as shared_attach_native_error, attach_provider_restriction,
         event_id as shared_event_id, native_no_write, next_input_outcomes, rejected_control,
         unknown_control,
@@ -1284,26 +1284,19 @@ impl EventProcessor {
         if let Some(phase) = phase {
             data["phase"] = Value::String(phase.to_owned());
         }
-        let encoded_len = match serde_json::to_vec(&data) {
-            Ok(bytes) => bytes.len(),
-            Err(_) => usize::MAX,
-        };
-        if encoded_len > MAX_EVENT_BYTES {
-            return self
-                .record_gap("Codex completed message exceeded the persisted-event bound")
-                .await;
-        }
         let native_id = event_id(
             self.status.thread_id.as_deref().unwrap_or_default(),
             turn_id,
             item_id,
             "message.completed",
         )?;
-        if matches!(phase, Some("final_answer") | None) {
+        let is_final = matches!(phase, Some("final_answer") | None);
+        let commit = self.stream_source().commit_message(native_id, data).await?;
+        // A blank reply is no message, so it never overwrites the terminal text.
+        if commit == MessageCommit::Committed && is_final {
             self.final_text = Some(text);
         }
-        self.commit_event("message.completed", native_id, data)
-            .await
+        Ok(())
     }
 
     async fn complete_tool(&mut self, turn_id: &str, item: &Value) -> Result<()> {

@@ -15,8 +15,9 @@ use eliot_plugin::{
     },
     protocol::{HookEvent, HookResponse},
     session::{
-        EVENT_DEADLINE, StreamSource, attach_final_text, event_id, next_input_outcomes,
-        rejected_control, request_event_id, unknown_control,
+        EVENT_DEADLINE, MessageCommit, StreamSource, attach_final_text, event_id,
+        is_blank_native_text, next_input_outcomes, rejected_control, request_event_id,
+        unknown_control,
     },
 };
 use serde::Serialize;
@@ -167,7 +168,7 @@ struct CancellationIntent {
 fn reply_unavailable(truncated: bool, status: &str, text: &str) -> Option<&'static str> {
     if truncated {
         Some("event_budget")
-    } else if status == "completed" && text.is_empty() {
+    } else if status == "completed" && is_blank_native_text(text) {
         Some("empty_native_response")
     } else {
         None
@@ -1795,7 +1796,7 @@ impl State {
             );
         }
         self.policy.redact_values(&mut data);
-        if !text.is_empty() && !truncated {
+        if !is_blank_native_text(&text) && !truncated {
             let id = event_id(
                 &self.conversation,
                 &turn,
@@ -1807,7 +1808,7 @@ impl State {
             let mut message = json!({"command_id": command, "turn_id": turn, "text": text});
             self.policy.redact_values(&mut message);
             // A reply over the persisted-event bound costs only itself.
-            truncated = !self.source().commit_message(id, message).await?;
+            truncated = self.source().commit_message(id, message).await? == MessageCommit::Gapped;
         }
         let unavailable = reply_unavailable(truncated, status, &text);
         if let Some(marker) = unavailable {
@@ -1822,7 +1823,8 @@ impl State {
         if let Some(usage) = prompt_turn_usage(result) {
             data["usage"] = json!(usage);
         }
-        if failed && data.get("final_text").is_none() && !text.is_empty() && !truncated {
+        if failed && data.get("final_text").is_none() && !is_blank_native_text(&text) && !truncated
+        {
             attach_final_text(&mut data, &text, true, &self.policy);
         }
         self.commit("turn.completed", &turn, "completed", data.clone())

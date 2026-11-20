@@ -14,9 +14,9 @@ use eliot_plugin::{
     native_stdio::StreamState,
     protocol::{HookEvent, HookResponse},
     session::{
-        EVENT_DEADLINE, StreamSource, approval_reply_args, attach_final_text,
-        attach_final_text_unavailable, native_no_write, next_input_outcomes, rejected_control,
-        request_event_id, unknown_control, with_claimed_context,
+        EVENT_DEADLINE, MessageCommit, StreamSource, approval_reply_args, attach_final_text,
+        attach_final_text_unavailable, is_blank_native_text, native_no_write, next_input_outcomes,
+        rejected_control, request_event_id, unknown_control, with_claimed_context,
     },
 };
 use serde::Serialize;
@@ -1564,7 +1564,7 @@ impl EventProcessor {
             None
         };
         let text = assistant_text(record);
-        if text.is_empty() {
+        if is_blank_native_text(&text) {
             if let Some(model) = observed_model {
                 self.message_seq = self.message_seq.saturating_add(1);
                 let session_id = self.status.session_id.as_deref().unwrap_or_default();
@@ -1599,7 +1599,7 @@ impl EventProcessor {
         // (bounded) before the commit, so a definitely rejected message
         // never leaves a later terminal presenting only the remaining text.
         self.accumulate_final_text(&text);
-        if !self.stream_source().commit_message(native_id, data).await? {
+        if self.stream_source().commit_message(native_id, data).await? == MessageCommit::Gapped {
             // Only this message is lost: the turn keeps running and its
             // terminal text can no longer be the full reply.
             self.final_text = None;

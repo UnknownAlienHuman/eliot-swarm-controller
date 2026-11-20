@@ -878,6 +878,24 @@ pub fn attach_provider_restriction(
     false
 }
 
+/// Whether a native reply carries no text after trimming. This is the rule
+/// core applies to `message.completed` `text`, so a blank reply is never
+/// offered to the store as a message fact.
+pub fn is_blank_native_text(text: &str) -> bool {
+    text.trim().is_empty()
+}
+
+/// The outcome of [`StreamSource::commit_message`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageCommit {
+    /// The reply was blank after trimming: nothing was written, no gap opened.
+    Blank,
+    /// The message exceeded the persisted-event bound: one `message` gap was acknowledged.
+    Gapped,
+    /// The `message.completed` fact was acknowledged.
+    Committed,
+}
+
 /// The stream-commit half of a harness event processor: the commit sink, the
 /// host client, the bound identity, and the latches a failed commit sets.
 /// Each plugin builds one per call from its own processor fields.
@@ -944,23 +962,35 @@ impl StreamSource<'_> {
         Err(error)
     }
 
-    /// Commit one turn-bound `message.completed`. A valid native message
-    /// whose encoded data exceeds the persisted-event bound is not persisted:
-    /// it becomes one acknowledged `message` coverage gap, so the turn's
-    /// native outcome, its exact-turn evidence and later facts survive.
-    /// Returns whether the message was committed.
-    pub async fn commit_message(&mut self, native_id: String, data: Value) -> Result<bool> {
+    /// Commit one turn-bound `message.completed`. A blank native reply (its
+    /// `text` is empty after trimming) is not a message fact: nothing is
+    /// written and no gap opens. A valid native message whose encoded data
+    /// exceeds the persisted-event bound is not persisted: it becomes one
+    /// acknowledged `message` coverage gap, so the turn's native outcome, its
+    /// exact-turn evidence and later facts survive.
+    pub async fn commit_message(
+        &mut self,
+        native_id: String,
+        data: Value,
+    ) -> Result<MessageCommit> {
+        if data
+            .get("text")
+            .and_then(Value::as_str)
+            .is_some_and(is_blank_native_text)
+        {
+            return Ok(MessageCommit::Blank);
+        }
         if serde_json::to_vec(&data).map_or(true, |bytes| bytes.len() > MAX_EVENT_BYTES) {
             let reason = format!(
                 "{} completed message exceeded the persisted-event bound",
                 self.harness
             );
             self.record_coverage_gap(&reason, &["message"]).await?;
-            return Ok(false);
+            return Ok(MessageCommit::Gapped);
         }
         self.commit_event("message.completed", native_id, data)
             .await?;
-        Ok(true)
+        Ok(MessageCommit::Committed)
     }
 
     /// Record a native loss reported by the adapter.

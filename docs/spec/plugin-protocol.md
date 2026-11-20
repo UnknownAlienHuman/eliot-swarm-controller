@@ -382,8 +382,9 @@ bounded tool telemetry) without declaring the separately associated native
 turn outcome or later input unavailable. A valid native message whose
 `message.completed` data exceeds the persisted-event bound is one such `message`
 gap ([`StreamSource::commit_message`](../../crates/eliot-plugin/src/session.rs)):
-the turn keeps running and its terminal carries `final_text_unavailable`. A gap
-naming only `message` never starts turn recovery. This requires a canonical gap ACK;
+the turn keeps running and its terminal carries `final_text_unavailable`. A blank
+native reply (empty after trimming) is not a `message.completed` fact at all: it
+commits nothing and opens no gap. A gap naming only `message` never starts turn recovery. This requires a canonical gap ACK;
 an unresolved gap/batch ACK still fences admission. Session/turn identity loss,
 unproven delivery and transport loss cannot use this coverage-only path, and
 it never clears existing uncertainty or replays a missing fact.
