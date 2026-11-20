@@ -92,13 +92,14 @@ impl Router {
             eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         let policy = self.secret_policy_snapshot();
-        let store = self.inner.store.lock().await;
-        let reply = crate::config::settings::read_internal(
+        // File read, parses and validation run before the Store lock; only
+        // the author history is read under it.
+        let snapshot = crate::config::settings::read_snapshot(
             &self.inner.data_root,
-            &store,
             request.sections.as_deref(),
             &policy,
         )?;
+        let reply = snapshot.into_response(&*self.inner.store.lock().await)?;
         request.validate_response(&reply)?;
         encode(&reply, "settings read")
     }

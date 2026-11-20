@@ -5,7 +5,7 @@
 //! are resolved from the file at every launch admission, so a saved file is
 //! what the next launch uses; running Agents keep their frozen snapshots.
 //!
-//! `settings.read` exposes the profile section only when `editable` holds: a
+//! `settings.read` exposes the profile section only when `editability` finds no reason to refuse: a
 //! file whose profile tables mix in other sections, hold a known secret value,
 //! or fail strict validation (including credential-bearing proxy URLs) is never
 //! handed out as source. Profile saves go through `settings.save`.
@@ -192,9 +192,17 @@ fn has_secret(policy: &SecretPolicy, text: &str, parsed: Option<&toml::Table>) -
         })
 }
 
-/// Why the profile blocks of `source` cannot be edited as text, if so.
-fn editability(source: &str, policy: &SecretPolicy) -> Option<&'static str> {
-    let Ok(table) = parse_table(source, "config.toml") else {
+/// Why the profile sections of `source` may not be exposed, if so. `table`
+/// and `config` are the generic and the strict parse of that same `source`
+/// (`None` when the parse failed), so the reader parses the file once per
+/// kind.
+pub(super) fn editability(
+    source: &str,
+    table: Option<&toml::Table>,
+    config: Option<&super::FileConfig>,
+    policy: &SecretPolicy,
+) -> Option<&'static str> {
+    let Some(table) = table else {
         return Some("config.toml is not valid TOML; fix it in a text editor first");
     };
     let text = profile_text(source);
@@ -215,18 +223,10 @@ fn editability(source: &str, policy: &SecretPolicy) -> Option<&'static str> {
     // source, even when no known secret is present. Launch-readiness alone
     // (a missing model, a dangling child reference) stays a save-time error:
     // it carries no credentials and the editor can repair it.
-    let config = match parse_config(source) {
-        Ok(config) => config,
-        Err(_) => {
-            return Some(
-                "the profiles fail the daemon's strict validation; edit config.toml directly",
-            );
-        }
-    };
-    if has_unsafe_profile_or_proxy(&config) {
-        return Some("the profiles fail the daemon's strict validation; edit config.toml directly");
+    match config {
+        Some(config) if !has_unsafe_profile_or_proxy(config) => None,
+        _ => Some("the profiles fail the daemon's strict validation; edit config.toml directly"),
     }
-    None
 }
 
 /// Keep unsafe provider configuration and credential-bearing proxy URLs out
@@ -254,15 +254,6 @@ fn has_unsafe_profile_or_proxy(config: &super::FileConfig) -> bool {
         }
         .validate()
         .is_err()
-    })
-}
-
-/// Whether `settings.read` may expose the profile sections of the file. A
-/// missing file has no profiles and is editable.
-pub(crate) fn editable(data_root: &Path, policy: &SecretPolicy) -> core::Result<bool> {
-    Ok(match read_config_source(data_root)? {
-        Some(source) => editability(&source, policy).is_none(),
-        None => true,
     })
 }
 

@@ -97,8 +97,16 @@ fn carries_redaction(value: &JsonValue) -> bool {
 }
 
 fn section_json(source: &str, name: &str) -> core::Result<JsonValue> {
-    let parsed: toml::Table = toml::from_str(source)
-        .map_err(|_| core::Error::new("profile_error", "config.toml is not valid TOML"))?;
+    section_value(&parse_generic(source)?, name)
+}
+
+fn parse_generic(source: &str) -> core::Result<toml::Table> {
+    toml::from_str(source)
+        .map_err(|_| core::Error::new("profile_error", "config.toml is not valid TOML"))
+}
+
+/// One section of an already-parsed file as the settings reader shows it.
+fn section_value(parsed: &toml::Table, name: &str) -> core::Result<JsonValue> {
     let Some(value) = parsed.get(name) else {
         return Ok(match name {
             "routing" => serde_json::json!({"default": []}),
@@ -159,26 +167,62 @@ pub(crate) fn reconcile_at_startup(data_root: &Path, store: &mut Store) -> core:
     store.reconcile_settings_history(current_revision.as_deref())
 }
 
+/// The file half of `settings.read`: one read of `config.toml` and one
+/// parse of each kind (the generic table for the section values, the strict
+/// config for validation), so the gate, the checks and the returned values
+/// all describe the same bytes under one revision. It needs no Store, so a
+/// caller holding the Store lock can run it first.
+pub(crate) struct SettingsSnapshot {
+    revision: Option<String>,
+    sections: Vec<SettingsSection>,
+    values: BTreeMap<SettingsSection, JsonValue>,
+}
+
+impl SettingsSnapshot {
+    /// The full `settings.read` reply: these values plus the Store's
+    /// bounded author history.
+    pub(crate) fn into_response(self, store: &Store) -> core::Result<SettingsReadResponse> {
+        Ok(SettingsReadResponse {
+            revision: self.revision,
+            restart_required: restart_required(self.sections),
+            sections: self.values,
+            history: store.list_settings_history(HISTORY_LIMIT)?,
+        })
+    }
+}
+
 pub(crate) fn read_internal(
     data_root: &Path,
     store: &Store,
     requested: Option<&[SettingsSection]>,
     policy: &SecretPolicy,
 ) -> core::Result<SettingsReadResponse> {
+    read_snapshot(data_root, requested, policy)?.into_response(store)
+}
+
+pub(crate) fn read_snapshot(
+    data_root: &Path,
+    requested: Option<&[SettingsSection]>,
+    policy: &SecretPolicy,
+) -> core::Result<SettingsSnapshot> {
     let original = read_config_source(data_root)?;
-    let source = original.clone().unwrap_or_default();
+    let source = original.as_deref().unwrap_or_default();
     let revision = original.as_deref().map(profiles_edit::revision_of);
-    if !profiles_edit::editable(data_root, policy)? {
+    let table = parse_generic(source).ok();
+    let config = parse_config(source);
+    if profiles_edit::editability(source, table.as_ref(), config.as_ref().ok(), policy).is_some() {
         return Err(core::Error::new(
             "not_allowed",
             "settings include a profile section that is not safe to expose",
         ));
     }
-    validate_candidate(&source)?;
+    validate_parsed(&config?, source)?;
+    let table =
+        table.ok_or_else(|| core::Error::new("profile_error", "config.toml is not valid TOML"))?;
     let sections = requested.map_or_else(|| all_sections().to_vec(), ToOwned::to_owned);
     let mut values = BTreeMap::new();
     for section in &sections {
-        let mut value = section_json(&source, section_name(*section))?;
+        let mut value = section_value(&table, section_name(*section))?;
         if *section == SettingsSection::Daemon {
             // Explicit and default roots resolve through the same
             // launch-time validator, so a stored root inside the owner
@@ -205,12 +249,10 @@ pub(crate) fn read_internal(
         }
         values.insert(*section, value);
     }
-    let history = store.list_settings_history(HISTORY_LIMIT)?;
-    Ok(SettingsReadResponse {
+    Ok(SettingsSnapshot {
         revision,
-        sections: values,
-        restart_required: restart_required(sections),
-        history,
+        sections,
+        values,
     })
 }
 
@@ -391,12 +433,18 @@ fn save_internal_locked(
         prepare_candidate(data_root, expected_revision, sections, policy)?;
     let original = original_file.as_deref().unwrap_or_default();
     let current_revision = original_file.as_deref().map(profiles_edit::revision_of);
+    let before = parse_generic(original).ok();
+    let after = parse_generic(&candidate).ok();
+    let shown = |table: &Option<toml::Table>, section: SettingsSection| {
+        table
+            .as_ref()
+            .and_then(|table| section_value(table, section_name(section)).ok())
+    };
     let changed_sections = sections
         .keys()
         .copied()
         .filter(|section| {
-            section_json(original, section_name(*section)).ok()
-                != section_json(&candidate, section_name(*section)).ok()
+            shown(&before, *section) != shown(&after, *section)
                 || (*section == SettingsSection::Desktop
                     && has_desktop_section(original) != has_desktop_section(&candidate))
         })
@@ -764,7 +812,11 @@ fn splice_sections(source: &str, replacements: &BTreeMap<String, String>) -> Str
 }
 
 fn validate_candidate(source: &str) -> core::Result<()> {
-    let config = parse_config(source)?;
+    validate_parsed(&parse_config(source)?, source)
+}
+
+/// [`validate_candidate`] over the strict parse of that same `source`.
+fn validate_parsed(config: &FileConfig, source: &str) -> core::Result<()> {
     for (name, proxy) in &config.proxies {
         let proxy = proxy.get_ref();
         if is_builtin_codex_provider(name) {
@@ -801,9 +853,9 @@ fn validate_candidate(source: &str) -> core::Result<()> {
         }
     }
     for name in config.profiles.keys() {
-        resolve_profile_in(&config, source, name)?;
+        resolve_profile_in(config, source, name)?;
     }
-    project_registrations_in(&config, source)?;
+    project_registrations_in(config, source)?;
     let route_credentials = configured_route_credential_env_names(&config.proxies);
     config
         .automation
