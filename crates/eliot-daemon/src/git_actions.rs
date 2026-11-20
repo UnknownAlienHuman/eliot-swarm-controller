@@ -6,10 +6,11 @@
 
 use crate::{
     automation,
-    git_monitor::{GitBinding, GitProbe, canonical_root, git_path_argument, is_oid, reject_links},
+    git_monitor::{GitBinding, GitProbe, canonical_root, git_path_argument, reject_links},
     platform::OwnedChild,
     workspace_git::WorkspaceGit,
 };
+use eliot_core::api::is_git_oid;
 use eliot_core::{
     CommandState, Error, FrozenSetupFile, Result,
     api::{
@@ -1006,7 +1007,7 @@ async fn read_tracking_ref(
     match output.code {
         0 => {
             let oid = one_line(&output.stdout)?;
-            if !is_oid(&oid) {
+            if !is_git_oid(&oid) {
                 return Err(Error::new(
                     "source_integrity",
                     "tracking ref OID is malformed",
@@ -1182,7 +1183,7 @@ fn parse_advertisement(stdout: &[u8], source_ref: &str) -> Result<String> {
     let (oid, reference) = text
         .split_once('\t')
         .ok_or_else(|| Error::new("source_integrity", "Git advertisement record is malformed"))?;
-    if reference != source_ref || !is_oid(oid) || oid.len() != 40 && oid.len() != 64 {
+    if reference != source_ref || !is_git_oid(oid) {
         return Err(Error::new(
             "source_integrity",
             "Git advertisement did not contain the exact requested ref and OID",
@@ -2055,7 +2056,7 @@ fn read_private_ref(view: &Path, reference: &str) -> Result<String> {
         ensure_no_reparse_path(&path)?;
     }
     let oid = one_line(&read_private_file(&path, eliot_core::MAX_STDERR_BYTES)?)?;
-    if !is_oid(&oid) {
+    if !is_git_oid(&oid) {
         return Err(Error::new(
             "source_integrity",
             "private fetched ref OID is malformed",
