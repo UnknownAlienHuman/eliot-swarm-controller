@@ -1641,32 +1641,23 @@ fn snapshot_from_entry(
     table_offset: usize,
     source: &str,
 ) -> core::Result<Value> {
+    let site = ProfileSite {
+        name,
+        source,
+        offset: table_offset,
+    };
     let harness = entry.harness.trim();
-    if harness != "codex"
-        && harness != "muse"
-        && harness != "claude"
-        && harness != "opencode"
-        && harness != "antigravity"
-    {
-        return Err(profile_field_error(
-            source,
-            table_offset,
-            name,
-            "harness",
-            "unsupported harness",
-            "unsupported",
-        ));
+    if !core::api::is_supported_harness(harness) {
+        return Err(site.error("harness", "unsupported harness", "unsupported"));
     }
-    if harness != "opencode" && entry.local_provider.is_some() {
-        return Err(profile_field_error(
-            source,
-            table_offset,
-            name,
+    reject_unmapped(
+        site,
+        &[(
             "local_provider",
+            harness != "opencode" && entry.local_provider.is_some(),
             "local providers have no mapping on this harness",
-            "unsupported",
-        ));
-    }
+        )],
+    )?;
     if harness == "muse" {
         return muse_snapshot_from_entry(name, entry, table_offset, source);
     }
@@ -1683,93 +1674,57 @@ fn snapshot_from_entry(
     if let Some(model) = model {
         validate_model(name, model, source, table_offset)?;
     }
-    let effort = entry.effort.as_deref().map(str::trim);
-    if effort.is_some_and(|value| {
-        value.is_empty() || value.len() > MAX_EFFORT_LEN || value.chars().any(char::is_control)
-    }) {
-        return Err(profile_field_error(
-            source,
-            table_offset,
-            name,
-            "effort",
-            "must be non-empty, at most 128 characters and contain no controls",
-            "profile_error",
-        ));
-    }
-    let collaboration_mode = entry.collaboration_mode.as_deref().map(str::trim);
-    if collaboration_mode.is_some_and(|mode| !matches!(mode, "default" | "plan")) {
-        return Err(profile_field_error(
-            source,
-            table_offset,
-            name,
-            "collaboration_mode",
-            "must be default or plan",
-            "profile_error",
-        ));
-    }
-    let permissions = entry
-        .permissions
-        .as_deref()
-        .map(str::trim)
-        .unwrap_or(PERMISSION_WORKSPACE_WRITE);
-    if permissions != PERMISSION_READ_ONLY
-        && permissions != PERMISSION_WORKSPACE_WRITE
-        && permissions != PERMISSION_DANGER_FULL_ACCESS
-    {
-        return Err(profile_field_error(
-            source,
-            table_offset,
-            name,
-            "permissions",
-            "unsupported permission mode",
-            "unsupported",
-        ));
-    }
-    let approval_policy = entry
-        .approval_policy
-        .as_deref()
-        .map(str::trim)
-        .unwrap_or(APPROVAL_POLICY_NEVER);
-    if approval_policy != APPROVAL_POLICY_NEVER && approval_policy != APPROVAL_POLICY_ON_REQUEST {
-        return Err(profile_field_error(
-            source,
-            table_offset,
-            name,
-            "approval_policy",
-            "must be never or on-request",
-            "profile_error",
-        ));
-    }
-    if entry.approval.is_some() {
-        return Err(profile_field_error(
-            source,
-            table_offset,
-            name,
-            "approval",
-            "the Codex slice has no approval mapping; use approval_policy",
-            "unsupported",
-        ));
-    }
-    if entry.mode.is_some() || entry.dangerously_skip_permissions.is_some() {
-        return Err(profile_field_error(
-            source,
-            table_offset,
-            name,
-            "mode",
-            "mode and dangerously_skip_permissions have no Codex mapping",
-            "unsupported",
-        ));
-    }
-    if entry.auth_integration.is_some() {
-        return Err(profile_field_error(
-            source,
-            table_offset,
-            name,
-            "auth_integration",
-            "auth_integration has no Codex mapping",
-            "unsupported",
-        ));
-    }
+    let effort = validated_effort(site, entry.effort.as_deref())?;
+    let collaboration_mode = validated_choice(
+        site,
+        "collaboration_mode",
+        entry.collaboration_mode.as_deref(),
+        &["default", "plan"],
+        "must be default or plan",
+        "profile_error",
+    )?;
+    let permissions = validated_choice(
+        site,
+        "permissions",
+        entry.permissions.as_deref(),
+        &[
+            PERMISSION_READ_ONLY,
+            PERMISSION_WORKSPACE_WRITE,
+            PERMISSION_DANGER_FULL_ACCESS,
+        ],
+        "unsupported permission mode",
+        "unsupported",
+    )?
+    .unwrap_or(PERMISSION_WORKSPACE_WRITE);
+    let approval_policy = validated_choice(
+        site,
+        "approval_policy",
+        entry.approval_policy.as_deref(),
+        &[APPROVAL_POLICY_NEVER, APPROVAL_POLICY_ON_REQUEST],
+        "must be never or on-request",
+        "profile_error",
+    )?
+    .unwrap_or(APPROVAL_POLICY_NEVER);
+    reject_unmapped(
+        site,
+        &[
+            (
+                "approval",
+                entry.approval.is_some(),
+                "the Codex slice has no approval mapping; use approval_policy",
+            ),
+            (
+                "mode",
+                entry.mode.is_some() || entry.dangerously_skip_permissions.is_some(),
+                "mode and dangerously_skip_permissions have no Codex mapping",
+            ),
+            (
+                "auth_integration",
+                entry.auth_integration.is_some(),
+                "auth_integration has no Codex mapping",
+            ),
+        ],
+    )?;
     let tail = validate_profile_tail(name, entry, table_offset, source)?;
     let mut snapshot = serde_json::Map::new();
     snapshot.insert("harness".to_owned(), Value::String("codex".to_owned()));
@@ -1932,99 +1887,64 @@ fn muse_snapshot_from_entry(
     table_offset: usize,
     source: &str,
 ) -> core::Result<Value> {
+    let site = ProfileSite {
+        name,
+        source,
+        offset: table_offset,
+    };
     let model = entry.model.as_deref();
     if let Some(model) = model {
         validate_model(name, model, source, table_offset)?;
     }
-    let effort = entry.effort.as_deref().map(str::trim);
-    if effort.is_some_and(|value| {
-        value.is_empty() || value.len() > MAX_EFFORT_LEN || value.chars().any(char::is_control)
-    }) {
-        return Err(profile_field_error(
-            source,
-            table_offset,
-            name,
-            "effort",
-            "must be non-empty, at most 128 characters and contain no controls",
-            "profile_error",
-        ));
-    }
-    let approval = entry.approval.as_deref().map(str::trim);
-    if approval.is_some_and(|mode| {
-        !matches!(
-            mode,
-            "allowAll" | "promptUnmatched" | "onRequest" | "denyUnmatched"
-        )
-    }) {
-        return Err(profile_field_error(
-            source,
-            table_offset,
-            name,
-            "approval",
-            "must be allowAll, promptUnmatched, onRequest or denyUnmatched",
-            "profile_error",
-        ));
-    }
-    if entry.collaboration_mode.is_some() {
-        return Err(profile_field_error(
-            source,
-            table_offset,
-            name,
+    let effort = validated_effort(site, entry.effort.as_deref())?;
+    let approval = validated_choice(
+        site,
+        "approval",
+        entry.approval.as_deref(),
+        &["allowAll", "promptUnmatched", "onRequest", "denyUnmatched"],
+        "must be allowAll, promptUnmatched, onRequest or denyUnmatched",
+        "profile_error",
+    )?;
+    reject_unmapped(
+        site,
+        &[(
             "collaboration_mode",
+            entry.collaboration_mode.is_some(),
             "the Muse slice has no collaboration preset mapping",
-            "unsupported",
-        ));
-    }
-    let permissions = entry
-        .permissions
-        .as_deref()
-        .map(str::trim)
-        .unwrap_or(PERMISSION_WORKSPACE_WRITE);
-    if permissions != PERMISSION_WORKSPACE_WRITE && permissions != PERMISSION_DANGER_FULL_ACCESS {
-        return Err(profile_field_error(
-            source,
-            table_offset,
-            name,
-            "permissions",
-            "the Muse slice supports only workspace-write or danger-full-access",
-            "unsupported",
-        ));
-    }
-    if entry
-        .approval_policy
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|policy| policy != APPROVAL_POLICY_NEVER)
-    {
-        return Err(profile_field_error(
-            source,
-            table_offset,
-            name,
-            "approval_policy",
-            "the Muse slice leaves approvals unconnected",
-            "unsupported",
-        ));
-    }
-    if entry.mode.is_some() || entry.dangerously_skip_permissions.is_some() {
-        return Err(profile_field_error(
-            source,
-            table_offset,
-            name,
-            "mode",
-            "the Muse slice has no mapping for this preset",
-            "unsupported",
-        ));
-    }
-    if entry.auth_integration.is_some() {
-        return Err(profile_field_error(
-            source,
-            table_offset,
-            name,
-            "auth_integration",
-            "the Muse slice has no mapping for this preset",
-            "unsupported",
-        ));
-    }
+        )],
+    )?;
+    let permissions = validated_choice(
+        site,
+        "permissions",
+        entry.permissions.as_deref(),
+        &[PERMISSION_WORKSPACE_WRITE, PERMISSION_DANGER_FULL_ACCESS],
+        "the Muse slice supports only workspace-write or danger-full-access",
+        "unsupported",
+    )?
+    .unwrap_or(PERMISSION_WORKSPACE_WRITE);
+    validated_choice(
+        site,
+        "approval_policy",
+        entry.approval_policy.as_deref(),
+        &[APPROVAL_POLICY_NEVER],
+        "the Muse slice leaves approvals unconnected",
+        "unsupported",
+    )?;
+    reject_unmapped(
+        site,
+        &[
+            (
+                "mode",
+                entry.mode.is_some() || entry.dangerously_skip_permissions.is_some(),
+                "the Muse slice has no mapping for this preset",
+            ),
+            (
+                "auth_integration",
+                entry.auth_integration.is_some(),
+                "the Muse slice has no mapping for this preset",
+            ),
+        ],
+    )?;
     let tail = validate_profile_tail(name, entry, table_offset, source)?;
     let mut snapshot = serde_json::Map::new();
     snapshot.insert("harness".to_owned(), Value::String("muse".to_owned()));
@@ -2081,104 +2001,85 @@ fn claude_snapshot_from_entry(
     table_offset: usize,
     source: &str,
 ) -> core::Result<Value> {
+    let site = ProfileSite {
+        name,
+        source,
+        offset: table_offset,
+    };
     let model = entry.model.as_deref();
     if let Some(model) = model {
         validate_model(name, model, source, table_offset)?;
     }
     // Claude Code 2.1.278 `--effort <level>`: the CLI's closed vocabulary.
     // Absent effort keeps the CLI default; no value is fabricated.
-    let effort = match entry.effort.as_deref().map(str::trim) {
-        None | Some("") => None,
-        Some(level @ ("low" | "medium" | "high" | "xhigh" | "max")) => Some(level.to_owned()),
-        Some(_) => {
-            return Err(profile_field_error(
-                source,
-                table_offset,
-                name,
-                "effort",
-                "unknown Claude effort level (low, medium, high, xhigh, or max)",
-                "profile_error",
-            ));
-        }
-    };
-    let permission_mode = match entry.approval.as_deref().map(str::trim) {
-        None | Some("") => None,
-        Some(mode) => match mode {
-            "acceptEdits" | "auto" | "bypassPermissions" | "manual" | "dontAsk" | "plan" => {
-                Some(mode.to_owned())
-            }
-            _ => {
-                return Err(profile_field_error(
-                    source,
-                    table_offset,
-                    name,
-                    "approval",
-                    "unknown Claude permission mode (acceptEdits, auto, bypassPermissions, manual, dontAsk, or plan)",
-                    "profile_error",
-                ));
-            }
-        },
-    };
-    if entry.collaboration_mode.is_some() {
-        return Err(profile_field_error(
-            source,
-            table_offset,
-            name,
+    let effort = validated_choice(
+        site,
+        "effort",
+        entry
+            .effort
+            .as_deref()
+            .filter(|value| !value.trim().is_empty()),
+        &["low", "medium", "high", "xhigh", "max"],
+        "unknown Claude effort level (low, medium, high, xhigh, or max)",
+        "profile_error",
+    )?;
+    let permission_mode = validated_choice(
+        site,
+        "approval",
+        entry
+            .approval
+            .as_deref()
+            .filter(|value| !value.trim().is_empty()),
+        &[
+            "acceptEdits",
+            "auto",
+            "bypassPermissions",
+            "manual",
+            "dontAsk",
+            "plan",
+        ],
+        "unknown Claude permission mode (acceptEdits, auto, bypassPermissions, manual, dontAsk, or plan)",
+        "profile_error",
+    )?;
+    reject_unmapped(
+        site,
+        &[(
             "collaboration_mode",
+            entry.collaboration_mode.is_some(),
             "the Claude slice has no collaboration preset mapping",
-            "unsupported",
-        ));
-    }
-    if entry
-        .permissions
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|permissions| permissions != PERMISSION_WORKSPACE_WRITE)
-    {
-        return Err(profile_field_error(
-            source,
-            table_offset,
-            name,
-            "permissions",
-            "the Claude slice runs the CLI-default permission posture",
-            "unsupported",
-        ));
-    }
-    if entry
-        .approval_policy
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|policy| policy != APPROVAL_POLICY_NEVER)
-    {
-        return Err(profile_field_error(
-            source,
-            table_offset,
-            name,
-            "approval_policy",
-            "the Claude slice leaves approvals unconnected",
-            "unsupported",
-        ));
-    }
-    if entry.mode.is_some() || entry.dangerously_skip_permissions.is_some() {
-        return Err(profile_field_error(
-            source,
-            table_offset,
-            name,
-            "mode",
-            "the Claude slice has no mapping for this preset",
-            "unsupported",
-        ));
-    }
-    if entry.auth_integration.is_some() {
-        return Err(profile_field_error(
-            source,
-            table_offset,
-            name,
-            "auth_integration",
-            "the Claude slice has no mapping for this preset",
-            "unsupported",
-        ));
-    }
+        )],
+    )?;
+    validated_choice(
+        site,
+        "permissions",
+        entry.permissions.as_deref(),
+        &[PERMISSION_WORKSPACE_WRITE],
+        "the Claude slice runs the CLI-default permission posture",
+        "unsupported",
+    )?;
+    validated_choice(
+        site,
+        "approval_policy",
+        entry.approval_policy.as_deref(),
+        &[APPROVAL_POLICY_NEVER],
+        "the Claude slice leaves approvals unconnected",
+        "unsupported",
+    )?;
+    reject_unmapped(
+        site,
+        &[
+            (
+                "mode",
+                entry.mode.is_some() || entry.dangerously_skip_permissions.is_some(),
+                "the Claude slice has no mapping for this preset",
+            ),
+            (
+                "auth_integration",
+                entry.auth_integration.is_some(),
+                "the Claude slice has no mapping for this preset",
+            ),
+        ],
+    )?;
     let tail = validate_profile_tail(name, entry, table_offset, source)?;
     let mut snapshot = serde_json::Map::new();
     snapshot.insert("harness".to_owned(), Value::String("claude".to_owned()));
@@ -2194,7 +2095,7 @@ fn claude_snapshot_from_entry(
         Value::String(APPROVAL_POLICY_NEVER.to_owned()),
     );
     if let Some(mode) = permission_mode {
-        snapshot.insert("permission_mode".to_owned(), Value::String(mode));
+        snapshot.insert("permission_mode".to_owned(), Value::String(mode.to_owned()));
     }
     insert_control(
         &mut snapshot,
@@ -2204,7 +2105,7 @@ fn claude_snapshot_from_entry(
         table_offset,
     )?;
     if let Some(effort) = effort {
-        snapshot.insert("effort".to_owned(), Value::String(effort));
+        snapshot.insert("effort".to_owned(), Value::String(effort.to_owned()));
     }
     freeze_mcp_policy(
         &mut snapshot,
@@ -2262,15 +2163,17 @@ fn opencode_snapshot_from_entry(
     table_offset: usize,
     source: &str,
 ) -> core::Result<Value> {
+    let site = ProfileSite {
+        name,
+        source,
+        offset: table_offset,
+    };
     let model = entry.model.as_deref();
     if let Some(model) = model {
         validate_model(name, model, source, table_offset)?;
     }
     if model.is_some_and(|model| split_provider_model(model).is_none()) {
-        return Err(profile_field_error(
-            source,
-            table_offset,
-            name,
+        return Err(site.error(
             "model",
             "must be provider/model with non-empty slash segments and no variant suffix",
             "profile_error",
@@ -2278,52 +2181,30 @@ fn opencode_snapshot_from_entry(
     }
     // A frozen effort selects the installed `Model.Variant` id on launch
     // (`Model.Ref.variant`); the live native catalogue proves membership.
-    let effort = entry.effort.as_deref().map(str::trim);
-    if effort.is_some_and(|value| {
-        value.is_empty() || value.len() > MAX_EFFORT_LEN || value.chars().any(char::is_control)
-    }) {
-        return Err(profile_field_error(
-            source,
-            table_offset,
-            name,
-            "effort",
-            "must be non-empty, at most 128 characters and contain no controls",
-            "profile_error",
-        ));
-    }
-    for field in [
-        "approval",
-        "collaboration_mode",
-        "permissions",
-        "approval_policy",
-    ] {
-        let present = match field {
-            "approval" => entry.approval.as_deref(),
-            "collaboration_mode" => entry.collaboration_mode.as_deref(),
-            "permissions" => entry.permissions.as_deref(),
-            _ => entry.approval_policy.as_deref(),
-        };
-        if present.is_some() {
-            return Err(profile_field_error(
-                source,
-                table_offset,
-                name,
-                field,
-                "the OpenCode slice has no mapping for this preset",
-                "unsupported",
-            ));
-        }
-    }
-    if entry.mode.is_some() || entry.dangerously_skip_permissions.is_some() {
-        return Err(profile_field_error(
-            source,
-            table_offset,
-            name,
-            "mode",
-            "the OpenCode slice has no mapping for this preset",
-            "unsupported",
-        ));
-    }
+    let effort = validated_effort(site, entry.effort.as_deref())?;
+    let no_mapping = "the OpenCode slice has no mapping for this preset";
+    reject_unmapped(
+        site,
+        &[
+            ("approval", entry.approval.is_some(), no_mapping),
+            (
+                "collaboration_mode",
+                entry.collaboration_mode.is_some(),
+                no_mapping,
+            ),
+            ("permissions", entry.permissions.is_some(), no_mapping),
+            (
+                "approval_policy",
+                entry.approval_policy.is_some(),
+                no_mapping,
+            ),
+            (
+                "mode",
+                entry.mode.is_some() || entry.dangerously_skip_permissions.is_some(),
+                no_mapping,
+            ),
+        ],
+    )?;
     if let Some(selector) = entry.auth_integration.as_deref() {
         let trimmed = selector.trim();
         if trimmed.is_empty()
@@ -2331,10 +2212,7 @@ fn opencode_snapshot_from_entry(
             || trimmed.starts_with('-')
             || trimmed.chars().any(|value| value.is_control())
         {
-            return Err(profile_field_error(
-                source,
-                table_offset,
-                name,
+            return Err(site.error(
                 "auth_integration",
                 "must be a non-empty integration ID or name of at most 128 bytes with no control characters and no leading dash",
                 "profile_error",
@@ -2351,9 +2229,7 @@ fn opencode_snapshot_from_entry(
         snapshot.insert("effort".to_owned(), Value::String(effort.to_owned()));
     }
     if let Some(provider) = entry.local_provider.as_ref() {
-        let field_error = |field, message: &str| {
-            profile_field_error(source, table_offset, name, field, message, "profile_error")
-        };
+        let field_error = |field, message: &str| site.error(field, message, "profile_error");
         provider
             .validate(&tail.pass_env)
             .map_err(|message| field_error("local_provider", &message))?;
@@ -2414,68 +2290,57 @@ fn antigravity_snapshot_from_entry(
     table_offset: usize,
     source: &str,
 ) -> core::Result<Value> {
+    let site = ProfileSite {
+        name,
+        source,
+        offset: table_offset,
+    };
     let model = entry.model.as_deref();
     if let Some(model) = model {
         validate_model(name, model, source, table_offset)?;
     }
-    if entry
-        .effort
-        .as_deref()
-        .is_some_and(|effort| !effort.trim().is_empty())
-    {
-        return Err(profile_field_error(
-            source,
-            table_offset,
-            name,
+    reject_unmapped(
+        site,
+        &[(
             "effort",
+            entry
+                .effort
+                .as_deref()
+                .is_some_and(|effort| !effort.trim().is_empty()),
             "the Antigravity slice has no reasoning-effort mapping",
-            "unsupported",
-        ));
-    }
-    let mode = entry.mode.as_deref().map(str::trim);
-    if mode.is_some_and(|mode| !matches!(mode, "plan" | "auto" | "accept-edits")) {
-        return Err(profile_field_error(
-            source,
-            table_offset,
-            name,
-            "mode",
-            "must be plan, auto, or accept-edits",
-            "profile_error",
-        ));
-    }
-    for field in [
-        "approval",
-        "collaboration_mode",
-        "permissions",
-        "approval_policy",
-    ] {
-        let present = match field {
-            "approval" => entry.approval.as_deref(),
-            "collaboration_mode" => entry.collaboration_mode.as_deref(),
-            "permissions" => entry.permissions.as_deref(),
-            _ => entry.approval_policy.as_deref(),
-        };
-        if present.is_some() {
-            return Err(profile_field_error(
-                source,
-                table_offset,
-                name,
-                field,
-                "the Antigravity slice has no mapping for this preset",
-                "unsupported",
-            ));
-        }
-    }
-    if entry.auth_integration.is_some() {
-        return Err(profile_field_error(
-            source,
-            table_offset,
-            name,
-            "auth_integration",
-            "the Antigravity slice has no mapping for this preset",
-            "unsupported",
-        ));
-    }
+        )],
+    )?;
+    let mode = validated_choice(
+        site,
+        "mode",
+        entry.mode.as_deref(),
+        &["plan", "auto", "accept-edits"],
+        "must be plan, auto, or accept-edits",
+        "profile_error",
+    )?;
+    let no_mapping = "the Antigravity slice has no mapping for this preset";
+    reject_unmapped(
+        site,
+        &[
+            ("approval", entry.approval.is_some(), no_mapping),
+            (
+                "collaboration_mode",
+                entry.collaboration_mode.is_some(),
+                no_mapping,
+            ),
+            ("permissions", entry.permissions.is_some(), no_mapping),
+            (
+                "approval_policy",
+                entry.approval_policy.is_some(),
+                no_mapping,
+            ),
+            (
+                "auth_integration",
+                entry.auth_integration.is_some(),
+                no_mapping,
+            ),
+        ],
+    )?;
     let tail = validate_profile_tail(name, entry, table_offset, source)?;
     let mut snapshot = serde_json::Map::new();
     snapshot.insert(
@@ -3047,6 +2912,63 @@ fn profile_field_error(
         code,
     )
 }
+/// The profile table a field error is reported against.
+#[derive(Clone, Copy)]
+struct ProfileSite<'a> {
+    name: &'a str,
+    source: &'a str,
+    offset: usize,
+}
+
+impl ProfileSite<'_> {
+    fn error(self, field: &str, message: &str, code: &str) -> core::Error {
+        profile_field_error(self.source, self.offset, self.name, field, message, code)
+    }
+}
+
+/// Fails with `unsupported` for the first check whose field is present.
+fn reject_unmapped(site: ProfileSite<'_>, checks: &[(&str, bool, &str)]) -> core::Result<()> {
+    match checks.iter().find(|(_, present, _)| *present) {
+        Some((field, _, message)) => Err(site.error(field, message, "unsupported")),
+        None => Ok(()),
+    }
+}
+
+/// Trims an optional choice; fails with `code` unless it is one of `allowed`.
+fn validated_choice<'a>(
+    site: ProfileSite<'_>,
+    field: &str,
+    value: Option<&'a str>,
+    allowed: &[&str],
+    message: &str,
+    code: &str,
+) -> core::Result<Option<&'a str>> {
+    let value = value.map(str::trim);
+    if value.is_some_and(|value| !allowed.contains(&value)) {
+        return Err(site.error(field, message, code));
+    }
+    Ok(value)
+}
+
+/// Trims an optional free-text effort: non-empty, at most `MAX_EFFORT_LEN`
+/// bytes and free of control characters.
+fn validated_effort<'a>(
+    site: ProfileSite<'_>,
+    value: Option<&'a str>,
+) -> core::Result<Option<&'a str>> {
+    let effort = value.map(str::trim);
+    if effort.is_some_and(|value| {
+        value.is_empty() || value.len() > MAX_EFFORT_LEN || value.chars().any(char::is_control)
+    }) {
+        return Err(site.error(
+            "effort",
+            "must be non-empty, at most 128 characters and contain no controls",
+            "profile_error",
+        ));
+    }
+    Ok(effort)
+}
+
 fn config_error_at(source: &str, offset: usize, key: &str, class: &str, code: &str) -> core::Error {
     core::Error::new(
         code,
