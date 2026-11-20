@@ -102,7 +102,6 @@ pub(crate) struct ObserverSession {
     metadata_secrets: Vec<String>,
     reader: Option<NativeProcess>,
     drainer: Option<JoinHandle<()>>,
-    attach_result: Value,
     detach_command_id: Option<String>,
     detach_result: Option<Value>,
     reader_closed: bool,
@@ -221,7 +220,6 @@ impl ObserverSession {
             metadata_secrets,
             reader: Some(reader),
             drainer: Some(drainer),
-            attach_result: attach_result.clone(),
             detach_command_id: None,
             detach_result: None,
             reader_closed: false,
@@ -243,28 +241,6 @@ impl ObserverSession {
     }
 
     /// Return the original successful attach result for an exact command retry.
-    pub(crate) fn repeat_attach(&self, params: &ObserverAttachParams) -> Result<Value> {
-        self.binding(
-            &params.agent_id,
-            params.generation,
-            &params.native_scope,
-            &params.native_ref,
-        )?;
-        if params.command_id != self.params.command_id
-            || params.mode != self.params.mode
-            || params.profile != self.params.profile
-            || params.target_environment != self.params.target_environment
-            || params.source_plan != self.params.source_plan
-            || params.source_state != self.params.source_state
-        {
-            return Err(Error::new(
-                "id_conflict",
-                "Codex observer attach id was reused with another binding",
-            ));
-        }
-        Ok(self.attach_result.clone())
-    }
-
     pub(crate) async fn snapshot(
         &mut self,
         params: &ObserverSnapshotParams,
