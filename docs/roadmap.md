@@ -61,7 +61,7 @@ engine, second scheduler or critic loop.
 - [ ] **A5 Honest no-progress.** The Goal fingerprint reuses the Git monitor's
       content `dirty_digest` with workspace, freshness and completeness checks;
       an unproven observation never extends the no-progress streak.
-- [ ] **A6 Short handoff state.** The handoff brief adds Store facts, the
+- [x] **A6 Short handoff state.** The handoff brief adds Store facts, the
       current instruction and limits, and the executor's last decisions and
       next step, keeping machine facts and model claims distinct.
 - [ ] **A7 Goal cost budget.** Known usage at turn boundaries feeds a Goal

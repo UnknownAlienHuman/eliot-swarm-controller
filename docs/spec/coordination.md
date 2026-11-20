@@ -755,8 +755,13 @@ validation failure rolls back all these Store changes.
 
 The first successor input is one bounded handoff brief, admitted as ordinary `send`
 to B's exact generation. It contains the original task text from the named retained
-command, A's latest retained final output (exact turn binding, or an explicit absence),
-and pointers to A/generation/command/turn retained history. Apply existing known-secret
+command; the later send/steer/inject texts A received after it, oldest first, each with
+its principal and verb, because those carry the limits and clarifications a summary
+loses (A's Goal continuations are excluded: they are Swarm-generated, not instructions); Store facts about A (workspace and its Git work, Goal status and last check
+exit, open or unknown commands of the handed-off generation), labelled as recorded by
+Swarm; A's latest retained final output (exact turn binding, or an explicit absence),
+labelled as model output Swarm did not verify; and pointers to A/generation/command/turn
+retained history. Apply existing known-secret
 filtering/redaction and SEND/frame limits; label any truncated text and history gaps.
 Never copy credentials, raw native context or an inferred successful result. B keeps
 its own native context. The brief is labelled as context only and precedes successor
