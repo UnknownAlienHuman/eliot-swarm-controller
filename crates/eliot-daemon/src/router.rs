@@ -56,16 +56,16 @@ use eliot_core::{
         EmitDefinitionArgs, EventsBoundsRequest, EventsFilter, EventsReadRequest,
         EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse,
         GitFetchDefinitionArgs, GitView, HarnessDoctorRequest, HarnessDoctorResponse,
-        HeavyAgentTotals, HeavyEpisodeView, MAX_OBSERVATION_PAGE_BYTES, MAX_SWARM_WAIT_MS,
-        MAX_SWARM_WAIT_TARGETS, MAX_WAIT_FINAL_TEXT_BYTES, MAX_WAIT_FRAME_BYTES,
+        HeavyAgentTotals, HeavyEpisodeView, HeavySummaryView, MAX_OBSERVATION_PAGE_BYTES,
+        MAX_SWARM_WAIT_MS, MAX_SWARM_WAIT_TARGETS, MAX_WAIT_FINAL_TEXT_BYTES, MAX_WAIT_FRAME_BYTES,
         MaintenanceRunRequest, MaintenanceRunResponse, NotifyDefinitionArgs, ObservationPage,
         ObservationQuery, ObservationView, ObserveHeavyRequest, ObserveHeavyResponse,
         ProcessPageCursor, ProjectDiscoverRequest, ProjectRegistrationView,
         ProviderClearHoldRequest, ProviderHoldsRequest, RuleGetRequest, RuleStateView,
-        SWITCH_BLANK_SCOPE_ARG, SWITCH_PROJECT_REVISION_ARG, ShutdownMode, SourceState,
-        SwarmWaitRequest, SwarmWaitResponse, TimerGetRequest, TimerStateView, TurnGetRequest,
-        UsageScopeView, UsageSummaryRequest, WaitEntryResult, WorkerTaskHealth, fair_excerpt_cap,
-        is_supported_harness,
+        SWITCH_BLANK_SCOPE_ARG, SWITCH_PROJECT_REVISION_ARG, SessionGrowthView, ShutdownMode,
+        SourceState, SwarmWaitRequest, SwarmWaitResponse, TimerGetRequest, TimerStateView,
+        TurnGetRequest, UsageScopeView, UsageSummaryRequest, WaitEntryResult, WorkSummaryView,
+        WorkerTaskHealth, fair_excerpt_cap, is_supported_harness,
     },
 };
 use eliot_plugin::{MAX_EVENT_BYTES, sync::LockExt};
@@ -3619,28 +3619,7 @@ impl Router {
             })
             .collect::<Result<Vec<_>>>()?;
         let session_usage = self.session_usage(&agent).await?;
-        // Heavy-work and growth readbacks stay advisory: a degraded journal
-        // never fails the Agent view.
-        let (heavy, session_growth, work) = {
-            let growth = self.inner.observe.lock_recover().growth;
-            let store = self.inner.store.lock().await;
-            (
-                store
-                    .heavy_rollup(&agent.id, agent.generation)
-                    .unwrap_or(None),
-                store
-                    .session_growth_view(&agent.harness, &agent.id, agent.generation, &growth)
-                    .unwrap_or(None),
-                store
-                    .work_summary(
-                        &agent.id,
-                        agent.generation,
-                        agent.workspace.as_deref(),
-                        agent.active_turn.as_deref(),
-                    )
-                    .ok(),
-            )
-        };
+        let (heavy, session_growth, work) = self.advisory_agent_readbacks(&agent).await;
         // Current model/effort overlay for `swarm show`: the latest
         // retained revision with its effective values plus the original
         // frozen profile values and provenance. `profile` repeats the
@@ -3691,6 +3670,36 @@ impl Router {
     async fn session_usage(&self, agent: &Agent) -> Result<Option<SessionUsage>> {
         let store = self.inner.store.lock().await;
         store.get_session_usage(&agent.id, agent.generation)
+    }
+
+    /// Heavy-work, session-growth and work readbacks are advisory: a degraded
+    /// journal yields `None` instead of failing the Agent view.
+    async fn advisory_agent_readbacks(
+        &self,
+        agent: &Agent,
+    ) -> (
+        Option<HeavySummaryView>,
+        Option<SessionGrowthView>,
+        Option<WorkSummaryView>,
+    ) {
+        let growth = self.inner.observe.lock_recover().growth;
+        let store = self.inner.store.lock().await;
+        (
+            store
+                .heavy_rollup(&agent.id, agent.generation)
+                .unwrap_or(None),
+            store
+                .session_growth_view(&agent.harness, &agent.id, agent.generation, &growth)
+                .unwrap_or(None),
+            store
+                .work_summary(
+                    &agent.id,
+                    agent.generation,
+                    agent.workspace.as_deref(),
+                    agent.active_turn.as_deref(),
+                )
+                .ok(),
+        )
     }
 
     async fn observation_view(&self, agent: &Agent) -> ObservationView {
@@ -3878,28 +3887,7 @@ impl Router {
         }
         let observation = self.observation_view(&agent).await;
         let session_usage = self.session_usage(&agent).await?;
-        // Heavy-work and growth readbacks stay advisory: a degraded journal
-        // never fails the Agent view.
-        let (heavy, session_growth, work) = {
-            let growth = self.inner.observe.lock_recover().growth;
-            let store = self.inner.store.lock().await;
-            (
-                store
-                    .heavy_rollup(&agent.id, agent.generation)
-                    .unwrap_or(None),
-                store
-                    .session_growth_view(&agent.harness, &agent.id, agent.generation, &growth)
-                    .unwrap_or(None),
-                store
-                    .work_summary(
-                        &agent.id,
-                        agent.generation,
-                        agent.workspace.as_deref(),
-                        agent.active_turn.as_deref(),
-                    )
-                    .ok(),
-            )
-        };
+        let (heavy, session_growth, work) = self.advisory_agent_readbacks(&agent).await;
         serde_json::to_value(AgentStatsResponse {
             agent: agent.id,
             generation: agent.generation,
