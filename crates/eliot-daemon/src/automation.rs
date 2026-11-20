@@ -725,6 +725,26 @@ async fn apply_global_rule_snapshot(
     Ok(active)
 }
 
+async fn reload_owner_snapshot(
+    router: &Router,
+    policy: &SecretPolicy,
+    notices: &mut ReloadNoticeContext,
+    snapshot: &reload::RuleSnapshot,
+    rules: &[ActiveRule],
+) -> Result<Option<(Vec<ActiveRule>, bool)>> {
+    let mut reporter = ReloadReporter { policy, notices };
+    attempt_reload_snapshot(
+        router,
+        "owner",
+        None,
+        snapshot,
+        rules,
+        now_ms(),
+        &mut reporter,
+    )
+    .await
+}
+
 async fn attempt_reload_snapshot(
     router: &Router,
     principal: &str,
@@ -1069,22 +1089,9 @@ async fn run_global_rules_inner(
                 .any(|rule| rule.state.retiring_revision.is_some())
                 && notices.deferred.as_ref() == Some(&key);
             if !already_rejected && !already_deferred {
-                let update = {
-                    let mut reporter = ReloadReporter {
-                        policy: &policy,
-                        notices: &mut notices,
-                    };
-                    attempt_reload_snapshot(
-                        &router,
-                        "owner",
-                        None,
-                        &snapshot,
-                        &rules,
-                        now_ms(),
-                        &mut reporter,
-                    )
-                    .await?
-                };
+                let update =
+                    reload_owner_snapshot(&router, &policy, &mut notices, &snapshot, &rules)
+                        .await?;
                 if let Some((updated, deferred)) = update {
                     rules = updated;
                     if !deferred {
@@ -1376,22 +1383,8 @@ async fn run_global_rules_inner(
         if retirement_pending && notices.deferred.as_ref() == Some(&snapshot_key) {
             continue;
         }
-        let update = {
-            let mut reporter = ReloadReporter {
-                policy: &policy,
-                notices: &mut notices,
-            };
-            attempt_reload_snapshot(
-                &router,
-                "owner",
-                None,
-                &snapshot,
-                &rules,
-                now_ms(),
-                &mut reporter,
-            )
-            .await?
-        };
+        let update =
+            reload_owner_snapshot(&router, &policy, &mut notices, &snapshot, &rules).await?;
         if let Some((updated, deferred)) = update {
             rules = updated;
             if !deferred {
