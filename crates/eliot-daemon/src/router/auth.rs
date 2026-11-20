@@ -11,6 +11,7 @@ use super::{
 };
 use crate::common::secure_eq;
 use eliot_core::{Command, Error, Result, SubmitCommand};
+use eliot_core::{is_coordination_verb, is_request_reply_verb, is_user_event_verb};
 use eliot_plugin::sync::LockExt;
 use serde_json::Value;
 
@@ -304,7 +305,7 @@ pub(super) fn authorize_command(principal: &Principal, request: &mut SubmitComma
             }
             return Ok(());
         }
-        if matches!(request.verb.as_str(), "notify" | "emit") {
+        if is_user_event_verb(request.verb.as_str()) {
             if !registration
                 .actions
                 .iter()
@@ -328,7 +329,7 @@ pub(super) fn authorize_command(principal: &Principal, request: &mut SubmitComma
             }
             return Ok(());
         }
-        if matches!(request.verb.as_str(), "mail.send" | "var.set") {
+        if is_coordination_verb(request.verb.as_str()) {
             if !registration.actions.iter().any(|action| {
                 action == &request.verb || (request.verb == "mail.send" && action == "msg.send")
             }) {
@@ -373,7 +374,7 @@ pub(super) fn authorize_command(principal: &Principal, request: &mut SubmitComma
                 "project action requires its frozen Agent and generation",
             ));
         }
-        if matches!(request.verb.as_str(), "approve" | "deny" | "answer")
+        if is_request_reply_verb(request.verb.as_str())
             && (request
                 .expected_turn_id
                 .as_deref()

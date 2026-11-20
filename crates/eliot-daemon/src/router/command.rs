@@ -17,6 +17,7 @@ use eliot_core::{
     api::{FrozenGitFetch, ProjectRegistrationView, configure_uses_native_session},
     classify_dispatched_error,
 };
+use eliot_core::{is_coordination_verb, is_start_verb, is_user_event_verb};
 use eliot_plugin::{MAX_EVENT_BYTES, sync::LockExt};
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
@@ -489,7 +490,7 @@ impl Router {
                 return false;
             }
         }
-        if matches!(command.verb.as_str(), "launch" | "resume")
+        if is_start_verb(command.verb.as_str())
             && let Err(error) = self.inner.workspaces.prepare(id).await
         {
             self.settle_workspace_prepare_error(id, &error).await;
@@ -633,7 +634,7 @@ impl Router {
                             "force shutdown prevents local event dispatch",
                         ))
                     }
-                    None if matches!(command.verb.as_str(), "mail.send" | "var.set")
+                    None if is_coordination_verb(command.verb.as_str())
                         && self.inner.mode.load(Ordering::SeqCst) == MODE_FORCE =>
                     {
                         Err(Error::new(
@@ -836,7 +837,7 @@ impl Router {
                 .await;
             return;
         }
-        if matches!(dispatched.verb.as_str(), "notify" | "emit") {
+        if is_user_event_verb(dispatched.verb.as_str()) {
             self.execute_user_event_command(&id, dispatched).await;
             return;
         }
@@ -1403,7 +1404,7 @@ impl Router {
         if error.code == "unknown" {
             let mut store = self.inner.store.lock().await;
             if let Ok(Some(command)) = store.get_command(id)
-                && matches!(command.verb.as_str(), "launch" | "resume")
+                && is_start_verb(command.verb.as_str())
                 && matches!(command.state, CommandState::Accepted | CommandState::Queued)
                 && let Some(target_generation) = command
                     .generation

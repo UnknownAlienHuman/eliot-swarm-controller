@@ -1,4 +1,5 @@
 use super::{PluginClient, PluginConnection};
+use eliot_core::is_start_verb;
 mod actor;
 mod discovery;
 mod native_children;
@@ -457,7 +458,7 @@ impl PluginHost {
                 "an observed Agent cannot enter controlled startup",
             ));
         }
-        if !matches!(command.verb.as_str(), "launch" | "resume")
+        if !is_start_verb(command.verb.as_str())
             || command.target.as_deref() != Some(agent.id.as_str())
             || command.generation != Some(agent.generation)
         {

@@ -96,3 +96,28 @@ pub fn workspace_preparation_transition_allowed(from: CommandState, to: CommandS
             (Accepted | Queued, Failed | Unknown) | (Unknown, Accepted | Cancelled)
         )
 }
+
+/// Verbs that start an Agent generation: first launch or resume.
+pub fn is_start_verb(verb: &str) -> bool {
+    matches!(verb, "launch" | "resume")
+}
+
+/// Verbs that attach or detach an observer of an exact native subject.
+pub fn is_attachment_verb(verb: &str) -> bool {
+    matches!(verb, "attach" | "detach")
+}
+
+/// Verbs that answer a pending Agent request.
+pub fn is_request_reply_verb(verb: &str) -> bool {
+    matches!(verb, "approve" | "deny" | "answer")
+}
+
+/// Targetless verbs that record a user-visible event.
+pub fn is_user_event_verb(verb: &str) -> bool {
+    matches!(verb, "notify" | "emit")
+}
+
+/// Targetless verbs that move coordination data between Agents.
+pub fn is_coordination_verb(verb: &str) -> bool {
+    matches!(verb, "mail.send" | "var.set")
+}

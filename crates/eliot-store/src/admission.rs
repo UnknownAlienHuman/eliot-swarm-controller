@@ -1,4 +1,5 @@
 use super::*;
+use eliot_core::{is_attachment_verb, is_request_reply_verb, is_start_verb};
 
 /// Local topic reserved for the internal attention producer. Public `emit`
 /// commands cannot use it; only the internal `attention.emit` verb admits it.
@@ -546,14 +547,14 @@ fn submit_target_guards_tx(
     request: &SubmitCommand,
     preparation: &Option<WorkspacePreparationInput>,
 ) -> Result<()> {
-    if !matches!(request.verb.as_str(), "attach" | "detach")
+    if !is_attachment_verb(request.verb.as_str())
         && let Some(target) = request.target.as_deref()
         && let Some(agent) = load_agent_by_num(tx, parse_agent_id(target)?)?
     {
         observer::require_controlled(&agent)?;
     }
     if let Some(input) = preparation {
-        if !matches!(request.verb.as_str(), "launch" | "resume") {
+        if !is_start_verb(request.verb.as_str()) {
             return Err(Error::new(
                 "invalid",
                 "workspace preparation requires launch or resume",
@@ -1412,7 +1413,7 @@ fn admit_configure_tx(
 /// by admission and dispatch so retained commands cannot bypass the policy.
 pub(super) fn require_reply_authority(principal: &str, verb: &str, agent: &Agent) -> Result<()> {
     if principal != "owner"
-        && matches!(verb, "approve" | "deny" | "answer")
+        && is_request_reply_verb(verb)
         && agent.profile_snapshot.get("access").and_then(Value::as_str) == Some("ask")
     {
         return Err(Error::new(
@@ -1601,7 +1602,7 @@ fn admit_start_postlude_tx(
     events: &mut Vec<Event>,
     policy: Option<&capacity::PolicyLoader>,
 ) -> Result<(Command, Option<Command>)> {
-    if matches!(request.verb.as_str(), "launch" | "resume") {
+    if is_start_verb(request.verb.as_str()) {
         workspace::admit_workspace_preparation(tx, request, preparation.as_ref(), now, events)?;
     }
     let command = load_command(tx, &request.id)?
@@ -1610,7 +1611,7 @@ fn admit_start_postlude_tx(
         Some(linked_id) => load_command(tx, linked_id)?,
         None => None,
     };
-    if matches!(request.verb.as_str(), "launch" | "resume") {
+    if is_start_verb(request.verb.as_str()) {
         let agent_num = command
             .target
             .as_deref()

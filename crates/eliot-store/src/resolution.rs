@@ -24,6 +24,7 @@ use super::{
     insert_daemon_event, load_agent_by_num, load_command_record, load_turn, sql_error,
     turn_state_name, update_command_state, validate_id_age, write_binding,
 };
+use eliot_core::is_start_verb;
 use eliot_core::{
     CommandState, TurnOutcome, TurnState,
     api::{
@@ -168,7 +169,7 @@ impl Store {
                 },
             ));
         }
-        if matches!(record.command.verb.as_str(), "launch" | "resume")
+        if is_start_verb(record.command.verb.as_str())
             && request.resolution == CommandResolution::Applied
         {
             return Err(Error::new(
