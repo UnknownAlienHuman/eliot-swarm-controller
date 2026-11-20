@@ -575,6 +575,41 @@ fn submit_target_guards_tx(
     Ok(())
 }
 
+/// Reject any Agent binding on a targetless command with the caller's message.
+fn require_no_agent_bindings(
+    request: &SubmitCommand,
+    preparation: &Option<WorkspacePreparationInput>,
+    message: &str,
+) -> Result<()> {
+    if request.target.is_some()
+        || request.expected_generation.is_some()
+        || request.expected_turn_id.is_some()
+        || request.request_id.is_some()
+        || request.probe
+        || preparation.is_some()
+    {
+        return Err(Error::new("invalid", message));
+    }
+    Ok(())
+}
+
+/// Record a validated targetless command and its admission event.
+fn admit_targetless_tx(
+    tx: &Transaction<'_>,
+    principal: &str,
+    request: &SubmitCommand,
+    payload_digest: &[u8],
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<Option<String>> {
+    events.push(admit_command(
+        tx,
+        &CommandInsert::targetless_admitted(principal, request, payload_digest, now),
+        json!({"command_id": request.id, "verb": request.verb}),
+    )?);
+    Ok(None)
+}
+
 /// Admit one targetless `run`: no Agent bindings, frozen run intent only.
 fn admit_run_tx(
     tx: &Transaction<'_>,
@@ -585,25 +620,13 @@ fn admit_run_tx(
     now: i64,
     events: &mut Vec<Event>,
 ) -> Result<Option<String>> {
-    if request.target.is_some()
-        || request.expected_generation.is_some()
-        || request.expected_turn_id.is_some()
-        || request.request_id.is_some()
-        || request.probe
-        || preparation.is_some()
-    {
-        return Err(Error::new(
-            "invalid",
-            "run is a targetless command without Agent bindings",
-        ));
-    }
+    require_no_agent_bindings(
+        request,
+        preparation,
+        "run is a targetless command without Agent bindings",
+    )?;
     scripts::decode_frozen_run(&request.args)?;
-    events.push(admit_command(
-        tx,
-        &CommandInsert::targetless_admitted(principal, request, payload_digest, now),
-        json!({"command_id": request.id, "verb": "run"}),
-    )?);
-    Ok(None)
+    admit_targetless_tx(tx, principal, request, payload_digest, now, events)
 }
 
 /// Admit one targetless `git.fetch`: no Agent bindings, frozen intent only.
@@ -616,26 +639,14 @@ fn admit_git_fetch_tx(
     now: i64,
     events: &mut Vec<Event>,
 ) -> Result<Option<String>> {
-    if request.target.is_some()
-        || request.expected_generation.is_some()
-        || request.expected_turn_id.is_some()
-        || request.request_id.is_some()
-        || request.probe
-        || preparation.is_some()
-    {
-        return Err(Error::new(
-            "invalid",
-            "git.fetch is a targetless command without Agent bindings",
-        ));
-    }
+    require_no_agent_bindings(
+        request,
+        preparation,
+        "git.fetch is a targetless command without Agent bindings",
+    )?;
     let frozen = projects::decode_frozen_git_fetch(&request.args)?;
     projects::validate_git_fetch_intent_tx(tx, principal, &frozen)?;
-    events.push(admit_command(
-        tx,
-        &CommandInsert::targetless_admitted(principal, request, payload_digest, now),
-        json!({"command_id": request.id, "verb": "git.fetch"}),
-    )?);
-    Ok(None)
+    admit_targetless_tx(tx, principal, request, payload_digest, now, events)
 }
 
 /// Admit one targetless `notify`/`emit` definition.
@@ -648,18 +659,11 @@ fn admit_notify_emit_tx(
     now: i64,
     events: &mut Vec<Event>,
 ) -> Result<Option<String>> {
-    if request.target.is_some()
-        || request.expected_generation.is_some()
-        || request.expected_turn_id.is_some()
-        || request.request_id.is_some()
-        || request.probe
-        || preparation.is_some()
-    {
-        return Err(Error::new(
-            "invalid",
-            "notify/emit are targetless commands without Agent bindings",
-        ));
-    }
+    require_no_agent_bindings(
+        request,
+        preparation,
+        "notify/emit are targetless commands without Agent bindings",
+    )?;
     if request.verb == "notify" {
         serde_json::from_value::<core::api::NotifyDefinitionArgs>(request.args.clone())
             .map_err(|_| Error::new("invalid", "notify definition is malformed"))?
@@ -676,12 +680,7 @@ fn admit_notify_emit_tx(
             ));
         }
     }
-    events.push(admit_command(
-        tx,
-        &CommandInsert::targetless_admitted(principal, request, payload_digest, now),
-        json!({"command_id": request.id, "verb": request.verb}),
-    )?);
-    Ok(None)
+    admit_targetless_tx(tx, principal, request, payload_digest, now, events)
 }
 
 /// Admit one internal `attention.emit`: the reserved topic only.
@@ -694,18 +693,11 @@ fn admit_attention_emit_tx(
     now: i64,
     events: &mut Vec<Event>,
 ) -> Result<Option<String>> {
-    if request.target.is_some()
-        || request.expected_generation.is_some()
-        || request.expected_turn_id.is_some()
-        || request.request_id.is_some()
-        || request.probe
-        || preparation.is_some()
-    {
-        return Err(Error::new(
-            "invalid",
-            "attention.emit is a targetless command without Agent bindings",
-        ));
-    }
+    require_no_agent_bindings(
+        request,
+        preparation,
+        "attention.emit is a targetless command without Agent bindings",
+    )?;
     let definition = serde_json::from_value::<core::api::EmitDefinitionArgs>(request.args.clone())
         .map_err(|_| Error::new("invalid", "attention.emit definition is malformed"))?;
     definition.validate()?;
@@ -715,12 +707,7 @@ fn admit_attention_emit_tx(
             "attention.emit carries only the reserved attention topic",
         ));
     }
-    events.push(admit_command(
-        tx,
-        &CommandInsert::targetless_admitted(principal, request, payload_digest, now),
-        json!({"command_id": request.id, "verb": request.verb}),
-    )?);
-    Ok(None)
+    admit_targetless_tx(tx, principal, request, payload_digest, now, events)
 }
 
 /// Admit one rule-derived `mail.send`/`var.set` definition.

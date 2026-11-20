@@ -264,15 +264,7 @@ impl Store {
                     "user-event kind does not match its command",
                 ));
             }
-            if record.state == CommandState::Applied
-                && record
-                    .command
-                    .outcome
-                    .as_ref()
-                    .and_then(|outcome| outcome.get("kind"))
-                    .and_then(Value::as_str)
-                    == Some(kind)
-            {
+            if applied_user_event_replay(&record, kind) {
                 commit_transaction(tx, &self.write_faulted)?;
                 return Ok(Change {
                     value: record.command,
@@ -362,15 +354,7 @@ impl Store {
             if definition.topic != "agent.attention" {
                 return Err(Error::new("invalid", "not an attention user-event command"));
             }
-            if record.state == CommandState::Applied
-                && record
-                    .command
-                    .outcome
-                    .as_ref()
-                    .and_then(|outcome| outcome.get("kind"))
-                    .and_then(Value::as_str)
-                    == Some(kind)
-            {
+            if applied_user_event_replay(&record, kind) {
                 commit_transaction(tx, &self.write_faulted)?;
                 return Ok(Change {
                     value: record.command,
@@ -1615,4 +1599,17 @@ fn stop_agent_tx(
         now,
         events,
     )
+}
+
+/// An Applied user-event command replays only for the same kind: the caller
+/// commits and returns the recorded command without a new event.
+fn applied_user_event_replay(record: &CommandRecord, kind: &str) -> bool {
+    record.state == CommandState::Applied
+        && record
+            .command
+            .outcome
+            .as_ref()
+            .and_then(|outcome| outcome.get("kind"))
+            .and_then(Value::as_str)
+            == Some(kind)
 }

@@ -91,6 +91,31 @@ impl Store {
             AgentListProjection::Rows,
             custody.as_deref(),
         )?;
+        self.read_agent_list_page(
+            filter,
+            page,
+            limit,
+            |record| self.summary_from_record(record, now_ms, growth_thresholds),
+            |scoped, projection| {
+                agent_list_select(scoped, caller, None, None, projection, custody.as_deref())
+            },
+            |summary| summary.id.clone(),
+        )
+    }
+
+    /// Shared fleet page tail for both orders: the row query, the total and
+    /// optional per-state totals (both ignore the cursor and come from
+    /// `select_page`), then the byte bound. Each caller builds its own row
+    /// select for its cursor and encodes its own `next` cursor.
+    fn read_agent_list_page(
+        &self,
+        filter: &AgentListFilter,
+        page: AgentListSelect,
+        limit: usize,
+        summarize: impl Fn(AgentRecord) -> Result<AgentSummary>,
+        select_page: impl Fn(&AgentListFilter, AgentListProjection) -> Result<AgentListSelect>,
+        next_cursor: impl Fn(&AgentSummary) -> String,
+    ) -> Result<AgentListPage> {
         let mut statement = self.connection.prepare(&page.sql).map_err(sql_error)?;
         let rows = statement
             .query_map(
@@ -100,20 +125,9 @@ impl Store {
             .map_err(sql_error)?;
         let mut summaries = Vec::new();
         for row in rows {
-            summaries.push(self.summary_from_record(
-                row.map_err(sql_error)?,
-                now_ms,
-                growth_thresholds,
-            )?);
+            summaries.push(summarize(row.map_err(sql_error)?)?);
         }
-        let total_page = agent_list_select(
-            filter,
-            caller,
-            None,
-            None,
-            AgentListProjection::Count,
-            custody.as_deref(),
-        )?;
+        let total_page = select_page(filter, AgentListProjection::Count)?;
         let total: i64 = self
             .connection
             .query_row(
@@ -125,14 +139,7 @@ impl Store {
         let state_totals = if filter.states.is_some() {
             let mut all_states = filter.clone();
             all_states.states = None;
-            let select = agent_list_select(
-                &all_states,
-                caller,
-                None,
-                None,
-                AgentListProjection::StateTotals,
-                custody.as_deref(),
-            )?;
+            let select = select_page(&all_states, AgentListProjection::StateTotals)?;
             let mut statement = self.connection.prepare(&select.sql).map_err(sql_error)?;
             let rows = statement
                 .query_map(rusqlite::params_from_iter(select.params.iter()), |row| {
@@ -164,7 +171,7 @@ impl Store {
         let kept = summaries.len();
         enforce_page_bytes(&mut summaries)?;
         truncated = truncated || summaries.len() < kept;
-        let next = summaries.last().map(|summary| summary.id.clone());
+        let next = summaries.last().map(next_cursor);
         Ok(AgentListPage {
             summaries,
             state_totals,
@@ -215,89 +222,16 @@ impl Store {
             AgentListProjection::Rows,
             custody.as_deref(),
         )?;
-        let mut statement = self.connection.prepare(&page.sql).map_err(sql_error)?;
-        let rows = statement
-            .query_map(
-                rusqlite::params_from_iter(page.params.iter()),
-                agent_record_from_row,
-            )
-            .map_err(sql_error)?;
-        let mut summaries = Vec::new();
-        for row in rows {
-            summaries.push(self.summary_from_record(
-                row.map_err(sql_error)?,
-                now_ms,
-                growth_thresholds,
-            )?);
-        }
-        let total_page = agent_list_select_recent(
+        self.read_agent_list_page(
             filter,
-            caller,
-            None,
-            None,
-            AgentListProjection::Count,
-            custody.as_deref(),
-        )?;
-        let total: i64 = self
-            .connection
-            .query_row(
-                &total_page.sql,
-                rusqlite::params_from_iter(total_page.params.iter()),
-                |row| row.get(0),
-            )
-            .map_err(sql_error)?;
-        let state_totals = if filter.states.is_some() {
-            let mut all_states = filter.clone();
-            all_states.states = None;
-            let select = agent_list_select_recent(
-                &all_states,
-                caller,
-                None,
-                None,
-                AgentListProjection::StateTotals,
-                custody.as_deref(),
-            )?;
-            let mut statement = self.connection.prepare(&select.sql).map_err(sql_error)?;
-            let rows = statement
-                .query_map(rusqlite::params_from_iter(select.params.iter()), |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-                })
-                .map_err(sql_error)?;
-            let mut totals: Vec<_> = AGENT_LIST_STATES
-                .into_iter()
-                .map(|state| AgentStateTotal { state, total: 0 })
-                .collect();
-            for row in rows {
-                let (state, total) = row.map_err(sql_error)?;
-                let state: AgentState = parse_enum(&state, "Agent state")?;
-                let entry = totals
-                    .iter_mut()
-                    .find(|entry| entry.state == state)
-                    .ok_or_else(|| {
-                        Error::new("internal", "Agent state missing from state totals")
-                    })?;
-                entry.total = usize::try_from(total)
-                    .map_err(|_| Error::new("internal", "Agent state count exceeds usize"))?;
-            }
-            Some(totals)
-        } else {
-            None
-        };
-        let mut truncated = summaries.len() > limit;
-        summaries.truncate(limit);
-        let kept = summaries.len();
-        enforce_page_bytes(&mut summaries)?;
-        truncated = truncated || summaries.len() < kept;
-        let next = summaries
-            .last()
-            .map(|summary| encode_recent_cursor(&summary.id, summary.updated_at));
-        Ok(AgentListPage {
-            summaries,
-            state_totals,
-            total: usize::try_from(total.max(0)).unwrap_or(0),
-            truncated,
-            next,
-        })
+            page,
+            limit,
+            |record| self.summary_from_record(record, now_ms, growth_thresholds),
+            |scoped, projection| {
+                agent_list_select_recent(scoped, caller, None, None, projection, custody.as_deref())
+            },
+            |summary| encode_recent_cursor(&summary.id, summary.updated_at),
+        )
     }
 
     fn summary_from_record(
