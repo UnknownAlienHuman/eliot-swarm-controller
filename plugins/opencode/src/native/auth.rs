@@ -518,52 +518,6 @@ async fn import_once(
     ImportAttempt::Applied
 }
 
-/// Unused since k173d: fragment providers never import a canonical credential,
-/// so no isolated-store credential check is needed. Kept for the auth module
-/// boundary; allowed dead to keep the shared auth surface stable.
-#[allow(dead_code)]
-pub async fn ensure_no_credential_for_provider(
-    program: &OsStr,
-    workspace: &Path,
-    import_environment: &[(OsString, OsString)],
-    isolated_config_home: &Path,
-    isolated_data_home: &Path,
-    provider_id: &str,
-    deadline: Instant,
-) -> Result<()> {
-    let mut command = Command::new(program);
-    command
-        .current_dir(workspace)
-        .envs(import_environment.iter().map(|(key, value)| (key, value)))
-        .env("XDG_CONFIG_HOME", isolated_config_home)
-        .env("XDG_DATA_HOME", isolated_data_home)
-        .kill_on_drop(true);
-    command
-        .args(list_argv())
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
-    let entries = run_list(command, deadline).await.map_err(|error| {
-        Error::new(
-            "unknown",
-            format!(
-                "OpenCode local provider credential check is unresolved ({})",
-                error.message
-            ),
-        )
-    })?;
-    if entries
-        .iter()
-        .any(|entry| entry.id == provider_id || entry.name == provider_id)
-    {
-        return Err(Error::new(
-            "profile_error",
-            "OpenCode local provider holds an unexpected native credential for the dedicated provider ID",
-        ));
-    }
-    Ok(())
-}
-
 /// Read only the selected canonical credential using the native export schema.
 /// No import or write is performed; stderr and secret-bearing parse failures are discarded.
 /// The `integration` names one native integration id (`opencode` for the

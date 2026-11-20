@@ -167,30 +167,6 @@ impl Store {
         result
     }
 
-    /// Persist a timer's immutable schedule beside its owning rule state. The
-    /// daemon supplies calculations; Store captures an omitted interval anchor
-    /// exactly once and keeps the numeric UTC-millisecond cursor.
-    pub fn ensure_timer_state(
-        &mut self,
-        principal: &str,
-        input: &TimerDefinitionInput,
-        now: i64,
-    ) -> Result<core::api::TimerStateView> {
-        self.ensure_writer_healthy()?;
-        let result = (|| {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            validate_rule_principal_tx(&tx, principal)?;
-            let view = ensure_timer_state_tx(&tx, principal, input, now)?;
-            commit_transaction(tx, &self.write_faulted)?;
-            Ok(view)
-        })();
-        self.fault_on_persistence_error(&result);
-        result
-    }
-
     pub fn get_timer_state(
         &self,
         principal: &str,

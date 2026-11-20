@@ -298,17 +298,6 @@ impl AgentSummary {
             None => agent_state_name(self.state).to_owned(),
         }
     }
-
-    /// Fleet counting bucket for one summary. Per docs/spec/api.md:722-727, a lost observed
-    /// activity counts as unknown; its display label still describes the loss.
-    pub fn fleet_bucket(&self) -> &'static str {
-        match &self.activity {
-            Some(_) if self.state == AgentState::Stopped => "stopped",
-            Some(activity) if activity.state == NativeChildActivityState::Lost => "unknown",
-            Some(activity) => activity_state_name(activity.state),
-            None => agent_state_name(self.state),
-        }
-    }
 }
 
 /// Lifecycle state name shared by fleet displays and counts.

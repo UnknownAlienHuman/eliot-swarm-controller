@@ -1,8 +1,8 @@
 //! Native-family handoff wire data and pure acknowledgement/readback checks.
 //! Store remains authoritative for the transaction and successor publication.
 
-use crate::{Error, Result, SecretPolicy, api::SourceOwner, canonical_json_sha256, parse_agent_id};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use crate::{Error, Result, SecretPolicy, parse_agent_id};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 /// An explicit uncovered interval committed with the ownership transfer.
@@ -182,52 +182,6 @@ impl SourceHandoff {
         }
         Ok(())
     }
-
-    /// Verify the predecessor's private source.state projection. The retained
-    /// digest binds fields (including gap reason) absent from the ACK. Current
-    /// owners and boundary must still match; the last ACK alone is insufficient.
-    pub fn ack_from_state(&self, value: &Value) -> Result<SourceHandoffAck> {
-        self.validate().map_err(|_| unproven())?;
-        let map = value.as_object().ok_or_else(unproven)?;
-        let state: HandoffState =
-            serde_json::from_value(Value::Object(map.clone())).map_err(|_| unproven())?;
-        if state.agent_id != self.agent_id
-            || state.generation != self.generation
-            || state.source != self.source
-        {
-            return Err(unproven());
-        }
-        let mut normalized = self.clone();
-        normalized.families.sort_unstable();
-        let payload = serde_json::to_value(normalized).map_err(|_| unproven())?;
-        let digest = canonical_json_sha256(&payload).map_err(|_| unproven())?;
-        if state.last_handoff_digest != digest {
-            return Err(unproven());
-        }
-        self.validate_ack(&state.last_handoff)?;
-        for family in &self.families {
-            let mut owners = state.owners.iter().filter(|owner| owner.family == *family);
-            let owner = owners.next().ok_or_else(unproven)?;
-            if owners.next().is_some()
-                || owner.source != self.successor
-                || owner.mechanism != self.mechanism
-            {
-                return Err(unproven());
-            }
-        }
-        match (&self.cursor, &self.gap) {
-            (Some(cursor), None) if state.cursor.as_ref() == Some(cursor) => {}
-            (None, Some(gap))
-                if state.gap_id.as_ref() == Some(&gap.gap_id)
-                    && state.gap_from == gap.from
-                    && state.gap_to == gap.to
-                    && state
-                        .gap_seq
-                        .is_some_and(|seq| seq > 0 && seq < state.last_handoff.seq) => {}
-            _ => return Err(unproven()),
-        }
-        Ok(state.last_handoff)
-    }
 }
 
 fn validate_families(families: &[String]) -> Result<()> {
@@ -268,46 +222,6 @@ fn sorted_families(families: &[String]) -> Vec<&str> {
     let mut families: Vec<_> = families.iter().map(String::as_str).collect();
     families.sort_unstable();
     families
-}
-
-#[derive(Deserialize)]
-struct HandoffState {
-    agent_id: String,
-    generation: i64,
-    source: String,
-    #[serde(deserialize_with = "owner_objects")]
-    owners: Vec<SourceOwner>,
-    #[serde(deserialize_with = "nullable")]
-    cursor: Option<String>,
-    #[serde(deserialize_with = "nullable")]
-    gap_id: Option<String>,
-    #[serde(deserialize_with = "nullable")]
-    gap_from: Option<String>,
-    #[serde(deserialize_with = "nullable")]
-    gap_to: Option<String>,
-    #[serde(deserialize_with = "nullable")]
-    gap_seq: Option<i64>,
-    last_handoff_digest: [u8; 32],
-    last_handoff: SourceHandoffAck,
-}
-
-fn owner_objects<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> std::result::Result<Vec<SourceOwner>, D::Error> {
-    let maps = Vec::<Map<String, Value>>::deserialize(deserializer)?;
-    maps.into_iter()
-        .map(|map| object_value(map).map_err(serde::de::Error::custom))
-        .collect()
-}
-
-fn object_value<T: DeserializeOwned>(map: Map<String, Value>) -> serde_json::Result<T> {
-    serde_json::from_value(Value::Object(map))
-}
-
-fn nullable<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
-    deserializer: D,
-) -> std::result::Result<Option<T>, D::Error> {
-    Option::<T>::deserialize(deserializer)
 }
 
 fn unproven() -> Error {

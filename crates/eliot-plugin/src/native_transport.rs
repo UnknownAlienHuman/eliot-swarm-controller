@@ -578,13 +578,6 @@ impl OversizedFrame {
         self.kind
     }
 
-    /// True when the length was observed while the line was still open
-    /// (fault published at the threshold): the true line is at least this
-    /// long.
-    pub fn is_lower_bound(self) -> bool {
-        self.lower_bound
-    }
-
     /// The parsed JSON-RPC method, if one parsed and matched the adapter's
     /// known protocol set. `None` means absent, unknown, or not allowlisted,
     /// never a redaction.
@@ -1021,31 +1014,6 @@ impl NativeChild {
         self.wait_process_exit().await
     }
 
-    /// True once the stdout reader task has ended, whether it ended cleanly or
-    /// with a typed stream fault. Callers can require this before owner cleanup.
-    pub fn output_reader_finished(&self) -> bool {
-        self.output_reader_result.is_some()
-            || self
-                .output_reader
-                .as_ref()
-                .is_some_and(|reader| reader.is_finished())
-    }
-
-    /// Positively observe this child exit, then wait for its owned stdout
-    /// reader to finish. Each wait is bounded by the existing exit-drain
-    /// window; this never terminates the child or infers exit from silence.
-    pub async fn confirm_exit_and_output_drained(&mut self) -> bool {
-        match timeout_at(Instant::now() + NATIVE_EXIT_DRAIN, self.wait_process_exit()).await {
-            Ok(Ok(_status)) => {}
-            Ok(Err(_)) | Err(_) => return false,
-        }
-
-        let _ = self
-            .await_output_drained(Instant::now() + NATIVE_EXIT_DRAIN)
-            .await;
-        self.process_exit_observed() && self.writer.reader_closed() && self.output_reader_finished()
-    }
-
     pub fn stderr_snapshot(&self) -> StderrSnapshot {
         self.stderr_view.snapshot()
     }
@@ -1066,13 +1034,6 @@ impl NativeChild {
         if let Some(stderr) = self.stderr.take() {
             let _ = stderr.finish(deadline).await;
         }
-        result.map_err(|error| self.diagnostic_error(error))
-    }
-
-    /// Wait passively for the owned stdout reader task to finish, retaining
-    /// its result so the bounded drain helper can confirm the full endpoint.
-    pub async fn wait_for_output_reader_finished(&mut self) -> Result<()> {
-        let result = self.await_stdout_drained_until(None).await;
         result.map_err(|error| self.diagnostic_error(error))
     }
 

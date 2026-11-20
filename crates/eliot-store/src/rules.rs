@@ -257,35 +257,6 @@ enum RuleParentOutcome<'a> {
 }
 
 impl Store {
-    /// Create or reconcile one rule using the transaction's captured high-water.
-    pub fn ensure_rule_state(
-        &mut self,
-        principal: &str,
-        input: &RuleDefinitionInput,
-        now: i64,
-    ) -> Result<core::api::RuleStateView> {
-        self.ensure_writer_healthy()?;
-        let result = (|| {
-            validate_principal_rule(principal, &input.id)?;
-            let value = input.validated_value()?;
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            let project = validate_rule_principal_tx(&tx, principal)?;
-            validate_project_rule_definition(project.as_ref(), &value)?;
-
-            let high_water = high_water_tx(&tx)?;
-            let mut events = Vec::new();
-            let view =
-                ensure_rule_state_tx(&tx, principal, input, true, high_water, now, &mut events)?;
-            commit_transaction(tx, &self.write_faulted)?;
-            Ok(view)
-        })();
-        self.fault_on_persistence_error(&result);
-        result
-    }
-
     pub fn get_rule_state(
         &self,
         principal: &str,

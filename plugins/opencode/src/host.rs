@@ -154,11 +154,6 @@ enum StartPhase {
     /// or proven absent): this generation created nothing and the retained
     /// session, if any, is untouched.
     ResumeRefused,
-    /// Session/create may have been admitted; later readbacks and commits.
-    /// Only constructed in tests to pin the boundary: production never
-    /// converts a post-create failure into a proven-no-effect value.
-    #[allow(dead_code)]
-    PostCreate,
 }
 
 /// Whether a failure in this start phase with this error code proves no
@@ -187,7 +182,6 @@ fn start_point_for_phase(
         StartPhase::CreateRefused | StartPhase::ResumeRefused => {
             StartPoint::NativeRefusalBeforeDispatch
         }
-        StartPhase::PostCreate => StartPoint::AfterDispatch,
     }
 }
 
@@ -220,7 +214,6 @@ impl StartPhase {
             StartPhase::Verify => "verify",
             StartPhase::CreateRefused => "create_refused",
             StartPhase::ResumeRefused => "resume_refused",
-            StartPhase::PostCreate => "post_create",
         }
     }
 }
@@ -233,7 +226,6 @@ fn presession_reason(phase: StartPhase, code: &str) -> String {
         StartPhase::Register => "OpenCode native-process registration failed",
         StartPhase::CreateRefused => "OpenCode session/create was not admitted",
         StartPhase::ResumeRefused => "OpenCode resume did not start",
-        StartPhase::PostCreate => "OpenCode start failed after session/create",
     };
     eliot_plugin::start_classification::format_start_reason(
         what,

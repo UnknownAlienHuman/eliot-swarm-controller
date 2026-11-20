@@ -149,10 +149,9 @@ struct DaemonSupervision {
     automation_task_names: Vec<(tokio::task::Id, &'static str)>,
     automation_tasks: JoinSet<(&'static str, Result<automation::RuleWorkerExit>)>,
     automation_stop: watch::Sender<bool>,
-    // Aborts a still-waiting recheck when supervision drops, before the IPC
-    // listener below closes; never polled.
-    #[allow(dead_code)]
-    capacity_recheck: JoinSet<()>,
+    // Never polled: holding the JoinSet keeps the recheck task alive, and its
+    // abort-on-drop runs before the IPC listener below closes.
+    _capacity_recheck: JoinSet<()>,
     recovery: JoinSet<(&'static str, Result<()>)>,
     attention_tasks: JoinSet<Result<()>>,
     attention_stop: watch::Sender<bool>,
@@ -456,7 +455,7 @@ async fn spawn_workers(
         automation_task_names,
         automation_tasks,
         automation_stop,
-        capacity_recheck,
+        _capacity_recheck: capacity_recheck,
         recovery,
         attention_tasks,
         attention_stop,
