@@ -97,12 +97,12 @@ pub fn workspace_preparation_transition_allowed(from: CommandState, to: CommandS
         )
 }
 
-/// Verbs that start or continue an Agent's native turn from a linked input.
+/// Verbs that start an Agent generation: first launch or resume.
 pub fn is_start_verb(verb: &str) -> bool {
     matches!(verb, "launch" | "resume")
 }
 
-/// Verbs that attach or detach an Agent to or from a project assignment.
+/// Verbs that attach or detach an observer of an exact native subject.
 pub fn is_attachment_verb(verb: &str) -> bool {
     matches!(verb, "attach" | "detach")
 }
