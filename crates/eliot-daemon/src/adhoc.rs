@@ -12,6 +12,7 @@
 //! default at start and reports the effective value through its existing
 //! readback; no substitution is ever made for an unavailable requested model.
 
+use core::api::native_profile::{CodexApprovalPolicy, CodexPermissions};
 use eliot_core as core;
 use eliot_plugin::session::split_provider_model;
 use eliot_plugin::sync::LockExt;
@@ -205,46 +206,26 @@ fn apply_adhoc_access(
     profile_name: &str,
 ) -> core::Result<()> {
     snapshot.insert("access".to_owned(), Value::String(access.to_owned()));
+    let invalid = || core::Error::new("invalid", "ad-hoc access must be ask, auto or full");
+    let text = |value: &str| Value::String(value.to_owned());
     match harness {
-        "codex" => match access {
-            "ask" => {
-                snapshot.insert(
-                    "permissions".to_owned(),
-                    Value::String("workspace-write".to_owned()),
-                );
-                snapshot.insert(
-                    "approval_policy".to_owned(),
-                    Value::String("on-request".to_owned()),
-                );
-                Ok(())
-            }
-            "auto" => {
-                snapshot.insert(
-                    "permissions".to_owned(),
-                    Value::String("workspace-write".to_owned()),
-                );
-                snapshot.insert(
-                    "approval_policy".to_owned(),
-                    Value::String("never".to_owned()),
-                );
-                Ok(())
-            }
-            "full" => {
-                snapshot.insert(
-                    "permissions".to_owned(),
-                    Value::String("danger-full-access".to_owned()),
-                );
-                snapshot.insert(
-                    "approval_policy".to_owned(),
-                    Value::String("never".to_owned()),
-                );
-                Ok(())
-            }
-            _ => Err(core::Error::new(
-                "invalid",
-                "ad-hoc access must be ask, auto or full",
-            )),
-        },
+        "codex" => {
+            let (permissions, approval_policy) = match access {
+                "ask" => (
+                    CodexPermissions::WorkspaceWrite,
+                    CodexApprovalPolicy::OnRequest,
+                ),
+                "auto" => (CodexPermissions::WorkspaceWrite, CodexApprovalPolicy::Never),
+                "full" => (
+                    CodexPermissions::DangerFullAccess,
+                    CodexApprovalPolicy::Never,
+                ),
+                _ => return Err(invalid()),
+            };
+            snapshot.insert("permissions".to_owned(), text(permissions.as_str()));
+            snapshot.insert("approval_policy".to_owned(), text(approval_policy.as_str()));
+            Ok(())
+        }
         "claude" => {
             // The frozen `permission_mode` is the CLI `--permission-mode`
             // argv the Claude plugin pushes; `manual` routes `can_use_tool`
@@ -254,49 +235,22 @@ fn apply_adhoc_access(
                 "ask" => "manual",
                 "auto" => "auto",
                 "full" => "bypassPermissions",
-                _ => {
-                    return Err(core::Error::new(
-                        "invalid",
-                        "ad-hoc access must be ask, auto or full",
-                    ));
-                }
+                _ => return Err(invalid()),
             };
-            snapshot.insert("permission_mode".to_owned(), Value::String(mode.to_owned()));
+            snapshot.insert("permission_mode".to_owned(), text(mode));
             Ok(())
         }
-        "muse" => match access {
-            "ask" => {
-                snapshot.insert("approval".to_owned(), Value::String("onRequest".to_owned()));
-                snapshot.insert(
-                    "permissions".to_owned(),
-                    Value::String("workspace-write".to_owned()),
-                );
-                Ok(())
-            }
-            "auto" => {
-                snapshot.insert(
-                    "approval".to_owned(),
-                    Value::String("promptUnmatched".to_owned()),
-                );
-                snapshot.insert(
-                    "permissions".to_owned(),
-                    Value::String("workspace-write".to_owned()),
-                );
-                Ok(())
-            }
-            "full" => {
-                snapshot.insert("approval".to_owned(), Value::String("allowAll".to_owned()));
-                snapshot.insert(
-                    "permissions".to_owned(),
-                    Value::String("danger-full-access".to_owned()),
-                );
-                Ok(())
-            }
-            _ => Err(core::Error::new(
-                "invalid",
-                "ad-hoc access must be ask, auto or full",
-            )),
-        },
+        "muse" => {
+            let (approval, permissions) = match access {
+                "ask" => ("onRequest", CodexPermissions::WorkspaceWrite),
+                "auto" => ("promptUnmatched", CodexPermissions::WorkspaceWrite),
+                "full" => ("allowAll", CodexPermissions::DangerFullAccess),
+                _ => return Err(invalid()),
+            };
+            snapshot.insert("approval".to_owned(), text(approval));
+            snapshot.insert("permissions".to_owned(), text(permissions.as_str()));
+            Ok(())
+        }
         "opencode" => match access {
             // OpenCode exposes no verified distinct native permission knob
             // today: ask and auto share the native permission-reply surface
@@ -308,31 +262,20 @@ fn apply_adhoc_access(
                 "unsupported",
                 "the opencode slice has no full-access permission mapping",
             )),
-            _ => Err(core::Error::new(
-                "invalid",
-                "ad-hoc access must be ask, auto or full",
-            )),
+            _ => Err(invalid()),
         },
-        "antigravity" => match access {
+        "antigravity" => {
             // `false` keeps the ACP `session/request_permission` round-trip
             // that bridges to `swarm approve`/`deny`; `true` is the
             // full-access skip flag.
-            "ask" | "auto" => {
-                snapshot.insert(
-                    "dangerously_skip_permissions".to_owned(),
-                    Value::Bool(false),
-                );
-                Ok(())
-            }
-            "full" => {
-                snapshot.insert("dangerously_skip_permissions".to_owned(), Value::Bool(true));
-                Ok(())
-            }
-            _ => Err(core::Error::new(
-                "invalid",
-                "ad-hoc access must be ask, auto or full",
-            )),
-        },
+            let skip = match access {
+                "ask" | "auto" => false,
+                "full" => true,
+                _ => return Err(invalid()),
+            };
+            snapshot.insert("dangerously_skip_permissions".to_owned(), Value::Bool(skip));
+            Ok(())
+        }
         _ => Err(core::Error::new(
             "unsupported",
             format!("unsupported launch harness {harness}"),
@@ -560,11 +503,11 @@ pub(crate) fn adhoc_snapshot(
     if matches!(harness.as_str(), "codex" | "claude" | "muse") {
         snapshot.insert(
             "permissions".to_owned(),
-            Value::String("workspace-write".to_owned()),
+            Value::String(CodexPermissions::default().as_str().to_owned()),
         );
         snapshot.insert(
             "approval_policy".to_owned(),
-            Value::String("never".to_owned()),
+            Value::String(CodexApprovalPolicy::default().as_str().to_owned()),
         );
     }
     // Access mapping overwrites the safe defaults above with the exact

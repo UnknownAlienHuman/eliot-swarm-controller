@@ -22,6 +22,7 @@ mod monitor_views;
 mod mutation_validation;
 mod mutations;
 mod native_pages;
+pub mod native_profile;
 mod native_requests;
 mod notify;
 mod observe;

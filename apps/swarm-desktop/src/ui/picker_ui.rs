@@ -4,6 +4,7 @@
 //! are drawn by the conversation's composer; every popover overlays the
 //! conversation right above the composer.
 
+use eliot_core::api::native_profile::CodexPermissions;
 use std::collections::HashMap;
 
 use super::launch_ui::{CHAT_PROJECT, OTHER_FOLDER, Pop};
@@ -177,7 +178,8 @@ impl DesktopApp {
                     Some(_) => launch_ui::access_label(permissions),
                     None => "Access from the preset".to_owned(),
                 };
-                let full = permissions == Some("danger-full-access");
+                let full = permissions.and_then(CodexPermissions::parse)
+                    == Some(CodexPermissions::DangerFullAccess);
                 m3::fixed_chip(
                     palette,
                     full,
