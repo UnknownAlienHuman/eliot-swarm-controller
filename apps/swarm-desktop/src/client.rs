@@ -485,14 +485,14 @@ pub async fn read_command(data_dir: &Path, id: &str) -> Result<Command> {
     Ok(command)
 }
 
-/// Server-side wait until one retained command settles or `deadline` passes;
-/// returns its readback (settled, or still open at the deadline).
-pub async fn wait_command(
+/// Server-side wait (`swarm.wait`) until every listed command is terminal;
+/// false when `deadline` passes first.
+pub async fn wait_commands(
     data_dir: &Path,
-    id: &str,
+    ids: Vec<String>,
     deadline: tokio::time::Instant,
-) -> Result<Command> {
-    eliot_daemon::wait_command(data_dir, &CommandGetRequest::new(id), deadline).await
+) -> Result<bool> {
+    eliot_daemon::wait_terminal(data_dir, ids, Vec::new(), deadline).await
 }
 
 /// What a launch freezes: a stored profile, or the Owner ad-hoc snapshot

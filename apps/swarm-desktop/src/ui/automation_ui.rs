@@ -1083,15 +1083,16 @@ fn settle_timer_run(
     parent: Command,
     cancelled: &dyn Fn() -> bool,
 ) -> Fallible<(Command, Vec<Command>)> {
-    const POLL_MS: u64 = 1_000;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
     let mut parent = parent;
     loop {
         if cancelled() {
             return Err("stopped waiting; the run goes on in Swarm".to_owned());
         }
-        if parent.state.is_terminal() {
-            // The action children are read back here, not waited on by id.
+        if parent.state == CommandState::Unknown {
+            return Err("the run's outcome is unknown; waiting for resolution.".to_owned());
+        }
+        let open = if parent.state.is_terminal() {
             let children = client::block_on(client::command_children(data_dir, &parent.id))
                 .map_err(|error| error.to_string())?;
             if children.iter().all(|child| child.state.is_terminal()) {
@@ -1103,10 +1104,14 @@ fn settle_timer_run(
             {
                 return Err("an action's outcome is unknown; waiting for resolution.".to_owned());
             }
-        }
-        if parent.state == CommandState::Unknown {
-            return Err("the run's outcome is unknown; waiting for resolution.".to_owned());
-        }
+            children
+                .into_iter()
+                .filter(|child| !child.state.is_terminal())
+                .map(|child| child.id)
+                .collect()
+        } else {
+            vec![parent.id.clone()]
+        };
         if tokio::time::Instant::now() >= deadline {
             return Err(format!(
                 "still {} after two minutes (command {})",
@@ -1114,13 +1119,8 @@ fn settle_timer_run(
                 parent.id
             ));
         }
-        if parent.state.is_terminal() {
-            // Children still settling: pause before reading them again.
-            feed::backoff(POLL_MS, cancelled);
-        } else {
-            let slice =
-                (tokio::time::Instant::now() + std::time::Duration::from_secs(1)).min(deadline);
-            parent = client::block_on(client::wait_command(data_dir, &parent.id, slice))
+        if super::wait_slice(data_dir, open, deadline)? && !parent.state.is_terminal() {
+            parent = client::block_on(client::read_command(data_dir, &parent.id))
                 .map_err(|error| error.to_string())?;
         }
     }
