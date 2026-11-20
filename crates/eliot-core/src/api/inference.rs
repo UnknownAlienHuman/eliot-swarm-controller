@@ -12,10 +12,6 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-pub fn inference_sha256(bytes: &[u8]) -> String {
-    sha256_hex(bytes)
-}
-
 pub const INFERENCE_PROFILE: &str = "memory-text-v1";
 pub const MAX_INFERENCE_INPUT: usize = 32 * 1024;
 pub const MAX_INFERENCE_RESULT: usize = 64 * 1024;
@@ -97,7 +93,7 @@ impl InferenceTextRequest {
             || self.text.len() > MAX_INFERENCE_INPUT
             || self.text.contains('\0')
             || self.input_bytes != self.text.len()
-            || self.input_sha256 != inference_sha256(self.text.as_bytes())
+            || self.input_sha256 != sha256_hex(self.text.as_bytes())
             || self.max_result_bytes == 0
             || self.max_result_bytes > MAX_INFERENCE_RESULT
             || !(1000..=MAX_INFERENCE_DEADLINE_MS).contains(&self.deadline_ms)

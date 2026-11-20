@@ -815,15 +815,6 @@ of the explicitly selected release scope.
       Native first-token time is not exposed by the consumed completed-message
       surface. Preserve the unrelated native-archive Unknown fence; do not replay it.
 
-- [ ] **K92 Backend quota and chat lifecycle (#407).** Implemented provider
-      readers, durable archive/delete, settings project removal and private chats.
-      Private Windows Owner proof covers real Codex/Claude desktop launch/send,
-      a private chat, archive/unarchive/delete/replay, directory cleanup and Muse
-      stream-observed quota. OpenCode Go numerical readback remains blocked by
-      provider HTTP 403; Antigravity returned real windows before a later HTTP 401.
-      Native first-token time is not exposed by the consumed completed-message
-      surface. Preserve the unrelated native-archive Unknown fence; do not replay it.
-
 ## M1 — Memory one-shot inference (#199)
 
 - [x] **M1.1 Scoped first call.** Closed bounded DTOs, one actual non-agentic native

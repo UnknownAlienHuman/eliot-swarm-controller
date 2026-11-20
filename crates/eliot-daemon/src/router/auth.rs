@@ -82,7 +82,7 @@ impl Router {
                 if !hash.is_some_and(|hash| {
                     secure_eq(
                         &hash,
-                        &eliot_core::api::inference::inference_sha256(credential.as_bytes()),
+                        &eliot_core::api::inference::sha256_hex(credential.as_bytes()),
                     )
                 }) {
                     return Err(Error::new(

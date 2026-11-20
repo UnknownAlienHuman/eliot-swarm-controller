@@ -418,12 +418,7 @@ impl PluginHost {
             })
             .map_err(|_| Error::new("internal", "quota.read params encoding failed"))?;
             let value = reader.client.call("quota.read", request, until).await?;
-            if SecretPolicy::new(metadata_secrets.iter()).contains_value(&value) {
-                return Err(Error::new(
-                    "source_integrity",
-                    "quota.read metadata contains reserved credentials",
-                ));
-            }
+            reject_reserved_metadata(&value, &metadata_secrets, "quota.read")?;
             let details = value
                 .get("details")
                 .filter(|details| details.is_object())
@@ -530,12 +525,7 @@ impl PluginHost {
             let request = serde_json::json!({"profile": profile, "native_ref": native_ref});
             archive_dispatched = true;
             let value = reader.client.call("native.archive", request, until).await?;
-            if SecretPolicy::new(metadata_secrets.iter()).contains_value(&value) {
-                return Err(Error::new(
-                    "source_integrity",
-                    "native.archive metadata contains reserved credentials",
-                ));
-            }
+            reject_reserved_metadata(&value, &metadata_secrets, "native.archive")?;
             let archived = value
                 .get("archived")
                 .and_then(Value::as_bool)
@@ -688,12 +678,7 @@ impl PluginHost {
             let request = serde_json::to_value(&request)
                 .map_err(|_| Error::new("internal", "model.list params encoding failed"))?;
             let value = reader.client.call("model.list", request, until).await?;
-            if SecretPolicy::new(metadata_secrets.iter()).contains_value(&value) {
-                return Err(Error::new(
-                    "source_integrity",
-                    "model.list metadata contains reserved credentials",
-                ));
-            }
+            reject_reserved_metadata(&value, &metadata_secrets, "model.list")?;
             let mut value: Value = value;
             if value.get("models").and_then(Value::as_array).is_none() {
                 return Err(Error::new(
@@ -887,12 +872,7 @@ impl PluginHost {
             let request = serde_json::to_value(&params)
                 .map_err(|_| Error::new("internal", "cannot encode profile.store params"))?;
             let value = reader.client.call("profile.store", request, until).await?;
-            if SecretPolicy::new(metadata_secrets.iter()).contains_value(&value) {
-                return Err(Error::new(
-                    "source_integrity",
-                    "profile.store metadata contains reserved credentials",
-                ));
-            }
+            reject_reserved_metadata(&value, &metadata_secrets, "profile.store")?;
             let preparation: ProfileStoreResult = serde_json::from_value(value).map_err(|_| {
                 Error::new("source_integrity", "profile.store binding is malformed")
             })?;
@@ -1076,6 +1056,18 @@ fn overlay_model_metadata(catalogue: &mut Value, metadata: &Value) {
             }
         }
     }
+}
+
+/// Refuse a metadata reply that echoes a reserved credential. Discovery
+/// redacts instead of refusing, so it keeps its own `redact_value` path.
+fn reject_reserved_metadata(value: &Value, secrets: &[String], method: &str) -> Result<()> {
+    if SecretPolicy::new(secrets.iter()).contains_value(value) {
+        return Err(Error::new(
+            "source_integrity",
+            format!("{method} metadata contains reserved credentials"),
+        ));
+    }
+    Ok(())
 }
 
 fn metadata_reader_close_deadline(stop: &watch::Receiver<Option<Instant>>) -> Instant {
