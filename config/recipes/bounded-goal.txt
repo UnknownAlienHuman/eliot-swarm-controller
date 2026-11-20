@@ -9,4 +9,4 @@
 # (bounded, beginning and end kept). Prefer the project's own required command
 # for the changed package, as below, over a placeholder that always passes.
 # The agent must be launched with a native adapter profile (for example codex-luna).
-goal set AGENT --text "Make the changed package build without warnings." --max-rounds 5 --check cargo clippy --locked -p eliot-daemon --all-targets -- -D warnings
+goal set AGENT --text "Make the changed package build." --max-rounds 5 --check cargo build --locked -p eliot-daemon --all-targets

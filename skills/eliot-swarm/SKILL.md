@@ -50,8 +50,8 @@ Return: result, change locations, checks actually run, what is left.
   proportionate check passed.
 - "Already correct, verified against current behavior" is a valid outcome.
   "Could not reproduce" alone is not a fix.
-- After the criterion and the review pass, stop. A further edit needs a
-  concrete defect.
+- Once the criterion is met and the required review is done, stop. A
+  further edit needs a concrete defect.
 - After two failed approaches to one problem, stop continuing. Send the
   manager both attempts, the failure, and the observation that would tell them
   apart.

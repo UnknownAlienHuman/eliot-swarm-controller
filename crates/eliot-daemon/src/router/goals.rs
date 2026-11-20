@@ -1359,12 +1359,17 @@ fn goal_completed_check_result(
             "goal check has no exit code; its outcome is unknown",
         ));
     };
-    // The no-progress digest and completeness stay on stdout, as before:
-    // stderr is the bounded tail the capture keeps, so it is diagnostic
-    // feedback for the Agent, labelled with its own completeness.
-    let digest = sha256_hex(stdout);
-    let stdout = policy.redact_text(&String::from_utf8_lossy(stdout));
+    // Many checks (cargo, rustc, clippy) report only on stderr, so the
+    // no-progress digest covers both streams. Same output is proven only when
+    // both were captured in full: a truncated stderr tail never proves no
+    // progress, it just leaves the round and turn budgets to stop the Goal.
     let stderr_text = policy.redact_text(&stderr.text);
+    let stderr_complete = !stderr.truncated && stderr.eof && !stderr.read_error;
+    let mut digest_input = stdout.to_vec();
+    digest_input.extend_from_slice(b"\0stderr\0");
+    digest_input.extend_from_slice(stderr_text.as_bytes());
+    let digest = sha256_hex(&digest_input);
+    let stdout = policy.redact_text(&String::from_utf8_lossy(stdout));
     let stderr_label = if stderr.read_error || !stderr.eof {
         "[stderr, incomplete]\n"
     } else if stderr.truncated {
@@ -1379,7 +1384,7 @@ fn goal_completed_check_result(
     };
     Ok(GoalCheckResult {
         exit_code: Some(exit_code),
-        output_complete: stdout_complete,
+        output_complete: stdout_complete && stderr_complete,
         output_digest: Some(digest),
         observation: check_observation(
             [
