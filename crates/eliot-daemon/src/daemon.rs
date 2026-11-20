@@ -7,10 +7,12 @@ use crate::{
     restart_capacity,
     router::Router,
 };
-use eliot_core::api::{MAX_SWARM_WAIT_MS, SwarmWaitRequest, SwarmWaitResponse, WaitTurnRef};
+use eliot_core::api::{
+    CommandGetRequest, MAX_SWARM_WAIT_MS, SwarmWaitRequest, SwarmWaitResponse, WaitTurnRef,
+};
 use eliot_core::{
-    Error, MAX_STDERR_DIAGNOSTIC_BYTES, Result, SecretPolicy, StderrDiagnostic,
-    bound_stderr_diagnostics,
+    Command, CommandState, Error, MAX_STDERR_DIAGNOSTIC_BYTES, Result, SecretPolicy,
+    StderrDiagnostic, bound_stderr_diagnostics,
 };
 use eliot_plugin::{RpcError, RpcRequest, RpcResponse};
 use futures_util::{SinkExt, StreamExt};
@@ -1158,6 +1160,33 @@ pub async fn wait_terminal(
             return Ok(true);
         }
     }
+}
+
+/// Pause before re-waiting when `swarm.wait` reported a turn-bound command
+/// complete by its turn while the command row itself still reads open.
+const SETTLE_LAG: Duration = Duration::from_millis(200);
+
+/// Wait server-side until one command is terminal (unknown included), then
+/// return its record; `None` when `deadline` passes first.
+pub async fn wait_command(
+    data_dir: &Path,
+    request: &CommandGetRequest,
+    deadline: Instant,
+) -> Result<Option<Command>> {
+    request.validate()?;
+    while wait_terminal(data_dir, vec![request.id.clone()], Vec::new(), deadline).await? {
+        let command: Command = client_call_typed(data_dir, "command.get", request).await?;
+        request.validate_response(&command)?;
+        if !matches!(
+            command.state,
+            CommandState::Accepted | CommandState::Queued | CommandState::Dispatched
+        ) {
+            return Ok(Some(command));
+        }
+        tokio::time::sleep(SETTLE_LAG.min(deadline.saturating_duration_since(Instant::now())))
+            .await;
+    }
+    Ok(None)
 }
 
 fn decode_client_result<R: DeserializeOwned>(method: &str, result: Result<Value>) -> Result<R> {

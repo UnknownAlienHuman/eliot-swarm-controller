@@ -485,6 +485,16 @@ pub async fn read_command(data_dir: &Path, id: &str) -> Result<Command> {
     Ok(command)
 }
 
+/// Server-side wait until one retained command is terminal; its record, or
+/// `None` when `deadline` passes first.
+pub async fn wait_command(
+    data_dir: &Path,
+    id: &str,
+    deadline: tokio::time::Instant,
+) -> Result<Option<Command>> {
+    eliot_daemon::wait_command(data_dir, &CommandGetRequest::new(id), deadline).await
+}
+
 /// Server-side wait (`swarm.wait`) until every listed command is terminal;
 /// false when `deadline` passes first.
 pub async fn wait_commands(

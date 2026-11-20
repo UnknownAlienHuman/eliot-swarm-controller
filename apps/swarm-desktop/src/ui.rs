@@ -676,31 +676,35 @@ fn settle_command(
     cancelled: &dyn Fn() -> bool,
 ) -> Fallible<Command> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(max_seconds);
-    while !wait_slice(data_dir, vec![id.to_owned()], deadline)? {
+    loop {
+        if let Some(command) = wait_slice(data_dir, id, deadline)? {
+            return Ok(command);
+        }
         if cancelled() {
             return Err(format!(
                 "stopped waiting; command {id} continues in the daemon"
             ));
         }
         if tokio::time::Instant::now() >= deadline {
-            break;
+            let command = client::block_on(client::read_command(data_dir, id))
+                .map_err(|error| error.to_string())?;
+            return Err(format!(
+                "command {id} still {} after {max_seconds}s; its outcome stays with the daemon",
+                format!("{:?}", command.state).to_lowercase()
+            ));
         }
     }
-    let command =
-        client::block_on(client::read_command(data_dir, id)).map_err(|error| error.to_string())?;
-    if scripts::is_terminal(command.state) {
-        return Ok(command);
-    }
-    Err(format!(
-        "command {id} still {} after {max_seconds}s; its outcome stays with the daemon",
-        format!("{:?}", command.state).to_lowercase()
-    ))
 }
 
-/// One server-side wait of at most [`SETTLE_SLICE`] for the listed commands.
-fn wait_slice(data_dir: &Path, ids: Vec<String>, deadline: tokio::time::Instant) -> Fallible<bool> {
+/// One server-side wait of at most [`SETTLE_SLICE`] for one command: its
+/// terminal record, or `None` when the slice ends first.
+fn wait_slice(
+    data_dir: &Path,
+    id: &str,
+    deadline: tokio::time::Instant,
+) -> Fallible<Option<Command>> {
     let slice = (tokio::time::Instant::now() + SETTLE_SLICE).min(deadline);
-    client::block_on(client::wait_commands(data_dir, ids, slice)).map_err(|error| error.to_string())
+    client::block_on(client::wait_command(data_dir, id, slice)).map_err(|error| error.to_string())
 }
 
 /// Longest server-side wait per slice while a settle loop watches commands.
@@ -740,9 +744,8 @@ fn settle_run(data_dir: &Path, parent: Command, cancelled: &dyn Fn() -> bool) ->
                 watched.id
             ));
         }
-        if wait_slice(data_dir, vec![watched.id.clone()], deadline)? {
-            watched = client::block_on(client::read_command(data_dir, &watched.id))
-                .map_err(|error| error.to_string())?;
+        if let Some(settled) = wait_slice(data_dir, &watched.id, deadline)? {
+            watched = settled;
         }
     }
 }
