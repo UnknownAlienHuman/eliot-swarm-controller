@@ -1,6 +1,9 @@
 use super::*;
 use eliot_core::api::process_state_name;
 
+/// The role of an enumerated descendant inside Agent custody.
+const CHILD_ROLE: &str = "child";
+
 impl Store {
     pub(super) fn observe_processes_inner(
         &mut self,
@@ -65,7 +68,14 @@ impl Store {
                 ],
             ));
             changed = true;
-            if old.is_none() {
+            // An enumerated descendant (`child`) is a registry row only; heavy
+            // descendants surface as `activity.heavy`. Plugin, harness and
+            // workspace-runner rows get lifecycle events; a child promoted to
+            // harness gets its start event at promotion.
+            if next.role == CHILD_ROLE {
+                continue;
+            }
+            if old.as_ref().is_none_or(|old| old.role == CHILD_ROLE) {
                 events.push(insert_process_event(
                     &tx,
                     agent_num,
@@ -168,9 +178,9 @@ fn merge_process_record(
         }
         if next.role != old.role {
             match (old.role.as_str(), next.role.as_str()) {
-                ("child", "harness") => {}
-                ("child", _) if matches!(scope, ProcessSourceKind::Workspace) => {}
-                (_, "child") => next.role = old.role.clone(),
+                (CHILD_ROLE, "harness") => {}
+                (CHILD_ROLE, _) if matches!(scope, ProcessSourceKind::Workspace) => {}
+                (_, CHILD_ROLE) => next.role = old.role.clone(),
                 _ => {
                     return Err(Error::new(
                         "source_integrity",

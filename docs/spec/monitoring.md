@@ -129,7 +129,11 @@ Observe-only attachment cannot issue either native stop or other control operati
 
 The OS monitor is authoritative for process start/exit/stats. A plugin may register a
 PID only if host verification places it inside that Agent custody. Enumeration and
-plugin registration upsert one identity and one start event.
+plugin registration upsert one identity. Plugin, harness and workspace-runner rows also
+append one `process.started` event and, on departure, one `process.exited` or
+`process.unknown` event. An enumerated descendant (`child`) is a registry row only:
+`processes AGENT` and stats show it, and a heavy one surfaces as `activity.heavy`. A
+child promoted to harness gets its start event at promotion.
 
 Process exit does **not** immediately imply session/turn loss. It races buffered stdout
 and final native events:
