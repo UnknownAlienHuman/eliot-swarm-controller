@@ -9,7 +9,7 @@ use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
     protocol::MAX_COMMAND_ID_BYTES,
     session::{
-        EVENT_DEADLINE, StreamSource, attach_final_text, attach_native_error,
+        EVENT_DEADLINE, MessageCommit, StreamSource, attach_final_text, attach_native_error,
         attach_provider_restriction, event_id as shared_event_id, native_no_write,
         next_input_outcomes, redact_request_details_for_commit, rejected_control, request_event_id,
         unknown_control,
@@ -472,9 +472,11 @@ impl TurnMessages {
             // acknowledged text instead of replacing it from that snapshot.
             return Ok(());
         }
-        source
-            .commit_event("message.completed", native_id.clone(), data)
-            .await?;
+        // A blank or gapped reply is no terminal text: only a committed fact
+        // becomes the turn's final text.
+        if source.commit_message(native_id.clone(), data).await? != MessageCommit::Committed {
+            return Ok(());
+        }
         self.acknowledged.insert(native_id);
         self.final_text = Some(text);
         Ok(())
@@ -2660,15 +2662,6 @@ impl EventProcessor {
             "turn_id": turn_id,
             "text": text,
         });
-        let encoded_len = match serde_json::to_vec(&data) {
-            Ok(bytes) => bytes.len(),
-            Err(_) => usize::MAX,
-        };
-        if encoded_len > MAX_EVENT_BYTES {
-            return self
-                .record_gap("Muse completed message exceeded the persisted-event bound")
-                .await;
-        }
         let native_id = event_id(
             self.status.session_id.as_deref().unwrap_or_default(),
             turn_id,

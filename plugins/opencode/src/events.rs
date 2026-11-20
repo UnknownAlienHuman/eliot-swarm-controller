@@ -14,12 +14,13 @@ use eliot_core::{
     ContextItem, ContextOutcome, Error, InjectPoint, Result, SecretPolicy, TurnUsage,
 };
 use eliot_plugin::{
-    CommitSink, MAX_EVENT_BYTES, PeerClient,
+    CommitSink, PeerClient,
     native_stdio::StreamState,
     protocol::{HookEvent, HookResponse},
     session::{
-        EVENT_DEADLINE, StreamSource, attach_final_text, attach_native_error, event_id,
-        next_input_outcomes, redact_request_details_for_commit, with_claimed_context,
+        EVENT_DEADLINE, MessageCommit, StreamSource, attach_final_text, attach_native_error,
+        event_id, is_blank_native_text, next_input_outcomes, redact_request_details_for_commit,
+        with_claimed_context,
     },
 };
 
@@ -1890,7 +1891,9 @@ impl EventProcessor {
             command_id,
             turn_id: turn_id.clone(),
             status: Some(status.to_owned()),
-            final_text: readback.and_then(|readback| readback.final_text),
+            final_text: readback
+                .and_then(|readback| readback.final_text)
+                .filter(|text| !is_blank_native_text(text)),
             terminal: true,
         });
         self.status.active_turn_id = None;
@@ -1917,15 +1920,6 @@ impl EventProcessor {
                 "turn_id": turn_id,
                 "text": secrets.redact_text(text),
             });
-            if serde_json::to_vec(&data)
-                .map(|bytes| bytes.len())
-                .unwrap_or(usize::MAX)
-                > MAX_EVENT_BYTES
-            {
-                self.record_gap("OpenCode completed message exceeded the persisted-event bound")
-                    .await?;
-                return Err(Error::new("unknown", "OpenCode reply exceeded its bound"));
-            }
             let native_id = event_id(
                 &terminal.session_id,
                 turn_id,
@@ -1934,8 +1928,10 @@ impl EventProcessor {
                 "opencode",
                 "OpenCode",
             )?;
-            self.commit_event("message.completed", native_id, data)
-                .await?;
+            let commit = self.stream_source().commit_message(native_id, data).await?;
+            if commit == MessageCommit::Gapped {
+                return Err(Error::new("unknown", "OpenCode reply exceeded its bound"));
+            }
         }
         let mut data =
             terminal_turn_data(command_id, turn_id, status, terminal, readback, &secrets);

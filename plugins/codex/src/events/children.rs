@@ -65,6 +65,33 @@ impl ChildState {
         source.commit_event(kind, native_id, data).await
     }
 
+    async fn commit_message(
+        &mut self,
+        sink: &mut CommitSink,
+        host: &PeerClient,
+        credential: &str,
+        native_id: String,
+        data: Value,
+    ) -> Result<MessageCommit> {
+        let mut source = StreamSource {
+            sink,
+            host,
+            credential,
+            agent_id: &self.binding.agent_id,
+            generation: self.binding.agent_generation,
+            harness: "Codex",
+            id_prefix: "codex",
+            families: &eliot_core::NATIVE_CHILD_FAMILIES,
+            writes_blocked: &mut self.writes_blocked,
+            gap_reported: &mut self.gap_reported,
+            gap_number: &mut self.gap_number,
+            source_unknown: &mut self.source_unknown,
+            batch_unknown: &mut self.batch_unknown,
+            failure: &mut self.failure,
+        };
+        source.commit_message(native_id, data).await
+    }
+
     async fn record_gap(
         &mut self,
         sink: &mut CommitSink,
@@ -1059,10 +1086,6 @@ impl EventProcessor {
         if let Some(phase) = item.get("phase").and_then(Value::as_str) {
             data["phase"] = Value::String(phase.to_owned());
         }
-        let encoded_len = match serde_json::to_vec(&data) {
-            Ok(bytes) => bytes.len(),
-            Err(_) => usize::MAX,
-        };
         let host = self.host.clone();
         let credential = self.credential.clone();
         let sink = &mut self.sink;
@@ -1070,27 +1093,11 @@ impl EventProcessor {
             .child_states
             .get_mut(child_thread)
             .ok_or_else(|| Error::new("bad_state", "Codex child state missing"))?;
-        if encoded_len > MAX_EVENT_BYTES {
-            return state
-                .record_gap(
-                    sink,
-                    &host,
-                    &credential,
-                    "Codex child completed message exceeded persisted-event bound",
-                )
-                .await;
-        }
         let native_id = event_id(child_thread, &turn_id, item_id, "message.completed")?;
         state
-            .commit_event(
-                sink,
-                &host,
-                &credential,
-                "message.completed",
-                native_id,
-                data,
-            )
+            .commit_message(sink, &host, &credential, native_id, data)
             .await
+            .map(|_| ())
     }
 
     async fn complete_child_turn(&mut self, child_thread: &str, params: Value) -> Result<()> {
