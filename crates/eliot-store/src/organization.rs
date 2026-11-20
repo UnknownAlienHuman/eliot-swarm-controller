@@ -205,21 +205,31 @@ fn organization_group() -> String {
     )
 }
 
-/// One normalized checkout path: a `\\?\` verbatim prefix dropped,
-/// backslashes as `/`, trailing separators trimmed, ASCII-lowercased
-/// (Windows compares paths case-insensitively; SQLite's `lower` folds ASCII
-/// only). [`checkout_key_sql`] is its SQL twin.
+/// One normalized checkout path, trailing separators trimmed. On Windows a
+/// `\\?\` verbatim prefix is dropped, backslashes become `/` and ASCII case
+/// is folded (Windows compares paths case-insensitively; SQLite's `lower`
+/// folds ASCII only). Elsewhere case and a literal backslash are part of the
+/// name, so `/repo/Foo` and `/repo/foo` stay distinct. [`checkout_key_sql`]
+/// is its SQL twin.
 fn checkout_key(path: &str) -> String {
-    path.replace(r"\\?\", "")
-        .replace('\\', "/")
-        .trim_end_matches('/')
-        .to_ascii_lowercase()
+    if cfg!(windows) {
+        path.replace(r"\\?\", "")
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_ascii_lowercase()
+    } else {
+        path.trim_end_matches('/').to_owned()
+    }
 }
 
 /// The SQL twin of [`checkout_key`] over one column expression: the group
 /// key and both member predicates normalize through it.
 fn checkout_key_sql(column: &str) -> String {
-    format!(r"lower(rtrim(replace(replace({column}, '\\?\', ''), '\', '/'), '/'))")
+    if cfg!(windows) {
+        format!(r"lower(rtrim(replace(replace({column}, '\\?\', ''), '\', '/'), '/'))")
+    } else {
+        format!("rtrim({column}, '/')")
+    }
 }
 
 /// One Agent's organization group ([`organization_group`]), tags and overlay

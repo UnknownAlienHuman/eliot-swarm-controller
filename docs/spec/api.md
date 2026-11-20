@@ -552,9 +552,11 @@ in. Optional `query` applies the `agent.list` search haystack to member
 pages and every group's `member_total` alike, so header counts follow the
 search; registered groups still read back their headers with zero totals
 when nothing matches. A legacy Agent whose retained project label is a
-checkout path groups under the registration of that exact path (verbatim
-prefix, separators, trailing separator and case normalized), without
-rewriting the label; a path two registrations share stays unplaced.
+checkout path groups under the registration of that exact path, without
+rewriting the label; a path two registrations share stays unplaced. Only
+trailing separators are normalized everywhere. On Windows the `\\?\`
+verbatim prefix is dropped, `\` and `/` compare equal and ASCII case is
+folded; on other platforms case and a literal backslash stay significant.
 A registered group carries its header in the same read: the manager (with
 its managed worktree `branch`), the assignment, `needs_assignment`, and its
 exact team `totals` and project slot use (`capacity`), the numbers
