@@ -538,18 +538,7 @@ fn project_resume_binding_for_dispatch_tx(
                     "managed resume workspace is not ready at its exact next generation",
                 ));
             }
-            None if workspace_path == registration.checkout => (
-                registration.checkout.clone(),
-                registration.repo_common_dir.clone(),
-                None,
-                None,
-            ),
-            None => {
-                return Err(Error::new(
-                    "not_allowed",
-                    "project Agent workspace is not the registered checkout",
-                ));
-            }
+            None => registered_checkout_binding(registration, workspace_path)?,
         };
     Ok(ProjectCommandBinding {
         registration_revision: registration.revision,
@@ -560,6 +549,25 @@ fn project_resume_binding_for_dispatch_tx(
         workspace_phase,
         workspace_target_generation,
     })
+}
+
+/// Bind a registered checkout directly when no managed workspace row exists.
+fn registered_checkout_binding(
+    registration: &core::api::ProjectRegistrationView,
+    workspace_path: &str,
+) -> Result<(String, String, Option<WorkspacePhase>, Option<i64>)> {
+    if workspace_path != registration.checkout {
+        return Err(Error::new(
+            "not_allowed",
+            "project Agent workspace is not the registered checkout",
+        ));
+    }
+    Ok((
+        registration.checkout.clone(),
+        registration.repo_common_dir.clone(),
+        None,
+        None,
+    ))
 }
 
 fn targetless_project_command_binding(registration_revision: i64) -> ProjectCommandBinding {
@@ -855,18 +863,7 @@ fn project_binding_for_agent_tx(
                     "managed Agent workspace is not ready at this generation or its repository identity changed",
                 ));
             }
-            None if workspace_path == registration.checkout => (
-                registration.checkout.clone(),
-                registration.repo_common_dir.clone(),
-                None,
-                None,
-            ),
-            None => {
-                return Err(Error::new(
-                    "not_allowed",
-                    "project Agent workspace is not the registered checkout",
-                ));
-            }
+            None => registered_checkout_binding(registration, workspace_path)?,
         };
     Ok(ProjectCommandBinding {
         registration_revision: registration.revision,
