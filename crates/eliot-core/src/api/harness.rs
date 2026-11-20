@@ -593,8 +593,8 @@ pub const MAX_CATALOG_QUERY_BYTES: usize = 128;
 pub const MAX_CATALOG_LIMIT: usize = 100;
 /// Default `models.catalog` page size.
 pub const DEFAULT_CATALOG_LIMIT: usize = 50;
-/// Maximum models returned in one `models.catalog` page is the page limit;
-/// the aggregated catalogue behind the page is bounded by the per-harness cap.
+/// Maximum models in one `models.catalog` response (a validation bound on a
+/// single page). A listing spans pages, so it has no total bound here.
 pub const MAX_CATALOG_MODELS: usize = 1024;
 
 /// Availability of one catalogue model: `available` (provider quota supports

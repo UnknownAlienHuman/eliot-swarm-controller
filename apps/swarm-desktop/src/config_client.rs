@@ -213,13 +213,18 @@ pub async fn routing_preview(data_dir: &Path, role: Option<String>) -> Result<Ro
     Ok(reply.decision)
 }
 
-/// Pages of `models.catalog` the picker reads at most (100 models each:
-/// the daemon's 1024-model aggregate bound).
-const CATALOG_PAGES: usize = 11;
+/// Safety bound on `models.catalog` pages one listing reads (100 models
+/// each). The daemon's own bound is per response, not per listing, so this
+/// only stops a misbehaving daemon from paging forever. Reaching it leaves
+/// the returned `next` set: the listing is partial and says so.
+const CATALOG_MAX_PAGES: usize = 100;
 
 /// The unified model catalogue for the composer's picker: every installed
-/// harness with its version, and every model page by page (the daemon
-/// caches and coalesces the native reads).
+/// harness with its version, and the models read page by page until the
+/// daemon reports the end (`next` absent). A listing that changed between
+/// pages fails with the daemon's stale-cursor error instead of mixing two
+/// listings; the picker's next open reads it again. The daemon caches and
+/// coalesces the native reads.
 pub async fn models_catalog(data_dir: &Path) -> Result<ModelsCatalogResponse> {
     let mut request = ModelsCatalogRequest {
         query: None,
@@ -227,12 +232,13 @@ pub async fn models_catalog(data_dir: &Path) -> Result<ModelsCatalogResponse> {
         limit: Some(MAX_CATALOG_LIMIT),
     };
     let mut whole: Option<ModelsCatalogResponse> = None;
-    for _ in 0..CATALOG_PAGES {
+    let mut next = None;
+    for _ in 0..CATALOG_MAX_PAGES {
         request.validate()?;
         let page: ModelsCatalogResponse =
             eliot_daemon::client_call_typed(data_dir, "models.catalog", &request).await?;
         request.validate_response(&page)?;
-        let next = page.next.clone();
+        next = page.next.clone();
         match whole.as_mut() {
             Some(whole) => {
                 whole.models.extend(page.models);
@@ -241,13 +247,15 @@ pub async fn models_catalog(data_dir: &Path) -> Result<ModelsCatalogResponse> {
             }
             None => whole = Some(page),
         }
-        match next {
-            Some(after) => request.after = Some(after),
-            None => break,
-        }
+        let Some(after) = next.clone() else {
+            break;
+        };
+        request.after = Some(after);
     }
     let mut whole = whole.ok_or_else(|| Error::new("unknown", "no catalogue page was read"))?;
-    whole.next = None;
+    // `next` is the last page's cursor: `None` for a complete listing, set
+    // when the page bound stopped the read (a partial listing).
+    whole.next = next;
     Ok(whole)
 }
 
