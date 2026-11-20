@@ -39,7 +39,6 @@ use eliot_plugin::{
         with_context_points,
     },
     skill,
-    start_classification::SettledStartFailure,
 };
 use serde_json::{Value, json};
 use std::{
@@ -66,7 +65,7 @@ struct CodexPlugin {
     initialized: Option<Initialized>,
     session: Option<AgentSession>,
     failed_start: Option<FailedStart>,
-    failed_attach: Option<FailedObserverAttach>,
+    failed_attach: Option<FailedAttach>,
     observer: Option<ObserverSession>,
 }
 
@@ -75,44 +74,13 @@ struct Initialized {
     instance_dir: String,
 }
 
-struct FailedStart {
-    agent_id: String,
-    generation: i64,
-    command_id: String,
-    outcome: SettledStartFailure,
-}
+/// One start already settled failed: the daemon retires this plugin process
+/// and never re-sends agent.start.
+struct FailedStart;
 
-struct FailedObserverAttach {
-    params: ObserverAttachParams,
-    outcome: Value,
-}
-
-impl FailedObserverAttach {
-    fn new(params: &ObserverAttachParams, outcome: Value) -> Self {
-        Self {
-            params: params.clone(),
-            outcome,
-        }
-    }
-
-    fn replay(&self, params: &ObserverAttachParams) -> Result<Value> {
-        let exact = serde_json::to_value(&self.params)
-            .and_then(|retained| serde_json::to_value(params).map(|params| retained == params))
-            .map_err(|_| {
-                Error::new(
-                    "internal",
-                    "Codex observer attach binding could not be compared",
-                )
-            })?;
-        if exact {
-            return Ok(self.outcome.clone());
-        }
-        Err(Error::new(
-            "id_conflict",
-            "Codex observer attach retry changed its retained binding",
-        ))
-    }
-}
+/// One observer attach already settled failed: the daemon opens a fresh
+/// reader for any later attach.
+struct FailedAttach;
 
 fn is_proven_observer_start_failure(error: &Error) -> bool {
     error.code == "native_start_failed"
@@ -136,7 +104,6 @@ struct AgentSession {
     agent_id: String,
     generation: i64,
     start_command_id: String,
-    start_result: Option<Value>,
     phase: SessionPhase,
     thread_id: Option<String>,
     native_scope: String,
@@ -875,41 +842,39 @@ impl CodexPlugin {
                 "Codex observation requires a dedicated plugin instance",
             ));
         }
+        // The daemon calls agent.attach once per freshly spawned reader.
+        if self.observer.is_some() || self.failed_attach.is_some() {
+            return Err(Error::new(
+                "bad_state",
+                "Codex plugin already received agent.attach",
+            ));
+        }
         observe::validate_attach_binding(&params)?;
-        if let Some(failed) = &self.failed_attach {
-            return failed.replay(&params);
-        }
-        if let Some(observer) = &self.observer {
-            return observer.repeat_attach(&params);
-        }
-        let (launch, secrets, metadata_secrets) = match self
-            .reader_launch(&params.profile, &params.target_environment)
-        {
-            Ok(launch) => launch,
-            Err(_) => {
-                let result = observe::failed_attach_result(&params, "observer_preparation_failed");
-                self.failed_attach = Some(FailedObserverAttach::new(&params, result.clone()));
-                return Ok(result);
-            }
-        };
+        let (launch, secrets, metadata_secrets) =
+            match self.reader_launch(&params.profile, &params.target_environment) {
+                Ok(launch) => launch,
+                Err(_) => {
+                    self.failed_attach = Some(FailedAttach);
+                    return Ok(observe::failed_attach_result(
+                        &params,
+                        "observer_preparation_failed",
+                    ));
+                }
+            };
         if let Err(error) = observe::validate_attach_preparation(&params, &secrets) {
             if error.code == "frame_too_large" {
-                let result = observe::failed_attach_result(&params, "observer_preparation_failed");
-                self.failed_attach = Some(FailedObserverAttach::new(&params, result.clone()));
-                return Ok(result);
+                self.failed_attach = Some(FailedAttach);
+                return Ok(observe::failed_attach_result(
+                    &params,
+                    "observer_preparation_failed",
+                ));
             }
             return Err(error);
         }
-        let failure = FailedObserverAttach::new(
-            &params,
-            observe::failed_attach_result(&params, "native_start_failed"),
-        );
+        let failure = observe::failed_attach_result(&params, "native_start_failed");
         // A scope refusal proves no native effect: only the read-only store
-        // probe ran. It retains a preparation failure for exact-binding replay.
-        let scope_failure = FailedObserverAttach::new(
-            &params,
-            observe::failed_attach_result(&params, "observer_preparation_failed"),
-        );
+        // probe ran.
+        let scope_failure = observe::failed_attach_result(&params, "observer_preparation_failed");
         let attach = ObserverSession::attach(
             params,
             launch,
@@ -924,22 +889,12 @@ impl CodexPlugin {
                 Ok(result)
             }
             Err(error) if is_proven_observer_start_failure(&error) => {
-                self.failed_attach = Some(failure);
-                Ok(self
-                    .failed_attach
-                    .as_ref()
-                    .expect("failed attach was just retained")
-                    .outcome
-                    .clone())
+                self.failed_attach = Some(FailedAttach);
+                Ok(failure)
             }
             Err(error) if is_proven_scope_refusal(&error) => {
-                self.failed_attach = Some(scope_failure);
-                Ok(self
-                    .failed_attach
-                    .as_ref()
-                    .expect("scope refusal was just retained")
-                    .outcome
-                    .clone())
+                self.failed_attach = Some(FailedAttach);
+                Ok(scope_failure)
             }
             Err(error) => Err(error),
         }
@@ -968,40 +923,12 @@ impl CodexPlugin {
             &params.command_id,
             "Codex",
         )?;
-        if let Some(session) = &self.session {
-            if session.agent_id == params.agent_id
-                && session.generation == params.generation
-                && session.start_command_id == params.command_id
-            {
-                return match session.phase {
-                    SessionPhase::Ready => session.start_result.clone().ok_or_else(|| {
-                        Error::new("unknown", "Codex start result was not retained")
-                    }),
-                    SessionPhase::Unknown => Err(Error::new(
-                        "unknown",
-                        "Codex thread/start outcome is unresolved; it will not be repeated",
-                    )),
-                    SessionPhase::Stopped => Err(Error::new(
-                        "bad_state",
-                        "Codex Agent generation has already stopped",
-                    )),
-                };
-            }
-            return Err(Error::new(
-                "stale_generation",
-                "Codex plugin is already bound to another Agent generation",
-            ));
-        }
-        if let Some(failed) = &self.failed_start {
-            if failed.agent_id == params.agent_id
-                && failed.generation == params.generation
-                && failed.command_id == params.command_id
-            {
-                return failed.outcome.replay();
-            }
+        // The daemon sends agent.start exactly once per freshly spawned plugin
+        // process: a bound or settled plugin never starts again.
+        if self.session.is_some() || self.failed_start.is_some() {
             return Err(Error::new(
                 "bad_state",
-                "Codex plugin already settled a different start command",
+                "Codex plugin already received agent.start",
             ));
         }
         let initialized = self
@@ -1182,7 +1109,6 @@ impl CodexPlugin {
             agent_id: params.agent_id.clone(),
             generation: params.generation,
             start_command_id: params.command_id.clone(),
-            start_result: None,
             phase: SessionPhase::Unknown,
             thread_id: None,
             native_scope: String::new(),
@@ -1226,12 +1152,7 @@ impl CodexPlugin {
                 return Err(contextual_error(error, "unknown", message));
             }
             let error = session.native_client.diagnostic_error(error);
-            self.failed_start = Some(FailedStart {
-                agent_id: params.agent_id.clone(),
-                generation: params.generation,
-                command_id: params.command_id.clone(),
-                outcome: SettledStartFailure::Uncertain(error.clone()),
-            });
+            self.failed_start = Some(FailedStart);
             return Err(error);
         }
         Ok(session)
@@ -1390,12 +1311,7 @@ impl CodexPlugin {
                 };
                 let error = contextual_error(error, code, message);
                 let error = discard_failed_start(&mut session, error).await;
-                self.failed_start = Some(FailedStart {
-                    agent_id: params.agent_id.clone(),
-                    generation: params.generation,
-                    command_id: params.command_id.clone(),
-                    outcome: SettledStartFailure::Uncertain(error.clone()),
-                });
+                self.failed_start = Some(FailedStart);
                 return Err(error);
             }
             Err(error) if native_no_write(&error.code) => {
@@ -1403,12 +1319,7 @@ impl CodexPlugin {
                 let code = error.code.clone();
                 let error = contextual_error(error, code, message);
                 let error = discard_failed_start(&mut session, error).await;
-                self.failed_start = Some(FailedStart {
-                    agent_id: params.agent_id.clone(),
-                    generation: params.generation,
-                    command_id: params.command_id.clone(),
-                    outcome: SettledStartFailure::Uncertain(error.clone()),
-                });
+                self.failed_start = Some(FailedStart);
                 return Err(error);
             }
             Err(error) => {
@@ -1493,12 +1404,7 @@ impl CodexPlugin {
         // fails the start like any rejected dispatch.
         if let Err(error) = deliver_swarm_skill(&session.native_client, &plan.data_dir).await {
             let error = discard_failed_start(&mut session, error).await;
-            self.failed_start = Some(FailedStart {
-                agent_id: params.agent_id.clone(),
-                generation: params.generation,
-                command_id: params.command_id.clone(),
-                outcome: SettledStartFailure::Uncertain(error.clone()),
-            });
+            self.failed_start = Some(FailedStart);
             return Err(error);
         }
         // Requested vs observed MCP surface: read the thread-scoped
@@ -1524,12 +1430,7 @@ impl CodexPlugin {
                 Ok(inventory) => inventory,
                 Err(error) => {
                     let error = discard_failed_start(&mut session, error).await;
-                    self.failed_start = Some(FailedStart {
-                        agent_id: params.agent_id.clone(),
-                        generation: params.generation,
-                        command_id: params.command_id.clone(),
-                        outcome: SettledStartFailure::Uncertain(error.clone()),
-                    });
+                    self.failed_start = Some(FailedStart);
                     return Err(error);
                 }
             }
@@ -1648,7 +1549,6 @@ impl CodexPlugin {
         if let Some(mode) = session.collaboration_mode {
             result["requested"]["collaboration_mode"] = json!(mode);
         }
-        session.start_result = Some(result.clone());
         self.session = Some(session);
         Ok(result)
     }
@@ -1683,12 +1583,7 @@ impl CodexPlugin {
         };
         let error = eliot_plugin::session::classify_start_failure(error, "codex", "prepare");
         let value = eliot_plugin::session::failed_start_value(params, error);
-        self.failed_start = Some(FailedStart {
-            agent_id: params.agent_id.clone(),
-            generation: params.generation,
-            command_id: params.command_id.clone(),
-            outcome: SettledStartFailure::ProvenNoEffect(value.clone()),
-        });
+        self.failed_start = Some(FailedStart);
         Ok(value)
     }
 
