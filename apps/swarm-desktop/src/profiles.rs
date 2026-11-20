@@ -9,6 +9,11 @@
 //! daemon (`settings.save`, dry run first), which runs its own parser and
 //! launch resolution; nothing here decides validity.
 
+use eliot_core::api::native_profile::{
+    ANTIGRAVITY_MODES, CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES, COMMON_EFFORTS,
+    CodexApprovalPolicy, CodexPermissions, MUSE_APPROVALS, MUSE_PERMISSIONS,
+};
+
 /// The first choice of an enumerated field: the key is left out, so the
 /// harness default applies.
 pub const DEFAULT_CHOICE: &str = "Default";
@@ -21,9 +26,6 @@ pub struct FormField {
     pub label: &'static str,
     pub values: Vec<String>,
 }
-
-/// Claude Code's and the ad-hoc launch's effort vocabulary.
-const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
 /// The enumerated fields a profile of `harness` takes besides its model,
 /// with that harness's real values (the daemon's profile validation in
@@ -49,54 +51,47 @@ pub fn form_fields(harness: &str, efforts: Option<&[String]>) -> Vec<FormField> 
     };
     match harness {
         "codex" => vec![
-            effort(&["low", "medium", "high", "xhigh"]),
+            effort(&COMMON_EFFORTS),
             FormField {
                 key: "permissions",
                 label: "Permissions",
-                values: list(&["read-only", "workspace-write", "danger-full-access"]),
+                values: list(&CodexPermissions::ALL.map(CodexPermissions::as_str)),
             },
             FormField {
                 key: "approval_policy",
                 label: "Approval policy",
-                values: list(&["never", "on-request"]),
+                values: list(&CodexApprovalPolicy::ALL.map(CodexApprovalPolicy::as_str)),
             },
         ],
         "claude" => vec![
             FormField {
                 key: "effort",
                 label: "Effort",
-                values: list(&EFFORTS),
+                values: list(&CLAUDE_EFFORTS),
             },
             FormField {
                 key: "approval",
                 label: "Permission mode",
-                values: list(&[
-                    "manual",
-                    "auto",
-                    "acceptEdits",
-                    "plan",
-                    "dontAsk",
-                    "bypassPermissions",
-                ]),
+                values: list(&CLAUDE_PERMISSION_MODES),
             },
         ],
         "muse" => vec![
-            effort(&["low", "medium", "high", "xhigh"]),
+            effort(&COMMON_EFFORTS),
             FormField {
                 key: "approval",
                 label: "Approval",
-                values: list(&["onRequest", "promptUnmatched", "denyUnmatched", "allowAll"]),
+                values: list(&MUSE_APPROVALS),
             },
             FormField {
                 key: "permissions",
                 label: "Permissions",
-                values: list(&["workspace-write", "danger-full-access"]),
+                values: list(&MUSE_PERMISSIONS.map(CodexPermissions::as_str)),
             },
         ],
         "antigravity" => vec![FormField {
             key: "mode",
             label: "Mode",
-            values: list(&["plan", "auto", "accept-edits"]),
+            values: list(&ANTIGRAVITY_MODES),
         }],
         _ => Vec::new(),
     }

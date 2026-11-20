@@ -8,6 +8,10 @@
 //!
 //! Snapshots retain admitted environment names. Codex retains its native-store execution inputs. Private
 //! route selectors are bound by digest and resolved only in the process environment.
+use core::api::native_profile::{
+    ANTIGRAVITY_MODES, CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES, CodexApprovalPolicy,
+    CodexCollaborationMode, CodexPermissions, MUSE_APPROVALS, MUSE_PERMISSIONS,
+};
 use eliot_core as core;
 use eliot_plugin::session::split_provider_model;
 use serde::Deserialize;
@@ -41,11 +45,6 @@ const MAX_CMD_LEN: usize = 1024;
 const MAX_ENV_NAME_LEN: usize = 256;
 const MAX_PASS_ENV_ENTRIES: usize = 64;
 const MAX_CHILD_PROFILES: usize = 64;
-const APPROVAL_POLICY_NEVER: &str = "never";
-const APPROVAL_POLICY_ON_REQUEST: &str = "on-request";
-const PERMISSION_READ_ONLY: &str = "read-only";
-const PERMISSION_WORKSPACE_WRITE: &str = "workspace-write";
-const PERMISSION_DANGER_FULL_ACCESS: &str = "danger-full-access";
 
 /// Codex dispatch already retains these execution inputs verbatim. Other
 /// store and provider selectors are verified against an opaque route identity.
@@ -1679,7 +1678,7 @@ fn snapshot_from_entry(
         site,
         "collaboration_mode",
         entry.collaboration_mode.as_deref(),
-        &["default", "plan"],
+        &CodexCollaborationMode::ALL.map(CodexCollaborationMode::as_str),
         "must be default or plan",
         "profile_error",
     )?;
@@ -1687,24 +1686,20 @@ fn snapshot_from_entry(
         site,
         "permissions",
         entry.permissions.as_deref(),
-        &[
-            PERMISSION_READ_ONLY,
-            PERMISSION_WORKSPACE_WRITE,
-            PERMISSION_DANGER_FULL_ACCESS,
-        ],
+        &CodexPermissions::ALL.map(CodexPermissions::as_str),
         "unsupported permission mode",
         "unsupported",
     )?
-    .unwrap_or(PERMISSION_WORKSPACE_WRITE);
+    .unwrap_or(CodexPermissions::default().as_str());
     let approval_policy = validated_choice(
         site,
         "approval_policy",
         entry.approval_policy.as_deref(),
-        &[APPROVAL_POLICY_NEVER, APPROVAL_POLICY_ON_REQUEST],
+        &CodexApprovalPolicy::ALL.map(CodexApprovalPolicy::as_str),
         "must be never or on-request",
         "profile_error",
     )?
-    .unwrap_or(APPROVAL_POLICY_NEVER);
+    .unwrap_or(CodexApprovalPolicy::default().as_str());
     reject_unmapped(
         site,
         &[
@@ -1901,7 +1896,7 @@ fn muse_snapshot_from_entry(
         site,
         "approval",
         entry.approval.as_deref(),
-        &["allowAll", "promptUnmatched", "onRequest", "denyUnmatched"],
+        &MUSE_APPROVALS,
         "must be allowAll, promptUnmatched, onRequest or denyUnmatched",
         "profile_error",
     )?;
@@ -1917,16 +1912,16 @@ fn muse_snapshot_from_entry(
         site,
         "permissions",
         entry.permissions.as_deref(),
-        &[PERMISSION_WORKSPACE_WRITE, PERMISSION_DANGER_FULL_ACCESS],
+        &MUSE_PERMISSIONS.map(CodexPermissions::as_str),
         "the Muse slice supports only workspace-write or danger-full-access",
         "unsupported",
     )?
-    .unwrap_or(PERMISSION_WORKSPACE_WRITE);
+    .unwrap_or(CodexPermissions::default().as_str());
     validated_choice(
         site,
         "approval_policy",
         entry.approval_policy.as_deref(),
-        &[APPROVAL_POLICY_NEVER],
+        &[CodexApprovalPolicy::Never.as_str()],
         "the Muse slice leaves approvals unconnected",
         "unsupported",
     )?;
@@ -1975,7 +1970,7 @@ fn muse_snapshot_from_entry(
     );
     snapshot.insert(
         "approval_policy".to_owned(),
-        Value::String(APPROVAL_POLICY_NEVER.to_owned()),
+        Value::String(CodexApprovalPolicy::Never.as_str().to_owned()),
     );
     insert_control(
         &mut snapshot,
@@ -2019,7 +2014,7 @@ fn claude_snapshot_from_entry(
             .effort
             .as_deref()
             .filter(|value| !value.trim().is_empty()),
-        &["low", "medium", "high", "xhigh", "max"],
+        &CLAUDE_EFFORTS,
         "unknown Claude effort level (low, medium, high, xhigh, or max)",
         "profile_error",
     )?;
@@ -2030,14 +2025,7 @@ fn claude_snapshot_from_entry(
             .approval
             .as_deref()
             .filter(|value| !value.trim().is_empty()),
-        &[
-            "acceptEdits",
-            "auto",
-            "bypassPermissions",
-            "manual",
-            "dontAsk",
-            "plan",
-        ],
+        &CLAUDE_PERMISSION_MODES,
         "unknown Claude permission mode (acceptEdits, auto, bypassPermissions, manual, dontAsk, or plan)",
         "profile_error",
     )?;
@@ -2053,7 +2041,7 @@ fn claude_snapshot_from_entry(
         site,
         "permissions",
         entry.permissions.as_deref(),
-        &[PERMISSION_WORKSPACE_WRITE],
+        &[CodexPermissions::WorkspaceWrite.as_str()],
         "the Claude slice runs the CLI-default permission posture",
         "unsupported",
     )?;
@@ -2061,7 +2049,7 @@ fn claude_snapshot_from_entry(
         site,
         "approval_policy",
         entry.approval_policy.as_deref(),
-        &[APPROVAL_POLICY_NEVER],
+        &[CodexApprovalPolicy::Never.as_str()],
         "the Claude slice leaves approvals unconnected",
         "unsupported",
     )?;
@@ -2088,11 +2076,11 @@ fn claude_snapshot_from_entry(
     }
     snapshot.insert(
         "permissions".to_owned(),
-        Value::String(PERMISSION_WORKSPACE_WRITE.to_owned()),
+        Value::String(CodexPermissions::WorkspaceWrite.as_str().to_owned()),
     );
     snapshot.insert(
         "approval_policy".to_owned(),
-        Value::String(APPROVAL_POLICY_NEVER.to_owned()),
+        Value::String(CodexApprovalPolicy::Never.as_str().to_owned()),
     );
     if let Some(mode) = permission_mode {
         snapshot.insert("permission_mode".to_owned(), Value::String(mode.to_owned()));
@@ -2314,7 +2302,7 @@ fn antigravity_snapshot_from_entry(
         site,
         "mode",
         entry.mode.as_deref(),
-        &["plan", "auto", "accept-edits"],
+        &ANTIGRAVITY_MODES,
         "must be plan, auto, or accept-edits",
         "profile_error",
     )?;

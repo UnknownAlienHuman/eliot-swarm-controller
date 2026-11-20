@@ -1736,12 +1736,15 @@ pub(super) fn agent_access_label(settings: &crate::configure::Settings) -> Strin
 
 /// The access chip's words for a profile's permissions.
 pub(super) fn access_label(permissions: Option<&str>) -> String {
-    match permissions {
-        None => "Default access".to_owned(),
-        Some("danger-full-access") => "Full access".to_owned(),
-        Some("read-only") => "Read only".to_owned(),
-        Some("workspace-write") => "Workspace write".to_owned(),
-        Some(other) => other.replace(['-', '_'], " "),
+    use eliot_core::api::native_profile::CodexPermissions;
+    let Some(value) = permissions else {
+        return "Default access".to_owned();
+    };
+    match CodexPermissions::parse(value) {
+        Some(CodexPermissions::DangerFullAccess) => "Full access".to_owned(),
+        Some(CodexPermissions::ReadOnly) => "Read only".to_owned(),
+        Some(CodexPermissions::WorkspaceWrite) => "Workspace write".to_owned(),
+        None => value.replace(['-', '_'], " "),
     }
 }
 

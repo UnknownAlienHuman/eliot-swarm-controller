@@ -20,6 +20,9 @@ use crate::{
     observe::{self, ObserverSession},
     route::CodexRoute,
 };
+use eliot_core::api::native_profile::{
+    CodexCollaborationMode, CodexPermissions, CodexProfileFields,
+};
 use eliot_core::{
     ContextOutcome, Error, InjectArgs, InjectPoint, McpPolicy, NativeStoreBinding, Result,
     SecretPolicy,
@@ -32,7 +35,7 @@ use eliot_plugin::{
     session::{
         attach_reply_diagnostics, begin_stop, decode, ensure_dedicated_reader,
         ensure_reader_harness, initialize_fields_valid, is_passed_env, is_secret_name,
-        native_no_write, not_initialized, optional_profile_text, parse_resume_subject, paths_equal,
+        native_no_write, not_initialized, parse_resume_subject, paths_equal,
         register_native_process, rejected_control, request_reply_ids,
         target_environment as shared_target_environment, unknown_control, unknown_snapshot,
         validate_binding, validate_identity, validate_source_plan, with_claimed_context,
@@ -242,25 +245,24 @@ fn validate_start_plan(
     }
     let route = CodexRoute::from_profile(frozen_profile)?;
     let frozen_store = frozen_store_binding(profile)?;
-    let native_subagents = profile
-        .get("native_subagents")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
+    // The frozen profile's Codex fields decode once against the core
+    // vocabulary; that decode is the boundary check.
+    let fields: CodexProfileFields =
+        serde_json::from_value(frozen_profile.clone()).map_err(|error| {
+            Error::new(
+                "profile_error",
+                format!("Codex frozen profile is invalid: {error}"),
+            )
+        })?;
+    let non_blank = |value: Option<String>| value.filter(|value| !value.trim().is_empty());
+    let native_subagents = fields.native_subagents;
     // An omitted model selects the harness native default (`isDefault`)
     // at start; an explicit model must match exactly or fail honestly
     // with no substitution. Requested-absent stays null in readback.
     // The daemon carries its frozen choice separately in `daemon_model`,
     // so a model-less launch never becomes an explicit request.
-    let requested_model: Option<String> = profile
-        .get("model")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_owned);
-    let daemon_model: Option<String> = profile
-        .get("daemon_model")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_owned);
+    let requested_model = non_blank(fields.model);
+    let daemon_model = non_blank(fields.daemon_model);
     // A caller request and a daemon freeze never name different models:
     // the freeze only fills an omitted request.
     if let (Some(requested), Some(frozen)) = (&requested_model, &daemon_model)
@@ -271,42 +273,18 @@ fn validate_start_plan(
             "Codex frozen daemon model does not match the requested model",
         ));
     }
-    let requested_effort = optional_profile_text(profile, "effort", "Codex")?;
-    let collaboration_mode =
-        match optional_profile_text(profile, "collaboration_mode", "Codex")?.as_deref() {
-            None => None,
-            Some("default") => Some(NativeCollaborationModeKind::Default),
-            Some("plan") => Some(NativeCollaborationModeKind::Plan),
-            Some(_) => {
-                return Err(Error::new(
-                    "profile_error",
-                    "Codex collaboration_mode must be default or plan",
-                ));
-            }
-        };
-    let permissions = profile
-        .get("permissions")
-        .and_then(Value::as_str)
-        .unwrap_or("workspace-write")
-        .to_owned();
-    if !matches!(
-        permissions.as_str(),
-        "read-only" | "workspace-write" | "danger-full-access"
-    ) {
-        return Err(Error::new(
-            "profile_error",
-            "Codex profile permissions must be read-only, workspace-write, or danger-full-access",
-        ));
-    }
-    let sandbox_mode = native_sandbox_mode(&permissions)?;
-    let approval_policy = optional_profile_text(profile, "approval_policy", "Codex")?
-        .unwrap_or_else(|| "never".to_owned());
-    if !matches!(approval_policy.as_str(), "never" | "on-request") {
-        return Err(Error::new(
-            "profile_error",
-            "Codex approval_policy must be never or on-request",
-        ));
-    }
+    let requested_effort = non_blank(fields.effort);
+    let collaboration_mode = fields.collaboration_mode.map(|mode| match mode {
+        CodexCollaborationMode::Default => NativeCollaborationModeKind::Default,
+        CodexCollaborationMode::Plan => NativeCollaborationModeKind::Plan,
+    });
+    let sandbox_mode = match fields.permissions {
+        CodexPermissions::ReadOnly => NativeSandboxMode::ReadOnly,
+        CodexPermissions::WorkspaceWrite => NativeSandboxMode::WorkspaceWrite,
+        CodexPermissions::DangerFullAccess => NativeSandboxMode::DangerFullAccess,
+    };
+    let permissions = fields.permissions.as_str().to_owned();
+    let approval_policy = fields.approval_policy.as_str().to_owned();
     let (mcp_policy, mcp_allow) = policy_from_profile(profile)?;
     let mcp_cloud_hostname = cloud_hostname_from_profile(profile);
     let workspace = params
@@ -2870,18 +2848,6 @@ fn thread_state(thread: &Value) -> &'static str {
             if waiting { "waiting" } else { "busy" }
         }
         _ => "unknown",
-    }
-}
-
-fn native_sandbox_mode(permission: &str) -> Result<NativeSandboxMode> {
-    match permission {
-        "read-only" => Ok(NativeSandboxMode::ReadOnly),
-        "workspace-write" => Ok(NativeSandboxMode::WorkspaceWrite),
-        "danger-full-access" => Ok(NativeSandboxMode::DangerFullAccess),
-        _ => Err(Error::new(
-            "profile_error",
-            "Codex profile permissions are not a supported sandbox mode",
-        )),
     }
 }
 

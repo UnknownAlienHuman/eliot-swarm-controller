@@ -3,6 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use eliot_core::api::native_profile::ANTIGRAVITY_MODES;
 use eliot_core::{Error, Result, SecretPolicy};
 use eliot_plugin::{
     AgentStartParams,
@@ -207,7 +208,7 @@ impl Plan {
         let mode = optional_profile_text(profile, "mode", "Antigravity")?;
         if mode
             .as_deref()
-            .is_some_and(|mode| !matches!(mode, "plan" | "auto" | "accept-edits"))
+            .is_some_and(|mode| !ANTIGRAVITY_MODES.contains(&mode))
         {
             return Err(Error::new(
                 "profile_error",
