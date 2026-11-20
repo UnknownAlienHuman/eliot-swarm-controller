@@ -15,7 +15,7 @@
 use std::path::Path;
 
 use eliot_core::AgentState;
-use eliot_core::api::harness::{MAX_CATALOG_LIMIT, catalog_cursor_is_stale};
+use eliot_core::api::harness::MAX_CATALOG_LIMIT;
 use eliot_core::api::{
     AgentListRequest, ArchivedFilter, DaemonStatusRequest, DaemonStatusResponse,
     HarnessQuotaRequest, HarnessQuotaResponse, ManagedWorkspaceView, ModelsCatalogRequest,
@@ -221,18 +221,11 @@ const CATALOG_MAX_PAGES: usize = 100;
 
 /// The unified model catalogue for the composer's picker: every installed
 /// harness with its version, and the models read page by page until the
-/// daemon reports the end (`next` absent). A stale cursor (the listing
-/// changed between pages) restarts the listing once from the first page; a
-/// second failure is returned. The daemon caches and coalesces the native
-/// reads.
+/// daemon reports the end (`next` absent). A listing that changed between
+/// pages fails with the daemon's stale-cursor error instead of mixing two
+/// listings; the picker's next open reads it again. The daemon caches and
+/// coalesces the native reads.
 pub async fn models_catalog(data_dir: &Path) -> Result<ModelsCatalogResponse> {
-    match read_models_catalog(data_dir).await {
-        Err(error) if catalog_cursor_is_stale(&error) => read_models_catalog(data_dir).await,
-        result => result,
-    }
-}
-
-async fn read_models_catalog(data_dir: &Path) -> Result<ModelsCatalogResponse> {
     let mut request = ModelsCatalogRequest {
         query: None,
         after: None,

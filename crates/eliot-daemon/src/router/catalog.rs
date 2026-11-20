@@ -934,7 +934,10 @@ impl Router {
                 .position(|entry| entry.cursor() == cursor)
                 .map(|index| index + 1)
                 .ok_or_else(|| {
-                    Error::new("invalid", eliot_core::api::CATALOG_CURSOR_STALE_MESSAGE)
+                    Error::new(
+                        "invalid",
+                        "catalogue cursor is no longer in the listing; restart from the first page",
+                    )
                 })?,
         };
         let page: Vec<eliot_core::api::ModelsCatalogEntry> =
