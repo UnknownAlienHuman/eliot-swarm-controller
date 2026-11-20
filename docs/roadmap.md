@@ -34,6 +34,47 @@ See AGENTS.md for the work loop.
 S1-S4 are implemented. The configuration and automation specs own their contracts;
 fleet-wide and longer-running qualification remains in L7.
 
+## Agent automation quality (2026-11-20)
+
+Swarm takes the mechanical part of managing Agents: delivering the needed
+facts, bounding actions, waiting, checking result and change scope, stopping
+blind repeats and accounting cost. Agents keep the engineering work. Each item
+extends an existing owner (Goal, assignment, handoff, routing, usage); no task
+engine, second scheduler or critic loop.
+
+- [x] **A1 Useful check feedback.** A Goal check's stdout and stderr both reach
+      the bounded observation and continuation, each labelled with its own
+      completeness; the continuation marks it as diagnostic data and never asks
+      for a rerun to read the log. The no-progress digest covers both streams
+      and counts only fully captured output; exit and unknown are unchanged.
+- [ ] **A2 Exact brief and required sources.** The launch/send brief carries the
+      result, required reading, write area, explicit limits and the check; named
+      sources are delivered with path and version or their absence is explicit;
+      limits survive handoff and continuation.
+- [ ] **A3 Change scope and checker trust.** The manager compares the final
+      change with the task's starting point and allowed paths; a trusted
+      check-wrapper can report a scope violation that blocks the ordinary
+      continuation; changes to the checker's own inputs are reviewed separately.
+- [ ] **A4 Assignment owns completion.** A brief-queue assignment declares one
+      turn or Goal-owned work before dispatch; Goal-owned work retires on the
+      Goal's terminal state, not on the first `turn.completed`.
+- [ ] **A5 Honest no-progress.** The Goal fingerprint reuses the Git monitor's
+      content `dirty_digest` with workspace, freshness and completeness checks;
+      an unproven observation never extends the no-progress streak.
+- [ ] **A6 Short handoff state.** The handoff brief adds Store facts, the
+      current instruction and limits, and the executor's last decisions and
+      next step, keeping machine facts and model claims distinct.
+- [ ] **A7 Goal cost budget.** Known usage at turn boundaries feeds a Goal
+      budget without double counting; incomplete or mixed-unit data keeps the
+      money budget `unsupported`.
+- [ ] **A8 Bounded escalation.** After two failed approaches a diagnosis step,
+      then one Owner-authorized profile/model change by stated reason; never a
+      model ladder, wider rights or a replayed unknown.
+- [ ] **A9 Flow control and review digest.** Assignment pause and manager budget
+      follow integration capacity; a short patch digest (files, packages, new
+      dependencies, public interface, checker/lint changes, new suppressions)
+      focuses the independent review.
+
 ## Repairs to implemented paths
 
 Checked layers record delivered increments, not full crash/load qualification.

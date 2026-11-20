@@ -380,12 +380,12 @@ generation. Verify with `rule show resume-after-known-stop`.
 ### 3. Bounded Eliot-mode Goal
 
 ```powershell
-& $swarm --data-dir $dataDir goal set $agent --text keep-green --max-rounds 5 --check git --version
+& $swarm --data-dir $dataDir goal set $agent --text "Make the changed package build." --max-rounds 5 --check cargo build --locked -p eliot-daemon --all-targets
 ```
 
-The daemon rounds automatically on the next idle event; `git --version` is an
-exit-0 placeholder — replace it with a check that exits 0 when the goal holds.
-Verify with `goal show $agent`.
+The daemon rounds automatically on the next idle event. Use a check that exits 0
+exactly when the goal holds and says why it failed: both its stdout and stderr
+reach the next continuation. Verify with `goal show $agent`.
 
 ## Identity, transport and ownership
 

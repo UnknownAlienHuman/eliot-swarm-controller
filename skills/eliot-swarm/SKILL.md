@@ -30,6 +30,35 @@ this skill as first-turn text, find its companion at
    `& $swarm claim release 'src/area/**'`. Report changes, verified outcomes,
    and open or `unknown` work. See [artifact and cleanup rules](reference.md#artifacts-and-cleanup).
 
+## Brief, finish and stop
+
+Delegate with a short brief, not "improve everything":
+
+```text
+Result: the observable behavior that must change.
+Read: the exact required files or sections, and the callers that matter.
+Change: the write area and the linked interfaces it needs.
+Limits: explicit prohibitions, compatibility, allowed external actions.
+Check: the concrete scenario and the project's required commands.
+Return: result, change locations, checks actually run, what is left.
+```
+
+- "Start from these files" names entry points, not a closed write area.
+- A child gets the same or a narrower area. To cross an explicit limit, it
+  reports the reason and the minimal change instead of crossing it.
+- **Done** means three things: the effect is reached, the limits held, and a
+  proportionate check passed.
+- "Already correct, verified against current behavior" is a valid outcome.
+  "Could not reproduce" alone is not a fix.
+- Once the criterion is met and the required review is done, stop. A
+  further edit needs a concrete defect.
+- After two failed approaches to one problem, stop continuing. Send the
+  manager both attempts, the failure, and the observation that would tell them
+  apart.
+- Report what was obtained, where the change is, what was actually checked,
+  and what is left. Keep errors, `unknown`, numbers and negations, and mark
+  any truncation.
+
 ## Common tasks
 
 The examples use IDs, generations, paths, versions and turn IDs obtained
