@@ -89,8 +89,6 @@ enum StartPhase {
     /// Owned CLI spawn failure with no child produced.
     Spawn,
     /// At or after a live native child. Never proven-no-effect.
-    /// Only constructed in tests to pin the boundary.
-    #[allow(dead_code)]
     PostSpawn,
 }
 

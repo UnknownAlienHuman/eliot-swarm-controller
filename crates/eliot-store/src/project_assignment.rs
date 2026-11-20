@@ -70,14 +70,6 @@ impl Store {
         read_assignment(&self.connection, project)
     }
 
-    /// Whether a worktree path is currently bound to a project manager
-    /// assignment. Cleanup planning and worktree removal both refuse bound
-    /// paths; release unbinds them.
-    pub fn workspace_assignment_bound(&self, path: &str) -> Result<bool> {
-        self.ensure_committed_reads()?;
-        workspace_path_bound(&self.connection, path)
-    }
-
     pub fn claim_project_manager(
         &mut self,
         principal: &str,

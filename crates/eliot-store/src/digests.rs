@@ -356,33 +356,6 @@ impl Store {
     /// oldest row. The driver advances the cursor past every examined row and
     /// wraps to `None` at the end, so pending or mailbox-blocked rows at the
     /// front never trap later eligible registrations behind one fixed page.
-    /// High-water of the pending set: the newest `(created_at, id)` still
-    /// awaiting delivery, or `None` when nothing is pending. The driver
-    /// snapshots this at sweep start so the sweep wraps when the cursor
-    /// passes the end of the eligible set observed at that tick, instead of
-    /// chasing newly arriving registrations forever.
-    ///
-    /// The high-water and the page below must be read together with
-    /// [`Self::pending_completion_digests_page`]: separate locks let the
-    /// queue change between the two reads (an empty high-water with rows on
-    /// the page leaves the sweep with no wrap bound, so full pages of new
-    /// registrations prevent wrapping indefinitely).
-    pub fn pending_completion_digests_max(&self) -> Result<Option<(i64, String)>> {
-        self.ensure_committed_reads()?;
-        let row: Option<(i64, String)> = self
-            .connection
-            .query_row(
-                "SELECT created_at, id FROM completion_digests INDEXED BY completion_digests_pending_cursor
-                 WHERE delivered_at IS NULL
-                 ORDER BY created_at DESC, id DESC LIMIT 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(sql_error)?;
-        Ok(row)
-    }
-
     pub fn pending_completion_digests_after(
         &self,
         after: Option<(i64, &str)>,
@@ -444,32 +417,5 @@ impl Store {
             params![mail_delivery_id, now, id],
         ));
         Ok(())
-    }
-
-    /// Mark a pending digest delivered. Returns false when it was already
-    /// delivered (restart/retry safe).
-    pub fn mark_digest_delivered(
-        &mut self,
-        id: &str,
-        mail_delivery_id: &str,
-        now: i64,
-    ) -> Result<bool> {
-        self.ensure_committed_reads()?;
-        self.ensure_writer_healthy()?;
-        let result = (|| -> Result<bool> {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            let changed = db!(tx.execute(
-                "UPDATE completion_digests SET delivered_mail_id = ?1, delivered_at = ?2
-                 WHERE id = ?3 AND delivered_at IS NULL",
-                params![mail_delivery_id, now, id],
-            ));
-            commit_transaction(tx, &self.write_faulted)?;
-            Ok(changed == 1)
-        })();
-        self.fault_on_persistence_error(&result);
-        result
     }
 }

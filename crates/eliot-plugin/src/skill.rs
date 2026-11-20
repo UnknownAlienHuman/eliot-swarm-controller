@@ -48,11 +48,6 @@ pub fn skill_body_path(data_dir: &Path) -> PathBuf {
     skill_dir(data_dir).join(SKILL_FILE)
 }
 
-/// Path of the canonical `reference.md` under a data directory.
-pub fn skill_reference_path(data_dir: &Path) -> PathBuf {
-    skill_dir(data_dir).join(SKILL_REFERENCE_FILE)
-}
-
 /// Read back one daemon-materialized skill file, bounded and UTF-8. A
 /// missing or oversized file is reported; callers skip native delivery
 /// rather than failing the session.

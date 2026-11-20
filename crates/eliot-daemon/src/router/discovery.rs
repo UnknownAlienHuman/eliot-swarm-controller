@@ -236,19 +236,6 @@ const METHODS: &[Method] = &[
         {}
     ),
     method!(
-        "config.profiles.read",
-        ProfilesReadRequest,
-        ProfilesReadResponse,
-        true,
-        false,
-        "Read the verbatim [profiles.*] sections and the file revision.",
-        {}
-    ),
-    method!("config.profiles.save", ProfilesSaveRequest, ProfilesSaveResponse, true, true, "Validate (dry_run) or replace the [profiles.*] sections, guarded by revision.", {"expected_revision":null,"source":"[profiles.codex]
-harness = \"codex\"
-model = \"gpt-6-luna\"
-","dry_run":true}),
-    method!(
         "settings.read",
         SettingsReadRequest,
         SettingsReadResponse,

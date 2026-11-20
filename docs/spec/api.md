@@ -451,7 +451,6 @@ command id frozen at claim. Stored Goal responses/round records use Core
 | `harness.list/models/quota` | owner-only installed harness inventory with versions, per-harness read-only native catalogues and provider-supported quota readback; no model turn or inference |
 | `models.catalog` | Owner-only bounded, paginated search across installed harness catalogues; request, entries, failures and quota vocabulary: [canonical DTOs](../../crates/eliot-core/src/api/harness.rs). Membership never proves availability: affirmative fresh native quota and complete hold readback are required. Failed harness reads remain visible; a partial listing supports continuation but the next first page retries failed reads. Executable/version-bound caching and concurrent-read coalescing belong to the [catalogue owner](../../crates/eliot-daemon/src/router/catalog.rs). |
 | `script.list/read/save` | Owner-only scripts under approved Run roots: cursor/encoded-byte-bounded list (one root scan per page; continue through empty pages until `next_cursor` is absent), verified-handle bounded read, and serialized revision-guarded replacement. Complete secret-bearing entries are withheld; raw and decoded TOML/JSON keys/values are checked. Saves never execute; external-writer conflict limits and editor environment are specified in [automation](automation.md#script-editing). DTOs/budgets: [`script_edit.rs`](../../crates/eliot-core/src/api/script_edit.rs). |
-| `config.profiles.read/save` | legacy profile-only read and validated, revision-guarded replacement of the `[profiles.*]` sections of `config.toml` (same writer as `settings.save`) |
 | `settings.read/save` | owner-only unified section read/save, revision CAS, dry run, restart indication and bounded author history; see configuration |
 | `project.transfer` | Owner-only transfer intent, optional replacement launch, atomic commit or cancellation with typed readback. See [Project transfer](coordination.md#project-transfer). |
 | `project.assignment.get/claim/launch/release` | Current registered project manager, explicit adoption or manager launch, and revision-bound release through the ordinary command path. See [project manager assignments](#project-manager-assignments). |
@@ -1939,8 +1938,8 @@ approval policy (the resolved harness-native value: Codex `approval_policy`, Mus
 and whether launch-time resolution succeeds now (`launchable`, else `error`).
 It reads no environment value, and a profile whose summary would carry a value
 known to the daemon's secret policy is omitted from the list; parse diagnostics
-are redacted with that policy before they enter the reply. `config.profiles.read`
-and `config.profiles.save` follow [configuration](configuration.md#profile-editing).
+are redacted with that policy before they enter the reply. The `[profiles.*]` source is
+read and saved only through `settings.read`/`settings.save` ([configuration](configuration.md#unified-settings)).
 `rule.list` (`RuleListRequest`/`RuleListResponse`) pages one rule namespace
 (global, or `project`) by rule id with `after`/`limit`; each entry carries the
 stored `RuleStateView`, its effective `TimerStateView` when the rule is a timer,

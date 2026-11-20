@@ -21,9 +21,7 @@ pub use capacity::{RecordedProcess, RetainedGeneration};
 pub use command_children::{CommandChildrenPage, history_expired};
 pub use config_overlay::AgentConfig;
 pub use context::ContextDispatch;
-pub use coordination::{
-    MailSendOutcome, MailSendResult, NoticeClaim, NoticeKind, NoticePending, NoticeState,
-};
+pub use coordination::{MailSendOutcome, MailSendResult, NoticeClaim, NoticeKind, NoticePending};
 pub use digests::{DigestRegisterOutcome, DigestRow, DigestTurn};
 pub use fleet::{AgentListFilter, AgentListPage};
 pub use git::CodeProgressState;
@@ -64,7 +62,6 @@ use std::{
     cell::Cell,
     collections::{BTreeMap, HashSet},
     path::Path,
-    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 use ulid::Ulid;
@@ -239,22 +236,6 @@ fn validate_remote_command_context(
     Ok(())
 }
 
-/// Process-lifetime commit telemetry: every store transaction counts
-/// here, success and failure, with total commit milliseconds. Metadata
-/// only: no payloads, ids, or SQL text ever enter these counters. The
-/// daemon exposes the snapshot through `diagnose` so a slow or failing
-/// disk shows up as store evidence, not a guessed origin.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct TxnStats {
-    pub commits: u64,
-    pub commit_errors: u64,
-    pub commit_ms_total: u64,
-}
-
-static TXN_COMMITS: AtomicU64 = AtomicU64::new(0);
-static TXN_COMMIT_ERRORS: AtomicU64 = AtomicU64::new(0);
-static TXN_COMMIT_MS_TOTAL: AtomicU64 = AtomicU64::new(0);
-
 fn commit_transaction(tx: Transaction<'_>, write_faulted: &Cell<bool>) -> Result<()> {
     let Err(error) = commit_sql(&tx) else {
         return Ok(());
@@ -272,17 +253,7 @@ fn commit_transaction(tx: Transaction<'_>, write_faulted: &Cell<bool>) -> Result
 }
 
 fn commit_sql(tx: &Transaction<'_>) -> rusqlite::Result<()> {
-    let started = std::time::Instant::now();
-    let result = tx.execute_batch("COMMIT");
-    TXN_COMMITS.fetch_add(1, Ordering::Relaxed);
-    TXN_COMMIT_MS_TOTAL.fetch_add(
-        started.elapsed().as_millis().min(u64::MAX as u128) as u64,
-        Ordering::Relaxed,
-    );
-    if result.is_err() {
-        TXN_COMMIT_ERRORS.fetch_add(1, Ordering::Relaxed);
-    }
-    result
+    tx.execute_batch("COMMIT")
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -367,17 +338,6 @@ pub enum StoreOpenPhase {
 }
 
 impl Store {
-    /// Process-lifetime commit counters for debug and `diagnose` evidence.
-    /// Daemon reads are racy by design: exact per-RPC attribution comes
-    /// from the daemon log, these counters show store health over time.
-    pub fn txn_stats(&self) -> TxnStats {
-        TxnStats {
-            commits: TXN_COMMITS.load(Ordering::Relaxed),
-            commit_errors: TXN_COMMIT_ERRORS.load(Ordering::Relaxed),
-            commit_ms_total: TXN_COMMIT_MS_TOTAL.load(Ordering::Relaxed),
-        }
-    }
-
     pub fn open(path: &Path) -> Result<Self> {
         Self::open_with_observer(path, |_| {})
     }
@@ -512,19 +472,6 @@ impl Store {
     ) -> Result<Admission> {
         self.ensure_writer_healthy()?;
         let result = self.submit_inner(principal, request, None, now);
-        self.fault_on_persistence_error(&result);
-        result
-    }
-
-    pub fn submit_with_workspace(
-        &mut self,
-        principal: &str,
-        request: SubmitCommand,
-        preparation: WorkspacePreparationInput,
-        now: i64,
-    ) -> Result<Admission> {
-        self.ensure_writer_healthy()?;
-        let result = self.submit_inner(principal, request, Some(preparation), now);
         self.fault_on_persistence_error(&result);
         result
     }
@@ -1220,40 +1167,6 @@ impl Store {
         Ok((owners, usize::try_from(total.max(0)).unwrap_or(0)))
     }
 
-    /// Liveness inputs for one retained unknown command's generation: whether
-    /// Store custody still shows a live owned process or an open non-daemon
-    /// source at exactly this Agent generation. The daemon adds its own
-    /// plugin-reader and active-turn checks before retiring the drain wait.
-    /// Exact generation match only: a new generation's reader or child never
-    /// backs a fenced generation's unknown.
-    pub fn generation_liveness(&self, agent: &str, generation: i64) -> Result<GenerationLiveness> {
-        let agent_num = parse_agent_id(agent)?;
-        let live_process: bool = self
-            .connection
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM processes WHERE owner IN (?1, ?2) AND state IN ('running','unknown'))",
-                params![
-                    format!("agent:{agent}#{generation}"),
-                    format!("workspace:{agent}#{generation}")
-                ],
-                |row| row.get(0),
-            )
-            .map_err(sql_error)?;
-        let open_source: bool = self
-            .connection
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM source_state WHERE agent = ?1 AND generation = ?2
-                 AND source NOT IN ('daemon','os','git','workspace_process') AND state = 'open')",
-                params![agent_num, generation],
-                |row| row.get(0),
-            )
-            .map_err(sql_error)?;
-        Ok(GenerationLiveness {
-            live_process,
-            open_source,
-        })
-    }
-
     /// Last retained-event watermark for status and retention readback: the
     /// same `rule_history_coverage.pruned_through` the event bounds report.
     pub fn retention_watermark(&self) -> Result<i64> {
@@ -1464,31 +1377,6 @@ impl Store {
     pub fn get_turn(&self, agent: &str, generation: i64, turn_id: &str) -> Result<Option<Turn>> {
         let agent_num = parse_agent_id(agent)?;
         load_turn(&self.connection, agent_num, generation, turn_id)
-    }
-
-    /// Whether this exact turn has an unsettled command whose outcome is
-    /// uncertain in Store or the daemon's write-fault overlay. Other Agents'
-    /// commands and status-page limits cannot change this result.
-    pub fn turn_has_unknown_command(
-        &self,
-        agent: &str,
-        generation: i64,
-        turn_id: &str,
-        memory_unknown: &[String],
-    ) -> Result<bool> {
-        let agent_num = parse_agent_id(agent)?;
-        let memory_unknown = serde_json::to_string(memory_unknown)
-            .map_err(|_| Error::new("internal", "cannot encode unknown command keys"))?;
-        self.connection
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM commands
-             WHERE target=?1 AND generation=?2 AND turn_id=?3
-               AND state IN ('accepted','queued','dispatched','unknown')
-               AND (state='unknown' OR id IN (SELECT value FROM json_each(?4))))",
-                params![agent_num, generation, turn_id, memory_unknown],
-                |row| row.get(0),
-            )
-            .map_err(sql_error)
     }
 
     /// Set-based unknown-turn mask for one exact page: the subset of
@@ -3659,15 +3547,6 @@ pub struct LiveProcessOwner {
     pub agent: String,
     pub generation: i64,
     pub workspace: bool,
-}
-
-/// Whether Store custody still backs one Agent generation: a live owned
-/// process record or an open non-daemon source row at exactly that
-/// generation. Anything else (closed sources, exited processes, other
-/// generations) is not backing.
-pub struct GenerationLiveness {
-    pub live_process: bool,
-    pub open_source: bool,
 }
 
 /// Parse a stored process owner (`agent:<id>#<generation>` or

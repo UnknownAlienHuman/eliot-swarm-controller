@@ -1206,8 +1206,8 @@ pub(crate) fn resolve_profile_cached(
 }
 
 /// Launch-time profile resolution over already parsed source text. The same
-/// path validates an edited draft before `config.profiles.save` replaces
-/// the file, so a saved profile is one the next launch can resolve.
+/// path validates an edited draft before `settings.save` replaces the file,
+/// so a saved profile is one the next launch can resolve.
 fn resolve_profile_in(config: &FileConfig, source: &str, name: &str) -> core::Result<Value> {
     validate_profile_name(name)?;
     if config.profiles.len() > MAX_PROFILES {

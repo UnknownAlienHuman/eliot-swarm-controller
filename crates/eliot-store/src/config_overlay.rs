@@ -131,21 +131,6 @@ impl Store {
         self.get_agent_config(&agent, generation, record.config_revision)
     }
 
-    /// Effective configuration for one retained turn's stamped revision, or
-    /// `None` when the turn ran under the frozen snapshot. Reads only
-    /// retained rows, so reloads never rewrite a retained turn's meaning.
-    pub fn turn_effective_config(
-        &self,
-        agent: &str,
-        generation: i64,
-        turn_id: &str,
-    ) -> Result<Option<AgentConfig>> {
-        let turn = self
-            .get_turn(agent, generation, turn_id)?
-            .ok_or_else(|| Error::new("not_found", format!("turn {turn_id} was not found")))?;
-        self.get_agent_config(agent, generation, turn.config_revision)
-    }
-
     /// Retained configuration view for one command's exact stamped
     /// generation and revision: the requested and effective model/effort,
     /// the revision, the provenance, and the profile name. `None` when the

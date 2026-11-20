@@ -122,13 +122,6 @@ pub struct NoticeClaim {
     pub inline_text: Option<String>,
 }
 
-/// Durable notice state for one recipient.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NoticeState {
-    pub last_notice_at: i64,
-    pub open_notice_command: Option<String>,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MailSendOutcome {
     Fresh,
@@ -702,26 +695,6 @@ impl Store {
         let result = self.notice_claim_inner(recipient, notice_command, pending, now);
         self.fault_on_persistence_error(&result);
         result
-    }
-
-    /// Read durable notice state for one recipient.
-    pub fn notice_state(&self, recipient: &str) -> Result<Option<NoticeState>> {
-        let num = parse_agent_id(recipient)?;
-        let row: Option<(i64, Option<String>)> = self
-            .connection
-            .query_row(
-                "SELECT last_notice_at, open_notice_command FROM mail_notices WHERE recipient = ?1",
-                params![num],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(sql_error)?;
-        Ok(
-            row.map(|(last_notice_at, open_notice_command)| NoticeState {
-                last_notice_at,
-                open_notice_command,
-            }),
-        )
     }
 
     /// Release a claimed notice whose notice command was never admitted, so a

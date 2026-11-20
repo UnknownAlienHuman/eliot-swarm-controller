@@ -23,8 +23,7 @@ use crate::native::{
         AgentList, ConfigEntry, DataEnvelope, ErrorBody, FormInfo, FormReplyRequest, InboxPage,
         InboxUser, InterruptResponse, LocationRef, McpServerReadback, MessagePage, ModelRef,
         NativeModelEntry, PermissionReplyRequest, PermissionRequest, PermissionRule, PromptRequest,
-        ProviderReadback, SessionCreateRequest, SessionInfo, SwitchAgentRequest,
-        SwitchModelRequest,
+        SessionCreateRequest, SessionInfo, SwitchAgentRequest, SwitchModelRequest,
     },
 };
 
@@ -705,43 +704,6 @@ impl OpenCodeHttp {
             return Ok(list.data.into_iter().map(|entry| entry.id).collect());
         }
         Err(readback_error("agent list", &response))
-    }
-
-    /// `GET /api/provider/:providerID`: effective provider readback.
-    /// A read, so any failure is `native_readback`, never `unknown`. Only
-    /// nonsecret observations leave this call: the key value never decodes
-    /// into retention. Retained for direct provider reads; start readiness
-    /// uses the live model catalogue.
-    #[allow(dead_code)]
-    pub async fn get_provider(
-        &self,
-        provider_id: &str,
-        deadline: Instant,
-    ) -> Result<ProviderReadback> {
-        let path = format!(
-            "/api/provider/{}",
-            verified_segment(provider_id)
-                .map_err(|_| Error::new("invalid", "OpenCode provider identity is invalid"))?
-        );
-        let response = self
-            .send(reqwest::Method::GET, &path, &[], None, deadline)
-            .await
-            .map_err(readback_outcome_as_error)?;
-        if response.status == 200 {
-            if let Ok(envelope) =
-                serde_json::from_slice::<DataEnvelope<ProviderReadback>>(&response.body)
-            {
-                return Ok(envelope.data);
-            }
-            if let Ok(provider) = serde_json::from_slice::<ProviderReadback>(&response.body) {
-                return Ok(provider);
-            }
-            return Err(Error::new(
-                "native_readback",
-                "OpenCode provider readback was invalid",
-            ));
-        }
-        Err(readback_error("provider", &response))
     }
 
     /// `GET /api/model`: effective model catalogue. The endpoint answers

@@ -61,8 +61,7 @@ pub use agent_views::{
 };
 pub use config_views::{
     CONFIG_REVISION_HEX_LEN, MAX_LISTED_PROFILES, MAX_PROFILES_SOURCE_BYTES, ProfileListRequest,
-    ProfileListResponse, ProfileSummary, ProfilesReadRequest, ProfilesReadResponse,
-    ProfilesSaveRequest, ProfilesSaveResponse, REDACTION_MARKER, RoutingPreviewRequest,
+    ProfileListResponse, ProfileSummary, REDACTION_MARKER, RoutingPreviewRequest,
     RoutingPreviewResponse, RuleListEntry, RuleListRequest, RuleListResponse, SettingsClientSource,
     SettingsHistoryEntry, SettingsHistoryStatus, SettingsReadRequest, SettingsReadResponse,
     SettingsSaveRequest, SettingsSaveResponse, SettingsSection,

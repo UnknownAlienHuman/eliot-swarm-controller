@@ -168,8 +168,7 @@ pub(crate) fn read_internal(
     let original = read_config_source(data_root)?;
     let source = original.clone().unwrap_or_default();
     let revision = original.as_deref().map(profiles_edit::revision_of);
-    let safe_profiles = profiles_edit::read(data_root, policy)?;
-    if !safe_profiles.editable {
+    if !profiles_edit::editable(data_root, policy)? {
         return Err(core::Error::new(
             "not_allowed",
             "settings include a profile section that is not safe to expose",
