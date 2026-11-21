@@ -424,7 +424,15 @@ harness reports (Codex: its parsed `commandActions[].command`, one per line, els
 `command`; Claude: the `tool_use` `input.command`; OpenCode: the
 `session.tool.called` tool input string `command`, the shell tool), redacted with the secret policy and
 bounded to [`MAX_TOOL_COMMAND_BYTES`](../../crates/eliot-core/src/limits.rs); command
-output and other arguments are never persisted. Handoff transfer for
+output is never persisted, except the bounded, redacted tail of a failed Codex
+`commandExecution` (`error_tail`): the whole native output is redacted, then the
+LAST [`MAX_TOOL_ERROR_TAIL_BYTES`](../../crates/eliot-core/src/limits.rs) bytes are
+kept at a character boundary, starting at a line boundary when one is retained, so
+a long failure keeps its ending. A completed Codex `commandExecution` also carries
+its native `exit_code` when present; a successful event grows only by that code,
+and other arguments are never persisted. An item that does not match the installed
+native shape keeps its prior `tool.completed` fact (status alone) rather than
+failing the event. Handoff transfer for
 `child`, `goal` and `usage` stays `unsupported`. Native-child observation is
 implemented separately through the shared
 [`ChildParams`](../../crates/eliot-plugin/src/protocol.rs) /

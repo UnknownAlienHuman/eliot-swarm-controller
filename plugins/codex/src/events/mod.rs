@@ -7,7 +7,9 @@ use crate::native_child::{
 };
 use eliot_core::{
     ChildRegistration, ContextItem, Error, ProviderRestriction, Result, SecretPolicy,
-    SessionTokenTotals, SessionUsage, TurnUsage, limits::MAX_TOOL_COMMAND_BYTES, turn_started_data,
+    SessionTokenTotals, SessionUsage, TurnUsage,
+    limits::{MAX_TOOL_COMMAND_BYTES, MAX_TOOL_ERROR_TAIL_BYTES},
+    turn_started_data,
 };
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
@@ -31,8 +33,8 @@ use crate::native::{
     NativeClient, NativeFrame, StreamState,
     requests::{self, CorePending},
     types::{
-        NativeFileChangeItem, NativeItemCompletedNotification, NativePatchChangeKind,
-        NativeServerRequestResolvedNotification, NativeThreadTokenUsage,
+        NativeCommandExecutionItem, NativeFileChangeItem, NativeItemCompletedNotification,
+        NativePatchChangeKind, NativeServerRequestResolvedNotification, NativeThreadTokenUsage,
         NativeThreadTokenUsageUpdatedNotification, NativeTokenUsageDelta,
         NativeTurnCompletedNotification, NativeTurnError, NativeTurnStartedNotification,
         NativeTurnStatus,
@@ -1322,8 +1324,28 @@ impl EventProcessor {
             "item_id": item_id,
             "tool": item_type,
         });
-        if let Some(native_status) = native_status {
-            data["status"] = Value::String(native_status);
+        if let Some(ref native_status) = native_status {
+            data["status"] = Value::String(native_status.clone());
+        }
+        if item_type == "commandExecution" {
+            // A native shape change must not fail the event: the completion is
+            // committed with its status alone, exactly as before this mapping.
+            if let Ok(command) = serde_json::from_value::<NativeCommandExecutionItem>(item.clone())
+            {
+                if let Some(exit_code) = command.exit_code {
+                    data["exit_code"] = json!(exit_code);
+                }
+                // A failure without its reason is a bare `failed`; keep the tail
+                // that usually says why. Success keeps its exit code only.
+                if native_status.as_deref() == Some("failed")
+                    && let Some(output) = command.aggregated_output.as_deref()
+                {
+                    let tail = failed_output_tail(output, &self.secrets);
+                    if let Some(tail) = tail {
+                        data["error_tail"] = Value::String(tail);
+                    }
+                }
+            }
         }
         if completed_file_change {
             // Installed 0.161 ThreadItem/FileUpdateChange: only native path fields,
@@ -2005,6 +2027,27 @@ fn is_tool_type(item_type: &str) -> bool {
             | "webSearch"
             | "imageGeneration"
     )
+}
+
+/// The tail of a failed tool's output: the whole text is redacted first, then
+/// the LAST `MAX_TOOL_ERROR_TAIL_BYTES` at a character boundary, starting at a
+/// line boundary when the retained bytes already hold one. A long build keeps
+/// the lines that actually fail, not its first banner. `None` when nothing
+/// usable remains.
+fn failed_output_tail(output: &str, secrets: &[String]) -> Option<String> {
+    let safe = SecretPolicy::new(secrets.iter().cloned()).redact_text(output);
+    let max = MAX_TOOL_ERROR_TAIL_BYTES;
+    let tail = if safe.len() <= max {
+        safe.as_str()
+    } else {
+        let start = safe.floor_char_boundary(safe.len() - max);
+        let boundary = safe[start..]
+            .find(['\n', '\r'])
+            .map(|offset| start + offset + 1)
+            .unwrap_or(start);
+        &safe[boundary..]
+    };
+    (!tail.trim().is_empty()).then(|| tail.to_owned())
 }
 
 fn turn_status(status: &NativeTurnStatus) -> String {
