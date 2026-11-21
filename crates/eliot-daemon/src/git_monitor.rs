@@ -845,6 +845,27 @@ impl GitProbe {
         Ok(())
     }
 
+    /// A Goal's no-progress fingerprint, read now: HEAD and the monitor's
+    /// content `dirty_digest` over the dirty set. A read past the monitor's
+    /// caps or of a workspace that is not an exact Git root fails.
+    pub(crate) async fn work_fingerprint(&self, workspace: &str) -> Result<String> {
+        let root = canonical_root(workspace)?;
+        let deadline = Instant::now() + PROBE_TIME;
+        let overrides = self.safe_overrides(&root, deadline).await?;
+        self.require_exact_root(&root, &overrides, deadline).await?;
+        let status = parse_status(
+            &self
+                .checked(&root, STATUS_ARGS, &overrides, &[], deadline)
+                .await?,
+        )?;
+        let (dirty_digest, _) = dirty_worktree_digest(&root, &status.dirty)
+            .map_err(|reason| unavailable(&format!("workspace content digest: {reason}")))?;
+        let mut hasher = Sha256::new();
+        hash_digest_part(&mut hasher, status.head.as_deref().unwrap_or("").as_bytes());
+        hash_digest_part(&mut hasher, dirty_digest.as_bytes());
+        Ok(hex_digest(hasher.finalize().as_slice()))
+    }
+
     /// HEAD and the changed paths of a Goal's workspace.
     pub(crate) async fn scope_state(&self, workspace: &str) -> Result<ScopeState> {
         let root = canonical_root(workspace)?;

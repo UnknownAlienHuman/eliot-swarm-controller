@@ -15,6 +15,7 @@ use super::{
 };
 use crate::{
     common::now_ms,
+    git_monitor::GitProbe,
     scripts::process::{ProcessCapture, ProcessFailure, ProcessOutcome, run_owned_process},
 };
 use eliot_core::{
@@ -483,6 +484,12 @@ impl Router {
                 return claimed.complete(result);
             }
         }
+        // The no-progress fingerprint is read now, while the Agent is idle
+        // and before the check can write anything.
+        let fingerprint = match (probe.workspace.as_deref(), GitProbe::new()) {
+            (Some(workspace), Ok(git)) => git.work_fingerprint(workspace).await.ok(),
+            _ => None,
+        };
         let policy = self.secret_policy_snapshot();
         let mut command = TokioCommand::new(&definition.check[0]);
         command.args(&definition.check[1..]);
@@ -544,6 +551,7 @@ impl Router {
                 check: Some(check),
                 blocked_reason: None,
                 observation: None,
+                fingerprint,
                 continuation: Some(GoalContinuation {
                     id: continuation_id,
                     text,
@@ -612,6 +620,7 @@ impl Router {
             check: Some(check),
             blocked_reason,
             observation: None,
+            fingerprint,
             continuation: None,
         };
         let result = self.commit_goal_round(&principal, &request, commit).await;
@@ -641,6 +650,7 @@ impl Router {
             check: None,
             blocked_reason: Some(reason.to_owned()),
             observation,
+            fingerprint: None,
             continuation: None,
         };
         self.commit_goal_round(principal, request, commit).await
