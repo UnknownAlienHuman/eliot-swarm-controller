@@ -662,7 +662,10 @@ impl ClaudePlugin {
             failure.phase,
             &failure.error.code
         ));
-        let reason = if failure.phase == StartPhase::Auth && failure.error.code == "auth_required" {
+        // Auth-phase messages are fixed owner-safe phrases (signed out, not
+        // found at the profile's cmd, timed out, no JSON status): show the
+        // specific one instead of a generic phase reason.
+        let reason = if failure.phase == StartPhase::Auth {
             failure.error.message.to_string()
         } else {
             let mut reason = prespawn_reason(failure.phase, &failure.error.code);

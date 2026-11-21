@@ -33,10 +33,16 @@ pub(super) fn approval_summary(tool_name: &str, input: Option<&Value>) -> String
     let mut flattened = Vec::new();
     collect_summary_args(input, &mut flattened);
     flattened.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    // One field per line; a multi-line value (a file edit, a script) starts
+    // on its own line so it reads as a block instead of running on.
     for (key, value) in flattened {
-        parts.push(format!("{key}: {value}"));
+        if value.contains('\n') {
+            parts.push(format!("{key}:\n{}", value.trim_end()));
+        } else {
+            parts.push(format!("{key}: {value}"));
+        }
     }
-    parts.join("; ")
+    parts.join("\n")
 }
 
 /// Flatten the string leaves of a native input value into owned (key,

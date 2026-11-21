@@ -64,11 +64,23 @@ pub(crate) async fn auth_status(
         .stderr(Stdio::null())
         .kill_on_drop(true);
     let deadline = tokio::time::Instant::now() + STATUS_DEADLINE;
-    let mut child = command.spawn().map_err(|_| {
-        Error::new(
-            "native_not_dispatched",
-            "Claude CLI auth status could not run",
-        )
+    let mut child = command.spawn().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            // The profile's `cmd` names no executable: say so, rather than
+            // blaming authentication for a file that does not exist.
+            Error::new(
+                "native_spawn_refused",
+                format!(
+                    "Claude CLI was not found at {}; set cmd in the profile to an installed Claude Code executable",
+                    program.to_string_lossy()
+                ),
+            )
+        } else {
+            Error::new(
+                "native_not_dispatched",
+                "Claude CLI auth status could not run",
+            )
+        }
     })?;
     let mut stdout = child.stdout.take().ok_or_else(|| {
         Error::new(
