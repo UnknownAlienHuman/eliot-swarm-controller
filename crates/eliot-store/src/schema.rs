@@ -3,6 +3,8 @@ use super::*;
 pub(super) const CURRENT_SCHEMA_VERSION: i64 = 70;
 
 impl Store {
+    pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
+
     pub(super) fn migrate(&mut self) -> Result<()> {
         self.connection
             .execute_batch(

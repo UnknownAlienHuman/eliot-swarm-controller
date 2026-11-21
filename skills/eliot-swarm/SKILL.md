@@ -142,7 +142,7 @@ with an authorized fresh directory. Pass the printed path to every private comma
 - Do not end your turn waiting on a shell job or native Monitor. Run long commands in the foreground or poll them to completion.
 - Do not retry a refused Owner operation as Owner on prod, change inherited identity, or read the Owner token.
 - Do not guess child profiles or bypass a same-harness permission mismatch. Read your frozen `child_profiles`.
-- Do not start a private daemon on an unprotected data directory or leave a proof stand undrained.
+- Register owned managed-proof artifacts when they are under the bound artifact root. Use a protected private data directory and drain the stand before leaving the proof.
 - Do not launch Agents from a copy of production data. Copied stores can share production process custody names.
 - Do not leave a test desktop open after its screenshots. Use plain test repo names under one `qa-…` folder.
 - Do not accept a black screenshot as UI evidence. Check whether the console display is off.

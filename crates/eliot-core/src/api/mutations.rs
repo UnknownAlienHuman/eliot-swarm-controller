@@ -105,6 +105,9 @@ pub struct CommandSubmitResponse {
 pub enum ShutdownMode {
     Drain,
     Force,
+    PrepareRestart,
+    CancelRestart,
+    Restart,
 }
 
 impl ShutdownMode {
@@ -112,6 +115,9 @@ impl ShutdownMode {
         match self {
             Self::Drain => "drain",
             Self::Force => "force",
+            Self::PrepareRestart => "prepare_restart",
+            Self::CancelRestart => "cancel_restart",
+            Self::Restart => "restart",
         }
     }
 
@@ -119,10 +125,10 @@ impl ShutdownMode {
         match value {
             "drain" => Ok(Self::Drain),
             "force" => Ok(Self::Force),
-            _ => Err(Error::new(
-                "invalid",
-                "daemon.shutdown mode must be drain or force",
-            )),
+            "prepare_restart" => Ok(Self::PrepareRestart),
+            "cancel_restart" => Ok(Self::CancelRestart),
+            "restart" => Ok(Self::Restart),
+            _ => Err(Error::new("invalid", "invalid daemon.shutdown mode")),
         }
     }
 }
@@ -134,6 +140,8 @@ pub struct DaemonShutdownRequest {
     #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
     pub id: String,
     pub mode: ShutdownMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_id: Option<String>,
 }
 
 impl DaemonShutdownRequest {
@@ -141,11 +149,24 @@ impl DaemonShutdownRequest {
         Self {
             id: id.into(),
             mode,
+            restart_id: None,
         }
     }
 
     pub fn validate(&self) -> Result<()> {
-        validate_shutdown_id(&self.id)
+        validate_shutdown_id(&self.id)?;
+        match (self.mode, &self.restart_id) {
+            (ShutdownMode::Restart | ShutdownMode::CancelRestart, Some(id)) => {
+                validate_shutdown_id(id)
+            }
+            (ShutdownMode::Restart | ShutdownMode::CancelRestart, None) | (_, Some(_)) => {
+                Err(Error::new(
+                    "invalid",
+                    "restart_id binds restart and cancel to their prepare receipt",
+                ))
+            }
+            (_, None) => Ok(()),
+        }
     }
 }
 

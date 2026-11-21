@@ -2513,19 +2513,25 @@ success.
 ### Local operator commands
 
 **Daemon update (#836).** The local Owner supplies a release directory or
-Swarm executable. Update checks the candidate before it changes the fleet,
-stops controlled Agents through generation-bound commands, requires zero
-running turns and owned processes in status, then requests an ordinary drain.
-It waits for the recorded daemon process to exit before starting the specified
-binary against the same data directory. On Windows it preserves the running
-daemon's explicit absolute directory spelling so retained native sessions
-keep their scope. Success identifies the ready process and the new binary's SHA-256.
+Swarm executable. Both releases must report the same Store schema to permit
+rollback. The running daemon must support the planned-restart
+`daemon.shutdown` modes. `prepare_restart` records a bounded admission
+fence. The writer accepts `restart` under that fence only after admitted
+turns and workers finish. If the wait expires, `cancel_restart` reopens the
+same daemon. The fence also expires if its client disappears.
 
-Update uses promptless resume only for sessions it stopped from confirmed idle
-with an unchanged turn history. It reports which Agents resumed and the reason
-for each skip or failed resume. A turn active when stop began stays in retained
-history, and update never resubmits its input. It never uses force to get past
-a drain blocker. On Windows a companion included in the release can start
+After commit, the old daemon retires its owned idle processes and leaves
+the existing Store recovery facts for the next boot. Startup and rollback
+both use #851 continuation and honor `on_restart`. The CLI submits no Agent
+Stop or Resume commands during update. The output identifies the previous
+and running release and includes observed Agent state. Boot recovery can
+still be settling when that state is read.
+
+The replacement must report healthy open admission. If startup fails,
+update proves the candidate no longer holds the directory and restarts
+the previous executable. The report retains the replacement failure and
+the rollback result. On Windows the restart preserves the running daemon's
+explicit absolute directory spelling and starts an included companion
 detached with the same target data directory. For subsequent updates, the
 operator closes a changed companion only when it can verify the process it
 started for that directory.
@@ -2536,11 +2542,21 @@ file containing the `[profiles]` table and an optional alternate Swarm binary. I
 data and workspace paths after the daemon is ready. Operate on the printed
 directory through explicit `--data-dir`. The stand starts with a fresh Store.
 
-`stand down` accepts the creation-marked path printed by `stand up`. It stops
-the registered companion and controlled Agents, drains the daemon and proves
-owned process exit before removing the stand and its scratch repository. A
-path that cannot be tied to an owned stand, or a teardown with uncertain
-process exit, retains the files.
+`SWARM_STANDS_ROOT` selects the designated parent. The default is
+`EliotStands` under local application data on Windows or `eliot-stands`
+under the XDG state directory on Unix. A private registry binds the random creation
+token to the canonical stand path outside the stand itself.
+
+`stand down` requires both that registry binding and the stand marker. It
+stops owned processes, records exit proof before removal, and deletes the
+marker last. A retry uses the recorded removal phase. After a crash without
+exit proof, start the registered stand again so boot can reconcile custody,
+then retry teardown.
+
+This is explicit teardown of files owned by the stand, including its whole
+scratch repository and any branches and worktrees inside the stand. Repositories
+outside the stand keep their own worktrees and branches. Artifact registration
+for managed proofs is explicit and there is no automatic expiry.
 
 ## CLI
 
@@ -2554,7 +2570,7 @@ The synopsis is target grammar; later-layer forms are not an inventory of curren
 swarm daemon [--foreground]
 swarm daemon install | uninstall
 swarm daemon stop [--drain|--force]
-swarm daemon update <RELEASE>
+swarm daemon update <RELEASE> [--wait-seconds N]
 swarm stand up [--root PATH] [--profile FILE] [--binary PATH]
 swarm stand down <PATH>
 swarm status

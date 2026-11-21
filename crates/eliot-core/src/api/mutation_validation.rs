@@ -103,6 +103,15 @@ impl DaemonShutdownRequest {
                     return Err(binding_mismatch());
                 }
             }
+            ShutdownMode::PrepareRestart | ShutdownMode::CancelRestart | ShutdownMode::Restart => {
+                if response.state != CommandState::Applied
+                    || response.blockers.is_some()
+                    || response.drain.is_some()
+                    || response.store_write_faulted.is_some()
+                {
+                    return Err(binding_mismatch());
+                }
+            }
         }
         // These are the retained write's blockers/state, not current daemon
         // status, and even Applied is not evidence that the daemon has exited.

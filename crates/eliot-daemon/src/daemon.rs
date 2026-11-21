@@ -841,6 +841,8 @@ async fn shutdown_supervision(
     }
     if router.is_force_requested() {
         router.force_owned_processes().await;
+    } else if router.is_restart_requested() {
+        router.stop_for_restart().await;
     }
     recovery.abort_all();
     while recovery.join_next().await.is_some() {}
@@ -1338,7 +1340,11 @@ async fn serve_connection_with_write_timeout(
             match decode_request(&line) {
                 Ok(request) => {
                     measured = request.params.get("_timing") == Some(&Value::Bool(true));
-                    let is_shutdown = request.method == "daemon.shutdown";
+                    let is_shutdown = request.method == "daemon.shutdown"
+                        && !matches!(
+                            request.params.get("mode").and_then(Value::as_str),
+                            Some("prepare_restart" | "cancel_restart")
+                        );
                     match router.handle_rpc(&request, peer).await {
                         Ok(result) => {
                             arm_shutdown = is_shutdown;

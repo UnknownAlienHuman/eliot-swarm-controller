@@ -240,6 +240,7 @@ enum RuntimeMessage {
         reply: oneshot::Sender<Result<Value>>,
     },
     DaemonForce {
+        restart: bool,
         reply: oneshot::Sender<Result<()>>,
     },
 }
@@ -1074,7 +1075,7 @@ impl PluginHost {
         self.state.startup_closed.store(true, Ordering::SeqCst);
     }
 
-    pub(crate) async fn force_all(&self) {
+    pub(crate) async fn force_all(&self, restart: bool) {
         self.close_startup_admission();
         let entries: Vec<_> = {
             let _startup = self.state.startup_gate.lock().await;
@@ -1097,7 +1098,7 @@ impl PluginHost {
         for (key, sender) in entries {
             let (reply, response) = oneshot::channel();
             if sender
-                .send(RuntimeMessage::DaemonForce { reply })
+                .send(RuntimeMessage::DaemonForce { restart, reply })
                 .await
                 .is_ok()
             {

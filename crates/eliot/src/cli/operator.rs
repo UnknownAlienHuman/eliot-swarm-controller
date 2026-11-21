@@ -6,7 +6,6 @@ use eliot_core::api::{
     AgentGetRequest, AgentGetResponse, AgentListRequest, AgentListResponse, AgentSummary,
     ArchivedFilter, DaemonShutdownRequest, DaemonStatusRequest, DaemonStatusResponse, ShutdownMode,
 };
-use eliot_core::{AgentState, CommandState, TurnOutcome};
 use eliot_daemon::operator::{DaemonInfo, daemon_alive, daemon_info};
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -18,29 +17,43 @@ const STOP_WAIT: Duration = Duration::from_secs(90);
 const CUSTODY_SETTLE_WAIT: Duration = Duration::from_secs(10);
 const PROBE_INTERVAL: Duration = Duration::from_millis(200);
 
-pub(super) struct StoppedAgent {
-    pub(super) id: String,
-    pub(super) generation: i64,
-    pub(super) skip_reason: Option<String>,
+pub(super) async fn stop_and_drain(data_dir: &Path) -> Result<(), Failure> {
+    let (daemon, initial_status) = require_running(data_dir).await?;
+    if initial_status.store_write_faulted || initial_status.drain.is_none() {
+        return Err(Failure::new(1, "the daemon cannot prove a clean stop"));
+    }
+    let mut stops = Vec::new();
+    let result = async {
+        stop_stand_agents(data_dir, &mut stops).await?;
+        wait_for_custody_to_settle(data_dir, &daemon).await?;
+        let request = DaemonShutdownRequest::new(mutation_id(None)?, ShutdownMode::Drain);
+        shutdown_daemon(data_dir, &request).await?;
+        wait_for_exit(&daemon, STARTUP_WAIT).await?;
+        check_same_daemon(data_dir, &daemon)?;
+        if eliot_daemon::last_daemon_phase(data_dir).as_deref() != Some("daemon.stopped") {
+            return Err(Failure::new(
+                4,
+                format!(
+                    "daemon PID {} exited without a clean shutdown record",
+                    daemon.pid
+                ),
+            ));
+        }
+        Ok(())
+    }
+    .await;
+    result.map_err(|mut error| {
+        error.message = format!("{}; stand stop requests: {:?}", error.message, stops);
+        error
+    })
 }
 
-pub(super) async fn stop_and_drain(data_dir: &Path) -> Result<Vec<StoppedAgent>, Failure> {
-    let (daemon, initial_status) = require_running(data_dir).await?;
-    if initial_status.store_write_faulted {
-        return Err(Failure::new(
-            1,
-            "the daemon Store cannot commit a clean stop",
-        ));
-    }
-    if initial_status.drain.is_none() {
-        return Err(Failure::new(
-            1,
-            "the running daemon cannot report turn and process custody",
-        ));
-    }
-    let initial = agents(data_dir).await?;
-    let mut stopped = Vec::new();
-    for summary in initial.values().filter(|agent| !agent.state.is_terminal()) {
+async fn stop_stand_agents(data_dir: &Path, stops: &mut Vec<String>) -> Result<(), Failure> {
+    for summary in agents(data_dir)
+        .await?
+        .into_values()
+        .filter(|agent| !agent.state.is_terminal())
+    {
         let agent = read_agent(data_dir, &summary.id).await?.agent;
         if agent.generation != summary.generation {
             return Err(Failure::new(
@@ -51,108 +64,35 @@ pub(super) async fn stop_and_drain(data_dir: &Path) -> Result<Vec<StoppedAgent>,
         if agent.observe_only || agent.is_terminal() {
             continue;
         }
-        let ready_to_resume = summary.state == AgentState::Idle
-            && agent.state == AgentState::Idle
-            && agent.active_turn.is_none()
-            && agent.pending.is_empty()
-            && agent.native_ref.is_some()
-            && summary.last_outcome != Some(TurnOutcome::Unknown)
-            && !summary.archived;
         let deadline = Instant::now() + STOP_WAIT;
         let mut stop = submit_request(
             None,
             Some(agent.id.clone()),
             "stop",
-            json!({ "force": false }),
+            json!({"force": false}),
         )?;
         stop.expected_generation = Some(agent.generation);
-        let submitted = timeout_at(deadline, submit_command(data_dir, &stop))
+        stops.push(format!("{}#{} ({})", agent.id, agent.generation, stop.id));
+        timeout_at(deadline, submit_command(data_dir, &stop))
             .await
             .map_err(|_| Failure::timeout())??;
-        let outcome = if submitted.state == CommandState::Unknown {
-            Err(Failure::new(4, "stop outcome is unknown"))
-        } else {
-            wait_for_command(data_dir, &stop.id, deadline).await
-        };
-        let skip_reason = match outcome {
-            Ok(command)
-                if command
-                    .outcome
-                    .as_ref()
-                    .is_some_and(|outcome| outcome["already_terminal"].as_bool() == Some(true)) =>
-            {
-                Some("Agent had already stopped".to_owned())
-            }
-            Ok(_) if !ready_to_resume => Some(
-                if summary.active_turn.is_some() || agent.active_turn.is_some() {
-                    "turn was active when shutdown began".to_owned()
-                } else if summary.last_outcome == Some(TurnOutcome::Unknown) {
-                    "last turn outcome is unknown".to_owned()
-                } else {
-                    "Agent had no confirmed idle, resumable session".to_owned()
-                },
-            ),
-            Ok(_) => None,
-            Err(error) => Some(format!("stop {}: {}", stop.id, error.message)),
-        };
-        stopped.push(StoppedAgent {
-            id: agent.id,
-            generation: agent.generation,
-            skip_reason,
-        });
+        wait_for_command(data_dir, &stop.id, deadline).await?;
     }
+    Ok(())
+}
 
-    wait_for_custody_to_settle(data_dir, &daemon).await?;
-
-    // Read the committed post-stop projection. An ordinary stop does not bind
-    // an idle turn, so it can race a newly admitted input.
-    let final_agents = agents(data_dir).await?;
-    for stopped_agent in stopped
-        .iter_mut()
-        .filter(|agent| agent.skip_reason.is_none())
-    {
-        let before = initial.get(&stopped_agent.id);
-        let after = final_agents.get(&stopped_agent.id);
-        if before.zip(after).is_none_or(|(before, after)| {
-            after.generation != stopped_agent.generation
-                || after.state != AgentState::Stopped
-                || after.active_turn.is_some()
-                || after.last_turn_id != before.last_turn_id
-                || after.last_outcome != before.last_outcome
-        }) {
-            stopped_agent.skip_reason = Some("Agent or turn changed during stop".to_owned());
-        }
-    }
-
-    let deadline = Instant::now() + STARTUP_WAIT;
-    let request = DaemonShutdownRequest::new(mutation_id(None)?, ShutdownMode::Drain);
-    let response = timeout_at(deadline, shutdown_daemon(data_dir, &request))
-        .await
-        .map_err(|_| Failure::timeout())??;
-    while daemon_alive(&daemon).map_err(Failure::for_read)? {
+pub(super) async fn wait_for_exit(daemon: &DaemonInfo, wait: Duration) -> Result<(), Failure> {
+    let deadline = Instant::now() + wait;
+    while daemon_alive(daemon).map_err(Failure::for_read)? {
         if Instant::now() >= deadline {
             return Err(Failure::new(
                 5,
-                format!(
-                    "daemon PID {} did not exit after drain; initial blockers: {:?}; inspect swarm status",
-                    daemon.pid,
-                    response.blockers.unwrap_or_default()
-                ),
+                format!("daemon PID {} did not exit", daemon.pid),
             ));
         }
         sleep(PROBE_INTERVAL).await;
     }
-    check_same_daemon(data_dir, &daemon)?;
-    if eliot_daemon::last_daemon_phase(data_dir).as_deref() != Some("daemon.stopped") {
-        return Err(Failure::new(
-            4,
-            format!(
-                "daemon PID {} exited without a clean shutdown record",
-                daemon.pid
-            ),
-        ));
-    }
-    Ok(stopped)
+    Ok(())
 }
 
 async fn wait_for_custody_to_settle(data_dir: &Path, daemon: &DaemonInfo) -> Result<(), Failure> {
@@ -194,7 +134,7 @@ pub(super) async fn require_running(
     Ok((daemon, status))
 }
 
-fn check_same_daemon(data_dir: &Path, expected: &DaemonInfo) -> Result<(), Failure> {
+pub(super) fn check_same_daemon(data_dir: &Path, expected: &DaemonInfo) -> Result<(), Failure> {
     let daemon = daemon_info(data_dir).map_err(Failure::for_read)?;
     if daemon.as_ref() != Some(expected) {
         return Err(Failure::new(
@@ -205,7 +145,7 @@ fn check_same_daemon(data_dir: &Path, expected: &DaemonInfo) -> Result<(), Failu
     Ok(())
 }
 
-async fn status(data_dir: &Path) -> Result<DaemonStatusResponse, Failure> {
+pub(super) async fn status(data_dir: &Path) -> Result<DaemonStatusResponse, Failure> {
     let request = DaemonStatusRequest::default();
     let response = timeout_at(
         Instant::now() + Duration::from_secs(3),
@@ -220,7 +160,7 @@ async fn status(data_dir: &Path) -> Result<DaemonStatusResponse, Failure> {
     Ok(response)
 }
 
-async fn agents(data_dir: &Path) -> Result<BTreeMap<String, AgentSummary>, Failure> {
+pub(super) async fn agents(data_dir: &Path) -> Result<BTreeMap<String, AgentSummary>, Failure> {
     let mut request = AgentListRequest {
         archived: ArchivedFilter::Include,
         ..AgentListRequest::default()
@@ -275,12 +215,26 @@ pub(super) async fn start_owned(data_dir: &Path, binary: &Path) -> Result<u32, F
         std::ffi::OsStr::new("--foreground"),
     ];
     #[cfg(windows)]
-    let pid = eliot_daemon::operator::start_detached(binary, &args, true, None)
-        .map_err(Failure::for_read)?;
+    let (pid, birth) = {
+        let pid = eliot_daemon::operator::start_detached(binary, &args, true, None)
+            .map_err(Failure::for_read)?;
+        let birth = match eliot_daemon::operator::candidate_birth(pid) {
+            Ok(birth) => birth,
+            Err(error) if error.code == "process_gone" => {
+                return Err(Failure::new(
+                    1,
+                    format!("replacement PID {pid} exited during startup"),
+                ));
+            }
+            Err(error) => return Err(Failure::for_read(error)),
+        };
+        (pid, birth)
+    };
     #[cfg(unix)]
-    let pid = {
+    let (pid, mut child) = {
         use std::process::Stdio;
-        tokio::process::Command::new(binary)
+        let mut command = tokio::process::Command::new(binary);
+        command
             .args(args)
             .current_dir(
                 binary
@@ -290,14 +244,22 @@ pub(super) async fn start_owned(data_dir: &Path, binary: &Path) -> Result<u32, F
             .process_group(0)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+        for (name, _) in std::env::vars_os() {
+            if name.to_string_lossy().starts_with("ELIOT_") {
+                command.env_remove(name);
+            }
+        }
+        let child = command
             .spawn()
-            .map_err(|error| Failure::new(1, format!("start release daemon: {error}")))?
+            .map_err(|error| Failure::new(1, format!("start release daemon: {error}")))?;
+        let pid = child
             .id()
-            .ok_or_else(|| Failure::new(1, "release daemon did not return a process ID"))?
+            .ok_or_else(|| Failure::new(1, "release daemon did not return a process ID"))?;
+        (pid, child)
     };
     #[cfg(not(any(windows, unix)))]
-    let pid = {
+    let pid: u32 = {
         let _ = (binary, args);
         Err(Failure::new(
             2,
@@ -305,11 +267,39 @@ pub(super) async fn start_owned(data_dir: &Path, binary: &Path) -> Result<u32, F
         ))?
     };
 
+    let result = wait_for_ready(data_dir, pid, previous.as_ref(), start_ms).await;
+    if let Err(mut failure) = result {
+        #[cfg(windows)]
+        let cleanup = eliot_daemon::operator::stop_candidate(pid, birth).map_err(Failure::for_read);
+        #[cfg(unix)]
+        let cleanup = child
+            .kill()
+            .await
+            .map_err(|error| Failure::new(4, error.to_string()));
+        #[cfg(not(any(windows, unix)))]
+        let cleanup: Result<(), Failure> = Ok(());
+        if let Err(cleanup) = cleanup {
+            failure.message = format!(
+                "{}; replacement custody could not be closed: {}",
+                failure.message, cleanup.message
+            );
+        }
+        return Err(failure);
+    }
+    Ok(pid)
+}
+
+async fn wait_for_ready(
+    data_dir: &Path,
+    pid: u32,
+    previous: Option<&DaemonInfo>,
+    start_ms: u128,
+) -> Result<(), Failure> {
     let deadline = Instant::now() + STARTUP_WAIT;
     let log_path = data_dir.join("logs").join("daemon.log");
     loop {
         if let Some(current) = daemon_info(data_dir).map_err(Failure::for_read)?
-            && Some(&current) != previous.as_ref()
+            && Some(&current) != previous
         {
             if current.pid != pid {
                 return Err(Failure::new(
@@ -320,10 +310,13 @@ pub(super) async fn start_owned(data_dir: &Path, binary: &Path) -> Result<u32, F
                     ),
                 ));
             }
-            if daemon_alive(&current).map_err(Failure::for_read)? && status(data_dir).await.is_ok()
+            if daemon_alive(&current).map_err(Failure::for_read)?
+                && status(data_dir)
+                    .await
+                    .is_ok_and(|status| status.admission == "open" && !status.store_write_faulted)
             {
                 check_same_daemon(data_dir, &current)?;
-                return Ok(pid);
+                return Ok(());
             }
         }
         if let Some(failure) = eliot_daemon::daemon_failure_since(data_dir, start_ms) {

@@ -114,8 +114,11 @@ struct BootResumeWorker {
 type StoreHandle = Arc<AsyncMutex<eliot_store::Store>>;
 
 const MODE_OPEN: u8 = 0;
-const MODE_DRAIN: u8 = 1;
-const MODE_FORCE: u8 = 2;
+const MODE_QUIESCE: u8 = 1;
+const MODE_RESTART: u8 = 2;
+const MODE_DRAIN: u8 = 3;
+const MODE_FORCE: u8 = 4;
+const RESTART_LEASE: Duration = Duration::from_secs(120);
 
 #[derive(Clone)]
 pub(crate) struct Router {
@@ -149,6 +152,7 @@ struct RouterInner {
     previous_crash: Mutex<Option<CrashMarker>>,
     worker_tasks: Mutex<Vec<WorkerTaskStatus>>,
     mode: AtomicU8,
+    restart_lease: Mutex<Option<String>>,
     shutdown_ready: AtomicBool,
     progress: watch::Sender<u64>,
     run_cancellation: watch::Sender<bool>,
@@ -410,6 +414,7 @@ impl Router {
                         .collect(),
                 ),
                 mode: AtomicU8::new(MODE_OPEN),
+                restart_lease: Mutex::new(None),
                 shutdown_ready: AtomicBool::new(false),
                 progress,
                 run_cancellation,
@@ -732,9 +737,18 @@ impl Router {
         self.inner.mode.load(Ordering::SeqCst) == MODE_FORCE
     }
 
+    pub(crate) fn is_restart_requested(&self) -> bool {
+        self.inner.mode.load(Ordering::SeqCst) == MODE_RESTART
+    }
+
+    pub(crate) async fn stop_for_restart(&self) {
+        self.inner.workspaces.stop_all(true).await;
+        self.inner.plugin_host.force_all(true).await;
+    }
+
     pub(crate) async fn should_exit(&self) -> Result<bool> {
         match self.inner.mode.load(Ordering::SeqCst) {
-            MODE_FORCE => Ok(self.inner.shutdown_ready.load(Ordering::SeqCst)),
+            MODE_FORCE | MODE_RESTART => Ok(self.inner.shutdown_ready.load(Ordering::SeqCst)),
             MODE_DRAIN if self.inner.shutdown_ready.load(Ordering::SeqCst) => {
                 // The blocker list already names live Run workers, but the
                 // exit gate repeats the cheap registry check explicitly so a
@@ -781,7 +795,7 @@ impl Router {
             }
         }
         self.inner.workspaces.stop_all(true).await;
-        self.inner.plugin_host.force_all().await;
+        self.inner.plugin_host.force_all(false).await;
     }
     pub(crate) async fn recover_workspaces(&self) -> Result<()> {
         for id in self.inner.workspaces.recover().await? {
@@ -1323,8 +1337,8 @@ impl Router {
 
     fn check_command_admission_mode(&self, verb: &str) -> Result<()> {
         let mode = self.inner.mode.load(Ordering::SeqCst);
-        if mode == MODE_FORCE {
-            return Err(Error::new("unavailable", "daemon is forcing shutdown"));
+        if matches!(mode, MODE_FORCE | MODE_RESTART) {
+            return Err(Error::new("unavailable", "daemon is shutting down"));
         }
         if matches!(verb, "launch" | "resume" | "send" | "attach") && mode != MODE_OPEN {
             return Err(Error::new(
@@ -5294,6 +5308,12 @@ impl Router {
             eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         let mode = request.mode;
+        if matches!(
+            mode,
+            ShutdownMode::PrepareRestart | ShutdownMode::CancelRestart | ShutdownMode::Restart
+        ) {
+            return self.restart_shutdown(request, principal).await;
+        }
         let id = request.id.to_owned();
         // Drain is a pure read-side report: no effects run before the
         // shutdown-ID claim, so an exact retry replays the retained reply
@@ -5325,6 +5345,15 @@ impl Router {
             .map_err(|_| Error::new("internal", "shutdown result could not be encoded"))?;
         let write = {
             let mut store = self.inner.store.lock().await;
+            if matches!(
+                self.inner.mode.load(Ordering::SeqCst),
+                MODE_QUIESCE | MODE_RESTART
+            ) {
+                return Err(Error::new(
+                    "operator_busy",
+                    "a planned restart owns daemon admission",
+                ));
+            }
             let payload = json!({"mode": mode.as_str()});
             let write = match store.record_write(
                 &id,
@@ -5375,6 +5404,80 @@ impl Router {
         self.signal_progress();
         serde_json::to_value(response?)
             .map_err(|_| Error::new("internal", "shutdown result could not be encoded"))
+    }
+
+    async fn restart_shutdown(
+        &self,
+        request: DaemonShutdownRequest,
+        principal: &Principal,
+    ) -> Result<Value> {
+        let mut store = self.inner.store.lock().await;
+        let mut lease = self.inner.restart_lease.lock_recover();
+        let mode = self.inner.mode.load(Ordering::SeqCst);
+        let action = request.mode;
+        if action == ShutdownMode::PrepareRestart {
+            if mode != MODE_OPEN && !(mode == MODE_QUIESCE && lease.as_ref() == Some(&request.id)) {
+                return Err(Error::new(
+                    "bad_state",
+                    "daemon admission is already closed",
+                ));
+            }
+        } else if mode != MODE_QUIESCE || lease.as_ref() != request.restart_id.as_ref() {
+            return Err(Error::new(
+                "bad_state",
+                "the update admission fence is no longer held",
+            ));
+        }
+        if action == ShutdownMode::Restart
+            && (store.has_restart_work()?
+                || self.inner.workspaces.has_owned_processes()
+                || self.inference_workers_active()
+                || self.run_workers_active())
+        {
+            return Err(Error::new("restart_busy", "admitted work is still running"));
+        }
+        let result = json!({"state": "applied", "mode": action});
+        let admission = store.record_write(
+            &request.id,
+            &principal_name(principal),
+            "daemon.shutdown",
+            &json!({"mode": action, "restart_id": request.restart_id}),
+            &result,
+            now_ms(),
+        )?;
+        if admission.is_new {
+            match action {
+                ShutdownMode::PrepareRestart => {
+                    *lease = Some(request.id.clone());
+                    self.inner.mode.store(MODE_QUIESCE, Ordering::SeqCst);
+                    let router = self.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(RESTART_LEASE).await;
+                        let _store = router.inner.store.lock().await;
+                        let mut lease = router.inner.restart_lease.lock_recover();
+                        if router.inner.mode.load(Ordering::SeqCst) == MODE_QUIESCE
+                            && lease.as_ref() == Some(&request.id)
+                        {
+                            *lease = None;
+                            router.inner.mode.store(MODE_OPEN, Ordering::SeqCst);
+                            router.signal_progress();
+                        }
+                    });
+                }
+                ShutdownMode::CancelRestart => {
+                    *lease = None;
+                    self.inner.mode.store(MODE_OPEN, Ordering::SeqCst);
+                }
+                ShutdownMode::Restart => {
+                    self.inner.shutdown_ready.store(false, Ordering::SeqCst);
+                    self.inner.mode.store(MODE_RESTART, Ordering::SeqCst);
+                    *lease = None;
+                }
+                _ => unreachable!("ordinary shutdown handled separately"),
+            }
+        }
+        self.signal_progress();
+        Ok(admission.result)
     }
 
     async fn settle_run_worker_unknown(&self, run_id: &str, cause: &str) {
@@ -5731,6 +5834,8 @@ impl Router {
 
     fn mode_name(&self) -> &'static str {
         match self.inner.mode.load(Ordering::SeqCst) {
+            MODE_QUIESCE => "quiescing",
+            MODE_RESTART => "restarting",
             MODE_DRAIN => "draining",
             MODE_FORCE => "forcing",
             _ => "open",

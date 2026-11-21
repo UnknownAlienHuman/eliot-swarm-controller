@@ -5,6 +5,7 @@ use eliot_core::{Error, Result};
 use std::path::{Path, PathBuf};
 
 pub use crate::platform::data_dir::{DaemonInfo, DaemonLock, OperatorLock};
+pub const STORE_SCHEMA_VERSION: i64 = eliot_store::Store::SCHEMA_VERSION;
 
 pub fn daemon_info(path: &Path) -> Result<Option<DaemonInfo>> {
     DataDir::open_existing(path)?.read_daemon_info()
@@ -67,6 +68,16 @@ pub fn validate_stand_profiles(source: &[u8]) -> Result<()> {
     Ok(())
 }
 
+pub fn validate_stand_directory(path: &Path) -> Result<()> {
+    DataDir::open_existing(path)?;
+    Ok(())
+}
+
+pub fn write_stand_record(path: &Path, name: &str, bytes: &[u8]) -> Result<()> {
+    DataDir::open_existing(path)?;
+    crate::platform::data_dir::replace_file_atomically(path, name, bytes, true)
+}
+
 pub fn daemon_alive(info: &DaemonInfo) -> Result<bool> {
     #[cfg(windows)]
     return crate::platform::windows::recorded_process_alive(
@@ -88,6 +99,47 @@ pub fn daemon_alive(info: &DaemonInfo) -> Result<bool> {
             "cannot prove daemon process identity",
         ))
     }
+}
+
+pub fn running_binary(info: &DaemonInfo) -> Result<PathBuf> {
+    #[cfg(windows)]
+    return crate::platform::windows::recorded_process_image(
+        info.pid,
+        birth_time(info, "windows-creation-filetime:")?,
+    )?
+    .canonicalize()
+    .map_err(|error| Error::new("platform_io", format!("resolve previous release: {error}")));
+    #[cfg(target_os = "linux")]
+    {
+        let path = std::fs::read_link(format!("/proc/{}/exe", info.pid)).map_err(|error| {
+            Error::new("platform_io", format!("resolve previous release: {error}"))
+        })?;
+        if !daemon_alive(info)? || !path.is_file() {
+            return Err(Error::new(
+                "process_identity",
+                "previous release is unavailable",
+            ));
+        }
+        Ok(path)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = info;
+        Err(Error::new(
+            "platform_unsupported",
+            "cannot identify the previous release",
+        ))
+    }
+}
+
+#[cfg(windows)]
+pub fn candidate_birth(pid: u32) -> Result<u64> {
+    crate::platform::windows::process_start_time(pid)
+}
+
+#[cfg(windows)]
+pub fn stop_candidate(pid: u32, birth: u64) -> Result<()> {
+    crate::platform::windows::terminate_recorded_process(pid, birth)
 }
 
 /// Preserve the directory spelling given to the old process. On Windows a

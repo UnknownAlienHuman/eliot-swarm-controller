@@ -28,6 +28,9 @@ pub(crate) struct PageArgs {
     about = "Local controller for coding-agent sessions"
 )]
 pub(crate) struct Cli {
+    #[arg(long, hide = true, exclusive = true)]
+    pub(crate) operator_release_info: bool,
+
     /// Private Eliot data directory (defaults to ELIOT_HOME or the platform data location).
     #[arg(long, global = true, value_name = "PATH")]
     pub(crate) data_dir: Option<PathBuf>,
@@ -1072,6 +1075,9 @@ pub(crate) enum DaemonAction {
     Update {
         /// Release directory or path to the replacement Swarm executable.
         release: PathBuf,
+        /// Maximum seconds to let already-admitted work finish.
+        #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=90))]
+        wait_seconds: u64,
     },
 }
 

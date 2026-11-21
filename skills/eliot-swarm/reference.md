@@ -145,6 +145,8 @@ must explicitly request `--delete-remote` for remote branch deletion.
 
 Choose a fresh path and supply only the private profile settings needed for the
 proof. Use the workspace printed by `stand up` and keep teardown in the same turn.
+For managed proofs, explicitly register eligible directories under your bound
+artifact root. Stand registration establishes local teardown ownership.
 
 ## Unknown outcomes
 

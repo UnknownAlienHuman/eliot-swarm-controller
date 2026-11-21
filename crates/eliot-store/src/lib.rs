@@ -1171,6 +1171,21 @@ impl Store {
             .map_err(sql_error)
     }
 
+    /// Exact gate for a planned restart. The router holds the writer while
+    /// evaluating this gate and closing the last control admissions.
+    pub fn has_restart_work(&self) -> Result<bool> {
+        let active: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM agents WHERE observe_only = 0 AND
+                (active_turn IS NOT NULL OR state IN ('created', 'starting', 'busy', 'waiting')))",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
+        Ok(active || self.count_unsettled_commands_excluding_retained()? != 0)
+    }
+
     /// Total unsettled commands ignoring the drain list bound and the page
     /// byte bound. Compare with the bounded list to mark truncation honestly
     /// for any omission reason.

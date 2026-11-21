@@ -13,6 +13,16 @@ use cli::support::Failure;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    if cli.operator_release_info {
+        println!(
+            "{}",
+            serde_json::json!({
+                "version": concat!("swarm ", env!("CARGO_PKG_VERSION")),
+                "store_schema": eliot_daemon::operator::STORE_SCHEMA_VERSION,
+            })
+        );
+        return ExitCode::SUCCESS;
+    }
     let is_plugin = matches!(&cli.command, Some(CliCommand::Plugin(_)));
     // One hook for both binaries: the daemon and every plugin share this
     // executable, so the code is mode-aware. A WMI-started daemon has no

@@ -4,11 +4,12 @@ use super::operator::{start_owned, stop_and_drain};
 use super::support::{Failure, print_value};
 use eliot_daemon::operator::{
     create_stand_root, daemon_alive, daemon_info, lock_offline, lock_transition,
+    validate_stand_directory, write_stand_record,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -21,6 +22,14 @@ const MAX_PROFILE_BYTES: u64 = 1024 * 1024;
 struct StandMarker {
     format: u32,
     root: PathBuf,
+    token: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Registration {
+    marker: StandMarker,
+    removing_pid: Option<u32>,
 }
 
 pub(crate) async fn up(
@@ -29,8 +38,8 @@ pub(crate) async fn up(
     binary: Option<PathBuf>,
     json_output: bool,
 ) -> Result<u8, Failure> {
-    let root = root
-        .unwrap_or_else(|| std::env::temp_dir().join(format!("swarm-stand-{}", ulid::Ulid::new())));
+    let (base, registry) = stand_registry(true)?;
+    let root = root.unwrap_or_else(|| base.join(format!("swarm-stand-{}", ulid::Ulid::new())));
     let root =
         std::path::absolute(root).map_err(|error| io_failure("resolve stand path", error))?;
     let parent = root
@@ -52,6 +61,11 @@ pub(crate) async fn up(
         }
     }
     let root = parent.join(name);
+    ensure_registry_is_external(&root, &registry)?;
+    let name = registry_name(&root);
+    if registry.join(&name).exists() {
+        return Err(Failure::new(2, "this path has a prior stand registration"));
+    }
     let binary = match binary {
         Some(binary) => binary,
         None => std::env::current_exe().map_err(|error| io_failure("locate Swarm", error))?,
@@ -82,6 +96,23 @@ pub(crate) async fn up(
         return Err(failure);
     }
     let _transition = lock_transition(&root).map_err(Failure::for_read)?;
+    let registration = Registration {
+        marker: StandMarker {
+            format: 2,
+            root: root.clone(),
+            token: format!("{}{}", ulid::Ulid::new(), ulid::Ulid::new()),
+        },
+        removing_pid: None,
+    };
+    let mut marker = File::create_new(root.join(MARKER))
+        .map_err(|error| io_failure("create stand marker", error))?;
+    let bytes = serde_json::to_vec(&registration.marker)
+        .map_err(|_| Failure::new(1, "encode stand marker"))?;
+    marker
+        .write_all(&bytes)
+        .and_then(|()| marker.sync_all())
+        .map_err(|error| io_failure("write stand marker", error))?;
+    write_record(&registry, &name, &registration)?;
     let pid = start_owned(&root, &binary).await.map_err(|mut failure| {
         failure.message = format!("{}; stand retained at {}", failure.message, root.display());
         failure
@@ -105,66 +136,262 @@ pub(crate) async fn up(
 pub(crate) async fn down(path: PathBuf, json_output: bool) -> Result<u8, Failure> {
     let path =
         std::path::absolute(path).map_err(|error| io_failure("resolve stand path", error))?;
-    check_directory_chain(&path)?;
-    let root = path
+    let (_, registry) = stand_registry(false)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| Failure::new(2, "stand path has no parent"))?;
+    check_directory_chain(parent)?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| Failure::new(2, "stand path has no name"))?;
+    let root = parent
         .canonicalize()
-        .map_err(|error| io_failure("resolve stand path", error))?;
-    verify_marker(&root)?;
-    let _transition = lock_transition(&root).map_err(Failure::for_read)?;
-    verify_marker(&root)?;
-    let daemon = daemon_info(&root)
-        .map_err(Failure::for_read)?
-        .ok_or_else(|| Failure::new(4, "stand has no daemon process identity; files retained"))?;
-    #[cfg(windows)]
-    eliot_daemon::operator::stop_desktop(&root).map_err(Failure::for_read)?;
-    if daemon_alive(&daemon).map_err(Failure::for_read)? {
-        stop_and_drain(&root).await?;
+        .map_err(|error| io_failure("resolve stand parent", error))?
+        .join(name);
+    let name = registry_name(&root);
+    ensure_registry_is_external(&root, &registry)?;
+    let mut record = registered_stand(&registry, &name, &root)?;
+    match fs::symlink_metadata(&root) {
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound && record.removing_pid.is_some() =>
+        {
+            fs::remove_file(registry.join(name))
+                .map_err(|error| io_failure("remove stand registration", error))?;
+            return removed(&root, record.removing_pid.unwrap_or_default(), json_output);
+        }
+        Err(error) => return Err(io_failure("inspect stand root", error)),
+        Ok(_) => {}
     }
-    let _offline = lock_offline(&root).map_err(Failure::for_read)?;
-    let current = daemon_info(&root).map_err(Failure::for_read)?;
-    if current.as_ref() != Some(&daemon)
-        || daemon_alive(&daemon).map_err(Failure::for_read)?
-        || eliot_daemon::last_daemon_phase(&root).as_deref() != Some("daemon.stopped")
+    check_directory_chain(&root)?;
+    verify_marker(&root, &record)?;
+    let _transition = lock_transition(&root).map_err(Failure::for_read)?;
+    record = registered_stand(&registry, &name, &root)?;
+    verify_marker(&root, &record)?;
+    check_nested_roots(&root)?;
+    let pid = match record.removing_pid {
+        Some(pid) => pid,
+        None => prove_stand_exit(&root).await?,
+    };
+    let offline = lock_offline(&root).map_err(Failure::for_read)?;
+    if let Some(info) = daemon_info(&root).map_err(Failure::for_read)?
+        && (info.pid != pid || daemon_alive(&info).map_err(Failure::for_read)?)
     {
         return Err(Failure::new(
             4,
-            "stand lacks a clean daemon exit record; files retained",
+            "stand daemon identity changed; files retained",
         ));
     }
-    verify_marker(&root)?;
-    check_nested_roots(&root)?;
-    remove_offline_root(&root)?;
-    let data_dir = display(&root);
+    record.removing_pid = Some(pid);
+    write_record(&registry, &name, &record)?;
+    remove_offline_root(&root, offline)?;
+    fs::remove_file(registry.join(name))
+        .map_err(|error| io_failure("remove stand registration", error))?;
+    removed(&root, pid, json_output)
+}
+
+async fn prove_stand_exit(root: &Path) -> Result<u32, Failure> {
+    let daemon = daemon_info(root)
+        .map_err(Failure::for_read)?
+        .ok_or_else(|| unproven_exit(root))?;
+    #[cfg(windows)]
+    eliot_daemon::operator::stop_desktop(root).map_err(Failure::for_read)?;
+    if daemon_alive(&daemon).map_err(Failure::for_read)? {
+        stop_and_drain(root).await?;
+    }
+    let current = daemon_info(root).map_err(Failure::for_read)?;
+    if current.as_ref() != Some(&daemon)
+        || daemon_alive(&daemon).map_err(Failure::for_read)?
+        || eliot_daemon::last_daemon_phase(root).as_deref() != Some("daemon.stopped")
+    {
+        return Err(unproven_exit(root));
+    }
+    Ok(daemon.pid)
+}
+
+fn unproven_exit(root: &Path) -> Failure {
+    Failure::new(
+        4,
+        format!(
+            "stand lacks a clean exit record; files retained. Start this registered stand with swarm --data-dir \"{}\" daemon to reconcile custody, then retry stand down",
+            display(root)
+        ),
+    )
+}
+
+fn removed(root: &Path, pid: u32, json_output: bool) -> Result<u8, Failure> {
+    let data_dir = display(root);
     if json_output {
         print_value(
-            &json!({"state": "removed", "data_dir": data_dir, "daemon_pid": daemon.pid}),
+            &json!({"state":"removed","data_dir":data_dir,"daemon_pid":pid}),
             true,
         );
     } else {
-        println!(
-            "Removed {data_dir} after daemon PID {} and its owned processes exited",
-            daemon.pid
-        );
+        println!("Removed {data_dir} after daemon PID {pid} and its owned processes exited");
     }
     Ok(0)
 }
 
-fn remove_offline_root(root: &Path) -> Result<(), Failure> {
-    #[cfg(windows)]
-    let retired = root.to_owned();
-    #[cfg(not(windows))]
-    let retired = {
-        let retired = root.with_file_name(format!(".retired-swarm-stand-{}", ulid::Ulid::new()));
-        fs::rename(root, &retired)
-            .map_err(|error| io_failure("retire offline stand directory", error))?;
-        retired
-    };
-    fs::remove_dir_all(&retired).map_err(|error| {
+fn remove_offline_root(
+    root: &Path,
+    offline: eliot_daemon::operator::DaemonLock,
+) -> Result<(), Failure> {
+    let failure = |error| {
         io_failure(
-            &format!("remove offline stand {}", display(&retired)),
+            &format!("remove stand {}; retry stand down", display(root)),
             error,
         )
-    })
+    };
+    for entry in fs::read_dir(root).map_err(failure)? {
+        let entry = entry.map_err(failure)?;
+        if [MARKER, "daemon.lock", "operator.lock"]
+            .iter()
+            .any(|name| entry.file_name() == *name)
+        {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path).map_err(failure)?;
+        if metadata.is_dir() && is_link(&metadata) {
+            fs::remove_dir(path).map_err(failure)?;
+        } else if metadata.is_dir() {
+            fs::remove_dir_all(path).map_err(failure)?;
+        } else {
+            fs::remove_file(path).map_err(failure)?;
+        }
+    }
+    drop(offline);
+    for name in ["daemon.lock", "operator.lock", MARKER] {
+        match fs::remove_file(root.join(name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(failure(error)),
+        }
+    }
+    fs::remove_dir(root).map_err(failure)
+}
+
+fn stand_registry(create: bool) -> Result<(PathBuf, PathBuf), Failure> {
+    let base = match std::env::var_os("SWARM_STANDS_ROOT") {
+        Some(path) => PathBuf::from(path),
+        None => {
+            #[cfg(windows)]
+            let base = std::env::var_os("LOCALAPPDATA")
+                .map(PathBuf::from)
+                .map(|p| p.join("EliotStands"));
+            #[cfg(not(windows))]
+            let base = std::env::var_os("XDG_STATE_HOME")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME")
+                        .map(PathBuf::from)
+                        .map(|p| p.join(".local/state"))
+                })
+                .map(|p| p.join("eliot-stands"));
+            base.ok_or_else(|| {
+                Failure::new(2, "set SWARM_STANDS_ROOT to a designated stand directory")
+            })?
+        }
+    };
+    let base = std::path::absolute(base)
+        .map_err(|error| io_failure("resolve designated stand root", error))?;
+    if base.components().any(|part| part == Component::ParentDir) {
+        return Err(Failure::new(
+            2,
+            "stand root must not contain parent-directory traversal",
+        ));
+    }
+    if base.starts_with(std::env::temp_dir()) {
+        return Err(Failure::new(
+            2,
+            "the designated stand root must be outside the temporary directory",
+        ));
+    }
+    if base
+        .ancestors()
+        .any(|path| path.join("daemon.lock").exists() || path.join(MARKER).exists())
+    {
+        return Err(Failure::new(
+            2,
+            "the designated stand root cannot be inside daemon data",
+        ));
+    }
+    if create {
+        fs::create_dir_all(&base)
+            .map_err(|error| io_failure("create designated stand root", error))?;
+    }
+    check_directory_chain(&base)?;
+    let base = base
+        .canonicalize()
+        .map_err(|error| io_failure("resolve designated stand root", error))?;
+    if std::env::temp_dir()
+        .canonicalize()
+        .is_ok_and(|temp| base.starts_with(temp))
+    {
+        return Err(Failure::new(
+            2,
+            "the designated stand root must be outside the temporary directory",
+        ));
+    }
+    let registry = base.join(".registry");
+    if create
+        && !registry.exists()
+        && let Err(error) = create_stand_root(&registry)
+        && !registry.exists()
+    {
+        return Err(Failure::for_read(error));
+    }
+    check_directory_chain(&registry)?;
+    validate_stand_directory(&registry).map_err(Failure::for_read)?;
+    Ok((base, registry))
+}
+
+fn ensure_registry_is_external(root: &Path, registry: &Path) -> Result<(), Failure> {
+    if registry.starts_with(root) || root.starts_with(registry) {
+        return Err(Failure::new(
+            2,
+            "a stand and its registry must be in separate directories",
+        ));
+    }
+    Ok(())
+}
+
+fn registry_name(root: &Path) -> String {
+    let identity = root.to_string_lossy();
+    let identity = if cfg!(windows) {
+        identity.to_lowercase()
+    } else {
+        identity.into_owned()
+    };
+    format!(
+        "{}.json",
+        eliot_core::api::inference::sha256_hex(identity.as_bytes())
+    )
+}
+
+fn write_record(dir: &Path, name: &str, value: &impl Serialize) -> Result<(), Failure> {
+    let bytes =
+        serde_json::to_vec(value).map_err(|_| Failure::new(1, "encode stand registration"))?;
+    write_stand_record(dir, name, &bytes).map_err(Failure::for_read)
+}
+
+fn registered_stand(registry: &Path, name: &str, root: &Path) -> Result<Registration, Failure> {
+    let record: Registration = read_record(&registry.join(name))
+        .ok_or_else(|| Failure::new(2, "directory is not registered by swarm stand up"))?;
+    if record.marker.format != 2 || registry_name(&record.marker.root) != registry_name(root) {
+        return Err(Failure::new(
+            2,
+            "stand registration does not bind this directory",
+        ));
+    }
+    Ok(record)
+}
+
+fn read_record<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.is_file() || is_link(&metadata) || metadata.len() > 32 * 1024 {
+        return None;
+    }
+    serde_json::from_slice(&fs::read(path).ok()?).ok()
 }
 
 async fn prepare(root: &Path, workspace: &Path, profile: Option<Vec<u8>>) -> Result<(), Failure> {
@@ -191,13 +418,7 @@ async fn prepare(root: &Path, workspace: &Path, profile: Option<Vec<u8>>) -> Res
         fs::write(root.join("config.toml"), profile)
             .map_err(|error| io_failure("write private profile configuration", error))?;
     }
-    let marker = serde_json::to_vec(&StandMarker {
-        format: 1,
-        root: root.to_owned(),
-    })
-    .map_err(|_| Failure::new(1, "cannot encode stand ownership marker"))?;
-    fs::write(root.join(MARKER), marker)
-        .map_err(|error| io_failure("write stand ownership marker", error))
+    Ok(())
 }
 
 async fn git(workspace: &Path, args: &[&str]) -> Result<(), Failure> {
@@ -258,24 +479,26 @@ fn check_directory_chain(path: &Path) -> Result<(), Failure> {
     Ok(())
 }
 
-fn verify_marker(root: &Path) -> Result<(), Failure> {
-    let file = root.join(MARKER);
-    let metadata = fs::symlink_metadata(&file)
-        .map_err(|_| Failure::new(2, "directory was not created by swarm stand up"))?;
-    if !metadata.is_file() || is_link(&metadata) || metadata.len() > 32 * 1024 {
-        return Err(Failure::new(2, "stand ownership marker is invalid"));
+fn verify_marker(root: &Path, registration: &Registration) -> Result<(), Failure> {
+    let path = root.join(MARKER);
+    if let Some(marker) = read_record::<StandMarker>(&path) {
+        if marker.format == registration.marker.format
+            && marker.root == registration.marker.root
+            && marker.token == registration.marker.token
+        {
+            return Ok(());
+        }
+    } else if registration.removing_pid.is_some()
+        && fs::symlink_metadata(&path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        && fs::read_dir(root).is_ok_and(|mut entries| entries.next().is_none())
+    {
+        return Ok(());
     }
-    let marker: StandMarker = serde_json::from_slice(
-        &fs::read(file).map_err(|error| io_failure("read stand ownership marker", error))?,
-    )
-    .map_err(|_| Failure::new(2, "stand ownership marker is invalid"))?;
-    if marker.format != 1 || marker.root != root {
-        return Err(Failure::new(
-            2,
-            "stand ownership marker does not match this directory",
-        ));
-    }
-    Ok(())
+    Err(Failure::new(
+        2,
+        "stand ownership marker does not match the external registration",
+    ))
 }
 
 fn check_nested_roots(root: &Path) -> Result<(), Failure> {

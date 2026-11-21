@@ -58,8 +58,8 @@ use windows_sys::Win32::System::SystemInformation::{GetSystemTimeAsFileTime, Get
 use windows_sys::Win32::System::Threading::{
     CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CreateEventW, CreateProcessW,
     DETACHED_PROCESS, GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, OpenProcess,
-    OpenProcessToken, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_SYNCHRONIZE, QueryFullProcessImageNameW, STARTUPINFOW, TerminateProcess,
+    OpenProcessToken, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    PROCESS_TERMINATE, QueryFullProcessImageNameW, STARTUPINFOW, TerminateProcess,
     WaitForSingleObject,
 };
 
@@ -1023,10 +1023,46 @@ pub(crate) fn process_start_time(pid: u32) -> Result<u64> {
 }
 
 pub(crate) fn recorded_process_argv(pid: u32, start_time: u64) -> Result<Vec<String>> {
+    let process = verified_process(pid, start_time, 0)?;
+    let command_line = process_command_line(process.0)
+        .ok_or_else(|| Error::new("process_identity", "the daemon command line is unavailable"))?;
+    Ok(eliot_core::split_windows_command_line(&command_line))
+}
+
+pub(crate) fn recorded_process_image(pid: u32, start_time: u64) -> Result<PathBuf> {
+    let process = verified_process(pid, start_time, 0)?;
+    process_image_basename(process.0)
+        .map(PathBuf::from)
+        .ok_or_else(|| Error::new("process_identity", "the daemon executable is unavailable"))
+}
+
+pub(crate) fn terminate_recorded_process(pid: u32, start_time: u64) -> Result<()> {
+    if !recorded_process_alive(pid, start_time)? {
+        return Ok(());
+    }
+    let process = match verified_process(pid, start_time, PROCESS_TERMINATE) {
+        Ok(process) => process,
+        Err(_) if !recorded_process_alive(pid, start_time)? => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    // SAFETY: this handle belongs to the exact candidate process verified above.
+    unsafe {
+        TerminateProcess(process.0, 1);
+        if WaitForSingleObject(process.0, 5000) == WAIT_OBJECT_0 {
+            return Ok(());
+        }
+    }
+    Err(Error::new(
+        "process_identity",
+        "the replacement process did not exit",
+    ))
+}
+
+fn verified_process(pid: u32, start_time: u64, extra_access: u32) -> Result<QueryHandle> {
     // SAFETY: the query/synchronize handle pins the observed process identity.
     let process = unsafe {
         OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | extra_access,
             0,
             pid,
         )
@@ -1053,9 +1089,7 @@ pub(crate) fn recorded_process_argv(pid: u32, start_time: u64) -> Result<Vec<Str
             "the daemon process identity changed",
         ));
     }
-    let command_line = process_command_line(process.0)
-        .ok_or_else(|| Error::new("process_identity", "the daemon command line is unavailable"))?;
-    Ok(eliot_core::split_windows_command_line(&command_line))
+    Ok(process)
 }
 /// ProcessCommandLineInformation class for NtQueryInformationProcess.
 const PROCESS_COMMAND_LINE_INFORMATION: u32 = 60;
