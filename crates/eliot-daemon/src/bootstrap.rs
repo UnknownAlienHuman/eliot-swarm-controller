@@ -408,10 +408,12 @@ fn installed_default_profiles(
             _ => "minimal",
         };
         profile.insert("mcp".to_owned(), Value::String(mcp.to_owned()));
-        if let Some(cmd) = discovered.get("cmd").and_then(Value::as_str) {
-            profile.insert("cmd".to_owned(), Value::String(cmd.to_owned()));
-        } else if *harness != "codex" {
-            continue;
+        if *harness != "claude" {
+            if let Some(cmd) = discovered.get("cmd").and_then(Value::as_str) {
+                profile.insert("cmd".to_owned(), Value::String(cmd.to_owned()));
+            } else if *harness != "codex" {
+                continue;
+            }
         }
         profiles.insert((*harness).to_owned(), Value::Object(profile));
     }

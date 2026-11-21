@@ -518,11 +518,14 @@ impl NativeTurnError {
                         | "responseStreamConnectionFailed"
                         | "responseStreamDisconnected"
                         | "responseTooManyFailedAttempts"
-                ) || details.as_object()?.get("httpStatusCode")?.as_u64() != Some(429)
-                {
+                ) {
                     return None;
                 }
-                ProviderRestrictionKind::RateLimit
+                match details.as_object()?.get("httpStatusCode")?.as_u64()? {
+                    403 => ProviderRestrictionKind::Auth,
+                    429 => ProviderRestrictionKind::RateLimit,
+                    _ => return None,
+                }
             }
             _ => return None,
         };
@@ -530,6 +533,19 @@ impl NativeTurnError {
             kind,
             retry_after: None,
         })
+    }
+
+    /// Only a structured rejection of an upstream request qualifies. A broken
+    /// response stream can follow accepted upstream work.
+    pub(crate) fn upstream_request_refused(&self) -> bool {
+        match self.codex_error_info.as_ref() {
+            Some(serde_json::Value::String(_)) => self.provider_restriction().is_some(),
+            Some(serde_json::Value::Object(variants)) => {
+                !variants.contains_key("responseStreamDisconnected")
+                    && self.provider_restriction().is_some()
+            }
+            _ => false,
+        }
     }
 }
 
@@ -736,6 +752,8 @@ pub struct NativeFileChangeItem {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum NativeThreadItem {
+    #[serde(rename = "userMessage")]
+    UserMessage,
     #[serde(rename = "agentMessage")]
     AgentMessage(NativeAgentMessageItem),
     #[serde(rename = "commandExecution")]

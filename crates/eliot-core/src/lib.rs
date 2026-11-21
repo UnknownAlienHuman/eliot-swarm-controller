@@ -76,9 +76,10 @@ pub use observe::{
 pub use presentation::{count_words, origin_words, reason_message, reason_words};
 pub use remote_call::{RemoteCallContext, RemoteIdentity};
 pub use routing::{
-    CapacityScope, ProviderHold, ProviderHoldState, ProviderRestriction, ProviderRestrictionKind,
-    RouteBinding, RouteQuotaStatus, RouteSkip, RouteSkipReason, RoutingDecision,
-    frozen_provider_scope, frozen_provider_scope_for,
+    CapacityScope, MAX_AUTOMATIC_PROVIDER_PROBES, PROVIDER_PROBE_LAUNCH_ARG, PROVIDER_PROBE_PROMPT,
+    ProviderHold, ProviderHoldState, ProviderRestriction, ProviderRestrictionKind, RouteBinding,
+    RouteQuotaStatus, RouteSkip, RouteSkipReason, RoutingDecision, frozen_provider_scope,
+    frozen_provider_scope_for,
 };
 pub use secrets::SecretPolicy;
 pub use source_handoff::{SourceHandoff, SourceHandoffAck, SourceHandoffGap};
@@ -528,6 +529,16 @@ pub struct Agent {
 }
 
 impl Agent {
+    pub fn is_automatic_provider_probe(&self) -> bool {
+        self.chat
+            && !self.observe_only
+            && self.harness == "codex"
+            && self.project.is_empty()
+            && self.parent.is_none()
+            && self.profile_snapshot.get(PROVIDER_PROBE_LAUNCH_ARG)
+                == Some(&serde_json::Value::Bool(true))
+    }
+
     pub fn new(
         id: impl Into<String>,
         project: impl Into<String>,

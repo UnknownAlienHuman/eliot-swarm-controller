@@ -18,6 +18,9 @@ pub struct RoutingDecision {
     pub reason: String,
     pub skipped: Vec<RouteSkip>,
     pub quota_status: RouteQuotaStatus,
+    /// Frozen, ordered tail of an Owner's opted-in role launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_failover: Option<Vec<String>>,
 }
 
 /// Why an ordered routing candidate was not selected.
@@ -26,10 +29,25 @@ pub struct RoutingDecision {
 pub enum RouteSkipReason {
     NotInstalled,
     ProviderHold,
+    ProviderFailure,
     QuotaExhausted,
     CapacityFull,
     Unauthorized,
     InvalidProfile,
+}
+
+impl RouteSkipReason {
+    pub fn user_message(self) -> &'static str {
+        match self {
+            Self::NotInstalled => "not installed",
+            Self::ProviderHold => "provider on hold",
+            Self::ProviderFailure => "provider refused the previous attempt",
+            Self::QuotaExhausted => "quota used up",
+            Self::CapacityFull => "at capacity",
+            Self::Unauthorized => "not allowed here",
+            Self::InvalidProfile => "profile does not resolve",
+        }
+    }
 }
 
 #[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -202,6 +220,11 @@ pub enum ProviderHoldState {
     Probing,
 }
 
+/// Reserved launch argument set only by daemon-owned provider maintenance.
+pub const PROVIDER_PROBE_LAUNCH_ARG: &str = "_provider_probe";
+/// Fixed task sent by the isolated maintenance probe Agent.
+pub const PROVIDER_PROBE_PROMPT: &str = "Reply with exactly OK. Do not use tools or modify files.";
+
 impl ProviderHoldState {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -220,7 +243,19 @@ pub struct ProviderHold {
     pub probe_command: Option<String>,
     pub state: ProviderHoldState,
     pub updated_at: i64,
+    /// Next automatic minimal probe time when no provider reset is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_probe_at: Option<i64>,
+    /// Timestamp when the current uninterrupted hold began.
+    #[serde(default)]
+    pub held_since: i64,
+    #[serde(default)]
+    pub automatic_probes: u32,
+    #[serde(default)]
+    pub probe_outcome_unknown: bool,
 }
+
+pub const MAX_AUTOMATIC_PROVIDER_PROBES: u32 = 6;
 
 impl ProviderHold {
     pub fn validate(&self) -> Result<()> {
@@ -229,11 +264,23 @@ impl ProviderHold {
             max_live: None,
         }
         .validate()?;
-        if self.probe_command.as_ref().is_some_and(|command| {
-            command.trim().is_empty()
-                || command.len() > crate::limits::MAX_COMMAND_ID_BYTES
-                || command.chars().any(char::is_control)
-        }) || matches!(self.state, ProviderHoldState::Probing) != self.probe_command.is_some()
+        if self.retry_after.is_some_and(|at| at < 0)
+            || self.next_probe_at.is_some_and(|at| at < 0)
+            || self.automatic_probes > MAX_AUTOMATIC_PROVIDER_PROBES
+            || self.held_since < 0
+            || self.held_since > self.updated_at
+            || (self.retry_after.is_some() && self.next_probe_at.is_some())
+            || (self.next_probe_at.is_some()
+                && !matches!(
+                    self.kind,
+                    ProviderRestrictionKind::RateLimit | ProviderRestrictionKind::Quota
+                ))
+            || self.probe_command.as_ref().is_some_and(|command| {
+                command.trim().is_empty()
+                    || command.len() > crate::limits::MAX_COMMAND_ID_BYTES
+                    || command.chars().any(char::is_control)
+            })
+            || matches!(self.state, ProviderHoldState::Probing) != self.probe_command.is_some()
         {
             return Err(Error::new("invalid", "invalid provider hold state"));
         }

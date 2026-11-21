@@ -36,7 +36,7 @@ use crate::native::{
     types::{
         NativeCommandExecutionItem, NativeErrorNotification, NativeFileChangeItem,
         NativeItemCompletedNotification, NativePatchChangeKind,
-        NativeServerRequestResolvedNotification, NativeThreadTokenUsage,
+        NativeServerRequestResolvedNotification, NativeThreadItem, NativeThreadTokenUsage,
         NativeThreadTokenUsageUpdatedNotification, NativeTokenUsageDelta,
         NativeTurnCompletedNotification, NativeTurnError, NativeTurnStartedNotification,
         NativeTurnStatus,
@@ -186,6 +186,7 @@ struct EventProcessor {
     writes_blocked: bool,
     gap_reported: bool,
     final_text: Option<String>,
+    turn_has_work_or_uncertain_effects: bool,
     /// Usage baseline and latest cumulative snapshot for the exact active
     /// turn, from `thread/tokenUsage/updated`. The baseline is the cumulative
     /// `total` minus the first observed per-response `last` (the thread total
@@ -372,6 +373,7 @@ impl EventProcessor {
             writes_blocked: false,
             gap_reported: false,
             final_text: None,
+            turn_has_work_or_uncertain_effects: false,
             turn_usage: None,
             session_usage: None,
             session_usage_committed: None,
@@ -614,7 +616,7 @@ impl EventProcessor {
         if method == "thread/tokenUsage/updated" {
             return !self.status.ready;
         }
-        matches!(
+        (matches!(
             method,
             "turn/started"
                 | "turn/completed"
@@ -622,7 +624,8 @@ impl EventProcessor {
                 | "item/completed"
                 | "serverRequest/resolved"
                 | "error"
-        ) && (!self.status.ready || self.status.active_turn_id.is_none())
+        ) || turn_activity_notification(method))
+            && (!self.status.ready || self.status.active_turn_id.is_none())
     }
 
     fn buffer_frame(&mut self, frame: BufferedNativeFrame) {
@@ -743,6 +746,7 @@ impl EventProcessor {
         self.status.active_command_id = Some(command_id.clone());
         self.status.active_turn_id = Some(turn_id.clone());
         self.final_text = None;
+        self.turn_has_work_or_uncertain_effects = false;
         self.turn_usage = None;
         let thread_id = self.status.thread_id.as_deref().unwrap_or_default();
         let native_id = event_id(thread_id, &turn_id, &turn_id, "turn.started")?;
@@ -828,6 +832,7 @@ impl EventProcessor {
     }
 
     async fn process_request(&mut self, id: Value, method: String, params: Value) -> Result<()> {
+        self.turn_has_work_or_uncertain_effects = true;
         let thread_id = self
             .status
             .thread_id
@@ -1135,6 +1140,9 @@ impl EventProcessor {
             return Ok(());
         }
         validate_thread_and_turn(&self.status, thread_id, turn_id)?;
+        // Codex emits structured 429/403 notices as reconnect attempts.
+        // An explicit refusal is known even when the transport retries it.
+        self.turn_has_work_or_uncertain_effects |= error.provider_restriction().is_none();
 
         self.notice_seq = self
             .notice_seq
@@ -1153,6 +1161,12 @@ impl EventProcessor {
     }
 
     async fn process_notification(&mut self, method: &str, params: Value) -> Result<()> {
+        if turn_activity_notification(method)
+            && let Some(turn) = self.status.active_turn_id.as_deref()
+            && params.get("turnId").and_then(Value::as_str) == Some(turn)
+        {
+            self.turn_has_work_or_uncertain_effects = true;
+        }
         match method {
             "turn/started" => {
                 let notification: NativeTurnStartedNotification = serde_json::from_value(params)
@@ -1172,6 +1186,8 @@ impl EventProcessor {
                         .record_gap("Codex turn/started did not match the exact submitted turn")
                         .await;
                 }
+                self.turn_has_work_or_uncertain_effects |=
+                    has_non_user_items(&notification.turn.items);
             }
             "item/started" => {
                 let notification: NativeItemStarted =
@@ -1204,6 +1220,7 @@ impl EventProcessor {
                     .get("type")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
+                self.turn_has_work_or_uncertain_effects |= item_type != "userMessage";
                 if is_tool_type(item_type) {
                     let Some((item_id, item_type, _)) = tool_item(&notification.item) else {
                         return self
@@ -1262,6 +1279,7 @@ impl EventProcessor {
                     .get("type")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
+                self.turn_has_work_or_uncertain_effects |= item_type != "userMessage";
                 if item_type == "agentMessage" {
                     self.complete_message(&notification.turn_id, &raw_item)
                         .await?;
@@ -1538,6 +1556,18 @@ impl EventProcessor {
         }
         if let Some(restriction) = provider_restriction {
             attach_provider_restriction(&mut data, restriction, &secrets);
+            if !self.status.source_unknown
+                && !self.transport_loss
+                && !self.turn_has_work_or_uncertain_effects
+                && !has_non_user_items(&notification.turn.items)
+                && notification
+                    .turn
+                    .error
+                    .as_ref()
+                    .is_some_and(NativeTurnError::upstream_request_refused)
+            {
+                data["provider_request_refused_before_work"] = Value::Bool(true);
+            }
         }
         // Optional turn expenditure from `thread/tokenUsage/updated`
         // (latest cumulative snapshot minus the turn-start baseline):
@@ -1740,6 +1770,17 @@ impl EventProcessor {
             failure: &mut self.status.failure,
         }
     }
+}
+
+fn turn_activity_notification(method: &str) -> bool {
+    (method.starts_with("item/") && !matches!(method, "item/started" | "item/completed"))
+        || matches!(method, "turn/diff/updated" | "turn/plan/updated")
+}
+
+fn has_non_user_items(items: &[NativeThreadItem]) -> bool {
+    items
+        .iter()
+        .any(|item| !matches!(item, NativeThreadItem::UserMessage))
 }
 
 async fn run(

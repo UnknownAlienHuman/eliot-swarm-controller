@@ -1103,7 +1103,10 @@ impl Store {
         let Some(agent) = self.get_agent(&artifact.agent)? else {
             return Ok(false);
         };
-        if agent.generation != artifact.generation || !cleanup_terminal(agent.state) {
+        let probe = agent.is_automatic_provider_probe();
+        if agent.generation != artifact.generation
+            || !(cleanup_terminal(agent.state) || (probe && agent.state == AgentState::Lost))
+        {
             return Ok(false);
         }
         if artifact.purpose == "Swarm chat directory" {
@@ -1115,7 +1118,11 @@ impl Store {
             }
         }
         let sources: bool = self.connection.query_row("SELECT EXISTS(SELECT 1 FROM source_state WHERE agent=?1 AND state='open' AND source NOT IN ('daemon','os','git','workspace_process'))",[parse_agent_id(&agent.id)?],|r|r.get(0)).map_err(sql_error)?;
-        let pending: bool = self.connection.query_row("SELECT EXISTS(SELECT 1 FROM commands WHERE target=?1 AND state IN ('accepted','queued','dispatched','unknown'))",[parse_agent_id(&agent.id)?],|r|r.get(0)).map_err(sql_error)?;
+        let pending: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM commands WHERE target=?1
+             AND state IN ('accepted','queued','dispatched','unknown')
+             AND NOT (?2 AND state='unknown' AND (verb IN ('launch','stop') OR (verb='send' AND probe=1))))",
+            params![parse_agent_id(&agent.id)?,probe], |r|r.get(0)).map_err(sql_error)?;
         let live_process: bool = self.connection.query_row("SELECT EXISTS(SELECT 1 FROM processes WHERE owner IN (?1,?2) AND state != 'exited')",params![format!("agent:{}#{}",agent.id,agent.generation),format!("workspace:{}#{}",agent.id,agent.generation)],|r|r.get(0)).map_err(sql_error)?;
         Ok(!sources && !pending && !live_process)
     }

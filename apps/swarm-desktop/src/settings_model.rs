@@ -78,7 +78,9 @@ pub fn routing_roles(draft: &Value) -> Vec<String> {
     if let Some(map) = draft.as_object() {
         roles.extend(
             map.keys()
-                .filter(|key| !ROLES.contains(&key.as_str()))
+                .filter(|key| {
+                    key.as_str() != "on_provider_failure" && !ROLES.contains(&key.as_str())
+                })
                 .cloned(),
         );
     }
@@ -139,6 +141,9 @@ pub fn routing_add_role(draft: &mut Value, role: &str) -> Result<(), String> {
     }
     if routing_roles(draft).iter().any(|known| known == role) {
         return Err(format!("{role} is already listed."));
+    }
+    if role == "on_provider_failure" {
+        return Err("That name is reserved for the provider failure setting.".to_owned());
     }
     object(draft).insert(role.to_owned(), json!([]));
     Ok(())
@@ -668,14 +673,7 @@ pub fn utc_minute(ms: i64) -> String {
 
 /// Why routing passed over a candidate, in words.
 pub fn skip_reason(reason: RouteSkipReason) -> &'static str {
-    match reason {
-        RouteSkipReason::NotInstalled => "not installed",
-        RouteSkipReason::ProviderHold => "provider on hold",
-        RouteSkipReason::QuotaExhausted => "quota used up",
-        RouteSkipReason::CapacityFull => "at capacity",
-        RouteSkipReason::Unauthorized => "not allowed here",
-        RouteSkipReason::InvalidProfile => "profile does not resolve",
-    }
+    reason.user_message()
 }
 
 /// A routing decision as a headline and one line per skipped candidate.

@@ -367,16 +367,27 @@ CLI `--effort` flag in the closed vocabulary `low|medium|high|xhigh|max`
 (validated at the same boundary profiles use); an omitted effort keeps the
 CLI default.
 
-Discovery picks the newest standalone CLI by `--version` from `PATH` and
-standard user install locations (`claude.exe` on Windows, bare `claude` on
-Unix, also checking `/usr/local/bin/claude` and `~/.local/bin/claude`).
-`.cmd`/`.bat`/`.ps1` wrappers are refused and never frozen; an extensionless
-Unix candidate counts as native only after an ELF or Mach-O header check
-(`#!` scripts never qualify), and every candidate must be an absolute path
-before any `--version` probe runs. The Windows Claude Desktop payload under
-`%APPDATA%/Claude/claude-code/<version>/<hash>` requires an explicit
-`--cmd` or profile `cmd`. Anthropic documents standalone terminal
-installation separately from the Desktop Code tab.
+Discovery probes native Claude executables from versioned vendor roots before
+PATH, then orders candidates by the numeric `major.minor.patch` reported by
+`--version`, newest first.
+
+On Windows, discovery includes the current installation tree reported in #825:
+`%APPDATA%/Claude/claude-code/<version>/<hash>/claude.exe`. It also checks the
+native installer tree under `%USERPROFILE%/.local/share/claude/versions/<version>/claude.exe`.
+On macOS and Linux, it checks `~/.local/share/claude/versions/<version>/claude`
+and the native launcher `~/.local/bin/claude`, plus absolute PATH entries and
+`/usr/local/bin/claude`.
+
+Candidates must be absolute native executables; `.cmd`, `.bat` and `.ps1`
+wrappers are refused, and Unix binaries must have an ELF or Mach-O header.
+Versioned roots are probed before PATH so a stale PATH copy cannot hide a
+newer installation. An omitted `cmd` or `cmd = "latest"` resolves at launch
+admission; the Agent snapshot freezes the selected absolute `cmd` and reported
+`cmd_version`. An explicit path remains pinned. A missing pin names the
+installed replacement and a `swarm settings claude-cmd PROFILE --cmd PATH`
+repair command. First-use profiles leave `cmd` unset so later launches follow
+updates. The setup documentation was checked on 2026-11-21 (last modified
+2026-11-20).
 [Claude Code setup](https://code.claude.com/docs/en/setup).
 `swarm harnesses` shows the selected absolute `cmd` and lists eligible
 standalone `candidates` newest first. `swarm models --harness claude`

@@ -105,6 +105,7 @@ impl CodexRoute {
         mcp_disables: &[crate::mcp::EffectiveMcpServer],
         plugin_disables: &[String],
         native_subagents: Option<&str>,
+        provider_probe: bool,
     ) -> Result<Vec<OsString>> {
         if !swarm_executable.is_absolute() || !data_dir.is_absolute() || !cwd.is_absolute() {
             return Err(route_error(
@@ -141,19 +142,30 @@ impl CodexRoute {
         // Store admission and dispatch reserve ask-generation replies to the
         // Owner, including self and manager replies; auto-approving this MCP
         // transport therefore cannot approve the Agent's pending requests.
-        let server = format!(
-            "{{ enabled = true, command = {}, args = [\"mcp\", \"--require-agent\", \"--data-dir\", {}], env = {{}}, env_vars = [\"ELIOT_AGENT_ID\", \"ELIOT_AGENT_GENERATION\", \"ELIOT_AGENT_TOKEN\"], cwd = {}, tools = {{ swarm = {{ approval_mode = \"approve\" }} }} }}",
-            quote_path(swarm_executable)?,
-            quote_path(data_dir)?,
-            quote_path(cwd)?,
-        );
         let mut mcp_override = Vec::new();
         mcp_override.extend(native_subagents_argv(native_subagents));
-        push_override(
-            &mut mcp_override,
-            &format!("mcp_servers.{server_name}"),
-            server,
-        );
+        if provider_probe {
+            for (key, value) in [
+                ("features.shell_tool", "false"),
+                ("features.skill_mcp_dependency_install", "false"),
+                ("web_search", "\"disabled\""),
+                ("project_doc_max_bytes", "0"),
+            ] {
+                push_override(&mut mcp_override, key, value.to_owned());
+            }
+        } else {
+            let server = format!(
+                "{{ enabled = true, command = {}, args = [\"mcp\", \"--require-agent\", \"--data-dir\", {}], env = {{}}, env_vars = [\"ELIOT_AGENT_ID\", \"ELIOT_AGENT_GENERATION\", \"ELIOT_AGENT_TOKEN\"], cwd = {}, tools = {{ swarm = {{ approval_mode = \"approve\" }} }} }}",
+                quote_path(swarm_executable)?,
+                quote_path(data_dir)?,
+                quote_path(cwd)?,
+            );
+            push_override(
+                &mut mcp_override,
+                &format!("mcp_servers.{server_name}"),
+                server,
+            );
+        }
         // Minimal policy: suppress every inherited server explicitly. A bare
         // `mcp_servers={}` override merges with file config instead of
         // replacing it (verified on 0.167.1), so each server needs its own

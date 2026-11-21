@@ -77,11 +77,25 @@ pub struct AgentProviderHold {
     /// turn. Store clears this when native progress is newer than the hold.
     #[serde(default)]
     pub waiting_for_active_turn: bool,
+    /// Next automatic minimal probe time when no provider reset is known.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "nullable"
+    )]
+    pub next_probe_at: Option<i64>,
+    /// Timestamp when the current uninterrupted hold began.
+    #[serde(default)]
+    pub held_since: i64,
 }
 
 impl AgentProviderHold {
     pub fn validate(&self) -> Result<()> {
         if self.retry_after.is_some_and(|at| at < 0)
+            || self.next_probe_at.is_some_and(|at| at < 0)
+            || (self.retry_after.is_some() && self.next_probe_at.is_some())
+            || self.held_since < 0
+            || self.held_since > self.updated_at
             || self.updated_at < 0
             || (self.waiting_for_active_turn && self.state != ProviderHoldState::Probing)
         {
@@ -162,6 +176,12 @@ pub fn agent_status_line(
         } else {
             format!("Provider error: {kind}")
         };
+        if let Some(hold) = provider_hold {
+            line.push_str(&format!(
+                ", held {}",
+                elapsed_time(now_ms.saturating_sub(hold.held_since))
+            ));
+        }
         match native_notice.map(|notice| notice.kind) {
             Some(NativeNoticeKind::Retrying) => line.push_str(", retrying"),
             Some(NativeNoticeKind::Reconnecting) => line.push_str(", reconnecting"),
@@ -171,7 +191,16 @@ pub fn agent_status_line(
                 line.push_str(", probe in progress");
             }
             None => {
-                if let Some(retry_after) = provider_hold
+                if let Some(next_probe_at) = provider_hold.and_then(|hold| hold.next_probe_at) {
+                    if next_probe_at > now_ms {
+                        line.push_str(&format!(
+                            ", probe in {}",
+                            remaining_time(next_probe_at - now_ms)
+                        ));
+                    } else {
+                        line.push_str(", probe due");
+                    }
+                } else if let Some(retry_after) = provider_hold
                     .and_then(|hold| hold.retry_after)
                     .filter(|at| *at > now_ms)
                 {
@@ -179,6 +208,11 @@ pub fn agent_status_line(
                         ", retry in {}",
                         remaining_time(retry_after - now_ms)
                     ));
+                } else if provider_hold
+                    .and_then(|hold| hold.retry_after)
+                    .is_some_and(|retry_after| retry_after <= now_ms)
+                {
+                    line.push_str(", reset elapsed; release pending");
                 }
             }
         }
@@ -214,6 +248,24 @@ fn remaining_time(milliseconds: i64) -> String {
             format!("{hours}h")
         } else {
             format!("{}d", hours.saturating_add(23).div_euclid(24))
+        }
+    }
+}
+
+fn elapsed_time(milliseconds: i64) -> String {
+    let seconds = milliseconds.max(0).div_euclid(1_000);
+    if seconds < 60 {
+        return "just now".to_owned();
+    }
+    let minutes = seconds.div_euclid(60);
+    if minutes < 60 {
+        format!("{minutes}m")
+    } else {
+        let hours = minutes.div_euclid(60);
+        if hours < 24 {
+            format!("{hours}h")
+        } else {
+            format!("{}d", hours.div_euclid(24))
         }
     }
 }
@@ -1590,6 +1642,8 @@ impl RetentionView {
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonStatusResponse {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_probe_attention: Vec<crate::ProviderHold>,
     pub state: String,
     pub admission: String,
     pub agents: usize,
@@ -1597,6 +1651,8 @@ pub struct DaemonStatusResponse {
     pub owned_plugins: usize,
     pub observer_readers: usize,
     pub discovery_readers: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claude_profile_command_issues: Vec<crate::api::harness::ClaudeProfileCommandIssue>,
     #[serde(deserialize_with = "object")]
     pub workspace_custody: WorkspaceCustodyView,
     #[serde(deserialize_with = "nullable")]

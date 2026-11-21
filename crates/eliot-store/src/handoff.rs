@@ -81,7 +81,15 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
-        let change = handoff_tx(&tx, principal, request, policy, now, self.hierarchy_limits)?;
+        let change = handoff_tx(
+            &tx,
+            principal,
+            request,
+            policy,
+            now,
+            self.hierarchy_limits,
+            HandoffInput::Brief,
+        )?;
         commit_transaction(tx, &self.write_faulted)?;
         Ok(change)
     }
@@ -331,6 +339,12 @@ pub(super) fn source_inputs(
     Ok((task, originals))
 }
 
+pub(super) enum HandoffInput {
+    Brief,
+    /// The switch has already proven an exact provider refusal before work.
+    ProviderRetry,
+}
+
 /// Shared transfer transaction. Caller commits, or rolls back the entire transfer.
 pub(super) fn handoff_tx(
     tx: &Transaction<'_>,
@@ -339,6 +353,7 @@ pub(super) fn handoff_tx(
     policy: &core::SecretPolicy,
     now: i64,
     limits: core::api::HierarchyLimits,
+    input: HandoffInput,
 ) -> Result<HandoffAdmission> {
     request.validate()?;
     // Owner hands off anywhere with claims, Goal and children. A manager may
@@ -433,7 +448,23 @@ pub(super) fn handoff_tx(
         manager_caller.as_ref().map(|_| principal),
         policy,
     )?;
-    let (brief_text, brief_truncated) = brief::build(tx, request, &task, policy)?;
+    let (brief_text, brief_truncated) = match input {
+        HandoffInput::Brief => brief::build(tx, request, &task, policy)?,
+        HandoffInput::ProviderRetry => {
+            if policy.contains_value(&task.args) {
+                return Err(Error::new(
+                    "secret_in_payload",
+                    "retry input contains a known secret",
+                ));
+            }
+            let text = task
+                .args
+                .get("text")
+                .and_then(Value::as_str)
+                .ok_or_else(|| Error::new("source_integrity", "retry task text missing"))?;
+            (text.to_owned(), false)
+        }
+    };
     let mut events = Vec::new();
     // Agent authority never widens: an Agent handoff transfers only task
     // inputs the caller issued itself. Claims, Goals and children stay put;

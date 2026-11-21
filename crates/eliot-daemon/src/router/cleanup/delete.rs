@@ -98,6 +98,16 @@ impl Router {
                     reason: "terminal_owned_artifact".to_owned(),
                 });
             }
+            #[cfg(windows)]
+            if let Some(artifact) = self.agent_delete_probe_chat(agent).await? {
+                let bytes = self.cleanup_preflight(&artifact).await?;
+                items.push(CleanupCandidate {
+                    artifact,
+                    bytes: Some(bytes),
+                    verdict: "safe".to_owned(),
+                    reason: "terminal_owned_artifact".to_owned(),
+                });
+            }
             if items.len() > MAX_CLEANUP_ITEMS {
                 return Err(Error::new(
                     "unavailable",
@@ -112,6 +122,43 @@ impl Router {
             truncated: false,
             continuation: None,
         })
+    }
+
+    #[cfg(windows)]
+    async fn agent_delete_probe_chat(&self, agent: &Agent) -> Result<Option<ArtifactView>> {
+        if !agent.chat
+            || agent
+                .profile_snapshot
+                .get(eliot_core::PROVIDER_PROBE_LAUNCH_ARG)
+                != Some(&Value::Bool(true))
+        {
+            return Ok(None);
+        }
+        let path = agent.workspace.as_deref().ok_or_else(|| {
+            Error::new("source_integrity", "provider probe chat has no workspace")
+        })?;
+        let path = match std::fs::canonicalize(path) {
+            Ok(path) => path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => {
+                return Err(Error::new(
+                    "unavailable",
+                    "provider probe chat is unavailable",
+                ));
+            }
+        };
+        let store = self.inner.store.lock().await;
+        let artifact = store
+            .known_artifact_path(&path.to_string_lossy())?
+            .filter(|artifact| {
+                artifact.agent == agent.id
+                    && artifact.generation == agent.generation
+                    && artifact.kind == ArtifactKind::Other
+                    && artifact.purpose == "Swarm chat directory"
+                    && artifact.state == "registered"
+            })
+            .ok_or_else(|| Error::new("source_integrity", "provider probe chat custody changed"))?;
+        Ok(Some(artifact))
     }
 
     async fn agent_delete_session(&self, agent: &Agent) -> Result<Option<ArtifactView>> {
@@ -205,6 +252,7 @@ fn require_agent_delete_cleanup(plan: &CleanupPlan, response: &CleanupApplyRespo
         let reason = outcome.reason.as_deref().unwrap_or("cleanup_refused");
         let object = match item.artifact.kind {
             ArtifactKind::NativeSession => "native chat",
+            ArtifactKind::Other => "provider probe directory",
             _ => "managed worktree",
         };
         return Err(Error::new(

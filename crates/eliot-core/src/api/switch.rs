@@ -5,7 +5,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SwitchLaunch {
     pub profile: Option<String>,
@@ -213,5 +213,7 @@ pub struct SwitchResponse {
     pub disposal_state: Option<CommandState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disposal_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<Box<crate::RoutingDecision>>,
     pub next_action: String,
 }

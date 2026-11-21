@@ -805,6 +805,15 @@ impl Store {
             }
             if !observed {
                 update_agent_projection(&tx, &next)?;
+                if !resolves_recovered && batch.source == "stream" {
+                    switch::reserve_provider_switch_tx(
+                        &tx,
+                        &next,
+                        native_event,
+                        now,
+                        &mut provider_events,
+                    )?;
+                }
             }
             projection = next;
             committed_events.push(stored);

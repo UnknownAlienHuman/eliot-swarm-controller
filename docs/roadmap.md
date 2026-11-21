@@ -26,7 +26,11 @@ See AGENTS.md for the work loop.
       profile-free launch from a clean directory.
 - [x] **S3 Routing.** Ordered role candidates, installed/provider-hold/quota/capacity
       selection before admission, recorded choice/reason, authorized child scope
-      and no retry or reroute after dispatch or uncertain delivery.
+      and frozen admissions across uncertain delivery.
+      - [x] **Provider failover (#818).** An opted-in role launch continues on the
+        next eligible profile after a confirmed pre-work refusal. A private Windows
+        daemon switched a Codex HTTP 429 to a successful turn in the same worktree
+        and showed the decision in `swarm why`.
 - [x] **S4 Assignment through automation.** Settings-managed existing rules/timers
       keep a configured number of Agents busy on a brief queue through ordinary
       routing-aware launch; retain exact command identity and unknown gates.
@@ -248,8 +252,8 @@ sections, and [OpenCodex](harnesses/opencodex.md) only for the proxy task.
 
 - [x] **L3.4 Proxy/capacity.** First attach to an already-running OpenCodex endpoint.
       Add managed service launch only when actually needed. Add account/proxy caps and
-      persistent provider holds with that route; freeze admitted nonsecret route/store
-      selectors across daemon replacement. No automatic model/account fallback.
+      persistent provider holds with that route. Freeze admitted nonsecret route/store
+      selectors across daemon replacement.
 
 **Result:** useful Codex work is observable and restart outcomes are explicit. The direct
 route still works without any proxy installation or worktree machinery.

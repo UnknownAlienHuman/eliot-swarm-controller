@@ -97,6 +97,14 @@ impl Router {
                     "harness does not match the selected profile",
                 ));
             }
+            if harness == "claude" {
+                let candidate = crate::adhoc::resolve_claude_profile_command(
+                    name,
+                    snapshot.get("cmd").and_then(Value::as_str),
+                )
+                .await?;
+                crate::adhoc::write_claude_command_snapshot(&mut snapshot, candidate)?;
+            }
             return Ok((Some(snapshot), name.to_owned(), None));
         }
         let (cmd, discovered) = if harness == "claude" && !quota {

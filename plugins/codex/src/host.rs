@@ -170,6 +170,7 @@ struct ValidatedStartPlan {
     swarm_executable: PathBuf,
     mcp_cwd: PathBuf,
     mcp_server_name: String,
+    provider_probe: bool,
     native_subagents: Option<String>,
     credential: String,
     profile: serde_json::Map<String, Value>,
@@ -287,6 +288,21 @@ fn validate_start_plan(
     let approval_policy = fields.approval_policy.as_str().to_owned();
     let (mcp_policy, mcp_allow) = policy_from_profile(profile)?;
     let mcp_cloud_hostname = cloud_hostname_from_profile(profile);
+    let provider_probe =
+        profile.get(eliot_core::PROVIDER_PROBE_LAUNCH_ARG) == Some(&Value::Bool(true));
+    if provider_probe
+        && (resume_subject.is_some()
+            || permissions != "read-only"
+            || approval_policy != "never"
+            || native_subagents.as_deref() != Some("deny")
+            || mcp_policy != McpPolicy::Minimal
+            || !mcp_allow.is_empty())
+    {
+        return Err(Error::new(
+            "profile_error",
+            "Codex provider probe permissions are invalid",
+        ));
+    }
     let workspace = params
         .workspace
         .as_deref()
@@ -316,10 +332,18 @@ fn validate_start_plan(
         .transpose()?
         .unwrap_or_else(|| OsString::from("codex"));
     let TargetEnvironment {
-        variables: environment,
+        variables: mut environment,
         mut secrets,
         mut metadata_secrets,
     } = target_environment(params.target_environment.as_ref(), profile.get("pass_env"))?;
+    if provider_probe {
+        environment.retain(|(name, _)| {
+            !name
+                .to_string_lossy()
+                .to_ascii_uppercase()
+                .starts_with("ELIOT_AGENT_")
+        });
+    }
     route.capture_client_secret(&environment, &mut secrets, &mut metadata_secrets, true)?;
     secrets.push(initialized.credential.clone());
     metadata_secrets.push(initialized.credential.clone());
@@ -375,6 +399,7 @@ fn validate_start_plan(
         mcp_cwd,
 
         mcp_server_name,
+        provider_probe,
         native_subagents,
         credential: initialized.credential.clone(),
         profile: profile.clone(),
@@ -1061,6 +1086,7 @@ impl CodexPlugin {
                 &mcp_disables,
                 &plugin_disables,
                 plan.native_subagents.as_deref(),
+                plan.provider_probe,
             )?,
             cwd: plan.workspace.clone(),
             environment: plan.environment.clone(),
@@ -1381,7 +1407,9 @@ impl CodexPlugin {
         // input is sent: without it the Agent would start believing it has
         // no skill. The roots replace nothing on disk; a failed delivery
         // fails the start like any rejected dispatch.
-        if let Err(error) = deliver_swarm_skill(&session.native_client, &plan.data_dir).await {
+        if !plan.provider_probe
+            && let Err(error) = deliver_swarm_skill(&session.native_client, &plan.data_dir).await
+        {
             let error = discard_failed_start(&mut session, error).await;
             self.failed_start = Some(FailedStart);
             return Err(error);
@@ -1401,7 +1429,7 @@ impl CodexPlugin {
                 &session.native_client,
                 &readback.thread.id,
                 &plan.mcp_allow,
-                &plan.mcp_server_name,
+                (!plan.provider_probe).then_some(plan.mcp_server_name.as_str()),
                 &plan.metadata_secrets,
             )
             .await
@@ -1774,7 +1802,7 @@ impl CodexPlugin {
         client: &NativeClient,
         thread_id: &str,
         allow: &[String],
-        own_mcp_server: &str,
+        own_mcp_server: Option<&str>,
         metadata_secrets: &[String],
     ) -> Result<McpReadback> {
         let mut accumulated: Vec<String> = Vec::new();
@@ -1802,7 +1830,7 @@ impl CodexPlugin {
                         "Codex mcpServerStatus/list read failed; no input was sent",
                     )
                 })?;
-            let page = parse_status_page(&response, allow, own_mcp_server)?;
+            let page = parse_status_page(&response, allow, own_mcp_server.unwrap_or_default())?;
             let names = Value::Array(page.effective.iter().cloned().map(Value::String).collect());
             if SecretPolicy::new(metadata_secrets.iter().cloned()).contains_value(&names) {
                 return Err(Error::new(
@@ -1827,7 +1855,14 @@ impl CodexPlugin {
         // a disabled own entry proves nothing and fails closed here, before
         // any input. The empty thread is retained like any stopped Agent's
         // thread; it never receives input.
-        require_minimal_own_server(&accumulated, own_mcp_server)?;
+        if let Some(server) = own_mcp_server {
+            require_minimal_own_server(&accumulated, server)?;
+        } else if !accumulated.is_empty() {
+            return Err(Error::new(
+                "profile_error",
+                "Codex provider probe must have an empty MCP inventory",
+            ));
+        }
         Ok(McpReadback::verified(accumulated))
     }
 
