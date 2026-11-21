@@ -1237,8 +1237,10 @@ files the Agent must read. Before admission the daemon reads each one from the l
 workspace, or for `send` from the target Agent's workspace, and replaces `sources` with a
 delivered block appended to `text`. Each file gets one section with its path, a content
 SHA-256 prefix, its size and its completeness (`complete`, or the first N of M bytes,
-with the rest left in the file), sharing a 96 KiB budget. Known secrets are redacted.
-A file that is missing, outside the workspace, not regular, binary or larger than 8 MiB
+with the rest left in the file). The texts share what the 64 KiB persisted input text
+leaves after the prompt, smallest first, so a short file is never cut to make room.
+Known secrets are redacted.
+A file that is missing, outside the workspace, not regular, binary (including NUL bytes) or larger than 8 MiB
 gets a `not delivered (reason)` line instead of being skipped. Delivery proves the text
 reached the input, not that it was understood. A same-ID retry re-reads the files: an
 unchanged file replays, and a changed file is `id_conflict`.

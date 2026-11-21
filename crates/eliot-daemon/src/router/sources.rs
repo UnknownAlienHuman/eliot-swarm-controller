@@ -8,7 +8,7 @@ use super::Router;
 use eliot_core::{
     Error, Result, SecretPolicy, SubmitCommand,
     api::{inference::sha256_hex, truncate_bytes},
-    limits::MAX_TEXT_BYTES,
+    limits::MAX_EVENT_BYTES,
 };
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -16,8 +16,9 @@ use std::path::{Path, PathBuf};
 /// Most files one input may name.
 pub(crate) const MAX_SOURCES: usize = 16;
 const MAX_SOURCE_PATH_BYTES: usize = 1024;
-/// Delivered text across all sources of one input.
-const MAX_DELIVERED_BYTES: usize = 96 * 1024;
+/// Room kept for the block's own header and each section's header line.
+const BLOCK_HEADER_BYTES: usize = 256;
+const SECTION_HEADER_BYTES: usize = 160;
 /// Larger files are refused rather than read just to be cut.
 const MAX_SOURCE_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -69,7 +70,10 @@ impl Router {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned();
-        let budget = MAX_DELIVERED_BYTES.min(MAX_TEXT_BYTES.saturating_sub(text.len() + 4096));
+        // The whole input text is persisted with the command, so the
+        // delivered content shares the 64 KiB persisted-text bound.
+        let budget = MAX_EVENT_BYTES
+            .saturating_sub(text.len() + BLOCK_HEADER_BYTES + SECTION_HEADER_BYTES * paths.len());
         let block = delivered_block(&root, &paths, budget, &self.secret_policy_snapshot());
         request.args["text"] = Value::String(if text.trim().is_empty() {
             block
