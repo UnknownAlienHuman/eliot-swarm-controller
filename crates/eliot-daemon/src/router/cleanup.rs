@@ -24,6 +24,51 @@ pub(super) struct AutomaticCleanupState {
 const SWARM_PLUGIN_INSTANCE_PURPOSE: &str = "Swarm plugin instance directory";
 const SWARM_ARTIFACT_ROOT_PURPOSE: &str = "Swarm artifact root";
 
+fn validate_cleanup_path(path: &Path) -> Result<()> {
+    if !path.is_absolute()
+        || path.components().any(|p| match p {
+            Component::ParentDir | Component::CurDir => true,
+            Component::Normal(name) => name.to_str().is_none_or(|n| {
+                n.contains(':')
+                    || n.ends_with(['.', ' '])
+                    || crate::platform::script_file::protected_cleanup_name(n)
+            }),
+            _ => false,
+        })
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "artifact path is not an absolute safe local directory",
+        ));
+    }
+    Ok(())
+}
+
+fn require_cleanup_outside_native_home(canonical: &Path) -> Result<()> {
+    for env in [
+        "USERPROFILE",
+        "HOME",
+        "CODEX_HOME",
+        "CODEX_SQLITE_HOME",
+        "CLAUDE_CONFIG_DIR",
+    ] {
+        if let Some(home) = std::env::var_os(env).and_then(|p| std::fs::canonicalize(p).ok())
+            && (canonical == home
+                || home.starts_with(canonical)
+                || (matches!(
+                    env,
+                    "CODEX_HOME" | "CODEX_SQLITE_HOME" | "CLAUDE_CONFIG_DIR"
+                ) && canonical.starts_with(home)))
+        {
+            return Err(Error::new(
+                "not_allowed",
+                "user or native configuration root is protected",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn encoded(value: impl serde::Serialize) -> Result<Value> {
     serde_json::to_value(value)
         .map_err(|_| Error::new("internal", "cleanup response cannot encode"))
@@ -553,22 +598,7 @@ impl Router {
     }
     async fn checked_artifact_path(&self, agent: &Agent, path: &str) -> Result<PathBuf> {
         let path = Path::new(path);
-        if !path.is_absolute()
-            || path.components().any(|p| match p {
-                Component::ParentDir | Component::CurDir => true,
-                Component::Normal(name) => name.to_str().is_none_or(|n| {
-                    n.contains(':')
-                        || n.ends_with(['.', ' '])
-                        || crate::platform::script_file::protected_cleanup_name(n)
-                }),
-                _ => false,
-            })
-        {
-            return Err(Error::new(
-                "not_allowed",
-                "artifact path is not an absolute safe local directory",
-            ));
-        }
+        validate_cleanup_path(path)?;
         directory_identity(path)?;
         let canonical = std::fs::canonicalize(path)
             .map_err(|_| Error::new("not_allowed", "artifact directory unavailable"))?;
@@ -599,27 +629,7 @@ impl Router {
                 "daemon data and configuration are protected",
             ));
         }
-        for env in [
-            "USERPROFILE",
-            "HOME",
-            "CODEX_HOME",
-            "CODEX_SQLITE_HOME",
-            "CLAUDE_CONFIG_DIR",
-        ] {
-            if let Some(home) = std::env::var_os(env).and_then(|p| std::fs::canonicalize(p).ok())
-                && (canonical == home
-                    || home.starts_with(&canonical)
-                    || (matches!(
-                        env,
-                        "CODEX_HOME" | "CODEX_SQLITE_HOME" | "CLAUDE_CONFIG_DIR"
-                    ) && canonical.starts_with(home)))
-            {
-                return Err(Error::new(
-                    "not_allowed",
-                    "user or native configuration root is protected",
-                ));
-            }
-        }
+        require_cleanup_outside_native_home(&canonical)?;
         let chat_directory = if agent.chat {
             let identity = directory_identity(&canonical)?;
             if let Some(workspace) = agent.workspace.as_deref() {
@@ -762,7 +772,10 @@ impl Router {
             ));
         }
         drop(store);
-        let path = std::fs::canonicalize(&artifact.path)
+        let source = Path::new(&artifact.path);
+        validate_cleanup_path(source)?;
+        directory_identity(source)?;
+        let path = std::fs::canonicalize(source)
             .map_err(|_| Error::new("not_allowed", "Agent artifact root unavailable"))?;
         if path != self.selected_agent_artifact_root(agent)?
             || crate::platform::script_file::directory_identity(&path)? != artifact.identity
@@ -772,6 +785,7 @@ impl Router {
                 "owned artifact root is outside the selected current root",
             ));
         }
+        require_cleanup_outside_native_home(&path)?;
         Ok(path)
     }
 
@@ -1213,6 +1227,12 @@ impl Router {
                 candidate.reason = candidate.artifact.state.clone();
                 middle.push(candidate);
                 continue;
+            }
+            if auto_cleanup
+                && call_deadline.saturating_duration_since(Instant::now())
+                    < CLEANUP_PLAN_MAX_PREFLIGHT
+            {
+                break;
             }
             if let Some(retention_ms) = auto_cleanup_after_ms {
                 match self
