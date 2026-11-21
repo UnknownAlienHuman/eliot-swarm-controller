@@ -86,6 +86,17 @@ pub struct DataEnvelope<T> {
     pub data: T,
 }
 
+/// `GET /api/session` (`session.list`) page: stored sessions with their
+/// directory locations, newest first. `cursor.next` continues toward older
+/// sessions; a null next cursor ends the listing. Used by the archive
+/// reader to prove one exact session is missing from the served store.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct SessionPage {
+    pub data: Vec<SessionInfo>,
+    #[serde(default)]
+    pub cursor: PageCursor,
+}
+
 // ---------------------------------------------------------------------------
 // Prompts and inbox
 // ---------------------------------------------------------------------------
