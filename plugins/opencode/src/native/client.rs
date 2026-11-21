@@ -26,6 +26,7 @@ use crate::native::{
         SessionCreateRequest, SessionInfo, SwitchAgentRequest, SwitchModelRequest,
     },
 };
+use super::types::SessionPage;
 
 /// Largest single HTTP body accepted. Prompt/readback payloads are small;
 /// anything larger is a protocol violation, never truncated into a decision.
@@ -332,6 +333,29 @@ impl OpenCodeHttp {
             return Ok(true);
         }
         Err(readback_error("session absence", &response))
+    }
+
+    /// One `GET /api/session` (`session.list`) page under this client's
+    /// bound server, store and directory header. A read: any failure is
+    /// `native_readback`, never a proven absence.
+    pub async fn list_sessions(
+        &self,
+        cursor: Option<&str>,
+        deadline: Instant,
+    ) -> Result<SessionPage> {
+        let query: Vec<(&str, &str)> = match cursor {
+            Some(cursor) => vec![("limit", "100"), ("cursor", cursor)],
+            None => vec![("limit", "100")],
+        };
+        let response = self
+            .send(reqwest::Method::GET, "/api/session", &query, None, deadline)
+            .await
+            .map_err(readback_outcome_as_error)?;
+        if response.status != 200 {
+            return Err(readback_error("session list", &response));
+        }
+        serde_json::from_slice(&response.body)
+            .map_err(|_| Error::new("native_readback", "OpenCode session list was invalid"))
     }
 
     /// `DELETE /api/session/{id}`: the native close operation. `Ok(true)`

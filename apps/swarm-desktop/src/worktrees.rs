@@ -205,7 +205,7 @@ pub fn size_words(bytes: u64) -> String {
 pub fn reason_words(reason: &str) -> String {
     match reason {
         "terminal_owned_artifact" => "its task finished".to_owned(),
-        "native_archive_pending" => "archive the finished Codex session".to_owned(),
+        "native_archive_pending" => "archive the finished app session".to_owned(),
         "no_native_archive" => "its app cannot archive sessions".to_owned(),
         "agent_not_quiescent" => {
             "its task is not finished: it is running or was interrupted".to_owned()
