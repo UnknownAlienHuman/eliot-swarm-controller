@@ -867,6 +867,11 @@ pub(crate) struct SwitchArgs {
     pub(crate) worktree: Option<String>,
     #[arg(long, requires = "worktree")]
     pub(crate) base: Option<String>,
+    /// Return the admission receipt immediately.
+    #[arg(long)]
+    pub(crate) no_wait: bool,
+    #[arg(long, default_value_t = 120, value_name = "SECONDS")]
+    pub(crate) timeout_seconds: u64,
 }
 
 #[derive(Args)]
@@ -882,6 +887,11 @@ pub(crate) struct HandoffArgs {
     pub(crate) task_command: String,
     /// Ordered accepted/queued SEND command ids, at most 64.
     pub(crate) commands: Vec<String>,
+    /// Return after the transfer commits, while the brief may still be queued.
+    #[arg(long)]
+    pub(crate) no_wait: bool,
+    #[arg(long, default_value_t = DEFAULT_WAIT_SECONDS, value_name = "SECONDS")]
+    pub(crate) timeout_seconds: u64,
 }
 
 #[derive(Args)]
