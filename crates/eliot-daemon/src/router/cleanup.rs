@@ -1110,7 +1110,7 @@ impl Router {
         {
             return Err(Error::new("invalid", "cleanup continuation is stale"));
         }
-        if page.snapshot_seq.is_none() {
+        if !auto_cleanup && page.snapshot_seq.is_none() {
             // Backfill within one slice, then freeze the inventory on the
             // first candidate page. Large or slow fleets resume the backfill.
             page.backfill_after = self

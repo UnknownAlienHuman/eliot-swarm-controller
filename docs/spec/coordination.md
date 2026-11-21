@@ -185,8 +185,9 @@ confirmation (local deletions only, one mutation id per plan and selection until
 definite reply), and shows removed, kept-with-reason and unknown outcomes. The plan
 has no Owner per-Agent scope, so there is no per-task cleanup entry.
 
-The daemon's automatic sweep pages through finished Agent generations, including
-archived ones, and applies a retained plan through the same guarded cleanup path.
+The daemon's automatic sweep pages through recorded owned artifacts of finished
+Agent generations, including archived ones, and applies a retained plan through
+the same guarded cleanup path. Manual previews can backfill older ownership records.
 The [Owner settings](configuration.md#later-configuration-example) control the age and enablement.
 Both the artifact and its finished generation must be older than the configured
 window. The sweep keeps dirty or unmerged worktrees and their generation's artifacts.
