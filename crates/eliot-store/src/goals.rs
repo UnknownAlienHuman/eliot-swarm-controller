@@ -1905,6 +1905,11 @@ impl Store {
                     }
                 }
                 counters.last_output_digest = Some(digest.clone());
+            } else {
+                // A partly captured output proves no repeat: no streak may
+                // span it, so the next round compares against nothing.
+                counters.last_output_digest = None;
+                counters.consecutive_same_output = 0;
             }
             let cost = goal_cost_reading_tx(
                 &tx,
@@ -1939,6 +1944,13 @@ impl Store {
                 .and_then(|reading| reading.block(&row.definition))
             {
                 GoalCommitOutcome::Blocked { reason }
+            } else if stage == GoalContinuationStage::Escalate
+                && !escalation_admissible(&commit.principal, &row.definition, &agent_row)
+            {
+                // Committed, so the round and its budgets still advance.
+                GoalCommitOutcome::Blocked {
+                    reason: "escalation_refused".to_owned(),
+                }
             } else if let Some(continuation) = &commit.continuation {
                 if continuation.stage != stage {
                     return Err(Error::new(
@@ -2420,6 +2432,20 @@ fn goal_cost_status(definition: &GoalDefinition, counters: &GoalCounters) -> Str
             limit.unit
         ),
     }
+}
+
+/// Whether the Goal's escalation `configure` can be admitted now: the Owner
+/// principal and a model or effort this Agent's harness can apply.
+fn escalation_admissible(principal: &str, definition: &GoalDefinition, agent: &Agent) -> bool {
+    principal == "owner"
+        && definition.escalation.as_ref().is_some_and(|escalation| {
+            admission::resolve_configure(
+                &escalation.configure_args(),
+                &agent.harness,
+                &agent.profile_snapshot,
+            )
+            .is_ok()
+        })
 }
 
 fn goal_postcheck_block(definition: &GoalDefinition, counters: &GoalCounters) -> Option<String> {

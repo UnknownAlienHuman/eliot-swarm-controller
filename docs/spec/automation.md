@@ -1278,7 +1278,8 @@ blocks as `cost_unverified` until the Owner sets the Goal again.
 
 **Diagnosis and escalation.** A failed round whose fully captured check output repeats the
 previous round's counts toward `consecutive_same_failure`, whatever the workspace did.
-A new output, or one captured only in part, resets it. The second identical failure in a row
+A new output resets it. An output captured only in part resets it too, and clears the
+compared digest, so neither this streak nor the no-progress streak spans the gap. The second identical failure in a row
 means two approaches failed the same way. That round's continuation, once per Goal
 revision, is the diagnosis step: compare the attempts, name the shared cause, run one
 observation that tells the remaining causes apart, then take one different approach.
@@ -1287,8 +1288,10 @@ refuses it unless the Agent's harness can apply that `configure`. When the same 
 repeats after the diagnosis step, the round commit admits that one `configure` (Owner
 principal, the Goal's generation) immediately before the continuation, in the same
 transaction. The settings lane therefore dispatches the configure first, and the
-continuation names the change and the Owner's reason. It happens at most once per
-revision. There is no model ladder, no change of authority fields, and nothing to
+continuation names the requested change and the Owner's reason (a refused configure
+leaves the old model, and the text says the switch applies only if accepted). An
+escalation the Store cannot admit at that round blocks as `escalation_refused`. That
+round still commits, so its budgets advance. It happens at most once per revision. There is no model ladder, no change of authority fields, and nothing to
 replay: an `unknown` configure holds the lane as usual. The Router derives the stage
 from the counters bound to the claimed revision, and the commit re-derives it,
 refusing a mismatch as `stale_round`. The output digest is the stage's notion of "the

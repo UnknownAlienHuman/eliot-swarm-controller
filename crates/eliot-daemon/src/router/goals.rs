@@ -1648,7 +1648,7 @@ fn goal_continuation_text(
             .collect::<Vec<_>>()
             .join(" and ");
             goal_text.push_str(&format!(
-                "\n\nEscalation: the same failure repeated after the diagnosis step. Swarm switched this Agent to {target} for this turn, as the Owner authorized: {}. Use what the diagnosis established and do not repeat an approach that already failed.",
+                "\n\nEscalation: the same failure repeated after the diagnosis step. Swarm asked to switch this Agent to {target} before this turn, as the Owner authorized: {}. The switch applies only if the harness accepted it. Use what the diagnosis established and do not repeat an approach that already failed.",
                 escalation.reason
             ));
         }
