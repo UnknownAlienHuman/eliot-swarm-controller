@@ -674,6 +674,49 @@ pub struct StepStartedData {
     pub model: ModelRef,
 }
 
+/// Installed 2.2.7 `Session.Event.Tool` base data shared by
+/// `session.tool.input.started`, `session.tool.called`,
+/// `session.tool.success` and `session.tool.failed`:
+/// `{sessionID, assistantMessageID, id}` where `id` is the tool part id
+/// (the vendor TUI's `callID`). `input.delta`/`input.ended`/`progress`
+/// share the base but stay unmapped streaming detail.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolEventData {
+    #[serde(rename = "sessionID")]
+    pub session_id: String,
+    pub id: String,
+}
+
+/// `session.tool.input.started` data: the base plus the native tool
+/// `name`. The only installed tool event carrying the name: `called`,
+/// `success` and `failed` schemas have no name field, so completions
+/// read it back from this event, exactly like the vendor TUI reducer.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolInputStartedData {
+    #[serde(rename = "sessionID")]
+    pub session_id: String,
+    pub id: String,
+    pub name: String,
+}
+
+/// `session.tool.failed` data subset: the base plus the structured
+/// error (`Session.StructuredError`, the same body execution terminals
+/// carry). The installed schema declares `error` required, but the
+/// adapter tolerates its absence: a failure without a message still
+/// commits `tool.completed` with `status: error`, never a stream loss.
+/// The optional `content`/`metadata` result payload is never persisted.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolFailedData {
+    #[serde(rename = "sessionID")]
+    pub session_id: String,
+    pub id: String,
+    #[serde(default)]
+    pub error: Option<StructuredError>,
+}
+
 /// `session.created` / `session.deleted` data subset: the exact session id.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]

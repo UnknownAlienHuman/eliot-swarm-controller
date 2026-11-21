@@ -413,15 +413,16 @@ of the predecessor's `last_store_seq`. For a gap-backed handoff, `0 < gap_seq < 
 
 `source` is the expected predecessor. `families` is a unique nonempty set; order is not
 significant, and Store sorts it before hashing the canonical operation and forming the
-ACK. Store rechecks the selected harness subset: Codex and Muse support `session`,
-`turn`, `message`, `tool` and `request`; each other native adapter advertises
+ACK. Store rechecks the selected harness subset: Codex, Muse and OpenCode support
+`session`, `turn`, `message`, `tool` and `request`; each other native adapter advertises
 only the families its implemented handlers support. Muse `tool` facts are the
 normalized `toolCall`/turn-bound `userShell` item revisions; a completed edit-family `toolCall`
 attaches bounded `changed_paths` from the inline `args` target (`path`), else from one bounded
 `item/readOutput` fetch of the stored `patchRef` headers, with `changed_paths_truncated` on any
 coverage gap. A command tool's `tool.started` may carry `command`, the command text the
 harness reports (Codex: its parsed `commandActions[].command`, one per line, else the raw
-`command`; Claude: the `tool_use` `input.command`), redacted with the secret policy and
+`command`; Claude: the `tool_use` `input.command`; OpenCode: the
+`session.tool.called` tool input string `command`, the shell tool), redacted with the secret policy and
 bounded to [`MAX_TOOL_COMMAND_BYTES`](../../crates/eliot-core/src/limits.rs); command
 output and other arguments are never persisted. Handoff transfer for
 `child`, `goal` and `usage` stays `unsupported`. Native-child observation is
