@@ -3,8 +3,8 @@
 //! A resolution records an owner assertion about an already-uncertain outcome:
 //! it moves exactly one unknown command or turn to its asserted terminal state
 //! and releases only that command/turn gate. It never invents a native receipt
-//! or turn association, never replays an effect, and never touches capacity
-//! reservations, Agent rows, or any sibling command/turn.
+//! or turn association and never replays an effect. An exact workspace launch
+//! failure before native dispatch also settles its created Agent and linked input.
 //!
 //! Provenance is retained where every readback can see it: a resolved command carries
 //! `resolution_source=owner` in its outcome, and each resolution emits a
@@ -180,11 +180,38 @@ impl Store {
         if record.command.verb == "configure" && request.resolution == CommandResolution::Applied {
             resolve_configure_overlay(&tx, &record, readback, now)?;
         }
-        let event = resolve_command_tx(&tx, &record, request, request.resolution.state(), now)?;
+        let state = request.resolution.state();
+        let mut events = vec![resolve_command_tx(&tx, &record, request, state, now)?];
+        if state == CommandState::Failed
+            && record.command.verb == "launch"
+            && record.command.generation == Some(0)
+            && record.command.outcome.as_ref().is_some_and(|outcome| {
+                outcome["stage"] == "workspace" && outcome["native_dispatched"] == false
+            })
+            && let Some(agent_num) = record.target
+            && let Some(workspace) = super::workspace::load_workspace(&tx, agent_num)?
+            && workspace.start_command_id == request.command_id
+            && workspace.target_generation == 1
+            && workspace.phase == eliot_core::WorkspacePhase::Unknown
+        {
+            if super::workspace::workspace_cancel_requested(&workspace) {
+                return Err(Error::new("bad_state", "workspace cancellation is pending"));
+            }
+            super::capacity::release_unstarted_tx(&tx, agent_num, 1, &request.command_id)?;
+            super::lifecycle::apply_settle_agent_transition(
+                &tx,
+                &record,
+                state,
+                &request.command_id,
+                true,
+                now,
+                &mut events,
+            )?;
+        }
         let value = CommandResolveResponse {
             id: request.id.clone(),
             command_id: request.command_id.clone(),
-            state: request.resolution.state(),
+            state,
         };
         insert_resolution_write(
             &tx,
@@ -196,10 +223,7 @@ impl Store {
             now,
         )?;
         commit_transaction(tx, &self.write_faulted)?;
-        Ok(Change {
-            value,
-            events: vec![event],
-        })
+        Ok(Change { value, events })
     }
 
     /// Resolve one unknown turn to its owner-asserted terminal status. The
@@ -497,8 +521,7 @@ fn turn_resolution_digest(request: &TurnResolveRequest) -> Result<Vec<u8>> {
 
 /// Move one unknown command to its asserted terminal state and record the
 /// owner assertion in the outcome and the event. The shared transition
-/// check keeps this to the Unknown -> Applied/Failed edges; no Agent,
-/// capacity, or sibling state is touched.
+/// check keeps ordinary resolutions on the Unknown -> Applied/Failed edges.
 fn resolve_command_tx(
     tx: &Transaction<'_>,
     record: &CommandRecord,

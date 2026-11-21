@@ -889,7 +889,7 @@ fn release_settle_capacity(
     Ok(())
 }
 
-fn apply_settle_agent_transition(
+pub(super) fn apply_settle_agent_transition(
     tx: &Transaction<'_>,
     record: &CommandRecord,
     state: CommandState,

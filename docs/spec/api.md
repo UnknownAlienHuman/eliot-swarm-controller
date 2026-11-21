@@ -1516,7 +1516,10 @@ command to be stored `unknown`. The one additional Owner assertion is
 `failed -> applied` for an exact handoff brief; ordinary terminal commands,
 dispatched, queued and accepted commands refuse with `bad_state`. `launch` and `resume` resolve as `failed`
 only: `applied` is refused with `bad_state`, since an applied start without its
-Agent transition is inconsistent. An unknown native configure resolves as `applied`
+Agent transition is inconsistent. Resolving a managed `launch` that became unknown
+during workspace preparation marks the created Agent and preparation `failed`
+and cancels the linked initial input in the same transaction. Git cleanup still
+requires its own custody and readback. An unknown native configure resolves as `applied`
 only when the owned session proves the requested configuration and the
 Store commits its overlay in the resolution transaction. Muse supports
 this with exact idle-session model readback. When the adapter cannot
