@@ -141,25 +141,6 @@ impl Store {
                 CommandState::Applied,
                 now,
             )?);
-            if stop.mark_stopped {
-                let changed = tx
-                    .execute(
-                        "UPDATE agents SET state = 'stopped', updated_at = ?1
-                     WHERE id = ?2 AND generation = ?3 AND state = 'lost' AND observe_only = 0",
-                        params![now, agent_num, stop.generation],
-                    )
-                    .map_err(sql_error)?;
-                if changed != 1 {
-                    return Err(Error::new(
-                        "source_integrity",
-                        "reviewed lost generation changed",
-                    ));
-                }
-                events.push(insert_daemon_event(
-                    &tx, now, "agent.stopped", "agent", Some(agent_num), Some(stop.generation),
-                    json!({"agent_id": stop.agent, "command_id": stop.command_id, "reason": "owned_exit_proven"}),
-                )?);
-            }
             if let Some(turn_id) = &stop.interrupted_turn {
                 let turn = TurnResolveRequest {
                     id: request.id.clone(),
@@ -170,6 +151,14 @@ impl Store {
                     reason: "stopped_by_owner".into(),
                 };
                 events.push(resolve_turn_tx(&tx, agent_num, &turn, now)?);
+            }
+            if stop.mark_stopped {
+                super::lifecycle::settle_lost_stop_after_owned_exit_tx(
+                    &tx,
+                    &stop.command_id,
+                    now,
+                    &mut events,
+                )?;
             }
         }
         value.applied = true;

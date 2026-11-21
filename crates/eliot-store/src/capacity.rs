@@ -78,6 +78,26 @@ pub(super) fn restart_idle_resume_candidate_tx(
     connection
         .query_row(&query, params![agent_num, generation], |row| row.get(0))
         .map_err(sql_error)
+/// Independent Store readback of the two facts required to settle a stop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OwnedExitProof {
+    pub process_custody_exited: bool,
+    pub native_source_drained: bool,
+}
+
+impl OwnedExitProof {
+    pub fn is_complete(self) -> bool {
+        self.process_custody_exited && self.native_source_drained
+    }
+
+    pub fn missing_reason(self) -> Option<&'static str> {
+        match (self.process_custody_exited, self.native_source_drained) {
+            (false, false) => Some("process custody exit and native source drain are unproven"),
+            (false, true) => Some("process custody exit is unproven"),
+            (true, false) => Some("native source drain is unproven"),
+            (true, true) => None,
+        }
+    }
 }
 
 /// A controlled generation left `lost` or `stopped` by a daemon replacement
@@ -217,11 +237,16 @@ impl Store {
         commit_transaction(tx, &self.write_faulted)
     }
 
+    /// Independent process/source facts used to settle a stopped generation.
+    pub fn owned_exit_proof(&self, agent: &str, generation: i64) -> Result<OwnedExitProof> {
+        let agent_num = parse_agent_id(agent)?;
+        owned_exit_proof_tx(&self.connection, agent_num, generation)
+    }
+
     /// Authoritative owned-exit proof: physical exit plus the plugin host's
     /// drain record. Closed source rows alone are not closure.
     pub fn has_owned_exit_and_reader_drain(&self, agent: &str, generation: i64) -> Result<bool> {
-        let agent_num = parse_agent_id(agent)?;
-        has_owned_exit_and_reader_drain_tx(&self.connection, agent_num, generation)
+        Ok(self.owned_exit_proof(agent, generation)?.is_complete())
     }
 
     /// One page, ordered by Agent, of lost or stopped generations that still
@@ -1095,22 +1120,33 @@ pub(super) fn has_owned_exit_and_reader_drain_tx(
     agent: i64,
     generation: i64,
 ) -> Result<bool> {
-    if !has_physical_exit_tx(connection, agent, generation)? {
-        return Ok(false);
-    }
-    connection
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM owned_exits WHERE agent = ?1 AND generation = ?2)",
-            params![agent, generation],
-            |row| row.get(0),
-        )
-        .map_err(sql_error)
+    Ok(owned_exit_proof_tx(connection, agent, generation)?.is_complete())
+}
+
+pub(super) fn owned_exit_proof_tx(
+    connection: &Connection,
+    agent: i64,
+    generation: i64,
+) -> Result<OwnedExitProof> {
+    Ok(OwnedExitProof {
+        process_custody_exited: has_process_custody_exit_tx(connection, agent, generation)?,
+        native_source_drained: has_native_source_drain_tx(connection, agent, generation)?,
+    })
 }
 
 // Physical exit facts, shared by the reservation migration (which predates the
 // drain record) and live release, so neither treats source closure alone as
 // custody proof.
 fn has_physical_exit_tx(connection: &Connection, agent: i64, generation: i64) -> Result<bool> {
+    Ok(has_process_custody_exit_tx(connection, agent, generation)?
+        && native_sources_closed_tx(connection, agent, generation)?)
+}
+
+fn has_process_custody_exit_tx(
+    connection: &Connection,
+    agent: i64,
+    generation: i64,
+) -> Result<bool> {
     let os_closed: bool = connection
         .query_row(
             "SELECT EXISTS(
@@ -1119,16 +1155,6 @@ fn has_physical_exit_tx(connection: &Connection, agent: i64, generation: i64) ->
              )",
             params![agent, generation],
             |row| row.get(0),
-        )
-        .map_err(sql_error)?;
-    let (native_sources, open_native_sources): (i64, i64) = connection
-        .query_row(
-            "SELECT COUNT(*), COALESCE(SUM(state = 'open'), 0)
-             FROM source_state
-             WHERE agent = ?1 AND generation = ?2
-               AND source NOT IN ('daemon', 'os', 'git', 'workspace_process')",
-            params![agent, generation],
-            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(sql_error)?;
     let owner = format!("agent:{}#{}", format_agent_id(agent), generation);
@@ -1141,12 +1167,39 @@ fn has_physical_exit_tx(connection: &Connection, agent: i64, generation: i64) ->
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(sql_error)?;
-    Ok(os_closed
-        && native_sources > 0
-        && open_native_sources == 0
-        && processes > 0
-        && processes == exited_processes
-        && exited_plugins > 0)
+
+    Ok(os_closed && processes > 0 && processes == exited_processes && exited_plugins > 0)
+}
+
+fn native_sources_closed_tx(connection: &Connection, agent: i64, generation: i64) -> Result<bool> {
+    let (native_sources, open_native_sources): (i64, i64) = connection
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(state = 'open'), 0)
+             FROM source_state
+             WHERE agent = ?1 AND generation = ?2
+               AND source NOT IN ('daemon', 'os', 'git', 'workspace_process')",
+            params![agent, generation],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(sql_error)?;
+    Ok(native_sources > 0 && open_native_sources == 0)
+}
+
+fn has_native_source_drain_tx(
+    connection: &Connection,
+    agent: i64,
+    generation: i64,
+) -> Result<bool> {
+    if !native_sources_closed_tx(connection, agent, generation)? {
+        return Ok(false);
+    }
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM owned_exits WHERE agent = ?1 AND generation = ?2)",
+            params![agent, generation],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)
 }
 
 fn reservation_generation_tx(tx: &Transaction<'_>, agent: i64) -> Result<Option<i64>> {

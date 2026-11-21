@@ -606,6 +606,145 @@ fn rule_mail_delivery_prefix(command: &Command) -> Result<String> {
     Ok(format!("rule:{id}"))
 }
 
+impl Store {
+    /// Apply a dispatched or already-unknown stop after the Store has
+    /// committed independent process-custody exit and native-source drain
+    /// proof for its exact generation. This is runtime evidence settlement,
+    /// not owner assertion or native-effect replay.
+    pub fn settle_stop_after_proven_exit(
+        &mut self,
+        id: &str,
+        mut outcome: Value,
+        now: i64,
+    ) -> Result<Change<Command>> {
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let record = load_command_record(&tx, id)?
+                .ok_or_else(|| Error::new("not_found", "stop command was not found"))?;
+            if record.command.verb != "stop" {
+                return Err(Error::new(
+                    "bad_state",
+                    "process/source proof settlement only applies to stop",
+                ));
+            }
+            if let Some(command) = check_settle_idempotent(&record, CommandState::Applied, None)? {
+                commit_transaction(tx, &self.write_faulted)?;
+                return Ok(Change {
+                    value: command,
+                    events: Vec::new(),
+                });
+            }
+            if !matches!(
+                record.state,
+                CommandState::Dispatched | CommandState::Unknown
+            ) {
+                return Err(Error::new(
+                    "bad_state",
+                    "only a dispatched or unknown stop can use process/source proof settlement",
+                ));
+            }
+            let (Some(agent_num), Some(generation)) = (record.target, record.command.generation)
+            else {
+                return Err(Error::new(
+                    "bad_state",
+                    "stop has no exact generation binding",
+                ));
+            };
+            let proof = capacity::owned_exit_proof_tx(&tx, agent_num, generation)?;
+            if !proof.is_complete() {
+                return Err(Error::new(
+                    "unknown",
+                    format!(
+                        "stop cannot apply: {}",
+                        proof
+                            .missing_reason()
+                            .unwrap_or("process/source proof is incomplete"),
+                    ),
+                ));
+            }
+            let native_ended: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM events WHERE agent=?1 AND generation=?2
+                    AND kind='session.ended' AND source='stream')",
+                    params![agent_num, generation],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error)?;
+            let fields = outcome.as_object_mut().ok_or_else(|| {
+                Error::new("source_integrity", "applied stop outcome is not an object")
+            })?;
+            fields.insert("process_custody_exit_proven".into(), json!(true));
+            fields.insert("native_source_drain_proven".into(), json!(true));
+            fields.insert("native_session_end_observed".into(), json!(native_ended));
+            if native_ended {
+                fields.remove("native_stop_reason");
+            } else {
+                fields.insert(
+                    "native_stop_reason".into(),
+                    json!("The native session terminal event was not observed."),
+                );
+            }
+            validate_settle_outcome(CommandState::Applied, &Some(outcome.clone()))?;
+            check_settle_verb_guards(
+                &tx,
+                &record,
+                CommandState::Applied,
+                &Some(outcome.clone()),
+                id,
+            )?;
+            if record.state == CommandState::Dispatched
+                && !core::command_transition_allowed(record.state, CommandState::Applied)
+            {
+                return Err(Error::new(
+                    "bad_state",
+                    "dispatched stop cannot transition to Applied",
+                ));
+            }
+            update_command_state(&tx, id, CommandState::Applied, Some(&outcome), None, now)?;
+            let mut events = vec![insert_daemon_command_event(
+                &tx,
+                now,
+                "command.applied",
+                Some(agent_num),
+                Some(generation),
+                id,
+                json!({"command_id": id, "state": "applied", "outcome": outcome}),
+            )?];
+            release_settle_capacity(
+                &tx,
+                &record,
+                CommandState::Applied,
+                id,
+                false,
+                now,
+                &mut events,
+            )?;
+            apply_settle_agent_transition(
+                &tx,
+                &record,
+                CommandState::Applied,
+                id,
+                false,
+                now,
+                &mut events,
+            )?;
+            let command = load_command(&tx, id)?
+                .ok_or_else(|| Error::new("source_integrity", "settled stop disappeared"))?;
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(Change {
+                value: command,
+                events,
+            })
+        })();
+        self.fault_on_persistence_error(&result);
+        result
+    }
+}
+
 /// Applied settlement tail shared by the targetless rule commits: validate
 /// the outcome and verb guards, move the command to Applied, append its
 /// `command.applied` fact, then release capacity and apply the Agent
@@ -933,7 +1072,13 @@ pub(super) fn apply_settle_agent_transition(
         && state == CommandState::Applied
         && let (Some(agent_num), Some(generation)) = (target, generation)
     {
-        stop_agent_tx(tx, agent_num, generation, id, now, events)?;
+        let agent = load_agent_by_num(tx, agent_num)?
+            .ok_or_else(|| Error::new("not_found", "stop target Agent was not found"))?;
+        if agent.state == AgentState::Lost {
+            settle_lost_stop_after_owned_exit_inner(tx, id, now, events, true)?;
+        } else {
+            stop_agent_tx(tx, agent_num, generation, id, now, events, true)?;
+        }
     }
     Ok(())
 }
@@ -1529,6 +1674,63 @@ fn fail_start_tx(
     Ok(())
 }
 
+/// Close a Lost Agent after the owning manager's exact historical stop
+/// reconciliation. The caller resolves the stop/related turn in its own
+/// transaction first; this helper only performs the Lost -> Stopped lifecycle
+/// effect after committed process and source proof.
+pub(crate) fn settle_lost_stop_after_owned_exit_tx(
+    tx: &Transaction<'_>,
+    command_id: &str,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<()> {
+    settle_lost_stop_after_owned_exit_inner(tx, command_id, now, events, false)
+}
+
+fn settle_lost_stop_after_owned_exit_inner(
+    tx: &Transaction<'_>,
+    command_id: &str,
+    now: i64,
+    events: &mut Vec<Event>,
+    interrupt_owner_turn: bool,
+) -> Result<()> {
+    let stop = load_command_record(tx, command_id)?
+        .ok_or_else(|| Error::new("not_found", "proven stop command was not found"))?;
+    if stop.command.verb != "stop" || stop.state != CommandState::Applied {
+        return Err(Error::new(
+            "bad_state",
+            "Lost-to-Stopped requires an Applied stop command",
+        ));
+    }
+    let (Some(agent_num), Some(generation)) = (stop.target, stop.command.generation) else {
+        return Err(Error::new(
+            "bad_state",
+            "proven stop has no generation binding",
+        ));
+    };
+    let Some(agent) = load_agent_by_num(tx, agent_num)? else {
+        return Err(Error::new("not_found", "proven stop Agent was not found"));
+    };
+    if agent.generation != generation || agent.state != AgentState::Lost {
+        return Ok(());
+    }
+    if !capacity::has_owned_exit_and_reader_drain_tx(tx, agent_num, generation)? {
+        return Err(Error::new(
+            "unknown",
+            "Lost Agent stop is missing committed process custody exit or native source drain proof",
+        ));
+    }
+    stop_agent_tx(
+        tx,
+        agent_num,
+        generation,
+        command_id,
+        now,
+        events,
+        interrupt_owner_turn,
+    )
+}
+
 fn stop_agent_tx(
     tx: &Transaction<'_>,
     agent_num: i64,
@@ -1536,12 +1738,34 @@ fn stop_agent_tx(
     command_id: &str,
     now: i64,
     events: &mut Vec<Event>,
+    interrupt_owner_turn: bool,
 ) -> Result<()> {
     let Some(agent) = load_agent_by_num(tx, agent_num)? else {
         return Err(Error::new("not_found", "stop target Agent was not found"));
     };
     observer::require_controlled(&agent)?;
-    if agent.generation != generation || agent.is_terminal() {
+    if agent.generation != generation {
+        return Ok(());
+    }
+    if agent.state == AgentState::Lost
+        && !capacity::has_owned_exit_and_reader_drain_tx(tx, agent_num, generation)?
+    {
+        return Err(Error::new(
+            "unknown",
+            "Lost Agent cannot become Stopped without committed process custody exit and native source drain proof",
+        ));
+    }
+    let stop = load_command_record(tx, command_id)?
+        .ok_or_else(|| Error::new("not_found", "stop command disappeared during settlement"))?;
+    let captured_turn = stop
+        .expected_turn_id
+        .as_deref()
+        .or(agent.active_turn.as_deref());
+    let owner_stop = interrupt_owner_turn && stop.command.principal == "owner";
+    if owner_stop && let Some(turn_id) = captured_turn {
+        settle_owner_stopped_turn_tx(tx, agent_num, generation, command_id, turn_id, now, events)?;
+    }
+    if matches!(agent.state, AgentState::Stopped | AgentState::Failed) {
         return Ok(());
     }
     for dispatched_id in command_ids_in_state(tx, agent_num, generation, "dispatched")? {
@@ -1583,24 +1807,12 @@ fn stop_agent_tx(
             events,
         )?;
     }
-    if let Some(turn_id) = agent.active_turn.as_deref() {
-        db!(tx.execute(
-            "UPDATE turns SET state = 'unknown', completed_at = ?1
-             WHERE agent = ?2 AND generation = ?3 AND turn_id = ?4",
-            params![now, agent_num, generation, turn_id],
-        ));
-        events.push(insert_daemon_event_for_command(
-            tx,
-            command_id,
-            DaemonEventInput::new(
-                now,
-                "turn.unknown",
-                "turn",
-                Some(agent_num),
-                Some(generation),
-                json!({"turn_id": turn_id, "reason": "stopped_without_terminal_result"}),
-            ),
-        )?);
+    if let Some(turn_id) = agent.active_turn.as_deref()
+        && (!owner_stop || captured_turn != Some(turn_id))
+    {
+        settle_stopped_turn_unknown_tx(
+            tx, agent_num, generation, command_id, turn_id, now, events,
+        )?;
     }
     db!(tx.execute(
         "UPDATE agents SET state = 'stopped', active_turn = NULL, pending = '[]',
@@ -1636,6 +1848,98 @@ fn stop_agent_tx(
         now,
         events,
     )
+}
+
+fn settle_owner_stopped_turn_tx(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    generation: i64,
+    command_id: &str,
+    turn_id: &str,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<()> {
+    let Some(turn) = load_turn(tx, agent_num, generation, turn_id)? else {
+        return Ok(());
+    };
+    if !matches!(
+        turn.state,
+        eliot_core::TurnState::Running | eliot_core::TurnState::Unknown
+    ) {
+        // The drained native terminal result is authoritative and remains as
+        // written, including its status, text, usage and outcome.
+        return Ok(());
+    }
+    let changed = db!(tx.execute(
+        "UPDATE turns SET state = 'completed', status = 'interrupted', outcome = 'interrupted',
+                          completed_at = ?1, resolution_source = 'owner'
+         WHERE agent = ?2 AND generation = ?3 AND turn_id = ?4
+           AND state IN ('running', 'unknown')",
+        params![now, agent_num, generation, turn_id],
+    ));
+    if changed != 1 {
+        return Err(Error::new(
+            "source_integrity",
+            "captured Owner-stopped turn changed before stop settlement",
+        ));
+    }
+    events.push(insert_daemon_event_for_command(
+        tx,
+        command_id,
+        DaemonEventInput::new(
+            now,
+            "turn.resolved",
+            "turn",
+            Some(agent_num),
+            Some(generation),
+            json!({
+                "command_id": command_id,
+                "turn_id": turn_id,
+                "status": "interrupted",
+                "resolution_source": "owner",
+                "reason": "stopped_by_owner",
+            }),
+        ),
+    )?);
+    Ok(())
+}
+
+fn settle_stopped_turn_unknown_tx(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    generation: i64,
+    command_id: &str,
+    turn_id: &str,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<()> {
+    if !load_turn(tx, agent_num, generation, turn_id)?
+        .is_some_and(|turn| turn.state == eliot_core::TurnState::Running)
+    {
+        // Keep a drained native terminal result or an earlier unknown fact.
+        return Ok(());
+    }
+    let changed = db!(tx.execute(
+        "UPDATE turns SET state = 'unknown', completed_at = ?1
+         WHERE agent = ?2 AND generation = ?3 AND turn_id = ?4 AND state = 'running'",
+        params![now, agent_num, generation, turn_id],
+    ));
+    if changed != 1 {
+        return Ok(());
+    }
+    events.push(insert_daemon_event_for_command(
+        tx,
+        command_id,
+        DaemonEventInput::new(
+            now,
+            "turn.unknown",
+            "turn",
+            Some(agent_num),
+            Some(generation),
+            json!({"command_id": command_id, "turn_id": turn_id, "reason": "stopped_without_terminal_result"}),
+        ),
+    )?);
+    Ok(())
 }
 
 /// An Applied user-event command replays only for the same kind: the caller

@@ -18,7 +18,7 @@ mod status_views;
 
 pub use assignment::AssignmentStatus;
 pub use attribution::WhoWorkerRow;
-pub use capacity::{RecordedProcess, RestartResumeCandidate, RetainedGeneration};
+pub use capacity::{OwnedExitProof, RecordedProcess, RestartResumeCandidate, RetainedGeneration};
 pub use command_children::{CommandChildrenPage, history_expired};
 pub use config_overlay::AgentConfig;
 pub use context::ContextDispatch;

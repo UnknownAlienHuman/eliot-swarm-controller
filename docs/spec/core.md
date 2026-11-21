@@ -212,15 +212,31 @@ If a running turn has no terminal evidence, retain it as `unknown` before cleari
 active-turn pointer; do not erase or fabricate its result. Dispatched/unknown commands
 remain historical and are never reissued.
 
-A graceful stop captures the dispatched generation's active turn. Its one
-interrupt attempt uses the stop's authority and binds to that generation and turn.
-After the attempt, wait up to five seconds for committed readback that the turn is
-no longer running or the generation has ended. A cancellation terminal settles
-`interrupted`, while natural completion/failure keeps its actual outcome.
-A pre-native refusal skips the wait and proceeds to session closure. An interrupt
-acknowledgement or timeout supplies no turn result. Stop the owned session and
-retain the unresolved turn as `unknown` if terminal evidence is absent. Force stop
-skips the cooperative window.
+A dispatched stop captures the generation's active turn, including when the
+caller omits `expected_turn_id`. A graceful stop makes one interrupt attempt
+under the stop's authority and binds it to that captured turn. After the
+attempt, wait up to five seconds for committed readback that the turn is no
+longer running or the generation has ended. A cancellation terminal settles
+`interrupted`, while natural completion/failure keeps its actual outcome. A
+pre-native refusal skips the wait and proceeds to process custody closure. An
+interrupt acknowledgement or timeout supplies no turn result.
+
+Stop is `applied` only after two independent, bounded facts are committed for
+the exact generation: its owned process custody is empty and its authoritative
+native source is drained. The plugin's stop reply or a native `session.ended`
+terminal is retained when observed; either may be absent after process/source
+proof, in which case the stop outcome records
+`native_session_end_observed=false`. Missing process-exit or source-drain proof
+keeps the stop `unknown` with the missing fact named. Stop never retries an
+uncertain native call.
+
+When an Owner-requested stop proves both facts, its captured turn becomes
+`interrupted` with `resolution_source=owner` and reason `stopped_by_owner` if no
+terminal native result arrived. A drained native terminal result, including its
+status, outcome, text and usage, remains authoritative. A turn not captured by
+that stop, or a non-Owner stop without terminal evidence, stays `unknown`.
+Force stop skips the cooperative interrupt window and uses the same process and
+source proof requirement.
 
 Diagnosis of a stopped, failed or lost Agent names retained unknown commands and
 turns across all generations, including history outside the recent-turn page.

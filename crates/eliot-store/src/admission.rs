@@ -458,16 +458,13 @@ pub(super) fn admit_stop_member(
     )?;
     events.push(admit_command(
         tx,
-        &CommandInsert {
-            turn_id: request.expected_turn_id.as_deref(),
-            ..CommandInsert::admitted(
-                principal,
-                request,
-                payload_digest,
-                (agent_num, agent.generation),
-                now,
-            )
-        },
+        &CommandInsert::admitted(
+            principal,
+            request,
+            payload_digest,
+            (agent_num, agent.generation),
+            now,
+        ),
         json!({"command_id": request.id, "verb": "stop"}),
     )?);
     Ok(())
