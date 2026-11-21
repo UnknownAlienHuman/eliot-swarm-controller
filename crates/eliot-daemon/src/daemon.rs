@@ -95,6 +95,11 @@ pub async fn run(path: PathBuf) -> Result<()> {
     crate::logging::set_log_level(crate::logging::LogLevel::parse(&daemon_config.log_level)?);
     let policy = Arc::new(SecretPolicy::new([data_dir.owner_token()]));
     logging::record(&policy, "daemon.starting", &[], None);
+    if let Err(error) =
+        crate::platform::data_dir::remove_abandoned_mcp_temps(&data_dir, &daemon_lock)
+    {
+        logging::record(&policy, "daemon.mcp_temp_cleanup_failed", &[], Some(&error));
+    }
     let outcome = run_owned(&data_dir, &daemon_lock, Arc::clone(&policy)).await;
     logging::record(
         &policy,

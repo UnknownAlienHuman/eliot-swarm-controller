@@ -360,12 +360,12 @@ Every profile selects a worker MCP policy in `mcp`: `minimal` (the default
 where the harness maps it) or `inherit` (explicit opt-in, and the default for
 Muse, which has no minimal mapping), plus an optional `mcp_allow` list of native
 server names. Where a harness filters native sources, it identifies Owner
-transports with `eliot_core::is_owner_swarm_server`. The rule matches a stdio server whose
-command resolves to a Swarm executable -- by file name `swarm`/`swarm.exe`
-or the active controller binary path -- with arguments containing `mcp` but
-not `--require-agent`, or an HTTP server whose URL host equals a configured
-`cloud_mcp` hostname (the owner cloud endpoint carries Owner authority
-through Access). The server Eliot generates always carries `--require-agent`
+transports with `eliot_core::is_owner_swarm_server`. The rule scans literal
+command and argument words for `swarm`, `swarm.exe` or the active controller
+binary and `mcp` without the `--require-agent` flag. Shell text naming Swarm
+also matches. HTTP matches the configured `cloud_mcp` hostname, or a Swarm
+service label when the hostname is absent. The owner endpoint carries Owner
+authority through Access. The server Eliot generates always carries `--require-agent`
 and requires the generation-bound Agent credential. Swarm MCP names
 (`eliot_swarm`, `eliot-swarm` and the per-session prefixes) are reserved and
 cannot be allow-listed. A renamed Owner entry still matches by transport.
@@ -385,7 +385,7 @@ The resolved policy and allow list are frozen in the profile snapshot
 requested policy is reported in secret-free diagnostics and effective
 settings. Frozen snapshots without the key keep their recorded meaning
 (`inherit`); snapshots that predate `mcp_cloud_hostname` read it back as
-absent, leaving the identity HTTP arm inert. Unknown policies and reserved
+absent and use the Swarm service label check. Unknown policies and reserved
 Swarm names in `mcp_allow` are rejected at config load, and a non-empty
 allow list requires `minimal`.
 

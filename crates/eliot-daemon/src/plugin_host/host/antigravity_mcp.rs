@@ -278,6 +278,28 @@ impl Sources<'_> {
                 )
             })?;
             let allowed = self.allow.contains(name);
+            let (command, args) =
+                owner_scan::project_string_command_args(table.get("command"), table.get("args"));
+            // AGY documents serverUrl and url. Scan the Gemini CLI spelling
+            // too, and check each supplied alias before considering disabled.
+            let owner_http = ["serverUrl", "url", "httpUrl"]
+                .iter()
+                .filter_map(|key| table.get(*key).and_then(Value::as_str))
+                .any(|url| eliot_core::is_owner_swarm_http(Some(url), self.cloud));
+            if is_swarm_reserved_server_name(name)
+                || owner_http
+                || eliot_core::is_owner_swarm_stdio(
+                    command.as_deref(),
+                    args.as_deref(),
+                    self.controller.and_then(Path::to_str),
+                )
+            {
+                return Err(mcp_refusal(
+                    "Antigravity cannot exclude Owner or reserved Swarm MCP server",
+                    name,
+                    path,
+                ));
+            }
             if minimal && allowed {
                 if source == Source::Global {
                     self.global_names.insert(name.clone());
@@ -301,27 +323,6 @@ impl Sources<'_> {
                     ));
                 }
                 continue;
-            }
-            let (command, args) =
-                owner_scan::project_string_command_args(table.get("command"), table.get("args"));
-            let url = table
-                .get("serverUrl")
-                .or_else(|| table.get("url"))
-                .and_then(Value::as_str);
-            if is_swarm_reserved_server_name(name)
-                || owner_scan::is_owner_transport(
-                    command.as_deref(),
-                    args.as_deref(),
-                    url,
-                    self.controller.and_then(Path::to_str),
-                    self.cloud,
-                )
-            {
-                return Err(mcp_refusal(
-                    "Antigravity cannot exclude Owner or reserved Swarm MCP server",
-                    name,
-                    path,
-                ));
             }
             if minimal {
                 self.selected.insert(name.clone(), entry.clone());

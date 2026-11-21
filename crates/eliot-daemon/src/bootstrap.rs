@@ -394,8 +394,11 @@ fn installed_default_profiles(
         }
         let mut profile = serde_json::Map::new();
         profile.insert("harness".to_owned(), Value::String((*harness).to_owned()));
-        // Antigravity bootstrap keeps native customizations. Muse only
-        // supports inherit. The remaining bootstrap profiles use minimal.
+        // Explicit worker MCP policy per harness: the new default is
+        // `minimal` wherever the harness implements an isolation mechanism
+        // (Codex, Claude, OpenCode all serve only the Agent-scoped server);
+        // Muse and Antigravity keep an explicit `inherit` opt-in because no
+        // verified isolation mechanism exists for them.
         let mcp = match *harness {
             "muse" | "antigravity" => "inherit",
             _ => "minimal",

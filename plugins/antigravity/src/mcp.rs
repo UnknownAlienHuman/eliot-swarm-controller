@@ -1,5 +1,6 @@
 use std::{
     fs,
+    io::ErrorKind,
     path::{Path, PathBuf},
 };
 
@@ -46,8 +47,19 @@ pub(crate) fn install(plan: &Plan, instance: &Path) -> Result<Option<OwnedConfig
     }
     match fs::create_dir(root) {
         Ok(()) => (),
-        Err(error)
-            if error.kind() == std::io::ErrorKind::AlreadyExists && plan.resume().is_some() => {}
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            check_root(root)?;
+            if plan.resume().is_none() {
+                // This fresh launch owns the Agent's private slot and has no
+                // retained session to load. Never follow a redirected root.
+                fs::remove_dir_all(root).map_err(|_| {
+                    Error::new("io_error", "Could not clear stale Antigravity MCP root")
+                })?;
+                fs::create_dir(root).map_err(|_| {
+                    Error::new("io_error", "Could not recreate owned Antigravity MCP root")
+                })?;
+            }
+        }
         Err(_) => {
             return Err(Error::new(
                 "io_error",
@@ -55,11 +67,7 @@ pub(crate) fn install(plan: &Plan, instance: &Path) -> Result<Option<OwnedConfig
             ));
         }
     }
-    let canonical_root = fs::canonicalize(root)
-        .map_err(|_| Error::new("invalid", "Antigravity MCP root is unavailable"))?;
-    if without_verbatim_prefix(&canonical_root) != without_verbatim_prefix(root) {
-        return Err(Error::new("invalid", "Antigravity MCP root was redirected"));
-    }
+    check_root(root)?;
     let config_dir = root.join("config");
     fs::create_dir_all(&config_dir).map_err(|_| {
         Error::new(
@@ -92,4 +100,26 @@ pub(crate) fn install(plan: &Plan, instance: &Path) -> Result<Option<OwnedConfig
         )
     })?;
     Ok(Some(OwnedConfig(root.clone())))
+}
+
+fn check_root(root: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(root)
+        .map_err(|_| Error::new("invalid", "Antigravity MCP root is unavailable"))?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(Error::new("invalid", "Antigravity MCP root was redirected"));
+        }
+    }
+    if !metadata.is_dir()
+        || fs::canonicalize(root)
+            .ok()
+            .map(|path| without_verbatim_prefix(&path))
+            != Some(without_verbatim_prefix(root))
+    {
+        return Err(Error::new("invalid", "Antigravity MCP root was redirected"));
+    }
+    Ok(())
 }

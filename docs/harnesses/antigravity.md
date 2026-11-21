@@ -402,6 +402,8 @@ and [customization discovery](https://antigravity.google/docs/customization-disc
 
 Before launch and resume the daemon checks the user, workspace and standard
 plugin MCP files for Owner Swarm transports and reserved Swarm names.
+This check includes disabled entries and the Gemini CLI `httpUrl` spelling.
+AGY documents `serverUrl` and `url` for remote connections.
 AGY 1.5.14 has no documented per-session exclusion for an individual
 discovered server. A match refuses startup and identifies the server and file.
 Plugin manifests or personal customization redirects that the daemon cannot
@@ -409,9 +411,9 @@ check refuse startup and identify the declaring file.
 
 New custom profiles default to `minimal`. The daemon selects enabled `mcp_allow`
 entries from the user `~/.gemini/config/mcp_config.json` and workspace MCP files.
-An allow-listed workspace entry with the same name as a user entry refuses
-startup. The daemon atomically publishes the prepared MCP file in the private
-instance directory.
+When a user entry is allow-listed, a workspace entry with the same name
+refuses startup. The daemon atomically publishes the prepared MCP file in the
+private instance directory and removes abandoned MCP temporary files at startup.
 The plugin installs that prepared file at
 `<private-plugins>/<Agent>-agy/config/mcp_config.json` and selects the root with
 `acp --gemini-dir`. Exclusion of the user MCP file and user plugins from the
@@ -421,6 +423,7 @@ refuse startup with the source path when the CLI cannot suppress them.
 A missing allowed name or an allowed owner Swarm transport also refuses startup.
 
 The private Gemini root persists as part of the native scope for exact resume.
+Fresh starts clear a stale private root before installing the prepared file.
 The plugin removes the staged MCP file after native exit and retains native
 conversations. `inherit` resumes in the original native store. The private
 Gemini root is outside the `--add-dir` workspace roots. `--app-data-dir` stays
@@ -438,7 +441,7 @@ Every managed ACP session carries the Agent-scoped swarm MCP server on the
 documented session-setup surface: `session/new` — and `session/load` with
 the exact retained session id on resume — sends
 `mcpServers: [{name, command, args, env}]` with one stdio entry,
-`eliot-swarm-<Agent>`, invoking the current Eliot executable as
+`eliot-swarm`, invoking the current Eliot executable as
 `<exe> --data-dir <Agent-bound root> mcp --require-agent`. The entry shape
 follows the official ACP v1 schema (`schema/v1/schema.json`: stdio entries
 carry name, command (absolute path), args and env, all required, and every
