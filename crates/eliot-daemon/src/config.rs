@@ -24,6 +24,7 @@ use std::sync::Mutex;
 mod automation;
 pub(crate) mod profiles_edit;
 mod projects;
+pub(crate) mod recovery;
 pub(crate) mod settings;
 
 pub(crate) use automation::{

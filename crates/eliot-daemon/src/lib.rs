@@ -33,6 +33,7 @@ mod workspaces;
 pub use adhoc::CLAUDE_EFFORT_LEVELS;
 pub use config::desktop_window_in_bounds;
 pub use config::load_cloud_access_config;
+pub use config::recovery::{read_settings_for_repair, save_settings_for_repair};
 pub use config::settings::stored_section as stored_settings_section;
 pub use daemon::client_call_with_remote_context;
 pub use daemon::{
