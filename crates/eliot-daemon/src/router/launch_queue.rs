@@ -16,14 +16,12 @@ impl Router {
         original.validate()?;
         let mut request = original.command();
         let caller = principal_name(principal);
-        if let Some(view) = self
-            .inner
-            .store
-            .lock()
-            .await
-            .replay_launch_intent(&caller, &original)?
         {
-            return encode(view);
+            let store = self.inner.store.lock().await;
+            if let Some(view) = store.replay_launch_intent(&caller, &original)? {
+                return encode(view);
+            }
+            hierarchy::authorize_agent_submit(&store, principal)?;
         }
         authorize_command(principal, &mut request)?;
         self.check_command_admission_mode("launch")?;

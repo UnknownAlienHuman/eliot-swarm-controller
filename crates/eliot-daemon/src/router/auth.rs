@@ -6,7 +6,7 @@
 //! Rule-action shape validation stays with submission preparation in the
 //! parent module; Agent submit policy stays in `hierarchy`.
 use super::{
-    Principal, Router, hierarchy::authorize_agent_submit, validate_rule_launch_action,
+    Principal, Router, hierarchy::bind_agent_submit, validate_rule_launch_action,
     validate_rule_resume_action,
 };
 use crate::common::secure_eq;
@@ -412,7 +412,7 @@ pub(super) fn authorize_command(principal: &Principal, request: &mut SubmitComma
     let Principal::Agent { id, generation } = principal else {
         return Ok(());
     };
-    authorize_agent_submit(id, *generation, request)
+    bind_agent_submit(id, *generation, request)
 }
 
 pub(super) fn authorize_command_read_self(principal: &Principal, command: &Command) -> Result<()> {

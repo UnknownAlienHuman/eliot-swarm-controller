@@ -306,6 +306,9 @@ Read [coordination](spec/coordination.md). Use two Codex Agents initially.
 - [x] **L5.3 Hierarchy.** Controller-launched children and tree selectors, then native
       child discovery/control where supported. An existing child is never hidden by a
       fanout limit. Parent completion is not child completion.
+  - [x] **Child launch admission.** On 2026-11-21, private OpenCode Agents proved
+        that a `self` caller's prompted and promptless child launches are refused
+        before allocation, and a `tree` caller's child completes its linked first turn.
 - [x] **H1 Manager change.** Owner-only atomic subtree/all-children re-parent through
       Store, router, CLI and MCP; preserve frozen native identities and snapshots.
       Codex Sol manager to Antigravity Argon manager, exact next-turn wait, scoped

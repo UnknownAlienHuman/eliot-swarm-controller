@@ -1292,10 +1292,12 @@ ordinary launch label. A managed Agent's summary can also carry its retained
 `repo_common_dir` for display, including after worktree removal. Same-ID retries
 reuse the admitted project decision.
 
-With `parent`, the launch creates a child of that Agent. An Agent principal launches
-only its own children (the Router defaults an absent parent to the caller). The child
-inherits the parent's authorization namespace and tree root, and the configured fanout
-limits are checked at admission. The parent must be controlled. An Agent-principal child
+With `parent`, the launch creates a child of that Agent. An Agent principal with
+`control=tree` or `control=project` launches only its own children (the Router defaults
+an absent parent to the caller). A caller with `control=self` is refused before a child
+is created, including when the launch has no prompt. The child inherits the parent's
+authorization namespace and tree root, and the configured fanout limits are checked
+at admission. The parent must be controlled. An Agent-principal child
 never supplies `profile_snapshot`: the daemon freezes it, so a supplied snapshot
 rejects. With no configured default route, it may omit `profile`, or it may
 specify the parent's same profile name, with no

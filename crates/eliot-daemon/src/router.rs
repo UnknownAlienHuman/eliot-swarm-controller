@@ -1916,6 +1916,7 @@ impl Router {
                 let frozen = async {
                     {
                         let store = self.inner.store.lock().await;
+                        hierarchy::authorize_agent_submit(&store, principal)?;
                         hierarchy::default_child_workspace(&store, &mut request)?;
                     }
                     let chat = match request.args.get("chat") {

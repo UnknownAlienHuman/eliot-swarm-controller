@@ -547,8 +547,15 @@ preparation phase and setup index while failing only the removal command. Partia
 uncertain or cleanup-unconfirmed removal remains unknown; it cannot claim this
 no-effect restoration.
 
-Launch/resume text creates a linked `<id>/send`. Selector expansion creates a Store-only
-parent plus deterministically ordered concrete children; parent applied means expansion,
+Launch/resume text creates a linked `<id>/send`. The daemon commits both commands
+together before acknowledging `command.submit`. An applied start records native
+readiness. The linked input dispatches as a generation-bound `SEND` with its own
+outcome. An uncertain native effect stays `unknown` pending resolution. See
+[coordination](coordination.md#claims-and-hierarchy) for the authority over child
+launches and their first input.
+
+Selector expansion creates a Store-only parent plus deterministically ordered
+concrete children; parent applied means expansion,
 not children finished. Later automation uses the same parent/ordinal representation
 with `link_kind=rule_action`; only its ordered actions wait for the preceding action.
 Selector children remain independent. No second run/action journal is introduced.

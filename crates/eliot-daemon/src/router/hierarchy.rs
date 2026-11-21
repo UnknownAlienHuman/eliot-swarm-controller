@@ -11,11 +11,17 @@ use super::*;
 use eliot_core::AgentControl;
 use eliot_store::Store;
 
-/// Agent submit policy past the owner/run/rule gates. Launches default an
-/// absent parent to the caller and reject any other parent; selector and
-/// non-self targets pass through to the Store-backed scope check in
-/// preparation.
-pub(super) fn authorize_agent_submit(
+/// Check the current Agent generation before preparing a fresh launch.
+/// Retained retries return their existing admission before this check.
+pub(super) fn authorize_agent_submit(store: &Store, principal: &Principal) -> Result<()> {
+    if matches!(principal, Principal::Agent { .. }) {
+        store.authorize_agent_child_launch(&principal_name(principal))?;
+    }
+    Ok(())
+}
+
+/// Bind the caller's parent or self-target before scope checks and replay.
+pub(super) fn bind_agent_submit(
     id: &str,
     generation: i64,
     request: &mut SubmitCommand,

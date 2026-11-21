@@ -28,6 +28,23 @@ pub(super) enum Caller {
     },
 }
 
+impl Caller {
+    fn require_child_launch_control(&self) -> Result<()> {
+        if let Self::Agent { id, control, .. } = self
+            && !matches!(control, AgentControl::Tree | AgentControl::Project)
+        {
+            return Err(Error::new(
+                "not_allowed",
+                format!(
+                    "{id} has control={} and cannot launch children. Ask its manager.",
+                    control.as_str()
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Resolve a live Owner or Agent principal inside the writer transaction.
 /// The Agent projection's `own_identity` reflects the current token and
 /// control state without retrieving the credential itself.
@@ -206,6 +223,13 @@ fn scope_allows(
 }
 
 impl Store {
+    /// Check the live caller before launch preparation. Admission repeats
+    /// the same policy inside the writer transaction.
+    pub fn authorize_agent_child_launch(&self, principal: &str) -> Result<()> {
+        self.ensure_committed_reads()?;
+        parse_caller(&self.connection, principal)?.require_child_launch_control()
+    }
+
     /// Whether `target_id` is in `caller`'s frozen scope, for Router reads.
     pub fn agent_in_scope(&self, caller: &Agent, target_id: &str) -> Result<bool> {
         scope_allows(
@@ -268,29 +292,25 @@ pub(super) struct ParentLink {
 }
 
 /// Resolve `args.parent` for a launch: the parent must exist and be
-/// controlled (not observe-only or unknown), an Agent caller launches only
-/// its own children, and the child inherits project and root.
+/// controlled (not observe-only or unknown), a tree/project-control Agent
+/// caller launches only its own children, and the child inherits project and root.
 pub(super) fn resolve_launch_parent(
     tx: &Transaction<'_>,
     principal: &str,
     args: &Value,
 ) -> Result<Option<ParentLink>> {
-    let Some(parent) = args.get("parent") else {
-        if let Some(rest) = principal.strip_prefix("agent:")
-            && rest.split_once(':').is_some()
-        {
-            return Err(Error::new(
-                "not_allowed",
-                "Agents launch only their own children",
-            ));
-        }
+    let parent = args.get("parent");
+    if parent.is_none() && !principal.starts_with("agent:") {
         return Ok(None);
-    };
+    }
+    let caller = parse_caller(tx, principal)?;
+    caller.require_child_launch_control()?;
+    let parent =
+        parent.ok_or_else(|| Error::new("not_allowed", "Agents launch only their own children"))?;
     let parent_id = parent
         .as_str()
         .ok_or_else(|| Error::new("invalid", "launch parent must be an Agent id"))?;
     let parent_num = parse_agent_id(parent_id)?;
-    let caller = parse_caller(tx, principal)?;
     if let Caller::Agent { id, .. } = &caller
         && id != parent_id
     {
