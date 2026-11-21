@@ -480,9 +480,9 @@ impl Plugin {
         let hook_config =
             crate::session::stage_hook_config(&instance_dir, &workspace_path, &helper, &data_dir)
                 .map_err(|error| error.with_code("native_not_dispatched"))?;
-        let mut plan =
+        let plan =
             crate::profile::Plan::new(&params, &credential, hooks.token(), hook_config.root())?;
-        let mcp_config = crate::mcp::prepare(&mut plan, &params, &instance_dir)
+        let mcp_config = crate::mcp::install(&plan, &instance_dir)
             .map_err(|error| error.with_code("native_not_dispatched"))?;
         // Latch before creating a native conversation: this generation
         // never starts a second process on retry.

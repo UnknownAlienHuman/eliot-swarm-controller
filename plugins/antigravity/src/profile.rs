@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 use crate::{
     events::FAMILIES,
     native::{InitializeResult, SessionResult},
+    session::without_verbatim_prefix,
 };
 
 pub(crate) struct Plan {
@@ -60,8 +61,6 @@ pub(crate) struct SwarmMcp {
 }
 
 impl SwarmMcp {
-    pub(crate) const SERVER_NAME: &str = WORKER_SWARM_MCP_SERVER_NAME;
-
     fn require(
         environment: &[(OsString, OsString)],
         agent_id: &str,
@@ -87,7 +86,7 @@ impl SwarmMcp {
             ));
         }
         Ok(Self {
-            name: Self::SERVER_NAME.to_owned(),
+            name: format!("{WORKER_SWARM_MCP_SERVER_NAME}-{agent_id}"),
             command,
             data_dir,
         })
@@ -185,9 +184,6 @@ impl Plan {
         let model = optional_profile_text(profile, "model", "Antigravity")?;
         let mcp_policy = eliot_core::McpPolicy::parse_snapshot(profile)?;
         let mcp_allow = eliot_core::parse_snapshot_allow_list(profile)?;
-        if mcp_policy != eliot_core::McpPolicy::Minimal && !mcp_allow.is_empty() {
-            return Err(Error::new("profile_error", "mcp_allow requires minimal"));
-        }
         let program = optional_profile_text(profile, "cmd", "Antigravity")?.ok_or_else(|| {
             Error::new(
                 "profile_error",
@@ -304,13 +300,13 @@ impl Plan {
                 "Antigravity hook discovery directory is unavailable",
             ));
         }
-        let args = native_args(
-            model.as_deref().unwrap_or_default(),
-            mode.as_deref(),
-            skip_permissions,
-            resume.as_deref(),
-            hook_discovery_dir,
-        );
+        let mut args = native_args(skip_permissions, hook_discovery_dir);
+        if let Some(root) = &mcp_root {
+            args.extend([
+                OsString::from("--gemini-dir"),
+                without_verbatim_prefix(root).into_os_string(),
+            ]);
+        }
         // The native realignment target: the inherited overlay's effective
         // values on a resume that carries them (the retained session
         // already runs them), else the frozen profile translation. A
@@ -757,13 +753,7 @@ pub(crate) fn reader_environment(snapshot: &Value) -> Result<TargetEnvironment> 
     Ok(environment)
 }
 
-fn native_args(
-    _model: &str,
-    _mode: Option<&str>,
-    skip_permissions: bool,
-    _resume: Option<&str>,
-    hook_discovery_dir: &Path,
-) -> Vec<OsString> {
+fn native_args(skip_permissions: bool, hook_discovery_dir: &Path) -> Vec<OsString> {
     // One ACP stdio server per generation. Model, thought level, session
     // mode and resume are ACP session facts now (set_config_option /
     // set_mode / session load), not CLI flags. Permission posture and the

@@ -392,31 +392,30 @@ bounded reads.
 
 ## Session MCP servers (managed Agents)
 
-The frozen `mcp` policy defaults to `minimal` for new profiles. Installed agy
-1.5.10 documents `acp --gemini-dir` (Gemini files) and `--app-data-dir`
-(application data). The plugin stages `<private-plugins>/<Agent>-agy/config/mcp_config.json`
-with only enabled `mcp_allow` definitions and passes that isolated Gemini root;
-the owner's global MCP servers and plugins are therefore outside native discovery.
-This root persists across generations and is part of the native scope, preserving
-exact session resume. The MCP file is held until native exit and removed with
-generation shutdown; native conversations remain in this Agent's root. Legacy
-`inherit` sessions keep their original native store. The root is never an
-`--add-dir` workspace root. `--app-data-dir` is left unset: despite its help wording,
-1.5.10 rejects absolute application-data paths (observed on Windows 2026-11-17).
+The bootstrap profile uses `mcp = "inherit"`. In that mode Antigravity discovers
+the user and workspace configuration directly, including MCP servers bundled
+with enabled plugins. Swarm adds its Agent-scoped server through ACP session
+setup. The same discovery applies to retained profiles that predate the `mcp`
+field. See the vendor docs for [MCP](https://antigravity.google/docs/mcp),
+[plugin MCP servers](https://antigravity.google/docs/build-plugins/#mcp-servers)
+and [customization discovery](https://antigravity.google/docs/customization-discovery/).
 
-The [vendor MCP docs](https://antigravity.google/docs/mcp) identify the global
-`~/.gemini/config/mcp_config.json` and workspace `.agents/mcp_config.json` sources.
-The [customization discovery docs](https://antigravity.google/docs/customization-discovery/)
-also identify `.agent`, `_agents`, `_agent`, repository ancestors, plugins and
-personal customization directories. Allowed enabled names are resolved from those
-global/workspace MCP files. A missing name or owner Swarm transport rejects startup.
-Workspace MCP servers outside the allow list, plugin directories/manifests, and
-personal customization directory redirects reject as `unsupported` before spawning:
-the CLI has no verified per-server suppression for these workspace sources. No
-workspace config is edited. Explicit or legacy `inherit` preserves native discovery,
-checks owner Swarm identities before spawn, and rejects unenumerated plugin sources.
-The policy/allow list in requested and effective settings records the enforced
-configuration; ACP still supplies no observed inventory.
+New custom profiles default to `minimal`. The daemon selects enabled `mcp_allow`
+entries from the user `~/.gemini/config/mcp_config.json` and workspace MCP files.
+The plugin installs that prepared file at
+`<private-plugins>/<Agent>-agy/config/mcp_config.json` and selects the root with
+`acp --gemini-dir`. The private root excludes the user MCP file and user plugins
+from native discovery. Workspace MCP servers outside the allow list, workspace
+plugin directories or manifests, and personal customization directory redirects
+refuse startup with the source path when the CLI cannot suppress them.
+A missing allowed name or an allowed owner Swarm transport also refuses startup.
+
+The private Gemini root persists as part of the native scope for exact resume.
+The plugin removes the staged MCP file after native exit and retains native
+conversations. `inherit` resumes in the original native store. The private
+Gemini root is outside the `--add-dir` workspace roots. `--app-data-dir` stays
+unset. AGY 1.5.10 rejected absolute application-data paths on Windows on
+2026-11-17. Requested and effective settings report the policy and allow list.
 
 The [vendor authentication docs](https://antigravity.google/docs/install?tab=cli)
 document local silent sign-in through the OS keyring (Windows Credential Manager).
@@ -429,7 +428,7 @@ Every managed ACP session carries the Agent-scoped swarm MCP server on the
 documented session-setup surface: `session/new` — and `session/load` with
 the exact retained session id on resume — sends
 `mcpServers: [{name, command, args, env}]` with one stdio entry,
-`eliot-swarm`, invoking the current Eliot executable as
+`eliot-swarm-<Agent>`, invoking the current Eliot executable as
 `<exe> --data-dir <Agent-bound root> mcp --require-agent`. The entry shape
 follows the official ACP v1 schema (`schema/v1/schema.json`: stdio entries
 carry name, command (absolute path), args and env, all required, and every
@@ -532,7 +531,7 @@ Implementation:
 ## Minimal-context measurement (k61, 2026-11-16)
 
 Private daemon, identical trivial turn, `gemini-3.8-flash-high`, installed
-1.5.9, `inherit` (explicit; no minimal mapping exists). ACP exposes no MCP
+1.5.9, explicit `inherit`. ACP exposes no MCP
 inventory, so the effective record stays null/unverified; the session carries
 exactly the Agent-scoped server by construction. Turn usage: input 14,934 +
 cache-read 16,837 + output 559 (total 32,330). A follow-up turn called
