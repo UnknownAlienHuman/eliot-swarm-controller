@@ -618,14 +618,21 @@ explicit null; it cannot clear an unresolved probe. The mutation ID binds the cl
 request, so an exact retry returns the retained result and changed evidence conflicts.
 
 `agent.list` and `agent.get` project the hold matching that Agent's frozen account or
-profile as `AgentProviderHold { kind, state, retry_after, updated_at }`; shared scope and
-probe-command identity remain on the owner-only provider-hold read. They also project
+profile as `AgentProviderHold { kind, state, retry_after, updated_at,
+waiting_for_active_turn }`; shared scope and probe-command identity remain on the
+owner-only provider-hold read. They also project
 the latest `turn.notice`, or the latest failed terminal `native_error`, as
 `AgentNativeNotice { generation, turn_id, kind, message, truncated, observed_at }`.
 The notice must match the row's generation and active or most recent turn. These views
 read the existing hold row and committed native events; they add no timer or polling
-source. `retry_after` still describes probe eligibility and never promises automatic
-retry. The desktop uses the existing daemon attention incident for its attention tone:
+source. A retry/reconnect notice is omitted from an active turn once native progress is
+newer than the notice. `waiting_for_active_turn` is true for a probing hold only while
+the active turn has no native progress newer than that hold's `updated_at`; the hold
+itself remains visible because it still gates future dispatch in the matching scope.
+When an Agent is idle, a failed provider notice is omitted after its matching hold has
+been cleared. A newly started turn is projected only against its own turn binding.
+`retry_after` still describes probe eligibility and never promises automatic retry.
+The desktop uses the existing daemon attention incident for its attention tone:
 the configured no-progress window (default 900 seconds) and source-health triggers are
 unchanged.
 

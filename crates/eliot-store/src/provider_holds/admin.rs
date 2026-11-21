@@ -1,23 +1,38 @@
-use super::super::{Error, Result, sql_error};
+use super::super::{Error, Result, encode_json, sql_error};
 use eliot_core::{
     ProviderHold, ProviderHoldState, ProviderRestrictionKind,
     api::{ProviderHoldsRequest, ProviderHoldsResponse},
 };
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
+use std::collections::BTreeMap;
 
 type RawHold = (String, String, Option<i64>, Option<String>, String, i64);
 
-pub(super) fn get(connection: &Connection, scope: &str) -> Result<Option<ProviderHold>> {
-    let raw = connection
-        .query_row(
-            "SELECT scope, kind, retry_after, probe_command, state, updated_at
-             FROM provider_holds WHERE scope = ?1",
-            [scope],
-            raw_hold_from_row,
+pub(super) fn get_many(
+    connection: &Connection,
+    scopes: &[String],
+) -> Result<BTreeMap<String, ProviderHold>> {
+    if scopes.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let encoded = encode_json(&scopes)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT h.scope, h.kind, h.retry_after, h.probe_command, h.state, h.updated_at
+             FROM json_each(?1) AS requested
+             CROSS JOIN provider_holds AS h
+             WHERE h.scope = requested.value",
         )
-        .optional()
         .map_err(sql_error)?;
-    raw.map(hold_from_raw).transpose()
+    let rows = statement
+        .query_map(params![encoded], raw_hold_from_row)
+        .map_err(sql_error)?;
+    let mut holds = BTreeMap::new();
+    for row in rows {
+        let hold = hold_from_raw(row.map_err(sql_error)?)?;
+        holds.insert(hold.scope.clone(), hold);
+    }
+    Ok(holds)
 }
 
 pub(super) fn list_page(

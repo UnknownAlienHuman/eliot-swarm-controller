@@ -3636,13 +3636,7 @@ impl Router {
             let agent = store
                 .get_agent(id)?
                 .ok_or_else(|| Error::new("not_found", format!("Agent {id} was not found")))?;
-            let provider_hold =
-                store.agent_provider_hold(&agent.profile, &agent.profile_snapshot)?;
-            let native_notice = store.agent_native_notice(
-                &agent.id,
-                agent.generation,
-                agent.active_turn.as_deref(),
-            )?;
+            let (provider_hold, native_notice) = store.agent_status_projection(&agent)?;
             let mut source_states = store.list_source_states(id, agent.generation)?;
             if let Some(workspace) = store.get_workspace(id)?
                 && workspace.target_generation != agent.generation

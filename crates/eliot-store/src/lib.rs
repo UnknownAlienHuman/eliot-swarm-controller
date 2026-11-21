@@ -14,6 +14,7 @@ mod provider_holds;
 mod rules;
 mod scripts;
 mod settings;
+mod status_views;
 
 pub use assignment::AssignmentStatus;
 pub use attribution::WhoWorkerRow;

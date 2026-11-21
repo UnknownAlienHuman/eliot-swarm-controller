@@ -5,7 +5,7 @@ use super::{
     encode_json, load_agent_by_num, require_nonempty, sql_error, validate_id_age, write_binding,
 };
 mod admin;
-use admin::{clear_hold_tx, get, list_page};
+use admin::{clear_hold_tx, get_many, list_page};
 
 use eliot_core::{
     self as core, Agent, Command, CommandState, ProviderHold, ProviderHoldState,
@@ -16,6 +16,7 @@ use eliot_core::{
 };
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
 const CLEAR_HOLD_METHOD: &str = "provider.clear_hold";
 const INTERVENING_RESTRICTION_BATCH: i64 = 64;
@@ -30,22 +31,27 @@ impl Store {
         list_page(&self.connection, after, limit)
     }
 
-    /// Project only the provider restriction facts relevant to this frozen
-    /// profile/account. The shared scope and probe command stay owner-only.
-    pub fn agent_provider_hold(
+    /// Resolve the holds for the distinct scopes captured by one status page.
+    /// Scope and probe-command identity remain owner-only.
+    pub(super) fn agent_provider_holds(
         &self,
-        profile: &str,
-        profile_snapshot: &Value,
-    ) -> Result<Option<AgentProviderHold>> {
-        let scope = core::frozen_provider_scope_for(profile, profile_snapshot)?;
-        Ok(
-            get(&self.connection, &scope)?.map(|hold| AgentProviderHold {
-                kind: hold.kind,
-                retry_after: hold.retry_after,
-                state: hold.state,
-                updated_at: hold.updated_at,
-            }),
-        )
+        scopes: &[String],
+    ) -> Result<BTreeMap<String, AgentProviderHold>> {
+        Ok(get_many(&self.connection, scopes)?
+            .into_iter()
+            .map(|(scope, hold)| {
+                (
+                    scope,
+                    AgentProviderHold {
+                        kind: hold.kind,
+                        retry_after: hold.retry_after,
+                        state: hold.state,
+                        updated_at: hold.updated_at,
+                        waiting_for_active_turn: false,
+                    },
+                )
+            })
+            .collect())
     }
 
     /// Clear a hold using the Core request's closed corrective evidence and

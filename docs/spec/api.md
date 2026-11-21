@@ -800,6 +800,15 @@ target generation's rows when it differs. If persisted state requires a live own
 the corresponding source is absent, it returns `unknown` rather than asserting the
 persisted state is current. It includes the same `provider_hold` and generation/turn-bound
 `native_notice` facts as `agent.list`, with the native notice's bounded projection.
+`AgentProviderHold.waiting_for_active_turn` is true only when a probing hold is the
+current wait reason for an active turn; Store clears that projection when native
+progress is newer than the hold's `updated_at`. Retry/reconnect notices are likewise
+omitted when the active turn has newer native progress. When idle, a failed provider
+notice is omitted after its matching hold is cleared; a new turn uses its own binding.
+`agent.list` resolves all distinct holds for the selected page in one indexed scope
+query and resolves native notices in one page-scoped query over the existing event
+index. `agent.get` uses the same projection for its single Agent. Neither read adds a
+polling source.
 The Agent `effective` settings are the last
 natively admitted values, never a prediction: the launch `session.ready`
 readback sets them, and a `configure` revision's turn refreshes them when the

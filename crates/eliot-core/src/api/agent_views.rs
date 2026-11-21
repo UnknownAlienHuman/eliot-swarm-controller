@@ -73,11 +73,18 @@ pub struct AgentProviderHold {
     pub retry_after: Option<i64>,
     pub state: ProviderHoldState,
     pub updated_at: i64,
+    /// Whether this hold is the current wait reason for the Agent's active
+    /// turn. Store clears this when native progress is newer than the hold.
+    #[serde(default)]
+    pub waiting_for_active_turn: bool,
 }
 
 impl AgentProviderHold {
     pub fn validate(&self) -> Result<()> {
-        if self.retry_after.is_some_and(|at| at < 0) || self.updated_at < 0 {
+        if self.retry_after.is_some_and(|at| at < 0)
+            || self.updated_at < 0
+            || (self.waiting_for_active_turn && self.state != ProviderHoldState::Probing)
+        {
             return Err(Error::new("invalid", "Agent provider hold is invalid"));
         }
         Ok(())
@@ -127,6 +134,8 @@ pub fn agent_status_line(
     native_notice: Option<&AgentNativeNotice>,
     now_ms: i64,
 ) -> Option<String> {
+    let provider_hold =
+        provider_hold.filter(|hold| active_turn.is_none() || hold.waiting_for_active_turn);
     let provider_kind = provider_hold
         .map(|hold| hold.kind)
         .or_else(|| native_notice.and_then(|notice| notice.provider_kind));
@@ -142,7 +151,7 @@ pub fn agent_status_line(
                 native_notice.map(|notice| notice.kind),
                 Some(NativeNoticeKind::Retrying | NativeNoticeKind::Reconnecting)
             ) || (native_notice.is_none()
-                && provider_hold.is_some_and(|hold| hold.state == ProviderHoldState::Probing)));
+                && provider_hold.is_some_and(|hold| hold.waiting_for_active_turn)));
         let mut line = if waiting_for_provider {
             format!("Waiting for the provider: {kind}")
         } else if provider_hold.is_some() {
