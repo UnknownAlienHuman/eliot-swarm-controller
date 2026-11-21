@@ -330,7 +330,8 @@ pub(super) fn interval_ms(text: &str) -> Option<i64> {
 /// A folder by its last two names (`agent-briefs\queue10`): enough to know
 /// it; the full path is the card's link.
 fn short_folder(path: &str) -> String {
-    let shown = nav::display_path(path).trim_end_matches(['\\', '/']);
+    let shown = nav::display_path(path);
+    let shown = shown.trim_end_matches(['\\', '/']);
     let names: Vec<&str> = shown
         .split(['\\', '/'])
         .filter(|name| !name.is_empty())

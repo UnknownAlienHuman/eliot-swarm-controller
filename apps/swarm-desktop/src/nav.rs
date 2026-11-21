@@ -360,15 +360,7 @@ pub fn place_label(label: &str, checkouts: &[Checkout]) -> String {
     }
 }
 
-/// A path as a person reads it: without the `\\?\` verbatim prefix the
-/// daemon keeps on canonical Windows paths (a verbatim UNC path is left as
-/// it is).
-pub fn display_path(path: &str) -> &str {
-    if path.starts_with(r"\\?\UNC\") {
-        return path;
-    }
-    path.strip_prefix(r"\\?\").unwrap_or(path)
-}
+pub use eliot_core::display_path;
 
 /// A path as the daemon's Git identity compares it: no verbatim prefix,
 /// one separator, no trailing separator, case-insensitive on Windows.
@@ -387,7 +379,8 @@ pub fn path_key(path: &str) -> String {
 /// there; any other common directory (a bare `name.git`) names itself
 /// without `.git` and has no main checkout.
 pub fn repository(common_dir: &str) -> (String, Option<String>) {
-    let shown = display_path(common_dir).trim_end_matches(['\\', '/']);
+    let shown = display_path(common_dir);
+    let shown = shown.trim_end_matches(['\\', '/']);
     let mut parts = shown.rsplitn(2, ['\\', '/']);
     let last = parts.next().unwrap_or(shown);
     if last.eq_ignore_ascii_case(".git")

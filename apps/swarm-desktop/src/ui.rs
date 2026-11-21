@@ -405,7 +405,7 @@ fn load_projects_blocking(data_dir: &Path) -> Fallible<Vec<UiProject>> {
             .map_err(|error| error.to_string())?
             .into_iter()
             .map(|registration| UiProject {
-                missing: folder_missing(nav::display_path(&registration.checkout)),
+                missing: folder_missing(&nav::display_path(&registration.checkout)),
                 workspace: registration.checkout,
                 common_dir: registration.repo_common_dir,
                 profiles: registration.profiles,
