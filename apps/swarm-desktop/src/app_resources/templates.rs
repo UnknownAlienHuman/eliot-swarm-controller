@@ -155,6 +155,7 @@ pub(super) fn button(look: Look) -> String {
     // the ripple fades, the press springs back.
     let release = |layer: f64, hovered: bool| {
         let mut out = animate("StateLayer", "Opacity", layer, ms, EMPHASIZED)
+            + &set("StateFill", "Opacity", 1.0)
             + &animate("Ripple", "Opacity", 0.0, RIPPLE_MS, EMPHASIZED)
             + &scale(1.0, STATE_MS, DECELERATE);
         if lift != Lift::Flat {
@@ -168,13 +169,16 @@ pub(super) fn button(look: Look) -> String {
         }
         out
     };
+    // Both effects share the 12% pressed layer so their overlap cannot
+    // wash out the content. The fill catches up with the growing ripple.
     let mut pressed = animate(
         "StateLayer",
         "Opacity",
         state::PRESSED,
         PRESS_MS,
         EMPHASIZED,
-    ) + &set("Ripple", "Opacity", state::RIPPLE)
+    ) + &grow("StateFill", "Opacity", 0.0, 1.0, RIPPLE_MS, DECELERATE)
+        + &set("Ripple", "Opacity", 1.0)
         + &grow("RippleScale", "ScaleX", 0.0, 1.0, RIPPLE_MS, DECELERATE)
         + &grow("RippleScale", "ScaleY", 0.0, 1.0, RIPPLE_MS, DECELERATE)
         + &scale(press, PRESS_MS, EMPHASIZED);
@@ -218,14 +222,15 @@ pub(super) fn button(look: Look) -> String {
                BorderThickness=\"{{TemplateBinding BorderThickness}}\" \
                CornerRadius=\"{{TemplateBinding CornerRadius}}\">\
                <Grid CornerRadius=\"{{TemplateBinding CornerRadius}}\">\
-                 <Border x:Name=\"StateLayer\" Opacity=\"0\" \
-                   Background=\"{{TemplateBinding Foreground}}\"/>\
-                 <Ellipse x:Name=\"Ripple\" Opacity=\"0\" Fill=\"{{TemplateBinding Foreground}}\" \
-                   RenderTransformOrigin=\"0.5,0.5\" Stretch=\"Fill\" Margin=\"-{ripple_inset}\">\
-                   <Ellipse.RenderTransform>\
-                     <ScaleTransform x:Name=\"RippleScale\" ScaleX=\"0\" ScaleY=\"0\"/>\
-                   </Ellipse.RenderTransform>\
-                 </Ellipse>\
+                 <Grid x:Name=\"StateLayer\" Opacity=\"0\" IsHitTestVisible=\"False\">\
+                   <Border x:Name=\"StateFill\" Background=\"{{TemplateBinding Foreground}}\"/>\
+                   <Ellipse x:Name=\"Ripple\" Opacity=\"0\" Fill=\"{{TemplateBinding Foreground}}\" \
+                     RenderTransformOrigin=\"0.5,0.5\" Stretch=\"Fill\" Margin=\"-{ripple_inset}\">\
+                     <Ellipse.RenderTransform>\
+                       <ScaleTransform x:Name=\"RippleScale\" ScaleX=\"0\" ScaleY=\"0\"/>\
+                     </Ellipse.RenderTransform>\
+                   </Ellipse>\
+                 </Grid>\
                  <ContentPresenter x:Name=\"Content\" \
                    AutomationProperties.AccessibilityView=\"Raw\" \
                    Content=\"{{TemplateBinding Content}}\" \
@@ -244,6 +249,6 @@ pub(super) fn button(look: Look) -> String {
          </ControlTemplate>",
         normal = release(0.0, false),
         over = release(state::HOVER, true),
-        ripple_inset = spacing::LG,
+        ripple_inset = layout::RIPPLE_INSET,
     )
 }

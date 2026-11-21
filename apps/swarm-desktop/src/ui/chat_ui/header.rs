@@ -263,7 +263,7 @@ impl DesktopApp {
                                         "Ends Agent {} (run {}) at once instead of a clean stop; an active turn is cut off.",
                                         bound.agent, bound.generation
                                     ),
-                                    tokens::text::SECONDARY,
+                                    tokens::text::CAPTION,
                                 )
                                 .foreground(palette.attention())
                                 .text_wrapping(TextWrapping::Wrap),
@@ -319,7 +319,8 @@ pub(super) struct HeaderInput {
 /// actions always keep their room.
 fn header_widths(main: f64) -> (f64, f64) {
     let chrome = tokens::spacing::LG + tokens::spacing::MD + 2.0 * tokens::spacing::ROW;
-    let pill_chrome = tokens::layout::BADGE_DOT + 6.0 + 2.0 * tokens::spacing::ROW;
+    let pill_chrome =
+        tokens::layout::BADGE_DOT + tokens::spacing::CHIP_GAP + 2.0 * tokens::spacing::ROW;
     let actions = 2.0 * tokens::height::CONTROL + tokens::spacing::ROW_GAP;
     let room = main - chrome - pill_chrome - actions;
     let label = (room - tokens::layout::HEADER_TITLE_MIN_WIDTH).clamp(

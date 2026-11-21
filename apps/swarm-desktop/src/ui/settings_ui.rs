@@ -1776,7 +1776,7 @@ impl DesktopApp {
             return View::empty();
         };
         let text = if note.error {
-            m3::text(note.text.clone(), tokens::text::SECONDARY).foreground(palette.attention())
+            m3::text(note.text.clone(), tokens::text::CAPTION).foreground(palette.attention())
         } else {
             m3::secondary(note.text.clone())
         }

@@ -929,6 +929,8 @@ pub fn styles_xaml() -> String {
         text::FAMILY,
         text::BODY.size,
     );
+    let min_height = format!("<Setter Property=\"MinHeight\" Value=\"{min}\"/>");
+    let control = format!("{font}{min_height}");
     let button_font = format!("{font}<Setter Property=\"FontWeight\" Value=\"Medium\"/>");
     let template = |look: Look| {
         format!(
@@ -964,12 +966,15 @@ pub fn styles_xaml() -> String {
          <FontFamily x:Key=\"ContentControlThemeFontFamily\">{family}</FontFamily>\
          <x:Double x:Key=\"ControlContentThemeFontSize\">{font_size}</x:Double>\
          <Style TargetType=\"TextBlock\">{font}</Style>\
-         <Style TargetType=\"RichTextBlock\">{font}</Style>\
+         <Style TargetType=\"RichTextBlock\">\
+           {font}\
+           <Setter Property=\"Foreground\" Value=\"{{ThemeResource TextFillColorPrimaryBrush}}\"/>\
+         </Style>\
          <Style TargetType=\"Button\">\
            {button_font}\
            <Setter Property=\"CornerRadius\" Value=\"{pill}\"/>\
            <Setter Property=\"Padding\" Value=\"{row},0,{row},0\"/>\
-           <Setter Property=\"MinHeight\" Value=\"{min}\"/>\
+           {min_height}\
            {flat}\
          </Style>\
          <Style x:Key=\"SubtleButtonStyle\" TargetType=\"Button\">\
@@ -991,49 +996,41 @@ pub fn styles_xaml() -> String {
            {button_font}\
            <Setter Property=\"CornerRadius\" Value=\"{container}\"/>\
            <Setter Property=\"Padding\" Value=\"{inset},0,{inset},0\"/>\
-           <Setter Property=\"MinHeight\" Value=\"{min}\"/>\
+           {min_height}\
            <Setter Property=\"BorderThickness\" Value=\"0\"/>\
            {card}\
          </Style>\
          <Style TargetType=\"TextBox\">\
-           {font}\
+           {control}\
            <Setter Property=\"CornerRadius\" Value=\"{field}\"/>\
-           <Setter Property=\"MinHeight\" Value=\"{min}\"/>\
            <Setter Property=\"IsTextPredictionEnabled\" Value=\"False\"/>\
            <Setter Property=\"IsSpellCheckEnabled\" Value=\"False\"/>\
          </Style>\
          <Style TargetType=\"ComboBox\">\
-           {font}\
+           {control}\
            <Setter Property=\"CornerRadius\" Value=\"{pill}\"/>\
-           <Setter Property=\"MinHeight\" Value=\"{min}\"/>\
          </Style>\
          <Style TargetType=\"ComboBoxItem\">\
-           {font}\
+           {control}\
            <Setter Property=\"CornerRadius\" Value=\"{pill}\"/>\
-           <Setter Property=\"MinHeight\" Value=\"{min}\"/>\
          </Style>\
          <Style TargetType=\"AutoSuggestBox\">\
-           {font}\
+           {control}\
            <Setter Property=\"CornerRadius\" Value=\"{pill}\"/>\
-           <Setter Property=\"MinHeight\" Value=\"{min}\"/>\
          </Style>\
          <Style TargetType=\"NumberBox\">\
-           {font}\
-           <Setter Property=\"MinHeight\" Value=\"{min}\"/>\
+           {control}\
          </Style>\
          <Style TargetType=\"CheckBox\">\
-           {font}\
+           {control}\
            <Setter Property=\"CornerRadius\" Value=\"{check}\"/>\
-           <Setter Property=\"MinHeight\" Value=\"{min}\"/>\
          </Style>\
          <Style TargetType=\"RadioButton\">\
-           {font}\
+           {control}\
            <Setter Property=\"CornerRadius\" Value=\"{pill}\"/>\
-           <Setter Property=\"MinHeight\" Value=\"{min}\"/>\
          </Style>\
          <Style TargetType=\"ToggleSwitch\">\
-           {font}\
-           <Setter Property=\"MinHeight\" Value=\"{min}\"/>\
+           {control}\
            <Setter Property=\"Width\" Value=\"{switch_width}\"/>\
            <Setter Property=\"OnContent\" Value=\"\"/>\
            <Setter Property=\"OffContent\" Value=\"\"/>\

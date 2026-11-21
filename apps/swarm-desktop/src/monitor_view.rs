@@ -16,7 +16,7 @@ use crate::ui::tokens;
 /// A note: secondary size, wrapped and selectable (callers lower its
 /// emphasis where it is supporting text).
 fn small(text: impl Into<String>) -> TextBlock {
-    crate::m3::text(text, tokens::text::SECONDARY)
+    crate::m3::text(text, tokens::text::CAPTION)
         .text_wrapping(TextWrapping::Wrap)
         .is_text_selection_enabled(true)
 }
@@ -293,9 +293,9 @@ fn chart_card(
         Grid::new()
             .columns([GridLength::STAR, GridLength::Auto])
             .children((
-                crate::m3::muted(title, tokens::text::SECONDARY)
+                crate::m3::muted(title, tokens::text::CAPTION)
                     .vertical_alignment(VerticalAlignment::Bottom),
-                crate::m3::text(latest, tokens::text::SECTION_TITLE).grid_column(1),
+                crate::m3::text(latest, tokens::text::HEADER).grid_column(1),
             )),
         // The plot well in the surface color: one tonal step from the card
         // in both schemes (the highest container nearly matched the light

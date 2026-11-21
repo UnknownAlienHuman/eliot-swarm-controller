@@ -639,7 +639,7 @@ impl DesktopApp {
             let icon = m3::icon(access_glyph(access));
             let row = Button::new()
                 .resource_overrides(if warn {
-                    palette.attention_row()
+                    palette.destructive_row(false)
                 } else {
                     palette.row(false)
                 })
@@ -1007,8 +1007,7 @@ fn group_heading(
     } else {
         (m3::glyph::CHEVRON_DOWN, "expanded")
     };
-    let label =
-        m3::section_label(title.to_owned()).font_weight(m3::weight(tokens::text::SECTION_TITLE));
+    let label = m3::section_label(title.to_owned()).font_weight(m3::weight(tokens::text::HEADER));
     m3::sub_row(palette, false)
         .margin(Thickness::new(indent, 0.0, 0.0, 0.0))
         .automation_name(format!("{title} models, {state}"))
@@ -1072,8 +1071,7 @@ fn heading(title: &str, note: &str) -> View {
             tokens::spacing::XS,
         ))
         .children((
-            m3::section_label(title.to_owned())
-                .font_weight(m3::weight(tokens::text::SECTION_TITLE)),
+            m3::section_label(title.to_owned()).font_weight(m3::weight(tokens::text::HEADER)),
             if note.is_empty() {
                 View::empty()
             } else {

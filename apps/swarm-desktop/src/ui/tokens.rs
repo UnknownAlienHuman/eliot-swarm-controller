@@ -86,8 +86,12 @@ pub mod text {
     pub const CHIP: TypeStyle = style(13.0, 400);
     pub const LABEL: TypeStyle = style(12.0, 500);
     pub const CAPTION: TypeStyle = style(12.0, 400);
-    pub const SECONDARY: TypeStyle = CAPTION;
-    pub const SECTION_TITLE: TypeStyle = HEADER;
+}
+
+/// Supporting roles in variant, border, tonal and running order.
+pub mod color {
+    pub const LIGHT_SUPPORTING: [u32; 4] = [0x46464f, 0xc6c5d0, 0xf0eff7, 0xe8e9ff];
+    pub const DARK_SUPPORTING: [u32; 4] = [0xd5d3dd, 0x595860, 0x1f1e24, 0x272a47];
 }
 
 /// The 4-DIP grid in DIPs.
@@ -150,8 +154,6 @@ pub mod motion {
 pub mod state {
     pub const HOVER: f64 = 0.08;
     pub const PRESSED: f64 = 0.12;
-    /// The ripple above the pressed layer, fading on release.
-    pub const RIPPLE: f64 = 0.03;
     pub const DISABLED_CONTAINER: f64 = 0.12;
     /// Disabled selection marks and other non-text affordances.
     pub const DISABLED_CONTENT: f64 = 0.38;
@@ -241,6 +243,8 @@ pub mod layout {
     pub const BADGE_DOT: f64 = 6.0;
     /// Dividers.
     pub const HAIRLINE: f64 = 1.0;
+    /// Extend the ripple past the control so its final frame fills the shape.
+    pub const RIPPLE_INSET: f64 = 24.0;
     pub const FOCUS_RING: f64 = 2.0;
     pub const STATUS_STROKE: f64 = 1.5;
     /// The indeterminate progress bar of a running turn.

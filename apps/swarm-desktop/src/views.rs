@@ -247,8 +247,9 @@ fn label(text: &str) -> TextBlock {
 }
 
 /// Message text: body.
-fn body_text(text: &str) -> TextBlock {
+fn body_text(text: &str, palette: Palette) -> TextBlock {
     crate::m3::body(text.to_owned())
+        .foreground(palette.text())
         .text_wrapping(TextWrapping::Wrap)
         .is_text_selection_enabled(true)
 }
@@ -287,7 +288,7 @@ fn block_views(
     palette: Palette,
 ) -> Vec<KeyedView> {
     let Some(blocks) = part.blocks.as_ref() else {
-        return vec![KeyedView::new("plain", body_text(&part.plain))];
+        return vec![KeyedView::new("plain", body_text(&part.plain, palette))];
     };
     blocks
         .iter()
@@ -367,7 +368,7 @@ fn part_view(
             .horizontal_alignment(HorizontalAlignment::Right)
             .max_width(tokens::layout::READING_WIDTH * tokens::layout::BUBBLE_SHARE)
             .children((
-                crate::m3::bubble(palette, body_text(&part.plain), None),
+                crate::m3::bubble(palette, body_text(&part.plain, palette), None),
                 if part.attachments.is_empty() {
                     View::empty()
                 } else {

@@ -141,7 +141,7 @@ fn readable(color: Rgb8, on_surface: Rgb8, backgrounds: &[f64]) -> Rgb8 {
                 foreground.max(background) / foreground.min(background) >= MIN_TEXT_CONTRAST
             })
         })
-        .unwrap_or(on_surface)
+        .expect("desktop palette must provide 4.5:1 text contrast")
 }
 
 const BLACK: Rgb8 = Rgb8::new(0, 0, 0);
@@ -347,20 +347,15 @@ impl Roles {
                 primary.mix(WHITE, 0.6),
             ]
         };
-        let (variant, border, tonal, running) = if theme == Theme::Light {
-            (
-                Rgb8::hex(0x46464f),
-                Rgb8::hex(0xc6c5d0),
-                Rgb8::hex(0xf0eff7),
-                Rgb8::hex(0xe8e9ff),
-            )
-        } else {
-            (
+        let [variant, border, tonal, running] = match theme {
+            Theme::Light => crate::tokens::color::LIGHT_SUPPORTING.map(Rgb8::hex),
+            Theme::Dark => crate::tokens::color::DARK_SUPPORTING.map(Rgb8::hex),
+            _ => [
                 text.mix(muted, 0.5),
                 outline.mix(muted, 0.25),
                 surface.mix(container, 0.5),
                 surface.mix(selected, 0.6),
-            )
+            ],
         };
         let attention_container = surface.mix(attention, 0.12);
         let backgrounds = [
@@ -373,13 +368,7 @@ impl Roles {
             running,
             attention_container,
         ]
-        .map(|background| {
-            luminance(
-                background
-                    .mix(text, state::PRESSED)
-                    .mix(text, state::RIPPLE),
-            )
-        });
+        .map(|background| luminance(background.mix(text, state::PRESSED)));
         let readable_text = |color| readable(color, text, &backgrounds);
         Self {
             theme,
@@ -653,11 +642,6 @@ pub mod winui {
                 }
                 .overrides(r)
             })
-        }
-
-        /// A row in the attention color (Full access in a menu).
-        pub fn attention_row(self) -> ResourceOverrides {
-            self.destructive_row(false)
         }
 
         /// A destructive menu action, including the keyboard selection.
