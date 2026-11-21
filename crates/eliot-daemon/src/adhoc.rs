@@ -673,7 +673,7 @@ fn discover_cmd_for_harness(harness: &str, deadline: Instant) -> core::Result<Op
     discovery_remaining(deadline)?;
     match harness {
         "codex" => Ok(None),
-        "claude" => claude_cmd_from_candidates(&discover_claude_candidates(deadline)).map(Some),
+        "claude" => discover_verified_claude(deadline).map(|candidate| Some(candidate.cmd)),
         "muse" => discover_muse_cmd(Path::new(r"C:\Tools\MuseCode")).map(Some),
         "opencode" => discover_opencode_cmd().map(Some),
         "antigravity" => discover_antigravity_cmd().map(Some),
@@ -789,16 +789,55 @@ type VersionedCliPath = (PathBuf, Option<CliVersion>);
 
 /// Discover native Claude CLI installations and probe their versions.
 pub(crate) fn discover_claude_candidates(deadline: Instant) -> Vec<core::api::HarnessCandidate> {
-    probe_claude_candidates(claude_candidate_paths(), |cmd| {
-        probe_native_version(cmd, false, deadline).ok().flatten()
-    })
+    probe_claude_installations(deadline).0
 }
 
-fn probe_claude_candidates(
-    paths: Vec<PathBuf>,
-    probe: impl FnMut(&str) -> Option<String>,
-) -> Vec<core::api::HarnessCandidate> {
-    probe_candidate_paths_with(paths, probe)
+fn probe_claude_installations(
+    deadline: Instant,
+) -> (Vec<core::api::HarnessCandidate>, Option<CliVersion>) {
+    let mut timed_out_version = None;
+    let candidates = probe_candidate_paths_with(claude_candidate_paths(), |cmd| {
+        match probe_native_version(cmd, false, deadline) {
+            Ok(version) => version,
+            Err(error) => {
+                if error.code == "timeout" {
+                    let labelled = Path::new(cmd)
+                        .ancestors()
+                        .take(4)
+                        .find(|entry| {
+                            entry
+                                .parent()
+                                .and_then(Path::file_name)
+                                .is_some_and(|parent| {
+                                    parent.eq_ignore_ascii_case("claude-code")
+                                        || parent == "versions"
+                                })
+                        })
+                        .and_then(Path::file_name)
+                        .and_then(|name| name.to_str())
+                        .and_then(parse_cli_version);
+                    timed_out_version = timed_out_version.max(labelled);
+                }
+                None
+            }
+        }
+    });
+    (candidates, timed_out_version)
+}
+
+fn discover_verified_claude(deadline: Instant) -> core::Result<core::api::HarnessCandidate> {
+    let (candidates, timed_out_version) = probe_claude_installations(deadline);
+    discovery_remaining(deadline)?;
+    let (best, version) = verified_claude_candidate_from_candidates(&candidates)
+        .and_then(|candidate| Some((candidate, parse_cli_version(candidate.version.as_deref()?)?)))
+        .ok_or_else(|| claude_discovery_error(&candidates))?;
+    if timed_out_version.is_some_and(|timed_out| timed_out > version) {
+        return Err(core::Error::new(
+            "timeout",
+            "a newer installed Claude CLI timed out during --version",
+        ));
+    }
+    Ok(best.clone())
 }
 
 fn versioned_claude_paths(
@@ -812,7 +851,7 @@ fn versioned_claude_paths(
     let mut versions = entries
         .filter_map(|entry| {
             let path = entry.ok()?.path();
-            path.is_dir().then(|| {
+            (path.is_dir() || (!nested_hash && is_native_executable(&path))).then(|| {
                 let version = path
                     .file_name()
                     .and_then(|name| name.to_str())
@@ -845,7 +884,11 @@ fn versioned_claude_paths(
                 }
             }
         } else {
-            let path = version_path.join(executable);
+            let path = if version_path.is_file() {
+                version_path
+            } else {
+                version_path.join(executable)
+            };
             if is_native_executable(&path) {
                 candidates.push((path, version));
             }
@@ -1109,13 +1152,6 @@ fn verified_claude_candidate_from_candidates(
     })
 }
 
-fn claude_cmd_from_candidates(candidates: &[core::api::HarnessCandidate]) -> core::Result<String> {
-    if let Some(best) = verified_claude_candidate_from_candidates(candidates) {
-        return Ok(best.cmd.clone());
-    }
-    Err(claude_discovery_error(candidates))
-}
-
 fn claude_discovery_error(candidates: &[core::api::HarnessCandidate]) -> core::Error {
     let detail = if candidates.is_empty() {
         "Standalone Claude CLI was not found"
@@ -1187,13 +1223,8 @@ fn resolve_claude_profile_command_sync(
         return Err(missing_claude_profile_command(profile, &cmd, &candidates));
     }
 
-    let candidates = discover_claude_candidates(deadline);
-    verified_claude_candidate_from_candidates(&candidates)
-        .cloned()
-        .ok_or_else(|| {
-            let error = claude_discovery_error(&candidates);
-            core::Error::new("profile_error", format!("{profile}: {}", error.message))
-        })
+    discover_verified_claude(deadline)
+        .map_err(|error| core::Error::new(error.code, format!("{profile}: {}", error.message)))
 }
 
 pub(crate) async fn ensure_claude_profile_command(profile: &str, cmd: &str) -> core::Result<()> {
@@ -1267,7 +1298,7 @@ fn shell_quote_settings_arg(value: &str) -> String {
 /// Inventory entry for Claude from one candidate pass, so `harness.list`
 /// does not enumerate and version every install twice.
 pub(crate) fn claude_installation(candidates: &[core::api::HarnessCandidate]) -> Value {
-    if let Some(best) = candidates.first() {
+    if let Some(best) = verified_claude_candidate_from_candidates(candidates) {
         let version = best.version.clone().map_or(Value::Null, Value::String);
         json!({
             "harness": "claude",
@@ -1900,10 +1931,7 @@ pub(crate) async fn claude_reader_executable(
     deadline: Instant,
 ) -> core::Result<core::api::HarnessCandidate> {
     blocking_discovery(deadline, move || {
-        let candidates = discover_claude_candidates(deadline);
-        discovery_remaining(deadline)?;
-        let best = verified_claude_candidate_from_candidates(&candidates)
-            .ok_or_else(|| claude_discovery_error(&candidates))?;
+        let best = discover_verified_claude(deadline)?;
         let cmd = resolve_native_executable(&best.cmd, false)?;
         Ok(core::api::HarnessCandidate {
             cmd,
@@ -2096,7 +2124,7 @@ fn probe_version_uncached(program: &str, agy: bool, deadline: Instant) -> Versio
             program,
             &["acp", "--help"],
             deadline.min(Instant::now() + VERSION_PROBE_TIMEOUT),
-        );
+        )?;
         discovery_remaining(deadline)?;
         if !help.is_some_and(|capture| {
             agy_help_has_acp(&capture.stdout) || agy_help_has_acp(capture.stderr.text.as_bytes())
@@ -2104,11 +2132,13 @@ fn probe_version_uncached(program: &str, agy: bool, deadline: Instant) -> Versio
             return Ok(None);
         }
     }
-    let bytes = native_read(
+    let bytes = native_capture(
         program,
         &["--version"],
         deadline.min(Instant::now() + VERSION_PROBE_TIMEOUT),
-    );
+    )?
+    .filter(|capture| capture.status.success() && capture.stdout_complete)
+    .map(|capture| capture.stdout);
     discovery_remaining(deadline)?;
     Ok(bytes.as_deref().and_then(|bytes| {
         let text = std::str::from_utf8(bytes).ok()?.lines().next()?.trim();
@@ -2122,17 +2152,20 @@ fn probe_version_uncached(program: &str, agy: bool, deadline: Instant) -> Versio
 /// both inside a Tokio runtime and during synchronous configuration loading.
 /// No process handle, pipe reader or runtime survives this call.
 fn native_read(program: &str, args: &[&str], deadline: Instant) -> Option<Vec<u8>> {
-    native_capture(program, args, deadline).map(|capture| capture.stdout)
+    native_capture(program, args, deadline)
+        .ok()
+        .flatten()
+        .map(|capture| capture.stdout)
 }
 
 fn native_capture(
     program: &str,
     args: &[&str],
     deadline: Instant,
-) -> Option<crate::scripts::process::ProcessCapture> {
-    use crate::scripts::process::{ProcessOutcome, run_owned_process};
+) -> core::Result<Option<crate::scripts::process::ProcessCapture>> {
+    use crate::scripts::process::{ProcessFailure, ProcessOutcome, run_owned_process};
     if !Path::new(program).is_absolute() || !is_native_executable(Path::new(program)) {
-        return None;
+        return Ok(None);
     }
     use std::sync::Arc;
 
@@ -2145,7 +2178,7 @@ fn native_capture(
                     .build()
                     .ok()?;
                 runtime.block_on(async {
-                    let budget = discovery_remaining(deadline).ok()?;
+                    let budget = discovery_remaining(deadline)?;
                     let mut command = tokio::process::Command::new(program);
                     command
                         .args(args)
@@ -2161,15 +2194,20 @@ fn native_capture(
                     )
                     .await
                     {
-                        ProcessOutcome::Completed(capture) => Some(capture),
-                        _ => None,
+                        ProcessOutcome::Completed(capture) => Ok(Some(capture)),
+                        ProcessOutcome::Failed {
+                            reason: ProcessFailure::Timeout,
+                            ..
+                        } => Err(discovery_timeout()),
+                        _ => Ok(None),
                     }
                 })
             })
             .ok()?
             .join()
-            .ok()?
+            .ok()
     })
+    .unwrap_or(Ok(None))
 }
 
 /// Bound on one `<exe> auth list` read: a hung native executable must not
