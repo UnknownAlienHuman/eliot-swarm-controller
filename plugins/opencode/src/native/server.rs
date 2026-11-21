@@ -771,7 +771,10 @@ impl OwnedServer {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .kill_on_drop(false);
+            // The daemon's 25 s reader deadline can cancel this future. Kill
+            // the direct helper on drop; its reader process remains inside the
+            // daemon-owned Job for Windows family cleanup.
+            .kill_on_drop(true);
         let mut child = command.spawn().map_err(|error| {
             Error::new(
                 "native_spawn",

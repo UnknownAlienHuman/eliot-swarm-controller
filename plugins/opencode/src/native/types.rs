@@ -61,15 +61,15 @@ pub struct LocationRef {
     pub directory: String,
 }
 
-/// `Session.Info` subset: identity, agent, model, location, permissions.
-/// Times, tokens, cost and the rest are ignored. `agent` and `model` are
-/// absent until set; PR2 reads both back after the resume setters.
-/// `permissions` carries the stored per-session ruleset; the launch path
-/// reads it back to prove a `deny` profile's subagent denial is effective.
+/// `Session.Info` subset: identity, optional parent, agent, model,
+/// location, and permissions. `parentID` lets archive preflight prove DELETE
+/// cannot cascade into a native child session. Other API fields are ignored.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionInfo {
     pub id: String,
+    #[serde(rename = "parentID", default)]
+    pub parent_id: Option<String>,
     #[serde(default)]
     pub agent: Option<String>,
     #[serde(default)]
@@ -86,14 +86,13 @@ pub struct DataEnvelope<T> {
     pub data: T,
 }
 
-/// `GET /api/session` (`session.list`) page: stored sessions with their
-/// directory locations, newest first. `cursor.next` continues toward older
-/// sessions; a null next cursor ends the listing. Used by the archive
-/// reader to prove one exact session is missing from the served store.
+/// `GET /api/session` (`session.list`) response: stored sessions with
+/// directory locations and a required cursor object. The OpenCode 2.2.7
+/// contract defaults to 50 newest rows; archive proof requests 100 rows and
+/// follows `cursor.next` to its null end with no aggregate page limit.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SessionPage {
     pub data: Vec<SessionInfo>,
-    #[serde(default)]
     pub cursor: PageCursor,
 }
 
