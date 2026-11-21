@@ -426,13 +426,11 @@ impl DesktopApp {
         };
         let quiet = row.quiet(now);
         let group = row.group(data.incident(row));
-        // The group decides the color; the Agent's own state tells a
-        // failure, an unconfirmed outcome or a start apart by shape.
+        // A failure, an unconfirmed outcome or a wait for the owner keeps
+        // its own mark in any group (a native subagent's failure sits under
+        // Recently stopped); otherwise the group decides, a start excepted.
         let tone = match (group_tone(group), StatusTone::of_state(row.state)) {
-            (
-                StatusTone::Attention,
-                own @ (StatusTone::Failed | StatusTone::Unknown | StatusTone::Attention),
-            ) => own,
+            (_, own @ (StatusTone::Failed | StatusTone::Unknown | StatusTone::Attention)) => own,
             (StatusTone::Neutral, StatusTone::Pending) => StatusTone::Pending,
             (group_tone, _) => group_tone,
         };
