@@ -45,6 +45,10 @@ pub fn reason_words(code: &str) -> String {
         "cancelled" => "Cancelled",
         "crashed" => "The Agent software stopped unexpectedly",
         "success" | "completed" | "applied" => "Completed",
+        "native_not_dispatched" => "The agent app did not start",
+        "native_spawn_refused" | "native_spawn" => "The agent app could not start",
+        "native_model_unavailable" => "The model is unavailable",
+        "native_rejected" => "The agent app declined the request",
         _ => return code.replace(['_', '.'], " "),
     };
     words.to_owned()
@@ -71,6 +75,9 @@ pub fn origin_words(origin: &str) -> &'static str {
 /// Shared words lead, followed by the daemon's specific explanation intact,
 /// including colons or the text `origin:`.
 pub fn reason_message(code: &str, message: &str) -> String {
+    // The words already name the code: drop a repeated " (code)" from the
+    // daemon's explanation so the owner reads each fact once.
+    let message = message.replacen(&format!(" ({code})"), "", 1);
     if message.trim().is_empty() {
         reason_words(code)
     } else {
