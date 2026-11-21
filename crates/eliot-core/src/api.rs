@@ -79,7 +79,8 @@ pub use coordination::{
     MailInboxResponse, MailLimits, MailMode, MailReadRequest, MailSendRequest, MailSendResponse,
     VarDefinitionArgs, VarGetRequest, VarGetResponse, VarScope, VarSetRequest, VarSetResponse,
     WhoRequest, WhoResponse, WhoSharedWorkspace, WhoWorker, claim_glob_matches,
-    claim_globs_overlap, claim_globs_overlap_normalized, normalize_claim_glob, parse_var_scope,
+    claim_glob_matches_normalized, claim_globs_overlap, claim_globs_overlap_normalized,
+    normalize_claim_glob, parse_var_scope,
 };
 pub use digests::{
     DIGEST_THREAD_PREFIX, SwarmDigestRequest, SwarmDigestResponse, digest_mode_completed,
@@ -93,8 +94,8 @@ pub use goals::{
     AssignmentGoal, DEFAULT_GOAL_CHECK_TIMEOUT_MS, GOAL_COST_UNSUPPORTED, GoalClearRequest,
     GoalCounters, GoalDefinition, GoalGetRequest, GoalMarkerState, GoalMode, GoalPauseRequest,
     GoalResumeRequest, GoalRoundMarker, GoalRoundOutcome, GoalRoundRequest, GoalRoundResponse,
-    GoalSetRequest, GoalStatus, GoalView, MAX_GOAL_CADENCE_MS, MAX_GOAL_LIMIT,
-    MAX_GOAL_OBSERVATION_BYTES, MIN_GOAL_CADENCE_MS,
+    GoalScopeBase, GoalScopeStart, GoalSetRequest, GoalStatus, GoalView, MAX_GOAL_CADENCE_MS,
+    MAX_GOAL_LIMIT, MAX_GOAL_OBSERVATION_BYTES, MAX_GOAL_SCOPE_BASE_PATHS, MIN_GOAL_CADENCE_MS,
 };
 pub use handoff::{
     CommandCancelRequest, CommandCancelResponse, HandoffRequest, HandoffResponse,

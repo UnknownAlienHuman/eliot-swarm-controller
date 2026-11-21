@@ -5,7 +5,14 @@
 //! commits one outcome only if generation, revision and round still match.
 //! Unknown check outcomes retain no Goal progress or continuation and never
 //! authorize another check; the reservation retains their error.
-use super::{Principal, Router, coordination::decode_coordination_request, require_owner};
+use super::{
+    Principal, Router,
+    coordination::decode_coordination_request,
+    goal_scope::{
+        ScopeFinding, changed_check_inputs, finding, outside_scope, scope_reminder, with_finding,
+    },
+    require_owner,
+};
 use crate::{
     common::now_ms,
     scripts::process::{ProcessCapture, ProcessFailure, ProcessOutcome, run_owned_process},
@@ -13,9 +20,9 @@ use crate::{
 use eliot_core::{
     AgentState, Error, Event, Result, SecretPolicy, StderrSnapshot,
     api::{
-        GoalClearRequest, GoalGetRequest, GoalMode, GoalPauseRequest, GoalResumeRequest,
-        GoalRoundRequest, GoalSetRequest, GoalStatus, MAX_GOAL_OBSERVATION_BYTES,
-        inference::sha256_hex, truncate_bytes,
+        GoalClearRequest, GoalDefinition, GoalGetRequest, GoalMode, GoalPauseRequest,
+        GoalResumeRequest, GoalRoundRequest, GoalSetRequest, GoalStatus,
+        MAX_GOAL_OBSERVATION_BYTES, inference::sha256_hex, truncate_bytes,
     },
     limits::MAX_FRAME_BYTES,
 };
@@ -193,14 +200,37 @@ impl Router {
             GoalSetRequest::validate,
         )?;
         require_eliot_mode(request.mode)?;
-        let view = self.inner.store.lock().await.goal_set(
-            &request.agent,
-            request.mode.as_str(),
-            &request.id,
-            &super::principal_name(principal),
-            &request.definition,
-            now_ms(),
-        )?;
+        let principal = super::principal_name(principal);
+        // A retry is answered from the retained result before the workspace
+        // is read again for a starting point.
+        let replay = if request.definition.tracks_changes() {
+            self.inner.store.lock().await.goal_set_replay(
+                &request.agent,
+                request.mode.as_str(),
+                &request.id,
+                &principal,
+                &request.definition,
+            )?
+        } else {
+            None
+        };
+        let view = match replay {
+            Some(view) => view,
+            None => {
+                let scope_base = self
+                    .goal_scope_base(&request.agent, &request.definition)
+                    .await?;
+                self.inner.store.lock().await.goal_set(
+                    &request.agent,
+                    request.mode.as_str(),
+                    &request.id,
+                    &principal,
+                    &request.definition,
+                    scope_base,
+                    now_ms(),
+                )?
+            }
+        };
         if view.definition.cadence_ms.is_none() {
             self.notify_goal_reconcile();
         }
@@ -405,9 +435,53 @@ impl Router {
             && !probe.spent_by_goal_continuation
         {
             let result = self
-                .commit_goal_block(&principal, &request, &probe, key, claim_seq, "turn_limit")
+                .commit_goal_block(
+                    &principal,
+                    &request,
+                    &probe,
+                    key,
+                    claim_seq,
+                    "turn_limit",
+                    None,
+                )
                 .await;
             return claimed.complete(result);
+        }
+        // The change scope is read while the Agent is idle, before the
+        // check runs. A confirmed change outside `scope` blocks the round:
+        // no check and no repair continuation.
+        let scope = if definition.tracks_changes() {
+            Some(match &probe.scope_base {
+                Some(base) => (
+                    Some(base),
+                    self.goal_scope_changes(probe.workspace.as_deref(), base)
+                        .await,
+                ),
+                None => (
+                    None,
+                    ScopeFinding::Unverified("no starting point was recorded".to_owned()),
+                ),
+            })
+        } else {
+            None
+        };
+        if let Some((_, ScopeFinding::Verified(changed))) = &scope {
+            let outside = outside_scope(&definition, changed);
+            if !outside.is_empty() {
+                let observation = finding("Changed outside the Goal's scope", &outside);
+                let result = self
+                    .commit_goal_block(
+                        &principal,
+                        &request,
+                        &probe,
+                        key,
+                        claim_seq,
+                        "scope_violation",
+                        Some(observation),
+                    )
+                    .await;
+                return claimed.complete(result);
+            }
         }
         let policy = self.secret_policy_snapshot();
         let mut command = TokioCommand::new(&definition.check[0]);
@@ -457,7 +531,7 @@ impl Router {
             }
         };
         if check.exit_code != Some(0) {
-            let text = goal_continuation_text(&definition.text, &definition.check, &check, &policy);
+            let text = goal_continuation_text(&definition, &check, &policy);
             let commit = GoalRoundCommit {
                 id: request.id.clone(),
                 principal: principal.clone(),
@@ -469,6 +543,7 @@ impl Router {
                 claim_seq,
                 check: Some(check),
                 blocked_reason: None,
+                observation: None,
                 continuation: Some(GoalContinuation {
                     id: continuation_id,
                     text,
@@ -477,6 +552,54 @@ impl Router {
             let result = self.commit_goal_round(&principal, &request, commit).await;
             return claimed.complete(result);
         }
+        // A pass is measured again, so files the check wrote count too. It
+        // completes only with a verified change set inside `scope` that
+        // leaves the check's own inputs untouched; otherwise it blocks.
+        let scope = match scope {
+            Some((Some(base), _)) => Some((
+                Some(base),
+                self.goal_scope_changes(probe.workspace.as_deref(), base)
+                    .await,
+            )),
+            other => other,
+        };
+        let mut check = check;
+        let block = match &scope {
+            Some((_, ScopeFinding::Unverified(reason))) => Some((
+                "scope_unverified",
+                truncate_bytes(
+                    &format!("The Goal's change set could not be verified: {reason}"),
+                    1024,
+                )
+                .0,
+            )),
+            Some((Some(base), ScopeFinding::Verified(changed))) => {
+                let outside = outside_scope(&definition, changed);
+                let inputs = changed_check_inputs(&definition, base, changed);
+                if !outside.is_empty() {
+                    Some((
+                        "scope_violation",
+                        finding("Changed outside the Goal's scope", &outside),
+                    ))
+                } else if !inputs.is_empty() {
+                    Some((
+                        "checker_changed",
+                        finding("Check inputs changed since the Goal started", &inputs),
+                    ))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        let blocked_reason = block.map(|(reason, text)| {
+            check.observation = Some(with_finding(
+                &text,
+                check.observation.as_deref(),
+                MAX_GOAL_OBSERVATION_BYTES,
+            ));
+            reason.to_owned()
+        });
         let commit = GoalRoundCommit {
             id: request.id.clone(),
             principal: principal.clone(),
@@ -487,13 +610,15 @@ impl Router {
             round_key: key,
             claim_seq,
             check: Some(check),
-            blocked_reason: None,
+            blocked_reason,
+            observation: None,
             continuation: None,
         };
         let result = self.commit_goal_round(&principal, &request, commit).await;
         claimed.complete(result)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn commit_goal_block(
         &self,
         principal: &str,
@@ -502,6 +627,7 @@ impl Router {
         key: GoalRoundKey,
         claim_seq: i64,
         reason: &str,
+        observation: Option<String>,
     ) -> Result<Value> {
         let commit = GoalRoundCommit {
             id: request.id.clone(),
@@ -514,6 +640,7 @@ impl Router {
             claim_seq,
             check: None,
             blocked_reason: Some(reason.to_owned()),
+            observation,
             continuation: None,
         };
         self.commit_goal_round(principal, request, commit).await
@@ -1459,12 +1586,15 @@ fn custody_proven_for_capture(capture: &ProcessCapture) -> bool {
 }
 
 fn goal_continuation_text(
-    goal_text: &str,
-    check_argv: &[String],
+    definition: &GoalDefinition,
     check: &GoalCheckResult,
     policy: &SecretPolicy,
 ) -> String {
-    let argv = check_argv.join(" ");
+    let goal_text = match scope_reminder(definition) {
+        Some(reminder) => format!("{}\n\n{reminder}", definition.text),
+        None => definition.text.clone(),
+    };
+    let argv = definition.check.join(" ");
     let exit = check
         .exit_code
         .map_or_else(|| "no exit code".to_owned(), |code| format!("exit {code}"));

@@ -10,6 +10,7 @@ mod coordination;
 mod diagnose;
 mod digests;
 pub(crate) mod discovery;
+mod goal_scope;
 mod goals;
 mod handoff;
 mod hierarchy;
