@@ -186,7 +186,8 @@ owner-channel closure, daemon force-stop, startup cleanup, or the stop's own
 exit; see [Process observation and terminal ordering](monitoring.md#process-observation-and-terminal-ordering)).
 Readers accept persisted rows carrying any of these reasons.
 
-After restart, the daemon reopens an eligible retained idle session through a
+With the default [restart policy](configuration.md#agent-restart-policy), the
+daemon reopens an eligible retained idle session after restart through a
 generation-bound `resume` without text. Eligibility requires the prior
 generation's exact custody closure and no unsettled work. The new generation
 keeps the same native subject. An interrupted turn or uncertain dispatched

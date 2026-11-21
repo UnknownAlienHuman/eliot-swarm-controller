@@ -9,6 +9,7 @@
 use crate::{
     bus::Bus,
     common::now_ms,
+    config::OnRestart,
     logging,
     platform::{RestartCustody, restart_custody},
     router::Router,
@@ -137,8 +138,12 @@ pub(crate) async fn recheck(context: Reconcile) {
         tokio::time::sleep(RECHECK).await;
         match reconcile_pass(&context, false).await {
             Ok(report) => {
-                if report.processed > report.retained
-                    && let Err(error) = context.router.recover_restart_idle_agents().await
+                if context.on_restart == OnRestart::Continue
+                    && report.processed > report.retained
+                    && let Err(error) = context
+                        .router
+                        .recover_restart_idle_agents(context.on_restart)
+                        .await
                 {
                     logging::record(
                         &context.policy,
@@ -166,6 +171,7 @@ pub(crate) struct Reconcile {
     pub bus: Bus,
     pub router: Router,
     pub policy: Arc<SecretPolicy>,
+    pub on_restart: OnRestart,
 }
 
 impl Reconcile {

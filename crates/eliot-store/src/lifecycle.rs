@@ -179,7 +179,10 @@ impl Store {
     ) -> Result<Event> {
         if !matches!(
             kind,
-            core::ACTIVITY_HEAVY_KIND | core::SESSION_GROWTH_KIND | core::HARNESS_DRIFT_KIND
+            core::ACTIVITY_HEAVY_KIND
+                | core::SESSION_GROWTH_KIND
+                | core::HARNESS_DRIFT_KIND
+                | "agent.restart_resume_blocked"
         ) {
             return Err(Error::new("invalid", "unknown observe event kind"));
         }

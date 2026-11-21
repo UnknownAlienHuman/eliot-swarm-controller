@@ -243,6 +243,12 @@ impl Router {
         let mut preceded_by = None;
         let mut commands = std::collections::HashSet::new();
         let mut unresolved = Vec::new();
+        if row.is_terminal()
+            && let Some(blocked) = store.restart_resume_blocked(agent, generation)?
+            && let Some(message) = blocked.get("message").and_then(Value::as_str)
+        {
+            unresolved.push(message.to_owned());
+        }
         let (command, turn) = store.agent_unknowns(agent)?;
         if let Some(command) = command {
             unresolved.push(unknown_command_message(&command, row.observe_only));
@@ -552,7 +558,7 @@ fn loss_step(event: &Event, at: Option<i64>) -> DiagnoseStep {
             .unwrap_or("<agent>");
         Some(bound_chars(
             &format!(
-                "the turn outcome is unknown after a Swarm restart; inspect `swarm why {agent}` and, when ready, run `swarm resume {agent} \"<text>\"` to start a new generation without replaying the prior prompt"
+                "Swarm restarted and disconnected the session. To reopen a retained session, run `swarm resume {agent}` when ready."
             ),
             1024,
         ))

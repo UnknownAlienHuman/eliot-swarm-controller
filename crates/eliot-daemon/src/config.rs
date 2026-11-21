@@ -812,6 +812,9 @@ fn default_max_unread_messages_per_agent() -> i64 {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DaemonConfig {
+    /// Whether to reopen eligible idle retained sessions after restart.
+    #[serde(default)]
+    pub(crate) on_restart: OnRestart,
     #[serde(default)]
     pub(crate) chats_root: Option<String>,
     #[serde(default)]
@@ -853,6 +856,14 @@ pub(crate) struct DaemonConfig {
     pub(crate) session_file_bytes: i64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum OnRestart {
+    Hold,
+    #[default]
+    Continue,
+}
+
 fn default_log_level() -> String {
     "standard".to_owned()
 }
@@ -860,6 +871,7 @@ fn default_log_level() -> String {
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
+            on_restart: OnRestart::default(),
             chats_root: None,
             artifact_roots: Vec::new(),
             retention: RetentionConfig::default(),
@@ -967,6 +979,7 @@ impl DaemonConfig {
         }
         Ok(Self {
             chats_root: self.chats_root,
+            on_restart: self.on_restart,
             artifact_roots: self.artifact_roots,
             retention: self.retention.validate()?,
             limits: self.limits,

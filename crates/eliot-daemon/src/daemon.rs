@@ -255,11 +255,14 @@ async fn initialize_runtime(
     };
     router.note_events(&recovered);
     logging::record(&policy, "daemon.recovered", &[], None);
+    let daemon_config =
+        crate::config::load_daemon_config(data_dir.path()).map_err(startup_config_failure)?;
     let capacity = restart_capacity::Reconcile {
         store: Arc::clone(&store),
         bus: bus.clone(),
         router: router.clone(),
         policy: Arc::clone(&policy),
+        on_restart: daemon_config.on_restart,
     };
     let report = restart_capacity::reconcile_first_pass(&capacity).await?;
     logging::record(&policy, "daemon.capacity_reconciled", &[], None);
@@ -276,8 +279,6 @@ async fn initialize_runtime(
     );
     let automation_config =
         crate::config::load_automation_config(data_dir.path()).map_err(startup_config_failure)?;
-    let daemon_config =
-        crate::config::load_daemon_config(data_dir.path()).map_err(startup_config_failure)?;
     let cloud_mcp_config =
         crate::config::load_cloud_mcp_config(data_dir.path()).map_err(startup_config_failure)?;
     let attention_suspicion_window =
@@ -437,24 +438,36 @@ async fn spawn_workers(
     let mut recovery = JoinSet::new();
     let recovery_router = router.clone();
     recovery.spawn(async move { ("workspace", recovery_router.recover_workspaces().await) });
-    let recovery_router = router.clone();
-    recovery.spawn(async move { ("command", recovery_router.recover_accepted_commands().await) });
-    let recovery_router = router.clone();
-    recovery.spawn(async move {
-        (
-            "restart_agent",
-            recovery_router
-                .recover_restart_idle_agents()
-                .await
-                .map(|_| ()),
-        )
-    });
     // Owned by supervision; its abort-on-drop runs before the IPC listener
     // closes because the struct declares this field ahead of the listener.
     let mut capacity_recheck = JoinSet::new();
-    if capacity_retained > 0 {
-        capacity_recheck.spawn(restart_capacity::recheck(capacity));
-    }
+    // Serialize the initial resume pass and later custody passes so their
+    // batches cannot add to each other's concurrency limit.
+    capacity_recheck.spawn(async move {
+        if let Err(error) = capacity.router.recover_accepted_commands().await {
+            logging::record(
+                &capacity.policy,
+                "daemon.command_recovery_failed",
+                &[],
+                Some(&error),
+            );
+        }
+        if let Err(error) = capacity
+            .router
+            .recover_restart_idle_agents(capacity.on_restart)
+            .await
+        {
+            logging::record(
+                &capacity.policy,
+                "daemon.restart_agent_recovery_failed",
+                &[],
+                Some(&error),
+            );
+        }
+        if capacity_retained > 0 {
+            restart_capacity::recheck(capacity).await;
+        }
+    });
     let initial_rule_start = Arc::new(Mutex::new(Some(automation::RuleWorkerStart {
         global_rules,
         project_rules: project_rule_namespaces,
@@ -697,12 +710,6 @@ async fn supervise(mut supervision: DaemonSupervision) -> (Result<()>, DaemonSup
             joined = recovery.join_next(), if !recovery.is_empty() => {
                 match joined {
                     Some(Ok((_, Ok(())))) => {}
-                    Some(Ok(("command", Err(error)))) => {
-                        logging::record(&policy, "daemon.command_recovery_failed", &[], Some(&error));
-                    }
-                    Some(Ok(("restart_agent", Err(error)))) => {
-                        logging::record(&policy, "daemon.restart_agent_recovery_failed", &[], Some(&error));
-                    }
                     Some(Ok((_, Err(error)))) => {
                         logging::record(&policy, "daemon.workspace_recovery_failed", &[], Some(&error));
                         router.note_workspace_recovery_failure(&error.code);

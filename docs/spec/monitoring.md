@@ -857,8 +857,10 @@ That proof requires recorded exited processes, a closed OS source, closed native
 sources and the Host's owned-exit record for the same generation. Recovery records
 `agent.stopped` with reason `owned_exit_before_restart` and preserves the turn and
 command history as recorded. A process still recorded as running at restart becomes
-unknown. The daemon checks retained custody before reopening an eligible idle
-session through normal resume admission. The new generation starts without input.
+unknown. The daemon checks retained custody and the
+[restart policy](configuration.md#agent-restart-policy) before reopening an
+eligible idle session through normal resume admission. The new generation starts
+without input.
 Missing custody proof and unresolved effects leave the old generation fenced.
 
 ## Views

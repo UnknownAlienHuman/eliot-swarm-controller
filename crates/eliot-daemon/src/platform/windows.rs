@@ -55,10 +55,10 @@ use windows_sys::Win32::System::Pipes::{
 use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 use windows_sys::Win32::System::SystemInformation::{GetSystemTimeAsFileTime, GetTickCount64};
 use windows_sys::Win32::System::Threading::{
-    CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, CreateProcessW, GetCurrentProcess,
-    GetExitCodeProcess, GetProcessTimes, OpenProcess, OpenProcessToken, PROCESS_INFORMATION,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, QueryFullProcessImageNameW,
-    STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+    CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CreateProcessW, DETACHED_PROCESS,
+    GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, OpenProcess, OpenProcessToken,
+    PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    QueryFullProcessImageNameW, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
 };
 
 /// Availability is only a connect hint: another client may win the instance.
@@ -117,7 +117,8 @@ pub(crate) fn start_background_daemon_executable(executable: &Path, data_dir: &P
     // SAFETY: application and the writable command line are NUL-terminated UTF-16.
     // All structures live through the call. FALSE disables ALL handle inheritance,
     // including otherwise-unused capture-pipe writers held by the CLI. No standard
-    // handles are supplied; CREATE_NO_WINDOW prevents console inheritance/creation.
+    // handles are supplied; DETACHED_PROCESS prevents console inheritance/creation.
+    // A new process group separates console signaling where a console is attached.
     // BREAKAWAY prevents a caller in a kill-on-close Job from lending that Job's
     // lifetime to the independently owned daemon. A Job that forbids
     // breakaway causes an explicit start failure instead of a short-lived daemon.
@@ -129,7 +130,7 @@ pub(crate) fn start_background_daemon_executable(executable: &Path, data_dir: &P
             null(),
             null(),
             0,
-            CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB,
+            DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB,
             null(),
             null(),
             &startup,
