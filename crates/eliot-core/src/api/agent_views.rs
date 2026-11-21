@@ -1682,16 +1682,29 @@ impl RetentionView {
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AutomaticCleanupView {
+    pub policy: AutomaticCleanupPolicy,
     pub enabled: bool,
+    pub startup_plan_only_pending: bool,
     pub after: Option<String>,
     pub config_error: Option<String>,
     pub last_sweep: Option<AutomaticCleanupSweep>,
+}
+
+#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomaticCleanupPolicy {
+    Disabled,
+    PlanOnly,
+    Enabled,
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AutomaticCleanupSweep {
     pub finished_at: i64,
+    pub enabled: bool,
+    pub plan_only: bool,
+    pub would_remove: usize,
     pub removed: usize,
     pub kept: usize,
     pub unknown: usize,

@@ -28,10 +28,9 @@ pub(crate) struct RunGrantConfig {
 pub(crate) struct AutomationConfig {
     #[serde(default = "default_max_event_backlog")]
     pub(crate) max_event_backlog: i64,
-    /// Automatically apply the shared cleanup plan for aged, terminal
-    /// Agent artifacts on the existing Owner automation reconciliation timer.
-    #[serde(default = "default_auto_cleanup")]
-    pub(crate) auto_cleanup: bool,
+    /// Absent means plan-only; only explicit `true` can apply a guarded plan.
+    #[serde(default)]
+    pub(crate) auto_cleanup: Option<bool>,
     /// Minimum age before automatic cleanup, measured from the later of the
     /// artifact creation and the exact terminal generation end.
     #[serde(default = "default_auto_cleanup_after")]
@@ -72,7 +71,7 @@ impl Default for AutomationConfig {
     fn default() -> Self {
         Self {
             max_event_backlog: default_max_event_backlog(),
-            auto_cleanup: default_auto_cleanup(),
+            auto_cleanup: None,
             auto_cleanup_after: default_auto_cleanup_after(),
             run: RunGrantConfig::default(),
             assignments: BTreeMap::new(),
@@ -149,10 +148,6 @@ impl AutomationConfig {
 
 fn default_max_event_backlog() -> i64 {
     100_000
-}
-
-fn default_auto_cleanup() -> bool {
-    true
 }
 
 fn default_auto_cleanup_after() -> String {

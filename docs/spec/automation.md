@@ -516,6 +516,12 @@ When the assignment sets `cleanup_on_retire = true` (default false), the
 applied stop also cleans that Agent's build, temp and managed-worktree
 artifacts inline in the stop worker: same authority check, same quiescence
 gate and guarded deletion, with retained receipts, and no second executor.
+The daemon's periodic automatic cleanup uses the same guarded paged planner.
+An omitted `automation.auto_cleanup` is plan-only; explicit `true` applies only
+after one complete plan-only sweep per daemon startup, and explicit `false`
+turns the automatic planner off. It sends one Owner `notify` after a complete
+sweep, with the planned would-remove and kept totals and the configured
+enablement; pages do not each send a notice.
 `enabled = false` (default true) pauses the assignment at timer admission before
 `settings.save` acknowledges it. An unrelated rules-file parse error can retain the
 previous rule snapshot, and the saved pause still fences fresh scheduled and manual

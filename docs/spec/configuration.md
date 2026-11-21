@@ -627,11 +627,14 @@ auto_cleanup_after = "7d"
 ```
 
 `max_event_backlog` is a positive signed 64-bit integer. It defaults to `100000`; zero,
-negative, wrong-type and unknown automation values are invalid. `auto_cleanup` defaults
-to `true`. Set it to `false` to turn off the automatic sweep. `auto_cleanup_after` is a
-positive duration and defaults to seven days. The sweep applies the [cleanup retention
-policy](coordination.md#registered-artifacts-and-cleanup-k69) through the same plan and
-apply path as the cleanup UI and CLI.
+negative, wrong-type and unknown automation values are invalid. Omitted `auto_cleanup`
+means plan-only: the guarded paged planner runs and reports its completed sweep, but no
+plan is retained for apply. Explicit `true` enables automatic apply only after the first
+complete plan-only sweep of that daemon startup. Explicit `false` disables automatic
+cleanup entirely, including planning and the protected-copy benchmark. `auto_cleanup_after`
+is a positive duration and defaults to seven days. Every automatic apply uses the
+[cleanup retention policy](coordination.md#registered-artifacts-and-cleanup-k69) through
+the same guarded plan and apply path as the cleanup UI and CLI.
 
 Store retention uses the `[daemon.retention]` table.
 

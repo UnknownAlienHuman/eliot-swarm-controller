@@ -285,9 +285,6 @@ fn section_value(parsed: &toml::Table, name: &str) -> core::Result<JsonValue> {
             core::Error::new("source_integrity", "automation settings are not an object")
         })?;
         automation
-            .entry("auto_cleanup")
-            .or_insert(JsonValue::Bool(true));
-        automation
             .entry("auto_cleanup_after")
             .or_insert(JsonValue::String("7d".to_owned()));
     }

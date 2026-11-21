@@ -186,19 +186,27 @@ definite reply), and shows removed, kept-with-reason and unknown outcomes. The p
 has no Owner per-Agent scope, so there is no per-task cleanup entry.
 
 The daemon's automatic sweep pages through recorded owned artifacts of finished
-Agent generations, including archived ones, and applies a retained plan through
-the same guarded cleanup path. Manual previews can backfill older ownership records.
-The [Owner settings](configuration.md#later-configuration-example) control the age and enablement.
-Both the artifact and its finished generation must be older than the configured
-window. The sweep keeps dirty or unmerged worktrees and their generation's artifacts.
+Agent generations and uses the same guarded cleanup path.
+Manual previews can backfill older ownership records. The [Owner settings]
+(configuration.md#later-configuration-example) control the age and enablement. Both
+the artifact and its exact finished generation must be older than the configured
+window. Archived Agents and their artifacts stay protected from automatic cleanup.
+An omitted `automation.auto_cleanup` runs plan-only pages, retaining no plans for
+apply and reserving no apply. Explicit `true` applies only after the first complete
+plan-only sweep of each daemon startup. Explicit `false` disables the automatic
+planner entirely, including the protected-copy benchmark. Each completed paged
+sweep updates aggregate status and sends one Owner `notify` with would-remove and
+kept totals and enablement; intermediate pages do not send notices. Per-item
+`cleanup.automatic` reason events remain available. The sweep keeps dirty or
+unmerged worktrees and their generation's artifacts.
 Eligible paths include managed worktrees, recorded per-generation plugin directories,
 and artifacts under exact Swarm-created generation roots. A generation root can be
 removed when its creation identity is still bound, its registered descendants are
 settled, and the guarded scan of its contents succeeds. Branches, project registrations
 and native sessions require an explicit cleanup request. Status reports the policy
-and the latest page's outcomes since daemon startup. A `cleanup.automatic` event
-records removals, uncertain outcomes and new keep reasons. Repeated keep reasons
-are omitted from later events.
+and the latest completed sweep's aggregate outcomes since daemon startup. A
+`cleanup.automatic` event records removals, planned removals, uncertain outcomes
+and new keep reasons. Repeated keep reasons are omitted from later events.
 
 A folder assignment opts in with
 `cleanup_on_retire`: after an applied stop retires its Agent, the existing

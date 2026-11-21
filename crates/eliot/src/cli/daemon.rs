@@ -3,8 +3,8 @@ use super::args::{DaemonAction, DaemonArgs, MaintenanceArgs, MaintenanceCommand,
 use super::support::{Failure, mutation_id, print_value, read_and_print, response_exit_code};
 use crate::mcp;
 use eliot_core::api::{
-    DaemonShutdownRequest, DaemonShutdownResponse, DaemonStatusRequest, DaemonStatusResponse,
-    MaintenanceRunRequest, MaintenanceRunResponse, ShutdownMode,
+    AutomaticCleanupPolicy, DaemonShutdownRequest, DaemonShutdownResponse, DaemonStatusRequest,
+    DaemonStatusResponse, MaintenanceRunRequest, MaintenanceRunResponse, ShutdownMode,
 };
 use serde_json::Value;
 use serde_json::json;
@@ -176,20 +176,30 @@ pub(crate) async fn run_status(data_dir: PathBuf, json_output: bool) -> Result<u
     let cleanup_line = response.automatic_cleanup.as_ref().map(|cleanup| {
         let policy = if let Some(code) = &cleanup.config_error {
             format!("unavailable ({code})")
-        } else if cleanup.enabled {
-            format!(
-                "enabled after {}",
-                cleanup.after.as_deref().unwrap_or("the configured window")
-            )
         } else {
-            "disabled".to_owned()
+            match cleanup.policy {
+                AutomaticCleanupPolicy::Disabled => "disabled".to_owned(),
+                AutomaticCleanupPolicy::PlanOnly => "plan-only".to_owned(),
+                AutomaticCleanupPolicy::Enabled if cleanup.startup_plan_only_pending => format!(
+                    "enabled after {} (initial plan-only sweep pending)",
+                    cleanup.after.as_deref().unwrap_or("the configured window")
+                ),
+                AutomaticCleanupPolicy::Enabled => format!(
+                    "enabled after {}",
+                    cleanup.after.as_deref().unwrap_or("the configured window")
+                ),
+            }
         };
         match &cleanup.last_sweep {
             Some(sweep) => match &sweep.error_code {
                 Some(code) => format!("Automatic cleanup {policy} | last sweep failed ({code})"),
                 None => format!(
-                    "Automatic cleanup {policy} | last sweep removed {}, kept {}, unknown {}",
-                    sweep.removed, sweep.kept, sweep.unknown,
+                    "Automatic cleanup {policy} | last sweep would remove {}, kept {}, removed {}, unknown {}{}",
+                    sweep.would_remove,
+                    sweep.kept,
+                    sweep.removed,
+                    sweep.unknown,
+                    if sweep.plan_only { " (plan-only)" } else { "" },
                 ),
             },
             None => format!("Automatic cleanup {policy}"),

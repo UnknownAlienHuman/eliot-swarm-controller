@@ -19,7 +19,14 @@ const CLEANUP_PLAN_MAX_PREFLIGHT: Duration = Duration::from_secs(15);
 #[derive(Default)]
 pub(super) struct AutomaticCleanupState {
     kept_reasons: HashMap<String, String>,
+    first_sweep_complete: bool,
+    active_sweep: Option<AutomaticCleanupProgress>,
     last_sweep: Option<eliot_core::api::AutomaticCleanupSweep>,
+}
+
+#[derive(Default)]
+struct AutomaticCleanupProgress {
+    summary: eliot_core::api::AutomaticCleanupSweep,
 }
 const SWARM_PLUGIN_INSTANCE_PURPOSE: &str = "Swarm plugin instance directory";
 const SWARM_ARTIFACT_ROOT_PURPOSE: &str = "Swarm artifact root";
@@ -121,21 +128,36 @@ pub(super) fn swarm_preparation_failure(mut error: Error, where_: &str, evidence
 
 impl Router {
     pub(super) fn automatic_cleanup_view(&self) -> eliot_core::api::AutomaticCleanupView {
-        let (enabled, after, config_error) =
+        let (policy, enabled, after, config_error) =
             match crate::config::load_automation_config(&self.inner.data_root) {
-                Ok(config) => (config.auto_cleanup, Some(config.auto_cleanup_after), None),
-                Err(error) => (false, None, Some(error.code)),
+                Ok(config) => {
+                    let policy = match config.auto_cleanup {
+                        Some(true) => AutomaticCleanupPolicy::Enabled,
+                        Some(false) => AutomaticCleanupPolicy::Disabled,
+                        None => AutomaticCleanupPolicy::PlanOnly,
+                    };
+                    (
+                        policy,
+                        config.auto_cleanup == Some(true),
+                        Some(config.auto_cleanup_after),
+                        None,
+                    )
+                }
+                Err(error) => (
+                    AutomaticCleanupPolicy::Disabled,
+                    false,
+                    None,
+                    Some(error.code),
+                ),
             };
+        let state = self.inner.automatic_cleanup.lock_recover();
         eliot_core::api::AutomaticCleanupView {
+            policy,
             enabled,
+            startup_plan_only_pending: !state.first_sweep_complete,
             after,
             config_error,
-            last_sweep: self
-                .inner
-                .automatic_cleanup
-                .lock_recover()
-                .last_sweep
-                .clone(),
+            last_sweep: state.last_sweep.clone(),
         }
     }
 
@@ -154,10 +176,14 @@ impl Router {
         &self,
         plan: &CleanupPlan,
         applied: Option<&CleanupApplyResponse>,
-    ) -> Result<()> {
+        enabled: bool,
+        plan_only: bool,
+    ) -> Result<AutomaticCleanupSweep> {
         let now = now_ms();
         let mut sweep = eliot_core::api::AutomaticCleanupSweep {
             finished_at: now,
+            enabled,
+            plan_only,
             ..Default::default()
         };
         let policy = self.secret_policy_snapshot();
@@ -178,8 +204,13 @@ impl Router {
                         .iter()
                         .find(|outcome| outcome.artifact_id == item.artifact.id)
                 });
+                if item.verdict == "safe" {
+                    sweep.would_remove += 1;
+                }
                 let (outcome, reason, bytes) = if item.verdict != "safe" {
                     ("kept", item.reason.as_str(), 0)
+                } else if plan_only {
+                    ("would_remove", item.reason.as_str(), 0)
                 } else if let Some(settled) = settled {
                     match settled.outcome.as_str() {
                         "removed" => ("removed", item.reason.as_str(), settled.bytes_reclaimed),
@@ -190,6 +221,7 @@ impl Router {
                     ("unknown", "missing_cleanup_outcome", 0)
                 };
                 match outcome {
+                    "would_remove" => {}
                     "removed" => sweep.removed += 1,
                     "kept" => {
                         sweep.kept += 1;
@@ -240,8 +272,98 @@ impl Router {
                 state.kept_reasons.remove(&id);
             }
         }
-        state.last_sweep = Some(sweep);
-        Ok(())
+        Ok(sweep)
+    }
+
+    fn accumulate_automatic_cleanup_page(
+        &self,
+        page: AutomaticCleanupSweep,
+        first_page: bool,
+        complete: bool,
+    ) -> Option<AutomaticCleanupSweep> {
+        let mut state = self.inner.automatic_cleanup.lock_recover();
+        if first_page {
+            state.active_sweep = Some(AutomaticCleanupProgress {
+                summary: AutomaticCleanupSweep {
+                    plan_only: true,
+                    ..Default::default()
+                },
+            });
+        }
+        let progress = state
+            .active_sweep
+            .get_or_insert_with(|| AutomaticCleanupProgress {
+                summary: AutomaticCleanupSweep {
+                    plan_only: true,
+                    ..Default::default()
+                },
+            });
+        progress.summary.finished_at = page.finished_at;
+        progress.summary.enabled = page.enabled;
+        progress.summary.plan_only &= page.plan_only;
+        progress.summary.would_remove += page.would_remove;
+        progress.summary.removed += page.removed;
+        progress.summary.kept += page.kept;
+        progress.summary.unknown += page.unknown;
+        if !complete {
+            return None;
+        }
+        let summary = progress.summary.clone();
+        state.active_sweep = None;
+        state.last_sweep = Some(summary.clone());
+        Some(summary)
+    }
+
+    async fn notify_automatic_cleanup_sweep(&self, sweep: &AutomaticCleanupSweep) -> Result<()> {
+        let enablement = match (sweep.enabled, sweep.plan_only) {
+            (true, true) => "Automatic cleanup is enabled. This first sweep was plan-only.",
+            (true, false) => "Automatic cleanup is enabled.",
+            (false, _) => "Set automation.auto_cleanup = true to apply.",
+        };
+        let message = format!(
+            "{} worktrees/artifacts would be removed, {} kept. Removed {}, unknown {}. {enablement}",
+            sweep.would_remove, sweep.kept, sweep.removed, sweep.unknown
+        );
+        let id = ulid::Ulid::new().to_string();
+        let mut progress = self.progress_receiver();
+        let request = json!({
+            "id": id,
+            "verb": "notify",
+            "args": {
+                "title": "Automatic cleanup sweep",
+                "message": message,
+            },
+        });
+        self.submit(&request, &Principal::Owner).await?;
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let state = self
+                    .inner
+                    .store
+                    .lock()
+                    .await
+                    .get_command(&id)?
+                    .map(|c| c.state);
+                match state {
+                    Some(CommandState::Applied) => return Ok(()),
+                    Some(state) if state.is_terminal() => {
+                        return Err(Error::new(
+                            "cleanup_notice_failed",
+                            "Owner cleanup notice did not apply",
+                        ));
+                    }
+                    _ => {}
+                }
+                progress.changed().await.map_err(|_| {
+                    Error::new(
+                        "unavailable",
+                        "Owner cleanup notice settlement is unavailable",
+                    )
+                })?;
+            }
+        })
+        .await
+        .map_err(|_| Error::new("unknown", "Owner cleanup notice settlement timed out"))?
     }
 
     pub(super) async fn prepare_chat_directory(&self, command: &Command) -> Result<()> {
@@ -955,6 +1077,9 @@ impl Router {
             if agent.generation != artifact.generation {
                 return Ok(Some("stale_generation".to_owned()));
             }
+            if agent.archived {
+                return Ok(Some("archived".to_owned()));
+            }
             if !agent.state.is_terminal() {
                 return Ok(Some("agent_not_terminal".to_owned()));
             }
@@ -1054,12 +1179,22 @@ impl Router {
         params: &Value,
         principal: &Principal,
     ) -> Result<Value> {
-        self.cleanup_plan_page(params, principal, None).await
+        self.cleanup_plan_page(params, principal, None, false).await
     }
 
-    async fn auto_cleanup_plan(&self, params: &Value, retention_ms: i64) -> Result<Value> {
-        self.cleanup_plan_page(params, &Principal::Owner, Some(retention_ms))
-            .await
+    async fn auto_cleanup_plan(
+        &self,
+        params: &Value,
+        retention_ms: i64,
+        retain_for_apply: bool,
+    ) -> Result<Value> {
+        self.cleanup_plan_page(
+            params,
+            &Principal::Owner,
+            Some(retention_ms),
+            retain_for_apply,
+        )
+        .await
     }
 
     async fn cleanup_plan_page(
@@ -1067,6 +1202,7 @@ impl Router {
         params: &Value,
         principal: &Principal,
         auto_cleanup_after_ms: Option<i64>,
+        retain_automatic_plan: bool,
     ) -> Result<Value> {
         let auto_cleanup = auto_cleanup_after_ms.is_some();
         let call_deadline = Instant::now() + Duration::from_secs(25);
@@ -1408,7 +1544,7 @@ impl Router {
             );
         }
         let retain_plan = if auto_cleanup {
-            plan.items.iter().any(|item| item.verdict == "safe")
+            retain_automatic_plan && plan.items.iter().any(|item| item.verdict == "safe")
         } else {
             !plan.items.is_empty() || !plan.truncated
         };
@@ -1536,6 +1672,7 @@ impl Router {
         if let Err(error) = self.sweep_automatic_cleanup(after).await {
             if error.code == "invalid" {
                 *after = None;
+                self.inner.automatic_cleanup.lock_recover().active_sweep = None;
             }
             self.automatic_cleanup_failed(&error);
         }
@@ -1543,25 +1680,33 @@ impl Router {
 
     async fn sweep_automatic_cleanup(&self, after: &mut Option<String>) -> Result<()> {
         let config = crate::config::load_automation_config(&self.inner.data_root)?;
-        if !config.auto_cleanup {
+        if config.auto_cleanup == Some(false) {
             *after = None;
+            self.inner.automatic_cleanup.lock_recover().active_sweep = None;
             return Ok(());
         }
+        let first_page = after.is_none();
+        let plan_only = config.auto_cleanup != Some(true)
+            || !self
+                .inner
+                .automatic_cleanup
+                .lock_recover()
+                .first_sweep_complete;
         let retention_ms =
             crate::automation::parse_positive_duration_ms(&config.auto_cleanup_after)?;
         let params = json!({"scope": "all", "continuation": after.clone()});
         let plan: CleanupPlan = serde_json::from_value(
-            self.auto_cleanup_plan(&params, retention_ms).await?,
+            self.auto_cleanup_plan(&params, retention_ms, !plan_only)
+                .await?,
         )
         .map_err(|_| Error::new("source_integrity", "automatic cleanup plan readback failed"))?;
-        *after = plan.continuation.clone();
         let selected = plan
             .items
             .iter()
             .filter(|item| item.verdict == "safe")
             .map(|item| item.artifact.id.clone())
             .collect::<Vec<_>>();
-        let applied: Option<CleanupApplyResponse> = if selected.is_empty() {
+        let applied: Option<CleanupApplyResponse> = if plan_only || selected.is_empty() {
             None
         } else {
             let request = json!({
@@ -1579,15 +1724,44 @@ impl Router {
                 )
             })?)
         };
-        self.record_automatic_cleanup(&plan, applied.as_ref()).await
+        let page = self
+            .record_automatic_cleanup(
+                &plan,
+                applied.as_ref(),
+                config.auto_cleanup == Some(true),
+                plan_only,
+            )
+            .await?;
+        *after = plan.continuation.clone();
+        if let Some(sweep) =
+            self.accumulate_automatic_cleanup_page(page, first_page, plan.continuation.is_none())
+        {
+            self.notify_automatic_cleanup_sweep(&sweep).await?;
+            self.inner
+                .automatic_cleanup
+                .lock_recover()
+                .first_sweep_complete = true;
+        }
+        Ok(())
     }
 
     async fn automatic_cleanup_effect_gate(&self, artifact: &ArtifactView) -> Result<()> {
         let config = crate::config::load_automation_config(&self.inner.data_root)?;
-        if !config.auto_cleanup {
+        if config.auto_cleanup != Some(true) {
             return Err(Error::new(
                 "cleanup_disabled",
-                "automatic cleanup was disabled",
+                "automatic cleanup apply requires explicit enablement",
+            ));
+        }
+        if !self
+            .inner
+            .automatic_cleanup
+            .lock_recover()
+            .first_sweep_complete
+        {
+            return Err(Error::new(
+                "cleanup_startup_sweep_pending",
+                "the first complete daemon-startup cleanup sweep must be plan-only",
             ));
         }
         let age = crate::automation::parse_positive_duration_ms(&config.auto_cleanup_after)?;
@@ -1756,11 +1930,15 @@ impl Router {
                 ))
             } else if automatic {
                 match self.automatic_cleanup_effect_gate(&item.artifact).await {
-                    Ok(()) => self.cleanup_remove(name, &item.artifact, request).await,
+                    Ok(()) => {
+                        self.cleanup_remove(name, &item.artifact, request, true)
+                            .await
+                    }
                     Err(error) => Err(error),
                 }
             } else {
-                self.cleanup_remove(name, &item.artifact, request).await
+                self.cleanup_remove(name, &item.artifact, request, false)
+                    .await
             };
             let outcome = match removal {
                 Ok(bytes) => CleanupItemOutcome {
@@ -1802,6 +1980,7 @@ impl Router {
         principal: &str,
         artifact: &ArtifactView,
         request: &CleanupApplyRequest,
+        automatic: bool,
     ) -> Result<u64> {
         if artifact.kind == ArtifactKind::Branch {
             let git = artifact
@@ -1902,7 +2081,7 @@ impl Router {
         }
         if artifact.kind == ArtifactKind::Worktree {
             return self
-                .cleanup_remove_worktree(principal, artifact, &request.id)
+                .cleanup_remove_worktree(principal, artifact, &request.id, automatic)
                 .await;
         }
         let agent = self
@@ -1932,6 +2111,16 @@ impl Router {
                 Self::cleanup_check_daemon_lock(Path::new(&artifact.path))?;
             }
             let store = self.inner.store.lock().await;
+            if automatic
+                && store
+                    .get_agent(&artifact.agent)?
+                    .is_some_and(|agent| agent.archived)
+            {
+                return Err(Error::new(
+                    "archived",
+                    "Archived Agent artifacts are protected",
+                ));
+            }
             if artifact.state == "ownership_root" && tree.contains_daemon_lock {
                 return Err(Error::new(
                     "nested_daemon_lock",
@@ -2044,10 +2233,21 @@ impl Router {
         principal: &str,
         artifact: &ArtifactView,
         apply_id: &str,
+        automatic: bool,
     ) -> Result<u64> {
         let mut progress = self.progress_receiver();
         let admission = {
             let mut store = self.inner.store.lock().await;
+            if automatic
+                && store
+                    .get_agent(&artifact.agent)?
+                    .is_some_and(|agent| agent.archived)
+            {
+                return Err(Error::new(
+                    "archived",
+                    "Archived Agent worktrees are protected",
+                ));
+            }
             if !store.cleanup_authorized(principal, artifact)?
                 || !store.cleanup_agent_quiescent(artifact)?
             {
@@ -3019,7 +3219,10 @@ impl Router {
             if item.verdict != "safe" || response.items[index].outcome != "unknown" {
                 continue;
             }
-            let outcome = match self.cleanup_remove("owner", &item.artifact, &apply).await {
+            let outcome = match self
+                .cleanup_remove("owner", &item.artifact, &apply, false)
+                .await
+            {
                 Ok(bytes) => CleanupItemOutcome {
                     artifact_id: item.artifact.id.clone(),
                     outcome: "removed".to_owned(),
