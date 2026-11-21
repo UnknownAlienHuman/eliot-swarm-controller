@@ -334,14 +334,14 @@ pub fn lifted(
     };
     let bands: Vec<Border> = match roles.lift {
         crate::theme::Lift::Shadow { key, ambient } => {
-            let [key_shadow, ambient_shadow] = elevation::shadows(level);
-            let shadow = |shadow, opacity| {
-                elevation::bands(shadow)
-                    .into_iter()
-                    .map(move |band| paint(band, crate::theme::SHADOW_COLOR, opacity))
+            let [key_bands, ambient_bands] = elevation::level_bands(level);
+            let shadow = |bands: &'static [Band], opacity| {
+                bands
+                    .iter()
+                    .map(move |band| paint(*band, crate::theme::SHADOW_COLOR, opacity))
             };
-            shadow(ambient_shadow, ambient)
-                .chain(shadow(key_shadow, key))
+            shadow(ambient_bands, ambient)
+                .chain(shadow(key_bands, key))
                 .collect()
         }
         // A ring theme: one hairline around the element, no blur.

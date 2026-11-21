@@ -834,7 +834,9 @@ of the explicitly selected release scope.
       Delete stopped tasks, Remove project) and on tasks and chats (Rename,
       Stop while live, idle included, Archive/Unarchive, Delete after a
       confirmation naming it, with a refused step's typed error, Copy
-      Agent ID, Open folder) are drawn in the window; archiving the open chat
+      Agent ID, Open folder) are drawn in the window and open from a right
+      click, the row's "⋯" (shown under the pointer, with keyboard focus in
+      the row and on the open task), Shift+F10 or the context-menu key; archiving the open chat
       returns to a new task with "Archived · Undo", and the fleet line counts
       live archived Agents; Rename writes `[desktop]
       display_names`, Remove project the `projects` section. A Chats section

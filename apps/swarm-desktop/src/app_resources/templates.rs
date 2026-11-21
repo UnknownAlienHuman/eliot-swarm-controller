@@ -127,12 +127,12 @@ fn band_border(radius: f64, band: Band, brush: &str) -> String {
 fn shadow(name: &str, level: Level, radius: f64, opacity: f64) -> String {
     let mut out =
         format!("<Grid x:Name=\"{name}\" Opacity=\"{opacity}\" IsHitTestVisible=\"False\">");
-    let [key, ambient] = elevation::shadows(level);
-    for band in elevation::bands(ambient) {
-        out += &band_border(radius, band, LIFT_AMBIENT);
+    let [key, ambient] = elevation::level_bands(level);
+    for band in ambient {
+        out += &band_border(radius, *band, LIFT_AMBIENT);
     }
-    for band in elevation::bands(key) {
-        out += &band_border(radius, band, LIFT_KEY);
+    for band in key {
+        out += &band_border(radius, *band, LIFT_KEY);
     }
     out += &format!(
         "<Border CornerRadius=\"{corner}\" Margin=\"-{stroke}\" BorderThickness=\"{stroke}\" \

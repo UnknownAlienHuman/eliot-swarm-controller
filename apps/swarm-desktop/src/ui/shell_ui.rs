@@ -916,6 +916,19 @@ impl DesktopApp {
                     }
                     Shortcut::Popover(key) => self.launch_update(LaunchMsg::Key(key), context),
                     Shortcut::ComposerPressed => self.composer_pressed(),
+                    Shortcut::FocusMoved => {
+                        let row = crate::motion::resolve_focused_row();
+                        if self.menu.focused != row {
+                            self.menu.focused = row;
+                        }
+                    }
+                    Shortcut::RowMenu => {
+                        if let Some((row, x, y)) = crate::motion::focused_row_anchor()
+                            && let Some(target) = self.row_target(&row)
+                        {
+                            self.menu_update(MenuMsg::Requested(target, x, y), context);
+                        }
+                    }
                     Shortcut::Enter(_) if self.menu.renaming.is_some() => {
                         self.menu_update(MenuMsg::RenameCommitted, context);
                     }
@@ -1941,19 +1954,13 @@ impl DesktopApp {
         Grid::new().keyed_children(vec![KeyedView::new(palette_key, window)])
     }
 
-    /// The sidebar's rows as the window reads them ([`sidebar_ui::Sidebar`]
-    /// draws them): the projects with their tasks nested inside them, a
-    /// search's matches flat in their projects, the owner's names, the
-    /// Monitor's reports and each row's age and work line, read now.
-    fn sidebar_input(&self, context: &mut ViewContext<Self>, palette: Palette) -> SidebarInput {
-        let fleet = Fleet::of(&self.nav.agents, |agent| self.reported(agent).is_some());
-        let query = self.nav.search.query.trim().to_owned();
-        let checkouts = self.checkouts();
-        let filtered = !query.is_empty();
+    /// The sidebar's sections now: a search's matches flat in their
+    /// projects, else every loaded row nested in its project.
+    fn sections_now(&self, checkouts: &[Checkout]) -> Vec<nav::Section> {
+        let filtered = !self.nav.search.query.trim().is_empty();
         // A search lists what it found (the server's matches across every
-        // Agent, plus the loaded rows matching while it reads), flat in
-        // their projects.
-        let found = self.search_found(&checkouts);
+        // Agent, plus the loaded rows matching while it reads).
+        let found = self.search_found(checkouts);
         let listed: &[UiAgent] = if filtered { &found } else { &self.nav.agents };
         let keep = |_: &UiAgent| true;
         let open = self.selected_agent_id();
@@ -1966,7 +1973,45 @@ impl DesktopApp {
             only: filtered.then_some(&keep as &dyn Fn(&UiAgent) -> bool),
             open: open.as_deref(),
         };
-        let sections = nav::sections(listed, &self.nav.organization, &checkouts, &shown);
+        nav::sections(listed, &self.nav.organization, checkouts, &shown)
+    }
+
+    /// The menu target of a sidebar row key (`agent:<id>`, `project:<key>`),
+    /// as its "⋯" builds it.
+    fn row_target(&self, row: &str) -> Option<menu_ui::Target> {
+        if let Some(id) = row.strip_prefix("agent:") {
+            return self.find_agent(id).cloned().map(menu_ui::Target::Agent);
+        }
+        let key = row.strip_prefix("project:")?;
+        let section = self
+            .sections_now(&self.checkouts())
+            .into_iter()
+            .find(|section| section.key == key && section.key != nav::OTHER_LOCATIONS)?;
+        Some(menu_ui::Target::Project {
+            key: section.key.clone(),
+            name: self
+                .prefs
+                .display_name(&format!("project:{}", section.key))
+                .map_or_else(|| section.name.clone(), str::to_owned),
+            checkout: section.checkout,
+            checkouts: section.checkouts,
+            collapsed: section.collapsed,
+        })
+    }
+
+    /// The sidebar's rows as the window reads them ([`sidebar_ui::Sidebar`]
+    /// draws them): the projects with their tasks nested inside them, a
+    /// search's matches flat in their projects, the owner's names, the
+    /// Monitor's reports and each row's age and work line, read now.
+    fn sidebar_input(&self, context: &mut ViewContext<Self>, palette: Palette) -> SidebarInput {
+        let fleet = Fleet::of(&self.nav.agents, |agent| self.reported(agent).is_some());
+        let query = self.nav.search.query.trim().to_owned();
+        let checkouts = self.checkouts();
+        let filtered = !query.is_empty();
+        // A search lists what it found (the server's matches across every
+        // Agent, plus the loaded rows matching while it reads), flat in
+        // their projects.
+        let sections = self.sections_now(&checkouts);
         let empty = if !sections.is_empty() {
             None
         } else if self.nav.agents_loading || (filtered && self.nav.found.loading) {
@@ -2063,6 +2108,7 @@ impl DesktopApp {
             }),
             filtered,
             hovered: self.menu.hovered.clone(),
+            focused: self.menu.focused.clone(),
             errors: self
                 .nav
                 .organization

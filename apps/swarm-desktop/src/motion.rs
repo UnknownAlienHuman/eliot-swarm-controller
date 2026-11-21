@@ -11,6 +11,11 @@
 //!   button before the press animation renders its first frame. The root
 //!   is the `XamlRoot.Content` of the first element that takes focus
 //!   (`FocusManager.GotFocus`): Reactor hands out no native element.
+//! - **Focus within a sidebar row.** The same `GotFocus` records the
+//!   focused element and tells the window, which finds the row holding it
+//!   (automation id [`ROW_ID_PREFIX`], [`resolve_focused_row`]) so the row
+//!   shows its "⋯" to the keyboard as to the pointer; Shift+F10 or the
+//!   context-menu key opens its menu at the row ([`focused_row_anchor`]).
 //! - **Popover rise.** Reactor fades the popover in through its opacity
 //!   transition; [`popover_entered`] lowers the popover (automation id
 //!   [`POPOVER_ID`]) by the design's 4 DIPs and lets
@@ -39,6 +44,10 @@ use crate::winrt::{Getter, InspectableSlots, Raw, get, winrt_interface};
 
 /// The automation id of the composer's popover (`ui::picker_ui`).
 pub const POPOVER_ID: &str = "eliot-popover";
+
+/// The automation id prefix of a sidebar row's container, followed by the
+/// row's key (`agent:<id>`, `project:<key>`; `ui::sidebar_ui`).
+pub const ROW_ID_PREFIX: &str = "eliot-row:";
 
 /// The button template's ripple ellipse (`app_resources::templates`).
 const RIPPLE_NAME: &str = "Ripple";
@@ -101,6 +110,9 @@ struct UIElementVtbl {
     _110_214: [usize; 105],
     /// 215 `AddHandler(RoutedEvent, Object, Boolean)`.
     add_handler: unsafe extern "system" fn(Raw, Raw, Raw, bool) -> HRESULT,
+    _216: usize,
+    /// 217 `TransformToVisual(UIElement)`.
+    transform_to_visual: unsafe extern "system" fn(Raw, Raw, *mut Raw) -> HRESULT,
 }
 const _: () = {
     assert!(offset_of!(UIElementVtbl, put_render_transform_origin) == 20 * SLOT);
@@ -108,7 +120,17 @@ const _: () = {
     assert!(offset_of!(UIElementVtbl, put_translation_transition) == 92 * SLOT);
     assert!(offset_of!(UIElementVtbl, xaml_root) == 109 * SLOT);
     assert!(offset_of!(UIElementVtbl, add_handler) == 215 * SLOT);
+    assert!(offset_of!(UIElementVtbl, transform_to_visual) == 217 * SLOT);
 };
+
+#[repr(C)]
+struct GeneralTransformVtbl {
+    base: InspectableSlots,
+    _6: usize,
+    /// 7 `TransformPoint(Point)`.
+    transform_point: unsafe extern "system" fn(Raw, Point, *mut Point) -> HRESULT,
+}
+const _: () = assert!(offset_of!(GeneralTransformVtbl, transform_point) == 7 * SLOT);
 
 #[repr(C)]
 struct UIElementStaticsVtbl {
@@ -174,7 +196,7 @@ struct FrameworkElementVtbl {
     actual_height: unsafe extern "system" fn(Raw, *mut f64) -> HRESULT,
     _15_32: [usize; 18],
     /// 33 `get_Name`.
-    name: unsafe extern "system" fn(Raw, *mut Raw) -> HRESULT,
+    name: unsafe extern "system" fn(Raw, *mut HSTRING) -> HRESULT,
 }
 const _: () = {
     assert!(offset_of!(FrameworkElementVtbl, actual_width) == 13 * SLOT);
@@ -186,7 +208,7 @@ struct AutomationPropertiesStaticsVtbl {
     base: InspectableSlots,
     _6_12: [usize; 7],
     /// 13 `GetAutomationId(DependencyObject)`.
-    automation_id: unsafe extern "system" fn(Raw, Raw, *mut Raw) -> HRESULT,
+    automation_id: unsafe extern "system" fn(Raw, Raw, *mut HSTRING) -> HRESULT,
 }
 const _: () = assert!(offset_of!(AutomationPropertiesStaticsVtbl, automation_id) == 13 * SLOT);
 
@@ -205,6 +227,13 @@ struct Vector3TransitionVtbl {
     put_duration: unsafe extern "system" fn(Raw, i64) -> HRESULT,
 }
 
+/// `DependencyObject` parameters take this interface's pointer (the ABI
+/// passes a class by its default interface); no slot is called on it.
+#[repr(C)]
+struct DependencyObjectVtbl {
+    base: InspectableSlots,
+}
+
 /// A delegate: IUnknown, then `Invoke(sender, args)`.
 #[repr(C)]
 struct DelegateVtbl {
@@ -212,6 +241,11 @@ struct DelegateVtbl {
     invoke: unsafe extern "system" fn(Raw, Raw, Raw) -> HRESULT,
 }
 
+winrt_interface!(
+    IDependencyObject,
+    DependencyObjectVtbl,
+    GUID::from_u128(0xe7beaee7_160e_50f7_8789_d63463f979fa)
+);
 winrt_interface!(
     IFocusManagerStatics,
     FocusManagerStaticsVtbl,
@@ -266,6 +300,11 @@ winrt_interface!(
     IAutomationPropertiesStatics,
     AutomationPropertiesStaticsVtbl,
     GUID::from_u128(0xb1e3e0f3_112f_5966_87dc_7862d4ad50e5)
+);
+winrt_interface!(
+    IGeneralTransform,
+    GeneralTransformVtbl,
+    GUID::from_u128(0x04eedeeb_31e5_54c0_ae3f_8bd06645d339)
 );
 winrt_interface!(
     IVector3TransitionFactory,
@@ -359,8 +398,10 @@ struct State {
     got_focus: Option<GotFocusHandler>,
     /// The XAML root the pointer handler is on.
     root: Option<IUIElement>,
-    /// Where the popover was found last.
-    popover_parent: Option<IInspectable>,
+    /// The element that took focus last (resolved by the window).
+    focused: Option<IUIElement>,
+    /// The sidebar row holding the focused element: its key and container.
+    focused_row: Option<(String, IUIElement)>,
 }
 
 thread_local! {
@@ -392,13 +433,17 @@ fn borrowed<T: Interface>(raw: Raw) -> Option<T> {
 }
 
 fn on_got_focus(_sender: Raw, args: Raw) {
-    let root = (|| -> Option<IUIElement> {
+    let Some(element) = (|| -> Option<IUIElement> {
         let args: IFocusManagerGotFocusEventArgs = borrowed(args)?;
         // SAFETY: slot 6 of IFocusManagerGotFocusEventArgs is get_NewFocusedElement.
-        let element: IUIElement = unsafe { get(&args, args.vtable().new_focused_element) }
+        unsafe { get(&args, args.vtable().new_focused_element) }
             .ok()?
             .cast()
-            .ok()?;
+            .ok()
+    })() else {
+        return;
+    };
+    let root = (|| -> Option<IUIElement> {
         // SAFETY: slot 109 of IUIElement is get_XamlRoot.
         let xaml_root: IXamlRoot = unsafe { get(&element, element.vtable().xaml_root) }
             .ok()?
@@ -410,17 +455,87 @@ fn on_got_focus(_sender: Raw, args: Raw) {
             .cast()
             .ok()
     })();
+    // The row is resolved later, by the window ([`resolve_focused_row`]):
+    // walking the tree inside WinUI's own focus dispatch faults inside WinUI
+    // at start (observed live), so the handler only records the element.
+    STATE.with(|state| state.borrow_mut().focused = Some(element));
+    crate::shortcuts::focus_moved();
     let Some(root) = root else { return };
-    if STATE.with(|state| state.borrow().root.as_ref() == Some(&root)) {
-        return;
+    if STATE.with(|state| state.borrow().root.as_ref() != Some(&root))
+        && add_pointer_handler(&root).is_ok()
+    {
+        STATE.with(|state| state.borrow_mut().root = Some(root));
     }
-    if add_pointer_handler(&root).is_ok() {
-        STATE.with(|state| {
-            let mut state = state.borrow_mut();
-            state.root = Some(root);
-            state.popover_parent = None;
-        });
+}
+
+/// The sidebar row holding the last focused element, worked out from the
+/// window's update (outside WinUI's focus dispatch): its key, or `None`.
+/// The walk stops at the window's content root.
+pub fn resolve_focused_row() -> Option<String> {
+    let (focused, root) = STATE.with(|state| {
+        let state = state.borrow();
+        (state.focused.clone(), state.root.clone())
+    });
+    let found = (|| -> Option<(String, IUIElement)> {
+        let tree = tree()?;
+        let statics =
+            windows_core::factory::<AutomationProperties, IAutomationPropertiesStatics>().ok()?;
+        let top: IUnknown = root?.cast().ok()?;
+        let mut node: IInspectable = focused?.cast().ok()?;
+        for _ in 0..MAX_ANCESTORS {
+            if node.cast::<IUnknown>().ok()? == top {
+                return None;
+            }
+            if let Some(id) = automation_id(&statics, &node)
+                && let Some(key) = id.to_string_lossy().strip_prefix(ROW_ID_PREFIX)
+            {
+                return Some((key.to_owned(), node.cast().ok()?));
+            }
+            node = parent(&tree, &node)?;
+        }
+        None
+    })();
+    crate::shortcuts::set_row_focused(found.is_some());
+    let key = found.as_ref().map(|(key, _)| key.clone());
+    STATE.with(|state| state.borrow_mut().focused_row = found);
+    key
+}
+
+/// The focused sidebar row's key and the point under its start where its
+/// menu opens (window DIPs), for Shift+F10 and the context-menu key.
+pub fn focused_row_anchor() -> Option<(String, f64, f64)> {
+    let (key, row) = STATE.with(|state| state.borrow().focused_row.clone())?;
+    let frame: IFrameworkElement = row.cast().ok()?;
+    let mut height = 0.0;
+    let mut transform = std::ptr::null_mut();
+    let mut point = Point::default();
+    // SAFETY: slot 14 of IFrameworkElement is get_ActualHeight; slot 217 of
+    // IUIElement is TransformToVisual (null: to the root), which returns
+    // one owned GeneralTransform; slot 7 of IGeneralTransform is
+    // TransformPoint.
+    unsafe {
+        (frame.vtable().actual_height)(frame.as_raw(), &mut height)
+            .ok()
+            .ok()?;
+        (row.vtable().transform_to_visual)(row.as_raw(), std::ptr::null_mut(), &mut transform)
+            .ok()
+            .ok()?;
+        if transform.is_null() {
+            return None;
+        }
+        let transform: IGeneralTransform = IInspectable::from_raw(transform).cast().ok()?;
+        (transform.vtable().transform_point)(
+            transform.as_raw(),
+            Point {
+                x: 0.0,
+                y: height as f32,
+            },
+            &mut point,
+        )
+        .ok()
+        .ok()?;
     }
+    Some((key, f64::from(point.x), f64::from(point.y)))
 }
 
 fn add_pointer_handler(root: &IUIElement) -> windows_core::Result<()> {
@@ -438,10 +553,17 @@ fn tree() -> Option<IVisualTreeHelperStatics> {
     windows_core::factory::<VisualTreeHelper, IVisualTreeHelperStatics>().ok()
 }
 
+/// `of` as the `IDependencyObject` pointer a `DependencyObject` parameter
+/// takes (an object's `IInspectable` pointer is a different vtable).
+fn dependency(of: &IInspectable) -> Option<IDependencyObject> {
+    of.cast().ok()
+}
+
 fn parent(tree: &IVisualTreeHelperStatics, of: &IInspectable) -> Option<IInspectable> {
+    let of = dependency(of)?;
     let mut out = std::ptr::null_mut();
-    // SAFETY: slot 12 of IVisualTreeHelperStatics is GetParent; it returns
-    // one owned reference or null.
+    // SAFETY: slot 12 of IVisualTreeHelperStatics is GetParent(DependencyObject);
+    // it returns one owned reference or null.
     unsafe { (tree.vtable().parent)(tree.as_raw(), of.as_raw(), &mut out) }
         .ok()
         .ok()?;
@@ -450,6 +572,9 @@ fn parent(tree: &IVisualTreeHelperStatics, of: &IInspectable) -> Option<IInspect
 }
 
 fn children(tree: &IVisualTreeHelperStatics, of: &IInspectable) -> Vec<IInspectable> {
+    let Some(of) = dependency(of) else {
+        return Vec::new();
+    };
     let mut count = 0;
     // SAFETY: slot 11 of IVisualTreeHelperStatics is GetChildrenCount.
     if unsafe { (tree.vtable().children_count)(tree.as_raw(), of.as_raw(), &mut count) }.is_err() {
@@ -469,29 +594,26 @@ fn children(tree: &IVisualTreeHelperStatics, of: &IInspectable) -> Vec<IInspecta
         .collect()
 }
 
-/// An HSTRING an out-parameter returned.
-fn owned_string(raw: Raw) -> HSTRING {
-    // SAFETY: the callee returned one owned HSTRING handle (null is empty).
-    unsafe { std::mem::transmute::<Raw, HSTRING>(raw) }
-}
-
 fn name(of: &IInspectable) -> Option<HSTRING> {
     let element: IFrameworkElement = of.cast().ok()?;
-    let mut out = std::ptr::null_mut();
-    // SAFETY: slot 33 of IFrameworkElement is get_Name.
+    let mut out = HSTRING::new();
+    // SAFETY: slot 33 of IFrameworkElement is get_Name; it writes one owned
+    // handle into the empty, transparent HSTRING.
     unsafe { (element.vtable().name)(element.as_raw(), &mut out) }
         .ok()
         .ok()?;
-    Some(owned_string(out))
+    Some(out)
 }
 
 fn automation_id(statics: &IAutomationPropertiesStatics, of: &IInspectable) -> Option<HSTRING> {
-    let mut out = std::ptr::null_mut();
-    // SAFETY: slot 13 of IAutomationPropertiesStatics is GetAutomationId.
+    let of = dependency(of)?;
+    let mut out = HSTRING::new();
+    // SAFETY: slot 13 of IAutomationPropertiesStatics is GetAutomationId; it
+    // writes one owned handle into the empty, transparent HSTRING.
     unsafe { (statics.vtable().automation_id)(statics.as_raw(), of.as_raw(), &mut out) }
         .ok()
         .ok()?;
-    Some(owned_string(out))
+    Some(out)
 }
 
 /// A press anywhere in the window: grow the pressed button's ripple from
@@ -591,26 +713,15 @@ fn find(
     })
 }
 
-/// The popover's element: under the parent it was found in last, else a
-/// breadth-first search from the root.
+/// The popover's element, breadth-first from the root (it sits a few
+/// levels down). Nothing is kept once it is found.
 fn popover(tree: &IVisualTreeHelperStatics) -> Option<IInspectable> {
     let statics =
         windows_core::factory::<AutomationProperties, IAutomationPropertiesStatics>().ok()?;
-    let is_popover = |element: &IInspectable| {
-        automation_id(&statics, element).is_some_and(|id| id == POPOVER_ID)
-    };
-    let (root, cached) = STATE.with(|state| {
-        let state = state.borrow();
-        (state.root.clone(), state.popover_parent.clone())
-    });
-    if let Some(found) = cached.as_ref().and_then(|parent| {
-        children(tree, parent)
-            .into_iter()
-            .find(|child| is_popover(child))
-    }) {
-        return Some(found);
-    }
-    let root: IInspectable = root?.cast().ok()?;
+    let root: IInspectable = STATE
+        .with(|state| state.borrow().root.clone())?
+        .cast()
+        .ok()?;
     let mut queue = VecDeque::from([root]);
     let mut visited = 0;
     while let Some(node) = queue.pop_front() {
@@ -619,8 +730,7 @@ fn popover(tree: &IVisualTreeHelperStatics) -> Option<IInspectable> {
             return None;
         }
         for child in children(tree, &node) {
-            if is_popover(&child) {
-                STATE.with(|state| state.borrow_mut().popover_parent = Some(node.clone()));
+            if automation_id(&statics, &child).is_some_and(|id| id == POPOVER_ID) {
                 return Some(child);
             }
             queue.push_back(child);

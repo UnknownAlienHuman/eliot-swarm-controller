@@ -61,6 +61,19 @@ pub mod elevation {
         }
     }
 
+    /// The bands of `level`'s key and ambient shadows ([`bands`]), worked
+    /// out once per level: the in-tree lifts draw them on every render.
+    pub fn level_bands(level: Level) -> &'static [Vec<Band>; 2] {
+        static CACHE: [std::sync::OnceLock<[Vec<Band>; 2]>; 3] =
+            [const { std::sync::OnceLock::new() }; 3];
+        let index = match level {
+            Level::One => 0,
+            Level::Two => 1,
+            Level::Three => 2,
+        };
+        CACHE[index].get_or_init(|| shadows(level).map(bands))
+    }
+
     /// The night themes' glow around the FAB: a centred blur of `radius`.
     pub const fn glow(radius: f64) -> Shadow {
         Shadow::new(0.0, radius, 0.0)
