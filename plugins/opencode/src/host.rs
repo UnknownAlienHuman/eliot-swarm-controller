@@ -16,7 +16,7 @@ use crate::{
     },
 };
 use eliot_core::local_provider::LocalProvider;
-use eliot_core::{ContextItem, Error, FailureOrigin, InjectPoint, McpPolicy, Result};
+use eliot_core::{ContextItem, Error, FailureOrigin, InjectPoint, McpPolicy, Result, SecretPolicy};
 use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
     MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
@@ -374,6 +374,7 @@ struct AgentSession {
     resources_proved_closed: bool,
     stop_end_ack_proved: bool,
     local_provider: Option<LocalProvider>,
+    secret_policy: SecretPolicy,
 }
 
 /// A start request that passed admission: decoded params plus the validated
@@ -1325,6 +1326,7 @@ impl OpenCodePlugin {
             resources_proved_closed: false,
             stop_end_ack_proved: false,
             local_provider: parsed.local_provider.clone(),
+            secret_policy: SecretPolicy::new(&parsed.secrets),
         };
 
         Ok(session)
@@ -3676,14 +3678,21 @@ impl OpenCodePlugin {
                 "terminal": false,
             }),
             Some(events::TurnReadback::Terminal(terminal)) => {
-                json!({
+                let mut turn = json!({
                     "command_id": params.command_id,
                     "turn_id": request.turn_id,
                     "status": terminal.outcome,
                     "terminal": true,
-                    "final_text": terminal.final_text,
+                    "final_text": null,
                     "native_error": terminal.idle_error.map(|error| error.message),
-                })
+                });
+                if let Some(text) = terminal.final_text {
+                    eliot_plugin::session::attach_final_text(
+                        &mut turn,
+                        &session.secret_policy.redact_text(&text),
+                    );
+                }
+                turn
             }
             None => match Self::snapshot_turn_facts(
                 &event_status,

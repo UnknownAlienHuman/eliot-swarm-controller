@@ -374,6 +374,7 @@ where
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum AssistantContent {
     Text(TextPart),
+    Tool,
     #[serde(other)]
     Other,
 }

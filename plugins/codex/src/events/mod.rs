@@ -16,7 +16,7 @@ use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
     protocol::MAX_COMMAND_ID_BYTES,
     session::{
-        EVENT_DEADLINE, MessageCommit, StreamSource, attach_final_text as shared_attach_final_text,
+        EVENT_DEADLINE, MessageCommit, StreamSource, attach_final_text,
         attach_native_error as shared_attach_native_error, attach_provider_restriction,
         event_id as shared_event_id, native_no_write, next_input_outcomes, rejected_control,
         request_reply_applied, unknown_control,
@@ -1584,10 +1584,10 @@ impl EventProcessor {
         if let Some(usage) = turn_usage {
             data["usage"] = serde_json::to_value(&usage).unwrap_or(Value::Null);
         }
-        if let Some(text) = self.final_text.as_ref() {
-            attach_final_text(&mut data, text, &notification.turn.status, &secrets);
-        }
         attach_native_error(&mut data, notification.turn.error.as_ref(), &secrets);
+        if let Some(text) = self.final_text.as_ref() {
+            attach_final_text(&mut data, text);
+        }
         let native_id = event_id(
             self.status.thread_id.as_deref().unwrap_or_default(),
             &notification.turn.id,
@@ -2205,21 +2205,4 @@ fn terminal_provider_restriction(
         .error
         .as_ref()
         .and_then(NativeTurnError::provider_restriction)
-}
-
-/// Shared bounded terminal-text attachment, projecting the Codex turn
-/// status to its failed bit. Kept under the local path for the
-/// terminal-data tests.
-fn attach_final_text(
-    data: &mut Value,
-    final_text: &str,
-    status: &NativeTurnStatus,
-    policy: &SecretPolicy,
-) {
-    shared_attach_final_text(
-        data,
-        final_text,
-        *status == NativeTurnStatus::Failed,
-        policy,
-    );
 }

@@ -3,7 +3,7 @@
 use super::{
     ActiveIncident, AgentKey, AttentionReport, AttentionState, CapturedAgent, FrozenReport,
     IncidentKey, IncidentKind, NativeStatus, ReportContext, ReportPhase, Router,
-    delivery::{persist_and_notify, persist_loss_delivery},
+    delivery::{attention_thread, persist_and_notify, persist_loss_delivery},
     observe::{build_report, child_capture_is_current, process_observation, source_is_unhealthy},
 };
 use crate::common::now_ms;
@@ -149,10 +149,7 @@ fn record_obsolete_delivery(key: &IncidentKey, phase: &str, error: &Error) {
 }
 
 /// Whether the retained loss incident needs no further work: its incident
-/// event is already committed and every expected notice is already
-/// delivered. Expected notices are the advisory subject copy, plus the
-/// supervisor escalation for a parented subject or the owner notice
-/// otherwise. A post-restart re-report that finds this state is a no-op.
+/// event and its manager or Owner notice already committed.
 pub(super) async fn loss_report_already_complete(
     router: &Router,
     incident_id: &str,
@@ -162,30 +159,12 @@ pub(super) async fn loss_report_already_complete(
     if !store.attention_incident_exists(incident_id)? {
         return Ok(false);
     }
-    let escalation_thread = Some(format!(
-        "attention-{}",
-        &incident_id[..20.min(incident_id.len())]
-    ));
-    let advisory_thread = escalation_thread
-        .as_deref()
-        .map(|thread| format!("{thread}-advisory"));
-    let Some(advisory_thread) = advisory_thread else {
-        return Ok(false);
-    };
-    if !store.attention_thread_mailed_to(&advisory_thread, &agent.id)? {
-        return Ok(false);
+    if let Some(parent) = agent.parent.as_deref()
+        && store.attention_thread_mailed_to(&attention_thread(incident_id), parent)?
+    {
+        return Ok(true);
     }
-    if let Some(parent) = agent.parent.as_deref().filter(|parent| *parent != agent.id) {
-        let Some(escalation_thread) = escalation_thread.as_deref() else {
-            return Ok(false);
-        };
-        if !store.attention_thread_mailed_to(escalation_thread, parent)? {
-            return Ok(false);
-        }
-    } else if !store.attention_owner_notice_exists(incident_id)? {
-        return Ok(false);
-    }
-    Ok(true)
+    store.attention_owner_notice_exists(incident_id)
 }
 
 /// Deliver the frozen loss incident, then drop it from the active set.
@@ -481,7 +460,6 @@ pub(super) fn freeze_report(report: AttentionReport) -> FrozenReport {
     FrozenReport {
         report,
         emit_command_id: ulid::Ulid::new().to_string(),
-        affected_mail_id: ulid::Ulid::new().to_string(),
         supervisor_mail_id: ulid::Ulid::new().to_string(),
         owner_notify_id: ulid::Ulid::new().to_string(),
     }
@@ -499,12 +477,6 @@ pub(super) fn freeze_loss_report(report: AttentionReport, loss_event_ts_ms: i64)
     };
     FrozenReport {
         emit_command_id: attention_ulid(&report.incident_id, phase, "emit", loss_event_ts_ms),
-        affected_mail_id: attention_ulid(
-            &report.incident_id,
-            phase,
-            "affected-mail",
-            loss_event_ts_ms,
-        ),
         supervisor_mail_id: attention_ulid(
             &report.incident_id,
             phase,

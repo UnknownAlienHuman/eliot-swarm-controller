@@ -521,13 +521,12 @@ fn persist_turn_associated(
          WHERE recipient = ?2 AND open_notice_command = ?3",
         params![now, agent_num, command_id],
     ));
-    // Self-registered completion digests shown directly in that wake `send`
-    // are marked presented and read on the wake turn's `turn.started`.
+    // Inline deliveries are presented and read with this exact wake turn.
     db!(tx.execute(
         "UPDATE messages SET presented_at = COALESCE(presented_at, ?1),
                              read_at = COALESCE(read_at, ?1)
-         WHERE recipient = ?2 AND presentation_command = ?3",
-        params![now, agent_num, command_id],
+         WHERE recipient = ?2 AND presentation_command = ?3 AND recipient_generation = ?4",
+        params![now, agent_num, command_id, generation],
     ));
     let mut command_events = vec![PendingCommandEvent {
         command_id: command_id.to_owned(),

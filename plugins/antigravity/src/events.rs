@@ -16,9 +16,8 @@ use eliot_plugin::{
     },
     protocol::{HookEvent, HookResponse},
     session::{
-        EVENT_DEADLINE, MessageCommit, StreamSource, attach_final_text, event_id,
-        is_blank_native_text, next_input_outcomes, rejected_control, request_event_id,
-        unknown_control,
+        EVENT_DEADLINE, StreamSource, attach_final_text, event_id, is_blank_native_text,
+        next_input_outcomes, rejected_control, request_event_id, unknown_control,
     },
 };
 use serde::Serialize;
@@ -45,9 +44,9 @@ pub(crate) const FAMILIES: &[&str] = &["session", "turn", "message", "tool", "re
 pub(crate) const STEER_MECHANISM: &str = "antigravity.PreInvocation.injectSteps.systemMessage";
 pub(crate) type Shared = Arc<Mutex<State>>;
 
-/// Upper bound on accumulated assistant text per turn. Beyond this the
-/// tail is dropped and the turn carries `final_text_unavailable` instead
-/// of an unbounded payload.
+/// Maximum redacted assistant text retained for a final response. If the
+/// response grows beyond this suffix buffer, the shared terminal bound marks
+/// its bounded value with the truncation marker.
 const MAX_TURN_TEXT_BYTES: usize = 256 * 1024;
 const MAX_UNBOUND_UPDATES: usize = 32;
 const MAX_UNBOUND_UPDATE_BYTES: usize = 256 * 1024;
@@ -93,8 +92,8 @@ pub(crate) struct TurnFacts {
     /// Empty while no bounded reply text is known; never presented as one.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub final_text: String,
-    /// Why no reply text is presented (`event_budget` or
-    /// `empty_native_response`), the same marker the terminal write carries,
+    /// Why no reply text is presented (native_update_gap or
+    /// empty_native_response), the same marker the terminal write carries,
     /// so a recovered terminal keeps it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub final_text_unavailable: Option<&'static str>,
@@ -161,11 +160,10 @@ struct CancellationIntent {
     command_id: String,
 }
 
-/// Why a terminal presents no reply text: the reply exceeded the event
-/// bound, or the native ended the turn normally but supplied no assistant
-/// text at all. The second keeps the native `end_turn` fact but marks the
-/// missing message instead of presenting a normal answer; consumers tell it
-/// from a real reply by the absent `message.completed` plus this marker.
+/// Why a terminal presents no reply text: native output was gapped, or
+/// the native ended the turn normally but supplied no assistant text at all.
+/// Consumers distinguish the latter from a real reply by the absent
+/// message.completed plus this marker.
 fn reply_unavailable(
     reason: Option<&'static str>,
     status: &str,
@@ -254,6 +252,9 @@ pub(crate) struct State {
     unbound_updates: VecDeque<QueuedUpdate>,
     unbound_update_bytes: usize,
     text_accum: String,
+    assistant_message_seq: u64,
+    text_redaction_pending: Vec<u8>,
+    text_truncated: bool,
     text_unavailable: Option<&'static str>,
     idle_message_gap_reported: bool,
     idle_tool_gap_reported: bool,
@@ -340,6 +341,9 @@ impl State {
             unbound_updates: VecDeque::new(),
             unbound_update_bytes: 0,
             text_accum: String::new(),
+            assistant_message_seq: 0,
+            text_redaction_pending: Vec::new(),
+            text_truncated: false,
             text_unavailable: None,
             idle_message_gap_reported: false,
             idle_tool_gap_reported: false,
@@ -667,8 +671,8 @@ impl State {
         self.tool_emitted.clear();
         self.tools.clear();
         self.clear_fenced();
-        self.text_accum.clear();
-        self.text_unavailable = None;
+        self.reset_assistant_text();
+        self.assistant_message_seq = 0;
         Ok(result)
     }
 
@@ -1347,6 +1351,7 @@ impl State {
             AgyFrame::OversizedUpdate(detail) => {
                 if self.pending.is_some() {
                     self.text_unavailable = Some("native_update_gap");
+                    self.text_redaction_pending.clear();
                 }
                 self.record_coverage_gap(
                     &format!(
@@ -1488,13 +1493,7 @@ impl State {
             }
             AcpUpdate::MessageChunk { text } => {
                 self.associate().await?;
-                if self.text_unavailable.is_none() {
-                    if self.text_accum.len().saturating_add(text.len()) > MAX_TURN_TEXT_BYTES {
-                        self.text_unavailable = Some("event_budget");
-                    } else {
-                        self.text_accum.push_str(&text);
-                    }
-                }
+                self.append_assistant_text(&text);
                 Ok(())
             }
             // Bookkeeping: neither input acknowledgement nor assistant output.
@@ -1542,6 +1541,9 @@ impl State {
                         && self.tools.len() >= MAX_LIVE_TOOLS)
                 {
                     return self.record_unattributed_tool().await;
+                }
+                if !self.tools.contains_key(&tool_call_id) {
+                    self.finish_message_before_tool().await?;
                 }
                 self.merge_tool(&tool_call_id, &title, &status);
                 self.tool_event(&tool_call_id, "tool.started", "running")
@@ -1594,6 +1596,13 @@ impl State {
     }
 
     async fn record_unattributed_tool(&mut self) -> Result<()> {
+        let first_tool_gap = self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| !pending.tool_gap_reported);
+        if first_tool_gap {
+            self.finish_message_before_tool().await?;
+        }
         if self
             .pending
             .as_ref()
@@ -1641,6 +1650,116 @@ impl State {
         .await?;
         self.session_usage_committed = Some(usage);
         Ok(())
+    }
+
+    fn reset_assistant_text(&mut self) {
+        self.text_accum.clear();
+        self.text_redaction_pending.clear();
+        self.text_truncated = false;
+        self.text_unavailable = None;
+    }
+
+    async fn finish_message_before_tool(&mut self) -> Result<()> {
+        self.finish_assistant_text();
+        let text = std::mem::take(&mut self.text_accum);
+        if self.text_unavailable.is_none() {
+            self.commit_assistant_message(&text).await?;
+        }
+        self.reset_assistant_text();
+        Ok(())
+    }
+
+    async fn commit_assistant_message(&mut self, text: &str) -> Result<()> {
+        if is_blank_native_text(text) {
+            return Ok(());
+        }
+        let pending = self
+            .pending
+            .as_ref()
+            .ok_or_else(|| Error::new("unknown", "Antigravity turn is absent"))?;
+        self.assistant_message_seq += 1;
+        let native_id = event_id(
+            &self.conversation,
+            &pending.turn,
+            &format!("assistant:{}", self.assistant_message_seq),
+            "message.completed",
+            "agy",
+            "Antigravity",
+        )?;
+        let mut data = json!({
+            "command_id": pending.command,
+            "turn_id": pending.turn,
+            "text": text,
+        });
+        self.policy.redact_values(&mut data);
+        self.source().commit_message(native_id, data).await?;
+        Ok(())
+    }
+
+    /// Redact native chunks as a stream before retaining only a bounded suffix.
+    /// The raw pending bytes contain only the unfinished secret or marker prefix.
+    fn append_assistant_text(&mut self, text: &str) {
+        if self.text_unavailable.is_some() {
+            return;
+        }
+
+        const REDACTION_CHUNK_BYTES: usize = 8 * 1024;
+        let mut offset = 0;
+        while offset < text.len() {
+            let mut end = (offset + REDACTION_CHUNK_BYTES).min(text.len());
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.text_redaction_pending
+                .extend_from_slice(&text.as_bytes()[offset..end]);
+            offset = end;
+            self.redact_pending_text(false);
+            if self.text_unavailable.is_some() {
+                return;
+            }
+        }
+    }
+
+    fn finish_assistant_text(&mut self) {
+        if self.text_unavailable.is_some() {
+            self.text_redaction_pending.clear();
+        } else {
+            self.redact_pending_text(true);
+        }
+    }
+
+    fn redact_pending_text(&mut self, eof: bool) {
+        let (safe, consumed) = self.policy.redact_prefix(&self.text_redaction_pending, eof);
+        self.text_redaction_pending.drain(..consumed);
+        let safe = String::from_utf8_lossy(&safe);
+        self.append_assistant_text_suffix(&safe);
+    }
+
+    fn append_assistant_text_suffix(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if text.len() > MAX_TURN_TEXT_BYTES {
+            let mut start = text.len() - MAX_TURN_TEXT_BYTES;
+            while !text.is_char_boundary(start) {
+                start += 1;
+            }
+            self.text_accum.clear();
+            self.text_accum.push_str(&text[start..]);
+            self.text_truncated = true;
+            return;
+        }
+
+        let retained_prefix = MAX_TURN_TEXT_BYTES - text.len();
+        if self.text_accum.len() > retained_prefix {
+            let mut start = self.text_accum.len() - retained_prefix;
+            while !self.text_accum.is_char_boundary(start) {
+                start += 1;
+            }
+            self.text_accum.drain(..start);
+            self.text_truncated = true;
+        }
+        self.text_accum.push_str(text);
     }
 
     /// Merge one partial tool-call delta into the known per-id state.
@@ -1719,11 +1838,13 @@ impl State {
         let Some(mut status) = result.terminal_status()? else {
             return Ok(());
         };
+        self.finish_assistant_text();
         let observed_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .ok()
             .and_then(|elapsed| i64::try_from(elapsed.as_millis()).ok());
         let restriction = (self.text_unavailable.is_none()
+            && !self.text_truncated
             && matches!(status, "completed" | "failed"))
         .then(|| crate::quota::turn_restriction(&self.text_accum, observed_at.unwrap_or(0)))
         .flatten()
@@ -1783,7 +1904,7 @@ impl State {
         // terminal commit, without a command binding.
         self.close_pending_requests(Some(&turn)).await?;
         let text = self.policy.redact_text(&self.text_accum);
-        let mut missing_text = self.text_unavailable;
+        let missing_text = self.text_unavailable;
         let mut data = json!({"command_id": command, "turn_id": turn,
             "status": status, "outcome": outcome, "native_status": native_status});
         if let Some(restriction) = restriction {
@@ -1811,21 +1932,8 @@ impl State {
             );
         }
         self.policy.redact_values(&mut data);
-        if !is_blank_native_text(&text) && missing_text.is_none() {
-            let id = event_id(
-                &self.conversation,
-                &turn,
-                "response",
-                "message.completed",
-                "agy",
-                "Antigravity",
-            )?;
-            let mut message = json!({"command_id": command, "turn_id": turn, "text": text});
-            self.policy.redact_values(&mut message);
-            // A reply over the persisted-event bound costs only itself.
-            if self.source().commit_message(id, message).await? == MessageCommit::Gapped {
-                missing_text = Some("event_budget");
-            }
+        if missing_text.is_none() {
+            self.commit_assistant_message(&text).await?;
         }
         let unavailable = reply_unavailable(missing_text, status, &text);
         if let Some(marker) = unavailable {
@@ -1840,12 +1948,8 @@ impl State {
         if let Some(usage) = prompt_turn_usage(result) {
             data["usage"] = json!(usage);
         }
-        if failed
-            && data.get("final_text").is_none()
-            && !is_blank_native_text(&text)
-            && missing_text.is_none()
-        {
-            attach_final_text(&mut data, &text, true, &self.policy);
+        if (self.text_truncated || !is_blank_native_text(&text)) && missing_text.is_none() {
+            attach_final_text(&mut data, &text);
         }
         self.commit("turn.completed", &turn, "completed", data.clone())
             .await?;
@@ -1854,11 +1958,11 @@ impl State {
         self.reject_pending_steer(
             "Antigravity turn ended before its next PreInvocation steer point",
         );
-        let final_text = match data.get("final_text").and_then(Value::as_str) {
-            Some(final_text) => final_text.to_owned(),
-            None if !failed && missing_text.is_none() => text,
-            None => String::new(),
-        };
+        let final_text = data
+            .get("final_text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
         if let Some(last) = self.last_turn.as_mut() {
             last.final_text = final_text;
         }

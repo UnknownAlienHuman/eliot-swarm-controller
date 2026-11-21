@@ -120,7 +120,6 @@ struct ActiveIncident {
 struct FrozenReport {
     report: AttentionReport,
     emit_command_id: String,
-    affected_mail_id: String,
     supervisor_mail_id: String,
     owner_notify_id: String,
 }
@@ -468,6 +467,11 @@ async fn inspect_agent(
     else {
         return Ok(());
     };
+    // A source probe may race the transition to Lost. The retained loss
+    // trigger owns that report, including when the source check began earlier.
+    if after_probe.agent.state == AgentState::Lost && key.kind != IncidentKind::ChildrenUnattended {
+        return Ok(());
+    }
     let Some((still_key, still_activity)) = desired_incident(&after_probe, suspicion_window) else {
         return Ok(());
     };

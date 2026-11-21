@@ -23,8 +23,8 @@ use eliot_plugin::{
     native_stdio::StreamState,
     protocol::{HookEvent, HookResponse},
     session::{
-        EVENT_DEADLINE, MessageCommit, StreamSource, attach_final_text, attach_native_error,
-        event_id, is_blank_native_text, next_input_outcomes, redact_request_details_for_commit,
+        EVENT_DEADLINE, StreamSource, attach_final_text, attach_native_error, event_id,
+        is_blank_native_text, next_input_outcomes, redact_request_details_for_commit,
         with_claimed_context,
     },
 };
@@ -2262,10 +2262,9 @@ impl EventProcessor {
                 "opencode",
                 "OpenCode",
             )?;
-            let commit = self.stream_source().commit_message(native_id, data).await?;
-            if commit == MessageCommit::Gapped {
-                return Err(Error::new("unknown", "OpenCode reply exceeded its bound"));
-            }
+            // A message-event gap does not erase exact terminal text
+            // obtained from readback; terminal_turn_data bounds final_text.
+            let _message_commit = self.stream_source().commit_message(native_id, data).await?;
         }
         let mut data =
             terminal_turn_data(command_id, turn_id, status, terminal, readback, &secrets);
@@ -2874,18 +2873,8 @@ fn terminal_turn_data(
         "turn_id": turn_id,
         "status": status,
     });
-    if let Some(readback) = readback {
-        if let Some(text) = readback.final_text.as_deref() {
-            attach_final_text(
-                &mut data,
-                &secrets.redact_text(text),
-                status == "failed",
-                secrets,
-            );
-        }
-        if let Some(usage) = readback.usage.as_ref() {
-            data["usage"] = serde_json::to_value(usage).unwrap_or(Value::Null);
-        }
+    if let Some(usage) = readback.and_then(|readback| readback.usage.as_ref()) {
+        data["usage"] = serde_json::to_value(usage).unwrap_or(Value::Null);
     }
     let native_error = terminal
         .error
@@ -2912,6 +2901,9 @@ fn terminal_turn_data(
             secrets,
         );
     }
+    if let Some(text) = readback.and_then(|readback| readback.final_text.as_deref()) {
+        attach_final_text(&mut data, &secrets.redact_text(text));
+    }
     data
 }
 
@@ -2936,7 +2928,7 @@ pub(crate) async fn read_turn_messages(
     let mut seen_cursors = HashSet::new();
     let mut user_position: Option<usize> = None;
     let mut idle: Option<(String, String, Option<StructuredError>, usize)> = None;
-    let mut texts: Vec<(usize, usize, i64, String)> = Vec::new();
+    let mut assistant_messages: Vec<(usize, Vec<String>)> = Vec::new();
     let mut usages: HashMap<String, (usize, i64, Option<AssistantTokens>)> = HashMap::new();
     let mut position: usize = 0;
     for _ in 0..MAX_MESSAGE_PAGES {
@@ -2953,18 +2945,19 @@ pub(crate) async fn read_turn_messages(
                     break;
                 }
                 Message::Assistant(assistant) => {
-                    for (part_index, part) in assistant.content.iter().enumerate() {
-                        if let AssistantContent::Text(text) = part
-                            && let Some(body) = text.text.as_deref()
-                        {
-                            texts.push((
-                                position,
-                                part_index,
-                                assistant.time.created,
-                                body.to_owned(),
-                            ));
+                    let mut message_text = Vec::new();
+                    for part in &assistant.content {
+                        match part {
+                            AssistantContent::Text(text) => {
+                                if let Some(body) = text.text.as_deref() {
+                                    message_text.push(body.to_owned());
+                                }
+                            }
+                            AssistantContent::Tool => message_text.clear(),
+                            AssistantContent::Other => {}
                         }
                     }
+                    assistant_messages.push((position, message_text));
                     // A repeated message id replaces its usage; repeated
                     // observations are never summed.
                     usages.insert(
@@ -3011,11 +3004,9 @@ pub(crate) async fn read_turn_messages(
     let Some((idle_id, outcome, idle_error, idle_position)) = idle else {
         return Ok(TurnReadback::Running);
     };
-    // Assistant text strictly between our input and the selected idle in
-    // newest-first page order: positions after the idle, before our user.
-    // Both text and usage share this exact slice, so assistants newer
-    // than the selected idle never leak into either.
-    let final_text = project_terminal_text(texts, idle_position, user_position);
+    // The newest assistant message strictly between our input and selected
+    // idle supplies final_text; earlier messages remain separate events.
+    let final_text = project_terminal_text(assistant_messages, idle_position, user_position);
     Ok(TurnReadback::Terminal(Box::new(TerminalReadback {
         idle_id,
         outcome: match outcome.as_str() {
@@ -3048,35 +3039,19 @@ pub(crate) struct TerminalReadback {
     usage: Option<TurnUsage>,
 }
 
-/// Project the terminal assistant text for one turn from collected parts:
-/// `(newest-first message position, intra-message content index, created,
-/// body)`. Positions are newest-first page order strictly between the
-/// selected idle and our input; the projection returns chronological text
-/// by reversing that page order while preserving each message's native
-/// `content` array order. Page position alone decides message order:
-/// `created` never outranks it, because timestamps can disagree with the
-/// native sequence across pages. The part index orders parts within one
-/// message (parts of one message share `created`, which previously made
-/// the text body the tiebreaker and reordered the response
-/// alphabetically).
+/// Project only the newest assistant message in the exact user-to-idle
+/// slice. Content parts before its final tool call are excluded, and a
+/// newer textless assistant message prevents fallback to an earlier reply.
 fn project_terminal_text(
-    texts: Vec<(usize, usize, i64, String)>,
+    messages: Vec<(usize, Vec<String>)>,
     idle_position: usize,
     user_position: usize,
 ) -> Option<String> {
-    let mut selected: Vec<(usize, usize, String)> = texts
+    let (_, parts) = messages
         .into_iter()
-        .filter(|(position, _, _, _)| *position > idle_position && *position < user_position)
-        .map(|(position, part, _, body)| (position, part, body))
-        .collect();
-    selected.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
-    let mut final_text = String::new();
-    for (_, _, body) in selected {
-        if !final_text.is_empty() {
-            final_text.push('\n');
-        }
-        final_text.push_str(&body);
-    }
+        .filter(|(position, _)| *position > idle_position && *position < user_position)
+        .min_by_key(|(position, _)| *position)?;
+    let final_text = parts.join("\n");
     if final_text.is_empty() {
         None
     } else {

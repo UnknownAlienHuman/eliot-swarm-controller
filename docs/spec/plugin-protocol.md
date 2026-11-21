@@ -389,7 +389,7 @@ bounded tool telemetry) without declaring the separately associated native
 turn outcome or later input unavailable. A valid native message whose
 `message.completed` data exceeds the persisted-event bound is one such `message`
 gap ([`StreamSource::commit_message`](../../crates/eliot-plugin/src/session.rs)):
-the turn keeps running and its terminal carries `final_text_unavailable`. A blank
+the turn keeps running and its terminal can retain a bounded final reply. A blank
 native reply (empty after trimming) is not a `message.completed` fact at all: it
 commits nothing and opens no gap. A gap naming only `message` never starts turn recovery. This requires a canonical gap ACK;
 an unresolved gap/batch ACK still fences admission. Session/turn identity loss,
@@ -551,14 +551,16 @@ HTTP transcript enrichment is unavailable, including after the native server exi
 Commit that status without final text or usage; unavailable enrichment is not a
 contradictory transcript, and neither permits inferring a missing terminal event.
 
-On a failed terminal event, preserve its exact command/turn binding, status and structured
-provider restriction before optional final text. The following final-text budget rule
-applies to every failed terminal event, whether or not it has a structured provider
-restriction. If final text exceeds the event budget, omit it rather than publish a
-truncated string as complete; add
-`final_text_unavailable:"event_budget"` when that marker fits. The full raw text remains
-only in private native history. A Core `Turn.final_text` of `None` means public final
-text is unavailable, not empty or successful.
+The terminal event preserves the exact command/turn binding, status and structured
+provider restriction. The adapter translates the turn's final assistant reply into
+`final_text`. A stream with tool boundaries uses the last assistant message after
+the last tool invocation. Earlier messages retain their own `message.completed`
+events within the message budget.
+After redaction, the shared retention path bounds the encoded terminal event. An
+oversized `final_text` retains its ending after a plain `[... truncated ...]` line.
+The same rule applies to every terminal outcome and recovered turn. A Core
+`Turn.final_text` of `None` means public final text is unavailable.
+
 Requested route/settings are not proof of effective values; unavailable readback is
 reported as such. The host owns queued-send FIFO and unknown gates.
 
@@ -637,9 +639,8 @@ until intake finishes it, and no recovered outcome settles the turn while such a
 is marked. The adapter's write commits the turn, or its failure clears the mark for the
 next sweep. These deferrals only spare a needless `unknown`; correctness does not
 depend on them. The Store rechecks the generation, native subject, turn, and source episode
-before committing `turn.completed` from a proven terminal (keeping
-`final_text_unavailable` when the adapter reported it or the recovered text exceeds
-the event bound), `turn.unknown` with
+before committing `turn.completed` from a proven terminal and applying the terminal
+event budget, `turn.unknown` with
 `native_exit_without_session_terminal` at once from a lost readback, or
 `turn.unknown` after four inconclusive reads. It retains the source gap and settles only that
 turn. A settled turn never reopens or runs again. Of its later facts only the adapter's own

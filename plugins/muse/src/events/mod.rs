@@ -3080,18 +3080,13 @@ impl EventProcessor {
         if let Some(usage) = turn_usage(&notification) {
             data["usage"] = serde_json::to_value(&usage).unwrap_or(Value::Null);
         }
-        if let Some(text) = self.messages.final_text.as_ref() {
-            attach_final_text(
-                &mut data,
-                text,
-                notification.terminal == NativeTurnTerminal::Failed,
-                &secrets,
-            );
-        }
         // The durable terminal record keeps the structured error message,
         // falling back to the terminal reason the readback used to drop.
         let native_error = turn_native_error(&notification, &notification.terminal, &secrets);
         attach_native_error(&mut data, native_error.as_deref(), &secrets);
+        if let Some(text) = self.messages.final_text.as_ref() {
+            attach_final_text(&mut data, text);
+        }
         let native_id = event_id(
             self.status.session_id.as_deref().unwrap_or_default(),
             &notification.turn_id,

@@ -301,17 +301,12 @@ exact-filename scan, never a guessed slug) fills `session_file_bytes`.
 Unavailable/malformed individual counters stay null
 (other valid counters are retained), and no valid native counters means
 the corresponding fact is omitted — never blocks or gaps the terminal.
-Callbacks own missing permission/question decisions; hooks never mirror the same
-lifecycle. Assistant messages remain individually bounded: one over the
-persisted-event bound is an acknowledged `message` coverage gap for that message
-alone, latches `final_text_unavailable`, and leaves the turn running on a healthy
-source. A message within the bound joins the aggregate before its write, so a
-definitely rejected write never shortens the reply. Aggregate terminal text
-and retained `last_turn` use the shared `MAX_EVENT_BYTES` budget: overflow drops
-the aggregate and latches `final_text_unavailable="event_budget"` without changing
-the native terminal status or interrupting bounded message events. A partial prefix
-is never reported as the full reply; the latch resets only at exact turn activation.
-Terminal event data and snapshots retain the same bounded text or unavailable fact.
+Callbacks own missing permission/question decisions. Main-thread assistant text
+after the last tool use supplies `final_text`. Earlier messages remain available
+as individual events. A message over the persisted-event bound produces an
+acknowledged `message` coverage gap for that message and leaves the turn
+running. The shared terminal event budget retains a marked suffix of an
+oversized final reply without changing the native terminal status.
 Distinguish content blocks/tool ids within a message instead of deduplicating all
 blocks by message id.
 

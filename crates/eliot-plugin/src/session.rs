@@ -917,57 +917,18 @@ pub fn attach_native_error(data: &mut Value, message: Option<&str>, policy: &Sec
     }
 }
 
-/// Attach terminal `final_text` to committed turn data. A failed turn whose
-/// text would exceed the event bound records `final_text_unavailable`
-/// instead; anything else keeps the text as committed.
-pub fn attach_final_text(data: &mut Value, final_text: &str, failed: bool, policy: &SecretPolicy) {
-    let mut candidate = data.clone();
-    let Some(fields) = candidate.as_object_mut() else {
+/// Translate an available native final reply into terminal turn data.
+pub fn attach_final_text(data: &mut Value, final_text: &str) {
+    let Some(fields) = data.as_object_mut() else {
         return;
     };
     fields.insert(
         "final_text".to_owned(),
         Value::String(final_text.to_owned()),
     );
-    let exceeds_event_bound =
-        serde_json::to_vec(&candidate).map_or(true, |encoded| encoded.len() > MAX_EVENT_BYTES);
-    if failed && exceeds_event_bound {
-        attach_final_text_unavailable(data, policy);
-        return;
-    }
-    *data = candidate;
-}
-
-/// Record that terminal text exists but exceeded the event bound. Refuses to
-/// write when the marker words collide with a redacted secret or the field
-/// is already present, and when even the marker would exceed the bound.
-pub fn attach_final_text_unavailable(data: &mut Value, policy: &SecretPolicy) {
-    if ["final_text_unavailable", "event_budget"]
-        .iter()
-        .any(|literal| policy.contains_text(literal))
-        || data
-            .as_object()
-            .is_none_or(|fields| fields.contains_key("final_text_unavailable"))
-    {
-        return;
-    }
-    let mut candidate = data.clone();
-    let Some(fields) = candidate.as_object_mut() else {
-        return;
-    };
-    fields.insert(
-        "final_text_unavailable".to_owned(),
-        Value::String("event_budget".to_owned()),
-    );
-    if serde_json::to_vec(&candidate).map_or(true, |encoded| encoded.len() > MAX_EVENT_BYTES) {
-        return;
-    }
-    if let Some(fields) = data.as_object_mut() {
-        fields.insert(
-            "final_text_unavailable".to_owned(),
-            Value::String("event_budget".to_owned()),
-        );
-    }
+    // Adapters can also retain the attached reply for a private snapshot.
+    // Its smaller public event budget is applied when the Store writes it.
+    eliot_core::limits::bound_terminal_text(data, eliot_core::limits::MAX_TERMINAL_WIRE_BYTES);
 }
 
 /// Attach a terminal provider-restriction fact to committed event data.

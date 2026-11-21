@@ -2,9 +2,10 @@
 //!
 //! Queueing, bounds, acknowledgement and compare-and-swap live in the Store;
 //! the Router only authenticates the caller, rejects known credentials in
-//! payloads, publishes committed events, and fans out at most one generic
-//! wake notice per routed recipient through the ordinary `send` path. A
-//! notice carries only the unread count, never the body; every suppression
+//! payloads, publishes committed events, and fans out at most one wake
+//! notice per routed recipient through the ordinary `send` path. A
+//! notice carries Store-selected mail content only when the complete
+//! presentation fits; otherwise it carries the unread count. Every suppression
 //! gate simply skips it.
 
 use super::{Principal, Router, contains_known_secret_including_keys, principal_name};
@@ -404,7 +405,7 @@ impl Router {
         }
     }
 
-    /// Offer one generic notice to a routed recipient through the shared
+    /// Offer one bounded notice to a routed recipient through the shared
     /// Store gate. Every gate — the per-kind routing pre-check, no live
     /// plugin owner, the Store's atomic claim (mail-only busy/waiting plus
     /// pending send input), or the ordinary send admission (provider hold,

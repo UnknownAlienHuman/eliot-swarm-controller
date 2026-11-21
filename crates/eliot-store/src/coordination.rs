@@ -4,8 +4,9 @@
 //! concrete recipients once, inside the admission transaction, and mailbox
 //! bounds are checked for every recipient before any row is written, so an
 //! overfull mailbox rejects without a partial fanout. Reads never mark
-//! state; only an explicit ack over exact delivery ids does, idempotently.
-//! A notice claim is an atomic check-and-set: at most one generic notice per
+//! state; explicit ack over exact delivery ids is idempotent. Inline wake
+//! mail is acknowledged only when its bound turn.started commits.
+//! A notice claim is an atomic check-and-set: at most one notice per
 //! recipient per minute with at most one open (or unknown) notice command,
 //! shared by mail wakes and claim-conflict notices. Variable writes are
 //! compare-and-swap on an incrementing version; an absent row reads as
@@ -111,9 +112,9 @@ const ATTENTION_WAKING_THREAD_SQL: &str = "COALESCE(m.thread, '') LIKE 'attentio
                OR json_extract(e.data, '$.data.reason') = 'children_unattended')
     )";
 
-/// A claimed notice: the pending count for the generic notice text, the
-/// recipient generation the notice command must bind, and an optional direct
-/// wake body when unread self-registered completion digests fit in the `send`.
+/// A claimed notice: the pending count for the count-only text, the
+/// recipient generation the notice command must bind, and optional bounded
+/// inline mail text whose deliveries are bound to that notice command.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NoticeClaim {
     pub kind: NoticeKind,
@@ -675,7 +676,7 @@ impl Store {
         }))
     }
 
-    /// Atomically claim one generic notice, or suppress it (cooldown from
+    /// Atomically claim one notice, or suppress it (cooldown from
     /// actual presentation, open/unknown notice command, unknown command
     /// or turn, pending request, provider hold, busy/waiting/input-pending
     /// mail recipient, or nothing pending) returning `Ok(None)` and
@@ -1796,6 +1797,7 @@ impl Store {
         // unread incident set cannot wake the recipient again until new
         // evidence arrives on a new thread.
         let inline_text = if pending.kind() == NoticeKind::Mail {
+            let inline = inline_mail_wake_tx(&tx, &agent, num, notice_command, count)?;
             db!(tx.execute(
                 "INSERT OR IGNORE INTO attention_wakes(recipient, thread, woken_at)
                  SELECT DISTINCT ?1, m.thread, ?2 FROM messages m
@@ -1804,7 +1806,7 @@ impl Store {
                    AND COALESCE(m.thread, '') NOT LIKE 'attention-%-advisory'",
                 params![num, now],
             ));
-            inline_self_digest_wake_tx(&tx, &agent, num, notice_command, count)?
+            inline
         } else {
             None
         };
@@ -1838,11 +1840,12 @@ impl Store {
     }
 }
 
-/// Inline unread completion digests registered by `agent` at its current
-/// generation when they fit in the wake `send` budget (`MAX_EVENT_BYTES`),
-/// binding `presentation_command` so `turn.started` of that wake marks them
-/// read without a separate `mail.inbox`/`mail.ack` round trip.
-fn inline_self_digest_wake_tx(
+/// Inline ordinary unread messages for agent's current generation and
+/// self-registered completion digests whose exact eligibility still holds.
+/// The full encoded send request must fit before any delivery is bound.
+/// Settled failed bindings and missing obsolete command bindings may be reused;
+/// active or unknown bindings and attention copies that cannot wake are excluded.
+fn inline_mail_wake_tx(
     tx: &Transaction<'_>,
     agent: &Agent,
     num: i64,
@@ -1851,19 +1854,28 @@ fn inline_self_digest_wake_tx(
 ) -> Result<Option<String>> {
     let expected_requester = format!("agent:{}:{}", agent.id, agent.generation);
     let mut statement = tx
-        .prepare(
-            "SELECT d.id, m.delivery_id, m.thread, m.text
+        .prepare(&format!(
+            "SELECT m.delivery_id, m.sender, m.thread, m.text,
+                    m.presentation_command, digest.id
              FROM messages m
-             JOIN completion_digests d
-               ON d.delivered_mail_id = m.delivery_id
-              AND d.parent = m.recipient
+             LEFT JOIN commands previous ON previous.id = m.presentation_command
+             LEFT JOIN completion_digests digest
+                ON digest.id = substr(m.delivery_id, 1, instr(m.delivery_id, '/') - 1)
+               AND digest.delivered_mail_id = m.delivery_id
              WHERE m.recipient = ?1
-               AND m.read_at IS NULL
-               AND m.sender = 'owner'
                AND m.recipient_generation = ?2
-               AND d.requester = ?3
+               AND m.read_at IS NULL
+               AND m.presented_at IS NULL
+               AND (previous.id IS NULL OR (previous.target = m.recipient
+                    AND COALESCE(previous.generation, previous.expected_generation) = m.recipient_generation
+                    AND previous.verb = 'send'
+                    AND previous.state IN ('rejected', 'failed', 'cancelled')))
+               AND (COALESCE(m.thread, '') NOT LIKE 'attention-%'
+                    OR ({ATTENTION_WAKING_THREAD_SQL}))
+               AND (digest.id IS NULL OR (digest.parent = m.recipient
+                    AND digest.requester = ?3 AND m.sender = 'owner'))
              ORDER BY m.id ASC",
-        )
+        ))
         .map_err(sql_error)?;
     let rows = statement
         .query_map(params![num, agent.generation, expected_requester], |row| {
@@ -1872,64 +1884,93 @@ fn inline_self_digest_wake_tx(
                 row.get::<_, String>(1)?,
                 row.get::<_, Option<String>>(2)?,
                 row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
             ))
         })
         .map_err(sql_error)?;
-    let mut candidates = Vec::new();
+    let mut presentations = Vec::new();
+    let mut body = String::new();
     for row in rows {
-        let (digest_id, delivery_id, thread, text) = row.map_err(sql_error)?;
-        if thread.as_deref() == Some(digest_thread(&digest_id).as_str()) {
-            candidates.push((delivery_id, text));
-        }
-    }
-    drop(statement);
-    if candidates.is_empty() {
-        return Ok(None);
-    }
-    let mut inlined_ids = Vec::new();
-    let mut inlined_texts = Vec::new();
-    let mut current_len: usize = 0;
-    for (delivery_id, text) in candidates {
-        if text.trim().is_empty() {
+        let (delivery_id, sender, topic, text, previous_command, digest_id) =
+            row.map_err(sql_error)?;
+        if digest_id
+            .as_deref()
+            .is_some_and(|id| topic.as_deref() != Some(digest_thread(id).as_str()))
+        {
             continue;
         }
-        let sep_len = if inlined_texts.is_empty() { 0 } else { 2 };
-        let remaining_unread = total_unread.saturating_sub((inlined_ids.len() + 1) as i64);
-        let suffix_len = if remaining_unread > 0 {
-            format!("\n\n{remaining_unread} unread: mail.inbox, then mail.ack").len()
-        } else {
-            0
-        };
-        if current_len
-            .saturating_add(sep_len)
-            .saturating_add(text.len())
-            .saturating_add(suffix_len)
+
+        let mail = format!(
+            "Mail from {sender} | {} | delivery {delivery_id}\n{text}",
+            topic.as_deref().unwrap_or("(no topic)")
+        );
+        let separator = if body.is_empty() { "" } else { "\n\n---\n\n" };
+        if body
+            .len()
+            .saturating_add(separator.len())
+            .saturating_add(mail.len())
             > MAX_EVENT_BYTES
         {
-            break;
+            return Ok(None);
         }
-        current_len = current_len
-            .saturating_add(sep_len)
-            .saturating_add(text.len());
-        inlined_ids.push(delivery_id);
-        inlined_texts.push(text);
+        body.push_str(separator);
+        body.push_str(&mail);
+        presentations.push((delivery_id, previous_command));
     }
-    if inlined_ids.is_empty() {
+    drop(statement);
+    if presentations.is_empty() || total_unread < presentations.len() as i64 {
         return Ok(None);
     }
-    for delivery_id in &inlined_ids {
-        db!(tx.execute(
-            "UPDATE messages SET presentation_command = ?1
-             WHERE delivery_id = ?2 AND recipient = ?3 AND read_at IS NULL",
-            params![notice_command, delivery_id, num],
-        ));
-    }
-    let mut body = inlined_texts.join("\n\n");
-    let remaining_unread = total_unread.saturating_sub(inlined_ids.len() as i64);
+
+    body.insert_str(
+        0,
+        "The deliveries below are included in this turn and already acknowledged.\n\n",
+    );
+    let remaining_unread = total_unread - presentations.len() as i64;
     if remaining_unread > 0 {
-        body.push_str(&format!(
-            "\n\n{remaining_unread} unread: mail.inbox, then mail.ack"
+        let suffix = format!("\n\n{remaining_unread} other unread: mail.inbox, then mail.ack");
+        if body.len().saturating_add(suffix.len()) > MAX_EVENT_BYTES {
+            return Ok(None);
+        }
+        body.push_str(&suffix);
+    }
+
+    let send_params = json!({
+        "id": notice_command,
+        "target": agent.id,
+        "verb": "send",
+        "expected_generation": agent.generation,
+        "args": {
+            "text": &body,
+            "notice_kind": "mail",
+            "inline_digest": true,
+        },
+    });
+    if encode_json(&send_params)?.len() > MAX_EVENT_BYTES {
+        return Ok(None);
+    }
+
+    for (delivery_id, previous_command) in &presentations {
+        let changed = db!(tx.execute(
+            "UPDATE messages SET presentation_command = ?1
+             WHERE delivery_id = ?2 AND recipient = ?3 AND recipient_generation = ?4
+               AND read_at IS NULL AND presented_at IS NULL
+               AND presentation_command IS ?5",
+            params![
+                notice_command,
+                delivery_id,
+                num,
+                agent.generation,
+                previous_command,
+            ],
         ));
+        if changed != 1 {
+            return Err(Error::new(
+                "source_integrity",
+                "mail presentation binding changed during notice claim",
+            ));
+        }
     }
     Ok(Some(body))
 }

@@ -1,5 +1,6 @@
 use super::native_events::{persist_effects, verified_native_event_cause_tx};
 use super::*;
+use std::borrow::Cow;
 
 impl Store {
     pub fn latest_stream_gap(&self, agent: &str, generation: i64) -> Result<Option<Event>> {
@@ -518,6 +519,7 @@ impl Store {
         }
         let agent_num = parse_agent_id(&batch.agent_id)?;
         let mut native_ids = HashSet::with_capacity(batch.events.len());
+        let mut publication = Vec::with_capacity(batch.events.len());
         for event in &batch.events {
             require_nonempty(&event.kind, "event kind")?;
             require_nonempty(&event.native_id, "native_id")?;
@@ -530,12 +532,24 @@ impl Store {
                     ),
                 ));
             }
+            let mut published = Cow::Borrowed(event);
             if encode_json(&event.data)?.len() > MAX_EVENT_BYTES {
-                return Err(Error::new(
-                    "frame_too_large",
-                    format!("event {} data exceeds 64 KiB", event.native_id),
-                ));
+                if event.kind == "turn.completed" && event.data["final_text"].is_string() {
+                    core::limits::bound_terminal_text(
+                        &mut published.to_mut().data,
+                        MAX_EVENT_BYTES,
+                    );
+                }
+                if matches!(published, Cow::Borrowed(_))
+                    || encode_json(&published.data)?.len() > MAX_EVENT_BYTES
+                {
+                    return Err(Error::new(
+                        "frame_too_large",
+                        format!("event {} data exceeds 64 KiB", event.native_id),
+                    ));
+                }
             }
+            publication.push(published);
         }
         let batch_digest = batch
             .semantic_digest()
@@ -689,7 +703,9 @@ impl Store {
         let mut committed_events = Vec::with_capacity(batch.events.len());
         let mut command_events = Vec::new();
         let mut provider_events = Vec::new();
-        for (index, native_event) in batch.events.iter().enumerate() {
+        for (index, (source_event, published)) in batch.events.iter().zip(&publication).enumerate()
+        {
+            let native_event = published.as_ref();
             if !observed {
                 validate_resume_ready_subject_tx(
                     &tx,
@@ -726,7 +742,8 @@ impl Store {
                 core::apply(&projection, native_event, now)?
             };
             let family = family_for_kind(&native_event.kind)?;
-            let event_digest = canonical::digest(&native_event.semantic_value())?;
+            // Deduplication still binds the exact redacted source payload.
+            let event_digest = canonical::digest(&source_event.semantic_value())?;
             let cause = if !observed {
                 verified_native_event_cause_tx(
                     &tx,

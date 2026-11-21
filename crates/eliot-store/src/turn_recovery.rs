@@ -86,18 +86,13 @@ impl Store {
         data["command_id"] = json!(binding.command_id);
         data["turn_id"] = json!(binding.turn_id);
         data["source_event_seq"] = json!(binding.source_event_seq);
-        // Optional recovered output must not prevent retaining terminal proof;
-        // dropped reply text keeps the reason it is missing.
+        // Size the final reply after adding the exact recovery bindings.
+        core::limits::bound_terminal_text(&mut data, MAX_EVENT_BYTES);
         if encode_json(&data)?.len() > MAX_EVENT_BYTES
             && let Some(fields) = data.as_object_mut()
         {
-            if fields
-                .remove("final_text")
-                .is_some_and(|text| text.is_string())
-            {
-                fields.insert("final_text_unavailable".to_owned(), json!("event_budget"));
-            }
             fields.remove("native_error");
+            core::limits::bound_terminal_text(&mut data, MAX_EVENT_BYTES);
         }
         let native = NativeEvent {
             kind: kind.to_owned(),

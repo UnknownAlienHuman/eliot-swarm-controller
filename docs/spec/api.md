@@ -1503,12 +1503,11 @@ Codes without specific words display their readable code name without implying a
 failure. Accepted, queued and dispatched commands describe progress; process steps
 retain whether the Agent was lost or failed and explain their recorded reason.
 
-For every failed terminal turn, with or without a structured provider restriction, status
-and exact command/turn binding remain authoritative when final text exceeds the event
-budget. The event omits oversized final text rather than exposing a truncated string as
-complete, and includes
-`final_text_unavailable:"event_budget"` when representable. `Turn.final_text = None`
-means the public final text is unavailable; full native text remains private history.
+The terminal event and `Turn.final_text` carry the final assistant message.
+When the reply exceeds the encoded event budget, the retained suffix starts
+with `[... truncated ...]`. Status, exact command/turn binding and any
+structured provider restriction remain authoritative. `Turn.final_text = None`
+means the public final text is unavailable. Full native text remains private history.
 `Turn.usage = None` likewise means native token usage is unavailable. A present usage
 carries nullable token members with `scope`/`message_id` attribution when the harness
 reports it; null attribution means the native scope is unknown. Message scope is never
@@ -1914,17 +1913,10 @@ pending registrations with a progressing keyset cursor that seeks after the last
 examined `(created_at, id)` and wraps once it passes the sweep high-water
 observed at sweep start, so pending or undeliverable registrations at the front
 never starve later eligible ones even while new registrations keep arriving;
-new arrivals join the next sweep. The digest reuses the
-ordinary mail wake (one generic coalesced notice per minute, at most one open notice
-command), except that when the registrant and recipient are the same Agent at its
-current generation and the digest body fits within `MAX_EVENT_BYTES` (64 KiB),
-the wake `send` carries that body directly (with `N unread: mail.inbox, then mail.ack`
-appended if other unread mail remains) and `turn.started` of that wake marks the
-digest delivery read (ordinary command readback via `command.get`/`command.children`
-redacts the wake `args.text` so only the recipient's own turn sees the excerpt
-text); otherwise (for example Owner-registered digests, other
-generations, or overflow) the generic count notice and `mail.inbox`/`mail.ack`
-apply. The digest emits no `x.user.agent.attention` event; a successful completion stays
+new arrivals join the next sweep. A digest registered by its recipient in the
+current generation is eligible for inline presentation under the ordinary mail
+wake budget. Other digest deliveries remain available through the mailbox.
+The digest emits no `x.user.agent.attention` event; a successful completion stays
 distinct from an attention incident and no model call is needed to poll. The CLI is
 `swarm digest --all|--any --to PARENT ID...` with the same `ID` shape as
 `swarm wait`; it exits 0 when the digest is accepted (pending or delivered).
@@ -2362,16 +2354,17 @@ as JSON before admission. The file path is not part of command metadata;
 only the resulting value is stored.
 
 A routed recipient with `wake_on_mail` (profile snapshot, default true) may
-receive one generic coalesced wake per minute with at most one open notice
-command per recipient across mail and claims. The wake text is one neutral
-line for every harness: `N unread: mail.inbox, then mail.ack`. An unread reply
+receive one coalesced wake per minute with at most one open notice
+command per recipient across mail and claims. An unread reply
 whose `reply_to_delivery` names mail the recipient itself sent, admitted after
 the last presentation, skips the one-minute cooldown once; the open-notice,
 busy, pending-input and unknown gates still apply.
-Ordinary mail notices never contain
-the body; only a self-registered completion digest at the recipient's current
-generation shows its body directly when it fits (`MAX_EVENT_BYTES`) and marks
-read on `turn.started`. Every notice is sent through the ordinary owner `send` path bound to the
+Eligible mail for the current generation is presented with sender, thread,
+delivery ID and body within the encoded wake budget. The exact bound
+`turn.started` marks presented deliveries read in the same transaction.
+Command readback redacts wake text that contains mail. Uninlined deliveries
+remain unread and the wake reports their count. Every notice uses the ordinary
+owner `send` path bound to the
 recipient's current generation, and is skipped — never retried — while a
 notice command is open or unknown, a provider hold, pending request or
 unknown command/turn stands, the daemon is draining, or no live plugin

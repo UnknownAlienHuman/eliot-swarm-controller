@@ -80,12 +80,14 @@ before integrating, and read `agent.result` when the text was truncated.
 
 ## Mail and shared variables
 
-A mail notice is a prompt to read the inbox. Read one delivery with
-`mail.read`, then pass that exact `delivery_id` in `mail.ack`'s
-`deliveries` list. Reading leaves it unread until acknowledged. If the
-only reason for a new turn is a notice after your final report, process
-the addressed mail and acknowledge it. Continue the old task only if
-the mail contains a new instruction requiring it.
+A `Mail from` entry supplies an inline delivery's sender, topic, ID and body.
+The bound `turn.started` acknowledges it. For a count of other unread
+deliveries, use
+`mail.read`, then pass the exact `delivery_id` in `mail.ack`'s `deliveries`
+list. Reading from the inbox leaves a delivery unread until acknowledged. If
+the only reason for a new turn is a notice after your final report, process
+the inline mail directly or acknowledge the exact count-only delivery. Continue
+the old task only if the mail contains a new instruction requiring it.
 
 Agent variables default to the actual project. Agents can read global
 values, and global writes require Owner authority. Read the current

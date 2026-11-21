@@ -3653,7 +3653,7 @@ impl Router {
             args.remove("inline_digest");
             args.insert(
                 "text".to_owned(),
-                Value::String("[redacted: inline completion digest]".to_owned()),
+                Value::String("[redacted: inline mail]".to_owned()),
             );
             args.insert("redacted".to_owned(), Value::Bool(true));
         }
