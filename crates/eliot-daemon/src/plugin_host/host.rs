@@ -12,7 +12,7 @@ use crate::bus::Bus;
 use crate::common::{now_ms, valid_environment_name};
 use crate::monitor::Monitoring;
 use crate::platform::OwnedChild;
-use crate::platform::custody::AgentSpawnError;
+use crate::platform::custody::{AgentCustodies, AgentSpawnError, LocalPeer};
 use actor::run_agent_inner;
 use eliot_core::{
     Agent, Command, ContextItem, Error, InjectArgs, InjectPoint, Result, SecretPolicy, SourceBatch,
@@ -283,6 +283,7 @@ struct HostState {
     store: StoreHandle,
     bus: Bus,
     monitoring: Monitoring,
+    agent_custodies: AgentCustodies,
     secrets: SecretSet,
     agent_credentials: AgentCredentials,
     unknown_commands: UnknownCommands,
@@ -406,6 +407,7 @@ impl PluginHost {
                 store,
                 bus,
                 monitoring,
+                agent_custodies: AgentCustodies::default(),
                 secrets,
                 agent_credentials,
                 unknown_commands,
@@ -1373,11 +1375,32 @@ impl PluginHost {
         let command = self
             .plugin_command(&agent.harness, Path::new(workspace))
             .map_err(AgentSpawnError::NotSpawned)?;
-        OwnedChild::spawn_agent(command, &namespace, &agent.id, agent.generation)
+        self.state.agent_custodies.spawn(&agent.id, || {
+            OwnedChild::spawn_agent(command, &namespace, &agent.id, agent.generation)
+        })
     }
 
-    fn spawn_plugin_process(&self, harness: &str, workspace: &Path) -> Result<OwnedChild> {
-        OwnedChild::spawn(self.plugin_command(harness, workspace)?)
+    pub(crate) fn authorize_local_owner(&self, peer: Option<LocalPeer>) -> Result<()> {
+        self.state.agent_custodies.authorize_owner(peer)
+    }
+
+    fn spawn_plugin_process(
+        &self,
+        harness: &str,
+        workspace: &Path,
+        observation: Option<&Agent>,
+    ) -> Result<OwnedChild> {
+        let command = self.plugin_command(harness, workspace)?;
+        if let Some(agent) = observation {
+            self.state
+                .agent_custodies
+                .spawn(&agent.id, || {
+                    OwnedChild::spawn(command).map_err(AgentSpawnError::NotSpawned)
+                })
+                .map_err(AgentSpawnError::into_error)
+        } else {
+            OwnedChild::spawn(command)
+        }
     }
 
     fn plugin_command(&self, harness: &str, workspace: &Path) -> Result<ProcessCommand> {

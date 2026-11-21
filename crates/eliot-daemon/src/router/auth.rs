@@ -10,13 +10,18 @@ use super::{
     validate_rule_resume_action,
 };
 use crate::common::secure_eq;
+use crate::platform::custody::LocalPeer;
 use eliot_core::{Command, Error, Result, SubmitCommand};
 use eliot_core::{is_coordination_verb, is_request_reply_verb, is_user_event_verb};
 use eliot_plugin::sync::LockExt;
 use serde_json::Value;
 
 impl Router {
-    pub(super) async fn authenticate(&self, wire_params: Value) -> Result<(Principal, Value)> {
+    pub(super) async fn authenticate(
+        &self,
+        wire_params: Value,
+        peer: Option<LocalPeer>,
+    ) -> Result<(Principal, Value)> {
         let mut envelope = wire_params.as_object().cloned().ok_or_else(|| {
             Error::new(
                 "invalid",
@@ -105,6 +110,7 @@ impl Router {
             }
             "owner" => {
                 if secure_eq(credential, &self.inner.owner_token) {
+                    self.inner.plugin_host.authorize_local_owner(peer)?;
                     if let Some(remote) = auth.get("remote_call") {
                         let remote: eliot_core::RemoteCallContext =
                             serde_json::from_value(remote.clone())

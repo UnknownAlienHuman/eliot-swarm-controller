@@ -1,3 +1,4 @@
+use super::custody::LocalPeer;
 use crate::platform::data_dir::{DaemonLock, DataDir};
 use eliot_core::{Error, Result};
 #[cfg(unix)]
@@ -12,7 +13,7 @@ use tokio::time::Instant;
 pub trait IpcStreamIo: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T> IpcStreamIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
-pub struct IpcStream(Box<dyn IpcStreamIo>);
+pub struct IpcStream(Box<dyn IpcStreamIo>, Option<LocalPeer>);
 
 impl AsyncRead for IpcStream {
     fn poll_read(
@@ -126,7 +127,11 @@ impl IpcListener {
                 .accept()
                 .await
                 .map_err(|error| io_error("accept Unix daemon connection", error))?;
-            Ok(IpcStream(Box::new(stream)))
+            #[cfg(target_os = "linux")]
+            let peer = LocalPeer::capture(&stream);
+            #[cfg(not(target_os = "linux"))]
+            let peer = None;
+            Ok(IpcStream(Box::new(stream), peer))
         }
 
         #[cfg(windows)]
@@ -151,7 +156,8 @@ impl IpcListener {
                     "connected named-pipe listener instance disappeared",
                 )
             })?;
-            Ok(IpcStream(Box::new(connected_server)))
+            let peer = LocalPeer::capture(&connected_server);
+            Ok(IpcStream(Box::new(connected_server), peer))
         }
 
         #[cfg(not(any(unix, windows)))]
@@ -181,6 +187,10 @@ impl Drop for IpcListener {
 }
 
 impl IpcStream {
+    pub(crate) fn take_local_peer(&mut self) -> Option<LocalPeer> {
+        self.1.take()
+    }
+
     pub async fn connect(endpoint: &str, until: Instant) -> Result<Self> {
         #[cfg(unix)]
         {
@@ -188,7 +198,7 @@ impl IpcStream {
             let stream = tokio::net::UnixStream::connect(endpoint)
                 .await
                 .map_err(|error| io_error("connect Unix daemon socket", error))?;
-            Ok(IpcStream(Box::new(stream)))
+            Ok(IpcStream(Box::new(stream), None))
         }
 
         #[cfg(windows)]
@@ -206,7 +216,7 @@ impl IpcStream {
                     ));
                 }
                 match ClientOptions::new().open(endpoint) {
-                    Ok(client) => return Ok(IpcStream(Box::new(client))),
+                    Ok(client) => return Ok(IpcStream(Box::new(client), None)),
                     Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => {
                         // Wake on actual availability rather than leaving the
                         // writer idle during a fixed retry sleep. A wake does

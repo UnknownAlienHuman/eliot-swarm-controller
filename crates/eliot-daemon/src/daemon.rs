@@ -1276,11 +1276,12 @@ async fn send_response_frame(
 }
 
 async fn serve_connection_with_write_timeout(
-    stream: IpcStream,
+    mut stream: IpcStream,
     router: Router,
     policy: Arc<SecretPolicy>,
     write_timeout: Duration,
 ) {
+    let peer = stream.take_local_peer();
     let mut framed = Framed::new(
         stream,
         LinesCodec::new_with_max_length(MAX_RPC_FRAME_BYTES.saturating_sub(1)),
@@ -1297,7 +1298,7 @@ async fn serve_connection_with_write_timeout(
                 Ok(request) => {
                     measured = request.params.get("_timing") == Some(&Value::Bool(true));
                     let is_shutdown = request.method == "daemon.shutdown";
-                    match router.handle_rpc(&request).await {
+                    match router.handle_rpc(&request, peer).await {
                         Ok(result) => {
                             arm_shutdown = is_shutdown;
                             #[cfg(debug_assertions)]

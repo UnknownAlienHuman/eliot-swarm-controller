@@ -117,6 +117,15 @@ returns `process_custody_foreign`, leaves the Job untouched and settles unknown 
 replaying the command. Agent Jobs are kill-on-close and only their owning daemon holds
 custody, so a live Job under an older namespace belongs to another running daemon.
 
+The local Owner gate uses the custody of the Agent generations started by this
+daemon. The host registers their Job or Linux process-group identity as part of
+spawn and keeps it while it owns the child. Unavailable custody identity fails
+startup before plugin initialization, with the usual cleanup and uncertainty
+rules. Windows checks exact Job membership.
+Linux checks the owned group and observable parent lineage and retains the existing
+degraded custody guarantee. Neither another daemon's custody nor periodic process
+samples decide local Owner authority. See [local principals](api.md#transport-and-principal-identity).
+
 No-Agent discovery (catalogue, quota, profile-store and installation/auth probes)
 and inference use the same scoped process-custody API. On Windows each helper
 family is assigned to a daemon-owned kill-on-close Job before it resumes, with

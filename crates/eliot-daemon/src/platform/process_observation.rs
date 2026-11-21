@@ -37,6 +37,7 @@ pub(crate) fn read_bounded_cmdline<R: std::io::Read>(reader: R) -> Option<Vec<u8
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LinuxProcessStat {
+    pub parent: u32,
     pub pgid: i32,
     pub start_ticks: u64,
     pub state: ProcessState,

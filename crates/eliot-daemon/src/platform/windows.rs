@@ -11,7 +11,7 @@ use eliot_plugin::sync::LockExt;
 use std::ffi::{OsStr, c_void};
 use std::fs;
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::FromRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::{Component, Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::slice;
@@ -49,8 +49,8 @@ use windows_sys::Win32::System::JobObjects::{
     SetInformationJobObject, TerminateJobObject,
 };
 use windows_sys::Win32::System::Pipes::{
-    CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
-    PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, WaitNamedPipeW,
+    CreateNamedPipeW, GetNamedPipeClientProcessId, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
+    PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, WaitNamedPipeW,
 };
 use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 use windows_sys::Win32::System::SystemInformation::{GetSystemTimeAsFileTime, GetTickCount64};
@@ -564,12 +564,75 @@ pub(crate) struct Job {
     family_empty_confirmed: Arc<AtomicBool>,
 }
 
+pub(crate) struct LocalPeer(QueryHandle);
+
+impl LocalPeer {
+    pub(crate) fn capture(pipe: &tokio::net::windows::named_pipe::NamedPipeServer) -> Option<Self> {
+        let mut pid = 0;
+        // SAFETY: the accepted pipe instance is live and pid is a writable DWORD.
+        if unsafe { GetNamedPipeClientProcessId(pipe.as_raw_handle(), &mut pid) } == 0 || pid == 0 {
+            return None;
+        }
+        // SAFETY: OpenProcess takes a PID and returns a new noninheritable handle.
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                0,
+                pid,
+            )
+        };
+        if handle.is_null() {
+            return None;
+        }
+        Some(Self(QueryHandle(handle)))
+    }
+
+    pub(crate) fn inspect(self, _owned_agents: bool) -> Result<Self> {
+        self.verify()?;
+        Ok(self)
+    }
+
+    pub(crate) fn verify(&self) -> Result<()> {
+        // SAFETY: the process handle has synchronize access and outlives the wait.
+        if unsafe { WaitForSingleObject(self.0.0, 0) } != WAIT_TIMEOUT {
+            return Err(Error::new(
+                "process_identity",
+                "named-pipe client is no longer live",
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub(crate) struct JobMembership(Arc<Mutex<Option<QueryHandle>>>);
+
+impl JobMembership {
+    pub(crate) fn contains(&self, peer: &LocalPeer) -> Result<bool> {
+        let query = self.0.lock_recover();
+        let job = query.as_ref().ok_or_else(|| {
+            Error::new(
+                "process_custody_unknown",
+                "owned Job query handle is closed",
+            )
+        })?;
+        let mut contained = 0;
+        // SAFETY: both handles remain live during this read-only membership query.
+        if unsafe { IsProcessInJob(peer.0.0, job.0, &mut contained) } == 0 {
+            return Err(io_error(
+                "verify owned Job membership",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        Ok(contained != 0)
+    }
+}
+
 // The owned kernel handle may be transferred to another thread; no borrowed
 // pointer or thread-affine state is stored in this wrapper.
 unsafe impl Send for Job {}
 
 impl Job {
-    pub(crate) fn observer(&self, pid: u32) -> Result<ProcessObserver> {
+    fn query_handle(&self) -> Result<std::sync::MutexGuard<'_, Option<QueryHandle>>> {
         let mut query = self.query.lock_recover();
         if query.is_none() {
             let mut handle = null_mut();
@@ -595,6 +658,16 @@ impl Job {
             }
             *query = Some(QueryHandle(handle));
         }
+        Ok(query)
+    }
+
+    pub(crate) fn membership(&self) -> Result<JobMembership> {
+        drop(self.query_handle()?);
+        Ok(JobMembership(Arc::clone(&self.query)))
+    }
+
+    pub(crate) fn observer(&self, pid: u32) -> Result<ProcessObserver> {
+        let query = self.query_handle()?;
         let handle = query
             .as_ref()
             .ok_or_else(|| {

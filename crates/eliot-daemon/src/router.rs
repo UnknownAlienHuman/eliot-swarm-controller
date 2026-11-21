@@ -401,12 +401,17 @@ impl Router {
         }
     }
 
-    pub(crate) async fn handle(&self, method: &str, wire_params: Value) -> Result<Value> {
+    async fn handle(
+        &self,
+        method: &str,
+        wire_params: Value,
+        peer: Option<crate::platform::custody::LocalPeer>,
+    ) -> Result<Value> {
         let remote = wire_params
             .get("_auth")
             .and_then(|a| a.get("remote_call"))
             .cloned();
-        let (principal, params) = self.authenticate(wire_params).await?;
+        let (principal, params) = self.authenticate(wire_params, peer).await?;
         let remote: Option<eliot_core::RemoteCallContext> = remote
             .map(serde_json::from_value)
             .transpose()
@@ -644,7 +649,11 @@ impl Router {
         })
     }
 
-    pub(crate) async fn handle_rpc(&self, request: &eliot_plugin::RpcRequest) -> Result<Value> {
+    pub(crate) async fn handle_rpc(
+        &self,
+        request: &eliot_plugin::RpcRequest,
+        peer: Option<crate::platform::custody::LocalPeer>,
+    ) -> Result<Value> {
         if let Some(remote) = request
             .params
             .get("_auth")
@@ -656,7 +665,8 @@ impl Router {
                 "remote call does not match its RPC request",
             ));
         }
-        self.handle(&request.method, request.params.clone()).await
+        self.handle(&request.method, request.params.clone(), peer)
+            .await
     }
 
     pub(crate) fn progress_receiver(&self) -> watch::Receiver<u64> {
