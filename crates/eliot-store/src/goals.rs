@@ -571,6 +571,14 @@ pub(super) fn transfer_goal_tx(
     // destination was not launched by the assignment, so its Goal is not
     // assignment-owned and never claims that Agent's retirement.
     source.state.assignment_cause = None;
+    // A cost baseline belongs to the source Agent's native session: the
+    // destination's spend cannot be measured against it, so its next failed
+    // round reports `cost_unverified` until the Owner sets the Goal again.
+    if source.state.cost_base.take().is_some() {
+        source.state.counters.cost_spent_micros = None;
+        source.state.counters.cost_unverified =
+            Some("the Goal moved by handoff; set it again to budget this session".to_owned());
+    }
     source.state.counters.last_observation = source
         .state
         .counters
@@ -2266,7 +2274,7 @@ fn goal_cost_reading_tx(
     };
     let Some(base) = base else {
         return Ok(Some(GoalCostReading::Unverified(
-            "no cost baseline was recorded",
+            "no cost baseline is recorded for this session",
         )));
     };
     let Some((usage, observed_at)) = latest_session_usage(tx, agent_num, generation)? else {
@@ -2290,6 +2298,9 @@ fn goal_cost_reading_tx(
         None => GoalCostReading::Unverified("the latest session snapshot has no cost"),
         Some((_, unit)) if unit != limit.unit => {
             GoalCostReading::Unverified("the session cost unit changed")
+        }
+        Some(_) if usage.source.is_none() && base.amount_micros > 0 => {
+            GoalCostReading::Unverified("the session snapshot names no source")
         }
         Some(_) if base.source.is_some() && usage.source != base.source => {
             GoalCostReading::Unverified("the native session changed")

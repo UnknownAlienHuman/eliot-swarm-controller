@@ -1269,7 +1269,12 @@ than the last completed turn, and never with a decreasing cumulative. Anything e
 `cost_unverified`, never zero, and blocks the Goal: an Owner budget that cannot be
 checked does not silently become unlimited. A spent cost at or above the budget blocks
 as `cost_limit`. A passing check still completes. The budget is checked between turns,
-so it limits new continuations but cannot cap a turn already running.
+so it limits new continuations but cannot cap a turn already running. Snapshot and
+turn times share the host clock: plugins are local processes, and Claude commits
+`session.usage` after its `turn.completed`. A snapshot without a source cannot prove the
+same session against a non-zero baseline. A handoff does not carry the baseline,
+because it belongs to the source Agent's session: the destination's next failed round
+blocks as `cost_unverified` until the Owner sets the Goal again.
 
 `goal show` reports the exact status, counters (with a live turn count and the spent
 cost), budgets, limits and the unresolved round marker if any. `cost_status` is
