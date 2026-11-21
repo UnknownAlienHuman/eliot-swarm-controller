@@ -8,6 +8,19 @@ use std::collections::BTreeMap;
 
 type RawHold = (String, String, Option<i64>, Option<String>, String, i64);
 
+pub(super) fn get(connection: &Connection, scope: &str) -> Result<Option<ProviderHold>> {
+    let raw = connection
+        .query_row(
+            "SELECT scope, kind, retry_after, probe_command, state, updated_at
+             FROM provider_holds WHERE scope = ?1",
+            [scope],
+            raw_hold_from_row,
+        )
+        .optional()
+        .map_err(sql_error)?;
+    raw.map(hold_from_raw).transpose()
+}
+
 pub(super) fn get_many(
     connection: &Connection,
     scopes: &[String],

@@ -5,7 +5,7 @@ use super::{
     encode_json, load_agent_by_num, require_nonempty, sql_error, validate_id_age, write_binding,
 };
 mod admin;
-use admin::{clear_hold_tx, get_many, list_page};
+use admin::{clear_hold_tx, get, get_many, list_page};
 
 use eliot_core::{
     self as core, Agent, Command, CommandState, ProviderHold, ProviderHoldState,

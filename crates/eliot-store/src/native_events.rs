@@ -97,10 +97,7 @@ pub(super) fn agent_native_notices(
             notice_data,
         ) = row.map_err(sql_error)?;
         let latest_turn_data = if active_turn.is_none() {
-            latest_data
-                .as_deref()
-                .map(decode_json::<Value>)
-                .transpose()?
+            latest_data.as_deref().map(decode_json).transpose()?
         } else {
             None
         };
