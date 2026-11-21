@@ -166,9 +166,12 @@ pub struct GoalRoundCommit {
     pub blocked_reason: Option<String>,
     /// Bounded observation of a block decided without a check.
     pub observation: Option<String>,
-    /// Workspace fingerprint the Router read just before the check; absent
-    /// when that read failed or exceeded its bounds.
-    pub fingerprint: Option<String>,
+    /// Workspace fingerprint read just before the check, compared with the
+    /// previous round's baseline; absent when that read failed.
+    pub fingerprint_before: Option<String>,
+    /// Workspace fingerprint read right after a failed check: the next
+    /// round's baseline, so the check's own writes are never progress.
+    pub fingerprint_after: Option<String>,
     pub continuation: Option<GoalContinuation>,
 }
 
@@ -1822,7 +1825,7 @@ impl Store {
                     &tx,
                     agent_num,
                     row.generation,
-                    commit.fingerprint.as_deref(),
+                    commit.fingerprint_before.as_deref(),
                 )? {
                     GoalFingerprint::None => {
                         // No Git observation exists for this generation;
@@ -1836,7 +1839,7 @@ impl Store {
                     GoalFingerprint::Incomplete => {
                         // An incomplete fingerprint never proves no progress.
                         counters.consecutive_same_output = 0;
-                        counters.last_fingerprint = None;
+                        counters.last_fingerprint = commit.fingerprint_after.clone();
                     }
                     GoalFingerprint::Complete(fingerprint) => {
                         let same_fingerprint =
@@ -1846,7 +1849,7 @@ impl Store {
                         } else {
                             counters.consecutive_same_output = 0;
                         }
-                        counters.last_fingerprint = Some(fingerprint);
+                        counters.last_fingerprint = commit.fingerprint_after.clone();
                     }
                 }
                 counters.last_output_digest = Some(digest.clone());
@@ -2457,6 +2460,7 @@ enum GoalFingerprint {
     /// The fresh read failed or exceeded its bounds. Never proves no progress.
     Incomplete,
     /// Digest of HEAD and the content `dirty_digest`, read before the check.
+    /// It is compared with the read after the previous failed check.
     Complete(String),
 }
 

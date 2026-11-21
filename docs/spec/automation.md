@@ -1311,16 +1311,19 @@ repeated set/retry, reads and daemon restart cannot create another
 round.
 
 No-progress compares check output digests and the workspace fingerprint
-together. Just before each check, while the Agent is idle, the daemon reads the
-round's workspace once: HEAD plus the Git monitor's content `dirty_digest` over the
-dirty set (path, status and file content, within the monitor's caps). The read is
-bound to that workspace and fresh by construction, so a shell edit of an already
-dirty file changes the fingerprint even when no edit is attributed. A failed read,
-a read past the caps or a workspace that is not an exact Git root is incomplete.
-Without a Git binding for the Agent's generation the streak falls back to check
-output alone. An incomplete fingerprint never proves no progress: it resets the
-streak instead of extending it. A write by any process in the workspace counts
-as change; the streak exists to stop blind repeats, not to attribute work.
+together. The fingerprint is HEAD plus the Git monitor's content `dirty_digest`
+over the dirty set (path, status and file content of files Git does not ignore,
+within the monitor's caps), read from the round's workspace while the Agent is
+idle. Just before each check the daemon reads it and compares it with the read
+taken right after the previous failed check, so a shell edit of an already dirty
+file counts as progress even when no edit is attributed, and files the check
+itself writes never do. A failed read, a read past the caps or a workspace that
+is not an exact Git root is incomplete; past the caps every round is incomplete
+and only the round and turn budgets stop the Goal. Without a Git binding for the
+Agent's generation the streak falls back to check output alone. An incomplete
+fingerprint never proves no progress: it resets the streak instead of extending
+it. A change by any process to a file Git does not ignore counts; the streak
+exists to stop blind repeats, not to attribute work.
 
 Checks are arbitrary explicit commands, not magically read-only. Check outcomes
 use the same frozen inputs/custody/no-blind-retry rules. Incomplete

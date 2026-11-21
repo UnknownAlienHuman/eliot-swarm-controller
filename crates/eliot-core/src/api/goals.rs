@@ -289,9 +289,9 @@ pub struct GoalCounters {
     pub last_exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_output_digest: Option<String>,
-    /// Digest of the last complete workspace fingerprint, read just before
-    /// the check. Absent without a Git binding or when the latest read was
-    /// incomplete; an incomplete fingerprint never extends a no-progress streak.
+    /// Workspace fingerprint read right after the last failed check; the next
+    /// round compares its pre-check read with it, so the check's own writes
+    /// are never progress. Absent without a Git binding or after a failed read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
