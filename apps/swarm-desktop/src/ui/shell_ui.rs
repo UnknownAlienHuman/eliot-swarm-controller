@@ -49,6 +49,8 @@ pub(super) enum ShellMsg {
     AutoSettings,
     RepairSettings,
     RetryStartup,
+    /// Open this data directory's editable daemon configuration.
+    OpenStartupConfig,
     /// The daemon runs (started when needed), the opened checkout was
     /// discovered, and the settings were read.
     DaemonReady(MutationResult<(Option<String>, eliot_core::api::SettingsReadResponse)>),
@@ -328,6 +330,14 @@ impl DesktopApp {
                 if let Ok(data_dir) = self.data_dir.clone() {
                     self.startup_error = None;
                     self.start_connection(data_dir, context);
+                }
+            }
+            ShellMsg::OpenStartupConfig => {
+                if let Ok(data_dir) = &self.data_dir
+                    && let Err(error) =
+                        super::reveal::open_with_default_app(&data_dir.join("config.toml"))
+                {
+                    self.alert(error);
                 }
             }
             ShellMsg::DaemonReady(result) => match result {
@@ -2266,20 +2276,25 @@ impl DesktopApp {
             .spacing(tokens::spacing::MD)
             .margin(Thickness::uniform(tokens::spacing::LG))
             .children((
-                m3::page_title("Swarm could not start here"),
-                m3::text(
-                    "Swarm could not open this data directory. Existing settings have not been moved.",
-                    tokens::text::BODY,
-                )
-                .text_wrapping(TextWrapping::Wrap),
+                m3::page_title("Swarm daemon could not start"),
                 m3::secondary(error)
                     .text_wrapping(TextWrapping::Wrap)
                     .is_text_selection_enabled(true),
                 if self.repairing_settings() {
-                    m3::filled(palette)
-                        .automation_name("Repair settings")
-                        .on_click(context.message(Message::Shell(ShellMsg::RepairSettings)))
-                        .content(m3::label("Repair settings"))
+                    StackPanel::new()
+                        .spacing(tokens::spacing::SM)
+                        .children((
+                            m3::filled(palette)
+                                .automation_name("Repair settings")
+                                .on_click(context.message(Message::Shell(ShellMsg::RepairSettings)))
+                                .content(m3::label("Repair settings")),
+                            m3::text_button(palette)
+                                .automation_name("Open config.toml")
+                                .on_click(
+                                    context.message(Message::Shell(ShellMsg::OpenStartupConfig)),
+                                )
+                                .content(m3::link_content("Open config.toml")),
+                        ))
                         .into()
                 } else {
                     View::empty()

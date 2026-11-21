@@ -82,6 +82,12 @@ Windows starts that independent process without inheriting caller handles, so ca
 CLI stdout/stderr reach EOF while the daemon remains alive. Its own private IPC and
 owned plugin/workspace custody establish subsequent authority.
 
+The desktop uses this owner-only startup path. If its launched daemon exits before
+readiness with a configuration error, the startup view shows `config.toml`, the reported
+line and a bounded source-free issue, with an action to open that file. Raw config lines
+and parser source excerpts are never shown. A readiness response observed during a
+concurrent start race takes precedence over the launched child's failure.
+
 ### Memory one-shot inference (M1, #199)
 
 M1 implements a bounded subset of Memory Contract 0.19 at

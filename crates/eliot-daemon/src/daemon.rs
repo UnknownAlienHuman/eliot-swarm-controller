@@ -11,7 +11,7 @@ use eliot_core::api::{
     CommandGetRequest, MAX_SWARM_WAIT_MS, SwarmWaitRequest, SwarmWaitResponse, WaitTurnRef,
 };
 use eliot_core::{
-    Command, CommandState, Error, MAX_STDERR_DIAGNOSTIC_BYTES, Result, SecretPolicy,
+    Command, CommandState, Error, FailureOrigin, MAX_STDERR_DIAGNOSTIC_BYTES, Result, SecretPolicy,
     StderrDiagnostic, bound_stderr_diagnostics,
 };
 use eliot_plugin::{RpcError, RpcRequest, RpcResponse};
@@ -89,11 +89,23 @@ pub async fn run(path: PathBuf) -> Result<()> {
     let daemon_lock = data_dir.acquire_daemon_lock()?;
     crate::skill::materialize(data_dir.path())?;
     let _log = logging::init(&data_dir, &daemon_lock)?;
+    let policy = Arc::new(SecretPolicy::new([data_dir.owner_token()]));
     // `[daemon] log_level` sets process verbosity at startup; an invalid
     // value fails startup like invalid retention or mail config.
-    let daemon_config = crate::config::load_daemon_config(data_dir.path())?;
+    let daemon_config = match crate::config::load_daemon_config(data_dir.path()) {
+        Ok(config) => config,
+        Err(error) => {
+            let failure = Error::new(error.code.clone(), "daemon configuration failed")
+                .with_where(crate::startup::CONFIG_STARTUP_LOCATION)
+                .with_origin(
+                    FailureOrigin::Swarm,
+                    config_startup_evidence(&error.message),
+                );
+            logging::record(&policy, "daemon.failed", &[], Some(&failure));
+            return Err(error);
+        }
+    };
     crate::logging::set_log_level(crate::logging::LogLevel::parse(&daemon_config.log_level)?);
-    let policy = Arc::new(SecretPolicy::new([data_dir.owner_token()]));
     logging::record(&policy, "daemon.starting", &[], None);
     if let Err(error) =
         crate::platform::data_dir::remove_abandoned_mcp_temps(&data_dir, &daemon_lock)
@@ -1774,10 +1786,69 @@ pub struct DaemonStartupFailure {
     pub error_code: String,
     pub ts_ms: u128,
     pub diagnostics: Vec<StderrDiagnostic>,
+    /// The source-free config parser issue from a typed Swarm startup failure.
+    pub config_diagnostic: Option<String>,
 }
 
 const LOG_TAIL_BYTES: u64 = 64 * 1024;
 const LOG_TAIL_RECORDS: usize = 64;
+const CONFIG_STARTUP_EVIDENCE_BYTES: usize = 512;
+const CONFIG_STARTUP_MAX_LINE: u32 = 128 * 1024;
+
+/// Reduce the config parser's message to fixed issue vocabulary and a line
+/// number. Never persist its field text, source line or caret excerpt.
+fn config_startup_evidence(message: &str) -> String {
+    let issue = message
+        .strip_prefix("config.toml:")
+        .and_then(|location_and_detail| location_and_detail.split_once(": "))
+        .and_then(|(location, detail)| {
+            let (line, column) = location.split_once(':')?;
+            let line = line.parse::<u32>().ok()?;
+            let _column = column.parse::<u32>().ok()?;
+            if line == 0 || line > CONFIG_STARTUP_MAX_LINE {
+                return None;
+            }
+            let issue = detail.rsplit_once(": ")?.1;
+            let issue = match issue {
+                "invalid TOML syntax or value" => "invalid TOML syntax or value",
+                "unknown configuration field" => "unknown configuration field",
+                "unsupported configuration field" => "unsupported configuration field",
+                _ => return None,
+            };
+            Some(format!("config.toml, line {line}: {issue}"))
+        })
+        .unwrap_or_else(|| {
+            "config.toml, line unavailable: daemon configuration could not be loaded".to_owned()
+        });
+    issue.chars().take(CONFIG_STARTUP_EVIDENCE_BYTES).collect()
+}
+
+/// Accept only the fixed evidence format emitted above from private logs.
+fn validated_config_startup_diagnostic(evidence: &str) -> Option<String> {
+    let (file, remainder) = evidence.split_once(", line ")?;
+    if file != "config.toml" {
+        return None;
+    }
+    let (line, issue) = remainder.split_once(": ")?;
+    let line = if line == "unavailable" {
+        line.to_owned()
+    } else {
+        let line = line.parse::<u32>().ok()?;
+        if line == 0 || line > CONFIG_STARTUP_MAX_LINE {
+            return None;
+        }
+        line.to_string()
+    };
+    let issue = match issue {
+        "invalid TOML syntax or value" => "invalid TOML syntax or value",
+        "unknown configuration field" => "unknown configuration field",
+        "unsupported configuration field" => "unsupported configuration field",
+        "daemon configuration could not be loaded" => "daemon configuration could not be loaded",
+        _ => return None,
+    };
+    let diagnostic = format!("config.toml, line {line}: {issue}");
+    (diagnostic.len() <= CONFIG_STARTUP_EVIDENCE_BYTES).then_some(diagnostic)
+}
 
 /// Newest `daemon.failed` record in the bounded log tail, if any.
 pub fn last_daemon_failure(data_dir: &Path) -> Option<DaemonStartupFailure> {
@@ -1875,10 +1946,25 @@ fn read_log_failures(data_dir: &Path) -> Vec<DaemonStartupFailure> {
                 serde_json::from_value::<Vec<StderrDiagnostic>>(diagnostics.clone()).ok()
             })
             .unwrap_or_default();
+        let config_diagnostic = (value
+            .get("origin")
+            .and_then(Value::as_str)
+            .and_then(FailureOrigin::parse)
+            == Some(FailureOrigin::Swarm)
+            && value.get("where").and_then(Value::as_str)
+                == Some(crate::startup::CONFIG_STARTUP_LOCATION))
+        .then(|| {
+            value
+                .get("origin_evidence")
+                .and_then(Value::as_str)
+                .and_then(validated_config_startup_diagnostic)
+        })
+        .flatten();
         failures.push(DaemonStartupFailure {
             error_code,
             ts_ms,
             diagnostics,
+            config_diagnostic,
         });
     }
     failures
