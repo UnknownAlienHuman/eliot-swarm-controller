@@ -353,6 +353,10 @@ impl WorkspaceGit {
             .prepare_workspace_command(
                 &source.root,
                 &[
+                    "-c",
+                    "core.sparseCheckout=false",
+                    "-c",
+                    "index.sparse=false",
                     "worktree",
                     "add",
                     "--no-guess-remote",
@@ -465,7 +469,26 @@ impl WorkspaceGit {
                 "created workspace HEAD differs from the frozen base",
             ));
         }
-        self.require_clean(&subject, true, deadline).await?;
+        let status = self
+            .read(
+                &subject.target.root,
+                &[
+                    "status",
+                    "--porcelain=v2",
+                    "--untracked-files=all",
+                    "--ignored=matching",
+                    "--ignore-submodules=none",
+                    "-z",
+                ],
+                deadline,
+            )
+            .await?;
+        if !status.is_empty() {
+            return Err(problem(
+                "dirty",
+                "created workspace has tracked, untracked, or ignored changes",
+            ));
+        }
         self.confirm_subject(preparation, &subject, deadline)
             .await?;
         Ok(WorkspaceCreationOutcome::Verified {

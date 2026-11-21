@@ -327,9 +327,9 @@ Flow:
 
 1. create/retain the Agent projection and workspace row for `target_generation` with
    phase `creating`;
-2. run `git worktree add` against frozen OID;
-3. read back exact path, branch and HEAD; then set `phase=setup_ready`,
-   `setup_index=0`;
+2. run `git worktree add` against the frozen OID with sparse checkout disabled;
+3. verify the exact path, branch, frozen HEAD and empty porcelain status
+   including untracked and ignored paths. Set `phase=setup_ready`, `setup_index=0`;
 4. before setup entry `i` starts, commit `phase=setup_running`, `setup_index=i` and its
    frozen argv/file identity; only then spawn it in
    `workspace:<agent>#<target_generation>` custody;
