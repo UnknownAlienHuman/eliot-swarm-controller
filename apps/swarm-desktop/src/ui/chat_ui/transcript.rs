@@ -229,9 +229,12 @@ impl DesktopApp {
                                         "Your answer is needed"
                                     })
                                     .foreground(on),
+                                    // The title carries the attention tone;
+                                    // the request itself (often a long
+                                    // command or edit) reads in the body color.
                                     TextBlock::new()
                                         .text(request.summary.clone())
-                                        .foreground(on)
+                                        .foreground(palette.text())
                                         .text_wrapping(TextWrapping::Wrap)
                                         .is_text_selection_enabled(true),
                                     answer_box,

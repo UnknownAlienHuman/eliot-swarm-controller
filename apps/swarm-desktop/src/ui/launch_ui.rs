@@ -337,7 +337,7 @@ impl LaunchState {
     pub(super) fn auto_detail(&self) -> String {
         match &self.preview {
             Some(Ok(decision)) => {
-                let (headline, _) = crate::settings_model::decision_lines(decision);
+                let (headline, skipped) = crate::settings_model::decision_lines(decision);
                 match decision.profile.as_deref() {
                     Some(profile) => format!(
                         "Swarm picks {profile}: {}",
@@ -346,7 +346,8 @@ impl LaunchState {
                             .and_then(|rest| rest.split_once(": ").map(|(_, why)| why))
                             .unwrap_or(&headline)
                     ),
-                    None => format!("Swarm has no preset to pick: {headline}"),
+                    None if skipped.is_empty() => headline,
+                    None => format!("{headline} ({})", skipped.join("; ")),
                 }
             }
             Some(Err(error)) => format!("Swarm's pick is unavailable: {error}"),

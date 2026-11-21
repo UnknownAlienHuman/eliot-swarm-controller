@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 69;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 70;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -1623,6 +1623,20 @@ impl Store {
             tx.execute_batch(
                 "ALTER TABLE manager_budgets ADD COLUMN paused INTEGER NOT NULL DEFAULT 0;
                  INSERT INTO schema_migrations(version) VALUES (69);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 70 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            // The code that skipped or rejected a timer's last scheduled
+            // slot; NULL once a slot admits its action.
+            tx.execute_batch(
+                "ALTER TABLE timers ADD COLUMN last_outcome TEXT;
+                 INSERT INTO schema_migrations(version) VALUES (70);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;

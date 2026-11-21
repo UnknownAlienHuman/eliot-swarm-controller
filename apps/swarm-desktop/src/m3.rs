@@ -182,23 +182,54 @@ pub fn card_high(palette: Palette) -> Border {
     card(palette).background(palette.container())
 }
 
-/// The status dot of an Agent state in a list; empty for states that need
-/// no mark.
+/// The status mark of an Agent state in a list; empty for states that need
+/// no mark (ready, ended), so a calm list shows none.
 pub fn list_dot(palette: Palette, state: eliot_core::AgentState) -> View {
-    match palette.dot(StatusTone::of_state(state)) {
-        Some(fill) => dot(fill),
+    let tone = StatusTone::of_state(state);
+    match palette.dot(tone) {
+        Some(_) => status_mark(palette, tone, layout::DOT),
         None => View::empty(),
     }
 }
 
-/// An 8-DIP status dot.
-pub fn dot(fill: Brush) -> View {
-    Ellipse::new()
-        .fill(fill)
-        .width(layout::DOT)
-        .height(layout::DOT)
-        .vertical_alignment(VerticalAlignment::Center)
-        .into()
+/// A status mark of `size` DIPs whose shape tells states apart within the
+/// theme's two status colors: a filled circle for working (accent), needs
+/// you (attention) and ready (outline grey); a ring for starting (accent),
+/// ended (grey) and an unconfirmed outcome (attention); a rounded square
+/// for failed or lost (attention), so a failure never reads as a question.
+pub fn status_mark(palette: Palette, tone: StatusTone, size: f64) -> View {
+    let circle = |fill: Brush| -> View {
+        Ellipse::new()
+            .fill(fill)
+            .width(size)
+            .height(size)
+            .vertical_alignment(VerticalAlignment::Center)
+            .into()
+    };
+    let ring = |stroke: Brush| -> View {
+        Ellipse::new()
+            .stroke(stroke)
+            .stroke_thickness(1.5)
+            .width(size)
+            .height(size)
+            .vertical_alignment(VerticalAlignment::Center)
+            .into()
+    };
+    match tone {
+        StatusTone::Active => circle(palette.primary()),
+        StatusTone::Attention => circle(palette.attention()),
+        StatusTone::Ready => circle(palette.border()),
+        StatusTone::Pending => ring(palette.primary()),
+        StatusTone::Neutral => ring(palette.border()),
+        StatusTone::Unknown => ring(palette.attention()),
+        StatusTone::Failed => Border::new()
+            .background(palette.attention())
+            .corner_radius(2.0)
+            .width(size)
+            .height(size)
+            .vertical_alignment(VerticalAlignment::Center)
+            .into(),
+    }
 }
 
 /// A system icon of `size` DIPs; it takes the foreground of the control
@@ -868,11 +899,7 @@ pub fn status_pill(palette: Palette, tone: StatusTone, label: &str, label_width:
                 .orientation(Orientation::Horizontal)
                 .spacing(6.0)
                 .children((
-                    Ellipse::new()
-                        .fill(palette.header_dot(tone))
-                        .width(layout::BADGE_DOT)
-                        .height(layout::BADGE_DOT)
-                        .vertical_alignment(VerticalAlignment::Center),
+                    status_mark(palette, tone, layout::BADGE_DOT),
                     text(label.to_owned(), style::CAPTION)
                         .foreground(on)
                         .vertical_alignment(VerticalAlignment::Center)

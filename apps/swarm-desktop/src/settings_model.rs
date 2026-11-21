@@ -694,9 +694,9 @@ pub fn decision_lines(decision: &RoutingDecision) -> (String, Vec<String>) {
             format!("Routing picks {profile}{role}: {}{quota}", decision.reason)
         }
         None if decision.skipped.is_empty() => {
-            format!("No profile is set{role}; add one in Settings, Routing")
+            format!("No model is set{role}; add one in Settings › Routing")
         }
-        None => format!("No profile is available{role}"),
+        None => format!("No model can take this task now{role}"),
     };
     let skipped = decision
         .skipped
@@ -706,7 +706,8 @@ pub fn decision_lines(decision: &RoutingDecision) -> (String, Vec<String>) {
     (headline, skipped)
 }
 
-/// A refused launch in words: a routing miss lists its skipped candidates.
+/// A refused launch in words: a routing miss lists its skipped candidates
+/// and says what the Owner can do.
 pub fn launch_error(error: &eliot_core::Error) -> String {
     let decision = error
         .routing
@@ -716,10 +717,11 @@ pub fn launch_error(error: &eliot_core::Error) -> String {
     match decision {
         Some(decision) if error.code == "routing_unavailable" => {
             let (headline, skipped) = decision_lines(&decision);
-            let mut text = format!("routing_unavailable: {headline}");
+            let mut text = headline;
             if !skipped.is_empty() {
                 text.push_str(&format!(" ({})", skipped.join("; ")));
             }
+            text.push_str(". Pick a model in the list, or change Settings › Routing.");
             text
         }
         _ => error.to_string(),

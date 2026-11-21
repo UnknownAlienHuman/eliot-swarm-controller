@@ -120,6 +120,9 @@ pub mod layout {
     pub const SIDEBAR_PADDING: f64 = 12.0;
     /// The Monitor and Details pane.
     pub const PANEL_WIDTH: f64 = 320.0;
+    /// The narrowest the task area gets beside the full sidebar; a smaller
+    /// window folds the sidebar to its rail.
+    pub const MAIN_MIN_WIDTH: f64 = 480.0;
     /// The conversation's column and its composer.
     pub const READING_WIDTH: f64 = 720.0;
     /// The home screen's composer and suggestions.

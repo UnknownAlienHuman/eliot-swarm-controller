@@ -1526,10 +1526,22 @@ impl DesktopApp {
         self.window_width.map(|width| width - side - panel)
     }
 
-    /// Tasks hide the sidebar to its rail; Settings always shows its
-    /// navigation.
+    /// Tasks hide the sidebar to its rail, by choice or when the window is
+    /// too narrow to keep the task area at its minimum beside the sidebar
+    /// (and the open panel); Settings always shows its navigation.
     fn rail_shown(&self) -> bool {
-        self.nav.sidebar_collapsed && self.main != Main::Settings && !self.startup_error
+        if self.main == Main::Settings || self.startup_error {
+            return false;
+        }
+        let panel = if self.panel_shown() {
+            tokens::layout::PANEL_WIDTH
+        } else {
+            0.0
+        };
+        self.nav.sidebar_collapsed
+            || self.window_width.is_some_and(|width| {
+                width - tokens::layout::SIDEBAR_WIDTH - panel < tokens::layout::MAIN_MIN_WIDTH
+            })
     }
 
     /// The right panel belongs to the conversation: Settings shows two
@@ -2093,15 +2105,13 @@ impl DesktopApp {
             None
         };
         // The dot sits on the button's corner, clear of the icon.
-        let dot: View = tone
-            .and_then(|tone| palette.dot(tone))
-            .map_or_else(View::empty, |fill| {
-                Border::new()
-                    .horizontal_alignment(HorizontalAlignment::Right)
-                    .vertical_alignment(VerticalAlignment::Top)
-                    .margin(Thickness::new(0.0, 2.0, 2.0, 0.0))
-                    .content(m3::dot(fill))
-            });
+        let dot: View = tone.map_or_else(View::empty, |tone| {
+            Border::new()
+                .horizontal_alignment(HorizontalAlignment::Right)
+                .vertical_alignment(VerticalAlignment::Top)
+                .margin(Thickness::new(0.0, 2.0, 2.0, 0.0))
+                .content(m3::status_mark(palette, tone, tokens::layout::DOT))
+        });
         let button = |glyph: &str, name: String, message: Message| {
             m3::icon_button(palette)
                 .height(tokens::height::CONTROL)

@@ -433,7 +433,10 @@ the original choice.
 
 Queue assignment is configured in the unified settings file and runs through the existing
 timer and ordinary `launch` path. Each firing reads the next bounded `.md` brief by
-filename and emits one routing-aware launch. `max_busy` counts unresolved launches,
+filename and emits one routing-aware launch. In a `worktree`-mode project that launch
+gets the standard managed worktree an interactive top-level launch would get, frozen by
+the daemon and prepared by Store in the launch admission; a rule cannot name a worktree
+or base itself. `max_busy` counts unresolved launches,
 linked initial sends and live Agents; an unknown command holds its slot. Store advances
 the filename cursor only in the transaction that admits the durable launch command.
 An unknown launch is never rerouted or replayed. No brief is moved or marked started in
@@ -460,6 +463,10 @@ brief. Each brief is
 limited to the ordinary 64 KiB launch-text bound. Unsafe, oversized or invalid UTF-8
 briefs fail the slot visibly. An unreadable or missing briefs folder fails only that
 assignment's slot with its code. A slot with no next brief advances to the next interval.
+Every scheduled timer slot that is skipped or rejected (no next brief is `not_found`, a
+routing miss is `routing_unavailable`) commits that code as the timer's `last_outcome`
+with the slot, and an admitted slot clears it, so timer reads show why the last check
+started nothing. A manual run changes neither `last_outcome` nor `last_key`.
 A capacity, provider, workspace or transfer wait keeps the due slot and its brief cursor.
 Settings generate a global interval timer
 rule and an ordinary completion rule. Before admitting cleanup, Store verifies that

@@ -67,6 +67,11 @@ pub struct TimerStateView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_due_at: Option<i64>,
     pub enabled: bool,
+    /// The code that skipped or rejected the last scheduled slot (for an
+    /// assignment, `not_found` means no new brief); absent once a slot admits
+    /// its action. A manual run changes neither this nor `last_key`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_outcome: Option<String>,
 }
 
 impl TimerStateView {
@@ -74,6 +79,9 @@ impl TimerStateView {
         validate_nonempty(&self.id, "timer id")?;
         if let Some(project) = &self.project {
             validate_nonempty(project, "project id")?;
+        }
+        if let Some(code) = &self.last_outcome {
+            validate_nonempty(code, "timer last_outcome")?;
         }
         if self.schedule_revision < 0 {
             return Err(Error::new(

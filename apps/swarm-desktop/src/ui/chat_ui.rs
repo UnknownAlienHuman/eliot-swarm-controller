@@ -1151,7 +1151,7 @@ impl DesktopApp {
                     .is_some_and(|offer| &offer.alert == text)
                 {
                     m3::text_button(palette)
-                        .grid_column(1)
+                        .grid_column(2)
                         .is_enabled(!self.submitting())
                         .automation_name("Queue it")
                         .on_click(context.message(Message::Launch(LaunchMsg::QueueRequested)))
@@ -1165,7 +1165,12 @@ impl DesktopApp {
                     .max_width(tokens::layout::READING_WIDTH)
                     .horizontal_alignment(HorizontalAlignment::Center)
                     .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
-                    .background(palette.tonal())
+                    // Alerts are refusals, uncertain outcomes and failed
+                    // reads: the attention surface and mark, the text in
+                    // the body color so it stays easy to read.
+                    .background(palette.attention_container())
+                    .border_brush(palette.attention_outline())
+                    .border_thickness(Thickness::uniform(1.0))
                     .corner_radius(tokens::radius::CONTAINER)
                     .padding(Thickness::new(
                         tokens::spacing::MD,
@@ -1175,16 +1180,30 @@ impl DesktopApp {
                     ))
                     .content(
                         Grid::new()
-                            .columns([GridLength::STAR, GridLength::Auto, GridLength::Auto])
+                            .columns([
+                                GridLength::Auto,
+                                GridLength::STAR,
+                                GridLength::Auto,
+                                GridLength::Auto,
+                            ])
                             .column_spacing(tokens::spacing::SM)
                             .children((
+                                Border::new()
+                                    .vertical_alignment(VerticalAlignment::Center)
+                                    .content(m3::status_mark(
+                                        palette,
+                                        crate::theme::StatusTone::Attention,
+                                        tokens::layout::DOT,
+                                    )),
                                 m3::body(text.clone())
+                                    .grid_column(1)
+                                    .foreground(palette.text())
                                     .vertical_alignment(VerticalAlignment::Center)
                                     .text_wrapping(TextWrapping::Wrap)
                                     .is_text_selection_enabled(true),
                                 queue,
                                 m3::icon_button(palette)
-                                    .grid_column(2)
+                                    .grid_column(3)
                                     .automation_name("Dismiss")
                                     .on_click(
                                         context.message(Message::Shell(ShellMsg::AlertDismissed)),
