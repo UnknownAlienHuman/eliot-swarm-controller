@@ -10,6 +10,9 @@ use tokio::time::timeout;
 
 mod projects;
 
+const CLEANUP_BACKFILL_PAGE: usize = 8;
+const CLEANUP_PLAN_MAX_PREFLIGHT: std::time::Duration = std::time::Duration::from_secs(15);
+
 fn encoded(value: impl serde::Serialize) -> Result<Value> {
     serde_json::to_value(value)
         .map_err(|_| Error::new("internal", "cleanup response cannot encode"))
@@ -573,6 +576,8 @@ impl Router {
         params: &Value,
         principal: &Principal,
     ) -> Result<Value> {
+        let call_deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_secs(25);
         let request: CleanupPlanRequest = coordination::decode_coordination_request(
             params,
             &self.inner.secrets,
@@ -580,7 +585,7 @@ impl Router {
             CleanupPlanRequest::validate,
         )?;
         let name = principal_name(principal);
-        let continued = request
+        let mut page = request
             .continuation
             .as_deref()
             .map(PlanContinuation::decode)
@@ -594,59 +599,119 @@ impl Router {
                 safe_ids: None,
                 kept_ids: None,
                 backfill_after: None,
+                inventory_rank: None,
+                inventory_seq_after: None,
+                request_binding: None,
             });
-        // Backfill only facts already retained by Swarm, not arbitrary files.
-        // Every page resumes after the previous backfill position instead of
-        // restarting from the first row, so a persistently capped fleet
-        // still terminates instead of repeating the same empty page.
-        let (agents, agents_truncated) = self
-            .inner
-            .store
-            .lock()
-            .await
-            .list_agents(continued.backfill_after.as_deref(), 1000)?;
-        let mut inventory_incomplete = agents_truncated || agents.len() == 1000;
-        let mut backfill_after = continued.backfill_after.clone();
-        for agent in &agents {
-            backfill_after = Some(agent.id.clone());
-            if request
-                .project
-                .as_ref()
-                .is_some_and(|p| p != &agent.project)
-            {
-                continue;
-            }
-            let allowed = self
-                .inner
-                .store
-                .lock()
-                .await
-                .cleanup_visible_agent(&name, agent)?;
-            if allowed {
-                inventory_incomplete |= self.record_agent_artifacts(agent).await.is_err();
-            }
-        }
-        if !inventory_incomplete {
-            backfill_after = None;
-        }
-        // The Store pages the final candidate order once: ordinary rows,
-        // then worktrees, then branches and native sessions, each oldest
-        // insertion first. The router never re-sorts; it only merges the
-        // ephemeral project rows around the pinned artifact page.
-        let (artifacts, artifacts_truncated, snapshot_seq) = self
-            .inner
-            .store
-            .lock()
-            .await
-            .cleanup_inventory(&name, &request)?;
-        let page = continued;
         let mut plan = CleanupPlan {
             plan_id: ulid::Ulid::new().to_string(),
             created_at: now_ms(),
             items: Vec::new(),
-            truncated: artifacts_truncated || inventory_incomplete,
+            truncated: false,
             continuation: None,
         };
+        let binding = cleanup_plan_request_binding(&name, &request)?;
+        if page
+            .request_binding
+            .as_deref()
+            .is_some_and(|saved| saved != binding.as_str())
+        {
+            return Err(Error::new("invalid", "cleanup continuation is stale"));
+        }
+        if page.snapshot_seq.is_none() {
+            // Backfill one bounded Agent page, then return. Candidate
+            // preflights never share an RPC with this work.
+            let (agents, agents_truncated) = self
+                .inner
+                .store
+                .lock()
+                .await
+                .list_agents(page.backfill_after.as_deref(), CLEANUP_BACKFILL_PAGE)?;
+            let mut eligible_agents = Vec::new();
+            for (index, agent) in agents.iter().enumerate() {
+                if request
+                    .project
+                    .as_ref()
+                    .is_some_and(|project| project != &agent.project)
+                {
+                    continue;
+                }
+                if self
+                    .inner
+                    .store
+                    .lock()
+                    .await
+                    .cleanup_visible_agent(&name, agent)?
+                {
+                    eligible_agents.push(index);
+                }
+            }
+            let router = self;
+            let agents_ref = &agents;
+            let _backfill_results = futures_util::future::join_all(
+                eligible_agents.into_iter().map(|index| async move {
+                    (index, router.record_agent_artifacts(&agents_ref[index]).await)
+                }),
+            )
+            .await;
+            // Record failures are handled conservatively by retaining known
+            // ledger rows; do not strand fleet traversal on one unavailable
+            // checkout.
+            let backfill_after = agents
+                .last()
+                .map(|agent| agent.id.clone())
+                .or_else(|| page.backfill_after.clone());
+            let backfill_more =
+                agents_truncated || agents.len() == CLEANUP_BACKFILL_PAGE;
+            if backfill_more {
+                plan.truncated = true;
+                plan.continuation = Some(
+                    PlanContinuation {
+                        artifact_after: None,
+                        safe_skipped: 0,
+                        kept_skipped: 0,
+                        regs_revision: None,
+                        snapshot_seq: None,
+                        safe_ids: None,
+                        kept_ids: None,
+                        backfill_after,
+                        inventory_rank: None,
+                        inventory_seq_after: None,
+                        request_binding: Some(binding),
+                    }
+                    .encode()?,
+                );
+                return encoded(plan);
+            }
+
+            // Freeze the artifact snapshot only after every Agent was
+            // backfilled. A zero-item Store scan still records cursor
+            // progress through an empty or filtered page.
+            let (_, _, snapshot_seq, inventory_rank, inventory_seq_after) = self
+                .inner
+                .store
+                .lock()
+                .await
+                .cleanup_inventory(&name, &request, &page, 0)?;
+            plan.truncated = true;
+            plan.continuation = Some(
+                PlanContinuation {
+                    artifact_after: None,
+                    safe_skipped: 0,
+                    kept_skipped: 0,
+                    regs_revision: None,
+                    snapshot_seq: Some(snapshot_seq),
+                    safe_ids: None,
+                    kept_ids: None,
+                    backfill_after: None,
+                    inventory_rank: Some(inventory_rank),
+                    inventory_seq_after,
+                    request_binding: Some(binding),
+                }
+                .encode()?,
+            );
+            return encoded(plan);
+        }
         let (safe_projects, kept_projects, regs_revision): (Vec<_>, Vec<_>, Option<String>) =
             if matches!(principal, Principal::Owner) {
                 let (registrations, revision) = self.plan_project_registrations(&request).await?;
@@ -711,12 +776,17 @@ impl Router {
         {
             shown_safe.push(item);
         }
+        let artifact_limit = MAX_CLEANUP_ITEMS - shown_safe.len();
+        let (artifacts, artifacts_truncated, snapshot_seq, next_inventory_rank, next_inventory_seq) =
+            self.inner
+                .store
+                .lock()
+                .await
+                .cleanup_inventory(&name, &request, &page, artifact_limit)?;
+        plan.truncated = artifacts_truncated;
         let artifacts_total = artifacts.len();
         let mut middle = Vec::new();
-        for artifact in artifacts
-            .into_iter()
-            .take(MAX_CLEANUP_ITEMS - shown_safe.len())
-        {
+        for artifact in artifacts {
             let mut candidate = CleanupCandidate {
                 artifact,
                 bytes: None,
@@ -726,6 +796,11 @@ impl Router {
             if candidate.artifact.state != "registered" {
                 candidate.reason = candidate.artifact.state.clone();
             } else if candidate.artifact.kind == ArtifactKind::Worktree {
+                if call_deadline.saturating_duration_since(tokio::time::Instant::now())
+                    < CLEANUP_PLAN_MAX_PREFLIGHT
+                {
+                    break;
+                }
                 self.classify_worktree(&mut candidate).await;
             } else if candidate.artifact.kind == ArtifactKind::Branch {
                 let Some(git) = candidate.artifact.git.as_ref() else {
@@ -733,6 +808,11 @@ impl Router {
                     middle.push(candidate);
                     continue;
                 };
+                if call_deadline.saturating_duration_since(tokio::time::Instant::now())
+                    < CLEANUP_PLAN_MAX_PREFLIGHT
+                {
+                    break;
+                }
                 if !self
                     .inner
                     .store
@@ -745,7 +825,11 @@ impl Router {
                     continue;
                 }
                 match self
-                    .cleanup_branch_classification(&candidate.artifact, git)
+                    .cleanup_branch_classification_with_deadline(
+                        &candidate.artifact,
+                        git,
+                        std::time::Instant::now() + CLEANUP_PLAN_MAX_PREFLIGHT,
+                    )
                     .await
                 {
                     Ok(classification) => {
@@ -791,6 +875,11 @@ impl Router {
                 .await
                 .cleanup_agent_quiescent(&candidate.artifact)?
             {
+                if call_deadline.saturating_duration_since(tokio::time::Instant::now())
+                    < CLEANUP_PLAN_MAX_PREFLIGHT
+                {
+                    break;
+                }
                 match self.cleanup_preflight(&candidate.artifact).await {
                     Ok(bytes) => {
                         candidate.verdict = "safe".to_owned();
@@ -811,7 +900,7 @@ impl Router {
         // Store reported no truncation of its own.
         plan.truncated |= artifact_listing_truncated(
             artifacts_truncated,
-            inventory_incomplete,
+            false,
             artifacts_total,
             middle_len,
             safe_total,
@@ -833,6 +922,7 @@ impl Router {
                 .find(|item| item.artifact.kind != ArtifactKind::ProjectRegistration)
                 .map(|item| item.artifact.id.clone())
                 .or(page.artifact_after);
+            let keep_scan_cursor = artifacts_total == 0 || middle_len == artifacts_total;
             plan.continuation = Some(
                 PlanContinuation {
                     artifact_after: last_artifact,
@@ -842,16 +932,25 @@ impl Router {
                     snapshot_seq: Some(snapshot_seq),
                     safe_ids,
                     kept_ids,
-                    backfill_after,
+                    backfill_after: None,
+                    inventory_rank: keep_scan_cursor.then_some(next_inventory_rank),
+                    inventory_seq_after: if keep_scan_cursor {
+                        next_inventory_seq
+                    } else {
+                        None
+                    },
+                    request_binding: Some(binding),
                 }
                 .encode()?,
             );
         }
-        self.inner
-            .store
-            .lock()
-            .await
-            .retain_cleanup_plan(&name, &plan, now_ms())?;
+        if !plan.items.is_empty() {
+            self.inner
+                .store
+                .lock()
+                .await
+                .retain_cleanup_plan(&name, &plan, now_ms())?;
+        }
         encoded(plan)
     }
 
@@ -1383,6 +1482,20 @@ impl Router {
         artifact: &ArtifactView,
         git: &CleanupGitBinding,
     ) -> Result<BranchClassification> {
+        self.cleanup_branch_classification_with_deadline(
+            artifact,
+            git,
+            std::time::Instant::now() + Duration::from_secs(60),
+        )
+        .await
+    }
+
+    async fn cleanup_branch_classification_with_deadline(
+        &self,
+        artifact: &ArtifactView,
+        git: &CleanupGitBinding,
+        deadline: std::time::Instant,
+    ) -> Result<BranchClassification> {
         let workspace = self
             .inner
             .store
@@ -1399,7 +1512,7 @@ impl Router {
                 "the retained worktree still uses this branch",
             ));
         }
-        Self::classify_branch(&self.inner.data_root, git).await
+        Self::classify_branch(&self.inner.data_root, git, deadline).await
     }
 
     /// Fetch the branch upstream and classify the local branch. `safe` means
@@ -1410,6 +1523,7 @@ impl Router {
     async fn classify_branch(
         data_root: &Path,
         git: &CleanupGitBinding,
+        deadline: std::time::Instant,
     ) -> Result<BranchClassification> {
         use crate::git_actions::{CleanupTransportOp, run_cleanup_transport};
         if !crate::git_actions::valid_cleanup_branch(&git.branch) {
@@ -1420,7 +1534,6 @@ impl Router {
         }
         let repo = Path::new(&git.common);
         let probe = crate::git_monitor::GitProbe::new()?;
-        let deadline = Instant::now() + Duration::from_secs(60);
         let branch_ref = format!("refs/heads/{}", git.branch);
         let remote = Self::branch_upstream_remote(&probe, repo, &branch_ref, deadline).await?;
         let url = Self::branch_remote_url(&probe, repo, &remote, deadline).await?;
@@ -1913,6 +2026,24 @@ fn project_ids(candidates: &[CleanupCandidate]) -> Vec<String> {
         .iter()
         .map(|item| item.artifact.project.clone())
         .collect()
+}
+
+fn cleanup_plan_request_binding(principal: &str, request: &CleanupPlanRequest) -> Result<String> {
+    let value = json!({
+        "principal": principal,
+        "scope": request.scope,
+        "project": request.project.as_deref(),
+        "older_than": request.older_than,
+    });
+    let digest = eliot_core::canonical_json_sha256(&value)
+        .map_err(|_| Error::new("internal", "cleanup request binding could not encode"))?;
+    let mut binding = String::with_capacity(64);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in digest {
+        binding.push(HEX[(byte >> 4) as usize] as char);
+        binding.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    Ok(binding)
 }
 
 /// Whether a continued page may reuse its offsets: the settings revision

@@ -109,11 +109,13 @@ pub struct CleanupPlanRequest {
     #[serde(default)]
     pub older_than: Option<i64>,
     /// Opaque continuation token from a previous `cleanup.plan` response.
-    /// It encodes the artifact cursor, the consumed registration offsets,
-    /// the settings revision those offsets were computed against, and the
-    /// ledger snapshot the pages are pinned to. Filters still come from the
-    /// request: keep them stable across pages.
-    #[serde(default)]
+    /// It encodes the displayed-artifact cursor, bounded inventory cursor,
+    /// consumed registration offsets and pinned snapshots. New tokens bind
+    /// the caller and filters; older JSON-text tokens and continuation
+    /// objects remain accepted on input.
+    #[serde(default, deserialize_with = "deserialize_cleanup_continuation")]
+    #[schemars(description = "Opaque cleanup continuation string. Legacy JSON text or a continuation object is accepted on input.")]
+    #[schemars(with = "Option<CleanupContinuationInputSchema>")]
     pub continuation: Option<String>,
 }
 impl CleanupPlanRequest {
@@ -141,10 +143,11 @@ impl CleanupPlanRequest {
 
 /// Explicit paging state for one `cleanup.plan` listing, serialized as an
 /// opaque token in the plan response and echoed back in the next request.
-/// The artifact cursor always resolves against the pinned ledger snapshot,
-/// so concurrent registrations can neither skip nor repeat candidates, and
-/// registration offsets skip already-emitted project rows whose ids are
-/// minted fresh on every plan.
+/// The artifact cursor records the last displayed row for legacy callers.
+/// New tokens also carry a bounded raw-row rank/sequence cursor, including
+/// progress through empty pages. The pinned ledger snapshot excludes later
+/// registrations, while project offsets skip rows whose ids are minted fresh
+/// on every plan.
 #[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlanContinuation {
@@ -180,24 +183,136 @@ pub struct PlanContinuation {
     /// of returning the same empty page and token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backfill_after: Option<String>,
+    /// Rank and ledger sequence reached by the bounded Store inventory scan.
+    /// This advances through empty/filtered pages without changing the
+    /// displayed-artifact cursor above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory_rank: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory_seq_after: Option<i64>,
+    /// Binds new continuations to the caller and stable request filters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_binding: Option<String>,
 }
+
+#[derive(schemars::JsonSchema)]
+#[schemars(untagged)]
+#[doc(hidden)]
+pub enum CleanupContinuationInputSchema {
+    Token(String),
+    State(PlanContinuation),
+}
+
 impl PlanContinuation {
     pub fn encode(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|_| Error::new("internal", "cleanup continuation could not encode"))
+        self.validate_fields()?;
+        let payload = serde_json::to_vec(self)
+            .map_err(|_| Error::new("internal", "cleanup continuation could not encode"))?;
+        let mut token = String::with_capacity(3 + payload.len() * 2);
+        token.push_str("c1_");
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for byte in payload {
+            token.push(HEX[(byte >> 4) as usize] as char);
+            token.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        Ok(token)
     }
     pub fn decode(text: &str) -> Result<Self> {
-        let parsed: PlanContinuation = serde_json::from_str(text)
-            .map_err(|_| Error::new("invalid", "cleanup continuation is invalid"))?;
-        if parsed
+        let parsed = if let Some(encoded) = text.strip_prefix("c1_") {
+            if encoded.is_empty() || encoded.len() % 2 != 0 {
+                return Err(Error::new("invalid", "cleanup continuation is invalid"));
+            }
+            let mut payload = Vec::with_capacity(encoded.len() / 2);
+            for pair in encoded.as_bytes().chunks_exact(2) {
+                let high = cleanup_hex_value(pair[0])
+                    .ok_or_else(|| Error::new("invalid", "cleanup continuation is invalid"))?;
+                let low = cleanup_hex_value(pair[1])
+                    .ok_or_else(|| Error::new("invalid", "cleanup continuation is invalid"))?;
+                payload.push((high << 4) | low);
+            }
+            let parsed: PlanContinuation = serde_json::from_slice(&payload)
+                .map_err(|_| Error::new("invalid", "cleanup continuation is invalid"))?;
+            if parsed.encode()?.as_str() != text {
+                return Err(Error::new("invalid", "cleanup continuation is invalid"));
+            }
+            parsed
+        } else {
+            // Older releases emitted the continuation state as JSON text.
+            // Some shells copied the JSON string quotes from the enclosing
+            // response as well, so accept that representation too.
+            serde_json::from_str::<PlanContinuation>(text)
+                .or_else(|_| {
+                    serde_json::from_str::<String>(text)
+                        .and_then(|unquoted| serde_json::from_str::<PlanContinuation>(&unquoted))
+                })
+                .map_err(|_| Error::new("invalid", "cleanup continuation is invalid"))?
+        };
+        parsed.validate_fields()?;
+        Ok(parsed)
+    }
+
+    fn validate_fields(&self) -> Result<()> {
+        if self
             .artifact_after
             .as_deref()
             .is_some_and(|id| cleanup_id(id).is_err())
+            || self
+                .backfill_after
+                .as_deref()
+                .is_some_and(|id| crate::parse_agent_id(id).is_err())
+            || self.snapshot_seq.is_some_and(|seq| seq < 0)
+            || self.inventory_rank.is_some_and(|rank| rank > 3)
+            || (self.inventory_rank.is_none() && self.inventory_seq_after.is_some())
+            || self.inventory_seq_after.is_some_and(|seq| seq <= 0)
+            || (self.inventory_rank == Some(3) && self.inventory_seq_after.is_some())
+            || (self.snapshot_seq.is_none()
+                && (self.inventory_rank.is_some() || self.inventory_seq_after.is_some()))
+            || self
+                .request_binding
+                .as_deref()
+                .is_some_and(|binding| {
+                    binding.len() != 64
+                        || binding
+                            .bytes()
+                            .any(|byte| cleanup_hex_value(byte).is_none())
+                })
         {
             return Err(Error::new("invalid", "cleanup continuation is invalid"));
         }
-        Ok(parsed)
+        Ok(())
     }
+}
+
+fn cleanup_hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
+fn deserialize_cleanup_continuation<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let token = match value {
+        None => return Ok(None),
+        Some(serde_json::Value::String(text)) => {
+            PlanContinuation::decode(&text)
+                .and_then(|state| state.encode())
+                .map_err(serde::de::Error::custom)?
+        }
+        Some(value @ serde_json::Value::Object(_)) => {
+            let state: PlanContinuation =
+                serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+            state.encode().map_err(serde::de::Error::custom)?
+        }
+        Some(_) => return Err(serde::de::Error::custom("invalid cleanup continuation")),
+    };
+    Ok(Some(token))
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]

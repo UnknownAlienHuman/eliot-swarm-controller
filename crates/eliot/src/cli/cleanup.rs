@@ -18,6 +18,11 @@ pub(crate) async fn run_cleanup(
             older_than,
             continuation,
         } => {
+            let continuation = continuation
+                .as_deref()
+                .map(|token| PlanContinuation::decode(token).and_then(|page| page.encode()))
+                .transpose()
+                .map_err(Failure::for_read)?;
             let request = CleanupPlanRequest {
                 scope: match scope.as_str() {
                     "all" => CleanupScope::All,

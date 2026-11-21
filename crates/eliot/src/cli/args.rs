@@ -204,8 +204,9 @@ pub(crate) enum CleanupCommand {
         #[arg(long)]
         older_than: Option<i64>,
         /// Continue a truncated listing with the opaque token from the
-        /// previous plan response.
-        #[arg(long)]
+        /// previous plan response. Legacy JSON text and continuation
+        /// objects are accepted; the emitted token is PowerShell-safe.
+        #[arg(long, help = "Opaque token from the previous cleanup plan (PowerShell-safe)")]
         continuation: Option<String>,
     },
     Apply {
