@@ -825,6 +825,8 @@ also requires resolved custody, so an open `observe` source blocks it.
 A failed guard returns typed `busy` and names the blocking Agent and its state,
 request, command, turn, process, source or artifact. Archive stops nothing and
 preserves retained unknown evidence.
+The desktop offers Archive and Unarchive in the task row and header menus.
+Show archived in the sidebar includes archived tasks in the list.
 Unarchive applies the same state, turn, request and command guards and skips
 the custody check. The flag is durable. Admission of send, resume, steer or inject
 atomically unarchives its target, including selector members, so new activity appears in
@@ -855,11 +857,17 @@ turn still blocks deletion after stop; the ended-observation evidence retires wi
 tree instead. Delete removes the tree's turns and events without resolving them: no
 resolution is recorded and no `turn.resolved` event is emitted. Live custody, open
 commands, uncertain turns, active or uncertain cleanup attempts, or a pinned history
-floor return `busy`; oversized operations return `unavailable` atomically. An unapplied
-[cleanup review](coordination.md#registered-artifacts-and-cleanup-k69) is superseded for
-the deleted tree's items. Delete never stops an Agent or deletes workspace files,
-native stores or Git branches. Run artifact cleanup separately before removing its
-ownership records. Process records for every generation of the tree are removed;
+floor return `busy`; oversized operations return `unavailable` before cleanup. Before
+removing the records, Delete uses the [cleanup ledger](coordination.md#registered-artifacts-and-cleanup-k69)
+to archive eligible Codex chats, delete eligible OpenCode chats and remove the tree's
+eligible Swarm-created worktrees. It uses the same worktree ownership, clean and merged
+checks as `cleanup.apply`. Ordinary checkouts, Git branches, external sessions and
+Claude Code, Muse and Antigravity chat history stay in place. The desktop confirms
+the scope and offers Delete only for eligible stopped or failed task trees.
+If cleanup is refused or uncertain, Delete keeps the task records. Earlier confirmed
+cleanup in the same request still stands. Uncertain effects are fenced, and an exact
+retry reads the retained outcome. A successful Delete supersedes unapplied cleanup
+reviews for the deleted tree's items. Process records for every generation are removed;
 consumed cleanup plans and their exact apply replay remain retained. A deleted command
 keeps any existing write receipt verbatim, including the receipt for a managed
 `project.assignment.launch`. Delete records a retry tombstone when the command ID has
@@ -876,7 +884,9 @@ Removing a project already uses the settings writer: call
 projects object, then `settings.save {expected_revision:<read revision>,
 sections:{projects:<remaining object>},client:"desktop",dry_run:false}`. This
 unregisters it without deleting its checkout or chats. No `project.remove` alias
-is needed. A later explicit open/launch in that checkout can discover it again.
+is needed. The desktop labels the project menu action **Remove from Swarm** and
+confirms that the checkout stays on disk. A later explicit open/launch in that
+checkout can discover it again.
 
 `agent.list` returns compact summaries ordered by Agent ID by default (`order: "id"`),
 or newest activity first with `order: "recent"` (`updated_at` descending, then numeric

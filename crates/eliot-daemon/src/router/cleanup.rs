@@ -8,6 +8,7 @@ use eliot_core::api::*;
 use std::path::{Component, Path};
 use tokio::time::timeout;
 
+mod delete;
 mod projects;
 
 fn encoded(value: impl serde::Serialize) -> Result<Value> {
@@ -206,7 +207,9 @@ impl Router {
         let mut known = Vec::new();
         if let Some(workspace) = workspace
             && workspace.target_generation == agent.generation
-            && workspace.phase == WorkspacePhase::Ready
+            && (workspace.phase == WorkspacePhase::Ready
+                || workspace.phase == WorkspacePhase::Failed
+                    && std::fs::symlink_metadata(&workspace.worktree_path).is_ok())
         {
             let probe = crate::git_monitor::GitProbe::new()?;
             let admin = probe
@@ -364,21 +367,8 @@ impl Router {
                 });
             }
         }
-        if let (Some(scope), Some(reference)) = (&agent.native_scope, &agent.native_ref) {
-            known.push(ArtifactView {
-                id: ulid::Ulid::new().to_string(),
-                agent: agent.id.clone(),
-                generation: agent.generation,
-                project: agent.project.clone(),
-                tree: Vec::new(),
-                path: format!("native:{scope}:{reference}"),
-                kind: ArtifactKind::NativeSession,
-                purpose: agent.harness.clone(),
-                identity: scope.clone(),
-                created_at: agent.created_at,
-                state: "registered".to_owned(),
-                git: None,
-            });
+        if let Some(session) = native_session_artifact(agent) {
+            known.push(session);
         }
         // Branches outlive their worktree: re-resolve every retained tip
         // through its own binding so the ledger tracks the live branch even
@@ -767,9 +757,7 @@ impl Router {
                     .await
                     .get_agent(&candidate.artifact.agent)?
                     .is_some_and(|agent| swarm_created_session_agent(&agent));
-                if !swarm_created
-                    || !matches!(candidate.artifact.purpose.as_str(), "codex" | "opencode")
-                {
+                if !swarm_created || !native_archive_supported(&candidate.artifact.purpose) {
                     candidate.reason = "no_native_archive".to_owned();
                 } else if !self
                     .inner
@@ -1027,6 +1015,18 @@ impl Router {
             self.apply_project_registrations(&mut store, &request, &plan, &mut response)?;
             (plan, response)
         };
+        self.apply_cleanup_artifacts(&name, &request, &plan, &mut response)
+            .await?;
+        encoded(response)
+    }
+
+    async fn apply_cleanup_artifacts(
+        &self,
+        name: &str,
+        request: &CleanupApplyRequest,
+        plan: &CleanupPlan,
+        response: &mut CleanupApplyResponse,
+    ) -> Result<()> {
         for (index, item) in plan.items.iter().enumerate() {
             if item.artifact.kind == ArtifactKind::ProjectRegistration
                 || item.verdict != "safe"
@@ -1034,7 +1034,7 @@ impl Router {
             {
                 continue;
             }
-            let outcome = match self.cleanup_remove(&name, &item.artifact, &request).await {
+            let outcome = match self.cleanup_remove(name, &item.artifact, request).await {
                 Ok(bytes) => CleanupItemOutcome {
                     artifact_id: item.artifact.id.clone(),
                     outcome: "removed".to_owned(),
@@ -1059,14 +1059,14 @@ impl Router {
             response.bytes_reclaimed += outcome.bytes_reclaimed;
             response.items[index] = outcome.clone();
             self.inner.store.lock().await.settle_cleanup_item(
-                &name,
-                &request,
-                &response,
+                name,
+                request,
+                response,
                 &item.artifact,
                 &outcome,
             )?;
         }
-        encoded(response)
+        Ok(())
     }
 
     async fn cleanup_remove(
@@ -1128,8 +1128,7 @@ impl Router {
                 .await
                 .get_agent(&artifact.agent)?
                 .ok_or_else(|| Error::new("not_found", "Agent absent"))?;
-            if !swarm_created_session_agent(&agent)
-                || !matches!(artifact.purpose.as_str(), "codex" | "opencode")
+            if !swarm_created_session_agent(&agent) || !native_archive_supported(&artifact.purpose)
             {
                 return Err(Error::new(
                     "no_native_archive",
@@ -2019,7 +2018,8 @@ fn frozen_archive_profile(agent: &Agent, artifact: &ArtifactView) -> Result<(Val
         || agent.generation != artifact.generation
         || agent.native_scope.as_deref() != Some(artifact.identity.as_str())
         || agent.native_ref.as_deref() != Some(reference.as_str())
-        || !matches!(agent.harness.as_str(), "codex" | "opencode")
+        || !native_archive_supported(&agent.harness)
+        || artifact.purpose != agent.harness
         || profile["harness"] != agent.harness.as_str()
     {
         return Err(Error::new(
@@ -2060,6 +2060,29 @@ fn frozen_archive_profile(agent: &Agent, artifact: &ArtifactView) -> Result<(Val
 /// observed native children) that belongs to its own producer.
 fn swarm_created_session_agent(agent: &Agent) -> bool {
     !agent.observe_only && matches!(agent.origin, eliot_core::AgentOrigin::Eliot)
+}
+
+fn native_archive_supported(harness: &str) -> bool {
+    matches!(harness, "codex" | "opencode")
+}
+
+fn native_session_artifact(agent: &Agent) -> Option<ArtifactView> {
+    let scope = agent.native_scope.as_ref()?;
+    let reference = agent.native_ref.as_ref()?;
+    Some(ArtifactView {
+        id: ulid::Ulid::new().to_string(),
+        agent: agent.id.clone(),
+        generation: agent.generation,
+        project: agent.project.clone(),
+        tree: Vec::new(),
+        path: format!("native:{scope}:{reference}"),
+        kind: ArtifactKind::NativeSession,
+        purpose: agent.harness.clone(),
+        identity: scope.clone(),
+        created_at: agent.created_at,
+        state: "registered".to_owned(),
+        git: None,
+    })
 }
 
 impl Router {

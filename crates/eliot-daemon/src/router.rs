@@ -521,18 +521,7 @@ impl Router {
                     now_ms(),
                 )
             }
-            "agent.delete" => {
-                require_owner(&principal)?;
-                let request: eliot_core::api::AgentDeleteRequest =
-                    eliot_core::api::discovery::decode_params(params.clone())?;
-                request.validate()?;
-                self.inner.store.lock().await.change_agent_tree(
-                    &request.id,
-                    &request.agent,
-                    None,
-                    now_ms(),
-                )
-            }
+            "agent.delete" => self.agent_delete(&params, &principal).await,
             "agent.list" => self.agent_list(&params, &principal).await,
             "agent.result" => self.agent_result(&params, &principal).await,
             "agent.processes" => self.agent_processes(&params, &principal).await,

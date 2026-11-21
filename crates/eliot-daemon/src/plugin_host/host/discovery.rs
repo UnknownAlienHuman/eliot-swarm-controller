@@ -541,17 +541,10 @@ impl PluginHost {
                 native_scope: opencode.then(|| agent.native_scope.clone()).flatten(),
                 workspace: opencode.then(|| agent.workspace.clone()).flatten(),
             };
+            let request = serde_json::to_value(&request)
+                .map_err(|_| Error::new("invalid", "native.archive params cannot encode"))?;
             archive_dispatched = true;
-            let value = reader
-                .client
-                .call(
-                    "native.archive",
-                    serde_json::to_value(&request).map_err(|_| {
-                        Error::new("invalid", "native.archive params cannot encode")
-                    })?,
-                    until,
-                )
-                .await?;
+            let value = reader.client.call("native.archive", request, until).await?;
             reject_reserved_metadata(&value, &metadata_secrets, "native.archive")?;
             let archived = value
                 .get("archived")
@@ -573,7 +566,8 @@ impl PluginHost {
             _ = stop.changed() => Err(Error::new("cancelled", "native.archive was cancelled")),
         };
         let result = result.map_err(|error| {
-            let error = if archive_dispatched {
+            let refused = harness == "opencode" && error.code == "native_archive_refused";
+            let error = if archive_dispatched && !refused {
                 Error::new("unknown", "native.archive may have taken effect; no replay")
             } else {
                 error

@@ -100,18 +100,30 @@ push, and a remote failure after local deletion is `unknown`, never `skipped`.
 Native sessions are archived at apply through the harness documented archive
 method (Codex `thread/archive`, OpenCode session delete on the retained
 per-Agent store) using the Agent's frozen profile. Only a Swarm-created Agent's
-session is archived; attached or observed sessions are never deleted. Artifact
+session is eligible. Attached and observe-only sessions stay with their producer.
+Claude Code's [background-session removal](https://code.claude.com/docs/en/agent-view#what-deleting-a-session-removes)
+keeps the transcript. Muse keeps its durable host sessions. Antigravity 1.5.14
+advertises ACP close, load, list and resume, and keeps its chat history.
+Artifact
 scope/reference must match that generation's native subject. The Codex reader
 verifies its effective home/SQLite root against the frozen store binding before
 dispatch; a legacy Codex home scope derived from an alias missing from the
 frozen binding remains ineligible for Swarm archive, and only a new launch can
 capture a verified binding for its own session. The OpenCode reader proves its
-served store derives the exact retained native scope before the delete. A
-malformed or secret-bearing acknowledgement after dispatch is `unknown` and
-retains the durable retry fence; an uncertain delete is never replayed. Raw
+served store derives the exact retained native scope before the delete. An
+OpenCode 404 counts as removed only if the same server, store and directory
+give a complete session list with the exact session absent. An authoritative
+refusal settles as skipped and keeps the session. A timeout or malformed or
+secret-bearing readback after dispatch is `unknown` and retains the durable
+retry fence. The metadata reader owns the vendor helper through shutdown. Raw
 native store files are never touched. Logical reclaimed bytes count only fully
 confirmed removed trees; partial attempts report unknown and zero confirmed
 bytes.
+
+`agent.delete` runs the same guarded effects for the selected task tree's
+eligible native sessions and managed worktrees before retiring the task records.
+It records cleanup outcomes before retiring ownership and keeps the task records
+if an attempted effect is refused or uncertain.
 
 Owner plans with scope `all` or a registration ID in scope `project` include
 project registrations from the current settings revision. A creation-time cutoff

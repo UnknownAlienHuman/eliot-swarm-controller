@@ -74,6 +74,14 @@ impl Store {
         .transpose()
     }
 
+    pub fn known_native_session_artifact(
+        &self,
+        agent: &str,
+        path: &str,
+    ) -> Result<Option<ArtifactView>> {
+        known_native_session_artifact(&self.connection, parse_agent_id(agent)?, path)
+    }
+
     /// Internal, non-deletable custody row committed before the native Agent
     /// receives its new directory. Legacy paths are never adopted as roots.
     pub fn agent_artifact_root(
@@ -175,6 +183,22 @@ impl Store {
                 "worktree artifact custody changed",
             ));
         }
+        let agent_num = parse_agent_id(&artifact.agent)?;
+        if artifact.kind == ArtifactKind::NativeSession
+            && let Some(previous) = known_native_session_artifact(&tx, agent_num, &artifact.path)?
+        {
+            // A resume may carry the same native session into the new
+            // generation. Updating custody must preserve the attempt fence.
+            if previous.state == "registered" && previous.generation < artifact.generation {
+                artifact.id = previous.id;
+                tx.execute(
+                    "UPDATE artifacts SET generation=?1,body=?2 WHERE id=?3",
+                    params![artifact.generation, encode_json(&artifact)?, artifact.id],
+                )
+                .map_err(sql_error)?;
+            }
+            return commit_transaction(tx, &self.write_faulted);
+        }
         let count: i64 = tx
             .query_row("SELECT COUNT(*) FROM artifacts", [], |r| r.get(0))
             .map_err(sql_error)?;
@@ -186,7 +210,7 @@ impl Store {
                 r.get(0)
             })
             .map_err(sql_error)?;
-        let changed = tx.execute("INSERT OR IGNORE INTO artifacts(id,agent,generation,path,body,seq) VALUES (?1,?2,?3,?4,?5,?6)",params![artifact.id,parse_agent_id(&artifact.agent)?,artifact.generation,artifact.path,encode_json(&artifact)?,seq]).map_err(sql_error)?;
+        let changed = tx.execute("INSERT OR IGNORE INTO artifacts(id,agent,generation,path,body,seq) VALUES (?1,?2,?3,?4,?5,?6)",params![artifact.id,agent_num,artifact.generation,artifact.path,encode_json(&artifact)?,seq]).map_err(sql_error)?;
         if changed == 0 && artifact.kind == ArtifactKind::Branch {
             // Branches move as their agent commits: refresh the tracked tip
             // so the plan snapshot anchors exactly what apply re-verifies.
@@ -1107,7 +1131,8 @@ impl Store {
                 params![
                     encode_json(&updated)?,
                     artifact.id,
-                    if outcome.outcome == "removed" {
+                    if outcome.outcome == "removed" && artifact.kind != ArtifactKind::NativeSession
+                    {
                         format!("retired:{}", artifact.id)
                     } else {
                         artifact.path.clone()
@@ -1152,6 +1177,29 @@ impl Store {
         }
         commit_transaction(tx, &self.write_faulted)
     }
+}
+
+fn known_native_session_artifact(
+    connection: &Connection,
+    agent: i64,
+    path: &str,
+) -> Result<Option<ArtifactView>> {
+    let body: Option<String> = connection
+        .query_row(
+            "SELECT body FROM artifacts WHERE agent=?1
+             AND json_extract(body,'$.kind')='native_session'
+             AND (path=?2 OR (path='retired:'||id AND json_extract(body,'$.path')=?2))
+             ORDER BY (json_extract(body,'$.state')='removed') DESC, generation DESC LIMIT 1",
+            params![agent, path],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    body.map(|body| {
+        serde_json::from_str(&body)
+            .map_err(|_| Error::new("source_integrity", "invalid native session artifact"))
+    })
+    .transpose()
 }
 
 /// Bounded self-heal for a full cleanup-plan ledger, oldest first. Deletes
