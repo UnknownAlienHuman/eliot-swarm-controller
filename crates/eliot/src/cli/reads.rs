@@ -8,7 +8,7 @@ use super::support::read_and_print;
 use super::support::{Failure, PAGE_SIZE, print_value, validate_limit};
 use eliot_core::api::{
     AgentEditsRequest, AgentEditsResponse, AgentGetRequest, AgentGetResponse, AgentGitRequest,
-    AgentGitResponse, AgentHistoryRequest, AgentListRequest, AgentListResponse,
+    AgentGitResponse, AgentHistoryRequest, AgentListRequest, AgentListResponse, AgentListRow,
     AgentPatchDigestRequest, AgentPatchDigestResponse, AgentProcessesRequest,
     AgentProcessesResponse, AgentResultRequest, AgentResultResponse, AgentStatsRequest,
     AgentStatsResponse, DiagnoseRequest, DiagnoseResponse, EventsBoundsRequest,
@@ -22,6 +22,13 @@ use eliot_core::{AgentState, Error as CoreError};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+struct TopListRead {
+    response: AgentListResponse,
+    rejected_rows: Vec<String>,
+    continuation_error: Option<String>,
+    byte_limited: bool,
+}
 
 pub(crate) async fn run_ls(
     LsArgs {
@@ -44,7 +51,7 @@ pub(crate) async fn run_ls(
         )
     } else {
         let response = read_agent_list(&data_dir, &params).await?;
-        print_agent_table(&response, false);
+        print_agent_table(&response, false, 0, false);
         Ok(0)
     }
 }
@@ -69,9 +76,26 @@ pub(crate) async fn run_top(
             AgentListResponse
         )
     } else {
-        let response = read_agent_list(&data_dir, &params).await?;
-        print_agent_table(&response, true);
-        Ok(0)
+        let page = read_top_agent_list(&data_dir, &params).await?;
+        print_agent_table(
+            &page.response,
+            true,
+            page.rejected_rows.len(),
+            page.byte_limited,
+        );
+        for diagnostic in &page.rejected_rows {
+            eprintln!("rejected row: {diagnostic}");
+        }
+        if let Some(error) = &page.continuation_error {
+            eprintln!("continuation withheld: {error}");
+        }
+        Ok(
+            if page.rejected_rows.is_empty() && page.continuation_error.is_none() {
+                0
+            } else {
+                4
+            },
+        )
     }
 }
 
@@ -890,6 +914,108 @@ pub(crate) async fn read_agent_list(
     Ok(response)
 }
 
+async fn read_top_agent_list(
+    data_dir: &Path,
+    params: &AgentListRequest,
+) -> Result<TopListRead, Failure> {
+    params.validate().map_err(Failure::for_read)?;
+    let raw: Value = eliot_daemon::client_call_typed(data_dir, "agent.list", params)
+        .await
+        .map_err(Failure::for_read)?;
+    let Some(raw_object) = raw.as_object() else {
+        return Err(Failure::invalid_response(CoreError::invalid_field(
+            "response",
+            "object containing agents",
+        )));
+    };
+    let Some(raw_rows) = raw_object.get("agents").and_then(Value::as_array) else {
+        return Err(Failure::invalid_response(CoreError::invalid_field(
+            "response.agents",
+            "array of Agent rows",
+        )));
+    };
+
+    let mut envelope = raw.clone();
+    let Some(envelope_object) = envelope.as_object_mut() else {
+        return Err(Failure::invalid_response(CoreError::invalid_field(
+            "response",
+            "object containing agents",
+        )));
+    };
+    envelope_object.insert("agents".to_owned(), Value::Array(Vec::new()));
+    let mut response: AgentListResponse =
+        eliot_core::api::discovery::decode_params_at(envelope, "response")
+            .map_err(Failure::invalid_response)?;
+
+    let mut accepted_rows = Vec::with_capacity(raw_rows.len());
+    let mut rejected_rows = Vec::new();
+    let mut row_keys = Vec::with_capacity(raw_rows.len());
+    let mut cursor_key_error = None;
+    for (index, raw_row) in raw_rows.iter().enumerate() {
+        let agent_id = raw_row
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| eliot_core::parse_agent_id(id).is_ok());
+        match (agent_id, raw_row.get("updated_at").and_then(Value::as_i64)) {
+            (Some(id), Some(updated_at)) if updated_at >= 0 => {
+                row_keys.push((id.to_owned(), updated_at));
+            }
+            _ => {
+                cursor_key_error.get_or_insert_with(|| {
+                    format!(
+                        "response.agents[{index}].id and updated_at must form a valid list cursor"
+                    )
+                });
+            }
+        }
+
+        let decoded = eliot_core::api::discovery::decode_params_at::<AgentListRow>(
+            raw_row.clone(),
+            &format!("response.agents[{index}]"),
+        );
+        match decoded {
+            Ok(row) => match params.validate_row(&row, index) {
+                Ok(()) => accepted_rows.push(row),
+                Err(error) => rejected_rows.push(top_row_diagnostic(index, agent_id, error)),
+            },
+            Err(error) => rejected_rows.push(top_row_diagnostic(index, agent_id, error)),
+        }
+    }
+
+    response.agents = accepted_rows;
+    let byte_limited = response.truncated && raw_rows.len() < params.limit;
+    let mut continuation_error = None;
+    if rejected_rows.is_empty() {
+        params
+            .validate_response(&response)
+            .map_err(Failure::invalid_response)?;
+    } else if let Some(error) = cursor_key_error {
+        response.next = None;
+        continuation_error = Some(error);
+    } else if let Err(error) = params.validate_response_page(&response, &row_keys) {
+        response.next = None;
+        continuation_error = Some(error.to_string());
+    }
+
+    Ok(TopListRead {
+        response,
+        rejected_rows,
+        continuation_error,
+        byte_limited,
+    })
+}
+
+fn top_row_diagnostic(index: usize, agent_id: Option<&str>, error: CoreError) -> String {
+    let identity = agent_id
+        .map(|id| format!(" for Agent {id}"))
+        .unwrap_or_else(|| " (Agent id unavailable)".to_owned());
+    if error.details.is_some() {
+        format!("response.agents[{index}]{identity}: {error}")
+    } else {
+        format!("response.agents[{index}]: {error}")
+    }
+}
+
 /// Readable fleet table for `swarm ls` (summaries) and `swarm top` (plus
 /// child activity, last-terminal usage and observation data availability).
 /// `ACT_TURN` is the live active turn; `LAST_OUT`/`USAGE` belong to the
@@ -914,7 +1040,12 @@ pub(crate) fn observe_cell(summary: &AgentSummary) -> String {
     }
 }
 
-pub(crate) fn print_agent_table(response: &AgentListResponse, with_observations: bool) {
+pub(crate) fn print_agent_table(
+    response: &AgentListResponse,
+    with_observations: bool,
+    rejected_rows: usize,
+    byte_limited: bool,
+) {
     if with_observations {
         println!(
             "{:<6} {:<4} {:<22} {:<11} {:<12} {:<6} {:<11} {:<11} {:<12} {:<14}",
@@ -1000,15 +1131,31 @@ pub(crate) fn print_agent_table(response: &AgentListResponse, with_observations:
         }
     }
     if response.agents.is_empty() {
-        println!("(no Agents in scope for these filters)");
+        if rejected_rows == 0 {
+            println!("(no Agents in scope for these filters)");
+        } else {
+            println!("(no valid Agent rows in this page)");
+        }
     }
-    println!(
-        "total {} shown {} truncated {} next {} (full record: swarm show <id>)",
-        response.total,
-        response.agents.len(),
-        yes_no(response.truncated),
-        response.next.as_deref().unwrap_or("-"),
-    );
+    if with_observations {
+        println!(
+            "total {} shown {} rejected {} truncated {} byte-budget {} next {} (full record: swarm show <id>)",
+            response.total,
+            response.agents.len(),
+            rejected_rows,
+            yes_no(response.truncated),
+            yes_no(byte_limited),
+            response.next.as_deref().unwrap_or("-"),
+        );
+    } else {
+        println!(
+            "total {} shown {} truncated {} next {} (full record: swarm show <id>)",
+            response.total,
+            response.agents.len(),
+            yes_no(response.truncated),
+            response.next.as_deref().unwrap_or("-"),
+        );
+    }
 }
 
 /// Fleet usage cell for `swarm ls`/`swarm top`: the shared

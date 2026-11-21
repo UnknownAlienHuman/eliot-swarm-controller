@@ -139,30 +139,47 @@ pub struct AgentSummary {
 
 impl AgentSummary {
     pub fn validate(&self) -> Result<()> {
-        text(&self.id)?;
-        crate::parse_agent_id(&self.id)?;
+        text(&self.id).map_err(|_| {
+            invalid_response_detail("agent.id", None, "must be nonblank bounded text")
+        })?;
+        crate::parse_agent_id(&self.id)
+            .map_err(|_| invalid_response_detail("agent.id", None, "must be a valid Agent ID"))?;
+        let agent_id = Some(self.id.as_str());
         if self.generation < 0 {
-            return Err(Error::new("invalid", "Agent summary generation is invalid"));
+            return Err(invalid_response_detail(
+                "agent.generation",
+                agent_id,
+                "must be nonnegative",
+            ));
         }
         if self.chat {
             if !self.project.is_empty() {
-                return Err(invalid_response());
+                return Err(invalid_response_detail(
+                    "agent.project",
+                    agent_id,
+                    "must be empty for a chat Agent",
+                ));
             }
         } else {
-            text(&self.project)?;
+            text(&self.project).map_err(|_| {
+                invalid_response_detail("agent.project", agent_id, "must be nonblank bounded text")
+            })?;
         }
-        text(&self.harness)?;
-        for value in [
-            &self.name,
-            &self.profile,
-            &self.preview,
-            &self.repo_common_dir,
-            &self.model,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            text(value)?;
+        text(&self.harness).map_err(|_| {
+            invalid_response_detail("agent.harness", agent_id, "must be nonblank text")
+        })?;
+        for (field, value) in [
+            ("agent.name", &self.name),
+            ("agent.profile", &self.profile),
+            ("agent.preview", &self.preview),
+            ("agent.repo_common_dir", &self.repo_common_dir),
+            ("agent.model", &self.model),
+        ] {
+            if let Some(value) = value {
+                text(value).map_err(|_| {
+                    invalid_response_detail(field, agent_id, "must be nonblank bounded text")
+                })?;
+            }
         }
         // A switch that continues a projectless chat keeps the blank source
         // namespace on a project worker so the handoff stays in one
@@ -170,85 +187,148 @@ impl AgentSummary {
         if let Some(scope) = &self.project_scope
             && !scope.is_empty()
         {
-            text(scope)?;
+            text(scope).map_err(|_| {
+                invalid_response_detail(
+                    "agent.project_scope",
+                    agent_id,
+                    "must be empty or nonblank bounded text",
+                )
+            })?;
         }
         if self
             .preview
             .as_ref()
             .is_some_and(|preview| preview.chars().count() > AGENT_PREVIEW_CHARS)
         {
-            return Err(Error::new("invalid", "Agent summary preview is too long"));
+            return Err(invalid_response_detail(
+                "agent.preview",
+                agent_id,
+                "must not exceed AGENT_PREVIEW_CHARS",
+            ));
         }
-        text(&self.root)?;
-        crate::parse_agent_id(&self.root)?;
+        text(&self.root).map_err(|_| {
+            invalid_response_detail("agent.root", agent_id, "must be nonblank text")
+        })?;
+        crate::parse_agent_id(&self.root).map_err(|_| {
+            invalid_response_detail("agent.root", agent_id, "must be a valid Agent ID")
+        })?;
         if let Some(parent) = &self.parent {
-            text(parent)?;
-            crate::parse_agent_id(parent)?;
+            text(parent).map_err(|_| {
+                invalid_response_detail(
+                    "agent.parent",
+                    agent_id,
+                    "must be nonblank text when present",
+                )
+            })?;
+            crate::parse_agent_id(parent).map_err(|_| {
+                invalid_response_detail("agent.parent", agent_id, "must be a valid Agent ID")
+            })?;
         }
         if let Some(turn) = &self.active_turn {
-            text(turn)?;
+            text(turn).map_err(|_| {
+                invalid_response_detail("agent.active_turn", agent_id, "must be nonblank text")
+            })?;
         }
         if let Some(at) = self.last_progress_at
             && at < 0
         {
-            return Err(Error::new(
-                "invalid",
-                "Agent summary progress time is invalid",
+            return Err(invalid_response_detail(
+                "agent.last_progress_at",
+                agent_id,
+                "must be nonnegative",
             ));
         }
         if let Some(age) = self.progress_age_ms
             && age < 0
         {
-            return Err(Error::new(
-                "invalid",
-                "Agent summary progress age is invalid",
+            return Err(invalid_response_detail(
+                "agent.progress_age_ms",
+                agent_id,
+                "must be nonnegative",
             ));
         }
         if self.last_outcome.is_none() && self.last_turn_id.is_some() {
-            return Err(Error::new(
-                "invalid",
-                "Agent summary turn needs its outcome",
+            return Err(invalid_response_detail(
+                "agent.last_outcome",
+                agent_id,
+                "must be present when last_turn_id is present",
             ));
         }
         if let Some(turn) = &self.last_turn_id {
-            text(turn)?;
+            text(turn).map_err(|_| {
+                invalid_response_detail("agent.last_turn_id", agent_id, "must be nonblank text")
+            })?;
         }
         match (&self.usage, &self.usage_scope) {
             (None, None) => {}
             (Some(_), Some(scope)) if scope == "turn" || scope == "session" => {}
             _ => {
-                return Err(Error::new(
-                    "invalid",
-                    "Agent summary usage needs its turn/session scope",
+                return Err(invalid_response_detail(
+                    "agent.usage_scope",
+                    agent_id,
+                    "must be turn or session exactly when usage is present",
                 ));
             }
         }
         if self.updated_at < 0 {
-            return Err(Error::new(
-                "invalid",
-                "Agent summary observation time is invalid",
+            return Err(invalid_response_detail(
+                "agent.updated_at",
+                agent_id,
+                "must be nonnegative milliseconds",
             ));
         }
         if let Some(heavy) = &self.heavy {
-            heavy.validate()?;
+            heavy.validate().map_err(|_| {
+                invalid_response_detail(
+                    "agent.heavy",
+                    agent_id,
+                    "must satisfy the heavy summary rules",
+                )
+            })?;
         }
         if let Some(growth) = &self.session_growth {
-            growth.validate()?;
+            growth.validate().map_err(|_| {
+                invalid_response_detail(
+                    "agent.session_growth",
+                    agent_id,
+                    "must satisfy the session growth rules",
+                )
+            })?;
         }
         if let Some(work) = &self.work {
-            work.validate()?;
+            work.validate().map_err(|_| {
+                invalid_response_detail(
+                    "agent.work",
+                    agent_id,
+                    "must satisfy the work summary rules",
+                )
+            })?;
         }
         if let Some(group) = &self.organization {
-            super::organization::validate_project_name(group, "Agent summary organization")?;
+            super::organization::validate_project_name(group, "Agent summary organization")
+                .map_err(|_| {
+                    invalid_response_detail(
+                        "agent.organization",
+                        agent_id,
+                        "must be a valid project name",
+                    )
+                })?;
         }
-        super::organization::validate_tags(&self.tags)?;
+        super::organization::validate_tags(&self.tags).map_err(|_| {
+            invalid_response_detail(
+                "agent.tags",
+                agent_id,
+                "must satisfy the organization tag rules",
+            )
+        })?;
         if self
             .organization_revision
             .is_some_and(|revision| revision < 1)
         {
-            return Err(Error::new(
-                "invalid",
-                "Agent summary organization revision is invalid",
+            return Err(invalid_response_detail(
+                "agent.organization_revision",
+                agent_id,
+                "must be positive when present",
             ));
         }
         Ok(())
@@ -1654,6 +1734,16 @@ pub(super) fn scope(value: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+pub(super) fn invalid_response_detail(field: &str, agent_id: Option<&str>, rule: &str) -> Error {
+    let agent = agent_id
+        .map(|id| format!(" for Agent {id}"))
+        .unwrap_or_default();
+    Error::new(
+        "unknown",
+        format!("Agent view response is invalid: {field}{agent}: {rule}"),
+    )
 }
 
 pub(super) fn invalid_response() -> Error {
