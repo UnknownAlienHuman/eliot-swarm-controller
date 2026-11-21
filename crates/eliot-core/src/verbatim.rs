@@ -4,6 +4,21 @@
 //! verbatim prefix so raw Win32 calls work past the legacy parse limit;
 //! every other path is returned unchanged.
 
+/// Owner-facing rendering of a retained path: the verbatim prefix leaves, so
+/// a person and an ordinary tool can read it.
+///
+/// `\\?\C:\repo` reads `C:\repo`, `\\?\UNC\server\share` reads
+/// `\\server\share`, and anything else is unchanged. This never reaches the
+/// Store: retained identity, Git keys and path-keyed rows keep their exact
+/// stored spelling, so only the view that leaves the daemon uses this form.
+pub fn display_path(path: &str) -> String {
+    match path.strip_prefix(r"\\?\") {
+        Some(rest) if rest.starts_with(r"UNC\") => format!(r"\\{}", &rest[4..]),
+        Some(rest) => rest.to_owned(),
+        None => path.to_owned(),
+    }
+}
+
 use std::path::{Path, PathBuf};
 
 /// Verbatim-prefixed form of `path` for raw Win32 file opens.
