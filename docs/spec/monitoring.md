@@ -414,7 +414,10 @@ capabilities, `PR_SET_NO_NEW_PRIVS` and irreversible `RLIMIT_NPROC=0`. Root/priv
 Linux and other Unix contexts return explicit unavailable; there is no unfenced retry
 or fallback. These restrictions apply to Git reads, not normal harness/plugin custody.
 
-Diff/log commands additionally pass `--no-ext-diff --no-textconv`. The daemon sets
+Diff/log commands additionally pass `--no-ext-diff --no-textconv`. Monitor-built Git
+commands also set `core.safecrlf=false`, so a CRLF conversion warning for a dirty file
+under `core.autocrlf` is not read as a failure by the leaf fence; none of them checks
+files into the index, where that setting applies. The daemon sets
 `GIT_TERMINAL_PROMPT=0`, disables editors and aliases, and never invokes repository
 hooks, fsmonitor helpers, external diff drivers or textconv filters. It never permits an
 unapproved/custom remote-helper scheme: any optional network read uses an
