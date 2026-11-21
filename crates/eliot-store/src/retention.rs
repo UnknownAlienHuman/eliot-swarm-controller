@@ -669,10 +669,11 @@ fn event_prune_end_tx(
                  WHERE enabled = 1
                    AND retiring_cursor IS NOT NULL AND retire_through IS NOT NULL
                  UNION ALL
-                 SELECT MIN(e.seq) - 1 FROM source_state s
-                 JOIN agents a ON a.id = s.agent
-                 JOIN events e ON e.agent = s.agent AND e.generation = s.generation
-                 WHERE s.source = 'git' AND s.state = 'open' AND s.generation = a.generation
+                 SELECT MIN(e.seq) - 1 FROM events e
+                 CROSS JOIN source_state s
+                    ON s.agent = e.agent AND s.generation = e.generation AND s.source = 'git'
+                 CROSS JOIN agents a ON a.id = e.agent AND a.generation = e.generation
+                 WHERE s.state = 'open'
                    AND s.cursor IS NOT NULL AND e.seq > CAST(s.cursor AS INTEGER)
                    AND e.seq > ?1 AND e.seq <= ?2
                    AND e.family = 'tool' AND e.kind = 'tool.completed'
@@ -740,7 +741,7 @@ fn event_prune_end_tx(
     // without reading the event row.
     let first_gap: Option<i64> = tx
         .query_row(
-            "SELECT MIN(s.gap_seq) FROM source_state s
+            "SELECT MIN(s.gap_seq) FROM source_state s INDEXED BY source_state_open_gap_seq
              JOIN agents a ON a.id = s.agent
              WHERE s.state = 'open' AND s.gap_seq IS NOT NULL
                AND s.gap_from IS NOT NULL AND s.gap_from = COALESCE(s.cursor, '0')

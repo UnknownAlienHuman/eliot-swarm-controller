@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 73;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 74;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -1713,6 +1713,19 @@ impl Store {
                      next_probe_at = CASE WHEN probe_attempts >= {limit} THEN NULL ELSE next_probe_at END;
                  INSERT INTO schema_migrations(version) VALUES (73);"
             )).map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 74 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE INDEX source_state_open_gap_seq ON source_state(gap_seq)
+                     WHERE state = 'open' AND gap_seq IS NOT NULL AND gap_from IS NOT NULL;
+                 INSERT INTO schema_migrations(version) VALUES (74);",
+            )
+            .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
         Ok(())
