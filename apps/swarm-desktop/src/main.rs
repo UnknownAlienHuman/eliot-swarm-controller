@@ -34,6 +34,8 @@ mod shortcuts;
 mod ui;
 #[cfg(windows)]
 mod views;
+#[cfg(windows)]
+mod window_place;
 
 #[cfg_attr(not(windows), allow(dead_code))]
 mod attachments;

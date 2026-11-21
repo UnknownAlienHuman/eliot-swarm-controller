@@ -1384,7 +1384,7 @@ pub(crate) fn own_window() -> Option<HWND> {
 }
 
 /// The window class of a WinUI 3 desktop window.
-const WINUI_WINDOW_CLASS: &str = "WinUIDesktopWin32WindowClass";
+pub(crate) const WINUI_WINDOW_CLASS: &str = "WinUIDesktopWin32WindowClass";
 
 /// `Windowing_GetWindowIdFromWindow`, as `Microsoft.UI.Interop.h` loads it.
 fn window_id(hwnd: HWND) -> Result<u64, String> {

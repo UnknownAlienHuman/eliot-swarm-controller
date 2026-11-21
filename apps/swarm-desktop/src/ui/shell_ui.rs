@@ -327,7 +327,6 @@ impl DesktopApp {
                     self.palette_changed(before, context);
                     self.nav.collapsed = self.prefs.collapsed.iter().cloned().collect();
                     self.launch_preferences_loaded();
-                    self.preferred_window = crate::settings::window(&read);
                     self.seed_settings(read, context);
                     // The opened checkout, registered by discovery, is where
                     // a new task starts.
@@ -718,18 +717,12 @@ impl DesktopApp {
                     self.reprime_fields(context);
                 }
             }
+            // The sidebar's Monitor entry opens and closes the Monitor;
+            // the pane's X closes the pane.
             ShellMsg::PanelToggled(panel) => match panel {
-                Panel::Details => match self.selected_agent_id() {
-                    Some(agent) if self.panel != Panel::Details => {
-                        self.show_details(&agent, context);
-                    }
-                    _ => self.close_panel(),
-                },
-                Panel::Monitor if self.panel != Panel::Monitor => {
-                    self.panel = Panel::Monitor;
-                    self.start_monitor(context);
-                }
-                _ => self.close_panel(),
+                Panel::Monitor if self.panel == Panel::Monitor => self.close_panel(),
+                Panel::Closed => self.close_panel(),
+                panel => self.choose_panel(panel, context),
             },
             ShellMsg::SchemeObserved(scheme) => {
                 let before = self.palette();
@@ -744,7 +737,9 @@ impl DesktopApp {
                 self.window_width = Some(size.width);
                 self.window_height = Some(size.height);
                 self.sync_title_bar();
-                if size.width >= 640.0 && size.height >= 480.0 {
+                // A maximized size is not the size the window restores to.
+                if size.width >= 640.0 && size.height >= 480.0 && !crate::window_place::maximized()
+                {
                     let window = (size.width as u32, size.height as u32);
                     if self.window_size != Some(window) {
                         self.window_size = Some(window);

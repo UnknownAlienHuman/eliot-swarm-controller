@@ -1054,8 +1054,9 @@ Rules/scripts remain files owned by their existing APIs; settings references and
 automation policy do not create a second executor. Desktop preferences use
 `[desktop]`: `theme` (`system`, `light`, `dark`, `amoled`, `purple`, `neon`,
 `matrix`: the desktop's six palettes, `system` following Windows between
-light and dark), `window` (`width`/`height`, at least
-640 by 480), `startup` (`new_task`, or `last_conversation` to reopen the most
+light and dark), `window` (`width`/`height`: the normal client size in DIPs, at least
+640 by 480; optional `x`/`y`: the normal outer top-left in physical screen pixels;
+optional `maximized`), `startup` (`new_task`, or `last_conversation` to reopen the most
 recently active Agent's conversation), `last_access` (`ask`, `auto` or `full`), and
 these bounded lists: `favorite_models` (`{harness, model, effort?}`), `recent_models`
 (most-recent-first `{harness, model, effort?}`), `collapsed_projects` (the sidebar's
@@ -1072,7 +1073,11 @@ Picker strings are stored verbatim: harness and access values must match their
 closed vocabularies exactly. Model ids, provider names, collapsed project and group
 keys and display-name keys are 1–256 bytes, and effort is 1–128 bytes; these reject
 controls and surrounding whitespace.
-The desktop keeps no other preference store. The desktop writes `window` back once when the window closes, and only when the size changed.
+The desktop keeps no other preference store. The desktop writes `window` back once when the
+window closes, and only when it changed. It reads `window` from the file before its window
+exists, so the window opens at that size, place and maximized state with no move after the
+first frame; a place no longer on an attached monitor is clamped into the nearest one's work
+area, and without `x`/`y` Windows chooses the place.
 The new-task composer writes `recent_models` after an admitted model launch,
 `favorite_models` from the model picker (Ctrl+F or the row's star), `last_access`
 from the access chip or Settings › Default access, and `collapsed_projects` when a

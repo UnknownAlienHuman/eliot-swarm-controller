@@ -242,15 +242,18 @@ enum Message {
     Reveal(String, String),
 }
 
-/// The input to the single desktop window: the workspace plus the shared
-/// slot that remembers the last observed window size for the one `[desktop]`
-/// write after the window closes (windows-reactor 0.100.0 exposes no close
-/// hook: `ViewContext` offers only `on_color_scheme`, `on_window_size`,
+/// The input to the single desktop window: the workspace, the saved window
+/// placement its first frame opens with, and the shared slot that remembers
+/// the last observed window size for the one `[desktop]` write after the
+/// window closes (windows-reactor 0.100.0 exposes no close hook:
+/// `ViewContext` offers only `on_color_scheme`, `on_window_size`,
 /// `window_title` and `window_visuals`).
 #[derive(Clone)]
 struct DesktopInput {
     /// `--workspace`, when given.
     workspace: Option<PathBuf>,
+    /// `[desktop] window`, read before the window exists.
+    window: Option<crate::settings::WindowPlacement>,
     close_window: CloseWindow,
 }
 
@@ -309,10 +312,11 @@ struct DesktopApp {
     window_width: Option<f64>,
     /// The window's client height in DIPs (menu placement clamps to it).
     window_height: Option<f64>,
-    /// The client size for the one `[desktop]` write at close, once at
-    /// least 640 x 480.
+    /// The normal (not maximized) client size for the one `[desktop]`
+    /// write at close, once at least 640 x 480; the saved size until then.
     window_size: Option<(u32, u32)>,
-    /// The saved window size, applied to the window's first size.
+    /// The saved window size the first frame declares (constant: a later
+    /// declaration would resize the window after it is shown).
     preferred_window: Option<(u32, u32)>,
     /// The last observed size for the one `[desktop]` write at close.
     close_window: CloseWindow,
@@ -774,9 +778,9 @@ impl Component for DesktopApp {
             startup_done: false,
             window_width: None,
             window_height: None,
-            window_size: None,
+            window_size: input.window.map(|window| (window.width, window.height)),
             close_window: input.close_window.clone(),
-            preferred_window: None,
+            preferred_window: input.window.map(|window| (window.width, window.height)),
             preferences_loaded: false,
             fields_primed: true,
             prime_epoch: 0,
@@ -868,6 +872,7 @@ impl Component for DesktopApp {
         if let Err(error) = crate::app_resources::install(app.palette().roles()) {
             app.status = format!("WinUI M3 resources not applied: {error}");
         }
+        app.note_window_size();
         if let Ok(data_dir) = app.data_dir.clone() {
             app.watch_high_contrast(context);
             app.start_connection(data_dir, context);
@@ -920,21 +925,51 @@ impl Component for DesktopApp {
 }
 
 /// Run the single desktop window. Blocks while the WinUI message loop runs;
-/// closing the window disconnects the UI, never the Agent. Afterwards the
-/// last observed window size persists once into `[desktop]`, only when it
-/// differs from the saved value.
+/// closing the window disconnects the UI, never the Agent. The window opens
+/// at the saved size, place and maximized state (`[desktop] window`, read
+/// from the settings file before it exists); afterwards its last normal
+/// size and place and its maximized state persist once into `[desktop]`,
+/// only when they differ from the saved value.
 pub fn run(workspace: Option<PathBuf>) -> Result<(), String> {
+    let window = client::data_dir()
+        .ok()
+        .and_then(|data_dir| crate::settings::saved_window(&data_dir));
     let close_window = CloseWindow::default();
+    // On this thread, which creates the window (Reactor runs WinUI here).
+    let placement = crate::window_place::install(window);
     let result = App::run_component::<DesktopApp>(DesktopInput {
         workspace,
+        window,
         close_window: close_window.clone(),
     })
     .map_err(|error| error.to_string());
-    if let Some((data_dir, window)) = close_window.load()
-        && let Err(error) =
-            client::block_on(crate::settings::save_window_on_close(&data_dir, window))
-    {
-        eprintln!("swarm-desktop: window size not saved: {error}");
+    let closed = match placement {
+        Ok(hook) => hook.finish(),
+        Err(error) => {
+            eprintln!("swarm-desktop: {error}");
+            None
+        }
+    };
+    if let Some((data_dir, (width, height))) = close_window.load() {
+        // Without a read placement the saved place stays as it was.
+        let placement = crate::settings::WindowPlacement {
+            width,
+            height,
+            x: closed
+                .map(|closed| closed.x)
+                .or(window.and_then(|saved| saved.x)),
+            y: closed
+                .map(|closed| closed.y)
+                .or(window.and_then(|saved| saved.y)),
+            maximized: closed.map_or(window.is_some_and(|saved| saved.maximized), |closed| {
+                closed.maximized
+            }),
+        };
+        if let Err(error) =
+            client::block_on(crate::settings::save_window_on_close(&data_dir, placement))
+        {
+            eprintln!("swarm-desktop: window placement not saved: {error}");
+        }
     }
     result
 }

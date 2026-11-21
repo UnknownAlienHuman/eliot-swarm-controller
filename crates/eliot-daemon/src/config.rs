@@ -425,6 +425,13 @@ enum DesktopStartup {
 struct DesktopWindow {
     width: u32,
     height: u32,
+    /// The window's outer top-left in physical screen pixels, once moved.
+    #[serde(default)]
+    x: Option<i32>,
+    #[serde(default)]
+    y: Option<i32>,
+    #[serde(default)]
+    maximized: bool,
 }
 
 /// One desktop model favorite or recent entry.

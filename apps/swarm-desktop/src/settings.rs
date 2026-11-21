@@ -1,6 +1,6 @@
 //! Desktop preferences share the daemon settings source and revision guard.
 //!
-//! The theme, window size and what opens at start live in the daemon's
+//! The theme, window placement and what opens at start live in the daemon's
 //! `[desktop]` section; the desktop keeps no file of its own. A legacy
 //! per-user `swarm-desktop.json` is imported once when `[desktop]` is absent.
 //! RPC goes through [`crate::config_client`].
@@ -556,15 +556,49 @@ pub fn startup(reply: &SettingsReadResponse) -> Startup {
         .unwrap_or_default()
 }
 
-pub fn window(reply: &SettingsReadResponse) -> Option<(u32, u32)> {
+/// `[desktop] window`: the normal client size in DIPs, the normal outer
+/// top-left in physical screen pixels once known, and whether the window
+/// was maximized.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowPlacement {
+    pub width: u32,
+    pub height: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y: Option<i32>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub maximized: bool,
+}
+
+impl WindowPlacement {
+    /// The saved outer top-left, when both coordinates are known.
+    pub fn position(&self) -> Option<(i32, i32)> {
+        self.x.zip(self.y)
+    }
+}
+
+pub fn window(reply: &SettingsReadResponse) -> Option<WindowPlacement> {
     let window = reply
         .sections
         .get(&SettingsSection::Desktop)?
         .get("window")?;
-    Some((
-        u32::try_from(window.get("width")?.as_u64()?).ok()?,
-        u32::try_from(window.get("height")?.as_u64()?).ok()?,
-    ))
+    serde_json::from_value(window.clone()).ok()
+}
+
+/// `[desktop] window` read from the settings file before the window exists
+/// (the daemon may not run yet), so the first frame already has the saved
+/// size and place. Anything unreadable opens at the defaults.
+pub fn saved_window(data_dir: &Path) -> Option<WindowPlacement> {
+    let source = read_config_source(data_dir).ok()??;
+    let value: toml::Value = toml::from_str(&source).ok()?;
+    value
+        .get("desktop")?
+        .get("window")?
+        .clone()
+        .try_into()
+        .ok()
+        .filter(|window: &WindowPlacement| window.width >= 640 && window.height >= 480)
 }
 
 pub async fn save(
@@ -599,20 +633,26 @@ pub async fn save_preferences(
     save(data_dir, &request).await
 }
 
-/// Attempts for the one window-size write at close.
+/// Attempts for the one window write at close.
 const CLOSE_SAVE_ATTEMPTS: usize = 4;
 
-/// The window-size update for one settings read: the read's own revision
-/// with its preferences carried over and only the size replaced. Built from
-/// a single read so a concurrent preference write between two reads cannot
+/// The window update for one settings read: the read's own revision with
+/// its preferences carried over and only `window` replaced. Built from a
+/// single read so a concurrent preference write between two reads cannot
 /// be silently overwritten: it reports `conflict` instead (#641).
-pub fn window_close_request(read: &SettingsReadResponse, size: (u32, u32)) -> SettingsSaveRequest {
+pub fn window_close_request(
+    read: &SettingsReadResponse,
+    window: WindowPlacement,
+) -> SettingsSaveRequest {
     let preferences = Preferences::from_reply(read);
-    let desktop = crate::settings_model::desktop_section(
+    let mut desktop = crate::settings_model::desktop_section(
         read.sections.get(&SettingsSection::Desktop),
         &preferences,
-        Some(size),
+        None,
     );
+    if let Some(map) = desktop.as_object_mut() {
+        map.insert("window".to_owned(), serde_json::json!(window));
+    }
     SettingsSaveRequest {
         expected_revision: read.revision.clone(),
         sections: [(SettingsSection::Desktop, desktop)].into(),
@@ -621,21 +661,24 @@ pub fn window_close_request(read: &SettingsReadResponse, size: (u32, u32)) -> Se
     }
 }
 
-/// Persist the last observed window size into `[desktop]` once, at close: a
-/// revision-guarded write only when it differs from the saved value, keeping
-/// the saved theme and startup. A concurrent save (for example an in-flight
-/// choice landing while the window closes) reports `conflict` instead of
-/// clobbering, so retry with a fresh read a few times. Returns whether a
-/// write landed.
-pub async fn save_window_on_close(data_dir: &Path, size: (u32, u32)) -> eliot_core::Result<bool> {
+/// Persist the window's last normal size, place and maximized state into
+/// `[desktop]` once, at close: a revision-guarded write only when it
+/// differs from the saved value, keeping the other preferences. A
+/// concurrent save (for example an in-flight choice landing while the
+/// window closes) reports `conflict` instead of clobbering, so retry with a
+/// fresh read a few times. Returns whether a write landed.
+pub async fn save_window_on_close(
+    data_dir: &Path,
+    window: WindowPlacement,
+) -> eliot_core::Result<bool> {
     for _ in 0..CLOSE_SAVE_ATTEMPTS {
         let read = read(data_dir).await?;
-        if window(&read) == Some(size) {
+        if self::window(&read) == Some(window) {
             return Ok(false);
         }
         // One read, one revision: never re-read inside `save_preferences`,
         // whose fresh revision would overwrite the concurrent change.
-        let request = window_close_request(&read, size);
+        let request = window_close_request(&read, window);
         match save(data_dir, &request).await {
             Ok(_) => return Ok(true),
             Err(error) if error.code == "conflict" => continue,
@@ -644,6 +687,6 @@ pub async fn save_window_on_close(data_dir: &Path, size: (u32, u32)) -> eliot_co
     }
     Err(eliot_core::Error::new(
         "conflict",
-        "settings changed while the window size was saved",
+        "settings changed while the window was saved",
     ))
 }
