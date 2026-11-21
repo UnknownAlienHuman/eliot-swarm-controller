@@ -337,7 +337,12 @@ Flow:
 6. only a `ready` row whose target generation matches the start command permits that
    generation's native dispatch.
 
-A lost Git response is settled by exact worktree/path/branch/OID readback. A setup entry
+A lost Git response is settled by exact worktree/path/branch/OID readback. A failed
+checkout can leave its new Git branch after Git has removed the worktree. Cleanup
+requires the creation command's branch reflog marker, the frozen tip and no other
+registration. Rollback removes a proven clean worktree with ordinary Git removal
+and compare-deletes the exact ref. A failed checkout reports its exit code once
+readback proves that the checkout and branch are absent. A setup entry
 has no generic readback: after restart or lost process result, `setup_running` becomes
 `unknown` unless exact platform evidence proves the process never started. It is never
 rerun. The owner removes/recreates or explicitly resolves the workspace. This needs one
@@ -430,6 +435,8 @@ silently disabling the configured HTTPS/SSH transport itself.
 
 - refresh on debounced filesystem invalidation and poll interval, at most once per 2 s;
 - `status --porcelain=v2 --branch -z` for current state;
+- index entries are parsed as a bounded NUL-delimited stream. Filter attributes
+  are checked in bounded path batches and a second index digest fences the sample;
 - bounded `log --no-ext-diff --no-textconv` on HEAD movement from the last stored HEAD,
   so commits made while daemon was down are recovered; no prior baseline yields an
   explicit gap;

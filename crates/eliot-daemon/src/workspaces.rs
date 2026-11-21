@@ -383,11 +383,8 @@ impl WorkspaceManager {
                                                 ),
                                             )
                                             .await;
-                                        if !result.quiescent {
-                                            creation_unknown(result.code)
-                                        } else {
-                                            git.inspect(&current).await
-                                        }
+                                        self.finish_workspace_create(&git, &slot, &current, result)
+                                            .await?
                                     }
                                     WorkspaceGitReservation::Deferred => {
                                         drop(gate);
@@ -409,10 +406,23 @@ impl WorkspaceManager {
                                 }
                             }
                             Err(error)
-                                if error.code == "already_exists"
-                                    && self.git_write_never_dispatched(&slot, &current).await? =>
+                                if self.git_write_never_dispatched(&slot, &current).await? =>
                             {
-                                target_exists_refusal(&error)
+                                if error.code == "already_exists" {
+                                    target_exists_refusal(&error)
+                                } else {
+                                    WorkspaceCreationOutcome::Failed {
+                                        code: error.code,
+                                        message: *error.message,
+                                        failure_where: Some(
+                                            "store.dispatch.workspace_gate".to_owned(),
+                                        ),
+                                        origin: Some(eliot_core::FailureOrigin::Swarm),
+                                        origin_evidence: Some(
+                                            "Git creation did not dispatch".to_owned(),
+                                        ),
+                                    }
+                                }
                             }
                             Err(_) => git.inspect(&current).await,
                         }
@@ -420,26 +430,17 @@ impl WorkspaceManager {
                     let _gate = slot.gate.clone().lock_owned().await;
                     self.require_current(&current, WorkspacePhase::Creating)
                         .await?;
+                    let failure = workspace_creation_error(&outcome);
                     let mut store = self.inner.store.lock().await;
                     let change = store.settle_workspace_creation(
                         command_id,
                         current.target_generation,
-                        safe_creation(outcome),
+                        outcome,
                         now_ms(),
                     )?;
                     self.publish(&change.events);
-                    if matches!(
-                        change.value.phase,
-                        WorkspacePhase::Unknown | WorkspacePhase::Failed
-                    ) {
-                        return Err(problem(
-                            if change.value.phase == WorkspacePhase::Unknown {
-                                "unknown"
-                            } else {
-                                "failed"
-                            },
-                            "workspace creation did not establish readiness",
-                        ));
+                    if let Some(error) = failure {
+                        return Err(error);
                     }
                 }
                 WorkspacePhase::SetupReady => {
@@ -586,6 +587,93 @@ impl WorkspaceManager {
         let result = self.remove_workspace(command, &preparation).await;
         self.retire_slots(agent).await;
         result
+    }
+
+    async fn finish_workspace_create(
+        &self,
+        git: &WorkspaceGit,
+        slot: &Arc<Slot>,
+        preparation: &WorkspacePreparation,
+        result: RunResult,
+    ) -> Result<WorkspaceCreationOutcome> {
+        if !result.quiescent {
+            return Ok(creation_unknown(result.code));
+        }
+        let mut outcome = git.inspect(preparation).await;
+        let verification_error = match &outcome {
+            WorkspaceCreationOutcome::Unknown { message, .. } => Some(message.clone()),
+            _ => None,
+        };
+        if verification_error.is_some()
+            && let Ok(Some(command)) = git.prepare_created_worktree_rollback(preparation).await
+        {
+            outcome = self
+                .run_creation_rollback(git, slot, preparation, command)
+                .await?;
+        }
+        if matches!(outcome, WorkspaceCreationOutcome::Unknown { .. })
+            && workspace_git_effect_quiescent(slot)
+            && let Ok(Some(command)) = git.prepare_failed_checkout_rollback(preparation).await
+        {
+            outcome = self
+                .run_creation_rollback(git, slot, preparation, command)
+                .await?;
+        }
+        if let WorkspaceCreationOutcome::Failed {
+            code,
+            message,
+            origin_evidence,
+            ..
+        } = &mut outcome
+        {
+            match (result.state, verification_error) {
+                (RunState::Exited(exit_code), _) if exit_code != 0 => {
+                    *code = "workspace_checkout_failed".to_owned();
+                    *message = format!(
+                        "Git worktree checkout failed with exit code {exit_code}. The worktree and branch are absent."
+                    );
+                    *origin_evidence = Some(message.clone());
+                }
+                (_, Some(reason)) => {
+                    *code = "workspace_verification_failed".to_owned();
+                    *message = format!(
+                        "Git worktree verification failed: {reason}. The worktree and branch are absent."
+                    );
+                }
+                _ => {}
+            }
+        }
+        Ok(outcome)
+    }
+
+    async fn run_creation_rollback(
+        &self,
+        git: &WorkspaceGit,
+        slot: &Arc<Slot>,
+        preparation: &WorkspacePreparation,
+        command: Command,
+    ) -> Result<WorkspaceCreationOutcome> {
+        let gate = slot.gate.clone().lock_owned().await;
+        self.require_current(preparation, preparation.phase).await?;
+        let result = self
+            .run_owned(
+                slot,
+                command,
+                Instant::now() + GIT_TIME,
+                gate,
+                WorkspaceProcessContext::new(
+                    preparation,
+                    &preparation.start_command_id,
+                    "workspace_rollback",
+                    None,
+                ),
+            )
+            .await;
+        if result.quiescent {
+            Ok(git.inspect(preparation).await)
+        } else {
+            Ok(creation_unknown(result.code))
+        }
     }
 
     pub(crate) async fn removal_candidates(
@@ -1045,15 +1133,25 @@ impl WorkspaceManager {
                     let outcome = if reuse {
                         git.inspect_retained(preparation).await
                     } else {
-                        git.inspect(preparation).await
+                        self.finish_workspace_create(
+                            &git,
+                            &slot,
+                            preparation,
+                            RunResult {
+                                state: RunState::Interrupted,
+                                quiescent: true,
+                                code: "workspace_restart_readback",
+                            },
+                        )
+                        .await?
                     };
-                    if matches!(outcome, WorkspaceCreationOutcome::Verified { .. }) {
+                    if !matches!(outcome, WorkspaceCreationOutcome::Unknown { .. }) {
                         let _gate = slot.gate.clone().lock_owned().await;
                         let mut store = self.inner.store.lock().await;
                         match store.settle_workspace_creation(
                             &preparation.start_command_id,
                             preparation.target_generation,
-                            safe_creation(outcome),
+                            outcome,
                             now_ms(),
                         ) {
                             Ok(change) => self.publish(&change.events),
@@ -1932,6 +2030,35 @@ fn removal_preflight_error(error: &Error) -> WorkspaceRemovalOutcome {
     }
 }
 
+fn workspace_creation_error(outcome: &WorkspaceCreationOutcome) -> Option<Error> {
+    let (status, message, failure_where, origin, origin_evidence) = match outcome {
+        WorkspaceCreationOutcome::Verified { .. } => return None,
+        WorkspaceCreationOutcome::Failed {
+            message,
+            failure_where,
+            origin,
+            origin_evidence,
+            ..
+        } => ("failed", message, failure_where, origin, origin_evidence),
+        WorkspaceCreationOutcome::Unknown {
+            message,
+            failure_where,
+            origin,
+            origin_evidence,
+            ..
+        } => ("unknown", message, failure_where, origin, origin_evidence),
+    };
+    let mut error = problem(status, message).with_where(
+        failure_where
+            .as_deref()
+            .unwrap_or("store.dispatch.workspace_gate"),
+    );
+    if let (Some(origin), Some(evidence)) = (origin, origin_evidence) {
+        error = error.with_origin(*origin, evidence.as_str());
+    }
+    Some(error)
+}
+
 fn creation_unknown(code: &str) -> WorkspaceCreationOutcome {
     WorkspaceCreationOutcome::Unknown {
         code: code.to_owned(),
@@ -1964,25 +2091,6 @@ fn target_exists_refusal(error: &Error) -> WorkspaceCreationOutcome {
         origin_evidence: Some(
             "the target already existed and this preparation dispatched no Git write".to_owned(),
         ),
-    }
-}
-
-fn safe_creation(outcome: WorkspaceCreationOutcome) -> WorkspaceCreationOutcome {
-    match outcome {
-        verified @ WorkspaceCreationOutcome::Verified { .. } => verified,
-        refused if matches!(&refused, WorkspaceCreationOutcome::Failed { code, .. } if code == WORKSPACE_TARGET_EXISTS) => {
-            refused
-        }
-        WorkspaceCreationOutcome::Failed { .. } => WorkspaceCreationOutcome::Failed {
-            code: "workspace_creation_failed".to_owned(),
-            message: "workspace creation readback proved no created subject".to_owned(),
-            failure_where: Some("store.dispatch.workspace_gate".to_owned()),
-            origin: Some(eliot_core::FailureOrigin::Swarm),
-            origin_evidence: Some(
-                "managed workspace preparation gate proved no created subject".to_owned(),
-            ),
-        },
-        WorkspaceCreationOutcome::Unknown { .. } => creation_unknown("workspace_creation_unknown"),
     }
 }
 

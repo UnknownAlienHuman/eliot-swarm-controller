@@ -1031,7 +1031,26 @@ pub(super) fn settle_preparation_command(
             "workspace start is already settled or dispatched",
         ));
     }
-    let outcome = json!({"stage": "workspace", "native_dispatched": false, "target_generation": workspace.target_generation, "detail": workspace.outcome});
+    let mut outcome = json!({"stage": "workspace", "native_dispatched": false, "target_generation": workspace.target_generation, "detail": workspace.outcome});
+    if matches!(state, CommandState::Failed | CommandState::Unknown)
+        && let Some(result) = workspace
+            .outcome
+            .as_ref()
+            .and_then(|value| value.get("result"))
+    {
+        for key in [
+            "code",
+            "message",
+            "where",
+            "origin",
+            "origin_evidence",
+            "exit_code",
+        ] {
+            if let Some(value) = result.get(key).filter(|value| !value.is_null()) {
+                outcome[key] = value.clone();
+            }
+        }
+    }
     // preparation_command plus the typed workspace caller prove the pre-native
     // marker/verb/generation exception; ordinary settlement cannot use it.
     write_command_state(tx, &command.command.id, state, Some(&outcome), None, now)?;
@@ -1952,10 +1971,12 @@ impl Store {
                         }
                     }
                     WorkspaceCreationOutcome::Failed { .. } => {
-                        if old.phase == WorkspacePhase::Unknown {
+                        if old.phase == WorkspacePhase::Unknown
+                            && (reuse || command.command.verb != "launch")
+                        {
                             return Err(Error::new(
                                 "unknown",
-                                "absent or partial creation readback remains unknown",
+                                "reused workspace creation cannot settle absent",
                             ));
                         }
                         workspace.phase = WorkspacePhase::Failed;

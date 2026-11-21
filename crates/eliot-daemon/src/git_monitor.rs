@@ -20,7 +20,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
-    process::Command,
+    process::{ChildStdout, Command},
     time::{Instant, timeout_at},
 };
 
@@ -47,6 +47,10 @@ const STATUS_ARGS: &[&str] = &[
     "--renames",
 ];
 const INDEX_ARGS: &[&str] = &["ls-files", "--stage", "-v", "-z"];
+const INDEX_RECORDS: usize = 100_000;
+const INDEX_RECORD_BYTES: usize = 32 * 1024;
+const INDEX_TOTAL_BYTES: usize = 16 * 1024 * 1024;
+const ATTRIBUTE_BATCH_BYTES: usize = OUTPUT_BYTES / 4;
 /// A Goal's change scope lists a rename as both of its paths. A changed
 /// submodule is reported, so its record makes the change set unverified
 /// instead of hiding edits inside it.
@@ -152,10 +156,7 @@ impl GitProbe {
         let overrides = self.safe_overrides(&root, deadline).await?;
         self.require_exact_root(&root, &overrides, deadline).await?;
 
-        let index_bytes = self
-            .checked(&root, INDEX_ARGS, &overrides, &[], deadline)
-            .await?;
-        let index = parse_index(&index_bytes)?;
+        let (index_digest, index) = self.index_snapshot(&root, &overrides, deadline).await?;
         let status_bytes = self
             .checked(&root, STATUS_ARGS, &overrides, &[], deadline)
             .await?;
@@ -201,30 +202,9 @@ impl GitProbe {
             attribute_paths.insert(dirty.path.clone());
             attribute_paths.extend(dirty.original_path.iter().cloned());
         }
-        let mut attribute_input = Vec::new();
-        for path in &attribute_paths {
-            attribute_input.extend_from_slice(path.as_bytes());
-            attribute_input.push(0);
-            if attribute_input.len() > OUTPUT_BYTES {
-                return Err(unavailable(
-                    "Git attribute input exceeds the observation bound",
-                ));
-            }
-        }
-        let filter_affected = if attribute_input.is_empty() {
-            BTreeSet::new()
-        } else {
-            let attributes = self
-                .checked(
-                    &root,
-                    &["check-attr", "--stdin", "-z", "filter"],
-                    &overrides,
-                    &attribute_input,
-                    deadline,
-                )
-                .await?;
-            parse_filter_attributes(&attributes, &attribute_paths)?
-        };
+        let filter_affected = self
+            .filter_attributes(&root, &overrides, attribute_paths, deadline)
+            .await?;
         // Disabling executable conversions can differ from the owner's normal
         // comparison. Publish bounded raw status as partial, never normal-Git
         // clean coverage, when an applicable filter attribute is present.
@@ -288,13 +268,11 @@ impl GitProbe {
             .await?;
         // Do not clear attribution from a poll that crossed a checkout/index/status
         // change. The history commands themselves use immutable object IDs.
-        let final_index = self
-            .checked(&root, INDEX_ARGS, &overrides, &[], deadline)
-            .await?;
+        let (final_index_digest, _) = self.index_snapshot(&root, &overrides, deadline).await?;
         let final_status = self
             .checked(&root, STATUS_ARGS, &overrides, &[], deadline)
             .await?;
-        if index_bytes != final_index || status_bytes != final_status {
+        if index_digest != final_index_digest || status_bytes != final_status {
             return Err(unavailable("Git worktree changed during observation"));
         }
         if !complete || !base_complete {
@@ -322,6 +300,53 @@ impl GitProbe {
             base_complete,
             work: Some(work),
         })
+    }
+
+    async fn index_snapshot(
+        &self,
+        root: &Path,
+        overrides: &[(String, String)],
+        deadline: Instant,
+    ) -> Result<([u8; 32], BTreeMap<String, bool>)> {
+        let command = self.build_command(root, INDEX_ARGS, overrides, None)?;
+        let (code, index) = Self::capture_git(command, &[], deadline, read_index).await?;
+        if code != 0 {
+            return Err(unavailable("Git index readback failed"));
+        }
+        Ok(index)
+    }
+
+    async fn filter_attributes(
+        &self,
+        root: &Path,
+        overrides: &[(String, String)],
+        paths: BTreeSet<String>,
+        deadline: Instant,
+    ) -> Result<BTreeSet<String>> {
+        let mut affected = BTreeSet::new();
+        let mut input = Vec::new();
+        let mut batch = BTreeSet::new();
+        let args = ["check-attr", "--stdin", "-z", "filter"];
+        for path in paths {
+            if !input.is_empty() && input.len() + path.len() + 1 > ATTRIBUTE_BATCH_BYTES {
+                let output = self
+                    .checked(root, &args, overrides, &input, deadline)
+                    .await?;
+                affected.extend(parse_filter_attributes(&output, &batch)?);
+                batch.clear();
+                input.clear();
+            }
+            input.extend_from_slice(path.as_bytes());
+            input.push(0);
+            batch.insert(path);
+        }
+        if !input.is_empty() {
+            let output = self
+                .checked(root, &args, overrides, &input, deadline)
+                .await?;
+            affected.extend(parse_filter_attributes(&output, &batch)?);
+        }
+        Ok(affected)
     }
 
     async fn safe_overrides(
@@ -1266,10 +1291,22 @@ impl GitProbe {
         deadline: Instant,
         binding: Option<GitBinding<'_>>,
     ) -> Result<Captured> {
+        let command = self.build_command(root, args, overrides, binding)?;
+        let (code, stdout) = Self::capture_git(command, input, deadline, |stdout| {
+            bounded_read(stdout, OUTPUT_BYTES)
+        })
+        .await?;
+        Ok(Captured { code, stdout })
+    }
+    async fn capture_git<T, F: Future<Output = Result<T>>>(
+        command: Command,
+        input: &[u8],
+        deadline: Instant,
+        read_stdout: impl FnOnce(ChildStdout) -> F,
+    ) -> Result<(i32, T)> {
         if Instant::now() >= deadline {
             return Err(unavailable("Git observation deadline elapsed"));
         }
-        let command = self.build_command(root, args, overrides, binding)?;
         let mut child = OwnedChild::spawn_leaf(command).map_err(|error| {
             if error.code == "unavailable" {
                 Error::new("git_leaf_fence_unavailable", *error.message)
@@ -1303,7 +1340,7 @@ impl GitProbe {
                     Ok::<_, Error>(())
                 };
                 let (stdout, stderr, (), status) = tokio::try_join!(
-                    bounded_read(stdout, OUTPUT_BYTES),
+                    read_stdout(stdout),
                     bounded_read(stderr, STDERR_BYTES),
                     write,
                     child.wait(),
@@ -1319,7 +1356,7 @@ impl GitProbe {
                         "Git emitted diagnostics under the leaf process fence",
                     ));
                 }
-                Ok::<_, Error>(Captured { code, stdout })
+                Ok::<_, Error>((code, stdout))
             };
             timeout_at(deadline, capture).await
         };
@@ -1488,29 +1525,77 @@ fn parse_status(bytes: &[u8]) -> Result<Status> {
     })
 }
 
-fn parse_index(bytes: &[u8]) -> Result<BTreeMap<String, bool>> {
+async fn read_index(mut stdout: ChildStdout) -> Result<([u8; 32], BTreeMap<String, bool>)> {
     let mut index = BTreeMap::<String, bool>::new();
-    for record in nul_records(bytes)? {
-        let (metadata, path) = record
-            .split_once('\t')
-            .ok_or_else(|| unavailable("Git index record is malformed"))?;
-        let fields: Vec<_> = metadata.split(' ').collect();
-        if fields.len() != 4 || fields[0].len() != 1 || !is_git_oid(fields[2]) {
-            return Err(unavailable("Git index metadata is malformed"));
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 8192];
+    let mut record = Vec::new();
+    let mut records = 0;
+    let mut bytes = 0;
+    loop {
+        let read = stdout
+            .read(&mut buffer)
+            .await
+            .map_err(|_| unavailable("Git index capture failed"))?;
+        if read == 0 {
+            break;
         }
-        if fields[1] == "160000" {
-            return Err(unavailable(
-                "Git submodule worktrees are not covered by this local probe",
-            ));
+        bytes += read;
+        if bytes > INDEX_TOTAL_BYTES {
+            return Err(unavailable(&format!(
+                "Git index scan read {bytes} bytes and exceeded the {INDEX_TOTAL_BYTES}-byte bound"
+            )));
         }
-        let path = git_path(path)?;
-        let clean_eligible = fields[0] == "H" && fields[3] == "0";
-        index
-            .entry(path)
-            .and_modify(|eligible| *eligible &= clean_eligible)
-            .or_insert(clean_eligible);
+        digest.update(&buffer[..read]);
+        for chunk in buffer[..read].split_inclusive(|byte| *byte == 0) {
+            if record.len() + chunk.len() > INDEX_RECORD_BYTES {
+                return Err(unavailable(
+                    "Git index record exceeds the observation bound",
+                ));
+            }
+            if let Some(record_end) = chunk.strip_suffix(&[0]) {
+                record.extend_from_slice(record_end);
+                records += 1;
+                if records > INDEX_RECORDS {
+                    return Err(unavailable(&format!(
+                        "Git index scan read {records} records and exceeded the {INDEX_RECORDS}-record bound"
+                    )));
+                }
+                add_index_record(&mut index, &record)?;
+                record.clear();
+            } else {
+                record.extend_from_slice(chunk);
+            }
+        }
     }
-    Ok(index)
+    if !record.is_empty() {
+        return Err(unavailable("Git index record is truncated"));
+    }
+    Ok((digest.finalize().into(), index))
+}
+
+fn add_index_record(index: &mut BTreeMap<String, bool>, record: &[u8]) -> Result<()> {
+    let record = std::str::from_utf8(record)
+        .map_err(|_| unavailable("Git index record contains non-UTF-8 data"))?;
+    let (metadata, path) = record
+        .split_once('\t')
+        .ok_or_else(|| unavailable("Git index record is malformed"))?;
+    let fields: Vec<_> = metadata.split(' ').collect();
+    if fields.len() != 4 || fields[0].len() != 1 || !is_git_oid(fields[2]) {
+        return Err(unavailable("Git index metadata is malformed"));
+    }
+    if fields[1] == "160000" {
+        return Err(unavailable(
+            "Git submodule worktrees are not covered by this local probe",
+        ));
+    }
+    let path = git_path(path)?;
+    let clean_eligible = fields[0] == "H" && fields[3] == "0";
+    index
+        .entry(path)
+        .and_modify(|eligible| *eligible &= clean_eligible)
+        .or_insert(clean_eligible);
+    Ok(())
 }
 
 fn nul_records(bytes: &[u8]) -> Result<Vec<&str>> {
