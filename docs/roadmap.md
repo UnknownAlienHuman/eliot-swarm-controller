@@ -410,14 +410,19 @@ qualification is incomplete; do not describe it as feature complete.
         - the host crate stays outside this repository, as a patch on Zed `761786a4`.
       - **Resume when Zed releases a headless agent mode with ACP.** Start from #720 and the frozen branches, against the installed release. Until then, no Zed work.
 
-- [ ] **Failure diagnostics that say why and where (#384).** Typed `where`/`origin`
+- [x] **Failure diagnostics that say why and where (#384).** Typed `where`/`origin`
       on every settled failure, sanitized daemon log with standard/debug modes,
       crash markers surfaced in `daemon.status`, startup output and `swarm why`,
       owner-scoped `diagnose` plus `swarm why <command|Agent|agent:turn>` with a
       causal chain and one-line summary, `preceded_by` on turn outcomes, and the
       same summary in desktop Agent details. Qualify on a private daemon:
       nonexistent command, killed turn, invalid model, `max_live`, plugin panic
-      and forced daemon panic with the marker consumed exactly once.
+      and forced daemon panic with the marker consumed exactly once. Qualified
+      2026-11-21 on swarm.exe 8544DDDF (private data dir): nonexistent command and
+      max_live said origin/where; a real OpenRouter credit failure said provider
+      origin at `plugin.opencode.turn`; a killed plugin process and a daemon-restart
+      leftover said `Swarm` at `daemon.restart`; the debug `daemon.panic_test`
+      marker was reported once at restart and never again.
 
 ## L7 — Qualification, repair and release
 
