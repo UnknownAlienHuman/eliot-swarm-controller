@@ -867,8 +867,9 @@ the scope and offers Delete only for eligible stopped or failed task trees.
 Preflight can defer a settled managed workspace's process source to worktree
 removal. Open or uncertain processes still block preflight, and the source must
 close before the task records are removed.
-If cleanup is refused or uncertain, Delete keeps the task records. Earlier confirmed
-cleanup in the same request still stands. Uncertain effects are fenced, and an exact
+If cleanup is refused or uncertain, Delete keeps the task records. An unsuccessful
+native session cleanup also keeps the tree's worktrees. Earlier confirmed cleanup
+in the same request still stands. Uncertain effects are fenced, and an exact
 retry reads the retained outcome. A successful Delete supersedes unapplied cleanup
 reviews for the deleted tree's items. Process records for every generation are removed;
 consumed cleanup plans and their exact apply replay remain retained. A deleted command

@@ -110,11 +110,13 @@ verifies its effective home/SQLite root against the frozen store binding before
 dispatch; a legacy Codex home scope derived from an alias missing from the
 frozen binding remains ineligible for Swarm archive, and only a new launch can
 capture a verified binding for its own session. The OpenCode reader proves its
-served store derives the exact retained native scope before the delete. An
-OpenCode session with native children stays in place because the vendor
-delete would also remove the children. A delete acknowledgement or 404
-counts as removed only if the same server, store and directory give a
-complete session list with the exact session absent. An authoritative
+served store derives the exact retained native scope before the delete. The
+reader records a proven-absent target as removed even if its former children
+remain. A present target with native children stays in place because the
+vendor delete would also remove the children. Each child needs its own
+Swarm-created retained session artifact to qualify for cleanup. A delete
+acknowledgement or 404 counts as removed only if the same server, store and
+directory give a complete session list with the exact target absent. An authoritative
 refusal settles as skipped and keeps the session. A timeout or malformed or
 secret-bearing readback after dispatch is `unknown` and retains the durable
 retry fence. The metadata reader owns the vendor helper through shutdown. Raw
@@ -125,13 +127,19 @@ bytes.
 `agent.delete` runs the same guarded effects for the selected task tree's
 eligible native sessions and managed worktrees before retiring the task records.
 It records cleanup outcomes before retiring ownership and keeps the task records
-if an attempted effect is refused or uncertain.
+if an attempted effect is refused or uncertain. Session cleanup runs first.
+If a selected session is kept or uncertain, pending worktrees in that task
+tree settle as `skipped(native_session_kept)`. This also applies to a
+`cleanup.apply` selection that includes both effects.
 
 Continue a cleanup review with the opaque `continuation` string from the previous
 response and the same scope, project and age cutoff. The CLI passes it as
 `--continuation <token>` and MCP passes the string as `params.continuation`.
 The daemon also accepts legacy JSON continuations. A progress page can contain
 zero candidates with a continuation while the daemon scans the retained inventory.
+The backfill cursor advances only across completed probe batches. A failed probe
+rejects the page. A time slice that ends mid-batch can return progress through
+the last completed batch, with the unfinished batch retried on continuation.
 The desktop advances through those pages and offers Next page for more candidates.
 
 Owner plans with scope `all` or a registration ID in scope `project` include

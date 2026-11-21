@@ -45,7 +45,7 @@ impl Router {
             let result = async {
                 if let Some(mut response) = started? {
                     router
-                        .apply_cleanup_artifacts("owner", &apply, &plan, &mut response)
+                        .apply_cleanup_artifacts("owner", &apply, &plan, &mut response, true)
                         .await?;
                     require_agent_delete_cleanup(&plan, &response)?;
                 }
@@ -199,7 +199,8 @@ fn require_agent_delete_cleanup(plan: &CleanupPlan, response: &CleanupApplyRespo
         .items
         .iter()
         .zip(&response.items)
-        .find(|(_, outcome)| outcome.outcome != "removed")
+        .filter(|(_, outcome)| outcome.outcome != "removed")
+        .min_by_key(|(item, _)| item.artifact.kind != ArtifactKind::NativeSession)
     {
         let reason = outcome.reason.as_deref().unwrap_or("cleanup_refused");
         let object = match item.artifact.kind {

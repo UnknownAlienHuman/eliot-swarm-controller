@@ -864,6 +864,7 @@ impl Router {
         mut after: Option<String>,
     ) -> Result<Option<String>> {
         let deadline = Instant::now() + CLEANUP_BACKFILL_BUDGET;
+        let initial_after = after.clone();
         for _ in (0..CLEANUP_BACKFILL_LIMIT).step_by(CLEANUP_BACKFILL_BATCH) {
             let (agents, truncated) = self
                 .inner
@@ -887,14 +888,30 @@ impl Router {
                     eligible.push(agent);
                 }
             }
-            let backfill = futures_util::future::join_all(
-                eligible
-                    .into_iter()
-                    .map(|agent| self.record_agent_artifacts(agent)),
-            );
-            // A failed probe leaves existing ownership in the ledger.
-            // Move past the bounded batch even if a path is unavailable.
-            let _ = timeout_at(deadline, backfill).await;
+            let backfill =
+                futures_util::future::try_join_all(eligible.into_iter().map(|agent| async move {
+                    self.record_agent_artifacts(agent).await.map_err(|error| {
+                        let message = format!(
+                            "Cleanup inventory could not read {}. {}",
+                            agent.id, error.message
+                        );
+                        error.with_message(message)
+                    })
+                }));
+            match timeout_at(deadline, backfill).await {
+                Ok(result) => {
+                    result?;
+                }
+                // A partial batch can leave idempotent ownership records,
+                // but only completed batches advance the continuation.
+                Err(_) if after != initial_after => break,
+                Err(_) => {
+                    return Err(Error::new(
+                        "unavailable",
+                        "Cleanup inventory probe timed out",
+                    ));
+                }
+            }
             if !truncated && agents.len() < CLEANUP_BACKFILL_BATCH {
                 return Ok(None);
             }
@@ -1078,7 +1095,7 @@ impl Router {
             self.apply_project_registrations(&mut store, &request, &plan, &mut response)?;
             (plan, response)
         };
-        self.apply_cleanup_artifacts(&name, &request, &plan, &mut response)
+        self.apply_cleanup_artifacts(&name, &request, &plan, &mut response, false)
             .await?;
         encoded(response)
     }
@@ -1089,6 +1106,7 @@ impl Router {
         request: &CleanupApplyRequest,
         plan: &CleanupPlan,
         response: &mut CleanupApplyResponse,
+        entire_tree: bool,
     ) -> Result<()> {
         // A native reader may need the managed workspace as its directory.
         let (sessions, other): (Vec<_>, Vec<_>) = plan
@@ -1103,7 +1121,31 @@ impl Router {
             {
                 continue;
             }
-            let outcome = match self.cleanup_remove(name, &item.artifact, request).await {
+            let blocked_worktree = item.artifact.kind == ArtifactKind::Worktree
+                && plan
+                    .items
+                    .iter()
+                    .zip(&response.items)
+                    .any(|(session, outcome)| {
+                        session.artifact.kind == ArtifactKind::NativeSession
+                            && session.verdict == "safe"
+                            && request.selects(&session.artifact.id)
+                            && outcome.outcome != "removed"
+                            && (entire_tree
+                                || session.artifact.agent == item.artifact.agent
+                                || cleanup_tree_root(&session.artifact).is_some_and(|root| {
+                                    cleanup_tree_root(&item.artifact) == Some(root)
+                                }))
+                    });
+            let removal = if blocked_worktree {
+                Err(Error::new(
+                    "native_session_kept",
+                    "The tree's native session cleanup did not complete",
+                ))
+            } else {
+                self.cleanup_remove(name, &item.artifact, request).await
+            };
+            let outcome = match removal {
                 Ok(bytes) => CleanupItemOutcome {
                     artifact_id: item.artifact.id.clone(),
                     outcome: "removed".to_owned(),
@@ -2144,6 +2186,11 @@ fn swarm_created_session_agent(agent: &Agent) -> bool {
 
 fn native_archive_supported(harness: &str) -> bool {
     matches!(harness, "codex" | "opencode")
+}
+
+fn cleanup_tree_root(artifact: &ArtifactView) -> Option<&str> {
+    let (agent, _) = artifact.tree.last()?.split_once(':')?;
+    Some(agent)
 }
 
 fn native_session_artifact(agent: &Agent) -> Option<ArtifactView> {
