@@ -81,6 +81,9 @@ impl DesktopApp {
                     // The state filter stays as the owner chose it, even
                     // while no Agent is in that state.
                     self.monitor.data.apply(*snapshot);
+                    if !self.monitor.data.errors.is_empty() {
+                        self.link_suspect(context);
+                    }
                     // The next read waits on its own worker: a timer message
                     // would render the whole window for nothing.
                     self.read_monitor(monitor::PERIOD_MS, context);
@@ -224,9 +227,14 @@ impl DesktopApp {
     }
 
     /// One refresh after `delay_ms` (the next one is planned when it lands).
-    fn read_monitor(&mut self, delay_ms: u64, context: &ComponentContext<Self>) {
+    /// While no daemon answers nothing is read; the reconnect reads again.
+    pub(super) fn read_monitor(&mut self, delay_ms: u64, context: &ComponentContext<Self>) {
         if let Some(task) = self.monitor.task.take() {
             task.cancel();
+        }
+        if self.daemon_down() {
+            self.monitor.refreshing = false;
+            return;
         }
         self.monitor.epoch += 1;
         let data_dir = match self.data_dir.clone() {

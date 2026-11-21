@@ -588,6 +588,7 @@ impl DesktopApp {
                 match result {
                     Ok(reread) => {
                         let reread = *reread;
+                        self.chat.failures = 0;
                         self.chat.docs.extend(reread.docs);
                         if let Some(detail) = reread.detail.as_ref() {
                             self.chat.detail = Some(detail_from(detail));
@@ -611,7 +612,10 @@ impl DesktopApp {
                             error.user_message()
                         ));
                         self.chat.invalidated.merge(work);
-                        let delay = live::backoff_ms(self.chat.failures.min(4));
+                        // Each failure in a row waits longer (#826).
+                        let delay = live::backoff_ms(self.chat.failures);
+                        self.chat.failures = self.chat.failures.saturating_add(1);
+                        self.link_suspect(context);
                         let _task = context.spawn_background(move |cancel| {
                             let cancelled = || cancel.is_cancelled();
                             let _ = feed::backoff(delay, &cancelled);
@@ -1140,10 +1144,13 @@ impl DesktopApp {
         };
         let body = View::fragment((transcript, cover));
         let pending = self.pending_view(column, context, palette);
+        let reconnect = self.reconnect_notice(column, palette);
         let alert: View = match (&self.chat.confirm_force, &self.alert) {
             (Some((bound, title)), _) => {
                 self.force_stop_banner(bound, title, column, context, palette)
             }
+            // A restart in progress says so once, over the reads it stalls.
+            (None, _) if reconnect.is_some() => reconnect.unwrap_or_else(View::empty),
             (None, Some(text)) => {
                 let queue: View = if self
                     .launch

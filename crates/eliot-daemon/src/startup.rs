@@ -18,20 +18,8 @@ pub async fn ensure_running(data_dir: &Path, swarm_executable: &Path) -> Result<
         return Ok(());
     }
 
-    match crate::client_call_typed::<_, DaemonStatusResponse>(
-        data_dir,
-        "daemon.status",
-        &DaemonStatusRequest::default(),
-    )
-    .await
-    {
-        Ok(_) => return Ok(()),
-        Err(error)
-            if matches!(
-                error.code.as_str(),
-                "unavailable" | "platform_io" | "data_dir_unavailable"
-            ) => {}
-        Err(error) => return Err(error),
+    if reachable(data_dir).await? {
+        return Ok(());
     }
     crate::platform::DataDir::open(data_dir)?;
     let started = std::time::SystemTime::now()
@@ -87,6 +75,32 @@ pub async fn ensure_running(data_dir: &Path, swarm_executable: &Path) -> Result<
             ));
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Whether this data directory's daemon answers the Owner-only
+/// `daemon.status`. `Ok(false)` means no daemon is reachable there (nothing
+/// listens, or the root has no daemon yet): the case [`ensure_running`]
+/// starts one for. Any other failure, such as a refused identity, is
+/// returned as it is.
+pub async fn reachable(data_dir: &Path) -> Result<bool> {
+    match crate::client_call_typed::<_, DaemonStatusResponse>(
+        data_dir,
+        "daemon.status",
+        &DaemonStatusRequest::default(),
+    )
+    .await
+    {
+        Ok(_) => Ok(true),
+        Err(error)
+            if matches!(
+                error.code.as_str(),
+                "unavailable" | "platform_io" | "data_dir_unavailable"
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
     }
 }
 

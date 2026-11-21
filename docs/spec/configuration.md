@@ -39,8 +39,8 @@ private files. Owner and ACL checks open the root by handle through the verbatim
 so roots past the Win32 parse limit keep the same current-user-only protection.
 An existing unsafe root is refused; never repair ownership, weaken the
 check or copy its contents silently. The error offers one explicit command selecting
-a fresh private per-user directory; the desktop offers the same remedy. The user must
-choose it. Existing roots and configuration are not overwritten by bootstrap.
+a fresh private per-user directory; the desktop offers it as the last, explicitly
+named choice of its startup failure view (below). The user must choose it. Existing roots and configuration are not overwritten by bootstrap.
 
 The desktop's explicitly chosen fresh root is retained in a private per-user pointer:
 `%LOCALAPPDATA%\Eliot-bootstrap\selected-data-dir` on Windows, or
@@ -62,7 +62,18 @@ Owner CLI callers start their private daemon when needed (`status` remains a rea
 probe). Agent and Run callers keep their inherited identity and dispatch directly;
 they never probe Owner-only readiness or start a daemon with Owner authority.
 The desktop starts the sibling `swarm.exe` and waits for daemon readiness before
-loading settings. `swarm-desktop --workspace PATH` opens and registers that checkout;
+loading settings. After that first connection, a failed read asks `daemon.status`;
+when no daemon answers, the desktop runs the same startup path again (it starts a
+daemon only when none is reachable, and the data-directory lock admits one), at
+most five attempts with 1, 2, 4 and 8 s pauses between them. A notice above the
+composer counts the attempts and gives the previous attempt's reason; the polls and
+the open conversation wait and read again once the daemon answers. After the last
+attempt, or when the first start fails, the main area shows the daemon's own reason
+and the choices in this order: Retry on the same data directory (the default),
+Repair settings, Open log, Open the data folder, Use another data directory (an
+existing private Swarm root, validated and remembered by the selected-root pointer)
+and, last, a new empty data directory. The desktop does not validate the daemon's
+configuration itself. `swarm-desktop --workspace PATH` opens and registers that checkout;
 without the flag it registers nothing: the folder it was started from never becomes
 a project implicitly. A later launch in a different checkout registers that
 workspace through the same machine-author settings writer.
@@ -1087,8 +1098,8 @@ window closes, and only when it changed. It reads `window` from the file before 
 exists, so the window opens at that size, place and maximized state with no move after the
 first frame; a place no longer on an attached monitor is clamped into the nearest one's work
 area, and without `x`/`y` Windows chooses the place.
-When configuration prevents daemon startup, the local Owner can open Settings
-from the startup error. Repair uses the daemon's settings reader and
+When the daemon cannot start, the local Owner can open Settings (Repair
+settings) from the startup failure view. Repair uses the daemon's settings reader and
 revision-checked writer under the private daemon lock. After a repair save
 succeeds and Settings reads the saved file back successfully, Settings offers
 Retry startup through the existing startup action.
