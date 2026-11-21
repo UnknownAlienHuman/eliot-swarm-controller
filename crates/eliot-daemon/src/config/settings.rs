@@ -150,6 +150,7 @@ fn issue_from_error(source: &str, error: &core::Error, policy: &SecretPolicy) ->
         section: section_for_error(source, error),
         code: error.code.clone(),
         message,
+        removable: false,
     }
 }
 
@@ -209,6 +210,7 @@ fn add_section_error_issue(
                 section: Some(section),
                 code: error.code.clone(),
                 message,
+                removable: false,
             },
         );
     }
@@ -395,6 +397,7 @@ pub(crate) fn read_snapshot(
                             section: Some(section),
                             code: "profile_error".to_owned(),
                             message: format!("config.toml: [{name}]: {reason}"),
+                            removable: true,
                         },
                     );
                 }
@@ -462,6 +465,7 @@ pub(crate) fn read_snapshot(
                 section: Some(SettingsSection::Profiles),
                 code: "not_allowed".to_owned(),
                 message: reason.to_owned(),
+                removable: false,
             },
         );
     }
@@ -491,6 +495,7 @@ pub(crate) fn read_snapshot(
                     section: Some(*section),
                     code: "profile_error".to_owned(),
                     message: format!("config.toml: [{name}] must be a table"),
+                    removable: true,
                 },
             );
             continue;
@@ -509,6 +514,7 @@ pub(crate) fn read_snapshot(
                             section: Some(SettingsSection::Daemon),
                             code: "profile_error".to_owned(),
                             message: "daemon.chats_root must be a string".to_owned(),
+                            removable: true,
                         },
                     );
                     values.insert(*section, value);
@@ -539,11 +545,27 @@ pub(crate) fn read_snapshot(
                         "the {} section contains a value withheld by the current secret policy",
                         name
                     ),
+                    removable: false,
                 },
             );
             continue;
         }
         values.insert(*section, value);
+    }
+    for issue in &mut issues {
+        let Some(section) = issue.section else {
+            continue;
+        };
+        if issue.removable || issue.code == "not_allowed" {
+            continue;
+        }
+        let name = section_name(section);
+        let source_section = project_source_sections(source, &[name]);
+        issue.removable = invalid_sections.contains_key(name)
+            || table.get(name).is_some_and(|value| !value.is_table())
+            || super::parse_config_document(&source_section).is_err()
+            || (validation_dependencies(section) == [name]
+                && validate_candidate(&source_section).is_err());
     }
     Ok(SettingsSnapshot {
         revision,

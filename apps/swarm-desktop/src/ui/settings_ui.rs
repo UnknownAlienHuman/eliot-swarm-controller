@@ -1468,7 +1468,7 @@ impl DesktopApp {
             .settings
             .issues
             .iter()
-            .filter(|issue| issue.code != "not_allowed")
+            .filter(|issue| issue.removable)
             .filter_map(|issue| issue.section)
             .collect();
         let sections: BTreeMap<_, _> = sections
@@ -1868,7 +1868,7 @@ impl DesktopApp {
         }
         let removable: Vec<_> = issues
             .iter()
-            .filter(|issue| issue.code != "not_allowed")
+            .filter(|issue| issue.removable)
             .filter_map(|issue| issue.section)
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()

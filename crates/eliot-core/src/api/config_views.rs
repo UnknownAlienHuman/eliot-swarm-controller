@@ -263,6 +263,7 @@ impl SettingsReadRequest {
                     || issue.message.is_empty()
                     || issue.message.len() > 4096
                     || issue.message.contains('\0')
+                    || (issue.removable && (issue.section.is_none() || issue.code == "not_allowed"))
             })
         {
             return Err(Error::new(
@@ -323,6 +324,9 @@ pub struct SettingsReadIssue {
     pub section: Option<SettingsSection>,
     pub code: String,
     pub message: String,
+    /// The daemon verified a failure in the section itself.
+    #[serde(default)]
+    pub removable: bool,
 }
 
 /// Response for `settings.read`.
