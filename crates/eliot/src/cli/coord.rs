@@ -1,9 +1,9 @@
 //! Command and turn resolution, mail, variables, workers and claims.
 use super::args::{
     ClaimArgs, ClaimCommand, ClaimListArgs, ClaimReleaseArgs, ClaimSetArgs, CmdArgs,
-    CmdChildrenArgs, CmdCommand, CmdResolveArgs, CmdShowArgs, InboxArgs, MsgAckArgs, MsgArgs,
-    MsgCommand, MsgSendArgs, MsgShowArgs, PageArgs, TurnArgs, TurnCommand, TurnResolveArgs,
-    VarArgs, VarCommand, VarGetArgs, VarSetArgs, WhoArgs,
+    CmdChildrenArgs, CmdCommand, CmdResolveArgs, CmdSettleStoppedArgs, CmdShowArgs, InboxArgs,
+    MsgAckArgs, MsgArgs, MsgCommand, MsgSendArgs, MsgShowArgs, PageArgs, TurnArgs, TurnCommand,
+    TurnResolveArgs, VarArgs, VarCommand, VarGetArgs, VarSetArgs, WhoArgs,
 };
 use super::support::{
     Failure, command_value, mutation_id, print_value, sleep_before_deadline, validate_limit,
@@ -17,8 +17,9 @@ use eliot_core::api::{
     CommandGetRequest, CommandResolution, CommandResolveRequest, CommandResolveResponse,
     MAX_VAR_VALUE_BYTES, MailAckRequest, MailAckResponse, MailDelivery, MailInboxRequest,
     MailInboxResponse, MailMode, MailReadRequest, MailSendRequest, MailSendResponse,
-    TurnResolveRequest, TurnResolveResponse, TurnResolveStatus, VarGetRequest, VarGetResponse,
-    VarSetRequest, VarSetResponse, WhoRequest, WhoResponse,
+    SettleStoppedRequest, SettleStoppedResponse, TurnResolveRequest, TurnResolveResponse,
+    TurnResolveStatus, VarGetRequest, VarGetResponse, VarSetRequest, VarSetResponse, WhoRequest,
+    WhoResponse,
 };
 use serde_json::Value;
 use std::{
@@ -35,6 +36,31 @@ pub(crate) async fn run_cmd(
     id: Option<String>,
 ) -> Result<u8, Failure> {
     match command {
+        CmdCommand::SettleStopped(CmdSettleStoppedArgs { apply, after }) => {
+            let request = SettleStoppedRequest {
+                id: mutation_id(id)?,
+                after,
+                review: apply,
+            };
+            request.validate().map_err(Failure::for_mutation)?;
+            let response: SettleStoppedResponse =
+                eliot_daemon::client_call_typed(&data_dir, "command.settle_stopped", &request)
+                    .await
+                    .map_err(Failure::for_mutation)?;
+            if response.id != request.id
+                || response.applied != request.review.is_some()
+                || request
+                    .review
+                    .as_ref()
+                    .is_some_and(|review| review != &response.review)
+            {
+                return Err(Failure::new(4, "stop settlement response binding differs"));
+            }
+            let value = serde_json::to_value(response)
+                .map_err(|_| Failure::new(4, "stop settlement response is invalid"))?;
+            print_value(&value, json_output);
+            Ok(0)
+        }
         CmdCommand::Cancel(CmdShowArgs { command_id }) => {
             let request = eliot_core::api::CommandCancelRequest {
                 id: mutation_id(id)?,

@@ -1094,6 +1094,8 @@ pub(crate) enum CmdCommand {
     Children(CmdChildrenArgs),
     /// Resolve an unknown command to its owner-asserted terminal state.
     Resolve(CmdResolveArgs),
+    /// Preview or settle unknown stops whose owned process exit is proven.
+    SettleStopped(CmdSettleStoppedArgs),
     /// Withdraw one undispatched handoff input with no native effect.
     Cancel(CmdShowArgs),
 }
@@ -1122,6 +1124,16 @@ pub(crate) struct CmdResolveArgs {
     pub(crate) resolution: String,
     #[arg(long, value_name = "TEXT")]
     pub(crate) reason: String,
+}
+
+#[derive(Args)]
+pub(crate) struct CmdSettleStoppedArgs {
+    /// Apply the exact page identified by a preview's review digest.
+    #[arg(long, value_name = "SHA256")]
+    pub(crate) apply: Option<String>,
+    /// Resume after the previous page's next command ID.
+    #[arg(long, value_name = "COMMAND_ID", value_parser = command_id)]
+    pub(crate) after: Option<String>,
 }
 
 fn command_id(value: &str) -> Result<String, String> {

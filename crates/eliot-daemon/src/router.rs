@@ -531,6 +531,7 @@ impl Router {
             "command.get" => self.command_get(&params, &principal).await,
             "command.children" => self.command_children(&params, &principal).await,
             "command.resolve" => self.command_resolve(&params, &principal).await,
+            "command.settle_stopped" => self.command_settle_stopped(&params, &principal).await,
             "agent.get" => self.agent_get(&params, &principal).await,
             "agent.discover" => self.agent_discover(&params, &principal).await,
             "harness.list" => self.harness_list(&params, &principal).await,

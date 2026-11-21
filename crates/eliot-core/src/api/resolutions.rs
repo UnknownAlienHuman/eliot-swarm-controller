@@ -77,6 +77,54 @@ pub struct CommandResolveResponse {
     pub state: CommandState,
 }
 
+/// With no review digest, list one page. With a digest, settle exactly the
+/// reviewed page after checking its evidence again.
+#[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SettleStoppedRequest {
+    pub id: String,
+    #[serde(default)]
+    pub after: Option<String>,
+    #[serde(default)]
+    pub review: Option<String>,
+}
+
+impl SettleStoppedRequest {
+    pub fn validate(&self) -> Result<()> {
+        validate_write_id(&self.id)?;
+        if let Some(after) = &self.after {
+            crate::validate_command_id(after)?;
+        }
+        if let Some(review) = &self.review
+            && (review.len() != 64 || !review.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            return Err(Error::new(
+                "invalid",
+                "stop settlement review must be a SHA-256 digest",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
+pub struct SettleStoppedResponse {
+    pub id: String,
+    pub review: String,
+    pub applied: bool,
+    pub stops: Vec<StoppedCommandSettlement>,
+    pub next: Option<String>,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
+pub struct StoppedCommandSettlement {
+    pub agent: String,
+    pub generation: i64,
+    pub command_id: String,
+    pub mark_stopped: bool,
+    pub interrupted_turn: Option<String>,
+}
+
 #[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnResolveStatus {
