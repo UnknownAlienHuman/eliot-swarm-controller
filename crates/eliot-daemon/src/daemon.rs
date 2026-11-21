@@ -92,19 +92,11 @@ pub async fn run(path: PathBuf) -> Result<()> {
     let policy = Arc::new(SecretPolicy::new([data_dir.owner_token()]));
     // `[daemon] log_level` sets process verbosity at startup; an invalid
     // value fails startup like invalid retention or mail config.
-    let daemon_config = match crate::config::load_daemon_config(data_dir.path()) {
-        Ok(config) => config,
-        Err(error) => {
-            let failure = Error::new(error.code.clone(), "daemon configuration failed")
-                .with_where(crate::startup::CONFIG_STARTUP_LOCATION)
-                .with_origin(
-                    FailureOrigin::Swarm,
-                    config_startup_evidence(&error.message),
-                );
-            logging::record(&policy, "daemon.failed", &[], Some(&failure));
-            return Err(error);
-        }
-    };
+    let daemon_config = crate::config::load_daemon_config(data_dir.path()).map_err(|error| {
+        let failure = startup_config_failure(error);
+        logging::record(&policy, "daemon.failed", &[], Some(&failure));
+        failure
+    })?;
     crate::logging::set_log_level(crate::logging::LogLevel::parse(&daemon_config.log_level)?);
     logging::record(&policy, "daemon.starting", &[], None);
     if let Err(error) =
@@ -219,7 +211,8 @@ async fn initialize_runtime(
     let bus = Bus::new(1_024);
     // Invalid `[mail]` fails startup like invalid retention; the Router keeps
     // the loaded limits for the run instead of re-reading the file per send.
-    let mail_config = crate::config::load_mail_config(data_dir.path())?;
+    let mail_config =
+        crate::config::load_mail_config(data_dir.path()).map_err(startup_config_failure)?;
     let router = Router::new_with_mail_config(
         data_dir.path().to_path_buf(),
         data_dir.owner_token().to_owned(),
@@ -285,9 +278,12 @@ async fn initialize_runtime(
             ("retained", report.retained as u64),
         ],
     );
-    let automation_config = crate::config::load_automation_config(data_dir.path())?;
-    let daemon_config = crate::config::load_daemon_config(data_dir.path())?;
-    let cloud_mcp_config = crate::config::load_cloud_mcp_config(data_dir.path())?;
+    let automation_config =
+        crate::config::load_automation_config(data_dir.path()).map_err(startup_config_failure)?;
+    let daemon_config =
+        crate::config::load_daemon_config(data_dir.path()).map_err(startup_config_failure)?;
+    let cloud_mcp_config =
+        crate::config::load_cloud_mcp_config(data_dir.path()).map_err(startup_config_failure)?;
     let attention_suspicion_window =
         Duration::from_secs(daemon_config.attention_suspicion_secs as u64);
     // Install [daemon] observe thresholds once: monitor sweeps and Router
@@ -1794,6 +1790,19 @@ const LOG_TAIL_BYTES: u64 = 64 * 1024;
 const LOG_TAIL_RECORDS: usize = 64;
 const CONFIG_STARTUP_EVIDENCE_BYTES: usize = 512;
 const CONFIG_STARTUP_MAX_LINE: u32 = 128 * 1024;
+const CONFIG_STARTUP_ISSUES: &[&str] = &[
+    "invalid TOML syntax or value",
+    "unknown configuration field",
+    "unsupported configuration field",
+    "daemon configuration could not be loaded",
+];
+
+fn startup_config_failure(error: Error) -> Error {
+    let evidence = config_startup_evidence(&error.message);
+    error
+        .with_where(crate::startup::CONFIG_STARTUP_LOCATION)
+        .with_origin(FailureOrigin::Swarm, evidence)
+}
 
 /// Reduce the config parser's message to fixed issue vocabulary and a line
 /// number. Never persist its field text, source line or caret excerpt.
@@ -1809,13 +1818,9 @@ fn config_startup_evidence(message: &str) -> String {
                 return None;
             }
             let issue = detail.rsplit_once(": ")?.1;
-            let issue = match issue {
-                "invalid TOML syntax or value" => "invalid TOML syntax or value",
-                "unknown configuration field" => "unknown configuration field",
-                "unsupported configuration field" => "unsupported configuration field",
-                _ => return None,
-            };
-            Some(format!("config.toml, line {line}: {issue}"))
+            CONFIG_STARTUP_ISSUES
+                .contains(&issue)
+                .then(|| format!("config.toml, line {line}: {issue}"))
         })
         .unwrap_or_else(|| {
             "config.toml, line unavailable: daemon configuration could not be loaded".to_owned()
@@ -1839,13 +1844,9 @@ fn validated_config_startup_diagnostic(evidence: &str) -> Option<String> {
         }
         line.to_string()
     };
-    let issue = match issue {
-        "invalid TOML syntax or value" => "invalid TOML syntax or value",
-        "unknown configuration field" => "unknown configuration field",
-        "unsupported configuration field" => "unsupported configuration field",
-        "daemon configuration could not be loaded" => "daemon configuration could not be loaded",
-        _ => return None,
-    };
+    if !CONFIG_STARTUP_ISSUES.contains(&issue) {
+        return None;
+    }
     let diagnostic = format!("config.toml, line {line}: {issue}");
     (diagnostic.len() <= CONFIG_STARTUP_EVIDENCE_BYTES).then_some(diagnostic)
 }
