@@ -1,9 +1,9 @@
 //! The sidebar's right-click menus (owner review 2026-11-16): a project's
 //! or subproject's New task here, Open folder, Rename, Collapse or Expand,
-//! Archive finished tasks, Delete stopped tasks and Remove project (k142,
+//! Archive finished tasks, Delete stopped tasks and Remove from Swarm (k142,
 //! through [`super::bulk_ui`]); a chat's or task's Rename, Stop (while it is live, idle
 //! included), Move under another task (k113, [`super::move_ui`]), Resume
-//! (a lost one), Archive or Unarchive, Delete, Copy Agent ID and Open
+//! (a lost one), Archive or Unarchive, Delete (stopped or failed trees only), Copy Agent ID and Open
 //! folder.
 //!
 //! Delete follows the Store's rule (`docs/spec/core.md`, explicit Agent
@@ -793,8 +793,14 @@ impl DesktopApp {
                 self.menu.renaming = Some((target, current));
                 self.focus_rename(5, context);
             }
-            (Action::Delete, _) => {
+            (Action::Delete, Target::Agent(agent))
+                if !agent.native_child && agent.deletable() =>
+            {
                 self.menu.confirm = Some((target, action));
+            }
+            (Action::Delete, Target::Agent(_)) => {
+                self.alert("Delete is available only for stopped or failed task trees.");
+                self.shell_update(ShellMsg::RefreshRequested, context);
             }
             (
                 Action::ArchiveFinished | Action::DeleteStopped,
@@ -1111,7 +1117,7 @@ impl DesktopApp {
                 if !self.registrations_in(checkouts).is_empty() {
                     entries.push((
                         Action::RemoveProject,
-                        "Remove project…".to_owned(),
+                        "Remove from Swarm…".to_owned(),
                         m3::glyph::DELETE,
                         true,
                     ));
@@ -1235,15 +1241,10 @@ impl DesktopApp {
                 if agent.live() && !agent.native_child {
                     entries.push((Action::Stop, "Stop".to_owned(), m3::glyph::STOP, false));
                 }
-                if !agent.native_child && (agent.live() || agent.deletable()) {
+                if !agent.native_child && agent.deletable() {
                     entries.push((
                         Action::Delete,
-                        if agent.live() {
-                            "Stop and delete…"
-                        } else {
-                            "Delete…"
-                        }
-                        .to_owned(),
+                        "Delete…".to_owned(),
                         m3::glyph::DELETE,
                         true,
                     ));
@@ -1393,14 +1394,14 @@ impl DesktopApp {
                 "Stop and delete",
             ),
             Action::Delete => (
-                format!("Delete “{}”?", target.title()),
-                "Its conversation and records leave Swarm for good. Its folder, files and branches stay.",
+                format!("Delete “{}” and its task tree?", target.title()),
+                "Swarm removes this task and its descendant tasks and records. Swarm workspace files and Git branches stay. Eligible Swarm-created Codex sessions are archived and eligible OpenCode sessions are deleted. Claude Code, Muse and Antigravity keep their own history; attached or observed sessions are left untouched.",
                 "Delete",
             ),
             _ => (
-                format!("Remove project “{}”?", target.title()),
-                "Swarm forgets this project. Its folder, files and tasks stay; you can add it again in Settings › Projects.",
-                "Remove project",
+                format!("Remove “{}” from Swarm?", target.title()),
+                "Swarm removes this project registration. The checkout, workspace files, branches and task records stay; you can add the checkout again in Settings › Projects.",
+                "Remove from Swarm",
             ),
         };
         super::dialog_ui::surface(
