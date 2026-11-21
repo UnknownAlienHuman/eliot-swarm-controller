@@ -422,7 +422,7 @@ attaches bounded `changed_paths` from the inline `args` target (`path`), else fr
 coverage gap. A command tool's `tool.started` may carry `command`, the command text the
 harness reports (Codex: its parsed `commandActions[].command`, one per line, else the raw
 `command`; Claude: the `tool_use` `input.command`; OpenCode: the
-`session.tool.called` `input.command`), redacted with the secret policy and
+`session.tool.called` tool input string `command`, the shell tool), redacted with the secret policy and
 bounded to [`MAX_TOOL_COMMAND_BYTES`](../../crates/eliot-core/src/limits.rs); command
 output and other arguments are never persisted. Handoff transfer for
 `child`, `goal` and `usage` stays `unsupported`. Native-child observation is

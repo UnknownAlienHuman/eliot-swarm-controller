@@ -703,15 +703,18 @@ pub struct ToolInputStartedData {
 
 /// `session.tool.failed` data subset: the base plus the structured
 /// error (`Session.StructuredError`, the same body execution terminals
-/// carry). The optional `content`/`metadata` result payload is never
-/// persisted.
+/// carry). The installed schema declares `error` required, but the
+/// adapter tolerates its absence: a failure without a message still
+/// commits `tool.completed` with `status: error`, never a stream loss.
+/// The optional `content`/`metadata` result payload is never persisted.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolFailedData {
     #[serde(rename = "sessionID")]
     pub session_id: String,
     pub id: String,
-    pub error: StructuredError,
+    #[serde(default)]
+    pub error: Option<StructuredError>,
 }
 
 /// `session.created` / `session.deleted` data subset: the exact session id.

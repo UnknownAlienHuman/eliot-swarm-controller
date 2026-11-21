@@ -133,16 +133,22 @@ tool event that does); the adapter remembers it by the tool part `id` for
 the exact active turn. `session.tool.called` (input complete, native
 execution starts) commits `tool.started`, and the durable
 `session.tool.success`/`session.tool.failed` terminals commit
-`tool.completed` (`status` `completed`, or `error` with the bounded
-redacted `Session.StructuredError` message), bound to the exact turn and
-generation with the native part `id` as the item id. A string
-`input.command` on `called` (the bash tool) is added to `tool.started` as
-`command`, secret-redacted and bounded (plugin protocol); other arguments
-and the result `content`/`metadata` are never persisted.
+`tool.completed` (`status` `completed`, or `error`; a failure carries
+the bounded redacted `Session.StructuredError` message when present —
+the installed schema requires `error`, but its absence still commits
+`status: error` without a message, never a stream loss), bound to the
+exact turn and generation with the native part `id` as the item id. A
+tool input string `command` on `called` (the shell tool) is added to
+`tool.started` as `command`, secret-redacted and bounded (plugin
+protocol); other arguments and the result `content`/`metadata` are
+never persisted.
 `session.tool.input.delta`, `input.ended` and `progress` stay unmapped
 streaming detail. A terminal with no observed start is one tool-family
 coverage gap, never a guessed tool row; replays of an already-committed
-start or terminal never re-commit. These facts advance native liveness
+start or terminal never re-commit. Per-part tracking (name plus
+committed start/terminal flags) retains the first 128 parts of a turn
+without eviction and clears when the turn fences; facts for later parts
+drop with one tool-family coverage gap per turn. These facts advance native liveness
 progress exactly like the other adapters' tool events.
 
 Busy graceful stop first sends the exact-session native interrupt once, guarded

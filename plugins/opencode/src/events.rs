@@ -58,8 +58,21 @@ const MAX_MESSAGE_PAGES: usize = 4;
 const MAX_PENDING_REQUESTS: usize = 128;
 const MAX_RESOLVED_REQUESTS: usize = 128;
 const MAX_STEER_WATCHES: usize = 128;
-const MAX_TOOL_NAMES: usize = 128;
+const MAX_TOOL_PARTS: usize = 128;
 const REPLY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Per-part tool tracking for the exact active turn: the native name
+/// from `session.tool.input.started` (the only installed tool event
+/// carrying it) plus the committed start/terminal flags. Bounded to the
+/// first [`MAX_TOOL_PARTS`] parts per turn without eviction, so an
+/// in-flight part never loses its flags; facts for later parts drop with
+/// one tool-family coverage gap per turn. Cleared when the turn fences.
+#[derive(Default)]
+struct ToolPart {
+    name: Option<String>,
+    started: bool,
+    completed: bool,
+}
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct EventStatus {
@@ -288,19 +301,12 @@ struct EventProcessor {
     /// Inbox id of the currently open turn: the prompt response id, which
     /// is the user message id the terminal readback bounds against.
     active_model: Option<ModelRef>,
-    /// Native tool names by part id for the exact active turn, remembered
-    /// from `session.tool.input.started`: the installed `called`,
-    /// `success` and `failed` schemas carry no name field. Cleared with
-    /// the turn; bounded like the other per-turn maps.
-    tool_names: HashMap<String, String>,
-    tool_name_order: VecDeque<String>,
-    /// Part ids with a committed `tool.started` in the exact active turn:
-    /// a replayed `called` never re-commits (the Store refuses a
-    /// previously committed native id).
-    tools_started: HashSet<String>,
-    /// Part ids with a committed `tool.completed` in the exact active
-    /// turn: the first terminal wins, a replay never re-commits.
-    tools_completed: HashSet<String>,
+    /// Per-part tool tracking for the exact active turn (name plus
+    /// committed start/terminal flags), bounded to [`MAX_TOOL_PARTS`].
+    tool_parts: HashMap<String, ToolPart>,
+    /// One tool-family coverage gap per turn when the tracking bound is
+    /// full; later part facts drop instead of growing without bound.
+    tool_parts_overflowed: bool,
     /// Inbox ids observed as enqueued or delivered, by id. Bounded by the
     /// per-generation command history the host keeps.
     seen_inbox: HashSet<String>,
@@ -678,10 +684,8 @@ impl EventProcessor {
             gap_reported: false,
             pending: None,
             active_model: None,
-            tool_names: HashMap::new(),
-            tool_name_order: VecDeque::new(),
-            tools_started: HashSet::new(),
-            tools_completed: HashSet::new(),
+            tool_parts: HashMap::new(),
+            tool_parts_overflowed: false,
             seen_inbox: HashSet::new(),
             seen_delivered: HashSet::new(),
             seen_cancelled: HashSet::new(),
@@ -1837,25 +1841,21 @@ impl EventProcessor {
         {
             return Ok(());
         }
-        if !self.tool_names.contains_key(&started.id) {
-            self.tool_name_order.push_back(started.id.clone());
-            while self.tool_name_order.len() > MAX_TOOL_NAMES {
-                if let Some(evicted) = self.tool_name_order.pop_front() {
-                    self.tool_names.remove(&evicted);
-                }
-            }
-        }
-        self.tool_names.insert(started.id, started.name);
+        let Some(part) = self.tool_part(&started.id).await? else {
+            return Ok(());
+        };
+        part.name = Some(started.name);
         Ok(())
     }
 
     /// `session.tool.called`: the input is complete and native execution
     /// starts (the vendor sets the part to `running` on exactly this
     /// event). Commit `tool.started` bound to the exact active turn with
-    /// the native part id as the item id. A string `input.command` (the
-    /// installed bash tool) is redacted and bounded like the other
-    /// plugins; other arguments and results are never persisted. A
-    /// replayed `called` for an already-started part never re-commits.
+    /// the native part id as the item id. A string `input.command` on any
+    /// tool input (the installed shell tool) is redacted and bounded like
+    /// the other plugins; other arguments and results are never
+    /// persisted. A replayed `called` for an already-started part never
+    /// re-commits.
     async fn observe_tool_called(&mut self, envelope: &SseEnvelope) -> Result<()> {
         let called: ToolEventData =
             serde_json::from_value(envelope.data.clone()).map_err(|_| {
@@ -1872,14 +1872,13 @@ impl EventProcessor {
         let Some((command_id, turn_id)) = self.active_tool_turn().await? else {
             return Ok(());
         };
-        if self.tools_started.contains(&called.id) {
+        let Some(part) = self.tool_part(&called.id).await? else {
+            return Ok(());
+        };
+        if part.started {
             return Ok(());
         }
-        let tool = self
-            .tool_names
-            .get(&called.id)
-            .cloned()
-            .unwrap_or_else(|| "tool".to_owned());
+        let tool = part.name.clone().unwrap_or_else(|| "tool".to_owned());
         let mut data = json!({
             "command_id": command_id,
             "turn_id": turn_id,
@@ -1913,14 +1912,18 @@ impl EventProcessor {
             "OpenCode",
         )?;
         self.commit_event("tool.started", native_id, data).await?;
-        self.tools_started.insert(called.id);
+        if let Some(part) = self.tool_parts.get_mut(&called.id) {
+            part.started = true;
+        }
         Ok(())
     }
 
     /// `session.tool.success` / `session.tool.failed`: the installed
     /// durable tool terminals. Commit `tool.completed` with the frame's
-    /// own verdict (`completed` or `error`) and, on failure, the bounded
-    /// redacted `Session.StructuredError` message. The result
+    /// own verdict (`completed` or `error`) and, on failure with an
+    /// error body, the bounded redacted `Session.StructuredError` message
+    /// (the installed schema requires `error`, but its absence still
+    /// commits `status: error` without a message). The result
     /// `content`/`metadata` payload is never persisted. A terminal with
     /// no remembered start (its `input.started`/`called` were lost) is one
     /// tool-family coverage gap, never a guessed tool row; the first
@@ -1932,7 +1935,7 @@ impl EventProcessor {
                 serde_json::from_value(envelope.data.clone()).map_err(|_| {
                     Error::new(
                         "native_protocol",
-                        "OpenCode tool failure omitted its exact identity or error",
+                        "OpenCode tool failure omitted its exact identity",
                     )
                 })?;
             (
@@ -1940,7 +1943,7 @@ impl EventProcessor {
                     session_id: failure.session_id,
                     id: failure.id,
                 },
-                Some(failure.error),
+                failure.error,
             )
         } else {
             let terminal: ToolEventData =
@@ -1960,11 +1963,14 @@ impl EventProcessor {
         let Some((command_id, turn_id)) = self.active_tool_turn().await? else {
             return Ok(());
         };
-        if self.tools_completed.contains(&terminal.id) {
+        let Some(part) = self.tool_part(&terminal.id).await? else {
+            return Ok(());
+        };
+        if part.completed {
             return Ok(());
         }
-        if !self.tools_started.contains(&terminal.id) {
-            self.tools_completed.insert(terminal.id);
+        if !part.started {
+            part.completed = true;
             return self
                 .stream_source()
                 .record_coverage_gap(
@@ -1973,11 +1979,7 @@ impl EventProcessor {
                 )
                 .await;
         }
-        let tool = self
-            .tool_names
-            .get(&terminal.id)
-            .cloned()
-            .unwrap_or_else(|| "tool".to_owned());
+        let tool = part.name.clone().unwrap_or_else(|| "tool".to_owned());
         let secrets = SecretPolicy::new(self.secrets.iter().cloned());
         let mut data = json!({
             "command_id": command_id,
@@ -2005,8 +2007,33 @@ impl EventProcessor {
             "OpenCode",
         )?;
         self.commit_event("tool.completed", native_id, data).await?;
-        self.tools_completed.insert(terminal.id);
+        if let Some(part) = self.tool_parts.get_mut(&terminal.id) {
+            part.completed = true;
+        }
         Ok(())
+    }
+
+    /// Look up (or open) the tracking slot for one tool part id. The map
+    /// retains the first [`MAX_TOOL_PARTS`] parts of the turn without
+    /// eviction; a fact for a later part drops after one tool-family
+    /// coverage gap per turn, never growing the map without bound.
+    async fn tool_part(&mut self, id: &str) -> Result<Option<&mut ToolPart>> {
+        if !self.tool_parts.contains_key(id) {
+            if self.tool_parts.len() >= MAX_TOOL_PARTS {
+                if !self.tool_parts_overflowed {
+                    self.tool_parts_overflowed = true;
+                    self.stream_source()
+                        .record_coverage_gap(
+                            "OpenCode tool parts overflowed their per-turn bound",
+                            &["tool"],
+                        )
+                        .await?;
+                }
+                return Ok(None);
+            }
+            self.tool_parts.insert(id.to_owned(), ToolPart::default());
+        }
+        Ok(self.tool_parts.get_mut(id))
     }
 
     /// Exact active-turn binding shared by the tool facts. A tool fact
@@ -2035,10 +2062,8 @@ impl EventProcessor {
 
     /// Drop the per-turn tool bookkeeping when the turn fences.
     fn clear_tool_facts(&mut self) {
-        self.tool_names.clear();
-        self.tool_name_order.clear();
-        self.tools_started.clear();
-        self.tools_completed.clear();
+        self.tool_parts.clear();
+        self.tool_parts_overflowed = false;
     }
 
     /// Bind a terminal event of our session to its exact Eliot turn.
@@ -2763,7 +2788,7 @@ impl EventProcessor {
             generation: self.generation,
             harness: "OpenCode",
             id_prefix: "opencode",
-            families: &["session", "turn", "message", "request"],
+            families: &["session", "turn", "message", "tool", "request"],
             writes_blocked: &mut self.writes_blocked,
             gap_reported: &mut self.gap_reported,
             gap_number: &mut self.gap_number,
