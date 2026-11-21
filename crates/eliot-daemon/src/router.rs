@@ -4110,6 +4110,8 @@ impl Router {
                 let fetched = self.observation_view(&agent).await;
                 Self::join_observation_for_summary(summary_generation, &agent, fetched)
             };
+            let mut observation = observation;
+            display_observation(&mut observation);
             let row = AgentListRow {
                 summary: display_agent_summary(summary),
                 observation: Some(observation),
@@ -6044,7 +6046,19 @@ fn display_agent_summary(mut summary: AgentSummary) -> AgentSummary {
     if let Some(project_scope) = summary.project_scope.as_deref() {
         summary.project_scope = Some(eliot_core::display_path(project_scope));
     }
+    // An unregistered workspace's project label is its canonical path.
+    summary.project = eliot_core::display_path(&summary.project);
     summary
+}
+
+/// The joined Git observation names the workspace it read; it renders like
+/// the Agent's own workspace.
+fn display_observation(observation: &mut ObservationView) {
+    if let ObservationView::Data(data) = observation
+        && let GitView::Data(git) = &mut data.git
+    {
+        git.workspace = eliot_core::display_path(&git.workspace);
+    }
 }
 
 /// Owner-facing spelling of one `agent.get`/`swarm show` view: the retained
@@ -6059,12 +6073,8 @@ fn display_agent_get_response(response: &mut AgentGetResponse) {
     if let Some(project_scope) = response.agent.project_scope.as_deref() {
         response.agent.project_scope = Some(eliot_core::display_path(project_scope));
     }
-    if let ObservationView::Data(data) = &mut response.observation
-        && let GitView::Data(git) = &mut data.git
-        && let Some(stored) = workspace.as_deref()
-    {
-        git.workspace = eliot_core::display_path(stored);
-    }
+    response.agent.project = eliot_core::display_path(&response.agent.project);
+    display_observation(&mut response.observation);
 }
 
 /// Owner-facing spelling of one project registration view: `checkout`,
