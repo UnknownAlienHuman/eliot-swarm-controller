@@ -734,11 +734,19 @@ manual pass adds no new retention semantics; the contract stays in
 canonical checkout, repository common directory, explicit profile/action allowlists and
 optional Git fetch approval. They do not create or modify registrations. Their project
 values use Core [`ProjectRegistrationView`](../../crates/eliot-core/src/api/agent_views.rs),
+
 whose optional `git` value uses [`ProjectGitView` and `GitCredentialHelper`](../../crates/eliot-core/src/api/agent_views.rs).
 The read-only `origin` is the validated basename of the local `origin` remote's path,
 with `.git` stripped. Malformed and pathless remotes produce no name. The daemon
 reads each common directory in the Git probe's sanitized environment after releasing
 the Store lock. The readback carries only the name.
+Owner-facing views render Windows paths without the verbatim prefix, through Core
+`display_path` ([verbatim.rs](../../crates/eliot-core/src/verbatim.rs)): the registration
+`checkout`, `repo_common_dir` and every `checkouts` path, and the Agent views'
+`workspace`, `project_scope`, `repo_common_dir`, a path-valued `project` label and the
+joined Git observation's `workspace`. Store rows, Git lookups and path-keyed tables keep
+their exact stored spelling; `project.discover` and reads validated against stored
+values stay on it.
 The bounded `checkouts` inventory carries live verified paths, main-checkout identity,
 and a branch when a bound `symbolic-ref HEAD` supplies one. A linked entry requires a
 reciprocal Git registration in the pinned common directory. A list can carry the

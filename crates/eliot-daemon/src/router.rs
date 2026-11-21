@@ -53,11 +53,11 @@ use eliot_core::{
         AgentGetRequest, AgentGetResponse, AgentGitRequest, AgentGitResponse, AgentHistoryRequest,
         AgentListRequest, AgentListResponse, AgentListRow, AgentProcessesRequest,
         AgentProcessesResponse, AgentResultRequest, AgentResultResponse, AgentStatsRequest,
-        AgentStatsResponse, CommandChildrenRequest, CommandChildrenResponse, CommandGetRequest,
-        CommandSubmitRequest, CommandSubmitResponse, CrashMarker, DaemonShutdownRequest,
-        DaemonShutdownResponse, DaemonStatusRequest, DiscoverPage, DoctorHarnessEntry,
-        EmitDefinitionArgs, EventsBoundsRequest, EventsFilter, EventsReadRequest,
-        EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse,
+        AgentStatsResponse, AgentSummary, CommandChildrenRequest, CommandChildrenResponse,
+        CommandGetRequest, CommandSubmitRequest, CommandSubmitResponse, CrashMarker,
+        DaemonShutdownRequest, DaemonShutdownResponse, DaemonStatusRequest, DiscoverPage,
+        DoctorHarnessEntry, EmitDefinitionArgs, EventsBoundsRequest, EventsFilter,
+        EventsReadRequest, EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse,
         GitFetchDefinitionArgs, GitView, HarnessDoctorRequest, HarnessDoctorResponse,
         HeavyAgentTotals, HeavyEpisodeView, HeavySummaryView, MAX_OBSERVATION_PAGE_BYTES,
         MAX_SWARM_WAIT_MS, MAX_SWARM_WAIT_TARGETS, MAX_WAIT_FINAL_TEXT_BYTES, MAX_WAIT_FRAME_BYTES,
@@ -2718,6 +2718,7 @@ impl Router {
         // Git reads run after the Store lock is released.
         let mut registrations = [registration];
         crate::workspace_git::WorkspaceGit::fill_project_readbacks(&mut registrations).await;
+        display_project_registration(&mut registrations[0]);
         let [registration] = registrations;
         registration.validate()?;
         serde_json::to_value(registration)
@@ -2735,6 +2736,9 @@ impl Router {
             .list_project_registrations("owner", None, PAGE_MAX)?;
         // Git reads run after the Store lock is released.
         crate::workspace_git::WorkspaceGit::fill_project_readbacks(&mut registrations).await;
+        for registration in &mut registrations {
+            display_project_registration(registration);
+        }
         for registration in &registrations {
             registration.validate()?;
         }
@@ -3684,7 +3688,7 @@ impl Router {
                     .map(ToOwned::to_owned),
             })
         };
-        serde_json::to_value(AgentGetResponse {
+        let mut response = AgentGetResponse {
             agent,
             observation,
             source_states,
@@ -3693,8 +3697,10 @@ impl Router {
             heavy,
             session_growth,
             work,
-        })
-        .map_err(|_| Error::new("internal", "Agent view could not be encoded"))
+        };
+        display_agent_get_response(&mut response);
+        serde_json::to_value(response)
+            .map_err(|_| Error::new("internal", "Agent view could not be encoded"))
     }
 
     async fn session_usage(&self, agent: &Agent) -> Result<Option<SessionUsage>> {
@@ -4067,6 +4073,7 @@ impl Router {
                 agents: page
                     .summaries
                     .into_iter()
+                    .map(display_agent_summary)
                     .map(|summary| AgentListRow {
                         summary,
                         observation: None,
@@ -4103,8 +4110,10 @@ impl Router {
                 let fetched = self.observation_view(&agent).await;
                 Self::join_observation_for_summary(summary_generation, &agent, fetched)
             };
+            let mut observation = observation;
+            display_observation(&mut observation);
             let row = AgentListRow {
-                summary,
+                summary: display_agent_summary(summary),
                 observation: Some(observation),
             };
             let row_bytes = serde_json::to_vec(&row)
@@ -6022,6 +6031,61 @@ fn workspace_folder_name(workspace: &str) -> Option<String> {
         .file_name()
         .and_then(|name| name.to_str())
         .map(str::to_owned)
+}
+
+/// Owner-facing spelling of one `agent.list` summary row: only the fields a
+/// person reads lose the Windows verbatim prefix. Retained identity, the
+/// Store's path-keyed rows and Git lookups keep their exact stored form.
+fn display_agent_summary(mut summary: AgentSummary) -> AgentSummary {
+    if let Some(workspace) = summary.workspace.as_deref() {
+        summary.workspace = Some(eliot_core::display_path(workspace));
+    }
+    if let Some(repo_common_dir) = summary.repo_common_dir.as_deref() {
+        summary.repo_common_dir = Some(eliot_core::display_path(repo_common_dir));
+    }
+    if let Some(project_scope) = summary.project_scope.as_deref() {
+        summary.project_scope = Some(eliot_core::display_path(project_scope));
+    }
+    // An unregistered workspace's project label is its canonical path.
+    summary.project = eliot_core::display_path(&summary.project);
+    summary
+}
+
+/// The joined Git observation names the workspace it read; it renders like
+/// the Agent's own workspace.
+fn display_observation(observation: &mut ObservationView) {
+    if let ObservationView::Data(data) = observation
+        && let GitView::Data(git) = &mut data.git
+    {
+        git.workspace = eliot_core::display_path(&git.workspace);
+    }
+}
+
+/// Owner-facing spelling of one `agent.get`/`swarm show` view: the retained
+/// workspace, its scope and the Git observation that reads them leave without
+/// the verbatim prefix. The workspace feeds Git observation and edit lookups
+/// by exact key, so it renders from the same stored value.
+fn display_agent_get_response(response: &mut AgentGetResponse) {
+    let workspace = response.agent.workspace.clone();
+    if let Some(workspace) = workspace.as_deref() {
+        response.agent.workspace = Some(eliot_core::display_path(workspace));
+    }
+    if let Some(project_scope) = response.agent.project_scope.as_deref() {
+        response.agent.project_scope = Some(eliot_core::display_path(project_scope));
+    }
+    response.agent.project = eliot_core::display_path(&response.agent.project);
+    display_observation(&mut response.observation);
+}
+
+/// Owner-facing spelling of one project registration view: `checkout`,
+/// `repo_common_dir` and every live checkout path lose the verbatim prefix.
+/// Stored registration values and Git identity comparisons stay untouched.
+fn display_project_registration(registration: &mut ProjectRegistrationView) {
+    registration.checkout = eliot_core::display_path(&registration.checkout);
+    registration.repo_common_dir = eliot_core::display_path(&registration.repo_common_dir);
+    for checkout in &mut registration.checkouts {
+        checkout.path = eliot_core::display_path(&checkout.path);
+    }
 }
 
 /// A path as the daemon's Git identity compares it: no verbatim prefix, one

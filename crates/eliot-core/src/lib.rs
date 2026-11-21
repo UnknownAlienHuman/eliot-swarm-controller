@@ -82,7 +82,7 @@ pub use routing::{
 };
 pub use secrets::SecretPolicy;
 pub use source_handoff::{SourceHandoff, SourceHandoffAck, SourceHandoffGap};
-pub use verbatim::verbatim_path;
+pub use verbatim::{display_path, verbatim_path};
 
 use crate::api::AgentConfigView;
 use serde::{Deserialize, Serialize};
