@@ -747,23 +747,18 @@ return sites: an intentional admission/shutdown exit surfaces as `stopped`,
 while any other `Ok(())` surfaces as `failed` (`worker_exited`).
 
 `daemon.status` also reports the retention view: the `eliot.db` main and WAL
-file sizes in bytes, the configured `daemon.retention` windows (`null` is an
-unset window that disables pruning for that side), and the retained-event
-watermark `pruned_through`. `unbounded` is true only when all three windows
-are unset — the default daemon never prunes. When retention is unbounded and
-the combined store size passes the documented threshold, the view carries a
-bounded `size_advisory` naming the remedy; the hourly maintenance tick logs
-one line for the same condition. When `config.toml` cannot be read, status
-stays available but the windows are unknown: the view carries the redacted
-`config_error` (`code: message`), all windows absent, `unbounded:false` and no
-advisory, so a read failure never reads back as an unset policy. See
-[configuration](configuration.md) for the windows and the
-threshold, and [monitoring](monitoring.md#views) for the advisory.
+file sizes in bytes, the effective event and exited-child process windows,
+the optional command and mail windows, and the retained-event watermark
+`pruned_through`. The event and exited-child windows have finite defaults.
+When `config.toml` cannot be read, status stays available with a redacted
+`config_error` (`code: message`) and unknown window values. See
+[configuration](configuration.md#later-configuration-example) for the defaults
+and the older-Store conversion.
 
 `maintenance.run` is owner-only and accepts an empty object. It reloads the
-daemon retention settings and runs one bounded retention epoch (the hourly
+daemon retention settings and runs one bounded retention epoch (the periodic
 tick's row and time budgets), so it returns inside the client call deadline; a
-larger backlog continues on the hourly tick. It returns the Core
+larger backlog continues through periodic maintenance. It returns the Core
 [`MaintenanceRunResponse`](../../crates/eliot-core/src/api/maintenance.rs)
 pruned counts and the retained-event watermark `pruned_through`. A rejected
 settings reload fails the call instead of pruning under stale windows. The
@@ -2519,10 +2514,10 @@ current blockers snapshot, while open it reflects the current fleet.
 `swarm daemon stop --drain` prints the retained `DaemonShutdownResponse` including
 `blockers` and `drain`; `swarm status` prints the typed `DaemonStatusResponse`
 including `blockers`, `unsettled_commands`, `unknown_commands`, `drain` and
-the retention view (store sizes, configured windows or unbounded,
-`pruned_through`, and the unbounded-growth advisory when due), and
-`claude_profile_command_issues` when an explicit Claude profile executable is
-missing.
+the retention view with store sizes, configured windows, SQLite page counts
+and `pruned_through`. It also reports the automatic cleanup policy and latest
+sweep outcome, and `claude_profile_command_issues` for missing explicit Claude
+profile executables.
 
 Local IPC accept failures are logged and retried with bounded backoff.
 During the delay, admitted work and existing connections continue, and the

@@ -1681,6 +1681,25 @@ impl RetentionView {
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct AutomaticCleanupView {
+    pub enabled: bool,
+    pub after: Option<String>,
+    pub config_error: Option<String>,
+    pub last_sweep: Option<AutomaticCleanupSweep>,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutomaticCleanupSweep {
+    pub finished_at: i64,
+    pub removed: usize,
+    pub kept: usize,
+    pub unknown: usize,
+    pub error_code: Option<String>,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DaemonStatusResponse {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_probe_attention: Vec<crate::ProviderHold>,
@@ -1701,6 +1720,8 @@ pub struct DaemonStatusResponse {
     pub cloud_mcp: Option<CloudMcpStatus>,
     #[serde(deserialize_with = "objects")]
     pub automation_tasks: Vec<WorkerTaskStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automatic_cleanup: Option<AutomaticCleanupView>,
     pub unknown_commands_count: usize,
     pub unknown_commands: Vec<String>,
     pub unknown_commands_truncated: bool,

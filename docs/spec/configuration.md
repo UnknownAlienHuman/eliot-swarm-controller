@@ -617,37 +617,39 @@ proxy = "opencodex"
 account = "codex-main"
 ```
 
-The implemented backlog setting is a root-level automation option:
+Backlog and automatic cleanup are root-level automation options.
 
 ```toml
 [automation]
 max_event_backlog = 100000
-auto_cleanup = false
+auto_cleanup = true
+auto_cleanup_after = "7d"
 ```
 
 `max_event_backlog` is a positive signed 64-bit integer. It defaults to `100000`; zero,
-negative, wrong-type and unknown automation values are invalid. `auto_cleanup` is an
-Owner setting that defaults to `false`. When enabled, the existing automation
-reconciliation timer performs bounded, paginated worktree selection at most once per
-minute, applying eligible merged worktrees through the same cleanup plan and apply path
-used by the cleanup UI and CLI. Eligibility and the durable removal fence are rechecked
-before removal.
+negative, wrong-type and unknown automation values are invalid. `auto_cleanup` defaults
+to `true`. Set it to `false` to turn off the automatic sweep. `auto_cleanup_after` is a
+positive duration and defaults to seven days. The sweep applies the [cleanup retention
+policy](coordination.md#registered-artifacts-and-cleanup-k69) through the same plan and
+apply path as the cleanup UI and CLI.
 
-The implemented daemon retention setting is a `[daemon]` retention table:
+Store retention uses the `[daemon.retention]` table.
 
 ```toml
-[daemon]
-retention.events_days = 30
-retention.commands_days = 30
-retention.mail_days = 30
+[daemon.retention]
+events_days = 30
+processes_seconds = 86400
+interval_seconds = 300
+compact_on_start = false
 ```
 
-All three windows are optional positive integer days; each defaults to unset,
-which disables pruning for that side. A daemon without retention settings
-deletes nothing; set a window to prune expired history for that side. Daemon
-maintenance periodically prunes expired event history (with exited child process
-rows), closed command/child sets and acknowledged mail older than `mail_days` through the Store writer;
-see the [Core retention contract](core.md#retention). Command and write
+Omitted settings use the defaults shown. `events_seconds` can specify the event
+window in seconds instead of `events_days`. Set at most one of the two. The event
+and exited-child process windows are positive integers. `interval_seconds` allows
+1 through 86,400 seconds. Optional positive `commands_days` and `mail_days` windows
+enable pruning of closed command trees and acknowledged mail, respectively.
+The [Core retention contract](core.md#retention) defines the protected records.
+Command and write
 bindings always outlive the 24-hour retry window plus the 5-minute allowed
 clock-skew margin regardless of `commands_days`, so a pruned id resubmits as
 `id_expired`, never as new. Mail rows outlive the retry window plus twice
@@ -655,16 +657,13 @@ that margin regardless of `mail_days`, so a removed delivery admitted with a
 skew-bounded write id reads `history_gap` on its own mailbox's read paths;
 a retried ack over it succeeds as already acked.
 
-Retention is visible without changing its semantics. `daemon.status` reports
-a retention view: the `eliot.db` main and WAL file sizes in bytes, the three
-configured windows (`null` is unset, i.e. unbounded for that side), and the
-retained-event watermark `pruned_through`. `unbounded` is true only when all
-three windows are unset — the default daemon never prunes. When retention is
-unbounded and the combined store size passes 100 MiB, the view carries a
-bounded `size_advisory` telling the owner to set `daemon.retention` windows;
-the hourly maintenance tick logs one `daemon.retention_unbounded_store_large`
-line for the same condition. The sizes are informational and never gate reads;
-changing retention windows is out of scope for this advisory.
+`daemon.status` reports the main and WAL file sizes, retention windows, and
+the retained-event watermark `pruned_through`. New Stores reclaim free pages
+incrementally. Older Stores reuse freed pages while the daemon runs, so a
+retention pass can leave `eliot.db` at its prior high-water size. To convert an
+older Store to incremental vacuum and reclaim space from the file, set
+`compact_on_start = true` and restart in a maintenance window with space for
+SQLite's rebuild. The full rebuild runs before the daemon serves requests.
 
 The automatic attention no-progress suspicion window is optional:
 

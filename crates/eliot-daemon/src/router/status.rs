@@ -86,6 +86,7 @@ impl Router {
             workspace_recovery_error: self.inner.workspace_recovery_error.lock_recover().clone(),
             cloud_mcp: crate::cloud_mcp::service_snapshot(),
             automation_tasks: self.inner.worker_tasks.lock_recover().clone(),
+            automatic_cleanup: Some(self.automatic_cleanup_view()),
             unknown_commands_count,
             unknown_commands,
             unknown_commands_truncated,

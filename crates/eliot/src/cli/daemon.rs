@@ -173,15 +173,43 @@ pub(crate) async fn run_status(data_dir: PathBuf, json_output: bool) -> Result<u
     params
         .validate_response(&response)
         .map_err(Failure::invalid_response)?;
+    let cleanup_line = response.automatic_cleanup.as_ref().map(|cleanup| {
+        let policy = if let Some(code) = &cleanup.config_error {
+            format!("unavailable ({code})")
+        } else if cleanup.enabled {
+            format!(
+                "enabled after {}",
+                cleanup.after.as_deref().unwrap_or("the configured window")
+            )
+        } else {
+            "disabled".to_owned()
+        };
+        match &cleanup.last_sweep {
+            Some(sweep) => match &sweep.error_code {
+                Some(code) => format!("Automatic cleanup {policy} | last sweep failed ({code})"),
+                None => format!(
+                    "Automatic cleanup {policy} | last sweep removed {}, kept {}, unknown {}",
+                    sweep.removed, sweep.kept, sweep.unknown,
+                ),
+            },
+            None => format!("Automatic cleanup {policy}"),
+        }
+    });
     let mut value = serde_json::to_value(response)
         .map_err(|_| Failure::new(4, "daemon.status response is invalid"))?;
     if let Some(object) = value.as_object_mut() {
+        if !json_output {
+            object.remove("automatic_cleanup");
+        }
         object.insert(
             "data_dir".to_owned(),
             Value::String(data_dir.to_string_lossy().into_owned()),
         );
     }
     print_value(&value, json_output);
+    if !json_output && let Some(line) = cleanup_line {
+        println!("{line}");
+    }
     Ok(0)
 }
 

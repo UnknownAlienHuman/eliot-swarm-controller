@@ -17,6 +17,7 @@ use actor::run_agent_inner;
 use eliot_core::{
     Agent, Command, ContextItem, Error, InjectArgs, InjectPoint, Result, SecretPolicy, SourceBatch,
     SourceGap, SourceGapAck, StderrSource,
+    api::{ArtifactKind, ArtifactView},
 };
 use eliot_plugin::{
     AgentCommandParams, PluginManifest, StderrCapture, StderrView, spawn_plugin_stderr,
@@ -668,6 +669,13 @@ impl PluginHost {
             ));
         }
         let (instance_dir, credential) = self.create_instance_dir(&key)?;
+        if let Err(error) = self
+            .register_plugin_instance_dir(&agent, &instance_dir)
+            .await
+        {
+            remove_empty_instance_dir(&instance_dir);
+            return Err(error);
+        }
         let prepared_mcp = if agent.harness == "antigravity" {
             match antigravity_mcp::prepare(&agent, &target_environment, &instance_dir) {
                 Ok(config) => config,
@@ -1415,6 +1423,56 @@ impl PluginHost {
         {
             self.create_instance_dir_with(key, |_| Ok(()))
         }
+    }
+
+    async fn register_plugin_instance_dir(&self, agent: &Agent, path: &Path) -> Result<()> {
+        let path = std::fs::canonicalize(path)
+            .map_err(|_| Error::new("unavailable", "plugin instance directory unavailable"))?;
+        let path_text = path.to_string_lossy().into_owned();
+        let identity = crate::platform::script_file::directory_identity(&path)?;
+        let mut store = self.state.store.lock().await;
+        let current = store
+            .get_agent(&agent.id)?
+            .ok_or_else(|| Error::new("stale_generation", "plugin Agent generation absent"))?;
+        if current.generation != agent.generation {
+            return Err(Error::new(
+                "stale_generation",
+                "plugin Agent generation changed before instance registration",
+            ));
+        }
+        let artifact = ArtifactView {
+            id: Ulid::new().to_string(),
+            agent: agent.id.clone(),
+            generation: agent.generation,
+            project: agent.project.clone(),
+            tree: Vec::new(),
+            path: path_text.clone(),
+            kind: ArtifactKind::Other,
+            purpose: "Swarm plugin instance directory".to_owned(),
+            identity: identity.clone(),
+            created_at: now_ms(),
+            state: "registered".to_owned(),
+            git: None,
+        };
+        store.record_known_artifact(artifact)?;
+        let Some(readback) = store.known_artifact_path(&path_text)? else {
+            return Err(Error::new(
+                "source_integrity",
+                "plugin instance ownership was not retained",
+            ));
+        };
+        if readback.agent != agent.id
+            || readback.generation != agent.generation
+            || readback.kind != ArtifactKind::Other
+            || readback.purpose != "Swarm plugin instance directory"
+            || readback.identity != identity
+        {
+            return Err(Error::new(
+                "source_integrity",
+                "plugin instance ownership readback changed",
+            ));
+        }
+        Ok(())
     }
 
     fn create_instance_dir_with(

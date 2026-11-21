@@ -28,10 +28,14 @@ pub(crate) struct RunGrantConfig {
 pub(crate) struct AutomationConfig {
     #[serde(default = "default_max_event_backlog")]
     pub(crate) max_event_backlog: i64,
-    /// Automatically apply the shared merged-worktree cleanup plan on the
-    /// existing Owner automation reconciliation timer.
-    #[serde(default)]
+    /// Automatically apply the shared cleanup plan for aged, terminal
+    /// Agent artifacts on the existing Owner automation reconciliation timer.
+    #[serde(default = "default_auto_cleanup")]
     pub(crate) auto_cleanup: bool,
+    /// Minimum age before automatic cleanup, measured from the later of the
+    /// artifact creation and the exact terminal generation end.
+    #[serde(default = "default_auto_cleanup_after")]
+    pub(crate) auto_cleanup_after: String,
     #[serde(default)]
     pub(crate) run: RunGrantConfig,
     #[serde(default)]
@@ -68,7 +72,8 @@ impl Default for AutomationConfig {
     fn default() -> Self {
         Self {
             max_event_backlog: default_max_event_backlog(),
-            auto_cleanup: false,
+            auto_cleanup: default_auto_cleanup(),
+            auto_cleanup_after: default_auto_cleanup_after(),
             run: RunGrantConfig::default(),
             assignments: BTreeMap::new(),
         }
@@ -85,6 +90,16 @@ impl AutomationConfig {
             return Err(core::Error::new(
                 "profile_error",
                 "config.toml: automation.max_event_backlog must be a positive integer",
+            ));
+        }
+        if self.auto_cleanup_after.trim() != self.auto_cleanup_after
+            || self.auto_cleanup_after.is_empty()
+            || self.auto_cleanup_after.len() > 64
+            || crate::automation::parse_positive_duration_ms(&self.auto_cleanup_after).is_err()
+        {
+            return Err(core::Error::new(
+                "profile_error",
+                "config.toml: automation.auto_cleanup_after must be a positive duration",
             ));
         }
         for (key, assignment) in &self.assignments {
@@ -134,6 +149,14 @@ impl AutomationConfig {
 
 fn default_max_event_backlog() -> i64 {
     100_000
+}
+
+fn default_auto_cleanup() -> bool {
+    true
+}
+
+fn default_auto_cleanup_after() -> String {
+    "7d".to_owned()
 }
 
 fn default_assignment_enabled() -> bool {
