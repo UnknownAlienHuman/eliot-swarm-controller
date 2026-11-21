@@ -1256,9 +1256,25 @@ through a new `set` after the Owner reviews the finding; that `set` records a ne
 `goal show` reports the starting HEAD, the number of pre-existing changes and the
 argv-named check files.
 
-`goal show` reports the exact status, counters (with a live turn count),
-budgets, limits and the unresolved round marker if any; cost stays
-`unsupported` until a usage source exists.
+**Cost budget.** `max_cost {unit, amount_micros}` budgets the Agent's native
+session cost since `set`, in that verbatim unit (Claude reports `usd_estimate`; units
+are never converted, and subscription quota is a separate resource). At `set` the Store
+records a baseline from the generation's latest `session_usage` snapshot in that unit.
+An Agent that has run no turn starts from zero and binds the first session it sees.
+`set` is refused as `unsupported` when the harness reports no session cost, reports
+another unit, or ran turns without one. After each failed check, the round commit reads
+the latest snapshot. The spent cost is that cumulative amount minus the baseline. It
+counts only for the same native session and unit, from a snapshot observed no earlier
+than the last completed turn, and never with a decreasing cumulative. Anything else is
+`cost_unverified`, never zero, and blocks the Goal: an Owner budget that cannot be
+checked does not silently become unlimited. A spent cost at or above the budget blocks
+as `cost_limit`. A passing check still completes. The budget is checked between turns,
+so it limits new continuations but cannot cap a turn already running.
+
+`goal show` reports the exact status, counters (with a live turn count and the spent
+cost), budgets, limits and the unresolved round marker if any. `cost_status` is
+`untracked` without a budget, otherwise the spent and budgeted amounts or why the spent
+cost is unverified.
 
 A cadenced Goal carries `cadence_ms` (one minute to seven days) and rounds
 only on anchored slots. The anchor is captured when the cadence is set, stays

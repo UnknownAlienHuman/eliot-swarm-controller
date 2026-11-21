@@ -3,9 +3,9 @@
 
 use super::*;
 use eliot_core::api::{
-    CommandSubmitResponse, GOAL_COST_UNSUPPORTED, GoalCounters, GoalDefinition, GoalMarkerState,
-    GoalMode, GoalRoundMarker, GoalRoundOutcome, GoalRoundRequest, GoalRoundResponse, GoalStatus,
-    GoalView, MAX_GOAL_OBSERVATION_BYTES,
+    CommandSubmitResponse, GoalCounters, GoalDefinition, GoalMarkerState, GoalMode,
+    GoalRoundMarker, GoalRoundOutcome, GoalRoundRequest, GoalRoundResponse, GoalStatus, GoalView,
+    MAX_GOAL_OBSERVATION_BYTES,
 };
 use serde::{Deserialize, Serialize};
 
@@ -432,6 +432,9 @@ struct GoalStatePersist {
     /// the Router at `set` and kept until the next `set`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     scope_base: Option<core::api::GoalScopeBase>,
+    /// Cost baseline of a Goal with `max_cost`, recorded at `set`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cost_base: Option<GoalCostBase>,
 }
 
 struct GoalRow {
@@ -1082,6 +1085,8 @@ impl Store {
                 commit_transaction(tx, &self.write_faulted)?;
                 return Ok(view);
             }
+            let cost_base =
+                goal_cost_base_tx(&tx, agent_num, agent_row.generation, definition, turn_count)?;
             let revision = row.revision + 1;
             let state = GoalStatePersist {
                 transferred_turns: 0,
@@ -1090,6 +1095,7 @@ impl Store {
                 blocked_reason: None,
                 counters: GoalCounters {
                     turns_at_set: turn_count,
+                    cost_spent_micros: definition.max_cost.as_ref().map(|_| 0),
                     ..GoalCounters::default()
                 },
                 cadence_anchor_ms: definition.cadence_ms.map(|_| now),
@@ -1097,6 +1103,7 @@ impl Store {
                 last_continuation_command_id: None,
                 assignment_cause: row.state.assignment_cause.clone(),
                 scope_base: scope_base.clone(),
+                cost_base: cost_base.clone(),
             };
             db!(tx.execute(
                 "UPDATE goals SET generation = ?1, revision = ?2, definition = ?3,
@@ -1119,6 +1126,8 @@ impl Store {
             commit_transaction(tx, &self.write_faulted)?;
             return Ok(view);
         }
+        let cost_base =
+            goal_cost_base_tx(&tx, agent_num, agent_row.generation, definition, turn_count)?;
         let state = GoalStatePersist {
             transferred_turns: 0,
             status: GoalStatus::Active,
@@ -1126,6 +1135,7 @@ impl Store {
             blocked_reason: None,
             counters: GoalCounters {
                 turns_at_set: turn_count,
+                cost_spent_micros: definition.max_cost.as_ref().map(|_| 0),
                 ..GoalCounters::default()
             },
             cadence_anchor_ms: definition.cadence_ms.map(|_| now),
@@ -1133,6 +1143,7 @@ impl Store {
             last_continuation_command_id: None,
             assignment_cause: None,
             scope_base: scope_base.clone(),
+            cost_base: cost_base.clone(),
         };
         db!(tx.execute(
             "INSERT INTO goals(agent, mode, generation, revision, definition,
@@ -1263,6 +1274,7 @@ impl Store {
                 last_continuation_command_id: None,
                 assignment_cause: row.state.assignment_cause.clone(),
                 scope_base: row.state.scope_base.clone(),
+                cost_base: row.state.cost_base.clone(),
             };
             update_goal_state_tx(&tx, agent_num, mode, row.revision, &state, now)?;
             let updated = load_goal_row(&tx, agent_num, mode)?
@@ -1378,6 +1390,7 @@ impl Store {
             last_continuation_command_id: row.state.last_continuation_command_id.clone(),
             assignment_cause: row.state.assignment_cause.clone(),
             scope_base: row.state.scope_base.clone(),
+            cost_base: row.state.cost_base.clone(),
         };
         update_goal_state_tx(&tx, agent_num, &row.mode, row.revision, &state, now)?;
         commit_transaction(tx, &self.write_faulted)?;
@@ -1436,6 +1449,7 @@ impl Store {
                     last_continuation_command_id: row.state.last_continuation_command_id.clone(),
                     assignment_cause: row.state.assignment_cause.clone(),
                     scope_base: row.state.scope_base.clone(),
+                    cost_base: row.state.cost_base.clone(),
                 };
                 update_goal_state_tx(&tx, agent_num, mode, row.revision, &state, now)?;
                 commit_transaction(tx, &self.write_faulted)?;
@@ -1812,6 +1826,7 @@ impl Store {
                 .saturating_add(turn_count.saturating_sub(counters.turns_at_set)),
         );
         let mut admission: Option<Admission> = None;
+        let mut learned_cost_source = None;
         let outcome = if let Some(check) = &commit.check {
             counters.rounds += 1;
             counters.last_exit_code = check.exit_code;
@@ -1854,6 +1869,26 @@ impl Store {
                 }
                 counters.last_output_digest = Some(digest.clone());
             }
+            let cost = goal_cost_reading_tx(
+                &tx,
+                agent_num,
+                row.generation,
+                &row.definition,
+                row.state.cost_base.as_ref(),
+                counters.turns_used,
+            )?;
+            match &cost {
+                Some(GoalCostReading::Spent { micros, source }) => {
+                    counters.cost_spent_micros = Some(*micros);
+                    counters.cost_unverified = None;
+                    learned_cost_source = source.clone();
+                }
+                Some(GoalCostReading::Unverified(reason)) => {
+                    counters.cost_spent_micros = None;
+                    counters.cost_unverified = Some((*reason).to_owned());
+                }
+                None => {}
+            }
             if let Some(reason) = &commit.blocked_reason {
                 GoalCommitOutcome::Blocked {
                     reason: reason.clone(),
@@ -1861,6 +1896,11 @@ impl Store {
             } else if check.exit_code == Some(0) {
                 GoalCommitOutcome::Completed
             } else if let Some(reason) = goal_postcheck_block(&row.definition, &counters) {
+                GoalCommitOutcome::Blocked { reason }
+            } else if let Some(reason) = cost
+                .as_ref()
+                .and_then(|reading| reading.block(&row.definition))
+            {
                 GoalCommitOutcome::Blocked { reason }
             } else if let Some(continuation) = &commit.continuation {
                 let request = SubmitCommand {
@@ -1916,6 +1956,12 @@ impl Store {
             ));
         };
         let mut state = row.state;
+        // A zero baseline (no session yet at set) binds the first session seen.
+        if let (Some(base), Some(source)) = (state.cost_base.as_mut(), learned_cost_source)
+            && base.source.is_none()
+        {
+            base.source = Some(source);
+        }
         match &outcome {
             GoalCommitOutcome::Completed => {
                 state.status = GoalStatus::Completed;
@@ -2108,6 +2154,185 @@ fn goal_continuation_spent_budget(
 /// Decide a failed check against the frozen limits. Success always
 /// completes; otherwise the round budget, turn budget and no-progress streak
 /// block in that order. Counters are already updated for this check.
+/// Cost baseline of a Goal with `max_cost`: the native session's cumulative
+/// cost at `set` in the budget's unit, and the session it came from. A zero
+/// baseline without a source binds the first session the Goal sees.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct GoalCostBase {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+    amount_micros: i64,
+}
+
+/// The cost spent since `set`, or why it cannot be trusted.
+enum GoalCostReading {
+    Spent { micros: i64, source: Option<String> },
+    Unverified(&'static str),
+}
+
+impl GoalCostReading {
+    fn block(&self, definition: &GoalDefinition) -> Option<String> {
+        match self {
+            Self::Unverified(_) => Some("cost_unverified".to_owned()),
+            Self::Spent { micros, .. } => definition
+                .max_cost
+                .as_ref()
+                .filter(|limit| *micros >= limit.amount_micros)
+                .map(|_| "cost_limit".to_owned()),
+        }
+    }
+}
+
+fn cost_micros(amount: f64) -> i64 {
+    (amount * 1_000_000.0).round().clamp(0.0, i64::MAX as f64) as i64
+}
+
+/// The latest native session snapshot of an Agent generation and when it was
+/// observed.
+fn latest_session_usage(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    generation: i64,
+) -> Result<Option<(core::SessionUsage, i64)>> {
+    let row: Option<(String, i64)> = tx
+        .query_row(
+            "SELECT snapshot, observed_at FROM session_usage WHERE agent = ?1 AND generation = ?2",
+            params![agent_num, generation],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    row.map(|(snapshot, observed_at)| {
+        serde_json::from_value(decode_json(&snapshot)?)
+            .map(|usage| (usage, observed_at))
+            .map_err(|_| Error::new("internal", "stored session usage is malformed"))
+    })
+    .transpose()
+}
+
+/// The verbatim cumulative cost of a snapshot, when it has amount and unit.
+fn snapshot_cost(usage: &core::SessionUsage) -> Option<(f64, &str)> {
+    let cost = usage.cumulative_cost.as_ref()?;
+    Some((cost.amount?, cost.unit.as_deref()?))
+}
+
+/// Baseline at `set`. A budget needs the Agent's native session cost in its
+/// unit: the latest snapshot, or zero for an Agent that has run no turn.
+fn goal_cost_base_tx(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    generation: i64,
+    definition: &GoalDefinition,
+    turn_count: i64,
+) -> Result<Option<GoalCostBase>> {
+    let Some(limit) = &definition.max_cost else {
+        return Ok(None);
+    };
+    match latest_session_usage(tx, agent_num, generation)? {
+        Some((usage, _)) => match snapshot_cost(&usage) {
+            Some((amount, unit)) if unit == limit.unit => Ok(Some(GoalCostBase {
+                source: usage.source.clone(),
+                amount_micros: cost_micros(amount),
+            })),
+            Some(_) => Err(Error::new(
+                "unsupported",
+                "the Agent reports its session cost in another unit than max_cost",
+            )),
+            None => Err(Error::new(
+                "unsupported",
+                "the Agent's harness reports no session cost",
+            )),
+        },
+        None if turn_count == 0 => Ok(Some(GoalCostBase::default())),
+        None => Err(Error::new(
+            "unsupported",
+            "no session cost was observed for this Agent's turns",
+        )),
+    }
+}
+
+/// The cost spent since `set`, read after a check. Missing, stale, mixed,
+/// reset or decreasing data is unverified, never zero.
+fn goal_cost_reading_tx(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    generation: i64,
+    definition: &GoalDefinition,
+    base: Option<&GoalCostBase>,
+    turns_used: i64,
+) -> Result<Option<GoalCostReading>> {
+    let Some(limit) = &definition.max_cost else {
+        return Ok(None);
+    };
+    let Some(base) = base else {
+        return Ok(Some(GoalCostReading::Unverified(
+            "no cost baseline was recorded",
+        )));
+    };
+    let Some((usage, observed_at)) = latest_session_usage(tx, agent_num, generation)? else {
+        return Ok(Some(if turns_used == 0 {
+            GoalCostReading::Spent {
+                micros: 0,
+                source: base.source.clone(),
+            }
+        } else {
+            GoalCostReading::Unverified("no session cost was observed")
+        }));
+    };
+    let last_completed: Option<i64> = tx
+        .query_row(
+            "SELECT MAX(completed_at) FROM turns WHERE agent = ?1 AND generation = ?2",
+            params![agent_num, generation],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    let reading = match snapshot_cost(&usage) {
+        None => GoalCostReading::Unverified("the latest session snapshot has no cost"),
+        Some((_, unit)) if unit != limit.unit => {
+            GoalCostReading::Unverified("the session cost unit changed")
+        }
+        Some(_) if base.source.is_some() && usage.source != base.source => {
+            GoalCostReading::Unverified("the native session changed")
+        }
+        Some(_) if last_completed.is_some_and(|done| done > observed_at) => {
+            GoalCostReading::Unverified("no session cost after the last turn")
+        }
+        Some((amount, _)) => match cost_micros(amount).checked_sub(base.amount_micros) {
+            Some(micros) if micros >= 0 => GoalCostReading::Spent {
+                micros,
+                source: usage.source.clone(),
+            },
+            _ => GoalCostReading::Unverified("the cumulative session cost went down"),
+        },
+    };
+    Ok(Some(reading))
+}
+
+/// `untracked` without a budget; otherwise spent and budgeted amounts, or why
+/// the spent cost is unverified.
+fn goal_cost_status(definition: &GoalDefinition, counters: &GoalCounters) -> String {
+    let Some(limit) = &definition.max_cost else {
+        return "untracked".to_owned();
+    };
+    if let Some(reason) = &counters.cost_unverified {
+        return format!("unverified: {reason}");
+    }
+    let amount = |micros: i64| format!("{}.{:06}", micros / 1_000_000, micros % 1_000_000);
+    match counters.cost_spent_micros {
+        Some(spent) => format!(
+            "{} of {} {}",
+            amount(spent),
+            amount(limit.amount_micros),
+            limit.unit
+        ),
+        None => format!(
+            "not observed yet, budget {} {}",
+            amount(limit.amount_micros),
+            limit.unit
+        ),
+    }
+}
+
 fn goal_postcheck_block(definition: &GoalDefinition, counters: &GoalCounters) -> Option<String> {
     if definition
         .max_rounds
@@ -2252,6 +2477,7 @@ fn goal_view_on(connection: &Connection, goal_holder: &str, row: GoalRow) -> Res
         &row.mode,
         row.generation,
     )?;
+    let cost_status = goal_cost_status(&row.definition, &counters);
     Ok(GoalView {
         agent: format!("a{}", row.agent_num),
         mode: if row.mode == "eliot" {
@@ -2272,7 +2498,7 @@ fn goal_view_on(connection: &Connection, goal_holder: &str, row: GoalRow) -> Res
             .scope_base
             .as_ref()
             .map(core::api::GoalScopeBase::start),
-        cost_status: GOAL_COST_UNSUPPORTED.to_owned(),
+        cost_status,
         last_round_key: row.last_round_key,
         round_marker,
         updated_at: row.updated_at,
@@ -2636,6 +2862,7 @@ pub(super) fn install_assignment_goal_tx(
         last_continuation_command_id: None,
         assignment_cause: Some(cause),
         scope_base: None,
+        cost_base: None,
     };
     db!(tx.execute(
         "INSERT INTO goals(agent, mode, generation, revision, definition,

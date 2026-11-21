@@ -1350,7 +1350,7 @@ pub(crate) struct TimerRunArgs {
 #[derive(Subcommand)]
 pub(crate) enum GoalCommand {
     /// Set (or replace) the Agent's Eliot-mode Goal with an explicit check command.
-    Set(GoalSetArgs),
+    Set(Box<GoalSetArgs>),
     /// Show the Goal definition, counters, budgets and limits.
     Show(GoalShowArgs),
     /// Pause the Goal; a paused Goal takes no rounds.
@@ -1396,6 +1396,14 @@ pub(crate) struct GoalSetArgs {
     /// blocks the Goal for review instead of completing it.
     #[arg(long = "check-input", value_name = "GLOB")]
     pub(crate) check_inputs: Vec<String>,
+    /// Money budget over the Agent's native session cost since set, for
+    /// example 0.25; needs --cost-unit.
+    #[arg(long, value_name = "AMOUNT", requires = "cost_unit")]
+    pub(crate) max_cost: Option<String>,
+    /// The native cost unit of --max-cost, verbatim (Claude reports
+    /// usd_estimate).
+    #[arg(long, value_name = "UNIT", requires = "max_cost")]
+    pub(crate) cost_unit: Option<String>,
 }
 
 #[derive(Args)]

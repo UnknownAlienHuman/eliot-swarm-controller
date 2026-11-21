@@ -460,7 +460,7 @@ command id frozen at claim. Stored Goal responses/round records use Core
 | `project.discover` | owner-only opened Git checkout registration through the settings writer; non-Git paths return no project |
 | `routing.preview` | owner-only advisory `RoutingDecision` for a role, computed like admission without admitting, freezing or reserving; see configuration |
 | `timer.get/run` | owner-only timer read and idempotent manual firing |
-| `goal.set/get/pause/clear/resume/round` | owner-only Eliot-mode Goal with explicit and automatic idle rounds plus explicit cadence slot rounds; automatic driving needs `max_turns` or `max_rounds`, native mode and cost limits are `unsupported` |
+| `goal.set/get/pause/clear/resume/round` | owner-only Eliot-mode Goal with explicit and automatic idle rounds plus explicit cadence slot rounds; automatic driving needs `max_turns` or `max_rounds`; native mode is `unsupported`; `max_cost` needs the Agent's native session cost in its unit |
 | `provider.holds/clear_hold` | owner-only provider hold readback and constrained correction |
 | `events.bounds/read/subscribe` | journal bounds, persisted replay and bounded live delivery |
 | `agent.discover` | owner-only native metadata discovery, without creating Agents |
@@ -628,7 +628,7 @@ requested method, rather than inheriting the caller-wide list from `api.identity
 A mailbox scope denotes the `agent` mailbox selector, not a `scope` request field.
 Other methods return an empty list; native, process and provider selector values
 remain described by their owning request DTO fields.
-Unsupported mail presentation modes, tree variable scopes and native Goal/cost controls
+Unsupported mail presentation modes, tree variable scopes and native Goal controls
 are described as unsupported, not advertised as available native capabilities. Use
 `agent.get` for target-generation capabilities before `command.submit`.
 
@@ -2422,7 +2422,7 @@ swarm project list | show ID
 swarm rule show ID [--project PROJECT]
 swarm rule catch-up ID --after SEQ [--through SEQ] [--project PROJECT]
 swarm timer show ID [--project PROJECT] | run ID [--project PROJECT]
-swarm goal set A --text TEXT --check CMD [ARGS...] [--mode eliot|native] [--check-cwd PATH] [--check-timeout-ms MS] [--max-turns N] [--max-rounds N] [--max-without-progress N] [--cadence-ms MS] [--scope GLOB]... [--check-input GLOB]...
+swarm goal set A --text TEXT --check CMD [ARGS...] [--mode eliot|native] [--check-cwd PATH] [--check-timeout-ms MS] [--max-turns N] [--max-rounds N] [--max-without-progress N] [--cadence-ms MS] [--scope GLOB]... [--check-input GLOB]... [--max-cost AMOUNT --cost-unit UNIT]
 swarm goal show|pause|clear|resume A [--mode eliot|native] [--reason R]
 swarm goal round A (--idle-seq SEQ | --slot N) [--mode eliot|native]
 swarm discover --profile P [--harness H] [--scope S] [--cursor C] [--archived] [--limit N]

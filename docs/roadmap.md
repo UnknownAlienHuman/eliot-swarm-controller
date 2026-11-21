@@ -67,9 +67,10 @@ engine, second scheduler or critic loop.
 - [x] **A6 Short handoff state.** The handoff brief adds Store facts, the
       current instruction and limits, and the executor's last decisions and
       next step, keeping machine facts and model claims distinct.
-- [ ] **A7 Goal cost budget.** Known usage at turn boundaries feeds a Goal
-      budget without double counting; incomplete or mixed-unit data keeps the
-      money budget `unsupported`.
+- [x] **A7 Goal cost budget.** `max_cost` budgets the native session cost
+      since `set` in its verbatim unit from a baseline snapshot; incomplete,
+      stale, mixed-unit, reset or decreasing data is `cost_unverified` and
+      blocks, never zero.
 - [ ] **A8 Bounded escalation.** After two failed approaches a diagnosis step,
       then one Owner-authorized profile/model change by stated reason; never a
       model ladder, wider rights or a replayed unknown.

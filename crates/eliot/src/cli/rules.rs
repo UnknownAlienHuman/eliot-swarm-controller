@@ -9,12 +9,12 @@ use super::support::read_and_print;
 use super::support::{Failure, command_value, mutation_id, print_value, response_exit_code};
 use eliot_core::Command as CoreCommand;
 use eliot_core::api::{
-    DEFAULT_GOAL_CHECK_TIMEOUT_MS, GoalClearRequest, GoalDefinition, GoalGetRequest, GoalMode,
-    GoalPauseRequest, GoalResumeRequest, GoalRoundRequest, GoalRoundResponse, GoalSetRequest,
-    GoalView, ProjectOverviewRequest, ProjectOverviewResponse, ProjectRegistrationView,
-    ProviderClearHoldRequest, ProviderClearHoldResponse, ProviderCorrectiveEvidence,
-    ProviderHoldsRequest, ProviderHoldsResponse, RuleCatchUpRequest, RuleGetRequest, RuleStateView,
-    TimerGetRequest, TimerRunRequest, TimerStateView,
+    DEFAULT_GOAL_CHECK_TIMEOUT_MS, GoalClearRequest, GoalCostLimit, GoalDefinition, GoalGetRequest,
+    GoalMode, GoalPauseRequest, GoalResumeRequest, GoalRoundRequest, GoalRoundResponse,
+    GoalSetRequest, GoalView, ProjectOverviewRequest, ProjectOverviewResponse,
+    ProjectRegistrationView, ProviderClearHoldRequest, ProviderClearHoldResponse,
+    ProviderCorrectiveEvidence, ProviderHoldsRequest, ProviderHoldsResponse, RuleCatchUpRequest,
+    RuleGetRequest, RuleStateView, TimerGetRequest, TimerRunRequest, TimerStateView,
 };
 use serde_json::Value;
 use serde_json::json;
@@ -240,6 +240,36 @@ pub(crate) async fn run_timer(
     }
 }
 
+/// A decimal amount such as `0.25` in millionths, without float rounding.
+fn cost_amount_micros(text: &str) -> Result<i64, eliot_core::Error> {
+    let invalid = || {
+        eliot_core::Error::new(
+            "invalid",
+            "--max-cost takes a decimal amount with at most 6 fractional digits",
+        )
+    };
+    let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
+    if whole.is_empty() && fraction.is_empty()
+        || fraction.len() > 6
+        || !whole
+            .chars()
+            .chain(fraction.chars())
+            .all(|c| c.is_ascii_digit())
+    {
+        return Err(invalid());
+    }
+    let whole: i64 = if whole.is_empty() {
+        0
+    } else {
+        whole.parse().map_err(|_| invalid())?
+    };
+    let fraction: i64 = format!("{fraction:0<6}").parse().map_err(|_| invalid())?;
+    whole
+        .checked_mul(1_000_000)
+        .and_then(|micros| micros.checked_add(fraction))
+        .ok_or_else(invalid)
+}
+
 pub(crate) async fn run_goal(
     GoalArgs { command }: GoalArgs,
     data_dir: PathBuf,
@@ -247,20 +277,30 @@ pub(crate) async fn run_goal(
     id: Option<String>,
 ) -> Result<u8, Failure> {
     match command {
-        GoalCommand::Set(GoalSetArgs {
-            agent,
-            mode,
-            text,
-            check,
-            check_cwd,
-            check_timeout_ms,
-            max_turns,
-            max_rounds,
-            max_without_progress,
-            cadence_ms,
-            scope,
-            check_inputs,
-        }) => {
+        GoalCommand::Set(args) => {
+            let GoalSetArgs {
+                agent,
+                mode,
+                text,
+                check,
+                check_cwd,
+                check_timeout_ms,
+                max_turns,
+                max_rounds,
+                max_without_progress,
+                cadence_ms,
+                scope,
+                check_inputs,
+                max_cost,
+                cost_unit,
+            } = *args;
+            let max_cost = match (max_cost, cost_unit) {
+                (Some(amount), Some(unit)) => Some(GoalCostLimit {
+                    unit,
+                    amount_micros: cost_amount_micros(&amount).map_err(Failure::for_mutation)?,
+                }),
+                _ => None,
+            };
             let request = GoalSetRequest {
                 id: mutation_id(id)?,
                 agent,
@@ -276,8 +316,8 @@ pub(crate) async fn run_goal(
                     cadence_ms,
                     scope,
                     check_inputs,
+                    max_cost,
                 },
-                max_cost: None,
             };
             request.validate().map_err(Failure::for_mutation)?;
             let response: GoalView =
