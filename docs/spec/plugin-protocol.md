@@ -423,11 +423,15 @@ coverage gap. A command tool's `tool.started` may carry `command`, the command t
 harness reports (Codex: its parsed `commandActions[].command`, one per line, else the raw
 `command`; Claude: the `tool_use` `input.command`), redacted with the secret policy and
 bounded to [`MAX_TOOL_COMMAND_BYTES`](../../crates/eliot-core/src/limits.rs); command
-output and other arguments are never persisted. A completed Codex `commandExecution`
-carries its native `exit_code` when present, and on `status` `failed` a redacted,
-line-bounded tail of the native aggregated output as `error_tail`
-([`MAX_TOOL_ERROR_TAIL_BYTES`](../../crates/eliot-core/src/limits.rs)); a successful
-event grows only by its exit code. Handoff transfer for
+output is never persisted, except the bounded, redacted tail of a failed Codex
+`commandExecution` (`error_tail`): the whole native output is redacted, then the
+LAST [`MAX_TOOL_ERROR_TAIL_BYTES`](../../crates/eliot-core/src/limits.rs) bytes are
+kept at a character boundary, starting at a line boundary when one is retained, so
+a long failure keeps its ending. A completed Codex `commandExecution` also carries
+its native `exit_code` when present; a successful event grows only by that code,
+and other arguments are never persisted. An item that does not match the installed
+native shape keeps its prior `tool.completed` fact (status alone) rather than
+failing the event. Handoff transfer for
 `child`, `goal` and `usage` stays `unsupported`. Native-child observation is
 implemented separately through the shared
 [`ChildParams`](../../crates/eliot-plugin/src/protocol.rs) /
