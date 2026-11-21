@@ -419,12 +419,18 @@ fn check_new_name(draft: &str, name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The `key = …` line of profile `name` exactly as written.
-fn raw_line<'a>(draft: &'a str, name: &str, key: &str) -> Option<&'a str> {
-    let (_, body, end) = block_range(draft, name)?;
-    draft[body..end]
-        .lines()
-        .find(|line| key_of(line) == Some(key))
+/// The `cmd` another profile of `harness` names, read with the TOML
+/// parser so any string form (literal, multi-line, escaped) is decoded.
+fn harness_cmd(draft: &str, harness: &str) -> Option<String> {
+    let document: toml::Table = toml::from_str(draft).ok()?;
+    document
+        .get("profiles")?
+        .as_table()?
+        .values()
+        .filter_map(toml::Value::as_table)
+        .filter(|profile| profile.get("harness").and_then(toml::Value::as_str) == Some(harness))
+        .find_map(|profile| profile.get("cmd").and_then(toml::Value::as_str))
+        .map(str::to_owned)
 }
 
 /// Append a new `[profiles.<name>]` table for `harness`; its model and
@@ -434,11 +440,7 @@ fn raw_line<'a>(draft: &'a str, name: &str, key: &str) -> Option<&'a str> {
 pub fn create(draft: &str, name: &str, harness: &str) -> Result<String, String> {
     let name = name.trim();
     check_new_name(draft, name)?;
-    let cmd = profile_names(draft)
-        .iter()
-        .filter(|other| field(draft, other, "harness") == Field::Simple(harness.to_owned()))
-        .find_map(|other| raw_line(draft, other, "cmd"))
-        .map(|line| format!("{}\n", line.trim()));
+    let cmd = harness_cmd(draft, harness).map(|cmd| format!("cmd = {}\n", quote(&cmd)));
     let mut out = draft.to_owned();
     if !out.is_empty() && !out.ends_with('\n') {
         out.push('\n');

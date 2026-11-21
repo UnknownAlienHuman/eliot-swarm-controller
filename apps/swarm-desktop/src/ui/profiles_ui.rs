@@ -138,6 +138,8 @@ impl DesktopApp {
                 if let Some(name) = index.and_then(|index| names.get(index)) {
                     if self.editor.selected.as_ref() != Some(name) {
                         self.close_popover();
+                        // A refusal belongs to the change that caused it.
+                        self.editor.field_error = None;
                     }
                     self.editor.selected = Some(name.clone());
                 }
@@ -259,7 +261,17 @@ impl DesktopApp {
                     profiles::set_field(&self.editor.draft, &name, "control", on.then_some("tree"));
                 self.apply_form_edit(draft, context);
             }
-            ProfilesMsg::NewNameChanged(text) => self.editor.new_name = text,
+            ProfilesMsg::NewNameChanged(text) => {
+                if self
+                    .editor
+                    .field_error
+                    .as_ref()
+                    .is_some_and(|error| error.key == profiles::NEW_PRESET_ROW)
+                {
+                    self.editor.field_error = None;
+                }
+                self.editor.new_name = text;
+            }
             ProfilesMsg::NewHarnessPicked(index) => {
                 if let Some(index) = index.filter(|index| *index < crate::picker::HARNESSES.len()) {
                     self.editor.new_harness = index;
