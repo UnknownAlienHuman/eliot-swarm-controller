@@ -13,7 +13,13 @@
 
 use super::*;
 
-const MS_PER_DAY: i64 = 24 * 60 * 60 * 1_000;
+const MS_PER_SECOND: i64 = 1_000;
+const MS_PER_DAY: i64 = 24 * 60 * 60 * MS_PER_SECOND;
+/// Event and process retention delete at most this many rows of each kind per
+/// Store-lock acquisition. The daemon releases the writer mutex between calls.
+const RETENTION_BATCH_ENTRIES: i64 = 128;
+/// Incremental auto-vacuum work is page-bounded for fairness with writers.
+const INCREMENTAL_VACUUM_PAGES: i64 = 256;
 /// Traversal backstop for parent/child sets. Parent links are bound once at
 /// admission, so sets are acyclic; reaching this fails the pass loudly rather
 /// than looping.
@@ -40,7 +46,25 @@ const PRUNE_COMMAND_CANDIDATES_AFTER: &str =
                AND (created_at, id) > (?2, ?3)
              ORDER BY created_at, id LIMIT ?4";
 
-/// Outcome of one bounded maintenance pass.
+/// SQLite storage facts exposed by the daemon retention status.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RetentionSpaceStatus {
+    /// SQLite PRAGMA auto_vacuum: 0=none, 1=full, 2=incremental.
+    pub auto_vacuum_mode: i64,
+    pub page_count: i64,
+    pub freelist_pages: i64,
+}
+
+/// Result of an explicitly configured startup conversion for an existing DB.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StoreCompactionReport {
+    pub converted: bool,
+    pub pages_before: i64,
+    pub pages_after: i64,
+    pub freelist_pages: i64,
+}
+
+/// Outcome of one bounded maintenance pass, including SQLite space handling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetentionReport {
     pub events_deleted: i64,
@@ -50,6 +74,21 @@ pub struct RetentionReport {
     pub mail_deleted: i64,
     pub digests_deleted: i64,
     pub processes_deleted: i64,
+    pub pages_reclaimed: i64,
+    pub freelist_pages: i64,
+    pub auto_vacuum_mode: i64,
+    pub wal_frames: i64,
+    pub checkpointed_frames: i64,
+    pub checkpoint_busy: bool,
+}
+
+struct SpaceReclaimOutcome {
+    pages_reclaimed: i64,
+    freelist_pages: i64,
+    auto_vacuum_mode: i64,
+    wal_frames: i64,
+    checkpointed_frames: i64,
+    checkpoint_busy: bool,
 }
 
 struct SubtreeMember {
@@ -65,48 +104,94 @@ struct SubtreeMember {
 }
 
 impl Store {
+    /// Read SQLite's current physical-retention mode and page inventory.
+    pub fn retention_space_status(&self) -> Result<RetentionSpaceStatus> {
+        Ok(RetentionSpaceStatus {
+            auto_vacuum_mode: self
+                .connection
+                .query_row("PRAGMA auto_vacuum", [], |row| row.get(0))
+                .map_err(sql_error)?,
+            page_count: self
+                .connection
+                .query_row("PRAGMA page_count", [], |row| row.get(0))
+                .map_err(sql_error)?,
+            freelist_pages: self
+                .connection
+                .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+                .map_err(sql_error)?,
+        })
+    }
+
+    /// Owner-opt-in conversion for an existing database. `VACUUM` runs only
+    /// during startup, before the daemon serves requests; ordinary live
+    /// retention uses bounded page reuse/checkpointing instead.
+    pub fn compact_to_incremental(&mut self) -> Result<StoreCompactionReport> {
+        self.ensure_writer_healthy()?;
+        let before = self.retention_space_status()?;
+        let converted = before.auto_vacuum_mode != 2;
+        if converted {
+            self.connection
+                .execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;")
+                .map_err(sql_error)?;
+        }
+        let space = self.reclaim_retention_space(false)?;
+        if space.auto_vacuum_mode != 2 {
+            return Err(Error::new(
+                "internal",
+                "SQLite did not enable incremental auto-vacuum",
+            ));
+        }
+        Ok(StoreCompactionReport {
+            converted,
+            pages_before: before.page_count,
+            pages_after: self.retention_space_status()?.page_count,
+            freelist_pages: space.freelist_pages,
+        })
+    }
+
     /// Delete one bounded batch of expired history. Event pruning removes an
-    /// expired contiguous prefix below every live cursor; command pruning
-    /// removes whole closed child-sets leaf-first; writes pruning removes
-    /// expired mutation bindings; mail pruning removes acknowledged messages
-    /// older than the mail window, never unread mail; digest pruning removes
-    /// delivered completion digests older than the commands window, never
-    /// pending ones. Projections, source recovery state, timers, and the
-    /// event id allocator are never touched.
-    /// An unset (`None`) window disables pruning for that side: no deletion
-    /// without an owner window.
+    /// expired contiguous prefix below every live cursor; exited child rows
+    /// use their own shorter cutoff and remain protected while live or while
+    /// their generation holds capacity. Command pruning removes whole closed
+    /// child-sets leaf-first; mail pruning never removes unread rows. Event
+    /// identities, projections, source recovery state, timers, and the event
+    /// allocator are preserved.
     pub fn prune_retention(
         &mut self,
-        events_days: Option<i64>,
+        events_seconds: i64,
+        processes_seconds: i64,
         commands_days: Option<i64>,
         mail_days: Option<i64>,
         now: i64,
     ) -> Result<RetentionReport> {
         self.ensure_writer_healthy()?;
-        let result = self.prune_retention_inner(events_days, commands_days, mail_days, now);
+        let result = self.prune_retention_inner(
+            events_seconds,
+            processes_seconds,
+            commands_days,
+            mail_days,
+            now,
+        );
         self.fault_on_persistence_error(&result);
         result
     }
 
     fn prune_retention_inner(
         &mut self,
-        events_days: Option<i64>,
+        events_seconds: i64,
+        processes_seconds: i64,
         commands_days: Option<i64>,
         mail_days: Option<i64>,
         now: i64,
     ) -> Result<RetentionReport> {
-        let events_cutoff = match events_days {
-            Some(days) => {
-                if days <= 0 {
-                    return Err(Error::new(
-                        "invalid",
-                        "retention windows must be positive days",
-                    ));
-                }
-                Some(now.saturating_sub(days.saturating_mul(MS_PER_DAY)))
-            }
-            None => None,
-        };
+        if events_seconds <= 0 || processes_seconds <= 0 {
+            return Err(Error::new(
+                "invalid",
+                "event and process retention windows must be positive seconds",
+            ));
+        }
+        let events_cutoff = now.saturating_sub(events_seconds.saturating_mul(MS_PER_SECOND));
+        let processes_cutoff = now.saturating_sub(processes_seconds.saturating_mul(MS_PER_SECOND));
         let commands_cutoff = match commands_days {
             Some(days) => {
                 if days <= 0 {
@@ -149,10 +234,7 @@ impl Store {
             }
             None => None,
         };
-        let (events_deleted, pruned_through) = match events_cutoff {
-            Some(cutoff) => self.prune_events(cutoff)?,
-            None => (0, coverage_pruned_through(&self.connection)?),
-        };
+        let (events_deleted, pruned_through) = self.prune_events(events_cutoff)?;
         let (commands_deleted, writes_deleted) = match commands_cutoff {
             Some(cutoff) => self.prune_commands_and_writes(cutoff)?,
             None => (0, 0),
@@ -165,11 +247,15 @@ impl Store {
             Some(cutoff) => self.prune_delivered_digests(cutoff)?,
             None => 0,
         };
-        // Same cutoff as events: exited process rows are diagnostic history.
-        let processes_deleted = match events_cutoff {
-            Some(cutoff) => self.prune_exited_processes(cutoff)?,
-            None => 0,
-        };
+        // Exited child rows have an independent, shorter age window.
+        let processes_deleted = self.prune_exited_processes(processes_cutoff)?;
+        let deleted_rows = events_deleted
+            + commands_deleted
+            + writes_deleted
+            + mail_deleted
+            + digests_deleted
+            + processes_deleted;
+        let space = self.reclaim_retention_space(deleted_rows > 0)?;
         Ok(RetentionReport {
             events_deleted,
             pruned_through,
@@ -178,6 +264,40 @@ impl Store {
             mail_deleted,
             digests_deleted,
             processes_deleted,
+            pages_reclaimed: space.pages_reclaimed,
+            freelist_pages: space.freelist_pages,
+            auto_vacuum_mode: space.auto_vacuum_mode,
+            wal_frames: space.wal_frames,
+            checkpointed_frames: space.checkpointed_frames,
+            checkpoint_busy: space.checkpoint_busy,
+        })
+    }
+
+    fn reclaim_retention_space(&mut self, deleted_rows: bool) -> Result<SpaceReclaimOutcome> {
+        let before = self.retention_space_status()?;
+        if deleted_rows && before.auto_vacuum_mode == 2 {
+            self.connection
+                .execute_batch(&format!(
+                    "PRAGMA incremental_vacuum({INCREMENTAL_VACUUM_PAGES});"
+                ))
+                .map_err(sql_error)?;
+        }
+        // PASSIVE checkpoints make progress without waiting for readers. The
+        // configured journal_size_limit trims WAL after a completed checkpoint.
+        let (busy, wal_frames, checkpointed_frames): (i64, i64, i64) = self
+            .connection
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(sql_error)?;
+        let after = self.retention_space_status()?;
+        Ok(SpaceReclaimOutcome {
+            pages_reclaimed: before.page_count.saturating_sub(after.page_count).max(0),
+            freelist_pages: after.freelist_pages,
+            auto_vacuum_mode: after.auto_vacuum_mode,
+            wal_frames: wal_frames.max(0),
+            checkpointed_frames: checkpointed_frames.max(0),
+            checkpoint_busy: busy != 0,
         })
     }
 
@@ -209,7 +329,7 @@ impl Store {
                      SELECT seq FROM events WHERE seq > ?1 AND seq <= ?2
                      ORDER BY seq LIMIT ?3
                  )",
-                params![pruned_through, end, MAX_PAGE_ENTRIES as i64],
+                params![pruned_through, end, RETENTION_BATCH_ENTRIES],
                 |row| row.get(0),
             )
             .map_err(sql_error)?;
@@ -376,13 +496,11 @@ impl Store {
         Ok(deleted as i64)
     }
 
-    /// Delete one bounded batch of exited child process rows whose last changed
-    /// fact is older than the events cutoff, oldest change first. Only
-    /// `role = 'child'` matches: plugin and harness rows stay, since the
-    /// owned-exit proof and restart custody read their exited witnesses. Live
-    /// rows (`running`/`unknown`) never match. Generations that still hold a
-    /// capacity reservation are excluded, because restart custody reads their
-    /// whole recorded set. Deletion is silent and never replays a process.
+    /// Delete one bounded batch of exited child rows older than the separate
+    /// process cutoff, oldest change first, using the schema's partial index.
+    /// Plugin and harness rows stay as owned-exit and restart-custody evidence;
+    /// live/unknown rows and generations holding capacity never match.
+    /// Deletion is silent and never replays a process.
     fn prune_exited_processes(&mut self, cutoff: i64) -> Result<i64> {
         let tx = self
             .connection
@@ -390,7 +508,7 @@ impl Store {
             .map_err(sql_error)?;
         let deleted = db!(tx.execute(
             "DELETE FROM processes WHERE rowid IN (
-                 SELECT rowid FROM processes
+                 SELECT rowid FROM processes INDEXED BY processes_exited_child_updated
                  WHERE state = 'exited' AND role = 'child' AND updated_at < ?1
                    AND owner NOT IN (
                        SELECT 'agent:a' || id || '#' || capacity_generation
@@ -398,7 +516,7 @@ impl Store {
                    )
                  ORDER BY updated_at LIMIT ?2
              )",
-            params![cutoff, MAX_PAGE_ENTRIES as i64],
+            params![cutoff, RETENTION_BATCH_ENTRIES],
         ));
         commit_transaction(tx, &self.write_faulted)?;
         Ok(deleted as i64)

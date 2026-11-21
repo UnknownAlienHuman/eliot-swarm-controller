@@ -1,9 +1,7 @@
-//! Periodic physical-retention maintenance. Each hourly wake reloads the
-//! daemon retention settings, then runs bounded retention epochs through
-//! the one Store writer until an epoch drains: an epoch that exhausts its
-//! budgets while still deleting rows continues cooperatively instead of
-//! leaving eligible backlog until the next hour. Pruning is silent and
-//! never replays an effect; only counts are logged.
+//! Periodic physical-retention maintenance. Each configured wake reloads
+//! daemon retention settings and runs bounded epochs through the one Store
+//! writer, releasing its mutex between small batches. Pruning is silent and
+//! never replays an effect; row and space-reclaim outcomes are logged.
 
 use crate::{common::now_ms, config, daemon::workers::WorkerReporter, logging};
 use eliot_core::{Result, SecretPolicy};
@@ -15,12 +13,11 @@ use std::{
 };
 use tokio::sync::{Mutex, watch};
 
-/// Hourly cleanup is plenty for day-granularity retention windows.
-pub(crate) const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(3600);
 /// One retention epoch loops bounded passes until a pass deletes nothing
 /// or a budget runs out.
 pub(crate) const RETENTION_TICK_ROW_BUDGET: i64 = 10_000;
 pub(crate) const RETENTION_TICK_TIME_BUDGET: Duration = Duration::from_secs(30);
+
 /// Known provider resets and due probes are serviced within one second.
 pub(crate) const PROVIDER_HOLD_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -30,23 +27,28 @@ pub(crate) async fn run(
     policy: Arc<SecretPolicy>,
     initial: config::DaemonConfig,
     router: crate::router::Router,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
     reporter: WorkerReporter,
 ) -> Result<()> {
-    let mut config = initial;
-    let mut ticker = tokio::time::interval(MAINTENANCE_INTERVAL);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    router.recover_ended_provider_probes(&shutdown).await?;
+    reporter.running("maintenance");
+    tokio::try_join!(
+        run_retention(store, data_root, Arc::clone(&policy), initial, shutdown.clone()),
+        run_provider_maintenance(router, policy, shutdown),
+    )?;
+    Ok(())
+}
+
+async fn run_provider_maintenance(
+    router: crate::router::Router,
+    policy: Arc<SecretPolicy>,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
     let mut provider_ticker = tokio::time::interval(PROVIDER_HOLD_INTERVAL);
     provider_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut provider_probe_tasks = tokio::task::JoinSet::new();
-    router.recover_ended_provider_probes(&shutdown).await?;
-    // Skip the immediate first tick: maintenance runs on the interval, not at
-    // startup.
-    ticker.tick().await;
-    reporter.running("maintenance");
     loop {
         tokio::select! {
-            _ = ticker.tick() => {}
             _ = provider_ticker.tick() => {
                 let available = eliot_store::PROVIDER_PROBE_BATCH_LIMIT
                     .saturating_sub(provider_probe_tasks.len());
@@ -90,11 +92,48 @@ pub(crate) async fn run(
                 continue;
             }
         }
+    }
+}
+
+async fn run_retention(
+    store: Arc<Mutex<Store>>,
+    data_root: PathBuf,
+    policy: Arc<SecretPolicy>,
+    initial: config::DaemonConfig,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    let mut config = initial;
+    let mut interval_seconds = config.retention.maintenance_interval_seconds();
+    let mut ticker = tokio::time::interval(Duration::from_secs(interval_seconds));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Tokio's first tick is immediate: do one bounded startup pass, then keep
+    // the configured cadence for subsequent passes.
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {}
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Ok(());
+                }
+                continue;
+            }
+        }
         if *shutdown.borrow() {
-            continue;
+            return Ok(());
         }
         match config::load_daemon_config(&data_root) {
-            Ok(reloaded) => config = reloaded,
+            Ok(reloaded) => {
+                let next_interval_seconds = reloaded.retention.maintenance_interval_seconds();
+                config = reloaded;
+                if next_interval_seconds != interval_seconds {
+                    let mut next_ticker =
+                        tokio::time::interval(Duration::from_secs(next_interval_seconds));
+                    next_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    next_ticker.tick().await;
+                    ticker = next_ticker;
+                    interval_seconds = next_interval_seconds;
+                }
+            }
             Err(error) => {
                 logging::record(
                     &policy,
@@ -105,19 +144,15 @@ pub(crate) async fn run(
             }
         }
         // Retention catch-up: while an epoch spends a budget, run another
-        // instead of leaving eligible backlog until the next hourly wake.
-        // Only retention repeats here; the config reload above stays hourly.
-        // Epoch failures are already logged inside; the next hourly wake
-        // retries.
+        // instead of leaving eligible backlog until the next configured wake.
+        // Epoch failures are already logged inside; the next wake retries.
         run_epochs(&store, &config.retention, &policy, now_ms(), || {
             shutdown.has_changed().is_err() || *shutdown.borrow()
         })
         .await
         .ok();
-        // Unbounded-growth visibility, at most one line per hourly pass:
-        // while every retention window is unset and the store passes the
-        // documented size, say so. Retention semantics never change here;
-        // the exact sizes stay in `daemon.status`.
+        // Keep the legacy unbounded-growth notice for any future policy that
+        // disables both event and process retention; current defaults are finite.
         if unbounded_store_over_threshold(
             &config.retention,
             &data_root,
@@ -128,7 +163,7 @@ pub(crate) async fn run(
     }
 }
 
-/// True when every retention window is unset and the main+WAL store files
+/// True when no retention window is active and the main+WAL store files
 /// pass `threshold_bytes`. Missing files read as zero bytes. Retention
 /// semantics never change here: this only decides whether the unbounded
 /// advisory is due.
@@ -137,7 +172,8 @@ pub(crate) fn unbounded_store_over_threshold(
     data_root: &Path,
     threshold_bytes: u64,
 ) -> bool {
-    if retention.events_days.is_some()
+    if retention.events_retention_seconds() > 0
+        || retention.processes_retention_seconds() > 0
         || retention.commands_days.is_some()
         || retention.mail_days.is_some()
     {
@@ -162,7 +198,7 @@ pub(crate) fn store_file_sizes(data_root: &Path) -> (u64, u64) {
 
 /// Owner-triggered pass (`maintenance.run`): reload the daemon retention
 /// settings, then run one bounded epoch, so the call returns inside the
-/// client deadline; a larger backlog continues on the hourly tick. A
+/// client deadline; a larger backlog continues on the configured tick. A
 /// rejected reload fails the call so the owner fixes the config instead of
 /// pruning under stale windows.
 pub(crate) async fn run_now(
@@ -200,6 +236,12 @@ pub(crate) async fn run_epochs(
         mail_deleted: 0,
         digests_deleted: 0,
         processes_deleted: 0,
+        pages_reclaimed: 0,
+        freelist_pages: 0,
+        auto_vacuum_mode: 0,
+        wal_frames: 0,
+        checkpointed_frames: 0,
+        checkpoint_busy: false,
     };
     loop {
         // Shutdown is checked at the top of every epoch, so a signal
@@ -223,13 +265,19 @@ pub(crate) async fn run_epochs(
         total.mail_deleted += report.mail_deleted;
         total.digests_deleted += report.digests_deleted;
         total.processes_deleted += report.processes_deleted;
+        total.pages_reclaimed += report.pages_reclaimed;
+        total.freelist_pages = report.freelist_pages;
+        total.auto_vacuum_mode = report.auto_vacuum_mode;
+        total.wal_frames = report.wal_frames;
+        total.checkpointed_frames = report.checkpointed_frames;
+        total.checkpoint_busy |= report.checkpoint_busy;
         let rows = report.events_deleted
             + report.commands_deleted
             + report.writes_deleted
             + report.mail_deleted
             + report.digests_deleted
             + report.processes_deleted;
-        if rows > 0 {
+        if rows > 0 || report.pages_reclaimed > 0 || report.checkpoint_busy {
             logging::record_counts(
                 policy,
                 "daemon.retention_pruned",
@@ -241,6 +289,12 @@ pub(crate) async fn run_epochs(
                     mail: report.mail_deleted.max(0) as u64,
                     digests: report.digests_deleted.max(0) as u64,
                     processes: report.processes_deleted.max(0) as u64,
+                    pages_reclaimed: report.pages_reclaimed.max(0) as u64,
+                    freelist_pages: report.freelist_pages.max(0) as u64,
+                    auto_vacuum_mode: report.auto_vacuum_mode.max(0) as u64,
+                    wal_frames: report.wal_frames.max(0) as u64,
+                    checkpointed_frames: report.checkpointed_frames.max(0) as u64,
+                    checkpoint_busy: if report.checkpoint_busy { 1 } else { 0 },
                 },
                 None,
             );
@@ -296,12 +350,19 @@ pub(crate) async fn run_once_with_budgets(
         mail_deleted: 0,
         digests_deleted: 0,
         processes_deleted: 0,
+        pages_reclaimed: 0,
+        freelist_pages: 0,
+        auto_vacuum_mode: 0,
+        wal_frames: 0,
+        checkpointed_frames: 0,
+        checkpoint_busy: false,
     };
     loop {
         let pass = {
             let mut guard = store.lock().await;
             guard.prune_retention(
-                retention.events_days,
+                retention.events_retention_seconds(),
+                retention.processes_retention_seconds(),
                 retention.commands_days,
                 retention.mail_days,
                 now,
@@ -314,6 +375,12 @@ pub(crate) async fn run_once_with_budgets(
         total.mail_deleted += pass.mail_deleted;
         total.digests_deleted += pass.digests_deleted;
         total.processes_deleted += pass.processes_deleted;
+        total.pages_reclaimed += pass.pages_reclaimed;
+        total.freelist_pages = pass.freelist_pages;
+        total.auto_vacuum_mode = pass.auto_vacuum_mode;
+        total.wal_frames = pass.wal_frames;
+        total.checkpointed_frames = pass.checkpointed_frames;
+        total.checkpoint_busy |= pass.checkpoint_busy;
         let pass_rows = pass.events_deleted
             + pass.commands_deleted
             + pass.writes_deleted

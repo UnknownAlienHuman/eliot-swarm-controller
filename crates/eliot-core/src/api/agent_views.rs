@@ -1582,23 +1582,32 @@ impl CloudMcpStatus {
     }
 }
 
-/// Retention and store-size visibility for `daemon.status`. The windows are
-/// the configured `daemon.retention` day counts; `None` is an unset window
-/// that disables pruning for that side, and `unbounded` is true only when
-/// all three are unset (a default daemon never prunes). `db_bytes` and
+/// Retention and store-size visibility for `daemon.status`. Day settings
+/// remain available for compatibility; the seconds fields expose effective
+/// event and child-process ages. `db_bytes` and
 /// `wal_bytes` are the `eliot.db` main and WAL file sizes;
-/// `pruned_through` is the retained-event watermark. `size_advisory` is
-/// present only when retention is unbounded and the combined size passes the
-/// documented threshold (see `configuration.md` daemon retention).
-/// `config_error` is the typed code and message when `config.toml` could not
-/// be read: the windows are then unknown, so they read back absent with
-/// `unbounded` false and no advisory, never as an unset (unbounded) policy.
+/// `pruned_through` is the retained-event watermark. `auto_vacuum_mode`,
+/// `page_count`, and `freelist_pages` show whether deleted pages can shrink
+/// the file now or be reused. `config_error` is the typed code and message
+/// when `config.toml` could not be read: settings then read back absent while
+/// the SQLite page inventory remains available.
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RetentionView {
     pub events_days: Option<i64>,
     pub commands_days: Option<i64>,
     pub mail_days: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub events_seconds: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub processes_seconds: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance_interval_seconds: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact_on_start: Option<bool>,
+    pub auto_vacuum_mode: i64,
+    pub page_count: i64,
+    pub freelist_pages: i64,
     pub pruned_through: i64,
     pub db_bytes: u64,
     pub wal_bytes: u64,
@@ -1617,14 +1626,42 @@ impl RetentionView {
                 return Err(invalid_response());
             }
         }
-        if self.pruned_through < 0 {
+        for seconds in [
+            self.events_seconds,
+            self.processes_seconds,
+            self.maintenance_interval_seconds,
+        ] {
+            if seconds.is_some_and(|value| value <= 0) {
+                return Err(invalid_response());
+            }
+        }
+        if self
+            .maintenance_interval_seconds
+            .is_some_and(|seconds| seconds > 86_400)
+            || !(0..=2).contains(&self.auto_vacuum_mode)
+            || self.page_count < 0
+            || self.freelist_pages < 0
+            || self.freelist_pages > self.page_count
+            || self.pruned_through < 0
+        {
             return Err(invalid_response());
         }
-        let unset =
-            self.events_days.is_none() && self.commands_days.is_none() && self.mail_days.is_none();
+        let unset = self.events_days.is_none()
+            && self.commands_days.is_none()
+            && self.mail_days.is_none()
+            && self.events_seconds.is_none()
+            && self.processes_seconds.is_none();
         let known = match &self.config_error {
             None => true,
-            Some(error) if !error.trim().is_empty() && error.len() <= 512 && unset => false,
+            Some(error)
+                if !error.trim().is_empty()
+                    && error.len() <= 512
+                    && unset
+                    && self.maintenance_interval_seconds.is_none()
+                    && self.compact_on_start.is_none() =>
+            {
+                false
+            }
             Some(_) => return Err(invalid_response()),
         };
         if self.unbounded != (known && unset) {

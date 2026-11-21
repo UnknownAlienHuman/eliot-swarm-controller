@@ -34,7 +34,7 @@ pub use goals::{
 pub use handoff::HandoffAdmission;
 pub use projects::ProjectRegistrationInput;
 pub use resolution::{ConfigureReadback, TurnInactiveProof};
-pub use retention::RetentionReport;
+pub use retention::{RetentionReport, RetentionSpaceStatus, StoreCompactionReport};
 pub use rules::{
     RuleCatchUpAction, RuleCatchUpActionOutcome, RuleCatchUpAdmission, RuleCursorOutcome,
     RuleDefinitionInput, RuleEventAdmission, RuleProcessingState, TimerDefinitionInput,
@@ -406,11 +406,30 @@ impl Store {
             .busy_timeout(Duration::from_secs(5))
             .map_err(sql_error)?;
         on_phase(StoreOpenPhase::ConnectionOpened);
+        let has_schema: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_schema
+                    WHERE type IN ('table', 'index') AND name NOT LIKE 'sqlite_%'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
+        if !has_schema {
+            // Set this before migrations create the first table. Existing
+            // databases keep their current mode until an owner opts into the
+            // startup VACUUM path; retention still reuses their freed pages.
+            connection
+                .execute_batch("PRAGMA auto_vacuum=INCREMENTAL;")
+                .map_err(sql_error)?;
+        }
         connection
             .execute_batch(
                 "PRAGMA journal_mode=WAL;
                  PRAGMA synchronous=FULL;
-                 PRAGMA foreign_keys=ON;",
+                 PRAGMA foreign_keys=ON;
+                 PRAGMA journal_size_limit=67108864;",
             )
             .map_err(sql_error)?;
         on_phase(StoreOpenPhase::PragmasApplied);

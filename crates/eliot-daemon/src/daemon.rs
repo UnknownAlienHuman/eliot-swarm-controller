@@ -124,7 +124,14 @@ async fn run_with_update(path: PathBuf, attempt: Option<&str>) -> Result<()> {
     {
         logging::record(&policy, "daemon.mcp_temp_cleanup_failed", &[], Some(&error));
     }
-    let outcome = run_owned(&data_dir, &daemon_lock, Arc::clone(&policy), attempt).await;
+    let outcome = run_owned(
+        &data_dir,
+        &daemon_lock,
+        Arc::clone(&policy),
+        attempt,
+        daemon_config,
+    )
+    .await;
     logging::record(
         &policy,
         if outcome.is_ok() {
@@ -143,8 +150,9 @@ async fn run_owned(
     daemon_lock: &DaemonLock,
     policy: Arc<SecretPolicy>,
     attempt: Option<&str>,
+    daemon_config: crate::config::DaemonConfig,
 ) -> Result<()> {
-    let runtime = initialize_runtime(data_dir, policy).await?;
+    let runtime = initialize_runtime(data_dir, policy, daemon_config).await?;
     let supervision = spawn_workers(data_dir, daemon_lock, runtime, attempt).await?;
     let (outcome, supervision) = supervise(supervision).await;
     shutdown_supervision(supervision, outcome).await
@@ -197,6 +205,7 @@ struct DaemonSupervision {
 async fn initialize_runtime(
     data_dir: &DataDir,
     policy: Arc<SecretPolicy>,
+    daemon_config: crate::config::DaemonConfig,
 ) -> Result<DaemonRuntime> {
     let store_path = data_dir.path().join("eliot.db");
     logging::record(&policy, "daemon.store_opening", &[], None);
@@ -211,6 +220,39 @@ async fn initialize_runtime(
             logging::record(&policy, "daemon.store_migrated", &[], None);
         }
     })?;
+    // Explicit compaction is opt-in because converting a large existing DB
+    // needs a full VACUUM and temporary disk space. It runs before workers or
+    // IPC bind, so no live request waits behind the conversion.
+    if daemon_config.retention.compact_on_start {
+        let report = store.compact_to_incremental()?;
+        logging::record_counts(
+            &policy,
+            if report.converted {
+                "daemon.store_compaction_converted"
+            } else {
+                "daemon.store_compaction_already_incremental"
+            },
+            logging::Counts {
+                events: 0,
+                pruned_through: 0,
+                commands: 0,
+                writes: 0,
+                mail: 0,
+                digests: 0,
+                processes: 0,
+                pages_reclaimed: report
+                    .pages_before
+                    .saturating_sub(report.pages_after)
+                    .max(0) as u64,
+                freelist_pages: report.freelist_pages.max(0) as u64,
+                auto_vacuum_mode: 2,
+                wal_frames: 0,
+                checkpointed_frames: 0,
+                checkpoint_busy: 0,
+            },
+            None,
+        );
+    }
     // Startup phase markers: a readiness timeout names the phase that stalled.
     logging::record(&policy, "daemon.store_opened", &[], None);
     let capacity_root = data_dir.path().to_path_buf();
@@ -273,8 +315,6 @@ async fn initialize_runtime(
     };
     router.note_events(&recovered);
     logging::record(&policy, "daemon.recovered", &[], None);
-    let daemon_config =
-        crate::config::load_daemon_config(data_dir.path()).map_err(startup_config_failure)?;
     let capacity = restart_capacity::Reconcile {
         store: Arc::clone(&store),
         bus: bus.clone(),
