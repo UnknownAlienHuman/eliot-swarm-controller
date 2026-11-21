@@ -115,6 +115,17 @@ impl Store {
 
         if record.command.verb == "send" && state != CommandState::Applied {
             context::settle_send_claims_tx(&tx, &record, state, now, &mut events)?;
+            if matches!(
+                state,
+                CommandState::Rejected | CommandState::Failed | CommandState::Cancelled
+            ) {
+                tx.execute(
+                    "UPDATE mail_notices SET last_notice_at = ?1, open_notice_command = NULL
+                     WHERE recipient = ?2 AND open_notice_command = ?3",
+                    params![now, target, id],
+                )
+                .map_err(sql_error)?;
+            }
         }
 
         if is_attachment_verb(record.command.verb.as_str()) {
@@ -878,7 +889,7 @@ fn release_settle_capacity(
     Ok(())
 }
 
-fn apply_settle_agent_transition(
+pub(super) fn apply_settle_agent_transition(
     tx: &Transaction<'_>,
     record: &CommandRecord,
     state: CommandState,

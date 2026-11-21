@@ -97,14 +97,51 @@ impl Router {
             "command resolution",
             CommandResolveRequest::validate,
         )?;
-        let live_agent = if request.resolution == eliot_core::api::CommandResolution::Applied {
+        let command = {
             let store = self.inner.store.lock().await;
             if let Some(value) = store.stored_command_resolution("owner", &request)? {
                 return serde_json::to_value(value).map_err(|_| {
                     Error::new("internal", "command resolution could not be encoded")
                 });
             }
-            match store.get_command(&request.command_id)? {
+            store.get_command(&request.command_id)?
+        };
+        if request.resolution == eliot_core::api::CommandResolution::Failed
+            && let Some(command) = command.as_ref().filter(|command| {
+                command.verb == "launch"
+                    && command.generation == Some(0)
+                    && command.state == eliot_core::CommandState::Unknown
+                    && command
+                        .outcome
+                        .as_ref()
+                        .is_some_and(|outcome| outcome["stage"] == "workspace")
+            })
+        {
+            let target = command
+                .target
+                .as_deref()
+                .ok_or_else(|| Error::new("bad_state", "managed launch has no Agent"))?;
+            let preparation = self
+                .inner
+                .store
+                .lock()
+                .await
+                .get_workspace(target)?
+                .ok_or_else(|| {
+                    Error::new("bad_state", "managed launch has no workspace to read back")
+                })?;
+            let value = self
+                .inner
+                .workspaces
+                .resolve_failed_launch(&request, &preparation)
+                .await?;
+            self.signal_progress();
+            return serde_json::to_value(value)
+                .map_err(|_| Error::new("internal", "command resolution could not be encoded"));
+        }
+        let live_agent = if request.resolution == eliot_core::api::CommandResolution::Applied {
+            let store = self.inner.store.lock().await;
+            match command {
                 Some(command)
                     if command.verb == "configure"
                         && command.state == eliot_core::CommandState::Unknown =>

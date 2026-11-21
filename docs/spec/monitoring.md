@@ -327,9 +327,9 @@ Flow:
 
 1. create/retain the Agent projection and workspace row for `target_generation` with
    phase `creating`;
-2. run `git worktree add` against frozen OID;
-3. read back exact path, branch and HEAD; then set `phase=setup_ready`,
-   `setup_index=0`;
+2. run `git worktree add` against the frozen OID with sparse checkout disabled;
+3. verify the exact path, branch, frozen HEAD and empty porcelain status
+   including untracked and ignored paths. Set `phase=setup_ready`, `setup_index=0`;
 4. before setup entry `i` starts, commit `phase=setup_running`, `setup_index=i` and its
    frozen argv/file identity; only then spawn it in
    `workspace:<agent>#<target_generation>` custody;
@@ -337,7 +337,15 @@ Flow:
 6. only a `ready` row whose target generation matches the start command permits that
    generation's native dispatch.
 
-A lost Git response is settled by exact worktree/path/branch/OID readback. A setup entry
+A lost Git response is settled by exact worktree/path/branch/OID readback. A failed
+checkout can leave its new Git branch after Git has removed the worktree. Cleanup
+requires the creation command's branch reflog marker, the frozen tip and no other
+registration. Rollback checks a newly created worktree with porcelain status and
+removes it with ordinary Git removal before compare-deleting the exact ref.
+With quiescent custody, a rollback refusal or failed readback settles the launch
+as failed with the specific reason and preserves any remaining artifacts for cleanup.
+A failed checkout reports its exit code once readback proves that the checkout and
+branch are absent. A setup entry
 has no generic readback: after restart or lost process result, `setup_running` becomes
 `unknown` unless exact platform evidence proves the process never started. It is never
 rerun. The owner removes/recreates or explicitly resolves the workspace. This needs one
@@ -374,6 +382,8 @@ stops at that phase until settlement. Removal requires at least 60 seconds since
 the last owner or borrower ended. The worktree tip must be an ancestor of the
 exact base OID frozen at preparation, and Git must report a clean index and worktree
 apart from regular untracked or ignored files in frozen scratch paths.
+The cached path inventory includes Git links. Cleanup accepts empty or absent
+submodule directories and retains populated submodule checkouts.
 
 Once an exclusive filesystem write guard is established, apply rechecks Git,
 deletes approved scratch files and runs ordinary non-force `git worktree remove`
@@ -430,6 +440,8 @@ silently disabling the configured HTTPS/SSH transport itself.
 
 - refresh on debounced filesystem invalidation and poll interval, at most once per 2 s;
 - `status --porcelain=v2 --branch -z` for current state;
+- index entries are parsed as a bounded NUL-delimited stream. Filter attributes
+  are checked in bounded path batches and a second index digest fences the sample;
 - bounded `log --no-ext-diff --no-textconv` on HEAD movement from the last stored HEAD,
   so commits made while daemon was down are recovered; no prior baseline yields an
   explicit gap;

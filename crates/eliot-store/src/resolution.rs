@@ -3,8 +3,8 @@
 //! A resolution records an owner assertion about an already-uncertain outcome:
 //! it moves exactly one unknown command or turn to its asserted terminal state
 //! and releases only that command/turn gate. It never invents a native receipt
-//! or turn association, never replays an effect, and never touches capacity
-//! reservations, Agent rows, or any sibling command/turn.
+//! or turn association and never replays an effect. An exact workspace launch
+//! failure before native dispatch also settles its created Agent and linked input.
 //!
 //! Provenance is retained where every readback can see it: a resolved command carries
 //! `resolution_source=owner` in its outcome, and each resolution emits a
@@ -26,7 +26,7 @@ use super::{
 };
 use eliot_core::is_start_verb;
 use eliot_core::{
-    CommandState, TurnOutcome, TurnState,
+    CommandState, TurnOutcome, TurnState, WorkspacePhase, WorkspacePreparation,
     api::{
         CommandResolution, CommandResolveRequest, CommandResolveResponse, TurnResolveRequest,
         TurnResolveResponse, TurnResolveStatus,
@@ -57,6 +57,11 @@ pub struct ConfigureReadback {
     pub model: String,
 }
 
+enum CommandReadback<'a> {
+    Configure(&'a ConfigureReadback),
+    WorkspaceAbsent(&'a WorkspacePreparation),
+}
+
 impl Store {
     /// Resolve one unknown command to its owner-asserted terminal state. The
     /// mutation id binds the assertion for idempotent retries; the command
@@ -75,6 +80,38 @@ impl Store {
         principal: &str,
         request: &CommandResolveRequest,
         readback: Option<&ConfigureReadback>,
+        now: i64,
+    ) -> Result<Change<CommandResolveResponse>> {
+        self.resolve_command_with_proof(
+            principal,
+            request,
+            readback.map(CommandReadback::Configure),
+            now,
+        )
+    }
+
+    /// `preparation` binds the daemon's Git absence readback to the exact
+    /// workspace snapshot. The manager holds its effect gates through commit.
+    pub fn resolve_command_with_absent_workspace(
+        &mut self,
+        principal: &str,
+        request: &CommandResolveRequest,
+        preparation: &WorkspacePreparation,
+        now: i64,
+    ) -> Result<Change<CommandResolveResponse>> {
+        self.resolve_command_with_proof(
+            principal,
+            request,
+            Some(CommandReadback::WorkspaceAbsent(preparation)),
+            now,
+        )
+    }
+
+    fn resolve_command_with_proof(
+        &mut self,
+        principal: &str,
+        request: &CommandResolveRequest,
+        readback: Option<CommandReadback<'_>>,
         now: i64,
     ) -> Result<Change<CommandResolveResponse>> {
         self.ensure_writer_healthy()?;
@@ -108,7 +145,7 @@ impl Store {
         &mut self,
         principal: &str,
         request: &CommandResolveRequest,
-        readback: Option<&ConfigureReadback>,
+        readback: Option<CommandReadback<'_>>,
         now: i64,
     ) -> Result<Change<CommandResolveResponse>> {
         request.validate()?;
@@ -178,13 +215,71 @@ impl Store {
             ));
         }
         if record.command.verb == "configure" && request.resolution == CommandResolution::Applied {
-            resolve_configure_overlay(&tx, &record, readback, now)?;
+            let configure = match readback {
+                Some(CommandReadback::Configure(proof)) => Some(proof),
+                _ => None,
+            };
+            resolve_configure_overlay(&tx, &record, configure, now)?;
         }
-        let event = resolve_command_tx(&tx, &record, request, request.resolution.state(), now)?;
+        let state = request.resolution.state();
+        let workspace_launch = state == CommandState::Failed
+            && record.command.verb == "launch"
+            && record.command.generation == Some(0)
+            && record
+                .command
+                .outcome
+                .as_ref()
+                .is_some_and(|outcome| outcome["stage"] == "workspace");
+        if workspace_launch {
+            let Some(CommandReadback::WorkspaceAbsent(proof)) = readback else {
+                return Err(Error::new(
+                    "bad_state",
+                    "managed launch resolution requires Git readback proving the workspace path, registration, and branch are absent",
+                ));
+            };
+            if record.target != Some(parse_agent_id(&proof.agent)?)
+                || proof.start_command_id != request.command_id
+                || proof.target_generation != 1
+                || proof.phase != WorkspacePhase::Unknown
+                || super::workspace::workspace_cancel_requested(proof)
+                || super::workspace::load_workspace(&tx, parse_agent_id(&proof.agent)?)?.as_ref()
+                    != Some(proof)
+            {
+                return Err(Error::new(
+                    "bad_state",
+                    "workspace changed after Git absence readback",
+                ));
+            }
+        }
+        let mut events = vec![resolve_command_tx(&tx, &record, request, state, now)?];
+        if workspace_launch && let Some(agent_num) = record.target {
+            super::capacity::release_unstarted_tx(&tx, agent_num, 1, &request.command_id)?;
+            super::lifecycle::apply_settle_agent_transition(
+                &tx,
+                &record,
+                state,
+                &request.command_id,
+                true,
+                now,
+                &mut events,
+            )?;
+            // The same daemon proof holds the workspace's quiescence gate.
+            // Reconcile records whose last observation preceded a restart.
+            tx.execute(
+                "UPDATE processes SET state = 'exited', exit_code = NULL, updated_at = ?1
+                 WHERE owner = ?2 AND state IN ('running','unknown')",
+                params![
+                    now,
+                    format!("workspace:{}#1", super::format_agent_id(agent_num))
+                ],
+            )
+            .map_err(sql_error)?;
+            super::close_drained_workspace_process_source(&tx, agent_num, 1, now, &mut events)?;
+        }
         let value = CommandResolveResponse {
             id: request.id.clone(),
             command_id: request.command_id.clone(),
-            state: request.resolution.state(),
+            state,
         };
         insert_resolution_write(
             &tx,
@@ -196,10 +291,7 @@ impl Store {
             now,
         )?;
         commit_transaction(tx, &self.write_faulted)?;
-        Ok(Change {
-            value,
-            events: vec![event],
-        })
+        Ok(Change { value, events })
     }
 
     /// Resolve one unknown turn to its owner-asserted terminal status. The
@@ -497,8 +589,7 @@ fn turn_resolution_digest(request: &TurnResolveRequest) -> Result<Vec<u8>> {
 
 /// Move one unknown command to its asserted terminal state and record the
 /// owner assertion in the outcome and the event. The shared transition
-/// check keeps this to the Unknown -> Applied/Failed edges; no Agent,
-/// capacity, or sibling state is touched.
+/// check keeps ordinary resolutions on the Unknown -> Applied/Failed edges.
 fn resolve_command_tx(
     tx: &Transaction<'_>,
     record: &CommandRecord,

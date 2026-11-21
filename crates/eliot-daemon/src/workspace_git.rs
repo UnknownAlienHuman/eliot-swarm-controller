@@ -349,10 +349,17 @@ impl WorkspaceGit {
             ));
         }
         let target_text = git_path_argument(&target)?;
-        self.git
+        let mut command = self
+            .git
             .prepare_workspace_command(
                 &source.root,
                 &[
+                    "-c",
+                    "core.sparseCheckout=false",
+                    "-c",
+                    "index.sparse=false",
+                    "-c",
+                    "core.logAllRefUpdates=always",
                     "worktree",
                     "add",
                     "--no-guess-remote",
@@ -369,7 +376,139 @@ impl WorkspaceGit {
                 },
                 deadline,
             )
+            .await?;
+        command.env("GIT_COMMITTER_NAME", creation_committer(preparation));
+        command.env("GIT_COMMITTER_EMAIL", "worktree@eliot.invalid");
+        Ok(command)
+    }
+
+    /// Git can leave its new branch after a failed checkout has removed its
+    /// registration and directory. Authorize deletion only for our own ref.
+    pub(crate) async fn prepare_failed_checkout_rollback(
+        &self,
+        preparation: &WorkspacePreparation,
+    ) -> Result<Option<Command>> {
+        let deadline = Instant::now() + READ_TIME;
+        let source = self.source(preparation, deadline).await?;
+        let target = destination_path(&preparation.worktree_path)?;
+        separate_target(&source, &target)?;
+        let branch = branch_ref(&preparation.requested_branch);
+        if !absent(&target)?
+            || self
+                .entries(&source.root, deadline)
+                .await?
+                .iter()
+                .any(|entry| {
+                    entry.path == target || entry.branch.as_deref() == Some(branch.as_str())
+                })
+        {
+            return Err(problem(
+                "source_integrity",
+                "workspace path or Git registration remains",
+            ));
+        }
+        if self
+            .branch_oid(&source.root, &preparation.requested_branch, deadline)
+            .await?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        if !self
+            .creation_branch_is_owned(preparation, &source, deadline)
+            .await?
+        {
+            return Err(problem(
+                "source_integrity",
+                "remaining branch does not match the launch's creation marker and frozen tip",
+            ));
+        }
+        self.git
+            .prepare_workspace_command(
+                &source.root,
+                &[
+                    "update-ref",
+                    "--no-deref",
+                    "-d",
+                    &branch,
+                    &preparation.base_oid,
+                ],
+                GitBinding {
+                    git_dir: &source.git_dir,
+                    common_dir: &source.common_dir,
+                },
+                deadline,
+            )
             .await
+            .map(Some)
+    }
+
+    pub(crate) async fn prepare_created_worktree_rollback(
+        &self,
+        preparation: &WorkspacePreparation,
+    ) -> Result<Option<Command>> {
+        if absent(&destination_path(&preparation.worktree_path)?)? {
+            return Ok(None);
+        }
+        let deadline = Instant::now() + READ_TIME;
+        let subject = self.subject(preparation, deadline).await?;
+        if subject.head != preparation.base_oid
+            || !self
+                .creation_branch_is_owned(preparation, &subject.source, deadline)
+                .await?
+        {
+            return Err(problem(
+                "source_integrity",
+                "remaining worktree does not match the launch's creation marker and frozen tip",
+            ));
+        }
+        self.require_created_clean(&subject, deadline).await?;
+        self.confirm_subject(preparation, &subject, deadline)
+            .await?;
+        let target = git_path_argument(&subject.target.root)?;
+        self.git
+            .prepare_workspace_command_with_config_roots(
+                &subject.source.root,
+                &["worktree", "remove", "--", &target],
+                GitBinding {
+                    git_dir: &subject.source.git_dir,
+                    common_dir: &subject.source.common_dir,
+                },
+                &[&subject.target.root],
+                deadline,
+            )
+            .await
+            .map(Some)
+    }
+
+    async fn creation_branch_is_owned(
+        &self,
+        preparation: &WorkspacePreparation,
+        source: &Repository,
+        deadline: Instant,
+    ) -> Result<bool> {
+        if self
+            .branch_oid(&source.root, &preparation.requested_branch, deadline)
+            .await?
+            .as_deref()
+            != Some(preparation.base_oid.as_str())
+        {
+            return Ok(false);
+        }
+        let branch = branch_ref(&preparation.requested_branch);
+        let provenance = self
+            .read_line(
+                &source.root,
+                &["reflog", "show", "-n", "1", "--format=%gn;%ge;%H", &branch],
+                deadline,
+            )
+            .await?;
+        let expected = format!(
+            "{};worktree@eliot.invalid;{}",
+            creation_committer(preparation),
+            preparation.base_oid,
+        );
+        Ok(provenance == expected)
     }
 
     /// Call only after the manager confirms the previous mutator is quiescent.
@@ -434,20 +573,32 @@ impl WorkspaceGit {
         }
     }
 
+    pub(crate) async fn creation_is_absent(
+        &self,
+        preparation: &WorkspacePreparation,
+    ) -> Result<bool> {
+        let deadline = Instant::now() + READ_TIME;
+        let source = self.source(preparation, deadline).await?;
+        let target = destination_path(&preparation.worktree_path)?;
+        separate_target(&source, &target)?;
+        let branch = branch_ref(&preparation.requested_branch);
+        let entries = self.entries(&source.root, deadline).await?;
+        Ok(!entries
+            .iter()
+            .any(|entry| entry.path == target || entry.branch.as_deref() == Some(branch.as_str()))
+            && absent(&target)?
+            && self
+                .branch_oid(&source.root, &preparation.requested_branch, deadline)
+                .await?
+                .is_none())
+    }
+
     async fn inspect_created(
         &self,
         preparation: &WorkspacePreparation,
     ) -> Result<WorkspaceCreationOutcome> {
         let deadline = Instant::now() + READ_TIME;
-        let source = self.source(preparation, deadline).await?;
-        let target = destination_path(&preparation.worktree_path)?;
-        separate_target(&source, &target)?;
-        let entries = self.entries(&source.root, deadline).await?;
-        let registered = entries.iter().any(|entry| entry.path == target);
-        let branch = self
-            .branch_oid(&source.root, &preparation.requested_branch, deadline)
-            .await?;
-        if !registered && absent(&target)? && branch.is_none() {
+        if self.creation_is_absent(preparation).await? {
             return Ok(WorkspaceCreationOutcome::Failed {
                 code: "not_created".to_owned(),
                 message: "no workspace path, branch, or registration exists".to_owned(),
@@ -465,7 +616,7 @@ impl WorkspaceGit {
                 "created workspace HEAD differs from the frozen base",
             ));
         }
-        self.require_clean(&subject, true, deadline).await?;
+        self.require_created_clean(&subject, deadline).await?;
         self.confirm_subject(preparation, &subject, deadline)
             .await?;
         Ok(WorkspaceCreationOutcome::Verified {
@@ -475,6 +626,30 @@ impl WorkspaceGit {
             branch: preparation.requested_branch.clone(),
             head: subject.head,
         })
+    }
+
+    async fn require_created_clean(&self, subject: &Subject, deadline: Instant) -> Result<()> {
+        let status = self
+            .read(
+                &subject.target.root,
+                &[
+                    "status",
+                    "--porcelain=v2",
+                    "--untracked-files=all",
+                    "--ignored=matching",
+                    "--ignore-submodules=none",
+                    "-z",
+                ],
+                deadline,
+            )
+            .await?;
+        if !status.is_empty() {
+            return Err(problem(
+                "dirty",
+                "created workspace has tracked, untracked, or ignored changes",
+            ));
+        }
+        Ok(())
     }
 
     /// Read-only full preflight. The manager holds its removing/cancellation gate
@@ -506,7 +681,6 @@ impl WorkspaceGit {
             allowed.insert(prefix);
         }
 
-        let cached_args = ["ls-files", "--cached", "-z"];
         let other_args = ["ls-files", "--others", "--exclude-standard", "-z"];
         let ignored_args = [
             "ls-files",
@@ -515,9 +689,14 @@ impl WorkspaceGit {
             "--exclude-standard",
             "-z",
         ];
-        let cached = scratch_paths(&self.read(root, &cached_args, deadline).await?)?;
         let other = scratch_paths(&self.read(root, &other_args, deadline).await?)?;
         let ignored = scratch_paths(&self.read(root, &ignored_args, deadline).await?)?;
+        if other.is_empty() && ignored.is_empty() {
+            self.confirm_subject(preparation, &subject, deadline)
+                .await?;
+            return Ok(Vec::new());
+        }
+        let cached = scratch_index_paths(self.git.cached_index_paths(root, deadline).await?)?;
         let mut tracked = BTreeSet::new();
         for relative in &cached {
             if Instant::now() >= deadline {
@@ -570,7 +749,9 @@ impl WorkspaceGit {
 
         self.require_tracked_clean(&subject, deadline).await?;
         self.require_merged(preparation, &subject, deadline).await?;
-        if cached != scratch_paths(&self.read(root, &cached_args, deadline).await?)?
+        let cached_readback =
+            scratch_index_paths(self.git.cached_index_paths(root, deadline).await?)?;
+        if cached != cached_readback
             || other != scratch_paths(&self.read(root, &other_args, deadline).await?)?
             || ignored != scratch_paths(&self.read(root, &ignored_args, deadline).await?)?
         {
@@ -591,12 +772,9 @@ impl WorkspaceGit {
             .ok()
             .and_then(|value| i64::try_from(value.as_millis()).ok())
             .ok_or_else(|| problem("unavailable", "scratch observation clock is unavailable"))?;
-        let snapshot = timeout_at(
-            deadline,
-            self.git.probe(&path, None, Some(&subject.head), &[], now),
-        )
-        .await
-        .map_err(|_| problem("unavailable", "scratch Git coverage timed out"))??;
+        let snapshot = timeout_at(deadline, self.git.probe_cleanup(&path, &subject.head, now))
+            .await
+            .map_err(|_| problem("unavailable", "scratch Git coverage timed out"))??;
         if !snapshot.complete
             || snapshot.head.as_deref() != Some(subject.head.as_str())
             || snapshot.branch.as_deref() != subject.branch.strip_prefix("refs/heads/")
@@ -875,12 +1053,9 @@ impl WorkspaceGit {
             .ok()
             .and_then(|value| i64::try_from(value.as_millis()).ok())
             .ok_or_else(|| problem("unavailable", "workspace observation clock is unavailable"))?;
-        let snapshot = timeout_at(
-            deadline,
-            self.git.probe(&path, None, Some(&subject.head), &[], now),
-        )
-        .await
-        .map_err(|_| problem("unavailable", "workspace clean readback timed out"))??;
+        let snapshot = timeout_at(deadline, self.git.probe_cleanup(&path, &subject.head, now))
+            .await
+            .map_err(|_| problem("unavailable", "workspace clean readback timed out"))??;
         if !snapshot.complete
             || snapshot.head.as_deref() != Some(subject.head.as_str())
             || snapshot.branch.as_deref() != subject.branch.strip_prefix("refs/heads/")
@@ -1069,6 +1244,10 @@ fn branch_ref(branch: &str) -> String {
     format!("refs/heads/{branch}")
 }
 
+fn creation_committer(preparation: &WorkspacePreparation) -> String {
+    format!("Eliot workspace {}", preparation.start_command_id)
+}
+
 fn scratch_relative(path: &str) -> Result<PathBuf> {
     let path = Path::new(path);
     if path.as_os_str().is_empty()
@@ -1097,6 +1276,20 @@ fn scratch_paths(bytes: &[u8]) -> Result<BTreeSet<PathBuf>> {
     text.split('\0')
         .map(|path| {
             scratch_relative(path).map_err(|_| {
+                problem(
+                    "unavailable",
+                    "scratch Git listing contains an invalid relative path",
+                )
+            })
+        })
+        .collect()
+}
+
+fn scratch_index_paths(paths: BTreeSet<String>) -> Result<BTreeSet<PathBuf>> {
+    paths
+        .into_iter()
+        .map(|path| {
+            scratch_relative(&path).map_err(|_| {
                 problem(
                     "unavailable",
                     "scratch Git listing contains an invalid relative path",

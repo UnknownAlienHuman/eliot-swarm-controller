@@ -406,9 +406,10 @@ fn startup_blocks_release(conn: &Connection, assignment: &ProjectAssignment) -> 
     // effect and capacity remain retained independently of the assignment.
     let preparation_unknown = start.verb == "launch"
         && start.generation == Some(0)
-        && start.outcome.as_ref().is_some_and(|outcome| {
-            outcome["stage"] == "workspace" && outcome["native_dispatched"] == false
-        });
+        && start
+            .outcome
+            .as_ref()
+            .is_some_and(|outcome| outcome["stage"] == "workspace");
     Ok(start.state == CommandState::Dispatched
         || start.state == CommandState::Unknown && !preparation_unknown)
 }
