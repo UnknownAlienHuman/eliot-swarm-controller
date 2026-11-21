@@ -90,7 +90,7 @@ impl Store {
             {
                 return Err(Error::new("busy", "provider probe has not ended"));
             }
-            if super::agent_lifecycle::custody_blocker_tx(&tx, num, true, None)?.is_some() {
+            if super::agent_lifecycle::custody_blocker_tx(&tx, num, false, None)?.is_some() {
                 return Err(Error::new(
                     "busy",
                     "provider probe custody is still draining",

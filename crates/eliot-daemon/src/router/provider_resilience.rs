@@ -343,6 +343,24 @@ impl Router {
                     .reconcile_ended_provider_probe(agent, now_ms())
                     .and_then(|events| {
                         self.publish_locked(&events);
+                        // A restarted lost Agent can keep its resumable Git observer
+                        // open after the native Job has been fenced. A maintenance
+                        // probe has no resumable task or Git work to carry forward.
+                        if let Some(current) = store.get_agent(agent)?
+                            && store
+                                .list_source_states(agent, current.generation)?
+                                .iter()
+                                .any(|source| source.source == "git" && source.state == "open")
+                        {
+                            let closed = store.set_git_source_status(
+                                agent,
+                                current.generation,
+                                "stale",
+                                true,
+                                now_ms(),
+                            )?;
+                            self.publish_locked(&closed);
+                        }
                         store.inspect_agent_delete(id, agent, now_ms())
                     })
             };
