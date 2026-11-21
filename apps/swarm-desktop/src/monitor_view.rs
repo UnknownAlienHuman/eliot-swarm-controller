@@ -47,8 +47,9 @@ pub struct RowLook<'a> {
     /// ("last progress 3 min ago").
     pub elapsed: &'a str,
     pub elapsed_words: &'a str,
-    /// The dot in its group's chart color.
-    pub dot: Brush,
+    /// The row's status: its group's tone, with a failure, an unconfirmed
+    /// outcome or a start told apart by the mark's shape.
+    pub tone: crate::theme::StatusTone,
     /// The open Agent's row.
     pub selected: bool,
     /// In the Working group (or working without writing code): its
@@ -148,7 +149,10 @@ pub fn list_row(
     let content = Grid::new()
         .columns([GridLength::Auto, GridLength::STAR])
         .column_spacing(tokens::spacing::ROW)
-        .children((crate::m3::dot(look.dot), text_column));
+        .children((
+            crate::m3::status_mark(palette, look.tone, tokens::layout::DOT),
+            text_column,
+        ));
     let tooltip = format!("{} · {status} · {harness}{note_name}{line_tip}", look.title);
     let button = crate::m3::row(palette, look.selected);
     let button = if look.line.is_some() {
@@ -591,7 +595,7 @@ pub struct RowEntry {
     pub title: String,
     pub elapsed: String,
     pub elapsed_words: String,
-    pub dot: Brush,
+    pub tone: crate::theme::StatusTone,
     pub selected: bool,
     pub working: bool,
     pub line: Option<RowLine>,
@@ -702,7 +706,7 @@ fn entry_view(entry: &MonitorEntry, input: &MonitorListInput) -> KeyedView {
                             title: &entry.title,
                             elapsed: &entry.elapsed,
                             elapsed_words: &entry.elapsed_words,
-                            dot: entry.dot,
+                            tone: entry.tone,
                             selected: entry.selected,
                             working: entry.working,
                             line: entry.line.clone(),

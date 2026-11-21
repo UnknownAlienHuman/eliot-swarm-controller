@@ -576,41 +576,6 @@ pub mod winui {
             Some(self.role(pick, ThemeBrush::AccentText))
         }
 
-        /// The header pill's and Monitor row's dot: every tone has one.
-        pub fn header_dot(self, tone: StatusTone) -> Brush {
-            self.dot(tone)
-                .unwrap_or_else(|| self.role(|r| r.border, ThemeBrush::PrimaryText))
-        }
-
-        /// A Monitor chart role and the content color its state layers mix
-        /// in: working in primary, attention in the attention role, idle in
-        /// the border tone, anything else muted.
-        fn chart_roles(tone: StatusTone) -> fn(&Roles) -> (Rgb8, Rgb8) {
-            match tone {
-                StatusTone::Active => |r| (r.primary, r.on_primary),
-                StatusTone::Attention | StatusTone::Failed | StatusTone::Unknown => {
-                    |r| (r.attention, r.on_primary)
-                }
-                StatusTone::Ready => |r| (r.border, r.text),
-                StatusTone::Pending | StatusTone::Neutral => |r| (r.muted, r.text),
-            }
-        }
-
-        /// The fill of a Monitor chart mark (a bar segment, a list dot).
-        pub fn chart_fill(self, tone: StatusTone) -> Brush {
-            let roles = Self::chart_roles(tone);
-            match self.roles {
-                Some(r) => Brush::Solid(color(roles(r).0)),
-                None => Brush::Theme(match tone {
-                    StatusTone::Active => ThemeBrush::AccentText,
-                    StatusTone::Attention | StatusTone::Failed | StatusTone::Unknown => {
-                        ThemeBrush::SystemCritical
-                    }
-                    _ => ThemeBrush::CardStroke,
-                }),
-            }
-        }
-
         /// Container and content of a status chip.
         pub fn status_chip(self, tone: StatusTone) -> (Brush, Brush) {
             match self.roles {

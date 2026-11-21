@@ -680,7 +680,11 @@ fn agent_row(task: &TaskEntry, input: &SidebarInput, context: &mut ViewContext<S
     // A live task shows its dot (working, attention: a reported one in the
     // attention tone); a quiet one its age, its title in the variant tone.
     let dot = if line.as_ref().is_some_and(|(_, attention)| *attention) {
-        palette.dot(StatusTone::Attention).map(m3::dot)
+        Some(m3::status_mark(
+            palette,
+            StatusTone::Attention,
+            tokens::layout::DOT,
+        ))
     } else {
         task_dot(palette, agent)
     };
@@ -774,7 +778,7 @@ fn fleet_row(fleet: &FleetEntry, context: &mut ViewContext<Sidebar>, palette: Pa
                     Border::new()
                         .width(tokens::icon::ROW)
                         .vertical_alignment(VerticalAlignment::Center)
-                        .content(m3::dot(palette.header_dot(fleet.tone))),
+                        .content(m3::status_mark(palette, fleet.tone, tokens::layout::DOT)),
                     TextBlock::new()
                         .text(fleet.line.clone())
                         .grid_column(1)

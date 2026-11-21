@@ -356,7 +356,7 @@ impl DesktopApp {
                             .spacing(tokens::spacing::XS)
                             .vertical_alignment(VerticalAlignment::Center)
                             .children((
-                                m3::dot(palette.header_dot(card.state.tone())),
+                                m3::status_mark(palette, card.state.tone(), tokens::layout::DOT),
                                 m3::secondary(card.state.label())
                                     .vertical_alignment(VerticalAlignment::Center),
                             )),

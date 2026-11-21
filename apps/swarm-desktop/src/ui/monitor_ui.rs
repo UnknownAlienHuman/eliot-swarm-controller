@@ -355,7 +355,6 @@ impl DesktopApp {
         tree: Option<&Tree>,
         selected: Option<&str>,
         now: i64,
-        palette: Palette,
         entries: &mut Vec<monitor_view::MonitorEntry>,
     ) {
         let data = &self.monitor.data;
@@ -427,13 +426,23 @@ impl DesktopApp {
         };
         let quiet = row.quiet(now);
         let group = row.group(data.incident(row));
+        // The group decides the color; the Agent's own state tells a
+        // failure, an unconfirmed outcome or a start apart by shape.
+        let tone = match (group_tone(group), StatusTone::of_state(row.state)) {
+            (
+                StatusTone::Attention,
+                own @ (StatusTone::Failed | StatusTone::Unknown | StatusTone::Attention),
+            ) => own,
+            (StatusTone::Neutral, StatusTone::Pending) => StatusTone::Pending,
+            (group_tone, _) => group_tone,
+        };
         entries.push(monitor_view::MonitorEntry::Row(Box::new(
             monitor_view::RowEntry {
                 row: row.clone(),
                 title: title.clone(),
                 elapsed: quiet.label(),
                 elapsed_words: quiet.words(),
-                dot: palette.chart_fill(group_tone(group)),
+                tone,
                 selected: selected == Some(row.id.as_str()),
                 working: group == monitor::Group::Working || no_code.is_some(),
                 line,
@@ -459,15 +468,7 @@ impl DesktopApp {
         });
         if open {
             for child in children {
-                self.monitor_entries(
-                    child,
-                    depth + 1,
-                    Some(tree),
-                    selected,
-                    now,
-                    palette,
-                    entries,
-                );
+                self.monitor_entries(child, depth + 1, Some(tree), selected, now, entries);
             }
         }
     }
@@ -570,15 +571,7 @@ impl DesktopApp {
                 ));
             }
             for row in &section.rows {
-                self.monitor_entries(
-                    row,
-                    0,
-                    nest,
-                    focused.as_deref(),
-                    read_at,
-                    palette,
-                    &mut entries,
-                );
+                self.monitor_entries(row, 0, nest, focused.as_deref(), read_at, &mut entries);
             }
         }
         if data.read_at_ms.is_some() && no_rows && !showing_loaded {
