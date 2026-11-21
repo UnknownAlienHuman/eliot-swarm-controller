@@ -1353,13 +1353,14 @@ fn cleanup_terminal(state: AgentState) -> bool {
     matches!(state, AgentState::Stopped | AgentState::Failed)
 }
 
-/// Fence resume at admission and dispatch while an attempted cleanup is unknown.
+/// Fence resume at admission and dispatch while cleanup is unknown, or after
+/// the current native session has been removed but before its Agent is deleted.
 pub(super) fn require_no_cleanup_attempt(connection: &Connection, agent: &Agent) -> Result<()> {
-    let pending: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM artifacts WHERE agent=?1 AND generation=?2 AND json_extract(body,'$.state')='unknown')",params![parse_agent_id(&agent.id)?,agent.generation],|r|r.get(0)).map_err(sql_error)?;
+    let pending: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM artifacts WHERE agent=?1 AND generation=?2 AND (json_extract(body,'$.state')='unknown' OR (json_extract(body,'$.kind')='native_session' AND json_extract(body,'$.state')='removed')))",params![parse_agent_id(&agent.id)?,agent.generation],|r|r.get(0)).map_err(sql_error)?;
     if pending {
         return Err(Error::new(
             "bad_state",
-            "Agent has an unresolved cleanup attempt",
+            "Agent has a cleanup attempt or removed native session",
         ));
     }
     Ok(())
