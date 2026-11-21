@@ -127,6 +127,13 @@ eligible native sessions and managed worktrees before retiring the task records.
 It records cleanup outcomes before retiring ownership and keeps the task records
 if an attempted effect is refused or uncertain.
 
+Continue a cleanup review with the opaque `continuation` string from the previous
+response and the same scope, project and age cutoff. The CLI passes it as
+`--continuation <token>` and MCP passes the string as `params.continuation`.
+The daemon also accepts legacy JSON continuations. A progress page can contain
+zero candidates with a continuation while the daemon scans the retained inventory.
+The desktop advances through those pages and offers Next page for more candidates.
+
 Owner plans with scope `all` or a registration ID in scope `project` include
 project registrations from the current settings revision. A creation-time cutoff
 excludes these entries because the settings do not record their creation time.

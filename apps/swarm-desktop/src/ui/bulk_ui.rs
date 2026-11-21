@@ -18,7 +18,7 @@
 use super::*;
 use crate::theme::winui::Palette;
 use eliot_core::api::{
-    ArtifactKind, CleanupApplyRequest, CleanupApplyResponse, CleanupPlan, CleanupPlanRequest,
+    ArtifactKind, CleanupApplyRequest, CleanupApplyResponse, CleanupPlanRequest,
     CleanupScope,
 };
 
@@ -447,16 +447,15 @@ fn plan_missing_project(
             older_than: None,
             continuation: None,
         };
-        let reply: CleanupPlan = client::block_on(eliot_daemon::client_call_typed(
-            data_dir,
-            "cleanup.plan",
-            &request,
-        ))
-        .map_err(|error| error.user_message())?;
-        let Some(item) = reply.items.iter().find(|item| {
+        let matches = |item: &eliot_core::api::CleanupCandidate| {
             item.artifact.kind == ArtifactKind::ProjectRegistration
                 && item.artifact.project == project
-        }) else {
+        };
+        let reply = client::block_on(client::cleanup_plan_page(data_dir, request, |page| {
+            page.items.iter().any(matches)
+        }))
+        .map_err(|error| error.user_message())?;
+        let Some(item) = reply.items.iter().find(|item| matches(item)) else {
             return Err(
                 "The daemon did not return this project registration in the cleanup plan."
                     .to_owned(),
@@ -951,7 +950,7 @@ impl DesktopApp {
                     "what".to_owned(),
                     m3::secondary(match dialog.op {
                         BulkOp::RemoveProjects => {
-                            "Swarm removes these project registrations. Their checkouts, workspace files, branches and task records stay; you can add a checkout again in Settings › Projects."
+                            "Swarm removes these project registrations. Their checkouts, workspace files, branches and task records stay. You can add a checkout again in Settings › Projects."
                         }
                         BulkOp::ArchiveFinished => {
                             "Archived tasks leave the list; Show archived brings them back, and Unarchive restores one."

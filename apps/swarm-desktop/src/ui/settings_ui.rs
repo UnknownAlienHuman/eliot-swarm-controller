@@ -721,9 +721,10 @@ impl DesktopApp {
                         continuation,
                     };
                     let result = client::block_on(async {
-                        let plan: eliot_core::api::CleanupPlan =
-                            eliot_daemon::client_call_typed(&data, "cleanup.plan", &request)
-                                .await?;
+                        let plan = client::cleanup_plan_page(&data, request, |page| {
+                            !page.items.is_empty()
+                        })
+                        .await?;
                         let wanted: HashSet<_> = plan
                             .items
                             .iter()
