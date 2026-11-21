@@ -16,8 +16,29 @@ pub(super) enum ProfilesMsg {
     ProfileChoicePicked(usize, Option<usize>),
     DuplicateNameChanged(String),
     DuplicateRequested,
+    /// "Can start": a child preset (by name) checked or unchecked.
+    ChildToggled(String, bool),
+    /// The agent app's own subagents allowed (on) or off.
+    NativeSubagentsToggled(bool),
+    /// "Manages its subagents through Swarm" (`control = "tree"`).
+    SwarmControlToggled(bool),
+    NewNameChanged(String),
+    /// The new preset's harness chooser (None: items replaced).
+    NewHarnessPicked(Option<usize>),
+    CreateRequested,
     /// Show or hide the TOML source editor.
     SourceToggled,
+}
+
+/// A refused form change: the preset and field it concerns (`key` is a
+/// profile key, or [`profiles::NEW_PRESET_ROW`] /
+/// [`profiles::DUPLICATE_ROW`] for those rows) and the reason in plain
+/// words.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct FieldError {
+    pub(super) preset: String,
+    pub(super) key: String,
+    pub(super) words: String,
 }
 
 /// One document draft: the `profiles` section as `[profiles.*]` TOML.
@@ -33,6 +54,12 @@ pub(super) struct ProfilesEditor {
     pub(super) reason: Option<String>,
     pub(super) selected: Option<String>,
     pub(super) duplicate_name: String,
+    /// The new preset's name and its harness (an index in
+    /// [`crate::picker::HARNESSES`]).
+    pub(super) new_name: String,
+    pub(super) new_harness: usize,
+    /// Why the last form change was refused, next to its field.
+    pub(super) field_error: Option<FieldError>,
     pub(super) status: String,
     pub(super) loaded: bool,
     /// The TOML source editor is shown.
@@ -133,17 +160,8 @@ impl DesktopApp {
                 if value == current.as_deref() {
                     return;
                 }
-                match profiles::set_field(&self.editor.draft, &name, key, value) {
-                    Ok(draft) => {
-                        self.editor.view = draft.clone();
-                        if draft != self.editor.draft {
-                            self.editor.edit += 1;
-                        }
-                        self.editor.draft = draft;
-                        self.autosave_profiles(context);
-                    }
-                    Err(error) => self.editor.status = error,
-                }
+                let draft = profiles::set_field(&self.editor.draft, &name, key, value);
+                self.apply_form_edit(draft, context);
             }
             ProfilesMsg::DuplicateNameChanged(text) => self.editor.duplicate_name = text,
             ProfilesMsg::DuplicateRequested => {
@@ -161,7 +179,107 @@ impl DesktopApp {
                             self.editor.status = format!("Duplicated {from} as {to}.");
                             self.autosave_profiles(context);
                         }
-                        Err(error) => self.editor.status = error,
+                        Err(words) => {
+                            self.editor.field_error = Some(FieldError {
+                                preset: from,
+                                key: profiles::DUPLICATE_ROW.to_owned(),
+                                words,
+                            });
+                        }
+                    }
+                }
+            }
+            ProfilesMsg::ChildToggled(child, on) => {
+                let Some(name) = self.editor.selected.clone() else {
+                    return;
+                };
+                let mut children =
+                    match profiles::list_field(&self.editor.draft, &name, "child_profiles") {
+                        profiles::ListField::Absent => Vec::new(),
+                        profiles::ListField::Items(items) => items,
+                        profiles::ListField::Complex => return,
+                    };
+                if children.contains(&child) == on {
+                    return;
+                }
+                if on {
+                    children.push(child);
+                } else {
+                    children.retain(|existing| *existing != child);
+                }
+                let mut draft = profiles::set_list_field(
+                    &self.editor.draft,
+                    &name,
+                    "child_profiles",
+                    &children,
+                );
+                // A harness that cannot turn its own subagents off keeps
+                // them allowed explicitly: with child presets an omitted
+                // value means "deny", which it does not support.
+                if !children.is_empty()
+                    && self
+                        .preset_harness(&name)
+                        .is_some_and(|harness| profiles::native_subagents_fixed(&harness).is_some())
+                {
+                    draft = draft.and_then(|draft| {
+                        profiles::set_field(&draft, &name, "native_subagents", Some("allow"))
+                    });
+                }
+                self.apply_form_edit(draft, context);
+            }
+            ProfilesMsg::NativeSubagentsToggled(on) => {
+                let Some(name) = self.editor.selected.clone() else {
+                    return;
+                };
+                if profiles::native_subagents_allowed(&self.editor.draft, &name) == on {
+                    return;
+                }
+                let draft = profiles::set_field(
+                    &self.editor.draft,
+                    &name,
+                    "native_subagents",
+                    Some(if on { "allow" } else { "deny" }),
+                );
+                self.apply_form_edit(draft, context);
+            }
+            ProfilesMsg::SwarmControlToggled(on) => {
+                let Some(name) = self.editor.selected.clone() else {
+                    return;
+                };
+                let current = match profiles::field(&self.editor.draft, &name, "control") {
+                    profiles::Field::Simple(value) => value.trim().to_owned(),
+                    profiles::Field::Absent => "self".to_owned(),
+                    profiles::Field::Complex => return,
+                };
+                if (current != "self") == on {
+                    return;
+                }
+                // Off is the default scope (`self`): the key is left out.
+                let draft =
+                    profiles::set_field(&self.editor.draft, &name, "control", on.then_some("tree"));
+                self.apply_form_edit(draft, context);
+            }
+            ProfilesMsg::NewNameChanged(text) => self.editor.new_name = text,
+            ProfilesMsg::NewHarnessPicked(index) => {
+                if let Some(index) = index.filter(|index| *index < crate::picker::HARNESSES.len()) {
+                    self.editor.new_harness = index;
+                }
+            }
+            ProfilesMsg::CreateRequested => {
+                let name = self.editor.new_name.trim().to_owned();
+                let harness = crate::picker::HARNESSES[self.editor.new_harness];
+                match profiles::create(&self.editor.draft, &name, harness) {
+                    Ok(draft) => {
+                        self.editor.selected = Some(name.clone());
+                        self.editor.new_name.clear();
+                        self.apply_form_edit(Ok(draft), context);
+                    }
+                    Err(words) => {
+                        self.editor.field_error = Some(FieldError {
+                            preset: name,
+                            key: profiles::NEW_PRESET_ROW.to_owned(),
+                            words,
+                        });
                     }
                 }
             }
@@ -173,9 +291,26 @@ impl DesktopApp {
         }
     }
 
+    /// Take a form edit of the draft and save it, or show why it could
+    /// not be made.
+    fn apply_form_edit(&mut self, draft: Result<String, String>, context: &ComponentContext<Self>) {
+        match draft {
+            Ok(draft) => {
+                self.editor.view = draft.clone();
+                if draft != self.editor.draft {
+                    self.editor.edit += 1;
+                }
+                self.editor.draft = draft;
+                self.autosave_profiles(context);
+            }
+            Err(error) => self.editor.status = error,
+        }
+    }
+
     /// Save a form change of the presets at once, unless typed TOML is
     /// waiting for the save bar.
     pub(super) fn autosave_profiles(&mut self, context: &ComponentContext<Self>) {
+        self.editor.field_error = None;
         if !self.editor.raw_dirty {
             self.autosave(settings_ui::Page::Models, context);
         }
@@ -350,6 +485,23 @@ impl DesktopApp {
             .and_then(|name| self.preset_model_control(name, context, palette))
             .map_or((None, None), |(field, popover)| (Some(field), popover));
         let count = fields.len();
+        let harness = selected
+            .as_deref()
+            .and_then(|name| self.preset_harness(name));
+        let subagents = selected
+            .as_deref()
+            .zip(harness.as_deref())
+            .map(|(name, harness)| self.subagents_form(name, harness));
+        let children: Vec<String> = subagents
+            .as_ref()
+            .and_then(|form| form.children.as_ref())
+            .map(|children| children.iter().map(|(child, _)| child.clone()).collect())
+            .unwrap_or_default();
+        // A refusal shows next to its field while its preset is shown (the
+        // New preset row's whichever preset is selected).
+        let field_error = self.editor.field_error.as_ref().filter(|error| {
+            error.key == profiles::NEW_PRESET_ROW || selected.as_ref() == Some(&error.preset)
+        });
         let data = ProfilesData {
             file_valid: list.is_none_or(|list| list.valid),
             file_error: list.and_then(|list| list.error.as_deref()),
@@ -367,6 +519,11 @@ impl DesktopApp {
             fields,
             model,
             model_popover,
+            harness: harness.as_deref().map(crate::picker::harness_label),
+            subagents,
+            field_error: field_error.map(|error| (error.key.as_str(), error.words.as_str())),
+            new_name: &self.editor.new_name,
+            new_harness: self.editor.new_harness,
         };
         let actions = ProfilesActions {
             draft_changed: context
@@ -384,7 +541,68 @@ impl DesktopApp {
                     })
                 })
                 .collect(),
+            child_toggled: children
+                .into_iter()
+                .map(|child| {
+                    context.callback(move |on: bool| {
+                        Message::Profiles(ProfilesMsg::ChildToggled(child.clone(), on))
+                    })
+                })
+                .collect(),
+            native_toggled: context
+                .callback(|on| Message::Profiles(ProfilesMsg::NativeSubagentsToggled(on))),
+            control_toggled: context
+                .callback(|on| Message::Profiles(ProfilesMsg::SwarmControlToggled(on))),
+            new_name_changed: context
+                .callback(|text| Message::Profiles(ProfilesMsg::NewNameChanged(text))),
+            new_harness_picked: context
+                .callback(|index| Message::Profiles(ProfilesMsg::NewHarnessPicked(index))),
+            create: context.message(Message::Profiles(ProfilesMsg::CreateRequested)),
         };
         config_view::profiles_screen(data, actions, palette)
+    }
+
+    /// The selected preset's Subagents section from the draft: the other
+    /// presets it may start, its app's own subagents and its control scope.
+    fn subagents_form(&self, name: &str, harness: &str) -> config_view::SubagentsForm {
+        let draft = &self.editor.draft;
+        let children = match profiles::list_field(draft, name, "child_profiles") {
+            profiles::ListField::Complex => None,
+            listed => {
+                let listed = match listed {
+                    profiles::ListField::Items(items) => items,
+                    _ => Vec::new(),
+                };
+                let mut children: Vec<(String, bool)> = profiles::profile_names(draft)
+                    .into_iter()
+                    .filter(|other| other != name)
+                    .map(|other| {
+                        let on = listed.contains(&other);
+                        (other, on)
+                    })
+                    .collect();
+                // A listed name that is no preset stays visible (and
+                // can be unchecked) instead of vanishing from the form.
+                children.extend(
+                    listed
+                        .into_iter()
+                        .filter(|child| !children.iter().any(|(other, _)| other == child))
+                        .map(|child| (child, true))
+                        .collect::<Vec<_>>(),
+                );
+                Some(children)
+            }
+        };
+        let control = match profiles::field(draft, name, "control") {
+            profiles::Field::Simple(value) => Some(value.trim().to_owned()),
+            profiles::Field::Absent => Some("self".to_owned()),
+            profiles::Field::Complex => None,
+        };
+        config_view::SubagentsForm {
+            children,
+            native_allowed: profiles::native_subagents_allowed(draft, name),
+            native_fixed: profiles::native_subagents_fixed(harness),
+            control,
+        }
     }
 }

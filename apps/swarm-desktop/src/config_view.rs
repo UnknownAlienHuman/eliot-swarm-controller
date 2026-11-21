@@ -55,6 +55,30 @@ pub struct ProfilesData<'a> {
     /// The open picker: a layer over the form rows from the Model row down
     /// (the rows stay where they are).
     pub model_popover: Option<View>,
+    /// The selected profile's harness in the owner's words ("Claude Code").
+    pub harness: Option<&'a str>,
+    /// The selected profile's Subagents section.
+    pub subagents: Option<SubagentsForm>,
+    /// Why the last change was refused: the field key it names (a profile
+    /// key, `new` or `duplicate`) and the reason in plain words.
+    pub field_error: Option<(&'a str, &'a str)>,
+    pub new_name: &'a str,
+    /// The new preset's harness: an index in [`crate::picker::HARNESSES`].
+    pub new_harness: usize,
+}
+
+/// The selected profile's subagent settings.
+pub struct SubagentsForm {
+    /// The other presets and whether this one may start each
+    /// (`child_profiles`); `None` when the value is source-only.
+    pub children: Option<Vec<(String, bool)>>,
+    /// The harness's own subagents are allowed (`native_subagents`).
+    pub native_allowed: bool,
+    /// Why the harness's own subagents cannot be turned off, if so.
+    pub native_fixed: Option<&'static str>,
+    /// The `control` scope as written (`self` when absent); `None` when the
+    /// value is source-only.
+    pub control: Option<String>,
 }
 
 /// Callbacks the Models and profiles section emits.
@@ -66,6 +90,144 @@ pub struct ProfilesActions {
     pub toggle_source: Callback<()>,
     /// One per [`ProfilesData::fields`] entry: a dropdown index picked.
     pub choice_picked: Vec<Callback<Option<usize>>>,
+    /// One per [`SubagentsForm::children`] entry: checked or unchecked.
+    pub child_toggled: Vec<Callback<bool>>,
+    pub native_toggled: Callback<bool>,
+    pub control_toggled: Callback<bool>,
+    pub new_name_changed: Callback<String>,
+    pub new_harness_picked: Callback<Option<usize>>,
+    pub create: Callback<()>,
+}
+
+/// A switch keyed by its state (WinUI keeps a toggled switch's own state
+/// otherwise), as General's and Cloud MCP's.
+fn switch(key: &str, on: bool, enabled: bool, name: String, toggled: Callback<bool>) -> View {
+    Grid::new().keyed_children(vec![KeyedView::new(
+        format!("{key}:{on}:{enabled}"),
+        ToggleSwitch::new()
+            .is_on(on)
+            .is_enabled(enabled)
+            .width(tokens::layout::SWITCH_WIDTH)
+            .automation_name(name)
+            .on_toggled(toggled),
+    )])
+}
+
+/// The Subagents card of the selected profile: the presets it may start
+/// (`child_profiles`), its app's own subagents (`native_subagents`) and
+/// whether it manages its subagents through Swarm (`control = "tree"`).
+fn subagents_card(
+    form: SubagentsForm,
+    harness: &str,
+    error: Option<(&str, &str)>,
+    busy: bool,
+    actions: &ProfilesActions,
+    palette: Palette,
+) -> View {
+    let error_for = |key: &str| {
+        error
+            .filter(|(field, _)| *field == key)
+            .map(|(_, words)| KeyedView::new(format!("error-{key}"), error_note(words, palette)))
+    };
+    let mut rows: Vec<KeyedView> = Vec::new();
+
+    let mut start: Vec<KeyedView> = vec![KeyedView::new(
+        "title",
+        crate::m3::setting_row(
+            "Can start",
+            "Presets this one may start as Swarm subagents.",
+            View::empty(),
+        ),
+    )];
+    match form.children {
+        None => start.push(KeyedView::new(
+            "complex",
+            small("Complex value: edit it as TOML"),
+        )),
+        Some(children) if children.is_empty() => {
+            start.push(KeyedView::new("none", small("No other presets yet.")))
+        }
+        Some(children) => {
+            for ((child, checked), toggled) in children.into_iter().zip(&actions.child_toggled) {
+                start.push(KeyedView::new(
+                    format!("child:{child}:{checked}"),
+                    CheckBox::new()
+                        .is_checked(checked)
+                        .is_enabled(!busy)
+                        .min_width(0.0)
+                        .automation_name(format!("Can start {child}"))
+                        .on_is_checked_changed(toggled.clone())
+                        .content(crate::m3::label(&child)),
+                ));
+            }
+        }
+    }
+    start.extend(error_for("child_profiles"));
+    rows.push(KeyedView::new(
+        "children",
+        StackPanel::new()
+            .margin(Thickness::new(0.0, 0.0, 0.0, tokens::spacing::SM))
+            .keyed_children(start),
+    ));
+
+    let native_note = match form.native_fixed {
+        Some(reason) => format!("Allowed: {reason}."),
+        None if form.native_allowed => {
+            format!("Allowed: {harness} may start its own subagents too.")
+        }
+        None => "Off: it delegates only through Swarm subagents.".to_owned(),
+    };
+    let mut native = vec![KeyedView::new(
+        "row",
+        crate::m3::setting_row(
+            "The agent app's own subagents",
+            &native_note,
+            switch(
+                "native",
+                form.native_allowed || form.native_fixed.is_some(),
+                !busy && form.native_fixed.is_none(),
+                "The agent app's own subagents".to_owned(),
+                actions.native_toggled.clone(),
+            ),
+        ),
+    )];
+    native.extend(error_for("native_subagents"));
+    rows.push(KeyedView::new(
+        "native",
+        StackPanel::new().keyed_children(native),
+    ));
+
+    let control_row: View = match form.control.as_deref() {
+        None => crate::m3::setting_row(
+            "Manages its subagents through Swarm",
+            "Complex value: edit it as TOML",
+            View::empty(),
+        ),
+        Some(control) => crate::m3::setting_row(
+            "Manages its subagents through Swarm",
+            match control {
+                "self" => "Off: its Agents act on themselves only.",
+                "project" => {
+                    "On, for the whole project (set as TOML): it can steer every Agent of its project."
+                }
+                _ => "On: its Agents can steer, wait for and stop the subagents they start.",
+            },
+            switch(
+                "control",
+                control != "self",
+                !busy,
+                "Manages its subagents through Swarm".to_owned(),
+                actions.control_toggled.clone(),
+            ),
+        ),
+    };
+    let mut control = vec![KeyedView::new("row", control_row)];
+    control.extend(error_for("control"));
+    rows.push(KeyedView::new(
+        "control",
+        StackPanel::new().keyed_children(control),
+    ));
+    crate::m3::settings_card(palette, rows)
 }
 
 /// Models and profiles: one 32-DIP row per profile, the selected profile's
@@ -74,6 +236,75 @@ pub struct ProfilesActions {
 /// one draft.
 pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette: Palette) -> View {
     let names = profiles::profile_names(data.draft);
+    // A form row with the reason its last change was refused under it,
+    // in one card row (no divider between them).
+    let with_error = |key: &str, row: View| -> View {
+        match data.field_error.filter(|(field, _)| *field == key) {
+            Some((_, words)) => StackPanel::new().children((
+                row,
+                crate::m3::help(words.to_owned()).foreground(palette.attention()),
+            )),
+            None => row,
+        }
+    };
+    let subagents = data
+        .selected
+        .filter(|_| data.editable)
+        .zip(data.subagents)
+        .map(|(_, form)| {
+            subagents_card(
+                form,
+                data.harness.unwrap_or("The agent app"),
+                data.field_error,
+                data.busy,
+                &actions,
+                palette,
+            )
+        });
+    let new_preset = data.editable.then(|| {
+        let harnesses: Vec<String> = crate::picker::HARNESSES
+            .iter()
+            .map(|code| crate::picker::harness_label(code).to_owned())
+            .collect();
+        let rows = vec![KeyedView::new(
+            "new",
+            with_error(
+                profiles::NEW_PRESET_ROW,
+                crate::m3::form_row(
+                    "New preset",
+                    Grid::new()
+                        .columns([GridLength::STAR, GridLength::Auto])
+                        .column_spacing(tokens::spacing::SM)
+                        .children((
+                            crate::m3::field()
+                                .text(data.new_name.to_owned())
+                                .placeholder_text("New preset name")
+                                .automation_name("New preset name")
+                                .on_text_changed(actions.new_name_changed.clone()),
+                            Grid::new()
+                                .grid_column(1)
+                                .keyed_children(vec![KeyedView::new(
+                                    format!("harness:{}", data.new_harness),
+                                    crate::m3::enum_width(ComboBox::new())
+                                        .items_source(harnesses)
+                                        .selected_index(data.new_harness)
+                                        .is_enabled(!data.busy)
+                                        .automation_name("New preset agent app")
+                                        .on_selection_changed(actions.new_harness_picked.clone()),
+                                )]),
+                        )),
+                    Some(
+                        crate::m3::outlined(palette)
+                            .is_enabled(!data.busy)
+                            .automation_name("Create preset")
+                            .on_click(actions.create.clone())
+                            .content(crate::m3::label("Create")),
+                    ),
+                ),
+            ),
+        )];
+        crate::m3::settings_card(palette, rows)
+    });
     let mut rows: Vec<KeyedView> = Vec::new();
     for (index, name) in names.iter().enumerate() {
         let selected = data.selected == Some(name.as_str());
@@ -94,7 +325,7 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
         rows.push(KeyedView::new(
             "none",
             small(if data.editable {
-                "No presets yet: add one with Edit as TOML (a [profiles.NAME] table)."
+                "No presets yet: create one below."
             } else {
                 "Presets cannot be shown."
             }),
@@ -120,12 +351,27 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
                 error_note(format!("Cannot launch now: {error}"), palette),
             ));
         }
+        if let Some(harness) = data.harness {
+            form.push(KeyedView::new(
+                "field-harness",
+                with_error(
+                    "harness",
+                    crate::m3::form_row(
+                        "Agent app",
+                        crate::m3::body(harness.to_owned())
+                            .automation_name(format!("Profile agent app: {harness}"))
+                            .into(),
+                        None,
+                    ),
+                ),
+            ));
+        }
         // The rows from Model down: the open picker lies over them.
         let above = form.len();
         if let Some(model) = data.model {
             form.push(KeyedView::new(
                 "field-model",
-                crate::m3::form_row("Model", model, None),
+                with_error("model", crate::m3::form_row("Model", model, None)),
             ));
         }
         for (index, field) in data.fields.iter().enumerate() {
@@ -165,25 +411,28 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
             };
             form.push(KeyedView::new(
                 format!("field-{key}"),
-                crate::m3::form_row(field.label, control, None),
+                with_error(key, crate::m3::form_row(field.label, control, None)),
             ));
         }
         form.push(KeyedView::new(
             "duplicate",
-            crate::m3::form_row(
-                "Duplicate as",
-                crate::m3::field()
-                    .text(data.duplicate_name.to_owned())
-                    .placeholder_text("New preset name")
-                    .automation_name("Duplicate as")
-                    .on_text_changed(actions.duplicate_name_changed)
-                    .into(),
-                Some(
-                    crate::m3::outlined(palette)
-                        .is_enabled(!data.busy)
-                        .automation_name("Duplicate preset")
-                        .on_click(actions.duplicate)
-                        .content(crate::m3::label("Duplicate")),
+            with_error(
+                profiles::DUPLICATE_ROW,
+                crate::m3::form_row(
+                    "Duplicate as",
+                    crate::m3::field()
+                        .text(data.duplicate_name.to_owned())
+                        .placeholder_text("New preset name")
+                        .automation_name("Duplicate as")
+                        .on_text_changed(actions.duplicate_name_changed)
+                        .into(),
+                    Some(
+                        crate::m3::outlined(palette)
+                            .is_enabled(!data.busy)
+                            .automation_name("Duplicate preset")
+                            .on_click(actions.duplicate)
+                            .content(crate::m3::label("Duplicate")),
+                    ),
                 ),
             ),
         ));
@@ -238,6 +487,16 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
             "form",
             crate::m3::settings_card(palette, form),
         ));
+    }
+    if let Some(subagents) = subagents {
+        parts.push(KeyedView::new(
+            "subagents-title",
+            crate::m3::card_title("Subagents"),
+        ));
+        parts.push(KeyedView::new("subagents", subagents));
+    }
+    if let Some(new_preset) = new_preset {
+        parts.push(KeyedView::new("new-preset", new_preset));
     }
     parts.push(KeyedView::new("state", small(state)));
     parts.push(KeyedView::new("toggle", toggle));
