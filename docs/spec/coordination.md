@@ -537,9 +537,10 @@ CREATE TABLE claims (
 ```
 
 An Agent principal or the owner launches a child through the ordinary launch path
-with `args.parent`. An Agent with frozen `control=tree` or `control=project` can
+with `args.parent`. An Agent with current `control=tree` or `control=project` can
 launch its own children. A caller with `control=self` receives `not_allowed`
-before allocation for both prompted and promptless launches.
+before profile or workspace preparation for both prompted and promptless launches.
+Store admission rechecks the current generation's control before allocation.
 
 The child takes the parent's project authorization scope and tree root at one
 deeper depth. A prompted launch's linked first `SEND` uses the launch caller's
