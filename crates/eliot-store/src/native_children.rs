@@ -13,11 +13,26 @@ use std::collections::BTreeMap;
 pub const NATIVE_CHILD_ATTENTION_PAGE_SIZE: usize = 32;
 const OPEN_TURN_SQL: &str = "SELECT 1 FROM turns WHERE agent = ?1 AND generation = ?2
     AND state IN ('running', 'unknown') LIMIT 1";
-const NATIVE_PROGRESS_SQL: &str = "SELECT ts FROM events WHERE agent = ?1 AND generation = ?2
-    AND native_id IS NOT NULL AND source NOT IN ('daemon', 'os', 'git', 'workspace_process')
-    AND kind IN ('turn.started', 'turn.completed', 'message.completed',
-                 'tool.started', 'tool.completed', 'request.opened', 'request.resolved', 'request.closed')
-    ORDER BY ts DESC LIMIT 1";
+macro_rules! native_progress_select {
+    ($agent:literal, $generation:literal) => {
+        concat!(
+            "SELECT ts FROM events WHERE agent = ", $agent, " AND generation = ", $generation,
+            " AND native_id IS NOT NULL AND source NOT IN ('daemon', 'os', 'git', 'workspace_process')
+              AND kind IN ('turn.started', 'turn.completed', 'message.completed',
+                           'tool.started', 'tool.completed', 'request.opened', 'request.resolved', 'request.closed')
+              ORDER BY ts DESC LIMIT 1"
+        )
+    };
+}
+const NATIVE_PROGRESS_SQL: &str = native_progress_select!("?1", "?2");
+const NATIVE_PROGRESS_PAGE_SQL: &str = concat!(
+    "SELECT (",
+    native_progress_select!(
+        "json_extract(request.value, '$[0]')",
+        "json_extract(request.value, '$[1]')"
+    ),
+    ") FROM json_each(?1) AS request ORDER BY request.key"
+);
 const TERMINAL_ACTIVITY_SQL: &str =
     "SELECT status FROM turns WHERE agent = ?1 AND generation = ?2 AND state = 'completed'
     ORDER BY COALESCE(completed_at, started_at, 0) DESC, rowid DESC LIMIT 1";
@@ -138,6 +153,25 @@ pub(super) fn native_progress(
             row.get(0)
         })
         .optional()
+        .map_err(sql_error)
+}
+
+/// Latest native progress for each page key, in the input page's order.
+pub(super) fn native_progress_for_page(
+    connection: &Connection,
+    agents: &[(i64, i64)],
+) -> Result<Vec<Option<i64>>> {
+    if agents.is_empty() {
+        return Ok(Vec::new());
+    }
+    let encoded = encode_json(&agents)?;
+    let mut statement = connection
+        .prepare(NATIVE_PROGRESS_PAGE_SQL)
+        .map_err(sql_error)?;
+    statement
+        .query_map([encoded], |row| row.get(0))
+        .map_err(sql_error)?
+        .collect::<rusqlite::Result<_>>()
         .map_err(sql_error)
 }
 

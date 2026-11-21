@@ -245,11 +245,16 @@ impl Store {
         now_ms: i64,
         growth_thresholds: &core::SessionGrowthThresholds,
     ) -> Result<Vec<AgentSummary>> {
-        let mut progress = Vec::with_capacity(records.len());
+        let agents: Vec<_> = records
+            .iter()
+            .map(|record| (record.id, record.generation))
+            .collect();
+        let progress = native_children::native_progress_for_page(&self.connection, &agents)?;
+        if progress.len() != records.len() {
+            return Err(Error::new("internal", "Agent progress page is incomplete"));
+        }
         let mut lookups = Vec::with_capacity(records.len());
-        for record in &records {
-            let last_progress_at =
-                native_children::native_progress(&self.connection, record.id, record.generation)?;
+        for (record, &last_progress_at) in records.iter().zip(&progress) {
             let profile_snapshot: Value = decode_json(&record.profile_snapshot)?;
             lookups.push(AgentStatusLookup {
                 agent_num: record.id,
@@ -261,7 +266,6 @@ impl Store {
                     &profile_snapshot,
                 )?,
             });
-            progress.push(last_progress_at);
         }
         let statuses = self.project_agent_statuses(&lookups)?;
         if statuses.len() != records.len() {
