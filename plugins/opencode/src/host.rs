@@ -1411,7 +1411,13 @@ impl OpenCodePlugin {
                 .as_ref()
                 .and_then(|model_ref| model_ref.variant.as_deref());
             let _timing = crate::native::startup::Step::new("model_catalogue");
-            let catalogue = match wait_for_start_catalogue(&session.http, requested, envelope).await
+            let catalogue = match wait_for_start_catalogue(
+                &session.http,
+                requested,
+                requested_variant,
+                envelope,
+            )
+            .await
             {
                 Ok(catalogue) => catalogue,
                 Err(error) => {
@@ -4495,18 +4501,25 @@ fn catalogue_contains(catalogue: &[NativeModelEntry], requested: &str) -> bool {
     catalogue_entry(catalogue, requested).is_some()
 }
 
-/// An exact match on the first read is enough. On a cold catalogue miss,
-/// wait within the start budget for the provider to publish the model.
+/// An exact model and variant match on the first read is enough. On a
+/// cold catalogue miss, wait within the start budget for the missing entry.
 async fn wait_for_start_catalogue(
     http: &OpenCodeHttp,
     requested: &str,
+    requested_variant: Option<&str>,
     envelope: Instant,
 ) -> Result<Vec<NativeModelEntry>> {
     let deadline = phase_deadline(create_cutoff(envelope), START_CATALOGUE_READY_BUDGET);
+    let ready = |entries: &[NativeModelEntry]| {
+        catalogue_entry(entries, requested).is_some_and(|entry| {
+            requested_variant.is_none_or(|variant| {
+                catalogue_entry_variants(entry)
+                    .is_some_and(|variants| variants.iter().any(|known| known == variant))
+            })
+        })
+    };
     let mut entries = http.list_native_models(deadline).await?;
-    while !catalogue_contains(&entries, requested)
-        && Instant::now() + START_CATALOGUE_POLL < deadline
-    {
+    while !ready(&entries) && Instant::now() + START_CATALOGUE_POLL < deadline {
         sleep(START_CATALOGUE_POLL).await;
         entries = http.list_native_models(deadline).await?;
     }

@@ -134,8 +134,11 @@ pub fn agent_status_line(
     native_notice: Option<&AgentNativeNotice>,
     now_ms: i64,
 ) -> Option<String> {
-    let provider_hold =
-        provider_hold.filter(|hold| active_turn.is_none() || hold.waiting_for_active_turn);
+    let provider_hold = provider_hold.filter(|hold| {
+        active_turn.is_none()
+            || hold.state == ProviderHoldState::Held
+            || hold.waiting_for_active_turn
+    });
     let provider_kind = provider_hold
         .map(|hold| hold.kind)
         .or_else(|| native_notice.and_then(|notice| notice.provider_kind));
@@ -173,7 +176,7 @@ pub fn agent_status_line(
                     .filter(|at| *at > now_ms)
                 {
                     line.push_str(&format!(
-                        ", probe eligible in {}",
+                        ", retry in {}",
                         remaining_time(retry_after - now_ms)
                     ));
                 }

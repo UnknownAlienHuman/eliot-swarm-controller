@@ -107,11 +107,11 @@ Catalogue preflight may retry only before any session/input may have been admitt
 OpenCode 2.2.7 can serve its bundled model snapshot while a fresh store fetches
 the current catalogue and reloads its integrations and providers. An already
 populated native store can return newer models immediately. The native refresh
-notification precedes the provider reload, so launch uses the exact live
-`GET /api/model` match to establish readiness. It reads once when the model
-is present and rechecks only a first-read model miss, every 250 ms for up to
-12 seconds within the existing start budget. The resulting entry must also
-contain any requested variant before session creation.
+notification precedes the provider reload, which can publish a model before
+its variants. Launch uses the exact live `GET /api/model` match to establish
+readiness. If the model or requested variant is missing, it rechecks every
+250 ms for up to 12 seconds within the existing start budget. Session creation
+requires the model and any requested variant to be present.
 
 The native `x-opencode-directory` header is URI component encoded, including literal
 percent signs, using the same encoder as query values. Installed OpenCode 2.2.7
