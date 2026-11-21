@@ -1,6 +1,141 @@
 use super::*;
 use eliot_core::{is_request_reply_verb, is_start_verb};
 
+impl Store {
+    /// Latest notice for the current turn, or the last failed/unknown turn
+    /// when no turn is active. All reads are pinned to this Agent generation.
+    pub fn agent_native_notice(
+        &self,
+        agent_id: &str,
+        generation: i64,
+        active_turn: Option<&str>,
+    ) -> Result<Option<eliot_core::api::AgentNativeNotice>> {
+        let agent_num = parse_agent_id(agent_id)?;
+        if generation < 0 {
+            return Err(Error::new("invalid", "Agent notice generation is invalid"));
+        }
+        if let Some(turn_id) = active_turn {
+            return native_notice_for_turn(&self.connection, agent_num, generation, turn_id);
+        }
+
+        let latest: Option<(String, i64, String)> = self
+            .connection
+            .query_row(
+                "SELECT kind, ts, data FROM events
+                 WHERE agent = ?1 AND generation = ?2
+                   AND kind IN ('turn.started', 'turn.completed', 'turn.unknown')
+                 ORDER BY seq DESC LIMIT 1",
+                params![agent_num, generation],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        let Some((kind, ts, raw)) = latest else {
+            return Ok(None);
+        };
+        let data: Value = decode_json(&raw)?;
+        let Some(turn_id) = data.get("turn_id").and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        if kind == "turn.completed" {
+            if data.get("outcome").and_then(Value::as_str) != Some("failure") {
+                return Ok(None);
+            }
+            if let Some(notice) = terminal_native_notice(generation, ts, turn_id, &data) {
+                notice.validate()?;
+                return Ok(Some(notice));
+            }
+        }
+        native_notice_for_turn(&self.connection, agent_num, generation, turn_id)
+    }
+}
+
+fn native_notice_for_turn(
+    connection: &Connection,
+    agent_num: i64,
+    generation: i64,
+    turn_id: &str,
+) -> Result<Option<eliot_core::api::AgentNativeNotice>> {
+    let latest: Option<(i64, String)> = connection
+        .query_row(
+            "SELECT ts, data FROM events
+             WHERE agent = ?1 AND generation = ?2 AND kind = 'turn.notice'
+               AND json_extract(data, '$.turn_id') = ?3
+             ORDER BY seq DESC LIMIT 1",
+            params![agent_num, generation, turn_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    let Some((ts, raw)) = latest else {
+        return Ok(None);
+    };
+    let data: Value = decode_json(&raw)?;
+    let notice: eliot_core::api::NativeNotice = serde_json::from_value(data)
+        .map_err(|_| Error::new("source_integrity", "retained native notice is invalid"))?;
+    notice.validate()?;
+    if notice.turn_id != turn_id {
+        return Err(Error::new(
+            "source_integrity",
+            "retained native notice turn binding changed",
+        ));
+    }
+    let (message, truncated) = bounded_notice_message(notice.message.as_deref(), notice.truncated);
+    let view = eliot_core::api::AgentNativeNotice {
+        generation,
+        turn_id: notice.turn_id,
+        kind: notice.kind,
+        message,
+        truncated,
+        observed_at: ts,
+    };
+    view.validate()?;
+    Ok(Some(view))
+}
+
+fn terminal_native_notice(
+    generation: i64,
+    ts: i64,
+    turn_id: &str,
+    data: &Value,
+) -> Option<eliot_core::api::AgentNativeNotice> {
+    let error = data.get("native_error")?;
+    let message = error.get("message").and_then(Value::as_str);
+    let truncated = error
+        .get("truncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let (message, truncated) = bounded_notice_message(message, truncated);
+    Some(eliot_core::api::AgentNativeNotice {
+        generation,
+        turn_id: turn_id.to_owned(),
+        kind: eliot_core::api::NativeNoticeKind::Error,
+        message,
+        truncated,
+        observed_at: ts,
+    })
+}
+
+fn bounded_notice_message(
+    message: Option<&str>,
+    already_truncated: bool,
+) -> (Option<String>, bool) {
+    let Some(message) = message else {
+        return (None, already_truncated);
+    };
+    let normalized = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return (None, already_truncated);
+    }
+    let mut chars = normalized.chars();
+    let bounded = chars
+        .by_ref()
+        .take(eliot_core::api::AGENT_NOTICE_MESSAGE_CHARS)
+        .collect::<String>();
+    let truncated = already_truncated || chars.next().is_some();
+    (Some(bounded), truncated)
+}
+
 pub(super) struct PendingCommandEvent {
     pub(super) command_id: String,
     pub(super) state: CommandState,

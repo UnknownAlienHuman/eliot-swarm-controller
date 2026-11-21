@@ -362,6 +362,11 @@ Agent/command/mail/rule/Git/process facts and `agent.lost` cannot be supplied as
 arbitrary plugin lifecycle. Persist bounded final facts; deltas/samples stay ephemeral.
 Mask known secrets in native output; reject known secrets in caller durable text.
 
+`turn.notice` is a non-progress native fact in the turn family. It carries one exact
+`turn_id` and a normalized retrying/reconnecting/error kind; the reducer checks the
+current generation and live turn and leaves lifecycle state and model progress intact.
+It cannot create a provider hold or trigger a retry policy.
+
 An observe-only live source may commit normalized source-owned facts only after settled
 `observer_ready` proof and an explicit source handoff. Store rechecks the exact subject,
 readiness and current family owner in the transaction. Observed batches cannot carry

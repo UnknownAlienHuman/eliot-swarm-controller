@@ -78,7 +78,7 @@ pub use remote_call::{RemoteCallContext, RemoteIdentity};
 pub use routing::{
     CapacityScope, ProviderHold, ProviderHoldState, ProviderRestriction, ProviderRestrictionKind,
     RouteBinding, RouteQuotaStatus, RouteSkip, RouteSkipReason, RoutingDecision,
-    frozen_provider_scope,
+    frozen_provider_scope, frozen_provider_scope_for,
 };
 pub use secrets::SecretPolicy;
 pub use source_handoff::{SourceHandoff, SourceHandoffAck, SourceHandoffGap};
@@ -1852,6 +1852,18 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
         "turn.model_observed" => {
             require_live_turn(agent, event)?;
             record_serving_model(&mut next, required_text(event, "model")?);
+        }
+        "turn.notice" => {
+            require_live_turn(agent, event)?;
+            let notice: api::NativeNotice = serde_json::from_value(event.data.clone())
+                .map_err(|_| Error::new("invalid", "native notice schema is invalid"))?;
+            notice.validate()?;
+            if notice.turn_id != required_text(event, "turn_id")? {
+                return Err(Error::new(
+                    "source_integrity",
+                    "native notice turn binding is inconsistent",
+                ));
+            }
         }
         "message.completed" => {
             require_live_turn(agent, event)?;

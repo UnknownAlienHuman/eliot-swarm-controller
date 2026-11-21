@@ -617,6 +617,18 @@ Clear uses a same-scope compare-and-swap against the expected probe command, inc
 explicit null; it cannot clear an unresolved probe. The mutation ID binds the clear
 request, so an exact retry returns the retained result and changed evidence conflicts.
 
+`agent.list` and `agent.get` project the hold matching that Agent's frozen account or
+profile as `AgentProviderHold { kind, state, retry_after, updated_at }`; shared scope and
+probe-command identity remain on the owner-only provider-hold read. They also project
+the latest `turn.notice`, or the latest failed terminal `native_error`, as
+`AgentNativeNotice { generation, turn_id, kind, message, truncated, observed_at }`.
+The notice must match the row's generation and active or most recent turn. These views
+read the existing hold row and committed native events; they add no timer or polling
+source. `retry_after` still describes probe eligibility and never promises automatic
+retry. The desktop uses the existing daemon attention incident for its attention tone:
+the configured no-progress window (default 900 seconds) and source-health triggers are
+unchanged.
+
 ## Liveness
 
 Only generation-matched model facts update `last_progress_at`: turns, messages, tools,

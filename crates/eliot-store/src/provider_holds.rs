@@ -10,6 +10,7 @@ use admin::{clear_hold_tx, get, list_page};
 use eliot_core::{
     self as core, Agent, Command, CommandState, ProviderHold, ProviderHoldState,
     ProviderRestriction, ProviderRestrictionKind, TurnState,
+    api::AgentProviderHold,
     api::{ProviderClearHoldRequest, ProviderClearHoldResponse, ProviderHoldsResponse},
     parse_agent_id,
 };
@@ -27,6 +28,24 @@ impl Store {
         limit: usize,
     ) -> Result<ProviderHoldsResponse> {
         list_page(&self.connection, after, limit)
+    }
+
+    /// Project only the provider restriction facts relevant to this frozen
+    /// profile/account. The shared scope and probe command stay owner-only.
+    pub fn agent_provider_hold(
+        &self,
+        profile: &str,
+        profile_snapshot: &Value,
+    ) -> Result<Option<AgentProviderHold>> {
+        let scope = core::frozen_provider_scope_for(profile, profile_snapshot)?;
+        Ok(
+            get(&self.connection, &scope)?.map(|hold| AgentProviderHold {
+                kind: hold.kind,
+                retry_after: hold.retry_after,
+                state: hold.state,
+                updated_at: hold.updated_at,
+            }),
+        )
     }
 
     /// Clear a hold using the Core request's closed corrective evidence and

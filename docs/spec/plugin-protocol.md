@@ -572,6 +572,22 @@ Never invent unavailable text or alter terminal settlement, bindings, status, fi
 text or input acknowledgement for diagnostics. Raw vendor detail maps stay private;
 message text never determines error classification.
 
+`turn.notice` is a non-progress event in the existing `turn` family. Its Core
+[`NativeNotice`](../../crates/eliot-core/src/api/agent_views.rs) data binds `turn_id`
+and `NativeNoticeKind` (`retrying`, `reconnecting` or `error`) to the event's Agent and
+generation. Optional message text uses the same `SecretPolicy` redaction and 4 KiB
+bound as `native_error`; the projection limits it further for fleet pages. Store accepts
+the notice only for the exact active turn. It does not settle the turn, update model
+progress, create a provider hold, or authorize a retry.
+
+The Codex adapter translates its native `error` notification only when `threadId` and
+`turnId` match the owned thread and active turn. `willRetry:true` maps to `retrying`,
+except the typed `httpConnectionFailed`, `responseStreamConnectionFailed` and
+`responseStreamDisconnected` `codexErrorInfo` variants, which map to `reconnecting`;
+other notices map to `error`. An absent turn binding is not attached to an Agent.
+Transient notices never carry `provider_restriction`: only the existing exact-bound
+terminal rule below may create or clear a hold.
+
 An optional `turn.completed.data.provider_restriction` is the shared Core
 [`ProviderRestriction` DTO](../../crates/eliot-core/src/routing.rs) and is actionable only for that exact controlled Agent,
 generation, command and turn binding. A separate provider event, generic failure,

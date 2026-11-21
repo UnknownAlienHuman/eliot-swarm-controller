@@ -277,6 +277,10 @@ impl Store {
             record.active_turn.as_deref(),
         )?);
         let preview = self.first_input_preview(record.id)?;
+        let profile_snapshot: Value = decode_json(&record.profile_snapshot)?;
+        let provider_hold = self.agent_provider_hold(&record.profile, &profile_snapshot)?;
+        let native_notice =
+            self.agent_native_notice(&id, record.generation, record.active_turn.as_deref())?;
         let repo_common_dir = self
             .connection
             .query_row(
@@ -349,6 +353,8 @@ impl Store {
             organization_revision,
             model,
             work,
+            provider_hold,
+            native_notice,
         })
     }
 

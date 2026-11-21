@@ -7,8 +7,9 @@ use super::{
 };
 use crate::{
     Agent, AgentEdit, AgentState, CommandState, Error, NativeChildActivity,
-    NativeChildActivityState, ProcessIdentity, ProcessRecord, ProcessState, Result, SessionUsage,
-    StderrSnapshot, TurnOutcome, TurnResolutionSource, TurnUsage,
+    NativeChildActivityState, ProcessIdentity, ProcessRecord, ProcessState, ProviderHoldState,
+    ProviderRestrictionKind, Result, SessionUsage, StderrSnapshot, TurnOutcome,
+    TurnResolutionSource, TurnUsage,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
@@ -17,6 +18,207 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const PROCESS_CURSOR_MAX_BYTES: usize = 2_048;
 /// Most characters of [`AgentSummary::preview`].
 pub const AGENT_PREVIEW_CHARS: usize = 256;
+/// Maximum native notice text returned in an Agent projection.
+pub const AGENT_NOTICE_MESSAGE_CHARS: usize = 256;
+
+/// A native retry/reconnect/error fact, classified by its adapter.
+#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeNoticeKind {
+    Retrying,
+    Reconnecting,
+    Error,
+}
+
+impl NativeNoticeKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Retrying => "retrying",
+            Self::Reconnecting => "reconnecting",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// The normalized `turn.notice` event data. Its turn binding is checked by
+/// the reducer against the current generation before this fact is committed.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeNotice {
+    pub turn_id: String,
+    pub kind: NativeNoticeKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+impl NativeNotice {
+    pub fn validate(&self) -> Result<()> {
+        if self.turn_id.trim().is_empty()
+            || self.turn_id.chars().any(char::is_control)
+            || self.message.as_ref().is_some_and(|message| {
+                message.trim().is_empty() || message.chars().count() > 4 * 1024
+            })
+        {
+            return Err(Error::new("invalid", "native notice is invalid"));
+        }
+        Ok(())
+    }
+}
+
+/// Provider-hold facts safe to include on one Agent row. Scope and probe
+/// command stay on the owner-only provider-hold surface.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentProviderHold {
+    pub kind: ProviderRestrictionKind,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "nullable"
+    )]
+    pub retry_after: Option<i64>,
+    pub state: ProviderHoldState,
+    pub updated_at: i64,
+}
+
+impl AgentProviderHold {
+    pub fn validate(&self) -> Result<()> {
+        if self.retry_after.is_some_and(|at| at < 0) || self.updated_at < 0 {
+            return Err(Error::new("invalid", "Agent provider hold is invalid"));
+        }
+        Ok(())
+    }
+}
+
+/// A current or most recent native notice, bound to the event generation and
+/// exact turn from which its adapter translated the native fact.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentNativeNotice {
+    pub generation: i64,
+    pub turn_id: String,
+    pub kind: NativeNoticeKind,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "nullable"
+    )]
+    pub message: Option<String>,
+    pub truncated: bool,
+    pub observed_at: i64,
+}
+
+impl AgentNativeNotice {
+    pub fn validate(&self) -> Result<()> {
+        if self.generation < 0
+            || self.turn_id.trim().is_empty()
+            || self.turn_id.chars().any(char::is_control)
+            || self.message.as_ref().is_some_and(|message| {
+                message.trim().is_empty() || message.chars().count() > AGENT_NOTICE_MESSAGE_CHARS
+            })
+            || self.observed_at < 0
+        {
+            return Err(Error::new("invalid", "Agent native notice is invalid"));
+        }
+        Ok(())
+    }
+}
+
+/// Shared owner-facing words for an Agent's provider hold or native notice.
+pub fn agent_status_line(
+    active_turn: Option<&str>,
+    provider_hold: Option<&AgentProviderHold>,
+    native_notice: Option<&AgentNativeNotice>,
+    now_ms: i64,
+) -> Option<String> {
+    if let Some(hold) = provider_hold {
+        let kind = match hold.kind {
+            ProviderRestrictionKind::RateLimit => "rate limited",
+            ProviderRestrictionKind::Quota => "quota exhausted",
+            ProviderRestrictionKind::Auth => "authentication required",
+            ProviderRestrictionKind::ModelRemoved => "model unavailable",
+        };
+        let waiting_for_provider = active_turn.is_some()
+            && (matches!(
+                native_notice.map(|notice| notice.kind),
+                Some(NativeNoticeKind::Retrying | NativeNoticeKind::Reconnecting)
+            ) || (native_notice.is_none() && hold.state == ProviderHoldState::Probing));
+        let mut line = if waiting_for_provider {
+            format!("Waiting for the provider: {kind}")
+        } else {
+            format!("Provider hold: {kind}")
+        };
+        match native_notice.map(|notice| notice.kind) {
+            Some(NativeNoticeKind::Retrying) => line.push_str(", retrying"),
+            Some(NativeNoticeKind::Reconnecting) => line.push_str(", reconnecting"),
+            Some(NativeNoticeKind::Error) => line.push_str(", error"),
+            None if hold.state == ProviderHoldState::Probing => {
+                line.push_str(", probe in progress");
+            }
+            None => {
+                if let Some(retry_after) = hold.retry_after.filter(|at| *at > now_ms) {
+                    line.push_str(&format!(
+                        ", probe eligible in {}",
+                        remaining_time(retry_after - now_ms)
+                    ));
+                }
+            }
+        }
+        if let Some(message) = native_notice.and_then(|notice| notice.message.as_deref()) {
+            line.push_str(": ");
+            line.push_str(message);
+        }
+        return Some(line);
+    }
+
+    let notice = native_notice?;
+    let lead = match notice.kind {
+        NativeNoticeKind::Retrying => "Harness retrying",
+        NativeNoticeKind::Reconnecting => "Harness reconnecting",
+        NativeNoticeKind::Error => "Harness error",
+    };
+    Some(match notice.message.as_deref() {
+        Some(message) => format!("{lead}: {message}"),
+        None => lead.to_owned(),
+    })
+}
+
+/// Age of the oldest retained status fact, measured against the caller's read
+/// clock. This is display context; the daemon's existing attention incident
+/// remains the authority for the attention tone.
+pub fn agent_status_age_ms(
+    provider_hold: Option<&AgentProviderHold>,
+    native_notice: Option<&AgentNativeNotice>,
+    now_ms: i64,
+) -> Option<i64> {
+    let since = [
+        provider_hold.map(|hold| hold.updated_at),
+        native_notice.map(|notice| notice.observed_at),
+    ]
+    .into_iter()
+    .flatten()
+    .min()?;
+    now_ms.checked_sub(since).filter(|age| *age >= 0)
+}
+
+fn remaining_time(milliseconds: i64) -> String {
+    let minutes = milliseconds
+        .saturating_add(59_999)
+        .div_euclid(60_000)
+        .max(1);
+    if minutes < 60 {
+        format!("{minutes}m")
+    } else {
+        let hours = minutes.saturating_add(59).div_euclid(60);
+        if hours < 24 {
+            format!("{hours}h")
+        } else {
+            format!("{}d", hours.saturating_add(23).div_euclid(24))
+        }
+    }
+}
 
 /// Fixed compact fleet projection for `agent.list`. Identity, state, current
 /// turn and hierarchy position come from the live Agent row. `last_progress_at`
@@ -135,6 +337,22 @@ pub struct AgentSummary {
     /// generation. Trailing field; absent on old wire payloads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work: Option<WorkSummaryView>,
+    /// The hold for the frozen account/profile scope, if any. Trailing field;
+    /// absent on old wire payloads.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "nullable"
+    )]
+    pub provider_hold: Option<AgentProviderHold>,
+    /// Latest native notice bound to this generation and its active/last turn.
+    /// Trailing field; absent on old wire payloads.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "nullable"
+    )]
+    pub native_notice: Option<AgentNativeNotice>,
 }
 
 impl AgentSummary {
@@ -237,6 +455,21 @@ impl AgentSummary {
         }
         if let Some(work) = &self.work {
             work.validate()?;
+        }
+        if let Some(hold) = &self.provider_hold {
+            hold.validate()?;
+        }
+        if let Some(notice) = &self.native_notice {
+            notice.validate()?;
+            let expected_turn = self.active_turn.as_deref().or(self.last_turn_id.as_deref());
+            if notice.generation != self.generation
+                || expected_turn != Some(notice.turn_id.as_str())
+            {
+                return Err(Error::new(
+                    "invalid",
+                    "Agent summary native notice binding is invalid",
+                ));
+            }
         }
         if let Some(group) = &self.organization {
             super::organization::validate_project_name(group, "Agent summary organization")?;
@@ -397,6 +630,12 @@ pub struct AgentGetResponse {
     /// generation. Trailing field; absent on old wire payloads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work: Option<WorkSummaryView>,
+    /// The hold for the frozen account/profile scope, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_hold: Option<AgentProviderHold>,
+    /// Latest native notice bound to this generation and its active/last turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_notice: Option<AgentNativeNotice>,
 }
 
 /// Retained model/effort overlay readback for one Agent generation. The

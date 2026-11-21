@@ -798,7 +798,9 @@ action child. Manual runs do not consume the scheduled slot. See the timer seman
 `agent.get` includes the current generation's source rows and the managed workspace
 target generation's rows when it differs. If persisted state requires a live owner and
 the corresponding source is absent, it returns `unknown` rather than asserting the
-persisted state is current. The Agent `effective` settings are the last
+persisted state is current. It includes the same `provider_hold` and generation/turn-bound
+`native_notice` facts as `agent.list`, with the native notice's bounded projection.
+The Agent `effective` settings are the last
 natively admitted values, never a prediction: the launch `session.ready`
 readback sets them, and a `configure` revision's turn refreshes them when the
 harness proves what its native turn request carried (Codex reports the
@@ -968,7 +970,12 @@ attention scanning is unchanged.
 Each summary carries identity, state,
 current turn, progress age, the last terminal outcome with its turn and
 retained usage where available, child activity for native observed children,
-and the last controller-observed write time. It also carries what the Agent is
+and the last controller-observed write time. `provider_hold` reports the
+applicable frozen account/profile hold without its shared scope or probe command;
+`native_notice` reports a retry/reconnect/error fact with exact generation, turn and
+observation time. Both are absent when no retained fact applies. The notice follows
+the active turn or, after settlement, the latest terminal turn, so an older generation
+or turn cannot read as current. The summary also carries what the Agent is
 for, so a list needs no read per row (the pattern of Codex app-server
 `thread/list`, whose threads carry `name` and a first-message `preview`): the
 Agent `name` when one was set, its frozen `profile` name, and `preview`, the
