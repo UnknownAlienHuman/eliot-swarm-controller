@@ -108,28 +108,69 @@ fn parse_sources(value: &Value) -> Result<Vec<String>> {
     Ok(paths)
 }
 
-/// The delivered block: one section per named path, sharing `budget` bytes.
-/// A file over its share keeps its beginning and says how much is missing.
+/// The delivered block: one section per named path, in the given order.
+/// Deliverable texts share `budget` bytes smallest first, so a short file is
+/// never cut to make room and unused shares pass to larger files; a file
+/// over its share keeps its beginning and says how much is missing.
 fn delivered_block(root: &Path, paths: &[String], budget: usize, policy: &SecretPolicy) -> String {
+    enum Read {
+        Text {
+            content: String,
+            size: usize,
+            digest: String,
+        },
+        Skipped(String),
+    }
+    let reads: Vec<Read> = paths
+        .iter()
+        .map(|path| match read_source(root, path) {
+            Err(reason) => Read::Skipped(reason.to_owned()),
+            Ok(bytes) => {
+                let digest = sha256_hex(&bytes)[..16].to_owned();
+                match std::str::from_utf8(&bytes) {
+                    Ok(text) if !text.contains('\0') => Read::Text {
+                        content: policy.redact_text(text),
+                        size: bytes.len(),
+                        digest,
+                    },
+                    _ => Read::Skipped(format!(
+                        "binary content, sha256 {digest}, {} bytes",
+                        bytes.len()
+                    )),
+                }
+            }
+        })
+        .collect();
+    let mut order: Vec<usize> = (0..reads.len())
+        .filter(|index| matches!(reads[*index], Read::Text { .. }))
+        .collect();
+    order.sort_by_key(|index| match &reads[*index] {
+        Read::Text { content, .. } => content.len(),
+        Read::Skipped(_) => 0,
+    });
+    let mut shares = vec![0; reads.len()];
+    let mut remaining = budget;
+    for (position, index) in order.iter().enumerate() {
+        if let Read::Text { content, .. } = &reads[*index] {
+            let share = (remaining / (order.len() - position)).min(content.len());
+            shares[*index] = share;
+            remaining -= share;
+        }
+    }
     let mut out = String::from(
         "Required sources (delivered by Swarm with path, content digest and completeness; read them here instead of reopening the files):",
     );
-    let mut remaining = budget;
-    for (index, path) in paths.iter().enumerate() {
-        let share = remaining / (paths.len() - index);
-        match read_source(root, path) {
-            Err(reason) => out.push_str(&format!("\n\n=== {path}: not delivered ({reason}) ===")),
-            Ok(bytes) => {
-                let digest = &sha256_hex(&bytes)[..16];
-                let Ok(content) = std::str::from_utf8(&bytes) else {
-                    out.push_str(&format!(
-                        "\n\n=== {path}: not delivered (binary content, sha256 {digest}, {} bytes) ===",
-                        bytes.len()
-                    ));
-                    continue;
-                };
-                let content = policy.redact_text(content);
-                let (kept, cut) = truncate_bytes(&content, share);
+    for ((path, read), share) in paths.iter().zip(&reads).zip(shares) {
+        match read {
+            Read::Skipped(reason) => {
+                out.push_str(&format!("\n\n=== {path}: not delivered ({reason}) ==="));
+            }
+            Read::Text {
+                content,
+                size,
+                digest,
+            } => {
+                let (kept, cut) = truncate_bytes(content, share);
                 let completeness = if cut {
                     format!(
                         "first {} of {} bytes; read the rest from the file",
@@ -140,10 +181,8 @@ fn delivered_block(root: &Path, paths: &[String], budget: usize, policy: &Secret
                     "complete".to_owned()
                 };
                 out.push_str(&format!(
-                    "\n\n=== {path} (sha256 {digest}, {} bytes, {completeness}) ===\n{kept}",
-                    bytes.len()
+                    "\n\n=== {path} (sha256 {digest}, {size} bytes, {completeness}) ===\n{kept}"
                 ));
-                remaining = remaining.saturating_sub(kept.len());
             }
         }
     }
