@@ -179,6 +179,7 @@ const METHODS: &[Method] = &[
     ),
     method!("usage.summary", UsageSummaryRequest, UsageSummaryResponse, false, false, "Read bounded usage totals over one Agent, project or tree scope.", {"agent":"a1"}),
     method!("agent.git", AgentGitRequest, AgentGitResponse, false, false, "Read Git observations for one Agent's workspace.", {"id":"a1"}),
+    method!("agent.patch_digest", AgentPatchDigestRequest, AgentPatchDigestResponse, false, false, "Digest an Agent's patch for review: files, packages, new dependencies, public interface, checker changes and suppressions.", {"id":"a1"}),
     method!("agent.edits", AgentEditsRequest, AgentEditsResponse, false, false, "Read a bounded page of observed workspace edits.", {"id":"a1","limit":20}),
     method!("turn.get", TurnGetRequest, Turn, false, false, "Read one exact Agent/generation/turn binding.", {"agent":"a1","generation":1,"turn_id":"turn-1"}),
     method!("turn.resolve", TurnResolveRequest, TurnResolveResponse, true, true, "Record an owner resolution for one uncertain exact turn.", {"id":EXAMPLE_ID,"agent":"a1","generation":1,"turn_id":"turn-1","status":"completed","reason":"Owner verified completion."}),

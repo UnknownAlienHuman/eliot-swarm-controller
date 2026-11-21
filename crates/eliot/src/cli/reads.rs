@@ -9,8 +9,9 @@ use super::support::{Failure, PAGE_SIZE, print_value, validate_limit};
 use eliot_core::api::{
     AgentEditsRequest, AgentEditsResponse, AgentGetRequest, AgentGetResponse, AgentGitRequest,
     AgentGitResponse, AgentHistoryRequest, AgentListRequest, AgentListResponse,
-    AgentProcessesRequest, AgentProcessesResponse, AgentResultRequest, AgentResultResponse,
-    AgentStatsRequest, AgentStatsResponse, DiagnoseRequest, DiagnoseResponse, EventsBoundsRequest,
+    AgentPatchDigestRequest, AgentPatchDigestResponse, AgentProcessesRequest,
+    AgentProcessesResponse, AgentResultRequest, AgentResultResponse, AgentStatsRequest,
+    AgentStatsResponse, DiagnoseRequest, DiagnoseResponse, EventsBoundsRequest,
     EventsBoundsResponse, EventsFilter, EventsReadRequest, EventsReadResponse,
     EventsSubscribeRequest, EventsSubscribeResponse, HarnessDoctorRequest, HarnessDoctorResponse,
     ObservationPage, ObserveHeavyRequest, ObserveHeavyResponse, TurnCounterMissing,
@@ -438,6 +439,27 @@ pub(crate) async fn run_git_status(
         "agent.git",
         params,
         AgentGitResponse
+    )
+}
+
+pub(crate) async fn run_patch_digest(
+    GitStatusArgs {
+        agent,
+        generation: ReadGenerationArgs { generation },
+    }: GitStatusArgs,
+    data_dir: PathBuf,
+    json_output: bool,
+) -> Result<u8, Failure> {
+    let params = AgentPatchDigestRequest {
+        id: agent,
+        generation,
+    };
+    read_and_print!(
+        &data_dir,
+        json_output,
+        "agent.patch_digest",
+        params,
+        AgentPatchDigestResponse
     )
 }
 

@@ -79,6 +79,18 @@ pub(crate) struct GitBinding<'a> {
     pub common_dir: &'a Path,
 }
 
+/// The change an independent review looks at: a zero-context diff from the
+/// base (or HEAD) to the worktree, plus untracked paths.
+pub(crate) struct PatchRead {
+    pub root: PathBuf,
+    pub base: Option<String>,
+    pub head: Option<String>,
+    pub diff: String,
+    pub untracked: Vec<String>,
+    /// False when the diff exceeded the read bound and was left out.
+    pub complete: bool,
+}
+
 /// HEAD and the paths that differ from it (index, worktree and untracked
 /// files; ignored files excluded), for a Goal's change scope.
 pub(crate) struct ScopeState {
@@ -886,6 +898,91 @@ impl GitProbe {
             root,
             head: status.head,
             changed,
+        })
+    }
+
+    /// The patch of a workspace against `base`, or against HEAD without one.
+    pub(crate) async fn patch_read(
+        &self,
+        workspace: &str,
+        base: Option<&str>,
+    ) -> Result<PatchRead> {
+        let root = canonical_root(workspace)?;
+        let deadline = Instant::now() + PROBE_TIME;
+        let overrides = self.safe_overrides(&root, deadline).await?;
+        self.require_exact_root(&root, &overrides, deadline).await?;
+        let status = parse_status(
+            &self
+                .checked(&root, SCOPE_STATUS_ARGS, &overrides, &[], deadline)
+                .await?,
+        )?;
+        let untracked = status
+            .dirty
+            .iter()
+            .filter(|entry| entry.status == "??")
+            .map(|entry| entry.path.clone())
+            .collect();
+        let base = base.filter(|oid| is_git_oid(oid)).map(ToOwned::to_owned);
+        let from = base
+            .clone()
+            .or_else(|| status.head.clone())
+            .ok_or_else(|| unavailable("the patch needs a base commit or a HEAD"))?;
+        // Non-ASCII paths stay readable instead of octal-quoted.
+        let mut overrides = overrides;
+        overrides.push(("core.quotepath".to_owned(), "false".to_owned()));
+        let (diff, complete) = match self
+            .run(
+                &root,
+                &[
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--no-color",
+                    "--no-renames",
+                    "-U0",
+                    &from,
+                    "--",
+                ],
+                &overrides,
+                &[],
+                deadline,
+            )
+            .await
+        {
+            Ok(output) if output.code == 0 => {
+                (String::from_utf8_lossy(&output.stdout).into_owned(), true)
+            }
+            Ok(_) => return Err(unavailable("Git could not diff the patch")),
+            Err(error) if error.code == "git_leaf_fence_unavailable" => return Err(error),
+            Err(_) => (String::new(), false),
+        };
+        let mut diff = diff;
+        if !complete {
+            // Over the bound: keep the changed paths so the digest still
+            // names every file and package.
+            // Even the name list may exceed the bound: then no paths.
+            if let Ok(names) = self
+                .checked(
+                    &root,
+                    &["diff", "--name-only", "--no-renames", "-z", &from, "--"],
+                    &overrides,
+                    &[],
+                    deadline,
+                )
+                .await
+            {
+                for path in parse_paths(&names)? {
+                    diff.push_str(&format!("diff --git a/{path} b/{path}\n"));
+                }
+            }
+        }
+        Ok(PatchRead {
+            root,
+            base,
+            head: status.head,
+            diff,
+            untracked,
+            complete,
         })
     }
 

@@ -6,8 +6,8 @@ use super::agent_views::{
 };
 use super::{
     AgentEditsResponse, AgentGetResponse, AgentGitResponse, AgentListResponse,
-    AgentProcessesResponse, AgentStatsResponse, DaemonPanicTestResponse, DaemonStatusResponse,
-    DiagnoseResponse, ProcessPageCursor, ProjectDiscoverResponse,
+    AgentPatchDigestResponse, AgentProcessesResponse, AgentStatsResponse, DaemonPanicTestResponse,
+    DaemonStatusResponse, DiagnoseResponse, ProcessPageCursor, ProjectDiscoverResponse,
 };
 use crate::{Agent, AgentState, Error, Result};
 use serde::{Deserialize, Serialize};
@@ -560,6 +560,36 @@ impl AgentGitRequest {
         generation(self.generation)
     }
     pub fn validate_response(&self, reply: &AgentGitResponse) -> Result<()> {
+        if self.validate().is_err()
+            || !binding(&self.id, self.generation, &reply.agent, reply.generation)
+        {
+            return Err(invalid_response());
+        }
+        Ok(())
+    }
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentPatchDigestRequest {
+    #[serde(deserialize_with = "required_text")]
+    #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
+    pub id: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "optional_generation"
+    )]
+    #[schemars(range(min = 0))]
+    pub generation: Option<i64>,
+}
+
+impl AgentPatchDigestRequest {
+    pub fn validate(&self) -> Result<()> {
+        text(&self.id)?;
+        generation(self.generation)
+    }
+    pub fn validate_response(&self, reply: &AgentPatchDigestResponse) -> Result<()> {
         if self.validate().is_err()
             || !binding(&self.id, self.generation, &reply.agent, reply.generation)
         {

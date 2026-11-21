@@ -90,6 +90,8 @@ pub(crate) async fn run_project(
             revision,
             max_live,
             priority,
+            pause,
+            resume,
         } => {
             let request = eliot_core::api::ManagerBudgetRequest {
                 id: mutation_id(id)?,
@@ -97,6 +99,7 @@ pub(crate) async fn run_project(
                 expected_revision: revision,
                 max_live,
                 priority,
+                paused: (pause || resume).then_some(pause),
             };
             request.validate().map_err(Failure::for_mutation)?;
             let reply: eliot_core::api::ManagerBudgetView =

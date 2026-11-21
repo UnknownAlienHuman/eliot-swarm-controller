@@ -431,6 +431,7 @@ command id frozen at claim. Stored Goal responses/round records use Core
 | `agent.list/get/result` | scoped, paginated Agent state and exact results |
 | `agent.processes/stats` | scoped process records and ephemeral OS samples |
 | `agent.git/edits` | current Git snapshot and paginated native-attributed edits |
+| `agent.patch_digest` | review digest of the Agent's patch against its worktree base (else HEAD): changed files and packages, new dependencies, public-interface lines, checker/lint configuration changes and added suppressions, each list bounded; an attention filter, not a quality score |
 | `workspace.list` | owner-only page of the managed worktrees Swarm created |
 | `command.submit/get` | implemented immutable admission and command readback |
 | `turn.get` | implemented running/completed/unknown turn read |
@@ -1052,8 +1053,14 @@ and explicit interactive intents admitted by the arbiter. A direct Owner launch 
 use `--owner-override` to mark the command and its admission event as outside that
 fair ordering. It still checks all admission limits.
 
-A manager uses `swarm project budget PROJECT --revision REV` with `--max-live`
-or `--priority` to apply an Owner-granted change to its current assignment.
+A manager uses `swarm project budget PROJECT --revision REV` with `--max-live`,
+`--priority`, `--pause` or `--resume` to apply an Owner-granted change to its current
+assignment. `--pause` is a strict pause of new work for integration capacity. While it
+holds, the assignment scope's effective limit is 0, so no new admission takes a slot,
+including queued launch intents and a slot a finished child frees. Running children
+continue. The pause lives in the same epoch-bound budget row, so a new manager or epoch
+never inherits it. Lifting it restores the delegated limit without an increase check,
+because a pause gives no capacity away.
 
 `command.submit` uses `CommandSubmitRequest` (the Core `SubmitCommand` alias) and
 `CommandSubmitResponse` from the canonical mutation DTOs. `id` and `verb` are required;
@@ -2400,6 +2407,7 @@ swarm ls | show A | watch [A|SELECTOR] [--after SEQ] | top
 swarm processes A [--scope agent|workspace] [--generation N] [--after CURSOR] [--limit N]
 swarm stats A [--generation N]
 swarm git-status A [--generation N]
+swarm patch-digest A [--generation N]
 swarm edits A [--generation N] [--after PATH] [--limit N]
 swarm send A TEXT [--probe] [--wait] [--timeout-seconds N] [--generation N]
 swarm steer A TEXT [--generation N] [--turn ID]

@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 68;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 69;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -1609,6 +1609,20 @@ impl Store {
                 "CREATE INDEX processes_exited_child_updated ON processes(updated_at)
                      WHERE state = 'exited' AND role = 'child';
                  INSERT INTO schema_migrations(version) VALUES (68);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 69 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            // A manager's strict pause of new admissions, bound to its epoch
+            // through the same row as its delegated limit.
+            tx.execute_batch(
+                "ALTER TABLE manager_budgets ADD COLUMN paused INTEGER NOT NULL DEFAULT 0;
+                 INSERT INTO schema_migrations(version) VALUES (69);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;

@@ -567,9 +567,11 @@ pub(super) fn queue_usage(conn: &Connection, project: Option<&str>) -> Result<us
     Ok(total as usize)
 }
 
-fn budget_override(conn: &Connection, project: &str) -> Result<Option<(Option<u64>, u8)>> {
+/// The current manager epoch's budget override: delegated limit, priority
+/// and pause. A row of an earlier manager or epoch never applies.
+fn budget_override(conn: &Connection, project: &str) -> Result<Option<(Option<u64>, u8, bool)>> {
     conn.query_row(
-        "SELECT b.max_live, b.priority FROM manager_budgets b JOIN project_assignments p
+        "SELECT b.max_live, b.priority, b.paused FROM manager_budgets b JOIN project_assignments p
          ON b.project=p.project AND b.manager=p.manager AND b.generation=p.manager_generation AND b.epoch=p.epoch
          WHERE b.project=?1",
         [project],
@@ -577,6 +579,7 @@ fn budget_override(conn: &Connection, project: &str) -> Result<Option<(Option<u6
             Ok((
                 r.get::<_, Option<i64>>(0)?.map(|value| value as u64),
                 r.get(1)?,
+                r.get(2)?,
             ))
         },
     )
@@ -584,10 +587,29 @@ fn budget_override(conn: &Connection, project: &str) -> Result<Option<(Option<u6
     .map_err(sql_error)
 }
 
+/// Whether the current manager epoch has paused new admissions.
+pub(super) fn manager_paused(conn: &Connection, project: &str) -> Result<bool> {
+    Ok(budget_override(conn, project)?.is_some_and(|(_, _, paused)| paused))
+}
+
+/// The assignment limit admissions use: zero while the current manager has
+/// paused new work, so a slot a finished child frees cannot be taken.
 pub(super) fn effective_manager_limit(
     conn: &Connection,
     project: &str,
     policy: &core::api::ProjectScopeLimits,
+) -> Result<Option<u64>> {
+    let budget = budget_override(conn, project)?;
+    if policy.manager_assignment.is_some() && budget.is_some_and(|(_, _, paused)| paused) {
+        return Ok(Some(0));
+    }
+    delegated_manager_limit(policy, budget.and_then(|(limit, _, _)| limit))
+}
+
+/// The delegated limit without the pause.
+fn delegated_manager_limit(
+    policy: &core::api::ProjectScopeLimits,
+    budget: Option<u64>,
 ) -> Result<Option<u64>> {
     let Some(ceiling) = policy.manager_assignment else {
         return Ok(None);
@@ -595,7 +617,6 @@ pub(super) fn effective_manager_limit(
     let Some(floor) = policy.manager_min_live else {
         return Ok(Some(ceiling));
     };
-    let budget = budget_override(conn, project)?.and_then(|(limit, _)| limit);
     Ok(Some(
         budget.map_or(ceiling, |limit| limit.max(floor).min(ceiling)),
     ))
@@ -610,7 +631,7 @@ impl Store {
         let mut priorities = HashMap::new();
         for (project, limit) in &limits.projects {
             if let Some(max) = limit.manager_priority_max
-                && let Some((_, priority)) = budget_override(&self.connection, project)?
+                && let Some((_, priority, _)) = budget_override(&self.connection, project)?
             {
                 priorities.insert(project.clone(), priority.min(max));
             }
@@ -660,7 +681,7 @@ impl Store {
                 .projects
                 .get(&request.project)
                 .ok_or_else(|| Error::new("not_allowed", "Owner has not delegated a budget"))?;
-            let (old_max, old_priority) =
+            let (old_max, old_priority, old_paused) =
                 budget_override(&tx, &request.project)?.unwrap_or_default();
             if let Some(limit) = request.max_live {
                 if !matches!((policy.manager_min_live,policy.manager_assignment),
@@ -680,8 +701,9 @@ impl Store {
                         "only unused manager budget can be released",
                     ));
                 }
-                let previous =
-                    effective_manager_limit(&tx, &request.project, policy)?.unwrap_or(limit);
+                // A pause gives no capacity away, so an increase is measured
+                // from the delegated limit, not from the paused zero.
+                let previous = delegated_manager_limit(policy, old_max)?.unwrap_or(limit);
                 let increase = limit.saturating_sub(previous);
                 if increase > 0 {
                     for (scope, cap) in [
@@ -711,16 +733,25 @@ impl Store {
                     "priority is outside the Owner's delegated range",
                 ));
             }
+            if request.paused == Some(true) && policy.manager_assignment.is_none() {
+                return Err(Error::new(
+                    "not_allowed",
+                    "a pause needs the Owner's manager_max_live ceiling for this project",
+                ));
+            }
             let priority = request.priority.unwrap_or(old_priority);
             let max_live = request.max_live.or(old_max);
-            tx.execute("INSERT INTO manager_budgets(project,manager,generation,epoch,max_live,priority)
-                VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(project) DO UPDATE SET manager=excluded.manager,
-                generation=excluded.generation,epoch=excluded.epoch,max_live=excluded.max_live,priority=excluded.priority",
-                params![request.project,num,agent.generation,assignment.epoch,max_live.map(|value| value as i64),priority]).map_err(sql_error)?;
+            let paused = request.paused.unwrap_or(old_paused);
+            tx.execute("INSERT INTO manager_budgets(project,manager,generation,epoch,max_live,priority,paused)
+                VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(project) DO UPDATE SET manager=excluded.manager,
+                generation=excluded.generation,epoch=excluded.epoch,max_live=excluded.max_live,priority=excluded.priority,
+                paused=excluded.paused",
+                params![request.project,num,agent.generation,assignment.epoch,max_live.map(|value| value as i64),priority,paused]).map_err(sql_error)?;
             let view = ManagerBudgetView {
                 project: request.project.clone(),
                 max_live: effective_manager_limit(&tx, &request.project, policy)?,
                 priority: priority.min(policy.manager_priority_max.unwrap_or(0)),
+                paused,
             };
             insert_receipt(
                 &tx,
