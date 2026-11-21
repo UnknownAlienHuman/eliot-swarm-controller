@@ -54,9 +54,8 @@ impl Router {
             }
             let change = store
                 .reserve_switch(&principal_name(principal), &request, &policy, now_ms())
-                .map_err(|error| {
+                .inspect_err(|error| {
                     log_refusal(&policy, &request.id, &error.code, &error.message);
-                    error
                 })?;
             self.publish_locked(&change.events);
             // A disconnected caller cannot cancel the independently scheduled operation.

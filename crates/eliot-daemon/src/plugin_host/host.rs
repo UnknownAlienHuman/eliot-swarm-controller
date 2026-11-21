@@ -114,7 +114,7 @@ impl StopDeadlines {
 /// Read back the independent process-custody and native-source facts that
 /// make a stop applied. Sampling the exact generation is bounded by one
 /// absolute deadline; neither fact substitutes for the other.
-pub(super) async fn wait_for_stop_exit_proof(
+async fn wait_for_stop_exit_proof(
     state: &Weak<HostState>,
     agent: &Agent,
     until: Instant,
