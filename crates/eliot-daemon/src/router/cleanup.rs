@@ -613,12 +613,10 @@ impl Router {
             .ok_or_else(|| Error::new("not_allowed", "Agent has no Swarm-created artifact root"))?;
         let own_temp = std::fs::canonicalize(&owned.path)
             .map_err(|_| Error::new("not_allowed", "Agent artifact root unavailable"))?;
-        if directory_identity(&own_temp)? != owned.identity
-            || own_temp != self.selected_agent_artifact_root(agent)?
-        {
+        if directory_identity(&own_temp)? != owned.identity {
             return Err(Error::new(
                 "identity_changed",
-                "Agent artifact root is not the selected current root",
+                "Agent artifact root changed",
             ));
         }
         if (canonical == daemon_root || daemon_root.starts_with(&canonical))
@@ -933,6 +931,9 @@ impl Router {
             }
             artifact
         };
+        if let Err(error) = self.current_managed_worktree_path(&artifact.path) {
+            return Ok(Some(error.code));
+        }
         match self.worktree_cleanup_preflight(&artifact).await {
             Ok(()) => Ok(None),
             Err(error) => Ok(Some(error.code)),
@@ -1351,7 +1352,7 @@ impl Router {
                     Ok(bytes) => {
                         candidate.verdict = "safe".to_owned();
                         candidate.reason = if ownership_root {
-                            "empty_owned_artifact_root"
+                            "terminal_owned_artifact_root"
                         } else {
                             "terminal_owned_artifact"
                         }
@@ -1508,7 +1509,6 @@ impl Router {
                 "worktree write guard is unavailable",
             ));
         }
-        self.current_managed_worktree_path(&artifact.path)?;
         let (preparation, profile) = {
             let store = self.inner.store.lock().await;
             let preparation = store.workspace_removal_eligibility(&artifact.agent, now_ms())?;
@@ -2045,7 +2045,6 @@ impl Router {
         artifact: &ArtifactView,
         apply_id: &str,
     ) -> Result<u64> {
-        self.current_managed_worktree_path(&artifact.path)?;
         let mut progress = self.progress_receiver();
         let admission = {
             let mut store = self.inner.store.lock().await;

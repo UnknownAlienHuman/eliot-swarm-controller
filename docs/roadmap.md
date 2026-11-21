@@ -445,7 +445,13 @@ the connected product. Keep results in the PR/CI, not a permanent audit/readines
       rule history floor, replay/idempotency window and source recovery dependencies.
       Daemon maintenance deletes expired history via bounded Store pruning;
       queries/backlog handling alone do not. Keep open/unknown work and current
-      projections; no full rewrite, forced unknown resolution or separate cleanup ledger.
+      projections. Default event and exited-child windows are active, and live
+      maintenance reclaims pages incrementally or reuses them on older Stores.
+- [x] **Automatic artifact cleanup.** Apply the configured age policy through
+      [guarded cleanup](spec/coordination.md#registered-artifacts-and-cleanup-k69).
+      Proved on a private Windows daemon with real OpenCode Agents. The sweep removed
+      an archived eligible Agent's worktree, artifact root and transient plugin directory
+      and kept the same paths for dirty and unmerged Agents.
 - [x] Core/Store/API/reducer and event replay, including retention and non-reused ids.
       Qualified 2026-11-15 on release 70E7859B with real Muse/Codex Agents. Covered:
       replay equal to live; restart without effect replay; a mid-turn kill settling
