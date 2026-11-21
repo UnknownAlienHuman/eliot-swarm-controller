@@ -388,13 +388,15 @@ normal sends never inspect it. Mail revalidates the busy, pending and
 unknown gates at admission via its open-notice identity; the Store never
 parses notice text. Internal `notice_kind` remains Store admission metadata
 and is stripped at daemon dispatch, so vendor plugins receive only text arguments.
-Deferred mail re-offers on idle through the same
-atomic claim; no cooldown is spent while deferred. A claim preserves the
-prior `last_notice_at` (0 until first presentation), a failed admission
-clears only the open claim, restart recovery clears only commandless
-open claims, command retention clears only the open reference of the
-exact completed notice it deletes, and the shared cooldown
-runs from actual presentation (`turn.started` stamps `last_notice_at`).
+Deferred mail re-offers on idle through the same atomic claim; no cooldown is
+spent while deferred. A claim preserves the prior `last_notice_at` (0 until
+first presentation), and a failed admission clears only the matching open
+claim. Store dispatch settlement of a notice `send` as `rejected`, `failed`,
+or `cancelled` stamps the shared cooldown and clears that exact open claim in
+the same transaction. Restart recovery clears only commandless open claims.
+Command retention clears the open reference of the exact completed notice it
+deletes. A successful notice starts the cooldown at actual presentation
+(`turn.started` stamps `last_notice_at`).
 A daemon driver re-pages due recipients every 2 seconds: current `idle`,
 non-observer agents holding unread mail past the normal cooldown are
 re-offered through the same atomic claim, so an agent that idles with no
