@@ -504,11 +504,12 @@ pub fn desktop_section(
                 .collect::<Vec<_>>()
         ),
     );
+    // The size replaces only width and height: the saved place and
+    // maximized state stay until the close write replaces them.
     if let Some((width, height)) = window {
-        map.insert(
-            "window".to_owned(),
-            json!({"width": width, "height": height}),
-        );
+        let saved = object(map.entry("window".to_owned()).or_insert_with(|| json!({})));
+        saved.insert("width".to_owned(), json!(width));
+        saved.insert("height".to_owned(), json!(height));
     }
     desktop
 }

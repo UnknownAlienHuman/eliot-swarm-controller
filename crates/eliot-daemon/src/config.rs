@@ -425,6 +425,33 @@ enum DesktopStartup {
 struct DesktopWindow {
     width: u32,
     height: u32,
+    /// The window's outer top-left in physical screen pixels, once moved.
+    #[serde(default)]
+    x: Option<i32>,
+    #[serde(default)]
+    y: Option<i32>,
+    #[serde(default)]
+    maximized: bool,
+}
+
+/// `[desktop] window` bounds: the client size in DIPs and the outer
+/// top-left in physical screen pixels.
+const DESKTOP_WINDOW_MIN: (u32, u32) = (640, 480);
+const DESKTOP_WINDOW_MAX_SIZE: u32 = 32_768;
+const DESKTOP_WINDOW_MAX_COORDINATE: u32 = 32_768;
+
+/// Whether a `[desktop] window` is within bounds: a size from 640 by 480 to
+/// 32768 by 32768, coordinates within +-32768. The desktop applies the same
+/// check when it reads the file before its window exists.
+pub fn desktop_window_in_bounds(width: u32, height: u32, x: Option<i32>, y: Option<i32>) -> bool {
+    let size = |value: u32, min: u32| (min..=DESKTOP_WINDOW_MAX_SIZE).contains(&value);
+    let coordinate = |value: Option<i32>| {
+        value.is_none_or(|value| value.unsigned_abs() <= DESKTOP_WINDOW_MAX_COORDINATE)
+    };
+    size(width, DESKTOP_WINDOW_MIN.0)
+        && size(height, DESKTOP_WINDOW_MIN.1)
+        && coordinate(x)
+        && coordinate(y)
 }
 
 /// One desktop model favorite or recent entry.
@@ -535,14 +562,12 @@ fn desktop_error(message: &str) -> core::Error {
 
 impl DesktopSettings {
     fn validate(&self) -> core::Result<()> {
-        if self
-            .window
-            .as_ref()
-            .is_some_and(|window| window.width < 640 || window.height < 480)
-        {
+        if self.window.as_ref().is_some_and(|window| {
+            !desktop_window_in_bounds(window.width, window.height, window.x, window.y)
+        }) {
             return Err(core::Error::new(
                 "profile_error",
-                "config.toml: desktop window must be at least 640 by 480",
+                "config.toml: desktop window must be 640 by 480 to 32768 by 32768, with x and y within -32768 to 32768",
             ));
         }
         if self.favorite_models.len() > MAX_DESKTOP_FAVORITES {

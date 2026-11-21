@@ -215,7 +215,6 @@ impl DesktopApp {
             tone,
             pill,
             menu,
-            details_open: self.panel == Panel::Details,
             widths: self.main_width().map_or(
                 (
                     tokens::layout::READING_WIDTH,
@@ -309,7 +308,6 @@ pub(super) struct HeaderInput {
     /// The "…" entries; `None` while the detail is read (the button is
     /// shown, not active).
     menu: Option<Vec<MenuItem>>,
-    details_open: bool,
     /// The widest the title and the pill's label take ([`header_widths`]).
     widths: (f64, f64),
     send: Callback<Message>,
@@ -424,14 +422,12 @@ impl Component for Header {
                             .spacing(tokens::spacing::ROW_GAP)
                             .vertical_alignment(VerticalAlignment::Center)
                             .children((
+                                // Opens (or keeps) the Details tab; only the
+                                // pane's X closes the pane.
                                 m3::icon_button(palette)
-                                    .automation_name(if input.details_open {
-                                        "Hide details"
-                                    } else {
-                                        "Show details"
-                                    })
-                                    .on_click(context.message(Message::Shell(
-                                        ShellMsg::PanelToggled(Panel::Details),
+                                    .automation_name("Open details")
+                                    .on_click(context.message(Message::Monitor(
+                                        MonitorMsg::PanelChosen(Panel::Details),
                                     )))
                                     .content(m3::icon(m3::glyph::INFO)),
                                 menu,

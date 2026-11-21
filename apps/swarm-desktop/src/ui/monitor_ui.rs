@@ -24,6 +24,8 @@ pub(super) enum MonitorMsg {
     /// Show or hide Recently stopped.
     StoppedToggled,
     TechnicalToggled,
+    /// A pane tab or the header's details button: select that tab, never
+    /// close the pane.
     PanelChosen(Panel),
     /// The search field's text.
     SearchChanged(String),
@@ -53,6 +55,9 @@ pub(super) struct MonitorState {
     /// panel, and so its refresh, is closed).
     pub(super) sidebar_reading: bool,
 }
+
+/// Why the Details tab cannot open (its tooltip while disabled).
+const NO_DETAILS: &str = "Open a task, or choose an Agent in Monitor, to see its details";
 
 /// A group's tone in the Monitor's charts and list dots.
 fn group_tone(group: Group) -> StatusTone {
@@ -156,13 +161,35 @@ impl DesktopApp {
             MonitorMsg::TechnicalToggled => {
                 self.monitor.technical_open = !self.monitor.technical_open
             }
-            MonitorMsg::PanelChosen(panel) => {
-                if let Some(agent) = self.selected_agent_id() {
+            MonitorMsg::PanelChosen(panel) => self.choose_panel(panel, context),
+        }
+    }
+
+    /// Select a pane tab. Details shows the open task's Agent, else the one
+    /// chosen in the Monitor (without either it stays where it is); only
+    /// [`Self::close_panel`] closes the pane.
+    pub(super) fn choose_panel(&mut self, panel: Panel, context: &ComponentContext<Self>) {
+        match panel {
+            Panel::Details => {
+                if let Some(agent) = self.details_agent() {
                     self.show_details(&agent, context);
                 }
-                self.panel = panel;
             }
+            Panel::Monitor => {
+                if self.panel != Panel::Monitor {
+                    self.panel = Panel::Monitor;
+                    self.start_monitor(context);
+                }
+            }
+            Panel::Closed => {}
         }
+    }
+
+    /// The Agent the Details tab shows: the open task's, else the one
+    /// chosen in the Monitor.
+    fn details_agent(&self) -> Option<String> {
+        self.selected_agent_id()
+            .or_else(|| self.monitor.selected.clone())
     }
 
     /// Open the details of `agent` in the right panel.
@@ -284,20 +311,30 @@ impl DesktopApp {
             .into_iter()
             .map(|(label, panel)| {
                 let selected = self.panel == panel;
+                let enabled = panel != Panel::Details || self.details_agent().is_some();
+                let tab = m3::pane_tab(palette, selected)
+                    .is_enabled(enabled)
+                    .automation_name(if enabled {
+                        format!("Show {label}")
+                    } else {
+                        format!("Show {label}: {NO_DETAILS}")
+                    })
+                    .on_click(context.message(Message::Monitor(MonitorMsg::PanelChosen(panel))))
+                    .content(m3::pane_tab_label(label));
+                // WinUI shows no tooltip on a disabled control and does not
+                // hit-test it, so the reason sits on a hit-testable border
+                // behind it.
+                let tab: View = if enabled {
+                    tab
+                } else {
+                    Border::new()
+                        .background(Brush::Solid(Color::argb(0, 0, 0, 0)))
+                        .content(tab)
+                        .tooltip(NO_DETAILS)
+                };
                 // Keyed by its selection (k195 P2-5: the highlight follows
-                // the pane, however it opened).
-                KeyedView::new(
-                    format!("{label}:{selected}"),
-                    m3::pane_tab(palette, selected)
-                        .is_enabled(
-                            panel != Panel::Details
-                                || self.monitor.selected.is_some()
-                                || self.selected_agent_id().is_some(),
-                        )
-                        .automation_name(format!("Show {label}"))
-                        .on_click(context.message(Message::Monitor(MonitorMsg::PanelChosen(panel))))
-                        .content(m3::pane_tab_label(label)),
-                )
+                // the pane, however it opened) and by whether it can open.
+                KeyedView::new(format!("{label}:{selected}:{enabled}"), tab)
             })
             .collect();
         Grid::new()
