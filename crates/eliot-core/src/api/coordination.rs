@@ -952,8 +952,9 @@ pub fn claim_glob_matches(pattern: &str, path: &str) -> bool {
     claim_glob_matches_normalized(&pattern, &path)
 }
 
-/// `claim_glob_matches` for already-normalized inputs.
-fn claim_glob_matches_normalized(pattern: &str, path: &str) -> bool {
+/// `claim_glob_matches` for an already-normalized pattern and a canonical
+/// relative path (a Git path is used as is).
+pub fn claim_glob_matches_normalized(pattern: &str, path: &str) -> bool {
     if is_literal_glob(pattern) {
         return pattern == path;
     }

@@ -1228,6 +1228,34 @@ a new holder resolves the reservation to `unknown`; this is not cleanup proof.
 A persistence failure faults the Store and leaves the reservation unresolved; it
 never authorizes rerun. Neither a failed check nor a missing
 terminal fact authorizes replay: a refused or unknown round admits no send.
+
+**Change scope.** A Goal may declare `scope` (globs of the paths its work may change)
+and `check_inputs` (globs of the check's own inputs). Both use the claim glob syntax,
+relative to the Agent workspace, which must be its exact Git worktree root. With
+either one, `goal set` records the starting point before the Store write: HEAD and a
+content digest of every path that already differs from it (index, worktree and
+untracked files; ignored files excluded; renames as both paths). More than 512 such
+paths are refused rather than recorded incompletely. A changed submodule refuses the
+starting point, or leaves a round's change set unverified, rather than hiding edits. Files named by the check argv
+inside the workspace join the check inputs. An exact retry is answered from the
+retained result before the workspace is read again. Each round, before the check, the
+daemon compares the workspace with that starting point. The Goal's work is the paths
+committed since the starting HEAD, the paths changed now, and every pre-existing change
+whose content moved; a pre-existing change left unchanged and uncommitted is not the
+Goal's work. A change outside `scope` blocks the round as `scope_violation` without
+running the check or admitting a continuation. A passing check is measured again, so
+files a check writes count too; they belong in `scope` or in Git ignore rules. The pass
+completes only when that change set is verified, stays inside `scope` and leaves every
+check input untouched. Otherwise it blocks as `scope_violation`, as `checker_changed`
+with the changed inputs listed, or as `scope_unverified` with the reason, so the Owner
+reviews it separately. The observation lists at most 20 paths. A
+failing check continues as before. Its continuation repeats the `scope` line, so the
+limit survives every round. Swarm never reverts, resets or deletes anything for a
+scope finding. Pause and resume keep the starting point. A blocked Goal continues only
+through a new `set` after the Owner reviews the finding; that `set` records a new one.
+`goal show` reports the starting HEAD, the number of pre-existing changes and the
+argv-named check files.
+
 `goal show` reports the exact status, counters (with a live turn count),
 budgets, limits and the unresolved round marker if any; cost stays
 `unsupported` until a usage source exists.

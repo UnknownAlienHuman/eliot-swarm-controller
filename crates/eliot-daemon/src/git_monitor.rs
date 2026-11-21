@@ -47,6 +47,21 @@ const STATUS_ARGS: &[&str] = &[
     "--renames",
 ];
 const INDEX_ARGS: &[&str] = &["ls-files", "--stage", "-v", "-z"];
+/// A Goal's change scope lists a rename as both of its paths. A changed
+/// submodule is reported, so its record makes the change set unverified
+/// instead of hiding edits inside it.
+const SCOPE_STATUS_ARGS: &[&str] = &[
+    "status",
+    "--porcelain=v2",
+    "--branch",
+    "-z",
+    "--untracked-files=all",
+    "--ignore-submodules=none",
+    "--no-ahead-behind",
+    "--no-renames",
+];
+/// Most bytes read to digest the paths one scope comparison names.
+const SCOPE_READ_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone)]
 pub(crate) struct GitProbe {
@@ -62,6 +77,14 @@ pub(crate) struct Captured {
 pub(crate) struct GitBinding<'a> {
     pub git_dir: &'a Path,
     pub common_dir: &'a Path,
+}
+
+/// HEAD and the paths that differ from it (index, worktree and untracked
+/// files; ignored files excluded), for a Goal's change scope.
+pub(crate) struct ScopeState {
+    pub root: PathBuf,
+    pub head: Option<String>,
+    pub changed: BTreeSet<String>,
 }
 
 struct Status {
@@ -115,23 +138,7 @@ impl GitProbe {
             .ok_or_else(|| unavailable("workspace is not UTF-8"))?;
         let deadline = Instant::now() + PROBE_TIME;
         let overrides = self.safe_overrides(&root, deadline).await?;
-        let top = self
-            .checked(
-                &root,
-                &["rev-parse", "--path-format=absolute", "--show-toplevel"],
-                &overrides,
-                &[],
-                deadline,
-            )
-            .await?;
-        let top = std::str::from_utf8(&top).map_err(|_| unavailable("Git root is not UTF-8"))?;
-        // rev-parse adds exactly one record terminator; do not trim valid spaces.
-        let top = top
-            .strip_suffix('\n')
-            .ok_or_else(|| unavailable("Git root omitted its terminator"))?;
-        if canonical_root(top)? != root {
-            return Err(unavailable("workspace must be the exact Git worktree root"));
-        }
+        self.require_exact_root(&root, &overrides, deadline).await?;
 
         let index_bytes = self
             .checked(&root, INDEX_ARGS, &overrides, &[], deadline)
@@ -810,6 +817,75 @@ impl GitProbe {
             dirty_digest: Some(dirty_digest),
             has_changes: files_changed > 0 || !dirty.is_empty(),
         })
+    }
+
+    async fn require_exact_root(
+        &self,
+        root: &Path,
+        overrides: &[(String, String)],
+        deadline: Instant,
+    ) -> Result<()> {
+        let top = self
+            .checked(
+                root,
+                &["rev-parse", "--path-format=absolute", "--show-toplevel"],
+                overrides,
+                &[],
+                deadline,
+            )
+            .await?;
+        let top = std::str::from_utf8(&top).map_err(|_| unavailable("Git root is not UTF-8"))?;
+        // rev-parse adds exactly one record terminator; do not trim valid spaces.
+        let top = top
+            .strip_suffix('\n')
+            .ok_or_else(|| unavailable("Git root omitted its terminator"))?;
+        if canonical_root(top)? != root {
+            return Err(unavailable("workspace must be the exact Git worktree root"));
+        }
+        Ok(())
+    }
+
+    /// HEAD and the changed paths of a Goal's workspace.
+    pub(crate) async fn scope_state(&self, workspace: &str) -> Result<ScopeState> {
+        let root = canonical_root(workspace)?;
+        let deadline = Instant::now() + PROBE_TIME;
+        let overrides = self.safe_overrides(&root, deadline).await?;
+        self.require_exact_root(&root, &overrides, deadline).await?;
+        let status = parse_status(
+            &self
+                .checked(&root, SCOPE_STATUS_ARGS, &overrides, &[], deadline)
+                .await?,
+        )?;
+        let mut changed = BTreeSet::new();
+        for entry in status.dirty {
+            changed.extend(entry.original_path);
+            changed.insert(entry.path);
+        }
+        Ok(ScopeState {
+            root,
+            head: status.head,
+            changed,
+        })
+    }
+
+    /// Paths whose content differs between two commits of a Goal's workspace.
+    pub(crate) async fn scope_committed(
+        &self,
+        root: &Path,
+        base: &str,
+        head: &str,
+    ) -> Result<Vec<String>> {
+        let deadline = Instant::now() + PROBE_TIME;
+        let overrides = self.safe_overrides(root, deadline).await?;
+        match self
+            .committed_paths(root, Some(base), Some(head), &overrides, deadline)
+            .await?
+        {
+            (paths, true) => Ok(paths),
+            (_, false) => Err(unavailable(
+                "Git could not compare the starting commit with HEAD",
+            )),
+        }
     }
 
     /// Read actual workspace identity without masking it with frozen bindings.
@@ -1536,77 +1612,139 @@ fn dirty_worktree_digest(
         if let Some(orig) = &entry.original_path {
             hash_digest_part(&mut hasher, orig.as_bytes());
         }
-        let mut current = root.to_path_buf();
-        let parts: Vec<&str> = entry.path.split('/').collect();
-        let mut missing = false;
-        for (index, part) in parts.iter().enumerate() {
-            current.push(part);
-            let is_last = index + 1 == parts.len();
-            match fs::symlink_metadata(&current) {
-                Ok(meta) => {
-                    let link = meta.file_type().is_symlink() || is_reparse_point(&meta);
-                    if !is_last {
-                        if link || !meta.is_dir() {
-                            return Err("unavailable");
-                        }
-                        continue;
-                    }
-                    if link {
-                        let target = fs::read_link(&current).map_err(|_| "unavailable")?;
-                        hash_digest_part(&mut hasher, b"symlink");
-                        hash_digest_part(&mut hasher, target.to_string_lossy().as_bytes());
-                        if entry.status == "??" {
-                            untracked_lines.insert(entry.path.clone(), 0);
-                        }
-                    } else if meta.is_file() {
-                        let len = meta.len();
-                        if len > WORK_UNTRACKED_MAX_BYTES_PER_FILE
-                            || total_bytes.saturating_add(len) > WORK_UNTRACKED_MAX_TOTAL_BYTES
-                        {
-                            return Err("cap_exceeded");
-                        }
-                        let file = fs::File::open(&current).map_err(|_| "unavailable")?;
-                        let remaining = WORK_UNTRACKED_MAX_TOTAL_BYTES - total_bytes;
-                        let max_read = WORK_UNTRACKED_MAX_BYTES_PER_FILE.min(remaining);
-                        let mut bytes = Vec::with_capacity(len.min(max_read) as usize);
-                        file.take(max_read.saturating_add(1))
-                            .read_to_end(&mut bytes)
-                            .map_err(|_| "unavailable")?;
-                        if bytes.len() as u64 > max_read {
-                            return Err("cap_exceeded");
-                        }
-                        total_bytes = total_bytes.saturating_add(bytes.len() as u64);
-                        let content_hash = Sha256::digest(&bytes);
-                        hash_digest_part(&mut hasher, b"file");
-                        hash_digest_part(&mut hasher, &(bytes.len() as u64).to_le_bytes());
-                        hash_digest_part(&mut hasher, content_hash.as_slice());
-                        if entry.status == "??" {
-                            let lines = if bytes.contains(&0) {
-                                0
-                            } else {
-                                count_text_lines(&bytes)
-                            };
-                            untracked_lines.insert(entry.path.clone(), lines);
-                        }
-                    } else {
-                        hash_digest_part(&mut hasher, b"other");
-                        if entry.status == "??" {
-                            untracked_lines.insert(entry.path.clone(), 0);
-                        }
-                    }
+        match read_path_content(
+            root,
+            &entry.path,
+            WORK_UNTRACKED_MAX_BYTES_PER_FILE,
+            WORK_UNTRACKED_MAX_TOTAL_BYTES,
+            &mut total_bytes,
+        )? {
+            PathContent::Link(target) => {
+                hash_digest_part(&mut hasher, b"symlink");
+                hash_digest_part(&mut hasher, target.to_string_lossy().as_bytes());
+                if entry.status == "??" {
+                    untracked_lines.insert(entry.path.clone(), 0);
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    missing = true;
-                    break;
-                }
-                Err(_) => return Err("unavailable"),
             }
-        }
-        if missing {
-            hash_digest_part(&mut hasher, b"missing");
+            PathContent::File(bytes) => {
+                let content_hash = Sha256::digest(&bytes);
+                hash_digest_part(&mut hasher, b"file");
+                hash_digest_part(&mut hasher, &(bytes.len() as u64).to_le_bytes());
+                hash_digest_part(&mut hasher, content_hash.as_slice());
+                if entry.status == "??" {
+                    let lines = if bytes.contains(&0) {
+                        0
+                    } else {
+                        count_text_lines(&bytes)
+                    };
+                    untracked_lines.insert(entry.path.clone(), lines);
+                }
+            }
+            PathContent::Other => {
+                hash_digest_part(&mut hasher, b"other");
+                if entry.status == "??" {
+                    untracked_lines.insert(entry.path.clone(), 0);
+                }
+            }
+            PathContent::Missing => hash_digest_part(&mut hasher, b"missing"),
         }
     }
     Ok((hex_digest(hasher.finalize().as_slice()), untracked_lines))
+}
+
+/// Content of one Git path under `root`, read without following a link or
+/// non-directory among its parents.
+enum PathContent {
+    Missing,
+    Link(PathBuf),
+    File(Vec<u8>),
+    Other,
+}
+
+fn read_path_content(
+    root: &Path,
+    path: &str,
+    max_file_bytes: u64,
+    max_total_bytes: u64,
+    total_bytes: &mut u64,
+) -> std::result::Result<PathContent, &'static str> {
+    let mut current = root.to_path_buf();
+    let parts: Vec<&str> = path.split('/').collect();
+    for (index, part) in parts.iter().enumerate() {
+        current.push(part);
+        let meta = match fs::symlink_metadata(&current) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(PathContent::Missing);
+            }
+            Err(_) => return Err("unavailable"),
+        };
+        let link = meta.file_type().is_symlink() || is_reparse_point(&meta);
+        if index + 1 < parts.len() {
+            if link || !meta.is_dir() {
+                return Err("unavailable");
+            }
+            continue;
+        }
+        if link {
+            return fs::read_link(&current)
+                .map(PathContent::Link)
+                .map_err(|_| "unavailable");
+        }
+        if !meta.is_file() {
+            return Ok(PathContent::Other);
+        }
+        let len = meta.len();
+        if len > max_file_bytes || total_bytes.saturating_add(len) > max_total_bytes {
+            return Err("cap_exceeded");
+        }
+        let file = fs::File::open(&current).map_err(|_| "unavailable")?;
+        let max_read = max_file_bytes.min(max_total_bytes - *total_bytes);
+        let mut bytes = Vec::with_capacity(len.min(max_read) as usize);
+        file.take(max_read.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|_| "unavailable")?;
+        if bytes.len() as u64 > max_read {
+            return Err("cap_exceeded");
+        }
+        *total_bytes = total_bytes.saturating_add(bytes.len() as u64);
+        return Ok(PathContent::File(bytes));
+    }
+    Err("unavailable")
+}
+
+/// Content digest of each path for a Goal's change scope: the file bytes,
+/// the link target, `other` or `missing`. Equal digests mean equal content.
+pub(crate) fn scope_digests<'a>(
+    root: &Path,
+    paths: impl IntoIterator<Item = &'a str>,
+) -> Result<BTreeMap<String, String>> {
+    let mut total_bytes = 0_u64;
+    let mut digests = BTreeMap::new();
+    for path in paths {
+        let path = git_path(path)?;
+        let digest = match read_path_content(
+            root,
+            &path,
+            SCOPE_READ_MAX_BYTES,
+            SCOPE_READ_MAX_BYTES,
+            &mut total_bytes,
+        )
+        .map_err(|reason| unavailable(&format!("scope content read failed: {reason}")))?
+        {
+            PathContent::Missing => "missing".to_owned(),
+            PathContent::Other => "other".to_owned(),
+            PathContent::Link(target) => format!(
+                "link:{}",
+                &hex_digest(&Sha256::digest(target.to_string_lossy().as_bytes()))[..32]
+            ),
+            PathContent::File(bytes) => {
+                format!("file:{}", &hex_digest(&Sha256::digest(&bytes))[..32])
+            }
+        };
+        digests.insert(path, digest);
+    }
+    Ok(digests)
 }
 
 fn count_text_lines(bytes: &[u8]) -> u64 {

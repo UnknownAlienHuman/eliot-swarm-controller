@@ -4,8 +4,9 @@
 //! harness plugins expose no Goal protocol. Cost limits are detected the same
 //! way: no usage source exists yet.
 
-use crate::{Error, Result, limits::MAX_TEXT_BYTES};
+use crate::{Error, Result, api::coordination::normalize_claim_glob, limits::MAX_TEXT_BYTES};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Longest retained check-output snippet in a Goal view.
 pub const MAX_GOAL_OBSERVATION_BYTES: usize = 4 * 1024;
@@ -27,6 +28,11 @@ pub const MIN_GOAL_CADENCE_MS: i64 = 60_000;
 pub const MAX_GOAL_CADENCE_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 /// Reported while no usage source exists.
 pub const GOAL_COST_UNSUPPORTED: &str = "unsupported (no usage source)";
+/// Most `scope` or `check_inputs` globs of one Goal.
+pub const MAX_GOAL_SCOPE_GLOBS: usize = 32;
+/// Most paths already changed when a scoped Goal is set; a larger starting
+/// change set is refused rather than recorded incompletely.
+pub const MAX_GOAL_SCOPE_BASE_PATHS: usize = 512;
 
 #[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -118,6 +124,8 @@ impl AssignmentGoal {
             max_rounds: self.max_rounds,
             max_without_progress: self.max_without_progress,
             cadence_ms: None,
+            scope: Vec::new(),
+            check_inputs: Vec::new(),
         }
     }
 
@@ -150,6 +158,16 @@ pub struct GoalDefinition {
     /// time slots instead of idle events; without one rounds name idle seqs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cadence_ms: Option<i64>,
+    /// Paths the Goal's work may change: project-relative globs (`/`, `*`,
+    /// `**`, `?`) under the workspace's Git root. With it Swarm records the
+    /// starting point at `set` and blocks the Goal on any change outside.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scope: Vec<String>,
+    /// The check's own inputs, as the same globs. A passing check after one
+    /// of them changed is not accepted as completion: the Goal blocks for a
+    /// separate review. Workspace files named by the check argv are added.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub check_inputs: Vec<String>,
 }
 
 fn default_check_timeout() -> i64 {
@@ -215,7 +233,30 @@ impl GoalDefinition {
                 "goal cadence must be between 1 minute and 7 days in milliseconds",
             ));
         }
+        for (name, globs) in [("scope", &self.scope), ("check_inputs", &self.check_inputs)] {
+            if globs.len() > MAX_GOAL_SCOPE_GLOBS {
+                return Err(Error::new(
+                    "invalid",
+                    format!("goal {name} takes at most {MAX_GOAL_SCOPE_GLOBS} globs"),
+                ));
+            }
+            for glob in globs {
+                normalize_claim_glob(glob).map_err(|_| {
+                    Error::new(
+                        "invalid",
+                        format!(
+                            "goal {name} globs are project-relative with / separators and *, ** and ? only"
+                        ),
+                    )
+                })?;
+            }
+        }
         Ok(())
+    }
+
+    /// Whether Swarm records a starting point and checks the change scope.
+    pub fn tracks_changes(&self) -> bool {
+        !self.scope.is_empty() || !self.check_inputs.is_empty()
     }
 
     /// Automatic `on_idle` driving needs a bound: a Goal without a cadence
@@ -281,6 +322,46 @@ impl GoalCounters {
         }
         Ok(())
     }
+}
+
+/// Starting point Swarm records at `set` for a Goal with `scope` or
+/// `check_inputs`. Paths are relative to the Git root `root`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalScopeBase {
+    pub root: String,
+    /// HEAD at set; absent on an unborn branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
+    /// Content digest of each path that already differed from HEAD at set.
+    /// That content is the starting point, not the Goal's work.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub changed: BTreeMap<String, String>,
+    /// Workspace files named by the check argv; they count as check inputs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub check_files: Vec<String>,
+}
+
+impl GoalScopeBase {
+    pub fn start(&self) -> GoalScopeStart {
+        GoalScopeStart {
+            head: self.head.clone(),
+            changed_paths: self.changed.len(),
+            check_files: self.check_files.clone(),
+        }
+    }
+}
+
+/// What a Goal view shows of its recorded starting point, so a manager can
+/// compare the final change with it.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GoalScopeStart {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
+    /// Paths already changed at set (their content then is not the Goal's work).
+    pub changed_paths: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub check_files: Vec<String>,
 }
 
 /// Durable single-flight marker for one round: `running` while its check
@@ -363,6 +444,9 @@ pub struct GoalView {
     pub blocked_reason: Option<String>,
     pub definition: GoalDefinition,
     pub counters: GoalCounters,
+    /// Starting point of a Goal with `scope` or `check_inputs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_start: Option<GoalScopeStart>,
     pub cost_status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_round_key: Option<String>,

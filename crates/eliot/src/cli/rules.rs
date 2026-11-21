@@ -258,6 +258,8 @@ pub(crate) async fn run_goal(
             max_rounds,
             max_without_progress,
             cadence_ms,
+            scope,
+            check_inputs,
         }) => {
             let request = GoalSetRequest {
                 id: mutation_id(id)?,
@@ -272,6 +274,8 @@ pub(crate) async fn run_goal(
                     max_rounds,
                     max_without_progress,
                     cadence_ms,
+                    scope,
+                    check_inputs,
                 },
                 max_cost: None,
             };

@@ -51,10 +51,12 @@ engine, second scheduler or critic loop.
       result, required reading, write area, explicit limits and the check; named
       sources are delivered with path and version or their absence is explicit;
       limits survive handoff and continuation.
-- [ ] **A3 Change scope and checker trust.** The manager compares the final
-      change with the task's starting point and allowed paths; a trusted
-      check-wrapper can report a scope violation that blocks the ordinary
-      continuation; changes to the checker's own inputs are reviewed separately.
+- [x] **A3 Change scope and checker trust.** A Goal's `scope` and
+      `check_inputs` get a starting point at `set`; each round the daemon,
+      outside the writable checkout, compares the change with it. A change
+      outside `scope` blocks without a check or continuation; a pass after a
+      check input changed, or with the change set unverified, blocks for a
+      separate review instead of completing.
 - [x] **A4 Assignment owns completion.** A brief-queue assignment declares one
       turn or Goal-owned work before dispatch; Goal-owned work retires on the
       Goal's terminal state, not on the first `turn.completed`.

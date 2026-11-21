@@ -28,6 +28,8 @@ pub struct GoalRoundProbe {
     /// spent-budget round still run its final check.
     pub spent_by_goal_continuation: bool,
     pub workspace: Option<String>,
+    /// Starting point of a Goal with `scope` or `check_inputs`.
+    pub scope_base: Option<core::api::GoalScopeBase>,
 }
 
 /// Definite check result. Unknown check outcomes never reach the commit.
@@ -77,6 +79,14 @@ impl GoalRoundKey {
 /// Binding check inside an open Immediate transaction. Returns Some(view)
 /// when this exact write id is an exact replay; the caller commits and
 /// returns it without touching Goal state. Returns None for a fresh id.
+fn goal_set_digest(agent: &str, mode: &str, definition: &GoalDefinition) -> Result<Vec<u8>> {
+    canonical::digest(&json!({
+        "agent": agent,
+        "mode": mode,
+        "definition": definition,
+    }))
+}
+
 fn replay_goal_write<T: serde::de::DeserializeOwned>(
     tx: &Transaction<'_>,
     id: &str,
@@ -150,7 +160,12 @@ pub struct GoalRoundCommit {
     /// key itself instead.
     pub claim_seq: i64,
     pub check: Option<GoalCheckResult>,
+    /// A block the Router decided for this round. With a check result it
+    /// overrides that result (a scope finding after the check); without one
+    /// the round blocks before any check.
     pub blocked_reason: Option<String>,
+    /// Bounded observation of a block decided without a check.
+    pub observation: Option<String>,
     pub continuation: Option<GoalContinuation>,
 }
 
@@ -407,6 +422,10 @@ struct GoalStatePersist {
     /// assignment's completion rule retires exactly that Agent generation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     assignment_cause: Option<core::EventCause>,
+    /// Starting point of a Goal with `scope` or `check_inputs`, recorded by
+    /// the Router at `set` and kept until the next `set`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scope_base: Option<core::api::GoalScopeBase>,
 }
 
 struct GoalRow {
@@ -577,6 +596,7 @@ pub(super) fn transfer_goal_tx(
 }
 
 impl Store {
+    #[allow(clippy::too_many_arguments)]
     pub fn goal_set(
         &mut self,
         agent: &str,
@@ -584,13 +604,35 @@ impl Store {
         id: &str,
         principal: &str,
         definition: &GoalDefinition,
+        scope_base: Option<core::api::GoalScopeBase>,
         now: i64,
     ) -> Result<GoalView> {
         self.ensure_writer_healthy()?;
         definition.validate()?;
-        let result = self.goal_set_inner(agent, mode, id, principal, definition, now);
+        if definition.tracks_changes() != scope_base.is_some() {
+            return Err(Error::new(
+                "internal",
+                "a Goal tracks changes exactly when its starting point is recorded",
+            ));
+        }
+        let result = self.goal_set_inner(agent, mode, id, principal, definition, scope_base, now);
         self.fault_on_persistence_error(&result);
         result
+    }
+
+    /// The retained result of an earlier `goal.set` with this id, so a retry
+    /// is answered before the Router reads the workspace again.
+    pub fn goal_set_replay(
+        &mut self,
+        agent: &str,
+        mode: &str,
+        id: &str,
+        principal: &str,
+        definition: &GoalDefinition,
+    ) -> Result<Option<GoalView>> {
+        let payload_digest = goal_set_digest(agent, mode, definition)?;
+        let tx = self.connection.transaction().map_err(sql_error)?;
+        replay_goal_write(&tx, id, principal, "goal.set", &payload_digest)
     }
 
     pub fn goal_get(&self, agent: &str, mode: &str) -> Result<Option<GoalView>> {
@@ -814,8 +856,10 @@ impl Store {
             row.state.last_continuation_command_id.as_deref(),
             turn_count.saturating_add(row.state.transferred_turns),
         )?;
+        let scope_base = row.state.scope_base.clone();
         let view = self.goal_view(row)?;
         let probe = GoalRoundProbe {
+            scope_base,
             agent_state: agent_row.state,
             active_turn: agent_row.active_turn.clone(),
             pending_count: agent_row.pending.len(),
@@ -981,6 +1025,7 @@ impl Store {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn goal_set_inner(
         &mut self,
         agent: &str,
@@ -988,15 +1033,12 @@ impl Store {
         id: &str,
         principal: &str,
         definition: &GoalDefinition,
+        scope_base: Option<core::api::GoalScopeBase>,
         now: i64,
     ) -> Result<GoalView> {
         require_eliot_mode(mode)?;
         definition.require_auto_bound()?;
-        let payload_digest = canonical::digest(&json!({
-            "agent": agent,
-            "mode": mode,
-            "definition": definition,
-        }))?;
+        let payload_digest = goal_set_digest(agent, mode, definition)?;
         let goal_holder = self.goal_holder.clone();
         let tx = self
             .connection
@@ -1048,6 +1090,7 @@ impl Store {
                 last_committed_slot: None,
                 last_continuation_command_id: None,
                 assignment_cause: row.state.assignment_cause.clone(),
+                scope_base: scope_base.clone(),
             };
             db!(tx.execute(
                 "UPDATE goals SET generation = ?1, revision = ?2, definition = ?3,
@@ -1083,6 +1126,7 @@ impl Store {
             last_committed_slot: None,
             last_continuation_command_id: None,
             assignment_cause: None,
+            scope_base: scope_base.clone(),
         };
         db!(tx.execute(
             "INSERT INTO goals(agent, mode, generation, revision, definition,
@@ -1212,6 +1256,7 @@ impl Store {
                 last_committed_slot: row.state.last_committed_slot,
                 last_continuation_command_id: None,
                 assignment_cause: row.state.assignment_cause.clone(),
+                scope_base: row.state.scope_base.clone(),
             };
             update_goal_state_tx(&tx, agent_num, mode, row.revision, &state, now)?;
             let updated = load_goal_row(&tx, agent_num, mode)?
@@ -1326,6 +1371,7 @@ impl Store {
             last_committed_slot: row.state.last_committed_slot,
             last_continuation_command_id: row.state.last_continuation_command_id.clone(),
             assignment_cause: row.state.assignment_cause.clone(),
+            scope_base: row.state.scope_base.clone(),
         };
         update_goal_state_tx(&tx, agent_num, &row.mode, row.revision, &state, now)?;
         commit_transaction(tx, &self.write_faulted)?;
@@ -1383,6 +1429,7 @@ impl Store {
                     last_committed_slot: row.state.last_committed_slot,
                     last_continuation_command_id: row.state.last_continuation_command_id.clone(),
                     assignment_cause: row.state.assignment_cause.clone(),
+                    scope_base: row.state.scope_base.clone(),
                 };
                 update_goal_state_tx(&tx, agent_num, mode, row.revision, &state, now)?;
                 commit_transaction(tx, &self.write_faulted)?;
@@ -1595,10 +1642,18 @@ impl Store {
                 "goal continuation requires a check result",
             ));
         }
-        if commit.check.is_some() && commit.blocked_reason.is_some() {
+        // A checked round decides its own block, except the Router's scope
+        // finding on a passing check, which never carries a continuation.
+        if commit.blocked_reason.is_some()
+            && (commit.continuation.is_some()
+                || commit
+                    .check
+                    .as_ref()
+                    .is_some_and(|check| check.exit_code != Some(0)))
+        {
             return Err(Error::new(
                 "internal",
-                "checked goal rounds decide their own block",
+                "only a passing check may carry the Router's block, and no continuation",
             ));
         }
         if commit
@@ -1788,7 +1843,11 @@ impl Store {
                 }
                 counters.last_output_digest = Some(digest.clone());
             }
-            if check.exit_code == Some(0) {
+            if let Some(reason) = &commit.blocked_reason {
+                GoalCommitOutcome::Blocked {
+                    reason: reason.clone(),
+                }
+            } else if check.exit_code == Some(0) {
                 GoalCommitOutcome::Completed
             } else if let Some(reason) = goal_postcheck_block(&row.definition, &counters) {
                 GoalCommitOutcome::Blocked { reason }
@@ -1833,6 +1892,9 @@ impl Store {
                 ));
             }
         } else if let Some(reason) = &commit.blocked_reason {
+            if let Some(observation) = &commit.observation {
+                counters.last_observation = Some(observation.clone());
+            }
             GoalCommitOutcome::Blocked {
                 reason: reason.clone(),
             }
@@ -2194,6 +2256,11 @@ fn goal_view_on(connection: &Connection, goal_holder: &str, row: GoalRow) -> Res
         blocked_reason: row.state.blocked_reason,
         definition: row.definition,
         counters,
+        scope_start: row
+            .state
+            .scope_base
+            .as_ref()
+            .map(core::api::GoalScopeBase::start),
         cost_status: GOAL_COST_UNSUPPORTED.to_owned(),
         last_round_key: row.last_round_key,
         round_marker,
@@ -2610,6 +2677,7 @@ pub(super) fn install_assignment_goal_tx(
         last_committed_slot: None,
         last_continuation_command_id: None,
         assignment_cause: Some(cause),
+        scope_base: None,
     };
     db!(tx.execute(
         "INSERT INTO goals(agent, mode, generation, revision, definition,

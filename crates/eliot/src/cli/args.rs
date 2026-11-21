@@ -1388,6 +1388,14 @@ pub(crate) struct GoalSetArgs {
     /// time slots instead of idle events.
     #[arg(long, value_name = "MS")]
     pub(crate) cadence_ms: Option<i64>,
+    /// Path glob the Goal's work may change (repeatable); any other change
+    /// blocks the Goal.
+    #[arg(long = "scope", value_name = "GLOB")]
+    pub(crate) scope: Vec<String>,
+    /// Check input glob (repeatable); a passing check after one changed
+    /// blocks the Goal for review instead of completing it.
+    #[arg(long = "check-input", value_name = "GLOB")]
+    pub(crate) check_inputs: Vec<String>,
 }
 
 #[derive(Args)]
