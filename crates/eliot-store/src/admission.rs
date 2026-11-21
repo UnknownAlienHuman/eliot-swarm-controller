@@ -423,10 +423,14 @@ pub(super) fn admit_send_member(
         },
         json!({"command_id": request.id, "verb": "send"}),
     )?);
-    if let Some(event) = provider_holds::admit_send_tx(tx, agent, &request.id, request.probe, now)?
-    {
-        events.push(event);
-    }
+    events.extend(provider_holds::admit_send_tx(
+        tx,
+        agent,
+        &request.id,
+        request.probe,
+        None,
+        now,
+    )?);
     Ok(())
 }
 
@@ -826,6 +830,17 @@ fn admit_launch_tx(
         .get("chat")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let provider_probe_scope = request
+        .args
+        .get(core::PROVIDER_PROBE_LAUNCH_ARG)
+        .and_then(Value::as_str);
+    let provider_probe = provider_probe_scope.is_some();
+    if request.args.get(core::PROVIDER_PROBE_LAUNCH_ARG).is_some() && !provider_probe {
+        return Err(Error::new(
+            "invalid",
+            "provider probe launch marker must name its frozen provider scope",
+        ));
+    }
     let inherited_chat = parent_link.as_ref().is_some_and(|parent| parent.chat);
     // A switch that continues a projectless source keeps the blank source
     // namespace on B. Only the switch worker sets this flag after
@@ -1009,7 +1024,28 @@ fn admit_launch_tx(
     let agent_id = format_agent_id(agent_num);
     let agent = load_agent_by_num(tx, agent_num)?
         .ok_or_else(|| Error::new("internal", "new launch Agent disappeared"))?;
-    provider_holds::require_unheld_tx(tx, &agent)?;
+    if provider_probe {
+        let scope = core::frozen_provider_scope(&agent)?;
+        if principal != "owner"
+            || !chat
+            || parent_num.is_some()
+            || preparation.is_some()
+            || text.as_deref() != Some(core::PROVIDER_PROBE_PROMPT)
+            || provider_probe_scope != Some(scope.as_str())
+            || request
+                .args
+                .get("registered_project")
+                .is_some_and(|value| !value.is_null())
+        {
+            return Err(Error::new(
+                "not_allowed",
+                "provider probes require an isolated daemon-owned chat launch",
+            ));
+        }
+        provider_holds::require_automatic_probe_due_tx(tx, &agent, now)?;
+    } else {
+        provider_holds::require_unheld_tx(tx, &agent)?;
+    }
     if request
         .args
         .get(project_assignment::MANAGER_LAUNCH_ARG)
@@ -1064,9 +1100,26 @@ fn admit_launch_tx(
     )?);
 
     if let Some(text) = text {
-        let (linked_id, event) =
-            admit_linked_send(tx, principal, &request.id, agent_num, 1, &text, now)?;
+        let (linked_id, event) = admit_linked_send(
+            tx,
+            principal,
+            &request.id,
+            (agent_num, 1),
+            &text,
+            provider_probe,
+            now,
+        )?;
         events.push(event);
+        if provider_probe {
+            events.extend(provider_holds::admit_send_tx(
+                tx,
+                &agent,
+                &linked_id,
+                true,
+                Some(1),
+                now,
+            )?);
+        }
         Ok(Some(linked_id))
     } else {
         Ok(None)
@@ -1303,9 +1356,9 @@ fn admit_resume_tx(
             tx,
             principal,
             &request.id,
-            agent_num,
-            next_generation,
+            (agent_num, next_generation),
             &text,
+            false,
             now,
         )?;
         events.push(event);

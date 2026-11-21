@@ -731,6 +731,9 @@ The view calls use the Core view DTOs linked above. `daemon.status` is owner-onl
 and accepts an empty object. Its bounded blocker/command lists retain truncation flags;
 unknown commands remain unknown. Agent list observations appear only when requested.
 Absent source cursors and sequence/acknowledgement values remain null.
+When explicit Claude profile cmd paths no longer exist, status and doctor return
+`claude_profile_command_issues` with the configured path, discovered replacement
+path/version, and one-command repair when a replacement is installed.
 
 `daemon.status` also reports bounded, redacted runtime status for the two
 daemon-owned automation tasks (`rule_worker` and `goal_driver`) via Core
@@ -836,6 +839,10 @@ current wait reason for an active turn; Store clears that projection when native
 progress is newer than the hold's `updated_at`. Retry/reconnect notices are likewise
 omitted when the active turn has newer native progress. When idle, a failed provider
 notice is omitted after its matching hold is cleared; a new turn uses its own binding.
+`AgentProviderHold.retry_after` reports a known provider reset; `next_probe_at` reports
+the persisted automatic probe time when no reset is known; `held_since` preserves the
+start of the uninterrupted hold across retries. The status line shows the hold age and
+known reset or next probe without implying replay of an unknown native effect.
 `agent.list` resolves all distinct holds for the selected page in one indexed scope
 query and resolves native notices in one page-scoped query over the existing event
 index. `agent.get` uses the same projection for its single Agent. Neither read adds a
@@ -1325,6 +1332,11 @@ command.submit {id, verb:"launch",
         workspace, worktree?:BRANCH, base?:REF, parent?:AGENT, text?, sources?:[PATH]}}
 ```
 
+For Claude, omitted `cmd` or the selector `latest` chooses the newest discovered native
+installation, with versioned vendor roots considered before PATH. Admission freezes
+the selected executable path and reported version in the Agent snapshot. Another
+explicit path remains pinned.
+
 `sources` (launch and `send`, CLI `--source PATH`, at most 16 distinct paths) names
 files the Agent must read. Before admission the daemon reads each one from the launch
 workspace, or for `send` from the target Agent's workspace, and replaces `sources` with a
@@ -1683,25 +1695,41 @@ their field list.
 A provider scope comes from the frozen explicitly selected account, otherwise the
 exact profile; a shared adopted proxy is only a capacity scope, never a provider
 hold scope. Eliot never guesses a vendor account. A held scope rejects new launch/send before
-native I/O and is rechecked when queued work dispatches. Launch with linked input and
+native I/O and is rechecked when queued work dispatches. Bounded maintenance removes a
+rate-limit/quota hold at or after its known `retry_after` and publishes the automatic
+lift. Launch with linked input and
 resume with new text are gated as sends. Plain resume, reads, request replies, interrupt
 and stop remain available. At initial admission, `provider_held` rejects before binding
 and creates no command row; that ID may be submitted again after the hold is resolved.
 An already queued command that becomes held is rejected at dispatch under its existing
 binding, before native I/O.
 
-Only an explicit `send --probe` can claim an eligible rate-limit/quota hold. It uses the
-ordinary SEND authorization and target/scope/generation checks; it grants no owner
-authority and adds no role flag. The Store atomically allows one claim per frozen
-provider scope through the normal send path. Future bounded automation must use that
-same path, not a parallel probe executor. The flag defaults false and does not enter
-native input. Time makes a probe eligible but never clears a hold. A successful
-exact-bound terminal probe clears rate-limit/quota holds; failed or interrupted probes
-retain them, while unknown probes retain their claim across restart. Deleting an Agent
-whose probe command is settled releases that probe binding back to the conservative
-held restriction instead of dropping it. Auth and ModelRemoved
-holds require owner correction and are not probe-eligible. Provider restriction facts
-are defined in [monitoring](monitoring.md#provider-holds).
+An explicit `send --probe` can claim an eligible rate-limit/quota hold through ordinary
+SEND authorization and exact target/scope/generation checks. Daemon maintenance
+currently probes Codex profiles through the ordinary launch/SEND path for one fixed
+minimal request in a private chat with no project, registered worktree, or user task.
+Its frozen profile snapshot restricts permissions to read-only, disables approval and
+native subagents, selects minimal MCP with an empty allow list, and marks the internal
+probe mode. The Codex adapter skips the Swarm skill, shell/web/workspace instructions,
+and Agent credentials for that mode. Store atomically binds that linked SEND as the sole
+probe for its frozen provider scope before native spawn. The daemon-only outer launch
+marker carries the exact scope and is rejected on public submissions. Other adapters
+keep their holds and defer until they have a secure minimal probe path. The probe flag
+stays Store metadata; native input contains only the fixed minimal SEND text.
+
+A provider-supplied `retry_after` is a known reset: maintenance clears a held
+rate-limit/quota row at or after that timestamp and records the lift event. A hold with
+no reset persists `next_probe_at` and a completed-probe count, beginning at one minute
+and backing off to five and then thirty minutes. Each admitted probe and known terminal
+result is a provider event. A successful exact-turn native completion with no new
+restriction clears the hold; a known failure releases only the exact probe claim and
+schedules its next bounded attempt. Unknown command or turn outcomes keep the claim
+across restart and are never replayed. If a profile cannot be prepared for a safe
+minimal request, maintenance keeps the hold and backs off with a bounded defer event.
+Deleting an Agent whose explicit probe command is settled releases that probe binding
+back to the conservative held restriction instead of dropping it. Auth and
+ModelRemoved holds require owner correction and are not probe-eligible. Provider
+restriction facts are defined in [monitoring](monitoring.md#provider-holds).
 
 ## Handoff methods
 
@@ -1932,8 +1960,13 @@ restores revoked control; unknown blocks another takeover.
 `agent.discover` uses `AgentDiscoverRequest`/`DiscoverPage`; `agent.history` uses
 `AgentHistoryRequest`/`ObservationPage` from the canonical native metadata DTOs.
 `harness.list` (`HarnessListRequest`/`HarnessListResponse`, no params) reports
-per-harness installation facts (installed, resolved `cmd`, `--version`; Claude
-additionally reports every discovered install newest first in `candidates`).
+per-harness installation facts (`installed`, resolved `cmd`, and `--version`).
+For Claude, `candidates` contains every discovered install, with parseable
+numeric versions newest first and other entries following in discovery order.
+Candidate `version` retains the bounded raw first line when available, or is
+null when the probe is unavailable. Inventory presence does not make an
+executable eligible for automatic Claude selection; that requires a successful
+`--version` probe with a parseable numeric version.
 Inventory and native discovery run on the blocking pool. The
 `models.catalog` 90-second deadline covers the aggregate lock, inventory
 worker and per-harness reads. Expiry during a per-harness read can return a
@@ -2484,7 +2517,9 @@ current blockers snapshot, while open it reflects the current fleet.
 `blockers` and `drain`; `swarm status` prints the typed `DaemonStatusResponse`
 including `blockers`, `unsettled_commands`, `unknown_commands`, `drain` and
 the retention view (store sizes, configured windows or unbounded,
-`pruned_through`, and the unbounded-growth advisory when due).
+`pruned_through`, and the unbounded-growth advisory when due), and
+`claude_profile_command_issues` when an explicit Claude profile executable is
+missing.
 
 Local IPC accept failures are logged and retried with bounded backoff.
 During the delay, admitted work and existing connections continue, and the
@@ -2525,6 +2560,7 @@ swarm launch --profile P --workspace PATH [--worktree BRANCH [--base REF]] [--pa
 swarm launch --workspace PATH [PROMPT] [--wait] [--timeout-seconds N]
 swarm settings read
 swarm settings save FILE [--dry-run]
+swarm settings claude-cmd PROFILE (--cmd PATH|--latest)
 swarm worktree remove AGENT [--generation N]
 swarm ls | show A | watch [A|SELECTOR] [--after SEQ] | top
 swarm processes A [--scope agent|workspace] [--generation N] [--after CURSOR] [--limit N]

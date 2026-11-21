@@ -21,18 +21,25 @@ pub(crate) const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(3600);
 /// or a budget runs out.
 pub(crate) const RETENTION_TICK_ROW_BUDGET: i64 = 10_000;
 pub(crate) const RETENTION_TICK_TIME_BUDGET: Duration = Duration::from_secs(30);
+/// Known provider resets and due probes are serviced within one second.
+pub(crate) const PROVIDER_HOLD_INTERVAL: Duration = Duration::from_secs(1);
 
 pub(crate) async fn run(
     store: Arc<Mutex<Store>>,
     data_root: PathBuf,
     policy: Arc<SecretPolicy>,
     initial: config::DaemonConfig,
+    router: crate::router::Router,
     mut shutdown: watch::Receiver<bool>,
     reporter: WorkerReporter,
 ) -> Result<()> {
     let mut config = initial;
     let mut ticker = tokio::time::interval(MAINTENANCE_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut provider_ticker = tokio::time::interval(PROVIDER_HOLD_INTERVAL);
+    provider_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut provider_probe_tasks = tokio::task::JoinSet::new();
+    router.recover_ended_provider_probes(&shutdown).await?;
     // Skip the immediate first tick: maintenance runs on the interval, not at
     // startup.
     ticker.tick().await;
@@ -40,15 +47,51 @@ pub(crate) async fn run(
     loop {
         tokio::select! {
             _ = ticker.tick() => {}
+            _ = provider_ticker.tick() => {
+                let available = eliot_store::PROVIDER_PROBE_BATCH_LIMIT
+                    .saturating_sub(provider_probe_tasks.len());
+                match router.maintain_provider_holds(available).await {
+                    Ok(work) => {
+                        for work in work {
+                            let probe_router = router.clone();
+                            let probe_shutdown = shutdown.clone();
+                            provider_probe_tasks.spawn(async move {
+                                probe_router.finish_provider_probe(work, probe_shutdown).await
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        logging::record(&policy, "daemon.provider_hold_maintenance_failed", &[], Some(&error));
+                    }
+                }
+                continue;
+            }
+            joined = provider_probe_tasks.join_next(), if !provider_probe_tasks.is_empty() => {
+                match joined {
+                    Some(Ok(Err(error))) => {
+                        logging::record(&policy, "daemon.provider_probe_cleanup_failed", &[], Some(&error));
+                    }
+                    Some(Err(_)) => {
+                        logging::record(&policy, "daemon.provider_probe_cleanup_task_failed", &[], None);
+                    }
+                    _ => {}
+                }
+                continue;
+            }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
+                    while let Some(joined) = provider_probe_tasks.join_next().await {
+                        if let Ok(Err(error)) = joined {
+                            logging::record(&policy, "daemon.provider_probe_cleanup_failed", &[], Some(&error));
+                        }
+                    }
                     return Ok(());
                 }
                 continue;
             }
         }
         if *shutdown.borrow() {
-            return Ok(());
+            continue;
         }
         match config::load_daemon_config(&data_root) {
             Ok(reloaded) => config = reloaded,

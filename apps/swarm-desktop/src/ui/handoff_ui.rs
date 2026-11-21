@@ -609,10 +609,10 @@ impl DesktopApp {
                 match &submitted {
                     Submitted::Handoff(request) => client::handoff(&data_dir, request)
                         .await
-                        .map(Outcome::Handoff),
+                        .map(|reply| Outcome::Handoff(Box::new(reply))),
                     Submitted::Switch(request) => client::switch(&data_dir, request)
                         .await
-                        .map(Outcome::Switch),
+                        .map(|reply| Outcome::Switch(Box::new(reply))),
                 }
             });
             Message::Handoff(HandoffMsg::Replied(epoch, settles, id, Box::new(reply)))

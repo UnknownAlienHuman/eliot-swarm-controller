@@ -422,6 +422,9 @@ impl HarnessDoctorRequest {
                 return Err(Error::new("invalid", "doctor harnesses repeat"));
             }
         }
+        crate::api::harness::validate_claude_profile_command_issues(
+            &reply.claude_profile_command_issues,
+        )?;
         Ok(())
     }
 }
@@ -430,6 +433,8 @@ impl HarnessDoctorRequest {
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HarnessDoctorResponse {
     pub harnesses: Vec<DoctorHarnessEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claude_profile_command_issues: Vec<crate::api::harness::ClaudeProfileCommandIssue>,
 }
 
 /// Bounded per-Agent work summary covering Git progress versus frozen `base_oid`

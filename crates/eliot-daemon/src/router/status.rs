@@ -15,17 +15,25 @@ use std::collections::HashSet;
 
 impl Router {
     pub(super) async fn status(&self) -> Result<Value> {
+        let claude_profile_command_issues = self.claude_profile_command_issues(None).await;
         let blockers = self.status_blockers().await?;
         let drain = self.drain_report().await?;
         let retention = Some(self.retention_view().await?);
         let mode = self.mode_name();
-        let (agent_count, write_faulted, unsettled_commands, unsettled_total) = {
+        let (
+            agent_count,
+            write_faulted,
+            unsettled_commands,
+            unsettled_total,
+            provider_probe_attention,
+        ) = {
             let store = self.inner.store.lock().await;
             (
                 store.agent_count()?,
                 store.is_write_faulted(),
                 store.list_unsettled_commands(STATUS_BLOCKER_MAX)?,
                 store.count_unsettled_commands()?,
+                store.provider_probe_attention(STATUS_BLOCKER_MAX)?,
             )
         };
         let mut unknown_commands = self.unknown_ids();
@@ -64,6 +72,7 @@ impl Router {
             (status.markers.clone(), status.truncated)
         };
         serde_json::to_value(DaemonStatusResponse {
+            provider_probe_attention,
             state: if mode == "open" { "running" } else { mode }.to_owned(),
             admission: mode.to_owned(),
             agents: usize::try_from(agent_count)
@@ -72,6 +81,7 @@ impl Router {
             owned_plugins: self.inner.plugin_host.live_count(),
             observer_readers: self.inner.plugin_host.observer_count(),
             discovery_readers: self.inner.plugin_host.reader_count(),
+            claude_profile_command_issues,
             workspace_custody,
             workspace_recovery_error: self.inner.workspace_recovery_error.lock_recover().clone(),
             cloud_mcp: crate::cloud_mcp::service_snapshot(),

@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 70;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 73;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -1639,6 +1639,78 @@ impl Store {
                  INSERT INTO schema_migrations(version) VALUES (70);",
             )
             .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 71 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE provider_holds ADD COLUMN next_probe_at INTEGER
+                     CHECK(next_probe_at IS NULL OR next_probe_at >= 0);
+                 ALTER TABLE provider_holds ADD COLUMN probe_attempts INTEGER NOT NULL DEFAULT 0
+                     CHECK(probe_attempts >= 0);
+                 ALTER TABLE provider_holds ADD COLUMN probe_profile TEXT
+                     CHECK(probe_profile IS NULL OR length(probe_profile) > 0);
+                 UPDATE provider_holds
+                 SET probe_profile = CASE
+                         WHEN scope LIKE 'profile:%' THEN substr(scope, 9)
+                         ELSE (SELECT a.profile FROM agents AS a
+                               WHERE CASE
+                                   WHEN json_type(a.profile_snapshot, '$.account') = 'text'
+                                   THEN 'account:' || json_extract(a.profile_snapshot, '$.account')
+                                   ELSE 'profile:' || a.profile
+                               END = provider_holds.scope
+                               ORDER BY a.updated_at DESC, a.id DESC LIMIT 1)
+                     END,
+                     next_probe_at = CASE
+                         WHEN kind IN ('rate_limit','quota') AND retry_after IS NULL
+                              AND state = 'held'
+                         THEN updated_at + 60000 ELSE NULL
+                     END;
+                 CREATE INDEX provider_holds_probe_due ON provider_holds(next_probe_at, scope)
+                     WHERE next_probe_at IS NOT NULL;
+                 CREATE INDEX provider_holds_reset_due ON provider_holds(retry_after, scope)
+                     WHERE retry_after IS NOT NULL AND state = 'held'
+                       AND kind IN ('rate_limit','quota');
+                 INSERT INTO schema_migrations(version) VALUES (71);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 72 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE provider_holds ADD COLUMN held_since INTEGER NOT NULL DEFAULT 0
+                     CHECK(held_since >= 0);
+                 UPDATE provider_holds SET held_since = updated_at;
+                 INSERT INTO schema_migrations(version) VALUES (72);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 73 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let limit = core::MAX_AUTOMATIC_PROVIDER_PROBES;
+            // Old retry counters include pre-admission deferrals. Charge them
+            // conservatively rather than grant a fresh budget on upgrade.
+            tx.execute_batch(&format!(
+                "ALTER TABLE provider_holds ADD COLUMN automatic_probes INTEGER NOT NULL DEFAULT 0
+                     CHECK(automatic_probes BETWEEN 0 AND {limit});
+                 ALTER TABLE provider_holds ADD COLUMN probe_outcome_unknown INTEGER NOT NULL DEFAULT 0
+                     CHECK(probe_outcome_unknown IN (0,1));
+                 UPDATE provider_holds
+                 SET automatic_probes = MIN({limit}, probe_attempts + CASE WHEN state='probing' THEN 1 ELSE 0 END),
+                     next_probe_at = CASE WHEN probe_attempts >= {limit} THEN NULL ELSE next_probe_at END;
+                 INSERT INTO schema_migrations(version) VALUES (73);"
+            )).map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
         Ok(())

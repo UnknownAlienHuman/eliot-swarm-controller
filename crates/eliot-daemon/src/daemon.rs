@@ -567,6 +567,25 @@ async fn spawn_workers(
         goal_factory,
     ));
 
+    let switch_router = router.clone();
+    let switch_reporter = worker_reporter.clone();
+    workers.spawn(crate::daemon::workers::supervise(
+        "provider_switch",
+        worker_reporter.clone(),
+        worker_stop.subscribe(),
+        move |shutdown| {
+            let router = switch_router.clone();
+            let events = router.subscribe_rule_events();
+            let reporter = switch_reporter.clone();
+            async move {
+                reporter.running("provider_switch");
+                let result = router.run_provider_switches(events, shutdown.clone()).await;
+                crate::daemon::workers::from_result(result, &shutdown)
+            }
+        },
+    ));
+
+    let maintenance_router = router.clone();
     let initial_maintenance_config = Arc::new(Mutex::new(Some(daemon_config)));
     let maintenance_store = Arc::clone(&store);
     let maintenance_root = data_dir.path().to_path_buf();
@@ -579,6 +598,7 @@ async fn spawn_workers(
         let policy = Arc::clone(&maintenance_policy);
         let reporter = maintenance_reporter.clone();
         let initial = Arc::clone(&maintenance_initial);
+        let router = maintenance_router.clone();
         async move {
             let config = match initial.lock().await.take() {
                 Some(config) => config,
@@ -587,9 +607,16 @@ async fn spawn_workers(
                     Err(error) => return crate::daemon::workers::WorkerOutcome::Failed(error),
                 },
             };
-            let result =
-                maintenance::run(store, data_root, policy, config, shutdown.clone(), reporter)
-                    .await;
+            let result = maintenance::run(
+                store,
+                data_root,
+                policy,
+                config,
+                router,
+                shutdown.clone(),
+                reporter,
+            )
+            .await;
             crate::daemon::workers::from_result(result, &shutdown)
         }
     };

@@ -871,6 +871,11 @@ for readback.
 
 The switch parent is Accepted at reservation and Dispatched while orchestrating.
 Applied means the H2 Store transfer committed, not that the brief/task succeeded.
+An opt-in [provider switch](configuration.md#routing-policy-s3) reserves the same
+operation in the exact failed turn's transaction. It rechecks the source again
+at successor launch admission and H2 transfer. The first H2 SEND carries the
+original task text after a confirmed pre-work refusal. Ordinary readiness,
+workspace, authority, claims, Goal and successor delivery rules still apply.
 Rejected means preparation/admission refused; Failed means a known launch or
 handoff refusal; Unknown retains an uncertain launch or interrupted orchestration.
 The result keeps the child IDs, created Agent/generation, launch state and

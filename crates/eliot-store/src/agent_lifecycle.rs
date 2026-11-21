@@ -147,13 +147,16 @@ fn current_agent_tree_tx(
         let detached_observer = row.observe_only
             && row.origin == core::AgentOrigin::External
             && row.state == AgentState::Unknown;
+        let probe_cleanup = archived.is_none() && row.is_automatic_provider_probe();
         let allowed = if archived.is_some() {
             matches!(
                 row.state,
                 AgentState::Idle | AgentState::Stopped | AgentState::Failed | AgentState::Lost
             ) || detached_observer
         } else {
-            matches!(row.state, AgentState::Stopped | AgentState::Failed) || detached_observer
+            matches!(row.state, AgentState::Stopped | AgentState::Failed)
+                || (probe_cleanup && row.state == AgentState::Lost)
+                || detached_observer
         };
         if !allowed {
             return Err(Error::new(
@@ -174,6 +177,16 @@ fn current_agent_tree_tx(
         if archived.is_none() {
             project_transfer::require_deletable(tx, &row)?;
             workspace::require_workspace_owner_deletable(tx, &row)?;
+        }
+        if probe_cleanup {
+            let bound: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM provider_holds h JOIN commands c ON c.id=h.probe_command
+                               WHERE c.target=?1)",
+                [num], |r| r.get(0),
+            ).map_err(sql_error)?;
+            if bound {
+                return Err(Error::new("busy", "provider probe hold is still bound"));
+            }
         }
         if let Some(turn) = row.active_turn.as_deref() {
             return Err(Error::new(
@@ -203,8 +216,9 @@ fn current_agent_tree_tx(
             .query_row(
                 "SELECT id,state,generation FROM commands WHERE target=?1
                AND (state IN ('accepted','queued','dispatched') OR (state='unknown' AND NOT ?2))
+                 AND NOT (?3 AND state='unknown' AND (verb IN ('launch','stop') OR (verb='send' AND probe=1)))
              ORDER BY created_at,id LIMIT 1",
-                params![num, keep_drained_unknowns],
+                params![num, keep_drained_unknowns, probe_cleanup],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()
@@ -222,10 +236,13 @@ fn current_agent_tree_tx(
         }
         let turn: Option<(String, String, i64)> = tx
             .query_row(
-                "SELECT turn_id,state,generation FROM turns WHERE agent=?1
-               AND (state='running' OR (state='unknown' AND NOT ?2))
-             ORDER BY generation,turn_id LIMIT 1",
-                params![num, keep_drained_unknowns],
+                "SELECT t.turn_id,t.state,t.generation FROM turns t WHERE t.agent=?1
+             AND (t.state='running' OR (t.state='unknown' AND NOT ?3))
+             AND NOT (?2 AND t.state='unknown' AND EXISTS(
+                 SELECT 1 FROM commands c WHERE c.target=t.agent AND c.generation=t.generation
+                   AND c.turn_id=t.turn_id AND c.verb='send' AND c.probe=1))
+             ORDER BY t.generation,t.turn_id LIMIT 1",
+                params![num, probe_cleanup, keep_drained_unknowns],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()
@@ -858,8 +875,8 @@ pub(crate) fn default_list_custody_agents(connection: &Connection) -> Result<Vec
 /// A settled managed workspace keeps its process source open until removal.
 /// Only delete preflight can defer that exact generation's source. Every
 /// live process remains a blocker, and record deletion requires closure.
-fn custody_blocker_tx(
-    tx: &Transaction<'_>,
+pub(super) fn custody_blocker_tx(
+    tx: &Connection,
     agent: i64,
     observers: bool,
     workspace_cleanup_generation: Option<i64>,

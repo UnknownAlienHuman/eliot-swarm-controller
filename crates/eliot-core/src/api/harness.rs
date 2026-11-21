@@ -117,9 +117,8 @@ pub struct HarnessEntry {
     /// Human-readable searched-locations detail when not installed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// Every discovered native install, newest first (currently Claude
-    /// only: PATH, standard locations and desktop-app bundles, each with
-    /// its own `--version`). Absent for other harnesses.
+    /// Every discovered Claude native install, newest first by its reported
+    /// version. Versioned vendor roots are considered before PATH. Absent for other harnesses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidates: Option<Vec<HarnessCandidate>>,
 }
@@ -132,6 +131,75 @@ pub struct HarnessCandidate {
     /// Bounded `<exe> --version` first line, or null when unavailable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+}
+
+/// Maximum missing Claude profile commands reported by one preflight read.
+pub const MAX_CLAUDE_PROFILE_COMMAND_ISSUES: usize = 256;
+
+/// A pinned Claude executable missing from disk, with the current replacement
+/// selected by the shared daemon discovery policy.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeProfileCommandIssue {
+    pub profile: String,
+    pub configured_cmd: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement_cmd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair_command: Option<String>,
+}
+
+impl ClaudeProfileCommandIssue {
+    pub fn validate(&self) -> Result<()> {
+        let bounded = |value: &str, max: usize| {
+            !value.trim().is_empty() && value.len() <= max && !value.chars().any(char::is_control)
+        };
+        if !bounded(&self.profile, 128)
+            || !bounded(&self.configured_cmd, 4096)
+            || self
+                .replacement_cmd
+                .as_ref()
+                .is_some_and(|value| !bounded(value, 4096))
+            || self
+                .replacement_version
+                .as_ref()
+                .is_some_and(|value| !bounded(value, 256))
+            || self
+                .repair_command
+                .as_ref()
+                .is_some_and(|value| !bounded(value, 8192))
+            || self.replacement_cmd.is_some() != self.repair_command.is_some()
+            || self.replacement_version.is_some() && self.replacement_cmd.is_none()
+        {
+            return Err(Error::new(
+                "invalid",
+                "Claude profile command issue is malformed",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Validate a bounded, profile-unique Claude preflight issue list.
+pub fn validate_claude_profile_command_issues(issues: &[ClaudeProfileCommandIssue]) -> Result<()> {
+    if issues.len() > MAX_CLAUDE_PROFILE_COMMAND_ISSUES {
+        return Err(Error::new(
+            "invalid",
+            "Claude profile command issue list is oversized",
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for issue in issues {
+        issue.validate()?;
+        if !seen.insert(issue.profile.as_str()) {
+            return Err(Error::new(
+                "invalid",
+                "Claude profile command issue profiles repeat",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Response for `harness.list`.

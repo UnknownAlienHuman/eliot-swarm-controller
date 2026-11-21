@@ -384,9 +384,19 @@ struct FileConfig {
 pub(crate) struct RoutingConfig {
     #[serde(default)]
     pub(crate) default: Vec<String>,
+    #[serde(default)]
+    on_provider_failure: OnProviderFailure,
     /// Additional extensible roles share the same ordered candidate syntax.
     #[serde(flatten)]
     pub(crate) roles: BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum OnProviderFailure {
+    #[default]
+    Stop,
+    Next,
 }
 
 impl RoutingConfig {
@@ -396,6 +406,10 @@ impl RoutingConfig {
         } else {
             self.roles.get(role).map(Vec::as_slice)
         }
+    }
+
+    pub(crate) fn provider_failover(&self) -> bool {
+        self.on_provider_failure == OnProviderFailure::Next
     }
 }
 
@@ -1543,7 +1557,8 @@ fn parse_config_document(source: &str) -> core::Result<FileConfig> {
 }
 
 pub(crate) fn validate_routing_role(role: &str) -> core::Result<()> {
-    if role.is_empty()
+    if role == "on_provider_failure"
+        || role.is_empty()
         || role.len() > MAX_PROFILE_NAME_LEN
         || !role
             .chars()
@@ -1551,7 +1566,7 @@ pub(crate) fn validate_routing_role(role: &str) -> core::Result<()> {
     {
         return Err(core::Error::new(
             "profile_error",
-            "config.toml: routing role names must be nonempty letters, digits, hyphen or underscore",
+            "config.toml: routing role names must be nonempty letters, digits, hyphen or underscore and cannot be on_provider_failure",
         ));
     }
     Ok(())
@@ -1588,12 +1603,51 @@ fn read_config_source(data_root: &Path) -> core::Result<Option<String>> {
         .map_err(|_| core::Error::new("profile_error", "config.toml: invalid UTF-8"))
 }
 
-pub(crate) fn routing_candidates(data_root: &Path, role: &str) -> core::Result<Vec<String>> {
-    validate_routing_role(role)?;
-    let Some((config, _)) = read_config(data_root)? else {
-        return Ok(Vec::new());
+pub(crate) fn load_routing_config(data_root: &Path) -> core::Result<RoutingConfig> {
+    Ok(read_config(data_root)?
+        .map(|(config, _)| config.routing)
+        .unwrap_or_default())
+}
+
+pub(crate) fn missing_claude_profile_commands(data_root: &Path) -> Vec<(String, String)> {
+    let Ok(Some(source)) = read_config_source(data_root) else {
+        return Vec::new();
     };
-    Ok(config.routing.candidates(role).unwrap_or_default().to_vec())
+    let Ok(document) = toml::from_str::<toml::Value>(&source) else {
+        return Vec::new();
+    };
+    let Some(profiles) = document.get("profiles").and_then(toml::Value::as_table) else {
+        return Vec::new();
+    };
+
+    let mut missing = profiles
+        .iter()
+        .filter_map(|(name, entry)| {
+            if name.trim().is_empty() || name.len() > 128 || name.chars().any(char::is_control) {
+                return None;
+            }
+            let profile = entry.as_table()?;
+            if profile
+                .get("harness")
+                .and_then(toml::Value::as_str)
+                .is_none_or(|harness| harness.trim() != "claude")
+            {
+                return None;
+            }
+            let cmd = profile.get("cmd").and_then(toml::Value::as_str)?;
+            if cmd.trim().is_empty()
+                || cmd.len() > 4096
+                || cmd.chars().any(char::is_control)
+                || cmd.trim().eq_ignore_ascii_case("latest")
+                || Path::new(cmd).is_file()
+            {
+                return None;
+            }
+            Some((name.clone(), cmd.to_owned()))
+        })
+        .collect::<Vec<_>>();
+    missing.sort_by(|left, right| left.0.cmp(&right.0));
+    missing
 }
 
 pub(crate) fn load_daemon_config(data_root: &Path) -> core::Result<DaemonConfig> {
@@ -1830,6 +1884,9 @@ fn validate_profile_tail(
     };
     let harness = entry.harness.trim();
     let cmd = match entry.cmd.as_deref() {
+        Some(cmd) if harness == "claude" && cmd.trim().eq_ignore_ascii_case("latest") => {
+            Some("latest".to_owned())
+        }
         Some(cmd) => {
             let cmd = validate_executable_name(cmd)
                 .map_err(|class| {
@@ -1849,7 +1906,7 @@ fn validate_profile_tail(
                 cmd
             })
         }
-        None if harness == "codex" => None,
+        None if matches!(harness, "codex" | "claude") => None,
         None => {
             return Err(profile_field_error(
                 source,

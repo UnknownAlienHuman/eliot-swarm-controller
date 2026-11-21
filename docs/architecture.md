@@ -83,8 +83,9 @@ result. L2 replaced that fake with a per-Agent Codex app-server and added native
 controls and readback over an existing workspace and account. Current code has no fake
 runtime: the five native adapters launch from explicit profiles, or by `--role` through
 the ordered `[routing]` candidates when `--profile` is omitted, with frozen captured
-selectors. Routing runs before admission only; dispatch never reroutes, retries another
-route, or switches account on hold.
+selectors. Routing freezes before admission. The opted-in provider policy may
+admit a fresh switch after an exact native pre-work refusal. Uncertain effects
+keep their original bindings and outcome.
 
 L3 through L6 are implemented (monitoring, worktrees and the proxy route; automation and
 scripts; agent communication; the five harnesses with worker MCP and the `eliot-swarm`

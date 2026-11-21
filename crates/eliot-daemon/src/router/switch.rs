@@ -34,6 +34,43 @@ fn reuse_retained_checkout(
 }
 
 impl Router {
+    pub(crate) async fn run_provider_switches(
+        &self,
+        mut receiver: broadcast::Receiver<Event>,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> Result<()> {
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => return Ok(()),
+                event = receiver.recv() => {
+                    match event {
+                        Ok(event) if event.kind == eliot_store::PROVIDER_SWITCH_QUEUED => {
+                            if let Some(id) = event.data["switch_command"].as_str() {
+                                self.schedule_command(id.to_owned(), None);
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            let mut after = String::new();
+                            loop {
+                                let switches = self.inner.store.lock().await.accepted_provider_switches(&after)?;
+                                let Some(last) = switches.last() else {
+                                    break;
+                                };
+                                after.clone_from(last);
+                                for id in switches {
+                                    self.schedule_command(id, None);
+                                }
+                                tokio::task::yield_now().await;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                        Ok(_) => {}
+                    }
+                }
+            }
+        }
+    }
+
     pub(super) async fn swarm_switch(
         &self,
         params: &Value,
@@ -81,10 +118,16 @@ impl Router {
                 Err(_) => None,
             }
         };
-        let Some((request, plan)) = work else {
+        let Some(eliot_store::SwitchWork {
+            request,
+            plan,
+            provider_failure,
+        }) = work
+        else {
             return;
         };
         let prepared = async {
+            self.check_command_admission_mode("launch")?;
             let source = {
                 let store = self.inner.store.lock().await;
                 store
@@ -130,6 +173,23 @@ impl Router {
                     .to_owned(),
             };
             launch.args = request.launch.args(&workspace)?;
+            let provider_route = if let Some(failure) = provider_failure {
+                let authority = failure.require_authority(&source.profile_snapshot)?;
+                let (name, identity) = self
+                    .route_provider_switch(&mut launch, &source, failure.kind, authority)
+                    .await?;
+                launch.args["profile"] = json!(name);
+                Some((launch.args["profile_choice"].take(), identity))
+            } else {
+                None
+            };
+            if provider_route.is_some() {
+                launch
+                    .args
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("profile_choice");
+            }
             // A targeted continuation explicitly requests standard worktree
             // preparation, even in a `shared` project: B never starts in the
             // checkout itself.
@@ -157,6 +217,17 @@ impl Router {
             let mut prepared = self
                 .prepare_submission_after_authorization(launch, &Principal::Owner, false, false)
                 .await?;
+            if let Some((choice, identity)) = provider_route {
+                if routing::switch_account_identity(&prepared.request.args["profile_snapshot"])
+                    != identity
+                {
+                    return Err(Error::new(
+                        "bad_state",
+                        "provider switch account changed during launch preparation",
+                    ));
+                }
+                prepared.request.args["profile_choice"] = choice;
+            }
             if target.is_none()
                 && reuse_retained_checkout(request.launch.workspace.as_deref(), &prepared.workspace)
             {

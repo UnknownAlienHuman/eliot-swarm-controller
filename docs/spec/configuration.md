@@ -136,8 +136,9 @@ custody and kill-on-drop, with at most 100 inbound frames. It uses the
 and a total byte budget of one full frame plus 4 MiB. The launcher-marked 1.4.20 build serves
 an empty `bundledCatalog` and is skipped in favor of the 1.4.0 build with a live
 catalogue; `--cmd` still pins an explicit binary for ad-hoc launch.
-Before admission, an omitted profile selects the first available ordered role candidate. There is no post-dispatch harness/model/route/account
-fallback, no retry of an uncertain outcome and no hold-triggered account switch.
+Before admission, an omitted profile selects the first available ordered role candidate.
+The [routing policy](#routing-policy-s3) governs continuation after a confirmed provider
+refusal. Uncertain outcomes retain their original command bindings.
 Profiles stay the durable
 explicit record: ad-hoc Owner launch (`swarm launch --harness ...`) freezes an
 equivalent snapshot from built-in per-harness safe defaults plus flags (see
@@ -177,11 +178,21 @@ fields default to the safe posture (Codex `workspace-write` + `never`,
 Claude CLI-default permission mode, Muse current conservative
 defaults); broader authority stays profile-only, owner-written choice. When
 `--cmd` is not given, the daemon resolves the installed native executable
-deterministically and freezes the absolute path. Ad-hoc Claude uses
-`mcp = "minimal"` and selects the newest standalone CLI by `--version`
-from `PATH` and standard user install locations. The Windows Desktop
-bundle requires an explicit `--cmd` or profile `cmd`. See
-[Claude Code discovery](../harnesses/claude-code.md#ad-hoc-launch).
+deterministically and freezes the absolute path. Ad-hoc Claude uses `mcp = "minimal"`. Claude profiles may omit `cmd` or set
+`cmd = "latest"`; both automatic forms select only an executable whose bounded
+`--version` probe exits successfully and reports a parseable numeric version.
+Among verified installations, the newest numeric version wins. A timeout on a
+newer versioned installation refuses automatic selection. The absolute path and verified `cmd_version` are
+frozen in the Agent snapshot. Versioned vendor roots are considered before
+PATH. Unverified executables remain visible in the installation inventory,
+with the raw `--version` first line when available, but cannot be selected
+automatically. Explicit executable paths remain pinned even when their
+optional version probe fails or is not parseable. First-use profiles omit
+`cmd` so they keep following vendor
+updates. A missing pin is reported with the discovered
+replacement and the `swarm settings claude-cmd PROFILE --cmd PATH` repair
+command; use `swarm settings claude-cmd PROFILE --latest` to return a profile
+to automatic selection. See [Claude Code discovery](../harnesses/claude-code.md#ad-hoc-launch).
 OpenCode resolves the npm shim to the
 native `opencode.exe` inside the package (consulting the
 `USERPROFILE`-derived roaming root when `APPDATA` is stripped), Muse via the
@@ -662,7 +673,10 @@ heavy threshold closes as one `activity.heavy` event (defaults: 30 s wall, 60 s 
 1 GiB RSS). Session growth warns at 0.8 context occupancy or a 64 MiB native session
 file where the harness exposes a documented size source; there is no auto-compact.
 `swarm doctor` compares live installed harness versions and contract markers against
-the pinned `VERIFIED_HARNESSES` table without blocking launch.
+the pinned `VERIFIED_HARNESSES` table without blocking launch. It also reports
+Claude profiles whose explicitly pinned executable is missing, with the current
+replacement path/version and a one-command repair. `swarm status` includes the same
+profile issues when present.
 
 Cloud MCP is disabled when `[cloud_mcp]` is absent. When present, all fields are
 required. The HTTP MCP executable is the running daemon executable (`current_exe`);
@@ -1180,6 +1194,7 @@ Each role is an ordered array of existing profile names, for example:
 
 ```toml
 [routing]
+on_provider_failure = "next"
 default = ["codex-luna", "muse"]
 worker = ["codex-luna"]
 ```
@@ -1206,11 +1221,23 @@ on the Agent as `profile_choice` for `show`, `result` and desktop API consumers 
 after launch command history expires. `routing.preview` (Owner) runs the same
 selection for a role without a command and returns its `RoutingDecision`; it admits,
 freezes and reserves nothing, so the next launch evaluates again and may differ. The
-desktop shows it on the composer's Auto chip. Same-ID replay returns the frozen choice;
-failure, hold or unknown delivery never causes another candidate to run. A held
-candidate never selects a different account or captured credential selector of the
-same harness. Provider holds and capacity are rechecked transactionally at admission;
+desktop shows it on the composer's Auto chip. Same-ID replay returns the frozen choice.
+Provider holds and capacity are rechecked transactionally at admission;
 a concurrent state change can refuse an otherwise prepared choice before dispatch.
+
+`on_provider_failure` defaults to `stop`. With `next`, an Owner's role-routed
+launch in a project freezes the remaining candidate order. The daemon may continue
+the original launch input after a structured quota, rate-limit or access refusal
+when the adapter proves that no native work began for that exact turn. A stream
+gap, uncertain delivery, tool or output activity, an explicit profile or a later
+SEND leaves the ordinary outcome in place. An automatic successor must match the original frozen launch authority, including
+the harness, access, permissions, approval, account and credential selectors.
+An original launch with explicit overrides does not enter automatic failover.
+The Codex adapter supplies this evidence for structured upstream refusals.
+The daemon reuses the [switch and handoff](coordination.md#agent-switch-implemented)
+transaction with fresh command IDs, the retained workspace and the next eligible
+candidate. Each switch consumes part of the frozen order. `swarm why` reports
+the refusal, skipped profiles and, when admitted, the successor and input command.
 
 ### CLI editing
 
@@ -1229,6 +1256,15 @@ with `swarm settings save request.json` (add `--dry-run` to validate only):
 Each named section is a complete replacement; leave unmodified sections out of the
 request. The desktop Settings screen uses the same read/save contract and follows the
 stale-revision rule of [unified settings](#unified-settings).
+`swarm settings claude-cmd PROFILE --cmd PATH` replaces one Claude profile's
+executable through the existing revision-checked settings writer. Use
+`swarm settings claude-cmd PROFILE --latest` to restore automatic version
+selection. These forms are mutually exclusive; the CLI rejects an invocation
+that supplies both `--cmd` and `--latest` during argument parsing. The command
+uses revision compare-and-swap and refuses a profile section containing
+redacted values rather than overwriting hidden settings. Repair suggestions
+are shell-quoted for PowerShell on Windows and POSIX shells elsewhere.
+
 The desktop adds a project by choosing its checkout with the native folder picker;
 it derives a valid, collision-free ID from the folder name and immediately saves
 only the projects section through that same revision-checked writer. The Auto model

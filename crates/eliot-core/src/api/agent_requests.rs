@@ -876,6 +876,15 @@ impl DaemonStatusRequest {
                 .plugin_crashes
                 .iter()
                 .any(|crash| crash.code != "plugin.panicked" || crash.validate().is_err())
+            || crate::api::harness::validate_claude_profile_command_issues(
+                &reply.claude_profile_command_issues,
+            )
+            .is_err()
+            || reply.provider_probe_attention.len() > 16
+            || reply
+                .provider_probe_attention
+                .iter()
+                .any(|hold| hold.validate().is_err())
             || reply
                 .previous_crash
                 .as_ref()

@@ -5,6 +5,8 @@ use eliot_core::{RouteQuotaStatus, RouteSkip, RouteSkipReason, RoutingDecision};
 #[derive(Default)]
 struct RoutePreflight {
     arbitrated: bool,
+    provider_switch: bool,
+    provider_authority: Option<[u8; 32]>,
     held_accounts: HashMap<String, Value>,
     capacity_refusal: Option<Error>,
 }
@@ -72,6 +74,7 @@ impl Router {
             .unwrap_or("default")
             .to_owned();
         crate::config::validate_routing_role(&role)?;
+        let routing = crate::config::load_routing_config(&self.inner.data_root)?;
         let parent = if matches!(principal, Principal::Agent { .. }) {
             let store = self.inner.store.lock().await;
             let id = required_text(&request.args, "parent")?;
@@ -83,7 +86,7 @@ impl Router {
         } else {
             None
         };
-        let candidates = crate::config::routing_candidates(&self.inner.data_root, &role)?;
+        let candidates = routing.candidates(&role).unwrap_or_default().to_vec();
         // An unconfigured child default preserves the established inherited
         // profile path. An explicitly configured role is always intersected.
         let candidates = if candidates.is_empty()
@@ -94,28 +97,101 @@ impl Router {
         } else {
             candidates
         };
-        let mut decision = RoutingDecision {
+        let decision = RoutingDecision {
             role: role.clone(),
             profile: None,
             source: format!("settings.routing.{role}"),
             reason: "no available candidate".into(),
             skipped: Vec::new(),
             quota_status: RouteQuotaStatus::Unknown,
+            provider_failover: (routing.provider_failover()
+                && matches!(principal, Principal::Owner)
+                && !arbitrated
+                && request.args.get("chat") != Some(&Value::Bool(true)))
+            .then(Vec::new),
         };
         // A held account is never replaced with another account of the same
         // harness. Policy may still select a different native harness.
-        let mut preflight = RoutePreflight {
+        let preflight = RoutePreflight {
             arbitrated,
             ..RoutePreflight::default()
         };
-        for name in candidates {
+        self.choose_route(
+            principal,
+            request,
+            candidates,
+            parent.as_ref(),
+            decision,
+            preflight,
+        )
+        .await
+    }
+
+    pub(super) async fn route_provider_switch(
+        &self,
+        request: &mut SubmitCommand,
+        source: &Agent,
+        kind: eliot_core::ProviderRestrictionKind,
+        authority: [u8; 32],
+    ) -> Result<(String, Value)> {
+        let mut decision = source.profile_choice.clone().ok_or_else(|| {
+            Error::new("source_integrity", "provider switch has no retained route")
+        })?;
+        let candidates = decision.provider_failover.take().ok_or_else(|| {
+            Error::new(
+                "source_integrity",
+                "provider switch has no remaining policy",
+            )
+        })?;
+        decision.profile = None;
+        decision.reason = format!("{} refused the task ({})", source.profile, kind.as_str());
+        decision.skipped.push(RouteSkip {
+            profile: source.profile.clone(),
+            reason: RouteSkipReason::ProviderFailure,
+            quota_status: decision.quota_status,
+        });
+        decision.quota_status = RouteQuotaStatus::Unknown;
+        decision.provider_failover = Some(Vec::new());
+        let mut preflight = RoutePreflight {
+            provider_switch: true,
+            provider_authority: Some(authority),
+            ..RoutePreflight::default()
+        };
+        preflight.held_accounts.insert(
+            source.harness.clone(),
+            switch_account_identity(&source.profile_snapshot),
+        );
+        let (name, _, snapshot) = self
+            .choose_route(
+                &Principal::Owner,
+                request,
+                candidates,
+                None,
+                decision,
+                preflight,
+            )
+            .await?;
+        Ok((name, switch_account_identity(&snapshot)))
+    }
+
+    async fn choose_route(
+        &self,
+        principal: &Principal,
+        request: &mut SubmitCommand,
+        candidates: Vec<String>,
+        parent: Option<&Agent>,
+        mut decision: RoutingDecision,
+        mut preflight: RoutePreflight,
+    ) -> Result<(String, String, Value)> {
+        let mut candidates = candidates.into_iter();
+        while let Some(name) = candidates.next() {
             let mut quota_status = RouteQuotaStatus::Unknown;
             let evaluated = self
                 .routing_candidate(
                     principal,
                     request,
                     &name,
-                    parent.as_ref(),
+                    parent,
                     &mut quota_status,
                     &mut preflight,
                 )
@@ -123,12 +199,20 @@ impl Router {
             match evaluated {
                 Ok((harness, snapshot)) => {
                     decision.profile = Some(name.clone());
-                    decision.reason = if arbitrated {
-                        "first policy candidate for the selected project"
+                    decision.reason = if decision
+                        .skipped
+                        .iter()
+                        .any(|skip| skip.reason == RouteSkipReason::ProviderFailure)
+                    {
+                        format!("{}. Continuing on {name}", decision.reason)
+                    } else if preflight.arbitrated {
+                        "first policy candidate for the selected project".into()
                     } else {
-                        "first available candidate"
+                        "first available candidate".into()
+                    };
+                    if decision.provider_failover.is_some() {
+                        decision.provider_failover = Some(candidates.collect());
                     }
-                    .into();
                     decision.quota_status = quota_status;
                     request.args["profile_choice"] = serde_json::to_value(decision)
                         .map_err(|_| Error::new("internal", "routing decision encoding failed"))?;
@@ -216,7 +300,16 @@ impl Router {
                 return Ok(Err(RouteSkipReason::Unauthorized));
             }
         }
-        let account = account_identity(&snapshot);
+        if let Some(authority) = preflight.provider_authority
+            && eliot_core::provider_switch_authority(&snapshot)? != authority
+        {
+            return Ok(Err(RouteSkipReason::Unauthorized));
+        }
+        let account = if preflight.provider_switch {
+            switch_account_identity(&snapshot)
+        } else {
+            account_identity(&snapshot)
+        };
         if preflight
             .held_accounts
             .get(&harness)
@@ -280,7 +373,25 @@ fn account_identity(snapshot: &Value) -> Value {
         "literal_env":snapshot.get("literal_env")})
 }
 
+pub(super) fn switch_account_identity(snapshot: &Value) -> Value {
+    let mut identity = account_identity(snapshot);
+    // Compare the frozen selectors. The effective store binding is captured
+    // at dispatch and exists on the source but not the prospective route.
+    identity.as_object_mut().unwrap().remove("native_store");
+    identity
+}
+
 fn native_installed(harness: &str, snapshot: &Value) -> bool {
+    if harness == "claude" {
+        if let Some(pin) = snapshot
+            .get("cmd")
+            .and_then(Value::as_str)
+            .filter(|cmd| !crate::adhoc::is_latest_claude_selector(cmd))
+        {
+            return crate::adhoc::is_native_executable(std::path::Path::new(pin));
+        }
+        return crate::adhoc::claude_candidate_available();
+    }
     let cmd = snapshot
         .get("cmd")
         .and_then(Value::as_str)

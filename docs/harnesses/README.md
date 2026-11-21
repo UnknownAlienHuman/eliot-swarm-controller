@@ -44,8 +44,10 @@ table and reports drift without blocking launch:
 | antigravity | 1.5.9 | ACP v1 `7ec5185c.json`, AGY 1.5.2 |
 
 A drifted install still launches; the mismatch is annotated on `swarm doctor`, the
-`harness.drift` event and the launch flag. Historical source-check dates on adapter
-pages are not fresh verification; `swarm doctor` is the live readback.
+`harness.drift` event and the launch flag. Doctor also reports missing explicit
+Claude profile executable paths with an installed replacement and repair command;
+`swarm status` exposes the same profile warnings. Historical source-check dates
+on adapter pages are not fresh verification; `swarm doctor` is the live readback.
 
 ## Current versions and mechanisms
 

@@ -115,6 +115,13 @@ impl Router {
         if let (Some(agent), Some(generation)) = (command.target.as_deref(), command.generation)
             && let Ok(turns) = store.list_turns(agent, generation, 32)
         {
+            let task = linked_send
+                .as_ref()
+                .map(|send| send.id.as_str())
+                .unwrap_or(command_id);
+            if let Some(step) = provider_switch_step(&store, agent, generation, Some(task))? {
+                steps.push(step);
+            }
             for turn in turns {
                 if steps.len() > MAX_TURNS_PER_DIAGNOSIS {
                     break;
@@ -249,6 +256,25 @@ impl Router {
         {
             unresolved.push(message.to_owned());
         }
+        if let Some(choice) = row.profile_choice.as_ref()
+            && (!choice.skipped.is_empty() || choice.provider_failover.is_some())
+        {
+            let selection = format!("{} selected {}.", choice.role, row.profile);
+            let message = if choice.skipped.is_empty() {
+                selection
+            } else {
+                format!("{selection} {}", route_skips(choice))
+            };
+            steps.push(routing_step("selected", message, Some(row.created_at)));
+        }
+        if row
+            .profile_choice
+            .as_ref()
+            .is_some_and(|choice| choice.provider_failover.is_some())
+            && let Some(step) = provider_switch_step(&store, agent, generation, None)?
+        {
+            steps.push(step);
+        }
         let (command, turn) = store.agent_unknowns(agent)?;
         if let Some(command) = command {
             let mut step = command_step(&command);
@@ -350,6 +376,95 @@ impl Router {
             preceded_by,
         })
     }
+}
+
+fn route_skips(choice: &eliot_core::RoutingDecision) -> String {
+    choice
+        .skipped
+        .iter()
+        .map(|skip| format!("{} ({})", skip.profile, skip.reason.user_message()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn routing_step(code: &str, message: String, at: Option<i64>) -> DiagnoseStep {
+    DiagnoseStep {
+        kind: "routing".into(),
+        code: Some(code.to_owned()),
+        message: Some(bound_chars(
+            &message,
+            eliot_core::api::MAX_DIAGNOSE_MESSAGE_CHARS,
+        )),
+        failure_where: None,
+        origin: None,
+        origin_evidence: None,
+        exit_code: None,
+        ntstatus: None,
+        at,
+    }
+}
+
+fn provider_switch_step(
+    store: &eliot_store::Store,
+    agent: &str,
+    generation: i64,
+    task: Option<&str>,
+) -> Result<Option<DiagnoseStep>> {
+    let Some(event) = store.provider_switch_event(agent, generation, task)? else {
+        return Ok(None);
+    };
+    let cause = event.data["kind"].as_str().unwrap_or("provider refusal");
+    let (code, message) = if let Some(destination) = event.data["continued_to"].as_str() {
+        let profile = event.data["profile"].as_str().unwrap_or("unknown profile");
+        let command = event.data["retry_command"]
+            .as_str()
+            .unwrap_or("unavailable");
+        (
+            "switched",
+            format!(
+                "Provider refusal ({cause}). Continued on {destination} ({profile}), input {command}."
+            ),
+        )
+    } else if let Some(id) = event.data["switch_command"].as_str() {
+        match store.switch_result(id) {
+            Ok(result) if result.state == eliot_core::CommandState::Unknown => (
+                "unknown",
+                format!("Provider refusal ({cause}). Switch {id} has an unknown outcome."),
+            ),
+            Ok(result) if result.error.is_some() => {
+                let error = result.error.as_deref().unwrap_or_default();
+                let skipped = result
+                    .routing
+                    .as_deref()
+                    .map(route_skips)
+                    .unwrap_or_default();
+                let status = format!("Provider refusal ({cause}). Switch {id} stopped ({error}).");
+                (
+                    "stopped",
+                    if skipped.is_empty() {
+                        status
+                    } else {
+                        format!("{status} {skipped}")
+                    },
+                )
+            }
+            Ok(_) => (
+                "queued",
+                format!("Provider refusal ({cause}). Switch {id} is pending."),
+            ),
+            Err(error) if error.code == "not_found" => (
+                "history_expired",
+                format!("Provider refusal ({cause}). Switch {id} is no longer retained."),
+            ),
+            Err(error) => return Err(error),
+        }
+    } else {
+        (
+            "exhausted",
+            format!("Provider refusal ({cause}). No later candidate remains in this role."),
+        )
+    };
+    Ok(Some(routing_step(code, message, Some(event.ts))))
 }
 
 fn append_retained(summary: &str, unresolved: &[String]) -> String {

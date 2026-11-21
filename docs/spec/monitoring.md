@@ -630,17 +630,42 @@ resume without new text, readback, request replies, interrupt and stop remain av
 Resume with text is a linked send and remains gated. Steer remains bound to its exact
 active turn and generation.
 
-Rate-limit and quota holds permit at most one explicit eligible SEND probe claim per
-frozen provider scope in Store, acquired atomically by `probe=true` through the normal
-SEND path. The probe uses ordinary SEND authorization and target/scope/generation fences;
-it adds no owner-only modifier or parallel executor. `retry_after` controls probe
-eligibility only; its expiry never clears a hold. Only a successful exact-bound probe
-completion clears a rate-limit/quota hold. A known failed or interrupted probe leaves
-the hold and releases only its definitive probe claim. An unknown probe retains both
-hold and claim across restart; it is not retried automatically. When retention has
-pruned the probe's accepted event, the terminal scan fails with `source_integrity`
-instead of clearing the hold on incomplete history; the owner corrects the stuck
-hold with the existing `provider clear-hold`.
+Rate-limit and quota holds permit at most one SEND probe claim per frozen provider
+scope in Store. An explicit `probe=true` SEND uses ordinary authorization and exact
+target/scope/generation fences. Daemon maintenance currently probes Codex profiles
+through the same SEND admission and native dispatch path, with a fixed minimal prompt
+in an isolated private chat that has no project, registered worktree, or user task.
+Its frozen profile snapshot sets `_provider_probe=true`, `permissions=read-only`,
+`approval_policy=never`, `native_subagents=deny`, `mcp=minimal`, and `mcp_allow=[]`.
+The native adapter skips the Swarm skill, shell/web/workspace instructions and Agent
+credentials for this mode. Its linked SEND claim and launch commit atomically before
+native spawn; the outer internal launch marker carries the frozen scope and cannot be
+submitted by a client. Other adapters keep their holds and record a bounded defer until
+they have a secure minimal probe path.
+
+A provider-supplied `retry_after` is a known reset time. Bounded maintenance removes a
+held rate-limit/quota row at or after that time and records `provider.hold_cleared`.
+An unresolved `Probing` claim is never cleared by time. When no reset is supplied, the
+Store persists `next_probe_at` and the completed-probe count. The initial probe is due
+after one minute. Known failed probes back off to five minutes and then thirty minutes.
+Each uninterrupted hold allows six automatic probe admissions. The final slot records
+`provider.hold_probe_budget_exhausted`. The Owner can see the scope in
+`daemon.status.provider_probe_attention` and use the existing hold controls.
+A provider-supplied reset still clears the hold when due.
+Each admitted probe records `provider.hold_probe_started` and known
+completion records `provider.hold_probe_finished`. A successful exact-turn native
+completion with no restriction clears the hold. A known failure releases only its
+claim and persists the next backoff while budget remains. Startup sweeps ended
+maintenance Agents. Once the exact Agent's custody drains, an unresolved automatic
+probe releases its claim, records `provider.hold_probe_outcome_unknown` and pauses
+automation for Owner review. An uncertain probe is never replayed.
+If a minimal request cannot be prepared
+safely for the frozen profile, maintenance retains the hold, records a bounded defer
+event and backs off. A probe that exceeds the turn wait budget stops its owned Agent
+and retains the claim if the exact native outcome is unknown. When retention has
+pruned a probe's admission event, the terminal
+scan fails with `source_integrity` instead of clearing the hold on incomplete history;
+the owner corrects the stuck hold with the existing `provider clear-hold`.
 
 Auth and ModelRemoved holds are not probe-eligible and do not expire automatically. An
 owner clears them with one of the closed corrective evidence values:
@@ -651,8 +676,8 @@ request, so an exact retry returns the retained result and changed evidence conf
 
 `agent.list` and `agent.get` project the hold matching that Agent's frozen account or
 profile as `AgentProviderHold { kind, state, retry_after, updated_at,
-waiting_for_active_turn }`; shared scope and probe-command identity remain on the
-owner-only provider-hold read. They also project
+waiting_for_active_turn, next_probe_at, held_since }`; shared scope and probe-command
+identity remain on the owner-only provider-hold read. They also project
 the latest `turn.notice`, or the latest failed terminal `native_error`, as
 `AgentNativeNotice { generation, turn_id, kind, message, truncated, observed_at }`.
 The notice must match the row's generation and active or most recent turn. These views
@@ -663,7 +688,9 @@ the active turn has no native progress newer than that hold's `updated_at`; the 
 itself remains visible because it still gates future dispatch in the matching scope.
 When an Agent is idle, a failed provider notice is omitted after its matching hold has
 been cleared. A newly started turn is projected only against its own turn binding.
-`retry_after` still describes probe eligibility and never promises automatic retry.
+`retry_after` is the provider's known reset. `next_probe_at` is shown as the next
+automatic probe time when the reset is unknown. Neither field promises replay of an
+uncertain probe.
 The desktop uses the existing daemon attention incident for its attention tone:
 the configured no-progress window (default 900 seconds) and source-health triggers are
 unchanged.

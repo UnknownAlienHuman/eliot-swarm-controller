@@ -10,6 +10,7 @@ const RETAINED_PAGE_SIZE: i64 = 128;
 
 const RESTART_IDLE_RESUME_ELIGIBILITY: &str = r#"
     a.observe_only = 0 AND a.archived = 0
+    AND json_extract(a.profile_snapshot, '$._provider_probe') IS NOT 1
     AND a.state IN ('lost', 'stopped')
     AND a.capacity_generation IS NULL
     AND a.harness IN ('codex', 'muse', 'claude', 'opencode', 'antigravity')

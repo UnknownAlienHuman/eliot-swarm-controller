@@ -369,6 +369,27 @@ pub(crate) fn print_doctor_table(response: &HarnessDoctorResponse) {
             println!("  contract mismatch: {mismatch}");
         }
     }
+    for issue in &response.claude_profile_command_issues {
+        println!(
+            "Claude profile {}: configured executable is missing: {}",
+            issue.profile, issue.configured_cmd
+        );
+        if let Some(cmd) = &issue.replacement_cmd {
+            println!(
+                "  installed replacement: {} ({})",
+                issue
+                    .replacement_version
+                    .as_deref()
+                    .unwrap_or("version unknown"),
+                cmd
+            );
+            if let Some(command) = &issue.repair_command {
+                println!("  repair: {command}");
+            }
+        } else {
+            println!("  no installed Claude replacement was discovered");
+        }
+    }
 }
 
 pub(crate) async fn run_heavy(

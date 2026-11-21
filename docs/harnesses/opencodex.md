@@ -66,5 +66,5 @@ client-key value from the metadata reader while retaining it in the reader's red
 policy; the controlled process still requires the explicitly configured key. Runtime
 authentication, inference, billing, and auxiliary/subagent traffic remain unverified.
 Provider holds use local Eliot scopes as described in
-[monitoring](../spec/monitoring.md#provider-holds). No automatic route/account fallback
-is permitted.
+[monitoring](../spec/monitoring.md#provider-holds). Role-routed launches can opt
+into [provider failover](../spec/configuration.md#routing-policy-s3).

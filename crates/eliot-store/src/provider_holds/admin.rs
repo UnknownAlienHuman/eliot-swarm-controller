@@ -6,12 +6,24 @@ use eliot_core::{
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use std::collections::BTreeMap;
 
-type RawHold = (String, String, Option<i64>, Option<String>, String, i64);
+type RawHold = (
+    String,
+    String,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+    String,
+    i64,
+    i64,
+    u32,
+    bool,
+);
 
 pub(super) fn get(connection: &Connection, scope: &str) -> Result<Option<ProviderHold>> {
     let raw = connection
         .query_row(
-            "SELECT scope, kind, retry_after, probe_command, state, updated_at
+            "SELECT scope, kind, retry_after, next_probe_at, probe_command, state, updated_at,
+                    held_since, automatic_probes, probe_outcome_unknown
              FROM provider_holds WHERE scope = ?1",
             [scope],
             raw_hold_from_row,
@@ -31,7 +43,8 @@ pub(super) fn get_many(
     let encoded = encode_json(&scopes)?;
     let mut statement = connection
         .prepare(
-            "SELECT h.scope, h.kind, h.retry_after, h.probe_command, h.state, h.updated_at
+            "SELECT h.scope, h.kind, h.retry_after, h.next_probe_at, h.probe_command,
+                    h.state, h.updated_at, h.held_since, h.automatic_probes, h.probe_outcome_unknown
              FROM json_each(?1) AS requested
              CROSS JOIN provider_holds AS h
              WHERE h.scope = requested.value",
@@ -63,7 +76,8 @@ pub(super) fn list_page(
 
     let mut statement = connection
         .prepare(
-            "SELECT scope, kind, retry_after, probe_command, state, updated_at
+            "SELECT scope, kind, retry_after, next_probe_at, probe_command, state, updated_at,
+                    held_since, automatic_probes, probe_outcome_unknown
              FROM provider_holds
              WHERE (?1 IS NULL OR scope > ?1)
              ORDER BY scope
@@ -84,6 +98,26 @@ pub(super) fn list_page(
     };
     request.validate_response(&response)?;
     Ok(response)
+}
+
+pub(super) fn attention(connection: &Connection, limit: usize) -> Result<Vec<ProviderHold>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT scope, kind, retry_after, next_probe_at, probe_command, state, updated_at,
+                held_since, automatic_probes, probe_outcome_unknown
+         FROM provider_holds
+         WHERE probe_outcome_unknown = 1 OR (automatic_probes >= ?1 AND retry_after IS NULL)
+         ORDER BY scope LIMIT ?2",
+        )
+        .map_err(sql_error)?;
+    let rows = statement
+        .query_map(
+            params![eliot_core::MAX_AUTOMATIC_PROVIDER_PROBES, limit as i64],
+            raw_hold_from_row,
+        )
+        .map_err(sql_error)?;
+    rows.map(|row| hold_from_raw(row.map_err(sql_error)?))
+        .collect()
 }
 
 pub(super) fn clear_hold_tx(
@@ -130,11 +164,26 @@ fn raw_hold_from_row(row: &Row<'_>) -> rusqlite::Result<RawHold> {
         row.get(3)?,
         row.get(4)?,
         row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
     ))
 }
 
 fn hold_from_raw(raw: RawHold) -> Result<ProviderHold> {
-    let (scope, kind, retry_after, probe_command, state, updated_at) = raw;
+    let (
+        scope,
+        kind,
+        retry_after,
+        next_probe_at,
+        probe_command,
+        state,
+        updated_at,
+        held_since,
+        automatic_probes,
+        probe_outcome_unknown,
+    ) = raw;
     let kind = match kind.as_str() {
         "rate_limit" => ProviderRestrictionKind::RateLimit,
         "quota" => ProviderRestrictionKind::Quota,
@@ -151,9 +200,13 @@ fn hold_from_raw(raw: RawHold) -> Result<ProviderHold> {
         scope,
         kind,
         retry_after,
+        next_probe_at,
         probe_command,
         state,
         updated_at,
+        held_since,
+        automatic_probes,
+        probe_outcome_unknown,
     };
     hold.validate()
         .map_err(|_| Error::new("internal", "provider hold row is invalid"))?;

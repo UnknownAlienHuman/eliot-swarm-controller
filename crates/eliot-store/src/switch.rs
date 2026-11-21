@@ -1,13 +1,247 @@
 //! Switch orchestration uses only existing command rows and normal launch/handoff admission.
 use super::*;
 use eliot_core::api::{
-    ORGANIZATION_CHANGED_KIND, OrgRowChange, OrganizationChangedEvent, SwitchAgent, SwitchRequest,
-    SwitchResponse,
+    ORGANIZATION_CHANGED_KIND, OrgRowChange, OrganizationChangedEvent, SwitchAgent, SwitchLaunch,
+    SwitchRequest, SwitchResponse,
 };
 
 const METHOD: &str = "swarm.switch";
+const PROVIDER_FAILURE: &str = "provider_failure";
+const PROVIDER_AUTHORITY: &str = "provider_authority";
+
+#[derive(Clone, Copy)]
+pub struct ProviderSwitchFailure {
+    pub kind: core::ProviderRestrictionKind,
+    pub authority: Option<[u8; 32]>,
+}
+
+impl ProviderSwitchFailure {
+    pub fn require_authority(self, snapshot: &Value) -> Result<[u8; 32]> {
+        let candidate = core::provider_switch_authority(snapshot)?;
+        if Some(candidate) == self.authority {
+            return Ok(candidate);
+        }
+        Err(Error::new(
+            "not_allowed",
+            "automatic switch authority differs from the original launch",
+        ))
+    }
+}
+
+pub const PROVIDER_SWITCH_QUEUED: &str = "provider.failover_queued";
+pub const PROVIDER_SWITCH_SETTLED: &str = "provider.failover_settled";
+
+pub struct SwitchWork {
+    pub request: SwitchRequest,
+    pub plan: SwitchResponse,
+    pub provider_failure: Option<ProviderSwitchFailure>,
+}
+
+fn decode_switch(mut args: Value) -> Result<(SwitchRequest, Option<ProviderSwitchFailure>)> {
+    let malformed = || Error::new("source_integrity", "switch request malformed");
+    let failure = args
+        .as_object_mut()
+        .ok_or_else(malformed)?
+        .remove(PROVIDER_FAILURE)
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|_| malformed())?;
+    let authority = args
+        .as_object_mut()
+        .ok_or_else(malformed)?
+        .remove(PROVIDER_AUTHORITY)
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|_| malformed())?;
+    let request = serde_json::from_value(args).map_err(|_| malformed())?;
+    Ok((
+        request,
+        failure.map(|kind| ProviderSwitchFailure { kind, authority }),
+    ))
+}
+
+fn reserve_switch_tx(
+    tx: &Transaction<'_>,
+    request: &SwitchRequest,
+    args: Value,
+    digest: &[u8],
+    now: i64,
+) -> Result<Change<SwitchResponse>> {
+    let value = SwitchResponse {
+        id: request.id.clone(),
+        from: request.from.clone(),
+        from_generation: request.from_generation,
+        state: CommandState::Accepted,
+        launch_command: Ulid::new().to_string(),
+        handoff_command: Ulid::new().to_string(),
+        launch_state: None,
+        created: None,
+        handoff: None,
+        error: None,
+        error_reason: None,
+        disposal_command: None,
+        disposal_state: None,
+        disposal_reason: None,
+        routing: None,
+        next_action: "preparing_launch".into(),
+    };
+    let mut parent = SubmitCommand::new(&request.id, "switch");
+    parent.args = args;
+    let outcome = serde_json::to_value(&value)
+        .map_err(|_| Error::new("internal", "cannot encode switch result"))?;
+    let event = admit_command(
+        tx,
+        &CommandInsert {
+            method: METHOD,
+            outcome: Some(&outcome),
+            ..CommandInsert::targetless_admitted("owner", &parent, digest, now)
+        },
+        json!({"command_id":request.id,"verb":"switch"}),
+    )?;
+    Ok(Change {
+        value,
+        events: vec![event],
+    })
+}
+
+/// Reserve the ordinary switch with the terminal fact, before publication.
+/// The only replayable task is the original input of this role attempt.
+pub(super) fn reserve_provider_switch_tx(
+    tx: &Transaction<'_>,
+    agent: &Agent,
+    terminal: &core::NativeEvent,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<()> {
+    if terminal.kind != "turn.completed"
+        || terminal.data.get("provider_request_refused_before_work") != Some(&Value::Bool(true))
+        || terminal.data.get("outcome").and_then(Value::as_str) != Some("failure")
+        || agent.generation != 1
+        || agent.chat
+        || agent.project.is_empty()
+        || agent.observe_only
+        || agent.parent.is_some()
+        || agent.state != AgentState::Idle
+    {
+        return Ok(());
+    }
+    let Some(remaining) = agent
+        .profile_choice
+        .as_ref()
+        .and_then(|choice| choice.provider_failover.as_ref())
+    else {
+        return Ok(());
+    };
+    let Some(task) = terminal.data.get("command_id").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let Ok(restriction) = serde_json::from_value::<core::ProviderRestriction>(
+        terminal.data["provider_restriction"].clone(),
+    ) else {
+        return Ok(());
+    };
+    if restriction.kind == core::ProviderRestrictionKind::ModelRemoved
+        || !provider_retry_allowed(tx, agent, task)?
+    {
+        return Ok(());
+    }
+    match handoff::quiescent(tx, agent, false) {
+        Ok(()) => {}
+        Err(error) if error.code == "busy" => return Ok(()),
+        Err(error) => return Err(error),
+    }
+    let agent_num = parse_agent_id(&agent.id)?;
+    if remaining.is_empty() {
+        events.push(insert_daemon_event(
+            tx,
+            now,
+            PROVIDER_SWITCH_SETTLED,
+            "provider",
+            Some(agent_num),
+            Some(agent.generation),
+            json!({"task_command":task, "kind":restriction.kind, "state":"exhausted"}),
+        )?);
+        return Ok(());
+    }
+    let request = SwitchRequest {
+        id: Ulid::new().to_string(),
+        from: agent.id.clone(),
+        from_generation: agent.generation,
+        task_command: task.to_owned(),
+        commands: Vec::new(),
+        launch: SwitchLaunch::default(),
+    };
+    let mut args = serde_json::to_value(&request)
+        .map_err(|_| Error::new("internal", "cannot encode provider switch"))?;
+    args[PROVIDER_FAILURE] = json!(restriction.kind);
+    args[PROVIDER_AUTHORITY] = json!(core::provider_switch_authority(&agent.profile_snapshot)?);
+    let digest = canonical::digest(&args)?;
+    events.extend(reserve_switch_tx(tx, &request, args, &digest, now)?.events);
+    events.push(insert_daemon_event(
+        tx,
+        now,
+        PROVIDER_SWITCH_QUEUED,
+        "provider",
+        Some(agent_num),
+        Some(agent.generation),
+        json!({"switch_command":request.id, "task_command":task, "kind":restriction.kind}),
+    )?);
+    Ok(())
+}
+
+fn require_provider_retry(tx: &Transaction<'_>, agent: &Agent, task: &str) -> Result<()> {
+    if !provider_retry_allowed(tx, agent, task)? {
+        return Err(Error::new("bad_state", "provider retry source changed"));
+    }
+    Ok(())
+}
+
+fn provider_retry_allowed(tx: &Transaction<'_>, agent: &Agent, task: &str) -> Result<bool> {
+    let num = parse_agent_id(&agent.id)?;
+    tx.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM commands c
+            JOIN commands p ON p.id=c.parent_command
+            JOIN turns t ON t.agent=c.target AND t.generation=c.generation AND t.turn_id=c.turn_id
+            WHERE c.id=?1 AND c.target=?2 AND c.generation=?3 AND c.principal='owner'
+              AND c.verb='send' AND c.state='applied' AND c.ordinal=0
+              AND ((c.link_kind='send' AND p.verb='launch' AND p.target=c.target
+                  AND NOT EXISTS(SELECT 1 FROM json_each(p.args) field
+                    JOIN json_each(?4) explicit ON explicit.value=field.key))
+                OR (c.link_kind='handoff' AND p.method='swarm.handoff' AND EXISTS(
+                    SELECT 1 FROM commands s
+                    JOIN commands l ON l.parent_command=s.id AND l.ordinal=0 AND l.target=c.target
+                    WHERE s.id=p.parent_command AND s.method='swarm.switch'
+                      AND json_extract(s.args,'$.provider_failure') IS NOT NULL)))
+              AND t.state='completed' AND t.outcome='failure' AND t.tool_calls=0
+              AND t.final_text IS NULL
+              AND EXISTS(SELECT 1 FROM source_state ss WHERE ss.agent=?2 AND ss.generation=?3
+                AND ss.source='stream' AND ss.state='open' AND ss.health='ok' AND ss.gap_id IS NULL)
+              AND NOT EXISTS(SELECT 1 FROM commands other WHERE other.target=?2 AND other.generation=?3
+                AND other.id<>c.id AND other.verb<>'launch')
+        )",
+        params![task, num, agent.generation, encode_json(&core::PROVIDER_LAUNCH_OVERRIDE_FIELDS)?],
+        |row| row.get(0),
+    ).map_err(sql_error)
+}
 
 impl Store {
+    pub fn accepted_provider_switches(&self, after: &str) -> Result<Vec<String>> {
+        self.ensure_committed_reads()?;
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id FROM commands WHERE state='accepted' AND verb='switch' AND method=?1
+                 AND json_extract(args,'$.provider_failure') IS NOT NULL AND id > ?2
+                 ORDER BY id LIMIT 64",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(params![METHOD, after], |row| row.get(0))
+            .map_err(sql_error)?;
+        rows.collect::<rusqlite::Result<_>>().map_err(sql_error)
+    }
+
     pub fn replay_switch(
         &self,
         principal: &str,
@@ -67,52 +301,16 @@ impl Store {
                 ));
             }
             source_tx(&tx, request, self.hierarchy_limits, policy)?;
-            let value = SwitchResponse {
-                id: request.id.clone(),
-                from: request.from.clone(),
-                from_generation: request.from_generation,
-                state: CommandState::Accepted,
-                launch_command: Ulid::new().to_string(),
-                handoff_command: Ulid::new().to_string(),
-                launch_state: None,
-                created: None,
-                handoff: None,
-                error: None,
-                error_reason: None,
-                disposal_command: None,
-                disposal_state: None,
-                disposal_reason: None,
-                next_action: "preparing_launch".into(),
-            };
-            let mut parent = SubmitCommand::new(&request.id, "switch");
-            parent.args = args;
-            let outcome = serde_json::to_value(&value)
-                .map_err(|_| Error::new("internal", "cannot encode switch result"))?;
-            let event = admit_command(
-                &tx,
-                &CommandInsert {
-                    method: METHOD,
-                    outcome: Some(&outcome),
-                    ..CommandInsert::targetless_admitted(principal, &parent, &digest, now)
-                },
-                json!({"command_id":request.id,"verb":"switch"}),
-            )?;
+            let change = reserve_switch_tx(&tx, request, args, &digest, now)?;
             commit_transaction(tx, &self.write_faulted)?;
-            Ok(Change {
-                value,
-                events: vec![event],
-            })
+            Ok(change)
         })();
         self.fault_on_persistence_error(&result);
         result
     }
 
     /// Claim one worker once. Retries are readback, not continuation or another launch.
-    pub fn start_switch(
-        &mut self,
-        id: &str,
-        now: i64,
-    ) -> Result<Change<Option<(SwitchRequest, SwitchResponse)>>> {
+    pub fn start_switch(&mut self, id: &str, now: i64) -> Result<Change<Option<SwitchWork>>> {
         self.ensure_writer_healthy()?;
         let result = (|| {
             let tx = self
@@ -126,9 +324,8 @@ impl Store {
                     events: Vec::new(),
                 });
             }
-            let request: SwitchRequest = serde_json::from_value(command.args)
-                .map_err(|_| Error::new("source_integrity", "switch request malformed"))?;
             let value = stored_result(&command.outcome)?;
+            let (request, provider_failure) = decode_switch(command.args)?;
             update_command_state(
                 &tx,
                 id,
@@ -148,7 +345,11 @@ impl Store {
             )?;
             commit_transaction(tx, &self.write_faulted)?;
             Ok(Change {
-                value: Some((request, value)),
+                value: Some(SwitchWork {
+                    request,
+                    plan: value,
+                    provider_failure,
+                }),
                 events: vec![event],
             })
         })();
@@ -206,9 +407,27 @@ impl Store {
                     "switch launch binding or phase differs",
                 ));
             }
-            let source: SwitchRequest = serde_json::from_value(parent.args)
-                .map_err(|_| Error::new("source_integrity", "switch request malformed"))?;
+            let (source, provider_failure) = decode_switch(parent.args)?;
             let (agent, target) = source_tx(&tx, &source, self.hierarchy_limits, policy)?;
+            if let Some(failure) = provider_failure {
+                require_provider_retry(&tx, &agent, &source.task_command)?;
+                failure.require_authority(&agent.profile_snapshot)?;
+                failure.require_authority(&request.args["profile_snapshot"])?;
+                let selected = request.args.get("profile").and_then(Value::as_str);
+                if !agent
+                    .profile_choice
+                    .as_ref()
+                    .and_then(|choice| choice.provider_failover.as_ref())
+                    .is_some_and(|remaining| {
+                        remaining.iter().any(|name| Some(name.as_str()) == selected)
+                    })
+                {
+                    return Err(Error::new(
+                        "bad_state",
+                        "provider switch selection is outside the frozen role",
+                    ));
+                }
+            }
             let requested = serde_json::to_value(&source.launch)
                 .map_err(|_| Error::new("internal", "cannot encode switch selectors"))?;
             for key in [
@@ -365,8 +584,7 @@ impl Store {
                     events: Vec::new(),
                 });
             }
-            let request: SwitchRequest = serde_json::from_value(parent.args.clone())
-                .map_err(|_| Error::new("source_integrity", "switch request malformed"))?;
+            let (request, provider_failure) = decode_switch(parent.args)?;
             let plan = stored_result(&parent.outcome)?;
             let launch = component(&tx, id, &plan.launch_command, 0)?
                 .ok_or_else(|| Error::new("bad_state", "switch launch not admitted"))?;
@@ -386,6 +604,17 @@ impl Store {
                         &destination.id,
                         destination.generation,
                     );
+                    if let Some(failure) = provider_failure {
+                        let (agent, _) = source_tx(&tx, &request, self.hierarchy_limits, policy)?;
+                        require_provider_retry(&tx, &agent, &request.task_command)?;
+                        failure.require_authority(&agent.profile_snapshot)?;
+                        failure.require_authority(&destination.profile_snapshot)?;
+                    }
+                    let transfer = if provider_failure.is_some() {
+                        handoff::HandoffInput::ProviderRetry
+                    } else {
+                        handoff::HandoffInput::Brief
+                    };
                     let change = handoff::handoff_tx(
                         &tx,
                         "owner",
@@ -393,6 +622,7 @@ impl Store {
                         policy,
                         now,
                         self.hierarchy_limits,
+                        transfer,
                     )?;
                     tx.execute("UPDATE commands SET parent_command=?1,link_kind='switch',ordinal=1 WHERE id=?2", params![id,plan.handoff_command]).map_err(sql_error)?;
                     // The continuation rides the existing overlay: B's
@@ -530,6 +760,23 @@ impl Store {
                     "error":value.error,"reason":value.error_reason,"disposal_command":value.disposal_command}),
             )?);
             let value = result_on(&tx, id)?;
+            if let Some(failure) = provider_failure {
+                let kind = failure.kind;
+                events.push(insert_daemon_event(
+                    &tx, now, PROVIDER_SWITCH_SETTLED, "provider",
+                    Some(parse_agent_id(&request.from)?), Some(request.from_generation),
+                    json!({
+                        "switch_command": id,
+                        "task_command": request.task_command,
+                        "kind": kind,
+                        "continued_to": value.created.as_ref().filter(|_| state == CommandState::Applied).map(|agent| &agent.agent),
+                        "profile": launch.args.get("profile"),
+                        "retry_command": value.handoff.as_ref().map(|handoff| &handoff.brief_command),
+                        "error": value.error,
+                        "state": state,
+                    }),
+                )?);
+            }
             commit_transaction(tx, &self.write_faulted)?;
             Ok(Change { value, events })
         })();
@@ -548,6 +795,7 @@ impl Store {
         set_switch_error(&mut value, error, policy);
         value.state = CommandState::Rejected;
         value.next_action.clear();
+        value.routing = error.routing.clone();
         self.settle(
             id,
             CommandState::Rejected,
@@ -557,6 +805,35 @@ impl Store {
             ),
             now,
         )
+    }
+
+    /// Latest exact provider switch fact for this attempt, including queueing.
+    pub fn provider_switch_event(
+        &self,
+        agent: &str,
+        generation: i64,
+        task: Option<&str>,
+    ) -> Result<Option<Event>> {
+        self.ensure_committed_reads()?;
+        let row = self
+            .connection
+            .query_row(
+                "SELECT seq, ts, kind, agent, generation, source, native_id, data, subject, cause
+             FROM events WHERE agent=?1 AND generation=?2 AND kind IN (?3,?4)
+             AND (?5 IS NULL OR json_extract(data,'$.task_command')=?5)
+             ORDER BY seq DESC LIMIT 1",
+                params![
+                    parse_agent_id(agent)?,
+                    generation,
+                    PROVIDER_SWITCH_QUEUED,
+                    PROVIDER_SWITCH_SETTLED,
+                    task
+                ],
+                event_record_from_row,
+            )
+            .optional()
+            .map_err(sql_error)?;
+        row.map(event_from_record).transpose()
     }
 }
 

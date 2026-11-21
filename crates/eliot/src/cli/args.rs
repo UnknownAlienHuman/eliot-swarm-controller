@@ -240,6 +240,21 @@ pub(crate) enum ArtifactCommand {
 }
 
 #[derive(Args)]
+pub(crate) struct ClaudeCmdArgs {
+    #[arg(value_name = "PROFILE")]
+    pub(crate) profile: String,
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with = "latest",
+        required_unless_present = "latest"
+    )]
+    pub(crate) cmd: Option<String>,
+    #[arg(long, conflicts_with = "cmd")]
+    pub(crate) latest: bool,
+}
+
+#[derive(Args)]
 pub(crate) struct SettingsArgs {
     #[command(subcommand)]
     pub(crate) command: SettingsCommand,
@@ -257,6 +272,8 @@ pub(crate) enum SettingsCommand {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Replace one missing Claude executable path or restore automatic selection.
+    ClaudeCmd(ClaudeCmdArgs),
 }
 
 #[derive(Args)]
@@ -425,8 +442,8 @@ pub(crate) struct LaunchArgs {
     /// --harness.
     #[arg(long, value_name = "LEVEL", value_parser = ["ask", "auto", "full"])]
     pub(crate) access: Option<String>,
-    /// Explicit native executable, overriding discovery (e.g. to pin the
-    /// Muse binary version the launcher marks current). Requires --harness.
+    /// Explicit native executable path, overriding discovery. Claude accepts
+    /// `latest` to follow updates; another value pins one executable. Requires --harness.
     #[arg(long, value_name = "PATH")]
     pub(crate) cmd: Option<String>,
     #[arg(long, value_name = "PATH")]

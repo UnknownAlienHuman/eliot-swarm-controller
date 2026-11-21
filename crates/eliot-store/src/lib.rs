@@ -209,6 +209,7 @@ mod source_batches;
 mod source_handoff;
 mod source_install;
 mod switch;
+pub use switch::{PROVIDER_SWITCH_QUEUED, PROVIDER_SWITCH_SETTLED, SwitchWork};
 mod turn_recovery;
 pub(crate) mod usage;
 mod workspace;
@@ -267,6 +268,17 @@ pub struct Admission {
     pub events: Vec<Event>,
     pub is_new: bool,
 }
+
+/// One bounded due provider hold that the daemon may probe through its normal
+/// launch/SEND command path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderProbeCandidate {
+    pub scope: String,
+    pub profile: String,
+}
+
+/// Maximum due probes admitted by one daemon maintenance pass.
+pub const PROVIDER_PROBE_BATCH_LIMIT: usize = 4;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Change<T> {
@@ -4360,15 +4372,16 @@ fn admit_linked_send(
     tx: &Transaction<'_>,
     principal: &str,
     parent: &str,
-    agent: i64,
-    generation: i64,
+    (agent, generation): (i64, i64),
     text: &str,
+    probe: bool,
     now: i64,
 ) -> Result<(String, Event)> {
     let agent_id = format_agent_id(agent);
     let mut request = SubmitCommand::new(format!("{parent}/send"), "send");
     request.args = json!({"text": text});
     request.expected_generation = Some(generation);
+    request.probe = probe;
     check_rpc_frame(
         "agent.command",
         &json!({
@@ -4383,6 +4396,7 @@ fn admit_linked_send(
         "target": agent_id,
         "verb": "send",
         "args": request.args,
+        "probe": probe,
         "expected_generation": generation,
         "expected_turn_id": Value::Null,
     }))?;
