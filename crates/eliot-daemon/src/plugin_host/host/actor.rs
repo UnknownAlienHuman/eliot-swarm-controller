@@ -787,12 +787,6 @@ async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
                         } else {
                             None
                         };
-                        if matches!(proof.as_ref(), Some(Err(_))) {
-                            // Process/source cleanup was attempted, but Store
-                            // did not commit both independent proof facts by
-                            // the stop deadline. Preserve loss as unknown.
-                            mark_lost_state(state, key, "stop_exit_without_session_terminal").await;
-                        }
                         let (native_result, native_stop_error_code) = match native {
                             Ok(native_result) => (native_result, None),
                             Err(error) => (None, Some(error.code)),
@@ -832,6 +826,16 @@ async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
                                 "stop source settlement exceeded its absolute deadline",
                             )),
                         };
+                        if result.is_err() {
+                            // The actor is exiting and control is fenced even if cleanup
+                            // could not prove exit. Loss does not attest custody closure.
+                            let reason = if exited {
+                                "stop_exit_without_session_terminal"
+                            } else {
+                                "stop_process_exit_unproven"
+                            };
+                            mark_lost_state(state, key, reason).await;
+                        }
                         let _ = reply.send(result);
                         break;
                     }

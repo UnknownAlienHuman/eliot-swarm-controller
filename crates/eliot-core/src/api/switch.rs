@@ -211,5 +211,7 @@ pub struct SwitchResponse {
     pub disposal_command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disposal_state: Option<CommandState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposal_reason: Option<String>,
     pub next_action: String,
 }

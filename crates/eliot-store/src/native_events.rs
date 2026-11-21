@@ -452,8 +452,20 @@ fn persist_turn_associated(
     db!(tx.execute(
         "UPDATE commands SET expected_turn_id = ?1
          WHERE target = ?2 AND generation = ?3 AND verb = 'stop' AND principal = 'owner'
-           AND state IN ('dispatched','unknown') AND expected_turn_id IS NULL",
-        params![turn_id, agent_num, generation],
+           AND state IN ('dispatched','unknown') AND expected_turn_id IS NULL
+           AND EXISTS (
+             SELECT 1 FROM events AS stop_dispatch
+             WHERE stop_dispatch.agent=?2 AND stop_dispatch.generation=?3
+               AND stop_dispatch.kind='command.dispatched'
+               AND json_extract(stop_dispatch.data,'$.command_id')=commands.id
+               AND stop_dispatch.seq > (
+                 SELECT MAX(send_dispatch.seq) FROM events AS send_dispatch
+                 WHERE send_dispatch.agent=?2 AND send_dispatch.generation=?3
+                   AND send_dispatch.kind='command.dispatched'
+                   AND json_extract(send_dispatch.data,'$.command_id')=?4
+               )
+           )",
+        params![turn_id, agent_num, generation, command_id],
     ));
     // The applied send outcome repeats what the native turn request
     // carried, so the first turn under an overlay shows its effective

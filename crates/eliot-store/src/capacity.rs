@@ -75,10 +75,13 @@ pub(super) fn restart_idle_resume_candidate_tx(
         "SELECT EXISTS(SELECT 1 FROM agents a
          WHERE a.id = ?1 AND a.generation = ?2 AND {RESTART_IDLE_RESUME_ELIGIBILITY})"
     );
-    connection
+    let candidate: bool = connection
         .query_row(&query, params![agent_num, generation], |row| row.get(0))
-        .map_err(sql_error)
-/// Independent Store readback of the two facts required to settle a stop.
+        .map_err(sql_error)?;
+    Ok(candidate && has_owned_exit_and_reader_drain_tx(connection, agent_num, generation)?)
+}
+
+/// Shared generation proof for stop settlement and restart resume.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OwnedExitProof {
     pub process_custody_exited: bool,
@@ -1193,9 +1196,16 @@ fn has_native_source_drain_tx(
     if !native_sources_closed_tx(connection, agent, generation)? {
         return Ok(false);
     }
+    // Exact restart reconciliation revokes the old publisher and commits the
+    // same closed-source fact. Degraded restart evidence cannot supply it.
     connection
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM owned_exits WHERE agent = ?1 AND generation = ?2)",
+            "SELECT EXISTS(SELECT 1 FROM owned_exits WHERE agent = ?1 AND generation = ?2)
+              OR EXISTS(
+                  SELECT 1 FROM events WHERE agent=?1 AND generation=?2 AND kind='capacity.released'
+                  AND json_extract(data,'$.reason')='restart_custody_closed'
+                  AND json_extract(data,'$.orphan_possible')=0
+              )",
             params![agent, generation],
             |row| row.get(0),
         )

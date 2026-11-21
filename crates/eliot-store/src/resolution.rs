@@ -609,13 +609,34 @@ fn stopped_settlement_page(
     connection: &Connection,
     request: &SettleStoppedRequest,
 ) -> Result<SettleStoppedResponse> {
+    // Loss clears the projection pointer. An older stop can still recover the
+    // turn captured by the same loss, with journal order proving it was in flight.
     let mut statement = connection
         .prepare(
             "SELECT c.id, c.target, c.generation, t.turn_id,
                     a.generation = c.generation AND a.state = 'lost'
              FROM commands c JOIN agents a ON a.id = c.target
          LEFT JOIN turns t ON c.principal = 'owner' AND t.agent = c.target
-            AND t.generation = c.generation AND t.turn_id = c.expected_turn_id
+            AND t.generation = c.generation AND t.turn_id = COALESCE(
+                c.expected_turn_id,
+                CASE WHEN a.state='lost' AND a.generation=c.generation THEN
+                    COALESCE(a.active_turn, (
+                        SELECT json_extract(turn_loss.data,'$.turn_id')
+                        FROM events AS loss JOIN events AS turn_loss
+                          ON turn_loss.agent=loss.agent AND turn_loss.generation=loss.generation
+                          AND turn_loss.ts=loss.ts AND turn_loss.seq < loss.seq
+                          AND turn_loss.kind='turn.unknown'
+                          AND json_extract(turn_loss.data,'$.reason')=json_extract(loss.data,'$.reason')
+                        WHERE loss.agent=c.target AND loss.generation=c.generation AND loss.kind='agent.lost'
+                          AND EXISTS (
+                            SELECT 1 FROM events AS dispatch
+                            WHERE dispatch.agent=c.target AND dispatch.generation=c.generation
+                              AND dispatch.kind='command.dispatched' AND dispatch.seq < turn_loss.seq
+                              AND json_extract(dispatch.data,'$.command_id')=c.id
+                          )
+                        ORDER BY loss.seq DESC, turn_loss.seq DESC LIMIT 1
+                    )) END
+            )
             AND t.state = 'unknown'
          WHERE c.state = 'unknown' AND c.verb = 'stop' AND a.observe_only = 0
            AND c.id > COALESCE(?1, '')

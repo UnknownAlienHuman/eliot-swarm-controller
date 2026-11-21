@@ -905,6 +905,12 @@ pub(crate) async fn run_switch(
             return Err(Failure::new(4, "switch successor stop has another binding"));
         }
         response.disposal_state = Some(stop.state);
+        response.disposal_reason = stop
+            .outcome
+            .as_ref()
+            .and_then(|outcome| outcome.get("message"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
     }
     let exit = response_exit_code(response.state);
     print_value(

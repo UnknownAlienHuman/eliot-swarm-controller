@@ -81,6 +81,7 @@ impl Store {
                 error_reason: None,
                 disposal_command: None,
                 disposal_state: None,
+                disposal_reason: None,
                 next_action: "preparing_launch".into(),
             };
             let mut parent = SubmitCommand::new(&request.id, "switch");
@@ -371,18 +372,15 @@ impl Store {
                 .ok_or_else(|| Error::new("bad_state", "switch launch not admitted"))?;
             let mut events = Vec::new();
             let mut state = CommandState::Failed;
-            let mut error = None;
+            let error;
             let mut disposal = None;
-            // The destination binding is captured before the transfer creates
-            // B's first input; re-deriving it afterwards would see that input
-            // and refuse.
-            let mut continued_to: Option<String> = None;
-            if launch.state == CommandState::Applied {
+            let transfer: Result<handoff::HandoffAdmission> = if launch.state
+                == CommandState::Applied
+            {
                 tx.execute_batch("SAVEPOINT switch_transfer")
                     .map_err(sql_error)?;
-                let transfer: Result<handoff::HandoffAdmission> = (|| {
+                (|| {
                     let destination = ready_destination_tx(&tx, &launch)?;
-                    continued_to = Some(destination.id.clone());
                     let handoff = request.handoff(
                         &plan.handoff_command,
                         &destination.id,
@@ -397,80 +395,94 @@ impl Store {
                         self.hierarchy_limits,
                     )?;
                     tx.execute("UPDATE commands SET parent_command=?1,link_kind='switch',ordinal=1 WHERE id=?2", params![id,plan.handoff_command]).map_err(sql_error)?;
-                    Ok(change)
-                })();
-                match transfer {
-                    Ok(change) => {
-                        tx.execute_batch("RELEASE switch_transfer")
-                            .map_err(sql_error)?;
-                        events.extend(change.events);
-                        // The continuation rides the existing overlay: B's
-                        // link records the source it continues. Plain text,
-                        // never a foreign key, so deleting the source
-                        // afterwards cannot fault the Store writer.
-                        let created = continued_to
-                            .as_deref()
-                            .ok_or_else(|| {
-                                Error::new("source_integrity", "switch destination binding missing")
-                            })
-                            .and_then(|destination| {
-                                parse_agent_id(destination).map_err(|_| {
-                                    Error::new(
-                                        "source_integrity",
-                                        "switch destination id malformed",
-                                    )
-                                })
-                            })?;
-                        parse_agent_id(&request.from).map_err(|_| {
-                            Error::new("source_integrity", "switch source id malformed")
-                        })?;
-                        // An existing row (a menu write raced the handoff)
-                        // moves to a new revision like any overlay write, so
-                        // a menu that read it before the switch is refused.
-                        db!(tx.execute(
+                    // The continuation rides the existing overlay: B's
+                    // link records the source it continues. Plain text,
+                    // never a foreign key, so deleting the source
+                    // afterwards cannot fault the Store writer.
+                    let created = parse_agent_id(&destination.id)?;
+                    // An existing row (a menu write raced the handoff)
+                    // moves to a new revision like any overlay write, so
+                    // a menu that read it before the switch is refused.
+                    db!(tx.execute(
                             "INSERT INTO chat_organization(agent, project_link, tags, continued_from)
                              VALUES (?1, NULL, '[]', ?2)
                              ON CONFLICT(agent) DO UPDATE SET continued_from = excluded.continued_from,
                                  revision = chat_organization.revision + 1",
                             params![created, request.from],
                         ));
-                        // The event names B's row as this write left it, so a
-                        // loaded sidebar refreshes B by id at its revision.
-                        let (organization, tags, revision) =
-                            organization::agent_organization(&tx, created)?;
-                        let change = OrganizationChangedEvent {
-                            id: id.to_owned(),
-                            method: METHOD.to_owned(),
-                            rows: vec![OrgRowChange {
-                                agent: format_agent_id(created),
-                                organization,
-                                tags,
-                                revision: revision.ok_or_else(|| {
-                                    Error::new("internal", "switch overlay row is missing")
-                                })?,
-                            }],
-                        };
-                        change.validate()?;
-                        events.push(insert_daemon_event(
-                            &tx,
-                            now,
-                            ORGANIZATION_CHANGED_KIND,
-                            "organization",
-                            None,
-                            None,
-                            serde_json::to_value(&change).map_err(|_| {
-                                Error::new("internal", "cannot encode organization event")
+                    // The event names B's row as this write left it, so a
+                    // loaded sidebar refreshes B by id at its revision.
+                    let (organization, tags, revision) =
+                        organization::agent_organization(&tx, created)?;
+                    let organization_change = OrganizationChangedEvent {
+                        id: id.to_owned(),
+                        method: METHOD.to_owned(),
+                        rows: vec![OrgRowChange {
+                            agent: format_agent_id(created),
+                            organization,
+                            tags,
+                            revision: revision.ok_or_else(|| {
+                                Error::new("internal", "switch overlay row is missing")
                             })?,
-                        )?);
-                        state = CommandState::Applied;
-                    }
-                    Err(e) => {
+                        }],
+                    };
+                    organization_change.validate()?;
+                    let mut change = change;
+                    change.events.push(insert_daemon_event(
+                        &tx,
+                        now,
+                        ORGANIZATION_CHANGED_KIND,
+                        "organization",
+                        None,
+                        None,
+                        serde_json::to_value(&organization_change).map_err(|_| {
+                            Error::new("internal", "cannot encode organization event")
+                        })?,
+                    )?);
+                    Ok(change)
+                })()
+            } else {
+                Err(Error::new(
+                    if matches!(
+                        launch.state,
+                        CommandState::Accepted
+                            | CommandState::Queued
+                            | CommandState::Dispatched
+                            | CommandState::Unknown
+                    ) {
+                        "unknown"
+                    } else {
+                        "launch_not_ready"
+                    },
+                    "launch has no proven readiness",
+                ))
+            };
+            let mut disposal_reason = None;
+            match transfer {
+                Ok(change) => {
+                    tx.execute_batch("RELEASE switch_transfer")
+                        .map_err(sql_error)?;
+                    events.extend(change.events);
+                    state = CommandState::Applied;
+                    error = None;
+                }
+                Err(refusal) => {
+                    if launch.state == CommandState::Applied {
+                        // A successful rollback proves even an internal H2 failure had no transfer effect.
                         tx.execute_batch("ROLLBACK TO switch_transfer; RELEASE switch_transfer")
                             .map_err(sql_error)?;
-                        if e.code == "unknown" {
-                            state = CommandState::Unknown;
-                        } else if e.code != "internal" && continued_to.is_some() {
-                            let destination = ready_destination_tx(&tx, &launch)?;
+                    }
+                    if refusal.code == "unknown" {
+                        state = CommandState::Unknown;
+                    } else if let Some(destination) = launch_destination_tx(&tx, &launch)?
+                        && switch_successor_needs_stop(&tx, &destination)?
+                    {
+                        if switch_successor_has_input(&tx, &destination)? {
+                            disposal_reason = Some(
+                                "Successor has a SEND or turn. Its session was left running."
+                                    .to_owned(),
+                            );
+                        } else {
                             let mut stop = SubmitCommand::new(Ulid::new().to_string(), "stop");
                             stop.target = Some(destination.id);
                             stop.expected_generation = Some(destination.generation);
@@ -492,35 +504,16 @@ impl Store {
                             events.extend(admitted.events);
                             disposal = Some(admitted.command);
                         }
-                        error = Some(e);
                     }
+                    error = Some(refusal);
                 }
-            } else {
-                state = if matches!(
-                    launch.state,
-                    CommandState::Accepted
-                        | CommandState::Queued
-                        | CommandState::Dispatched
-                        | CommandState::Unknown
-                ) {
-                    CommandState::Unknown
-                } else {
-                    CommandState::Failed
-                };
-                error = Some(Error::new(
-                    "launch_not_ready",
-                    "launch has no proven readiness",
-                ));
-            }
-            // Persistence faults must roll back the whole transaction, never be converted to a refusal.
-            if error.as_ref().is_some_and(|error| error.code == "internal") {
-                return Err(error.unwrap());
             }
             let mut value = result_on(&tx, id)?;
             if let Some(error) = &error {
                 set_switch_error(&mut value, error, policy);
             }
             value.state = state;
+            value.disposal_reason = disposal_reason;
             if let Some(disposal) = disposal {
                 value.disposal_command = Some(disposal.id);
                 value.disposal_state = Some(disposal.state);
@@ -661,11 +654,19 @@ pub(super) fn require_unused_switch_successor(
     }
     let launch = component(tx, &switch_id, &receipt.launch_command, 0)?
         .ok_or_else(|| Error::new("source_integrity", "switch launch is not retained"))?;
-    let destination = ready_destination_tx(tx, &launch)?;
-    if destination.id != agent.id || destination.generation != agent.generation {
+    let destination = launch_destination_tx(tx, &launch)?;
+    if destination.as_ref().is_none_or(|destination| {
+        destination.id != agent.id || destination.generation != agent.generation
+    }) {
         return Err(Error::new(
             "stale_generation",
             "switch successor generation moved",
+        ));
+    }
+    if switch_successor_has_input(tx, agent)? {
+        return Err(Error::new(
+            "bad_state",
+            "Successor has a SEND or turn. Its session was left running.",
         ));
     }
     Ok(())
@@ -678,7 +679,8 @@ pub(super) fn refresh_disposal_parent_tx(
     now: i64,
 ) -> Result<()> {
     tx.execute(
-        "UPDATE commands SET outcome=json_set(outcome,'$.disposal_state',?2), updated_at=?3
+        "UPDATE commands SET outcome=json_set(outcome,'$.disposal_state',?2,'$.disposal_reason',
+             (SELECT json_extract(outcome,'$.message') FROM commands WHERE id=?1)), updated_at=?3
          WHERE id=(SELECT parent_command FROM commands WHERE id=?1 AND link_kind='switch' AND ordinal=2 AND verb='stop')
            AND method='swarm.switch' AND state='failed' AND json_extract(outcome,'$.disposal_command')=?1",
         params![command_id, command_state_name(state), now],
@@ -855,13 +857,67 @@ fn require_switch_children(
     Ok(())
 }
 
+fn launch_destination_tx(tx: &Connection, launch: &Command) -> Result<Option<Agent>> {
+    let (Some(target), Some(1)) = (launch.target.as_deref(), launch.generation) else {
+        return Ok(None);
+    };
+    Ok(load_agent_by_num(tx, parse_agent_id(target)?)?
+        .filter(|agent| launch.verb == "launch" && agent.generation == 1 && !agent.observe_only))
+}
+
+fn switch_successor_needs_stop(tx: &Connection, agent: &Agent) -> Result<bool> {
+    if !agent.is_terminal() {
+        return Ok(true);
+    }
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM processes WHERE owner=?1 AND state IN ('running','unknown'))",
+        [format!("agent:{}#{}", agent.id, agent.generation)],
+        |row| row.get(0),
+    )
+    .map_err(sql_error)
+}
+
+fn switch_successor_has_input(tx: &Connection, agent: &Agent) -> Result<bool> {
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM commands WHERE target=?1 AND generation=?2 AND verb='send')
+          OR EXISTS(SELECT 1 FROM turns WHERE agent=?1 AND generation=?2)",
+        params![parse_agent_id(&agent.id)?, agent.generation],
+        |row| row.get(0),
+    )
+    .map_err(sql_error)
+}
+
+pub(super) fn require_switch_successor_accepting_input(
+    tx: &Transaction<'_>,
+    agent: i64,
+    generation: i64,
+) -> Result<()> {
+    let disposing: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM commands WHERE target=?1 AND generation=?2
+           AND link_kind='switch' AND ordinal=2 AND verb='stop'
+           AND state IN ('dispatched','unknown'))",
+            params![agent, generation],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    if disposing {
+        return Err(Error::new(
+            "busy",
+            "Switch successor stop is already in flight.",
+        ));
+    }
+    Ok(())
+}
+
 fn ready_destination_tx(tx: &Connection, launch: &Command) -> Result<Agent> {
-    let agent = launch
-        .target
-        .as_deref()
-        .ok_or_else(|| Error::new("source_integrity", "switch launch target missing"))?;
-    let destination = load_agent_by_num(tx, parse_agent_id(agent)?)?
-        .ok_or_else(|| Error::new("not_found", "created Agent missing"))?;
+    let destination = launch_destination_tx(tx, launch)?.ok_or_else(|| {
+        Error::new(
+            "stale_generation",
+            "switch launch generation is unavailable",
+        )
+    })?;
+    let agent = &destination.id;
     // Some native adapters omit command_id on session.ready. The first generation
     // of this newly allocated B has exactly one start command: the reserved launch.
     // Use that exact persistent binding; a contradictory supplied ID still refuses.
@@ -885,8 +941,7 @@ fn ready_destination_tx(tx: &Connection, launch: &Command) -> Result<Agent> {
             "switch requires exact committed session readiness",
         ));
     }
-    let input: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM commands WHERE target=?1 AND generation=?2 AND verb='send') OR EXISTS(SELECT 1 FROM turns WHERE agent=?1 AND generation=?2)",params![parse_agent_id(agent)?,destination.generation],|row|row.get(0)).map_err(sql_error)?;
-    if input {
+    if switch_successor_has_input(tx, &destination)? {
         return Err(Error::new(
             "bad_state",
             "switch destination already has input",

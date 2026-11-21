@@ -861,10 +861,13 @@ batch can race; the worker waits up to 30 seconds for committed readiness after
 the ordinary launch worker returns. B must have no previous SEND/turn. In one
 immediate transaction a savepoint calls the same H2 handoff implementation,
 revalidates A/B, links the Handoff parent as the switch's second child and records
-completion. A definite H2 refusal rolls back the transfer and admits a linked
-ordinary stop for the exact ready, unused B. Stop dispatch checks that B is still
-the same unused generation. This leaves the retained Agent and custody result
-available to the Owner. An uncertain transfer keeps B's state for readback.
+completion. A definite refusal admits a linked ordinary stop for the exact
+unused successor, including when its readiness could not be established. The
+Store admits disposal only after any attempted transfer has rolled back. If B has
+any SEND or turn when the stop would be admitted or dispatched, B stays running
+and the receipt records the reason. SEND admission checks that disposal has not
+already dispatched or become uncertain. An uncertain transfer keeps B's state
+for readback.
 
 The switch parent is Accepted at reservation and Dispatched while orchestrating.
 Applied means the H2 Store transfer committed, not that the brief/task succeeded.
