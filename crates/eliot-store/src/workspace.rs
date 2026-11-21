@@ -1031,7 +1031,12 @@ pub(super) fn settle_preparation_command(
             "workspace start is already settled or dispatched",
         ));
     }
-    let mut outcome = json!({"stage": "workspace", "native_dispatched": false, "target_generation": workspace.target_generation, "detail": workspace.outcome});
+    let native_dispatched = workspace
+        .outcome
+        .as_ref()
+        .and_then(|value| value.get("native_git_write_dispatched"))
+        .and_then(Value::as_bool);
+    let mut outcome = json!({"stage": "workspace", "native_dispatched": native_dispatched, "target_generation": workspace.target_generation, "detail": workspace.outcome});
     if matches!(state, CommandState::Failed | CommandState::Unknown)
         && let Some(result) = workspace
             .outcome

@@ -316,6 +316,15 @@ impl GitProbe {
         Ok(index)
     }
 
+    pub(crate) async fn cached_index_paths(
+        &self,
+        root: &Path,
+        deadline: Instant,
+    ) -> Result<BTreeSet<String>> {
+        let (_, index) = self.index_snapshot(root, &[], deadline).await?;
+        Ok(index.into_keys().collect())
+    }
+
     async fn filter_attributes(
         &self,
         root: &Path,

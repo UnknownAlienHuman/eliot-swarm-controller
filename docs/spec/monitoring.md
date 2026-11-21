@@ -340,9 +340,12 @@ Flow:
 A lost Git response is settled by exact worktree/path/branch/OID readback. A failed
 checkout can leave its new Git branch after Git has removed the worktree. Cleanup
 requires the creation command's branch reflog marker, the frozen tip and no other
-registration. Rollback removes a proven clean worktree with ordinary Git removal
-and compare-deletes the exact ref. A failed checkout reports its exit code once
-readback proves that the checkout and branch are absent. A setup entry
+registration. Rollback checks a newly created worktree with porcelain status and
+removes it with ordinary Git removal before compare-deleting the exact ref.
+With quiescent custody, a rollback refusal or failed readback settles the launch
+as failed with the specific reason and preserves any remaining artifacts for cleanup.
+A failed checkout reports its exit code once readback proves that the checkout and
+branch are absent. A setup entry
 has no generic readback: after restart or lost process result, `setup_running` becomes
 `unknown` unless exact platform evidence proves the process never started. It is never
 rerun. The owner removes/recreates or explicitly resolves the workspace. This needs one

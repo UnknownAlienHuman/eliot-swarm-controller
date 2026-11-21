@@ -24,7 +24,8 @@ const UNKNOWN: &str = "a.capacity_generation IS NOT NULL AND (
                WHERE c.target = a.id AND c.verb IN ('launch','resume') AND c.state = 'unknown'
                  AND (c.generation = a.capacity_generation
                       OR (c.generation = a.capacity_generation - 1
-                          AND json_extract(c.outcome, '$.native_dispatched') = 0))))";
+                          AND (json_extract(c.outcome, '$.stage') = 'workspace'
+                               OR json_extract(c.outcome, '$.native_dispatched') = 0)))))";
 
 enum DetailAccess {
     Owner,

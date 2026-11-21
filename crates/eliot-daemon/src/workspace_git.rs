@@ -401,11 +401,27 @@ impl WorkspaceGit {
                 .any(|entry| {
                     entry.path == target || entry.branch.as_deref() == Some(branch.as_str())
                 })
-            || !self
-                .creation_branch_is_owned(preparation, &source, deadline)
-                .await?
+        {
+            return Err(problem(
+                "source_integrity",
+                "workspace path or Git registration remains",
+            ));
+        }
+        if self
+            .branch_oid(&source.root, &preparation.requested_branch, deadline)
+            .await?
+            .is_none()
         {
             return Ok(None);
+        }
+        if !self
+            .creation_branch_is_owned(preparation, &source, deadline)
+            .await?
+        {
+            return Err(problem(
+                "source_integrity",
+                "remaining branch does not match the launch's creation marker and frozen tip",
+            ));
         }
         self.git
             .prepare_workspace_command(
@@ -441,9 +457,12 @@ impl WorkspaceGit {
                 .creation_branch_is_owned(preparation, &subject.source, deadline)
                 .await?
         {
-            return Ok(None);
+            return Err(problem(
+                "source_integrity",
+                "remaining worktree does not match the launch's creation marker and frozen tip",
+            ));
         }
-        self.require_clean(&subject, true, deadline).await?;
+        self.require_created_clean(&subject, deadline).await?;
         self.confirm_subject(preparation, &subject, deadline)
             .await?;
         let target = git_path_argument(&subject.target.root)?;
@@ -554,20 +573,32 @@ impl WorkspaceGit {
         }
     }
 
+    pub(crate) async fn creation_is_absent(
+        &self,
+        preparation: &WorkspacePreparation,
+    ) -> Result<bool> {
+        let deadline = Instant::now() + READ_TIME;
+        let source = self.source(preparation, deadline).await?;
+        let target = destination_path(&preparation.worktree_path)?;
+        separate_target(&source, &target)?;
+        let branch = branch_ref(&preparation.requested_branch);
+        let entries = self.entries(&source.root, deadline).await?;
+        Ok(!entries
+            .iter()
+            .any(|entry| entry.path == target || entry.branch.as_deref() == Some(branch.as_str()))
+            && absent(&target)?
+            && self
+                .branch_oid(&source.root, &preparation.requested_branch, deadline)
+                .await?
+                .is_none())
+    }
+
     async fn inspect_created(
         &self,
         preparation: &WorkspacePreparation,
     ) -> Result<WorkspaceCreationOutcome> {
         let deadline = Instant::now() + READ_TIME;
-        let source = self.source(preparation, deadline).await?;
-        let target = destination_path(&preparation.worktree_path)?;
-        separate_target(&source, &target)?;
-        let entries = self.entries(&source.root, deadline).await?;
-        let registered = entries.iter().any(|entry| entry.path == target);
-        let branch = self
-            .branch_oid(&source.root, &preparation.requested_branch, deadline)
-            .await?;
-        if !registered && absent(&target)? && branch.is_none() {
+        if self.creation_is_absent(preparation).await? {
             return Ok(WorkspaceCreationOutcome::Failed {
                 code: "not_created".to_owned(),
                 message: "no workspace path, branch, or registration exists".to_owned(),
@@ -650,7 +681,6 @@ impl WorkspaceGit {
             allowed.insert(prefix);
         }
 
-        let cached_args = ["ls-files", "--cached", "-z"];
         let other_args = ["ls-files", "--others", "--exclude-standard", "-z"];
         let ignored_args = [
             "ls-files",
@@ -666,7 +696,7 @@ impl WorkspaceGit {
                 .await?;
             return Ok(Vec::new());
         }
-        let cached = scratch_paths(&self.read(root, &cached_args, deadline).await?)?;
+        let cached = scratch_index_paths(self.git.cached_index_paths(root, deadline).await?)?;
         let mut tracked = BTreeSet::new();
         for relative in &cached {
             if Instant::now() >= deadline {
@@ -719,7 +749,9 @@ impl WorkspaceGit {
 
         self.require_tracked_clean(&subject, deadline).await?;
         self.require_merged(preparation, &subject, deadline).await?;
-        if cached != scratch_paths(&self.read(root, &cached_args, deadline).await?)?
+        let cached_readback =
+            scratch_index_paths(self.git.cached_index_paths(root, deadline).await?)?;
+        if cached != cached_readback
             || other != scratch_paths(&self.read(root, &other_args, deadline).await?)?
             || ignored != scratch_paths(&self.read(root, &ignored_args, deadline).await?)?
         {
@@ -1250,6 +1282,20 @@ fn scratch_paths(bytes: &[u8]) -> Result<BTreeSet<PathBuf>> {
     text.split('\0')
         .map(|path| {
             scratch_relative(path).map_err(|_| {
+                problem(
+                    "unavailable",
+                    "scratch Git listing contains an invalid relative path",
+                )
+            })
+        })
+        .collect()
+}
+
+fn scratch_index_paths(paths: BTreeSet<String>) -> Result<BTreeSet<PathBuf>> {
+    paths
+        .into_iter()
+        .map(|path| {
+            scratch_relative(&path).map_err(|_| {
                 problem(
                     "unavailable",
                     "scratch Git listing contains an invalid relative path",
