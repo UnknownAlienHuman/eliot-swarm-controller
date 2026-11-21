@@ -4165,7 +4165,12 @@ impl Router {
             encoded_bytes += row_bytes + 1;
             rows.push(row);
         }
-        let next = rows.last().map(|row| row.summary.id.clone());
+        let next = rows.last().map(|row| match request.order {
+            eliot_core::api::AgentListOrder::Id => row.summary.id.clone(),
+            eliot_core::api::AgentListOrder::Recent => {
+                eliot_core::api::encode_recent_cursor(&row.summary.id, row.summary.updated_at)
+            }
+        });
         serde_json::to_value(AgentListResponse {
             state_totals: page.state_totals,
             agents: rows,
