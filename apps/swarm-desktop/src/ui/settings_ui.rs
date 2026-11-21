@@ -1042,10 +1042,29 @@ impl DesktopApp {
                     // (the JSON, typed presets TOML) and the Cloud MCP form
                     // keep their drafts, and the other pages' changes still
                     // save.
-                    Err(_) => {
+                    Err(error) => {
                         if !(page == Page::Models && self.editor.raw_dirty) {
                             if page == Page::Models {
+                                // A refused form change: its reason goes
+                                // next to the field it names. A refused new
+                                // preset is gone from the draft again, so
+                                // its reason goes to the New preset row.
+                                let created = self.editor.selected.clone();
                                 self.discard_profiles();
+                                self.editor.field_error = profiles::field_error(&error.message)
+                                    .map(|(preset, key, words)| {
+                                        let gone = !profiles::profile_names(&self.editor.draft)
+                                            .contains(&preset);
+                                        super::profiles_ui::FieldError {
+                                            key: if gone && created.as_ref() == Some(&preset) {
+                                                profiles::NEW_PRESET_ROW.to_owned()
+                                            } else {
+                                                key
+                                            },
+                                            preset,
+                                            words,
+                                        }
+                                    });
                             }
                             self.settings.refused(page, Note::of(false, &result));
                             self.reprime_fields(context);

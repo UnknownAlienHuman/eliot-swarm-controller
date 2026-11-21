@@ -809,7 +809,12 @@ of the explicitly selected release scope.
       catalogue does, the picker just under the field and never past the card),
       and its dropdowns carry that harness's real fields (Codex
       sandbox and approval policy, Claude Code permission mode, Muse approval
-      and sandbox, Antigravity mode); no text box offers Windows text
+      and sandbox, Antigravity mode). A preset shows its agent app (a chooser
+      creates a new preset, taking that app's `cmd` from an existing preset of it)
+      and a Subagents card: Can start (`child_profiles`), the agent app's own
+      subagents (`native_subagents`; fixed Allow on Muse and Antigravity) and
+      Manages its subagents through Swarm (`control = "tree"`); a refused change
+      shows its reason by its field. No text box offers Windows text
       prediction. Enter sends and Shift+Enter keeps the line break (the window
       hook marks the line break Enter typed); one Send steers the active turn
       while one runs and, after a definite `bad_state`/`stale_generation`/
