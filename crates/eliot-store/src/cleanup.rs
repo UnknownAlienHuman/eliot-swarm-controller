@@ -9,6 +9,9 @@ const MAX_CLEANUP_PLANS: i64 = 1_024;
 /// Reclaimable plans deleted per self-heal batch: fully settled consumed
 /// plans and abandoned never-consumed previews, oldest first.
 const CLEANUP_PLAN_RECLAIM_BATCH: i64 = 64;
+/// Ledger rows inspected by one cleanup inventory page, including rows that
+/// are settled or filtered out.
+const CLEANUP_INVENTORY_SCAN: usize = 256;
 
 /// An apply can read back its exact workspace command even after a crash
 /// between native removal and cleanup receipt settlement.
@@ -343,21 +346,22 @@ impl Store {
 
     /// Eligible cleanup candidates in final candidate order: ordinary rows
     /// first, then worktrees, then branches and native sessions, each oldest
-    /// insertion first. Only `registered` rows paginate: settled rows
-    /// (`removed`, `unknown`, `skipped(...)`) are attempt history, not
-    /// candidates, and their readback lives in the retained plans. Filtering
-    /// them before the page cap keeps a settled prefix from starving later
-    /// eligible rows. The page is pinned to a ledger snapshot: rows inserted
-    /// after the snapshot land on a fresh listing, never inside a page, and
-    /// the cursor resolves against the same snapshot, so a concurrent
-    /// registration can neither hide behind nor repeat a candidate. Returns
-    /// the page, whether eligible rows remain, and the snapshot to echo.
+    /// insertion first. A bounded raw-row scan advances by rank and sequence,
+    /// including through settled/filtered rows, so an empty page still makes
+    /// progress. The page is pinned to a ledger snapshot: later registrations
+    /// appear only in a fresh listing. Returns the candidates, whether more
+    /// inventory remains, the snapshot, and the next raw-row cursor.
     pub fn cleanup_inventory(
         &self,
         principal: &str,
         request: &CleanupPlanRequest,
-    ) -> Result<(Vec<ArtifactView>, bool, i64)> {
+        page: &PlanContinuation,
+        limit: usize,
+    ) -> Result<(Vec<ArtifactView>, bool, i64, u8, Option<i64>)> {
         request.validate()?;
+        if limit > MAX_CLEANUP_ITEMS {
+            return Err(Error::new("invalid", "cleanup inventory page exceeds bound"));
+        }
         let caller = parse_sender(principal, "cleanup")?;
         if !matches!(caller, Sender::Owner) && request.scope != CleanupScope::SelfTree {
             return Err(Error::new(
@@ -368,21 +372,6 @@ impl Store {
         if matches!(caller, Sender::Owner) && request.scope == CleanupScope::SelfTree {
             return Err(Error::new("invalid", "Owner must select project or all"));
         }
-        let page = request
-            .continuation
-            .as_deref()
-            .map(PlanContinuation::decode)
-            .transpose()?
-            .unwrap_or(PlanContinuation {
-                artifact_after: None,
-                safe_skipped: 0,
-                kept_skipped: 0,
-                regs_revision: None,
-                snapshot_seq: None,
-                safe_ids: None,
-                kept_ids: None,
-                backfill_after: None,
-            });
         let snapshot: i64 = match page.snapshot_seq {
             Some(snapshot) => snapshot,
             None => self
@@ -392,84 +381,113 @@ impl Store {
                 })
                 .map_err(sql_error)?,
         };
-        let cursor: Option<(u8, i64)> = match &page.artifact_after {
-            None => None,
-            Some(id) => {
-                let (kind, seq): (String, i64) = self
-                    .connection
-                    .query_row(
-                        "SELECT json_extract(body, '$.kind'), seq FROM artifacts WHERE id = ?1",
-                        [id],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
-                    )
-                    .map_err(|error| match error {
-                        rusqlite::Error::QueryReturnedNoRows => {
-                            Error::new("invalid", "cleanup continuation is stale")
-                        }
-                        other => sql_error(other),
-                    })?;
-                let kind: ArtifactKind = serde_json::from_value(Value::String(kind))
-                    .map_err(|_| Error::new("source_integrity", "invalid artifact ledger row"))?;
-                Some((kind.cleanup_rank(), seq))
-            }
+        let (mut rank, mut after_seq) = match page.inventory_rank {
+            Some(rank) => (rank, page.inventory_seq_after),
+            None => match page.artifact_after.as_deref() {
+                None => (0, None),
+                Some(id) => {
+                    let (kind, seq): (String, i64) = self
+                        .connection
+                        .query_row(
+                            "SELECT json_extract(body, '$.kind'), seq FROM artifacts WHERE id = ?1",
+                            [id],
+                            |r| Ok((r.get(0)?, r.get(1)?)),
+                        )
+                        .map_err(|error| match error {
+                            rusqlite::Error::QueryReturnedNoRows => {
+                                Error::new("invalid", "cleanup continuation is stale")
+                            }
+                            other => sql_error(other),
+                        })?;
+                    let kind: ArtifactKind = serde_json::from_value(Value::String(kind))
+                        .map_err(|_| {
+                            Error::new("source_integrity", "invalid artifact ledger row")
+                        })?;
+                    if seq > snapshot {
+                        return Err(Error::new("invalid", "cleanup continuation is stale"));
+                    }
+                    (kind.cleanup_rank(), Some(seq))
+                }
+            },
         };
-        let mut statement = self
-            .connection
-            .prepare("SELECT body, seq FROM artifacts WHERE seq <= ?1 ORDER BY seq ASC LIMIT 4097")
-            .map_err(sql_error)?;
-        let bodies = statement
-            .query_map([snapshot], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-            })
-            .map_err(sql_error)?;
+        if after_seq.is_some_and(|seq| seq > snapshot) {
+            return Err(Error::new("invalid", "cleanup continuation is stale"));
+        }
+        if rank == 3 {
+            return Ok((Vec::new(), false, snapshot, rank, None));
+        }
+
         let mut scanned = 0_usize;
-        let mut eligible: Vec<(u8, i64, ArtifactView)> = Vec::new();
-        for body in bodies {
-            scanned += 1;
-            let (body, seq) = body.map_err(sql_error)?;
-            let artifact: ArtifactView = serde_json::from_str(&body)
-                .map_err(|_| Error::new("source_integrity", "invalid artifact ledger row"))?;
-            let rank = artifact.kind.cleanup_rank();
-            if artifact.state != "registered"
-                || cursor
-                    .is_some_and(|(rank_after, seq_after)| (rank, seq) <= (rank_after, seq_after))
-            {
-                continue;
+        let mut eligible = Vec::with_capacity(limit);
+        let mut truncated = false;
+        'scan: while rank < 3 && scanned < CLEANUP_INVENTORY_SCAN {
+            let remaining = CLEANUP_INVENTORY_SCAN - scanned;
+            let mut statement = self
+                .connection
+                .prepare(
+                    "SELECT body, seq FROM artifacts
+                     WHERE seq > ?1 AND seq <= ?2 ORDER BY seq ASC LIMIT ?3",
+                )
+                .map_err(sql_error)?;
+            let rows = statement
+                .query_map(
+                    params![after_seq.unwrap_or(0), snapshot, (remaining + 1) as i64],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .map_err(sql_error)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(sql_error)?;
+            let fetched = rows.len();
+            for (body, seq) in rows.into_iter().take(remaining) {
+                let previous_seq = after_seq;
+                after_seq = Some(seq);
+                scanned += 1;
+                let artifact: ArtifactView = serde_json::from_str(&body)
+                    .map_err(|_| Error::new("source_integrity", "invalid artifact ledger row"))?;
+                if artifact.kind.cleanup_rank() != rank || artifact.state != "registered" {
+                    continue;
+                }
+                if request
+                    .project
+                    .as_ref()
+                    .is_some_and(|project| project != &artifact.project)
+                    || request.older_than.is_some_and(|cutoff| artifact.created_at >= cutoff)
+                {
+                    continue;
+                }
+                // Frozen and live subtree membership is checked before the
+                // target's assignment gate: unrelated rows skip, while a
+                // real assignment refusal still aborts the page.
+                if !self.cleanup_subtree_member(&caller, &artifact)? {
+                    continue;
+                }
+                if !self.cleanup_authorized(principal, &artifact)? {
+                    continue;
+                }
+                if eligible.len() == limit {
+                    // Do not consume the first candidate that does not fit.
+                    after_seq = previous_seq;
+                    truncated = true;
+                    break 'scan;
+                }
+                eligible.push(artifact);
             }
-            if request
-                .project
-                .as_ref()
-                .is_some_and(|p| p != &artifact.project)
-                || request.older_than.is_some_and(|t| artifact.created_at >= t)
-            {
-                continue;
+            if fetched > remaining {
+                truncated = true;
+                break;
             }
-            // Frozen and live subtree membership is checked before the
-            // target's assignment gate: a later row from another managed
-            // project must skip, never abort the page with `not_allowed`.
-            // Only rows in the caller's own subtree reach the gate in
-            // `cleanup_authorized`, where a real assignment refusal aborts.
-            if !self.cleanup_subtree_member(&caller, &artifact)? {
-                continue;
-            }
-            if !self.cleanup_authorized(principal, &artifact)? {
-                continue;
-            }
-            eligible.push((rank, seq, artifact));
+            // Fewer than remaining + 1 rows means this rank's raw tail is
+            // exhausted. Continue at the next final-order rank.
+            rank += 1;
+            after_seq = None;
         }
-        eligible.sort_by_key(|item| (item.0, item.1));
-        let mut truncated = scanned > 4096;
-        let items = if eligible.len() > MAX_CLEANUP_ITEMS {
+        if rank < 3 {
             truncated = true;
-            eligible.truncate(MAX_CLEANUP_ITEMS);
-            eligible
         } else {
-            eligible
+            rank = 3;
+            after_seq = None;
         }
-        .into_iter()
-        .map(|(_, _, artifact)| artifact)
-        .collect();
-        Ok((items, truncated, snapshot))
+        Ok((eligible, truncated, snapshot, rank, after_seq))
     }
 
     /// Retirement candidates for one exact Agent generation. The Agent,
