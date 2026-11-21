@@ -350,7 +350,9 @@ impl Router {
                             && store
                                 .list_source_states(agent, current.generation)?
                                 .iter()
-                                .any(|source| source.source == "git" && source.state == "open")
+                                .any(|source| {
+                                    source["source"] == "git" && source["state"] == "open"
+                                })
                         {
                             let closed = store.set_git_source_status(
                                 agent,

@@ -2176,7 +2176,9 @@ fn native_capture(
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
-                    .ok()?;
+                    .map_err(|_| {
+                        core::Error::new("unavailable", "native discovery runtime could not start")
+                    })?;
                 runtime.block_on(async {
                     let budget = discovery_remaining(deadline)?;
                     let mut command = tokio::process::Command::new(program);
