@@ -1386,6 +1386,15 @@ impl PluginHost {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // Debug-only owner fault hook: the plugin entry point panics when
+        // `ELIOT_DEBUG_PLUGIN_PANIC=1`. The child environment is rebuilt from
+        // a fixed base list, so forward this one flag explicitly or the hook
+        // is unreachable through the daemon. Compiled out of release builds
+        // with the trigger itself.
+        #[cfg(debug_assertions)]
+        if let Some(value) = std::env::var_os("ELIOT_DEBUG_PLUGIN_PANIC") {
+            command.env("ELIOT_DEBUG_PLUGIN_PANIC", value);
+        }
         Ok(command)
     }
 
@@ -1672,6 +1681,10 @@ async fn cleanup_startup(
     proven_no_dispatch: bool,
 ) {
     let exited = terminate_child(child, &actor.monitoring, &actor.agent).await;
+    // A plugin that panicked on its own left a crash marker in exactly this
+    // owned process pipe. Record that evidence beside the loss so diagnosis
+    // says why the Agent software died, not only that its start failed.
+    let panic_tail = plugin_crash_marker(&actor.stderr).map(|marker| marker.summary());
     // `settle_owned_source_exit` returns Ok only after positive custody exit,
     // completed reader drain, and the committed exit gap (see
     // `settle_drained_source_exit`). This failed-start path never enters the
@@ -1689,7 +1702,21 @@ async fn cleanup_startup(
     )
     .await;
     if settled.is_ok() && !proven_no_dispatch {
-        mark_lost_state(&actor.state, &actor.key, "plugin_startup_exit").await;
+        match panic_tail {
+            Some(tail) => {
+                mark_lost_state_with_exit(
+                    &actor.state,
+                    &actor.key,
+                    "plugin_startup_exit",
+                    None,
+                    Some(tail),
+                )
+                .await;
+            }
+            None => {
+                mark_lost_state(&actor.state, &actor.key, "plugin_startup_exit").await;
+            }
+        }
     } else if let Err(error) = settled {
         pending_failure.get_or_insert(PendingFailure {
             reply: None,
@@ -3327,6 +3354,19 @@ async fn record_root_exit_gap(state: &Weak<HostState>, key: &AgentKey, reason: &
 /// is reserved for an explicit Owner/host assertion of loss.
 async fn mark_lost_state(state: &Weak<HostState>, key: &AgentKey, reason: &'static str) {
     mark_lost_state_with_exit(state, key, reason, None, None).await;
+}
+
+/// The one owned plugin crash marker in this stderr snapshot, if any. Only
+/// the exact owned process pipe is ever read here; a disk marker belonging to
+/// another process or generation cannot enter this path.
+fn plugin_crash_marker(stderr: &StderrView) -> Option<eliot_core::api::CrashMarker> {
+    let snapshot = stderr.snapshot();
+    snapshot
+        .text
+        .lines()
+        .filter_map(|line| line.strip_prefix("eliot_crash "))
+        .filter_map(|json| serde_json::from_str::<eliot_core::api::CrashMarker>(json).ok())
+        .find(|marker| marker.code == "plugin.panicked" && marker.validate().is_ok())
 }
 
 /// Mark an agent generation lost with its process exit evidence: the

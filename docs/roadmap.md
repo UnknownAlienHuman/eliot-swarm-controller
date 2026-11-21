@@ -418,11 +418,14 @@ qualification is incomplete; do not describe it as feature complete.
       same summary in desktop Agent details. Qualify on a private daemon:
       nonexistent command, killed turn, invalid model, `max_live`, plugin panic
       and forced daemon panic with the marker consumed exactly once. Qualified
-      2026-11-21 on swarm.exe 8544DDDF (private data dir): nonexistent command and
-      max_live said origin/where; a real OpenRouter credit failure said provider
-      origin at `plugin.opencode.turn`; a killed plugin process and a daemon-restart
-      leftover said `Swarm` at `daemon.restart`; the debug `daemon.panic_test`
-      marker was reported once at restart and never again.
+      2026-11-21 on swarm.exe 944F2E27 (private data dir): nonexistent command,
+      invalid model and `max_live` named origin and where; `swarm why <launch>`
+      followed its linked `/send` to the provider refusal at
+      `plugin.opencode.turn`; a killed owned plugin process said `harness` at
+      `plugin.exit`; `ELIOT_DEBUG_PLUGIN_PANIC` surfaced `plugin.panicked` with
+      its location; the debug `daemon.panic_test` marker aborted the daemon and
+      was reported once at restart, never again; a force-stopped daemon's owned
+      harness process died with it and restart said `swarm` at `daemon.restart`.
 
 ## L7 — Qualification, repair and release
 

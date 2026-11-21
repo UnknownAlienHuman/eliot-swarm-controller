@@ -96,7 +96,23 @@ impl Router {
         let command = store.get_command(command_id)?.ok_or_else(|| {
             Error::new("not_found", format!("command {command_id} was not found"))
         })?;
+        // A start command's own outcome can be `ready` while the failure it
+        // produced sits on its linked input expansion (`<id>/send`), the
+        // command that actually settled the turn. Diagnosing the start alone
+        // would report success, so follow that exact link when it exists.
+        let linked_send = store
+            .get_command(&format!("{command_id}/send"))?
+            .filter(|linked| {
+                linked.target.as_deref() == command.target.as_deref()
+                    && linked.generation == command.generation
+            })
+            .map(|linked| linked.id.clone());
         let mut steps = vec![command_step(&command)];
+        if let Some(linked) = linked_send.as_deref()
+            && let Some(child) = store.get_command(linked)?
+        {
+            steps.push(command_step(&child));
+        }
         let mut preceded_by = None;
         if let (Some(agent), Some(generation)) = (command.target.as_deref(), command.generation)
             && let Ok(turns) = store.list_turns(agent, generation, 32)
@@ -105,9 +121,10 @@ impl Router {
                 if steps.len() > MAX_TURNS_PER_DIAGNOSIS {
                     break;
                 }
-                if store.turn_command_id(agent, generation, &turn.turn_id)?
-                    != Some(command_id.to_owned())
-                {
+                let turn_command = store.turn_command_id(agent, generation, &turn.turn_id)?;
+                let settled_here = turn_command.as_deref() == Some(command_id)
+                    || turn_command.as_deref() == linked_send.as_deref();
+                if !settled_here {
                     continue;
                 }
                 if preceded_by.is_none() {

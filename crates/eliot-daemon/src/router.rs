@@ -452,15 +452,23 @@ impl Router {
                 self.shutdown(&params, &principal).await
             }
             // Debug-only forced daemon panic for crash-capture tests.
-            // Compiled out of release builds: the detached thread panic
-            // aborts the process after the hook writes its marker.
+            // Compiled out of release builds. The panic hook writes the
+            // marker during unwinding; `panic = abort` is not set for the
+            // workspace, so an unwinding thread alone would leave the daemon
+            // serving. Abort this process once the hook has captured it so
+            // the marker is reported against a genuinely stopped daemon.
             #[cfg(debug_assertions)]
             "daemon.panic_test" => {
                 require_owner(&principal)?;
-                std::thread::spawn(|| {
+                let handle = std::thread::spawn(|| {
                     panic!("debug daemon panic-test trigger");
                 });
-                Ok(json!({"state": "panicking"}))
+                // Give the panicking thread its moment to run the installed
+                // hook, then end the process regardless of how that thread's
+                // panic resolves.
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                let _ = handle.join();
+                std::process::abort()
             }
             "maintenance.run" => self.maintenance_run(&params, &principal).await,
             "artifact.register" => self.artifact_register(&params, &principal).await,
