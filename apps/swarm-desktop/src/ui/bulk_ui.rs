@@ -951,13 +951,13 @@ impl DesktopApp {
                     "what".to_owned(),
                     m3::secondary(match dialog.op {
                         BulkOp::RemoveProjects => {
-                            "Swarm forgets these projects in one save. Their folders, files and tasks stay; you can add a project again in Settings › Projects."
+                            "Swarm removes these project registrations. Their checkouts, workspace files, branches and task records stay; you can add a checkout again in Settings › Projects."
                         }
                         BulkOp::ArchiveFinished => {
                             "Archived tasks leave the list; Show archived brings them back, and Unarchive restores one."
                         }
                         BulkOp::DeleteStopped => {
-                            "Their conversations and records leave Swarm for good. Folders, files, branches and the harnesses' own session files stay."
+                            "Swarm removes each listed task tree and its records. Swarm workspace files and Git branches stay. Eligible Swarm-created Codex sessions are archived and eligible OpenCode sessions are deleted. Claude Code, Muse and Antigravity keep their own history; attached or observed sessions are left untouched."
                         }
                     })
                     .text_wrapping(TextWrapping::Wrap)
