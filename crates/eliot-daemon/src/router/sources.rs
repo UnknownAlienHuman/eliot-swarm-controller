@@ -16,9 +16,11 @@ use std::path::{Path, PathBuf};
 /// Most files one input may name.
 pub(crate) const MAX_SOURCES: usize = 16;
 const MAX_SOURCE_PATH_BYTES: usize = 1024;
-/// Room kept for the block's own header and each section's header line.
+/// Room kept for the block's own header, and for each section's header line
+/// beyond its path (digest, sizes and the completeness phrase).
 const BLOCK_HEADER_BYTES: usize = 256;
 const SECTION_HEADER_BYTES: usize = 160;
+const BLOCK_HEADER: &str = "Required sources (delivered by Swarm with path, content digest and completeness; read them here instead of reopening the files):";
 /// Larger files are refused rather than read just to be cut.
 const MAX_SOURCE_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -72,9 +74,17 @@ impl Router {
             .to_owned();
         // The whole input text is persisted with the command, so the
         // delivered content shares the 64 KiB persisted-text bound.
-        let budget = MAX_EVENT_BYTES
-            .saturating_sub(text.len() + BLOCK_HEADER_BYTES + SECTION_HEADER_BYTES * paths.len());
-        let block = delivered_block(&root, &paths, budget, &self.secret_policy_snapshot());
+        let headers = paths
+            .iter()
+            .map(|path| path.len() + SECTION_HEADER_BYTES)
+            .sum::<usize>();
+        let budget = MAX_EVENT_BYTES.saturating_sub(text.len() + BLOCK_HEADER_BYTES + headers);
+        let policy = self.secret_policy_snapshot();
+        // File reads stay off the async router threads.
+        let block =
+            tokio::task::spawn_blocking(move || delivered_block(&root, &paths, budget, &policy))
+                .await
+                .map_err(|_| Error::new("internal", "source delivery task failed"))?;
         request.args["text"] = Value::String(if text.trim().is_empty() {
             block
         } else {
@@ -161,9 +171,7 @@ fn delivered_block(root: &Path, paths: &[String], budget: usize, policy: &Secret
             remaining -= share;
         }
     }
-    let mut out = String::from(
-        "Required sources (delivered by Swarm with path, content digest and completeness; read them here instead of reopening the files):",
-    );
+    let mut out = String::from(BLOCK_HEADER);
     for ((path, read), share) in paths.iter().zip(&reads).zip(shares) {
         match read {
             Read::Skipped(reason) => {
@@ -213,4 +221,17 @@ fn read_source(root: &Path, path: &str) -> std::result::Result<Vec<u8>, &'static
         return Err("larger than 8 MiB");
     }
     std::fs::read(&canonical).map_err(|_| "unreadable")
+}
+
+/// Whether `stored` is `text` with a delivered sources block appended, so a
+/// same-ID retry of that request replays the admitted text instead of
+/// re-reading files that may have changed since.
+pub(super) fn is_delivery_of(stored: &str, text: &str) -> bool {
+    if text.trim().is_empty() {
+        return stored.starts_with(BLOCK_HEADER);
+    }
+    stored
+        .strip_prefix(text)
+        .and_then(|rest| rest.strip_prefix("\n\n"))
+        .is_some_and(|rest| rest.starts_with(BLOCK_HEADER))
 }
