@@ -2896,6 +2896,7 @@ impl Router {
         timers: &[TimerDefinitionInput],
         registration_now: i64,
         absent_from_source: &[&str],
+        source_files: &HashMap<String, String>,
     ) -> Result<Vec<RuleProcessingState>> {
         self.validate_rule_definitions(principal, definitions)
             .await?;
@@ -2909,6 +2910,8 @@ impl Router {
                 registration_now,
                 absent_from_source,
             )?;
+            // rule.list holds this Store lock while reading the source map.
+            self.install_rule_source_files(principal, source_files);
             self.publish_locked(&change.events);
             change
         };

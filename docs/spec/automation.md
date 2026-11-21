@@ -27,8 +27,9 @@ The Owner can read, save and delete a top-level `.toml` source file in either ap
 rule root. Read supplies the exact UTF-8 text and a lowercase SHA-256 revision of the
 file bytes. Save creates a file only when the expected revision is absent and the file
 does not exist. Replace and delete require the current revision. Save uses the same
-parser and namespace validation as the loader. Rule file operations refuse content
-containing secrets known to the daemon and use the ordinary rule reconciliation path.
+parser and namespace validation as the loader. Read and save refuse content
+containing secrets known to the daemon. Delete can remove such a file when the
+Owner supplies its current byte revision. Writes use ordinary rule reconciliation.
 Use the `source_file` returned by `rule.list` to locate an existing file. A filename
 can contain several `[[rule]]` entries, and each revision covers the whole file.
 The daemon serializes file API writes. For direct edits by other processes, the

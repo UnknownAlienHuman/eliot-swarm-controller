@@ -334,11 +334,6 @@ pub(crate) async fn delete(
             "rule file changed since it was read; read it again before deleting",
         ));
     }
-    reject_secret_source(
-        policy,
-        std::str::from_utf8(&bytes)
-            .map_err(|_| Error::new("invalid", "rule file is not valid UTF-8"))?,
-    )?;
     directory.remove_file(&request.path, &bytes)?;
 
     let response = RuleDeleteResponse {

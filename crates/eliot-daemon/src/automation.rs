@@ -714,6 +714,7 @@ async fn apply_global_rule_snapshot(
             &timers,
             registration_now,
             &absent_from_source,
+            &snapshot.source_files,
         )
         .await?;
     let active = active_rules(
@@ -730,7 +731,6 @@ async fn apply_global_rule_snapshot(
         .map(|rule| (rule.state.revision, rule.definition.clone()))
         .collect::<Vec<_>>();
     router.install_rule_definitions(principal, &cached);
-    router.install_rule_source_files(principal, &snapshot.source_files);
     Ok(active)
 }
 
