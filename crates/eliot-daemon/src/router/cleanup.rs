@@ -760,7 +760,16 @@ impl Router {
                     Err(error) => candidate.reason = error.code,
                 }
             } else if candidate.artifact.kind == ArtifactKind::NativeSession {
-                if candidate.artifact.purpose.as_str() != "codex" {
+                let swarm_created = self
+                    .inner
+                    .store
+                    .lock()
+                    .await
+                    .get_agent(&candidate.artifact.agent)?
+                    .is_some_and(|agent| swarm_created_session_agent(&agent));
+                if !swarm_created
+                    || !matches!(candidate.artifact.purpose.as_str(), "codex" | "opencode")
+                {
                     candidate.reason = "no_native_archive".to_owned();
                 } else if !self
                     .inner
@@ -1106,14 +1115,12 @@ impl Router {
         }
         if artifact.kind == ArtifactKind::NativeSession {
             // Local native stores are never deleted as files. Codex threads
-            // are archived through the harness app-server API; every other
-            // harness has no documented archive surface and stays kept.
-            if artifact.purpose.as_str() != "codex" {
-                return Err(Error::new(
-                    "no_native_archive",
-                    "harness has no native archive method",
-                ));
-            }
+            // are archived through the harness app-server API and OpenCode
+            // sessions are deleted through the harness's documented session
+            // delete on the retained per-Agent store; every other harness
+            // has no documented archive surface and stays kept. Only a
+            // Swarm-created Agent's session is ever archived: attached or
+            // observed sessions belong to their own producer.
             let agent = self
                 .inner
                 .store
@@ -1121,6 +1128,14 @@ impl Router {
                 .await
                 .get_agent(&artifact.agent)?
                 .ok_or_else(|| Error::new("not_found", "Agent absent"))?;
+            if !swarm_created_session_agent(&agent)
+                || !matches!(artifact.purpose.as_str(), "codex" | "opencode")
+            {
+                return Err(Error::new(
+                    "no_native_archive",
+                    "harness has no native archive method",
+                ));
+            }
             {
                 let store = self.inner.store.lock().await;
                 if !store.cleanup_authorized(principal, artifact)?
@@ -1136,7 +1151,7 @@ impl Router {
             return self
                 .inner
                 .plugin_host
-                .archive_native_session(profile, &native_ref)
+                .archive_native_session(profile, &native_ref, &agent)
                 .await
                 .map_err(|error| {
                     if matches!(
@@ -1999,37 +2014,52 @@ fn native_session_reference(artifact: &ArtifactView) -> Result<String> {
 fn frozen_archive_profile(agent: &Agent, artifact: &ArtifactView) -> Result<(Value, String)> {
     let reference = native_session_reference(artifact)?;
     let profile = agent.profile_snapshot.clone();
-    let binding: eliot_core::NativeStoreBinding = profile
-        .get("native_store_binding")
-        .cloned()
-        .ok_or_else(|| {
-            Error::new(
-                "native_scope_unverified",
-                "archive requires the frozen native store",
-            )
-        })
-        .and_then(|value| {
-            serde_json::from_value(value).map_err(|_| {
-                Error::new(
-                    "native_scope_unverified",
-                    "frozen archive store is malformed",
-                )
-            })
-        })?;
-    if agent.id != artifact.agent
+    if !swarm_created_session_agent(agent)
+        || agent.id != artifact.agent
         || agent.generation != artifact.generation
         || agent.native_scope.as_deref() != Some(artifact.identity.as_str())
         || agent.native_ref.as_deref() != Some(reference.as_str())
-        || binding.native_scope != artifact.identity
-        || agent.harness != "codex"
-        || profile["harness"] != "codex"
+        || !matches!(agent.harness.as_str(), "codex" | "opencode")
+        || profile["harness"] != agent.harness.as_str()
     {
         return Err(Error::new(
             "native_scope_unverified",
             "archive identity differs from the frozen native store",
         ));
     }
+    if agent.harness == "codex" {
+        let binding: eliot_core::NativeStoreBinding = profile
+            .get("native_store_binding")
+            .cloned()
+            .ok_or_else(|| {
+                Error::new(
+                    "native_scope_unverified",
+                    "archive requires the frozen native store",
+                )
+            })
+            .and_then(|value| {
+                serde_json::from_value(value).map_err(|_| {
+                    Error::new(
+                        "native_scope_unverified",
+                        "frozen archive store is malformed",
+                    )
+                })
+            })?;
+        if binding.native_scope != artifact.identity {
+            return Err(Error::new(
+                "native_scope_unverified",
+                "archive identity differs from the frozen native store",
+            ));
+        }
+    }
     Ok((profile, reference))
+}
+
+/// Only a Swarm-created Agent's retained session may be archived: a
+/// launched Agent, never an attached or observed session (including
+/// observed native children) that belongs to its own producer.
+fn swarm_created_session_agent(agent: &Agent) -> bool {
+    !agent.observe_only && matches!(agent.origin, eliot_core::AgentOrigin::Eliot)
 }
 
 impl Router {
