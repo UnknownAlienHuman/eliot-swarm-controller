@@ -7,7 +7,9 @@ use crate::native_child::{
 };
 use eliot_core::{
     ChildRegistration, ContextItem, Error, ProviderRestriction, Result, SecretPolicy,
-    SessionTokenTotals, SessionUsage, TurnUsage, limits::MAX_TOOL_COMMAND_BYTES, turn_started_data,
+    SessionTokenTotals, SessionUsage, TurnUsage,
+    limits::{MAX_TOOL_COMMAND_BYTES, MAX_TOOL_ERROR_TAIL_BYTES},
+    turn_started_data,
 };
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
@@ -31,8 +33,8 @@ use crate::native::{
     NativeClient, NativeFrame, StreamState,
     requests::{self, CorePending},
     types::{
-        NativeFileChangeItem, NativeItemCompletedNotification, NativePatchChangeKind,
-        NativeServerRequestResolvedNotification, NativeThreadTokenUsage,
+        NativeCommandExecutionItem, NativeFileChangeItem, NativeItemCompletedNotification,
+        NativePatchChangeKind, NativeServerRequestResolvedNotification, NativeThreadTokenUsage,
         NativeThreadTokenUsageUpdatedNotification, NativeTokenUsageDelta,
         NativeTurnCompletedNotification, NativeTurnError, NativeTurnStartedNotification,
         NativeTurnStatus,
@@ -1322,8 +1324,31 @@ impl EventProcessor {
             "item_id": item_id,
             "tool": item_type,
         });
-        if let Some(native_status) = native_status {
-            data["status"] = Value::String(native_status);
+        if let Some(ref native_status) = native_status {
+            data["status"] = Value::String(native_status.clone());
+        }
+        if item_type == "commandExecution" {
+            let command: NativeCommandExecutionItem = serde_json::from_value(item.clone())
+                .map_err(|_| {
+                    Error::new(
+                        "native_protocol",
+                        "Codex completed commandExecution did not match the 0.161 schema",
+                    )
+                })?;
+            if let Some(exit_code) = command.exit_code {
+                data["exit_code"] = json!(exit_code);
+            }
+            // A failure without its reason is a bare `failed`; keep the tail that
+            // usually says why. Success keeps its exit code and nothing else.
+            if native_status.as_deref() == Some("failed")
+                && let Some(output) = command.aggregated_output.as_deref()
+            {
+                let tail = SecretPolicy::new(self.secrets.iter().cloned())
+                    .redact_bounded(output, MAX_TOOL_ERROR_TAIL_BYTES);
+                if !tail.trim().is_empty() {
+                    data["error_tail"] = Value::String(tail);
+                }
+            }
         }
         if completed_file_change {
             // Installed 0.161 ThreadItem/FileUpdateChange: only native path fields,

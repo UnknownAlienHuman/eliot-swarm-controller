@@ -423,7 +423,11 @@ coverage gap. A command tool's `tool.started` may carry `command`, the command t
 harness reports (Codex: its parsed `commandActions[].command`, one per line, else the raw
 `command`; Claude: the `tool_use` `input.command`), redacted with the secret policy and
 bounded to [`MAX_TOOL_COMMAND_BYTES`](../../crates/eliot-core/src/limits.rs); command
-output and other arguments are never persisted. Handoff transfer for
+output and other arguments are never persisted. A completed Codex `commandExecution`
+carries its native `exit_code` when present, and on `status` `failed` a redacted,
+line-bounded tail of the native aggregated output as `error_tail`
+([`MAX_TOOL_ERROR_TAIL_BYTES`](../../crates/eliot-core/src/limits.rs)); a successful
+event grows only by its exit code. Handoff transfer for
 `child`, `goal` and `usage` stays `unsupported`. Native-child observation is
 implemented separately through the shared
 [`ChildParams`](../../crates/eliot-plugin/src/protocol.rs) /

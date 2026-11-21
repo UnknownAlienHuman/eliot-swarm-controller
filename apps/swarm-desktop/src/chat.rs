@@ -130,6 +130,12 @@ struct ToolRow {
     /// The command a command tool runs, as its adapter retained it
     /// (`tool.started` `command`: redacted and bounded).
     command: Option<String>,
+    /// The native exit code of a failed command, as its adapter retained it
+    /// (`tool.completed` `exit_code`).
+    exit_code: Option<i64>,
+    /// The bounded, redacted tail of a failed tool's native output
+    /// (`tool.completed` `error_tail`): the lines that usually say why.
+    error_tail: Option<String>,
 }
 
 /// Separates a tool row's name, status, duration and start (ms since the
@@ -276,6 +282,13 @@ impl TurnEntry {
         let command = data_str(event, "command")
             .map(|command| command.replace(TOOL_FIELDS, " "))
             .filter(|command| !command.trim().is_empty());
+        let exit_code = event
+            .data
+            .get("exit_code")
+            .and_then(serde_json::Value::as_i64);
+        let error_tail = data_str(event, "error_tail")
+            .map(|tail| tail.replace(TOOL_FIELDS, " "))
+            .filter(|tail| !tail.trim().is_empty());
         let failed_now = done && status.as_deref().is_some_and(|status| !is_success(status));
         if let Some(&group) = self.item_groups.get(item_id)
             && let Some(Activity::Tools {
@@ -298,6 +311,12 @@ impl TurnEntry {
                     }
                     if row.command.is_none() {
                         row.command = command;
+                    }
+                    if row.exit_code.is_none() {
+                        row.exit_code = exit_code;
+                    }
+                    if row.error_tail.is_none() {
+                        row.error_tail = error_tail;
                     }
                     row.paths_truncated |= paths_truncated;
                     if status.is_some() || done {
@@ -325,6 +344,8 @@ impl TurnEntry {
             paths,
             paths_truncated,
             command,
+            exit_code,
+            error_tail,
         };
         if !matches!(self.activity.last(), Some(Activity::Tools { .. })) {
             self.activity.push(Activity::Tools {
@@ -1256,6 +1277,12 @@ impl Conversation {
                             (true, Some(status), _) => status,
                             (true, None, _) => "Finished · result not reported",
                         };
+                        // A failed command's row says its exit code; the first line of
+                        // the retained tail follows in the expanded detail.
+                        let status = row.exit_code.map_or_else(
+                            || status.to_owned(),
+                            |code| format!("{status} · exit {code}"),
+                        );
                         let elapsed = row
                             .started_ms
                             .zip(row.completed_ms)
@@ -1271,13 +1298,25 @@ impl Conversation {
                             .flat_map(|command| command.lines())
                             .map(str::to_owned)
                             .collect();
+                        if let Some(tail) = row.error_tail.as_deref() {
+                            detail.push(format!(
+                                "Failed with exit {} · {}",
+                                row.exit_code.map_or_else(
+                                    || "code unavailable".to_owned(),
+                                    |code| code.to_string(),
+                                ),
+                                tail.lines().next().unwrap_or_default()
+                            ));
+                        }
                         detail.extend(row.paths.iter().cloned());
                         if row.paths_truncated {
                             detail.push(
                                 "More changed paths were not retained in this card.".to_owned(),
                             );
                         }
-                        detail.push("Tool output was not retained by the app.".to_owned());
+                        if row.error_tail.is_none() {
+                            detail.push("Tool output was not retained by the app.".to_owned());
+                        }
                         if elapsed.is_some() {
                             detail.push(
                                 "Duration is measured between the recorded start and finish."
@@ -1295,8 +1334,16 @@ impl Conversation {
                             format!("tools:{}", row.item_id),
                             PartKind::Tools,
                             label.to_owned(),
-                            [name.as_str(), status, duration.as_str(), started.as_str()]
-                                .join(&TOOL_FIELDS.to_string()),
+                            [
+                                name.as_str(),
+                                status.as_str(),
+                                duration.as_str(),
+                                started.as_str(),
+                            ]
+                            .iter()
+                            .map(|field| field.to_owned())
+                            .collect::<Vec<_>>()
+                            .join(&TOOL_FIELDS.to_string()),
                             detail,
                         ));
                     }
