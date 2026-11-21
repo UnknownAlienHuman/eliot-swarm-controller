@@ -104,10 +104,12 @@ location from the session; requests outside a session pass the installed API's w
 parameter. Read complete error bodies; only authoritative
 rejection proves no effect. Timeout/ambiguous server response after a write is unknown.
 Catalogue preflight may retry only before any session/input may have been admitted.
-After the owned server proves its isolated config through `GET /api/config`,
-launch polls `GET /api/model` for up to 10 seconds when the selected model or
-variant is absent. Provider discovery can lag config readiness; launch still
-requires exact live `provider/model` and variant membership, and expiry fails
+OpenCode 2.2.7 can serve its bundled model snapshot while a fresh store fetches
+the current catalogue and reloads its integrations and providers. An already
+populated native store can return newer models immediately. After the server
+proves its isolated config through `GET /api/config`, launch rechecks an
+incomplete `GET /api/model` inventory for up to 12 seconds within the existing
+start budget. Exact live `provider/model` and variant membership are required
 before session creation.
 
 The native `x-opencode-directory` header is URI component encoded, including literal

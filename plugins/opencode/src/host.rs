@@ -45,9 +45,9 @@ use tokio::{
 
 const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// OpenCode can answer config readback before its provider inventory is
-/// available. Keep the exact launch catalogue gate bounded and before any
-/// session create, leaving the start cleanup reserve intact.
-const START_CATALOGUE_READY_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+/// available. Its native catalogue fetch allows 10 seconds; leave time for
+/// the provider reload while keeping the start cleanup reserve intact.
+const START_CATALOGUE_READY_BUDGET: std::time::Duration = std::time::Duration::from_secs(12);
 const START_CATALOGUE_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Total bound for one agent.start dispatch, from admission to the ready,
