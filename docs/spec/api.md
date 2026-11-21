@@ -1386,10 +1386,11 @@ outcomes with `preceded_by`; process steps from the
 `agent.lost`/`agent.failed` events with their recorded `origin`/`where`, exit code,
 NTSTATUS and the redacted stderr tail (a loss to a daemon restart is `swarm` at
 `daemon.restart`, a spontaneous plugin root exit is `harness` at
-`plugin.exit`, see [core](core.md#failure-location-and-origin)). A plugin panic
-during startup can include its marker summary in the process step's
-`origin_evidence` alongside the separate stderr tail. Diagnosis also
-includes the previous-run crash marker when the terminal failure is unclassified.
+`plugin.exit`, see [core](core.md#failure-location-and-origin)). The retained
+`agent.lost.stderr_tail` keeps the bounded, redacted capture verbatim, including
+any raw panic marker lines. The process step can carry the startup panic marker
+summary in `origin_evidence`. Diagnosis also includes the previous-run crash
+marker when the terminal failure is unclassified.
 When a failure exists, the one-line `summary` starts with its origin
 (`provider origin: <target> <code> at <where>: <message>`). A healthy idle, busy,
 waiting or stopped Agent with no failure in the bounded recent generation read

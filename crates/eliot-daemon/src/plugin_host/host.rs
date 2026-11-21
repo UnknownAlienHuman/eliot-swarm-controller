@@ -1418,7 +1418,7 @@ impl PluginHost {
             Ok(()) => error,
             Err(cleanup) => {
                 let message = format!("{}; {}", error.message, cleanup.message);
-                cleanup.with_message(message)
+                error.with_message(message)
             }
         };
         error.with_where(location).with_origin(

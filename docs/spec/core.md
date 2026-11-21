@@ -609,7 +609,8 @@ codes, never from message text. Exit codes ride alongside (`exit_code`, plus an
 |---|---|
 | Swarm validation, schema, queue or implementation failure | `swarm` |
 | Loss of a live generation during daemon restart | `swarm` at `daemon.restart` |
-| Owned plugin process loss during runtime or startup cleanup | `plugin.exit`, with the producer's origin or `harness` by default |
+| Swarm observer, monitoring attachment or pipe setup failure before the plugin handshake | `swarm` at the failing `swarm.start.*` phase |
+| Owned plugin process loss during runtime or cleanup after attempting the plugin handshake | `plugin.exit`, with the producer's origin or `harness` by default |
 | Missing executable; OS, disk, network or external credential failure | `environment` |
 | Native harness refusal, including an unavailable model without upstream evidence | `harness` |
 | Structured upstream rate, quota, auth or model error | `provider` |
@@ -618,14 +619,12 @@ codes, never from message text. Exit codes ride alongside (`exit_code`, plus an
 
 The restart's `agent.lost` and `turn.unknown` events carry `origin: swarm` and
 `where: daemon.restart` beside `reason: daemon_restart`. A spontaneous plugin
-root exit, reader EOF without a session terminal, or failed startup that loses
-the owned plugin generation carries `where: plugin.exit`. The producer's origin
-is retained when supplied, with `harness` as the default. Startup cleanup may
-terminate the owned process itself after an error. Swarm failures setting up
-the observer, monitoring attachment, or process pipes before the handshake use
-their own `swarm.start.*` command locations. Closure of the daemon's
-own control channel alone does not establish plugin failure. A retained loss
-without attribution uses its typed reason code
+root exit, reader EOF without a session terminal, or loss of the owned plugin
+generation after attempting the handshake carries `where: plugin.exit`. The
+producer's origin is retained when supplied, with `harness` as the default.
+Handshake cleanup may terminate the owned process itself after an error.
+Closure of the daemon's own control channel alone does not establish plugin
+failure. A retained loss without attribution uses its typed reason code
 ([`swarm_loss_location`](../../crates/eliot-core/src/lib.rs)).
 
 Redact complete messages and evidence before imposing their persistence/wire bounds.
