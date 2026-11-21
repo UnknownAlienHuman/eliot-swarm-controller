@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 74;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 75;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -1724,6 +1724,22 @@ impl Store {
                 "CREATE INDEX source_state_open_gap_seq ON source_state(gap_seq)
                      WHERE state = 'open' AND gap_seq IS NOT NULL AND gap_from IS NOT NULL;
                  INSERT INTO schema_migrations(version) VALUES (74);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 75 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE INDEX messages_presentation_command ON messages(presentation_command)
+                     WHERE presentation_command IS NOT NULL;
+                 CREATE INDEX mail_notices_open_notice_command ON mail_notices(open_notice_command)
+                     WHERE open_notice_command IS NOT NULL;
+                 CREATE INDEX writes_created_at ON writes(created_at, id);
+                 INSERT INTO schema_migrations(version) VALUES (75);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;

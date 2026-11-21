@@ -985,7 +985,9 @@ the oldest root, and examines at most a bounded number of candidates per pass;
 each candidate walks one bounded breadth-first subtree over the
 `commands_prune_roots` index with a per-parent limit, skipping kept or oversize
 sets in place, so no pass revisits every kept root, rewinds the root index, or
-materializes an oversize tree into an automatic index before the outer limit. Retain command bindings/results in `commands` and other mutation bindings/results
+materializes an oversize tree into an automatic index before the outer limit.
+A pass deletes at most 128 commands and 128 writes. A command set larger than
+128 is kept intact. Retain command bindings/results in `commands` and other mutation bindings/results
 in `writes` for at least the supported retry window plus the allowed clock-skew
 margin. Cleanup must not make an accepted id look new or replay an external effect.
 An unresolved Running Goal-round reservation remains pinned in `writes` beyond

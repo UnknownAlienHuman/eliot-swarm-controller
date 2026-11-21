@@ -15,8 +15,8 @@ use super::*;
 
 const MS_PER_SECOND: i64 = 1_000;
 const MS_PER_DAY: i64 = 24 * 60 * 60 * MS_PER_SECOND;
-/// Event and process retention delete at most this many rows of each kind per
-/// Store-lock acquisition. The daemon releases the writer mutex between calls.
+/// Event, process, command and write retention delete at most this many rows
+/// of each kind per Store-lock acquisition. The daemon releases it between calls.
 const RETENTION_BATCH_ENTRIES: i64 = 128;
 /// Incremental auto-vacuum work is page-bounded for fairness with writers.
 const INCREMENTAL_VACUUM_PAGES: i64 = 256;
@@ -26,8 +26,8 @@ const INCREMENTAL_VACUUM_PAGES: i64 = 256;
 const MAX_SET_DEPTH: i64 = 1_000;
 /// Members collected per command set. A set larger than this is kept, not an
 /// error: fan-out is legitimate, while the depth bound above trips only on
-/// corruption. Total deleted rows stay bounded by `MAX_PAGE_ENTRIES`.
-const MAX_SET_MEMBERS: usize = MAX_PAGE_ENTRIES;
+/// corruption. Total deleted commands stay within the retention batch limit.
+const MAX_SET_MEMBERS: usize = RETENTION_BATCH_ENTRIES as usize;
 /// Prunable roots deleted per pass. The candidate sweep skips kept roots in
 /// place and stops here, so kept sets never starve the pass.
 const MAX_PRUNE_ROOTS: i64 = 50;
@@ -450,7 +450,7 @@ impl Store {
                 // Advance the persistent cursor past every examined root so
                 // a budget stop resumes at the first unexamined root instead
                 // of skipping the rest of this batch on the next pass.
-                cursor = Some((*root_created, root.clone()));
+                let previous_cursor = cursor.replace((*root_created, root.clone()));
                 let (members, truncated) = match subtree_members_tx(&self.connection, root) {
                     Err(error) if error.code == "source_integrity" => {
                         // A set past the traversal bound stays kept, as the
@@ -464,9 +464,6 @@ impl Store {
                 if truncated {
                     continue;
                 }
-                if members.len() + doomed.len() > MAX_PAGE_ENTRIES && !doomed.is_empty() {
-                    break 'sweep;
-                }
                 if members.iter().any(|member| {
                     member.is_open()
                         || member.created_at > cutoff
@@ -478,9 +475,14 @@ impl Store {
                 }) {
                     continue;
                 }
+                if members.len() + doomed.len() > MAX_SET_MEMBERS {
+                    // This eligible set fits a fresh batch. Revisit it first.
+                    cursor = previous_cursor;
+                    break 'sweep;
+                }
                 doomed_roots += 1;
                 doomed.extend(members);
-                if doomed.len() >= MAX_PAGE_ENTRIES {
+                if doomed.len() >= MAX_SET_MEMBERS {
                     break 'sweep;
                 }
             }
@@ -941,7 +943,7 @@ fn prune_writes_tx(tx: &Transaction<'_>, cutoff: i64) -> Result<i64> {
          )",
         params![
             cutoff,
-            MAX_PAGE_ENTRIES as i64,
+            RETENTION_BATCH_ENTRIES,
             super::goals::goal_round_running_outcome_json()?,
         ],
     )) as i64)
