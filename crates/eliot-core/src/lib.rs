@@ -79,7 +79,7 @@ pub use routing::{
     CapacityScope, MAX_AUTOMATIC_PROVIDER_PROBES, PROVIDER_PROBE_LAUNCH_ARG, PROVIDER_PROBE_PROMPT,
     ProviderHold, ProviderHoldState, ProviderRestriction, ProviderRestrictionKind, RouteBinding,
     RouteQuotaStatus, RouteSkip, RouteSkipReason, RoutingDecision, frozen_provider_scope,
-    frozen_provider_scope_for,
+    frozen_provider_scope_for, provider_switch_authority,
 };
 pub use secrets::SecretPolicy;
 pub use source_handoff::{SourceHandoff, SourceHandoffAck, SourceHandoffGap};

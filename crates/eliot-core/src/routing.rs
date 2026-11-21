@@ -66,6 +66,55 @@ pub struct RouteSkip {
     pub quota_status: RouteQuotaStatus,
 }
 
+/// Authority must match exactly for an automatic switch. Profile order,
+/// model and effort can vary. The normal launch still verifies native
+/// readback against the selected frozen permissions and approval policy.
+pub fn provider_switch_authority(snapshot: &Value) -> Result<[u8; 32]> {
+    if !snapshot.is_object() || snapshot["harness"].as_str().is_none() {
+        return Err(Error::new(
+            "source_integrity",
+            "provider switch has no frozen profile authority",
+        ));
+    }
+    let fields = [
+        "harness",
+        "access",
+        "permissions",
+        "approval_policy",
+        "approval",
+        "permission_mode",
+        "dangerously_skip_permissions",
+        "mode",
+        "sandbox",
+        "native_subagents",
+        "control",
+        "child_profiles",
+        "mcp",
+        "mcp_allow",
+        "mcp_cloud_hostname",
+        "account",
+        "proxy",
+        "route_binding",
+        "auth_integration",
+        "native_route_identity",
+        "api_key_env",
+        "pass_env",
+        "pass_env_values",
+        "literal_env",
+        "cmd",
+        "setup",
+        "collaboration_mode",
+    ];
+    let authority = Value::Object(
+        fields
+            .into_iter()
+            .map(|key| (key.to_owned(), snapshot[key].clone()))
+            .collect(),
+    );
+    crate::canonical_json_sha256(&authority)
+        .map_err(|_| Error::new("internal", "provider switch authority could not be encoded"))
+}
+
 const MAX_NAME_BYTES: usize = 128;
 const MAX_ENV_NAME_BYTES: usize = 256;
 

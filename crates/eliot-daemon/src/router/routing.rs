@@ -6,6 +6,7 @@ use eliot_core::{RouteQuotaStatus, RouteSkip, RouteSkipReason, RoutingDecision};
 struct RoutePreflight {
     arbitrated: bool,
     provider_switch: bool,
+    provider_authority: Option<[u8; 32]>,
     held_accounts: HashMap<String, Value>,
     capacity_refusal: Option<Error>,
 }
@@ -131,6 +132,7 @@ impl Router {
         request: &mut SubmitCommand,
         source: &Agent,
         kind: eliot_core::ProviderRestrictionKind,
+        authority: [u8; 32],
     ) -> Result<(String, Value)> {
         let mut decision = source.profile_choice.clone().ok_or_else(|| {
             Error::new("source_integrity", "provider switch has no retained route")
@@ -152,6 +154,7 @@ impl Router {
         decision.provider_failover = Some(Vec::new());
         let mut preflight = RoutePreflight {
             provider_switch: true,
+            provider_authority: Some(authority),
             ..RoutePreflight::default()
         };
         preflight.held_accounts.insert(
@@ -296,6 +299,11 @@ impl Router {
             if hierarchy::check_agent_launch_authority(&store, principal, &candidate).is_err() {
                 return Ok(Err(RouteSkipReason::Unauthorized));
             }
+        }
+        if let Some(authority) = preflight.provider_authority
+            && eliot_core::provider_switch_authority(&snapshot)? != authority
+        {
+            return Ok(Err(RouteSkipReason::Unauthorized));
         }
         let account = if preflight.provider_switch {
             switch_account_identity(&snapshot)

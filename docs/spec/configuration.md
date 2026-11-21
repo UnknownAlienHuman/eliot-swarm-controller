@@ -1225,8 +1225,9 @@ launch in a project freezes the remaining candidate order. The daemon may contin
 the original launch input after a structured quota, rate-limit or access refusal
 when the adapter proves that no native work began for that exact turn. A stream
 gap, uncertain delivery, tool or output activity, an explicit profile or a later
-SEND leaves the ordinary outcome in place. A candidate using the same harness
-must retain the failed attempt's captured account and credential selector.
+SEND leaves the ordinary outcome in place. An automatic successor must match the original frozen launch authority, including
+the harness, access, permissions, approval, account and credential selectors.
+An original launch with explicit overrides does not enter automatic failover.
 The Codex adapter supplies this evidence for structured upstream refusals.
 The daemon reuses the [switch and handoff](coordination.md#agent-switch-implemented)
 transaction with fresh command IDs, the retained workspace and the next eligible

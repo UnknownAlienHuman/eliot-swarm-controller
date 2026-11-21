@@ -173,9 +173,10 @@ impl Router {
                     .to_owned(),
             };
             launch.args = request.launch.args(&workspace)?;
-            let provider_route = if let Some(kind) = provider_failure {
+            let provider_route = if let Some(failure) = provider_failure {
+                let authority = failure.require_authority(&source.profile_snapshot)?;
                 let (name, identity) = self
-                    .route_provider_switch(&mut launch, &source, kind)
+                    .route_provider_switch(&mut launch, &source, failure.kind, authority)
                     .await?;
                 launch.args["profile"] = json!(name);
                 Some((launch.args["profile_choice"].take(), identity))

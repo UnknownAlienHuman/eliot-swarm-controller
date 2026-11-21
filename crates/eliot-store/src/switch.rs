@@ -7,6 +7,26 @@ use eliot_core::api::{
 
 const METHOD: &str = "swarm.switch";
 const PROVIDER_FAILURE: &str = "provider_failure";
+const PROVIDER_AUTHORITY: &str = "provider_authority";
+
+#[derive(Clone, Copy)]
+pub struct ProviderSwitchFailure {
+    pub kind: core::ProviderRestrictionKind,
+    pub authority: Option<[u8; 32]>,
+}
+
+impl ProviderSwitchFailure {
+    pub fn require_authority(self, snapshot: &Value) -> Result<[u8; 32]> {
+        let candidate = core::provider_switch_authority(snapshot)?;
+        if Some(candidate) == self.authority {
+            return Ok(candidate);
+        }
+        Err(Error::new(
+            "not_allowed",
+            "automatic switch authority differs from the original launch",
+        ))
+    }
+}
 
 pub const PROVIDER_SWITCH_QUEUED: &str = "provider.failover_queued";
 pub const PROVIDER_SWITCH_SETTLED: &str = "provider.failover_settled";
@@ -14,12 +34,10 @@ pub const PROVIDER_SWITCH_SETTLED: &str = "provider.failover_settled";
 pub struct SwitchWork {
     pub request: SwitchRequest,
     pub plan: SwitchResponse,
-    pub provider_failure: Option<core::ProviderRestrictionKind>,
+    pub provider_failure: Option<ProviderSwitchFailure>,
 }
 
-fn decode_switch(
-    mut args: Value,
-) -> Result<(SwitchRequest, Option<core::ProviderRestrictionKind>)> {
+fn decode_switch(mut args: Value) -> Result<(SwitchRequest, Option<ProviderSwitchFailure>)> {
     let malformed = || Error::new("source_integrity", "switch request malformed");
     let failure = args
         .as_object_mut()
@@ -28,8 +46,18 @@ fn decode_switch(
         .map(serde_json::from_value)
         .transpose()
         .map_err(|_| malformed())?;
+    let authority = args
+        .as_object_mut()
+        .ok_or_else(malformed)?
+        .remove(PROVIDER_AUTHORITY)
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|_| malformed())?;
     let request = serde_json::from_value(args).map_err(|_| malformed())?;
-    Ok((request, failure))
+    Ok((
+        request,
+        failure.map(|kind| ProviderSwitchFailure { kind, authority }),
+    ))
 }
 
 fn reserve_switch_tx(
@@ -146,6 +174,7 @@ pub(super) fn reserve_provider_switch_tx(
     let mut args = serde_json::to_value(&request)
         .map_err(|_| Error::new("internal", "cannot encode provider switch"))?;
     args[PROVIDER_FAILURE] = json!(restriction.kind);
+    args[PROVIDER_AUTHORITY] = json!(core::provider_switch_authority(&agent.profile_snapshot)?);
     let digest = canonical::digest(&args)?;
     events.extend(reserve_switch_tx(tx, &request, args, &digest, now)?.events);
     events.push(insert_daemon_event(
@@ -176,7 +205,11 @@ fn provider_retry_allowed(tx: &Transaction<'_>, agent: &Agent, task: &str) -> Re
             JOIN turns t ON t.agent=c.target AND t.generation=c.generation AND t.turn_id=c.turn_id
             WHERE c.id=?1 AND c.target=?2 AND c.generation=?3 AND c.principal='owner'
               AND c.verb='send' AND c.state='applied' AND c.ordinal=0
-              AND ((c.link_kind='send' AND p.verb='launch' AND p.target=c.target)
+              AND ((c.link_kind='send' AND p.verb='launch' AND p.target=c.target
+                  AND json_type(p.args,'$.access') IS NULL AND json_type(p.args,'$.cmd') IS NULL
+                  AND json_type(p.args,'$.permissions') IS NULL AND json_type(p.args,'$.approval_policy') IS NULL
+                  AND json_type(p.args,'$.auth') IS NULL AND json_type(p.args,'$.model') IS NULL
+                  AND json_type(p.args,'$.effort') IS NULL)
                 OR (c.link_kind='handoff' AND p.method='swarm.handoff' AND EXISTS(
                     SELECT 1 FROM commands s
                     JOIN commands l ON l.parent_command=s.id AND l.ordinal=0 AND l.target=c.target
@@ -378,8 +411,10 @@ impl Store {
             }
             let (source, provider_failure) = decode_switch(parent.args)?;
             let (agent, target) = source_tx(&tx, &source, self.hierarchy_limits, policy)?;
-            if provider_failure.is_some() {
+            if let Some(failure) = provider_failure {
                 require_provider_retry(&tx, &agent, &source.task_command)?;
+                failure.require_authority(&agent.profile_snapshot)?;
+                failure.require_authority(&request.args["profile_snapshot"])?;
                 let selected = request.args.get("profile").and_then(Value::as_str);
                 if !agent
                     .profile_choice
@@ -571,9 +606,11 @@ impl Store {
                         &destination.id,
                         destination.generation,
                     );
-                    if provider_failure.is_some() {
+                    if let Some(failure) = provider_failure {
                         let (agent, _) = source_tx(&tx, &request, self.hierarchy_limits, policy)?;
                         require_provider_retry(&tx, &agent, &request.task_command)?;
+                        failure.require_authority(&agent.profile_snapshot)?;
+                        failure.require_authority(&destination.profile_snapshot)?;
                     }
                     let transfer = if provider_failure.is_some() {
                         handoff::HandoffInput::ProviderRetry
@@ -725,7 +762,8 @@ impl Store {
                     "error":value.error,"reason":value.error_reason,"disposal_command":value.disposal_command}),
             )?);
             let value = result_on(&tx, id)?;
-            if let Some(kind) = provider_failure {
+            if let Some(failure) = provider_failure {
+                let kind = failure.kind;
                 events.push(insert_daemon_event(
                     &tx, now, PROVIDER_SWITCH_SETTLED, "provider",
                     Some(parse_agent_id(&request.from)?), Some(request.from_generation),
