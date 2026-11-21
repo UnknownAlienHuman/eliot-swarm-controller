@@ -127,7 +127,7 @@ pub fn compact_store_offline(
         } else {
             Error::new(
                 "platform_io",
-                &format!("cannot inspect store database: {error}"),
+                format!("cannot inspect store database: {error}"),
             )
         }
     })?;
@@ -154,7 +154,7 @@ fn compact_store_with_preflight(
                 .map_err(|error| {
                     Error::new(
                         "platform_io",
-                        &format!("cannot inspect Store size before compaction: {error}"),
+                        format!("cannot inspect Store size before compaction: {error}"),
                     )
                 })?
                 .len();
@@ -167,7 +167,7 @@ fn compact_store_with_preflight(
                 Err(error) => {
                     return Err(Error::new(
                         "platform_io",
-                        &format!("cannot inspect Store WAL before compaction: {error}"),
+                        format!("cannot inspect Store WAL before compaction: {error}"),
                     ));
                 }
             };
@@ -192,7 +192,7 @@ fn compact_store_with_preflight(
         if estimate.available_bytes < estimate.estimated_required_bytes {
             return Err(Error::new(
                 "insufficient_disk_space",
-                &format!(
+                format!(
                     "Store compaction estimates {} bytes required, but only {} bytes are available",
                     estimate.estimated_required_bytes, estimate.available_bytes
                 ),
