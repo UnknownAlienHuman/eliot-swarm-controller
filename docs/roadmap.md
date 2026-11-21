@@ -410,14 +410,22 @@ qualification is incomplete; do not describe it as feature complete.
         - the host crate stays outside this repository, as a patch on Zed `761786a4`.
       - **Resume when Zed releases a headless agent mode with ACP.** Start from #720 and the frozen branches, against the installed release. Until then, no Zed work.
 
-- [ ] **Failure diagnostics that say why and where (#384).** Typed `where`/`origin`
+- [x] **Failure diagnostics that say why and where (#384).** Typed `where`/`origin`
       on every settled failure, sanitized daemon log with standard/debug modes,
       crash markers surfaced in `daemon.status`, startup output and `swarm why`,
       owner-scoped `diagnose` plus `swarm why <command|Agent|agent:turn>` with a
       causal chain and one-line summary, `preceded_by` on turn outcomes, and the
       same summary in desktop Agent details. Qualify on a private daemon:
       nonexistent command, killed turn, invalid model, `max_live`, plugin panic
-      and forced daemon panic with the marker consumed exactly once.
+      and forced daemon panic with the marker consumed exactly once. Qualified
+      2026-11-21 on swarm.exe 944F2E27 (private data dir): nonexistent command,
+      invalid model and `max_live` named origin and where; `swarm why <launch>`
+      followed its linked `/send` to the provider refusal at
+      `plugin.opencode.turn`; a killed owned plugin process said `harness` at
+      `plugin.exit`; `ELIOT_DEBUG_PLUGIN_PANIC` surfaced `plugin.panicked` with
+      its location; the debug `daemon.panic_test` marker aborted the daemon and
+      was reported once at restart, never again; a force-stopped daemon's owned
+      harness process died with it and restart said `swarm` at `daemon.restart`.
 
 ## L7 — Qualification, repair and release
 

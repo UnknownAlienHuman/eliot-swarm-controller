@@ -1999,6 +1999,7 @@ impl Store {
                 core::DAEMON_RESTART_REASON,
                 None,
                 None,
+                None,
                 &mut events,
             )?;
         }
@@ -2063,6 +2064,7 @@ impl Store {
             core::OWNER_MARKED_LOST_REASON,
             None,
             None,
+            None,
         )
     }
 
@@ -2080,9 +2082,11 @@ impl Store {
         reason: &str,
         exit: Option<eliot_core::ProcessExit>,
         stderr_tail: Option<String>,
+        origin: Option<eliot_core::FailureOrigin>,
     ) -> Result<Vec<Event>> {
         self.ensure_writer_healthy()?;
-        let result = self.mark_lost_inner(agent, generation, now, reason, exit, stderr_tail);
+        let result =
+            self.mark_lost_inner(agent, generation, now, reason, exit, stderr_tail, origin);
         self.fault_on_persistence_error(&result);
         result
     }
@@ -2096,6 +2100,7 @@ impl Store {
         reason: &str,
         exit: Option<eliot_core::ProcessExit>,
         stderr_tail: Option<String>,
+        origin: Option<eliot_core::FailureOrigin>,
     ) -> Result<Vec<Event>> {
         let agent_num = parse_agent_id(agent)?;
         let tx = self
@@ -2119,6 +2124,7 @@ impl Store {
             reason,
             exit.as_ref(),
             stderr_tail.as_deref(),
+            origin,
             &mut events,
         )?;
         commit_transaction(tx, &self.write_faulted)?;

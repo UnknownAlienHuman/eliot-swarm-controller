@@ -1258,6 +1258,7 @@ pub(super) fn transition_lost_tx(
     reason: &str,
     exit: Option<&eliot_core::ProcessExit>,
     stderr_tail: Option<&str>,
+    origin: Option<eliot_core::FailureOrigin>,
     events: &mut Vec<Event>,
 ) -> Result<()> {
     let Some(agent) = load_agent_by_num(tx, agent_num)? else {
@@ -1329,9 +1330,17 @@ pub(super) fn transition_lost_tx(
          WHERE agent = ?2 AND generation = ?3 AND source NOT IN ('os', 'git', 'workspace_process')",
         params![now, agent_num, generation],
     ));
+    // The typed `where` names the process boundary; the origin is the
+    // producer's own classification when it recorded one, else the fallback
+    // for this reason. A failed start on a missing external credential keeps
+    // its `environment` origin instead of being retyped as Agent software.
     let mut data = json!({"agent_id": agent.id, "reason": reason});
-    if let Some((origin, location)) = eliot_core::swarm_loss_location(reason) {
-        data["origin"] = json!(origin.as_str());
+    if let Some((fallback_origin, location)) = eliot_core::swarm_loss_location(reason) {
+        data["origin"] = json!(
+            origin
+                .unwrap_or(fallback_origin)
+                .as_str()
+        );
         data["where"] = json!(location);
     }
     if let Some(exit) = exit.filter(|exit| !exit.is_empty()) {

@@ -609,6 +609,7 @@ codes, never from message text. Exit codes ride alongside (`exit_code`, plus an
 |---|---|
 | Swarm validation, schema, queue or implementation failure | `swarm` |
 | Loss of a live generation during daemon restart | `swarm` at `daemon.restart` |
+| Spontaneous exit of an owned plugin process | `harness` at `plugin.exit` |
 | Missing executable; OS, disk, network or external credential failure | `environment` |
 | Native harness refusal, including an unavailable model without upstream evidence | `harness` |
 | Structured upstream rate, quota, auth or model error | `provider` |
@@ -616,7 +617,10 @@ codes, never from message text. Exit codes ride alongside (`exit_code`, plus an
 | Insufficient evidence | `unknown`, stating the missing evidence |
 
 The restart's `agent.lost` and `turn.unknown` events carry `origin: swarm` and
-`where: daemon.restart` beside `reason: daemon_restart`
+`where: daemon.restart` beside `reason: daemon_restart`; an owned plugin process
+exit, whether its root exited on its own, the daemon's owner channel closed first,
+the reader reached EOF with no terminal fact, or a start failed, carries
+`origin: harness` and `where: plugin.exit` beside its own typed reason
 ([`swarm_loss_location`](../../crates/eliot-core/src/lib.rs)); a retained loss
 written before those fields existed classifies from that typed reason code alone.
 
