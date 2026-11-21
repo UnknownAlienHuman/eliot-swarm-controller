@@ -1430,12 +1430,14 @@ impl DesktopApp {
                 "Saving…"
             }),
         );
+        let repairing = self.repairing_settings();
         let _task = context.spawn_background(move |_| {
-            Message::Settings(SettingsMsg::Saved(
-                page,
-                dry_run,
-                client::block_on(config_client::save_settings(&data_dir, &request)),
-            ))
+            let result = if repairing {
+                client::block_on(eliot_daemon::save_settings_for_repair(&data_dir, &request))
+            } else {
+                client::block_on(config_client::save_settings(&data_dir, &request))
+            };
+            Message::Settings(SettingsMsg::Saved(page, dry_run, result))
         });
     }
 
@@ -1523,10 +1525,15 @@ impl DesktopApp {
         };
         self.settings.reading = true;
         self.settings.read_prefs_rev = self.prefs_rev;
+        let repairing = self.repairing_settings();
         let _task = context.spawn_background(move |_| {
-            Message::Settings(SettingsMsg::Loaded(
+            let result = if repairing {
+                eliot_daemon::read_settings_for_repair(&data_dir)
+            } else {
                 client::block_on(config_client::read_settings(&data_dir))
-                    .map_err(|error| error.to_string()),
+            };
+            Message::Settings(SettingsMsg::Loaded(
+                result.map_err(|error| error.to_string()),
             ))
         });
     }

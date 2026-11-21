@@ -1084,6 +1084,10 @@ window closes, and only when it changed. It reads `window` from the file before 
 exists, so the window opens at that size, place and maximized state with no move after the
 first frame; a place no longer on an attached monitor is clamped into the nearest one's work
 area, and without `x`/`y` Windows chooses the place.
+When configuration prevents daemon startup, the local Owner can open Settings
+from the startup error. Repair uses the daemon's settings reader and
+revision-checked writer under the private daemon lock. The owner can retry
+startup after saving the repair.
 The new-task composer writes `recent_models` after an admitted model launch,
 `favorite_models` from the model picker (Ctrl+F or the row's star), `last_access`
 from the access chip or Settings › Default access, and `collapsed_projects` when a

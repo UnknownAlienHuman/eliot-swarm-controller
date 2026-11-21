@@ -5,6 +5,9 @@ use std::time::Duration;
 use eliot_core::api::{DaemonStatusRequest, DaemonStatusResponse};
 use eliot_core::{Error, Result};
 
+/// Failure location for the daemon's validation of its startup config.
+pub const CONFIG_STARTUP_LOCATION: &str = "daemon.start.config";
+
 /// Start the supplied Swarm executable only when no daemon is reachable.
 /// An authentication or safety failure is returned without changing the root.
 pub async fn ensure_running(data_dir: &Path, swarm_executable: &Path) -> Result<()> {

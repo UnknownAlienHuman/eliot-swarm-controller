@@ -348,9 +348,8 @@ struct DesktopApp {
     /// The unified settings: the read sections, the page's drafts and
     /// each section's last save result.
     settings: settings_ui::SettingsState,
-    /// The daemon could not start in the data directory (the fresh
-    /// private directory remedy is offered).
-    startup_error: bool,
+    /// The daemon could not start in the selected private data directory.
+    startup_error: Option<eliot_core::Error>,
     scripts: scripts_ui::ScriptsEditor,
     handoff: handoff_ui::DialogState,
     nav: shell_ui::ShellState,
@@ -795,7 +794,7 @@ impl Component for DesktopApp {
             catalog_seq: 0,
             editor: profiles_ui::ProfilesEditor::default(),
             settings: settings_ui::SettingsState::default(),
-            startup_error: false,
+            startup_error: None,
             scripts: scripts_ui::ScriptsEditor::default(),
             handoff: handoff_ui::DialogState::default(),
             nav: shell_ui::ShellState {
