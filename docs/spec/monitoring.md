@@ -516,10 +516,14 @@ deterministically sorted dirty prefix (then committed paths) with `complete=fals
 `base_complete=false` when committed paths were cut, so a large legitimate tree still
 commits instead of failing every poll. The persisted view also carries `view_digest`, the
 digest of the full canonical view, so a change outside the retained prefix still commits a
-new view. Commit delivery is tracked per commit id against retained `git.committed` events,
-never derived from dirty coverage: a delivered commit is never re-emitted, and a partial
-persisted view neither replays nor gates a commit. A repeat poll compares equal and writes
-nothing.
+new view. Commit delivery uses a durable OID ledger scoped to one Agent generation,
+independent of retained `git.committed` events and dirty coverage. Migration seeds it from
+retained events for open Git sources on current Agent generations. The ledger and each
+new commit event are written in the same Store transaction; event pruning does not permit
+redelivery. An OID delivered before a rewind remains suppressed if it reappears later in
+that generation. Source closure or a generation replacement clears its entries.
+A partial persisted view neither replays nor gates a commit. A repeat poll compares equal
+and writes nothing.
 
 Executable Git filters are disabled, and applicable filter
 attributes make raw status partial; bounded attribution-path coverage can also make a

@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 76;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 77;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -1805,6 +1805,50 @@ impl Store {
                        AND u.turn_id = turns.turn_id
                  );
                  INSERT INTO schema_migrations(version) VALUES (76);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 77 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE TABLE git_committed_oids (
+                     agent INTEGER NOT NULL,
+                     generation INTEGER NOT NULL,
+                     source TEXT NOT NULL DEFAULT 'git' CHECK(source = 'git'),
+                     oid TEXT NOT NULL,
+                     PRIMARY KEY(agent, generation, oid),
+                     FOREIGN KEY(agent, generation, source)
+                         REFERENCES source_state(agent, generation, source) ON DELETE CASCADE
+                 ) WITHOUT ROWID;
+                 INSERT OR IGNORE INTO git_committed_oids(agent, generation, oid)
+                 SELECT DISTINCT e.agent, e.generation, json_extract(e.data, '$.oid')
+                 FROM events e
+                 JOIN source_state s ON s.agent = e.agent AND s.generation = e.generation
+                     AND s.source = 'git' AND s.state = 'open'
+                 JOIN agents a ON a.id = e.agent AND a.generation = e.generation
+                 WHERE e.source = 'git' AND e.kind = 'git.committed'
+                   AND e.agent IS NOT NULL AND e.generation IS NOT NULL
+                   AND json_type(e.data, '$.oid') = 'text'
+                   AND length(json_extract(e.data, '$.oid')) > 0;
+                 CREATE TRIGGER git_committed_oids_source_closed
+                 AFTER UPDATE OF state ON source_state
+                 WHEN OLD.source = 'git' AND OLD.state = 'open' AND NEW.state = 'closed'
+                 BEGIN
+                     DELETE FROM git_committed_oids
+                     WHERE agent = NEW.agent AND generation = NEW.generation;
+                 END;
+                 CREATE TRIGGER git_committed_oids_generation_replaced
+                 AFTER UPDATE OF generation ON agents
+                 WHEN OLD.generation != NEW.generation
+                 BEGIN
+                     DELETE FROM git_committed_oids
+                     WHERE agent = OLD.id AND generation = OLD.generation;
+                 END;
+                 INSERT INTO schema_migrations(version) VALUES (77);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
