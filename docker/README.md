@@ -20,6 +20,10 @@ and permissions: unsafe roots fail, and the image never silently chmods host dat
 Use `--init` to reap exited descendants. No privileged mode, Docker socket mount,
 host PID namespace or cgroup delegation is needed.
 
+For unattended startup, add `--restart unless-stopped` to `docker run`.
+The Docker engine starts the container again after a failure or engine restart.
+Use `docker stop eliot` to keep the container stopped.
+
 ## Frozen dependencies
 
 Resolved from official sources on 2026-11-16; Dockerfile pins the amd64 manifests:

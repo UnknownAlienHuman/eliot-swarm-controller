@@ -38,6 +38,7 @@ use crate::{
     automation::RuleDefinition,
     bus::Bus,
     common::{now_ms, valid_environment_name},
+    config::OnRestart,
     monitor::{Monitoring, ObserveThresholds},
     plugin_host::{AgentCredentials, PluginHost, PluginHostOptions, SecretSet, UnknownCommands},
     scripts::auth::{RunCredentialGuard, RunCredentialRegistry, SavedRunPrincipal},
@@ -68,13 +69,13 @@ use eliot_core::{
         SWITCH_BLANK_SCOPE_ARG, SWITCH_PROJECT_REVISION_ARG, SessionGrowthView, ShutdownMode,
         SourceState, SwarmWaitRequest, SwarmWaitResponse, TimerGetRequest, TimerStateView,
         TurnGetRequest, UsageScopeView, UsageSummaryRequest, WaitEntryResult, WorkSummaryView,
-        WorkerTaskHealth, fair_excerpt_cap, is_supported_harness,
+        WorkerTaskHealth, WorkerTaskStatus, fair_excerpt_cap, is_supported_harness,
     },
 };
 use eliot_plugin::{MAX_EVENT_BYTES, sync::LockExt};
 use eliot_store::{
-    Admission, AgentListFilter, ProjectRegistrationInput, RuleProcessingState,
-    TimerDefinitionInput, TimerSlotAdmission, TimerSlotCommit,
+    Admission, AgentListFilter, ProjectRegistrationInput, RestartResumeCandidate,
+    RuleProcessingState, TimerDefinitionInput, TimerSlotAdmission, TimerSlotCommit,
 };
 use serde_json::{Value, json};
 use std::{
@@ -100,6 +101,15 @@ const EVENT_RESPONSE_ENTRIES_MAX_BYTES: usize =
 const LIVE_WAIT_MAX_MS: u64 = 30_000;
 const STATUS_BLOCKER_MAX: usize = 64;
 const RUN_WORKER_FORCE_GRACE: Duration = Duration::from_secs(15);
+/// Keep startup recovery bounded by actual resume-command settlement rather
+/// than admitting the entire retained fleet at once.
+const RESTART_RESUME_BATCH_SIZE: usize = 4;
+
+struct BootResumeWorker {
+    id: String,
+    task: tokio::task::JoinHandle<()>,
+    candidate: Option<RestartResumeCandidate>,
+}
 
 type StoreHandle = Arc<AsyncMutex<eliot_store::Store>>;
 
@@ -135,8 +145,9 @@ struct RouterInner {
     observe: Mutex<ObserveThresholds>,
     workspaces: WorkspaceManager,
     workspace_recovery_error: Mutex<Option<String>>,
+    plugin_crashes: Mutex<PluginCrashStatus>,
     previous_crash: Mutex<Option<CrashMarker>>,
-    automation_tasks: Mutex<Vec<(String, WorkerTaskHealth, Option<String>)>>,
+    worker_tasks: Mutex<Vec<WorkerTaskStatus>>,
     mode: AtomicU8,
     shutdown_ready: AtomicBool,
     progress: watch::Sender<u64>,
@@ -172,6 +183,12 @@ struct RouterInner {
     /// budget, settings, assignment, hold clear, or admitted slot) so `stop`
     /// acceptance never wakes arbitration ahead of committed `capacity.released`.
     launch_arbitration: watch::Sender<u64>,
+}
+
+#[derive(Default)]
+struct PluginCrashStatus {
+    markers: Vec<CrashMarker>,
+    truncated: bool,
 }
 
 struct RunWorkerHandle {
@@ -379,11 +396,19 @@ impl Router {
                 observe: Mutex::new(ObserveThresholds::default()),
                 workspaces,
                 workspace_recovery_error: Mutex::new(None),
+                plugin_crashes: Mutex::new(PluginCrashStatus::default()),
                 previous_crash: Mutex::new(None),
-                automation_tasks: Mutex::new(vec![
-                    ("rule_worker".to_owned(), WorkerTaskHealth::Starting, None),
-                    ("goal_driver".to_owned(), WorkerTaskHealth::Starting, None),
-                ]),
+                worker_tasks: Mutex::new(
+                    crate::daemon::workers::WORKER_NAMES
+                        .iter()
+                        .map(|name| WorkerTaskStatus {
+                            name: (*name).to_owned(),
+                            health: WorkerTaskHealth::Starting,
+                            failure_code: None,
+                            restart_count: 0,
+                        })
+                        .collect(),
+                ),
                 mode: AtomicU8::new(MODE_OPEN),
                 shutdown_ready: AtomicBool::new(false),
                 progress,
@@ -807,6 +832,7 @@ impl Router {
             if keys.is_empty() {
                 return Ok(());
             }
+            let mut resumes = Vec::with_capacity(RESTART_RESUME_BATCH_SIZE);
             for (id, created_at, rowid) in keys {
                 after = Some((created_at, rowid));
                 let admission = {
@@ -816,10 +842,270 @@ impl Router {
                 if let Some(admission) = admission
                     && command_needs_worker(&admission.command)
                 {
-                    self.schedule_admission(&admission);
+                    if admission.command.verb == "resume" {
+                        let candidate = admission
+                            .command
+                            .target
+                            .clone()
+                            .zip(admission.command.generation)
+                            .map(|(agent, generation)| RestartResumeCandidate {
+                                agent,
+                                generation,
+                            });
+                        self.queue_boot_resume(&mut resumes, &admission, candidate)
+                            .await?;
+                    } else {
+                        self.schedule_admission(&admission);
+                    }
                 }
             }
+            self.wait_restart_resume_workers(resumes).await?;
             tokio::task::yield_now().await;
+        }
+    }
+
+    /// Reopen only retained generations that were idle at restart and whose
+    /// exact custody and work state now permit a promptless Resume. Candidates
+    /// are derived durably by Store, so this can run after the initial custody
+    /// pass and again after a later recheck without replaying old input.
+    pub(crate) async fn recover_restart_idle_agents(&self, on_restart: OnRestart) -> Result<usize> {
+        if on_restart == OnRestart::Hold {
+            return Ok(0);
+        }
+        let mut after: Option<String> = None;
+        let mut admitted_count = 0;
+        loop {
+            let candidates = {
+                let store = self.inner.store.lock().await;
+                store.restart_idle_resume_candidates(after.as_deref())?
+            };
+            if candidates.is_empty() {
+                break;
+            }
+            after = candidates.last().map(|candidate| candidate.agent.clone());
+            let mut workers = Vec::with_capacity(RESTART_RESUME_BATCH_SIZE);
+            for candidate in candidates {
+                if let Some(admission) = self.prepare_restart_idle_resume(&candidate).await
+                    && admission.is_new
+                    && command_needs_worker(&admission.command)
+                {
+                    self.queue_boot_resume(&mut workers, &admission, Some(candidate))
+                        .await?;
+                    admitted_count += 1;
+                }
+            }
+            self.wait_restart_resume_workers(workers).await?;
+            tokio::task::yield_now().await;
+        }
+        if admitted_count > 0 {
+            self.signal_progress();
+        }
+        Ok(admitted_count)
+    }
+
+    async fn queue_boot_resume(
+        &self,
+        workers: &mut Vec<BootResumeWorker>,
+        admission: &Admission,
+        candidate: Option<RestartResumeCandidate>,
+    ) -> Result<()> {
+        let id = admission.command.id.clone();
+        let linked = admission
+            .linked_command
+            .as_ref()
+            .map(|command| command.id.clone());
+        let task = tokio::spawn(self.clone().process_command(id.clone(), linked));
+        workers.push(BootResumeWorker {
+            id,
+            task,
+            candidate,
+        });
+        if workers.len() == RESTART_RESUME_BATCH_SIZE {
+            self.wait_restart_resume_workers(std::mem::take(workers))
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Keep the boot batch tied to the actual command tasks. A task that
+    /// returns without durably settling its command stops further recovery.
+    async fn wait_restart_resume_workers(&self, workers: Vec<BootResumeWorker>) -> Result<()> {
+        let mut first_error = None;
+        for BootResumeWorker {
+            id,
+            task,
+            candidate,
+        } in workers
+        {
+            if task.await.is_err() {
+                first_error.get_or_insert_with(|| {
+                    Error::new(
+                        "unknown",
+                        "restart Resume command worker ended unexpectedly",
+                    )
+                });
+                continue;
+            }
+            let result = self.inner.store.lock().await.get_command(&id);
+            match result {
+                Ok(Some(command)) if command.state == CommandState::Rejected => {
+                    if let Some(candidate) = candidate
+                        && let Some(outcome) = command.outcome
+                    {
+                        let code = outcome
+                            .get("reason")
+                            .and_then(Value::as_str)
+                            .unwrap_or("resume_rejected");
+                        let message = outcome.get("message").and_then(Value::as_str).unwrap_or(
+                            "The resume command was rejected before starting a native process.",
+                        );
+                        self.report_restart_resume_blocked(&candidate, Error::new(code, message))
+                            .await;
+                    }
+                }
+                Ok(Some(command))
+                    if command.state.is_terminal() || command.state == CommandState::Unknown => {}
+                Ok(_) => {
+                    first_error.get_or_insert_with(|| {
+                        Error::new(
+                            "unknown",
+                            "restart Resume command worker ended before settlement",
+                        )
+                    });
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    async fn prepare_restart_idle_resume(
+        &self,
+        candidate: &RestartResumeCandidate,
+    ) -> Option<Admission> {
+        let request = SubmitCommand {
+            id: ulid::Ulid::new().to_string(),
+            target: Some(candidate.agent.clone()),
+            selector: None,
+            verb: "resume".to_owned(),
+            args: json!({}),
+            expected_generation: Some(candidate.generation),
+            expected_turn_id: None,
+            request_id: None,
+            probe: false,
+        };
+        let prepared = match self.prepare_submission(request, &Principal::Owner).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.report_restart_resume_blocked(candidate, error).await;
+                return None;
+            }
+        };
+        let PreparedSubmission { request, workspace } = prepared;
+        if workspace.is_some() {
+            let error = Error::new(
+                "unsupported",
+                "promptless restart Resume cannot prepare a workspace",
+            );
+            self.report_restart_resume_blocked(candidate, error).await;
+            return None;
+        }
+        let result = {
+            let mut store = self.inner.store.lock().await;
+            match self.check_command_admission_mode("resume") {
+                Err(error) => Err(error),
+                Ok(()) => match store.submit_restart_resume(request, now_ms()) {
+                    Ok(admission) => {
+                        if !admission.events.is_empty() {
+                            self.publish_locked(&admission.events);
+                        }
+                        Ok(admission)
+                    }
+                    Err(error) => Err(error),
+                },
+            }
+        };
+        match result {
+            Ok(admission) => Some(admission),
+            Err(error) => {
+                self.report_restart_resume_blocked(candidate, error).await;
+                None
+            }
+        }
+    }
+
+    async fn report_restart_resume_blocked(
+        &self,
+        candidate: &RestartResumeCandidate,
+        error: Error,
+    ) {
+        let error = self.sanitized_failure(&error, "daemon.restart.resume");
+        let policy = self.secret_policy_snapshot();
+        let generation = candidate.generation.to_string();
+        let fields = [
+            ("agent", candidate.agent.as_str()),
+            ("generation", generation.as_str()),
+        ];
+        let message = format!(
+            "Automatic resume for {} generation {} was blocked ({}). {}. When resolved, run swarm resume {}.",
+            candidate.agent,
+            candidate.generation,
+            eliot_core::bound_chars(&error.code, 128),
+            eliot_core::bound_chars(&error.message, 360).trim_end_matches('.'),
+            candidate.agent
+        );
+        let data = json!({"message": &message});
+        let record: Result<bool> = {
+            let mut store = self.inner.store.lock().await;
+            (|| {
+                let Some(current) = store.get_agent(&candidate.agent)? else {
+                    return Ok(false);
+                };
+                if current.generation != candidate.generation
+                    || !current.is_terminal()
+                    || current.archived
+                    || store
+                        .restart_resume_blocked(&candidate.agent, candidate.generation)?
+                        .as_ref()
+                        == Some(&data)
+                {
+                    return Ok(false);
+                }
+                let event = store.commit_observe_event(
+                    Some(&candidate.agent),
+                    Some(candidate.generation),
+                    "agent.restart_resume_blocked",
+                    data,
+                    now_ms(),
+                )?;
+                self.publish_locked(&[event]);
+                Ok(true)
+            })()
+        };
+        match record {
+            Ok(false) => return,
+            Ok(true) => crate::logging::record(
+                &policy,
+                "daemon.restart_resume_skipped",
+                &fields,
+                Some(&error),
+            ),
+            Err(record_error) => crate::logging::record(
+                &policy,
+                "daemon.restart_resume_record_failed",
+                &fields,
+                Some(&record_error),
+            ),
+        }
+        if let Err(error) = self.report_daemon_attention(message).await {
+            crate::logging::record(
+                &policy,
+                "daemon.attention_delivery_failed",
+                &fields,
+                Some(&error),
+            );
         }
     }
 
@@ -828,26 +1114,49 @@ impl Router {
         self.signal_progress();
     }
 
-    pub(crate) fn note_automation_task_running(&self, name: &str) {
-        for task in self.inner.automation_tasks.lock_recover().iter_mut() {
-            if task.0 == name {
-                task.1 = WorkerTaskHealth::Running;
-                task.2 = None;
-            }
-        }
-        self.signal_progress();
+    pub(crate) fn note_worker_task_starting(&self, name: &str) {
+        self.update_worker_task(name, WorkerTaskHealth::Starting, None);
     }
 
-    pub(crate) fn note_automation_task_stopped(&self, name: &str, failure_code: Option<String>) {
-        for task in self.inner.automation_tasks.lock_recover().iter_mut() {
-            if task.0 == name {
-                if let Some(code) = failure_code.clone() {
-                    task.1 = WorkerTaskHealth::Failed;
-                    task.2 = Some(code);
-                } else {
-                    task.1 = WorkerTaskHealth::Stopped;
-                    task.2 = None;
-                }
+    pub(crate) fn note_worker_task_running(&self, name: &str) {
+        self.update_worker_task(name, WorkerTaskHealth::Running, None);
+    }
+
+    pub(crate) fn note_worker_task_failed(
+        &self,
+        name: &str,
+        failure_code: String,
+        restart_count: u32,
+    ) {
+        self.update_worker_task(
+            name,
+            WorkerTaskHealth::Failed,
+            Some((failure_code, restart_count)),
+        );
+    }
+
+    pub(crate) fn note_worker_task_stopped(&self, name: &str) {
+        self.update_worker_task(name, WorkerTaskHealth::Stopped, None);
+    }
+
+    fn update_worker_task(
+        &self,
+        name: &str,
+        health: WorkerTaskHealth,
+        failure: Option<(String, u32)>,
+    ) {
+        if let Some(task) = self
+            .inner
+            .worker_tasks
+            .lock_recover()
+            .iter_mut()
+            .find(|task| task.name == name)
+        {
+            task.health = health;
+            task.failure_code = None;
+            if let Some((code, restart_count)) = failure {
+                task.failure_code = Some(code);
+                task.restart_count = restart_count;
             }
         }
         self.signal_progress();

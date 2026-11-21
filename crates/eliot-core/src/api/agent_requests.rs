@@ -871,6 +871,11 @@ impl DaemonStatusRequest {
                     || text(&command.verb).is_err()
                     || command.generation.is_some_and(|generation| generation < 0)
             })
+            || reply.plugin_crashes.len() > DaemonStatusResponse::MAX_PLUGIN_CRASHES
+            || reply
+                .plugin_crashes
+                .iter()
+                .any(|crash| crash.code != "plugin.panicked" || crash.validate().is_err())
             || reply
                 .previous_crash
                 .as_ref()

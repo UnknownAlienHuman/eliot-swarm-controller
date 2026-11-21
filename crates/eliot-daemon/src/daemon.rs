@@ -1,3 +1,5 @@
+pub(crate) mod workers;
+
 use crate::{
     automation,
     bus::Bus,
@@ -28,7 +30,7 @@ use std::{
 use tokio::{
     sync::{Mutex, watch},
     task::JoinSet,
-    time::{Instant, timeout, timeout_at},
+    time::{Instant, sleep_until, timeout, timeout_at},
 };
 use tokio_util::codec::{Framed, LinesCodec};
 use tokio_util::sync::CancellationToken;
@@ -71,6 +73,7 @@ pub async fn client_call_measured(
     Ok((value, timings))
 }
 const MAX_CLIENTS: usize = 128;
+const ACCEPT_FAILURE_LIMIT: u32 = 20;
 const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(35);
 const OVERLOAD_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// Bound for one server-side response write. A peer that stops reading must
@@ -149,26 +152,19 @@ struct DaemonRuntime {
 }
 
 /// Live workers and channels owned by the supervision loop and released by the
-/// shutdown drain. Fields are declared in the previous inline reverse
-/// declaration order, because struct fields drop in declaration order: the
-/// capacity recheck aborts before the IPC listener closes, and every
-/// shutdown sender drops after its task set, exactly as before the split.
+/// shutdown drain. Task sets precede their shutdown senders so abort-on-drop
+/// preserves ownership if normal draining cannot complete.
 struct DaemonSupervision {
     connections: JoinSet<()>,
     progress: watch::Receiver<u64>,
-    maintenance_tasks: JoinSet<Result<()>>,
-    maintenance_stop: watch::Sender<bool>,
-    automation_task_names: Vec<(tokio::task::Id, &'static str)>,
-    automation_tasks: JoinSet<(&'static str, Result<automation::RuleWorkerExit>)>,
-    automation_stop: watch::Sender<bool>,
+    workers: JoinSet<()>,
+    worker_stop: watch::Sender<bool>,
     // Never polled: holding the JoinSet keeps the recheck task alive, and its
     // abort-on-drop runs before the IPC listener below closes.
     _capacity_recheck: JoinSet<()>,
     recovery: JoinSet<(&'static str, Result<()>)>,
-    attention_tasks: JoinSet<Result<()>>,
-    attention_stop: watch::Sender<bool>,
     monitoring: crate::monitor::Monitoring,
-    background: JoinSet<Result<()>>,
+    monitor_tasks: JoinSet<()>,
     monitor_stop: watch::Sender<bool>,
     cloud_mcp_tasks: JoinSet<Result<()>>,
     cloud_mcp_shutdown: CancellationToken,
@@ -259,11 +255,14 @@ async fn initialize_runtime(
     };
     router.note_events(&recovered);
     logging::record(&policy, "daemon.recovered", &[], None);
+    let daemon_config =
+        crate::config::load_daemon_config(data_dir.path()).map_err(startup_config_failure)?;
     let capacity = restart_capacity::Reconcile {
         store: Arc::clone(&store),
         bus: bus.clone(),
         router: router.clone(),
         policy: Arc::clone(&policy),
+        on_restart: daemon_config.on_restart,
     };
     let report = restart_capacity::reconcile_first_pass(&capacity).await?;
     logging::record(&policy, "daemon.capacity_reconciled", &[], None);
@@ -280,8 +279,6 @@ async fn initialize_runtime(
     );
     let automation_config =
         crate::config::load_automation_config(data_dir.path()).map_err(startup_config_failure)?;
-    let daemon_config =
-        crate::config::load_daemon_config(data_dir.path()).map_err(startup_config_failure)?;
     let cloud_mcp_config =
         crate::config::load_cloud_mcp_config(data_dir.path()).map_err(startup_config_failure)?;
     let attention_suspicion_window =
@@ -358,125 +355,261 @@ async fn spawn_workers(
     }
 
     let (monitor_stop, monitor_shutdown) = watch::channel(false);
-    let mut background = JoinSet::new();
+    let mut monitor_tasks = JoinSet::new();
     let monitoring = router.monitoring();
-    background.spawn(monitoring.clone().run(monitor_shutdown));
-    let (attention_stop, attention_shutdown) = watch::channel(false);
-    let mut attention_tasks = JoinSet::new();
+    let worker_reporter =
+        crate::daemon::workers::WorkerReporter::new(router.clone(), Arc::clone(&policy));
+    let monitor_instance = monitoring.clone();
+    let monitor_failure_state = monitoring.clone();
+    let monitor_reporter = worker_reporter.clone();
+    let monitor_factory = move |shutdown: watch::Receiver<bool>| {
+        let monitoring = monitor_instance.clone();
+        let reporter = monitor_reporter.clone();
+        async move {
+            let result = monitoring.run(shutdown.clone(), reporter).await;
+            crate::daemon::workers::from_result(result, &shutdown)
+        }
+    };
+    monitor_tasks.spawn(crate::daemon::workers::supervise_with(
+        "monitor",
+        worker_reporter.clone(),
+        monitor_shutdown,
+        monitor_factory,
+        move |error| monitor_failure_state.mark_unavailable(&error.code),
+    ));
+
+    let (worker_stop, _) = watch::channel(false);
+    let mut workers = JoinSet::new();
     let attention_router = router.clone();
-    attention_tasks.spawn(async move {
-        crate::router::run_attention(
-            attention_router,
-            attention_suspicion_window,
-            attention_shutdown,
-        )
-        .await
-    });
-    {
-        let mail_router = router.clone();
-        let mail_shutdown = attention_stop.subscribe();
-        attention_tasks.spawn(async move {
-            crate::router::run_mail_reoffer(mail_router, mail_shutdown).await
-        });
-    }
-    {
-        let digest_router = router.clone();
-        let digest_shutdown = attention_stop.subscribe();
-        attention_tasks.spawn(async move {
-            crate::router::run_completion_digest(digest_router, digest_shutdown).await
-        });
-    }
+    let attention_reporter = worker_reporter.clone();
+    let attention_factory = move |shutdown: watch::Receiver<bool>| {
+        let router = attention_router.clone();
+        let reporter = attention_reporter.clone();
+        async move {
+            let result = crate::router::run_attention(
+                router,
+                attention_suspicion_window,
+                shutdown.clone(),
+                reporter,
+            )
+            .await;
+            crate::daemon::workers::from_result(result, &shutdown)
+        }
+    };
+    workers.spawn(crate::daemon::workers::supervise(
+        "attention",
+        worker_reporter.clone(),
+        worker_stop.subscribe(),
+        attention_factory,
+    ));
+    let mail_router = router.clone();
+    let mail_reporter = worker_reporter.clone();
+    let mail_factory = move |shutdown: watch::Receiver<bool>| {
+        let router = mail_router.clone();
+        let reporter = mail_reporter.clone();
+        async move {
+            let result = crate::router::run_mail_reoffer(router, shutdown.clone(), reporter).await;
+            crate::daemon::workers::from_result(result, &shutdown)
+        }
+    };
+    workers.spawn(crate::daemon::workers::supervise(
+        "mail_reoffer",
+        worker_reporter.clone(),
+        worker_stop.subscribe(),
+        mail_factory,
+    ));
+    let digest_router = router.clone();
+    let digest_reporter = worker_reporter.clone();
+    let digest_factory = move |shutdown: watch::Receiver<bool>| {
+        let router = digest_router.clone();
+        let reporter = digest_reporter.clone();
+        async move {
+            let result =
+                crate::router::run_completion_digest(router, shutdown.clone(), reporter).await;
+            crate::daemon::workers::from_result(result, &shutdown)
+        }
+    };
+    workers.spawn(crate::daemon::workers::supervise(
+        "completion_digest",
+        worker_reporter.clone(),
+        worker_stop.subscribe(),
+        digest_factory,
+    ));
     let mut recovery = JoinSet::new();
     let recovery_router = router.clone();
     recovery.spawn(async move { ("workspace", recovery_router.recover_workspaces().await) });
-    let recovery_router = router.clone();
-    recovery.spawn(async move { ("command", recovery_router.recover_accepted_commands().await) });
     // Owned by supervision; its abort-on-drop runs before the IPC listener
     // closes because the struct declares this field ahead of the listener.
     let mut capacity_recheck = JoinSet::new();
-    if capacity_retained > 0 {
-        capacity_recheck.spawn(restart_capacity::recheck(capacity));
-    }
-    let (automation_stop, automation_shutdown) = watch::channel(false);
-    // The rule worker's successful output carries its actual exit reason
-    // through the JoinSet to both supervisor consumers, so an intentional
-    // admission-closed drain is never re-derived from the shutdown flag.
-    let mut automation_tasks: JoinSet<(&'static str, Result<automation::RuleWorkerExit>)> =
-        JoinSet::new();
-    let mut automation_task_names: Vec<(tokio::task::Id, &'static str)> = Vec::new();
+    // Serialize the initial resume pass and later custody passes so their
+    // batches cannot add to each other's concurrency limit.
+    capacity_recheck.spawn(async move {
+        if let Err(error) = capacity.router.recover_accepted_commands().await {
+            logging::record(
+                &capacity.policy,
+                "daemon.command_recovery_failed",
+                &[],
+                Some(&error),
+            );
+        }
+        if let Err(error) = capacity
+            .router
+            .recover_restart_idle_agents(capacity.on_restart)
+            .await
+        {
+            logging::record(
+                &capacity.policy,
+                "daemon.restart_agent_recovery_failed",
+                &[],
+                Some(&error),
+            );
+        }
+        if capacity_retained > 0 {
+            restart_capacity::recheck(capacity).await;
+        }
+    });
+    let initial_rule_start = Arc::new(Mutex::new(Some(automation::RuleWorkerStart {
+        global_rules,
+        project_rules: project_rule_namespaces,
+        max_event_backlog: automation_config.max_event_backlog,
+        data_root: data_dir.path().to_path_buf(),
+        policy: Arc::clone(&policy),
+        initial_notices: initial_deferred_notice,
+    })));
     let rule_router = router.clone();
     let rule_data_root = data_dir.path().to_path_buf();
     let rule_policy = Arc::clone(&policy);
-    let rule_task_id = automation_tasks
-        .spawn(async move {
-            let outcome = automation::run_global_rules(
-                rule_router,
-                automation::RuleWorkerStart {
-                    global_rules,
-                    project_rules: project_rule_namespaces,
-                    max_event_backlog: automation_config.max_event_backlog,
-                    data_root: rule_data_root,
-                    policy: rule_policy,
-                    initial_notices: initial_deferred_notice,
-                },
-                automation_shutdown,
+    let rule_start = Arc::clone(&initial_rule_start);
+    let rule_factory = move |shutdown: watch::Receiver<bool>| {
+        let router = rule_router.clone();
+        let data_root = rule_data_root.clone();
+        let policy = Arc::clone(&rule_policy);
+        let first_start = Arc::clone(&rule_start);
+        async move {
+            let initial = first_start.lock().await.take();
+            let start = match initial {
+                Some(start) => start,
+                None => {
+                    let (global_rules, initial_notices) =
+                        match automation::initialize_global_rules(&router, &data_root, &policy)
+                            .await
+                        {
+                            Ok(initialized) => initialized,
+                            Err(error) => {
+                                return crate::daemon::workers::WorkerOutcome::Failed(error);
+                            }
+                        };
+                    let project_rules =
+                        match automation::initialize_project_rules(&router, &data_root, &policy)
+                            .await
+                        {
+                            Ok(rules) => rules,
+                            Err(error) => {
+                                return crate::daemon::workers::WorkerOutcome::Failed(error);
+                            }
+                        };
+                    let automation_config = match crate::config::load_automation_config(&data_root)
+                    {
+                        Ok(config) => config,
+                        Err(error) => {
+                            return crate::daemon::workers::WorkerOutcome::Failed(error);
+                        }
+                    };
+                    automation::RuleWorkerStart {
+                        global_rules,
+                        project_rules,
+                        max_event_backlog: automation_config.max_event_backlog,
+                        data_root: data_root.clone(),
+                        policy: Arc::clone(&policy),
+                        initial_notices,
+                    }
+                }
+            };
+            match automation::run_global_rules(router, start, shutdown).await {
+                Ok(
+                    automation::RuleWorkerExit::Shutdown
+                    | automation::RuleWorkerExit::AdmissionClosed,
+                ) => crate::daemon::workers::WorkerOutcome::Stopped,
+                Ok(automation::RuleWorkerExit::Exited) => {
+                    crate::daemon::workers::WorkerOutcome::Failed(Error::new(
+                        "worker_exited",
+                        "rule worker exited unexpectedly",
+                    ))
+                }
+                Err(error) => crate::daemon::workers::WorkerOutcome::Failed(error),
+            }
+        }
+    };
+    workers.spawn(crate::daemon::workers::supervise(
+        "rule_worker",
+        worker_reporter.clone(),
+        worker_stop.subscribe(),
+        rule_factory,
+    ));
+
+    let goal_router = router.clone();
+    let goal_factory = move |shutdown: watch::Receiver<bool>| {
+        let router = goal_router.clone();
+        async move {
+            let result = crate::router::run_goal_driver(
+                router,
+                crate::router::real_goal_check,
+                shutdown.clone(),
             )
             .await;
-            ("rule_worker", outcome)
-        })
-        .id();
-    automation_task_names.push((rule_task_id, "rule_worker"));
-    {
-        let goal_router = router.clone();
-        let goal_shutdown = automation_stop.subscribe();
-        let goal_task_id = automation_tasks
-            .spawn(async move {
-                let outcome = crate::router::run_goal_driver(
-                    goal_router,
-                    crate::router::real_goal_check,
-                    goal_shutdown,
-                )
-                .await;
-                // The goal driver keeps its current shutdown-only output.
-                let outcome = outcome.map(|()| automation::RuleWorkerExit::Shutdown);
-                ("goal_driver", outcome)
-            })
-            .id();
-        automation_task_names.push((goal_task_id, "goal_driver"));
-    }
-    let (maintenance_stop, maintenance_shutdown) = watch::channel(false);
-    let mut maintenance_tasks = JoinSet::new();
-    {
-        let store = Arc::clone(&store);
-        let data_root = data_dir.path().to_path_buf();
-        let policy = Arc::clone(&policy);
-        maintenance_tasks.spawn(async move {
-            maintenance::run(
-                store,
-                data_root,
-                policy,
-                daemon_config,
-                maintenance_shutdown,
-            )
-            .await
-        });
-    }
+            crate::daemon::workers::from_result(result, &shutdown)
+        }
+    };
+    workers.spawn(crate::daemon::workers::supervise(
+        "goal_driver",
+        worker_reporter.clone(),
+        worker_stop.subscribe(),
+        goal_factory,
+    ));
+
+    let initial_maintenance_config = Arc::new(Mutex::new(Some(daemon_config)));
+    let maintenance_store = Arc::clone(&store);
+    let maintenance_root = data_dir.path().to_path_buf();
+    let maintenance_policy = Arc::clone(&policy);
+    let maintenance_reporter = worker_reporter.clone();
+    let maintenance_initial = Arc::clone(&initial_maintenance_config);
+    let maintenance_factory = move |shutdown: watch::Receiver<bool>| {
+        let store = Arc::clone(&maintenance_store);
+        let data_root = maintenance_root.clone();
+        let policy = Arc::clone(&maintenance_policy);
+        let reporter = maintenance_reporter.clone();
+        let initial = Arc::clone(&maintenance_initial);
+        async move {
+            let config = match initial.lock().await.take() {
+                Some(config) => config,
+                None => match crate::config::load_daemon_config(&data_root) {
+                    Ok(config) => config,
+                    Err(error) => return crate::daemon::workers::WorkerOutcome::Failed(error),
+                },
+            };
+            let result =
+                maintenance::run(store, data_root, policy, config, shutdown.clone(), reporter)
+                    .await;
+            crate::daemon::workers::from_result(result, &shutdown)
+        }
+    };
+    workers.spawn(crate::daemon::workers::supervise(
+        "maintenance",
+        worker_reporter,
+        worker_stop.subscribe(),
+        maintenance_factory,
+    ));
     let progress = router.progress_receiver();
     let connections = JoinSet::new();
     Ok(DaemonSupervision {
         connections,
         progress,
-        maintenance_tasks,
-        maintenance_stop,
-        automation_task_names,
-        automation_tasks,
-        automation_stop,
+        workers,
+        worker_stop,
         _capacity_recheck: capacity_recheck,
         recovery,
-        attention_tasks,
-        attention_stop,
         monitoring,
-        background,
+        monitor_tasks,
         monitor_stop,
         cloud_mcp_tasks,
         cloud_mcp_shutdown,
@@ -493,13 +626,10 @@ async fn supervise(mut supervision: DaemonSupervision) -> (Result<()>, DaemonSup
         router,
         policy,
         listener,
-        background,
+        workers,
+        monitor_tasks,
         monitoring,
-        attention_tasks,
         recovery,
-        automation_tasks,
-        automation_task_names,
-        maintenance_tasks,
         cloud_mcp_tasks,
         progress,
         connections,
@@ -507,6 +637,8 @@ async fn supervise(mut supervision: DaemonSupervision) -> (Result<()>, DaemonSup
     } = &mut supervision;
     let router = router.clone();
     let policy = Arc::clone(policy);
+    let mut accept_failures = 0_u32;
+    let mut accept_retry_at: Option<Instant> = None;
     let outcome = loop {
         match router.should_exit().await {
             Ok(true) => break Ok(()),
@@ -514,69 +646,70 @@ async fn supervise(mut supervision: DaemonSupervision) -> (Result<()>, DaemonSup
             Err(error) => break Err(error),
         }
         tokio::select! {
-            accepted = listener.accept() => {
-                match accepted {
-                    Ok(stream) if connections.len() < MAX_CLIENTS => {
+            accepted = listener.accept(), if accept_retry_at.is_none() => {
+                let (stream, error) = match accepted {
+                    Ok(stream) => (Some(stream), listener.take_replacement_error()),
+                    Err(error) => (None, Some(error)),
+                };
+                if let Some(error) = error {
+                    if router.is_force_requested() {
+                        break Ok(());
+                    }
+                    accept_failures = accept_failures.saturating_add(1);
+                    if accept_failures >= ACCEPT_FAILURE_LIMIT {
+                        break Err(report_accept_exhausted(&router, &policy, accept_failures, &error).await);
+                    }
+                    accept_retry_at = Some(note_accept_retry(&policy, accept_failures, &error));
+                } else {
+                    accept_failures = 0;
+                }
+                if let Some(stream) = stream {
+                    if connections.len() < MAX_CLIENTS {
                         let router = router.clone();
                         let policy = Arc::clone(&policy);
                         connections.spawn(async move {
                             serve_connection(stream, router, policy).await;
                         });
-                    }
-                    Ok(stream) => {
-                        // At the connection limit the request was never read
-                        // or routed, so nothing was admitted. Echo one typed
-                        // retryable refusal instead of dropping silently.
-                        tokio::spawn(async move {
-                            reply_overloaded(stream).await;
-                        });
-                    }
-                    Err(error) => {
-                        if router.is_force_requested() {
-                            break Ok(());
-                        }
-                        break Err(error);
+                    } else {
+                        // At the connection limit the request was never read or routed.
+                        tokio::spawn(reply_overloaded(stream));
                     }
                 }
+            }
+            _ = async {
+                if let Some(retry_at) = accept_retry_at {
+                    sleep_until(retry_at).await;
+                }
+            }, if accept_retry_at.is_some() => {
+                accept_retry_at = None;
             }
             changed = progress.changed() => {
                 if changed.is_err() {
                     break Err(Error::new("internal", "daemon progress channel closed"));
                 }
             }
-            joined = background.join_next(), if !background.is_empty() => {
-                match joined {
-                    Some(Ok(Err(error))) => {
-                        logging::record(&policy, "daemon.monitor_failed", &[], Some(&error));
-                        monitoring.mark_unavailable(&error.code);
-                    }
-                    Some(Err(_)) => {
-                        logging::record(&policy, "daemon.monitor_task_failed", &[], None);
-                        monitoring.mark_unavailable("monitor_task_failed");
-                    }
-                    _ => {
-                        logging::record(&policy, "daemon.monitor_task_stopped", &[], None);
-                        monitoring.mark_unavailable("monitor_task_stopped");
-                    }
+            joined = workers.join_next(), if !workers.is_empty() => {
+                if matches!(joined, Some(Err(_))) {
+                    logging::record(&policy, "daemon.worker_supervisor_failed", &[], None);
+                    break Err(Error::new(
+                        "worker_supervisor_failed",
+                        "daemon worker supervisor stopped unexpectedly",
+                    ));
                 }
             }
-            joined = attention_tasks.join_next(), if !attention_tasks.is_empty() => {
-                match joined {
-                    Some(Ok(Err(error))) => {
-                        logging::record(&policy, "daemon.attention_task_failed", &[], Some(&error));
-                    }
-                    Some(Err(_)) => {
-                        logging::record(&policy, "daemon.attention_task_failed", &[], None);
-                    }
-                    _ => {}
+            joined = monitor_tasks.join_next(), if !monitor_tasks.is_empty() => {
+                if matches!(joined, Some(Err(_))) {
+                    logging::record(&policy, "daemon.monitor_supervisor_failed", &[], None);
+                    monitoring.mark_unavailable("monitor_supervisor_failed");
+                    break Err(Error::new(
+                        "monitor_supervisor_failed",
+                        "monitor supervisor stopped unexpectedly",
+                    ));
                 }
             }
             joined = recovery.join_next(), if !recovery.is_empty() => {
                 match joined {
                     Some(Ok((_, Ok(())))) => {}
-                    Some(Ok(("command", Err(error)))) => {
-                        logging::record(&policy, "daemon.command_recovery_failed", &[], Some(&error));
-                    }
                     Some(Ok((_, Err(error)))) => {
                         logging::record(&policy, "daemon.workspace_recovery_failed", &[], Some(&error));
                         router.note_workspace_recovery_failure(&error.code);
@@ -585,78 +718,6 @@ async fn supervise(mut supervision: DaemonSupervision) -> (Result<()>, DaemonSup
                         logging::record(&policy, "daemon.workspace_recovery_task_failed", &[], None);
                         router.note_workspace_recovery_failure("workspace_recovery_task_failed");
                     }
-                }
-            }
-            joined = automation_tasks.join_next_with_id(), if !automation_tasks.is_empty() => {
-                match joined {
-                    Some(Ok((task_id, (name, Err(error))))) => {
-                        router.note_automation_task_stopped(name, Some(error.code.clone()));
-                        logging::record(
-                            &policy,
-                            "daemon.automation_worker_failed",
-                            &[("task", name)],
-                            Some(&error),
-                        );
-                        let _ = task_id;
-                    }
-                    Some(Ok((task_id, (name, Ok(reason))))) => {
-                        match reason {
-                            automation::RuleWorkerExit::Shutdown
-                            | automation::RuleWorkerExit::AdmissionClosed => {
-                                router.note_automation_task_stopped(name, None);
-                            }
-                            automation::RuleWorkerExit::Exited => {
-                                // Only an unexpected exit reaches this arm;
-                                // an intentional reason stays stopped even when
-                                // automation_stop is still false.
-                                router.note_automation_task_stopped(
-                                    name,
-                                    Some("worker_exited".to_owned()),
-                                );
-                                logging::record(
-                                    &policy,
-                                    "daemon.automation_worker_exited",
-                                    &[("task", name)],
-                                    None,
-                                );
-                            }
-                        }
-                        let _ = task_id;
-                    }
-                    Some(Err(join_error)) => {
-                        let failed_id = join_error.id();
-                        let code = if join_error.is_panic() {
-                            "worker_panicked"
-                        } else if join_error.is_cancelled() {
-                            "worker_cancelled"
-                        } else {
-                            "worker_task_failed"
-                        };
-                        if let Some((_, name)) = automation_task_names
-                            .iter()
-                            .find(|(task_id, _)| *task_id == failed_id)
-                        {
-                            router.note_automation_task_stopped(name, Some(code.to_owned()));
-                        }
-                        logging::record(
-                            &policy,
-                            "daemon.automation_worker_task_failed",
-                            &[],
-                            None,
-                        );
-                    }
-                    None => {}
-                }
-            }
-            joined = maintenance_tasks.join_next(), if !maintenance_tasks.is_empty() => {
-                match joined {
-                    Some(Ok(Err(error))) => {
-                        logging::record(&policy, "daemon.maintenance_failed", &[], Some(&error));
-                    }
-                    Some(Err(_)) => {
-                        logging::record(&policy, "daemon.maintenance_task_failed", &[], None);
-                    }
-                    _ => {}
                 }
             }
             joined = cloud_mcp_tasks.join_next(), if !cloud_mcp_tasks.is_empty() => {
@@ -694,6 +755,47 @@ async fn supervise(mut supervision: DaemonSupervision) -> (Result<()>, DaemonSup
     (outcome, supervision)
 }
 
+fn note_accept_retry(policy: &SecretPolicy, attempt: u32, error: &Error) -> Instant {
+    let delay = crate::daemon::workers::retry_backoff(attempt);
+    let attempt = attempt.to_string();
+    let retry_after_ms = delay.as_millis().to_string();
+    logging::record(
+        policy,
+        "daemon.ipc_accept_retry",
+        &[("attempt", &attempt), ("retry_after_ms", &retry_after_ms)],
+        Some(error),
+    );
+    Instant::now() + delay
+}
+
+async fn report_accept_exhausted(
+    router: &Router,
+    policy: &SecretPolicy,
+    failures: u32,
+    error: &Error,
+) -> Error {
+    let attempt = failures.to_string();
+    let fields = [("attempt", attempt.as_str())];
+    logging::record(policy, "daemon.ipc_accept_attention", &fields, Some(error));
+    let message = format!(
+        "The local IPC listener failed {failures} consecutive times. Swarm is exiting. Check the daemon log for the last accept error."
+    );
+    if let Err(error) = router.report_daemon_attention(message.clone()).await {
+        logging::record(
+            policy,
+            "daemon.attention_delivery_failed",
+            &fields,
+            Some(&error),
+        );
+    }
+    Error::new("ipc_accept_exhausted", message)
+        .with_where("daemon.ipc.accept")
+        .with_origin(
+            FailureOrigin::Swarm,
+            "consecutive local IPC accept failures reached the retry limit",
+        )
+}
+
 /// Drain workers in dependency order after the supervision loop ends. Task
 /// sets still owned here abort on drop, matching the previous inline drain at
 /// the end of `run_owned`.
@@ -704,16 +806,11 @@ async fn shutdown_supervision(
     let DaemonSupervision {
         router,
         policy,
+        workers,
+        worker_stop,
         monitor_stop,
-        background,
+        monitor_tasks,
         monitoring,
-        attention_stop,
-        attention_tasks,
-        automation_stop,
-        automation_tasks,
-        automation_task_names,
-        maintenance_stop,
-        maintenance_tasks,
         cloud_mcp_shutdown,
         cloud_mcp_tasks,
         recovery,
@@ -736,76 +833,10 @@ async fn shutdown_supervision(
             Err(_) => logging::record(&policy, "daemon.cloud_mcp_task_failed", &[], None),
         }
     }
-    attention_stop.send_replace(true);
-    while let Some(joined) = attention_tasks.join_next().await {
-        match joined {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                logging::record(&policy, "daemon.attention_task_failed", &[], Some(&error));
-            }
-            Err(_) => logging::record(&policy, "daemon.attention_task_failed", &[], None),
-        }
-    }
-    automation_stop.send_replace(true);
-    while let Some(joined) = automation_tasks.join_next_with_id().await {
-        match joined {
-            Ok((task_id, (name, Ok(reason)))) => {
-                // The shutdown drain honours the same propagated reason:
-                // an unexpected exit must not be forgiven as stopped here.
-                match reason {
-                    automation::RuleWorkerExit::Shutdown
-                    | automation::RuleWorkerExit::AdmissionClosed => {
-                        router.note_automation_task_stopped(name, None);
-                    }
-                    automation::RuleWorkerExit::Exited => {
-                        router.note_automation_task_stopped(name, Some("worker_exited".to_owned()));
-                        logging::record(
-                            &policy,
-                            "daemon.automation_worker_exited",
-                            &[("task", name)],
-                            None,
-                        );
-                    }
-                }
-                let _ = task_id;
-            }
-            Ok((task_id, (name, Err(error)))) => {
-                router.note_automation_task_stopped(name, Some(error.code.clone()));
-                logging::record(
-                    &policy,
-                    "daemon.automation_worker_failed",
-                    &[("task", name)],
-                    Some(&error),
-                );
-                let _ = task_id;
-            }
-            Err(join_error) => {
-                let failed_id = join_error.id();
-                let code = if join_error.is_panic() {
-                    "worker_panicked"
-                } else if join_error.is_cancelled() {
-                    "worker_cancelled"
-                } else {
-                    "worker_task_failed"
-                };
-                if let Some((_, name)) = automation_task_names
-                    .iter()
-                    .find(|(task_id, _)| *task_id == failed_id)
-                {
-                    router.note_automation_task_stopped(name, Some(code.to_owned()));
-                }
-                logging::record(&policy, "daemon.automation_worker_task_failed", &[], None);
-            }
-        }
-    }
-    maintenance_stop.send_replace(true);
-    while let Some(joined) = maintenance_tasks.join_next().await {
-        match joined {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                logging::record(&policy, "daemon.maintenance_failed", &[], Some(&error));
-            }
-            Err(_) => logging::record(&policy, "daemon.maintenance_task_failed", &[], None),
+    worker_stop.send_replace(true);
+    while let Some(joined) = workers.join_next().await {
+        if joined.is_err() {
+            logging::record(&policy, "daemon.worker_supervisor_failed", &[], None);
         }
     }
     if router.is_force_requested() {
@@ -816,11 +847,13 @@ async fn shutdown_supervision(
     connections.abort_all();
     while connections.join_next().await.is_some() {}
     monitor_stop.send_replace(true);
-    while let Some(joined) = background.join_next().await {
+    while let Some(joined) = monitor_tasks.join_next().await {
         match joined {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => monitoring.mark_unavailable(&error.code),
-            Err(_) => monitoring.mark_unavailable("monitor_task_failed"),
+            Ok(()) => {}
+            Err(_) => {
+                monitoring.mark_unavailable("monitor_supervisor_failed");
+                logging::record(&policy, "daemon.monitor_supervisor_failed", &[], None);
+            }
         }
     }
     outcome

@@ -141,7 +141,8 @@ edge case. Repair the owning spec and its actual caller together.
 ## Process and recovery boundary
 
 Use one process-owning plugin/app-server per Agent generation. A replacement never
-inherits an uncertain call. Resume is explicit and does not resend the old prompt.
+inherits an uncertain call. Restart recovery can reopen a retained session in a new
+generation once custody and work-state checks pass. Resume never resends the old prompt.
 Shared services are later capabilities and require exact per-session isolation; stopping
 one Agent never kills another session or an owner-run service.
 

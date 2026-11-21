@@ -340,7 +340,13 @@ pub(super) fn admit_send_member(
         ));
     }
     if agent.is_terminal() {
-        return Err(Error::new("bad_state", "cannot send to a terminal Agent"));
+        return Err(Error::new(
+            "bad_state",
+            format!(
+                "cannot send to terminal Agent {}; inspect `swarm why {}` and, if its native session is retained, run `swarm resume {} \"<text>\"`; Resume starts a new generation and does not replay the previous prompt",
+                agent.id, agent.id, agent.id
+            ),
+        ));
     }
     let text = required_string(&request.args, "text")?;
     check_input(&text)?;
@@ -1634,9 +1640,59 @@ pub(super) fn submit_tx(
     limits: core::api::HierarchyLimits,
     policy: Option<&capacity::PolicyLoader>,
 ) -> Result<Admission> {
+    submit_tx_mode(
+        tx,
+        principal,
+        request,
+        preparation,
+        now,
+        derived_rule,
+        limits,
+        policy,
+        false,
+    )
+}
+
+pub(super) fn submit_restart_resume_tx(
+    tx: &Transaction<'_>,
+    request: SubmitCommand,
+    now: i64,
+    limits: core::api::HierarchyLimits,
+    policy: Option<&capacity::PolicyLoader>,
+) -> Result<Admission> {
+    submit_tx_mode(tx, "owner", request, None, now, false, limits, policy, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn submit_tx_mode(
+    tx: &Transaction<'_>,
+    principal: &str,
+    request: SubmitCommand,
+    preparation: Option<WorkspacePreparationInput>,
+    now: i64,
+    derived_rule: bool,
+    limits: core::api::HierarchyLimits,
+    policy: Option<&capacity::PolicyLoader>,
+    restart_idle_resume: bool,
+) -> Result<Admission> {
     let (payload_digest, replay) = submit_head_tx(tx, principal, &request, now, derived_rule)?;
     if let Some(admission) = replay {
         return Ok(admission);
+    }
+    if restart_idle_resume {
+        let target = request
+            .target
+            .as_deref()
+            .ok_or_else(|| Error::new("invalid", "restart Resume has no Agent target"))?;
+        let generation = request.expected_generation.ok_or_else(|| {
+            Error::new("invalid", "restart Resume has no captured Agent generation")
+        })?;
+        if !capacity::restart_idle_resume_candidate_tx(tx, target, generation)? {
+            return Err(Error::new(
+                "bad_state",
+                "restart Resume eligibility changed before admission",
+            ));
+        }
     }
     if request.selector.is_some() {
         return submit_selector_tx(

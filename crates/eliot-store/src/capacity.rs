@@ -8,6 +8,78 @@ pub(super) type PolicyLoader = dyn Fn() -> Result<ScopeLimits> + Send + Sync;
 const MIGRATION_BATCH_SIZE: i64 = 128;
 const RETAINED_PAGE_SIZE: i64 = 128;
 
+const RESTART_IDLE_RESUME_ELIGIBILITY: &str = r#"
+    a.observe_only = 0 AND a.archived = 0
+    AND a.state IN ('lost', 'stopped')
+    AND a.capacity_generation IS NULL
+    AND a.harness IN ('codex', 'muse', 'claude', 'opencode', 'antigravity')
+    AND TRIM(COALESCE(a.native_scope, '')) <> ''
+    AND TRIM(COALESCE(a.native_ref, '')) <> ''
+    AND EXISTS (
+        SELECT 1 FROM events restart_event
+        WHERE restart_event.agent = a.id
+          AND restart_event.generation = a.generation
+          AND ((restart_event.kind = 'agent.lost'
+                AND json_extract(restart_event.data, '$.reason') = 'daemon_restart'
+                AND json_extract(restart_event.data, '$.previous_state') = 'idle')
+            OR (restart_event.kind = 'agent.stopped'
+                AND json_extract(restart_event.data, '$.reason') = 'owned_exit_before_restart'))
+    )
+    AND EXISTS (
+        SELECT 1 FROM events custody_event
+        WHERE custody_event.agent = a.id
+          AND custody_event.generation = a.generation
+          AND custody_event.kind = 'capacity.released'
+          AND json_extract(custody_event.data, '$.reason') = 'restart_custody_closed'
+          AND json_extract(custody_event.data, '$.orphan_possible') = 0
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM commands c
+        WHERE c.target = a.id
+          AND c.state IN ('accepted', 'queued', 'dispatched', 'unknown')
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM commands c
+        WHERE c.target = a.id AND c.generation = a.generation
+          AND c.verb = 'resume'
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM commands c
+        WHERE c.target = a.id AND c.generation = a.generation
+          AND c.verb = 'stop' AND c.state = 'cancelled'
+          AND json_extract(c.outcome, '$.reason') = 'generation_lost'
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM turns t
+        WHERE t.agent = a.id AND t.state IN ('running', 'unknown')
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM pending_requests r
+        WHERE r.agent = a.id
+          AND (r.state = 'pending'
+               OR (r.generation = a.generation AND r.state = 'stale'))
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM goal_markers g
+        WHERE g.agent = a.id AND g.state IN ('running', 'unknown')
+    )
+"#;
+
+pub(super) fn restart_idle_resume_candidate_tx(
+    connection: &Connection,
+    agent: &str,
+    generation: i64,
+) -> Result<bool> {
+    let agent_num = parse_agent_id(agent)?;
+    let query = format!(
+        "SELECT EXISTS(SELECT 1 FROM agents a
+         WHERE a.id = ?1 AND a.generation = ?2 AND {RESTART_IDLE_RESUME_ELIGIBILITY})"
+    );
+    connection
+        .query_row(&query, params![agent_num, generation], |row| row.get(0))
+        .map_err(sql_error)
+}
+
 /// A controlled generation left `lost` or `stopped` by a daemon replacement
 /// while it still reserves capacity, with the process identities recorded in
 /// its custody.
@@ -26,6 +98,14 @@ pub struct RetainedGeneration {
     pub processes_truncated: bool,
 }
 
+/// One exact terminal generation that was idle at daemon restart and is now
+/// safe to reopen without replaying input.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestartResumeCandidate {
+    pub agent: String,
+    pub generation: i64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecordedProcess {
     pub identity: ProcessIdentity,
@@ -34,6 +114,23 @@ pub struct RecordedProcess {
 }
 
 impl Store {
+    /// Read the last automatic-resume refusal for the exact generation.
+    pub fn restart_resume_blocked(&self, agent: &str, generation: i64) -> Result<Option<Value>> {
+        let agent = parse_agent_id(agent)?;
+        let data = self
+            .connection
+            .query_row(
+                "SELECT data FROM events
+             WHERE agent = ?1 AND generation = ?2 AND kind = 'agent.restart_resume_blocked'
+             ORDER BY seq DESC LIMIT 1",
+                params![agent, generation],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        data.as_deref().map(decode_json).transpose()
+    }
+
     /// Current namespace, bound to this Store identity and canonical data dir.
     /// Existing generations use their separately recorded namespace.
     pub fn custody_namespace(&self) -> Result<String> {
@@ -211,6 +308,38 @@ impl Store {
             });
         }
         Ok(retained)
+    }
+
+    /// Page durable, promptless restart candidates. Eligibility is derived
+    /// from the retained restart event and exact custody proof, so a crash
+    /// between loss settlement and automatic Resume admission does not lose
+    /// the candidate. Any uncertain turn, command, request, stop intent, or
+    /// Goal round keeps it held.
+    pub fn restart_idle_resume_candidates(
+        &self,
+        after: Option<&str>,
+    ) -> Result<Vec<RestartResumeCandidate>> {
+        let after = after.map(parse_agent_id).transpose()?.unwrap_or(0);
+        let query = format!(
+            "SELECT a.id, a.generation FROM agents a
+             WHERE a.id > ?1 AND {RESTART_IDLE_RESUME_ELIGIBILITY}
+             ORDER BY a.id LIMIT ?2"
+        );
+        let mut statement = self.connection.prepare(&query).map_err(sql_error)?;
+        let rows = statement
+            .query_map(params![after, RETAINED_PAGE_SIZE], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(sql_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sql_error)?;
+        Ok(rows
+            .into_iter()
+            .map(|(agent, generation)| RestartResumeCandidate {
+                agent: format_agent_id(agent),
+                generation,
+            })
+            .collect())
     }
 
     /// Commit custody closure that the daemon verified outside the Store lock,

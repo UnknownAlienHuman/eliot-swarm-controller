@@ -222,6 +222,10 @@ fn encode_record(
                 | "boot_id"
                 | "pid"
                 | "method"
+                | "worker"
+                | "restart_count"
+                | "attempt"
+                | "retry_after_ms"
         ) {
             context.insert(
                 key.to_owned(),

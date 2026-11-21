@@ -1485,8 +1485,10 @@ On panic the daemon writes a `daemon.panicked` marker and plugins write a
 omitted before either disk or stderr; source location, approved thread name and
 payload-free backtrace are sanitized and bounded first. Publication uses the
 existing private temporary-file/write/sync/atomic-rename primitive (bounded
-file/count); readers ignore temporary or incomplete files. The previous daemon
-marker is consumed once and reported in `daemon.status`, in `swarm daemon`
+file size and a separate count for each panic code). Readers ignore temporary
+or incomplete files. Owner status reads consume validated plugin marker files
+into a bounded view of the most recent plugin panics seen during this run.
+The previous daemon marker is consumed once and reported in `daemon.status`, in `swarm daemon`
 startup output, and in `swarm why` when the diagnosed failure is otherwise
 unclassified. The desktop Agent details view shows the same one-line
 diagnosis summary; the full chain lives behind `swarm why`.
@@ -1498,6 +1500,34 @@ repository config. Use a separate Cargo target directory per worktree. Executabl
 cwd and env remain separate. Launch/workspace admission never performs an implicit fetch.
 All persisted fields and frames are bounded. The roadmap determines when each section
 becomes implemented; absent later features return `unsupported`, not a hidden substitute.
+
+### Daemon autostart
+
+On Windows, use `swarm --data-dir DIR daemon install` to register a Task
+Scheduler entry for the current OS user and the selected private data directory.
+It runs the installed executable at user logon and restarts it after a failed
+exit. After moving the executable, run `daemon install` from its new location
+to refresh the verified task. `swarm --data-dir DIR daemon uninstall` removes
+the verified task even when the original data directory is absent. Scheduler
+refusals identify the task by name when available.
+Run these commands from an Owner CLI. The daemon lock admits one instance per
+data directory. Windows demand-start uses a detached process group with Job
+breakaway and reports a start error when the caller's Job forbids it.
+
+The supported Linux image uses the [Docker restart policy](../../docker/README.md)
+for unattended startup.
+
+### Agent restart policy
+
+`[daemon].on_restart` takes `"continue"` (default) or `"hold"` and applies
+at daemon startup. Continue reopens eligible retained idle sessions without
+input, in batches of up to four resume commands within configured capacity.
+Hold leaves those sessions for explicit resume. Previously admitted commands
+still follow durable command recovery. Interrupted turns and uncertain effects
+stay `unknown` under either policy.
+
+A refused automatic resume leaves an Owner notice and a reason in
+`swarm why AGENT`. Address that reason before explicitly resuming the Agent.
 
 ## Private chats root
 

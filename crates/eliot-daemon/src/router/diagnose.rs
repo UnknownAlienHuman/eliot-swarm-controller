@@ -243,6 +243,12 @@ impl Router {
         let mut preceded_by = None;
         let mut commands = std::collections::HashSet::new();
         let mut unresolved = Vec::new();
+        if row.is_terminal()
+            && let Some(blocked) = store.restart_resume_blocked(agent, generation)?
+            && let Some(message) = blocked.get("message").and_then(Value::as_str)
+        {
+            unresolved.push(message.to_owned());
+        }
         let (command, turn) = store.agent_unknowns(agent)?;
         if let Some(command) = command {
             unresolved.push(unknown_command_message(&command, row.observe_only));
@@ -544,10 +550,25 @@ fn loss_step(event: &Event, at: Option<i64>) -> DiagnoseStep {
             .and_then(Value::as_str)
             .map(|value| bound_chars(value, limit))
     };
+    let message = if reason == Some("daemon_restart") {
+        let agent = event
+            .data
+            .get("agent_id")
+            .and_then(Value::as_str)
+            .unwrap_or("<agent>");
+        Some(bound_chars(
+            &format!(
+                "Swarm restarted and disconnected the session. To reopen a retained session, run `swarm resume {agent}` when ready."
+            ),
+            1024,
+        ))
+    } else {
+        reason.map(|reason| bound_chars(reason, 1024))
+    };
     DiagnoseStep {
         kind: "process".to_owned(),
         code: Some(bound_chars(&event.kind, 128)),
-        message: reason.map(|reason| bound_chars(reason, 1024)),
+        message,
         failure_where: text("where", 128)
             .or_else(|| typed.map(|(_, location)| location.to_owned())),
         origin: text("origin", 32).or_else(|| typed.map(|(origin, _)| origin.as_str().to_owned())),

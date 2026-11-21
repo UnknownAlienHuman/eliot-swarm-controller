@@ -3,6 +3,7 @@
 //! module only routes a parsed command to the owning family runner.
 mod agents;
 pub(crate) mod args;
+mod autostart;
 mod cleanup;
 mod coord;
 mod daemon;

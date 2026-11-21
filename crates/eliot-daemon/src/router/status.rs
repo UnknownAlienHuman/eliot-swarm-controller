@@ -6,7 +6,7 @@ use eliot_core::{
     api::{
         DaemonStatusResponse, DrainReport, OwnedProcessKind, OwnedProcessSummary,
         RetainedUnknownSummary, RetentionView, RunningTurnSummary, StatusBlocker,
-        UnsettledCommandSummary, WorkerTaskStatus, WorkspaceCustodyView,
+        UnsettledCommandSummary, WorkspaceCustodyView,
     },
 };
 use eliot_plugin::sync::LockExt;
@@ -47,6 +47,22 @@ impl Router {
         let workspace_custody: WorkspaceCustodyView =
             serde_json::from_value(crate::workspaces::custody_capability())
                 .map_err(|_| Error::new("internal", "workspace custody view is invalid"))?;
+        let policy = self.secret_policy_snapshot();
+        let (plugin_crashes, plugin_crashes_truncated) = {
+            let mut status = self.inner.plugin_crashes.lock_recover();
+            let markers = crate::crash::take_plugin_crashes(&self.inner.data_root, &policy);
+            if !markers.is_empty() {
+                status.markers.extend(markers);
+                status.markers.sort_by_key(|marker| marker.timestamp);
+                let excess = status
+                    .markers
+                    .len()
+                    .saturating_sub(DaemonStatusResponse::MAX_PLUGIN_CRASHES);
+                status.markers.drain(..excess);
+                status.truncated |= excess > 0;
+            }
+            (status.markers.clone(), status.truncated)
+        };
         serde_json::to_value(DaemonStatusResponse {
             state: if mode == "open" { "running" } else { mode }.to_owned(),
             admission: mode.to_owned(),
@@ -59,17 +75,7 @@ impl Router {
             workspace_custody,
             workspace_recovery_error: self.inner.workspace_recovery_error.lock_recover().clone(),
             cloud_mcp: crate::cloud_mcp::service_snapshot(),
-            automation_tasks: self
-                .inner
-                .automation_tasks
-                .lock_recover()
-                .iter()
-                .map(|(name, health, failure_code)| WorkerTaskStatus {
-                    name: name.clone(),
-                    health: *health,
-                    failure_code: failure_code.clone(),
-                })
-                .collect(),
+            automation_tasks: self.inner.worker_tasks.lock_recover().clone(),
             unknown_commands_count,
             unknown_commands,
             unknown_commands_truncated,
@@ -79,6 +85,8 @@ impl Router {
             blockers,
             drain: Some(drain),
             retention,
+            plugin_crashes,
+            plugin_crashes_truncated,
             previous_crash: self.inner.previous_crash.lock_recover().clone(),
         })
         .map_err(|_| Error::new("internal", "daemon status could not be encoded"))
