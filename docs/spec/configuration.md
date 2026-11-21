@@ -179,12 +179,17 @@ Claude CLI-default permission mode, Muse current conservative
 defaults); broader authority stays profile-only, owner-written choice. When
 `--cmd` is not given, the daemon resolves the installed native executable
 deterministically and freezes the absolute path. Ad-hoc Claude uses `mcp = "minimal"`. Claude profiles may omit `cmd` or set
-`cmd = "latest"`; the daemon resolves the newest native installation at launch
-admission and freezes the absolute path plus reported `cmd_version` in the
-Agent snapshot. Versioned vendor roots are considered before PATH, and
-candidates are ordered by the numeric version reported by `--version`.
-Explicit executable paths remain pinned. First-use profiles omit `cmd` so they
-keep following vendor updates. A missing pin is reported with the discovered
+`cmd = "latest"`; both automatic forms select only an executable whose bounded
+`--version` probe exits successfully and reports a parseable numeric version.
+Among verified installations, the newest numeric version wins even when
+another probe times out. The absolute path and verified `cmd_version` are
+frozen in the Agent snapshot. Versioned vendor roots are considered before
+PATH. Unverified executables remain visible in the installation inventory,
+with the raw `--version` first line when available, but cannot be selected
+automatically. Explicit executable paths remain pinned even when their
+optional version probe fails or is not parseable. First-use profiles omit
+`cmd` so they keep following vendor
+updates. A missing pin is reported with the discovered
 replacement and the `swarm settings claude-cmd PROFILE --cmd PATH` repair
 command; use `swarm settings claude-cmd PROFILE --latest` to return a profile
 to automatic selection. See [Claude Code discovery](../harnesses/claude-code.md#ad-hoc-launch).
@@ -1254,9 +1259,11 @@ stale-revision rule of [unified settings](#unified-settings).
 `swarm settings claude-cmd PROFILE --cmd PATH` replaces one Claude profile's
 executable through the existing revision-checked settings writer. Use
 `swarm settings claude-cmd PROFILE --latest` to restore automatic version
-selection. The command uses revision compare-and-swap and refuses a profile
-section containing redacted values rather than overwriting hidden settings. Repair
-suggestions are shell-quoted for PowerShell on Windows and POSIX shells elsewhere.
+selection. These forms are mutually exclusive; the CLI rejects an invocation
+that supplies both `--cmd` and `--latest` during argument parsing. The command
+uses revision compare-and-swap and refuses a profile section containing
+redacted values rather than overwriting hidden settings. Repair suggestions
+are shell-quoted for PowerShell on Windows and POSIX shells elsewhere.
 
 The desktop adds a project by choosing its checkout with the native folder picker;
 it derives a valid, collision-free ID from the folder name and immediately saves

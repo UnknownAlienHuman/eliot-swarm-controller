@@ -1960,8 +1960,13 @@ restores revoked control; unknown blocks another takeover.
 `agent.discover` uses `AgentDiscoverRequest`/`DiscoverPage`; `agent.history` uses
 `AgentHistoryRequest`/`ObservationPage` from the canonical native metadata DTOs.
 `harness.list` (`HarnessListRequest`/`HarnessListResponse`, no params) reports
-per-harness installation facts (installed, resolved `cmd`, `--version`; Claude
-additionally reports every discovered install newest first in `candidates`).
+per-harness installation facts (`installed`, resolved `cmd`, and `--version`).
+For Claude, `candidates` contains every discovered install, with parseable
+numeric versions newest first and other entries following in discovery order.
+Candidate `version` retains the bounded raw first line when available, or is
+null when the probe is unavailable. Inventory presence does not make an
+executable eligible for automatic Claude selection; that requires a successful
+`--version` probe with a parseable numeric version.
 Inventory and native discovery run on the blocking pool. The
 `models.catalog` 90-second deadline covers the aggregate lock, inventory
 worker and per-harness reads. Expiry during a per-harness read can return a

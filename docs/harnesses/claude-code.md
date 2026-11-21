@@ -381,16 +381,23 @@ and the native launcher `~/.local/bin/claude`, plus absolute PATH entries and
 Candidates must be absolute native executables; `.cmd`, `.bat` and `.ps1`
 wrappers are refused, and Unix binaries must have an ELF or Mach-O header.
 Versioned roots are probed before PATH so a stale PATH copy cannot hide a
-newer installation. An omitted `cmd` or `cmd = "latest"` resolves at launch
-admission; the Agent snapshot freezes the selected absolute `cmd` and reported
-`cmd_version`. An explicit path remains pinned. A missing pin names the
-installed replacement and a `swarm settings claude-cmd PROFILE --cmd PATH`
+newer installation. Automatic selection for an omitted `cmd` or `cmd =
+"latest"` requires the bounded `--version` probe to exit successfully and
+report a parseable numeric version. It selects the newest verified candidate;
+a timeout on another candidate does not displace that preference. Unverified
+executables remain in the installation inventory, with the raw `--version`
+first line when available, but do not qualify for automatic selection. The
+Agent snapshot freezes the selected absolute `cmd` and verified `cmd_version`.
+An explicit path remains pinned even when its optional version probe fails or
+is not parseable. A missing pin names the installed replacement and a
+`swarm settings claude-cmd PROFILE --cmd PATH`
 repair command. First-use profiles leave `cmd` unset so later launches follow
 updates. The setup documentation was checked on 2026-11-21 (last modified
 2026-11-20).
 [Claude Code setup](https://code.claude.com/docs/en/setup).
-`swarm harnesses` shows the selected absolute `cmd` and lists eligible
-standalone `candidates` newest first. `swarm models --harness claude`
+`swarm harnesses` shows the selected absolute `cmd` and lists discovered
+standalone `candidates`, with verified versions newest first and unverified
+entries last. `swarm models --harness claude`
 reports the native initialize inventory first when the reader proves one:
 selectable values with display names and per-model effort levels, each entry
 without a provenance marker. Only when the native read is unavailable does

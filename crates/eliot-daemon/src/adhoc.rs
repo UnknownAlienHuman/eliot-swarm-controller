@@ -950,8 +950,10 @@ fn claude_candidate_paths() -> Vec<PathBuf> {
 /// [`MAX_DISCOVERY_CANDIDATE_PROBES`] native executables: filesystem hits
 /// are cheap, process launches are not. Paths past the cap stay listed
 /// without a version so inventory stays complete while launches stay
-/// bounded. The stable sort keeps versioned newest-first; unversioned paths
-/// keep discovery order at the end.
+/// bounded. Automatic selection accepts only candidates with a successful,
+/// parseable `--version`; inventory retains every path and any raw first line.
+/// The stable sort keeps parsed versions newest-first and other paths in
+/// discovery order at the end.
 fn probe_candidate_paths_with(
     paths: Vec<PathBuf>,
     mut probe: impl FnMut(&str) -> Option<String>,
@@ -1092,17 +1094,41 @@ fn claude_search_locations() -> Vec<String> {
     searched
 }
 
+fn verified_claude_candidate_from_candidates(
+    candidates: &[core::api::HarnessCandidate],
+) -> Option<&core::api::HarnessCandidate> {
+    // Discovery sorts parseable versions newest-first and leaves failed,
+    // timed-out, or unparseable probes at the end. Skip those entries rather
+    // than letting one obscure the newest version that was verified.
+    candidates.iter().find(|candidate| {
+        candidate
+            .version
+            .as_deref()
+            .and_then(parse_cli_version)
+            .is_some()
+    })
+}
+
 fn claude_cmd_from_candidates(candidates: &[core::api::HarnessCandidate]) -> core::Result<String> {
-    if let Some(best) = candidates.first() {
+    if let Some(best) = verified_claude_candidate_from_candidates(candidates) {
         return Ok(best.cmd.clone());
     }
-    Err(core::Error::new(
+    Err(claude_discovery_error(candidates))
+}
+
+fn claude_discovery_error(candidates: &[core::api::HarnessCandidate]) -> core::Error {
+    let detail = if candidates.is_empty() {
+        "Standalone Claude CLI was not found"
+    } else {
+        "Claude CLI executables were found, but none had a successful parseable --version result"
+    };
+    core::Error::new(
         "profile_error",
         format!(
-            "Standalone Claude CLI was not found; searched {}. Install Claude Code or select a native executable explicitly with --cmd",
+            "{detail}; searched {}. Install Claude Code or select a native executable explicitly with --cmd",
             claude_search_locations().join(", ")
         ),
-    ))
+    )
 }
 
 pub(crate) fn is_latest_claude_selector(cmd: &str) -> bool {
@@ -1162,15 +1188,12 @@ fn resolve_claude_profile_command_sync(
     }
 
     let candidates = discover_claude_candidates(deadline);
-    candidates.into_iter().next().ok_or_else(|| {
-        core::Error::new(
-            "profile_error",
-            format!(
-                "{profile}: standalone Claude CLI was not found; searched {}. Install Claude Code or set cmd = \"latest\" after installation",
-                claude_search_locations().join(", ")
-            ),
-        )
-    })
+    verified_claude_candidate_from_candidates(&candidates)
+        .cloned()
+        .ok_or_else(|| {
+            let error = claude_discovery_error(&candidates);
+            core::Error::new("profile_error", format!("{profile}: {}", error.message))
+        })
 }
 
 pub(crate) async fn ensure_claude_profile_command(profile: &str, cmd: &str) -> core::Result<()> {
@@ -1193,7 +1216,7 @@ fn missing_claude_profile_command(
     cmd: &str,
     candidates: &[core::api::HarnessCandidate],
 ) -> core::Error {
-    let replacement = candidates.first().map(|candidate| {
+    let replacement = verified_claude_candidate_from_candidates(candidates).map(|candidate| {
         let version = candidate.version.as_deref().unwrap_or("version unknown");
         let command = claude_settings_command(profile, &candidate.cmd);
         format!(
@@ -1202,10 +1225,14 @@ fn missing_claude_profile_command(
         )
     });
     let detail = replacement.unwrap_or_else(|| {
-        format!(
-            "Install Claude Code or reset the profile with {} after installation",
-            claude_latest_settings_command(profile)
-        )
+        if candidates.is_empty() {
+            format!(
+                "Install Claude Code or reset the profile with {} after installation",
+                claude_latest_settings_command(profile)
+            )
+        } else {
+            "Claude executables were found, but none had a successful parseable --version result; repair an installation before using automatic selection".to_owned()
+        }
     });
     core::Error::new(
         "profile_error",
@@ -1240,27 +1267,24 @@ fn shell_quote_settings_arg(value: &str) -> String {
 /// Inventory entry for Claude from one candidate pass, so `harness.list`
 /// does not enumerate and version every install twice.
 pub(crate) fn claude_installation(candidates: &[core::api::HarnessCandidate]) -> Value {
-    match claude_cmd_from_candidates(candidates) {
-        Ok(cmd) => {
-            let version = candidates
-                .first()
-                .and_then(|best| best.version.clone())
-                .map_or(Value::Null, Value::String);
-            json!({
-                "harness": "claude",
-                "installed": true,
-                "cmd": cmd,
-                "version": version,
-            })
-        }
-        Err(error) => json!({
+    if let Some(best) = candidates.first() {
+        let version = best.version.clone().map_or(Value::Null, Value::String);
+        json!({
+            "harness": "claude",
+            "installed": true,
+            "cmd": best.cmd.clone(),
+            "version": version,
+        })
+    } else {
+        let error = claude_discovery_error(candidates);
+        json!({
             "harness": "claude",
             "installed": false,
             "cmd": Value::Null,
             "version": Value::Null,
             "error": error.message,
             "code": error.code,
-        }),
+        })
     }
 }
 
@@ -1870,22 +1894,20 @@ pub(crate) async fn reader_executable(
     .await?
 }
 
-/// Select the Claude reader under the caller's deadline and reuse the
-/// selected candidate's version from the same discovery pass.
+/// Select the newest Claude reader with a successful parseable `--version`
+/// under the caller's deadline, reusing its version from the same pass.
 pub(crate) async fn claude_reader_executable(
     deadline: Instant,
 ) -> core::Result<core::api::HarnessCandidate> {
     blocking_discovery(deadline, move || {
         let candidates = discover_claude_candidates(deadline);
         discovery_remaining(deadline)?;
-        let best = candidates
-            .into_iter()
-            .next()
-            .ok_or_else(native_cmd_unavailable)?;
+        let best = verified_claude_candidate_from_candidates(&candidates)
+            .ok_or_else(|| claude_discovery_error(&candidates))?;
         let cmd = resolve_native_executable(&best.cmd, false)?;
         Ok(core::api::HarnessCandidate {
             cmd,
-            version: best.version,
+            version: best.version.clone(),
         })
     })
     .await?
