@@ -27,12 +27,15 @@ pub(super) fn surface(
         .is_open(true)
         .on_closed(context.callback(move |_| Message::DialogClosed(epoch)))
         .content(
-            m3::card_high(palette)
+            Border::new()
+                .padding(Thickness::uniform(tokens::spacing::LG))
                 .max_width(width)
                 .automation_name(title.clone())
                 .content(
                     StackPanel::new().spacing(tokens::spacing::MD).children((
-                        m3::text(title, tokens::text::TITLE).text_wrapping(TextWrapping::Wrap),
+                        m3::text(title, tokens::text::TITLE)
+                            .foreground(palette.text())
+                            .text_wrapping(TextWrapping::Wrap),
                         ScrollViewer::new()
                             .max_height(tokens::layout::DIALOG_MAX_HEIGHT)
                             .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)

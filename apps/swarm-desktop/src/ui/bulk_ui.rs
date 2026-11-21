@@ -926,8 +926,8 @@ impl DesktopApp {
                     .children((
                         ProgressRing::new()
                             .is_indeterminate(true)
-                            .width(16.0)
-                            .height(16.0),
+                            .width(tokens::layout::RING)
+                            .height(tokens::layout::RING),
                         m3::secondary("Reading every task and project…"),
                     )),
             ),
@@ -973,8 +973,8 @@ impl DesktopApp {
                     .children((
                         ProgressRing::new()
                             .is_indeterminate(true)
-                            .width(16.0)
-                            .height(16.0),
+                            .width(tokens::layout::RING)
+                            .height(tokens::layout::RING),
                         m3::secondary(if stopping {
                             "Stopping after this one…"
                         } else {

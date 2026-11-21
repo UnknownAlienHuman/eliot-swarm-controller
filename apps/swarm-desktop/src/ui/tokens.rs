@@ -35,6 +35,7 @@ pub mod radius {
     pub const BUBBLE_TAIL: f64 = 4.0;
     /// The Stop square inside the FAB.
     pub const STOP: f64 = 3.0;
+    pub const STATUS_MARK: f64 = 2.0;
     /// Check boxes keep the M3 corner.
     pub const CHECK_BOX: f64 = 2.0;
 }
@@ -59,14 +60,34 @@ pub mod height {
     pub const FORM_ROW: f64 = 40.0;
     /// A picker row with a supporting line under its title.
     pub const TWO_LINE_ROW: f64 = 48.0;
+    pub const SUGGESTION: f64 = 44.0;
 }
 
-/// The design's type roles.
+/// The design's type roles. Segoe UI Variable is the Windows fallback
+/// specified for Roboto Flex in the design.
 pub mod text {
-    pub use crate::theme::typography::{
-        BODY, BUTTON, CAPTION, CAPTION as SECONDARY, CHIP, HEADER, HEADER as SECTION_TITLE, HERO,
-        LABEL, TITLE, TypeStyle,
-    };
+    pub const FAMILY: &str = "Segoe UI Variable";
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct TypeStyle {
+        pub size: f64,
+        pub weight: u16,
+    }
+
+    const fn style(size: f64, weight: u16) -> TypeStyle {
+        TypeStyle { size, weight }
+    }
+
+    pub const HERO: TypeStyle = style(28.0, 500);
+    pub const TITLE: TypeStyle = style(16.0, 600);
+    pub const HEADER: TypeStyle = style(15.0, 500);
+    pub const BODY: TypeStyle = style(14.0, 400);
+    pub const BUTTON: TypeStyle = style(14.0, 500);
+    pub const CHIP: TypeStyle = style(13.0, 400);
+    pub const LABEL: TypeStyle = style(12.0, 500);
+    pub const CAPTION: TypeStyle = style(12.0, 400);
+    pub const SECONDARY: TypeStyle = CAPTION;
+    pub const SECTION_TITLE: TypeStyle = HEADER;
 }
 
 /// The 4-DIP grid in DIPs.
@@ -77,6 +98,8 @@ pub mod spacing {
     pub const XS: f64 = 4.0;
     /// Inside a group: between chips, a glyph and its label.
     pub const SM: f64 = 8.0;
+    /// Icon-to-label gap inside a chip.
+    pub const CHIP_GAP: f64 = 6.0;
     /// A row's inset from its pill and the gap from its icon to its label
     /// ("every sidebar row starts its icon at 10 DIP inside an 8-DIP
     /// gutter").
@@ -107,7 +130,25 @@ pub mod icon {
 /// popover's entrance (a fade and a 4-DIP rise).
 pub mod motion {
     pub const STATE_MS: u64 = 150;
+    pub const PRESS_MS: u64 = 100;
+    pub const RIPPLE_MS: u64 = 300;
     pub const POPOVER_MS: u64 = 250;
+    pub const PRESS_SCALE: f64 = 0.97;
+    pub const FAB_PRESS_SCALE: f64 = 0.94;
+    pub const EMPHASIZED: &str = "0.2,0 0,1";
+    pub const DECELERATE: &str = "0.05,0.7 0.1,1";
+}
+
+/// State layers of the content color over a container.
+pub mod state {
+    pub const HOVER: f64 = 0.08;
+    pub const PRESSED: f64 = 0.12;
+    /// The ripple above the pressed layer, fading on release.
+    pub const RIPPLE: f64 = 0.03;
+    pub const DISABLED_CONTAINER: f64 = 0.12;
+    /// Disabled selection marks and other non-text affordances.
+    pub const DISABLED_CONTENT: f64 = 0.38;
+    pub const SCRIM: f64 = 0.32;
 }
 
 /// Widths and the few fixed sizes of the shell.
@@ -182,6 +223,8 @@ pub mod layout {
     pub const BADGE_DOT: f64 = 6.0;
     /// Dividers.
     pub const HAIRLINE: f64 = 1.0;
+    pub const FOCUS_RING: f64 = 2.0;
+    pub const STATUS_STROKE: f64 = 1.5;
     /// The indeterminate progress bar of a running turn.
     pub const PROGRESS_WIDTH: f64 = 160.0;
     /// A monitor chart's plot, and the stub of an unknown sample.

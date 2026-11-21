@@ -20,16 +20,8 @@
 
 use crate::theme::elevation::{self, Level};
 use crate::theme::state;
-use crate::ui::tokens::motion;
-
-/// Emphasized easing, cubic-bezier(0.2, 0, 0, 1), as a WinUI key spline.
-const EMPHASIZED: &str = "0.2,0 0,1";
-/// The ripple's growth: emphasized decelerate, cubic-bezier(0.05, 0.7, 0.1, 1).
-const DECELERATE: &str = "0.05,0.7 0.1,1";
-/// The press, faster than a state change.
-const PRESS_MS: u64 = 100;
-/// The ripple's growth and fade.
-const RIPPLE_MS: u64 = 300;
+use crate::ui::tokens::motion::{DECELERATE, EMPHASIZED, PRESS_MS, RIPPLE_MS, STATE_MS};
+use crate::ui::tokens::{layout, spacing};
 
 /// The theme brushes of a lift: the key and ambient shadow layers (each
 /// already at its layer's share of the theme's opacity), the hairline ring
@@ -55,7 +47,7 @@ pub(super) enum Lift {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct Look {
     pub lift: Lift,
-    /// The press scale (1: none).
+    /// The press scale.
     pub press: f64,
     /// The corner radius of the lifted layers (the button's own).
     pub radius: f64,
@@ -134,9 +126,10 @@ fn shadow(name: &str, level: Level, radius: f64, opacity: f64) -> String {
         );
     }
     out += &format!(
-        "<Border CornerRadius=\"{corner}\" Margin=\"-1\" BorderThickness=\"1\" \
+        "<Border CornerRadius=\"{corner}\" Margin=\"-{stroke}\" BorderThickness=\"{stroke}\" \
            BorderBrush=\"{{ThemeResource {LIFT_RING}}}\"/>",
-        corner = radius + 1.0
+        corner = radius + layout::HAIRLINE,
+        stroke = layout::HAIRLINE,
     );
     out + "</Grid>"
 }
@@ -144,7 +137,7 @@ fn shadow(name: &str, level: Level, radius: f64, opacity: f64) -> String {
 /// The FAB's glow: three layers reaching 12 DIPs, a blur's steps.
 fn glow(radius: f64) -> String {
     let mut out = "<Grid IsHitTestVisible=\"False\">".to_owned();
-    for spread in [4.0, 8.0, 12.0] {
+    for spread in [spacing::XS, spacing::SM, spacing::INSET] {
         out += &layer_border(radius, spread, 0.0, GLOW);
     }
     out + "</Grid>"
@@ -157,15 +150,13 @@ pub(super) fn button(look: Look) -> String {
         press,
         radius,
     } = look;
-    let ms = motion::STATE_MS;
+    let ms = STATE_MS;
     // Normal and PointerOver share the release: the state layer settles,
     // the ripple fades, the press springs back.
     let release = |layer: f64, hovered: bool| {
         let mut out = animate("StateLayer", "Opacity", layer, ms, EMPHASIZED)
-            + &animate("Ripple", "Opacity", 0.0, RIPPLE_MS, EMPHASIZED);
-        if press < 1.0 {
-            out += &scale(1.0, motion::POPOVER_MS, DECELERATE);
-        }
+            + &animate("Ripple", "Opacity", 0.0, RIPPLE_MS, EMPHASIZED)
+            + &scale(1.0, STATE_MS, DECELERATE);
         if lift != Lift::Flat {
             out += &animate(
                 "HoverShadow",
@@ -185,10 +176,8 @@ pub(super) fn button(look: Look) -> String {
         EMPHASIZED,
     ) + &set("Ripple", "Opacity", state::RIPPLE)
         + &grow("RippleScale", "ScaleX", 0.0, 1.0, RIPPLE_MS, DECELERATE)
-        + &grow("RippleScale", "ScaleY", 0.0, 1.0, RIPPLE_MS, DECELERATE);
-    if press < 1.0 {
-        pressed += &scale(press, PRESS_MS, EMPHASIZED);
-    }
+        + &grow("RippleScale", "ScaleY", 0.0, 1.0, RIPPLE_MS, DECELERATE)
+        + &scale(press, PRESS_MS, EMPHASIZED);
     let mut disabled = resource("Container", "Background", "ButtonBackgroundDisabled")
         + &resource("Container", "BorderBrush", "ButtonBorderBrushDisabled")
         + &resource("Content", "Foreground", "ButtonForegroundDisabled")
@@ -210,15 +199,10 @@ pub(super) fn button(look: Look) -> String {
                 + &shadow("HoverShadow", Level::Two, radius, 0.0)
         }
     };
-    let transform = if press < 1.0 {
-        "<Grid.RenderTransform><ScaleTransform x:Name=\"Press\"/></Grid.RenderTransform>"
-    } else {
-        ""
-    };
     format!(
         "<ControlTemplate TargetType=\"Button\">\
            <Grid x:Name=\"Root\" Background=\"Transparent\" RenderTransformOrigin=\"0.5,0.5\">\
-             {transform}\
+             <Grid.RenderTransform><ScaleTransform x:Name=\"Press\"/></Grid.RenderTransform>\
              <VisualStateManager.VisualStateGroups>\
                <VisualStateGroup x:Name=\"CommonStates\">\
                  <VisualState x:Name=\"Normal\"><Storyboard>{normal}</Storyboard></VisualState>\
@@ -237,7 +221,7 @@ pub(super) fn button(look: Look) -> String {
                  <Border x:Name=\"StateLayer\" Opacity=\"0\" \
                    Background=\"{{TemplateBinding Foreground}}\"/>\
                  <Ellipse x:Name=\"Ripple\" Opacity=\"0\" Fill=\"{{TemplateBinding Foreground}}\" \
-                   RenderTransformOrigin=\"0.5,0.5\" Stretch=\"Fill\" Margin=\"-24\">\
+                   RenderTransformOrigin=\"0.5,0.5\" Stretch=\"Fill\" Margin=\"-{ripple_inset}\">\
                    <Ellipse.RenderTransform>\
                      <ScaleTransform x:Name=\"RippleScale\" ScaleX=\"0\" ScaleY=\"0\"/>\
                    </Ellipse.RenderTransform>\
@@ -248,6 +232,9 @@ pub(super) fn button(look: Look) -> String {
                    ContentTemplate=\"{{TemplateBinding ContentTemplate}}\" \
                    ContentTransitions=\"{{TemplateBinding ContentTransitions}}\" \
                    Foreground=\"{{TemplateBinding Foreground}}\" \
+                   FontFamily=\"{{TemplateBinding FontFamily}}\" \
+                   FontSize=\"{{TemplateBinding FontSize}}\" \
+                   FontWeight=\"{{TemplateBinding FontWeight}}\" \
                    Padding=\"{{TemplateBinding Padding}}\" \
                    HorizontalContentAlignment=\"{{TemplateBinding HorizontalContentAlignment}}\" \
                    VerticalContentAlignment=\"{{TemplateBinding VerticalContentAlignment}}\"/>\
@@ -257,5 +244,6 @@ pub(super) fn button(look: Look) -> String {
          </ControlTemplate>",
         normal = release(0.0, false),
         over = release(state::HOVER, true),
+        ripple_inset = spacing::LG,
     )
 }

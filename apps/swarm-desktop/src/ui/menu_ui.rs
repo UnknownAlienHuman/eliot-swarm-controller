@@ -1326,12 +1326,13 @@ impl DesktopApp {
             .into_iter()
             .enumerate()
             .map(|(index, (action, label, glyph, destructive))| {
-                let text = if destructive {
-                    m3::body(label.clone()).foreground(palette.attention())
+                let selected = highlight == Some(index);
+                let entry = if destructive {
+                    m3::destructive_row(palette, selected)
                 } else {
-                    m3::body(label.clone())
+                    m3::row(palette, selected)
                 };
-                let mut button = m3::row(palette, highlight == Some(index))
+                let mut button = entry
                     .automation_name(label.clone())
                     .on_click(context.message(Message::Menu(MenuMsg::Chosen(action))));
                 if highlight == Some(index) {
@@ -1339,13 +1340,14 @@ impl DesktopApp {
                     // view (#683).
                     button = button.element_ref(&self.menu.row_ref);
                 }
+                let title = m3::body(label.clone());
                 KeyedView::new(
                     label,
                     button.content(
                         StackPanel::new()
                             .orientation(Orientation::Horizontal)
                             .spacing(tokens::spacing::ROW)
-                            .children((m3::icon(glyph), text)),
+                            .children((m3::icon(glyph), title)),
                     ),
                 )
             })
@@ -1446,8 +1448,8 @@ impl DesktopApp {
                 .children((
                     ProgressRing::new()
                         .is_indeterminate(true)
-                        .width(16.0)
-                        .height(16.0)
+                        .width(tokens::layout::RING)
+                        .height(tokens::layout::RING)
                         .vertical_alignment(VerticalAlignment::Center),
                     m3::secondary(
                         removal

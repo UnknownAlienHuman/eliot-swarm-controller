@@ -209,7 +209,7 @@ pub fn status_mark(palette: Palette, tone: StatusTone, size: f64) -> View {
     let ring = |stroke: Brush| -> View {
         Ellipse::new()
             .stroke(stroke)
-            .stroke_thickness(1.5)
+            .stroke_thickness(layout::STATUS_STROKE)
             .width(size)
             .height(size)
             .vertical_alignment(VerticalAlignment::Center)
@@ -224,7 +224,7 @@ pub fn status_mark(palette: Palette, tone: StatusTone, size: f64) -> View {
         StatusTone::Unknown => ring(palette.attention()),
         StatusTone::Failed => Border::new()
             .background(palette.attention())
-            .corner_radius(2.0)
+            .corner_radius(radius::STATUS_MARK)
             .width(size)
             .height(size)
             .vertical_alignment(VerticalAlignment::Center)
@@ -310,7 +310,7 @@ pub fn lifted(
         return place.keyed_children(vec![KeyedView::new("content", view.into())]);
     };
     let tint = match roles.lift {
-        crate::theme::Lift::Shadow { .. } => crate::theme::Rgb8::new(0, 0, 0),
+        crate::theme::Lift::Shadow { .. } => crate::theme::SHADOW_COLOR,
         crate::theme::Lift::Ring(color) => color,
     };
     let mut cells: Vec<KeyedView> = crate::theme::elevation::layers(level, roles.lift)
@@ -410,6 +410,11 @@ pub fn row(palette: Palette, selected: bool) -> Button {
         .min_height(height::CONTROL)
         .horizontal_alignment(HorizontalAlignment::Stretch)
         .horizontal_content_alignment(HorizontalAlignment::Stretch)
+}
+
+/// A menu row with the attention role carried by its content and state layer.
+pub fn destructive_row(palette: Palette, selected: bool) -> Button {
+    row(palette, selected).resource_overrides(palette.destructive_row(selected))
 }
 
 /// A row under its parent (same height as every row).
@@ -623,7 +628,7 @@ pub fn fixed_chip(
         .content(
             StackPanel::new()
                 .orientation(Orientation::Horizontal)
-                .spacing(6.0)
+                .spacing(spacing::CHIP_GAP)
                 .vertical_alignment(VerticalAlignment::Center)
                 .keyed_children(parts),
         )
@@ -656,7 +661,7 @@ pub fn chip_content(glyph: Option<&str>, label: &str, chevron: bool, max: f64) -
     }
     StackPanel::new()
         .orientation(Orientation::Horizontal)
-        .spacing(6.0)
+        .spacing(spacing::CHIP_GAP)
         .keyed_children(parts)
 }
 
@@ -799,7 +804,7 @@ pub fn suggestion(palette: Palette) -> Button {
     Button::new()
         .resource_overrides(palette.suggestion())
         .style(ButtonStyle::Accent)
-        .min_height(44.0)
+        .min_height(height::SUGGESTION)
         .horizontal_alignment(HorizontalAlignment::Stretch)
         .horizontal_content_alignment(HorizontalAlignment::Left)
 }
@@ -853,7 +858,7 @@ pub fn steer_bubble(palette: Palette, text_value: &str, max_width: Option<f64>) 
         .horizontal_alignment(HorizontalAlignment::Right)
         .max_width(max_width)
         .content(
-            StackPanel::new().spacing(2.0).children((
+            StackPanel::new().spacing(spacing::ROW_GAP).children((
                 muted("Steer", style::LABEL),
                 body(text_value.to_owned())
                     .text_wrapping(TextWrapping::Wrap)
@@ -897,7 +902,7 @@ pub fn status_pill(palette: Palette, tone: StatusTone, label: &str, label_width:
         .content(
             StackPanel::new()
                 .orientation(Orientation::Horizontal)
-                .spacing(6.0)
+                .spacing(spacing::CHIP_GAP)
                 .children((
                     status_mark(palette, tone, layout::BADGE_DOT),
                     text(label.to_owned(), style::CAPTION)
@@ -970,8 +975,7 @@ pub fn field_button_content(value: &str) -> View {
         .columns([GridLength::STAR, GridLength::Auto])
         .column_spacing(spacing::SM)
         .children((
-            TextBlock::new()
-                .text(value.to_owned())
+            body(value)
                 .vertical_alignment(VerticalAlignment::Center)
                 .text_trimming(TextTrimming::CharacterEllipsis),
             Border::new()
