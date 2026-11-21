@@ -400,12 +400,22 @@ field. See the vendor docs for [MCP](https://antigravity.google/docs/mcp),
 [plugin MCP servers](https://antigravity.google/docs/build-plugins/#mcp-servers)
 and [customization discovery](https://antigravity.google/docs/customization-discovery/).
 
+Before launch and resume the daemon checks the user, workspace and standard
+plugin MCP files for Owner Swarm transports and reserved Swarm names.
+AGY 1.5.14 has no documented per-session exclusion for an individual
+discovered server. A match refuses startup and identifies the server and file.
+Plugin manifests or personal customization redirects that the daemon cannot
+check refuse startup and identify the declaring file.
+
 New custom profiles default to `minimal`. The daemon selects enabled `mcp_allow`
 entries from the user `~/.gemini/config/mcp_config.json` and workspace MCP files.
+An allow-listed workspace entry with the same name as a user entry refuses
+startup. The daemon atomically publishes the prepared MCP file in the private
+instance directory.
 The plugin installs that prepared file at
 `<private-plugins>/<Agent>-agy/config/mcp_config.json` and selects the root with
-`acp --gemini-dir`. The private root excludes the user MCP file and user plugins
-from native discovery. Workspace MCP servers outside the allow list, workspace
+`acp --gemini-dir`. Exclusion of the user MCP file and user plugins from the
+effective ACP session inventory is unverified. Workspace MCP servers outside the allow list, workspace
 plugin directories or manifests, and personal customization directory redirects
 refuse startup with the source path when the CLI cannot suppress them.
 A missing allowed name or an allowed owner Swarm transport also refuses startup.

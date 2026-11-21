@@ -369,6 +369,7 @@ through Access). The server Eliot generates always carries `--require-agent`
 and requires the generation-bound Agent credential. Swarm MCP names
 (`eliot_swarm`, `eliot-swarm` and the per-session prefixes) are reserved and
 cannot be allow-listed. A renamed Owner entry still matches by transport.
+A worker that talks to the owner daemon with the owner identity is an authority leak.
 
 ```toml
 [profiles.codex-minimal]
@@ -427,13 +428,19 @@ Agent-scoped server and the explicitly allowed native servers.
   `mcp_servers_verified` is reported only after the gate passes with the
   Agent-scoped entry connected.
 - Antigravity bootstrap profiles use `inherit`. Explicit and legacy `inherit`
-  pass user and workspace discovery through unchanged, including enabled
-  plugins and the capabilities their configuration grants. Swarm adds its
+  preserve user and workspace discovery, including standard plugin sources,
+  after the daemon checks their MCP files for Owner Swarm transports and
+  reserved names. Without a native per-session exclusion, a match refuses
+  startup and identifies the server and file. Uncheckable discovery redirects
+  refuse startup and identify the declaring file. Swarm adds its
   generation-bound Agent bridge through ACP session setup. For `minimal`,
   the daemon resolves enabled `mcp_allow` entries from global and workspace MCP
-  files and rejects missing names or Owner Swarm transports. The plugin installs
+  files and rejects missing names, Owner Swarm transports, and workspace
+  entries that duplicate allow-listed global names. The daemon atomically
+  publishes the prepared file. The plugin installs
   the prepared file under an Agent-owned Gemini root selected via `acp --gemini-dir`.
-  The root excludes the user's MCP file and plugins and persists for exact resume.
+  The root persists for exact resume. Exclusion of user MCP and plugin sources
+  from the effective ACP inventory is unverified.
   A workspace MCP server outside the allow list, a workspace plugin source, or
   a personal customization directory redirect refuses startup with its source
   path when it cannot be filtered. The staged MCP file is removed after native

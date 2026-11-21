@@ -1,6 +1,6 @@
 use std::{
-    fs::{self, OpenOptions},
-    io::Write,
+    collections::HashSet,
+    fs,
     path::{Path, PathBuf},
 };
 
@@ -10,6 +10,8 @@ use eliot_core::{
 };
 use eliot_plugin::{native_cli::ANTIGRAVITY_MCP_CONFIG_FILE, owner_scan};
 use serde_json::{Map, Value, json};
+
+use crate::platform::data_dir::replace_private_file;
 
 /// Remove the private handoff file if the plugin never moved it into its
 /// native config root. The generation-specific path cannot race a resume.
@@ -32,13 +34,9 @@ pub(super) fn prepare(
         .ok_or_else(|| Error::new("profile_error", "Antigravity requires a frozen profile"))?;
     let policy = McpPolicy::parse_snapshot(profile)?;
     let allow = parse_snapshot_allow_list(profile)?;
-    if policy == McpPolicy::Inherit {
-        if !allow.is_empty() {
-            return Err(Error::new("profile_error", "mcp_allow requires minimal"));
-        }
-        return Ok(None);
+    if policy == McpPolicy::Inherit && !allow.is_empty() {
+        return Err(Error::new("profile_error", "mcp_allow requires minimal"));
     }
-
     let workspace = agent
         .workspace
         .as_deref()
@@ -47,64 +45,23 @@ pub(super) fn prepare(
     let controller = std::env::current_exe().ok();
     let cloud = parse_snapshot_cloud_hostname(profile);
     let mut sources = Sources {
+        policy,
         allow: &allow,
         controller: controller.as_deref(),
         cloud: cloud.as_deref(),
+        global_names: HashSet::new(),
         selected: Map::new(),
     };
-    if !allow.is_empty() {
-        let home_name = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
-        let home = environment
-            .as_object()
-            .and_then(|values| {
-                values.iter().find_map(|(name, value)| {
-                    let matches = name == home_name
-                        || (cfg!(windows) && name.eq_ignore_ascii_case(home_name));
-                    matches.then(|| value.as_str()).flatten()
-                })
-            })
-            .map(Path::new)
-            .filter(|home| home.is_absolute() && home.is_dir())
-            .ok_or_else(|| Error::new("profile_error", "Antigravity native home is unavailable"))?;
-        let global = home
-            .join(".gemini/config")
-            .join(ANTIGRAVITY_MCP_CONFIG_FILE);
-        // Native startup can initialize the user MCP file at zero bytes.
-        if !global
-            .metadata()
-            .is_ok_and(|meta| meta.is_file() && meta.len() == 0)
-        {
-            sources.read_servers(&global, false)?;
+    if policy == McpPolicy::Inherit || !allow.is_empty() {
+        let config = gemini_config_dir(environment)?;
+        sources.read_servers(&config.join(ANTIGRAVITY_MCP_CONFIG_FILE), Source::Global)?;
+        if policy == McpPolicy::Inherit {
+            sources.scan_plugins(&config)?;
         }
     }
-
-    // The isolated Gemini root excludes user plugins. Workspace customizations
-    // still load, so refuse sources we cannot constrain with this native flag.
-    let repo_root = workspace
-        .ancestors()
-        .find(|path| path.join(".git").exists());
-    for root in workspace.ancestors() {
-        if root != workspace && repo_root.is_none() {
-            break;
-        }
-        for alias in [".agents", ".agent", "_agents", "_agent"] {
-            let layer = root.join(alias);
-            reject_plugins(&layer)?;
-            sources.read_servers(&layer.join(ANTIGRAVITY_MCP_CONFIG_FILE), true)?;
-        }
-        let config = root.join(".gemini/config.json");
-        if read(&config)?
-            .is_some_and(|document| document.get("personal_customization_dir").is_some())
-        {
-            return Err(source_error(
-                "unsupported",
-                "Antigravity minimal cannot filter the personal customization directory declared in",
-                &config,
-            ));
-        }
-        if Some(root) == repo_root {
-            break;
-        }
+    sources.scan_workspace(&workspace)?;
+    if policy == McpPolicy::Inherit {
+        return Ok(None);
     }
     if allow
         .iter()
@@ -116,27 +73,37 @@ pub(super) fn prepare(
         ));
     }
 
-    let path = instance.join(ANTIGRAVITY_MCP_CONFIG_FILE);
     let bytes = serde_json::to_vec(&json!({"mcpServers": sources.selected}))
         .map_err(|_| Error::new("internal", "Could not encode Antigravity MCP config"))?;
-    let mut options = OpenOptions::new();
-    options.create_new(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&path).map_err(|_| {
-        Error::new(
-            "io_error",
-            "Could not create private Antigravity MCP config",
+    let path = instance.join(ANTIGRAVITY_MCP_CONFIG_FILE);
+    replace_private_file(instance, ANTIGRAVITY_MCP_CONFIG_FILE, &bytes).map_err(|error| {
+        source_error(
+            &error.code,
+            &format!(
+                "Could not publish private Antigravity MCP config ({})",
+                error.message
+            ),
+            &path,
         )
     })?;
-    let prepared = PreparedConfig(path);
-    let write = file.write_all(&bytes);
-    drop(file);
-    write.map_err(|_| Error::new("io_error", "Could not write private Antigravity MCP config"))?;
-    Ok(Some(prepared))
+    Ok(Some(PreparedConfig(path)))
+}
+
+fn gemini_config_dir(environment: &Value) -> Result<PathBuf> {
+    let home_name = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    environment
+        .as_object()
+        .and_then(|values| {
+            values.iter().find_map(|(name, value)| {
+                let matches =
+                    name == home_name || (cfg!(windows) && name.eq_ignore_ascii_case(home_name));
+                matches.then(|| value.as_str()).flatten()
+            })
+        })
+        .map(Path::new)
+        .filter(|home| home.is_absolute() && home.is_dir())
+        .map(|home| home.join(".gemini/config"))
+        .ok_or_else(|| Error::new("profile_error", "Antigravity native home is unavailable"))
 }
 
 fn read(path: &Path) -> Result<Option<Value>> {
@@ -151,6 +118,10 @@ fn source_error(code: &str, reason: &str, path: &Path) -> Error {
     )
 }
 
+fn mcp_refusal(reason: &str, name: &str, path: &Path) -> Error {
+    owner_scan::refusal_error(reason, name, &display_path(&path.to_string_lossy()))
+}
+
 fn reject_plugins(layer: &Path) -> Result<()> {
     for entry in ["plugins", "plugins.json"] {
         let path = layer.join(entry);
@@ -159,7 +130,7 @@ fn reject_plugins(layer: &Path) -> Result<()> {
             Ok(true) => {
                 return Err(source_error(
                     "unsupported",
-                    "Antigravity minimal cannot filter plugin MCP sources at",
+                    "Antigravity minimal cannot filter plugin MCP sources",
                     &path,
                 ));
             }
@@ -175,15 +146,115 @@ fn reject_plugins(layer: &Path) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Source {
+    Global,
+    Workspace,
+    Plugin,
+}
+
 struct Sources<'a> {
+    policy: McpPolicy,
     allow: &'a [String],
     controller: Option<&'a Path>,
     cloud: Option<&'a str>,
+    global_names: HashSet<String>,
     selected: Map<String, Value>,
 }
 
 impl Sources<'_> {
-    fn read_servers(&mut self, path: &Path, workspace: bool) -> Result<()> {
+    fn scan_workspace(&mut self, workspace: &Path) -> Result<()> {
+        let repo_root = workspace
+            .ancestors()
+            .find(|path| path.join(".git").exists());
+        for root in workspace.ancestors() {
+            for alias in [".agents", ".agent", "_agents", "_agent"] {
+                let layer = root.join(alias);
+                self.read_servers(&layer.join(ANTIGRAVITY_MCP_CONFIG_FILE), Source::Workspace)?;
+                match self.policy {
+                    McpPolicy::Inherit => self.scan_plugins(&layer)?,
+                    McpPolicy::Minimal => reject_plugins(&layer)?,
+                }
+            }
+            let config = root.join(".gemini/config.json");
+            if read(&config)?.is_some_and(|doc| doc.get("personal_customization_dir").is_some()) {
+                return Err(source_error(
+                    "unsupported",
+                    "Antigravity cannot check the personal customization directory declared in",
+                    &config,
+                ));
+            }
+            if repo_root.is_none() || Some(root) == repo_root {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn scan_plugins(&mut self, layer: &Path) -> Result<()> {
+        let manifest = layer.join("plugins.json");
+        if read(&manifest)?.is_some_and(|document| {
+            !document.is_object()
+                || ["entries", "inherits"].iter().any(|field| {
+                    document
+                        .get(field)
+                        .is_some_and(|value| !value.as_array().is_some_and(Vec::is_empty))
+                })
+        }) {
+            return Err(source_error(
+                "unsupported",
+                "Antigravity cannot check redirected plugin MCP sources declared in",
+                &manifest,
+            ));
+        }
+        let path = layer.join("plugins");
+        let plugins = match fs::read_dir(&path) {
+            Ok(plugins) => plugins,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => {
+                return Err(source_error(
+                    "profile_error",
+                    "Antigravity plugin directory is unreadable",
+                    &path,
+                ));
+            }
+        };
+        for (index, plugin) in plugins.enumerate() {
+            owner_scan::ensure_total_entries(
+                index + 1,
+                owner_scan::MAX_SCAN_SERVERS,
+                "Antigravity plugin directory exceeds its scan bound",
+            )?;
+            let plugin = plugin
+                .map_err(|_| {
+                    source_error(
+                        "profile_error",
+                        "Antigravity plugin directory is unreadable",
+                        &path,
+                    )
+                })?
+                .path();
+            if fs::metadata(&plugin)
+                .map_err(|_| {
+                    source_error(
+                        "profile_error",
+                        "Antigravity plugin entry is unreadable",
+                        &plugin,
+                    )
+                })?
+                .is_dir()
+            {
+                self.read_servers(&plugin.join(ANTIGRAVITY_MCP_CONFIG_FILE), Source::Plugin)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn read_servers(&mut self, path: &Path, source: Source) -> Result<()> {
+        // AGY can initialize its global MCP file at zero bytes.
+        if source == Source::Global && path.metadata().is_ok_and(|m| m.is_file() && m.len() == 0) {
+            return Ok(());
+        }
         let Some(document) = read(path)? else {
             return Ok(());
         };
@@ -197,22 +268,35 @@ impl Sources<'_> {
             owner_scan::MAX_SCAN_SERVERS,
             "Antigravity MCP source exceeds its server bound",
         )?;
+        let minimal = self.policy == McpPolicy::Minimal;
         for (name, entry) in servers {
             let table = entry.as_object().ok_or_else(|| {
-                source_error(
-                    "profile_error",
-                    "Antigravity MCP entry must be an object in",
+                mcp_refusal(
+                    "Antigravity expects an MCP entry object for server",
+                    name,
                     path,
                 )
             })?;
+            let allowed = self.allow.contains(name);
+            if minimal && allowed {
+                if source == Source::Global {
+                    self.global_names.insert(name.clone());
+                } else if self.global_names.contains(name) {
+                    return Err(mcp_refusal(
+                        "Antigravity minimal refuses workspace override of global MCP server",
+                        name,
+                        path,
+                    ));
+                }
+            }
             if table.get("disabled") == Some(&Value::Bool(true)) {
                 continue;
             }
-            if !self.allow.contains(name) {
-                if workspace {
-                    return Err(source_error(
-                        "unsupported",
-                        "Antigravity minimal cannot suppress a workspace MCP server in",
+            if minimal && !allowed {
+                if source == Source::Workspace {
+                    return Err(mcp_refusal(
+                        "Antigravity minimal cannot suppress workspace MCP server",
+                        name,
                         path,
                     ));
                 }
@@ -233,13 +317,15 @@ impl Sources<'_> {
                     self.cloud,
                 )
             {
-                return Err(source_error(
-                    "profile_error",
-                    "Antigravity cannot admit an owner Swarm MCP server from",
+                return Err(mcp_refusal(
+                    "Antigravity cannot exclude Owner or reserved Swarm MCP server",
+                    name,
                     path,
                 ));
             }
-            self.selected.insert(name.clone(), entry.clone());
+            if minimal {
+                self.selected.insert(name.clone(), entry.clone());
+            }
         }
         Ok(())
     }
