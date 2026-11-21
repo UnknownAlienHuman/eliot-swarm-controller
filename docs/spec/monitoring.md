@@ -382,6 +382,8 @@ stops at that phase until settlement. Removal requires at least 60 seconds since
 the last owner or borrower ended. The worktree tip must be an ancestor of the
 exact base OID frozen at preparation, and Git must report a clean index and worktree
 apart from regular untracked or ignored files in frozen scratch paths.
+The cached path inventory includes Git links. Cleanup accepts empty or absent
+submodule directories and retains populated submodule checkouts.
 
 Once an exclusive filesystem write guard is established, apply rechecks Git,
 deletes approved scratch files and runs ordinary non-force `git worktree remove`

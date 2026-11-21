@@ -499,7 +499,7 @@ impl WorkspaceGit {
         let provenance = self
             .read_line(
                 &source.root,
-                &["reflog", "show", "-n", "2", "--format=%gn;%ge;%H", &branch],
+                &["reflog", "show", "-n", "1", "--format=%gn;%ge;%H", &branch],
                 deadline,
             )
             .await?;
@@ -772,12 +772,9 @@ impl WorkspaceGit {
             .ok()
             .and_then(|value| i64::try_from(value.as_millis()).ok())
             .ok_or_else(|| problem("unavailable", "scratch observation clock is unavailable"))?;
-        let snapshot = timeout_at(
-            deadline,
-            self.git.probe(&path, None, Some(&subject.head), &[], now),
-        )
-        .await
-        .map_err(|_| problem("unavailable", "scratch Git coverage timed out"))??;
+        let snapshot = timeout_at(deadline, self.git.probe_cleanup(&path, &subject.head, now))
+            .await
+            .map_err(|_| problem("unavailable", "scratch Git coverage timed out"))??;
         if !snapshot.complete
             || snapshot.head.as_deref() != Some(subject.head.as_str())
             || snapshot.branch.as_deref() != subject.branch.strip_prefix("refs/heads/")
@@ -1056,12 +1053,9 @@ impl WorkspaceGit {
             .ok()
             .and_then(|value| i64::try_from(value.as_millis()).ok())
             .ok_or_else(|| problem("unavailable", "workspace observation clock is unavailable"))?;
-        let snapshot = timeout_at(
-            deadline,
-            self.git.probe(&path, None, Some(&subject.head), &[], now),
-        )
-        .await
-        .map_err(|_| problem("unavailable", "workspace clean readback timed out"))??;
+        let snapshot = timeout_at(deadline, self.git.probe_cleanup(&path, &subject.head, now))
+            .await
+            .map_err(|_| problem("unavailable", "workspace clean readback timed out"))??;
         if !snapshot.complete
             || snapshot.head.as_deref() != Some(subject.head.as_str())
             || snapshot.branch.as_deref() != subject.branch.strip_prefix("refs/heads/")

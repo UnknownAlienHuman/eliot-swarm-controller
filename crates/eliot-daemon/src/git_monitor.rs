@@ -42,7 +42,7 @@ const STATUS_ARGS: &[&str] = &[
     "--branch",
     "-z",
     "--untracked-files=all",
-    "--ignore-submodules=all",
+    "--ignore-submodules=none",
     "--no-ahead-behind",
     "--renames",
 ];
@@ -51,6 +51,13 @@ const INDEX_RECORDS: usize = 100_000;
 const INDEX_RECORD_BYTES: usize = 32 * 1024;
 const INDEX_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 const ATTRIBUTE_BATCH_BYTES: usize = OUTPUT_BYTES / 4;
+
+#[derive(Clone, Copy)]
+enum Gitlinks<'a> {
+    Reject,
+    RequireUnpopulated(&'a Path),
+    NamesOnly,
+}
 /// A Goal's change scope lists a rename as both of its paths. A changed
 /// submodule is reported, so its record makes the change set unverified
 /// instead of hiding edits inside it.
@@ -148,6 +155,29 @@ impl GitProbe {
         edited_paths: &[String],
         now: i64,
     ) -> Result<GitSnapshot> {
+        self.probe_with_gitlinks(workspace, baseline, base_oid, edited_paths, now, false)
+            .await
+    }
+
+    pub(crate) async fn probe_cleanup(
+        &self,
+        workspace: &str,
+        base_oid: &str,
+        now: i64,
+    ) -> Result<GitSnapshot> {
+        self.probe_with_gitlinks(workspace, None, Some(base_oid), &[], now, true)
+            .await
+    }
+
+    async fn probe_with_gitlinks(
+        &self,
+        workspace: &str,
+        baseline: Option<&GitBaseline>,
+        base_oid: Option<&str>,
+        edited_paths: &[String],
+        now: i64,
+        for_cleanup: bool,
+    ) -> Result<GitSnapshot> {
         let root = canonical_root(workspace)?;
         let root_text = root
             .to_str()
@@ -156,7 +186,14 @@ impl GitProbe {
         let overrides = self.safe_overrides(&root, deadline).await?;
         self.require_exact_root(&root, &overrides, deadline).await?;
 
-        let (index_digest, index) = self.index_snapshot(&root, &overrides, deadline).await?;
+        let gitlinks = if for_cleanup {
+            Gitlinks::RequireUnpopulated(&root)
+        } else {
+            Gitlinks::Reject
+        };
+        let (index_digest, index) = self
+            .index_snapshot(&root, &overrides, deadline, gitlinks)
+            .await?;
         let status_bytes = self
             .checked(&root, STATUS_ARGS, &overrides, &[], deadline)
             .await?;
@@ -268,7 +305,9 @@ impl GitProbe {
             .await?;
         // Do not clear attribution from a poll that crossed a checkout/index/status
         // change. The history commands themselves use immutable object IDs.
-        let (final_index_digest, _) = self.index_snapshot(&root, &overrides, deadline).await?;
+        let (final_index_digest, _) = self
+            .index_snapshot(&root, &overrides, deadline, gitlinks)
+            .await?;
         let final_status = self
             .checked(&root, STATUS_ARGS, &overrides, &[], deadline)
             .await?;
@@ -307,9 +346,13 @@ impl GitProbe {
         root: &Path,
         overrides: &[(String, String)],
         deadline: Instant,
+        gitlinks: Gitlinks<'_>,
     ) -> Result<([u8; 32], BTreeMap<String, bool>)> {
         let command = self.build_command(root, INDEX_ARGS, overrides, None)?;
-        let (code, index) = Self::capture_git(command, &[], deadline, read_index).await?;
+        let (code, index) = Self::capture_git(command, &[], deadline, |stdout| {
+            read_index(stdout, gitlinks)
+        })
+        .await?;
         if code != 0 {
             return Err(unavailable("Git index readback failed"));
         }
@@ -321,7 +364,9 @@ impl GitProbe {
         root: &Path,
         deadline: Instant,
     ) -> Result<BTreeSet<String>> {
-        let (_, index) = self.index_snapshot(root, &[], deadline).await?;
+        let (_, index) = self
+            .index_snapshot(root, &[], deadline, Gitlinks::NamesOnly)
+            .await?;
         Ok(index.into_keys().collect())
     }
 
@@ -1534,7 +1579,10 @@ fn parse_status(bytes: &[u8]) -> Result<Status> {
     })
 }
 
-async fn read_index(mut stdout: ChildStdout) -> Result<([u8; 32], BTreeMap<String, bool>)> {
+async fn read_index(
+    mut stdout: ChildStdout,
+    gitlinks: Gitlinks<'_>,
+) -> Result<([u8; 32], BTreeMap<String, bool>)> {
     let mut index = BTreeMap::<String, bool>::new();
     let mut digest = Sha256::new();
     let mut buffer = [0u8; 8192];
@@ -1570,7 +1618,7 @@ async fn read_index(mut stdout: ChildStdout) -> Result<([u8; 32], BTreeMap<Strin
                         "Git index scan read {records} records and exceeded the {INDEX_RECORDS}-record bound"
                     )));
                 }
-                add_index_record(&mut index, &record)?;
+                add_index_record(&mut index, &record, gitlinks)?;
                 record.clear();
             } else {
                 record.extend_from_slice(chunk);
@@ -1583,7 +1631,11 @@ async fn read_index(mut stdout: ChildStdout) -> Result<([u8; 32], BTreeMap<Strin
     Ok((digest.finalize().into(), index))
 }
 
-fn add_index_record(index: &mut BTreeMap<String, bool>, record: &[u8]) -> Result<()> {
+fn add_index_record(
+    index: &mut BTreeMap<String, bool>,
+    record: &[u8],
+    gitlinks: Gitlinks<'_>,
+) -> Result<()> {
     let record = std::str::from_utf8(record)
         .map_err(|_| unavailable("Git index record contains non-UTF-8 data"))?;
     let (metadata, path) = record
@@ -1593,17 +1645,53 @@ fn add_index_record(index: &mut BTreeMap<String, bool>, record: &[u8]) -> Result
     if fields.len() != 4 || fields[0].len() != 1 || !is_git_oid(fields[2]) {
         return Err(unavailable("Git index metadata is malformed"));
     }
-    if fields[1] == "160000" {
-        return Err(unavailable(
-            "Git submodule worktrees are not covered by this local probe",
-        ));
-    }
     let path = git_path(path)?;
+    if fields[1] == "160000" {
+        match gitlinks {
+            Gitlinks::Reject => {
+                return Err(unavailable(
+                    "Git submodule worktrees are not covered by this local probe",
+                ));
+            }
+            Gitlinks::RequireUnpopulated(root) => {
+                require_unpopulated_gitlink(root, Path::new(&path))?
+            }
+            Gitlinks::NamesOnly => {}
+        }
+    }
     let clean_eligible = fields[0] == "H" && fields[3] == "0";
     index
         .entry(path)
         .and_modify(|eligible| *eligible &= clean_eligible)
         .or_insert(clean_eligible);
+    Ok(())
+}
+
+fn require_unpopulated_gitlink(root: &Path, relative: &Path) -> Result<()> {
+    if relative
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(unavailable(
+            "Git submodule path is not a normal relative path",
+        ));
+    }
+    let path = root.join(relative);
+    reject_links(&path)?;
+    let mut entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => {
+            return Err(unavailable(
+                "Git submodule directory could not be inspected",
+            ));
+        }
+    };
+    if entries.next().is_some() {
+        return Err(unavailable(
+            "populated Git submodule directories prevent worktree cleanup",
+        ));
+    }
     Ok(())
 }
 
