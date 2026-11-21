@@ -980,7 +980,7 @@ impl OpenCodePlugin {
         }
         validate_source_plan(
             "OpenCode",
-            &["session", "turn", "message", "request"],
+            &["session", "turn", "message", "tool", "request"],
             params.source_plan.as_ref(),
         )?;
         let frozen_profile = params.profile.as_ref().ok_or_else(|| {
@@ -4665,7 +4665,7 @@ fn opencode_manifest() -> PluginManifest {
         },
         BTreeMap::from([(
             "controlled".to_owned(),
-            stream_sources(&["message", "request", "session", "turn"]),
+            stream_sources(&["message", "request", "session", "tool", "turn"]),
         )]),
         "none",
     )

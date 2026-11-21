@@ -2,19 +2,22 @@
 //!
 //! The event task owns the controlled `stream` source: it routes every SSE
 //! envelope by exact session, commits one native record per batch
-//! (`session.ready`, `turn.started`, `message.completed`, `turn.completed`,
-//! `session.ended`), and records an explicit gap on any loss or
-//! unmodelled native behavior. Streaming detail (`text`/`reasoning`/`tool`
-//! deltas, steps, usage, ephemeral status) is intentionally folded into
+//! (`session.ready`, `turn.started`, `tool.started`, `tool.completed`,
+//! `message.completed`, `turn.completed`, `session.ended`), and records an
+//! explicit gap on any loss or unmodelled native behavior. Tool lifecycle
+//! facts map from the installed `session.tool.*` events; the remaining
+//! streaming detail (`text`/`reasoning` deltas, tool input deltas and
+//! progress, steps, usage, ephemeral status) is intentionally folded into
 //! the terminal message readback, never published as its own facts.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use eliot_core::{
     ContextItem, ContextOutcome, Error, InjectPoint, Result, SecretPolicy, TurnUsage,
+    limits::MAX_TOOL_COMMAND_BYTES,
 };
 use eliot_plugin::{
-    CommitSink, PeerClient,
+    CommitSink, MAX_EVENT_BYTES, PeerClient,
     native_stdio::StreamState,
     protocol::{HookEvent, HookResponse},
     session::{
@@ -44,6 +47,7 @@ use crate::native::{
         EliotContextResolveInput, ExecutionEventData, FormCancelledData, FormCreatedData,
         FormRepliedData, InboxEventData, Message, ModelRef, ModelSelectedData, PermissionAskedData,
         PermissionRepliedData, SessionLifecycleData, SseEnvelope, StepStartedData, StructuredError,
+        ToolEventData, ToolFailedData, ToolInputStartedData,
     },
 };
 
@@ -54,6 +58,7 @@ const MAX_MESSAGE_PAGES: usize = 4;
 const MAX_PENDING_REQUESTS: usize = 128;
 const MAX_RESOLVED_REQUESTS: usize = 128;
 const MAX_STEER_WATCHES: usize = 128;
+const MAX_TOOL_NAMES: usize = 128;
 const REPLY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Clone, Debug, Default)]
@@ -283,6 +288,19 @@ struct EventProcessor {
     /// Inbox id of the currently open turn: the prompt response id, which
     /// is the user message id the terminal readback bounds against.
     active_model: Option<ModelRef>,
+    /// Native tool names by part id for the exact active turn, remembered
+    /// from `session.tool.input.started`: the installed `called`,
+    /// `success` and `failed` schemas carry no name field. Cleared with
+    /// the turn; bounded like the other per-turn maps.
+    tool_names: HashMap<String, String>,
+    tool_name_order: VecDeque<String>,
+    /// Part ids with a committed `tool.started` in the exact active turn:
+    /// a replayed `called` never re-commits (the Store refuses a
+    /// previously committed native id).
+    tools_started: HashSet<String>,
+    /// Part ids with a committed `tool.completed` in the exact active
+    /// turn: the first terminal wins, a replay never re-commits.
+    tools_completed: HashSet<String>,
     /// Inbox ids observed as enqueued or delivered, by id. Bounded by the
     /// per-generation command history the host keeps.
     seen_inbox: HashSet<String>,
@@ -660,6 +678,10 @@ impl EventProcessor {
             gap_reported: false,
             pending: None,
             active_model: None,
+            tool_names: HashMap::new(),
+            tool_name_order: VecDeque::new(),
+            tools_started: HashSet::new(),
+            tools_completed: HashSet::new(),
             seen_inbox: HashSet::new(),
             seen_delivered: HashSet::new(),
             seen_cancelled: HashSet::new(),
@@ -922,9 +944,13 @@ impl EventProcessor {
                 | "session.execution.failed"
                 | "session.execution.interrupted"
                 | "session.step.started"
+                | "session.tool.input.started"
+                | "session.tool.called"
+                | "session.tool.success"
+                | "session.tool.failed"
         ) {
-            // A step or terminal buffers only while an association may still open
-            // its turn: our send is in flight, or a start awaits its
+            // A step, tool fact or terminal buffers only while an association
+            // may still open its turn: our send is in flight, or a start awaits its
             // association. A turn-less terminal with neither coming is
             // classifiable now — the dead generation's close (dropped) or a
             // transcript gap — and must never wait to be misbound to a
@@ -1010,8 +1036,8 @@ impl EventProcessor {
     }
 
     /// Pre-readiness envelopes proving the retained session is not idle:
-    /// inbox, execution-start and request facts. Terminals, lifecycle and
-    /// status/detail events are history, not activity.
+    /// inbox, execution-start, tool-lifecycle and request facts. Terminals,
+    /// lifecycle and status/detail events are history, not activity.
     fn preflight_activity(&self) -> bool {
         self.buffer.iter().any(|frame| {
             matches!(
@@ -1020,6 +1046,10 @@ impl EventProcessor {
                     | "session.inbox.delivered"
                     | "session.inbox.cancelled"
                     | "session.execution.started"
+                    | "session.tool.input.started"
+                    | "session.tool.called"
+                    | "session.tool.success"
+                    | "session.tool.failed"
                     | "permission.asked"
                     | "permission.replied"
                     | "form.created"
@@ -1581,6 +1611,9 @@ impl EventProcessor {
                 }
                 Ok(())
             }
+            "session.tool.input.started" => self.observe_tool_input_started(&envelope.data).await,
+            "session.tool.called" => self.observe_tool_called(&envelope).await,
+            "session.tool.success" | "session.tool.failed" => self.complete_tool(&envelope).await,
             "session.execution.succeeded"
             | "session.execution.failed"
             | "session.execution.interrupted" => self.complete_turn(&envelope).await,
@@ -1592,9 +1625,10 @@ impl EventProcessor {
             "session.model.selected" | "session.agent.selected" => {
                 self.observe_selected(&envelope).await
             }
-            // Streaming detail (text/reasoning/tool deltas, steps, usage),
-            // ephemeral status, and any future type fold into the terminal
-            // readback or stay unconnected; they are never gaps.
+            // Streaming detail (text/reasoning deltas, tool input deltas and
+            // progress, steps, usage), ephemeral status, and any future type
+            // fold into the terminal readback or stay unconnected; they are
+            // never gaps.
             _ => Ok(()),
         }
     }
@@ -1783,6 +1817,230 @@ impl EventProcessor {
         Ok(())
     }
 
+    /// `session.tool.input.started`: remember the native tool name for the
+    /// exact active turn. This is the only installed tool event carrying
+    /// the name; `called`/`success`/`failed` read it back here, exactly
+    /// like the vendor TUI reducer. A fact with no active turn or for a
+    /// foreign session drops; a corrupt payload gaps like the other
+    /// lifecycle arms.
+    async fn observe_tool_input_started(&mut self, data: &Value) -> Result<()> {
+        let started: ToolInputStartedData = serde_json::from_value(data.clone()).map_err(|_| {
+            Error::new(
+                "native_protocol",
+                "OpenCode tool input start omitted its exact identity or name",
+            )
+        })?;
+        if self.status.active_turn_id.is_none()
+            || self.status.session_id.as_deref() != Some(started.session_id.as_str())
+            || started.id.trim().is_empty()
+            || started.name.trim().is_empty()
+        {
+            return Ok(());
+        }
+        if !self.tool_names.contains_key(&started.id) {
+            self.tool_name_order.push_back(started.id.clone());
+            while self.tool_name_order.len() > MAX_TOOL_NAMES {
+                if let Some(evicted) = self.tool_name_order.pop_front() {
+                    self.tool_names.remove(&evicted);
+                }
+            }
+        }
+        self.tool_names.insert(started.id, started.name);
+        Ok(())
+    }
+
+    /// `session.tool.called`: the input is complete and native execution
+    /// starts (the vendor sets the part to `running` on exactly this
+    /// event). Commit `tool.started` bound to the exact active turn with
+    /// the native part id as the item id. A string `input.command` (the
+    /// installed bash tool) is redacted and bounded like the other
+    /// plugins; other arguments and results are never persisted. A
+    /// replayed `called` for an already-started part never re-commits.
+    async fn observe_tool_called(&mut self, envelope: &SseEnvelope) -> Result<()> {
+        let called: ToolEventData =
+            serde_json::from_value(envelope.data.clone()).map_err(|_| {
+                Error::new(
+                    "native_protocol",
+                    "OpenCode tool call omitted its exact identity",
+                )
+            })?;
+        if self.status.session_id.as_deref() != Some(called.session_id.as_str())
+            || called.id.trim().is_empty()
+        {
+            return Ok(());
+        }
+        let Some((command_id, turn_id)) = self.active_tool_turn().await? else {
+            return Ok(());
+        };
+        if self.tools_started.contains(&called.id) {
+            return Ok(());
+        }
+        let tool = self
+            .tool_names
+            .get(&called.id)
+            .cloned()
+            .unwrap_or_else(|| "tool".to_owned());
+        let mut data = json!({
+            "command_id": command_id,
+            "turn_id": turn_id,
+            "item_id": called.id,
+            "tool": tool,
+        });
+        if let Some(command) = envelope
+            .data
+            .get("input")
+            .and_then(|input| input.get("command"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|command| !command.is_empty())
+        {
+            data["command"] = Value::String(
+                SecretPolicy::new(self.secrets.iter().cloned())
+                    .redact_bounded(command, MAX_TOOL_COMMAND_BYTES),
+            );
+        }
+        if serde_json::to_vec(&data).map_or(true, |bytes| bytes.len() > MAX_EVENT_BYTES) {
+            return self
+                .record_gap("OpenCode tool start exceeded the persisted-event bound")
+                .await;
+        }
+        let native_id = event_id(
+            &called.session_id,
+            &turn_id,
+            &called.id,
+            "tool.started",
+            "opencode",
+            "OpenCode",
+        )?;
+        self.commit_event("tool.started", native_id, data).await?;
+        self.tools_started.insert(called.id);
+        Ok(())
+    }
+
+    /// `session.tool.success` / `session.tool.failed`: the installed
+    /// durable tool terminals. Commit `tool.completed` with the frame's
+    /// own verdict (`completed` or `error`) and, on failure, the bounded
+    /// redacted `Session.StructuredError` message. The result
+    /// `content`/`metadata` payload is never persisted. A terminal with
+    /// no remembered start (its `input.started`/`called` were lost) is one
+    /// tool-family coverage gap, never a guessed tool row; the first
+    /// terminal per part wins and a replay never re-commits.
+    async fn complete_tool(&mut self, envelope: &SseEnvelope) -> Result<()> {
+        let failed = envelope.event_type == "session.tool.failed";
+        let (terminal, native_error) = if failed {
+            let failure: ToolFailedData =
+                serde_json::from_value(envelope.data.clone()).map_err(|_| {
+                    Error::new(
+                        "native_protocol",
+                        "OpenCode tool failure omitted its exact identity or error",
+                    )
+                })?;
+            (
+                ToolEventData {
+                    session_id: failure.session_id,
+                    id: failure.id,
+                },
+                Some(failure.error),
+            )
+        } else {
+            let terminal: ToolEventData =
+                serde_json::from_value(envelope.data.clone()).map_err(|_| {
+                    Error::new(
+                        "native_protocol",
+                        "OpenCode tool success omitted its exact identity",
+                    )
+                })?;
+            (terminal, None)
+        };
+        if self.status.session_id.as_deref() != Some(terminal.session_id.as_str())
+            || terminal.id.trim().is_empty()
+        {
+            return Ok(());
+        }
+        let Some((command_id, turn_id)) = self.active_tool_turn().await? else {
+            return Ok(());
+        };
+        if self.tools_completed.contains(&terminal.id) {
+            return Ok(());
+        }
+        if !self.tools_started.contains(&terminal.id) {
+            self.tools_completed.insert(terminal.id);
+            return self
+                .stream_source()
+                .record_coverage_gap(
+                    "OpenCode tool terminal did not match an observed tool start",
+                    &["tool"],
+                )
+                .await;
+        }
+        let tool = self
+            .tool_names
+            .get(&terminal.id)
+            .cloned()
+            .unwrap_or_else(|| "tool".to_owned());
+        let secrets = SecretPolicy::new(self.secrets.iter().cloned());
+        let mut data = json!({
+            "command_id": command_id,
+            "turn_id": turn_id,
+            "item_id": terminal.id,
+            "tool": tool,
+            "status": if failed { "error" } else { "completed" },
+        });
+        attach_native_error(
+            &mut data,
+            native_error.as_ref().map(|error| error.message.as_str()),
+            &secrets,
+        );
+        if serde_json::to_vec(&data).map_or(true, |bytes| bytes.len() > MAX_EVENT_BYTES) {
+            return self
+                .record_gap("OpenCode tool completion exceeded the persisted-event bound")
+                .await;
+        }
+        let native_id = event_id(
+            &terminal.session_id,
+            &turn_id,
+            &terminal.id,
+            "tool.completed",
+            "opencode",
+            "OpenCode",
+        )?;
+        self.commit_event("tool.completed", native_id, data).await?;
+        self.tools_completed.insert(terminal.id);
+        Ok(())
+    }
+
+    /// Exact active-turn binding shared by the tool facts. A tool fact
+    /// with no turn before this generation's first send is the dead
+    /// generation's tail: drop it, never attribute it (same rule as the
+    /// execution terminal). Any other turn-less tool fact is a tool-family
+    /// coverage gap that leaves the turn outcome alone.
+    async fn active_tool_turn(&mut self) -> Result<Option<(String, String)>> {
+        match (
+            self.status.active_command_id.clone(),
+            self.status.active_turn_id.clone(),
+        ) {
+            (Some(command_id), Some(turn_id)) => Ok(Some((command_id, turn_id))),
+            _ if self.resumed && !self.saw_send => Ok(None),
+            _ => {
+                self.stream_source()
+                    .record_coverage_gap(
+                        "OpenCode tool event matched no exact active turn",
+                        &["tool"],
+                    )
+                    .await?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Drop the per-turn tool bookkeeping when the turn fences.
+    fn clear_tool_facts(&mut self) {
+        self.tool_names.clear();
+        self.tool_name_order.clear();
+        self.tools_started.clear();
+        self.tools_completed.clear();
+    }
+
     /// Bind a terminal event of our session to its exact Eliot turn.
     /// A terminal with no turn before this generation's first send is the
     /// dead generation's close: drop it (`None`), never attribute it. Any
@@ -1830,6 +2088,7 @@ impl EventProcessor {
         self.status.active_turn_id = None;
         self.status.active_command_id = None;
         self.miss_ended_steers(&turn_id);
+        self.clear_tool_facts();
         // Canonical outcome decided here at the plugin boundary from the
         // OpenCode execution vocabulary; the raw SSE event type is preserved
         // as `native_status` next to it.
@@ -1984,6 +2243,7 @@ impl EventProcessor {
         self.status.ready = false;
         self.status.active_command_id = None;
         self.status.active_turn_id = None;
+        self.clear_tool_facts();
         self.pending = None;
         self.status.turn_input = None;
         self.active_model = None;

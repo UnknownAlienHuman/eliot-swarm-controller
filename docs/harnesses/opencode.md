@@ -127,6 +127,24 @@ fail readiness with location-not-found (observed in the Linux Docker image).
 | fork/background | installed native method and exact resulting identity/state |
 | goal | explicitly selected Eliot Goal; no assumed native Goal |
 
+Native tool calls arrive as the installed 2.2.7 `Session.Event.Tool` SSE
+events. `session.tool.input.started` carries the tool `name` (the only
+tool event that does); the adapter remembers it by the tool part `id` for
+the exact active turn. `session.tool.called` (input complete, native
+execution starts) commits `tool.started`, and the durable
+`session.tool.success`/`session.tool.failed` terminals commit
+`tool.completed` (`status` `completed`, or `error` with the bounded
+redacted `Session.StructuredError` message), bound to the exact turn and
+generation with the native part `id` as the item id. A string
+`input.command` on `called` (the bash tool) is added to `tool.started` as
+`command`, secret-redacted and bounded (plugin protocol); other arguments
+and the result `content`/`metadata` are never persisted.
+`session.tool.input.delta`, `input.ended` and `progress` stay unmapped
+streaming detail. A terminal with no observed start is one tool-family
+coverage gap, never a guessed tool row; replays of an already-committed
+start or terminal never re-commit. These facts advance native liveness
+progress exactly like the other adapters' tool events.
+
 Busy graceful stop first sends the exact-session native interrupt once, guarded
 by the captured active turn, then waits up to the core stop interrupt bound for
 that turn's `session.execution.interrupted` SSE terminal. HTTP acknowledgement
