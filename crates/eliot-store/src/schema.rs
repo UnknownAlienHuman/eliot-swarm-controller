@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 75;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 76;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -1740,6 +1740,71 @@ impl Store {
                      WHERE open_notice_command IS NOT NULL;
                  CREATE INDEX writes_created_at ON writes(created_at, id);
                  INSERT INTO schema_migrations(version) VALUES (75);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 76 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE turns ADD COLUMN start_command_id TEXT;
+                 WITH event_facts AS (
+                     SELECT e.agent, e.generation,
+                            json_extract(e.data, '$.turn_id') AS turn_id,
+                            json_extract(e.data, '$.command_id') AS command_id
+                     FROM events e
+                     WHERE e.kind = 'turn.started'
+                       AND e.agent IS NOT NULL AND e.generation IS NOT NULL
+                       AND json_type(e.data, '$.turn_id') = 'text'
+                       AND json_type(e.data, '$.command_id') = 'text'
+                       AND length(json_extract(e.data, '$.turn_id')) > 0
+                       AND length(json_extract(e.data, '$.command_id')) > 0
+                 ), invalid_event_bindings AS (
+                     SELECT DISTINCT f.agent, f.generation, f.turn_id
+                     FROM event_facts f
+                     JOIN commands c ON c.id = f.command_id
+                     WHERE c.target IS NOT f.agent
+                        OR c.generation IS NOT f.generation
+                        OR c.verb != 'send'
+                        OR c.turn_id IS NOT f.turn_id
+                 ), candidates AS (
+                     SELECT f.agent, f.generation, f.turn_id, f.command_id
+                     FROM event_facts f
+                     LEFT JOIN commands c ON c.id = f.command_id
+                     WHERE c.id IS NULL
+                        OR (c.target = f.agent AND c.generation = f.generation
+                            AND c.verb = 'send' AND c.turn_id = f.turn_id)
+                     UNION ALL
+                     SELECT c.target, c.generation, c.turn_id, c.id
+                     FROM commands c
+                     WHERE c.target IS NOT NULL AND c.generation IS NOT NULL
+                       AND c.turn_id IS NOT NULL AND c.verb = 'send'
+                       AND NOT EXISTS (
+                           SELECT 1 FROM invalid_event_bindings i
+                           WHERE i.agent = c.target AND i.generation = c.generation
+                             AND i.turn_id = c.turn_id
+                       )
+                 ), unique_bindings AS (
+                     SELECT agent, generation, turn_id, MIN(command_id) AS command_id
+                     FROM candidates
+                     GROUP BY agent, generation, turn_id
+                     HAVING COUNT(DISTINCT command_id) = 1
+                 )
+                 UPDATE turns
+                 SET start_command_id = (
+                     SELECT u.command_id FROM unique_bindings u
+                     WHERE u.agent = turns.agent AND u.generation = turns.generation
+                       AND u.turn_id = turns.turn_id
+                 )
+                 WHERE EXISTS (
+                     SELECT 1 FROM unique_bindings u
+                     WHERE u.agent = turns.agent AND u.generation = turns.generation
+                       AND u.turn_id = turns.turn_id
+                 );
+                 INSERT INTO schema_migrations(version) VALUES (76);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;

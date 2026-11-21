@@ -833,6 +833,7 @@ CREATE UNIQUE INDEX commands_children ON commands(parent_command,ordinal)
   WHERE parent_command IS NOT NULL;
 CREATE TABLE turns (
   agent INTEGER NOT NULL, generation INTEGER NOT NULL, turn_id TEXT NOT NULL,
+  start_command_id TEXT,
   state TEXT NOT NULL, status TEXT, outcome TEXT, native_status TEXT,
   resolution_source TEXT,
   final_text TEXT, usage TEXT, started_at INTEGER, completed_at INTEGER,
@@ -843,6 +844,12 @@ CREATE TABLE session_usage (
   snapshot TEXT NOT NULL, observed_at INTEGER NOT NULL CHECK(observed_at >= 0),
   PRIMARY KEY(agent,generation)
 );
+
+`turns.start_command_id` retains the exact SEND command that started a controlled
+turn. It has no foreign key to `commands`, so command retention cannot erase the
+binding. Store writes it with the turn projection; migration backfills only a
+unique, consistent retained event or command fact. Missing or conflicting old
+evidence stays unbound, and event retention does not pin `turn.started` for this link.
 
 `turns.outcome` is the canonical task outcome (`success` | `failure` |
 `interrupted` | `unknown`) decided at the plugin boundary from the adapter's

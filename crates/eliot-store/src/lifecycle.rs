@@ -1562,12 +1562,14 @@ fn mark_lost_turn_unknown_tx(
                 params![now, agent_num, generation, turn_id],
             ));
         } else {
+            let start_command_id = command_id_for_turn_tx(tx, agent_num, generation, turn_id)?;
             insert_turn(
                 tx,
                 TurnInsert {
                     agent: agent_num,
                     generation,
                     turn_id,
+                    start_command_id: start_command_id.as_deref(),
                     state: TurnState::Unknown,
                     status: None,
                     outcome: None,

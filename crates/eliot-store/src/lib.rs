@@ -1597,8 +1597,8 @@ impl Store {
         Ok(unknown)
     }
 
-    /// Return the committed command binding for an exact generation/turn.
-    /// Missing or pruned turn-start evidence stays absent.
+    /// Return the retained starting SEND command for an exact generation/turn.
+    /// Legacy rows without a unique retained binding remain unbound.
     pub fn turn_command_id(
         &self,
         agent: &str,
@@ -1608,10 +1608,9 @@ impl Store {
         let agent_num = parse_agent_id(agent)?;
         self.connection
             .query_row(
-                "SELECT json_extract(data, '$.command_id') FROM events
-                 WHERE agent = ?1 AND generation = ?2 AND kind = 'turn.started'
-                   AND json_extract(data, '$.turn_id') = ?3
-                 ORDER BY seq DESC LIMIT 1",
+                "SELECT start_command_id FROM turns
+                 WHERE agent = ?1 AND generation = ?2 AND turn_id = ?3
+                   AND start_command_id IS NOT NULL",
                 params![agent_num, generation, turn_id],
                 |row| row.get(0),
             )
@@ -3708,6 +3707,7 @@ struct TurnInsert<'a> {
     agent: i64,
     generation: i64,
     turn_id: &'a str,
+    start_command_id: Option<&'a str>,
     state: TurnState,
     status: Option<&'a str>,
     outcome: Option<&'a str>,
@@ -5319,14 +5319,15 @@ fn load_harness_by_num(connection: &Connection, agent: i64) -> Result<String> {
 
 fn insert_turn(tx: &Transaction<'_>, turn: TurnInsert<'_>) -> Result<()> {
     db!(tx.execute(
-        "INSERT INTO turns(agent, generation, turn_id, state, status, outcome, native_status,
+        "INSERT INTO turns(agent, generation, turn_id, start_command_id, state, status, outcome, native_status,
                            final_text, started_at, completed_at, usage, config_revision,
                            preceded_by, effective_model)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         params![
             turn.agent,
             turn.generation,
             turn.turn_id,
+            turn.start_command_id,
             turn_state_name(turn.state),
             turn.status,
             turn.outcome,
@@ -5794,6 +5795,18 @@ fn command_cause_for_turn_tx(
     if load_turn(tx, agent_num, generation, turn_id)?.is_none() {
         return Ok(None);
     }
+    let Some(command_id) = command_id_for_turn_tx(tx, agent_num, generation, turn_id)? else {
+        return Ok(None);
+    };
+    command_cause_tx(tx, &command_id)
+}
+
+fn command_id_for_turn_tx(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    generation: i64,
+    turn_id: &str,
+) -> Result<Option<String>> {
     let mut statement = tx
         .prepare(
             "SELECT id FROM commands
@@ -5812,7 +5825,7 @@ fn command_cause_for_turn_tx(
         ids.push(row.map_err(sql_error)?);
     }
     match ids.as_slice() {
-        [command_id] => command_cause_tx(tx, command_id),
+        [command_id] => Ok(Some(command_id.clone())),
         _ => Ok(None),
     }
 }

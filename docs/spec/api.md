@@ -1936,8 +1936,9 @@ do not add `agent.wait` to the current method set. Current CLI `--wait` behavior
 described under Command admission.
 
 Capture generation at call start. `turn --after-command ID` follows that input's exact
-association/result; without an id, capture the current turn or the first after the call
-high-water. `idle` requires no open input/turn/transition or unresolved settings gate.
+association/result; the retained turn row keeps its starting SEND command binding after
+the `turn.started` event ages out. Without an id, capture the current turn or the first
+after the call high-water. `idle` requires no open input/turn/transition or unresolved settings gate.
 `stopped` means terminal; `goal` captures its revision. Replacement returns
 `stale_generation`; timeout never cancels admitted work. Several native inputs may
 legitimately share one turn result.
