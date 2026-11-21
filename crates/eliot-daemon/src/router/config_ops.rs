@@ -11,9 +11,9 @@ use super::{PAGE_MAX, Principal, Router, require_owner, rule_principal};
 use eliot_core::{
     Error, Result, SecretPolicy,
     api::{
-        ProfileListRequest, ProjectRegistrationView, RuleListEntry, RuleListRequest,
-        RuleListResponse, ScriptListRequest, ScriptReadRequest, ScriptSaveRequest,
-        SettingsReadRequest, SettingsSaveRequest,
+        ProfileListRequest, ProjectRegistrationView, RuleDeleteRequest, RuleListEntry,
+        RuleListRequest, RuleListResponse, RuleReadRequest, RuleSaveRequest, ScriptListRequest,
+        ScriptReadRequest, ScriptSaveRequest, SettingsReadRequest, SettingsSaveRequest,
     },
 };
 use serde_json::Value;
@@ -211,9 +211,15 @@ impl Router {
                     Error::new("source_integrity", "stored rule definition is not JSON")
                 })?;
             let timer = store.get_timer_state(&namespace, &state.view.id)?;
+            let source_file = if state.source_present {
+                self.rule_source_file(&namespace, &state.view.id)
+            } else {
+                None
+            };
             rules.push(RuleListEntry {
                 state: state.view,
                 source_present: state.source_present,
+                source_file,
                 timer,
                 definition,
             });
@@ -228,6 +234,33 @@ impl Router {
         let reply = RuleListResponse { rules, next };
         request.validate_response(&reply)?;
         encode(&reply, "rule list")
+    }
+
+    pub(super) async fn rule_read(&self, params: &Value, principal: &Principal) -> Result<Value> {
+        require_owner(principal)?;
+        let request: RuleReadRequest = eliot_core::api::discovery::decode_params(params.clone())?;
+        let policy = self.secret_policy_snapshot();
+        let reply =
+            crate::automation::rule_edit::read(&self.inner.data_root, &request, &policy).await?;
+        encode(&reply, "rule read")
+    }
+
+    pub(super) async fn rule_save(&self, params: &Value, principal: &Principal) -> Result<Value> {
+        require_owner(principal)?;
+        let request: RuleSaveRequest = eliot_core::api::discovery::decode_params(params.clone())?;
+        let policy = self.secret_policy_snapshot();
+        let reply =
+            crate::automation::rule_edit::save(&self.inner.data_root, &request, &policy).await?;
+        encode(&reply, "rule save")
+    }
+
+    pub(super) async fn rule_delete(&self, params: &Value, principal: &Principal) -> Result<Value> {
+        require_owner(principal)?;
+        let request: RuleDeleteRequest = eliot_core::api::discovery::decode_params(params.clone())?;
+        let policy = self.secret_policy_snapshot();
+        let reply =
+            crate::automation::rule_edit::delete(&self.inner.data_root, &request, &policy).await?;
+        encode(&reply, "rule delete")
     }
 
     /// Registered projects whose `.eliot/scripts/` roots scripts may live in.

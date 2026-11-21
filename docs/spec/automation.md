@@ -21,6 +21,26 @@ do = [{ action = "send", target = "${event.agent}", expected_generation = "${eve
 limit = { max = 3, per = "agent", window = "1h" }
 ```
 
+### Rule file editing
+
+The Owner can read, save and delete a top-level `.toml` source file in either approved
+rule root. Read supplies the exact UTF-8 text and a lowercase SHA-256 revision of the
+file bytes. Save creates a file only when the expected revision is absent and the file
+does not exist. Replace and delete require the current revision. Save uses the same
+parser and namespace validation as the loader. Read and save refuse content
+containing secrets known to the daemon. Delete can remove such a file when the
+Owner supplies its current byte revision. Writes use ordinary rule reconciliation.
+Use the `source_file` returned by `rule.list` to locate an existing file. A filename
+can contain several `[[rule]]` entries, and each revision covers the whole file.
+The daemon serializes file API writes. For direct edits by other processes, the
+filesystem conflict checks have the same limits as the script editor below.
+Save acknowledges the file's publication. `rule.list` and `timer.get` show the
+effective state after the existing worker reconciles the change.
+
+Edit `enabled` and save to disable or reenable a rule. Deleting a file removes all of
+its definitions from the source, while the ordinary retirement rules still govern
+retained history and already-admitted commands. Saving never invokes Run now.
+
 ### Script editing
 
 Owner-only `script.list`, `script.read` and `script.save`
@@ -324,8 +344,8 @@ through the existing exact approval callbacks.
 
 Scalar `match` values compare exactly. String values prefixed `glob:` or `re:` use bounded
 glob or regex matching; `{ one_of = [...] }` accepts a list of scalar values, and
-`{ exists = true|false }` checks path presence. Conditions combine with AND. A missing
-field does not match an ordinary condition; `exists = false` explicitly matches absence.
+`{ exists = true|false }` checks path presence. Conditions combine with AND. The
+[matching contract](#matching-and-rendering) also covers `any_of`, `not` and missing fields.
 For example:
 
 ```toml
@@ -682,6 +702,66 @@ at admission and at the dispatch effect boundary; adapters whose effective
 `context_points` lack the requested point return their typed `unsupported`, never a
 weaker send. `inject` requires an event trigger and is unsupported for timers.
 
+## Outcome chaining
+
+Run settlements use `command.applied`, `command.failed` and `command.unknown` with
+`data.verb = "run"`, `data.state` and the exact `data.command_id`. A project Run also
+has `data.rule_project`. Match it with `event.cause.rule` to select a rule within its
+namespace. An observed script exit is in `data.outcome.process.direct_exit`, including
+its `exit_code` when available. An applied Run has a successful exit and admitted
+script output. The `script_exit_failed` cause selects an observed nonzero exit.
+
+`turn.completed` has the native terminal outcome in `data.outcome` (`success`,
+`failure`, `interrupted` or `unknown`). For a turn started by a rule's SEND,
+`data.command_id` identifies that SEND and `event.cause.rule` identifies the rule.
+A launch with text uses its linked initial SEND, which carries the launch rule's
+cause. `turn.unknown` records an uncertain terminal with `data.outcome = "unknown"`
+and the SEND ID when Store can prove that binding.
+
+To launch a fixer when a project check exits unsuccessfully, put the timer and follow-up
+definitions in the registered project's rule directory. In this example the project
+`app` approves `run`, `launch`, `send`, the `pwsh` interpreter and the `fixer` profile.
+`check.ps1` is under the project's `.eliot/scripts/` directory. Use the registered
+checkout path as returned by `project.get` for `workspace`.
+
+```toml
+[[rule]]
+id = "quality-check"
+on = { every = "1h" }
+do = [{ action = "run", cmd = ["pwsh", ".eliot/scripts/check.ps1"] }]
+
+[[rule]]
+id = "fix-quality-check"
+on = { event = "command.failed", match = { "data.verb" = "run", "data.rule_project" = "app", "event.cause.rule" = "quality-check", "data.outcome.cause" = "script_exit_failed" } }
+do = [{ action = "launch", profile = "fixer", workspace = "/work/app", text = "Investigate check exit ${data.outcome.process.direct_exit.exit_code}." }]
+```
+
+To notify on success and resume once on a known unsuccessful terminal turn, match the
+producer `fix-quality-check`. A terminal turn leaves the live Agent idle. To resume its
+native session into a new generation, first stop the exact generation and use the applied
+Stop from that rule as the trigger for `resume`. For project rules, grant `notify`,
+`stop`, `resume` and `send` explicitly and use rule IDs unique to the intended chain.
+
+```toml
+[[rule]]
+id = "notify-fixer-success"
+on = { event = "turn.completed", match = { "event.cause.rule" = "fix-quality-check", "data.outcome" = "success" } }
+do = [{ action = "notify", message = "The fixer task completed successfully." }]
+
+[[rule]]
+id = "retire-fixer-for-resume"
+on = { event = "turn.completed", match = { "event.cause.rule" = "fix-quality-check", "data.outcome" = { one_of = ["failure", "interrupted"] } } }
+do = [{ action = "stop", target = "${event.agent}", expected_generation = "${event.generation}" }]
+
+[[rule]]
+id = "resume-fixer-once"
+on = { event = "command.applied", match = { "event.cause.rule" = "retire-fixer-for-resume" } }
+do = [{ action = "resume", target = "${event.agent}", expected_generation = "${event.generation}", text = "Investigate the known unsuccessful result and continue once." }]
+```
+
+The resumed turn has the retry rule's cause, so its terminal cannot reenter the stop
+rule. Unknown turns and unknown Stop outcomes require readback before further action.
+
 ## Matching and rendering
 
 `on.event` names a literal static committed event kind; ephemeral samples are not
@@ -692,9 +772,24 @@ undocumented `agent.*` alias.
 Scalar values compare exactly. String values beginning `glob:` use glob matching and
 strings beginning `re:` use regex matching. `{ one_of = [...] }` accepts scalar choices;
 `{ exists = true|false }` tests whether a path is present. Conditions combine with AND.
-Missing paths do not match ordinary conditions; `exists = false` is the explicit missing
-path check. Invalid regex/glob syntax rejects the file. An unresolved action placeholder
-fails admission.
+Missing paths do not match equality, choices or patterns. Use `exists = false` to check
+for absence. A field can have `{ not = CONDITION }` with any one of these conditions.
+`not` complements the result, including when the source path is absent.
+
+Use `any_of` inside `match` for OR across fields. It takes 1 to 32 nonempty field
+tables. Each table is an AND group with the same paths and field operators. The top-level
+field conditions and at least one alternative must match. The file-size and pattern
+bounds also apply to the alternatives. `any_of` groups and `not` operators are each
+one level deep.
+
+```toml
+on = { event = "turn.completed", match = { "data.outcome" = { not = "success" }, any_of = [{ "subject.harness" = "claude" }, { "subject.profile" = "batch" }] } }
+```
+
+An `if` builder needs OR across different paths and a way to complement a comparison.
+Overlapping alternatives admit a single firing of the rule. Separate OR rules could
+each admit an action, and `exists = false` only tests absence. Invalid pattern syntax
+rejects the file. Unresolved action placeholders fail admission.
 
 Substitution fills argument values, never executable/action kind, option name,
 environment name, credential or authority scope. Workspace/ref/remote substitutions
@@ -917,9 +1012,9 @@ workflow. Its raw input and frozen command args use Core `RunDefinitionArgs` and
 Those DTOs own their field catalogs; this spec defines their run semantics.
 
 For project event rules, `RunDefinitionArgs.cmd` is a literal argv vector: element 0 is
-the exact owner-approved key in `interpreters`; element 1 is a literal relative entry
-path below the registered checkout's `.eliot/scripts/`; later elements are literal script
-arguments. The entry must resolve to a canonical regular file under that directory, with
+the exact owner-approved key in `interpreters`; element 1 is a literal path relative
+to the registered checkout and must select an entry below `.eliot/scripts/`. Later elements
+are literal script arguments. The entry must resolve to a canonical regular file under that directory, with
 no path escape, symlink/reparse point, device or alternate stream. Before spawn, authorize
 the project `run` action and resolve element 0 to its approved interpreter. The executable
 path and fixed argv prefix come only from owner configuration. Event data cannot change

@@ -2,6 +2,7 @@ pub(crate) mod assignment;
 mod definition;
 mod projects;
 mod reload;
+pub(crate) mod rule_edit;
 mod schedule;
 pub(crate) use definition::RuleDefinition;
 pub(crate) use schedule::parse_positive_duration_ms;
@@ -498,7 +499,13 @@ async fn refresh_project_namespaces(
         }
     };
     let current_ids: HashSet<_> = views.iter().map(|view| view.id.clone()).collect();
-    namespaces.retain(|namespace| current_ids.contains(&namespace.registration.id));
+    namespaces.retain(|namespace| {
+        let current = current_ids.contains(&namespace.registration.id);
+        if !current {
+            router.install_rule_source_files(&namespace.principal, &HashMap::new());
+        }
+        current
+    });
 
     for view in views {
         let Some(registration) = registrations
@@ -557,6 +564,7 @@ async fn refresh_project_namespaces(
             .map(|rule| rule.definition.clone())
             .collect::<Vec<_>>();
         if namespace.rules.iter().all(|rule| rule.source_present) && snapshot.matches(&current)? {
+            router.install_rule_source_files(&namespace.principal, &snapshot.source_files);
             namespace.notices.deferred = None;
             namespace.notices.rejected = None;
             continue;
@@ -706,6 +714,7 @@ async fn apply_global_rule_snapshot(
             &timers,
             registration_now,
             &absent_from_source,
+            &snapshot.source_files,
         )
         .await?;
     let active = active_rules(
@@ -835,6 +844,7 @@ fn defer_retiring_edits(
     Ok(reload::RuleSnapshot {
         definitions,
         inputs,
+        source_files: snapshot.source_files.clone(),
     })
 }
 
@@ -1078,6 +1088,7 @@ async fn run_global_rules_inner(
         if rules.iter().all(|rule| rule.source_present)
             && snapshot.matches(&current).unwrap_or(false)
         {
+            router.install_rule_source_files("owner", &snapshot.source_files);
             last_applied_inputs = Some(snapshot.inputs);
             notices.deferred = None;
             notices.rejected = None;
@@ -1363,6 +1374,7 @@ async fn run_global_rules_inner(
             continue;
         }
         if last_applied_inputs.as_ref() == Some(&snapshot.inputs) {
+            router.install_rule_source_files("owner", &snapshot.source_files);
             notices.deferred = None;
             notices.rejected = None;
             continue;
@@ -1372,6 +1384,7 @@ async fn run_global_rules_inner(
             .map(|rule| rule.definition.clone())
             .collect::<Vec<_>>();
         if rules.iter().all(|rule| rule.source_present) && snapshot.matches(&current_definitions)? {
+            router.install_rule_source_files("owner", &snapshot.source_files);
             last_applied_inputs = Some(snapshot.inputs.clone());
             notices.deferred = None;
             notices.rejected = None;

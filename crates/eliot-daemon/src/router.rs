@@ -124,6 +124,7 @@ struct RouterInner {
     unknown_commands: UnknownCommands,
     unknown_causes: Mutex<HashMap<String, String>>,
     rule_definitions: Mutex<HashMap<(String, String), (i64, RuleDefinition)>>,
+    rule_source_files: Mutex<HashMap<String, HashMap<String, String>>>,
     catalog_cache: Mutex<catalog::CatalogCache>,
     profile_cache: Mutex<crate::config::ProfileCache>,
     catalog_aggregate_lock: AsyncMutex<()>,
@@ -367,6 +368,7 @@ impl Router {
                 unknown_commands,
                 unknown_causes: Mutex::new(HashMap::new()),
                 rule_definitions: Mutex::new(HashMap::new()),
+                rule_source_files: Mutex::new(HashMap::new()),
                 catalog_cache: Mutex::new(catalog::CatalogCache::default()),
                 profile_cache: Mutex::new(crate::config::ProfileCache::default()),
                 catalog_aggregate_lock: AsyncMutex::new(()),
@@ -575,6 +577,9 @@ impl Router {
             "settings.save" => self.settings_save(&params, &principal).await,
             "routing.preview" => self.routing_preview(&params, &principal).await,
             "rule.list" => self.rule_list(&params, &principal).await,
+            "rule.read" => self.rule_read(&params, &principal).await,
+            "rule.save" => self.rule_save(&params, &principal).await,
+            "rule.delete" => self.rule_delete(&params, &principal).await,
             "script.list" => self.script_list(&params, &principal).await,
             "script.read" => self.script_read(&params, &principal).await,
             "script.save" => self.script_save(&params, &principal).await,
@@ -2864,6 +2869,28 @@ impl Router {
             .cloned()
     }
 
+    pub(crate) fn install_rule_source_files(
+        &self,
+        principal: &str,
+        files: &HashMap<String, String>,
+    ) {
+        let mut stored = self.inner.rule_source_files.lock_recover();
+        if files.is_empty() {
+            stored.remove(principal);
+        } else if stored.get(principal) != Some(files) {
+            stored.insert(principal.to_owned(), files.clone());
+        }
+    }
+
+    fn rule_source_file(&self, principal: &str, id: &str) -> Option<String> {
+        self.inner
+            .rule_source_files
+            .lock_recover()
+            .get(principal)?
+            .get(id)
+            .cloned()
+    }
+
     pub(crate) async fn initialize_rules(
         &self,
         principal: &str,
@@ -2871,6 +2898,7 @@ impl Router {
         timers: &[TimerDefinitionInput],
         registration_now: i64,
         absent_from_source: &[&str],
+        source_files: &HashMap<String, String>,
     ) -> Result<Vec<RuleProcessingState>> {
         self.validate_rule_definitions(principal, definitions)
             .await?;
@@ -2884,6 +2912,8 @@ impl Router {
                 registration_now,
                 absent_from_source,
             )?;
+            // rule.list holds this Store lock while reading the source map.
+            self.install_rule_source_files(principal, source_files);
             self.publish_locked(&change.events);
             change
         };
@@ -5630,7 +5660,16 @@ fn validate_rule_launch_action(
                 "project registration does not approve the launch profile",
             ));
         }
-        if workspace != registration.checkout.as_str() {
+        // The project API displays Windows paths without the verbatim prefix.
+        // Compare the same canonical checkout that Store will fence at admission.
+        let canonical = crate::setup::canonical_directory(std::path::Path::new(workspace))
+            .map_err(|_| {
+                Error::new(
+                    "not_allowed",
+                    "project launch workspace is unavailable or unsafe",
+                )
+            })?;
+        if canonical != std::path::Path::new(&registration.checkout) {
             return Err(Error::new(
                 "not_allowed",
                 "project launch must use the registered checkout",

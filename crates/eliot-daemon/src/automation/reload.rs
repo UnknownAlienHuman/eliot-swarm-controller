@@ -15,6 +15,8 @@ use tokio::sync::watch;
 pub(crate) struct RuleSnapshot {
     pub(crate) definitions: Vec<RuleDefinition>,
     pub(crate) inputs: Vec<RuleDefinitionInput>,
+    /// Top-level source filename for each file-backed rule in this accepted snapshot.
+    pub(crate) source_files: HashMap<String, String>,
 }
 
 impl RuleSnapshot {
@@ -40,10 +42,37 @@ impl RuleSnapshot {
     }
 }
 
+pub(crate) static RULE_FILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn rule_file_guard() -> std::sync::MutexGuard<'static, ()> {
+    RULE_FILE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 pub(crate) fn load(data_root: &Path) -> Result<RuleSnapshot> {
-    let mut snapshot = load_rule_directory(&data_root.join("rules"))?;
+    let _guard = rule_file_guard();
+    load_with_file_override_unlocked(data_root, None)
+}
+
+/// Parse the complete global namespace with one candidate file substituted.
+/// Caller holds RULE_FILE_LOCK through validation and atomic publication.
+pub(crate) fn load_with_file_override(
+    data_root: &Path,
+    filename: &str,
+    content: &[u8],
+) -> Result<RuleSnapshot> {
+    load_with_file_override_unlocked(data_root, Some((filename, content)))
+}
+
+fn load_with_file_override_unlocked(
+    data_root: &Path,
+    override_file: Option<(&str, &[u8])>,
+) -> Result<RuleSnapshot> {
+    let mut snapshot = load_rule_directory_with_override(&data_root.join("rules"), override_file)?;
     let config = crate::config::load_automation_config(data_root)?;
     if !config.assignments.is_empty() {
+        let source_files = std::mem::take(&mut snapshot.source_files);
         let mut definitions = snapshot.definitions;
         for (key, assignment) in config.assignments {
             let id = format!("assignment-{key}");
@@ -60,13 +89,6 @@ pub(crate) fn load(data_root: &Path) -> Result<RuleSnapshot> {
                 assignment.goal.as_ref().map(goal_toml).unwrap_or_default(),
             );
             definitions.extend(definition::load(toml.as_bytes())?);
-            // Assigned Agents own one brief. Use the existing event-rule stop
-            // action to retire the exact generation when its work ends:
-            // after its terminal turn for one-turn work, or when its Goal
-            // completes or blocks for Goal-owned work. This frees configured
-            // live capacity for the next timer launch. The rule processor
-            // additionally verifies Store launch ancestry; this cause label
-            // alone is not enough to authorize cleanup.
             let ending = if assignment.goal.is_some() {
                 "goal.changed"
             } else {
@@ -80,6 +102,7 @@ pub(crate) fn load(data_root: &Path) -> Result<RuleSnapshot> {
             definitions.extend(definition::load(completion.as_bytes())?);
         }
         snapshot = from_definitions(definitions)?;
+        snapshot.source_files = source_files;
     }
     Ok(snapshot)
 }
@@ -114,6 +137,24 @@ fn quote_toml(value: &str) -> String {
 /// Project authorization, link rejection, and overlay rejection stay in
 /// `automation::projects` before this parser is called.
 pub(crate) fn load_project(checkout: &Path) -> Result<RuleSnapshot> {
+    let _guard = rule_file_guard();
+    load_project_with_file_override_unlocked(checkout, None)
+}
+
+/// Parse one complete project namespace with a candidate file substituted.
+/// Caller holds RULE_FILE_LOCK through validation and atomic publication.
+pub(crate) fn load_project_with_file_override(
+    checkout: &Path,
+    filename: &str,
+    content: &[u8],
+) -> Result<RuleSnapshot> {
+    load_project_with_file_override_unlocked(checkout, Some((filename, content)))
+}
+
+fn load_project_with_file_override_unlocked(
+    checkout: &Path,
+    override_file: Option<(&str, &[u8])>,
+) -> Result<RuleSnapshot> {
     let checkout = fs::canonicalize(checkout)
         .map_err(|_| Error::new("unavailable", "registered project checkout is unavailable"))?;
     let requested = checkout.join(".eliot").join("rules");
@@ -125,6 +166,7 @@ pub(crate) fn load_project(checkout: &Path) -> Result<RuleSnapshot> {
                 "registered project rule directory escapes its checkout",
             ));
         }
+        Err(error) if error.kind() == ErrorKind::NotFound && override_file.is_some() => requested,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(empty_snapshot()),
         Err(_) => {
             return Err(Error::new(
@@ -133,60 +175,85 @@ pub(crate) fn load_project(checkout: &Path) -> Result<RuleSnapshot> {
             ));
         }
     };
-    load_rule_directory(&rules)
+    load_rule_directory_with_override(&rules, override_file)
 }
 
 fn empty_snapshot() -> RuleSnapshot {
     RuleSnapshot {
         definitions: Vec::new(),
         inputs: Vec::new(),
+        source_files: HashMap::new(),
     }
 }
 
-fn load_rule_directory(directory: &Path) -> Result<RuleSnapshot> {
+fn load_rule_directory_with_override(
+    directory: &Path,
+    override_file: Option<(&str, &[u8])>,
+) -> Result<RuleSnapshot> {
     let entries = match fs::read_dir(directory) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            return Ok(empty_snapshot());
-        }
-        Err(_) => return Err(Error::new("unavailable", "cannot enumerate global rules")),
+        Ok(entries) => Some(entries),
+        Err(error) if error.kind() == ErrorKind::NotFound && override_file.is_some() => None,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(empty_snapshot()),
+        Err(_) => return Err(Error::new("unavailable", "cannot enumerate rule files")),
     };
 
     let mut paths = Vec::<PathBuf>::new();
-    for entry in entries {
-        let entry =
-            entry.map_err(|_| Error::new("unavailable", "cannot read global rule entry"))?;
-        let file_type = entry
-            .file_type()
-            .map_err(|_| Error::new("unavailable", "cannot inspect global rule entry"))?;
-        let path = entry.path();
-        if file_type.is_file()
-            && path
-                .extension()
-                .is_some_and(|extension| extension == "toml")
-        {
-            paths.push(path);
+    if let Some(entries) = entries {
+        for entry in entries {
+            let entry =
+                entry.map_err(|_| Error::new("unavailable", "cannot read rule directory entry"))?;
+            let file_type = entry
+                .file_type()
+                .map_err(|_| Error::new("unavailable", "cannot inspect rule directory entry"))?;
+            let path = entry.path();
+            if file_type.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension == "toml")
+            {
+                if override_file
+                    .is_some_and(|(filename, _)| entry.file_name().to_str() == Some(filename))
+                {
+                    continue;
+                }
+                paths.push(path);
+            }
         }
     }
     paths.sort();
 
     let mut definitions = Vec::new();
+    let mut source_files = HashMap::new();
     for path in paths {
-        let file = File::open(&path)
-            .map_err(|_| Error::new("unavailable", "cannot open global rule file"))?;
-        definitions.extend(definition::load(file)?);
+        let filename = path.file_name().and_then(|name| name.to_str());
+        let file =
+            File::open(&path).map_err(|_| Error::new("unavailable", "cannot open rule file"))?;
+        let loaded = definition::load(file)?;
+        if let Some(filename) = filename {
+            for rule in &loaded {
+                source_files.insert(rule.id.clone(), filename.to_owned());
+            }
+        }
+        definitions.extend(loaded);
     }
+    if let Some((filename, content)) = override_file {
+        let loaded = definition::load(content)?;
+        for rule in &loaded {
+            source_files.insert(rule.id.clone(), filename.to_owned());
+        }
+        definitions.extend(loaded);
+    }
+
     let mut ids = HashSet::new();
     if definitions
         .iter()
         .any(|definition| !ids.insert(definition.id.clone()))
     {
-        return Err(Error::new(
-            "invalid",
-            "global rule files contain duplicate IDs",
-        ));
+        return Err(Error::new("invalid", "rule files contain duplicate IDs"));
     }
-    from_definitions(definitions)
+    let mut snapshot = from_definitions(definitions)?;
+    snapshot.source_files = source_files;
+    Ok(snapshot)
 }
 
 pub(crate) fn from_definitions(definitions: Vec<RuleDefinition>) -> Result<RuleSnapshot> {
@@ -216,6 +283,7 @@ pub(crate) fn from_definitions(definitions: Vec<RuleDefinition>) -> Result<RuleS
     Ok(RuleSnapshot {
         definitions,
         inputs,
+        source_files: HashMap::new(),
     })
 }
 
@@ -242,6 +310,7 @@ pub(crate) fn from_processing(states: &[RuleProcessingState]) -> Result<RuleSnap
     Ok(RuleSnapshot {
         definitions,
         inputs,
+        source_files: HashMap::new(),
     })
 }
 

@@ -2,8 +2,8 @@ use eliot_core::{
     Error, Event, SubmitCommand,
     api::{
         CatchUp, CommandSubmitRequest, EmitDefinitionArgs, GitFetchDefinitionArgs,
-        MailDefinitionArgs, NotifyDefinitionArgs, RuleLimit, RuleLimitScope, RunDefinitionArgs,
-        TimerSchedule, VarDefinitionArgs,
+        MAX_RULE_FILE_BYTES, MailDefinitionArgs, NotifyDefinitionArgs, RuleLimit, RuleLimitScope,
+        RunDefinitionArgs, TimerSchedule, VarDefinitionArgs,
     },
     canonical_json_sha256,
     limits::{MAX_EVENT_BYTES, MAX_TEXT_BYTES},
@@ -20,10 +20,10 @@ use std::{
     io::Read,
 };
 
-const MAX_RULE_FILE_BYTES: usize = 128 * 1024;
 // Canonical Agent IDs are `a` plus at most 19 positive-i64 decimal digits.
 const MAX_AGENT_ID_BYTES: usize = 20;
 const MAX_RULE_CAUSE_DEPTH: u8 = 5;
+const MAX_MATCH_ALTERNATIVES: usize = 32;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -70,8 +70,12 @@ struct TriggerDefinition {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     at: Option<String>,
     #[serde(skip)]
-    compiled_matches: BTreeMap<String, CompiledMatch>,
+    compiled_matches: MatchGroup,
+    #[serde(skip)]
+    compiled_any_of: Vec<MatchGroup>,
 }
+
+type MatchGroup = BTreeMap<String, CompiledMatch>;
 
 #[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -425,6 +429,7 @@ enum CompiledMatch {
     Regex(Regex),
     OneOf(Vec<Value>),
     Exists(bool),
+    Not(Box<Self>),
 }
 
 impl CompiledMatch {
@@ -439,6 +444,7 @@ impl CompiledMatch {
                 .is_some_and(|value| pattern.is_match(value)),
             Self::OneOf(choices) => actual.is_some_and(|value| choices.contains(value)),
             Self::Exists(expected) => actual.is_some() == *expected,
+            Self::Not(condition) => !condition.matches(actual),
         }
     }
 }
@@ -783,10 +789,16 @@ pub fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<Option<SubmitCom
         .transpose()
         .map_err(|_| Error::new("invalid", "rule subject cannot be encoded"))?;
     let subject = subject_value.as_ref();
-    for (path, matcher) in &rule.trigger.compiled_matches {
-        if !matcher.matches(lookup(path, &event_value, subject, &event.data)) {
-            return Ok(None);
-        }
+    let matches_group = |group: &MatchGroup| {
+        group.iter().all(|(path, matcher)| {
+            matcher.matches(lookup(path, &event_value, subject, &event.data))
+        })
+    };
+    let alternatives = &rule.trigger.compiled_any_of;
+    if !matches_group(&rule.trigger.compiled_matches)
+        || (!alternatives.is_empty() && !alternatives.iter().any(matches_group))
+    {
+        return Ok(None);
     }
 
     let action = rule
@@ -1384,12 +1396,47 @@ fn validate_rule(rule: &mut RuleDefinition) -> Result<(), Error> {
 
 fn validate_event_matches(trigger: &mut TriggerDefinition) -> Result<(), Error> {
     let mut compiled = BTreeMap::new();
+    let mut alternatives = Vec::new();
     for (path, expected) in &trigger.matches {
-        validate_path(path)?;
-        compiled.insert(path.clone(), compile_match(expected)?);
+        if path == "any_of" {
+            let branches = expected
+                .as_array()
+                .filter(|branches| (1..=MAX_MATCH_ALTERNATIVES).contains(&branches.len()))
+                .ok_or_else(|| Error::new("invalid", "any_of needs 1 to 32 match tables"))?;
+            for branch in branches {
+                let fields = branch
+                    .as_object()
+                    .filter(|fields| !fields.is_empty())
+                    .ok_or_else(|| Error::new("invalid", "any_of needs nonempty match tables"))?;
+                alternatives.push(compile_match_group(fields.iter())?);
+            }
+            continue;
+        }
+        compiled.insert(path.clone(), compile_field_match(path, expected)?);
     }
     trigger.compiled_matches = compiled;
+    trigger.compiled_any_of = alternatives;
     Ok(())
+}
+
+fn compile_match_group<'a>(
+    fields: impl Iterator<Item = (&'a String, &'a Value)>,
+) -> Result<MatchGroup, Error> {
+    fields
+        .map(|(path, value)| Ok((path.clone(), compile_field_match(path, value)?)))
+        .collect()
+}
+
+fn compile_field_match(path: &str, value: &Value) -> Result<CompiledMatch, Error> {
+    validate_path(path)?;
+    if let Some(operand) = value
+        .as_object()
+        .filter(|operators| operators.len() == 1)
+        .and_then(|operators| operators.get("not"))
+    {
+        return Ok(CompiledMatch::Not(Box::new(compile_match(operand)?)));
+    }
+    compile_match(value)
 }
 
 fn compile_match(value: &Value) -> Result<CompiledMatch, Error> {
