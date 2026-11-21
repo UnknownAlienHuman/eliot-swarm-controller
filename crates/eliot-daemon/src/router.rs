@@ -463,10 +463,6 @@ impl Router {
                 let handle = std::thread::spawn(|| {
                     panic!("debug daemon panic-test trigger");
                 });
-                // Give the panicking thread its moment to run the installed
-                // hook, then end the process regardless of how that thread's
-                // panic resolves.
-                std::thread::sleep(std::time::Duration::from_millis(250));
                 let _ = handle.join();
                 std::process::abort()
             }

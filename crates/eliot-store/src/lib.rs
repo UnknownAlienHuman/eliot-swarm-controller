@@ -1357,6 +1357,11 @@ impl Store {
         Ok(load_command_record(&self.connection, id)?.map(|record| record.command))
     }
 
+    /// Read the retained SEND expansion of a start command.
+    pub fn get_linked_send(&self, parent: &str) -> Result<Option<Command>> {
+        load_linked_command(&self.connection, parent)
+    }
+
     /// Exact current-generation start, including a failed launch with no turn.
     /// Generation is unique for launch/resume; never substitute another Agent
     /// or a timestamp-near command when retention removed the causal command.
@@ -2074,6 +2079,7 @@ impl Store {
     /// tail only; no argv, environment or output framing. The truthful loss
     /// cause is recorded on `agent.lost`, the open turn's `turn.unknown`,
     /// and the dispatched commands' `command.unknown`.
+    #[allow(clippy::too_many_arguments)]
     pub fn mark_lost_with_exit(
         &mut self,
         agent: &str,

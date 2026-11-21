@@ -2742,6 +2742,9 @@ impl OpenCodePlugin {
             return Ok(json!({
                 "state": "rejected",
                 "reason": format!("OpenCode model {model} is not in the native catalogue"),
+                "origin": FailureOrigin::Harness,
+                "origin_evidence": "the native model catalogue omitted the requested model",
+                "where": "plugin.opencode.configure.catalogue",
             }));
         }
         // The same membership rule as the start and resume paths, before

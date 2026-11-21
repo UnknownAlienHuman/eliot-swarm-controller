@@ -1312,7 +1312,11 @@ pub(super) fn transition_lost_tx(
         )?;
     }
 
-    mark_lost_turn_unknown_tx(tx, &agent, agent_num, generation, now, reason, events)?;
+    let failure = eliot_core::swarm_loss_location(reason)
+        .map(|(fallback, location)| (origin.unwrap_or(fallback), location));
+    mark_lost_turn_unknown_tx(
+        tx, &agent, agent_num, generation, now, reason, failure, events,
+    )?;
 
     db!(tx.execute(
         "UPDATE agents SET state = 'lost', active_turn = NULL, pending = '[]',
@@ -1335,12 +1339,8 @@ pub(super) fn transition_lost_tx(
     // for this reason. A failed start on a missing external credential keeps
     // its `environment` origin instead of being retyped as Agent software.
     let mut data = json!({"agent_id": agent.id, "reason": reason});
-    if let Some((fallback_origin, location)) = eliot_core::swarm_loss_location(reason) {
-        data["origin"] = json!(
-            origin
-                .unwrap_or(fallback_origin)
-                .as_str()
-        );
+    if let Some((origin, location)) = failure {
+        data["origin"] = json!(origin.as_str());
         data["where"] = json!(location);
     }
     if let Some(exit) = exit.filter(|exit| !exit.is_empty()) {
@@ -1371,6 +1371,7 @@ pub(super) fn transition_lost_tx(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn mark_lost_turn_unknown_tx(
     tx: &Transaction<'_>,
     agent: &Agent,
@@ -1378,6 +1379,7 @@ fn mark_lost_turn_unknown_tx(
     generation: i64,
     now: i64,
     reason: &str,
+    failure: Option<(eliot_core::FailureOrigin, &str)>,
     events: &mut Vec<Event>,
 ) -> Result<()> {
     if let Some(turn_id) = agent.active_turn.as_deref() {
@@ -1411,7 +1413,7 @@ fn mark_lost_turn_unknown_tx(
         }
         let cause = command_cause_for_turn_tx(tx, agent_num, generation, turn_id)?;
         let mut data = json!({"turn_id": turn_id, "reason": reason});
-        if let Some((origin, location)) = eliot_core::swarm_loss_location(reason) {
+        if let Some((origin, location)) = failure {
             data["origin"] = json!(origin.as_str());
             data["where"] = json!(location);
         }

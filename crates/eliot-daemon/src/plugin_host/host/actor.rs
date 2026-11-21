@@ -6,7 +6,7 @@
 //! hosts the loop so host.rs no longer concentrates it alongside
 //! authenticated source-request intake.
 
-use super::super::connection::MAX_PENDING_CALLS;
+use super::super::connection::{MAX_PENDING_CALLS, PLUGIN_TRANSPORT_WHERE};
 use super::{
     AgentActorConfig, MAX_PENDING_SNAPSHOT_READS, PendingFailure, PendingSnapshotFuture,
     PendingSteerFuture, PluginClient, PluginCommandCompletion, PluginSnapshotCompletion, RPC_GRACE,
@@ -20,8 +20,8 @@ use super::{
 };
 use crate::monitor::Monitoring;
 use crate::platform::OwnedChild;
-use eliot_core::{Agent, AgentStartParams, Error, Result};
-use eliot_plugin::StderrView;
+use eliot_core::{Agent, AgentStartParams, Error, FailureOrigin, Result};
+use eliot_plugin::{StderrCapture, StderrView};
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use serde_json::{Value, json};
 use std::sync::{Arc, Weak};
@@ -191,6 +191,7 @@ pub(super) async fn settle_observed_root_exit(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_agent_inner(
     actor: AgentActorConfig,
     mut child: Option<OwnedChild>,
@@ -198,6 +199,7 @@ pub(super) async fn run_agent_inner(
     mut event_task: tokio::task::JoinHandle<()>,
     mut messages: mpsc::Receiver<RuntimeMessage>,
     started: oneshot::Sender<Result<Value>>,
+    stderr_capture: &mut Option<StderrCapture>,
     pending_failure: &mut Option<PendingFailure>,
 ) {
     // Drop order is load-bearing: every handle stays owned by this frame and
@@ -211,6 +213,7 @@ pub(super) async fn run_agent_inner(
         &mut child,
         &mut event_task,
         started,
+        stderr_capture,
         pending_failure,
     )
     .await
@@ -292,6 +295,7 @@ async fn run_agent_startup(
     child: &mut Option<OwnedChild>,
     event_task: &mut tokio::task::JoinHandle<()>,
     started: oneshot::Sender<Result<Value>>,
+    stderr_capture: &mut Option<StderrCapture>,
     pending_failure: &mut Option<PendingFailure>,
 ) -> bool {
     let initialize_started = Instant::now();
@@ -299,7 +303,7 @@ async fn run_agent_startup(
         Ok(source_plan) => source_plan,
         Err(error) => {
             let proven_no_dispatch = error.code == "native_not_dispatched";
-            let origin = error.origin.or(Some(eliot_core::FailureOrigin::Harness));
+            let origin = startup_loss_origin(&error);
             let _ = started.send(Err(error));
             cleanup_startup(
                 actor,
@@ -307,6 +311,7 @@ async fn run_agent_startup(
                     .take()
                     .expect("actor owns the starting child until cleanup"),
                 &mut *event_task,
+                stderr_capture,
                 pending_failure,
                 proven_no_dispatch,
                 origin,
@@ -323,7 +328,7 @@ async fn run_agent_startup(
     let resume_config = match resolve_resume_config(actor).await {
         Ok(resume_config) => resume_config,
         Err(error) => {
-            let origin = error.origin;
+            let origin = startup_loss_origin(&error);
             let _ = started.send(Err(error));
             cleanup_startup(
                 actor,
@@ -331,6 +336,7 @@ async fn run_agent_startup(
                     .take()
                     .expect("actor owns the starting child until cleanup"),
                 &mut *event_task,
+                stderr_capture,
                 pending_failure,
                 true,
                 origin,
@@ -439,7 +445,7 @@ async fn run_agent_startup(
             };
             let uncertain = error.code == "unknown";
             let proven_no_dispatch = error.code == "native_not_dispatched";
-            let origin = error.origin.or(Some(eliot_core::FailureOrigin::Harness));
+            let origin = startup_loss_origin(&error);
             let _ = started.send(Err(error));
             if !uncertain || native_endpoint_exited {
                 cleanup_startup(
@@ -448,6 +454,7 @@ async fn run_agent_startup(
                         .take()
                         .expect("actor owns the starting child until cleanup"),
                     &mut *event_task,
+                    stderr_capture,
                     pending_failure,
                     proven_no_dispatch,
                     origin,
@@ -458,6 +465,16 @@ async fn run_agent_startup(
         }
     }
     true
+}
+
+fn startup_loss_origin(error: &Error) -> Option<FailureOrigin> {
+    // The daemon's RPC classification describes the broken pipe. The loss
+    // event describes the owned plugin process and keeps its own evidence.
+    if error.failure_where.as_deref() == Some(PLUGIN_TRANSPORT_WHERE) {
+        None
+    } else {
+        error.origin
+    }
 }
 
 /// Typed process/source/control message handling: supervise the plugin child,

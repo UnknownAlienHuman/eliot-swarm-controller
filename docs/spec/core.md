@@ -617,12 +617,13 @@ codes, never from message text. Exit codes ride alongside (`exit_code`, plus an
 | Insufficient evidence | `unknown`, stating the missing evidence |
 
 The restart's `agent.lost` and `turn.unknown` events carry `origin: swarm` and
-`where: daemon.restart` beside `reason: daemon_restart`; an owned plugin process
-exit, whether its root exited on its own, the daemon's owner channel closed first,
-the reader reached EOF with no terminal fact, or a start failed, carries
-`origin: harness` and `where: plugin.exit` beside its own typed reason
-([`swarm_loss_location`](../../crates/eliot-core/src/lib.rs)); a retained loss
-written before those fields existed classifies from that typed reason code alone.
+`where: daemon.restart` beside `reason: daemon_restart`. A spontaneous plugin
+root exit, reader EOF without a session terminal, or failed startup that loses
+the owned plugin generation carries `where: plugin.exit`. The producer's origin
+is retained when supplied, with `harness` as the default. Closure of the daemon's
+own control channel alone does not establish plugin failure. A retained loss
+without attribution uses its typed reason code
+([`swarm_loss_location`](../../crates/eliot-core/src/lib.rs)).
 
 Redact complete messages and evidence before imposing their persistence/wire bounds.
 Constructors retain complete text until the owning policy is available. No minimum

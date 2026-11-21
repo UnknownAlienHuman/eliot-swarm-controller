@@ -1,4 +1,4 @@
-use super::{PluginClient, PluginConnection};
+use super::{PluginClient, PluginConnection, connection::PLUGIN_TRANSPORT_WHERE};
 use eliot_core::is_start_verb;
 mod actor;
 mod discovery;
@@ -177,12 +177,6 @@ impl ForceStopGuard {
     pub(crate) fn finish(mut self) {
         self.committed = true;
     }
-
-    /// Remember that this daemon itself settled the generation's channel, so
-    /// an actor sender-drop afterward is not read as a plugin failure.
-    fn mark_channel_settled(&self, state: &HostState) {
-        state.settled_channels.lock_recover().insert(self.key.clone());
-    }
 }
 
 impl Drop for ForceStopGuard {
@@ -193,7 +187,6 @@ impl Drop for ForceStopGuard {
         // Clear synchronously even when the enclosing future is cancelled.
         // Only this attempt owns the entry; actor cleanup must not remove it.
         state.planned_stops.lock_recover().remove(&self.key);
-        self.mark_channel_settled(state);
         let deferred = self.deferred_loss.lock_recover().take();
         // Replay the retained observation, never the planned force-stop label:
         // a force-stop that fails or is cancelled without any observed exit
@@ -300,10 +293,6 @@ struct HostState {
     late_batch_causes: Mutex<HashMap<AgentKey, String>>,
     running: Mutex<HashMap<AgentKey, RuntimeEntry>>,
     planned_stops: Mutex<HashMap<AgentKey, Arc<Mutex<Option<DeferredLoss>>>>>,
-    /// Keys whose owner channel was dropped by a settlement this daemon
-    /// started (a stop or force attempt): the actor must not report that drop
-    /// as an unrequested plugin failure. Only ever set under the running map.
-    settled_channels: Mutex<HashSet<AgentKey>>,
     startup_gate: AsyncMutex<()>,
     startup_closed: AtomicBool,
     observers: Mutex<HashMap<AgentKey, Arc<observation::ObserverEntry>>>,
@@ -426,7 +415,6 @@ impl PluginHost {
                 late_batch_causes: Mutex::new(HashMap::new()),
                 running: Mutex::new(HashMap::new()),
                 planned_stops: Mutex::new(HashMap::new()),
-                settled_channels: Mutex::new(HashSet::new()),
                 startup_gate: AsyncMutex::new(()),
                 startup_closed: AtomicBool::new(false),
                 observers: Mutex::new(HashMap::new()),
@@ -1549,6 +1537,8 @@ async fn run_agent(
 ) {
     let credentials = Arc::clone(&actor.source_credentials);
     let key = actor.key.clone();
+    let stderr = actor.stderr.clone();
+    let mut stderr_capture = Some(stderr_capture);
     let mut failure = None;
     run_agent_inner(
         actor,
@@ -1557,12 +1547,16 @@ async fn run_agent(
         event_task,
         messages,
         started,
+        &mut stderr_capture,
         &mut failure,
     )
     .await;
     // All existing child/custody cleanup paths have completed or dropped their
     // owning handle. Finish the sole stderr drain before the final error view.
-    let snapshot = stderr_capture.finish(Instant::now() + STOP_GRACE).await;
+    let snapshot = match stderr_capture {
+        Some(capture) => capture.finish(Instant::now() + STOP_GRACE).await,
+        None => stderr.snapshot(),
+    };
     if let Some(failure) = failure {
         let error = redact_native_error(
             failure.error.with_stderr(StderrSource::Plugin, snapshot),
@@ -1691,15 +1685,12 @@ async fn cleanup_startup(
     actor: &AgentActorConfig,
     child: OwnedChild,
     event_task: &mut tokio::task::JoinHandle<()>,
+    stderr_capture: &mut Option<StderrCapture>,
     pending_failure: &mut Option<PendingFailure>,
     proven_no_dispatch: bool,
     origin: Option<eliot_core::FailureOrigin>,
 ) {
     let exited = terminate_child(child, &actor.monitoring, &actor.agent).await;
-    // A plugin that panicked on its own left a crash marker in exactly this
-    // owned process pipe. Record that evidence beside the loss so diagnosis
-    // says why the Agent software died, not only that its start failed.
-    let panic_tail = plugin_crash_marker(&actor.stderr).map(|marker| marker.summary());
     // `settle_owned_source_exit` returns Ok only after positive custody exit,
     // completed reader drain, and the committed exit gap (see
     // `settle_drained_source_exit`). This failed-start path never enters the
@@ -1717,30 +1708,23 @@ async fn cleanup_startup(
     )
     .await;
     if settled.is_ok() && !proven_no_dispatch {
-        match panic_tail {
-            Some(tail) => {
-                mark_lost_state_with_exit(
-                    &actor.state,
-                    &actor.key,
-                    "plugin_startup_exit",
-                    None,
-                    Some(tail),
-                    origin,
-                )
-                .await;
-            }
-            None => {
-                mark_lost_state_with_exit(
-                    &actor.state,
-                    &actor.key,
-                    "plugin_startup_exit",
-                    None,
-                    None,
-                    origin,
-                )
-                .await;
-            }
-        }
+        // The stderr reader is independent of the source reader. Join it
+        // before inspecting the final bytes of a plugin that panicked.
+        let stderr = stderr_capture
+            .take()
+            .expect("startup owns the stderr capture until cleanup")
+            .finish(Instant::now() + STOP_GRACE)
+            .await;
+        let panic_tail = plugin_crash_marker(&stderr.text).map(|marker| marker.summary());
+        mark_lost_state_with_exit(
+            &actor.state,
+            &actor.key,
+            "plugin_startup_exit",
+            None,
+            panic_tail,
+            origin,
+        )
+        .await;
     } else if let Err(error) = settled {
         pending_failure.get_or_insert(PendingFailure {
             reply: None,
@@ -2092,17 +2076,19 @@ fn diagnose_error(error: Error, stderr: &StderrView, credentials: &[String]) -> 
     // never enter this path. Marker evidence never replaces the effect code.
     let snapshot = stderr.snapshot();
     let mut error = error;
-    for line in snapshot.text.lines() {
-        if let Some(json) = line.strip_prefix("eliot_crash ")
-            && let Ok(marker) = serde_json::from_str::<eliot_core::api::CrashMarker>(json)
-            && marker.code == "plugin.panicked"
-            && marker.validate().is_ok()
-        {
+    if let Some(marker) = plugin_crash_marker(&snapshot.text) {
+        let summary = marker.summary();
+        if error.failure_where.as_deref() == Some(PLUGIN_TRANSPORT_WHERE) {
+            error = error
+                .with_where(eliot_core::PLUGIN_EXIT_WHERE)
+                .with_origin(eliot_core::FailureOrigin::Harness, &summary)
+                .with_message(summary);
+        } else {
             let evidence = error
                 .origin_evidence
                 .as_deref()
                 .unwrap_or("original failure origin unclassified");
-            error.origin_evidence = Some(format!("{evidence}; {}", marker.summary()).into());
+            error.origin_evidence = Some(format!("{evidence}; {summary}").into());
         }
     }
     redact_native_error(
@@ -3383,10 +3369,8 @@ async fn mark_lost_state(state: &Weak<HostState>, key: &AgentKey, reason: &'stat
 /// The one owned plugin crash marker in this stderr snapshot, if any. Only
 /// the exact owned process pipe is ever read here; a disk marker belonging to
 /// another process or generation cannot enter this path.
-fn plugin_crash_marker(stderr: &StderrView) -> Option<eliot_core::api::CrashMarker> {
-    let snapshot = stderr.snapshot();
-    snapshot
-        .text
+fn plugin_crash_marker(stderr: &str) -> Option<eliot_core::api::CrashMarker> {
+    stderr
         .lines()
         .filter_map(|line| line.strip_prefix("eliot_crash "))
         .filter_map(|json| serde_json::from_str::<eliot_core::api::CrashMarker>(json).ok())
@@ -3428,17 +3412,15 @@ async fn mark_lost_state_with_exit(
             }
             return;
         }
-        if let Ok(events) =
-            store.mark_lost_with_exit(
-                &key.id,
-                key.generation,
-                now_ms(),
-                reason,
-                exit,
-                stderr_tail,
-                origin,
-            )
-        {
+        if let Ok(events) = store.mark_lost_with_exit(
+            &key.id,
+            key.generation,
+            now_ms(),
+            reason,
+            exit,
+            stderr_tail,
+            origin,
+        ) {
             state.bus.publish(&events);
             note_unknown_commands(&state, &events);
         }

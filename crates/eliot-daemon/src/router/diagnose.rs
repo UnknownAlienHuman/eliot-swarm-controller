@@ -100,18 +100,16 @@ impl Router {
         // produced sits on its linked input expansion (`<id>/send`), the
         // command that actually settled the turn. Diagnosing the start alone
         // would report success, so follow that exact link when it exists.
-        let linked_send = store
-            .get_command(&format!("{command_id}/send"))?
-            .filter(|linked| {
-                linked.target.as_deref() == command.target.as_deref()
-                    && linked.generation == command.generation
+        let linked_send = if eliot_core::is_start_verb(&command.verb) {
+            store.get_linked_send(command_id)?.filter(|linked| {
+                linked.target == command.target && linked.generation == command.generation
             })
-            .map(|linked| linked.id.clone());
+        } else {
+            None
+        };
         let mut steps = vec![command_step(&command)];
-        if let Some(linked) = linked_send.as_deref()
-            && let Some(child) = store.get_command(linked)?
-        {
-            steps.push(command_step(&child));
+        if let Some(linked) = &linked_send {
+            steps.push(command_step(linked));
         }
         let mut preceded_by = None;
         if let (Some(agent), Some(generation)) = (command.target.as_deref(), command.generation)
@@ -128,8 +126,8 @@ impl Router {
                 // a linked send.
                 let settled_here = turn_command.as_deref() == Some(command_id)
                     || linked_send
-                        .as_deref()
-                        .is_some_and(|linked| turn_command.as_deref() == Some(linked));
+                        .as_ref()
+                        .is_some_and(|linked| turn_command.as_deref() == Some(linked.id.as_str()));
                 if !settled_here {
                     continue;
                 }
@@ -421,9 +419,17 @@ fn outcome_code(outcome: &Value) -> Option<String> {
 fn turn_step(turn: &Turn, terminal: Option<&Event>) -> DiagnoseStep {
     let mut message = terminal
         .and_then(|event| event.data.get("native_error")?.get("message")?.as_str())
-        .or(turn.native_status.as_deref())
-        .or(turn.status.as_deref())
-        .map(|message| bound_chars(message, 1024));
+        .map(|message| bound_chars(message, 1024))
+        .or_else(|| {
+            let reason = terminal?.data.get("reason")?.as_str()?;
+            eliot_core::swarm_loss_location(reason).map(|_| eliot_core::reason_words(reason))
+        })
+        .or_else(|| {
+            turn.native_status
+                .as_deref()
+                .or(turn.status.as_deref())
+                .map(|message| bound_chars(message, 1024))
+        });
     if let Some(reset) = terminal.and_then(|event| {
         event
             .data
