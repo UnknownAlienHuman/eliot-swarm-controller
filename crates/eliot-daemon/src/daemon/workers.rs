@@ -17,6 +17,7 @@ pub(crate) const WORKER_NAMES: [&str; 8] = [
 const INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const HEALTHY_RUN_RESET: Duration = Duration::from_secs(60);
+const WORKER_FAILURE_LIMIT: u32 = 5;
 
 pub(crate) enum WorkerOutcome {
     Stopped,
@@ -72,6 +73,23 @@ impl WorkerReporter {
             &fields,
             Some(error),
         );
+    }
+
+    async fn attention(&self, name: &str, failures: u32, error: &Error) {
+        let code = bounded_failure_code(&error.code);
+        let attempt = failures.to_string();
+        let fields = [("worker", name), ("attempt", attempt.as_str())];
+        logging::record(
+            &self.policy,
+            "daemon.worker_attention",
+            &fields,
+            Some(error),
+        );
+        if let Err(error) = self.router.report_daemon_attention(format!(
+            "The {name} worker stopped after {failures} consecutive failures ({code}). Check the daemon log before restarting Swarm."
+        )).await {
+            logging::record(&self.policy, "daemon.attention_delivery_failed", &fields, Some(&error));
+        }
     }
 }
 
@@ -159,8 +177,13 @@ pub(crate) async fn supervise_with<F, Fut, H>(
                 if started.elapsed() >= HEALTHY_RUN_RESET {
                     consecutive_failures = 0;
                 }
-                restart_count = restart_count.saturating_add(1);
                 consecutive_failures = consecutive_failures.saturating_add(1);
+                if consecutive_failures >= WORKER_FAILURE_LIMIT {
+                    reporter.failed(name, &error, restart_count, None);
+                    reporter.attention(name, consecutive_failures, &error).await;
+                    return;
+                }
+                restart_count = restart_count.saturating_add(1);
                 let delay = retry_backoff(consecutive_failures);
                 reporter.failed(name, &error, restart_count, Some(delay));
                 if !wait_for_retry(&mut shutdown, delay).await {

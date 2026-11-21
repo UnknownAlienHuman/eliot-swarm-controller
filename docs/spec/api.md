@@ -2488,7 +2488,9 @@ the retention view (store sizes, configured windows or unbounded,
 
 Local IPC accept failures are logged and retried with bounded backoff.
 During the delay, admitted work and existing connections continue, and the
-daemon still honors shutdown.
+daemon still honors shutdown. A successful accept with a usable listener
+clears the failure count. After 20 consecutive failures, the daemon records
+Owner attention and exits with `ipc_accept_exhausted`.
 
 Drain rejects new turn-producing work and new automation, while continuing pre-admitted
 work and allowing exact stop/interrupt/request replies/cancel/detach/readback. Unknown

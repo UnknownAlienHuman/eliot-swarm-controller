@@ -73,6 +73,7 @@ pub async fn client_call_measured(
     Ok((value, timings))
 }
 const MAX_CLIENTS: usize = 128;
+const ACCEPT_FAILURE_LIMIT: u32 = 20;
 const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(35);
 const OVERLOAD_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// Bound for one server-side response write. A peer that stops reading must
@@ -633,44 +634,32 @@ async fn supervise(mut supervision: DaemonSupervision) -> (Result<()>, DaemonSup
         }
         tokio::select! {
             accepted = listener.accept(), if accept_retry_at.is_none() => {
-                match accepted {
-                    Ok(stream) => {
-                        if let Some(error) = listener.take_replacement_error() {
-                            accept_failures = accept_failures.saturating_add(1);
-                            accept_retry_at = Some(note_accept_retry(
-                                &policy,
-                                accept_failures,
-                                &error,
-                            ));
-                        } else {
-                            accept_failures = 0;
-                            accept_retry_at = None;
-                        }
-                        if connections.len() < MAX_CLIENTS {
-                            let router = router.clone();
-                            let policy = Arc::clone(&policy);
-                            connections.spawn(async move {
-                                serve_connection(stream, router, policy).await;
-                            });
-                        } else {
-                            // At the connection limit the request was never read
-                            // or routed, so nothing was admitted. Echo one typed
-                            // retryable refusal instead of dropping silently.
-                            tokio::spawn(async move {
-                                reply_overloaded(stream).await;
-                            });
-                        }
+                let (stream, error) = match accepted {
+                    Ok(stream) => (Some(stream), listener.take_replacement_error()),
+                    Err(error) => (None, Some(error)),
+                };
+                if let Some(error) = error {
+                    if router.is_force_requested() {
+                        break Ok(());
                     }
-                    Err(error) => {
-                        if router.is_force_requested() {
-                            break Ok(());
-                        }
-                        accept_failures = accept_failures.saturating_add(1);
-                        accept_retry_at = Some(note_accept_retry(
-                            &policy,
-                            accept_failures,
-                            &error,
-                        ));
+                    accept_failures = accept_failures.saturating_add(1);
+                    if accept_failures >= ACCEPT_FAILURE_LIMIT {
+                        break Err(report_accept_exhausted(&router, &policy, accept_failures, &error).await);
+                    }
+                    accept_retry_at = Some(note_accept_retry(&policy, accept_failures, &error));
+                } else {
+                    accept_failures = 0;
+                }
+                if let Some(stream) = stream {
+                    if connections.len() < MAX_CLIENTS {
+                        let router = router.clone();
+                        let policy = Arc::clone(&policy);
+                        connections.spawn(async move {
+                            serve_connection(stream, router, policy).await;
+                        });
+                    } else {
+                        // At the connection limit the request was never read or routed.
+                        tokio::spawn(reply_overloaded(stream));
                     }
                 }
             }
@@ -770,6 +759,34 @@ fn note_accept_retry(policy: &SecretPolicy, attempt: u32, error: &Error) -> Inst
         Some(error),
     );
     Instant::now() + delay
+}
+
+async fn report_accept_exhausted(
+    router: &Router,
+    policy: &SecretPolicy,
+    failures: u32,
+    error: &Error,
+) -> Error {
+    let attempt = failures.to_string();
+    let fields = [("attempt", attempt.as_str())];
+    logging::record(policy, "daemon.ipc_accept_attention", &fields, Some(error));
+    let message = format!(
+        "The local IPC listener failed {failures} consecutive times. Swarm is exiting. Check the daemon log for the last accept error."
+    );
+    if let Err(error) = router.report_daemon_attention(message.clone()).await {
+        logging::record(
+            policy,
+            "daemon.attention_delivery_failed",
+            &fields,
+            Some(&error),
+        );
+    }
+    Error::new("ipc_accept_exhausted", message)
+        .with_where("daemon.ipc.accept")
+        .with_origin(
+            FailureOrigin::Swarm,
+            "consecutive local IPC accept failures reached the retry limit",
+        )
 }
 
 /// Drain workers in dependency order after the supervision loop ends. Task

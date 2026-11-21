@@ -10,6 +10,22 @@ use tokio::time::timeout;
 
 const REPORT_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(15);
 
+impl Router {
+    pub(crate) async fn report_daemon_attention(&self, message: String) -> Result<()> {
+        let id = ulid::Ulid::new().to_string();
+        let message = self.secret_policy_snapshot().redact_text(&message);
+        Box::pin(self.submit(
+            &json!({"id": id, "verb": "notify", "args": {
+                "title": "Daemon attention",
+                "message": message,
+            }}),
+            &Principal::Owner,
+        ))
+        .await?;
+        wait_for_applied(self, &id).await
+    }
+}
+
 pub(super) async fn persist_and_notify(router: &Router, delivery: &FrozenReport) -> Result<()> {
     let report = &delivery.report;
     let data = serde_json::to_value(report)

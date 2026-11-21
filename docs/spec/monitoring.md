@@ -866,9 +866,12 @@ Missing custody proof and unresolved effects leave the old generation fenced.
 The daemon supervises long-lived rule, Goal, retention, monitoring, Git,
 attention, mail reoffer and completion digest workers. An unexpected failure
 is logged and retried with bounded backoff. `daemon.status` exposes worker
-health, a bounded failure code while failed, and the restart count. Shutdown
-cancels pending retries. A worker restart reconciles retained state and keeps
-the normal Store and router gates on effects.
+health, a bounded failure code while failed, and the restart count. A healthy
+run of at least one minute clears the consecutive-failure count. After five
+consecutive failures, the worker stays failed and the daemon records Owner
+attention. The daemon log retains the final error if the notice cannot be
+committed. Shutdown cancels pending retries. A worker restart reconciles
+retained state and keeps the normal Store and router gates on effects.
 
 `watch`, `top`, `show`, `daemon.status` query projections/events. They expose generation,
 active/unknown turn/input/transition gate, source owner/cursor/gap, custody
