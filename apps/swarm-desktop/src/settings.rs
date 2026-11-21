@@ -598,7 +598,9 @@ pub fn saved_window(data_dir: &Path) -> Option<WindowPlacement> {
         .clone()
         .try_into()
         .ok()
-        .filter(|window: &WindowPlacement| window.width >= 640 && window.height >= 480)
+        .filter(|window: &WindowPlacement| {
+            eliot_daemon::desktop_window_in_bounds(window.width, window.height, window.x, window.y)
+        })
 }
 
 pub async fn save(

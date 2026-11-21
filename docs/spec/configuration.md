@@ -1054,9 +1054,10 @@ Rules/scripts remain files owned by their existing APIs; settings references and
 automation policy do not create a second executor. Desktop preferences use
 `[desktop]`: `theme` (`system`, `light`, `dark`, `amoled`, `purple`, `neon`,
 `matrix`: the desktop's six palettes, `system` following Windows between
-light and dark), `window` (`width`/`height`: the normal client size in DIPs, at least
-640 by 480; optional `x`/`y`: the normal outer top-left in physical screen pixels;
-optional `maximized`), `startup` (`new_task`, or `last_conversation` to reopen the most
+light and dark), `window` (`width`/`height`: the normal client size in DIPs, from
+640 by 480 to 32768 by 32768; optional `x`/`y`: the normal outer top-left in physical
+screen pixels, from -32768 to 32768; optional `maximized`; out of these bounds the
+settings are refused and the desktop opens at its defaults), `startup` (`new_task`, or `last_conversation` to reopen the most
 recently active Agent's conversation), `last_access` (`ask`, `auto` or `full`), and
 these bounded lists: `favorite_models` (`{harness, model, effort?}`), `recent_models`
 (most-recent-first `{harness, model, effort?}`), `collapsed_projects` (the sidebar's

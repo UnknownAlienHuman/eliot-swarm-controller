@@ -21,9 +21,9 @@
 
 use std::cell::Cell;
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, MonitorFromRect,
+    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect,
 };
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::HiDpi::{
@@ -169,47 +169,55 @@ fn is_winui(window: HWND) -> bool {
 }
 
 /// The outer rectangle (x, y, width, height) for a saved top-left and
-/// client size: the client in the target monitor's pixels plus the frame
-/// of the window's `(style, extended style)`, kept inside the work area of
-/// the attached monitor nearest to it.
+/// client size. The attached monitor nearest to the saved rectangle is the
+/// one the window lands on: the client is converted with that monitor's
+/// DPI, the frame of the window's `(style, extended style)` is added, and
+/// the result is kept inside that monitor's work area. The settings check
+/// bounds the saved values; the math saturates as a defence.
 fn place(
     (x, y): (i32, i32),
     (width, height): (u32, u32),
     (style, ex_style): (u32, u32),
 ) -> (i32, i32, i32, i32) {
-    // SAFETY: plain value arguments; NEAREST always returns a monitor.
-    let monitor = unsafe { MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST) };
+    let dips = |value: u32| i32::try_from(value).unwrap_or(i32::MAX);
+    // The landing monitor, from the saved rectangle at 96 DPI.
+    let estimate = RECT {
+        left: x,
+        top: y,
+        right: x.saturating_add(dips(width)),
+        bottom: y.saturating_add(dips(height)),
+    };
+    // SAFETY: valid rectangle; NEAREST always returns a monitor.
+    let monitor = unsafe { MonitorFromRect(&estimate, MONITOR_DEFAULTTONEAREST) };
     let (mut dpi, mut dpi_y) = (96, 96);
     // SAFETY: valid monitor and out-pointers.
     unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi, &mut dpi_y) };
     let dpi = dpi.max(96);
-    let pixels = |dips: u32| (f64::from(dips) * f64::from(dpi) / 96.0).round() as i32;
-    let mut wanted = RECT {
-        left: x,
-        top: y,
-        right: x.saturating_add(pixels(width)),
-        bottom: y.saturating_add(pixels(height)),
+    let pixels = |value: u32| {
+        (f64::from(value) * f64::from(dpi) / 96.0)
+            .round()
+            .min(f64::from(i32::MAX)) as i32
+    };
+    // The frame, measured on a client rectangle at the origin.
+    let mut outer = RECT {
+        left: 0,
+        top: 0,
+        right: pixels(width),
+        bottom: pixels(height),
     };
     // SAFETY: a valid rectangle; on failure it stays the client rectangle.
-    unsafe { AdjustWindowRectExForDpi(&mut wanted, style, 0, ex_style, dpi) };
-    let (width, height) = (wanted.right - wanted.left, wanted.bottom - wanted.top);
-    let wanted = RECT {
-        left: x,
-        top: y,
-        right: x.saturating_add(width),
-        bottom: y.saturating_add(height),
-    };
-    // SAFETY: valid rectangle; NEAREST always returns a monitor.
-    let monitor = unsafe { MonitorFromRect(&wanted, MONITOR_DEFAULTTONEAREST) };
+    unsafe { AdjustWindowRectExForDpi(&mut outer, style, 0, ex_style, dpi) };
+    let width = outer.right.saturating_sub(outer.left).max(1);
+    let height = outer.bottom.saturating_sub(outer.top).max(1);
     let Some(info) = monitor_info(monitor) else {
         return (x, y, width, height);
     };
     let work = info.rcWork;
-    let width = width.min(work.right - work.left);
-    let height = height.min(work.bottom - work.top);
+    let width = width.min(work.right.saturating_sub(work.left));
+    let height = height.min(work.bottom.saturating_sub(work.top));
     (
-        x.clamp(work.left, work.right - width),
-        y.clamp(work.top, work.bottom - height),
+        x.clamp(work.left, work.right.saturating_sub(width).max(work.left)),
+        y.clamp(work.top, work.bottom.saturating_sub(height).max(work.top)),
         width,
         height,
     )
