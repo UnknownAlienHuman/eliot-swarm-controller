@@ -321,9 +321,9 @@ Read [coordination](spec/coordination.md). Use two Codex Agents initially.
       transferred task, no-effect original cancellation, exact claim expiry preserved,
       same-ID replay without another turn, and active-source refusal.
 - [x] **H3 Agent switch.** Owner launch-plus-handoff through ordinary durable
-      commands, reserved IDs before external preparation, promptless native launch
-      and exact committed readiness before the shared H2 transfer. A definitely
-      created B is finished through ordinary `swarm.handoff`; no finish mutation.
+      commands, source preflight before launch, promptless native launch and
+      exact committed readiness before the shared H2 transfer. A definite late
+      refusal admits an ordinary stop for the exact unused successor.
       Qualified 2026-11-15: Codex Sol low to a new Antigravity Hydrogen low,
       brief then transferred task completed, no-effect original cancellation,
       claim expiry preserved, same-ID replay without another Agent/turn,
