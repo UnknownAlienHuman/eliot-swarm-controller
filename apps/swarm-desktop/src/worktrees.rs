@@ -82,7 +82,7 @@ impl CleanupGroup {
         Self::Other,
     ];
 
-    /// Native session archives and project settings changes are opt-in.
+    /// Native session cleanup and project settings changes are opt-in.
     pub fn checked_by_default(self) -> bool {
         !matches!(self, Self::Sessions | Self::ProjectRegistrations)
     }
@@ -102,7 +102,7 @@ impl CleanupGroup {
             Self::Build => "Build and target folders",
             Self::Temp => "Temporary folders",
             Self::Chats => "Chat folders",
-            Self::Sessions => "Native session archives",
+            Self::Sessions => "Native sessions",
             Self::ProjectRegistrations => "Project registrations",
             Self::Other => "Other folders",
         }
@@ -206,7 +206,8 @@ pub fn reason_words(reason: &str) -> String {
     match reason {
         "terminal_owned_artifact" => "its task finished".to_owned(),
         "native_archive_pending" => "archive the finished app session".to_owned(),
-        "no_native_archive" => "its app cannot archive sessions".to_owned(),
+        "no_native_archive" => "the app keeps its chat history".to_owned(),
+        "native_archive_refused" => "the app kept its session".to_owned(),
         "agent_not_quiescent" => {
             "its task is not finished: it is running or was interrupted".to_owned()
         }
@@ -295,7 +296,10 @@ pub fn item_line(item: &CleanupCandidate, title: Option<&str>) -> (String, Strin
     };
     // The app is known here: name it rather than "its app".
     let reason = match item.reason.as_str() {
-        "no_native_archive" => format!("{harness} cannot archive its sessions"),
+        "native_archive_pending" if item.artifact.purpose == "opencode" => {
+            "delete the finished OpenCode session".to_owned()
+        }
+        "no_native_archive" => format!("{harness} keeps its chat history"),
         other => reason_words(other),
     };
     (name, format!("{owner}{size}{verdict}: {reason}{place}"))

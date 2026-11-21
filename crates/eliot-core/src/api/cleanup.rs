@@ -114,7 +114,9 @@ pub struct CleanupPlanRequest {
     /// the caller and filters; older JSON-text tokens and continuation
     /// objects remain accepted on input.
     #[serde(default, deserialize_with = "deserialize_cleanup_continuation")]
-    #[schemars(description = "Opaque cleanup continuation string. Legacy JSON text or a continuation object is accepted on input.")]
+    #[schemars(
+        description = "Opaque cleanup continuation string. Legacy JSON text or a continuation object is accepted on input."
+    )]
     #[schemars(with = "Option<CleanupContinuationInputSchema>")]
     pub continuation: Option<String>,
 }
@@ -219,14 +221,15 @@ impl PlanContinuation {
     }
     pub fn decode(text: &str) -> Result<Self> {
         let parsed = if let Some(encoded) = text.strip_prefix("c1_") {
-            if encoded.is_empty() || encoded.len() % 2 != 0 {
+            let (pairs, trailing) = encoded.as_bytes().as_chunks::<2>();
+            if pairs.is_empty() || !trailing.is_empty() {
                 return Err(Error::new("invalid", "cleanup continuation is invalid"));
             }
-            let mut payload = Vec::with_capacity(encoded.len() / 2);
-            for pair in encoded.as_bytes().chunks_exact(2) {
-                let high = cleanup_hex_value(pair[0])
+            let mut payload = Vec::with_capacity(pairs.len());
+            for &[high, low] in pairs {
+                let high = cleanup_hex_value(high)
                     .ok_or_else(|| Error::new("invalid", "cleanup continuation is invalid"))?;
-                let low = cleanup_hex_value(pair[1])
+                let low = cleanup_hex_value(low)
                     .ok_or_else(|| Error::new("invalid", "cleanup continuation is invalid"))?;
                 payload.push((high << 4) | low);
             }
@@ -267,15 +270,12 @@ impl PlanContinuation {
             || (self.inventory_rank == Some(3) && self.inventory_seq_after.is_some())
             || (self.snapshot_seq.is_none()
                 && (self.inventory_rank.is_some() || self.inventory_seq_after.is_some()))
-            || self
-                .request_binding
-                .as_deref()
-                .is_some_and(|binding| {
-                    binding.len() != 64
-                        || binding
-                            .bytes()
-                            .any(|byte| cleanup_hex_value(byte).is_none())
-                })
+            || self.request_binding.as_deref().is_some_and(|binding| {
+                binding.len() != 64
+                    || binding
+                        .bytes()
+                        .any(|byte| cleanup_hex_value(byte).is_none())
+            })
         {
             return Err(Error::new("invalid", "cleanup continuation is invalid"));
         }
@@ -300,11 +300,9 @@ where
     let value = Option::<serde_json::Value>::deserialize(deserializer)?;
     let token = match value {
         None => return Ok(None),
-        Some(serde_json::Value::String(text)) => {
-            PlanContinuation::decode(&text)
-                .and_then(|state| state.encode())
-                .map_err(serde::de::Error::custom)?
-        }
+        Some(serde_json::Value::String(text)) => PlanContinuation::decode(&text)
+            .and_then(|state| state.encode())
+            .map_err(serde::de::Error::custom)?,
         Some(value @ serde_json::Value::Object(_)) => {
             let state: PlanContinuation =
                 serde_json::from_value(value).map_err(serde::de::Error::custom)?;

@@ -11,8 +11,10 @@ use tokio::time::timeout;
 mod delete;
 mod projects;
 
-const CLEANUP_BACKFILL_PAGE: usize = 8;
-const CLEANUP_PLAN_MAX_PREFLIGHT: std::time::Duration = std::time::Duration::from_secs(15);
+const CLEANUP_BACKFILL_BATCH: usize = 8;
+const CLEANUP_BACKFILL_LIMIT: usize = 1_024;
+const CLEANUP_BACKFILL_BUDGET: Duration = Duration::from_secs(8);
+const CLEANUP_PLAN_MAX_PREFLIGHT: Duration = Duration::from_secs(15);
 
 fn encoded(value: impl serde::Serialize) -> Result<Value> {
     serde_json::to_value(value)
@@ -566,8 +568,7 @@ impl Router {
         params: &Value,
         principal: &Principal,
     ) -> Result<Value> {
-        let call_deadline =
-            tokio::time::Instant::now() + std::time::Duration::from_secs(25);
+        let call_deadline = Instant::now() + Duration::from_secs(25);
         let request: CleanupPlanRequest = coordination::decode_coordination_request(
             params,
             &self.inner.secrets,
@@ -609,98 +610,17 @@ impl Router {
             return Err(Error::new("invalid", "cleanup continuation is stale"));
         }
         if page.snapshot_seq.is_none() {
-            // Backfill one bounded Agent page, then return. Candidate
-            // preflights never share an RPC with this work.
-            let (agents, agents_truncated) = self
-                .inner
-                .store
-                .lock()
-                .await
-                .list_agents(page.backfill_after.as_deref(), CLEANUP_BACKFILL_PAGE)?;
-            let mut eligible_agents = Vec::new();
-            for (index, agent) in agents.iter().enumerate() {
-                if request
-                    .project
-                    .as_ref()
-                    .is_some_and(|project| project != &agent.project)
-                {
-                    continue;
-                }
-                if self
-                    .inner
-                    .store
-                    .lock()
-                    .await
-                    .cleanup_visible_agent(&name, agent)?
-                {
-                    eligible_agents.push(index);
-                }
-            }
-            let router = self;
-            let agents_ref = &agents;
-            let _backfill_results = futures_util::future::join_all(
-                eligible_agents.into_iter().map(|index| async move {
-                    (index, router.record_agent_artifacts(&agents_ref[index]).await)
-                }),
-            )
-            .await;
-            // Record failures are handled conservatively by retaining known
-            // ledger rows; do not strand fleet traversal on one unavailable
-            // checkout.
-            let backfill_after = agents
-                .last()
-                .map(|agent| agent.id.clone())
-                .or_else(|| page.backfill_after.clone());
-            let backfill_more =
-                agents_truncated || agents.len() == CLEANUP_BACKFILL_PAGE;
-            if backfill_more {
+            // Backfill within one slice, then freeze the inventory on the
+            // first candidate page. Large or slow fleets resume the backfill.
+            page.backfill_after = self
+                .backfill_cleanup_inventory(&name, &request, page.backfill_after)
+                .await?;
+            if page.backfill_after.is_some() {
+                page.request_binding = Some(binding);
                 plan.truncated = true;
-                plan.continuation = Some(
-                    PlanContinuation {
-                        artifact_after: None,
-                        safe_skipped: 0,
-                        kept_skipped: 0,
-                        regs_revision: None,
-                        snapshot_seq: None,
-                        safe_ids: None,
-                        kept_ids: None,
-                        backfill_after,
-                        inventory_rank: None,
-                        inventory_seq_after: None,
-                        request_binding: Some(binding),
-                    }
-                    .encode()?,
-                );
+                plan.continuation = Some(page.encode()?);
                 return encoded(plan);
             }
-
-            // Freeze the artifact snapshot only after every Agent was
-            // backfilled. A zero-item Store scan still records cursor
-            // progress through an empty or filtered page.
-            let (_, _, snapshot_seq, inventory_rank, inventory_seq_after) = self
-                .inner
-                .store
-                .lock()
-                .await
-                .cleanup_inventory(&name, &request, &page, 0)?;
-            plan.truncated = true;
-            plan.continuation = Some(
-                PlanContinuation {
-                    artifact_after: None,
-                    safe_skipped: 0,
-                    kept_skipped: 0,
-                    regs_revision: None,
-                    snapshot_seq: Some(snapshot_seq),
-                    safe_ids: None,
-                    kept_ids: None,
-                    backfill_after: None,
-                    inventory_rank: Some(inventory_rank),
-                    inventory_seq_after,
-                    request_binding: Some(binding),
-                }
-                .encode()?,
-            );
-            return encoded(plan);
         }
         let (safe_projects, kept_projects, regs_revision): (Vec<_>, Vec<_>, Option<String>) =
             if matches!(principal, Principal::Owner) {
@@ -767,13 +687,18 @@ impl Router {
             shown_safe.push(item);
         }
         let artifact_limit = MAX_CLEANUP_ITEMS - shown_safe.len();
-        let (artifacts, artifacts_truncated, snapshot_seq, next_inventory_rank, next_inventory_seq) =
-            self.inner
-                .store
-                .lock()
-                .await
-                .cleanup_inventory(&name, &request, &page, artifact_limit)?;
-        plan.truncated = artifacts_truncated;
+        let eliot_store::CleanupInventoryPage {
+            artifacts,
+            truncated: artifacts_truncated,
+            snapshot_seq,
+            next_rank,
+            next_seq,
+        } = self.inner.store.lock().await.cleanup_inventory(
+            &name,
+            &request,
+            &page,
+            artifact_limit,
+        )?;
         let artifacts_total = artifacts.len();
         let mut middle = Vec::new();
         for artifact in artifacts {
@@ -818,7 +743,7 @@ impl Router {
                     .cleanup_branch_classification_with_deadline(
                         &candidate.artifact,
                         git,
-                        std::time::Instant::now() + CLEANUP_PLAN_MAX_PREFLIGHT,
+                        Instant::now() + CLEANUP_PLAN_MAX_PREFLIGHT,
                     )
                     .await
                 {
@@ -886,16 +811,10 @@ impl Router {
         // Project rows consume page slots: when they displace artifact rows
         // off a full Store page, the listing continues even though the
         // Store reported no truncation of its own.
-        plan.truncated |= artifact_listing_truncated(
-            artifacts_truncated,
-            false,
-            artifacts_total,
-            middle_len,
-            safe_total,
-            page.safe_skipped + safe_shown,
-            kept_total,
-            page.kept_skipped + kept_shown,
-        );
+        plan.truncated = artifacts_truncated
+            || middle_len < artifacts_total
+            || page.safe_skipped + safe_shown < safe_total
+            || page.kept_skipped + kept_shown < kept_total;
         if plan.truncated {
             // The next page resumes after the last shown artifact inside the
             // same ledger snapshot, skipping the project rows already
@@ -921,18 +840,14 @@ impl Router {
                     safe_ids,
                     kept_ids,
                     backfill_after: None,
-                    inventory_rank: keep_scan_cursor.then_some(next_inventory_rank),
-                    inventory_seq_after: if keep_scan_cursor {
-                        next_inventory_seq
-                    } else {
-                        None
-                    },
+                    inventory_rank: keep_scan_cursor.then_some(next_rank),
+                    inventory_seq_after: if keep_scan_cursor { next_seq } else { None },
                     request_binding: Some(binding),
                 }
                 .encode()?,
             );
         }
-        if !plan.items.is_empty() {
+        if !plan.items.is_empty() || !plan.truncated {
             self.inner
                 .store
                 .lock()
@@ -940,6 +855,55 @@ impl Router {
                 .retain_cleanup_plan(&name, &plan, now_ms())?;
         }
         encoded(plan)
+    }
+
+    async fn backfill_cleanup_inventory(
+        &self,
+        principal: &str,
+        request: &CleanupPlanRequest,
+        mut after: Option<String>,
+    ) -> Result<Option<String>> {
+        let deadline = Instant::now() + CLEANUP_BACKFILL_BUDGET;
+        for _ in (0..CLEANUP_BACKFILL_LIMIT).step_by(CLEANUP_BACKFILL_BATCH) {
+            let (agents, truncated) = self
+                .inner
+                .store
+                .lock()
+                .await
+                .list_agents(after.as_deref(), CLEANUP_BACKFILL_BATCH)?;
+            let mut eligible = Vec::new();
+            for agent in &agents {
+                if request
+                    .project
+                    .as_ref()
+                    .is_none_or(|project| project == &agent.project)
+                    && self
+                        .inner
+                        .store
+                        .lock()
+                        .await
+                        .cleanup_visible_agent(principal, agent)?
+                {
+                    eligible.push(agent);
+                }
+            }
+            let backfill = futures_util::future::join_all(
+                eligible
+                    .into_iter()
+                    .map(|agent| self.record_agent_artifacts(agent)),
+            );
+            // A failed probe leaves existing ownership in the ledger.
+            // Move past the bounded batch even if a path is unavailable.
+            let _ = timeout_at(deadline, backfill).await;
+            if !truncated && agents.len() < CLEANUP_BACKFILL_BATCH {
+                return Ok(None);
+            }
+            after = agents.last().map(|agent| agent.id.clone()).or(after);
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+        Ok(after)
     }
 
     async fn classify_worktree(&self, candidate: &mut CleanupCandidate) {
@@ -1490,7 +1454,7 @@ impl Router {
         self.cleanup_branch_classification_with_deadline(
             artifact,
             git,
-            std::time::Instant::now() + Duration::from_secs(60),
+            Instant::now() + Duration::from_secs(60),
         )
         .await
     }
@@ -1499,7 +1463,7 @@ impl Router {
         &self,
         artifact: &ArtifactView,
         git: &CleanupGitBinding,
-        deadline: std::time::Instant,
+        deadline: Instant,
     ) -> Result<BranchClassification> {
         let workspace = self
             .inner
@@ -1528,7 +1492,7 @@ impl Router {
     async fn classify_branch(
         data_root: &Path,
         git: &CleanupGitBinding,
-        deadline: std::time::Instant,
+        deadline: Instant,
     ) -> Result<BranchClassification> {
         use crate::git_actions::{CleanupTransportOp, run_cleanup_transport};
         if !crate::git_actions::valid_cleanup_branch(&git.branch) {
@@ -2065,27 +2029,6 @@ fn continuation_order_valid(
     page.regs_revision == *revision
         && page.safe_ids.as_ref() == Some(&project_ids(safe))
         && page.kept_ids.as_ref() == Some(&project_ids(kept))
-}
-
-/// Whether the artifact listing continues: the Store still holds eligible
-/// rows, the agent backfill is capped, project rows remain, or project
-/// rows displaced artifact rows off this page.
-#[allow(clippy::too_many_arguments)]
-fn artifact_listing_truncated(
-    artifacts_truncated: bool,
-    inventory_incomplete: bool,
-    artifacts_total: usize,
-    middle_len: usize,
-    safe_total: usize,
-    safe_consumed: usize,
-    kept_total: usize,
-    kept_consumed: usize,
-) -> bool {
-    artifacts_truncated
-        || inventory_incomplete
-        || artifacts_total > middle_len
-        || safe_total > safe_consumed
-        || kept_total > kept_consumed
 }
 
 /// Splice one listing page in final candidate order: the already-offset

@@ -753,7 +753,7 @@ fn agent_row(task: &TaskEntry, input: &SidebarInput, context: &mut ViewContext<S
             row.depth + 1,
             title,
             quiet,
-            trailing.into(),
+            trailing,
             line,
         ));
     hover_area(hover_key, row_with_actions(row_button, actions), context)

@@ -607,19 +607,20 @@ impl DesktopApp {
         action: Action,
         context: &ComponentContext<Self>,
     ) {
-        match (action, target) {
-            (Action::Delete, Target::Agent(agent)) => {
-                if self.selected_agent_id().as_deref() == Some(agent.id.as_str()) {
-                    self.new_task(context);
-                }
-                let id = agent.id.clone();
-                let key = format!("delete:{id}");
-                self.submit_lifecycle("Delete", key, context, move |data_dir, mutation| {
-                    client::block_on(client::delete_agent(data_dir, mutation, &id))
-                        .map(|count| format!("{count} record tree(s) removed"))
-                });
+        if let (Action::Delete, Target::Agent(agent)) = (action, target) {
+            if self.selected_agent_id().as_deref() == Some(agent.id.as_str()) {
+                self.new_task(context);
             }
-            _ => {}
+            let id = agent.id;
+            let key = format!("delete:{id}");
+            self.submit_lifecycle("Delete", key, context, move |data_dir, mutation| {
+                client::block_on(client::delete_agent(data_dir, mutation, &id)).map(|count| {
+                    format!(
+                        "{} removed",
+                        eliot_core::count_words(count as u64, "task", "tasks")
+                    )
+                })
+            });
         }
     }
 

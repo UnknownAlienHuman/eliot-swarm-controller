@@ -18,8 +18,7 @@
 use super::*;
 use crate::theme::winui::Palette;
 use eliot_core::api::{
-    ArtifactKind, CleanupApplyRequest, CleanupApplyResponse, CleanupPlanRequest,
-    CleanupScope,
+    ArtifactKind, CleanupApplyRequest, CleanupApplyResponse, CleanupPlanRequest, CleanupScope,
 };
 
 /// What a bulk action does.

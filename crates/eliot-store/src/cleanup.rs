@@ -13,6 +13,14 @@ const CLEANUP_PLAN_RECLAIM_BATCH: i64 = 64;
 /// are settled or filtered out.
 const CLEANUP_INVENTORY_SCAN: usize = 256;
 
+pub struct CleanupInventoryPage {
+    pub artifacts: Vec<ArtifactView>,
+    pub truncated: bool,
+    pub snapshot_seq: i64,
+    pub next_rank: u8,
+    pub next_seq: Option<i64>,
+}
+
 /// An apply can read back its exact workspace command even after a crash
 /// between native removal and cleanup receipt settlement.
 pub fn cleanup_worktree_command_id(apply_id: &str, artifact_id: &str) -> Result<String> {
@@ -357,10 +365,13 @@ impl Store {
         request: &CleanupPlanRequest,
         page: &PlanContinuation,
         limit: usize,
-    ) -> Result<(Vec<ArtifactView>, bool, i64, u8, Option<i64>)> {
+    ) -> Result<CleanupInventoryPage> {
         request.validate()?;
         if limit > MAX_CLEANUP_ITEMS {
-            return Err(Error::new("invalid", "cleanup inventory page exceeds bound"));
+            return Err(Error::new(
+                "invalid",
+                "cleanup inventory page exceeds bound",
+            ));
         }
         let caller = parse_sender(principal, "cleanup")?;
         if !matches!(caller, Sender::Owner) && request.scope != CleanupScope::SelfTree {
@@ -399,8 +410,8 @@ impl Store {
                             }
                             other => sql_error(other),
                         })?;
-                    let kind: ArtifactKind = serde_json::from_value(Value::String(kind))
-                        .map_err(|_| {
+                    let kind: ArtifactKind =
+                        serde_json::from_value(Value::String(kind)).map_err(|_| {
                             Error::new("source_integrity", "invalid artifact ledger row")
                         })?;
                     if seq > snapshot {
@@ -414,7 +425,13 @@ impl Store {
             return Err(Error::new("invalid", "cleanup continuation is stale"));
         }
         if rank == 3 {
-            return Ok((Vec::new(), false, snapshot, rank, None));
+            return Ok(CleanupInventoryPage {
+                artifacts: Vec::new(),
+                truncated: false,
+                snapshot_seq: snapshot,
+                next_rank: rank,
+                next_seq: None,
+            });
         }
 
         let mut scanned = 0_usize;
@@ -451,7 +468,9 @@ impl Store {
                     .project
                     .as_ref()
                     .is_some_and(|project| project != &artifact.project)
-                    || request.older_than.is_some_and(|cutoff| artifact.created_at >= cutoff)
+                    || request
+                        .older_than
+                        .is_some_and(|cutoff| artifact.created_at >= cutoff)
                 {
                     continue;
                 }
@@ -487,7 +506,13 @@ impl Store {
             rank = 3;
             after_seq = None;
         }
-        Ok((eligible, truncated, snapshot, rank, after_seq))
+        Ok(CleanupInventoryPage {
+            artifacts: eligible,
+            truncated,
+            snapshot_seq: snapshot,
+            next_rank: rank,
+            next_seq: after_seq,
+        })
     }
 
     /// Retirement candidates for one exact Agent generation. The Agent,
