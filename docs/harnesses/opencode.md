@@ -106,11 +106,12 @@ rejection proves no effect. Timeout/ambiguous server response after a write is u
 Catalogue preflight may retry only before any session/input may have been admitted.
 OpenCode 2.2.7 can serve its bundled model snapshot while a fresh store fetches
 the current catalogue and reloads its integrations and providers. An already
-populated native store can return newer models immediately. After the server
-proves its isolated config through `GET /api/config`, launch rechecks an
-incomplete `GET /api/model` inventory for up to 12 seconds within the existing
-start budget. Exact live `provider/model` and variant membership are required
-before session creation.
+populated native store can return newer models immediately. The native refresh
+notification precedes the provider reload, so launch uses the exact live
+`GET /api/model` match to establish readiness. It reads once when the model
+is present and rechecks only a first-read model miss, every 250 ms for up to
+12 seconds within the existing start budget. The resulting entry must also
+contain any requested variant before session creation.
 
 The native `x-opencode-directory` header is URI component encoded, including literal
 percent signs, using the same encoder as query values. Installed OpenCode 2.2.7

@@ -1411,13 +1411,7 @@ impl OpenCodePlugin {
                 .as_ref()
                 .and_then(|model_ref| model_ref.variant.as_deref());
             let _timing = crate::native::startup::Step::new("model_catalogue");
-            let catalogue = match wait_for_start_catalogue(
-                &session.http,
-                requested,
-                requested_variant,
-                envelope,
-            )
-            .await
+            let catalogue = match wait_for_start_catalogue(&session.http, requested, envelope).await
             {
                 Ok(catalogue) => catalogue,
                 Err(error) => {
@@ -4501,35 +4495,22 @@ fn catalogue_contains(catalogue: &[NativeModelEntry], requested: &str) -> bool {
     catalogue_entry(catalogue, requested).is_some()
 }
 
-/// Wait for the selected model and optional variant to appear in the live
-/// server inventory. `GET /api/config` proves the server loaded our isolated
-/// config, but provider discovery may still be settling. These reads have no
-/// native effect and run before `POST /api/session`; timeout still returns the
-/// latest successful incomplete inventory so the caller's strict miss error is
-/// retained. A failed read keeps its native readback error.
+/// An exact match on the first read is enough. On a cold catalogue miss,
+/// wait within the start budget for the provider to publish the model.
 async fn wait_for_start_catalogue(
     http: &OpenCodeHttp,
     requested: &str,
-    requested_variant: Option<&str>,
     envelope: Instant,
 ) -> Result<Vec<NativeModelEntry>> {
     let deadline = phase_deadline(create_cutoff(envelope), START_CATALOGUE_READY_BUDGET);
-    loop {
-        let entries = http.list_native_models(deadline).await?;
-        let model_ready = catalogue_contains(&entries, requested);
-        let variant_ready = requested_variant.is_none_or(|variant| {
-            catalogue_variants(&entries, requested)
-                .is_some_and(|variants| variants.iter().any(|known| known == variant))
-        });
-        if model_ready && variant_ready {
-            return Ok(entries);
-        }
-
-        if Instant::now() + START_CATALOGUE_POLL >= deadline {
-            return Ok(entries);
-        }
+    let mut entries = http.list_native_models(deadline).await?;
+    while !catalogue_contains(&entries, requested)
+        && Instant::now() + START_CATALOGUE_POLL < deadline
+    {
         sleep(START_CATALOGUE_POLL).await;
+        entries = http.list_native_models(deadline).await?;
     }
+    Ok(entries)
 }
 
 /// The live native catalogue's selectable variant ids for one exact native
