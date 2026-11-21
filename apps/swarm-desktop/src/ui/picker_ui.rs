@@ -110,7 +110,7 @@ impl DesktopApp {
         };
         StackPanel::new()
             .orientation(Orientation::Horizontal)
-            .spacing(6.0)
+            .spacing(tokens::spacing::CHIP_GAP)
             .children((chip, worktree, folder))
     }
 
@@ -190,7 +190,7 @@ impl DesktopApp {
         // The design: the access chip, then the model chip.
         StackPanel::new()
             .orientation(Orientation::Horizontal)
-            .spacing(6.0)
+            .spacing(tokens::spacing::CHIP_GAP)
             .children((access, model))
     }
 
@@ -535,32 +535,24 @@ impl DesktopApp {
                                 .content(chip_text(
                                     picker::effort_label(effort),
                                     &picker::effort_name(effort),
+                                    false,
                                 )),
                         )
                     })
                     .collect();
-            Border::new()
-                .height(tokens::height::CHIP)
-                .corner_radius(tokens::height::CHIP / 2.0)
-                .background(palette.container())
-                .vertical_alignment(VerticalAlignment::Center)
-                .content(
-                    StackPanel::new()
-                        .orientation(Orientation::Horizontal)
-                        .keyed_children(segments),
-                )
+            effort_chip(
+                palette,
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .keyed_children(segments),
+            )
         } else if let Some((label, name)) = match item.effort.as_deref() {
             Some(effort) => Some((picker::effort_label(effort), picker::effort_name(effort))),
             // Display only: the row's choice still carries no effort.
             None if model_row => Some(("Default", DEFAULT_EFFORT.to_owned())),
             None => None,
         } {
-            Border::new()
-                .height(tokens::height::CHIP)
-                .corner_radius(tokens::height::CHIP / 2.0)
-                .background(palette.container())
-                .vertical_alignment(VerticalAlignment::Center)
-                .content(chip_text(label, &name).opacity(theme::MUTED_OPACITY))
+            effort_chip(palette, chip_text(label, &name, true))
         } else {
             View::empty()
         };
@@ -1037,11 +1029,24 @@ fn group_heading(
         )
 }
 
-/// The label of a picker row's effort chip or segment: the short effort in
-/// the secondary type, inset from the chip's edges, named in full words.
-fn chip_text(label: &str, name: &str) -> TextBlock {
-    m3::text(label.to_owned(), tokens::text::SECONDARY)
-        .automation_name(name.to_owned())
+/// A filled effort chip container, shared by its static tag and segments.
+fn effort_chip(palette: Palette, content: impl Into<View>) -> View {
+    Border::new()
+        .height(tokens::height::CHIP)
+        .corner_radius(tokens::radius::CHIP)
+        .background(palette.container())
+        .vertical_alignment(VerticalAlignment::Center)
+        .content(content)
+}
+
+/// The short effort label, named in full words for accessibility.
+fn chip_text(label: &str, name: &str, muted: bool) -> TextBlock {
+    let text = if muted {
+        m3::muted(label.to_owned(), tokens::text::CHIP)
+    } else {
+        m3::text(label.to_owned(), tokens::text::CHIP)
+    };
+    text.automation_name(name.to_owned())
         .margin(Thickness::xy(tokens::spacing::SM, 0.0))
         .vertical_alignment(VerticalAlignment::Center)
 }

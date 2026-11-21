@@ -814,7 +814,7 @@ impl Component for Composer {
         // The design: + (attach files), then the chips, 6 DIPs apart.
         let chips = StackPanel::new()
             .orientation(Orientation::Horizontal)
-            .spacing(6.0)
+            .spacing(tokens::spacing::CHIP_GAP)
             .children((
                 m3::icon_button(palette)
                     .automation_name("Attach files")
@@ -858,7 +858,11 @@ impl Component for Composer {
                 0.0,
                 tokens::spacing::INSET,
                 0.0,
-                if home { 28.0 } else { tokens::spacing::LG },
+                if home {
+                    tokens::spacing::XL - tokens::spacing::XS
+                } else {
+                    tokens::spacing::LG
+                },
             ))
             .content(m3::composer_card(
                 palette,
@@ -1009,7 +1013,7 @@ fn attachment_chips(
                     .content(
                         StackPanel::new()
                             .orientation(Orientation::Horizontal)
-                            .spacing(6.0)
+                            .spacing(tokens::spacing::CHIP_GAP)
                             .children((
                                 m3::chip_content(
                                     Some(m3::glyph::FILE),
@@ -1026,6 +1030,6 @@ fn attachment_chips(
         .collect();
     StackPanel::new()
         .orientation(Orientation::Horizontal)
-        .spacing(6.0)
+        .spacing(tokens::spacing::CHIP_GAP)
         .keyed_children(chips)
 }
