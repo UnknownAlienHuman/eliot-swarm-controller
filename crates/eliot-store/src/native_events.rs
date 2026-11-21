@@ -15,7 +15,14 @@ impl Store {
             return Err(Error::new("invalid", "Agent notice generation is invalid"));
         }
         if let Some(turn_id) = active_turn {
-            return native_notice_for_turn(&self.connection, agent_num, generation, turn_id);
+            let notice = native_notice_for_turn(&self.connection, agent_num, generation, turn_id)?;
+            if let Some(notice) = &notice
+                && native_children::native_progress(&self.connection, agent_num, generation)?
+                    .is_some_and(|progress| progress > notice.observed_at)
+            {
+                return Ok(None);
+            }
+            return Ok(notice);
         }
 
         let latest: Option<(String, i64, String)> = self
@@ -85,6 +92,7 @@ fn native_notice_for_turn(
         generation,
         turn_id: notice.turn_id,
         kind: notice.kind,
+        provider_kind: notice.provider_kind,
         message,
         truncated,
         observed_at: ts,
@@ -110,6 +118,12 @@ fn terminal_native_notice(
         generation,
         turn_id: turn_id.to_owned(),
         kind: eliot_core::api::NativeNoticeKind::Error,
+        provider_kind: data
+            .get("provider_restriction")
+            .and_then(|value| {
+                serde_json::from_value::<eliot_core::ProviderRestriction>(value.clone()).ok()
+            })
+            .map(|restriction| restriction.kind),
         message,
         truncated,
         observed_at: ts,
@@ -123,7 +137,11 @@ fn bounded_notice_message(
     let Some(message) = message else {
         return (None, already_truncated);
     };
-    let normalized = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    let normalized: String = message
+        .chars()
+        .filter(|character| !character.is_control() || character.is_whitespace())
+        .collect();
+    let normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.is_empty() {
         return (None, already_truncated);
     }

@@ -1685,6 +1685,7 @@ impl LaunchOutcome {
             generation: self.generation,
             harness: self.submitted.harness.clone().unwrap_or_default(),
             state: eliot_core::AgentState::Created,
+            status_line: None,
             project_id: if self.submitted.chat {
                 String::new()
             } else {

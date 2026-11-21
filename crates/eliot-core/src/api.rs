@@ -60,9 +60,8 @@ pub use agent_views::{
     ProjectCheckoutView, ProjectDiscoverResponse, ProjectGitView, ProjectRegistrationView,
     RetainedUnknownSummary, RetentionView, RunningTurnSummary, SourceOwner, SourceState,
     StatusBlocker, UnsettledCommandSummary, WorkerTaskHealth, WorkerTaskStatus,
-    WorkspaceCustodyView, activity_state_name, agent_state_name, agent_status_age_ms,
-    agent_status_line, diagnosis_reason, process_state_name, repository_name_from_url,
-    stats_coverage_name,
+    WorkspaceCustodyView, activity_state_name, agent_state_name, agent_status_line,
+    diagnosis_reason, process_state_name, repository_name_from_url, stats_coverage_name,
 };
 pub use config_views::{
     CONFIG_REVISION_HEX_LEN, MAX_LISTED_PROFILES, MAX_PROFILES_SOURCE_BYTES, ProfileListRequest,

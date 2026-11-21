@@ -563,6 +563,7 @@ pub struct MonitorRow {
     /// The model the harness last reported ([`AgentSummary::model`]).
     pub model: Option<String>,
     pub active_turn: Option<String>,
+    pub status_line: Option<String>,
     pub activity: Option<NativeChildActivityState>,
     pub last_progress_at: Option<i64>,
     pub progress_age_ms: Option<i64>,
@@ -641,6 +642,12 @@ impl MonitorRow {
             harness: summary.harness.clone(),
             model: summary.model.clone(),
             active_turn: summary.active_turn.clone(),
+            status_line: eliot_core::api::agent_status_line(
+                summary.active_turn.as_deref(),
+                summary.provider_hold.as_ref(),
+                summary.native_notice.as_ref(),
+                crate::handoff::now_ms(),
+            ),
             activity: summary.activity.as_ref().map(|activity| activity.state),
             last_progress_at: summary.last_progress_at,
             progress_age_ms: summary.progress_age_ms,

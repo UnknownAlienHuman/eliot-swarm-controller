@@ -48,6 +48,8 @@ pub struct NativeNotice {
     pub turn_id: String,
     pub kind: NativeNoticeKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_kind: Option<ProviderRestrictionKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     #[serde(default)]
     pub truncated: bool,
@@ -100,6 +102,8 @@ pub struct AgentNativeNotice {
     pub generation: i64,
     pub turn_id: String,
     pub kind: NativeNoticeKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_kind: Option<ProviderRestrictionKind>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -133,8 +137,11 @@ pub fn agent_status_line(
     native_notice: Option<&AgentNativeNotice>,
     now_ms: i64,
 ) -> Option<String> {
-    if let Some(hold) = provider_hold {
-        let kind = match hold.kind {
+    let provider_kind = provider_hold
+        .map(|hold| hold.kind)
+        .or_else(|| native_notice.and_then(|notice| notice.provider_kind));
+    if let Some(provider_kind) = provider_kind {
+        let kind = match provider_kind {
             ProviderRestrictionKind::RateLimit => "rate limited",
             ProviderRestrictionKind::Quota => "quota exhausted",
             ProviderRestrictionKind::Auth => "authentication required",
@@ -144,21 +151,28 @@ pub fn agent_status_line(
             && (matches!(
                 native_notice.map(|notice| notice.kind),
                 Some(NativeNoticeKind::Retrying | NativeNoticeKind::Reconnecting)
-            ) || (native_notice.is_none() && hold.state == ProviderHoldState::Probing));
+            ) || (native_notice.is_none()
+                && provider_hold.is_some_and(|hold| hold.state == ProviderHoldState::Probing)));
         let mut line = if waiting_for_provider {
             format!("Waiting for the provider: {kind}")
-        } else {
+        } else if provider_hold.is_some() {
             format!("Provider hold: {kind}")
+        } else {
+            format!("Provider error: {kind}")
         };
         match native_notice.map(|notice| notice.kind) {
             Some(NativeNoticeKind::Retrying) => line.push_str(", retrying"),
             Some(NativeNoticeKind::Reconnecting) => line.push_str(", reconnecting"),
-            Some(NativeNoticeKind::Error) => line.push_str(", error"),
-            None if hold.state == ProviderHoldState::Probing => {
+            Some(NativeNoticeKind::Error) => {}
+            None if waiting_for_provider => line.push_str(", retrying"),
+            None if provider_hold.is_some_and(|hold| hold.state == ProviderHoldState::Probing) => {
                 line.push_str(", probe in progress");
             }
             None => {
-                if let Some(retry_after) = hold.retry_after.filter(|at| *at > now_ms) {
+                if let Some(retry_after) = provider_hold
+                    .and_then(|hold| hold.retry_after)
+                    .filter(|at| *at > now_ms)
+                {
                     line.push_str(&format!(
                         ", probe eligible in {}",
                         remaining_time(retry_after - now_ms)
@@ -183,24 +197,6 @@ pub fn agent_status_line(
         Some(message) => format!("{lead}: {message}"),
         None => lead.to_owned(),
     })
-}
-
-/// Age of the oldest retained status fact, measured against the caller's read
-/// clock. This is display context; the daemon's existing attention incident
-/// remains the authority for the attention tone.
-pub fn agent_status_age_ms(
-    provider_hold: Option<&AgentProviderHold>,
-    native_notice: Option<&AgentNativeNotice>,
-    now_ms: i64,
-) -> Option<i64> {
-    let since = [
-        provider_hold.map(|hold| hold.updated_at),
-        native_notice.map(|notice| notice.observed_at),
-    ]
-    .into_iter()
-    .flatten()
-    .min()?;
-    now_ms.checked_sub(since).filter(|age| *age >= 0)
 }
 
 fn remaining_time(milliseconds: i64) -> String {

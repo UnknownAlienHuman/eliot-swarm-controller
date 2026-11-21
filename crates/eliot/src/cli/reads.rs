@@ -998,6 +998,14 @@ pub(crate) fn print_agent_table(response: &AgentListResponse, with_observations:
                 truncate_cell(&work_cell(summary), 22),
             );
         }
+        if let Some(status) = eliot_core::api::agent_status_line(
+            summary.active_turn.as_deref(),
+            summary.provider_hold.as_ref(),
+            summary.native_notice.as_ref(),
+            now_ms,
+        ) {
+            println!("       {status}");
+        }
     }
     if response.agents.is_empty() {
         println!("(no Agents in scope for these filters)");

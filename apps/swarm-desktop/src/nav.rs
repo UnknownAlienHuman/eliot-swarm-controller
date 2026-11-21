@@ -39,6 +39,7 @@ pub struct UiAgent {
     pub generation: i64,
     pub harness: String,
     pub state: eliot_core::AgentState,
+    pub status_line: Option<String>,
     /// The recorded registration ID (the daemon's project label), independently
     /// of the execution path. Move queries the authorization scope, never
     /// this label; Handoff narrows listed rows by the scope.
@@ -94,6 +95,12 @@ impl UiAgent {
             generation: summary.generation,
             harness: summary.harness.clone(),
             state: summary.state,
+            status_line: eliot_core::api::agent_status_line(
+                summary.active_turn.as_deref(),
+                summary.provider_hold.as_ref(),
+                summary.native_notice.as_ref(),
+                crate::handoff::now_ms(),
+            ),
             project_id: summary.project.clone(),
             project_scope: summary.project_scope.clone(),
             repo_common_dir: summary.repo_common_dir.clone(),

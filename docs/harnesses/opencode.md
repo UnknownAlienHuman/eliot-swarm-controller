@@ -158,6 +158,10 @@ without eviction and clears when the turn fences; facts for later parts
 drop with one tool-family coverage gap per turn. These facts advance native liveness
 progress exactly like the other adapters' tool events.
 
+A contiguous `session.retry.scheduled` event for the active session and
+Eliot turn provides a redacted `turn.notice` that records the native retry
+decision.
+
 Busy graceful stop first sends the exact-session native interrupt once, guarded
 by the captured active turn, then waits up to the core stop interrupt bound for
 that turn's `session.execution.interrupted` SSE terminal. HTTP acknowledgement

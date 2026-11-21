@@ -8,7 +8,7 @@ use crate::native_child::{
 use eliot_core::{
     ChildRegistration, ContextItem, Error, ProviderRestriction, Result, SecretPolicy,
     SessionTokenTotals, SessionUsage, TurnUsage,
-    api::NativeNoticeKind,
+    api::{NativeNotice, NativeNoticeKind},
     limits::{MAX_TOOL_COMMAND_BYTES, MAX_TOOL_ERROR_TAIL_BYTES},
     turn_started_data,
 };
@@ -1142,7 +1142,7 @@ impl EventProcessor {
             .ok_or_else(|| Error::new("source_integrity", "Codex notice sequence overflow"))?;
         let kind = native_error_notice_kind(error, notification.will_retry == Some(true));
         let secrets = SecretPolicy::new(self.secrets.iter().cloned());
-        let data = native_notice_data(turn_id, kind, &error.message, &secrets);
+        let data = native_notice_data(turn_id, kind, error, &secrets)?;
         let native_id = event_id(
             thread_id,
             turn_id,
@@ -1820,27 +1820,25 @@ fn native_error_notice_kind(error: &NativeTurnError, will_retry: bool) -> Native
 fn native_notice_data(
     turn_id: &str,
     kind: NativeNoticeKind,
-    message: &str,
+    error: &NativeTurnError,
     policy: &SecretPolicy,
-) -> Value {
-    let mut data = json!({
-        "turn_id": turn_id,
-        "kind": kind,
-        "truncated": false,
-    });
-    if !message.trim().is_empty() {
-        let mut error = json!({});
-        shared_attach_native_error(&mut error, Some(message), policy);
-        if let Some(native_error) = error.get("native_error") {
-            if let Some(message) = native_error.get("message") {
-                data["message"] = message.clone();
-            }
-            if let Some(truncated) = native_error.get("truncated") {
-                data["truncated"] = truncated.clone();
-            }
-        }
-    }
-    data
+) -> Result<Value> {
+    let mut data = json!({});
+    shared_attach_native_error(&mut data, Some(&error.message), policy);
+    let native_error = &data["native_error"];
+    serde_json::to_value(NativeNotice {
+        turn_id: turn_id.to_owned(),
+        kind,
+        provider_kind: error
+            .provider_restriction()
+            .map(|restriction| restriction.kind),
+        message: native_error["message"]
+            .as_str()
+            .filter(|message| !message.trim().is_empty())
+            .map(str::to_owned),
+        truncated: native_error["truncated"].as_bool().unwrap_or(false),
+    })
+    .map_err(|_| Error::new("internal", "Codex native notice could not be encoded"))
 }
 
 /// Turn-start baseline from the first observed update: cumulative `total`

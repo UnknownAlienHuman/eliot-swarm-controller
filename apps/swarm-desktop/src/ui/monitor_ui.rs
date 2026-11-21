@@ -104,6 +104,7 @@ impl DesktopApp {
                                 generation: row.generation,
                                 harness: row.harness.clone(),
                                 state: row.state,
+                                status_line: row.status_line.clone(),
                                 project_id: row.project.clone(),
                                 project_scope: row.project_scope.clone(),
                                 repo_common_dir: None,
@@ -438,17 +439,22 @@ impl DesktopApp {
         // controlled Agent that has not stopped (`docs/spec/monitoring.md`,
         // Git-aware work summary). A failed or lost one shows it only when
         // measured: its Git is never read again, so a reason would stay.
-        let line = match no_code {
-            Some(incident) => {
-                let text = incident.words(now);
-                Some(monitor_view::RowLine {
-                    words: format!("needs attention: {text}"),
-                    text,
-                    attention: true,
-                })
-            }
-            None => row
-                .work
+        let group = row.group(data.incident(row));
+        let line = if let Some(status) = &row.status_line {
+            Some(monitor_view::RowLine {
+                text: status.clone(),
+                words: status.clone(),
+                attention: group == monitor::Group::Attention,
+            })
+        } else if let Some(incident) = no_code {
+            let text = incident.words(now);
+            Some(monitor_view::RowLine {
+                words: format!("needs attention: {text}"),
+                text,
+                attention: true,
+            })
+        } else {
+            row.work
                 .as_ref()
                 .filter(|work| {
                     !row.native_child
@@ -459,10 +465,9 @@ impl DesktopApp {
                     text: monitor::work_line(work, now),
                     words: monitor::work_words(work, now),
                     attention: false,
-                }),
+                })
         };
         let quiet = row.quiet(now);
-        let group = row.group(data.incident(row));
         // A failure, an unconfirmed outcome or a wait for the owner keeps
         // its own mark in any group (a native subagent's failure sits under
         // Recently stopped); otherwise the group decides, a start excepted.
