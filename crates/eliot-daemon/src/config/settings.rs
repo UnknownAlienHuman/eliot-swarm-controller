@@ -51,21 +51,6 @@ fn section_name(section: SettingsSection) -> &'static str {
     }
 }
 
-fn all_sections() -> [SettingsSection; 10] {
-    [
-        SettingsSection::Profiles,
-        SettingsSection::Routing,
-        SettingsSection::Projects,
-        SettingsSection::Daemon,
-        SettingsSection::Automation,
-        SettingsSection::Mail,
-        SettingsSection::CloudMcp,
-        SettingsSection::Desktop,
-        SettingsSection::Accounts,
-        SettingsSection::Proxies,
-    ]
-}
-
 fn restart_required(sections: impl IntoIterator<Item = SettingsSection>) -> Vec<SettingsSection> {
     let mut result: Vec<_> = sections
         .into_iter()
@@ -160,11 +145,7 @@ fn section_for_error(source: &str, error: &core::Error) -> Option<SettingsSectio
 }
 
 fn issue_from_error(source: &str, error: &core::Error, policy: &SecretPolicy) -> SettingsReadIssue {
-    let message: String = policy
-        .redact_text(&error.message)
-        .chars()
-        .take(4096)
-        .collect();
+    let message = policy.redact_bounded(&error.message, 4096);
     SettingsReadIssue {
         section: section_for_error(source, error),
         code: error.code.clone(),
@@ -221,7 +202,7 @@ fn add_section_error_issue(
                 Some(rest.trim_start())
             })
             .unwrap_or(message);
-        let message: String = policy.redact_text(message).chars().take(4096).collect();
+        let message = policy.redact_bounded(message, 4096);
         add_issue(
             issues,
             SettingsReadIssue {
@@ -376,7 +357,7 @@ pub(crate) fn read_snapshot(
     let original = read_config_source(data_root)?;
     let source = original.as_deref().unwrap_or_default();
     let revision = original.as_deref().map(profiles_edit::revision_of);
-    let sections = requested.map_or_else(|| all_sections().to_vec(), ToOwned::to_owned);
+    let sections = requested.map_or_else(|| SettingsSection::ALL.to_vec(), ToOwned::to_owned);
     let requested: BTreeSet<_> = sections.iter().copied().collect();
     let mut issues = Vec::new();
     let mut unreadable_sections = BTreeSet::new();
@@ -451,12 +432,18 @@ pub(crate) fn read_snapshot(
             if invalid_sections.contains_key(name) {
                 continue;
             }
-            let projected = project_source_sections(source, validation_dependencies(*section));
-            if super::parse_config_document(&projected).is_err() {
-                unreadable_sections.insert(section_name(*section).to_owned());
-            }
+            let dependencies = validation_dependencies(*section);
+            let projected = project_source_sections(source, dependencies);
             if let Err(error) = validate_candidate(&projected) {
-                add_section_error_issue(&mut issues, &error, *section, &requested, policy);
+                let responsible_section = section_for_error(&projected, &error);
+                if responsible_section == Some(*section)
+                    || (responsible_section.is_none() && dependencies.len() == 1)
+                {
+                    if super::parse_config_document(&projected).is_err() {
+                        unreadable_sections.insert(section_name(*section).to_owned());
+                    }
+                    add_section_error_issue(&mut issues, &error, *section, &requested, policy);
+                }
             }
         }
     }
@@ -587,7 +574,8 @@ pub(crate) fn save(
     if !request.dry_run
         && let Some(projects) = projects
     {
-        let (revision, configured) = project_configs_snapshot(data_root)?;
+        let source = read_config_source(data_root)?;
+        let revision = source.as_deref().map(profiles_edit::revision_of);
         if revision != request.expected_revision {
             return Err(core::Error::new(
                 "conflict",
@@ -599,6 +587,13 @@ pub(crate) fn save(
             .iter()
             .map(|input| input.id.as_str())
             .collect();
+        // A malformed projects section has no trustworthy file registrations.
+        // Retained Store registrations still fence the removals in that case.
+        let configured = source.as_deref().map_or_else(Vec::new, |source| {
+            project_configs(source)
+                .or_else(|_| project_configs(&project_source_sections(source, &["projects"])))
+                .unwrap_or_default()
+        });
         let mut previous: BTreeMap<_, _> = configured
             .into_iter()
             .map(|row| (row.id, row.path))

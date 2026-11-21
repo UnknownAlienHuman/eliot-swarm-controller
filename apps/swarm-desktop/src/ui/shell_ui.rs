@@ -2281,21 +2281,16 @@ impl DesktopApp {
                     .text_wrapping(TextWrapping::Wrap)
                     .is_text_selection_enabled(true),
                 if self.repairing_settings() {
-                    StackPanel::new()
-                        .spacing(tokens::spacing::SM)
-                        .children((
-                            m3::filled(palette)
-                                .automation_name("Repair settings")
-                                .on_click(context.message(Message::Shell(ShellMsg::RepairSettings)))
-                                .content(m3::label("Repair settings")),
-                            m3::text_button(palette)
-                                .automation_name("Open config.toml")
-                                .on_click(
-                                    context.message(Message::Shell(ShellMsg::OpenStartupConfig)),
-                                )
-                                .content(m3::link_content("Open config.toml")),
-                        ))
-                        .into()
+                    StackPanel::new().spacing(tokens::spacing::SM).children((
+                        m3::filled(palette)
+                            .automation_name("Repair settings")
+                            .on_click(context.message(Message::Shell(ShellMsg::RepairSettings)))
+                            .content(m3::label("Repair settings")),
+                        m3::text_button(palette)
+                            .automation_name("Open config.toml")
+                            .on_click(context.message(Message::Shell(ShellMsg::OpenStartupConfig)))
+                            .content(m3::link_content("Open config.toml")),
+                    ))
                 } else {
                     View::empty()
                 },

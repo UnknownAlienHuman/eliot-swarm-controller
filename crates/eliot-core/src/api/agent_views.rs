@@ -30,16 +30,6 @@ pub enum NativeNoticeKind {
     Error,
 }
 
-impl NativeNoticeKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Retrying => "retrying",
-            Self::Reconnecting => "reconnecting",
-            Self::Error => "error",
-        }
-    }
-}
-
 /// The normalized `turn.notice` event data. Its turn binding is checked by
 /// the reducer against the current generation before this fact is committed.
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

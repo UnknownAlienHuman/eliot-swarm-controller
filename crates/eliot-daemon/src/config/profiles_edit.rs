@@ -163,7 +163,7 @@ pub(super) fn section_at_offset(source: &str, offset: usize) -> Option<String> {
     let mut start = 0;
     for block in split_blocks(source) {
         let end = start + block.text.len();
-        if offset >= start && offset < end {
+        if offset >= start && (offset < end || (offset == end && end == source.len())) {
             return block.section.clone();
         }
         start = end;
