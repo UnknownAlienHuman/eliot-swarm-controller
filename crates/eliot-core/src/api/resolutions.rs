@@ -113,6 +113,9 @@ pub struct SettleStoppedResponse {
     pub review: String,
     pub applied: bool,
     pub stops: Vec<StoppedCommandSettlement>,
+    /// Reviewed candidates still missing process or reader proof.
+    #[serde(default)]
+    pub awaiting_proof: Vec<String>,
     pub next: Option<String>,
 }
 

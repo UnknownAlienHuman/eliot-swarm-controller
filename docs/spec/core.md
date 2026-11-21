@@ -231,7 +231,9 @@ unknown stop commands with committed ownership exit and reader drain. Run
 mark proven current lost generations stopped, and mark any exact, still-unknown
 turn named by an Owner stop as interrupted.
 Use the same `--after` value on preview and apply when following a page's `next`
-cursor. An effect whose outcome requires other evidence remains unknown.
+cursor. The page also lists candidates awaiting proof. Start a new preview
+without `--after` after their process and reader evidence arrives. An effect
+whose outcome requires other evidence remains unknown.
 
 Stall is a flag only for busy work with a healthy authoritative source. Waiting on a
 request is waiting, not stalled solely through silence. Native progress clears a stall;

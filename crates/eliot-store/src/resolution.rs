@@ -624,8 +624,7 @@ fn stopped_settlement_page(
         .prepare(
             "SELECT c.id, c.target, c.generation, t.turn_id,
                     a.generation = c.generation AND a.state = 'lost'
-         FROM commands c JOIN agents a ON a.id = c.target
-         JOIN owned_exits e ON e.agent = c.target AND e.generation = c.generation
+             FROM commands c JOIN agents a ON a.id = c.target
          LEFT JOIN turns t ON c.principal = 'owner' AND t.agent = c.target
             AND t.generation = c.generation AND t.turn_id = c.expected_turn_id
             AND t.state = 'unknown'
@@ -655,6 +654,7 @@ fn stopped_settlement_page(
     let next =
         (rows.len() > STOP_SETTLEMENT_PAGE).then(|| rows[STOP_SETTLEMENT_PAGE - 1].0.clone());
     let mut stops = Vec::new();
+    let mut awaiting_proof = Vec::new();
     let mut turns = std::collections::HashSet::new();
     let mut lost = std::collections::HashSet::new();
     for (command_id, agent, generation, turn, is_lost) in
@@ -669,14 +669,24 @@ fn stopped_settlement_page(
                 mark_stopped: is_lost && lost.insert(agent),
                 interrupted_turn,
             });
+        } else {
+            awaiting_proof.push(command_id);
         }
     }
-    let review = sha256_hex(encode_json(&json!({ "stops": stops, "next": next }))?.as_bytes());
+    let review = sha256_hex(
+        encode_json(&json!({
+            "stops": stops,
+            "awaiting_proof": awaiting_proof,
+            "next": next,
+        }))?
+        .as_bytes(),
+    );
     Ok(SettleStoppedResponse {
         id: request.id.clone(),
         review,
         applied: false,
         stops,
+        awaiting_proof,
         next,
     })
 }
