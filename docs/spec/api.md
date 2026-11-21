@@ -1229,8 +1229,19 @@ Worktree creation is opt-in on the same launch command:
 command.submit {id, verb:"launch",
   args:{profile?:NAME, harness?:HARNESS, model?:MODEL, effort?:EFFORT, cmd?:PATH,
         auth?:INTEGRATION,
-        workspace, worktree?:BRANCH, base?:REF, parent?:AGENT, text?}}
+        workspace, worktree?:BRANCH, base?:REF, parent?:AGENT, text?, sources?:[PATH]}}
 ```
+
+`sources` (launch and `send`, CLI `--source PATH`, at most 16 distinct paths) names
+files the Agent must read. Before admission the daemon reads each one from the launch
+workspace, or for `send` from the target Agent's workspace, and replaces `sources` with a
+delivered block appended to `text`. Each file gets one section with its path, a content
+SHA-256 prefix, its size and its completeness (`complete`, or the first N of M bytes,
+with the rest left in the file), sharing a 96 KiB budget. Known secrets are redacted.
+A file that is missing, outside the workspace, not regular, binary or larger than 8 MiB
+gets a `not delivered (reason)` line instead of being skipped. Delivery proves the text
+reached the input, not that it was understood. A same-ID retry re-reads the files: an
+unchanged file replays, and a changed file is `id_conflict`.
 
 A parentless Owner launch names a stored `profile`, requests the configured default
 by omitting profile/harness, or names an ad-hoc
@@ -2378,7 +2389,7 @@ The synopsis is target grammar; later-layer forms are not an inventory of curren
 swarm daemon [--foreground]
 swarm daemon stop [--drain|--force]
 swarm status
-swarm launch --profile P --workspace PATH [--worktree BRANCH [--base REF]] [--parent AGENT] [PROMPT] [--wait] [--timeout-seconds N]
+swarm launch --profile P --workspace PATH [--worktree BRANCH [--base REF]] [--parent AGENT] [--source PATH]... [PROMPT] [--wait] [--timeout-seconds N]
 swarm launch --workspace PATH [PROMPT] [--wait] [--timeout-seconds N]
 swarm settings read
 swarm settings save FILE [--dry-run]

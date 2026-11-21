@@ -1,0 +1,173 @@
+//! Required sources: files a launch or send names in `sources` are read by the
+//! daemon and delivered inside the input text with path, content digest and
+//! completeness. The Agent does not have to reopen them, and a missing,
+//! binary or out-of-workspace file is stated instead of silently skipped.
+//! Delivery proves the text reached the input, not that it was understood.
+
+use super::Router;
+use eliot_core::{
+    Error, Result, SecretPolicy, SubmitCommand,
+    api::{inference::sha256_hex, truncate_bytes},
+    limits::MAX_TEXT_BYTES,
+};
+use serde_json::Value;
+use std::path::{Path, PathBuf};
+
+/// Most files one input may name.
+pub(crate) const MAX_SOURCES: usize = 16;
+const MAX_SOURCE_PATH_BYTES: usize = 1024;
+/// Delivered text across all sources of one input.
+const MAX_DELIVERED_BYTES: usize = 96 * 1024;
+/// Larger files are refused rather than read just to be cut.
+const MAX_SOURCE_FILE_BYTES: u64 = 8 * 1024 * 1024;
+
+impl Router {
+    /// Replace `args.sources` of a launch or send with the delivered block
+    /// appended to its text. Files are read from the launch workspace or the
+    /// target Agent's workspace.
+    pub(super) async fn deliver_sources(&self, request: &mut SubmitCommand) -> Result<()> {
+        let Some(sources) = request
+            .args
+            .as_object_mut()
+            .and_then(|args| args.remove("sources"))
+        else {
+            return Ok(());
+        };
+        let paths = parse_sources(&sources)?;
+        let root = match request.verb.as_str() {
+            "launch" => request
+                .args
+                .get("workspace")
+                .and_then(Value::as_str)
+                .map(PathBuf::from),
+            "send" => {
+                let target = request
+                    .target
+                    .as_deref()
+                    .ok_or_else(|| Error::new("invalid", "send sources need a target Agent"))?;
+                self.inner
+                    .store
+                    .lock()
+                    .await
+                    .get_agent(target)?
+                    .and_then(|agent| agent.workspace)
+                    .map(PathBuf::from)
+            }
+            _ => {
+                return Err(Error::new(
+                    "invalid",
+                    "sources are only valid for launch and send",
+                ));
+            }
+        }
+        .ok_or_else(|| Error::new("invalid", "sources need a workspace to read from"))?;
+        let root = std::fs::canonicalize(&root)
+            .map_err(|_| Error::new("unavailable", "source workspace is unavailable"))?;
+        let text = request
+            .args
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let budget = MAX_DELIVERED_BYTES.min(MAX_TEXT_BYTES.saturating_sub(text.len() + 4096));
+        let block = delivered_block(&root, &paths, budget, &self.secret_policy_snapshot());
+        request.args["text"] = Value::String(if text.trim().is_empty() {
+            block
+        } else {
+            format!("{text}\n\n{block}")
+        });
+        Ok(())
+    }
+}
+
+fn parse_sources(value: &Value) -> Result<Vec<String>> {
+    let invalid = || {
+        Error::new(
+            "invalid",
+            format!(
+                "sources must be 1..={MAX_SOURCES} distinct non-empty paths of at most {MAX_SOURCE_PATH_BYTES} bytes without control characters"
+            ),
+        )
+    };
+    let items = value.as_array().ok_or_else(invalid)?;
+    if items.is_empty() || items.len() > MAX_SOURCES {
+        return Err(invalid());
+    }
+    let mut paths: Vec<String> = Vec::with_capacity(items.len());
+    for item in items {
+        let path = item.as_str().ok_or_else(invalid)?;
+        if path.trim().is_empty()
+            || path.len() > MAX_SOURCE_PATH_BYTES
+            || path.chars().any(char::is_control)
+            || paths.iter().any(|known| known == path)
+        {
+            return Err(invalid());
+        }
+        paths.push(path.to_owned());
+    }
+    Ok(paths)
+}
+
+/// The delivered block: one section per named path, sharing `budget` bytes.
+/// A file over its share keeps its beginning and says how much is missing.
+fn delivered_block(root: &Path, paths: &[String], budget: usize, policy: &SecretPolicy) -> String {
+    let mut out = String::from(
+        "Required sources (delivered by Swarm with path, content digest and completeness; read them here instead of reopening the files):",
+    );
+    let mut remaining = budget;
+    for (index, path) in paths.iter().enumerate() {
+        let share = remaining / (paths.len() - index);
+        match read_source(root, path) {
+            Err(reason) => out.push_str(&format!("\n\n=== {path}: not delivered ({reason}) ===")),
+            Ok(bytes) => {
+                let digest = &sha256_hex(&bytes)[..16];
+                let Ok(content) = std::str::from_utf8(&bytes) else {
+                    out.push_str(&format!(
+                        "\n\n=== {path}: not delivered (binary content, sha256 {digest}, {} bytes) ===",
+                        bytes.len()
+                    ));
+                    continue;
+                };
+                let content = policy.redact_text(content);
+                let (kept, cut) = truncate_bytes(&content, share);
+                let completeness = if cut {
+                    format!(
+                        "first {} of {} bytes; read the rest from the file",
+                        kept.len(),
+                        content.len()
+                    )
+                } else {
+                    "complete".to_owned()
+                };
+                out.push_str(&format!(
+                    "\n\n=== {path} (sha256 {digest}, {} bytes, {completeness}) ===\n{kept}",
+                    bytes.len()
+                ));
+                remaining = remaining.saturating_sub(kept.len());
+            }
+        }
+    }
+    out
+}
+
+/// Read one named file inside `root`. The reason is a short fixed phrase.
+fn read_source(root: &Path, path: &str) -> std::result::Result<Vec<u8>, &'static str> {
+    let candidate = Path::new(path);
+    let joined = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        root.join(candidate)
+    };
+    let canonical = std::fs::canonicalize(&joined).map_err(|_| "not found")?;
+    if !canonical.starts_with(root) {
+        return Err("outside the workspace");
+    }
+    let metadata = std::fs::metadata(&canonical).map_err(|_| "unreadable")?;
+    if !metadata.is_file() {
+        return Err("not a regular file");
+    }
+    if metadata.len() > MAX_SOURCE_FILE_BYTES {
+        return Err("larger than 8 MiB");
+    }
+    std::fs::read(&canonical).map_err(|_| "unreadable")
+}

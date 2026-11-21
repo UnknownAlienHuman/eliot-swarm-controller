@@ -207,6 +207,7 @@ pub(crate) async fn run_launch(
         base,
         parent,
         prompt,
+        sources,
         queue,
         owner_override,
         wait,
@@ -330,6 +331,9 @@ pub(crate) async fn run_launch(
     if let Some(prompt) = &prompt {
         args["text"] = Value::String(prompt.clone());
     }
+    if !sources.is_empty() {
+        args["sources"] = json!(sources);
+    }
     if queue {
         let request = eliot_core::api::LaunchQueueRequest {
             id: mutation_id(id)?,
@@ -424,6 +428,7 @@ pub(crate) async fn run_send(
     SendArgs {
         agent,
         text,
+        sources,
         wait,
         probe,
         generation: GenerationArgs { generation },
@@ -439,7 +444,11 @@ pub(crate) async fn run_send(
     } else {
         None
     };
-    let mut params = submit_request(id, Some(agent), "send", json!({ "text": text }))?;
+    let mut args = json!({ "text": text });
+    if !sources.is_empty() {
+        args["sources"] = json!(sources);
+    }
+    let mut params = submit_request(id, Some(agent), "send", args)?;
     params.expected_generation = generation;
     params.probe = probe;
     let submitted = submit_command(&data_dir, &params).await?;

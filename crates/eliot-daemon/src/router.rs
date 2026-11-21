@@ -21,6 +21,7 @@ mod project_assignment;
 mod resolution;
 mod routing;
 mod rules;
+mod sources;
 mod status;
 mod switch;
 
@@ -1966,6 +1967,11 @@ impl Router {
             "send" | "steer" | "inject" | "interrupt" | "approve" | "deny" | "answer"
         ) {
             validate_plugin_command_args(&request)?;
+        }
+        // Required sources are read and delivered before the secret check, so
+        // their redacted text is checked like any other input text.
+        if matches!(request.verb.as_str(), "launch" | "send") {
+            self.deliver_sources(&mut request).await?;
         }
         // Emit data and variable values are arbitrary JSON: their object keys
         // can smuggle a known credential past the values-only check. Block
