@@ -4546,11 +4546,37 @@ fn insert_daemon_event_for_command(
             .generation
             .is_some_and(|generation| command.command.generation != Some(generation));
     event.cause = if bound {
+        if command.command.verb == "run"
+            && let Some(state @ ("applied" | "failed" | "unknown")) =
+                event.kind.strip_prefix("command.")
+        {
+            bind_run_settlement(&mut event.data, state, &command.command.principal)?;
+        }
         command_cause_tx(tx, command_id)?
     } else {
         None
     };
     insert_daemon_event_input(tx, event)
+}
+
+fn bind_run_settlement(data: &mut Value, state: &str, principal: &str) -> Result<()> {
+    let fields = data
+        .as_object_mut()
+        .ok_or_else(|| Error::new("source_integrity", "Run settlement event must be an object"))?;
+    fields.insert("verb".to_owned(), json!("run"));
+    fields.insert("state".to_owned(), json!(state));
+    if let Some(project) = principal.strip_prefix("project:") {
+        fields.insert("rule_project".to_owned(), json!(project));
+    }
+    // Reserve room for the event fields while keeping the exact process exit.
+    if encode_json(data)?.len() > MAX_EVENT_BYTES
+        && let Some(mut outcome) = data.get_mut("outcome").map(std::mem::take)
+    {
+        let overhead = encode_json(data)?.len().saturating_sub(4); // null
+        core::bound_script_outcome_stderr(&mut outcome, MAX_EVENT_BYTES.saturating_sub(overhead));
+        data["outcome"] = outcome;
+    }
+    Ok(())
 }
 
 fn event_subject_for_generation(
@@ -4587,7 +4613,18 @@ fn insert_native_event(tx: &Transaction<'_>, event: NativeEventInsert<'_>) -> Re
     )
 }
 
-fn insert_event(tx: &Transaction<'_>, event: EventInsert<'_>) -> Result<Event> {
+fn insert_event(tx: &Transaction<'_>, mut event: EventInsert<'_>) -> Result<Event> {
+    if event.kind == "turn.unknown" {
+        let fields = event.data.as_object_mut().ok_or_else(|| {
+            Error::new("source_integrity", "unknown turn event must be an object")
+        })?;
+        fields.insert("outcome".to_owned(), json!(core::TurnOutcome::Unknown));
+        if let Some(cause) = event.cause.as_ref() {
+            fields
+                .entry("command_id")
+                .or_insert_with(|| json!(cause.command_id));
+        }
+    }
     let data_json = encode_json(&event.data)?;
     if data_json.len() > MAX_EVENT_BYTES {
         return Err(Error::new(

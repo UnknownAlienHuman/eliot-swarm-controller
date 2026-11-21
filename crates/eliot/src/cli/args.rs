@@ -67,7 +67,7 @@ pub(crate) enum CliCommand {
     Provider(ProviderArgs),
     /// Read owner-registered project authority.
     Project(ProjectArgs),
-    /// Read or explicitly catch up one startup-loaded rule.
+    /// Read or edit automation rules, or catch up one loaded rule.
     Rule(RuleArgs),
     /// Read or manually run a startup-loaded timer.
     Timer(TimerArgs),
@@ -1302,10 +1302,47 @@ pub(crate) struct ProviderClearHoldArgs {
 
 #[derive(Subcommand)]
 pub(crate) enum RuleCommand {
+    /// List loaded rules in the selected namespace.
+    List {
+        #[arg(long, value_name = "PROJECT")]
+        project: Option<String>,
+        #[arg(long, value_name = "RULE")]
+        after: Option<String>,
+        #[arg(long, default_value_t = eliot_core::api::RuleListRequest::default().limit)]
+        limit: usize,
+    },
     /// Show the loaded rule state and current/retiring cursor progress.
     Show(RuleShowArgs),
+    /// Read the source TOML and revision of a rule file.
+    Read(RuleFileArgs),
+    /// Create a rule file, or replace it when its revision still matches.
+    Save {
+        #[command(flatten)]
+        entry: RuleFileArgs,
+        /// Local UTF-8 TOML file to send to the daemon.
+        #[arg(long, value_name = "FILE")]
+        file: PathBuf,
+        /// Required when replacing an existing rule file.
+        #[arg(long, value_name = "SHA256")]
+        expected_revision: Option<String>,
+    },
+    /// Delete a rule file when its revision still matches.
+    Delete {
+        #[command(flatten)]
+        entry: RuleFileArgs,
+        #[arg(long, value_name = "SHA256")]
+        expected_revision: String,
+    },
     /// Process one finite committed-event range through the ordinary rule path.
     CatchUp(RuleCatchUpArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct RuleFileArgs {
+    #[arg(value_name = "NAME.toml")]
+    pub(crate) path: String,
+    #[arg(long, value_name = "PROJECT")]
+    pub(crate) project: Option<String>,
 }
 
 #[derive(Args)]

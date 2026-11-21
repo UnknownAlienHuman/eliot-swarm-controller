@@ -244,6 +244,141 @@ impl Directory {
         }
         result
     }
+
+    /// Atomically publish a new leaf without replacing an existing entry.
+    pub(crate) fn publish_new(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        plain(name)?;
+        #[cfg(unix)]
+        let stage_name = format!(".{}.stage", ulid::Ulid::new());
+        #[cfg(unix)]
+        let stage = native::open(self.handle(), stage_name.as_ref(), true, true).map_err(io)?;
+        #[cfg(unix)]
+        if !native::stage_is_private(&stage).map_err(io)? {
+            native::remove_stage_dir(self.handle(), &stage, &stage_name);
+            return Err(refused());
+        }
+        #[cfg(unix)]
+        let temp_name = "data";
+        #[cfg(unix)]
+        let mut temp = match native::open(&stage, temp_name.as_ref(), false, true) {
+            Ok(file) => file,
+            Err(error) => {
+                native::remove_stage_dir(self.handle(), &stage, &stage_name);
+                return Err(io(error));
+            }
+        };
+        #[cfg(not(unix))]
+        let temporary = format!(".{}.tmp", ulid::Ulid::new());
+        #[cfg(not(unix))]
+        let mut temp = native::open(self.handle(), temporary.as_ref(), false, true).map_err(io)?;
+
+        let mut published = false;
+        let result = (|| {
+            temp.write_all(bytes).map_err(io)?;
+            temp.sync_all().map_err(io)?;
+            #[cfg(unix)]
+            {
+                if let Err(error) = native::publish_staged(self.handle(), &stage, temp_name, name) {
+                    if self
+                        .file(name)
+                        .is_ok_and(|installed| native::same(&temp, &installed).unwrap_or(false))
+                    {
+                        published = true;
+                        return Err(Error::new(
+                            "unknown",
+                            "rule file published but staging cleanup failed",
+                        ));
+                    }
+                    if self.file(name).is_ok() {
+                        return Err(conflict());
+                    }
+                    return Err(io(error));
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                if let Err(error) = native::publish_new(self.handle(), &temp, name) {
+                    if self.file(name).is_ok() {
+                        return Err(conflict());
+                    }
+                    return Err(io(error));
+                }
+            }
+            published = true;
+            // Windows renames the exact open handle. Unix publishes a name,
+            // so verify it still identifies the staged bytes.
+            #[cfg(unix)]
+            {
+                let verify = || -> Result<()> {
+                    let mut installed = self.file(name)?;
+                    if !native::same(&temp, &installed).map_err(io)?
+                        || read(&mut installed)? != bytes
+                    {
+                        return Err(conflict());
+                    }
+                    Ok(())
+                };
+                verify().map_err(|_| {
+                    Error::new(
+                        "unknown",
+                        "new rule file identity or bytes could not be verified",
+                    )
+                })?;
+            }
+            native::sync(self.handle())
+                .map_err(|_| Error::new("unknown", "rule file published but directory sync failed"))
+        })();
+
+        #[cfg(unix)]
+        {
+            if result.is_err() && !published {
+                native::remove_staged(self.handle(), &stage, &stage_name, temp_name);
+            } else {
+                native::remove_stage_dir(self.handle(), &stage, &stage_name);
+            }
+        }
+        #[cfg(not(unix))]
+        if result.is_err() && !published {
+            native::remove(self.handle(), &temp, &temporary);
+        }
+        result
+    }
+
+    /// Remove one file only while the current bytes still equal the caller's revision.
+    pub(crate) fn remove_file(&self, name: &str, expected: &[u8]) -> Result<()> {
+        plain(name)?;
+        let mut first = self.file(name).map_err(|_| conflict())?;
+        if native::links(&first).map_err(io)? != 1 || read(&mut first)? != expected {
+            return Err(conflict());
+        }
+        drop(first);
+
+        #[cfg(windows)]
+        {
+            let mut current = native::open_cleanup(self.handle(), name.as_ref(), false)
+                .map_err(|_| conflict())?;
+            check_cleanup_file(&current)?;
+            if native::links(&current).map_err(io)? != 1 || read(&mut current)? != expected {
+                return Err(conflict());
+            }
+            native::delete_handle(&current)
+                .map_err(|_| Error::new("unknown", "rule file deletion could not be confirmed"))?;
+            drop(current);
+        }
+        #[cfg(unix)]
+        {
+            let mut current = self.file(name).map_err(|_| conflict())?;
+            if native::links(&current).map_err(io)? != 1 || read(&mut current)? != expected {
+                return Err(conflict());
+            }
+            native::unlink_file(self.handle(), name)
+                .map_err(|_| Error::new("conflict", "rule file changed before deletion"))?;
+            drop(current);
+        }
+        native::sync(self.handle())
+            .map_err(|_| Error::new("unknown", "rule file deleted but directory sync failed"))?;
+        Ok(())
+    }
 }
 
 fn conflict() -> Error {
@@ -635,6 +770,40 @@ mod native {
         }
         Ok(())
     }
+    pub(super) fn publish_new(parent: &File, temp: &File, name: &str) -> io::Result<()> {
+        use windows_sys::Wdk::Storage::FileSystem::{
+            FILE_RENAME_INFORMATION, FILE_RENAME_POSIX_SEMANTICS, FileRenameInformationEx,
+            NtSetInformationFile,
+        };
+        let wide: Vec<u16> = name.encode_utf16().collect();
+        let length = std::mem::size_of::<FILE_RENAME_INFORMATION>() + wide.len() * 2;
+        let mut buffer = vec![0usize; length.div_ceil(std::mem::size_of::<usize>())];
+        let rename = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+        unsafe {
+            (*rename).Anonymous.Flags = FILE_RENAME_POSIX_SEMANTICS;
+            (*rename).RootDirectory = parent.as_raw_handle();
+            (*rename).FileNameLength = (wide.len() * 2) as u32;
+            std::ptr::copy_nonoverlapping(
+                wide.as_ptr(),
+                (*rename).FileName.as_mut_ptr(),
+                wide.len(),
+            );
+            let mut status_block: IO_STATUS_BLOCK = std::mem::zeroed();
+            let status = NtSetInformationFile(
+                temp.as_raw_handle(),
+                &mut status_block,
+                rename.cast(),
+                length as u32,
+                FileRenameInformationEx,
+            );
+            if status < 0 {
+                return Err(io::Error::other(format!(
+                    "NtSetInformationFile status {status:#x}"
+                )));
+            }
+        }
+        Ok(())
+    }
     pub(super) fn remove(_: &File, temp: &File, _: &str) {
         let info = FILE_DISPOSITION_INFO { DeleteFile: true };
         unsafe {
@@ -814,6 +983,38 @@ mod native {
             )
         } != 0
         {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    pub(super) fn publish_staged(
+        parent: &File,
+        stage: &File,
+        temp: &str,
+        target: &str,
+    ) -> io::Result<()> {
+        let source = name(OsStr::new(temp))?;
+        let destination = name(OsStr::new(target))?;
+        if unsafe {
+            libc::linkat(
+                stage.as_raw_fd(),
+                source.as_ptr(),
+                parent.as_raw_fd(),
+                destination.as_ptr(),
+                0,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if unsafe { libc::unlinkat(stage.as_raw_fd(), source.as_ptr(), 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    pub(super) fn unlink_file(parent: &File, target: &str) -> io::Result<()> {
+        let target = name(OsStr::new(target))?;
+        if unsafe { libc::unlinkat(parent.as_raw_fd(), target.as_ptr(), 0) } != 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(())

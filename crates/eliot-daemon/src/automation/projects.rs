@@ -80,7 +80,29 @@ pub(super) async fn load_project_rules(
     })
 }
 
-fn validate_project_rule_actions(
+/// Resolve one current Owner-approved project rule root and reject link/overlay roots.
+pub(super) async fn rule_edit_registration(
+    data_root: &Path,
+    project_id: &str,
+) -> Result<RegistrationSnapshot> {
+    let (_, configured) = config::settings::project_configs_snapshot(data_root)?;
+    let project = configured
+        .into_iter()
+        .find(|project| project.id == project_id)
+        .ok_or_else(|| Error::new("not_found", "project is not registered"))?;
+    let git = WorkspaceGit::new()?;
+    let registration = resolve_registration(&git, project).await?;
+    verify_registration(data_root, &registration).await?;
+
+    let checkout = Path::new(&registration.checkout);
+    reject_links(checkout)?;
+    reject_unsupported_project_overlay(checkout)?;
+    let rules = checkout.join(".eliot").join("rules");
+    reject_links(&rules)?;
+    Ok(registration)
+}
+
+pub(super) fn validate_project_rule_actions(
     inputs: &[eliot_store::RuleDefinitionInput],
     registration: &RegistrationSnapshot,
 ) -> Result<()> {

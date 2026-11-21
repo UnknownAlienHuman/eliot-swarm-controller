@@ -282,6 +282,9 @@ No second executor, workflow graph or acceptance engine.
       Neither a failed check nor a missing terminal fact authorizes replay.
 - [x] **L4.4 Recipes.** One timer, one event action and one bounded Goal using Codex.
       No second harness is necessary to demonstrate these behaviors.
+- [x] **L4.5 Rule editing and outcome branches.** Create, edit, enable, disable and
+      delete rule files through the Owner API and CLI. A failed Run can launch a
+      task, and its successful terminal turn can emit a notification.
 
 **Result:** the first harness can work unattended under explicit limits. Hook support
 is added only for a native decision not expressible by the already-working stream.

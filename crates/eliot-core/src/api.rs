@@ -33,6 +33,7 @@ mod provider;
 mod read_validation;
 mod reads;
 mod resolutions;
+mod rule_edit;
 mod rules;
 mod script_edit;
 mod scripts;
@@ -164,6 +165,10 @@ pub use reads::{
 pub use resolutions::{
     CommandResolution, CommandResolveRequest, CommandResolveResponse, TurnResolveRequest,
     TurnResolveResponse, TurnResolveStatus,
+};
+pub use rule_edit::{
+    MAX_RULE_FILE_BYTES, MAX_RULE_PATH_BYTES, RULE_REVISION_HEX_LEN, RuleDeleteRequest,
+    RuleDeleteResponse, RuleReadRequest, RuleReadResponse, RuleSaveRequest, RuleSaveResponse,
 };
 pub use rules::{RuleCatchUpRequest, RuleLimit, RuleLimitScope};
 pub use script_edit::{

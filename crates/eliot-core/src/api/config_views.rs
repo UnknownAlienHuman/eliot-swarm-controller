@@ -414,6 +414,13 @@ impl RuleListRequest {
             {
                 return Err(Error::new("invalid", "timer state names another rule"));
             }
+            if let Some(source_file) = &entry.source_file {
+                super::RuleReadRequest {
+                    project: self.project.clone(),
+                    path: source_file.clone(),
+                }
+                .validate()?;
+            }
             if !entry.definition.is_object() {
                 return Err(Error::new("invalid", "rule definition must be an object"));
             }
@@ -441,6 +448,9 @@ pub struct RuleListEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timer: Option<TimerStateView>,
     pub definition: Value,
+    /// Top-level TOML filename from the last accepted source snapshot, when file-backed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_file: Option<String>,
 }
 
 fn rule_source_present() -> bool {

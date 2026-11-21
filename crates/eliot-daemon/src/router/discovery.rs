@@ -276,6 +276,9 @@ const METHODS: &[Method] = &[
     method!("script.save", ScriptSaveRequest, ScriptSaveResponse, true, true, "Validate (dry_run) or replace one existing script entry guarded by its revision; never executes.", {"project":null,"path":"check.ps1","expected_revision":"0000000000000000000000000000000000000000000000000000000000000000","content":"Write-Output ok\n","dry_run":true}),
     method!("rule.list", RuleListRequest, RuleListResponse, true, false, "Page one rule namespace's stored states and timer states.", {"limit":20}),
     method!("rule.get", RuleGetRequest, RuleStateView, true, false, "Read one rule's current and retiring cursors.", {"id":"rule-1"}),
+    method!("rule.read", RuleReadRequest, RuleReadResponse, true, false, "Read one approved rule source file and its byte revision.", {"path":"notify.toml"}),
+    method!("rule.save", RuleSaveRequest, RuleSaveResponse, true, true, "Create or replace a rule source file against its expected revision.", {"path":"notify.toml","expected_revision":null,"content":"[[rule]]\nid = 'notify-finished'\non = { event = 'turn.completed' }\ndo = [{ action = 'notify', message = 'Task done' }]\n"}),
+    method!("rule.delete", RuleDeleteRequest, RuleDeleteResponse, true, true, "Remove one rule source file against its expected revision.", {"path":"notify.toml","expected_revision":"0000000000000000000000000000000000000000000000000000000000000000"}),
     method!("rule.catch_up", RuleCatchUpRequest, Command, true, true, "Catch up a rule through a finite retained event interval.", {"id":EXAMPLE_ID,"rule":"rule-1","after_seq":0,"through_seq":10}),
     method!("timer.get", TimerGetRequest, TimerStateView, true, false, "Read one timer's state and next occurrence.", {"id":"timer-1"}),
     method!("timer.run", TimerRunRequest, Command, true, true, "Run one explicit retained timer occurrence.", {"id":EXAMPLE_ID,"rule":"timer-1"}),
@@ -466,6 +469,10 @@ impl Router {
             "chat.detach" => &["swarm chat detach"],
             "chat.tag" => &["swarm chat tag"],
             "command.cancel" => &["swarm cmd cancel"],
+            "rule.list" => &["swarm rule list"],
+            "rule.read" => &["swarm rule read"],
+            "rule.save" => &["swarm rule save"],
+            "rule.delete" => &["swarm rule delete"],
             _ => &[],
         };
         let mut unsupported = vec!["A method listing grants no additional authority. Unsupported native verbs reject; inspect agent.get for the exact target generation's capabilities.".to_owned()];
@@ -513,14 +520,33 @@ impl Router {
             (Value::Null, Value::Null)
         };
         encode(MethodHelpResponse {
-            method:method.name.to_owned(), summary:method.summary.to_owned(),
-            cli_aliases:aliases.iter().map(|s| (*s).to_owned()).collect(),
+            method: method.name.to_owned(),
+            summary: method.summary.to_owned(),
+            cli_aliases: aliases.iter().map(|s| (*s).to_owned()).collect(),
             fields,
-            request_schema, response_schema,
-            example:json!({"method":method.name,"params":example}),
-            mutation_id:if method.name.starts_with("inference.") && method.mutation { "Supply a caller-retained literal ULID before send; do not omit it. After a lost reply retry with that same id and identical semantic payload, or read inference.write.get. Never allocate another id to recover an uncertain mutation." } else if method.mutation { "id is optional on MCP: omit it and the server mints a ULID and returns it in the reply; retry with that same id. Otherwise supply a fresh caller-retained ULID in id before the first write. Retry only with that same id, principal, method and identical semantic payload. Never mint another id after an uncertain outcome; read back the retained result. The example id is illustrative; replace it for a new write." } else { "Read-only; no mutation id is required." }.to_owned(),
-            scopes, limits:format!("{} Responses retain their DTO pagination and daemon 4 MiB frame bounds; one help result is at most 256 KiB. Examples for existing resources require their actual retained ids/profile/source/view.", method_limits(method.name)), unsupported,
+            request_schema,
+            response_schema,
+            example: json!({"method":method.name,"params":example}),
+            mutation_id: mutation_id_help(method).to_owned(),
+            scopes,
+            limits: format!(
+                "{} Responses retain their DTO pagination and daemon 4 MiB frame bounds; one help result is at most 256 KiB. Examples for existing resources require their actual retained ids/profile/source/view.",
+                method_limits(method.name)
+            ),
+            unsupported,
         })
+    }
+}
+
+fn mutation_id_help(method: &Method) -> &'static str {
+    if !method.mutation {
+        "Read-only operation."
+    } else if !is_mutation_id_method(method.name) {
+        "The expected revision guards this edit. Read back the file after an uncertain result."
+    } else if method.name.starts_with("inference.") {
+        "Supply a caller-retained literal ULID before send; do not omit it. After a lost reply retry with that same id and identical semantic payload, or read inference.write.get. Never allocate another id to recover an uncertain mutation."
+    } else {
+        "id is optional on MCP: omit it and the server mints a ULID and returns it in the reply; retry with that same id. Otherwise supply a fresh caller-retained ULID in id before the first write. Retry only with that same id, principal, method and identical semantic payload. Never mint another id after an uncertain outcome; read back the retained result. The example id is illustrative; replace it for a new write."
     }
 }
 
@@ -849,6 +875,9 @@ fn method_limits(name: &str) -> &'static str {
         }
         "events.read" | "events.subscribe" => {
             "At most 1000 events per page and the encoded event-page byte budget; subscribe waits at most 30000 ms. Agent events remain self-scoped. History gaps do not authorize replay."
+        }
+        "rule.read" | "rule.save" | "rule.delete" => {
+            "Owner only. Use a top-level .toml filename in the global or registered project rule root. A null expected revision on save means create only. Replace and delete require the revision from rule.read."
         }
         "goal.set" | "goal.round" => {
             "Eliot mode only. Automatic idle driving requires max_turns or max_rounds unless a cadence is set. A round names exactly one idle_seq or slot; unknown effects are not replayed."

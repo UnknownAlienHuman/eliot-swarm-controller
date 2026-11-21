@@ -3,7 +3,7 @@ use super::args::{
     GoalArgs, GoalClearArgs, GoalCommand, GoalPauseArgs, GoalResumeArgs, GoalRoundArgs,
     GoalSetArgs, GoalShowArgs, ProjectArgs, ProjectCommand, ProjectShowArgs, ProviderArgs,
     ProviderClearHoldArgs, ProviderCommand, ProviderHoldsArgs, RuleArgs, RuleCatchUpArgs,
-    RuleCommand, RuleShowArgs, TimerArgs, TimerCommand, TimerRunArgs, TimerShowArgs,
+    RuleCommand, RuleFileArgs, RuleShowArgs, TimerArgs, TimerCommand, TimerRunArgs, TimerShowArgs,
 };
 use super::support::read_and_print;
 use super::support::{Failure, command_value, mutation_id, print_value, response_exit_code};
@@ -11,14 +11,17 @@ use eliot_core::Command as CoreCommand;
 use eliot_core::api::{
     DEFAULT_GOAL_CHECK_TIMEOUT_MS, GoalClearRequest, GoalCostLimit, GoalDefinition, GoalEscalation,
     GoalGetRequest, GoalMode, GoalPauseRequest, GoalResumeRequest, GoalRoundRequest,
-    GoalRoundResponse, GoalSetRequest, GoalView, ProjectOverviewRequest, ProjectOverviewResponse,
-    ProjectRegistrationView, ProviderClearHoldRequest, ProviderClearHoldResponse,
-    ProviderCorrectiveEvidence, ProviderHoldsRequest, ProviderHoldsResponse, RuleCatchUpRequest,
-    RuleGetRequest, RuleStateView, TimerGetRequest, TimerRunRequest, TimerStateView,
+    GoalRoundResponse, GoalSetRequest, GoalView, MAX_RULE_FILE_BYTES, ProjectOverviewRequest,
+    ProjectOverviewResponse, ProjectRegistrationView, ProviderClearHoldRequest,
+    ProviderClearHoldResponse, ProviderCorrectiveEvidence, ProviderHoldsRequest,
+    ProviderHoldsResponse, RuleCatchUpRequest, RuleDeleteRequest, RuleDeleteResponse,
+    RuleGetRequest, RuleListRequest, RuleListResponse, RuleReadRequest, RuleReadResponse,
+    RuleSaveRequest, RuleSaveResponse, RuleStateView, TimerGetRequest, TimerRunRequest,
+    TimerStateView,
 };
 use serde_json::Value;
 use serde_json::json;
-use std::path::PathBuf;
+use std::{fs::File, io::Read, path::PathBuf};
 
 pub(crate) async fn run_provider(
     ProviderArgs { command }: ProviderArgs,
@@ -173,12 +176,99 @@ pub(crate) async fn run_rule(
     id: Option<String>,
 ) -> Result<u8, Failure> {
     match command {
+        RuleCommand::List {
+            project,
+            after,
+            limit,
+        } => {
+            let request = RuleListRequest {
+                project,
+                after,
+                limit,
+            };
+            read_and_print!(
+                &data_dir,
+                json_output,
+                "rule.list",
+                request,
+                RuleListResponse
+            )
+        }
         RuleCommand::Show(RuleShowArgs { id, project }) => {
             let request = match project {
                 Some(project) => RuleGetRequest::new(id).in_project(project),
                 None => RuleGetRequest::new(id),
             };
             read_and_print!(&data_dir, json_output, "rule.get", request, RuleStateView)
+        }
+        RuleCommand::Read(RuleFileArgs { project, path }) => {
+            let request = RuleReadRequest { project, path };
+            read_and_print!(
+                &data_dir,
+                json_output,
+                "rule.read",
+                request,
+                RuleReadResponse
+            )
+        }
+        RuleCommand::Save {
+            entry: RuleFileArgs { project, path },
+            file,
+            expected_revision,
+        } => {
+            let mut bytes = Vec::new();
+            File::open(file)
+                .and_then(|file| {
+                    file.take(MAX_RULE_FILE_BYTES as u64 + 1)
+                        .read_to_end(&mut bytes)
+                })
+                .map_err(|error| {
+                    Failure::new(2, format!("cannot read rule input file ({})", error.kind()))
+                })?;
+            if bytes.len() > MAX_RULE_FILE_BYTES {
+                return Err(Failure::new(
+                    2,
+                    "rule input file exceeds the rule file limit",
+                ));
+            }
+            let content = String::from_utf8(bytes)
+                .map_err(|_| Failure::new(2, "rule input file must be UTF-8"))?;
+            let request = RuleSaveRequest {
+                project,
+                path,
+                expected_revision,
+                content,
+            };
+            request.validate().map_err(Failure::for_mutation)?;
+            let response: RuleSaveResponse =
+                eliot_daemon::client_call_typed(&data_dir, "rule.save", &request)
+                    .await
+                    .map_err(Failure::for_mutation)?;
+            request
+                .validate_response(&response)
+                .map_err(Failure::invalid_response)?;
+            print_value(&json!(response), json_output);
+            Ok(0)
+        }
+        RuleCommand::Delete {
+            entry: RuleFileArgs { project, path },
+            expected_revision,
+        } => {
+            let request = RuleDeleteRequest {
+                project,
+                path,
+                expected_revision,
+            };
+            request.validate().map_err(Failure::for_mutation)?;
+            let response: RuleDeleteResponse =
+                eliot_daemon::client_call_typed(&data_dir, "rule.delete", &request)
+                    .await
+                    .map_err(Failure::for_mutation)?;
+            request
+                .validate_response(&response)
+                .map_err(Failure::invalid_response)?;
+            print_value(&json!(response), json_output);
+            Ok(0)
         }
         RuleCommand::CatchUp(RuleCatchUpArgs {
             rule,

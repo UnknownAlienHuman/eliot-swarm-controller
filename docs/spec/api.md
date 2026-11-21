@@ -447,7 +447,8 @@ command id frozen at claim. Stored Goal responses/round records use Core
 | `launch.queue` | Read one page of scoped interactive intents and assignment waits |
 | `project.budget.set` | Current manager adjusts free budget or priority within the Owner's grant |
 | `project.overview` | Owner or Agent read of one project team or every team with workspaces, queue, capacity and whole-fleet totals; a manager sees its own team in full and aggregates for other projects |
-| `rule.list/get/catch_up` | owner-only paged rule list (state, timer state, canonical definition), one rule read, and finite committed-history catch-up |
+| `rule.list/get/catch_up` | Owner-only paged rule state and definition list, one loaded rule state, and finite committed-history catch-up |
+| `rule.read/save/delete` | Owner-only rule source read, revision-guarded create or replace, and revision-guarded delete through the [rule file editor](automation.md#rule-file-editing) |
 | `profile.list` | owner-only sanitized configured-profile summaries with launch-time resolvability |
 | `harness.list/models/quota` | owner-only installed harness inventory with versions, per-harness read-only native catalogues and provider-supported quota readback; no model turn or inference |
 | `models.catalog` | Owner-only bounded, paginated search across installed harness catalogues; request, entries, failures and quota vocabulary: [canonical DTOs](../../crates/eliot-core/src/api/harness.rs). Membership never proves availability: affirmative fresh native quota and complete hold readback are required. Failed harness reads remain visible; a partial listing supports continuation but the next first page retries failed reads. An `after` cursor that is not in the current listing (the models changed between pages) is an `invalid` error with the message `catalogue cursor is no longer in the listing; restart from the first page`; it is never a restart from page one. Executable/version-bound caching and concurrent-read coalescing belong to the [catalogue owner](../../crates/eliot-daemon/src/router/catalog.rs). |
@@ -469,7 +470,6 @@ command id frozen at claim. Stored Goal responses/round records use Core
 | `mail.send/inbox/read/ack`, `var.set/get` | addressed queued mail with separate acknowledgement, shared variables with CAS |
 | `swarm.reparent` | Owner-only atomic subtree or all-children manager change; generation-bound, no native effect |
 | `who`, `claim.set/list/release` | current-worker file areas plus advisory claims with coalesced conflict notices |
-| `rule.*` except `rule.list/get/catch_up` | later automation; effects remain commands; no rule or timer pause/resume operation exists |
 
 Canonical public wire types are re-exported by
 [`eliot_core::api`](../../crates/eliot-core/src/api.rs). These DTOs and their validators
@@ -1977,12 +1977,22 @@ stored `RuleStateView`, its effective `TimerStateView` when the rule is a timer,
 the canonical stored definition (`on`, `do`, `limit`, `catch_up`), and
 `source_present`. A removed rule can retain a stored definition and reports
 `source_present = false` regardless of its previous enabled value. Membership
-tracks source presence while a prior revision retires. Entries whose
+tracks source presence while a prior revision retires. `source_file` names the editable
+TOML file when the current definition has a file source. Entries whose
 stored state, timer state or definition carry a value known to the daemon's
 secret policy (keys included) are withheld, and `next` names the last returned
 id. Like `agent.list`, every nonempty page sets `next` to its last id and the
 caller continues until an empty page; a page shortened by the byte budget never
 hides later rules. It changes nothing.
+
+`rule.read`, `rule.save` and `rule.delete` select the global namespace by default or a
+registered namespace by `project`. `path` is a top-level TOML filename in that
+namespace. `rule.read` returns the source and its byte revision. `rule.save` takes
+`content` and an `expected_revision`; a null or omitted revision asserts absence and
+creates the file. `rule.delete` requires the current `expected_revision`. A failed
+precondition returns `conflict`. See [rule file editing](automation.md#rule-file-editing)
+for source validation, reload and enablement.
+
 `profile` and `id` are required nonempty strings. Present strings are checked for
 nonemptiness after trimming but are preserved as supplied. For `agent.discover`, optional
 `harness`, `native_scope` and `cursor` may be omitted or `null` to mean absent. For
@@ -2435,7 +2445,11 @@ swarm events [--since SEQ] [--allow-gap]
 swarm msg send ... | msg show ... | msg ack ... | inbox [AGENT] [--wait SECS]
 swarm var set KEY [VALUE | --value-file PATH] [--as-json] [...] | var get ... | who [--project P] [--history] | claim set|list|release ...
 swarm project list | show ID
+swarm rule list [--project PROJECT] [--after ID] [--limit N]
 swarm rule show ID [--project PROJECT]
+swarm rule read NAME.toml [--project PROJECT]
+swarm rule save NAME.toml --file FILE [--expected-revision SHA256] [--project PROJECT]
+swarm rule delete NAME.toml --expected-revision SHA256 [--project PROJECT]
 swarm rule catch-up ID --after SEQ [--through SEQ] [--project PROJECT]
 swarm timer show ID [--project PROJECT] | run ID [--project PROJECT]
 swarm goal set A --text TEXT --check CMD [ARGS...] [--mode eliot|native] [--check-cwd PATH] [--check-timeout-ms MS] [--max-turns N] [--max-rounds N] [--max-without-progress N] [--cadence-ms MS] [--scope GLOB]... [--check-input GLOB]... [--max-cost AMOUNT --cost-unit UNIT] [--escalate-model M] [--escalate-effort E] [--escalate-reason TEXT]
