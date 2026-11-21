@@ -2027,7 +2027,7 @@ pub(crate) fn available_disk_space(path: &Path) -> Result<u64> {
     // SAFETY: the path is NUL-terminated and the one requested output is writable.
     if unsafe { GetDiskFreeSpaceExW(path.as_ptr(), &mut available, null_mut(), null_mut()) } == 0 {
         return Err(io_error(
-            "query Store backup disk space",
+            "query available disk space",
             std::io::Error::last_os_error(),
         ));
     }

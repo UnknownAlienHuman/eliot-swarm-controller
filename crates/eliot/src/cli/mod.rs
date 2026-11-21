@@ -14,6 +14,7 @@ mod reads;
 mod rules;
 mod settings;
 mod stand;
+mod store;
 pub(crate) mod support;
 mod update;
 
@@ -43,6 +44,7 @@ pub(crate) async fn dispatch(
         CliCommand::Mcp(args) => daemon::run_mcp(args, data_dir, json_output).await,
         CliCommand::Status => daemon::run_status(data_dir, json_output).await,
         CliCommand::Maintenance(args) => daemon::run_maintenance(args, data_dir, json_output).await,
+        CliCommand::Store(args) => store::run_store(args, data_dir, json_output),
         CliCommand::Provider(args) => rules::run_provider(args, data_dir, json_output, id).await,
         CliCommand::Project(args) => rules::run_project(args, data_dir, json_output, id).await,
         CliCommand::Rule(args) => rules::run_rule(args, data_dir, json_output, id).await,

@@ -660,10 +660,15 @@ a retried ack over it succeeds as already acked.
 `daemon.status` reports the main and WAL file sizes, retention windows, and
 the retained-event watermark `pruned_through`. New Stores reclaim free pages
 incrementally. Older Stores reuse freed pages while the daemon runs, so a
-retention pass can leave `eliot.db` at its prior high-water size. To convert an
-older Store to incremental vacuum and reclaim space from the file, set
-`compact_on_start = true` and restart in a maintenance window with space for
-SQLite's rebuild. The full rebuild runs before the daemon serves requests.
+retention pass can leave `eliot.db` at its prior high-water size. To reclaim
+space from an older Store, run `swarm store compact` with the daemon stopped.
+This owner-only local command takes the private DataDir lock, refuses to
+operate while a daemon holds it, and does not start a daemon. Before SQLite
+runs `VACUUM`, it reports the estimated required and available bytes and
+requires free space of about twice the combined current `eliot.db` and WAL size.
+`compact_on_start` remains opt-in and defaults to `false`; when enabled, startup
+uses the same preflight before the daemon serves requests. Routine retention
+does not run compaction in the live request path.
 
 The automatic attention no-progress suspicion window is optional:
 

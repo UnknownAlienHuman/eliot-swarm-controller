@@ -39,8 +39,9 @@ pub use config::recovery::{read_settings_for_repair, save_settings_for_repair};
 pub use config::settings::stored_section as stored_settings_section;
 pub use daemon::client_call_with_remote_context;
 pub use daemon::{
-    CallTimings, DaemonStartupFailure, MAX_RPC_FRAME_BYTES, client_call, client_call_measured,
-    client_call_typed, client_call_with_agent_identity, client_call_with_owner_credential,
+    CallTimings, DaemonStartupFailure, MAX_RPC_FRAME_BYTES, StoreCompactionOutcome,
+    StoreCompactionSpaceEstimate, client_call, client_call_measured, client_call_typed,
+    client_call_with_agent_identity, client_call_with_owner_credential, compact_store_offline,
     daemon_connect_hint, daemon_failure_since, last_daemon_failure, last_daemon_phase,
     require_agent_identity, run, wait_command, wait_terminal,
 };

@@ -21,7 +21,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::{
-    fs::File,
+    fs::{self, File},
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::Arc,
@@ -80,6 +80,136 @@ const OVERLOAD_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// not hold its connection task past this deadline: the task ends and finishes
 /// response bookkeeping while the committed result stays readable by retry.
 const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Disk-space estimate reported immediately before a Store VACUUM rewrite.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct StoreCompactionSpaceEstimate {
+    pub main_database_bytes: u64,
+    pub wal_bytes: u64,
+    pub database_and_wal_bytes: u64,
+    pub estimated_required_bytes: u64,
+    pub available_bytes: u64,
+}
+
+/// Result of explicit offline or opt-in startup Store compaction.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct StoreCompactionOutcome {
+    pub estimate: Option<StoreCompactionSpaceEstimate>,
+    pub converted: bool,
+    pub pages_reclaimed: u64,
+    pub freelist_pages: u64,
+}
+
+/// Compact an existing private Store while holding its normal DataDir lock.
+/// The callback reports the shared disk-space preflight before SQLite can run
+/// VACUUM. This local path never starts or contacts a daemon.
+pub fn compact_store_offline(
+    path: &Path,
+    before_vacuum: impl FnMut(&StoreCompactionSpaceEstimate),
+) -> Result<StoreCompactionOutcome> {
+    if AGENT_IDENTITY_ENV
+        .iter()
+        .chain(&RUN_IDENTITY_ENV)
+        .any(|name| std::env::var_os(name).is_some())
+        || std::env::var_os(AGENT_DATA_DIR_ENV).is_some()
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "offline Store compaction requires the local Owner",
+        ));
+    }
+    let data_dir = DataDir::open_existing(path)?;
+    let _daemon_lock = data_dir.acquire_daemon_lock()?;
+    let store_path = data_dir.path().join("eliot.db");
+    let metadata = fs::symlink_metadata(&store_path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            Error::new("unavailable", "store database does not exist")
+        } else {
+            Error::new(
+                "platform_io",
+                &format!("cannot inspect store database: {error}"),
+            )
+        }
+    })?;
+    if !metadata.file_type().is_file() || crate::platform::is_reparse_point(&metadata) {
+        return Err(Error::new(
+            "not_allowed",
+            "store database path is not a regular file",
+        ));
+    }
+    let mut store = eliot_store::Store::open(&store_path)?;
+    compact_store_with_preflight(&mut store, data_dir.path(), &store_path, before_vacuum)
+}
+
+fn compact_store_with_preflight(
+    store: &mut eliot_store::Store,
+    data_dir: &Path,
+    store_path: &Path,
+    mut before_vacuum: impl FnMut(&StoreCompactionSpaceEstimate),
+) -> Result<StoreCompactionOutcome> {
+    let estimate = match store.retention_space_status()?.auto_vacuum_mode {
+        2 => None,
+        _ => {
+            let main_database_bytes = fs::metadata(store_path)
+                .map_err(|error| {
+                    Error::new(
+                        "platform_io",
+                        &format!("cannot inspect Store size before compaction: {error}"),
+                    )
+                })?
+                .len();
+            let mut wal_name = store_path.as_os_str().to_os_string();
+            wal_name.push("-wal");
+            let wal_path = PathBuf::from(wal_name);
+            let wal_bytes = match fs::metadata(&wal_path) {
+                Ok(metadata) => metadata.len(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+                Err(error) => {
+                    return Err(Error::new(
+                        "platform_io",
+                        &format!("cannot inspect Store WAL before compaction: {error}"),
+                    ));
+                }
+            };
+            let database_and_wal_bytes = main_database_bytes
+                .checked_add(wal_bytes)
+                .ok_or_else(|| Error::new("invalid", "Store file size estimate overflowed"))?;
+            let estimated_required_bytes = database_and_wal_bytes
+                .checked_mul(2)
+                .ok_or_else(|| Error::new("invalid", "Store compaction estimate overflowed"))?;
+            let available_bytes = crate::platform::available_disk_space(data_dir)?;
+            Some(StoreCompactionSpaceEstimate {
+                main_database_bytes,
+                wal_bytes,
+                database_and_wal_bytes,
+                estimated_required_bytes,
+                available_bytes,
+            })
+        }
+    };
+    if let Some(estimate) = &estimate {
+        before_vacuum(estimate);
+        if estimate.available_bytes < estimate.estimated_required_bytes {
+            return Err(Error::new(
+                "insufficient_disk_space",
+                &format!(
+                    "Store compaction estimates {} bytes required, but only {} bytes are available",
+                    estimate.estimated_required_bytes, estimate.available_bytes
+                ),
+            ));
+        }
+    }
+    let report = store.compact_to_incremental()?;
+    Ok(StoreCompactionOutcome {
+        estimate,
+        converted: report.converted,
+        pages_reclaimed: report
+            .pages_before
+            .saturating_sub(report.pages_after)
+            .max(0) as u64,
+        freelist_pages: report.freelist_pages.max(0) as u64,
+    })
+}
 
 /// Open the private local daemon, recover durable state without replaying any
 /// external effects, and serve concurrent local RPC connections.
@@ -220,11 +350,28 @@ async fn initialize_runtime(
             logging::record(&policy, "daemon.store_migrated", &[], None);
         }
     })?;
-    // Explicit compaction is opt-in because converting a large existing DB
-    // needs a full VACUUM and temporary disk space. It runs before workers or
-    // IPC bind, so no live request waits behind the conversion.
+    // Startup compaction is opt-in because converting an existing DB needs a
+    // full VACUUM and temporary disk space. It shares the same preflight as
+    // the offline owner command and runs before workers or IPC bind.
     if daemon_config.retention.compact_on_start {
-        let report = store.compact_to_incremental()?;
+        let report =
+            compact_store_with_preflight(&mut store, data_dir.path(), &store_path, |estimate| {
+                let main = estimate.main_database_bytes.to_string();
+                let wal = estimate.wal_bytes.to_string();
+                let required = estimate.estimated_required_bytes.to_string();
+                let available = estimate.available_bytes.to_string();
+                logging::record(
+                    &policy,
+                    "daemon.store_compaction_preflight",
+                    &[
+                        ("main_database_bytes", &main),
+                        ("wal_bytes", &wal),
+                        ("estimated_required_bytes", &required),
+                        ("available_bytes", &available),
+                    ],
+                    None,
+                );
+            })?;
         logging::record_counts(
             &policy,
             if report.converted {
@@ -240,11 +387,8 @@ async fn initialize_runtime(
                 mail: 0,
                 digests: 0,
                 processes: 0,
-                pages_reclaimed: report
-                    .pages_before
-                    .saturating_sub(report.pages_after)
-                    .max(0) as u64,
-                freelist_pages: report.freelist_pages.max(0) as u64,
+                pages_reclaimed: report.pages_reclaimed,
+                freelist_pages: report.freelist_pages,
                 auto_vacuum_mode: 2,
                 wal_frames: 0,
                 checkpointed_frames: 0,

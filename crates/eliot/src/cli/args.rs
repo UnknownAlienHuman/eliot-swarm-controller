@@ -65,6 +65,8 @@ pub(crate) enum CliCommand {
     Status,
     /// Run the bounded retention maintenance pass now (owner only).
     Maintenance(MaintenanceArgs),
+    /// Compact the private Store offline (owner only; daemon must be stopped).
+    Store(StoreArgs),
     /// Serve one generic { method, params } MCP tool over stdio (default) or loopback StreamableHTTP.
     #[command(name = "mcp")]
     Mcp(McpArgs),
@@ -1147,6 +1149,18 @@ pub(crate) struct MaintenanceArgs {
 pub(crate) enum MaintenanceCommand {
     /// Run one bounded retention pass now and report pruned counts.
     Run,
+}
+
+#[derive(Args)]
+pub(crate) struct StoreArgs {
+    #[command(subcommand)]
+    pub(crate) command: StoreCommand,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum StoreCommand {
+    /// Rebuild the Store and enable incremental vacuum after a disk-space preflight.
+    Compact,
 }
 
 #[derive(Args)]
