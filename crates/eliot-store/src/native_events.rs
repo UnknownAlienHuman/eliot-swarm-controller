@@ -446,6 +446,15 @@ fn persist_turn_associated(
                 .and_then(Value::as_str),
         },
     )?;
+    // A SEND dispatched before Stop may acquire its exact turn after Stop
+    // dispatch. Capture the association before any drained session terminal
+    // clears the Agent's active-turn pointer.
+    db!(tx.execute(
+        "UPDATE commands SET expected_turn_id = ?1
+         WHERE target = ?2 AND generation = ?3 AND verb = 'stop' AND principal = 'owner'
+           AND state IN ('dispatched','unknown') AND expected_turn_id IS NULL",
+        params![turn_id, agent_num, generation],
+    ));
     // The applied send outcome repeats what the native turn request
     // carried, so the first turn under an overlay shows its effective
     // model/effort in its readback. Unchanged without an overlay.

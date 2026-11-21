@@ -232,7 +232,8 @@ uncertain native call.
 
 When an Owner-requested stop proves both facts, its captured turn becomes
 `interrupted` with `resolution_source=owner` and reason `stopped_by_owner` if no
-terminal native result arrived. A drained native terminal result, including its
+terminal native result arrived. A SEND already dispatched can supply its exact
+turn binding while the Owner stop is in flight. A drained native terminal result, including its
 status, outcome, text and usage, remains authoritative. A turn not captured by
 that stop, or a non-Owner stop without terminal evidence, stays `unknown`.
 Force stop skips the cooperative interrupt window and uses the same process and
