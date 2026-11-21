@@ -254,6 +254,83 @@ impl Store {
     }
 }
 
+/// Validate the retained source work before allocation and again in the transfer.
+pub(super) fn source_inputs(
+    connection: &Connection,
+    from: &Agent,
+    task_command: &str,
+    commands: &[String],
+    principal: Option<&str>,
+    policy: &core::SecretPolicy,
+) -> Result<(Command, Vec<Command>)> {
+    let task = load_command(connection, task_command)?.ok_or_else(|| {
+        Error::new(
+            "not_found",
+            format!("original task SEND {task_command} is not retained"),
+        )
+    })?;
+    if task.verb != "send"
+        || task.target.as_deref() != Some(&from.id)
+        || task.generation != Some(from.generation)
+    {
+        return Err(Error::new(
+            "invalid",
+            format!(
+                "original task {task_command} must be a SEND on {} generation {}",
+                from.id, from.generation
+            ),
+        ));
+    }
+    if principal.is_some_and(|principal| task.principal != principal) {
+        return Err(Error::new(
+            "not_allowed",
+            "handoff transfers only SENDs issued by the caller",
+        ));
+    }
+    let mut originals = Vec::new();
+    for id in commands {
+        let record = load_command_record(connection, id)?.ok_or_else(|| {
+            Error::new("not_found", format!("selected SEND {id} is not retained"))
+        })?;
+        let c = &record.command;
+        if c.verb != "send"
+            || c.target.as_deref() != Some(&from.id)
+            || c.generation != Some(from.generation)
+            || !matches!(c.state, CommandState::Accepted | CommandState::Queued)
+            || c.turn_id.is_some()
+            || record.expected_turn_id.is_some()
+            || c.request_id.is_some()
+            || c.probe
+            || c.selector.is_some()
+            || c.args
+                .as_object()
+                .is_none_or(|args| args.len() != 1 || !args.contains_key("text"))
+        {
+            return Err(Error::new(
+                "bad_state",
+                format!(
+                    "selected command {id} is not an undispatched plain SEND on {} generation {}",
+                    from.id, from.generation
+                ),
+            ));
+        }
+        if principal.is_some_and(|principal| c.principal != principal) {
+            return Err(Error::new(
+                "not_allowed",
+                "handoff transfers only SENDs issued by the caller",
+            ));
+        }
+        if policy.contains_value(&c.args) {
+            return Err(Error::new(
+                "secret_in_payload",
+                "successor input contains a known secret",
+            ));
+        }
+        originals.push(record.command);
+    }
+    Ok((task, originals))
+}
+
 /// Shared transfer transaction. Caller commits, or rolls back the entire transfer.
 pub(super) fn handoff_tx(
     tx: &Transaction<'_>,
@@ -348,60 +425,14 @@ pub(super) fn handoff_tx(
     project_transfer::require_no_intent(tx, &to.project)?;
     quiescent(tx, &from, false)?;
     quiescent(tx, &to, true)?;
-    let task = load_command(tx, &request.task_command)?
-        .ok_or_else(|| Error::new("not_found", "original task is not retained"))?;
-    if task.verb != "send"
-        || task.target.as_deref() != Some(&from.id)
-        || task.generation != Some(from.generation)
-    {
-        return Err(Error::new(
-            "invalid",
-            "original task must be a SEND on A's exact generation",
-        ));
-    }
-    if manager_caller.is_some() && task.principal != principal {
-        return Err(Error::new(
-            "not_allowed",
-            "handoff transfers only SENDs issued by the caller",
-        ));
-    }
-    let mut originals = Vec::new();
-    for id in &request.commands {
-        let record = load_command_record(tx, id)?
-            .ok_or_else(|| Error::new("not_found", "selected SEND is not retained"))?;
-        let c = &record.command;
-        if c.verb != "send"
-            || c.target.as_deref() != Some(&from.id)
-            || c.generation != Some(from.generation)
-            || !matches!(c.state, CommandState::Accepted | CommandState::Queued)
-            || c.turn_id.is_some()
-            || record.expected_turn_id.is_some()
-            || c.request_id.is_some()
-            || c.probe
-            || c.selector.is_some()
-            || c.args
-                .as_object()
-                .is_none_or(|args| args.len() != 1 || !args.contains_key("text"))
-        {
-            return Err(Error::new(
-                "bad_state",
-                "selected work is not an undispatched plain SEND on A",
-            ));
-        }
-        if manager_caller.is_some() && c.principal != principal {
-            return Err(Error::new(
-                "not_allowed",
-                "handoff transfers only SENDs issued by the caller",
-            ));
-        }
-        if policy.contains_value(&c.args) {
-            return Err(Error::new(
-                "secret_in_payload",
-                "successor input contains a known secret",
-            ));
-        }
-        originals.push(record.command);
-    }
+    let (task, originals) = source_inputs(
+        tx,
+        &from,
+        &request.task_command,
+        &request.commands,
+        manager_caller.as_ref().map(|_| principal),
+        policy,
+    )?;
     let (brief_text, brief_truncated) = brief::build(tx, request, &task, policy)?;
     let mut events = Vec::new();
     // Agent authority never widens: an Agent handoff transfers only task
@@ -426,7 +457,7 @@ pub(super) fn handoff_tx(
                 },
                 limits,
                 now,
-                false,
+                true,
             )?;
             events.extend(moved.events);
             (
