@@ -675,15 +675,8 @@ impl Store {
         let root = self
             .agent_artifact_root(&agent.id, generation)?
             .ok_or_else(|| Error::new("not_allowed", "Agent has no Swarm-created artifact root"))?;
-        let normalized = |value: &str| {
-            std::path::PathBuf::from(if cfg!(windows) {
-                value.to_lowercase()
-            } else {
-                value.to_owned()
-            })
-        };
-        let proposed = normalized(path);
-        let owned = normalized(&root.path);
+        let proposed = cleanup_path(path);
+        let owned = cleanup_path(&root.path);
         if proposed == owned || !proposed.starts_with(&owned) {
             return Err(Error::new(
                 "not_allowed",
@@ -722,36 +715,6 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
-        {
-            let mut query = tx
-                .prepare("SELECT path FROM artifacts LIMIT 4096")
-                .map_err(sql_error)?;
-            let paths = query
-                .query_map([], |r| r.get::<_, String>(0))
-                .map_err(sql_error)?;
-            for existing in paths {
-                let existing = existing.map_err(sql_error)?;
-                if existing == root.path {
-                    continue;
-                }
-                let existing = std::path::PathBuf::from(if cfg!(windows) {
-                    existing.to_lowercase()
-                } else {
-                    existing
-                });
-                let proposed = std::path::PathBuf::from(if cfg!(windows) {
-                    path.to_lowercase()
-                } else {
-                    path.to_owned()
-                });
-                if existing.starts_with(&proposed) || proposed.starts_with(&existing) {
-                    return Err(Error::new(
-                        "conflict",
-                        "artifact overlaps an existing ownership record",
-                    ));
-                }
-            }
-        }
         let count: i64 = tx
             .query_row("SELECT COUNT(*) FROM artifacts", [], |r| r.get(0))
             .map_err(sql_error)?;
@@ -760,6 +723,26 @@ impl Store {
                 "unavailable",
                 "artifact ledger is full (4096 entries)",
             ));
+        }
+        {
+            let mut query = tx
+                .prepare("SELECT path FROM artifacts")
+                .map_err(sql_error)?;
+            let paths = query
+                .query_map([], |r| r.get::<_, String>(0))
+                .map_err(sql_error)?;
+            for existing in paths {
+                let existing = cleanup_path(&existing.map_err(sql_error)?);
+                if existing == owned {
+                    continue;
+                }
+                if existing.starts_with(&proposed) || proposed.starts_with(&existing) {
+                    return Err(Error::new(
+                        "conflict",
+                        "artifact overlaps an existing ownership record",
+                    ));
+                }
+            }
         }
         let body = encode_json(&artifact)?;
         let seq: i64 = tx
@@ -1232,7 +1215,7 @@ fn known_native_session_artifact(
             "SELECT body FROM artifacts WHERE agent=?1
              AND json_extract(body,'$.kind')='native_session'
              AND (path=?2 OR (path='retired:'||id AND json_extract(body,'$.path')=?2))
-             ORDER BY (json_extract(body,'$.state')='removed') DESC, generation DESC LIMIT 1",
+             ORDER BY (json_extract(body,'$.state')='removed') ASC, generation DESC LIMIT 1",
             params![agent, path],
             |row| row.get(0),
         )
