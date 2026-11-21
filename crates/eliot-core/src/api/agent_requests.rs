@@ -2,7 +2,8 @@
 //! Store authorization and the exact workspace target remain Router decisions.
 
 use super::agent_views::{
-    generation, invalid_response, required_text, scope, text, valid_identity,
+    generation, invalid_response, invalid_response_detail, required_text, scope, text,
+    valid_identity,
 };
 use super::{
     AgentEditsResponse, AgentGetResponse, AgentGitResponse, AgentListResponse,
@@ -202,6 +203,8 @@ impl AgentListRequest {
             text(after)?;
             if self.order == super::AgentListOrder::Recent {
                 decode_recent_cursor(after)?;
+            } else {
+                crate::parse_agent_id(after)?;
             }
         }
         if let Some(project) = &self.project {
@@ -227,75 +230,229 @@ impl AgentListRequest {
         limit(self.limit)
     }
 
-    pub fn validate_response(&self, reply: &AgentListResponse) -> Result<()> {
-        if self.validate().is_err() || reply.agents.len() > self.limit {
-            return Err(invalid_response());
+    /// Validate page bounds and continuation against keys from every wire row.
+    /// The key tuples are `(Agent ID, updated_at_ms)` and remain complete when
+    /// a human-facing reader rejects an individual row for display.
+    pub fn validate_response_page(
+        &self,
+        reply: &AgentListResponse,
+        row_keys: &[(String, i64)],
+    ) -> Result<()> {
+        self.validate().map_err(|_| {
+            invalid_response_detail("params", None, "request must validate before readback")
+        })?;
+        if row_keys.len() > self.limit {
+            return Err(invalid_response_detail(
+                "agents",
+                None,
+                "page must not exceed the requested row limit",
+            ));
         }
-        if reply.total < reply.agents.len() {
-            return Err(invalid_response());
+        if reply.total < row_keys.len() {
+            return Err(invalid_response_detail(
+                "total",
+                None,
+                "must be at least the number of rows in this page",
+            ));
         }
-        if self.order == super::AgentListOrder::Recent {
-            // Recent order pages by stable (updated_at, id): every nonempty
-            // page carries `next` as the last row's recent cursor, and an
-            // empty page carries no cursor. A quiet nonempty page still
-            // requires continuing through `next` until empty.
-            match reply.agents.last() {
-                Some(last) => {
-                    if reply.next.as_deref()
-                        != Some(
-                            encode_recent_cursor(&last.summary.id, last.summary.updated_at)
-                                .as_str(),
-                        )
-                    {
-                        return Err(invalid_response());
-                    }
-                }
-                None => {
-                    if reply.next.is_some() {
-                        return Err(invalid_response());
-                    }
-                }
-            }
-            // Recent pages must arrive newest-first: updated_at descending,
-            // then numeric Agent ID descending as the tiebreak.
-            let mut previous: Option<(i64, i64)> = None;
-            for row in &reply.agents {
-                let activity = row.summary.updated_at;
-                let num = crate::parse_agent_id(&row.summary.id).map_err(|_| invalid_response())?;
-                if let Some((prev_activity, prev_id)) = previous {
-                    if (activity, num) > (prev_activity, prev_id) {
-                        return Err(invalid_response());
-                    }
-                    if (activity, num) == (prev_activity, prev_id) {
-                        return Err(invalid_response());
-                    }
-                }
-                previous = Some((activity, num));
-            }
+
+        let after_recent = if self.order == super::AgentListOrder::Recent {
+            self.after
+                .as_deref()
+                .map(decode_recent_cursor)
+                .transpose()?
+                .map(|(id, activity)| Ok::<_, Error>((activity, crate::parse_agent_id(&id)?)))
+                .transpose()?
         } else {
-            // The Store pages by Agent ID: every nonempty page carries `next` at
-            // the last returned row, and an empty page carries no cursor. A quiet
-            // nonempty page still requires continuing through `next` until empty.
-            match reply.agents.last() {
-                Some(last) => {
-                    if reply.next.as_deref() != Some(last.summary.id.as_str()) {
-                        return Err(invalid_response());
-                    }
-                }
-                None => {
-                    if reply.next.is_some() {
-                        return Err(invalid_response());
-                    }
-                }
+            None
+        };
+        let after_id = if self.order == super::AgentListOrder::Id {
+            self.after
+                .as_deref()
+                .map(crate::parse_agent_id)
+                .transpose()?
+        } else {
+            None
+        };
+        let mut seen = BTreeSet::new();
+        let mut previous_recent: Option<(i64, i64)> = None;
+        let mut previous_id: Option<i64> = None;
+        for (index, (id, activity)) in row_keys.iter().enumerate() {
+            let number = crate::parse_agent_id(id).map_err(|_| {
+                invalid_response_detail(
+                    &format!("agents[{index}].id"),
+                    None,
+                    "must be a valid Agent ID",
+                )
+            })?;
+            if *activity < 0 {
+                return Err(invalid_response_detail(
+                    &format!("agents[{index}].updated_at"),
+                    Some(id),
+                    "must be nonnegative milliseconds",
+                ));
             }
+            if !seen.insert(id) {
+                return Err(invalid_response_detail(
+                    &format!("agents[{index}].id"),
+                    Some(id),
+                    "must be unique within the page",
+                ));
+            }
+            if self.order == super::AgentListOrder::Recent {
+                let key = (*activity, number);
+                if previous_recent.is_some_and(|previous| key >= previous) {
+                    return Err(invalid_response_detail(
+                        &format!("agents[{index}].updated_at"),
+                        Some(id),
+                        "rows must be strictly newest-first by updated_at then numeric Agent ID",
+                    ));
+                }
+                if after_recent.is_some_and(|after| key >= after) {
+                    return Err(invalid_response_detail(
+                        &format!("agents[{index}].updated_at"),
+                        Some(id),
+                        "row must sort after the supplied recent cursor",
+                    ));
+                }
+                previous_recent = Some(key);
+            } else {
+                if previous_id.is_some_and(|previous| number <= previous) {
+                    return Err(invalid_response_detail(
+                        &format!("agents[{index}].id"),
+                        Some(id),
+                        "rows must be in strictly increasing numeric Agent ID order",
+                    ));
+                }
+                if after_id.is_some_and(|after| number <= after) {
+                    return Err(invalid_response_detail(
+                        &format!("agents[{index}].id"),
+                        Some(id),
+                        "row must follow the supplied Agent ID cursor",
+                    ));
+                }
+                previous_id = Some(number);
+            }
+        }
+
+        let expected_next = row_keys.last().map(|(id, activity)| {
+            if self.order == super::AgentListOrder::Recent {
+                encode_recent_cursor(id, *activity)
+            } else {
+                id.clone()
+            }
+        });
+        if reply.next != expected_next {
+            return Err(invalid_response_detail(
+                "next",
+                row_keys.last().map(|(id, _)| id.as_str()),
+                "must identify the last row in this page using the requested order",
+            ));
         }
         if reply
             .next
             .as_ref()
             .is_some_and(|next| self.after.as_ref() == Some(next))
         {
-            return Err(invalid_response());
+            return Err(invalid_response_detail(
+                "next",
+                row_keys.last().map(|(id, _)| id.as_str()),
+                "must advance beyond the request cursor",
+            ));
         }
+        Ok(())
+    }
+
+    /// Validate one decoded row and its request filters, naming its page index
+    /// and Agent ID in any response diagnostic.
+    pub fn validate_row(&self, row: &super::AgentListRow, index: usize) -> Result<()> {
+        row.validate()?;
+        let id = row.summary.id.as_str();
+        let fail = |field: &str, rule: &str| {
+            invalid_response_detail(&format!("agents[{index}].{field}"), Some(id), rule)
+        };
+        if row.observation.is_some() != self.observations {
+            return Err(fail(
+                "observation",
+                "must be present exactly when observations were requested",
+            ));
+        }
+        // The default list keeps an archived ended Agent while its custody is
+        // unresolved (core.md); custody is not on the row.
+        match self.archived {
+            super::ArchivedFilter::Exclude
+                if row.summary.archived && !row.summary.state.is_terminal() =>
+            {
+                return Err(fail(
+                    "archived",
+                    "an archived nonterminal Agent must not appear in the default list",
+                ));
+            }
+            super::ArchivedFilter::Only if !row.summary.archived => {
+                return Err(fail("archived", "must be true for archived:only"));
+            }
+            _ => {}
+        }
+        if self.state.is_some_and(|state| row.summary.state != state) {
+            return Err(fail("state", "must match the requested state filter"));
+        }
+        if self
+            .states
+            .as_ref()
+            .is_some_and(|states| !states.contains(&row.summary.state))
+        {
+            return Err(fail("state", "must be in the requested states set"));
+        }
+        if self
+            .project
+            .as_ref()
+            .is_some_and(|project| &row.summary.project != project)
+        {
+            return Err(fail("project", "must match the requested project filter"));
+        }
+        if self.project_scope.as_ref().is_some_and(|scope| {
+            row.summary
+                .project_scope
+                .as_deref()
+                .unwrap_or(&row.summary.project)
+                != scope
+        }) {
+            return Err(fail(
+                "project_scope",
+                "must match the requested effective project scope",
+            ));
+        }
+        if self
+            .harness
+            .as_ref()
+            .is_some_and(|harness| &row.summary.harness != harness)
+        {
+            return Err(fail("harness", "must match the requested harness filter"));
+        }
+        if self
+            .parent
+            .as_ref()
+            .is_some_and(|parent| row.summary.parent.as_ref() != Some(parent))
+        {
+            return Err(fail("parent", "must match the requested parent filter"));
+        }
+        if self
+            .root
+            .as_ref()
+            .is_some_and(|root| &row.summary.root != root)
+        {
+            return Err(fail("root", "must match the requested root filter"));
+        }
+        Ok(())
+    }
+
+    pub fn validate_response(&self, reply: &AgentListResponse) -> Result<()> {
+        let row_keys = reply
+            .agents
+            .iter()
+            .map(|row| (row.summary.id.clone(), row.summary.updated_at))
+            .collect::<Vec<_>>();
+        self.validate_response_page(reply, &row_keys)?;
         match (&self.states, &reply.state_totals) {
             (Some(states), Some(totals)) => {
                 if totals.len() != super::AGENT_LIST_STATES.len()
@@ -316,51 +473,25 @@ impl AgentListRequest {
                             > entry.total
                     })
                 {
-                    return Err(invalid_response());
+                    return Err(invalid_response_detail(
+                        "state_totals",
+                        None,
+                        "must contain all nine states, sum selected totals to total, and cover returned rows",
+                    ));
                 }
             }
             (None, None) => {}
-            _ => return Err(invalid_response()),
+            _ => {
+                return Err(invalid_response_detail(
+                    "state_totals",
+                    None,
+                    "must be present exactly when states were requested",
+                ));
+            }
         }
-        let mut ids = BTreeSet::new();
-        if reply.agents.iter().any(|row| {
-            row.validate().is_err()
-                || !ids.insert(row.summary.id.clone())
-                || row.observation.is_some() != self.observations
-                // The default list keeps an archived ended Agent while its
-                // custody is unresolved (core.md); custody is not on the row.
-                || match self.archived {
-                    super::ArchivedFilter::Exclude => {
-                        row.summary.archived && !row.summary.state.is_terminal()
-                    }
-                    super::ArchivedFilter::Only => !row.summary.archived,
-                    super::ArchivedFilter::Include => false,
-                }
-                || self.state.is_some_and(|state| row.summary.state != state)
-                || self.states.as_ref().is_some_and(|states| !states.contains(&row.summary.state))
-                || self
-                    .project
-                    .as_ref()
-                    .is_some_and(|project| &row.summary.project != project)
-                || self.project_scope.as_ref().is_some_and(|scope| {
-                    row.summary.project_scope.as_deref().unwrap_or(&row.summary.project) != scope
-                })
-                || self
-                    .harness
-                    .as_ref()
-                    .is_some_and(|harness| &row.summary.harness != harness)
-                || self
-                    .parent
-                    .as_ref()
-                    .is_some_and(|parent| row.summary.parent.as_ref() != Some(parent))
-                || self
-                    .root
-                    .as_ref()
-                    .is_some_and(|root| &row.summary.root != root)
-        }) {
-            return Err(invalid_response());
+        for (index, row) in reply.agents.iter().enumerate() {
+            self.validate_row(row, index)?;
         }
-        // Neither a non-null next nor a full page promises another record.
         Ok(())
     }
 }

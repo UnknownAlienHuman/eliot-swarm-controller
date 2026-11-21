@@ -929,6 +929,15 @@ Agent ID descending; `updated_at` is bumped on every native event). The recent c
 `<id>@<updated_at_ms>` of the last row: `after` continues after that exact sort position,
 and the unfiltered pages seek the `agents_recent` index, so the first and continuation
 pages stay bounded on real volume; the `id` cursor stays the last returned Agent ID.
+For observation-bearing pages, the Router joins and byte-bounds the rows before setting
+`next`; it uses the last included row's cursor in the requested order (`id` for `id`,
+`<id>@<updated_at_ms>` for `recent`). `truncated` is true when either the row cap or the
+encoded response budget omits rows. The human `swarm top` footer calls out a byte-limited
+page when it is truncated below the requested row limit. Text `swarm top` prints valid
+rows and reports rejected rows with their field path and Agent ID (exit 4); it validates
+the page cursor against all returned row keys and withholds `next` when a rejected row
+has no usable cursor key. JSON and other API consumers retain strict whole-response
+validation.
 Existing callers keep the ID order unless they opt into `recent`. Each summary can carry
 the retained execution directory in `workspace`; full records stay available through
 `agent.get`. Optional `state`,
