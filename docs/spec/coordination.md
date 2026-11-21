@@ -537,11 +537,16 @@ CREATE TABLE claims (
 ```
 
 An Agent principal or the owner launches a child through the ordinary launch path
-with `args.parent`. An Agent launches only its own children. The child takes the
-parent's project authorization scope and tree root at one deeper depth. The parent
-link is durable. A launch parent must be a
-controlled Agent: observe-only and unknown Agents cannot take children. Per
-Authority above, a child reuses the parent profile's frozen snapshot or names a
+with `args.parent`. An Agent with frozen `control=tree` or `control=project` can
+launch its own children. A caller with `control=self` receives `not_allowed`
+before allocation for both prompted and promptless launches.
+
+The child takes the parent's project authorization scope and tree root at one
+deeper depth. A prompted launch's linked first `SEND` uses the launch caller's
+authority. The new child is in scope through its subtree link for `tree` and its
+inherited project authorization scope for `project`. The parent link is durable.
+A launch parent must be a controlled Agent. Under [Authority](#authority), a child
+reuses the parent profile's frozen snapshot or names a
 profile from the parent's captured `child_profiles` allow-list. An explicit profile
 bypasses routing; a `role` selects candidates intersected with that frozen list
 (including the inherited parent profile). A later config edit cannot widen the list.

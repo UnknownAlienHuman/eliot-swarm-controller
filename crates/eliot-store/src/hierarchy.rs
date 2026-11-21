@@ -268,8 +268,8 @@ pub(super) struct ParentLink {
 }
 
 /// Resolve `args.parent` for a launch: the parent must exist and be
-/// controlled (not observe-only or unknown), an Agent caller launches only
-/// its own children, and the child inherits project and root.
+/// controlled (not observe-only or unknown), a tree/project-control Agent
+/// caller launches only its own children, and the child inherits project and root.
 pub(super) fn resolve_launch_parent(
     tx: &Transaction<'_>,
     principal: &str,
@@ -291,13 +291,22 @@ pub(super) fn resolve_launch_parent(
         .ok_or_else(|| Error::new("invalid", "launch parent must be an Agent id"))?;
     let parent_num = parse_agent_id(parent_id)?;
     let caller = parse_caller(tx, principal)?;
-    if let Caller::Agent { id, .. } = &caller
-        && id != parent_id
-    {
-        return Err(Error::new(
-            "not_allowed",
-            "Agents launch only their own children",
-        ));
+    if let Caller::Agent { id, control, .. } = &caller {
+        if !matches!(*control, AgentControl::Tree | AgentControl::Project) {
+            return Err(Error::new(
+                "not_allowed",
+                format!(
+                    "{id} has control={} and cannot launch children. Ask its manager.",
+                    control.as_str()
+                ),
+            ));
+        }
+        if id != parent_id {
+            return Err(Error::new(
+                "not_allowed",
+                "Agents launch only their own children",
+            ));
+        }
     }
     let parent_agent = load_agent_by_num(tx, parent_num)?
         .ok_or_else(|| Error::new("not_found", format!("Agent {parent_id} was not found")))?;
