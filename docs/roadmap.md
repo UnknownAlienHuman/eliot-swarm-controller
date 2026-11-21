@@ -417,7 +417,7 @@ qualification is incomplete; do not describe it as feature complete.
       causal chain and one-line summary, `preceded_by` on turn outcomes, and the
       same summary in desktop Agent details. Qualify on a private daemon:
       nonexistent command, killed turn, invalid model, `max_live`, plugin panic
-      and forced daemon panic with the marker consumed exactly once.
+      during startup, and forced daemon panic with the marker consumed exactly once.
 
 ## L7 — Qualification, repair and release
 

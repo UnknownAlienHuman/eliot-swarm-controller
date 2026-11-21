@@ -451,16 +451,18 @@ impl Router {
                 require_owner(&principal)?;
                 self.shutdown(&params, &principal).await
             }
-            // Debug-only forced daemon panic for crash-capture tests.
-            // Compiled out of release builds: the detached thread panic
-            // aborts the process after the hook writes its marker.
             #[cfg(debug_assertions)]
-            "daemon.panic_test" => {
+            crate::crash::DAEMON_PANIC_TEST_METHOD => {
+                use eliot_core::api::{DaemonPanicTestRequest, DaemonPanicTestResponse};
+
                 require_owner(&principal)?;
-                std::thread::spawn(|| {
-                    panic!("debug daemon panic-test trigger");
-                });
-                Ok(json!({"state": "panicking"}))
+                let request: DaemonPanicTestRequest =
+                    eliot_core::api::discovery::decode_params(params.clone())?;
+                request.validate()?;
+                // IPC triggers the panic after sending this acknowledgement.
+                Ok(json!(DaemonPanicTestResponse {
+                    state: "panicking".to_owned()
+                }))
             }
             "maintenance.run" => self.maintenance_run(&params, &principal).await,
             "artifact.register" => self.artifact_register(&params, &principal).await,

@@ -609,6 +609,8 @@ codes, never from message text. Exit codes ride alongside (`exit_code`, plus an
 |---|---|
 | Swarm validation, schema, queue or implementation failure | `swarm` |
 | Loss of a live generation during daemon restart | `swarm` at `daemon.restart` |
+| Swarm observer, monitoring attachment or pipe setup failure before the plugin handshake | `swarm` at the failing `swarm.start.*` phase |
+| Owned plugin process loss during runtime or cleanup after attempting the plugin handshake | `plugin.exit`, with the producer's origin or `harness` by default |
 | Missing executable; OS, disk, network or external credential failure | `environment` |
 | Native harness refusal, including an unavailable model without upstream evidence | `harness` |
 | Structured upstream rate, quota, auth or model error | `provider` |
@@ -616,16 +618,22 @@ codes, never from message text. Exit codes ride alongside (`exit_code`, plus an
 | Insufficient evidence | `unknown`, stating the missing evidence |
 
 The restart's `agent.lost` and `turn.unknown` events carry `origin: swarm` and
-`where: daemon.restart` beside `reason: daemon_restart`
-([`swarm_loss_location`](../../crates/eliot-core/src/lib.rs)); a retained loss
-written before those fields existed classifies from that typed reason code alone.
+`where: daemon.restart` beside `reason: daemon_restart`. A spontaneous plugin
+root exit, reader EOF without a session terminal, or loss of the owned plugin
+generation after attempting the handshake carries `where: plugin.exit`. The
+producer's origin is retained when supplied, with `harness` as the default.
+Handshake cleanup may terminate the owned process itself after an error.
+Closure of the daemon's own control channel alone does not establish plugin
+failure. A retained loss without attribution uses its typed reason code
+([`swarm_loss_location`](../../crates/eliot-core/src/lib.rs)).
 
 Redact complete messages and evidence before imposing their persistence/wire bounds.
 Constructors retain complete text until the owning policy is available. No minimum
 secret or truncated-prefix length is a confidentiality boundary. A failed-start
 conversion preserves the typed origin, location and evidence; proof of no effect
 does not imply a Swarm origin. A plugin panic is diagnostic evidence from the exact
-owned process pipe bound to its Agent/generation, never a replacement effect code.
+owned process pipe bound to its Agent/generation. Its summary augments the
+recorded evidence while preserving the original command error.
 
 Native mappings are versioned at their owning adapters: Codex 0.167.1
 `CodexErrorInfo` upstream variants/statuses; Claude stream-json structured

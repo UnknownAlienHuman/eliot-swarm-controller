@@ -159,7 +159,9 @@ when the reader reached EOF with no terminal fact and no observed exit,
 The drain detail (which gap the reader hit, including
 `root_exit_source_failed`, `root_exit_drain_timeout`,
 `owned_exit_source_failed` and `owned_exit_drain_timeout`) stays on
-`source.gap`.
+`source.gap`. For a Swarm setup failure before the plugin handshake,
+`plugin_startup_setup_failed` is reserved for source-gap diagnostics. The start
+command carries `origin: swarm` and the failing `swarm.start.*` location.
 
 For a controlled start/resume, a plugin may report a positively observed native endpoint
 exit after its reader has closed and finished. The daemon preserves the command outcome

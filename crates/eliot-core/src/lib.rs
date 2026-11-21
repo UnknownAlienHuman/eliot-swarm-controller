@@ -1328,17 +1328,25 @@ pub const DAEMON_RESTART_REASON: &str = "daemon_restart";
 /// and the generation is lost. The detailed drain cause stays on `source.gap`.
 pub const PLUGIN_ROOT_EXITED_REASON: &str = "root_exited";
 
+/// Location of an owned plugin process exit.
+pub const PLUGIN_EXIT_WHERE: &str = "plugin.exit";
+
 /// The loss reason for an explicit Owner/host assertion of loss. Only that
 /// assertion path may record it; daemon telemetry of a spontaneous exit
 /// passes its truthful cause instead.
 pub const OWNER_MARKED_LOST_REASON: &str = "owner_marked_lost";
 
-/// The typed origin and `where` of a loss Swarm caused itself, from the
-/// loss event's typed `reason` code: a daemon restart is `swarm` at
-/// `daemon.restart`. Every other loss keeps the evidence its producer
-/// recorded (`None`).
+/// Default attribution for a typed loss reason. A recorded producer origin
+/// takes precedence. Closure of the daemon's own control channel alone says
+/// nothing about the plugin's cause of exit.
 pub fn swarm_loss_location(reason: &str) -> Option<(FailureOrigin, &'static str)> {
-    (reason == DAEMON_RESTART_REASON).then_some((FailureOrigin::Swarm, "daemon.restart"))
+    match reason {
+        DAEMON_RESTART_REASON => Some((FailureOrigin::Swarm, "daemon.restart")),
+        PLUGIN_ROOT_EXITED_REASON
+        | "stream_eof_without_session_terminal"
+        | "plugin_startup_exit" => Some((FailureOrigin::Harness, PLUGIN_EXIT_WHERE)),
+        _ => None,
+    }
 }
 
 /// Truncate to a character boundary; never splits UTF-8 mid-codepoint.

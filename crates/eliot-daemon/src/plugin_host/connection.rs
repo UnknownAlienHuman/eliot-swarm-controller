@@ -25,6 +25,7 @@ use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
 
 const PIPE_QUEUE_CAPACITY: usize = 16;
 pub(crate) const MAX_PENDING_CALLS: usize = 32;
+pub(super) const PLUGIN_TRANSPORT_WHERE: &str = "plugin.command.transport";
 
 type Pending = HashMap<String, oneshot::Sender<Result<RpcResponse>>>;
 
@@ -753,7 +754,7 @@ fn unknown_transport_error(error: Error) -> Error {
     error.message = message.into();
     // A framing/connection failure is ours to name: the daemon-plugin
     // transport, not the plugin's last known location.
-    error.failure_where = Some("plugin.command.transport".into());
+    error.failure_where = Some(PLUGIN_TRANSPORT_WHERE.into());
     error.origin = Some(FailureOrigin::Swarm);
     error.origin_evidence = Some("daemon-plugin transport failure".into());
     error
@@ -765,7 +766,7 @@ async fn fail_connection(inner: &ClientInner, error: Error) {
     // only missing location/origin falls back here.
     let mut error = error;
     if error.failure_where.is_none() {
-        error = error.with_where("plugin.command.transport");
+        error = error.with_where(PLUGIN_TRANSPORT_WHERE);
     }
     if error.origin.is_none() {
         error = error.with_origin(FailureOrigin::Swarm, "daemon-plugin transport failure");

@@ -38,6 +38,10 @@ pub fn reason_words(code: &str) -> String {
         "id_conflict" => "This request was already used for a different action",
         "daemon_restart" => "Interrupted by a Swarm restart",
         "root_exited" => "The agent app exited unexpectedly",
+        "stream_eof_without_session_terminal" => {
+            "The agent app closed its event stream before reporting the result"
+        }
+        "plugin_startup_exit" => "The agent app exited during startup",
         "no_progress" => "No progress for a while",
         "no_code_progress" => "Working without writing code",
         "source_unhealthy" => "Lost contact with its agent app",

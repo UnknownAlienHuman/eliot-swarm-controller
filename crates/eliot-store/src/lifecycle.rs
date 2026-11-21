@@ -1249,15 +1249,13 @@ pub(super) fn stop_exited_idle_on_restart_tx(
     .map(Some)
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn transition_lost_tx(
     tx: &Transaction<'_>,
     agent_num: i64,
     generation: i64,
     now: i64,
     reason: &str,
-    exit: Option<&eliot_core::ProcessExit>,
-    stderr_tail: Option<&str>,
+    evidence: &super::AgentLossEvidence,
     events: &mut Vec<Event>,
 ) -> Result<()> {
     let Some(agent) = load_agent_by_num(tx, agent_num)? else {
@@ -1311,7 +1309,11 @@ pub(super) fn transition_lost_tx(
         )?;
     }
 
-    mark_lost_turn_unknown_tx(tx, &agent, agent_num, generation, now, reason, events)?;
+    let failure = eliot_core::swarm_loss_location(reason)
+        .map(|(fallback, location)| (evidence.origin.unwrap_or(fallback), location));
+    mark_lost_turn_unknown_tx(
+        tx, &agent, agent_num, generation, now, reason, failure, events,
+    )?;
 
     db!(tx.execute(
         "UPDATE agents SET state = 'lost', active_turn = NULL, pending = '[]',
@@ -1329,12 +1331,16 @@ pub(super) fn transition_lost_tx(
          WHERE agent = ?2 AND generation = ?3 AND source NOT IN ('os', 'git', 'workspace_process')",
         params![now, agent_num, generation],
     ));
+    // The typed `where` names the process boundary; the origin is the
+    // producer's own classification when it recorded one, else the fallback
+    // for this reason. A failed start on a missing external credential keeps
+    // its `environment` origin instead of being retyped as Agent software.
     let mut data = json!({"agent_id": agent.id, "reason": reason});
-    if let Some((origin, location)) = eliot_core::swarm_loss_location(reason) {
+    if let Some((origin, location)) = failure {
         data["origin"] = json!(origin.as_str());
         data["where"] = json!(location);
     }
-    if let Some(exit) = exit.filter(|exit| !exit.is_empty()) {
+    if let Some(exit) = evidence.exit.as_ref().filter(|exit| !exit.is_empty()) {
         if let Some(exit_code) = exit.exit_code {
             data["exit_code"] = json!(exit_code);
         }
@@ -1342,8 +1348,15 @@ pub(super) fn transition_lost_tx(
             data["ntstatus"] = json!(ntstatus);
         }
     }
-    if let Some(tail) = stderr_tail.filter(|tail| !tail.trim().is_empty()) {
+    if let Some(tail) = evidence
+        .stderr_tail
+        .as_deref()
+        .filter(|tail| !tail.trim().is_empty())
+    {
         data["stderr_tail"] = json!(tail);
+    }
+    if let Some(origin_evidence) = evidence.origin_evidence.as_deref() {
+        data["origin_evidence"] = json!(eliot_core::bound_chars(origin_evidence, 512));
     }
     events.push(insert_daemon_event(
         tx,
@@ -1362,6 +1375,7 @@ pub(super) fn transition_lost_tx(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn mark_lost_turn_unknown_tx(
     tx: &Transaction<'_>,
     agent: &Agent,
@@ -1369,6 +1383,7 @@ fn mark_lost_turn_unknown_tx(
     generation: i64,
     now: i64,
     reason: &str,
+    failure: Option<(eliot_core::FailureOrigin, &str)>,
     events: &mut Vec<Event>,
 ) -> Result<()> {
     if let Some(turn_id) = agent.active_turn.as_deref() {
@@ -1402,7 +1417,7 @@ fn mark_lost_turn_unknown_tx(
         }
         let cause = command_cause_for_turn_tx(tx, agent_num, generation, turn_id)?;
         let mut data = json!({"turn_id": turn_id, "reason": reason});
-        if let Some((origin, location)) = eliot_core::swarm_loss_location(reason) {
+        if let Some((origin, location)) = failure {
             data["origin"] = json!(origin.as_str());
             data["where"] = json!(location);
         }

@@ -21,6 +21,7 @@ use eliot_plugin::{
     AgentCommandParams, PluginManifest, StderrCapture, StderrView, spawn_plugin_stderr,
     sync::LockExt,
 };
+use eliot_store::AgentLossEvidence;
 
 use serde_json::{Map, Value, json};
 use source_intake::serve_plugin_requests;
@@ -139,11 +140,9 @@ struct AgentKey {
 /// truthful cause with its process exit status and stderr tail together.
 /// Retention is first-writer-wins so an independently observed root exit is
 /// never overwritten by a later planned force-stop label.
-#[derive(Clone)]
 struct DeferredLoss {
     reason: &'static str,
-    exit: Option<eliot_core::ProcessExit>,
-    stderr_tail: Option<String>,
+    evidence: AgentLossEvidence,
 }
 
 /// Own loss suppression until the force command's Store settlement commits.
@@ -201,8 +200,7 @@ impl Drop for ForceStopGuard {
                     &Arc::downgrade(&state),
                     &key,
                     deferred.reason,
-                    deferred.exit,
-                    deferred.stderr_tail,
+                    deferred.evidence,
                 )
                 .await;
             });
@@ -643,50 +641,47 @@ impl PluginHost {
         let observer = match child.observer() {
             Ok(observer) => observer,
             Err(error) => {
-                let exited = terminate_child(child, &self.state.monitoring, &agent).await;
-                settle_owned_source_exit(
-                    &Arc::downgrade(&self.state),
-                    &key,
-                    None,
-                    exited,
-                    "plugin_startup_exit",
-                )
-                .await?;
-                return Err(error);
+                return Err(self
+                    .cleanup_startup_setup_failure(
+                        child,
+                        &agent,
+                        &key,
+                        error,
+                        "swarm.start.process_observer",
+                    )
+                    .await);
             }
         };
         if let Err(error) = self.state.monitoring.attach(&agent, observer).await {
-            let exited = terminate_child(child, &self.state.monitoring, &agent).await;
-            settle_owned_source_exit(
-                &Arc::downgrade(&self.state),
-                &key,
-                None,
-                exited,
-                "plugin_startup_exit",
-            )
-            .await?;
-            return Err(error);
+            return Err(self
+                .cleanup_startup_setup_failure(
+                    child,
+                    &agent,
+                    &key,
+                    error,
+                    "swarm.start.monitor_attach",
+                )
+                .await);
         }
         self.state.secrets.lock_recover().insert(credential.clone());
         let stdin = child.take_stdin();
         let stdout = child.take_stdout();
         let stderr = child.take_stderr();
         let (Some(stdin), Some(stdout), Some(stderr)) = (stdin, stdout, stderr) else {
-            let exited = terminate_child(child, &self.state.monitoring, &agent).await;
-            let source_exit = settle_owned_source_exit(
-                &Arc::downgrade(&self.state),
-                &key,
-                None,
-                exited,
-                "plugin_startup_exit",
-            )
-            .await;
+            let error = self
+                .cleanup_startup_setup_failure(
+                    child,
+                    &agent,
+                    &key,
+                    Error::new(
+                        "process_pipes",
+                        "Agent plugin did not expose all three owned pipes",
+                    ),
+                    "swarm.start.process_pipes",
+                )
+                .await;
             self.remove_plugin_secret(&credential);
-            source_exit?;
-            return Err(Error::new(
-                "process_pipes",
-                "Agent plugin did not expose all three owned pipes",
-            ));
+            return Err(error);
         };
 
         let telemetry_policy = Arc::new(SecretPolicy::new(source_credentials.iter()));
@@ -1386,11 +1381,50 @@ impl PluginHost {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // Debug-only owner fault hook: the plugin entry point panics when
+        // `ELIOT_DEBUG_PLUGIN_PANIC=1`. The child environment is rebuilt from
+        // a fixed base list, so forward this one flag explicitly or the hook
+        // is unreachable through the daemon. Compiled out of release builds
+        // with the trigger itself.
+        #[cfg(debug_assertions)]
+        if let Some(value) = std::env::var_os("ELIOT_DEBUG_PLUGIN_PANIC") {
+            command.env("ELIOT_DEBUG_PLUGIN_PANIC", value);
+        }
         Ok(command)
     }
 
     fn remove_plugin_secret(&self, credential: &str) {
         self.state.secrets.lock_recover().remove(credential);
+    }
+
+    async fn cleanup_startup_setup_failure(
+        &self,
+        child: OwnedChild,
+        agent: &Agent,
+        key: &AgentKey,
+        error: Error,
+        location: &'static str,
+    ) -> Error {
+        let exited = terminate_child(child, &self.state.monitoring, agent).await;
+        let settled = settle_owned_source_exit(
+            &Arc::downgrade(&self.state),
+            key,
+            None,
+            exited,
+            "plugin_startup_setup_failed",
+        )
+        .await;
+        let error = match settled {
+            Ok(()) => error,
+            Err(cleanup) => {
+                let message = format!("{}; {}", error.message, cleanup.message);
+                error.with_message(message)
+            }
+        };
+        error.with_where(location).with_origin(
+            eliot_core::FailureOrigin::Swarm,
+            "Swarm could not set up the owned plugin before its handshake",
+        )
     }
 
     /// Force is a custody operation, independent of the plugin command queue.
@@ -1526,6 +1560,8 @@ async fn run_agent(
 ) {
     let credentials = Arc::clone(&actor.source_credentials);
     let key = actor.key.clone();
+    let stderr = actor.stderr.clone();
+    let mut stderr_capture = Some(stderr_capture);
     let mut failure = None;
     run_agent_inner(
         actor,
@@ -1534,12 +1570,16 @@ async fn run_agent(
         event_task,
         messages,
         started,
+        &mut stderr_capture,
         &mut failure,
     )
     .await;
     // All existing child/custody cleanup paths have completed or dropped their
     // owning handle. Finish the sole stderr drain before the final error view.
-    let snapshot = stderr_capture.finish(Instant::now() + STOP_GRACE).await;
+    let snapshot = match stderr_capture {
+        Some(capture) => capture.finish(Instant::now() + STOP_GRACE).await,
+        None => stderr.snapshot(),
+    };
     if let Some(failure) = failure {
         let error = redact_native_error(
             failure.error.with_stderr(StderrSource::Plugin, snapshot),
@@ -1668,8 +1708,10 @@ async fn cleanup_startup(
     actor: &AgentActorConfig,
     child: OwnedChild,
     event_task: &mut tokio::task::JoinHandle<()>,
+    stderr_capture: &mut Option<StderrCapture>,
     pending_failure: &mut Option<PendingFailure>,
     proven_no_dispatch: bool,
+    origin: Option<eliot_core::FailureOrigin>,
 ) {
     let exited = terminate_child(child, &actor.monitoring, &actor.agent).await;
     // `settle_owned_source_exit` returns Ok only after positive custody exit,
@@ -1689,7 +1731,26 @@ async fn cleanup_startup(
     )
     .await;
     if settled.is_ok() && !proven_no_dispatch {
-        mark_lost_state(&actor.state, &actor.key, "plugin_startup_exit").await;
+        // The stderr reader is independent of the source reader. Join it
+        // before inspecting the final bytes of a plugin that panicked.
+        let stderr = stderr_capture
+            .take()
+            .expect("startup owns the stderr capture until cleanup")
+            .finish(Instant::now() + STOP_GRACE)
+            .await;
+        let origin_evidence = plugin_crash_marker(&stderr.text).map(|marker| marker.summary());
+        mark_lost_state_with_exit(
+            &actor.state,
+            &actor.key,
+            "plugin_startup_exit",
+            AgentLossEvidence {
+                stderr_tail: Some(stderr.text),
+                origin,
+                origin_evidence,
+                ..Default::default()
+            },
+        )
+        .await;
     } else if let Err(error) = settled {
         pending_failure.get_or_insert(PendingFailure {
             reply: None,
@@ -2041,18 +2102,15 @@ fn diagnose_error(error: Error, stderr: &StderrView, credentials: &[String]) -> 
     // never enter this path. Marker evidence never replaces the effect code.
     let snapshot = stderr.snapshot();
     let mut error = error;
-    for line in snapshot.text.lines() {
-        if let Some(json) = line.strip_prefix("eliot_crash ")
-            && let Ok(marker) = serde_json::from_str::<eliot_core::api::CrashMarker>(json)
-            && marker.code == "plugin.panicked"
-            && marker.validate().is_ok()
-        {
-            let evidence = error
-                .origin_evidence
-                .as_deref()
-                .unwrap_or("original failure origin unclassified");
-            error.origin_evidence = Some(format!("{evidence}; {}", marker.summary()).into());
-        }
+    if let Some(marker) = plugin_crash_marker(&snapshot.text) {
+        let summary = marker.summary();
+        error.origin_evidence = Some(
+            match error.origin_evidence.as_deref() {
+                Some(evidence) => format!("{evidence}; {summary}"),
+                None => summary,
+            }
+            .into(),
+        );
     }
     redact_native_error(
         error.with_stderr(StderrSource::Plugin, snapshot),
@@ -3326,7 +3384,18 @@ async fn record_root_exit_gap(state: &Weak<HostState>, key: &AgentKey, reason: &
 /// plugin root exit records `root_exited`, never `owner_marked_lost`, which
 /// is reserved for an explicit Owner/host assertion of loss.
 async fn mark_lost_state(state: &Weak<HostState>, key: &AgentKey, reason: &'static str) {
-    mark_lost_state_with_exit(state, key, reason, None, None).await;
+    mark_lost_state_with_exit(state, key, reason, AgentLossEvidence::default()).await;
+}
+
+/// The one owned plugin crash marker in this stderr snapshot, if any. Only
+/// the exact owned process pipe is ever read here; a disk marker belonging to
+/// another process or generation cannot enter this path.
+fn plugin_crash_marker(stderr: &str) -> Option<eliot_core::api::CrashMarker> {
+    stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix("eliot_crash "))
+        .filter_map(|json| serde_json::from_str::<eliot_core::api::CrashMarker>(json).ok())
+        .find(|marker| marker.code == "plugin.panicked" && marker.validate().is_ok())
 }
 
 /// Mark an agent generation lost with its process exit evidence: the
@@ -3338,8 +3407,7 @@ async fn mark_lost_state_with_exit(
     state: &Weak<HostState>,
     key: &AgentKey,
     reason: &'static str,
-    exit: Option<eliot_core::ProcessExit>,
-    stderr_tail: Option<String>,
+    evidence: AgentLossEvidence,
 ) {
     let Some(state) = state.upgrade() else {
         return;
@@ -3354,16 +3422,12 @@ async fn mark_lost_state_with_exit(
         if let Some(deferred) = state.planned_stops.lock_recover().get(key) {
             let mut slot = deferred.lock_recover();
             if slot.is_none() {
-                *slot = Some(DeferredLoss {
-                    reason,
-                    exit,
-                    stderr_tail,
-                });
+                *slot = Some(DeferredLoss { reason, evidence });
             }
             return;
         }
         if let Ok(events) =
-            store.mark_lost_with_exit(&key.id, key.generation, now_ms(), reason, exit, stderr_tail)
+            store.mark_lost_with_exit(&key.id, key.generation, now_ms(), reason, &evidence)
         {
             state.bus.publish(&events);
             note_unknown_commands(&state, &events);

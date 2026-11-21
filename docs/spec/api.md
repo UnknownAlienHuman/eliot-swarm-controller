@@ -1380,12 +1380,18 @@ an array of turn objects and an object for Agent metadata, not positional record
 
 `diagnose` (owner only) takes a command id, Agent id or `agent:turn` and returns
 the causal chain: the command outcome with code, message, `where`, `origin` and
-exit data; the related turn outcomes with `preceded_by`; process steps from the
+exit data; a start command's linked `<id>/send` input expansion when it exists,
+because that expansion rather than the start settles the turn; the related turn
+outcomes with `preceded_by`; process steps from the
 `agent.lost`/`agent.failed` events with their recorded `origin`/`where`, exit code,
 NTSTATUS and the redacted stderr tail (a loss to a daemon restart is `swarm` at
-`daemon.restart`, see [core](core.md#failure-location-and-origin)); and the
-previous-run crash marker when the terminal failure is
-unclassified. When a failure exists, the one-line `summary` starts with its origin
+`daemon.restart`, a spontaneous plugin root exit is `harness` at
+`plugin.exit`, see [core](core.md#failure-location-and-origin)). The retained
+`agent.lost.stderr_tail` keeps the bounded, redacted capture verbatim, including
+any raw panic marker lines. The process step can carry the startup panic marker
+summary in `origin_evidence`. Diagnosis also includes the previous-run crash
+marker when the terminal failure is unclassified.
+When a failure exists, the one-line `summary` starts with its origin
 (`provider origin: <target> <code> at <where>: <message>`). A healthy idle, busy,
 waiting or stopped Agent with no failure in the bounded recent generation read
 says that nothing has failed in that recent history; it carries no unrelated

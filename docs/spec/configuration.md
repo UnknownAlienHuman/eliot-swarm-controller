@@ -757,6 +757,9 @@ canonical Git common directory identifies its repository registration. Discovery
 prefers the registered primary checkout even when a legacy registration names the
 worktree itself. Without a registered primary checkout, discovery can reuse a
 sole registration for the common directory. Ambiguous matches refuse discovery.
+A checkout is compared canonically: the same directory reached through a
+drive-letter path or Windows' verbatim `\\?\` form is one checkout, so an
+unchanged registration is never refused as changed.
 Reuse returns that registration's checkout and exact allowlists, preserves the
 Agent's workspace, and adds no settings entry. A launch records the selected
 registration ID independently of its execution workspace and authorization scope.

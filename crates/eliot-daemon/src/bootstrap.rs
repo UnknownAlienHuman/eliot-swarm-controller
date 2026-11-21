@@ -190,7 +190,11 @@ async fn matching_project(
 fn same_git_path(left: &str, right: &str) -> bool {
     #[cfg(windows)]
     {
-        left.eq_ignore_ascii_case(right)
+        // `fs::canonicalize` on Windows yields the verbatim \\?\ form while a
+        // Git identity readback reports the drive-letter form. The same checkout
+        // must compare equal however each side was produced, or a registration
+        // that already matches is refused as changed and discovery fails.
+        eliot_core::display_path(left).eq_ignore_ascii_case(&eliot_core::display_path(right))
     }
     #[cfg(not(windows))]
     {
