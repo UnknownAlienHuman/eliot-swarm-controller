@@ -17,10 +17,14 @@ pub use crate::tokens::state;
 
 /// The design's elevation: level 1 (a pressable under the pointer), 2
 /// (menus, popovers, the FAB under the pointer) and 3 (the composer), each
-/// Material Components' key and ambient shadow (offset, blur, spread)
-/// drawn as three concentric translucent layers per blur, so a WinUI
-/// element without `ThemeShadow` receivers still lifts. The theme's
-/// [`super::Lift`] sets their opacity, or replaces them with a 1-DIP ring.
+/// Material Components' key and ambient shadow (offset, blur, spread, as
+/// CSS `box-shadow`). WinUI's `ThemeShadow` draws nothing outside a popup
+/// without receivers, so each shadow is drawn as the blur CSS renders: a
+/// Gaussian falloff (σ = blur / 2) centred on the spread edge, in 1-DIP
+/// bands that never overlap (a filled core, then rings), so a band's alpha
+/// is exactly its share of the theme's opacity and the falloff reads as
+/// one smooth shadow. The theme's [`super::Lift`] sets the opacity, or
+/// replaces the shadow with a 1-DIP ring.
 pub mod elevation {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum Level {
@@ -29,60 +33,95 @@ pub mod elevation {
         Three,
     }
 
-    /// One drawn layer: how far it spreads past the element, how far it
-    /// falls below it (DIPs) and its alpha (0–255) over the lift color.
+    /// One shadow in DIPs, as CSS `box-shadow` takes it (no x offset).
     #[derive(Clone, Copy, Debug, PartialEq)]
-    pub struct Layer {
-        pub spread: f64,
+    pub struct Shadow {
         pub offset: f64,
-        pub alpha: u8,
+        pub blur: f64,
+        pub spread: f64,
     }
 
-    /// (offset, blur, spread) of the key and the ambient shadow.
-    fn shadows(level: Level) -> [(f64, f64, f64); 2] {
-        match level {
-            Level::One => [(1.0, 2.0, 0.0), (1.0, 3.0, 1.0)],
-            Level::Two => [(1.0, 2.0, 0.0), (2.0, 6.0, 2.0)],
-            Level::Three => [(1.0, 3.0, 0.0), (4.0, 8.0, 3.0)],
-        }
-    }
-
-    /// Steps that draw one blur.
-    pub const STEPS: usize = 3;
-
-    /// The geometry of `level`'s layers, key layers first, then ambient,
-    /// with the share of each shadow's opacity a layer carries.
-    pub fn geometry(level: Level) -> Vec<(f64, f64, bool)> {
-        let mut out = Vec::new();
-        for (index, (offset, blur, spread)) in shadows(level).into_iter().enumerate() {
-            for step in 0..STEPS {
-                // Half-DIP steps keep the layers on whole device pixels at
-                // 200 % scale.
-                let reach = (blur * step as f64 / STEPS as f64 * 2.0).round() / 2.0;
-                out.push((spread + reach, offset, index == 0));
+    impl Shadow {
+        const fn new(offset: f64, blur: f64, spread: f64) -> Self {
+            Self {
+                offset,
+                blur,
+                spread,
             }
         }
-        out
     }
 
-    /// The layers of `level` under `lift`.
-    pub fn layers(level: Level, lift: super::Lift) -> Vec<Layer> {
-        let super::Lift::Shadow { key, ambient } = lift else {
-            // A ring theme: one hairline around the element, no blur.
-            return vec![Layer {
-                spread: 1.0,
-                offset: 0.0,
-                alpha: 255,
-            }];
+    /// The key and the ambient shadow of `level` (material-web
+    /// `elevation/internal/_elevation.scss`, the design's System board).
+    pub const fn shadows(level: Level) -> [Shadow; 2] {
+        match level {
+            Level::One => [Shadow::new(1.0, 2.0, 0.0), Shadow::new(1.0, 3.0, 1.0)],
+            Level::Two => [Shadow::new(1.0, 2.0, 0.0), Shadow::new(2.0, 6.0, 2.0)],
+            Level::Three => [Shadow::new(1.0, 3.0, 0.0), Shadow::new(4.0, 8.0, 3.0)],
+        }
+    }
+
+    /// The night themes' glow around the FAB: a centred blur of `radius`.
+    pub const fn glow(radius: f64) -> Shadow {
+        Shadow::new(0.0, radius, 0.0)
+    }
+
+    /// One drawn band of a shadow: its outer edge `reach` DIPs past the
+    /// element (negative inside it), its `width` (`None` for the filled
+    /// core), how far it falls and its share (0–1) of the shadow's opacity.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct Band {
+        pub reach: f64,
+        pub width: Option<f64>,
+        pub offset: f64,
+        pub share: f64,
+    }
+
+    /// The standard normal distribution function (Abramowitz and Stegun
+    /// 7.1.26, absolute error below 1.5e-7).
+    fn phi(x: f64) -> f64 {
+        let z = x.abs() / std::f64::consts::SQRT_2;
+        let t = 1.0 / (1.0 + 0.327_591_1 * z);
+        let poly = t
+            * (0.254_829_592
+                + t * (-0.284_496_736
+                    + t * (1.421_413_741 + t * (-1.453_152_027 + t * 1.061_405_429))));
+        let erf = 1.0 - poly * (-z * z).exp();
+        0.5 * (1.0 + if x < 0.0 { -erf } else { erf })
+    }
+
+    /// `shadow` as 1-DIP bands: the core is filled from where the shadow
+    /// first shows past the element (its bottom edge, where the drop
+    /// uncovers it), then a ring per DIP out to the end of the blur. Each
+    /// band carries the falloff at its middle.
+    pub fn bands(shadow: Shadow) -> Vec<Band> {
+        let Shadow {
+            offset,
+            blur,
+            spread,
+        } = shadow;
+        let band = |edge: f64, width: Option<f64>| Band {
+            reach: spread + edge,
+            width,
+            offset,
+            share: if blur > 0.0 {
+                1.0 - phi((edge - 0.5) / (blur / 2.0))
+            } else {
+                1.0
+            },
         };
-        geometry(level)
-            .into_iter()
-            .map(|(spread, offset, is_key)| Layer {
-                spread,
-                offset,
-                alpha: ((if is_key { key } else { ambient }) / STEPS as f64 * 255.0).round() as u8,
-            })
-            .collect()
+        let end = blur.ceil();
+        // Bands wholly under the element never show: start at the first
+        // edge past the drop (the element covers the shadow up to
+        // `spread + offset` inside its bottom edge).
+        let core = (-end).max((-(spread + offset)).floor() + 1.0).min(end);
+        let mut out = vec![band(core, None)];
+        let mut edge = core + 1.0;
+        while edge <= end {
+            out.push(band(edge, Some(1.0)));
+            edge += 1.0;
+        }
+        out
     }
 }
 

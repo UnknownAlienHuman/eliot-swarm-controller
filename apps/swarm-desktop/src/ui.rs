@@ -871,6 +871,9 @@ impl Component for DesktopApp {
         if let Err(error) = crate::app_resources::install(app.palette().roles()) {
             app.status = format!("WinUI M3 resources not applied: {error}");
         }
+        if let Err(error) = crate::motion::install() {
+            app.status = error;
+        }
         app.note_window_size();
         if let Ok(data_dir) = app.data_dir.clone() {
             app.watch_high_contrast(context);

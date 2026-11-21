@@ -578,7 +578,7 @@ fn place_row(place: &PlaceEntry, input: &SidebarInput, context: &mut ViewContext
                     .content(m3::icon(m3::glyph::DELETE)),
             ));
         }
-    } else if section.key != nav::OTHER_LOCATIONS {
+    } else if over && section.key != nav::OTHER_LOCATIONS {
         actions.push(KeyedView::new(
             "more",
             m3::icon_button(palette)
@@ -728,21 +728,28 @@ fn agent_row(task: &TaskEntry, input: &SidebarInput, context: &mut ViewContext<S
                 })),
         ));
     }
-    actions.push(KeyedView::new(
-        "more",
-        m3::icon_button(palette)
-            .automation_name(format!("Task actions for {title}, Agent {}", agent.id))
-            .on_click(context.message(Message::Menu(MenuMsg::Opened(Target::Agent(agent.clone())))))
-            .content(m3::icon(m3::glyph::MORE))
-            .tooltip("Task actions"),
-    ));
-    let trailing = StackPanel::new()
-        .orientation(Orientation::Horizontal)
-        .children((
-            if over { View::empty() } else { trailing },
-            Border::new()
-                .width(tokens::height::CONTROL * actions.len() as f64 - tokens::spacing::ROW),
+    // The design and Codex: a row's actions show under the pointer (and
+    // on the open task) in place of its dot or age; a right click opens
+    // the same menu at any time.
+    if over {
+        actions.push(KeyedView::new(
+            "more",
+            m3::icon_button(palette)
+                .automation_name(format!("Task actions for {title}, Agent {}", agent.id))
+                .on_click(
+                    context.message(Message::Menu(MenuMsg::Opened(Target::Agent(agent.clone())))),
+                )
+                .content(m3::icon(m3::glyph::MORE))
+                .tooltip("Task actions"),
         ));
+    }
+    let trailing: View = if over {
+        Border::new()
+            .width(tokens::height::CONTROL * actions.len() as f64 - tokens::spacing::ROW)
+            .into()
+    } else {
+        trailing
+    };
     let row_button = m3::sub_row(palette, selected);
     let row_button = if line.is_some() {
         row_button

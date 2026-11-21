@@ -70,7 +70,20 @@ shapes, elevation and motion in `apps/swarm-desktop/src/app_resources/templates.
   templates over lightweight-styling keys. Its XAML is not imported: the
   desktop's templates read its own button families' keys.
 - WinUI's `ThemeShadow` was tried first and draws nothing outside a popup
-  without receivers (observed live), so shadows are drawn layers.
+  without receivers (observed live), so shadows are drawn: each CSS
+  `box-shadow` of the design as its Gaussian falloff (σ = blur / 2) in
+  non-overlapping 1-DIP bands (`theme::elevation::bands`), checked against
+  the design board rendered by Edge (within 0.01 alpha per pixel).
+- **Extract (2026-11-21):** WinUI's default ComboBox `ControlTemplate`
+  ([microsoft/microsoft-ui-xaml](https://github.com/microsoft/microsoft-ui-xaml)
+  `controls/dev/ComboBox/ComboBox_themeresources.xaml`, MIT, "Copyright (c)
+  Microsoft Corporation"; license checked on `main` 2026-11-21), copied from
+  the build the desktop runs (Microsoft.WindowsAppSDK.WinUI 2.3.0
+  `Themes/generic.xaml`) into
+  `apps/swarm-desktop/src/app_resources/combo_box.xaml` with its notice. Only
+  the drop-down glyph size (the design's 14-DIP chevron), the focus
+  highlight corner and inlined StaticResource values differ; WinUI hard-codes
+  the 12-DIP glyph in the template, so no style setter can change it.
 
 ## Provider quota pattern (k92, inspected 2026-11-16)
 

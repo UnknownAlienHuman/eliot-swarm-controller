@@ -924,6 +924,13 @@ impl DesktopApp {
                 if agent.live() && !agent.native_child {
                     entries.push((Action::Stop, "Stop".to_owned(), m3::glyph::STOP, false));
                 }
+                entries.push((
+                    Action::More,
+                    "More".to_owned(),
+                    m3::glyph::CHEVRON_RIGHT,
+                    false,
+                ));
+                // The destructive action ends the menu.
                 if !agent.native_child && agent.deletable() {
                     entries.push((
                         Action::Delete,
@@ -932,12 +939,6 @@ impl DesktopApp {
                         true,
                     ));
                 }
-                entries.push((
-                    Action::More,
-                    "More".to_owned(),
-                    m3::glyph::CHEVRON_RIGHT,
-                    false,
-                ));
                 entries
             }
         }

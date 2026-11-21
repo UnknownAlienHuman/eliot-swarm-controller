@@ -219,9 +219,10 @@ impl DesktopApp {
             Pop::Effort => self.effort_popover(context, palette),
             Pop::Usage => self.usage_popover(context, palette),
         };
-        // The design's entrance: a fade with the popover settling into
-        // place (Reactor's transitions take a duration only; the scale from
-        // its bottom stands in for the 4-DIP rise).
+        // The design's entrance: a 250 ms fade (Reactor's opacity
+        // transition) while the popover rises 4 DIPs into place
+        // (`crate::motion::popover_entered`, which finds it by its
+        // automation id).
         let entering = self.launch.entering;
         let entrance = std::time::Duration::from_millis(tokens::motion::POPOVER_MS);
         Border::new()
@@ -231,14 +232,9 @@ impl DesktopApp {
             .width(column)
             .max_width(tokens::layout::READING_WIDTH)
             .horizontal_alignment(HorizontalAlignment::Center)
+            .automation_id(crate::motion::POPOVER_ID)
             .opacity(if entering { 0.0 } else { 1.0 })
             .opacity_transition(Some(entrance))
-            .scale(Some(if entering {
-                tokens::motion::POPOVER_START_SCALE
-            } else {
-                1.0
-            }))
-            .scale_transition(Some(entrance))
             .content(content)
     }
 

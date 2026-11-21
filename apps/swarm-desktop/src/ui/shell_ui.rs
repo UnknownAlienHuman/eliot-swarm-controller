@@ -2136,7 +2136,12 @@ impl DesktopApp {
             Border::new()
                 .horizontal_alignment(HorizontalAlignment::Right)
                 .vertical_alignment(VerticalAlignment::Top)
-                .margin(Thickness::new(0.0, 2.0, 2.0, 0.0))
+                .margin(Thickness::new(
+                    0.0,
+                    tokens::spacing::ROW_GAP,
+                    tokens::spacing::ROW_GAP,
+                    0.0,
+                ))
                 .content(m3::status_mark(palette, tone, tokens::layout::DOT))
         });
         let button = |glyph: &str, name: String, message: Message| {
@@ -2298,10 +2303,16 @@ impl DesktopApp {
                     .automation_name("Retry startup")
                     .on_click(context.message(Message::Shell(ShellMsg::RetryStartup)))
                     .content(m3::label("Retry startup")),
-                m3::filled(palette)
-                    .automation_name("Use fresh private directory")
-                    .on_click(context.message(Message::Shell(ShellMsg::UseFreshDirectory)))
-                    .content(m3::label("Use a fresh private directory")),
+                // One filled action per page: Repair settings when the
+                // config is what failed, else the fresh directory.
+                if self.repairing_settings() {
+                    m3::outlined(palette)
+                } else {
+                    m3::filled(palette)
+                }
+                .automation_name("Use fresh private directory")
+                .on_click(context.message(Message::Shell(ShellMsg::UseFreshDirectory)))
+                .content(m3::label("Use a fresh private directory")),
             ))
     }
 
