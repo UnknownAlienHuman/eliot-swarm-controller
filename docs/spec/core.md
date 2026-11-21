@@ -212,20 +212,47 @@ If a running turn has no terminal evidence, retain it as `unknown` before cleari
 active-turn pointer; do not erase or fabricate its result. Dispatched/unknown commands
 remain historical and are never reissued.
 
-A graceful stop captures the dispatched generation's active turn. Its one
-interrupt attempt uses the stop's authority and binds to that generation and turn.
-After the attempt, wait up to five seconds for committed readback that the turn is
-no longer running or the generation has ended. A cancellation terminal settles
-`interrupted`, while natural completion/failure keeps its actual outcome.
-A pre-native refusal skips the wait and proceeds to session closure. An interrupt
-acknowledgement or timeout supplies no turn result. Stop the owned session and
-retain the unresolved turn as `unknown` if terminal evidence is absent. Force stop
-skips the cooperative window.
+A dispatched stop captures the generation's active turn, including when the
+caller omits `expected_turn_id`. A graceful stop makes one interrupt attempt
+under the stop's authority and binds it to that captured turn. After the
+attempt, wait up to five seconds for committed readback that the turn is no
+longer running or the generation has ended. A cancellation terminal settles
+`interrupted`, while natural completion/failure keeps its actual outcome. A
+pre-native refusal skips the wait and proceeds to process custody closure. An
+interrupt acknowledgement or timeout supplies no turn result.
+
+Stop is `applied` only after two independent, bounded facts are committed for
+the exact generation: its owned process custody is empty and its authoritative
+native source is drained. The plugin's stop reply or a native `session.ended`
+terminal is retained when observed; either may be absent after process/source
+proof, in which case the stop outcome records
+`native_session_end_observed=false`. Missing process-exit or source-drain proof
+keeps the stop `unknown` with the missing fact named. Stop never retries an
+uncertain native call.
+An actor that retires control without proof of exit records the Agent as lost
+and keeps the custody reservation for reconciliation.
+
+When an Owner-requested stop proves both facts, its captured turn becomes
+`interrupted` with `resolution_source=owner` and reason `stopped_by_owner` if no
+terminal native result arrived. A SEND dispatched before the stop can supply
+its exact turn binding while the Owner stop is in flight. A drained native terminal result, including its
+status, outcome, text and usage, remains authoritative. A turn not captured by
+that stop, or a non-Owner stop without terminal evidence, stays `unknown`.
+Force stop skips the cooperative interrupt window and uses the same process and
+source proof requirement.
 
 Diagnosis of a stopped, failed or lost Agent names retained unknown commands and
 turns across all generations, including history outside the recent-turn page.
-It points to `swarm cmd resolve` or `swarm turn resolve` with an exact Owner
-assertion; stopped process custody alone does not resolve either unknown.
+It points to `swarm cmd resolve` or `swarm turn resolve` for an exact Owner
+assertion. For historical stops, `swarm cmd settle-stopped` previews one page of
+unknown stop commands with committed ownership exit and reader drain. Run
+`swarm cmd settle-stopped --apply <review>` to settle that reviewed page as applied,
+mark proven current lost generations stopped, and mark any exact, still-unknown
+turn named by an Owner stop as interrupted.
+Use the same `--after` value on preview and apply when following a page's `next`
+cursor. The page also lists candidates awaiting proof. Start a new preview
+without `--after` after their process and reader evidence arrives. An effect
+whose outcome requires other evidence remains unknown.
 
 Stall is a flag only for busy work with a healthy authoritative source. Waiting on a
 request is waiting, not stalled solely through silence. Native progress clears a stall;
@@ -266,6 +293,9 @@ facts, and source rows stay with the producer's retirement
 recovery applies the same rule to retained rows and never resets an ended child to
 `unknown`. An ended child opens no `children_unattended` incident. Detached external
 observers keep their `unknown` state.
+For a reusable native child, one terminal turn settles its activity, while the
+harness can still send it more work. Only the end of the child session or its
+producer grant is a lifecycle terminal.
 
 Observe attachment records `origin=external`, `observe_only=true`, `own_identity=false`
 and no token. The generation/source fence commits before reader I/O. Owner-issued native
@@ -997,8 +1027,9 @@ pruning.
 `archived` is a durable presentation flag independent of lifecycle state; archiving
 never stops a generation. Archive/unarchive requires idle, ended (stopped, failed or
 lost), an external observer in `unknown` state, or an ended native observation, with
-no active turn, no other uncertain turn, and no pending request or open command, so a lost tree
-that cannot be deleted can still be hidden. Archive never hides custody the owner
+no active turn, pending request, or open command. Unknown turns and commands can
+remain in an archived ended controlled Agent's history when all their exact
+generations have committed ownership exit and reader drain. Archive never hides custody the owner
 must still resolve (an unexited owned process, `unknown` artifact or open native
 source): archiving an ended member or external observer in `unknown` state requires
 its custody resolved. The default list still shows an archived ended Agent while

@@ -251,9 +251,24 @@ impl Router {
         }
         let (command, turn) = store.agent_unknowns(agent)?;
         if let Some(command) = command {
-            unresolved.push(unknown_command_message(&command, row.observe_only));
-            commands.insert(command.id.clone());
             let mut step = command_step(&command);
+            let settled_custody = match command.generation {
+                Some(bound)
+                    if command.verb == "stop"
+                        && !row.observe_only
+                        && (bound < row.generation
+                            || (bound == row.generation && row.is_terminal())) =>
+                {
+                    store.has_owned_exit_and_reader_drain(agent, bound)?
+                }
+                _ => false,
+            };
+            unresolved.push(unknown_command_message(
+                &command,
+                row.observe_only,
+                settled_custody,
+            ));
+            commands.insert(command.id.clone());
             step.message = unresolved.last().cloned();
             steps.push(step);
         }
@@ -354,14 +369,23 @@ fn append_retained(summary: &str, unresolved: &[String]) -> String {
     format!("{prefix}{retained}")
 }
 
-fn unknown_command_message(command: &Command, observe_only: bool) -> String {
+fn unknown_command_message(command: &Command, observe_only: bool, settled_custody: bool) -> String {
     let resolution = if observe_only {
         "not Owner-resolvable: observe-only commands remain retained for the record"
+    } else if settled_custody {
+        "review proven exit with swarm cmd settle-stopped"
     } else {
         "resolve with swarm cmd resolve using an exact Owner assertion"
     };
+    let reason = command
+        .outcome
+        .as_ref()
+        .and_then(|outcome| outcome.get("message").or_else(|| outcome.get("reason")))
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+        .map_or_else(String::new, |text| format!("; {}", bound_chars(text, 256)));
     format!(
-        "unknown command {} (generation {}); {resolution}",
+        "unknown command {} (generation {}){reason}; {resolution}",
         command.id,
         command
             .generation

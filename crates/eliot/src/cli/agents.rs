@@ -8,15 +8,16 @@ use super::args::{
 use super::support::read_and_print;
 use super::support::{
     DEFAULT_WAIT_SECONDS, Failure, INTERRUPTED_EXIT_CODE, MAX_ANSWERS_FILE_BYTES, MAX_TEXT_BYTES,
-    command_value, mutation_id, print_value, response_exit_code, submit_and_print, submit_command,
-    submit_request, submit_value, turn_exit_code, turn_value, validate_limit, wait_deadline,
-    wait_for_command, wait_for_linked_turn, wait_for_turn,
+    command_value, mutation_id, print_value, response_exit_code, sleep_before_deadline,
+    submit_and_print, submit_command, submit_request, submit_value, turn_exit_code, turn_value,
+    validate_limit, wait_call, wait_deadline, wait_for_command, wait_for_linked_turn,
+    wait_for_turn,
 };
 use eliot_core::api::{
-    AgentDiscoverRequest, AgentGetRequest, AgentGetResponse, DiscoverPage, HarnessListRequest,
-    HarnessListResponse, HarnessModelsRequest, HarnessModelsResponse, HarnessQuotaRequest,
-    HarnessQuotaResponse, MAX_SWARM_WAIT_TARGETS, SwarmDigestRequest, SwarmDigestResponse,
-    SwarmWaitRequest, SwarmWaitResponse, WaitTurnRef,
+    AgentDiscoverRequest, AgentGetRequest, AgentGetResponse, CommandGetRequest, DiscoverPage,
+    HarnessListRequest, HarnessListResponse, HarnessModelsRequest, HarnessModelsResponse,
+    HarnessQuotaRequest, HarnessQuotaResponse, MAX_SWARM_WAIT_TARGETS, SwarmDigestRequest,
+    SwarmDigestResponse, SwarmWaitRequest, SwarmWaitResponse, WaitTurnRef,
 };
 use eliot_core::{InjectArgs, InjectPoint, SubmitCommand};
 use serde_json::Value;
@@ -829,6 +830,9 @@ pub(crate) async fn run_switch(
     json_output: bool,
     id: Option<String>,
 ) -> Result<u8, Failure> {
+    let deadline = (!args.no_wait)
+        .then(|| wait_deadline(args.timeout_seconds))
+        .transpose()?;
     let request = eliot_core::api::SwitchRequest {
         id: mutation_id(id)?,
         from: args.from,
@@ -850,13 +854,64 @@ pub(crate) async fn run_switch(
         },
     };
     request.validate().map_err(Failure::for_mutation)?;
-    let response: eliot_core::api::SwitchResponse =
+    let mut response: eliot_core::api::SwitchResponse =
         eliot_daemon::client_call_typed(&data_dir, "swarm.switch", &request)
             .await
             .map_err(Failure::for_mutation)?;
     request
         .validate_response(&response)
         .map_err(Failure::invalid_response)?;
+    if let Some(deadline) = deadline
+        && coordination_pending(response.state)
+    {
+        let query = CommandGetRequest::new(&request.id);
+        let command = wait_call(
+            eliot_daemon::wait_command(&data_dir, &query, deadline),
+            deadline,
+        )
+        .await?
+        .ok_or_else(Failure::timeout)?;
+        let state = command.state;
+        response = coordination_outcome(command, "swarm.switch")?;
+        request
+            .validate_response(&response)
+            .map_err(Failure::invalid_response)?;
+        if response.state != state {
+            return Err(Failure::new(
+                4,
+                "switch outcome state differs from its command",
+            ));
+        }
+    }
+    if let Some(deadline) = deadline
+        && let (Some(disposal), Some(created), Some(state)) = (
+            response.disposal_command.as_ref(),
+            response.created.as_ref(),
+            response.disposal_state,
+        )
+        && coordination_pending(state)
+    {
+        let query = CommandGetRequest::new(disposal);
+        let stop = wait_call(
+            eliot_daemon::wait_command(&data_dir, &query, deadline),
+            deadline,
+        )
+        .await?
+        .ok_or_else(Failure::timeout)?;
+        if stop.verb != "stop"
+            || stop.target.as_deref() != Some(&created.agent)
+            || stop.generation != Some(created.generation)
+        {
+            return Err(Failure::new(4, "switch successor stop has another binding"));
+        }
+        response.disposal_state = Some(stop.state);
+        response.disposal_reason = stop
+            .outcome
+            .as_ref()
+            .and_then(|outcome| outcome.get("message"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+    }
     let exit = response_exit_code(response.state);
     print_value(
         &serde_json::to_value(response).map_err(|_| Failure::new(4, "invalid switch response"))?,
@@ -871,6 +926,9 @@ pub(crate) async fn run_handoff(
     json_output: bool,
     id: Option<String>,
 ) -> Result<u8, Failure> {
+    let deadline = (!args.no_wait)
+        .then(|| wait_deadline(args.timeout_seconds))
+        .transpose()?;
     let request = eliot_core::api::HandoffRequest {
         id: mutation_id(id)?,
         from: args.from,
@@ -881,18 +939,60 @@ pub(crate) async fn run_handoff(
         commands: args.commands,
     };
     request.validate().map_err(Failure::for_mutation)?;
-    let response: eliot_core::api::HandoffResponse =
+    let mut response: eliot_core::api::HandoffResponse =
         eliot_daemon::client_call_typed(&data_dir, "swarm.handoff", &request)
             .await
             .map_err(Failure::for_mutation)?;
     request
         .validate_response(&response)
         .map_err(Failure::invalid_response)?;
+    if let Some(deadline) = deadline {
+        let query = CommandGetRequest::new(&request.id);
+        while coordination_pending(response.brief_state) {
+            sleep_before_deadline(deadline).await?;
+            let command = wait_call(
+                eliot_daemon::client_call_typed(&data_dir, "command.get", &query),
+                deadline,
+            )
+            .await?;
+            query
+                .validate_response(&command)
+                .map_err(Failure::invalid_response)?;
+            response = coordination_outcome(command, "swarm.handoff")?;
+            request
+                .validate_response(&response)
+                .map_err(Failure::invalid_response)?;
+        }
+    }
+    let exit = if args.no_wait {
+        0
+    } else {
+        response_exit_code(response.brief_state)
+    };
     print_value(
         &serde_json::to_value(response).map_err(|_| Failure::new(4, "invalid handoff response"))?,
         json_output,
     );
-    Ok(0)
+    Ok(exit)
+}
+
+fn coordination_pending(state: eliot_core::CommandState) -> bool {
+    use eliot_core::CommandState::{Accepted, Dispatched, Queued};
+    matches!(state, Accepted | Dispatched | Queued)
+}
+
+fn coordination_outcome<T: serde::de::DeserializeOwned>(
+    command: eliot_core::Command,
+    method: &str,
+) -> Result<T, Failure> {
+    if command.method != method {
+        return Err(Failure::new(
+            4,
+            format!("{method} command readback has another method"),
+        ));
+    }
+    serde_json::from_value(command.outcome.unwrap_or(Value::Null))
+        .map_err(|_| Failure::new(4, format!("{method} outcome is unavailable")))
 }
 
 pub(crate) fn approval_reply_args(choice: Option<String>, feedback: Option<String>) -> Value {

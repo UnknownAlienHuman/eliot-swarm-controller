@@ -534,6 +534,7 @@ fn dispatch_stop_tx(
             ),
         ));
     }
+    super::switch::require_unused_switch_successor(tx, id, agent)?;
     if command
         .expected_turn_id
         .as_deref()
@@ -542,6 +543,19 @@ fn dispatch_stop_tx(
         return Err(Error::new(
             "stale_generation",
             "stop command's captured turn is no longer current",
+        ));
+    }
+    // Freeze the active turn at dispatch even when the caller did not supply
+    // an expected_turn_id. The source may end and clear active_turn before
+    // the stop effect commits; this binding lets a proven Owner stop classify
+    // only the turn it actually interrupted.
+    if command.expected_turn_id.is_none()
+        && let Some(turn_id) = agent.active_turn.as_deref()
+    {
+        db!(tx.execute(
+            "UPDATE commands SET expected_turn_id = ?1
+             WHERE id = ?2 AND state IN ('accepted', 'queued')",
+            params![turn_id, id],
         ));
     }
     if command.command.args.get("force").and_then(Value::as_bool) != Some(true)

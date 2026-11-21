@@ -105,11 +105,16 @@ normalized native family. Hooks never mirror lifecycle already supplied by the s
 
 For an ordinary stop with an active turn, the router attempts `agent.command`
 with `interrupt` under the stop's authority. It then sends `agent.stop` following
-the [generation and turn rules](core.md#states-and-reducer).
-The daemon alone terminates owned custody when needed, using the generation's
-Windows Job or the weaker Unix process custody. Explicit force bypasses plugin
-stop. Unproven stop effects stay unknown even after confirmed custody exit, and
-the daemon never reissues the uncertain native call.
+the [generation and turn rules](core.md#states-and-reducer). The daemon alone
+terminates owned custody when needed, using the generation's Windows Job or the
+weaker Unix process custody. Explicit force bypasses plugin stop.
+
+Stop is applied only after independent, bounded process-custody exit and native
+source-drain proofs are committed for that generation. A missing native stop
+reply or `session.ended` terminal does not block applied once both proofs hold;
+the result records `native_session_end_observed=false`. If either proof is
+missing, the stop remains unknown with the missing proof named. The daemon never
+reissues an uncertain native call.
 
 Steer uses an ordered, bounded write followed by a correlated response wait: the host
 writes its `agent.command` frame in dispatch order under the writer deadline. The host

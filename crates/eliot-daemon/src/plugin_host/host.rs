@@ -22,7 +22,7 @@ use eliot_plugin::{
     AgentCommandParams, PluginManifest, StderrCapture, StderrView, spawn_plugin_stderr,
     sync::LockExt,
 };
-use eliot_store::AgentLossEvidence;
+use eliot_store::{AgentLossEvidence, OwnedExitProof};
 
 use serde_json::{Map, Value, json};
 use source_intake::serve_plugin_requests;
@@ -109,6 +109,81 @@ impl StopDeadlines {
     fn rpc_deadline_at(self, now: Instant, budget: Duration) -> Instant {
         (now + budget).min(self.rpc_until)
     }
+}
+
+/// Read back the independent process-custody and native-source facts that
+/// make a stop applied. Sampling the exact generation is bounded by one
+/// absolute deadline; neither fact substitutes for the other.
+async fn wait_for_stop_exit_proof(
+    state: &Weak<HostState>,
+    agent: &Agent,
+    until: Instant,
+) -> Result<OwnedExitProof> {
+    let state = state
+        .upgrade()
+        .ok_or_else(|| Error::new("unknown", "plugin host is unavailable for stop proof"))?;
+    let last = loop {
+        let proof = if Instant::now() >= until {
+            let store = state.store.try_lock().map_err(|_| {
+                Error::new(
+                    "unknown",
+                    "stop proof deadline elapsed while Store was busy",
+                )
+            })?;
+            store.owned_exit_proof(&agent.id, agent.generation)
+        } else {
+            timeout_at(until, state.store.lock())
+                .await
+                .map_err(|_| Error::new("unknown", "stop proof Store readback timed out"))?
+                .owned_exit_proof(&agent.id, agent.generation)
+        }
+        .map_err(|error| {
+            Error::new(
+                "unknown",
+                format!("stop proof readback failed: {}", error.message),
+            )
+        })?;
+        if proof.is_complete() {
+            return Ok(proof);
+        }
+        if Instant::now() >= until {
+            break proof;
+        }
+        timeout_at(until, state.monitoring.sample_generation(agent))
+            .await
+            .map_err(|_| {
+                Error::new(
+                    "unknown",
+                    format!(
+                        "stop proof deadline elapsed: {}",
+                        proof
+                            .missing_reason()
+                            .unwrap_or("process/source proof is incomplete"),
+                    ),
+                )
+            })?
+            .map_err(|error| {
+                Error::new(
+                    "unknown",
+                    format!(
+                        "{}; process custody readback failed: {}",
+                        proof
+                            .missing_reason()
+                            .unwrap_or("process/source proof is incomplete"),
+                        error.message,
+                    ),
+                )
+            })?;
+        tokio::time::sleep_until((Instant::now() + Duration::from_millis(50)).min(until)).await;
+    };
+    Err(Error::new(
+        "unknown",
+        format!(
+            "stop proof deadline elapsed: {}",
+            last.missing_reason()
+                .unwrap_or("process/source proof is incomplete"),
+        ),
+    ))
 }
 
 pub(crate) type SecretSet = Arc<Mutex<HashSet<String>>>;
@@ -905,6 +980,7 @@ impl PluginHost {
                 "stop does not match the owned Agent generation",
             ));
         }
+        let deadlines = StopDeadlines::new(Instant::now());
         #[cfg(windows)]
         if force {
             return timeout_at(
@@ -918,10 +994,17 @@ impl PluginHost {
             id: agent.id.clone(),
             generation: agent.generation,
         };
-        let (sender, stderr, credentials) = self.sender(&key, "stop")?;
+        let (sender, stderr, credentials) = match self.sender(&key, "stop") {
+            Ok(sender) => sender,
+            Err(error) => {
+                let value = self
+                    .reconcile_stop_error(agent, error, deadlines.reply_until)
+                    .await?;
+                return Ok((value, None));
+            }
+        };
         let (reply, response) = oneshot::channel();
-        let deadlines = StopDeadlines::new(Instant::now());
-        enqueue_stop(
+        if let Err(error) = enqueue_stop(
             &sender,
             RuntimeMessage::Stop {
                 command,
@@ -931,7 +1014,14 @@ impl PluginHost {
             },
             deadlines.queued_until,
         )
-        .await?;
+        .await
+        {
+            let error = diagnose_error(error, &stderr, &credentials);
+            let value = self
+                .reconcile_stop_error(agent, error, deadlines.reply_until)
+                .await?;
+            return Ok((value, None));
+        }
         let result = match timeout_at(deadlines.reply_until, response).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(Error::new(
@@ -943,9 +1033,57 @@ impl PluginHost {
                 "Agent plugin stop exceeded its absolute deadline",
             )),
         };
-        result
-            .map(|value| (value, None))
-            .map_err(|error| diagnose_error(error, &stderr, &credentials))
+        match result {
+            Ok(mut value) => {
+                let proof = wait_for_stop_exit_proof(
+                    &Arc::downgrade(&self.state),
+                    agent,
+                    deadlines.reply_until,
+                )
+                .await?;
+                if let Some(fields) = value.as_object_mut() {
+                    fields.insert(
+                        "process_custody_exit_proven".to_owned(),
+                        Value::Bool(proof.process_custody_exited),
+                    );
+                    fields.insert(
+                        "native_source_drain_proven".to_owned(),
+                        Value::Bool(proof.native_source_drained),
+                    );
+                }
+                Ok((value, None))
+            }
+            Err(error) => {
+                let error = diagnose_error(error, &stderr, &credentials);
+                self.reconcile_stop_error(agent, error, deadlines.reply_until)
+                    .await
+                    .map(|value| (value, None))
+            }
+        }
+    }
+
+    async fn reconcile_stop_error(
+        &self,
+        agent: &Agent,
+        native_error: Error,
+        until: Instant,
+    ) -> Result<Value> {
+        let proof_until = (Instant::now() + RPC_GRACE).min(until);
+        match wait_for_stop_exit_proof(&Arc::downgrade(&self.state), agent, proof_until).await {
+            Ok(proof) => Ok(json!({
+                "state": "applied",
+                "process_custody_exit_proven": proof.process_custody_exited,
+                "native_source_drain_proven": proof.native_source_drained,
+                "native_session_end_observed": false,
+                "native_stop_error_code": native_error.code.as_str(),
+                "native_stop_reason": "native_session_end_unobserved",
+                "graceful": false,
+            })),
+            Err(proof_error) => {
+                let message = format!("{}; {}", native_error.message, proof_error.message);
+                Err(native_error.with_message(message))
+            }
+        }
     }
 
     /// Read one exact native turn through the owned plugin (`agent.snapshot`
@@ -1560,6 +1698,10 @@ impl PluginHost {
                     json!({
                         "state": "applied", "custody": "exact", "terminated": true,
                         "graceful": false,
+                        "process_custody_exit_proven": true,
+                        "native_source_drain_proven": true,
+                        "native_session_end_observed": false,
+                        "native_stop_reason": "native_session_end_unobserved",
                     }),
                     Some(guard),
                 ));

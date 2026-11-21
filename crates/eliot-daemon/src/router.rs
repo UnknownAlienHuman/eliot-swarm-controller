@@ -531,6 +531,7 @@ impl Router {
             "command.get" => self.command_get(&params, &principal).await,
             "command.children" => self.command_children(&params, &principal).await,
             "command.resolve" => self.command_resolve(&params, &principal).await,
+            "command.settle_stopped" => self.command_settle_stopped(&params, &principal).await,
             "agent.get" => self.agent_get(&params, &principal).await,
             "agent.discover" => self.agent_discover(&params, &principal).await,
             "harness.list" => self.harness_list(&params, &principal).await,
@@ -5560,6 +5561,37 @@ impl Router {
         };
         self.finish_settlement(id, result, write_faulted, &persistence_cause, true)
             .await
+    }
+
+    /// Settle a dispatched or already-unknown stop only after Store-owned
+    /// process-custody exit and native-source drain proof both read back true.
+    pub(crate) async fn settle_stop_with_proof(
+        &self,
+        id: &str,
+        mut outcome: Value,
+    ) -> Option<Command> {
+        let envelope = json!({"command_id": id, "state": CommandState::Applied, "outcome": null});
+        let overhead =
+            serde_json::to_vec(&envelope).map_or(usize::MAX, |bytes| bytes.len().saturating_sub(4));
+        let outcome_budget = MAX_EVENT_BYTES.saturating_sub(overhead);
+        crate::redaction::bound_outcome_diagnostics(&mut outcome, outcome_budget);
+        eliot_core::bound_script_outcome_stderr(&mut outcome, outcome_budget);
+        let (result, write_faulted) = {
+            let mut store = self.inner.store.lock().await;
+            let result = store.settle_stop_after_proven_exit(id, outcome, now_ms());
+            if let Ok(change) = &result {
+                self.publish_locked(&change.events);
+            }
+            (result, store.is_write_faulted())
+        };
+        self.finish_settlement(
+            id,
+            result,
+            write_faulted,
+            "stop_process_source_proof_missing",
+            true,
+        )
+        .await
     }
 
     async fn finish_settlement(

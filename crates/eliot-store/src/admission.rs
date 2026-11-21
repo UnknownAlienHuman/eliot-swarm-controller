@@ -333,6 +333,7 @@ pub(super) fn admit_send_member(
     events: &mut Vec<Event>,
 ) -> Result<()> {
     let agent_num = parse_agent_id(&agent.id)?;
+    super::switch::require_switch_successor_accepting_input(tx, agent_num, agent.generation)?;
     if agent.generation == 0 || agent.state == AgentState::Created {
         return Err(Error::new(
             "bad_state",
@@ -458,16 +459,13 @@ pub(super) fn admit_stop_member(
     )?;
     events.push(admit_command(
         tx,
-        &CommandInsert {
-            turn_id: request.expected_turn_id.as_deref(),
-            ..CommandInsert::admitted(
-                principal,
-                request,
-                payload_digest,
-                (agent_num, agent.generation),
-                now,
-            )
-        },
+        &CommandInsert::admitted(
+            principal,
+            request,
+            payload_digest,
+            (agent_num, agent.generation),
+            now,
+        ),
         json!({"command_id": request.id, "verb": "stop"}),
     )?);
     Ok(())

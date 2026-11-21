@@ -16,7 +16,7 @@ use super::{
     mark_lost_state_with_exit, prepare_queued_stop_call, record_plugin_error, redact_native_error,
     resolve_resume_config, resolve_send_config, retire_failed_start, settle_drained_source_exit,
     settle_owned_source_exit, shutdown_and_wait_child, snapshot_future, start_deadline,
-    validate_applied, validate_start_result, wait_child, wait_stop_child,
+    validate_applied, validate_start_result, wait_child, wait_for_stop_exit_proof, wait_stop_child,
 };
 use crate::monitor::Monitoring;
 use crate::platform::OwnedChild;
@@ -778,30 +778,64 @@ async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
                             fence_runtime_generation(&state, key);
                         }
                         planned_exit = true;
-                        if native.is_err() && source_exit.is_ok() {
-                            mark_lost_state(state, key, "stop_exit_without_session_terminal").await;
+                        let source_error = source_exit.err();
+                        let proof = if exited && source_error.is_none() {
+                            Some(
+                                wait_for_stop_exit_proof(state, agent, deadlines.source_until)
+                                    .await,
+                            )
+                        } else {
+                            None
+                        };
+                        let (native_result, native_stop_error_code) = match native {
+                            Ok(native_result) => (native_result, None),
+                            Err(error) => (None, Some(error.code)),
+                        };
+                        let native_session_end_observed = native_result.is_some();
+                        let result = match (exited, source_error, proof) {
+                            (false, _, _) => Err(Error::new(
+                                "unknown",
+                                format!(
+                                    "stop process custody exit is unproven ({})",
+                                    custody_label(guarantee),
+                                ),
+                            )),
+                            (true, Some(error), _) => Err(error),
+                            (true, None, Some(Err(error))) => Err(error),
+                            (true, None, Some(Ok(proof)))
+                                if Instant::now() <= deadlines.source_until =>
+                            {
+                                Ok(json!({
+                                    "state": "applied",
+                                    "custody": custody_label(guarantee),
+                                    "graceful": graceful,
+                                    "native": native_result,
+                                    "native_session_end_observed": native_session_end_observed,
+                                    "native_stop_error_code": native_stop_error_code,
+                                    "native_stop_reason": if native_session_end_observed {
+                                        Value::Null
+                                    } else {
+                                        json!("native_session_end_unobserved")
+                                    },
+                                    "process_custody_exit_proven": proof.process_custody_exited,
+                                    "native_source_drain_proven": proof.native_source_drained,
+                                }))
+                            }
+                            _ => Err(Error::new(
+                                "unknown",
+                                "stop source settlement exceeded its absolute deadline",
+                            )),
+                        };
+                        if result.is_err() {
+                            // The actor is exiting and control is fenced even if cleanup
+                            // could not prove exit. Loss does not attest custody closure.
+                            let reason = if exited {
+                                "stop_exit_without_session_terminal"
+                            } else {
+                                "stop_process_exit_unproven"
+                            };
+                            mark_lost_state(state, key, reason).await;
                         }
-                        let result = native.and_then(|native| {
-                            if !exited {
-                                return Err(Error::new(
-                                    "unknown",
-                                    format!(
-                                        "stop could not confirm owned process-family exit ({})",
-                                        custody_label(guarantee),
-                                    ),
-                                ));
-                            }
-                            source_exit?;
-                            if Instant::now() > deadlines.source_until {
-                                return Err(Error::new("unknown", "stop source settlement exceeded its absolute deadline"));
-                            }
-                            Ok(json!({
-                                "state": "applied",
-                                "custody": custody_label(guarantee),
-                                "graceful": graceful,
-                                "native": native,
-                            }))
-                        });
                         let _ = reply.send(result);
                         break;
                     }

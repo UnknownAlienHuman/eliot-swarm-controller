@@ -2,6 +2,11 @@
 use super::*;
 use eliot_core::api::{SWITCH_BLANK_SCOPE_ARG, SWITCH_PROJECT_REVISION_ARG, SwitchRequest};
 
+fn log_refusal(policy: &eliot_core::SecretPolicy, id: &str, code: &str, reason: &str) {
+    let error = Error::new(code, reason).with_origin(eliot_core::FailureOrigin::Swarm, reason);
+    crate::logging::record(policy, "switch.refused", &[("command", id)], Some(&error));
+}
+
 /// Whether a switch keeps its source checkout: it requests neither a
 /// workspace override nor a new branch. Reuse is selected before any
 /// preparation so the automatic worktree policy never mints (or fails to
@@ -47,8 +52,11 @@ impl Router {
             if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
                 return Err(Error::new("unavailable", "drain prevents new switches"));
             }
-            let change =
-                store.reserve_switch(&principal_name(principal), &request, &policy, now_ms())?;
+            let change = store
+                .reserve_switch(&principal_name(principal), &request, &policy, now_ms())
+                .inspect_err(|error| {
+                    log_refusal(&policy, &request.id, &error.code, &error.message);
+                })?;
             self.publish_locked(&change.events);
             // A disconnected caller cannot cancel the independently scheduled operation.
             if !change.events.is_empty() {
@@ -231,8 +239,13 @@ impl Router {
             }
             let mut store = self.inner.store.lock().await;
             self.check_command_admission_mode("launch")?;
-            let admission =
-                store.admit_switch_launch(id, prepared.request, prepared.workspace, now_ms())?;
+            let admission = store.admit_switch_launch(
+                id,
+                prepared.request,
+                prepared.workspace,
+                &policy,
+                now_ms(),
+            )?;
             self.publish_locked(&admission.events);
             Ok::<_, Error>(admission)
         }
@@ -240,9 +253,11 @@ impl Router {
         let admission = match prepared {
             Ok(admission) => admission,
             Err(error) => {
+                let policy = self.secret_policy_snapshot();
                 let mut store = self.inner.store.lock().await;
-                if let Ok(change) = store.fail_switch_preparation(id, &error.code, now_ms()) {
+                if let Ok(change) = store.fail_switch_preparation(id, &error, &policy, now_ms()) {
                     self.publish_locked(&change.events);
+                    log_refusal(&policy, id, &error.code, &error.message);
                 }
                 self.signal_progress();
                 self.signal_launch_arbitration();
@@ -285,11 +300,21 @@ impl Router {
                         self.schedule_command(child.clone(), None);
                     }
                 }
+                if let Some(stop) = &change.value.disposal_command
+                    && change.value.disposal_state == Some(CommandState::Accepted)
+                {
+                    self.schedule_command(stop.clone(), None);
+                }
             }
             result
         };
         self.signal_progress();
         self.signal_launch_arbitration();
+        if let Ok(change) = &result
+            && let (Some(code), Some(reason)) = (&change.value.error, &change.value.error_reason)
+        {
+            log_refusal(&policy, id, code, reason);
+        }
         if let Ok(change) = result
             && let Some(handoff) = change.value.handoff
         {

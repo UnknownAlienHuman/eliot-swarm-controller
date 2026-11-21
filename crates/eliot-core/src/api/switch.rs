@@ -163,6 +163,21 @@ impl SwitchRequest {
             self.handoff(&value.handoff_command, &created.agent, created.generation)
                 .validate_response(handoff)?;
         }
+        if value.disposal_command.is_some() != value.disposal_state.is_some()
+            || value.disposal_command.as_ref().is_some_and(|id| {
+                value.state != CommandState::Failed
+                    || value.created.is_none()
+                    || value.handoff.is_some()
+                    || id == &value.launch_command
+                    || id == &value.handoff_command
+                    || crate::validate_command_id(id).is_err()
+            })
+        {
+            return Err(Error::new(
+                "source_integrity",
+                "switch successor stop has an invalid binding",
+            ));
+        }
         Ok(())
     }
 }
@@ -189,5 +204,14 @@ pub struct SwitchResponse {
     pub created: Option<SwitchAgent>,
     pub handoff: Option<HandoffResponse>,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_reason: Option<String>,
+    /// The ordinary generation-bound stop admitted for an unused successor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposal_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposal_state: Option<CommandState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposal_reason: Option<String>,
     pub next_action: String,
 }

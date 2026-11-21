@@ -99,6 +99,17 @@ using that service.
   broker or service (or attributed to the wrong owner) is invisible to the
   Store and cannot be terminated safely by PID alone.
 
+Every applied stop requires two independently committed facts for the exact
+generation: process-custody exit and native-source drain. On Windows the
+process fact requires the owned Job empty and all recorded process identities
+exited; the source fact requires the authoritative reader drained and its
+closure committed. The checks share one absolute stop deadline. A missing
+process or source fact keeps the outcome unknown and names that missing proof.
+An `agent.stop` reply or native `session.ended` is preserved when observed, but
+neither is required once both process/source facts are proven. If native session
+termination was not observed, the applied stop records
+`native_session_end_observed=false`; it makes no claim about a remote session.
+
 ### Unix degraded
 
 For Linux containers, we recommend a reaping init such as Docker --init.
@@ -113,17 +124,23 @@ is implemented, capability is `degraded`:
 - degraded custody capability and the `orphan_possible` flag are typed surfaces of
   `daemon.status` (`workspace_custody`) and the `capacity.released` event.
 
+The stop process proof on Unix covers the recorded process group and known
+members. It retains the degraded custody label and does not assert that a child
+which escaped with `setsid` is gone.
+
 ### Adopted/shared services
 
 An owner-run service discovered from its registration is read-only/adopted and is never
 signalled or repaired by Eliot. Managed service custody is separate and stopped only by
 its service lifecycle. Stopping one Agent never signals the shared/adopted server.
 
-`stop` requires an isolated native operation that ends that Agent's session and exact
-readback of its terminal state. If the service cannot provide it, return `unsupported`;
-abort-plus-detach or dropping a subscription is not successful stop. `detach` is the
-separate explicit operation that releases Eliot control while leaving the session alive.
-Observe-only attachment cannot issue either native stop or other control operations.
+`stop` may request an isolated native operation for that Agent's session, and
+never signals an adopted/shared service. The stop is applied only after the
+Agent's own process custody exits and its native source drains. If no terminal
+session result arrives, the outcome keeps that fact unknown while reporting
+`native_session_end_observed=false`. `detach` remains the separate operation
+that releases Eliot control while leaving the session alive. Observe-only
+attachment cannot issue either native stop or other control operations.
 
 ## Process observation and terminal ordering
 
@@ -155,7 +172,10 @@ when the reader reached EOF with no terminal fact and no observed exit,
 `daemon_force_exit_without_session_terminal` for a daemon force-stop,
 `plugin_startup_exit` for a failed start, or the stop's own exit
 (`stop_exit_without_session_terminal`,
-`force_stop_exit_without_session_terminal`) once its custody exit is proven.
+`force_stop_exit_without_session_terminal`) when the bounded process/source
+proof did not complete and the generation is settled as lost. When both stop
+proof facts commit, the Agent is stopped and the stop is applied even if no
+native session terminal arrived.
 The drain detail (which gap the reader hit, including
 `root_exit_source_failed`, `root_exit_drain_timeout`,
 `owned_exit_source_failed` and `owned_exit_drain_timeout`) stays on
@@ -853,8 +873,9 @@ repeats a native or external write.
 Startup records an idle controlled generation as `stopped` when its native session
 identity is retained, its generation has no open request, open or unknown turn, or
 unsettled command, and prior owned-process exit and reader drain are durably proven.
-That proof requires recorded exited processes, a closed OS source, closed native
-sources and the Host's owned-exit record for the same generation. Recovery records
+Stop settlement and restart resume use the same generation proof. It requires
+recorded exited processes, a closed OS source and closed native sources, backed
+by the Host's owned-exit record or exact restart reconciliation. Recovery records
 `agent.stopped` with reason `owned_exit_before_restart` and preserves the turn and
 command history as recorded. A process still recorded as running at restart becomes
 unknown. The daemon checks retained custody and the

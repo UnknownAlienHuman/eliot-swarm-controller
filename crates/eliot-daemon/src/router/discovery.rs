@@ -140,6 +140,7 @@ const METHODS: &[Method] = &[
     method!("command.get", CommandGetRequest, Command, false, false, "Read a retained command in your authorized scope.", {"id":EXAMPLE_ID}),
     method!("command.children", CommandChildrenRequest, CommandChildrenResponse, false, false, "Page the retained children of one command.", {"id":EXAMPLE_ID,"limit":20}),
     method!("command.resolve", CommandResolveRequest, CommandResolveResponse, true, true, "Record an owner resolution of an uncertain command; never replay its effect.", {"id":EXAMPLE_ID,"command_id":"previous-command","as":"failed","reason":"Owner verified failure."}),
+    method!("command.settle_stopped", SettleStoppedRequest, SettleStoppedResponse, true, true, "Preview or settle a reviewed page of unknown stops backed by committed owned exit and reader drain.", {"id":EXAMPLE_ID}),
     method!("agent.get", AgentGetRequest, AgentGetResponse, false, false, "Read Agent state, native capabilities and source health.", {"id":"a1"}),
     method!("agent.discover", AgentDiscoverRequest, DiscoverPage, true, false, "Discover native metadata through an installed profile without creating Agents.", {"profile":"codex","limit":20}),
     method!(

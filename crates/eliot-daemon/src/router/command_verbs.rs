@@ -838,7 +838,7 @@ impl Router {
             .terminal_stop_noop_summary(id, agent, &dispatched)
             .await
         {
-            let _ = self.settle(id, CommandState::Applied, Some(summary)).await;
+            let _ = self.settle_stop_with_proof(id, summary).await;
             // Assignment retirement runs inline in this stop worker, never in
             // a second executor. Best effort: refused items stay registered.
             self.retire_assignment_cleanup(&agent.id, agent.generation)
@@ -864,13 +864,22 @@ impl Router {
                     "state": "applied",
                     "custody": value.get("custody").cloned().unwrap_or(Value::Null),
                     "graceful": value.get("graceful").cloned().unwrap_or(Value::Bool(false)),
+                    "process_custody_exit_proven": value.get("process_custody_exit_proven").cloned().unwrap_or(Value::Bool(false)),
+                    "native_source_drain_proven": value.get("native_source_drain_proven").cloned().unwrap_or(Value::Bool(false)),
+                    "native_session_end_observed": value.get("native_session_end_observed").cloned().unwrap_or(Value::Bool(false)),
                 });
+                if let Some(reason) = value.get("native_stop_reason") {
+                    summary["native_stop_reason"] = reason.clone();
+                }
+                if let Some(code) = value.get("native_stop_error_code") {
+                    summary["native_stop_error_code"] = code.clone();
+                }
                 if let Some(diagnostics) = value.get("diagnostics") {
                     summary["diagnostics"] = diagnostics.clone();
                 }
                 self.redact_native_value(&mut summary);
                 if self
-                    .settle(id, CommandState::Applied, Some(summary))
+                    .settle_stop_with_proof(id, summary)
                     .await
                     .is_some_and(|command| command.state == CommandState::Applied)
                 {
@@ -885,6 +894,18 @@ impl Router {
                 }
             }
             Err(error) => {
+                if let Some(summary) = self
+                    .terminal_stop_noop_summary(id, agent, &dispatched)
+                    .await
+                    && self
+                        .settle_stop_with_proof(id, summary)
+                        .await
+                        .is_some_and(|command| command.state == CommandState::Applied)
+                {
+                    self.retire_assignment_cleanup(&agent.id, agent.generation)
+                        .await;
+                    return true;
+                }
                 self.settle_plugin_error(id, &error).await;
             }
         }
@@ -984,9 +1005,9 @@ impl Router {
         .unwrap_or(Ok(()))
     }
 
-    /// Applied no-op summary for an already-terminal generation with verified
-    /// no owned runtime. Returns `None` when native stop must still run, so
-    /// exact member/generation binding and honest Unknown handling are kept.
+    /// Applied summary for a generation with no owned runtime and committed
+    /// process/source exit proof. This also closes the race where the plugin
+    /// disappears after the initial check but before Stop reaches its actor.
     async fn terminal_stop_noop_summary(
         &self,
         id: &str,
@@ -998,9 +1019,6 @@ impl Router {
             || dispatched.target.as_deref() != Some(agent.id.as_str())
             || dispatched.generation != Some(agent.generation)
             || dispatched.state != CommandState::Dispatched
-            || !agent.is_terminal()
-            || agent.active_turn.is_some()
-            || !agent.pending.is_empty()
             || agent.observe_only
         {
             return None;
@@ -1012,16 +1030,15 @@ impl Router {
         {
             return None;
         }
-        let store = self.inner.store.lock().await;
+        let store = timeout(Duration::from_secs(2), self.inner.store.lock())
+            .await
+            .ok()?;
         let current = match store.get_agent(&agent.id) {
             Ok(Some(current)) => current,
             _ => return None,
         };
         if Some(current.generation) != dispatched.generation
             || current.generation != agent.generation
-            || !current.is_terminal()
-            || current.active_turn.is_some()
-            || !current.pending.is_empty()
             || current.observe_only
         {
             return None;
@@ -1034,13 +1051,17 @@ impl Router {
                     && command.generation == Some(agent.generation) => {}
             _ => return None,
         }
-        match store.has_owned_exit_and_reader_drain(&agent.id, agent.generation) {
-            Ok(true) => {}
+        let proof = match store.owned_exit_proof(&agent.id, agent.generation) {
+            Ok(proof) if proof.is_complete() => proof,
             _ => return None,
-        }
+        };
         Some(json!({
             "state": "applied",
-            "already_terminal": true,
+            "stop_basis": "owned_process_exit",
+            "process_custody_exit_proven": proof.process_custody_exited,
+            "native_source_drain_proven": proof.native_source_drained,
+            "native_session_end_observed": false,
+            "native_stop_reason": "native_session_end_unobserved",
         }))
     }
 

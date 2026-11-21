@@ -28,8 +28,9 @@ use eliot_core::is_start_verb;
 use eliot_core::{
     CommandState, TurnOutcome, TurnState, WorkspacePhase, WorkspacePreparation,
     api::{
-        CommandResolution, CommandResolveRequest, CommandResolveResponse, TurnResolveRequest,
-        TurnResolveResponse, TurnResolveStatus,
+        CommandResolution, CommandResolveRequest, CommandResolveResponse, SettleStoppedRequest,
+        SettleStoppedResponse, StoppedCommandSettlement, TurnResolveRequest, TurnResolveResponse,
+        TurnResolveStatus, inference::sha256_hex,
     },
     parse_agent_id,
 };
@@ -39,6 +40,8 @@ use serde_json::json;
 const RESOLVE_COMMAND_METHOD: &str = "command.resolve";
 const RESOLVE_TURN_METHOD: &str = "turn.resolve";
 const OWNER_ASSERTION: &str = "owner";
+const SETTLE_STOPPED_METHOD: &str = "command.settle_stopped";
+const STOP_SETTLEMENT_PAGE: usize = 64;
 
 /// Native readback proving one turn inactive, obtained by the Router through
 /// the plugin's `agent.snapshot` turn readback before resolving a turn whose
@@ -63,6 +66,115 @@ enum CommandReadback<'a> {
 }
 
 impl Store {
+    pub fn settle_stopped(
+        &mut self,
+        request: &SettleStoppedRequest,
+        now: i64,
+    ) -> Result<Change<SettleStoppedResponse>> {
+        request.validate()?;
+        self.ensure_committed_reads()?;
+        let Some(review) = &request.review else {
+            return Ok(Change {
+                value: stopped_settlement_page(&self.connection, request)?,
+                events: Vec::new(),
+            });
+        };
+
+        self.ensure_writer_healthy()?;
+        let result = self.apply_stopped_settlement(request, review, now);
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    fn apply_stopped_settlement(
+        &mut self,
+        request: &SettleStoppedRequest,
+        review: &str,
+        now: i64,
+    ) -> Result<Change<SettleStoppedResponse>> {
+        let payload = canonical::digest(&json!({"after": request.after, "review": review}))?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        ensure_resolution_write_id(&tx, &request.id)?;
+        if let Some((principal, method, digest, result)) = write_binding(&tx, &request.id)? {
+            if principal != OWNER_ASSERTION || method != SETTLE_STOPPED_METHOD || digest != payload
+            {
+                return Err(Error::new(
+                    "id_conflict",
+                    "stop settlement id has another binding",
+                ));
+            }
+            let value = serde_json::from_value(decode_json(&result)?)
+                .map_err(|error| Error::new("internal", error.to_string()))?;
+            return Ok(Change {
+                value,
+                events: Vec::new(),
+            });
+        }
+        validate_id_age(&request.id, now)?;
+        let mut value = stopped_settlement_page(&tx, request)?;
+        if value.review != *review {
+            return Err(Error::new(
+                "conflict",
+                "stop settlement evidence changed; preview the page again",
+            ));
+        }
+
+        let mut events = Vec::new();
+        for stop in &value.stops {
+            let agent_num = parse_agent_id(&stop.agent)?;
+            let record = load_command_record(&tx, &stop.command_id)?.ok_or_else(|| {
+                Error::new("source_integrity", "reviewed stop command disappeared")
+            })?;
+            let command = CommandResolveRequest {
+                id: request.id.clone(),
+                command_id: stop.command_id.clone(),
+                resolution: CommandResolution::Applied,
+                reason: "Owned processes exited and the native reader drained. A native stop receipt was unavailable.".into(),
+            };
+            events.push(resolve_command_tx(
+                &tx,
+                &record,
+                &command,
+                CommandState::Applied,
+                now,
+            )?);
+            if let Some(turn_id) = &stop.interrupted_turn {
+                let turn = TurnResolveRequest {
+                    id: request.id.clone(),
+                    agent: stop.agent.clone(),
+                    generation: stop.generation,
+                    turn_id: turn_id.clone(),
+                    status: TurnResolveStatus::Interrupted,
+                    reason: "stopped_by_owner".into(),
+                };
+                events.push(resolve_turn_tx(&tx, agent_num, &turn, now)?);
+            }
+            if stop.mark_stopped {
+                super::lifecycle::settle_lost_stop_after_owned_exit_tx(
+                    &tx,
+                    &stop.command_id,
+                    now,
+                    &mut events,
+                )?;
+            }
+        }
+        value.applied = true;
+        insert_resolution_write(
+            &tx,
+            &request.id,
+            OWNER_ASSERTION,
+            SETTLE_STOPPED_METHOD,
+            &payload,
+            &value,
+            now,
+        )?;
+        commit_transaction(tx, &self.write_faulted)?;
+        Ok(Change { value, events })
+    }
+
     /// Resolve one unknown command to its owner-asserted terminal state. The
     /// mutation id binds the assertion for idempotent retries; the command
     /// keeps any committed turn association and gains no invented one.
@@ -491,6 +603,102 @@ impl Store {
             .optional()
             .map_err(sql_error)
     }
+}
+
+fn stopped_settlement_page(
+    connection: &Connection,
+    request: &SettleStoppedRequest,
+) -> Result<SettleStoppedResponse> {
+    // Loss clears the projection pointer. An older stop can still recover the
+    // turn captured by the same loss, with journal order proving it was in flight.
+    let mut statement = connection
+        .prepare(
+            "SELECT c.id, c.target, c.generation, t.turn_id,
+                    a.generation = c.generation AND a.state = 'lost'
+             FROM commands c JOIN agents a ON a.id = c.target
+         LEFT JOIN turns t ON c.principal = 'owner' AND t.agent = c.target
+            AND t.generation = c.generation AND t.turn_id = COALESCE(
+                c.expected_turn_id,
+                CASE WHEN a.state='lost' AND a.generation=c.generation THEN
+                    COALESCE(a.active_turn, (
+                        SELECT json_extract(turn_loss.data,'$.turn_id')
+                        FROM events AS loss JOIN events AS turn_loss
+                          ON turn_loss.agent=loss.agent AND turn_loss.generation=loss.generation
+                          AND turn_loss.ts=loss.ts AND turn_loss.seq < loss.seq
+                          AND turn_loss.kind='turn.unknown'
+                          AND json_extract(turn_loss.data,'$.reason')=json_extract(loss.data,'$.reason')
+                        WHERE loss.agent=c.target AND loss.generation=c.generation AND loss.kind='agent.lost'
+                          AND EXISTS (
+                            SELECT 1 FROM events AS dispatch
+                            WHERE dispatch.agent=c.target AND dispatch.generation=c.generation
+                              AND dispatch.kind='command.dispatched' AND dispatch.seq < turn_loss.seq
+                              AND json_extract(dispatch.data,'$.command_id')=c.id
+                          )
+                        ORDER BY loss.seq DESC, turn_loss.seq DESC LIMIT 1
+                    )) END
+            )
+            AND t.state = 'unknown'
+         WHERE c.state = 'unknown' AND c.verb = 'stop' AND a.observe_only = 0
+           AND c.id > COALESCE(?1, '')
+           AND (a.generation > c.generation OR
+                (a.generation = c.generation AND a.state IN ('stopped', 'failed', 'lost')))
+         ORDER BY c.id LIMIT ?2",
+        )
+        .map_err(sql_error)?;
+    let rows = statement
+        .query_map(
+            params![request.after, STOP_SETTLEMENT_PAGE as i64 + 1],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, bool>(4)?,
+                ))
+            },
+        )
+        .map_err(sql_error)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(sql_error)?;
+    let next =
+        (rows.len() > STOP_SETTLEMENT_PAGE).then(|| rows[STOP_SETTLEMENT_PAGE - 1].0.clone());
+    let mut stops = Vec::new();
+    let mut awaiting_proof = Vec::new();
+    let mut turns = std::collections::HashSet::new();
+    let mut lost = std::collections::HashSet::new();
+    for (command_id, agent, generation, turn, is_lost) in
+        rows.into_iter().take(STOP_SETTLEMENT_PAGE)
+    {
+        if super::capacity::has_owned_exit_and_reader_drain_tx(connection, agent, generation)? {
+            let interrupted_turn = turn.filter(|id| turns.insert((agent, generation, id.clone())));
+            stops.push(StoppedCommandSettlement {
+                agent: super::format_agent_id(agent),
+                generation,
+                command_id,
+                mark_stopped: is_lost && lost.insert(agent),
+                interrupted_turn,
+            });
+        } else {
+            awaiting_proof.push(command_id);
+        }
+    }
+    let review = sha256_hex(
+        encode_json(&json!({
+            "stops": stops,
+            "awaiting_proof": awaiting_proof,
+            "next": next,
+        }))?
+        .as_bytes(),
+    );
+    Ok(SettleStoppedResponse {
+        id: request.id.clone(),
+        review,
+        applied: false,
+        stops,
+        awaiting_proof,
+        next,
+    })
 }
 
 fn command_resolution_digest(request: &CommandResolveRequest) -> Result<Vec<u8>> {

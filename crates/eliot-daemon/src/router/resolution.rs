@@ -11,7 +11,7 @@ use super::{Principal, Router, contains_known_secret_including_keys, require_own
 use crate::{common::now_ms, plugin_host::SecretSet};
 use eliot_core::{
     Agent, Error, Result,
-    api::{CommandResolveRequest, TurnResolveRequest},
+    api::{CommandResolveRequest, SettleStoppedRequest, TurnResolveRequest},
 };
 use eliot_store::TurnInactiveProof;
 use serde::de::DeserializeOwned;
@@ -84,6 +84,32 @@ fn turn_inactive_proof(
 }
 
 impl Router {
+    pub(super) async fn command_settle_stopped(
+        &self,
+        params: &Value,
+        principal: &Principal,
+    ) -> Result<Value> {
+        let request = decode_resolve_request(
+            params,
+            principal,
+            &self.inner.secrets,
+            "command.settle_stopped",
+            "stop settlement",
+            SettleStoppedRequest::validate,
+        )?;
+        let change = {
+            let mut store = self.inner.store.lock().await;
+            let change = store.settle_stopped(&request, now_ms())?;
+            self.publish_locked(&change.events);
+            change
+        };
+        if change.value.applied {
+            self.signal_progress();
+        }
+        serde_json::to_value(change.value)
+            .map_err(|_| Error::new("internal", "stop settlement could not be encoded"))
+    }
+
     pub(super) async fn command_resolve(
         &self,
         params: &Value,

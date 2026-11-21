@@ -195,10 +195,20 @@ fn current_agent_tree_tx(
                 ),
             ));
         }
-        let command: Option<(String, String, Option<i64>)> = tx.query_row(
-            "SELECT id,state,generation FROM commands WHERE target=?1 AND state IN ('accepted','queued','dispatched','unknown') ORDER BY created_at,id LIMIT 1",
-            [num], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        ).optional().map_err(sql_error)?;
+        let keep_drained_unknowns = archived.is_some()
+            && !row.observe_only
+            && row.state.is_terminal()
+            && unknown_generations_drained(tx, *num)?;
+        let command: Option<(String, String, Option<i64>)> = tx
+            .query_row(
+                "SELECT id,state,generation FROM commands WHERE target=?1
+               AND (state IN ('accepted','queued','dispatched') OR (state='unknown' AND NOT ?2))
+             ORDER BY created_at,id LIMIT 1",
+                params![num, keep_drained_unknowns],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .map_err(sql_error)?;
         if let Some((command, state, generation)) = command {
             let generation =
                 generation.map_or_else(|| "unassigned".to_owned(), |value| value.to_string());
@@ -210,10 +220,16 @@ fn current_agent_tree_tx(
                 ),
             ));
         }
-        let turn: Option<(String, String, i64)> = tx.query_row(
-            "SELECT turn_id,state,generation FROM turns WHERE agent=?1 AND state IN ('running','unknown') ORDER BY generation,turn_id LIMIT 1",
-            [num], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        ).optional().map_err(sql_error)?;
+        let turn: Option<(String, String, i64)> = tx
+            .query_row(
+                "SELECT turn_id,state,generation FROM turns WHERE agent=?1
+               AND (state='running' OR (state='unknown' AND NOT ?2))
+             ORDER BY generation,turn_id LIMIT 1",
+                params![num, keep_drained_unknowns],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .map_err(sql_error)?;
         if let Some((turn, state, generation)) = turn {
             // Ended native observation keeps its unknown turn as retained
             // evidence, not a live gate: the child reaches stopped only
@@ -276,6 +292,35 @@ fn current_agent_tree_tx(
         agents.push(row);
     }
     Ok((members, agents))
+}
+
+/// Archive may preserve unknown history of an ended Agent whose exact
+/// generations have committed process exit and reader drain. Deletion still
+/// uses its own stricter guards.
+fn unknown_generations_drained(tx: &Transaction<'_>, agent: i64) -> Result<bool> {
+    let mut statement = tx
+        .prepare(
+            "SELECT generation FROM commands WHERE target=?1 AND state='unknown'
+             UNION SELECT generation FROM turns WHERE agent=?1 AND state='unknown'
+             LIMIT ?2",
+        )
+        .map_err(sql_error)?;
+    let generations = statement
+        .query_map(params![agent, MAX_PAGE_ENTRIES as i64 + 1], |row| {
+            row.get::<_, Option<i64>>(0)
+        })
+        .map_err(sql_error)?;
+    for (index, generation) in generations.enumerate() {
+        let Some(generation) = generation.map_err(sql_error)? else {
+            return Ok(false);
+        };
+        if index == MAX_PAGE_ENTRIES
+            || !super::capacity::has_owned_exit_and_reader_drain_tx(tx, agent, generation)?
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn verify_agent_delete_snapshot(expected: &[Agent], current: &[Agent]) -> Result<()> {
