@@ -65,7 +65,7 @@ pub struct StoreCompactionReport {
 }
 
 /// Outcome of one bounded maintenance pass, including SQLite space handling.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RetentionReport {
     pub events_deleted: i64,
     pub pruned_through: i64,
@@ -74,6 +74,8 @@ pub struct RetentionReport {
     pub mail_deleted: i64,
     pub digests_deleted: i64,
     pub processes_deleted: i64,
+    pub processes_examined: i64,
+    pub process_scan_more: bool,
     pub pages_reclaimed: i64,
     pub freelist_pages: i64,
     pub auto_vacuum_mode: i64,
@@ -82,13 +84,39 @@ pub struct RetentionReport {
     pub checkpoint_busy: bool,
 }
 
-struct SpaceReclaimOutcome {
-    pages_reclaimed: i64,
-    freelist_pages: i64,
-    auto_vacuum_mode: i64,
-    wal_frames: i64,
-    checkpointed_frames: i64,
-    checkpoint_busy: bool,
+impl RetentionReport {
+    pub fn rows_deleted(&self) -> i64 {
+        self.events_deleted
+            + self.commands_deleted
+            + self.writes_deleted
+            + self.mail_deleted
+            + self.digests_deleted
+            + self.processes_deleted
+    }
+
+    pub fn work_count(&self) -> i64 {
+        self.rows_deleted() - self.processes_deleted
+            + self.processes_examined
+            + self.pages_reclaimed
+    }
+
+    pub fn accumulate(&mut self, batch: Self) {
+        self.events_deleted += batch.events_deleted;
+        self.pruned_through = batch.pruned_through;
+        self.commands_deleted += batch.commands_deleted;
+        self.writes_deleted += batch.writes_deleted;
+        self.mail_deleted += batch.mail_deleted;
+        self.digests_deleted += batch.digests_deleted;
+        self.processes_deleted += batch.processes_deleted;
+        self.processes_examined += batch.processes_examined;
+        self.process_scan_more = batch.process_scan_more;
+        self.pages_reclaimed += batch.pages_reclaimed;
+        self.freelist_pages = batch.freelist_pages;
+        self.auto_vacuum_mode = batch.auto_vacuum_mode;
+        self.wal_frames = batch.wal_frames;
+        self.checkpointed_frames = batch.checkpointed_frames;
+        self.checkpoint_busy |= batch.checkpoint_busy;
+    }
 }
 
 struct SubtreeMember {
@@ -134,7 +162,8 @@ impl Store {
                 .execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;")
                 .map_err(sql_error)?;
         }
-        let space = self.reclaim_retention_space(false)?;
+        read_passive_checkpoint(&self.connection)?;
+        let space = self.retention_space_status()?;
         if space.auto_vacuum_mode != 2 {
             return Err(Error::new(
                 "internal",
@@ -248,14 +277,9 @@ impl Store {
             None => 0,
         };
         // Exited child rows have an independent, shorter age window.
-        let processes_deleted = self.prune_exited_processes(processes_cutoff)?;
-        let deleted_rows = events_deleted
-            + commands_deleted
-            + writes_deleted
-            + mail_deleted
-            + digests_deleted
-            + processes_deleted;
-        let space = self.reclaim_retention_space(deleted_rows > 0)?;
+        let (processes_deleted, processes_examined, process_scan_more) =
+            self.prune_exited_processes(processes_cutoff)?;
+        let (pages_reclaimed, space) = self.reclaim_retention_space()?;
         Ok(RetentionReport {
             events_deleted,
             pruned_through,
@@ -264,41 +288,43 @@ impl Store {
             mail_deleted,
             digests_deleted,
             processes_deleted,
-            pages_reclaimed: space.pages_reclaimed,
+            processes_examined,
+            process_scan_more,
+            pages_reclaimed,
             freelist_pages: space.freelist_pages,
             auto_vacuum_mode: space.auto_vacuum_mode,
-            wal_frames: space.wal_frames,
-            checkpointed_frames: space.checkpointed_frames,
-            checkpoint_busy: space.checkpoint_busy,
+            ..RetentionReport::default()
         })
     }
 
-    fn reclaim_retention_space(&mut self, deleted_rows: bool) -> Result<SpaceReclaimOutcome> {
+    fn reclaim_retention_space(&mut self) -> Result<(i64, RetentionSpaceStatus)> {
         let before = self.retention_space_status()?;
-        if deleted_rows && before.auto_vacuum_mode == 2 {
-            self.connection
-                .execute_batch(&format!(
-                    "PRAGMA incremental_vacuum({INCREMENTAL_VACUUM_PAGES});"
+        if before.auto_vacuum_mode != 2 || before.freelist_pages == 0 {
+            return Ok((0, before));
+        }
+        // Incremental vacuum yields a row per step. Finishing the statement
+        // commits the bounded set, even when no rows expired in this pass.
+        {
+            let mut statement = self
+                .connection
+                .prepare(&format!(
+                    "PRAGMA incremental_vacuum({INCREMENTAL_VACUUM_PAGES})"
                 ))
                 .map_err(sql_error)?;
+            let mut rows = statement.query([]).map_err(sql_error)?;
+            while rows.next().map_err(sql_error)?.is_some() {}
         }
-        // PASSIVE checkpoints make progress without waiting for readers. The
-        // configured journal_size_limit trims WAL after a completed checkpoint.
-        let (busy, wal_frames, checkpointed_frames): (i64, i64, i64) = self
-            .connection
-            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })
-            .map_err(sql_error)?;
         let after = self.retention_space_status()?;
-        Ok(SpaceReclaimOutcome {
-            pages_reclaimed: before.page_count.saturating_sub(after.page_count).max(0),
-            freelist_pages: after.freelist_pages,
-            auto_vacuum_mode: after.auto_vacuum_mode,
-            wal_frames: wal_frames.max(0),
-            checkpointed_frames: checkpointed_frames.max(0),
-            checkpoint_busy: busy != 0,
-        })
+        Ok((before.page_count.saturating_sub(after.page_count), after))
+    }
+
+    /// Run the passive WAL checkpoint without using the shared Store writer.
+    pub fn checkpoint_retention(path: &Path) -> Result<(i64, i64, bool)> {
+        let connection =
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+                .map_err(sql_error)?;
+        connection.busy_timeout(Duration::ZERO).map_err(sql_error)?;
+        read_passive_checkpoint(&connection)
     }
 
     fn prune_events(&mut self, cutoff: i64) -> Result<(i64, i64)> {
@@ -315,21 +341,14 @@ impl Store {
             .optional()
             .map_err(sql_error)?
             .ok_or_else(|| Error::new("source_integrity", "rule history coverage is absent"))?;
-        let end = match event_prune_end_tx(&tx, pruned_through, cutoff)? {
-            Some(end) => end,
-            None => {
-                commit_transaction(tx, &self.write_faulted)?;
-                return Ok((0, pruned_through));
-            }
-        };
-        // Delete the lowest remaining seqs first so coverage stays contiguous.
+        // Bound the sequence range before applying the age and source pins.
+        // A large expired prefix must not be scanned again on every batch.
         let batch_end: Option<i64> = tx
             .query_row(
                 "SELECT MAX(seq) FROM (
-                     SELECT seq FROM events WHERE seq > ?1 AND seq <= ?2
-                     ORDER BY seq LIMIT ?3
+                     SELECT seq FROM events WHERE seq > ?1 ORDER BY seq LIMIT ?2
                  )",
-                params![pruned_through, end, RETENTION_BATCH_ENTRIES],
+                params![pruned_through, RETENTION_BATCH_ENTRIES],
                 |row| row.get(0),
             )
             .map_err(sql_error)?;
@@ -337,15 +356,30 @@ impl Store {
             commit_transaction(tx, &self.write_faulted)?;
             return Ok((0, pruned_through));
         };
+        let Some(end) = event_prune_end_tx(&tx, pruned_through, batch_end, cutoff)? else {
+            commit_transaction(tx, &self.write_faulted)?;
+            return Ok((0, pruned_through));
+        };
+        let last_deleted: Option<i64> = tx
+            .query_row(
+                "SELECT MAX(seq) FROM events WHERE seq > ?1 AND seq <= ?2",
+                params![pruned_through, end],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
+        let Some(last_deleted) = last_deleted else {
+            commit_transaction(tx, &self.write_faulted)?;
+            return Ok((0, pruned_through));
+        };
         let deleted = db!(tx.execute(
             "DELETE FROM events WHERE seq > ?1 AND seq <= ?2",
-            params![pruned_through, batch_end],
+            params![pruned_through, last_deleted],
         ));
         // The allocator row in sqlite_sequence is deliberately untouched: event
         // ids are never reused and high-water survives prefix deletion.
         let advanced = db!(tx.execute(
             "UPDATE rule_history_coverage SET pruned_through = ?1 WHERE singleton = 1",
-            [batch_end],
+            [last_deleted],
         ));
         if advanced != 1 {
             return Err(Error::new(
@@ -354,7 +388,7 @@ impl Store {
             ));
         }
         commit_transaction(tx, &self.write_faulted)?;
-        Ok((deleted as i64, batch_end))
+        Ok((deleted as i64, last_deleted))
     }
 
     fn prune_commands_and_writes(&mut self, cutoff: i64) -> Result<(i64, i64)> {
@@ -501,25 +535,57 @@ impl Store {
     /// Plugin and harness rows stay as owned-exit and restart-custody evidence;
     /// live/unknown rows and generations holding capacity never match.
     /// Deletion is silent and never replays a process.
-    fn prune_exited_processes(&mut self, cutoff: i64) -> Result<i64> {
+    fn prune_exited_processes(&mut self, cutoff: i64) -> Result<(i64, i64, bool)> {
+        let (after_time, after_row) = self
+            .retention_processes_cursor
+            .unwrap_or((i64::MIN, i64::MIN));
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
-        let deleted = db!(tx.execute(
-            "DELETE FROM processes WHERE rowid IN (
-                 SELECT rowid FROM processes INDEXED BY processes_exited_child_updated
-                 WHERE state = 'exited' AND role = 'child' AND updated_at < ?1
-                   AND owner NOT IN (
-                       SELECT 'agent:a' || id || '#' || capacity_generation
-                       FROM agents WHERE capacity_generation IS NOT NULL
-                   )
-                 ORDER BY updated_at LIMIT ?2
-             )",
-            params![cutoff, RETENTION_BATCH_ENTRIES],
-        ));
+        // Apply the limit before custody filtering so a retained reservation
+        // cannot make this pass scan an arbitrarily long prefix.
+        let candidates = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT rowid, updated_at FROM processes
+                     INDEXED BY processes_exited_child_updated
+                     WHERE state = 'exited' AND role = 'child' AND updated_at < ?1
+                       AND (updated_at, rowid) > (?2, ?3)
+                     ORDER BY updated_at, rowid LIMIT ?4",
+                )
+                .map_err(sql_error)?;
+            statement
+                .query_map(
+                    params![cutoff, after_time, after_row, RETENTION_BATCH_ENTRIES],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .map_err(sql_error)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(sql_error)?
+        };
+        let examined = candidates.len() as i64;
+        let rowids: Vec<i64> = candidates.iter().map(|&(rowid, _)| rowid).collect();
+        let deleted = if rowids.is_empty() {
+            0
+        } else {
+            db!(tx.execute(
+                "DELETE FROM processes WHERE rowid IN (SELECT value FROM json_each(?1))
+                   AND NOT EXISTS (
+                       SELECT 1 FROM agents
+                       WHERE id = CAST(substr(processes.owner, 8, instr(processes.owner, '#') - 8) AS INTEGER)
+                         AND processes.owner = 'agent:a' || id || '#' || capacity_generation
+                   )",
+                [encode_json(&rowids)?],
+            ))
+        };
         commit_transaction(tx, &self.write_faulted)?;
-        Ok(deleted as i64)
+        let more = examined == RETENTION_BATCH_ENTRIES;
+        self.retention_processes_cursor = candidates
+            .last()
+            .filter(|_| more)
+            .map(|&(rowid, time)| (time, rowid));
+        Ok((deleted as i64, examined, more))
     }
 
     /// Delete one bounded batch of acknowledged messages whose acknowledgement
@@ -553,6 +619,19 @@ impl Store {
     }
 }
 
+fn read_passive_checkpoint(connection: &Connection) -> Result<(i64, i64, bool)> {
+    let (busy, frames, checkpointed): (i64, i64, i64) = connection
+        .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .map_err(sql_error)?;
+    Ok((
+        frames.max(0),
+        checkpointed.max(0),
+        busy != 0 || checkpointed < frames,
+    ))
+}
+
 /// The prune batch `prune_mail` deletes: acknowledged rows only, oldest ack
 /// first. Shared with the plan test so the asserted plan cannot drift from
 /// the executed query.
@@ -574,6 +653,7 @@ impl SubtreeMember {
 fn event_prune_end_tx(
     tx: &Transaction<'_>,
     pruned_through: i64,
+    batch_end: i64,
     cutoff: i64,
 ) -> Result<Option<i64>> {
     // Enabled current/retiring cursors pin the events they still need; this is
@@ -594,6 +674,7 @@ fn event_prune_end_tx(
                  JOIN events e ON e.agent = s.agent AND e.generation = s.generation
                  WHERE s.source = 'git' AND s.state = 'open' AND s.generation = a.generation
                    AND s.cursor IS NOT NULL AND e.seq > CAST(s.cursor AS INTEGER)
+                   AND e.seq > ?1 AND e.seq <= ?2
                    AND e.family = 'tool' AND e.kind = 'tool.completed'
                    AND e.native_id IS NOT NULL AND e.source NOT IN ('git', 'os', 'daemon')
                    AND json_extract(e.data, '$.tool') = 'fileChange'
@@ -602,11 +683,11 @@ fn event_prune_end_tx(
                         OR json_extract(e.data, '$.changed_paths_truncated') = 1
                         OR json_extract(e.data, '$.redacted') = 1)
              )",
-            [],
+            params![pruned_through, batch_end],
             |row| row.get(0),
         )
         .map_err(sql_error)?;
-    let ceiling = floor.unwrap_or(i64::MAX);
+    let ceiling = floor.map_or(batch_end, |pin| pin.min(batch_end));
     if ceiling <= pruned_through {
         return Ok(None);
     }

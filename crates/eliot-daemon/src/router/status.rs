@@ -568,7 +568,7 @@ fn retention_view_of(
         None
     };
     RetentionView {
-        events_days: retention.events_days,
+        events_days: known.then_some(retention.events_retention_days()).flatten(),
         commands_days: retention.commands_days,
         mail_days: retention.mail_days,
         events_seconds,

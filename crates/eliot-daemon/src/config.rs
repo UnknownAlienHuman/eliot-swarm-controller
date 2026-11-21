@@ -758,6 +758,12 @@ pub(crate) struct RetentionConfig {
 }
 
 impl RetentionConfig {
+    pub(crate) fn events_retention_days(&self) -> Option<i64> {
+        self.events_seconds
+            .is_none()
+            .then_some(self.events_days.unwrap_or(DEFAULT_EVENTS_RETENTION_DAYS))
+    }
+
     pub(crate) fn events_retention_seconds(&self) -> i64 {
         self.events_seconds.unwrap_or_else(|| {
             self.events_days

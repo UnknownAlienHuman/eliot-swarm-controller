@@ -316,6 +316,7 @@ pub struct Store {
     /// Successive passes resume here instead of restarting at the oldest
     /// root, so kept roots are not revisited every pass under the Store lock.
     retention_commands_cursor: Option<(i64, String)>,
+    retention_processes_cursor: Option<(i64, i64)>,
     /// Opaque owner of this handle's Goal round markers. A `running` marker
     /// from another holder is a crashed round: it reads as `unknown`.
     goal_holder: String,
@@ -438,6 +439,7 @@ impl Store {
             connection,
             write_faulted: Cell::new(false),
             retention_commands_cursor: None,
+            retention_processes_cursor: None,
             git_observed_at: BTreeMap::new(),
             goal_holder: Ulid::new().to_string(),
             hierarchy_limits: core::api::HierarchyLimits::default(),

@@ -1015,12 +1015,19 @@ so a removed delivery admitted with a skew-bounded write id reads
 read paths; a retried ack over it succeeds as already acked. An unset
 `mail_days` disables mail pruning.
 
-Prune exited child process rows with the event cutoff: one bounded batch per pass of
-`processes` rows with `state = 'exited'`, `role = 'child'` and `updated_at` older than the
-`events_days` window, oldest change first. Plugin and harness rows, running or unknown
-rows, and every generation still holding a capacity reservation are never pruned; the
-owned-exit proof and restart custody read those. An unset `events_days` disables this
-pruning.
+Prune exited child process rows using the independent `processes_seconds` window.
+Each pass deletes a bounded batch of `processes` rows with `state = 'exited'`,
+`role = 'child'` and `updated_at` older than the cutoff. Plugin and harness rows,
+running or unknown rows, and rows needed by retained generation custody stay available
+to the owned-exit proof and restart recovery. Historical child process events expire
+through the ordinary event prefix; the observer suppresses new child start and exit
+events.
+
+The daemon releases the Store writer between retention batches. New Stores use
+incremental auto-vacuum to return free pages in bounded steps. Existing Stores with
+auto-vacuum disabled reuse freed pages during live retention. An explicit [startup
+conversion](configuration.md#later-configuration-example) rebuilds an older file before
+serving and allows future incremental reclamation.
 
 ## Explicit Agent tree presentation and removal
 

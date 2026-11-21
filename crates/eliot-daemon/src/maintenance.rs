@@ -146,9 +146,14 @@ async fn run_retention(
         // Retention catch-up: while an epoch spends a budget, run another
         // instead of leaving eligible backlog until the next configured wake.
         // Epoch failures are already logged inside; the next wake retries.
-        run_epochs(&store, &config.retention, &policy, now_ms(), || {
-            shutdown.has_changed().is_err() || *shutdown.borrow()
-        })
+        run_epochs(
+            &store,
+            &data_root,
+            &config.retention,
+            &policy,
+            now_ms(),
+            || shutdown.has_changed().is_err() || *shutdown.borrow(),
+        )
         .await
         .ok();
         // Keep the legacy unbounded-growth notice for any future policy that
@@ -209,40 +214,34 @@ pub(crate) async fn run_now(
 ) -> Result<RetentionReport> {
     let config = config::load_daemon_config(data_root)?;
     let mut epochs = 0;
-    run_epochs(store, &config.retention, policy, now, move || {
-        epochs += 1;
-        epochs > 1
-    })
+    run_epochs(
+        store,
+        data_root,
+        &config.retention,
+        policy,
+        now,
+        move || {
+            epochs += 1;
+            epochs > 1
+        },
+    )
     .await
 }
 
 /// Run bounded retention epochs until an epoch drains or a budget runs out:
-/// the shared body of the hourly tick and the owner-triggered pass. Totals
+/// the shared body of the periodic tick and the owner-triggered pass. Totals
 /// sum every epoch; `pruned_through` is the last epoch's watermark.
 /// `stop_requested` is checked at the top of every epoch; the tick wires it
 /// to daemon shutdown, the RPC path stops after its first epoch.
-pub(crate) async fn run_epochs(
+async fn run_epochs(
     store: &Mutex<Store>,
+    data_root: &Path,
     retention: &config::RetentionConfig,
     policy: &Arc<SecretPolicy>,
     now: i64,
     mut stop_requested: impl FnMut() -> bool,
 ) -> Result<RetentionReport> {
-    let mut total = RetentionReport {
-        events_deleted: 0,
-        pruned_through: 0,
-        commands_deleted: 0,
-        writes_deleted: 0,
-        mail_deleted: 0,
-        digests_deleted: 0,
-        processes_deleted: 0,
-        pages_reclaimed: 0,
-        freelist_pages: 0,
-        auto_vacuum_mode: 0,
-        wal_frames: 0,
-        checkpointed_frames: 0,
-        checkpoint_busy: false,
-    };
+    let mut total = RetentionReport::default();
     loop {
         // Shutdown is checked at the top of every epoch, so a signal
         // arriving during the inter-epoch yield below still stops the
@@ -251,32 +250,38 @@ pub(crate) async fn run_epochs(
             return Ok(total);
         }
         let epoch_start = std::time::Instant::now();
-        let report = match run_once(store, retention, now).await {
+        let mut report = match run_once(store, retention, now).await {
             Ok(report) => report,
             Err(error) => {
                 logging::record(policy, "daemon.retention_failed", &[], Some(&error));
                 return Err(error);
             }
         };
-        total.events_deleted += report.events_deleted;
-        total.pruned_through = report.pruned_through;
-        total.commands_deleted += report.commands_deleted;
-        total.writes_deleted += report.writes_deleted;
-        total.mail_deleted += report.mail_deleted;
-        total.digests_deleted += report.digests_deleted;
-        total.processes_deleted += report.processes_deleted;
-        total.pages_reclaimed += report.pages_reclaimed;
-        total.freelist_pages = report.freelist_pages;
-        total.auto_vacuum_mode = report.auto_vacuum_mode;
-        total.wal_frames = report.wal_frames;
-        total.checkpointed_frames = report.checkpointed_frames;
-        total.checkpoint_busy |= report.checkpoint_busy;
-        let rows = report.events_deleted
-            + report.commands_deleted
-            + report.writes_deleted
-            + report.mail_deleted
-            + report.digests_deleted
-            + report.processes_deleted;
+        let rows = report.rows_deleted();
+        if rows > 0 || report.pages_reclaimed > 0 {
+            let path = data_root.join("eliot.db");
+            let result =
+                tokio::task::spawn_blocking(move || Store::checkpoint_retention(&path)).await;
+            match result {
+                Ok(Ok((frames, checkpointed, busy))) => {
+                    report.wal_frames = frames;
+                    report.checkpointed_frames = checkpointed;
+                    report.checkpoint_busy = busy;
+                }
+                Ok(Err(error)) => {
+                    logging::record(
+                        policy,
+                        "daemon.retention_checkpoint_failed",
+                        &[],
+                        Some(&error),
+                    );
+                }
+                Err(_) => {
+                    logging::record(policy, "daemon.retention_checkpoint_failed", &[], None);
+                }
+            }
+        }
+        total.accumulate(report);
         if rows > 0 || report.pages_reclaimed > 0 || report.checkpoint_busy {
             logging::record_counts(
                 policy,
@@ -299,12 +304,9 @@ pub(crate) async fn run_epochs(
                 None,
             );
         }
-        // Zero rows always means drained, even if lock waits pushed
-        // elapsed time past the budget. Otherwise a spent budget means
-        // more retention may be pending; a final empty epoch is harmless.
-        let exhausted = rows >= RETENTION_TICK_ROW_BUDGET
+        let exhausted = report.work_count() >= RETENTION_TICK_ROW_BUDGET
             || epoch_start.elapsed() >= RETENTION_TICK_TIME_BUDGET;
-        if rows == 0 || !exhausted {
+        if !exhausted || (rows == 0 && report.pages_reclaimed == 0 && !report.process_scan_more) {
             break;
         }
         tokio::task::yield_now().await;
@@ -342,21 +344,7 @@ pub(crate) async fn run_once_with_budgets(
     time_budget: Duration,
 ) -> Result<RetentionReport> {
     let start = std::time::Instant::now();
-    let mut total = RetentionReport {
-        events_deleted: 0,
-        pruned_through: 0,
-        commands_deleted: 0,
-        writes_deleted: 0,
-        mail_deleted: 0,
-        digests_deleted: 0,
-        processes_deleted: 0,
-        pages_reclaimed: 0,
-        freelist_pages: 0,
-        auto_vacuum_mode: 0,
-        wal_frames: 0,
-        checkpointed_frames: 0,
-        checkpoint_busy: false,
-    };
+    let mut total = RetentionReport::default();
     loop {
         let pass = {
             let mut guard = store.lock().await;
@@ -368,35 +356,11 @@ pub(crate) async fn run_once_with_budgets(
                 now,
             )?
         };
-        total.events_deleted += pass.events_deleted;
-        total.pruned_through = pass.pruned_through;
-        total.commands_deleted += pass.commands_deleted;
-        total.writes_deleted += pass.writes_deleted;
-        total.mail_deleted += pass.mail_deleted;
-        total.digests_deleted += pass.digests_deleted;
-        total.processes_deleted += pass.processes_deleted;
-        total.pages_reclaimed += pass.pages_reclaimed;
-        total.freelist_pages = pass.freelist_pages;
-        total.auto_vacuum_mode = pass.auto_vacuum_mode;
-        total.wal_frames = pass.wal_frames;
-        total.checkpointed_frames = pass.checkpointed_frames;
-        total.checkpoint_busy |= pass.checkpoint_busy;
-        let pass_rows = pass.events_deleted
-            + pass.commands_deleted
-            + pass.writes_deleted
-            + pass.mail_deleted
-            + pass.digests_deleted
-            + pass.processes_deleted;
-        if pass_rows == 0 {
+        total.accumulate(pass);
+        if pass.rows_deleted() == 0 && pass.pages_reclaimed == 0 && !pass.process_scan_more {
             break;
         }
-        let total_rows = total.events_deleted
-            + total.commands_deleted
-            + total.writes_deleted
-            + total.mail_deleted
-            + total.digests_deleted
-            + total.processes_deleted;
-        if total_rows >= row_budget || start.elapsed() >= time_budget {
+        if total.work_count() >= row_budget || start.elapsed() >= time_budget {
             break;
         }
         tokio::task::yield_now().await;

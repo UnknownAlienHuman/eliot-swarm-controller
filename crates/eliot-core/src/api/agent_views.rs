@@ -1605,8 +1605,11 @@ pub struct RetentionView {
     pub maintenance_interval_seconds: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compact_on_start: Option<bool>,
+    #[serde(default)]
     pub auto_vacuum_mode: i64,
+    #[serde(default)]
     pub page_count: i64,
+    #[serde(default)]
     pub freelist_pages: i64,
     pub pruned_through: i64,
     pub db_bytes: u64,
