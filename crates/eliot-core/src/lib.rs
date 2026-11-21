@@ -1363,12 +1363,22 @@ pub const OWNER_MARKED_LOST_REASON: &str = "owner_marked_lost";
 pub fn swarm_loss_location(reason: &str) -> Option<(FailureOrigin, &'static str)> {
     match reason {
         DAEMON_RESTART_REASON => Some((FailureOrigin::Swarm, "daemon.restart")),
+        // The typed `where` always names the process boundary. The origin is
+        // only a fallback for a loss whose producer recorded none: a start
+        // that failed on a missing external credential is `environment`, and
+        // silently retyping it as the harness would hide that evidence.
         _ if PLUGIN_PROCESS_LOSS_REASONS.contains(&reason) => {
-            Some((FailureOrigin::Harness, PLUGIN_EXIT_WHERE))
+            Some((FailureOrigin::Unknown, PLUGIN_EXIT_WHERE))
         }
         _ => None,
     }
 }
+
+/// The origin to record when a plugin-process loss carries no origin of its
+/// own: Agent software leaving. Callers apply it only when the producer left
+/// no origin, so a start that failed on a missing external credential stays
+/// `environment`.
+pub const PLUGIN_PROCESS_LOSS_ORIGIN: FailureOrigin = FailureOrigin::Harness;
 
 /// Truncate to a character boundary; never splits UTF-8 mid-codepoint.
 pub fn bound_chars(text: &str, limit: usize) -> String {

@@ -122,8 +122,14 @@ impl Router {
                     break;
                 }
                 let turn_command = store.turn_command_id(agent, generation, &turn.turn_id)?;
+                // A turn belongs to this diagnosis only through a recorded
+                // settlement link. Comparing two absent ids would otherwise
+                // adopt an unrelated unmapped turn for a start that never had
+                // a linked send.
                 let settled_here = turn_command.as_deref() == Some(command_id)
-                    || turn_command.as_deref() == linked_send.as_deref();
+                    || linked_send
+                        .as_deref()
+                        .is_some_and(|linked| turn_command.as_deref() == Some(linked));
                 if !settled_here {
                     continue;
                 }

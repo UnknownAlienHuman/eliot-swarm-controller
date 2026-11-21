@@ -185,6 +185,7 @@ pub(super) async fn settle_observed_root_exit(
             eliot_core::PLUGIN_ROOT_EXITED_REASON,
             Some(exit),
             Some(stderr_tail),
+            None,
         )
         .await;
     }
@@ -298,6 +299,7 @@ async fn run_agent_startup(
         Ok(source_plan) => source_plan,
         Err(error) => {
             let proven_no_dispatch = error.code == "native_not_dispatched";
+            let origin = error.origin.or(Some(eliot_core::FailureOrigin::Harness));
             let _ = started.send(Err(error));
             cleanup_startup(
                 actor,
@@ -307,6 +309,7 @@ async fn run_agent_startup(
                 &mut *event_task,
                 pending_failure,
                 proven_no_dispatch,
+                origin,
             )
             .await;
             return false;
@@ -320,6 +323,7 @@ async fn run_agent_startup(
     let resume_config = match resolve_resume_config(actor).await {
         Ok(resume_config) => resume_config,
         Err(error) => {
+            let origin = error.origin;
             let _ = started.send(Err(error));
             cleanup_startup(
                 actor,
@@ -329,6 +333,7 @@ async fn run_agent_startup(
                 &mut *event_task,
                 pending_failure,
                 true,
+                origin,
             )
             .await;
             return false;
@@ -434,6 +439,7 @@ async fn run_agent_startup(
             };
             let uncertain = error.code == "unknown";
             let proven_no_dispatch = error.code == "native_not_dispatched";
+            let origin = error.origin.or(Some(eliot_core::FailureOrigin::Harness));
             let _ = started.send(Err(error));
             if !uncertain || native_endpoint_exited {
                 cleanup_startup(
@@ -444,6 +450,7 @@ async fn run_agent_startup(
                     &mut *event_task,
                     pending_failure,
                     proven_no_dispatch,
+                    origin,
                 )
                 .await;
                 return false;

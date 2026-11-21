@@ -144,6 +144,7 @@ struct DeferredLoss {
     reason: &'static str,
     exit: Option<eliot_core::ProcessExit>,
     stderr_tail: Option<String>,
+    origin: Option<eliot_core::FailureOrigin>,
 }
 
 /// Own loss suppression until the force command's Store settlement commits.
@@ -176,6 +177,12 @@ impl ForceStopGuard {
     pub(crate) fn finish(mut self) {
         self.committed = true;
     }
+
+    /// Remember that this daemon itself settled the generation's channel, so
+    /// an actor sender-drop afterward is not read as a plugin failure.
+    fn mark_channel_settled(&self, state: &HostState) {
+        state.settled_channels.lock_recover().insert(self.key.clone());
+    }
 }
 
 impl Drop for ForceStopGuard {
@@ -186,6 +193,7 @@ impl Drop for ForceStopGuard {
         // Clear synchronously even when the enclosing future is cancelled.
         // Only this attempt owns the entry; actor cleanup must not remove it.
         state.planned_stops.lock_recover().remove(&self.key);
+        self.mark_channel_settled(state);
         let deferred = self.deferred_loss.lock_recover().take();
         // Replay the retained observation, never the planned force-stop label:
         // a force-stop that fails or is cancelled without any observed exit
@@ -203,6 +211,7 @@ impl Drop for ForceStopGuard {
                     deferred.reason,
                     deferred.exit,
                     deferred.stderr_tail,
+                    deferred.origin,
                 )
                 .await;
             });
@@ -291,6 +300,10 @@ struct HostState {
     late_batch_causes: Mutex<HashMap<AgentKey, String>>,
     running: Mutex<HashMap<AgentKey, RuntimeEntry>>,
     planned_stops: Mutex<HashMap<AgentKey, Arc<Mutex<Option<DeferredLoss>>>>>,
+    /// Keys whose owner channel was dropped by a settlement this daemon
+    /// started (a stop or force attempt): the actor must not report that drop
+    /// as an unrequested plugin failure. Only ever set under the running map.
+    settled_channels: Mutex<HashSet<AgentKey>>,
     startup_gate: AsyncMutex<()>,
     startup_closed: AtomicBool,
     observers: Mutex<HashMap<AgentKey, Arc<observation::ObserverEntry>>>,
@@ -413,6 +426,7 @@ impl PluginHost {
                 late_batch_causes: Mutex::new(HashMap::new()),
                 running: Mutex::new(HashMap::new()),
                 planned_stops: Mutex::new(HashMap::new()),
+                settled_channels: Mutex::new(HashSet::new()),
                 startup_gate: AsyncMutex::new(()),
                 startup_closed: AtomicBool::new(false),
                 observers: Mutex::new(HashMap::new()),
@@ -1679,6 +1693,7 @@ async fn cleanup_startup(
     event_task: &mut tokio::task::JoinHandle<()>,
     pending_failure: &mut Option<PendingFailure>,
     proven_no_dispatch: bool,
+    origin: Option<eliot_core::FailureOrigin>,
 ) {
     let exited = terminate_child(child, &actor.monitoring, &actor.agent).await;
     // A plugin that panicked on its own left a crash marker in exactly this
@@ -1710,11 +1725,20 @@ async fn cleanup_startup(
                     "plugin_startup_exit",
                     None,
                     Some(tail),
+                    origin,
                 )
                 .await;
             }
             None => {
-                mark_lost_state(&actor.state, &actor.key, "plugin_startup_exit").await;
+                mark_lost_state_with_exit(
+                    &actor.state,
+                    &actor.key,
+                    "plugin_startup_exit",
+                    None,
+                    None,
+                    origin,
+                )
+                .await;
             }
         }
     } else if let Err(error) = settled {
@@ -3353,7 +3377,7 @@ async fn record_root_exit_gap(state: &Weak<HostState>, key: &AgentKey, reason: &
 /// plugin root exit records `root_exited`, never `owner_marked_lost`, which
 /// is reserved for an explicit Owner/host assertion of loss.
 async fn mark_lost_state(state: &Weak<HostState>, key: &AgentKey, reason: &'static str) {
-    mark_lost_state_with_exit(state, key, reason, None, None).await;
+    mark_lost_state_with_exit(state, key, reason, None, None, None).await;
 }
 
 /// The one owned plugin crash marker in this stderr snapshot, if any. Only
@@ -3380,6 +3404,7 @@ async fn mark_lost_state_with_exit(
     reason: &'static str,
     exit: Option<eliot_core::ProcessExit>,
     stderr_tail: Option<String>,
+    origin: Option<eliot_core::FailureOrigin>,
 ) {
     let Some(state) = state.upgrade() else {
         return;
@@ -3398,12 +3423,21 @@ async fn mark_lost_state_with_exit(
                     reason,
                     exit,
                     stderr_tail,
+                    origin,
                 });
             }
             return;
         }
         if let Ok(events) =
-            store.mark_lost_with_exit(&key.id, key.generation, now_ms(), reason, exit, stderr_tail)
+            store.mark_lost_with_exit(
+                &key.id,
+                key.generation,
+                now_ms(),
+                reason,
+                exit,
+                stderr_tail,
+                origin,
+            )
         {
             state.bus.publish(&events);
             note_unknown_commands(&state, &events);
