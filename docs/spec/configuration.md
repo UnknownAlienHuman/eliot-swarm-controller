@@ -181,8 +181,8 @@ defaults); broader authority stays profile-only, owner-written choice. When
 deterministically and freezes the absolute path. Ad-hoc Claude uses `mcp = "minimal"`. Claude profiles may omit `cmd` or set
 `cmd = "latest"`; both automatic forms select only an executable whose bounded
 `--version` probe exits successfully and reports a parseable numeric version.
-Among verified installations, the newest numeric version wins even when
-another probe times out. The absolute path and verified `cmd_version` are
+Among verified installations, the newest numeric version wins. A timeout on a
+newer versioned installation refuses automatic selection. The absolute path and verified `cmd_version` are
 frozen in the Agent snapshot. Versioned vendor roots are considered before
 PATH. Unverified executables remain visible in the installation inventory,
 with the raw `--version` first line when available, but cannot be selected

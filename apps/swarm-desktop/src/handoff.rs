@@ -194,8 +194,8 @@ fn launch_key(launch: &SwitchLaunch) -> String {
 
 #[derive(Clone, Debug)]
 pub enum Outcome {
-    Handoff(HandoffResponse),
-    Switch(SwitchResponse),
+    Handoff(Box<HandoffResponse>),
+    Switch(Box<SwitchResponse>),
 }
 
 impl Outcome {

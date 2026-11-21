@@ -383,8 +383,8 @@ wrappers are refused, and Unix binaries must have an ELF or Mach-O header.
 Versioned roots are probed before PATH so a stale PATH copy cannot hide a
 newer installation. Automatic selection for an omitted `cmd` or `cmd =
 "latest"` requires the bounded `--version` probe to exit successfully and
-report a parseable numeric version. It selects the newest verified candidate;
-a timeout on another candidate does not displace that preference. Unverified
+report a parseable numeric version. It selects the newest verified candidate.
+A timeout on a newer versioned installation refuses automatic selection. Unverified
 executables remain in the installation inventory, with the raw `--version`
 first line when available, but do not qualify for automatic selection. The
 Agent snapshot freezes the selected absolute `cmd` and verified `cmd_version`.
