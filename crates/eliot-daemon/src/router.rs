@@ -18,6 +18,7 @@ mod inference;
 pub(crate) mod launch_queue;
 mod organization;
 mod overview;
+mod patch_digest;
 mod project_assignment;
 mod resolution;
 mod routing;
@@ -535,6 +536,7 @@ impl Router {
             "usage.summary" => self.usage_summary(&params, &principal).await,
             "observe.heavy" => self.observe_heavy(&params, &principal).await,
             "agent.git" => self.agent_git(&params, &principal).await,
+            "agent.patch_digest" => self.agent_patch_digest(&params, &principal).await,
             "agent.edits" => self.agent_edits(&params, &principal).await,
             "turn.get" => self.turn_get(&params, &principal).await,
             "turn.resolve" => self.turn_resolve(&params, &principal).await,

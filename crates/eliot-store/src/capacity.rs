@@ -439,8 +439,13 @@ pub(super) fn reserve_tx(
                 let (usage, member) = assignment_usage(tx, &agent.project, Some((id, generation)))?;
                 if member {
                     let scope = CapacityScope::manager_assignment_scope(&agent.project);
+                    let paused = launch_queue::manager_paused(tx, &agent.project)?;
                     require_scope_free(&scope, limit, usage).map_err(|mut error| {
-                        if limits.manager_min_live.is_some()
+                        if paused {
+                            error.message.push_str(
+                                "; the current manager paused new admissions (project budget --resume lifts it)",
+                            );
+                        } else if limits.manager_min_live.is_some()
                             && limits
                                 .manager_assignment
                                 .is_some_and(|ceiling| limit < ceiling)

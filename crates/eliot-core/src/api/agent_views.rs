@@ -573,6 +573,45 @@ pub struct AgentGitResponse {
     pub git: GitView,
 }
 
+/// A short digest of an Agent's patch for an independent review: an
+/// attention filter from a plain line scan, never a quality score.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentPatchDigestResponse {
+    pub agent: String,
+    pub generation: i64,
+    /// The commit the patch is measured from: the managed worktree's base,
+    /// else HEAD (uncommitted changes only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
+    /// False when the patch exceeded the read bound; the lists then cover
+    /// only the changed paths, not their lines.
+    pub complete: bool,
+    pub files: Vec<PatchDigestFile>,
+    /// Nearest package-manifest directories of the changed files.
+    pub packages: Vec<String>,
+    /// Added dependency entries in Cargo, npm and lock manifests.
+    pub new_dependencies: Vec<String>,
+    /// Added (`+`) or removed (`-`) public item declarations.
+    pub public_interface: Vec<String>,
+    /// Changed checker, lint, toolchain and CI configuration.
+    pub checker_changes: Vec<String>,
+    /// Added error or lint suppressions.
+    pub suppressions: Vec<String>,
+    /// True when a list was cut at its bound.
+    pub truncated: bool,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PatchDigestFile {
+    pub path: String,
+    /// `added`, `modified`, `deleted` or `untracked`.
+    pub change: String,
+}
+
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentEditsResponse {
     pub agent: String,

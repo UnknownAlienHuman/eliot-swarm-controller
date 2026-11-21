@@ -110,6 +110,10 @@ pub struct ManagerBudgetRequest {
     pub expected_revision: i64,
     pub max_live: Option<u64>,
     pub priority: Option<u8>,
+    /// Strict pause of new admissions in the manager's assignment scope,
+    /// queued launch intents included; running children keep running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused: Option<bool>,
 }
 
 impl ManagerBudgetRequest {
@@ -117,7 +121,7 @@ impl ManagerBudgetRequest {
         validate_id(&self.id)?;
         if self.project.is_empty()
             || self.expected_revision <= 0
-            || (self.max_live.is_none() && self.priority.is_none())
+            || (self.max_live.is_none() && self.priority.is_none() && self.paused.is_none())
         {
             return Err(Error::new(
                 "invalid",
@@ -131,8 +135,11 @@ impl ManagerBudgetRequest {
 #[derive(JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManagerBudgetView {
     pub project: String,
+    /// The effective assignment limit; 0 while paused.
     pub max_live: Option<u64>,
     pub priority: u8,
+    #[serde(default)]
+    pub paused: bool,
 }
 
 fn validate_id(id: &str) -> Result<()> {

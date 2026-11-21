@@ -127,6 +127,9 @@ pub(crate) enum CliCommand {
     Usage(UsageArgs),
     /// Read the current Git snapshot for an Agent's workspace.
     GitStatus(GitStatusArgs),
+    /// Digest an Agent's patch for review: files, packages, new
+    /// dependencies, public interface, checker changes and suppressions.
+    PatchDigest(GitStatusArgs),
     /// Read one page of edits attributed to an Agent by native file-change hints.
     Edits(EditsArgs),
     /// Follow new committed events; use --after to replay retained history.
@@ -1488,6 +1491,13 @@ pub(crate) enum ProjectCommand {
         max_live: Option<u64>,
         #[arg(long)]
         priority: Option<u8>,
+        /// Pause new admissions in the assignment scope (queued intents
+        /// included); running children keep running.
+        #[arg(long, conflicts_with = "resume")]
+        pause: bool,
+        /// Lift the pause.
+        #[arg(long)]
+        resume: bool,
     },
     /// Transfer an assignment to another manager.
     Transfer(ProjectTransferArgs),

@@ -71,6 +71,7 @@ pub(crate) async fn dispatch(
         CliCommand::Doctor => reads::run_doctor(data_dir, json_output).await,
         CliCommand::Heavy(args) => reads::run_heavy(args, data_dir, json_output).await,
         CliCommand::GitStatus(args) => reads::run_git_status(args, data_dir, json_output).await,
+        CliCommand::PatchDigest(args) => reads::run_patch_digest(args, data_dir, json_output).await,
         CliCommand::Edits(args) => reads::run_edits(args, data_dir, json_output).await,
         CliCommand::Watch(args) => reads::run_watch(args, data_dir, json_output).await,
         CliCommand::Result(args) => reads::run_result(args, data_dir, json_output).await,

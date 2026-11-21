@@ -76,8 +76,9 @@ engine, second scheduler or critic loop.
       the Goal's one Owner-authorized `escalation` (a model/effort `configure`
       with its reason, admitted before the continuation); never a model ladder,
       wider rights or a replayed unknown.
-- [ ] **A9 Flow control and review digest.** Assignment pause and manager budget
-      follow integration capacity; a short patch digest (files, packages, new
+- [x] **A9 Flow control and review digest.** A manager's epoch-bound
+      `project budget --pause` holds every new admission in its assignment
+      scope until `--resume`; `agent.patch_digest` (files, packages, new
       dependencies, public interface, checker/lint changes, new suppressions)
       focuses the independent review.
 
