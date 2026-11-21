@@ -671,6 +671,21 @@ pub(super) fn require_unused_switch_successor(
     Ok(())
 }
 
+pub(super) fn refresh_disposal_parent_tx(
+    tx: &Transaction<'_>,
+    command_id: &str,
+    state: CommandState,
+    now: i64,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE commands SET outcome=json_set(outcome,'$.disposal_state',?2), updated_at=?3
+         WHERE id=(SELECT parent_command FROM commands WHERE id=?1 AND link_kind='switch' AND ordinal=2 AND verb='stop')
+           AND method='swarm.switch' AND state='failed' AND json_extract(outcome,'$.disposal_command')=?1",
+        params![command_id, command_state_name(state), now],
+    ).map_err(sql_error)?;
+    Ok(())
+}
+
 fn result_on(connection: &Connection, id: &str) -> Result<SwitchResponse> {
     let parent = switch_parent(connection, id)?;
     let mut result = stored_result(&parent.outcome)?;
