@@ -66,7 +66,16 @@ impl Store {
                     "switch exceeds command budget",
                 ));
             }
-            source_tx(&tx, request, self.hierarchy_limits)?;
+            let (source, _) = source_tx(&tx, request, self.hierarchy_limits)?;
+            project_transfer::require_no_intent(&tx, &source.project)?;
+            handoff::source_inputs(
+                &tx,
+                &source,
+                &request.task_command,
+                &request.commands,
+                None,
+                policy,
+            )?;
             let value = SwitchResponse {
                 id: request.id.clone(),
                 from: request.from.clone(),
