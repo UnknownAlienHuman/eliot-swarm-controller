@@ -863,7 +863,7 @@ of the explicitly selected release scope.
       Worktrees & cleanup's "Select all safe" checks every
       group with something safe to remove before `cleanup.apply`. (Refs #407)
 
-- [ ] **Per-item desktop cleanup and full cleanup paging (2026-11-21).** Task row
+- [x] **Per-item desktop cleanup and full cleanup paging (2026-11-21).** Task row
       and header actions archive, unarchive and delete eligible trees, and
       Show archived is visible in the sidebar. Remove from Swarm unregisters
       a project and leaves its checkout on disk. Task deletion uses the same
