@@ -40,10 +40,15 @@ use std::{
 };
 use tokio::{
     sync::mpsc,
-    time::{Instant, timeout_at},
+    time::{Instant, sleep, timeout_at},
 };
 
 const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// OpenCode can answer config readback before its provider inventory is
+/// available. Keep the exact launch catalogue gate bounded and before any
+/// session create, leaving the start cleanup reserve intact.
+const START_CATALOGUE_READY_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+const START_CATALOGUE_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Total bound for one agent.start dispatch, from admission to the ready,
 /// failed, or unknown response. The daemon allows 90 s for the agent.start
@@ -1406,10 +1411,13 @@ impl OpenCodePlugin {
                 .as_ref()
                 .and_then(|model_ref| model_ref.variant.as_deref());
             let _timing = crate::native::startup::Step::new("model_catalogue");
-            let catalogue = match session
-                .http
-                .list_native_models(phase_deadline(envelope, RPC_TIMEOUT))
-                .await
+            let catalogue = match wait_for_start_catalogue(
+                &session.http,
+                requested,
+                requested_variant,
+                envelope,
+            )
+            .await
             {
                 Ok(catalogue) => catalogue,
                 Err(error) => {
@@ -4491,6 +4499,37 @@ fn catalogue_contains_for(catalogue: &[NativeModelEntry], provider_id: &str, id:
 /// `provider/model` id. See [`catalogue_entry`].
 fn catalogue_contains(catalogue: &[NativeModelEntry], requested: &str) -> bool {
     catalogue_entry(catalogue, requested).is_some()
+}
+
+/// Wait for the selected model and optional variant to appear in the live
+/// server inventory. `GET /api/config` proves the server loaded our isolated
+/// config, but provider discovery may still be settling. These reads have no
+/// native effect and run before `POST /api/session`; timeout still returns the
+/// latest successful incomplete inventory so the caller's strict miss error is
+/// retained. A failed read keeps its native readback error.
+async fn wait_for_start_catalogue(
+    http: &OpenCodeHttp,
+    requested: &str,
+    requested_variant: Option<&str>,
+    envelope: Instant,
+) -> Result<Vec<NativeModelEntry>> {
+    let deadline = phase_deadline(create_cutoff(envelope), START_CATALOGUE_READY_BUDGET);
+    loop {
+        let entries = http.list_native_models(deadline).await?;
+        let model_ready = catalogue_contains(&entries, requested);
+        let variant_ready = requested_variant.is_none_or(|variant| {
+            catalogue_variants(&entries, requested)
+                .is_some_and(|variants| variants.iter().any(|known| known == variant))
+        });
+        if model_ready && variant_ready {
+            return Ok(entries);
+        }
+
+        if Instant::now() + START_CATALOGUE_POLL >= deadline {
+            return Ok(entries);
+        }
+        sleep(START_CATALOGUE_POLL).await;
+    }
 }
 
 /// The live native catalogue's selectable variant ids for one exact native

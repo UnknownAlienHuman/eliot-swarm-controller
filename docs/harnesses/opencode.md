@@ -104,6 +104,11 @@ location from the session; requests outside a session pass the installed API's w
 parameter. Read complete error bodies; only authoritative
 rejection proves no effect. Timeout/ambiguous server response after a write is unknown.
 Catalogue preflight may retry only before any session/input may have been admitted.
+After the owned server proves its isolated config through `GET /api/config`,
+launch polls `GET /api/model` for up to 10 seconds when the selected model or
+variant is absent. Provider discovery can lag config readiness; launch still
+requires exact live `provider/model` and variant membership, and expiry fails
+before session creation.
 
 The native `x-opencode-directory` header is URI component encoded, including literal
 percent signs, using the same encoder as query values. Installed OpenCode 2.2.7
