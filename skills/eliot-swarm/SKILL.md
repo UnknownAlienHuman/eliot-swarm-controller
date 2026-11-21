@@ -43,6 +43,9 @@ Check: the concrete scenario and the project's required commands.
 Return: result, change locations, checks actually run, what is left.
 ```
 
+- Pass the required reading as `sources` on launch or send (CLI `--source
+  PATH`). Swarm delivers each file with its path, digest and completeness, or
+  says why it could not. Don't reopen a file that arrived complete.
 - "Start from these files" names entry points, not a closed write area.
 - A child gets the same or a narrower area. To cross an explicit limit, it
   reports the reason and the minimal change instead of crossing it.

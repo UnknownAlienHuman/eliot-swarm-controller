@@ -47,7 +47,7 @@ engine, second scheduler or critic loop.
       completeness; the continuation marks it as diagnostic data and never asks
       for a rerun to read the log. The no-progress digest covers both streams
       and counts only fully captured output; exit and unknown are unchanged.
-- [ ] **A2 Exact brief and required sources.** The launch/send brief carries the
+- [x] **A2 Exact brief and required sources.** The launch/send brief carries the
       result, required reading, write area, explicit limits and the check; named
       sources are delivered with path and version or their absence is explicit;
       limits survive handoff and continuation.

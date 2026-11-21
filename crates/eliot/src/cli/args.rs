@@ -440,6 +440,11 @@ pub(crate) struct LaunchArgs {
     pub(crate) parent: Option<String>,
     #[arg(value_name = "PROMPT")]
     pub(crate) prompt: Option<String>,
+    /// A file the Agent must read, relative to the workspace (repeatable,
+    /// up to 16). The daemon delivers its content with path, digest and
+    /// completeness in the first input.
+    #[arg(long = "source", value_name = "PATH")]
+    pub(crate) sources: Vec<String>,
     /// Enqueue durable launch intent and return its receipt immediately.
     #[arg(long, conflicts_with_all = ["wait", "owner_override"])]
     pub(crate) queue: bool,
@@ -469,6 +474,10 @@ pub(crate) struct SendArgs {
     pub(crate) agent: String,
     #[arg(value_name = "TEXT", allow_hyphen_values = true)]
     pub(crate) text: String,
+    /// A file the Agent must read, relative to its workspace (repeatable,
+    /// up to 16), delivered with path, digest and completeness.
+    #[arg(long = "source", value_name = "PATH")]
+    pub(crate) sources: Vec<String>,
     #[arg(long)]
     pub(crate) wait: bool,
     /// Explicitly claim one eligible provider-hold probe for this send.

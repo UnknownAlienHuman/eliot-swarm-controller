@@ -21,6 +21,7 @@ mod project_assignment;
 mod resolution;
 mod routing;
 mod rules;
+mod sources;
 mod status;
 mod switch;
 
@@ -1024,6 +1025,27 @@ impl Router {
     ) -> Result<Option<Value>> {
         let store = self.inner.store.lock().await;
         store.ensure_committed_reads()?;
+        // A same-ID retry of a launch or send with `sources` replays the text
+        // its first admission delivered, when that text is this request's
+        // prompt plus the delivered block.
+        if matches!(request.verb.as_str(), "launch" | "send")
+            && request.args.get("sources").is_some()
+            && let Some(retained) = store.get_command(&request.id)?
+            && let Some(stored) = retained.args.get("text").and_then(Value::as_str)
+            && sources::is_delivery_of(
+                stored,
+                request
+                    .args
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            )
+        {
+            request.args["text"] = json!(stored);
+            if let Some(args) = request.args.as_object_mut() {
+                args.remove("sources");
+            }
+        }
         match request.verb.as_str() {
             "launch" => {
                 reject_launch_derived_keys(&request.args)?;
@@ -1966,6 +1988,11 @@ impl Router {
             "send" | "steer" | "inject" | "interrupt" | "approve" | "deny" | "answer"
         ) {
             validate_plugin_command_args(&request)?;
+        }
+        // Required sources are read and delivered before the secret check, so
+        // their redacted text is checked like any other input text.
+        if matches!(request.verb.as_str(), "launch" | "send") {
+            self.deliver_sources(&mut request).await?;
         }
         // Emit data and variable values are arbitrary JSON: their object keys
         // can smuggle a known credential past the values-only check. Block
