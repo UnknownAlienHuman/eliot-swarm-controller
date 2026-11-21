@@ -790,7 +790,12 @@ impl Component for Composer {
         let mut field_cells = vec![KeyedView::new(
             "field",
             Border::new()
-                .margin(Thickness::new(-WINUI_TEXT_PADDING, 0.0, 0.0, 0.0))
+                .margin(Thickness::new(
+                    -tokens::spacing::FIELD_LEADING_INSET,
+                    0.0,
+                    0.0,
+                    0.0,
+                ))
                 .content(field),
         )];
         // A click into the field closes an open popover. WinUI's text box
@@ -859,7 +864,7 @@ impl Component for Composer {
                 tokens::spacing::INSET,
                 0.0,
                 if home {
-                    tokens::spacing::XL - tokens::spacing::XS
+                    tokens::spacing::HOME_GROUP_GAP
                 } else {
                     tokens::spacing::LG
                 },

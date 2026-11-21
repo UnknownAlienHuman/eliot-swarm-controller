@@ -278,6 +278,7 @@ fn chart_card(
                     .background(bar),
                 None => Border::new()
                     .height(tokens::layout::PLOT_STUB)
+                    .opacity(tokens::state::PLOT_STUB_OPACITY)
                     .background(palette.outline()),
             };
             KeyedView::new(

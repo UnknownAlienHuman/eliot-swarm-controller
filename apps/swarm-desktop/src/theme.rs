@@ -14,8 +14,6 @@
 //! nothing, so the system colors apply.
 
 pub use crate::tokens::state;
-#[cfg(windows)]
-pub use crate::tokens::text as typography;
 
 /// The design's elevation: level 1 (a pressable under the pointer), 2
 /// (menus, popovers, the FAB under the pointer) and 3 (the composer), each
@@ -87,10 +85,6 @@ pub mod elevation {
             .collect()
     }
 }
-
-/// Secondary text lowers emphasis with opacity on the theme text brush, so
-/// High Contrast still resolves the system color.
-pub const MUTED_OPACITY: f64 = 0.72;
 
 /// An opaque sRGB color.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

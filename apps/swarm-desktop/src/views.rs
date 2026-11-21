@@ -287,10 +287,7 @@ fn block_views(
     palette: Palette,
 ) -> Vec<KeyedView> {
     let Some(blocks) = part.blocks.as_ref() else {
-        return vec![KeyedView::new(
-            "plain",
-            body_text(&part.plain),
-        )];
+        return vec![KeyedView::new("plain", body_text(&part.plain))];
     };
     blocks
         .iter()

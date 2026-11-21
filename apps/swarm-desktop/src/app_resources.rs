@@ -313,7 +313,10 @@ fn text_field(s: &Roles) -> Vec<(&'static str, Value)> {
         ),
         ("TextControlElevationBorderBrush", opaque(s.border)),
         ("TextControlElevationBorderFocusedBrush", opaque(s.primary)),
-        ("TextControlBackgroundPointerOver", layer(s.text, state::HOVER)),
+        (
+            "TextControlBackgroundPointerOver",
+            layer(s.text, state::HOVER),
+        ),
         ("TextControlForegroundDisabled", opaque(s.secondary_text)),
         (
             "TextControlPlaceholderForegroundDisabled",

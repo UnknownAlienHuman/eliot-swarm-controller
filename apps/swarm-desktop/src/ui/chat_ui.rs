@@ -102,9 +102,6 @@ const MENU_DETACH: &str = "Detach";
 const MENU_STOP: &str = "Stop";
 const MENU_FORCE: &str = "Force stop…";
 
-/// WinUI's own left text padding inside a TextBox
-/// (`TextControlThemePadding`, 10,5,6,6).
-const WINUI_TEXT_PADDING: f64 = tokens::spacing::ROW;
 /// Delay before the composer takes focus after an open or a send, and
 /// before a send scrolls the transcript to its end: the next render has
 /// realized the newest turn by then (ms).
@@ -1063,7 +1060,7 @@ impl DesktopApp {
         let count = cards.len();
         StackPanel::new()
             .grid_row(1)
-            .spacing(tokens::spacing::XL - tokens::spacing::XS)
+            .spacing(tokens::spacing::HOME_GROUP_GAP)
             .horizontal_alignment(HorizontalAlignment::Center)
             .vertical_alignment(VerticalAlignment::Center)
             .margin(Thickness::xy(tokens::spacing::XL, 0.0))

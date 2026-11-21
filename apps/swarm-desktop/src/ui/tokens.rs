@@ -156,6 +156,7 @@ pub mod state {
     /// Disabled selection marks and other non-text affordances.
     pub const DISABLED_CONTENT: f64 = 0.38;
     pub const SCRIM: f64 = 0.32;
+    pub const PLOT_STUB_OPACITY: f64 = 0.72;
 }
 
 /// Widths and the few fixed sizes of the shell.
