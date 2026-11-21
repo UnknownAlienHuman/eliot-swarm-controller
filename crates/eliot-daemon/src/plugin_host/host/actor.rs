@@ -22,6 +22,7 @@ use crate::monitor::Monitoring;
 use crate::platform::OwnedChild;
 use eliot_core::{Agent, AgentStartParams, Error, FailureOrigin, Result};
 use eliot_plugin::{StderrCapture, StderrView};
+use eliot_store::AgentLossEvidence;
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use serde_json::{Value, json};
 use std::sync::{Arc, Weak};
@@ -183,9 +184,11 @@ pub(super) async fn settle_observed_root_exit(
             state,
             key,
             eliot_core::PLUGIN_ROOT_EXITED_REASON,
-            Some(exit),
-            Some(stderr_tail),
-            None,
+            AgentLossEvidence {
+                exit: Some(exit),
+                stderr_tail: Some(stderr_tail),
+                ..Default::default()
+            },
         )
         .await;
     }

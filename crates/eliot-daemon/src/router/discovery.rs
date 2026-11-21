@@ -124,7 +124,7 @@ const METHODS: &[Method] = &[
         DaemonPanicTestResponse,
         true,
         false,
-        "Debug builds only: force a daemon panic to test crash capture (Owner).",
+        "Debug builds only (Owner): acknowledge, capture a daemon panic, then abort.",
         {}
     ),
     method!(

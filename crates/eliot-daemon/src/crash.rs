@@ -33,6 +33,16 @@ static INSTALLED: AtomicBool = AtomicBool::new(false);
 /// startup never needs an unsafe environment write.
 static CRASH_DIR: OnceLock<PathBuf> = OnceLock::new();
 
+#[cfg(debug_assertions)]
+pub(crate) const DAEMON_PANIC_TEST_METHOD: &str = "daemon.panic_test";
+
+/// Run the installed hook to completion before aborting this daemon.
+#[cfg(debug_assertions)]
+pub(crate) fn panic_and_abort() -> ! {
+    let _ = std::panic::catch_unwind(|| panic!("debug daemon panic-test trigger"));
+    std::process::abort()
+}
+
 /// Remember the private marker directory for this process. First call wins;
 /// later calls are ignored so a re-executed entry point cannot redirect
 /// crash markers mid-run.

@@ -451,20 +451,18 @@ impl Router {
                 require_owner(&principal)?;
                 self.shutdown(&params, &principal).await
             }
-            // Debug-only forced daemon panic for crash-capture tests.
-            // Compiled out of release builds. The panic hook writes the
-            // marker during unwinding; `panic = abort` is not set for the
-            // workspace, so an unwinding thread alone would leave the daemon
-            // serving. Abort this process once the hook has captured it so
-            // the marker is reported against a genuinely stopped daemon.
             #[cfg(debug_assertions)]
-            "daemon.panic_test" => {
+            crate::crash::DAEMON_PANIC_TEST_METHOD => {
+                use eliot_core::api::{DaemonPanicTestRequest, DaemonPanicTestResponse};
+
                 require_owner(&principal)?;
-                let handle = std::thread::spawn(|| {
-                    panic!("debug daemon panic-test trigger");
-                });
-                let _ = handle.join();
-                std::process::abort()
+                let request: DaemonPanicTestRequest =
+                    eliot_core::api::discovery::decode_params(params.clone())?;
+                request.validate()?;
+                // IPC triggers the panic after sending this acknowledgement.
+                Ok(json!(DaemonPanicTestResponse {
+                    state: "panicking".to_owned()
+                }))
             }
             "maintenance.run" => self.maintenance_run(&params, &principal).await,
             "artifact.register" => self.artifact_register(&params, &principal).await,

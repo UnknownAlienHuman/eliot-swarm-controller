@@ -350,7 +350,7 @@ pub fn stats_coverage_name(coverage: StatsCoverage) -> &'static str {
 pub struct DaemonPanicTestResponse {
     #[serde(deserialize_with = "required_text")]
     #[schemars(
-        description = "Always \"panicking\": the hook acknowledged before the panic aborts the process."
+        description = "Always \"panicking\": the daemon acknowledges the request before capturing the panic and aborting."
     )]
     pub state: String,
 }

@@ -2002,9 +2002,7 @@ impl Store {
                 generation,
                 now,
                 core::DAEMON_RESTART_REASON,
-                None,
-                None,
-                None,
+                &AgentLossEvidence::default(),
                 &mut events,
             )?;
         }
@@ -2067,46 +2065,37 @@ impl Store {
             generation,
             now,
             core::OWNER_MARKED_LOST_REASON,
-            None,
-            None,
-            None,
+            &AgentLossEvidence::default(),
         )
     }
 
     /// Mark an agent generation lost with its process exit evidence: the
     /// numeric exit code, the Windows NTSTATUS hex for crash statuses, and
-    /// the bounded redacted stderr tail. Numbers and the already-redacted
-    /// tail only; no argv, environment or output framing. The truthful loss
+    /// the bounded redacted stderr tail, and any separately classified
+    /// origin and evidence. The truthful loss
     /// cause is recorded on `agent.lost`, the open turn's `turn.unknown`,
     /// and the dispatched commands' `command.unknown`.
-    #[allow(clippy::too_many_arguments)]
     pub fn mark_lost_with_exit(
         &mut self,
         agent: &str,
         generation: i64,
         now: i64,
         reason: &str,
-        exit: Option<eliot_core::ProcessExit>,
-        stderr_tail: Option<String>,
-        origin: Option<eliot_core::FailureOrigin>,
+        evidence: &AgentLossEvidence,
     ) -> Result<Vec<Event>> {
         self.ensure_writer_healthy()?;
-        let result =
-            self.mark_lost_inner(agent, generation, now, reason, exit, stderr_tail, origin);
+        let result = self.mark_lost_inner(agent, generation, now, reason, evidence);
         self.fault_on_persistence_error(&result);
         result
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn mark_lost_inner(
         &mut self,
         agent: &str,
         generation: i64,
         now: i64,
         reason: &str,
-        exit: Option<eliot_core::ProcessExit>,
-        stderr_tail: Option<String>,
-        origin: Option<eliot_core::FailureOrigin>,
+        evidence: &AgentLossEvidence,
     ) -> Result<Vec<Event>> {
         let agent_num = parse_agent_id(agent)?;
         let tx = self
@@ -2128,14 +2117,22 @@ impl Store {
             generation,
             now,
             reason,
-            exit.as_ref(),
-            stderr_tail.as_deref(),
-            origin,
+            evidence,
             &mut events,
         )?;
         commit_transaction(tx, &self.write_faulted)?;
         Ok(events)
     }
+}
+
+/// Evidence bound to one confirmed generation loss. The stderr tail and
+/// origin evidence have already passed the host's redaction policy.
+#[derive(Default)]
+pub struct AgentLossEvidence {
+    pub exit: Option<eliot_core::ProcessExit>,
+    pub stderr_tail: Option<String>,
+    pub origin: Option<eliot_core::FailureOrigin>,
+    pub origin_evidence: Option<String>,
 }
 
 #[derive(Clone, Copy)]

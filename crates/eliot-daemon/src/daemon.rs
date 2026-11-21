@@ -1281,6 +1281,8 @@ async fn serve_connection_with_write_timeout(
         LinesCodec::new_with_max_length(MAX_RPC_FRAME_BYTES.saturating_sub(1)),
     );
     let mut arm_shutdown = false;
+    #[cfg(debug_assertions)]
+    let mut arm_panic = false;
     let incoming = timeout_at(Instant::now() + DEFAULT_CALL_TIMEOUT, framed.next()).await;
     let handle_started = Instant::now();
     let mut measured = false;
@@ -1293,6 +1295,11 @@ async fn serve_connection_with_write_timeout(
                     match router.handle_rpc(&request).await {
                         Ok(result) => {
                             arm_shutdown = is_shutdown;
+                            #[cfg(debug_assertions)]
+                            {
+                                arm_panic =
+                                    request.method == crate::crash::DAEMON_PANIC_TEST_METHOD;
+                            }
                             RpcResponse {
                                 jsonrpc: "2.0".to_owned(),
                                 id: request.id,
@@ -1364,6 +1371,11 @@ async fn serve_connection_with_write_timeout(
         // Optional diagnostics never displace a semantic result that fits.
         encoded = serde_json::to_string(&response);
     }
+    #[cfg(debug_assertions)]
+    let sending_panic_ack = arm_panic
+        && encoded
+            .as_ref()
+            .is_ok_and(|frame| frame.len().saturating_add(1) <= MAX_RPC_FRAME_BYTES);
     let wrote_response = match encoded {
         Ok(frame) if frame.len().saturating_add(1) <= MAX_RPC_FRAME_BYTES => {
             send_response_frame(&mut framed, frame, write_timeout).await
@@ -1385,6 +1397,14 @@ async fn serve_connection_with_write_timeout(
         logging::record(&policy, "rpc.response_write_failed", &[], None);
     }
     router.response_finished(arm_shutdown);
+    #[cfg(debug_assertions)]
+    if sending_panic_ack && wrote_response {
+        // The one-call client closes after reading its reply. On Windows a
+        // successful write alone can leave unread bytes in the named pipe.
+        // Give the client a bounded chance to read before dropping the server.
+        let _ = timeout(write_timeout, framed.next()).await;
+        crate::crash::panic_and_abort();
+    }
 }
 
 /// Fallback error when a computed response cannot be framed or delivered:

@@ -1387,7 +1387,8 @@ outcomes with `preceded_by`; process steps from the
 NTSTATUS and the redacted stderr tail (a loss to a daemon restart is `swarm` at
 `daemon.restart`, a spontaneous plugin root exit is `harness` at
 `plugin.exit`, see [core](core.md#failure-location-and-origin)). A plugin panic
-during startup can include its marker summary in the stderr step. Diagnosis also
+during startup can include its marker summary in the process step's
+`origin_evidence` alongside the separate stderr tail. Diagnosis also
 includes the previous-run crash marker when the terminal failure is unclassified.
 When a failure exists, the one-line `summary` starts with its origin
 (`provider origin: <target> <code> at <where>: <message>`). A healthy idle, busy,
