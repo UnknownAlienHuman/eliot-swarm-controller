@@ -66,16 +66,7 @@ impl Store {
                     "switch exceeds command budget",
                 ));
             }
-            let (source, _) = source_tx(&tx, request, self.hierarchy_limits)?;
-            project_transfer::require_no_intent(&tx, &source.project)?;
-            handoff::source_inputs(
-                &tx,
-                &source,
-                &request.task_command,
-                &request.commands,
-                None,
-                policy,
-            )?;
+            source_tx(&tx, request, self.hierarchy_limits, policy)?;
             let value = SwitchResponse {
                 id: request.id.clone(),
                 from: request.from.clone(),
@@ -87,6 +78,9 @@ impl Store {
                 created: None,
                 handoff: None,
                 error: None,
+                error_reason: None,
+                disposal_command: None,
+                disposal_state: None,
                 next_action: "preparing_launch".into(),
             };
             let mut parent = SubmitCommand::new(&request.id, "switch");
@@ -188,6 +182,7 @@ impl Store {
         id: &str,
         request: SubmitCommand,
         preparation: Option<WorkspacePreparationInput>,
+        policy: &core::SecretPolicy,
         now: i64,
     ) -> Result<Admission> {
         self.ensure_writer_healthy()?;
@@ -212,7 +207,7 @@ impl Store {
             }
             let source: SwitchRequest = serde_json::from_value(parent.args)
                 .map_err(|_| Error::new("source_integrity", "switch request malformed"))?;
-            let (agent, target) = source_tx(&tx, &source, self.hierarchy_limits)?;
+            let (agent, target) = source_tx(&tx, &source, self.hierarchy_limits, policy)?;
             let requested = serde_json::to_value(&source.launch)
                 .map_err(|_| Error::new("internal", "cannot encode switch selectors"))?;
             for key in [
@@ -347,8 +342,8 @@ impl Store {
         result
     }
 
-    /// Shared H2 transfer and switch completion commit together. On refusal the savepoint
-    /// rolls back every H2 mutation, then records the created B for ordinary Owner recovery.
+    /// Commit the H2 transfer, or roll back H2 and admit ordinary disposal of
+    /// the exact unused successor after a definite refusal.
     pub fn finish_switch(
         &mut self,
         id: &str,
@@ -377,6 +372,7 @@ impl Store {
             let mut events = Vec::new();
             let mut state = CommandState::Failed;
             let mut error = None;
+            let mut disposal = None;
             // The destination binding is captured before the transfer creates
             // B's first input; re-deriving it afterwards would see that input
             // and refuse.
@@ -471,6 +467,31 @@ impl Store {
                     Err(e) => {
                         tx.execute_batch("ROLLBACK TO switch_transfer; RELEASE switch_transfer")
                             .map_err(sql_error)?;
+                        if e.code == "unknown" {
+                            state = CommandState::Unknown;
+                        } else if e.code != "internal" && continued_to.is_some() {
+                            let destination = ready_destination_tx(&tx, &launch)?;
+                            let mut stop = SubmitCommand::new(Ulid::new().to_string(), "stop");
+                            stop.target = Some(destination.id);
+                            stop.expected_generation = Some(destination.generation);
+                            stop.args = json!({"force": true});
+                            let admitted = admission::submit_tx(
+                                &tx,
+                                "owner",
+                                stop,
+                                None,
+                                now,
+                                false,
+                                self.hierarchy_limits,
+                                self.capacity_policy.as_deref(),
+                            )?;
+                            tx.execute(
+                                "UPDATE commands SET parent_command=?1,link_kind='switch',ordinal=2 WHERE id=?2",
+                                params![id, admitted.command.id],
+                            ).map_err(sql_error)?;
+                            events.extend(admitted.events);
+                            disposal = Some(admitted.command);
+                        }
                         error = Some(e);
                     }
                 }
@@ -496,14 +517,25 @@ impl Store {
                 return Err(error.unwrap());
             }
             let mut value = result_on(&tx, id)?;
-            value.error = error.map(|error| error.code);
+            if let Some(error) = &error {
+                set_switch_error(&mut value, error, policy);
+            }
             value.state = state;
+            if let Some(disposal) = disposal {
+                value.disposal_command = Some(disposal.id);
+                value.disposal_state = Some(disposal.state);
+            }
+            value.next_action = switch_next_action(&value).into();
             // H2 owns the full transfer result; keep only its fixed reference here.
             value.handoff = None;
             let outcome = serde_json::to_value(&value)
                 .map_err(|_| Error::new("internal", "cannot encode switch result"))?;
             update_command_state(&tx, id, state, Some(&outcome), None, now)?;
-            events.push(insert_daemon_command_event(&tx, now, &format!("command.{}",command_state_name(state)), None, None, id, json!({"launch_command":plan.launch_command,"handoff_command":plan.handoff_command}))?);
+            events.push(insert_daemon_command_event(
+                &tx, now, &format!("command.{}",command_state_name(state)), None, None, id,
+                json!({"launch_command":plan.launch_command,"handoff_command":plan.handoff_command,
+                    "error":value.error,"reason":value.error_reason,"disposal_command":value.disposal_command}),
+            )?);
             let value = result_on(&tx, id)?;
             commit_transaction(tx, &self.write_faulted)?;
             Ok(Change { value, events })
@@ -515,11 +547,14 @@ impl Store {
     pub fn fail_switch_preparation(
         &mut self,
         id: &str,
-        code: &str,
+        error: &Error,
+        policy: &core::SecretPolicy,
         now: i64,
     ) -> Result<Change<Command>> {
         let mut value = self.switch_result(id)?;
-        value.error = Some(code.to_owned());
+        set_switch_error(&mut value, error, policy);
+        value.state = CommandState::Rejected;
+        value.next_action.clear();
         self.settle(
             id,
             CommandState::Rejected,
@@ -530,6 +565,11 @@ impl Store {
             now,
         )
     }
+}
+
+fn set_switch_error(value: &mut SwitchResponse, error: &Error, policy: &core::SecretPolicy) {
+    value.error = Some(core::bound_chars(&policy.redact_text(&error.code), 128));
+    value.error_reason = Some(core::bound_chars(&policy.redact_text(&error.message), 512));
 }
 
 fn replay_on(
@@ -592,17 +632,50 @@ fn component(
     }
 }
 
+/// Check the exact unused successor again when its reserved stop dispatches.
+/// An Owner may have admitted input to B after the refusal was committed.
+pub(super) fn require_unused_switch_successor(
+    tx: &Transaction<'_>,
+    stop_id: &str,
+    agent: &Agent,
+) -> Result<()> {
+    let switch_id: Option<String> = tx
+        .query_row(
+            "SELECT parent_command FROM commands WHERE id=?1 AND link_kind='switch' AND ordinal=2",
+            [stop_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    let Some(switch_id) = switch_id else {
+        return Ok(());
+    };
+    let parent = switch_parent(tx, &switch_id)?;
+    let receipt = stored_result(&parent.outcome)?;
+    if parent.state != CommandState::Failed || receipt.disposal_command.as_deref() != Some(stop_id)
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "switch successor stop does not match the refusal",
+        ));
+    }
+    let launch = component(tx, &switch_id, &receipt.launch_command, 0)?
+        .ok_or_else(|| Error::new("source_integrity", "switch launch is not retained"))?;
+    let destination = ready_destination_tx(tx, &launch)?;
+    if destination.id != agent.id || destination.generation != agent.generation {
+        return Err(Error::new(
+            "stale_generation",
+            "switch successor generation moved",
+        ));
+    }
+    Ok(())
+}
+
 fn result_on(connection: &Connection, id: &str) -> Result<SwitchResponse> {
     let parent = switch_parent(connection, id)?;
     let mut result = stored_result(&parent.outcome)?;
     result.state = parent.state;
-    let mut ready = false;
     if let Some(launch) = component(connection, id, &result.launch_command, 0)? {
-        ready = match ready_destination_tx(connection, &launch) {
-            Ok(_) => launch.state == CommandState::Applied,
-            Err(error) if error.code == "internal" => return Err(error),
-            Err(_) => false,
-        };
         result.launch_state = Some(launch.state);
         result.created = launch.target.map(|agent| SwitchAgent {
             agent,
@@ -619,36 +692,45 @@ fn result_on(connection: &Connection, id: &str) -> Result<SwitchResponse> {
             .map_err(|_| Error::new("source_integrity", "handoff result malformed"))?,
         );
     }
-    result.next_action = if result.handoff.is_some() {
-        "read_handoff_children"
-    } else if result.launch_state == Some(CommandState::Unknown) {
-        "resolve_launch_unknown_never_relaunch"
-    } else if result.launch_state == Some(CommandState::Applied)
-        && parent.state != CommandState::Dispatched
-    {
-        if ready {
-            "finish_with_ordinary_swarm.handoff"
-        } else {
-            "inspect_readiness_then_ordinary_swarm.handoff"
+    if let Some(disposal_id) = &result.disposal_command {
+        let disposal = component(connection, id, disposal_id, 2)?.ok_or_else(|| {
+            Error::new("source_integrity", "switch successor stop is not retained")
+        })?;
+        if disposal.verb != "stop"
+            || result.created.as_ref().is_none_or(|agent| {
+                disposal.target.as_deref() != Some(&agent.agent)
+                    || disposal.generation != Some(agent.generation)
+            })
+        {
+            return Err(Error::new(
+                "source_integrity",
+                "switch successor stop binding changed",
+            ));
         }
-    } else if parent.state == CommandState::Unknown {
-        "inspect_retained_children_never_retry_launch"
-    } else if matches!(
-        parent.state,
-        CommandState::Failed | CommandState::Rejected | CommandState::Cancelled
-    ) {
-        "inspect_created_agent_stop_separately"
-    } else {
-        "wait_for_switch"
+        result.disposal_state = Some(disposal.state);
     }
-    .into();
+    result.next_action = switch_next_action(&result).into();
     Ok(result)
+}
+
+fn switch_next_action(result: &SwitchResponse) -> &'static str {
+    match result.state {
+        CommandState::Applied => "read_handoff_children",
+        CommandState::Failed | CommandState::Rejected | CommandState::Cancelled => "",
+        CommandState::Unknown if result.launch_state == Some(CommandState::Unknown) => {
+            "resolve_launch_unknown_never_relaunch"
+        }
+        CommandState::Unknown => "inspect_retained_children_never_retry_launch",
+        CommandState::Accepted => "preparing_launch",
+        _ => "wait_for_switch",
+    }
 }
 
 fn source_tx(
     tx: &Transaction<'_>,
     request: &SwitchRequest,
     limits: core::api::HierarchyLimits,
+    policy: &core::SecretPolicy,
 ) -> Result<(Agent, Option<core::api::ProjectRegistrationView>)> {
     if request.commands.len() as i64 > limits.max_selector_targets {
         return Err(Error::new(
@@ -662,6 +744,17 @@ fn source_tx(
         return Err(Error::new("stale_generation", "source generation moved"));
     }
     handoff::quiescent(tx, &source, false)?;
+    project_transfer::require_no_intent(tx, &source.project)?;
+    handoff::source_inputs(
+        tx,
+        &source,
+        &request.task_command,
+        &request.commands,
+        None,
+        policy,
+    )?;
+    goals::require_handoff_source_goal(tx, &source, policy)?;
+    require_switch_children(tx, &source, limits)?;
     // Continue-in-project binds the target registration at reserve time, so
     // preparation resolves the target checkout and never the source repo.
     // A projectless source has no execution project for B: it must name one.
@@ -684,7 +777,67 @@ fn source_tx(
         }
         None => None,
     };
+    if let Some(registration) = &target {
+        project_transfer::require_no_intent(tx, &registration.id)?;
+    }
     Ok((source, target))
+}
+
+fn require_switch_children(
+    tx: &Transaction<'_>,
+    source: &Agent,
+    limits: core::api::HierarchyLimits,
+) -> Result<()> {
+    let source_num = parse_agent_id(&source.id)?;
+    // B is a new root. Its controlled tree has the same size as this
+    // source's controlled subtree, with B taking the place of A.
+    let count_limit = limits
+        .max_tree_agents
+        .min(limits.max_selector_targets.saturating_add(1));
+    let members = hierarchy::controlled_subtree_member_nums(tx, source_num, count_limit)?;
+    if members.len() as i64 > count_limit {
+        return Err(Error::new(
+            "fanout_limit",
+            format!(
+                "Agent {} has too many controlled descendants to transfer",
+                source.id
+            ),
+        ));
+    }
+    let mut direct = 0_i64;
+    for id in members.into_iter().filter(|id| *id != source_num) {
+        let child = load_agent_by_num(tx, id)?
+            .ok_or_else(|| Error::new("source_integrity", "switch child disappeared"))?;
+        if child.project_scope() != source.project_scope() {
+            return Err(Error::new(
+                "not_allowed",
+                format!(
+                    "controlled child {} is outside the source project scope",
+                    child.id
+                ),
+            ));
+        }
+        if !(1..=limits.max_depth).contains(&child.depth.saturating_sub(source.depth)) {
+            return Err(Error::new(
+                "fanout_limit",
+                format!(
+                    "controlled child {} would exceed the successor depth limit",
+                    child.id
+                ),
+            ));
+        }
+        direct += i64::from(child.parent.as_deref() == Some(&source.id));
+    }
+    if direct > limits.max_children_per_agent {
+        return Err(Error::new(
+            "fanout_limit",
+            format!(
+                "Agent {} has too many direct controlled children to transfer",
+                source.id
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn ready_destination_tx(tx: &Connection, launch: &Command) -> Result<Agent> {

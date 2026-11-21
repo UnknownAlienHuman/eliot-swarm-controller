@@ -116,7 +116,10 @@ const RECOVER_ACCEPTED_COMMAND_FILTER: &str =
        OR (link_kind = 'handoff' AND state IN ('accepted','queued'))
        OR (link_kind = 'switch' AND ordinal = 0 AND verb = 'launch' AND state = 'accepted'
            AND EXISTS (SELECT 1 FROM commands p WHERE p.id = commands.parent_command AND p.method = 'swarm.switch')
-           AND NOT EXISTS (SELECT 1 FROM workspaces w WHERE w.agent = commands.target AND w.start_command_id = commands.id)))";
+           AND NOT EXISTS (SELECT 1 FROM workspaces w WHERE w.agent = commands.target AND w.start_command_id = commands.id))
+       OR (link_kind = 'switch' AND ordinal = 2 AND verb = 'stop' AND state = 'accepted'
+           AND EXISTS (SELECT 1 FROM commands p WHERE p.id = commands.parent_command
+                       AND p.method = 'swarm.switch' AND p.state = 'failed')))";
 
 /// Retained-unresolved unknowns as a SQL predicate over durable Store facts
 /// (on the `commands` table, without alias): a stored `unknown` command whose

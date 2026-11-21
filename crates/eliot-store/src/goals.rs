@@ -606,29 +606,40 @@ pub(super) fn eliot_goal_status(conn: &Connection, agent_num: i64) -> Result<Opt
     Ok(load_goal_row(conn, agent_num, "eliot")?.map(|row| row.state.status))
 }
 
-/// Keep definition/counters, clear A, and install B paused with a fresh turn baseline.
-pub(super) fn transfer_goal_tx(
+pub(super) fn require_handoff_source_goal(
+    tx: &Transaction<'_>,
+    source: &Agent,
+    policy: &core::SecretPolicy,
+) -> Result<()> {
+    require_settled_handoff_round(tx, parse_agent_id(&source.id)?)?;
+    transferable_source_goal(tx, source, policy)?;
+    Ok(())
+}
+
+fn require_settled_handoff_round(tx: &Transaction<'_>, agent: i64) -> Result<()> {
+    let unsettled: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM goal_markers WHERE agent=?1 AND state IN ('running','unknown'))",
+        [agent], |row| row.get(0),
+    ).map_err(sql_error)?;
+    if unsettled {
+        return Err(Error::new(
+            "busy",
+            format!(
+                "Agent {} has an unresolved Goal round",
+                super::format_agent_id(agent)
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn transferable_source_goal(
     tx: &Transaction<'_>,
     from: &Agent,
-    to: &Agent,
     policy: &core::SecretPolicy,
-    now: i64,
-    events: &mut Vec<Event>,
-) -> Result<Option<i64>> {
+) -> Result<Option<GoalRow>> {
     let from_num = parse_agent_id(&from.id)?;
-    let to_num = parse_agent_id(&to.id)?;
-    for num in [from_num, to_num] {
-        let unsettled: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM goal_markers WHERE agent=?1 AND state IN ('running','unknown'))",
-            [num], |row| row.get(0)).map_err(sql_error)?;
-        if unsettled {
-            return Err(Error::new(
-                "busy",
-                "handoff cannot transfer an unresolved Goal round",
-            ));
-        }
-    }
-    let Some(mut source) = load_goal_row(tx, from_num, "eliot")? else {
+    let Some(source) = load_goal_row(tx, from_num, "eliot")? else {
         return Ok(None);
     };
     if matches!(
@@ -641,16 +652,6 @@ pub(super) fn transfer_goal_tx(
         return Err(Error::new(
             "bad_state",
             "blocked source Goal requires an explicit set or clear before handoff",
-        ));
-    }
-    let destination = load_goal_row(tx, to_num, "eliot")?;
-    if destination
-        .as_ref()
-        .is_some_and(|row| row.state.status != GoalStatus::Cleared)
-    {
-        return Err(Error::new(
-            "bad_state",
-            "destination already has an Eliot Goal",
         ));
     }
     if source.generation != from.generation {
@@ -679,6 +680,35 @@ pub(super) fn transfer_goal_tx(
         return Err(Error::new(
             "secret_in_payload",
             "Goal contains a known secret",
+        ));
+    }
+    Ok(Some(source))
+}
+
+/// Keep definition/counters, clear A, and install B paused with a fresh turn baseline.
+pub(super) fn transfer_goal_tx(
+    tx: &Transaction<'_>,
+    from: &Agent,
+    to: &Agent,
+    policy: &core::SecretPolicy,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<Option<i64>> {
+    let from_num = parse_agent_id(&from.id)?;
+    let to_num = parse_agent_id(&to.id)?;
+    require_settled_handoff_round(tx, from_num)?;
+    require_settled_handoff_round(tx, to_num)?;
+    let Some(mut source) = transferable_source_goal(tx, from, policy)? else {
+        return Ok(None);
+    };
+    let destination = load_goal_row(tx, to_num, "eliot")?;
+    if destination
+        .as_ref()
+        .is_some_and(|row| row.state.status != GoalStatus::Cleared)
+    {
+        return Err(Error::new(
+            "bad_state",
+            "destination already has an Eliot Goal",
         ));
     }
     source.state.counters.turns_used = source.state.counters.turns_used.max(

@@ -790,9 +790,9 @@ including across another handoff. Cadence re-anchors at handoff; reserved contin
 and running/unknown Goal markers on either Agent refuse. Explicit
 resume is required; reserved/unknown continuations are never copied. Native Goals
 remain `unsupported` until the relevant adapters expose them. An Owner handoff
-transfers children through the same re-parent validation/transaction helper and its
-limits, not new ownership records; an Agent handoff never moves children. Any
-validation failure rolls back all these Store changes.
+transfers controlled children through the same re-parent transaction and its
+limits. Observed native children keep their harness-owned parentage. An Agent
+handoff leaves children in place. Validation failure rolls back the transfer.
 
 The first successor input is one bounded handoff brief, admitted as ordinary `send`
 to B's exact generation. It contains the original task text from the named retained
@@ -831,7 +831,8 @@ The parent result updates only `brief_state` and `successor_gate` as delivery se
 its original transfer identities and component facts remain fixed. `command.children`
 provides each actual child outcome. Same-ID retry returns those same identities and
 current brief-gate readback, and never repeats Store transfers or external effects.
-No compensating automatic stop/relaunch is implied.
+The CLI waits for the brief's delivery outcome by default. `--no-wait` returns
+the committed transfer and its current brief state.
 
 ### Agent switch (implemented)
 
@@ -845,13 +846,12 @@ it does not make B a child of A or rewrite either frozen native profile.
 Normal launch profile/credential checks, provider holds, capacity and workspace
 reservation/dispatch still apply. No native process or context is transplanted.
 
-Before any external preparation, an immediate Store transaction checks A's exact
-generation and quiescence, retains the switch parent and freezes its launch and
-handoff child IDs. A busy source refuses before any B allocation. The parent is
-claimed once, then an independent worker prepares and admits the ordinary launch
-and its parent/ordinal link in one transaction. No launch text is allowed: launch
-only creates B's session. The original task and selected SENDs use H2's grammar and
-bounds; their current eligibility is revalidated by H2, not frozen as ownership.
+Before external preparation the Store checks A's exact generation and quiescence,
+the retained task and selected SENDs, transferable Goal, and controlled child
+limits for the prospective root. The parent freezes the launch and handoff IDs
+after these checks pass. The worker rechecks the source when admitting the
+ordinary promptless launch and its parent link. H2 validates the complete
+transfer against current A and B.
 
 Only an Applied launch plus the exact generation/command-bound committed
 `session.ready` stream event and Idle B permits transfer. For adapters omitting the
@@ -861,17 +861,21 @@ batch can race; the worker waits up to 30 seconds for committed readiness after
 the ordinary launch worker returns. B must have no previous SEND/turn. In one
 immediate transaction a savepoint calls the same H2 handoff implementation,
 revalidates A/B, links the Handoff parent as the switch's second child and records
-completion. A refusal rolls back every attempted H2 change before recording failure.
-B remains explicit in the result; stopping A or B is a separate Owner command.
+completion. A definite H2 refusal rolls back the transfer and admits a linked
+ordinary stop for the exact ready, unused B. Stop dispatch checks that B is still
+the same unused generation. This leaves the retained Agent and custody result
+available to the Owner. An uncertain transfer keeps B's state for readback.
 
 The switch parent is Accepted at reservation and Dispatched while orchestrating.
 Applied means the H2 Store transfer committed, not that the brief/task succeeded.
 Rejected means preparation/admission refused; Failed means a known launch or
 handoff refusal; Unknown retains an uncertain launch or interrupted orchestration.
-The result keeps both child IDs, created Agent/generation, current launch state,
-Handoff result when admitted, refusal code and `next_action`. `command.children`
-shows the ordinary launch and, when admitted, the Handoff parent; the latter owns
-its brief/successor children and their H2 delivery gate.
+The result keeps the child IDs, created Agent/generation, launch state and
+handoff or disposal outcome. Refusals carry a code and a bounded reason in the
+result and daemon log. A terminal failure has an empty `next_action`.
+`command.children` shows the launch, handoff or successor stop. The CLI waits
+for the switch and any admitted successor stop by default. `--no-wait` returns
+the current receipt.
 
 Same-ID identical-payload retry is readback before live/config/model/auth checks;
 it never schedules another worker, creates another Agent or repeats launch/transfer.
@@ -879,15 +883,11 @@ A crash before the parent worker is claimed may recover that unattempted parent.
 A claimed orchestration becomes Unknown on restart with its reserved IDs intact;
 it is not automatically resumed. Its exact Accepted, unattempted launch child is
 recoverable through ordinary launch/workspace recovery; no new child ID is minted.
-A subsequently ready B still requires ordinary Owner handoff. Dispatched/Unknown
-launch children retain the normal no-replay rules; uncertainty never becomes a retry
-signal. Owner resolution alone is not session readiness. Interrupted transport proves no
-failure. No automatic stop, relaunch or compensation occurs.
-
-A definitely launched B without a committed handoff is finished by ordinary
-`swarm.handoff` to that exact existing Agent/generation after quiescence. The result
-names this `next_action`; use a new handoff mutation ID. There is no special finish
-mutation, and retrying the switch ID cannot perform this recovery.
+An exact Accepted, unattempted successor stop is recoverable through ordinary
+command recovery. Dispatched or unknown children retain the normal no-replay
+rules. A ready B from an interrupted orchestration can receive an explicit
+ordinary Owner handoff after the Owner checks its generation and the retained
+transfer outcome.
 
 Continuing a chat in a project is an ordinary switch with `launch.project` set to
 the registered target: the worker prepares the target's standard worktree (or

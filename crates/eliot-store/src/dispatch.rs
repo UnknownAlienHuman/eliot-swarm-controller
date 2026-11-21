@@ -534,6 +534,7 @@ fn dispatch_stop_tx(
             ),
         ));
     }
+    super::switch::require_unused_switch_successor(tx, id, agent)?;
     if command
         .expected_turn_id
         .as_deref()

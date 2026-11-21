@@ -883,6 +883,29 @@ pub(crate) async fn run_switch(
             ));
         }
     }
+    if let Some(deadline) = deadline
+        && let (Some(disposal), Some(created), Some(state)) = (
+            response.disposal_command.as_ref(),
+            response.created.as_ref(),
+            response.disposal_state,
+        )
+        && coordination_pending(state)
+    {
+        let query = CommandGetRequest::new(disposal);
+        let stop = wait_call(
+            eliot_daemon::wait_command(&data_dir, &query, deadline),
+            deadline,
+        )
+        .await?
+        .ok_or_else(Failure::timeout)?;
+        if stop.verb != "stop"
+            || stop.target.as_deref() != Some(&created.agent)
+            || stop.generation != Some(created.generation)
+        {
+            return Err(Failure::new(4, "switch successor stop has another binding"));
+        }
+        response.disposal_state = Some(stop.state);
+    }
     let exit = response_exit_code(response.state);
     print_value(
         &serde_json::to_value(response).map_err(|_| Failure::new(4, "invalid switch response"))?,

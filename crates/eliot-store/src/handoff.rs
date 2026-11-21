@@ -572,25 +572,42 @@ pub(super) fn handoff_tx(
 pub(super) fn quiescent(tx: &Transaction<'_>, agent: &Agent, destination: bool) -> Result<()> {
     observer::require_controlled(agent)?;
     let num = parse_agent_id(&agent.id)?;
-    if agent.state != AgentState::Idle
-        || agent.active_turn.is_some()
-        || !agent.pending.is_empty()
-        || has_unknown_gate(tx, num)?
-        || !send_gate_open(tx, num, agent.generation)?
-    {
+    if agent.state != AgentState::Idle || agent.active_turn.is_some() || !agent.pending.is_empty() {
         return Err(Error::new(
             "busy",
-            "handoff requires a quiescent Agent with known outcomes",
+            format!(
+                "handoff requires idle Agent {} generation {} with no active turn or pending request; its state is {}",
+                agent.id,
+                agent.generation,
+                agent_state_name(agent.state),
+            ),
         ));
     }
-    let open: bool = tx
+    if has_unknown_gate(tx, num)? || !send_gate_open(tx, num, agent.generation)? {
+        return Err(Error::new(
+            "busy",
+            format!(
+                "Agent {} generation {} has an unresolved outcome blocking handoff",
+                agent.id, agent.generation
+            ),
+        ));
+    }
+    let open: Option<String> = tx
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM commands WHERE target=?1 AND
-        (state IN ('dispatched','unknown') OR (?2 AND state IN ('accepted','queued'))))",
+            "SELECT id FROM commands WHERE target=?1 AND
+              (state IN ('dispatched','unknown') OR (?2 AND state IN ('accepted','queued')))
+             ORDER BY created_at,id LIMIT 1",
             params![num, destination],
             |row| row.get(0),
         )
+        .optional()
         .map_err(sql_error)?;
+    if let Some(command) = open {
+        return Err(Error::new(
+            "busy",
+            format!("Agent {} has unresolved command {command}", agent.id),
+        ));
+    }
     let pending: bool = tx
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM pending_requests WHERE agent=?1 AND state='pending')",
@@ -598,10 +615,13 @@ pub(super) fn quiescent(tx: &Transaction<'_>, agent: &Agent, destination: bool) 
             |row| row.get(0),
         )
         .map_err(sql_error)?;
-    if open || pending {
+    if pending {
         return Err(Error::new(
             "busy",
-            "handoff has unresolved commands or requests",
+            format!(
+                "Agent {} has an unresolved request blocking handoff",
+                agent.id
+            ),
         ));
     }
     Ok(())
