@@ -280,7 +280,7 @@ const METHODS: &[Method] = &[
     method!("timer.run", TimerRunRequest, Command, true, true, "Run one explicit retained timer occurrence.", {"id":EXAMPLE_ID,"rule":"timer-1"}),
     method!("provider.holds", ProviderHoldsRequest, ProviderHoldsResponse, true, false, "Page provider holds without credential values.", {"limit":20}),
     method!("provider.clear_hold", ProviderClearHoldRequest, ProviderClearHoldResponse, true, true, "Record corrective evidence and clear a provider hold.", {"id":EXAMPLE_ID,"scope":"profile:codex","corrective_evidence":"owner_verified","expected_probe_command":null}),
-    method!("goal.set", GoalSetRequest, GoalView, true, true, "Set a bounded Eliot Goal; native mode and cost limits are unsupported.", {"id":EXAMPLE_ID,"agent":"a1","definition":{"text":"Complete the assigned task.","check":["git","diff","--exit-code"],"max_rounds":1}}),
+    method!("goal.set", GoalSetRequest, GoalView, true, true, "Set a bounded Eliot Goal; native mode is unsupported and max_cost needs the Agent's native session cost in its unit.", {"id":EXAMPLE_ID,"agent":"a1","definition":{"text":"Complete the assigned task.","check":["git","diff","--exit-code"],"max_rounds":1}}),
     method!("goal.get", GoalGetRequest, GoalView, true, false, "Read the Eliot Goal for one Agent.", {"agent":"a1"}),
     method!("goal.pause", GoalPauseRequest, GoalView, true, true, "Pause an Eliot Goal without replaying an uncertain round.", {"id":EXAMPLE_ID,"agent":"a1","reason":"Owner pause."}),
     method!("goal.clear", GoalClearRequest, GoalView, true, true, "Clear one Eliot Goal.", {"id":EXAMPLE_ID,"agent":"a1"}),
@@ -478,7 +478,7 @@ impl Router {
             unsupported.push("tree variable scopes are unsupported.".to_owned());
         }
         if method.name.starts_with("goal.") {
-            unsupported.push("native Goal mode and max_cost are unsupported.".to_owned());
+            unsupported.push("native Goal mode is unsupported.".to_owned());
         }
         let mut example = (method.example)();
         // Examples use the caller's actual Agent where a concrete self target

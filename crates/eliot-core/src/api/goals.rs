@@ -1,8 +1,8 @@
 //! Typed Eliot-mode Goal definitions, reads and explicit rounds.
 //!
 //! Native Goal mode parses but is refused with `unsupported`: the installed
-//! harness plugins expose no Goal protocol. Cost limits are detected the same
-//! way: no usage source exists yet.
+//! harness plugins expose no Goal protocol. A money budget (`max_cost`) is
+//! kept only from the Agent's native session cost in its own unit.
 
 use crate::{Error, Result, api::coordination::normalize_claim_glob, limits::MAX_TEXT_BYTES};
 use serde::{Deserialize, Serialize};
@@ -26,8 +26,10 @@ pub const MAX_GOAL_LIMIT: i64 = 1_000_000;
 /// checks; above a week the Goal outlives any useful unattended window.
 pub const MIN_GOAL_CADENCE_MS: i64 = 60_000;
 pub const MAX_GOAL_CADENCE_MS: i64 = 7 * 24 * 60 * 60 * 1000;
-/// Reported while no usage source exists.
-pub const GOAL_COST_UNSUPPORTED: &str = "unsupported (no usage source)";
+/// Largest Goal money budget, in millionths of its unit.
+pub const MAX_GOAL_COST_MICROS: i64 = 1_000_000_000_000_000;
+/// Longest native cost unit name.
+const MAX_GOAL_COST_UNIT_BYTES: usize = 64;
 /// Most `scope` or `check_inputs` globs of one Goal.
 pub const MAX_GOAL_SCOPE_GLOBS: usize = 32;
 /// Most paths already changed when a scoped Goal is set; a larger starting
@@ -126,6 +128,7 @@ impl AssignmentGoal {
             cadence_ms: None,
             scope: Vec::new(),
             check_inputs: Vec::new(),
+            max_cost: None,
         }
     }
 
@@ -168,6 +171,43 @@ pub struct GoalDefinition {
     /// separate review. Workspace files named by the check argv are added.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub check_inputs: Vec<String>,
+    /// Money budget over the Agent's native session cost since `set`, in
+    /// that native unit (never converted). Checked after each failed check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cost: Option<GoalCostLimit>,
+}
+
+/// A Goal's money budget: millionths of one verbatim native cost unit, such
+/// as Claude's `usd_estimate`.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GoalCostLimit {
+    pub unit: String,
+    pub amount_micros: i64,
+}
+
+impl GoalCostLimit {
+    fn validate(&self) -> Result<()> {
+        if self.unit.is_empty()
+            || self.unit.len() > MAX_GOAL_COST_UNIT_BYTES
+            || self
+                .unit
+                .chars()
+                .any(|c| c.is_control() || c.is_whitespace())
+        {
+            return Err(Error::new(
+                "invalid",
+                "goal cost unit must be a nonempty native unit name of at most 64 bytes",
+            ));
+        }
+        if !(1..=MAX_GOAL_COST_MICROS).contains(&self.amount_micros) {
+            return Err(Error::new(
+                "invalid",
+                "goal cost limit must be positive and at most 1e9 units",
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn default_check_timeout() -> i64 {
@@ -232,6 +272,9 @@ impl GoalDefinition {
                 "invalid",
                 "goal cadence must be between 1 minute and 7 days in milliseconds",
             ));
+        }
+        if let Some(limit) = &self.max_cost {
+            limit.validate()?;
         }
         for (name, globs) in [("scope", &self.scope), ("check_inputs", &self.check_inputs)] {
             if globs.len() > MAX_GOAL_SCOPE_GLOBS {
@@ -298,6 +341,13 @@ pub struct GoalCounters {
     pub last_observation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_check_at: Option<i64>,
+    /// Session cost spent since `set` in the `max_cost` unit, in millionths,
+    /// as of the last round. Absent without a budget or while unverified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_spent_micros: Option<i64>,
+    /// Why the spent cost could not be verified at the last round.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_unverified: Option<String>,
 }
 
 impl GoalCounters {
@@ -319,6 +369,9 @@ impl GoalCounters {
             && observation.len() > MAX_GOAL_OBSERVATION_BYTES
         {
             return Err(Error::new("invalid", "goal observation exceeds 4 KiB"));
+        }
+        if self.cost_spent_micros.is_some_and(|spent| spent < 0) {
+            return Err(Error::new("invalid", "goal spent cost must be nonnegative"));
         }
         Ok(())
     }
@@ -447,6 +500,8 @@ pub struct GoalView {
     /// Starting point of a Goal with `scope` or `check_inputs`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope_start: Option<GoalScopeStart>,
+    /// `untracked` without `max_cost`; otherwise the spent and budgeted
+    /// amounts, or why the spent cost is unverified.
     pub cost_status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_round_key: Option<String>,
@@ -483,8 +538,8 @@ impl GoalView {
         }
         self.definition.validate()?;
         self.counters.validate()?;
-        if self.cost_status != GOAL_COST_UNSUPPORTED {
-            return Err(Error::new("invalid", "goal cost status is not recognized"));
+        if self.cost_status.trim().is_empty() || self.cost_status.len() > 256 {
+            return Err(Error::new("invalid", "goal cost status must be short text"));
         }
         if let Some(marker) = &self.round_marker {
             marker.validate()?;
@@ -501,9 +556,6 @@ pub struct GoalSetRequest {
     #[serde(default = "default_mode")]
     pub mode: GoalMode,
     pub definition: GoalDefinition,
-    /// Detected and refused: no usage source exists yet.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_cost: Option<f64>,
 }
 
 fn default_mode() -> GoalMode {
@@ -516,12 +568,6 @@ impl GoalSetRequest {
             return Err(Error::new("invalid", "goal set id must be nonempty"));
         }
         validate_agent(&self.agent)?;
-        if self.max_cost.is_some() {
-            return Err(Error::new(
-                "unsupported",
-                "goal cost limits need a usage source; usage is unsupported",
-            ));
-        }
         self.definition.validate()?;
         // Native mode is refused as unsupported either way; only Eliot
         // Goals drive automatically and need the bound.

@@ -91,11 +91,11 @@ pub use git::{
     is_git_oid,
 };
 pub use goals::{
-    AssignmentGoal, DEFAULT_GOAL_CHECK_TIMEOUT_MS, GOAL_COST_UNSUPPORTED, GoalClearRequest,
-    GoalCounters, GoalDefinition, GoalGetRequest, GoalMarkerState, GoalMode, GoalPauseRequest,
-    GoalResumeRequest, GoalRoundMarker, GoalRoundOutcome, GoalRoundRequest, GoalRoundResponse,
-    GoalScopeBase, GoalScopeStart, GoalSetRequest, GoalStatus, GoalView, MAX_GOAL_CADENCE_MS,
-    MAX_GOAL_LIMIT, MAX_GOAL_OBSERVATION_BYTES, MAX_GOAL_SCOPE_BASE_PATHS, MIN_GOAL_CADENCE_MS,
+    AssignmentGoal, DEFAULT_GOAL_CHECK_TIMEOUT_MS, GoalClearRequest, GoalCostLimit, GoalCounters,
+    GoalDefinition, GoalGetRequest, GoalMarkerState, GoalMode, GoalPauseRequest, GoalResumeRequest,
+    GoalRoundMarker, GoalRoundOutcome, GoalRoundRequest, GoalRoundResponse, GoalScopeBase,
+    GoalScopeStart, GoalSetRequest, GoalStatus, GoalView, MAX_GOAL_CADENCE_MS, MAX_GOAL_LIMIT,
+    MAX_GOAL_OBSERVATION_BYTES, MAX_GOAL_SCOPE_BASE_PATHS, MIN_GOAL_CADENCE_MS,
 };
 pub use handoff::{
     CommandCancelRequest, CommandCancelResponse, HandoffRequest, HandoffResponse,
