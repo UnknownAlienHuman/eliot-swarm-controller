@@ -1226,11 +1226,12 @@ pub(super) fn stop_exited_idle_on_restart_tx(
     agent: i64,
     generation: i64,
     now: i64,
-) -> Result<Option<Event>> {
+    events: &mut Vec<Event>,
+) -> Result<bool> {
     // Restart marks prior running process rows unknown before reaching here.
     // Only the prior Host and monitor can have committed this proof of exit.
     if !capacity::has_owned_exit_and_reader_drain_tx(tx, agent, generation)? {
-        return Ok(None);
+        return Ok(false);
     }
     let stopped = db!(tx.execute(
         "UPDATE agents AS a SET state = 'stopped', updated_at = ?1
@@ -1246,9 +1247,9 @@ pub(super) fn stop_exited_idle_on_restart_tx(
         params![now, agent, generation],
     ));
     if stopped == 0 {
-        return Ok(None);
+        return Ok(false);
     }
-    insert_daemon_event(
+    events.push(insert_daemon_event(
         tx,
         now,
         "agent.stopped",
@@ -1256,8 +1257,9 @@ pub(super) fn stop_exited_idle_on_restart_tx(
         Some(agent),
         Some(generation),
         json!({"agent_id": format_agent_id(agent), "reason": "owned_exit_before_restart"}),
-    )
-    .map(Some)
+    )?);
+    super::goals::pause_for_restart_tx(tx, agent, generation, "daemon_restart", now, events)?;
+    Ok(true)
 }
 
 pub(super) fn transition_lost_tx(
@@ -1347,6 +1349,9 @@ pub(super) fn transition_lost_tx(
     // for this reason. A failed start on a missing external credential keeps
     // its `environment` origin instead of being retyped as Agent software.
     let mut data = json!({"agent_id": agent.id, "reason": reason});
+    if reason == core::DAEMON_RESTART_REASON {
+        data["previous_state"] = json!(agent.state);
+    }
     if let Some((origin, location)) = failure {
         data["origin"] = json!(origin.as_str());
         data["where"] = json!(location);
@@ -1378,6 +1383,9 @@ pub(super) fn transition_lost_tx(
         Some(generation),
         data,
     )?);
+    if reason == core::DAEMON_RESTART_REASON {
+        super::goals::pause_for_restart_tx(tx, agent_num, generation, reason, now, events)?;
+    }
     super::native_children::end_native_children_with_parent_tx(
         tx,
         Some((agent_num, generation)),

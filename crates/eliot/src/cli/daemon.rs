@@ -23,6 +23,16 @@ pub(crate) async fn run_daemon(
     id: Option<String>,
 ) -> Result<u8, Failure> {
     let foreground = args.foreground;
+    if matches!(
+        &args.action,
+        Some(DaemonAction::Install | DaemonAction::Uninstall)
+    ) && (agent_credentials_inherited() || std::env::var_os("ELIOT_AGENT_DATA_DIR").is_some())
+    {
+        return Err(Failure::for_mutation(eliot_core::Error::new(
+            "not_allowed",
+            "daemon autostart requires an Owner CLI outside an Agent session",
+        )));
+    }
     match args.action {
         Some(DaemonAction::Stop(args)) => {
             if args.drain == args.force {
@@ -48,6 +58,24 @@ pub(crate) async fn run_daemon(
                 .map_err(|_| Failure::new(4, "daemon.shutdown response is invalid"))?;
             print_value(&value, json_output);
             Ok(response_exit_code(result.state))
+        }
+        Some(DaemonAction::Install) => {
+            if foreground {
+                return Err(Failure::new(
+                    2,
+                    "--foreground is only valid when starting the daemon",
+                ));
+            }
+            super::autostart::install(&data_dir, json_output).await
+        }
+        Some(DaemonAction::Uninstall) => {
+            if foreground {
+                return Err(Failure::new(
+                    2,
+                    "--foreground is only valid when starting the daemon",
+                ));
+            }
+            super::autostart::uninstall(&data_dir, json_output).await
         }
         None if foreground => {
             eliot_daemon::run(data_dir)
@@ -156,6 +184,11 @@ pub(crate) async fn start_daemon(data_dir: &Path, json_output: bool) -> Result<u
         let executable = std::env::current_exe()
             .map_err(|error| Failure::new(1, format!("cannot locate Eliot executable: {error}")))?;
         let mut command = ProcessCommand::new(executable);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
         command
             .arg("--data-dir")
             .arg(data_dir)

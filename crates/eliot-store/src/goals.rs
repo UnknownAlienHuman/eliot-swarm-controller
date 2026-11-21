@@ -481,6 +481,127 @@ fn update_goal_state_tx(
     Ok(())
 }
 
+/// Pause an active Goal in the same transaction as restart settlement. Its
+/// generation and any unresolved marker remain intact until a safe Resume.
+pub(super) fn pause_for_restart_tx(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    generation: i64,
+    reason: &str,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<()> {
+    let Some(mut row) = load_goal_row(tx, agent_num, "eliot")? else {
+        return Ok(());
+    };
+    if row.generation != generation || row.state.status != GoalStatus::Active {
+        return Ok(());
+    }
+    row.state.status = GoalStatus::Paused;
+    row.state.paused_reason = Some(reason.to_owned());
+    update_goal_state_tx(tx, agent_num, &row.mode, row.revision, &row.state, now)?;
+    events.push(insert_daemon_event(
+        tx,
+        now,
+        "goal.changed",
+        "goal",
+        Some(agent_num),
+        Some(generation),
+        json!({"status": "paused", "reason": reason}),
+    )?);
+    Ok(())
+}
+
+/// Carry a settled Goal to a resumed generation without rearming an uncertain
+/// round or unresolved Agent effect. Turn accounting is rebased while the
+/// native session and its cost baseline remain the same retained subject.
+pub(super) fn advance_resume_tx(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    old_generation: i64,
+    next_generation: i64,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<()> {
+    let Some(mut row) = load_goal_row(tx, agent_num, "eliot")? else {
+        return Ok(());
+    };
+    if row.generation != old_generation
+        || !matches!(row.state.status, GoalStatus::Active | GoalStatus::Paused)
+    {
+        return Ok(());
+    }
+    let unresolved_goal_round: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM goal_markers
+             WHERE agent = ?1 AND mode = ?2 AND state IN ('running', 'unknown'))",
+            params![agent_num, row.mode],
+            |record| record.get(0),
+        )
+        .map_err(sql_error)?;
+    let unresolved_agent_work = super::has_unknown_gate(tx, agent_num)?;
+    if unresolved_goal_round || unresolved_agent_work {
+        if row.state.status == GoalStatus::Active {
+            row.state.status = GoalStatus::Paused;
+            row.state.paused_reason = Some("prior Agent work is unresolved".to_owned());
+            update_goal_state_tx(tx, agent_num, &row.mode, row.revision, &row.state, now)?;
+            events.push(insert_daemon_event(
+                tx,
+                now,
+                "goal.changed",
+                "goal",
+                Some(agent_num),
+                Some(old_generation),
+                json!({"status": "paused", "reason": "prior_work_unresolved"}),
+            )?);
+        }
+        return Ok(());
+    }
+
+    let old_turn_count = count_turns(tx, agent_num, old_generation)?;
+    row.state.counters.turns_used = row.state.counters.turns_used.max(
+        row.state
+            .transferred_turns
+            .saturating_add(old_turn_count.saturating_sub(row.state.counters.turns_at_set)),
+    );
+    row.state.transferred_turns = row.state.counters.turns_used;
+    row.state.counters.turns_at_set = count_turns(tx, agent_num, next_generation)?;
+    row.state.last_continuation_command_id = None;
+    let revision = row
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| Error::new("bad_state", "Goal revision overflow"))?;
+    db!(tx.execute(
+        "UPDATE goals SET generation = ?1, revision = ?2, state = ?3,
+             last_round_key = NULL, updated_at = ?4
+         WHERE agent = ?5 AND mode = ?6 AND generation = ?7 AND revision = ?8",
+        params![
+            next_generation,
+            revision,
+            encode_json(&row.state)?,
+            now,
+            agent_num,
+            row.mode,
+            old_generation,
+            row.revision
+        ],
+    ));
+    events.push(insert_daemon_event(
+        tx,
+        now,
+        "goal.changed",
+        "goal",
+        Some(agent_num),
+        Some(next_generation),
+        json!({
+            "status": row.state.status.as_str(),
+            "reason": "agent_resumed",
+            "from_generation": old_generation
+        }),
+    )?);
+    Ok(())
+}
+
 pub(super) fn eliot_goal_status(conn: &Connection, agent_num: i64) -> Result<Option<GoalStatus>> {
     Ok(load_goal_row(conn, agent_num, "eliot")?.map(|row| row.state.status))
 }

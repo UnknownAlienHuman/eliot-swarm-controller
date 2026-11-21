@@ -14,8 +14,9 @@
 //! payloads are never classified as safe, even when no policy is available.
 //!
 //! Markers are consumed once: daemon startup loads the latest
-//! `daemon.panicked` marker into `daemon.status` and deletes it; plugin
-//! error settlement reads only the exact owned plugin's stderr pipe.
+//! `daemon.panicked` marker into `daemon.status` and deletes it; status
+//! reads consume validated `plugin.panicked` markers. Plugin error
+//! settlement also reads only the exact owned plugin's stderr pipe.
 
 use eliot_core::{
     SecretPolicy,
@@ -27,6 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static INSTALLED: AtomicBool = AtomicBool::new(false);
+const MAX_MARKERS_PER_CODE: usize = 64;
 
 /// In-process crash directory, set once at startup by the owning binary.
 /// The panic hook prefers this over the `ELIOT_CRASH_DIR` environment so
@@ -131,9 +133,9 @@ fn capture(code: &str, info: &std::panic::PanicHookInfo<'_>, policy: &SecretPoli
     }
 }
 
-/// Best-effort marker write. Missing directories are created; beyond a
-/// small file cap new markers are dropped rather than growing the
-/// directory. Never fails the panicking process further.
+/// Best-effort marker write. Missing directories are created; each panic
+/// code has its own file cap so plugin panics cannot starve daemon markers.
+/// Never fails the panicking process further.
 pub(crate) fn write_marker(dir: &Path, marker: &CrashMarker) {
     #[cfg(windows)]
     let private = crate::platform::windows::ensure_private_root(dir);
@@ -144,10 +146,20 @@ pub(crate) fn write_marker(dir: &Path, marker: &CrashMarker) {
     if private.is_err() {
         return;
     }
-    if std::fs::read_dir(dir)
-        .map(|entries| entries.count() > 64)
-        .unwrap_or(true)
-    {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let prefix = format!("{}-", marker.code);
+    let existing_markers = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            let name = entry.file_name();
+            name.to_str()
+                .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".json"))
+        })
+        .take(MAX_MARKERS_PER_CODE)
+        .count();
+    if existing_markers >= MAX_MARKERS_PER_CODE {
         return;
     }
     let name = format!(
@@ -170,21 +182,20 @@ pub(crate) fn write_marker(dir: &Path, marker: &CrashMarker) {
     }
 }
 
-/// Read and consume (delete) every marker of one code, oldest first.
+/// Read and consume (delete) every valid marker of one code, oldest first.
 /// Temporary or incomplete files are ignored, never deleted by a reader.
 pub(crate) fn take_markers(dir: &Path, code: &str) -> Vec<CrashMarker> {
     let mut markers = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
         return markers;
     };
+    let prefix = format!("{code}-");
     let mut paths: Vec<PathBuf> = entries
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| {
-                    name.starts_with(&format!("{code}-")) && name.ends_with(".json")
-                })
+                .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".json"))
         })
         .collect();
     paths.sort();
@@ -196,7 +207,7 @@ pub(crate) fn take_markers(dir: &Path, code: &str) -> Vec<CrashMarker> {
             .and_then(|bytes| serde_json::from_slice::<CrashMarker>(&bytes).ok())
             .filter(|marker| marker.code == code && marker.validate().is_ok());
         if let Some(marker) = parsed {
-            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(path);
             markers.push(marker);
         }
     }
@@ -209,13 +220,25 @@ pub(crate) fn take_markers(dir: &Path, code: &str) -> Vec<CrashMarker> {
 /// Consumption is once-only: files are deleted on read.
 pub(crate) fn load_previous_crash(data_root: &Path, policy: &SecretPolicy) -> Option<CrashMarker> {
     let mut markers = take_markers(&crash_dir(data_root), "daemon.panicked");
-    markers.pop().map(|mut marker| {
-        marker.message = policy.redact_text(&marker.message);
-        marker.backtrace = policy.redact_text(&marker.backtrace);
-        marker.thread = truncate_bytes(&marker.thread, CrashMarker::MAX_THREAD_CHARS).0;
-        marker.location = truncate_bytes(&marker.location, CrashMarker::MAX_LOCATION_CHARS).0;
-        marker.message = truncate_bytes(&marker.message, CrashMarker::MAX_MESSAGE_CHARS).0;
-        marker.backtrace = truncate_bytes(&marker.backtrace, CrashMarker::MAX_BACKTRACE_CHARS).0;
-        marker
-    })
+    markers.pop().map(|marker| redact_marker(marker, policy))
+}
+
+/// Read, redact and consume plugin panic markers for the status snapshot.
+pub(crate) fn take_plugin_crashes(data_root: &Path, policy: &SecretPolicy) -> Vec<CrashMarker> {
+    take_markers(&crash_dir(data_root), "plugin.panicked")
+        .into_iter()
+        .map(|marker| redact_marker(marker, policy))
+        .collect()
+}
+
+fn redact_marker(mut marker: CrashMarker, policy: &SecretPolicy) -> CrashMarker {
+    marker.message = policy.redact_text(&marker.message);
+    marker.backtrace = policy.redact_text(&marker.backtrace);
+    marker.location = policy.redact_text(&marker.location);
+    marker.thread = policy.redact_text(&marker.thread);
+    marker.thread = truncate_bytes(&marker.thread, CrashMarker::MAX_THREAD_CHARS).0;
+    marker.location = truncate_bytes(&marker.location, CrashMarker::MAX_LOCATION_CHARS).0;
+    marker.message = truncate_bytes(&marker.message, CrashMarker::MAX_MESSAGE_CHARS).0;
+    marker.backtrace = truncate_bytes(&marker.backtrace, CrashMarker::MAX_BACKTRACE_CHARS).0;
+    marker
 }

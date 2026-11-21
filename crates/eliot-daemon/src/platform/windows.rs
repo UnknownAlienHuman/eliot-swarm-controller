@@ -55,10 +55,10 @@ use windows_sys::Win32::System::Pipes::{
 use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 use windows_sys::Win32::System::SystemInformation::{GetSystemTimeAsFileTime, GetTickCount64};
 use windows_sys::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CreateProcessW, GetCurrentProcess, GetExitCodeProcess, GetProcessTimes,
-    OpenProcess, OpenProcessToken, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_SYNCHRONIZE, QueryFullProcessImageNameW, STARTUPINFOW, TerminateProcess,
-    WaitForSingleObject,
+    CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, CreateProcessW, GetCurrentProcess,
+    GetExitCodeProcess, GetProcessTimes, OpenProcess, OpenProcessToken, PROCESS_INFORMATION,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, QueryFullProcessImageNameW,
+    STARTUPINFOW, TerminateProcess, WaitForSingleObject,
 };
 
 /// Availability is only a connect hint: another client may win the instance.
@@ -118,6 +118,9 @@ pub(crate) fn start_background_daemon_executable(executable: &Path, data_dir: &P
     // All structures live through the call. FALSE disables ALL handle inheritance,
     // including otherwise-unused capture-pipe writers held by the CLI. No standard
     // handles are supplied; CREATE_NO_WINDOW prevents console inheritance/creation.
+    // BREAKAWAY prevents a caller in a kill-on-close Job from lending that Job's
+    // lifetime to the independently owned daemon. A Job that forbids
+    // breakaway causes an explicit start failure instead of a short-lived daemon.
     // Null environment/current-directory pointers preserve the caller's values.
     if unsafe {
         CreateProcessW(
@@ -126,7 +129,7 @@ pub(crate) fn start_background_daemon_executable(executable: &Path, data_dir: &P
             null(),
             null(),
             0,
-            CREATE_NO_WINDOW,
+            CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB,
             null(),
             null(),
             &startup,

@@ -18,7 +18,7 @@ mod status_views;
 
 pub use assignment::AssignmentStatus;
 pub use attribution::WhoWorkerRow;
-pub use capacity::{RecordedProcess, RetainedGeneration};
+pub use capacity::{RecordedProcess, RestartResumeCandidate, RetainedGeneration};
 pub use command_children::{CommandChildrenPage, history_expired};
 pub use config_overlay::AgentConfig;
 pub use context::ContextDispatch;
@@ -472,7 +472,30 @@ impl Store {
         now: i64,
     ) -> Result<Admission> {
         self.ensure_writer_healthy()?;
-        let result = self.submit_inner(principal, request, None, now);
+        let result = self.submit_inner(principal, request, None, now, false);
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    /// Admit one internal promptless Resume only while its durable restart
+    /// candidate remains eligible in this same Store transaction.
+    pub fn submit_restart_resume(&mut self, request: SubmitCommand, now: i64) -> Result<Admission> {
+        if request.verb != "resume"
+            || request.target.is_none()
+            || request.expected_generation.is_none()
+            || request.expected_turn_id.is_some()
+            || request.request_id.is_some()
+            || request.probe
+            || request.selector.is_some()
+            || request.args != json!({})
+        {
+            return Err(Error::new(
+                "invalid",
+                "restart Resume requires one exact-generation, promptless Agent request",
+            ));
+        }
+        self.ensure_writer_healthy()?;
+        let result = self.submit_inner("owner", request, None, now, true);
         self.fault_on_persistence_error(&result);
         result
     }
@@ -558,7 +581,7 @@ impl Store {
         now: i64,
     ) -> Result<Admission> {
         self.ensure_writer_healthy()?;
-        let result = self.submit_inner(principal, request, preparation, now);
+        let result = self.submit_inner(principal, request, preparation, now, false);
         self.fault_on_persistence_error(&result);
         result
     }
@@ -631,22 +654,33 @@ impl Store {
         request: SubmitCommand,
         preparation: Option<WorkspacePreparationInput>,
         now: i64,
+        restart_idle_resume: bool,
     ) -> Result<Admission> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
         let limits = self.hierarchy_limits;
-        let admission = admission::submit_tx(
-            &tx,
-            principal,
-            request,
-            preparation,
-            now,
-            false,
-            limits,
-            self.capacity_policy.as_deref(),
-        )?;
+        let admission = if restart_idle_resume {
+            admission::submit_restart_resume_tx(
+                &tx,
+                request,
+                now,
+                limits,
+                self.capacity_policy.as_deref(),
+            )?
+        } else {
+            admission::submit_tx(
+                &tx,
+                principal,
+                request,
+                preparation,
+                now,
+                false,
+                limits,
+                self.capacity_policy.as_deref(),
+            )?
+        };
         commit_transaction(tx, &self.write_faulted)?;
         Ok(admission)
     }
@@ -1991,10 +2025,14 @@ impl Store {
 
         for (agent_num, generation, idle) in agents {
             if idle
-                && let Some(event) =
-                    lifecycle::stop_exited_idle_on_restart_tx(&tx, agent_num, generation, now)?
+                && lifecycle::stop_exited_idle_on_restart_tx(
+                    &tx,
+                    agent_num,
+                    generation,
+                    now,
+                    &mut events,
+                )?
             {
-                events.push(event);
                 continue;
             }
             lifecycle::transition_lost_tx(

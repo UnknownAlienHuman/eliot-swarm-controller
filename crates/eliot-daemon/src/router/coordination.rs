@@ -503,10 +503,12 @@ const MAIL_REOFFER_PAGE: usize = 100;
 pub(crate) async fn run_mail_reoffer(
     router: Router,
     mut shutdown: watch::Receiver<bool>,
+    reporter: crate::daemon::workers::WorkerReporter,
 ) -> Result<()> {
     let mut ticks = interval(MAIL_REOFFER_INTERVAL);
     ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut after: Option<String> = None;
+    reporter.running("mail_reoffer");
     loop {
         tokio::select! {
             changed = shutdown.changed() => {

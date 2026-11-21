@@ -112,11 +112,12 @@ stop. Unproven stop effects stay unknown even after confirmed custody exit, and
 the daemon never reissues the uncertain native call.
 
 Steer uses an ordered, bounded write followed by a correlated response wait: the host
-writes its `agent.command` frame in dispatch order under the writer deadline, then keeps
-the exact response pending without a native/model-turn response deadline while continuing
-to process `interrupt`, `stop`, `agent.snapshot`, and lifecycle messages. The response,
-or transport/generation teardown, settles the wait; unresolved teardown remains `unknown`
-and is never replayed. Other RPC deadlines are unchanged.
+writes its `agent.command` frame in dispatch order under the writer deadline. The host
+then waits up to the plugin RPC response deadline while continuing to process
+`interrupt`, `stop`, `agent.snapshot`, and lifecycle messages. A timeout releases
+the correlation slot and settles the command as `unknown` with the elapsed deadline
+as its reason. An unresolved transport or generation teardown also settles as
+`unknown`. The host never replays the steer.
 
 An optional shared Core `RouteBinding` travels inside the frozen profile snapshot; it
 does not add a service RPC or a new harness. The controlled Codex process must apply the

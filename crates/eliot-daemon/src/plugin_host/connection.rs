@@ -281,7 +281,7 @@ impl PluginClient {
         let result = self
             .begin_call(method, params, deadline)
             .await?
-            .finish(Some(deadline))
+            .finish(deadline)
             .await;
         if let Some(started) = debug_started {
             let elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
@@ -427,26 +427,23 @@ impl PluginClient {
 }
 
 impl PendingCall {
-    /// Wait for the exact correlated response. `None` has no response timeout;
-    /// reader loss still resolves it through the existing pending map.
-    pub(crate) async fn finish(mut self, response_deadline: Option<Instant>) -> Result<Value> {
-        let response = match response_deadline {
-            Some(deadline) => match timeout_at(deadline, &mut self.response).await {
-                Ok(response) => response,
-                Err(_) => {
-                    self.remove_pending().await;
-                    return Err(Error::new(
-                        "unknown",
-                        format!("plugin method {} timed out after dispatch", self.method),
-                    )
-                    .with_where(format!("plugin.command.{}", self.method))
-                    .with_origin(
-                        FailureOrigin::Swarm,
-                        "daemon plugin-call deadline elapsed while a native outcome was pending",
-                    ));
-                }
-            },
-            None => (&mut self.response).await,
+    /// Wait for the exact correlated response until its absolute deadline.
+    /// Reader loss still resolves it through the existing pending map.
+    pub(crate) async fn finish(mut self, response_deadline: Instant) -> Result<Value> {
+        let response = match timeout_at(response_deadline, &mut self.response).await {
+            Ok(response) => response,
+            Err(_) => {
+                self.remove_pending().await;
+                return Err(Error::new(
+                    "unknown",
+                    format!("plugin method {} timed out after dispatch", self.method),
+                )
+                .with_where(format!("plugin.command.{}", self.method))
+                .with_origin(
+                    FailureOrigin::Swarm,
+                    "daemon plugin-call deadline elapsed while a native outcome was pending",
+                ));
+            }
         };
         self.remove_pending().await;
 

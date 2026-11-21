@@ -5,7 +5,7 @@
 //! leaving eligible backlog until the next hour. Pruning is silent and
 //! never replays an effect; only counts are logged.
 
-use crate::{common::now_ms, config, logging};
+use crate::{common::now_ms, config, daemon::workers::WorkerReporter, logging};
 use eliot_core::{Result, SecretPolicy};
 use eliot_store::{RetentionReport, Store};
 use std::{
@@ -28,6 +28,7 @@ pub(crate) async fn run(
     policy: Arc<SecretPolicy>,
     initial: config::DaemonConfig,
     mut shutdown: watch::Receiver<bool>,
+    reporter: WorkerReporter,
 ) -> Result<()> {
     let mut config = initial;
     let mut ticker = tokio::time::interval(MAINTENANCE_INTERVAL);
@@ -35,6 +36,7 @@ pub(crate) async fn run(
     // Skip the immediate first tick: maintenance runs on the interval, not at
     // startup.
     ticker.tick().await;
+    reporter.running("maintenance");
     loop {
         tokio::select! {
             _ = ticker.tick() => {}

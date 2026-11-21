@@ -544,10 +544,25 @@ fn loss_step(event: &Event, at: Option<i64>) -> DiagnoseStep {
             .and_then(Value::as_str)
             .map(|value| bound_chars(value, limit))
     };
+    let message = if reason == Some("daemon_restart") {
+        let agent = event
+            .data
+            .get("agent_id")
+            .and_then(Value::as_str)
+            .unwrap_or("<agent>");
+        Some(bound_chars(
+            &format!(
+                "the turn outcome is unknown after a Swarm restart; inspect `swarm why {agent}` and, when ready, run `swarm resume {agent} \"<text>\"` to start a new generation without replaying the prior prompt"
+            ),
+            1024,
+        ))
+    } else {
+        reason.map(|reason| bound_chars(reason, 1024))
+    };
     DiagnoseStep {
         kind: "process".to_owned(),
         code: Some(bound_chars(&event.kind, 128)),
-        message: reason.map(|reason| bound_chars(reason, 1024)),
+        message,
         failure_where: text("where", 128)
             .or_else(|| typed.map(|(_, location)| location.to_owned())),
         origin: text("origin", 32).or_else(|| typed.map(|(origin, _)| origin.as_str().to_owned())),

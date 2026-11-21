@@ -136,8 +136,21 @@ pub(crate) async fn recheck(context: Reconcile) {
     loop {
         tokio::time::sleep(RECHECK).await;
         match reconcile_pass(&context, false).await {
-            Ok(report) if report.retained == 0 => break,
-            Ok(_) => {}
+            Ok(report) => {
+                if report.processed > report.retained
+                    && let Err(error) = context.router.recover_restart_idle_agents().await
+                {
+                    logging::record(
+                        &context.policy,
+                        "daemon.restart_agent_recovery_failed",
+                        &[],
+                        Some(&error),
+                    );
+                }
+                if report.retained == 0 {
+                    break;
+                }
+            }
             Err(error) => logging::record(
                 &context.policy,
                 "daemon.restart_capacity_recheck_failed",

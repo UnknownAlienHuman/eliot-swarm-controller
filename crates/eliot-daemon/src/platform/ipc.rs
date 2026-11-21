@@ -52,6 +52,8 @@ pub struct IpcListener {
     socket_identity: (u64, u64),
     #[cfg(windows)]
     next_server: Option<tokio::net::windows::named_pipe::NamedPipeServer>,
+    #[cfg(windows)]
+    replacement_error: Option<Error>,
 }
 
 impl IpcListener {
@@ -102,6 +104,7 @@ impl IpcListener {
             Ok(Self {
                 endpoint,
                 next_server,
+                replacement_error: None,
             })
         }
 
@@ -117,6 +120,17 @@ impl IpcListener {
 
     pub fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    pub fn take_replacement_error(&mut self) -> Option<Error> {
+        #[cfg(windows)]
+        {
+            self.replacement_error.take()
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
     }
 
     pub async fn accept(&mut self) -> Result<IpcStream> {
@@ -139,23 +153,30 @@ impl IpcListener {
             if self.next_server.is_none() {
                 self.next_server = Some(super::windows::create_pipe_server(&self.endpoint, false)?);
             }
-            {
+            let connected = {
                 let server = self.next_server.as_ref().ok_or_else(|| {
                     Error::new("platform_io", "named-pipe listener instance is unavailable")
                 })?;
-                server
-                    .connect()
-                    .await
-                    .map_err(|error| io_error("accept named-pipe connection", error))?;
+                server.connect().await
+            };
+            if let Err(error) = connected {
+                // A completed connect error can leave this instance unusable.
+                // Retire it so the daemon's accept backoff recreates a fresh
+                // pipe; cancellation before completion leaves it untouched.
+                self.next_server.take();
+                return Err(io_error("accept named-pipe connection", error));
             }
 
-            let next_server = super::windows::create_pipe_server(&self.endpoint, false)?;
-            let connected_server = self.next_server.replace(next_server).ok_or_else(|| {
+            let connected_server = self.next_server.take().ok_or_else(|| {
                 Error::new(
                     "platform_io",
                     "connected named-pipe listener instance disappeared",
                 )
             })?;
+            match super::windows::create_pipe_server(&self.endpoint, false) {
+                Ok(next_server) => self.next_server = Some(next_server),
+                Err(error) => self.replacement_error = Some(error),
+            }
             let peer = LocalPeer::capture(&connected_server);
             Ok(IpcStream(Box::new(connected_server), peer))
         }

@@ -854,13 +854,21 @@ Startup records an idle controlled generation as `stopped` when its native sessi
 identity is retained, its generation has no open request, open or unknown turn, or
 unsettled command, and prior owned-process exit and reader drain are durably proven.
 That proof requires recorded exited processes, a closed OS source, closed native
-sources and the Host's owned-exit record for the same generation. The retained
-session can be explicitly resumed. Recovery records `agent.stopped` with reason
-`owned_exit_before_restart` and preserves the turn and command history as recorded.
-A process still recorded as running at restart becomes unknown. Missing exit or
-drain proof and unresolved effects leave the generation on the `lost` path.
+sources and the Host's owned-exit record for the same generation. Recovery records
+`agent.stopped` with reason `owned_exit_before_restart` and preserves the turn and
+command history as recorded. A process still recorded as running at restart becomes
+unknown. The daemon checks retained custody before reopening an eligible idle
+session through normal resume admission. The new generation starts without input.
+Missing custody proof and unresolved effects leave the old generation fenced.
 
 ## Views
+
+The daemon supervises long-lived rule, Goal, retention, monitoring, Git,
+attention, mail reoffer and completion digest workers. An unexpected failure
+is logged and retried with bounded backoff. `daemon.status` exposes worker
+health, a bounded failure code while failed, and the restart count. Shutdown
+cancels pending retries. A worker restart reconciles retained state and keeps
+the normal Store and router gates on effects.
 
 `watch`, `top`, `show`, `daemon.status` query projections/events. They expose generation,
 active/unknown turn/input/transition gate, source owner/cursor/gap, custody

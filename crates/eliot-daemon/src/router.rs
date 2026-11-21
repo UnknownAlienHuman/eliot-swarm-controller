@@ -68,13 +68,13 @@ use eliot_core::{
         SWITCH_BLANK_SCOPE_ARG, SWITCH_PROJECT_REVISION_ARG, SessionGrowthView, ShutdownMode,
         SourceState, SwarmWaitRequest, SwarmWaitResponse, TimerGetRequest, TimerStateView,
         TurnGetRequest, UsageScopeView, UsageSummaryRequest, WaitEntryResult, WorkSummaryView,
-        WorkerTaskHealth, fair_excerpt_cap, is_supported_harness,
+        WorkerTaskHealth, WorkerTaskStatus, fair_excerpt_cap, is_supported_harness,
     },
 };
 use eliot_plugin::{MAX_EVENT_BYTES, sync::LockExt};
 use eliot_store::{
-    Admission, AgentListFilter, ProjectRegistrationInput, RuleProcessingState,
-    TimerDefinitionInput, TimerSlotAdmission, TimerSlotCommit,
+    Admission, AgentListFilter, ProjectRegistrationInput, RestartResumeCandidate,
+    RuleProcessingState, TimerDefinitionInput, TimerSlotAdmission, TimerSlotCommit,
 };
 use serde_json::{Value, json};
 use std::{
@@ -135,8 +135,9 @@ struct RouterInner {
     observe: Mutex<ObserveThresholds>,
     workspaces: WorkspaceManager,
     workspace_recovery_error: Mutex<Option<String>>,
+    plugin_crashes: Mutex<PluginCrashStatus>,
     previous_crash: Mutex<Option<CrashMarker>>,
-    automation_tasks: Mutex<Vec<(String, WorkerTaskHealth, Option<String>)>>,
+    worker_tasks: Mutex<Vec<WorkerTaskStatus>>,
     mode: AtomicU8,
     shutdown_ready: AtomicBool,
     progress: watch::Sender<u64>,
@@ -172,6 +173,12 @@ struct RouterInner {
     /// budget, settings, assignment, hold clear, or admitted slot) so `stop`
     /// acceptance never wakes arbitration ahead of committed `capacity.released`.
     launch_arbitration: watch::Sender<u64>,
+}
+
+#[derive(Default)]
+struct PluginCrashStatus {
+    markers: Vec<CrashMarker>,
+    truncated: bool,
 }
 
 struct RunWorkerHandle {
@@ -379,11 +386,19 @@ impl Router {
                 observe: Mutex::new(ObserveThresholds::default()),
                 workspaces,
                 workspace_recovery_error: Mutex::new(None),
+                plugin_crashes: Mutex::new(PluginCrashStatus::default()),
                 previous_crash: Mutex::new(None),
-                automation_tasks: Mutex::new(vec![
-                    ("rule_worker".to_owned(), WorkerTaskHealth::Starting, None),
-                    ("goal_driver".to_owned(), WorkerTaskHealth::Starting, None),
-                ]),
+                worker_tasks: Mutex::new(
+                    crate::daemon::workers::WORKER_NAMES
+                        .iter()
+                        .map(|name| WorkerTaskStatus {
+                            name: (*name).to_owned(),
+                            health: WorkerTaskHealth::Starting,
+                            failure_code: None,
+                            restart_count: 0,
+                        })
+                        .collect(),
+                ),
                 mode: AtomicU8::new(MODE_OPEN),
                 shutdown_ready: AtomicBool::new(false),
                 progress,
@@ -823,31 +838,169 @@ impl Router {
         }
     }
 
+    /// Reopen only retained generations that were idle at restart and whose
+    /// exact custody and work state now permit a promptless Resume. Candidates
+    /// are derived durably by Store, so this can run after the initial custody
+    /// pass and again after a later recheck without replaying old input.
+    pub(crate) async fn recover_restart_idle_agents(&self) -> Result<usize> {
+        let mut after: Option<String> = None;
+        let mut admitted_count = 0;
+        loop {
+            let candidates = {
+                let store = self.inner.store.lock().await;
+                store.restart_idle_resume_candidates(after.as_deref())?
+            };
+            if candidates.is_empty() {
+                break;
+            }
+            after = candidates.last().map(|candidate| candidate.agent.clone());
+            for candidate in candidates {
+                if let Some(admission) = self.prepare_restart_idle_resume(&candidate).await?
+                    && admission.is_new
+                    && command_needs_worker(&admission.command)
+                {
+                    self.schedule_admission(&admission);
+                    admitted_count += 1;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+        if admitted_count > 0 {
+            self.signal_progress();
+        }
+        Ok(admitted_count)
+    }
+
+    async fn prepare_restart_idle_resume(
+        &self,
+        candidate: &RestartResumeCandidate,
+    ) -> Result<Option<Admission>> {
+        let request = SubmitCommand {
+            id: ulid::Ulid::new().to_string(),
+            target: Some(candidate.agent.clone()),
+            selector: None,
+            verb: "resume".to_owned(),
+            args: json!({}),
+            expected_generation: Some(candidate.generation),
+            expected_turn_id: None,
+            request_id: None,
+            probe: false,
+        };
+        let prepared = match self.prepare_submission(request, &Principal::Owner).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let generation = candidate.generation.to_string();
+                crate::logging::record(
+                    &self.secret_policy_snapshot(),
+                    "daemon.restart_resume_skipped",
+                    &[
+                        ("agent", candidate.agent.as_str()),
+                        ("generation", generation.as_str()),
+                    ],
+                    Some(&error),
+                );
+                return Ok(None);
+            }
+        };
+        let PreparedSubmission { request, workspace } = prepared;
+        if workspace.is_some() {
+            let error = Error::new(
+                "unsupported",
+                "promptless restart Resume cannot prepare a workspace",
+            );
+            let generation = candidate.generation.to_string();
+            crate::logging::record(
+                &self.secret_policy_snapshot(),
+                "daemon.restart_resume_skipped",
+                &[
+                    ("agent", candidate.agent.as_str()),
+                    ("generation", generation.as_str()),
+                ],
+                Some(&error),
+            );
+            return Ok(None);
+        }
+        let result = {
+            let mut store = self.inner.store.lock().await;
+            match self.check_command_admission_mode("resume") {
+                Err(error) => Err(error),
+                Ok(()) => match store.submit_restart_resume(request, now_ms()) {
+                    Ok(admission) => {
+                        if !admission.events.is_empty() {
+                            self.publish_locked(&admission.events);
+                        }
+                        Ok(admission)
+                    }
+                    Err(error) => Err(error),
+                },
+            }
+        };
+        match result {
+            Ok(admission) => Ok(Some(admission)),
+            Err(error) => {
+                let generation = candidate.generation.to_string();
+                crate::logging::record(
+                    &self.secret_policy_snapshot(),
+                    "daemon.restart_resume_skipped",
+                    &[
+                        ("agent", candidate.agent.as_str()),
+                        ("generation", generation.as_str()),
+                    ],
+                    Some(&error),
+                );
+                Ok(None)
+            }
+        }
+    }
+
     pub(crate) fn note_workspace_recovery_failure(&self, code: &str) {
         *self.inner.workspace_recovery_error.lock_recover() = Some(code.to_owned());
         self.signal_progress();
     }
 
-    pub(crate) fn note_automation_task_running(&self, name: &str) {
-        for task in self.inner.automation_tasks.lock_recover().iter_mut() {
-            if task.0 == name {
-                task.1 = WorkerTaskHealth::Running;
-                task.2 = None;
-            }
-        }
-        self.signal_progress();
+    pub(crate) fn note_worker_task_starting(&self, name: &str) {
+        self.update_worker_task(name, WorkerTaskHealth::Starting, None);
     }
 
-    pub(crate) fn note_automation_task_stopped(&self, name: &str, failure_code: Option<String>) {
-        for task in self.inner.automation_tasks.lock_recover().iter_mut() {
-            if task.0 == name {
-                if let Some(code) = failure_code.clone() {
-                    task.1 = WorkerTaskHealth::Failed;
-                    task.2 = Some(code);
-                } else {
-                    task.1 = WorkerTaskHealth::Stopped;
-                    task.2 = None;
-                }
+    pub(crate) fn note_worker_task_running(&self, name: &str) {
+        self.update_worker_task(name, WorkerTaskHealth::Running, None);
+    }
+
+    pub(crate) fn note_worker_task_failed(
+        &self,
+        name: &str,
+        failure_code: String,
+        restart_count: u32,
+    ) {
+        self.update_worker_task(
+            name,
+            WorkerTaskHealth::Failed,
+            Some((failure_code, restart_count)),
+        );
+    }
+
+    pub(crate) fn note_worker_task_stopped(&self, name: &str) {
+        self.update_worker_task(name, WorkerTaskHealth::Stopped, None);
+    }
+
+    fn update_worker_task(
+        &self,
+        name: &str,
+        health: WorkerTaskHealth,
+        failure: Option<(String, u32)>,
+    ) {
+        if let Some(task) = self
+            .inner
+            .worker_tasks
+            .lock_recover()
+            .iter_mut()
+            .find(|task| task.name == name)
+        {
+            task.health = health;
+            task.failure_code = None;
+            if let Some((code, restart_count)) = failure {
+                task.failure_code = Some(code);
+                task.restart_count = restart_count;
             }
         }
         self.signal_progress();

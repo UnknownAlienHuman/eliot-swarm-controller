@@ -1618,11 +1618,21 @@ pub struct DaemonStatusResponse {
     pub drain: Option<DrainReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retention: Option<RetentionView>,
-    /// The previous run's crash, loaded once at daemon startup from the
+    /// Most recent validated plugin panic markers observed this daemon run.
+    /// Marker files are consumed when they enter the bounded status view.
+    #[serde(default, deserialize_with = "objects")]
+    pub plugin_crashes: Vec<CrashMarker>,
+    #[serde(default)]
+    pub plugin_crashes_truncated: bool,
+    /// The previous daemon run's crash, loaded once at startup from the
     /// private crash marker and consumed. Absent when the previous run did
     /// not panic. `swarm daemon` startup output reports the same marker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_crash: Option<CrashMarker>,
+}
+
+impl DaemonStatusResponse {
+    pub const MAX_PLUGIN_CRASHES: usize = 8;
 }
 
 /// One captured process panic. Written by the panic hook (daemon and every
@@ -1815,11 +1825,11 @@ pub enum WorkerTaskHealth {
     Failed,
 }
 
-/// Bounded, redacted runtime status of one daemon-owned automation task.
-/// `running` means the task is alive after its startup boundary; it does
+/// Bounded, redacted runtime status of one daemon-owned background worker.
+/// `running` means the worker is alive after its startup boundary; it does
 /// not prove a rule/timer/goal delivery. `starting` means spawned but not
 /// yet initialized. `failed` carries only a bounded code, never a raw error
-/// message.
+/// message. `restart_count` is the number of worker restarts in this daemon run.
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerTaskStatus {
@@ -1827,6 +1837,8 @@ pub struct WorkerTaskStatus {
     pub health: WorkerTaskHealth,
     #[serde(deserialize_with = "nullable")]
     pub failure_code: Option<String>,
+    #[serde(default)]
+    pub restart_count: u32,
 }
 
 impl WorkerTaskStatus {

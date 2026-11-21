@@ -292,6 +292,7 @@ fn dispatch_resume_tx(
         ));
     }
     project_assignment::advance_resume(tx, agent, agent_num, next_generation, id)?;
+    super::goals::advance_resume_tx(tx, agent_num, old_generation, next_generation, now, events)?;
     install_initial_source_plan(tx, agent_num, next_generation, now)?;
     update_command_state(
         tx,

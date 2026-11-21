@@ -641,8 +641,12 @@ async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
                                 } else {
                                     match client.begin_call("agent.command", params, deadline()).await {
                                         Ok(pending_call) => {
+                                            let response_deadline = deadline();
                                             pending_steers.push(Box::pin(async move {
-                                                let result = pending_call.finish(None).await;
+                                                // Dispatch is already confirmed. Expiry is unknown,
+                                                // and PendingCall releases the correlation slot; this
+                                                // command must never be sent again.
+                                                let result = pending_call.finish(response_deadline).await;
                                                 PluginCommandCompletion {
                                                     command,
                                                     reply,

@@ -1443,10 +1443,10 @@ skipped before taking a scheduler slot, so burned keys cannot starve
 eligible Goals past the cap; a retained subject that finds its Goal busy
 or the cap full waits in revision-bound order and is revalidated when a
 round resolves. A busy Agent or a
-drifted generation skips silently; a set/resume never resumes a lost
-Agent, and only the round path itself may pause a drifted Goal. Startup
-performs no sweep: the restart marks every owned session lost, so no
-retained subject is eligible.
+drifted generation skips silently. Setting or resuming a Goal leaves Agent
+recovery to the daemon. When startup reopens a retained session, the new
+generation's idle event can drive an eligible Goal. Earlier idle events and
+unresolved rounds keep their original generation binding.
 A consumed idle subject rearms only through a new Goal revision: a
 definition change clears the committed key, so the next sweep may round
 the still-current subject again. Unknown-burned keys never rerun within

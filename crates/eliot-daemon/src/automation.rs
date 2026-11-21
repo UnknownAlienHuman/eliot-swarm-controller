@@ -1033,7 +1033,7 @@ async fn run_global_rules_inner(
     let mut events = router.subscribe_rule_events();
     let mut progress = router.progress_receiver();
     let mut arbitration = router.launch_arbitration_receiver();
-    router.note_automation_task_running("rule_worker");
+    router.note_worker_task_running("rule_worker");
     let mut watcher = match reload::RuleWatcher::watch(&data_root) {
         Ok(watcher) => Some(watcher),
         Err(error) => {

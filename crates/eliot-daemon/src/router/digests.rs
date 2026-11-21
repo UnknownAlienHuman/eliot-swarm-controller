@@ -384,6 +384,7 @@ impl Router {
 pub(crate) async fn run_completion_digest(
     router: Router,
     mut shutdown: watch::Receiver<bool>,
+    reporter: crate::daemon::workers::WorkerReporter,
 ) -> Result<()> {
     let mut ticks = interval(DIGEST_POLL_INTERVAL);
     ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -397,6 +398,7 @@ pub(crate) async fn run_completion_digest(
             Some(&error),
         );
     }
+    reporter.running("completion_digest");
     loop {
         tokio::select! {
             changed = shutdown.changed() => {

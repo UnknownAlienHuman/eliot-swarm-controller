@@ -1570,6 +1570,12 @@ track its result independently. Unassociated dispatched/unknown input blocks lat
 send/configure/Goal continuation; active/unknown turn blocks next turn; unknown transition
 blocks further takeover. Exact stop/interrupt/request replies/readback remain available.
 
+Steer is bound to the captured generation and active turn. Once submitted to
+the plugin it has a bounded response deadline. If that deadline expires, the
+command settles as `unknown` with a timeout reason, and the pending call slot
+is released. The daemon never repeats the steer or uses its timeout as evidence
+that the native turn has ended.
+
 A dispatched or unknown `configure` also holds the settings lane: do not dispatch a
 later configure, new input or native/Eliot Goal start/resume until its exact outcome and
 effective settings are read back or explicitly resolved. Timeout does not release this
@@ -2480,6 +2486,10 @@ including `blockers`, `unsettled_commands`, `unknown_commands`, `drain` and
 the retention view (store sizes, configured windows or unbounded,
 `pruned_through`, and the unbounded-growth advisory when due).
 
+Local IPC accept failures are logged and retried with bounded backoff.
+During the delay, admitted work and existing connections continue, and the
+daemon still honors shutdown.
+
 Drain rejects new turn-producing work and new automation, while continuing pre-admitted
 work and allowing exact stop/interrupt/request replies/cancel/detach/readback. Unknown
 outcomes remain visible blockers. Command admission retains its early per-verb mode check
@@ -2506,6 +2516,7 @@ The synopsis is target grammar; later-layer forms are not an inventory of curren
 
 ```text
 swarm daemon [--foreground]
+swarm daemon install | uninstall
 swarm daemon stop [--drain|--force]
 swarm status
 swarm launch --profile P --workspace PATH [--worktree BRANCH [--base REF]] [--parent AGENT] [--source PATH]... [PROMPT] [--wait] [--timeout-seconds N]

@@ -54,7 +54,7 @@ pub(crate) enum CliCommand {
     Artifact(ArtifactArgs),
     /// Read or save unified daemon settings with revision checking.
     Settings(SettingsArgs),
-    /// Start the local daemon, or stop it with a drain/force request.
+    /// Start or stop the local daemon, or manage current-user logon startup.
     Daemon(DaemonArgs),
     /// Read daemon state without starting a daemon.
     Status,
@@ -1061,6 +1061,10 @@ pub(crate) struct DaemonArgs {
 #[derive(Subcommand)]
 pub(crate) enum DaemonAction {
     Stop(ShutdownArgs),
+    /// Install a current-user logon task that starts the daemon.
+    Install,
+    /// Remove this data directory's verified current-user logon task.
+    Uninstall,
 }
 
 #[derive(Args)]

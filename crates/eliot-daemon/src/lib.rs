@@ -8,7 +8,7 @@ pub mod cloud_mcp;
 mod common;
 mod config;
 pub mod crash;
-mod daemon;
+pub(crate) mod daemon;
 mod fs_invalidation;
 mod git_actions;
 mod git_monitor;
@@ -42,7 +42,9 @@ pub use daemon::{
     daemon_connect_hint, daemon_failure_since, last_daemon_failure, last_daemon_phase,
     require_agent_identity, run, wait_command, wait_terminal,
 };
-pub use platform::data_dir::{persist_selected_root, resolve_data_dir, resolve_selected_root};
+pub use platform::data_dir::{
+    DataDir, persist_selected_root, resolve_data_dir, resolve_selected_root,
+};
 pub use router::discovery::is_mutation_id_method;
 pub use router::discovery::mutation_id_methods;
 

@@ -186,6 +186,14 @@ owner-channel closure, daemon force-stop, startup cleanup, or the stop's own
 exit; see [Process observation and terminal ordering](monitoring.md#process-observation-and-terminal-ordering)).
 Readers accept persisted rows carrying any of these reasons.
 
+After restart, the daemon reopens an eligible retained idle session through a
+generation-bound `resume` without text. Eligibility requires the prior
+generation's exact custody closure and no unsettled work. The new generation
+keeps the same native subject. An interrupted turn or uncertain dispatched
+effect stays `unknown` with the restart reason until it can be settled through
+the normal recovery path. A terminal `send` refusal identifies the next
+explicit action for that Agent.
+
 An open stop/transition is a command beside the observed state, not another state
 machine. Generation transition blocks ordinary turn work. A stop in `dispatched`
 or `unknown` fences sends, active-turn injection, turn controls, and native
@@ -429,7 +437,7 @@ retry a lost acknowledgement and must report a gap/reconcile current state inste
 | steer / interrupt | exact captured active turn, no implicit fallback |
 | inject | context at its requested next-input or exact-turn safe point; report the actual application point |
 | stop | end the controlled generation/session; not merely stop watching it |
-| resume | explicit reopen of retained subject as new generation; no old input replay |
+| resume | reopen the retained native subject as a new generation; new text only when explicitly supplied |
 | approve / deny / answer | exact pending request |
 | configure | report now/next_tool/next_turn/next_session application |
 | goal.* | native/Eliot goal, added with automation |

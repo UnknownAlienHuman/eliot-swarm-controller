@@ -260,6 +260,7 @@ pub(crate) async fn run_attention(
     router: Router,
     suspicion_window: Duration,
     mut shutdown: watch::Receiver<bool>,
+    reporter: crate::daemon::workers::WorkerReporter,
 ) -> Result<()> {
     let mut events = router.inner.bus.subscribe();
     let mut ticks = interval(SWEEP_INTERVAL);
@@ -287,6 +288,7 @@ pub(crate) async fn run_attention(
     // map plus the durable incident record: not every historical lost row
     // becomes a new incident engine.
     queue_startup_losses(&router, &state).await;
+    reporter.running("attention");
 
     loop {
         tokio::select! {

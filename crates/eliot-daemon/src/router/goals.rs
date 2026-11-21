@@ -868,7 +868,7 @@ pub(crate) async fn run_goal_driver(
     run_check: GoalCheckRunner,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-    router.note_automation_task_running("goal_driver");
+    router.note_worker_task_running("goal_driver");
     let mut events = router.subscribe_rule_events();
     let mut goal_changes = router.subscribe_goal_reconcile();
     let mut rounds: JoinSet<(String, i64)> = JoinSet::new();
@@ -881,6 +881,18 @@ pub(crate) async fn run_goal_driver(
     // for a free cap slot, in Agent order. Revalidated and drained when a
     // round resolves; never filled past shutdown.
     let mut pending_reconcile: BTreeMap<String, PendingReconcile> = BTreeMap::new();
+    // A worker restart may have missed the idle event that should drive a
+    // Goal. Reconcile from durable idle keys; consumed or unknown-burned keys
+    // stay fenced by Store and are never run twice.
+    reconcile_idle_goals(
+        &router,
+        run_check,
+        &mut rounds,
+        &mut in_flight,
+        &mut pending,
+        &mut pending_reconcile,
+    )
+    .await;
     loop {
         tokio::select! {
             changed = shutdown.changed() => {

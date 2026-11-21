@@ -270,6 +270,14 @@ impl Monitoring {
         self.mark_git_unavailable(code);
     }
 
+    fn mark_available(&self) {
+        *self.inner.unavailable.lock_recover() = None;
+    }
+
+    fn mark_git_available(&self) {
+        *self.inner.git_unavailable.lock_recover() = None;
+    }
+
     /// Install the [daemon] observe thresholds once at startup. Sweeps read
     /// them from memory; the daemon never re-reads the config file per sweep.
     pub(crate) fn set_observe_thresholds(&self, thresholds: ObserveThresholds) {
@@ -746,25 +754,54 @@ impl Monitoring {
         Ok(())
     }
 
-    pub(crate) async fn run(self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
+    pub(crate) async fn run(
+        self,
+        mut shutdown: watch::Receiver<bool>,
+        reporter: crate::daemon::workers::WorkerReporter,
+    ) -> Result<()> {
         let mut git_tasks = JoinSet::new();
-        git_tasks.spawn(self.clone().run_git(shutdown.clone()));
+        let git_monitoring = self.clone();
+        let git_worker_reporter = reporter.clone();
+        let git_factory = move |git_shutdown: watch::Receiver<bool>| {
+            let monitoring = git_monitoring.clone();
+            let git_reporter = git_worker_reporter.clone();
+            async move {
+                let result = monitoring.run_git(git_shutdown.clone(), git_reporter).await;
+                crate::daemon::workers::from_result(result, &git_shutdown)
+            }
+        };
+        let git_failure_monitor = self.clone();
+        git_tasks.spawn(crate::daemon::workers::supervise_with(
+            "git_sampler",
+            reporter.clone(),
+            shutdown.clone(),
+            git_factory,
+            move |error| git_failure_monitor.mark_git_unavailable(&error.code),
+        ));
         let mut ticks = interval(SAMPLE_INTERVAL);
         ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        reporter.running("monitor");
         loop {
             if *shutdown.borrow() {
                 break;
             }
             tokio::select! {
-                _ = ticks.tick() => self.sample_all().await,
+                _ = ticks.tick() => {
+                    self.sample_all().await;
+                    self.mark_available();
+                }
                 joined = git_tasks.join_next(), if !git_tasks.is_empty() => {
                     if !*shutdown.borrow() {
                         let code = match joined {
-                            Some(Ok(Err(ref error))) => error.code.as_str(),
-                            Some(Err(_)) => "git_task_failed",
-                            _ => "git_task_stopped",
+                            Some(Err(_)) => "git_supervisor_failed",
+                            Some(Ok(())) => "git_supervisor_stopped",
+                            None => "git_supervisor_missing",
                         };
                         self.mark_git_unavailable(code);
+                        return Err(Error::new(
+                            code,
+                            "Git sampler supervisor stopped unexpectedly",
+                        ));
                     }
                 }
                 changed = shutdown.changed() => {
@@ -777,7 +814,7 @@ impl Monitoring {
         self.sample_all().await;
         let joined = timeout_at(Instant::now() + GIT_SHUTDOWN_GRACE, async {
             while let Some(joined) = git_tasks.join_next().await {
-                if !matches!(joined, Ok(Ok(()))) {
+                if !matches!(joined, Ok(())) {
                     self.mark_git_unavailable("git_task_failed");
                 }
             }
@@ -799,13 +836,19 @@ impl Monitoring {
         self.release_inactive_watchers(&HashSet::new(), true);
     }
 
-    async fn run_git(self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
+    async fn run_git(
+        self,
+        mut shutdown: watch::Receiver<bool>,
+        reporter: crate::daemon::workers::WorkerReporter,
+    ) -> Result<()> {
         let mut ticks = interval(SAMPLE_INTERVAL);
         ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
         // A bound Agent's native stream closing makes its binding final:
         // read it now instead of at the next tick, so a stopped Agent's Git
         // source closes (and `agent.delete` stops answering busy) promptly.
         let mut committed = Some(self.inner.bus.subscribe());
+        self.mark_git_available();
+        reporter.running("git_sampler");
         loop {
             if *shutdown.borrow() {
                 break;
