@@ -1028,6 +1028,7 @@ pub fn styles_xaml() -> String {
          <Style TargetType=\"ToggleSwitch\">\
            {font}\
            <Setter Property=\"MinHeight\" Value=\"{min}\"/>\
+           <Setter Property=\"Width\" Value=\"{switch_width}\"/>\
            <Setter Property=\"OnContent\" Value=\"\"/>\
            <Setter Property=\"OffContent\" Value=\"\"/>\
            <Setter Property=\"MinWidth\" Value=\"0\"/>\
@@ -1085,6 +1086,7 @@ pub fn styles_xaml() -> String {
          </ResourceDictionary>",
         family = text::FAMILY,
         font_size = text::BODY.size,
+        switch_width = layout::SWITCH_WIDTH,
     )
 }
 

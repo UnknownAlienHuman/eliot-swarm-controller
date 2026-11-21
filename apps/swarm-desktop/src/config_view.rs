@@ -107,7 +107,6 @@ fn switch(key: &str, on: bool, enabled: bool, name: String, toggled: Callback<bo
         ToggleSwitch::new()
             .is_on(on)
             .is_enabled(enabled)
-            .width(tokens::layout::SWITCH_WIDTH)
             .automation_name(name)
             .on_toggled(toggled),
     )])

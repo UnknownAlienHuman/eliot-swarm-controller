@@ -873,7 +873,6 @@ impl DesktopApp {
                                 .text_trimming(TextTrimming::CharacterEllipsis),
                             ToggleSwitch::new()
                                 .grid_column(2)
-                                .width(tokens::layout::SWITCH_WIDTH)
                                 .is_on(model.visible)
                                 .vertical_alignment(VerticalAlignment::Center)
                                 .automation_name(format!(
@@ -987,7 +986,6 @@ fn manage_group_row(
     let group_key = group.key.clone();
     let check = ToggleSwitch::new()
         .grid_column(1)
-        .width(tokens::layout::SWITCH_WIDTH)
         .is_on(group.visible)
         .vertical_alignment(VerticalAlignment::Center)
         .automation_name(format!("Show every {} model", group.title))
