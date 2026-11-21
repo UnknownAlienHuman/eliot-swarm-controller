@@ -3,6 +3,7 @@
 
 use crate::{Agent, Error, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use url::Url;
 
 /// The routing choice frozen at launch admission. `profile` is absent when
@@ -245,8 +246,13 @@ impl ProviderHold {
 /// a provider-hold scope: a per-turn restriction proves only the admitted
 /// account/profile restriction, not that the whole proxy service is held.
 pub fn frozen_provider_scope(agent: &Agent) -> Result<String> {
-    let snapshot = agent
-        .profile_snapshot
+    frozen_provider_scope_for(&agent.profile, &agent.profile_snapshot)
+}
+
+/// Resolve the same frozen provider scope while projecting a compact Agent
+/// row from the stored profile snapshot.
+pub fn frozen_provider_scope_for(profile: &str, profile_snapshot: &Value) -> Result<String> {
+    let snapshot = profile_snapshot
         .as_object()
         .ok_or_else(invalid_provider_scope)?;
 
@@ -255,7 +261,7 @@ pub fn frozen_provider_scope(agent: &Agent) -> Result<String> {
             "account:{}",
             account.as_str().ok_or_else(invalid_provider_scope)?
         ),
-        None => format!("profile:{}", agent.profile),
+        None => format!("profile:{profile}"),
     };
 
     CapacityScope {

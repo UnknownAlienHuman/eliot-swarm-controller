@@ -1,9 +1,9 @@
 //! Optional WinUI 3 desktop companion for the Eliot daemon.
 //!
 //! The daemon stays the sole controller: this binary performs no automation,
-//! owns no database, embeds no WebView and spawns no second executor. Every
-//! read and mutation goes through the existing typed RPC client
-//! (`eliot_daemon::client_call_typed` and the `eliot_core::api` DTOs).
+//! owns no database, embeds no WebView and spawns no second executor. Live
+//! operations use the daemon's typed RPC client. Settings repair while the
+//! daemon is offline uses the same typed settings operations in its library.
 //! WinUI 3 controls come from the `windows-reactor` dependency, used only on
 //! Windows; other platforms build a stub that explains the requirement so the
 //! default workspace build and Ubuntu CI stay green.

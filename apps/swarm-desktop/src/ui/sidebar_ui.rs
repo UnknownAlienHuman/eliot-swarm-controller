@@ -670,12 +670,11 @@ fn agent_row(task: &TaskEntry, input: &SidebarInput, context: &mut ViewContext<S
     if let Some(note) = &row.note {
         name.push_str(&format!(", {note}"));
     }
-    // What needs attention, as the Monitor's row says it (its open report,
-    // e.g. working without writing code), else a running task's work line
-    // (`docs/spec/monitoring.md`, Git-aware work summary): whether it
-    // writes code, at a glance.
+    // The Monitor's incident report leads, then projected status and work.
     if let Some(words) = &task.reported {
         name.push_str(&format!(", needs attention: {words}"));
+    } else if let Some(status) = &agent.status_line {
+        name.push_str(&format!(", {status}"));
     } else if let Some((_, words)) = &task.work {
         name.push_str(&format!(", {words}"));
     }
@@ -683,6 +682,12 @@ fn agent_row(task: &TaskEntry, input: &SidebarInput, context: &mut ViewContext<S
         .reported
         .clone()
         .map(|words| (words, true))
+        .or_else(|| {
+            agent
+                .status_line
+                .as_ref()
+                .map(|status| (status.clone(), agent.needs_attention()))
+        })
         .or_else(|| task.work.as_ref().map(|(line, _)| (line.clone(), false)));
     // A live task shows its dot (working, attention: a reported one in the
     // attention tone); a quiet one its age, its title in the variant tone.

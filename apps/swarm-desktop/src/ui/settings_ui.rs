@@ -35,8 +35,8 @@ use crate::settings::{Access, Startup, ThemeChoice};
 use crate::settings_model::{self as model, AssignmentField};
 use crate::theme::winui::Palette;
 use eliot_core::api::{
-    HarnessQuotaResponse, SettingsClientSource, SettingsHistoryEntry, SettingsReadResponse,
-    SettingsSaveRequest, SettingsSaveResponse, SettingsSection as Section,
+    HarnessQuotaResponse, SettingsClientSource, SettingsHistoryEntry, SettingsReadIssue,
+    SettingsReadResponse, SettingsSaveRequest, SettingsSaveResponse, SettingsSection as Section,
 };
 use serde_json::{Value, json};
 use shortcuts::shortcuts_page;
@@ -209,6 +209,22 @@ impl Page {
     }
 }
 
+fn settings_issue_visible(page: Page, section: Option<Section>) -> bool {
+    if page == Page::Advanced {
+        return true;
+    }
+    match section {
+        Some(Section::Profiles) => page == Page::Models,
+        Some(Section::Routing) => page == Page::Routing,
+        Some(Section::Projects) => page == Page::Projects,
+        Some(Section::Automation) => page == Page::Automations,
+        Some(Section::CloudMcp) => page == Page::CloudMcp,
+        Some(Section::Desktop) => matches!(page, Page::General | Page::Access),
+        Some(Section::Daemon | Section::Mail | Section::Accounts | Section::Proxies) => false,
+        None => page.has_config(),
+    }
+}
+
 /// The index entries a Settings search finds (case-insensitive over the
 /// name, the page and its other words).
 fn search_settings(query: &str) -> Vec<(Page, &'static str)> {
@@ -248,6 +264,7 @@ pub(super) enum SettingsMsg {
     PageSelected(Page),
     Loaded(Fallible<SettingsReadResponse>),
     Reload,
+    RemoveInvalidSections(Vec<Section>),
     /// Validate (true) or save the page's section.
     Save(Page, bool),
     /// A typed change rests: save the page if no later keystroke came on
@@ -415,6 +432,8 @@ pub(super) struct SettingsState {
     /// Pages whose save was refused for a stale revision: the next read
     /// decides whether each goes again (see [`SettingsState::take`]).
     retry: Vec<Page>,
+    /// The saved revision of the last cold-start repair.
+    repair_saved_revision: Option<String>,
     /// Numbers every typed change.
     edit_seq: u64,
     /// Each page's latest typed change still waiting for its pause: typing
@@ -422,6 +441,7 @@ pub(super) struct SettingsState {
     typing: HashMap<Page, u64>,
     revision: Option<String>,
     base: BTreeMap<Section, Value>,
+    issues: Vec<SettingsReadIssue>,
     restart_required: Vec<Section>,
     history: Vec<SettingsHistoryEntry>,
     error: Option<String>,
@@ -573,6 +593,7 @@ impl SettingsState {
         }
         self.all_base = all;
         self.base = read.sections;
+        self.issues = read.issues;
         self.revision = read.revision;
         self.restart_required = read.restart_required;
         self.history = read.history;
@@ -695,6 +716,7 @@ impl SettingsState {
 
 impl DesktopApp {
     pub(super) fn settings_update(&mut self, msg: SettingsMsg, context: &ComponentContext<Self>) {
+        let repairing = self.repairing_settings();
         let s = &mut self.settings;
         match msg {
             SettingsMsg::CleanupPlan(continuation) => {
@@ -977,6 +999,9 @@ impl DesktopApp {
                 self.settings.notes.clear();
                 self.load_settings(context);
             }
+            SettingsMsg::RemoveInvalidSections(sections) => {
+                self.remove_invalid_sections(sections, context);
+            }
             SettingsMsg::Save(page, dry_run) => self.save_page(page, dry_run, context),
             SettingsMsg::AutoSave(page, seq) => {
                 if self.settings.rested(page, seq) {
@@ -1007,6 +1032,9 @@ impl DesktopApp {
                 }
                 match &result {
                     Ok(reply) => {
+                        if repairing && reply.saved {
+                            self.settings.repair_saved_revision = reply.revision.clone();
+                        }
                         if reply.saved {
                             // The read that follows shows these values, maybe
                             // normalised; the drafts that sent them follow it.
@@ -1334,6 +1362,24 @@ impl DesktopApp {
     /// they are never applied. Runs before [`SettingsState::take`] clears
     /// the saves it compares with.
     fn take_profiles(&mut self, read: &SettingsReadResponse) {
+        if !read.sections.contains_key(&Section::Profiles)
+            && let Some(issue) = read
+                .issues
+                .iter()
+                .find(|issue| issue.section == Some(Section::Profiles))
+        {
+            self.editor.loaded = true;
+            self.editor.revision = read.revision.clone();
+            self.editor.base.clear();
+            self.editor.draft.clear();
+            self.editor.view.clear();
+            self.editor.raw_dirty = false;
+            self.editor.editable = false;
+            self.editor.reason = Some(issue.message.clone());
+            self.editor.sent = None;
+            self.editor.select_existing();
+            return;
+        }
         let section = read
             .sections
             .get(&Section::Profiles)
@@ -1398,9 +1444,6 @@ impl DesktopApp {
             }
             return;
         }
-        let Ok(data_dir) = self.data_dir.clone() else {
-            return;
-        };
         if !dry_run && self.settings.refuse_if_changed(page) {
             self.reprime_fields(context);
             return;
@@ -1411,6 +1454,48 @@ impl DesktopApp {
                 self.settings.notes.insert(page, Note::error(note));
                 return;
             }
+        };
+        self.start_settings_save(page, sections, dry_run, context);
+    }
+
+    fn remove_invalid_sections(
+        &mut self,
+        sections: Vec<Section>,
+        context: &ComponentContext<Self>,
+    ) {
+        if !self.settings.loaded
+            || self.settings.busy()
+            || self.prefs_saving
+            || self.settings.dirty(Page::Advanced)
+        {
+            return;
+        }
+        let invalid: std::collections::BTreeSet<_> = self
+            .settings
+            .issues
+            .iter()
+            .filter(|issue| issue.removable)
+            .filter_map(|issue| issue.section)
+            .collect();
+        let sections: BTreeMap<_, _> = sections
+            .into_iter()
+            .filter(|section| invalid.contains(section))
+            .map(|section| (section, json!({})))
+            .collect();
+        if !sections.is_empty() {
+            self.start_settings_save(Page::Advanced, sections, false, context);
+        }
+    }
+
+    fn start_settings_save(
+        &mut self,
+        page: Page,
+        sections: BTreeMap<Section, Value>,
+        dry_run: bool,
+        context: &ComponentContext<Self>,
+    ) {
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return;
         };
         self.settings.sending = Some(sections.clone());
         self.editor.sending = (page == Page::Models).then(|| self.editor.draft.clone());
@@ -1430,12 +1515,14 @@ impl DesktopApp {
                 "Saving…"
             }),
         );
+        let repairing = self.repairing_settings();
         let _task = context.spawn_background(move |_| {
-            Message::Settings(SettingsMsg::Saved(
-                page,
-                dry_run,
-                client::block_on(config_client::save_settings(&data_dir, &request)),
-            ))
+            let result = if repairing {
+                client::block_on(eliot_daemon::save_settings_for_repair(&data_dir, &request))
+            } else {
+                client::block_on(config_client::save_settings(&data_dir, &request))
+            };
+            Message::Settings(SettingsMsg::Saved(page, dry_run, result))
         });
     }
 
@@ -1523,10 +1610,15 @@ impl DesktopApp {
         };
         self.settings.reading = true;
         self.settings.read_prefs_rev = self.prefs_rev;
+        let repairing = self.repairing_settings();
         let _task = context.spawn_background(move |_| {
-            Message::Settings(SettingsMsg::Loaded(
+            let result = if repairing {
+                eliot_daemon::read_settings_for_repair(&data_dir)
+            } else {
                 client::block_on(config_client::read_settings(&data_dir))
-                    .map_err(|error| error.to_string()),
+            };
+            Message::Settings(SettingsMsg::Loaded(
+                result.map_err(|error| error.to_string()),
             ))
         });
     }
@@ -1726,6 +1818,14 @@ impl DesktopApp {
                                 ),
                             ),
                             KeyedView::new("settings-read-status", status),
+                            KeyedView::new(
+                                "repair-startup-retry",
+                                self.repair_startup_retry_view(context, palette),
+                            ),
+                            KeyedView::new(
+                                "settings-section-issues",
+                                self.settings_issues_view(page, context, palette),
+                            ),
                             KeyedView::new(format!("body:{}", page.label()), body),
                         ]),
                 );
@@ -1746,6 +1846,94 @@ impl DesktopApp {
                     .grid_row(2)
                     .content(self.save_status(page, width, palette)),
             ))
+    }
+
+    fn repair_startup_retry_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+        if !self.repairing_settings()
+            || self.settings.repair_saved_revision.is_none()
+            || self.settings.repair_saved_revision != self.settings.revision
+            || self.settings.busy()
+            || self.prefs_saving
+        {
+            return View::empty();
+        }
+        m3::settings_card(
+            palette,
+            vec![KeyedView::new(
+                "repair-startup-retry-action",
+                m3::text_button(palette)
+                    .automation_name("Retry startup")
+                    .on_click(context.message(Message::Shell(ShellMsg::RetryStartup)))
+                    .content(m3::label("Retry startup")),
+            )],
+        )
+    }
+
+    fn settings_issues_view(
+        &self,
+        page: Page,
+        context: &mut ViewContext<Self>,
+        palette: Palette,
+    ) -> View {
+        let issues: Vec<_> = self
+            .settings
+            .issues
+            .iter()
+            .filter(|issue| settings_issue_visible(page, issue.section))
+            .collect();
+        if issues.is_empty() {
+            return View::empty();
+        }
+        let mut rows = Vec::with_capacity(issues.len() + 1);
+        for (index, issue) in issues.iter().enumerate() {
+            let label = issue
+                .section
+                .map(model::section_label)
+                .unwrap_or("config.toml");
+            rows.push(KeyedView::new(
+                format!("issue:{label}:{index}"),
+                m3::body(format!("{label}: {}", issue.message))
+                    .text_wrapping(TextWrapping::Wrap)
+                    .is_text_selection_enabled(true),
+            ));
+        }
+        let removable: Vec<_> = issues
+            .iter()
+            .filter(|issue| issue.removable)
+            .filter_map(|issue| issue.section)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if !removable.is_empty() {
+            let label = if removable.len() == 1 {
+                "Remove invalid section"
+            } else {
+                "Remove listed sections"
+            };
+            rows.push(KeyedView::new(
+                "remove-invalid-help",
+                m3::secondary(
+                    "This removes the entire listed section from config.toml and preserves the other sections.",
+                )
+                .text_wrapping(TextWrapping::Wrap),
+            ));
+            rows.push(KeyedView::new(
+                "remove-invalid-sections",
+                m3::outlined(palette)
+                    .horizontal_alignment(HorizontalAlignment::Left)
+                    .is_enabled(
+                        !self.settings.busy()
+                            && !self.prefs_saving
+                            && !self.settings.dirty(Page::Advanced),
+                    )
+                    .automation_name(label)
+                    .on_click(context.message(Message::Settings(
+                        SettingsMsg::RemoveInvalidSections(removable),
+                    )))
+                    .content(m3::label(label)),
+            ));
+        }
+        m3::settings_card(palette, rows)
     }
 
     /// The settings column: one explicit width, so every page's groups

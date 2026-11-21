@@ -676,6 +676,14 @@ pub struct ExecutionEventData {
     pub reason: Option<String>,
 }
 
+/// The native `session.retry.scheduled` payload subset.
+#[derive(Debug, Deserialize)]
+pub struct RetryScheduledData {
+    #[serde(rename = "sessionID")]
+    pub session_id: String,
+    pub error: StructuredError,
+}
+
 /// Bound inference model in the installed `session.step.started` event.
 #[derive(Debug, Deserialize)]
 pub struct StepStartedData {

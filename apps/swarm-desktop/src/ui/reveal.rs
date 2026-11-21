@@ -140,7 +140,7 @@ pub(super) fn path_row(
     open: Callback<()>,
 ) -> View {
     let shown = nav::display_path(path);
-    let note = if note.is_empty() { shown } else { note };
+    let note = if note.is_empty() { &shown } else { note };
     m3::row(palette, false)
         .height(tokens::height::TWO_LINE_ROW)
         .min_height(tokens::height::TWO_LINE_ROW)

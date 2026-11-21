@@ -47,9 +47,13 @@ pub(super) enum Panel {
 #[derive(Clone, Debug)]
 pub(super) enum ShellMsg {
     AutoSettings,
+    RepairSettings,
+    RetryStartup,
+    /// Open this data directory's editable daemon configuration.
+    OpenStartupConfig,
     /// The daemon runs (started when needed), the opened checkout was
     /// discovered, and the settings were read.
-    DaemonReady(Fallible<(Option<String>, eliot_core::api::SettingsReadResponse)>),
+    DaemonReady(MutationResult<(Option<String>, eliot_core::api::SettingsReadResponse)>),
     /// The owner chose a fresh private data directory (unsafe default).
     UseFreshDirectory,
     ProjectsLoaded(Fallible<Vec<UiProject>>),
@@ -319,9 +323,26 @@ impl DesktopApp {
                 self.close_popover();
                 self.open_settings(Some(Page::Routing), context);
             }
+            ShellMsg::RepairSettings => {
+                self.open_settings(Some(Page::Advanced), context);
+            }
+            ShellMsg::RetryStartup => {
+                if let Ok(data_dir) = self.data_dir.clone() {
+                    self.startup_error = None;
+                    self.start_connection(data_dir, context);
+                }
+            }
+            ShellMsg::OpenStartupConfig => {
+                if let Ok(data_dir) = &self.data_dir
+                    && let Err(error) =
+                        super::reveal::open_with_default_app(&data_dir.join("config.toml"))
+                {
+                    self.alert(error);
+                }
+            }
             ShellMsg::DaemonReady(result) => match result {
                 Ok((discovered, read)) => {
-                    self.startup_error = false;
+                    self.startup_error = None;
                     let before = self.palette();
                     self.prefs = crate::settings::Preferences::from_reply(&read);
                     self.palette_changed(before, context);
@@ -353,8 +374,7 @@ impl DesktopApp {
                     }
                 }
                 Err(error) => {
-                    self.startup_error = true;
-                    self.alert(format!("Cannot start Swarm: {error}"));
+                    self.startup_error = Some(error);
                 }
             },
             ShellMsg::UseFreshDirectory => {
@@ -368,7 +388,7 @@ impl DesktopApp {
                     ) {
                         Ok(selected) => {
                             self.data_dir = Ok(selected.clone());
-                            self.startup_error = false;
+                            self.startup_error = None;
                             self.note_window_size();
                             self.alert = None;
                             self.set_status(format!(
@@ -1019,6 +1039,9 @@ impl DesktopApp {
 
     /// Open Settings, at `page` when given.
     fn open_settings(&mut self, page: Option<settings_ui::Page>, context: &ComponentContext<Self>) {
+        if self.startup_error.is_some() && !self.repairing_settings() {
+            return;
+        }
         self.close_popover();
         let reopened = self.main != Main::Settings;
         let page_changed = page.is_some_and(|page| page != self.settings_page);
@@ -1032,10 +1055,16 @@ impl DesktopApp {
         }
     }
 
+    pub(super) fn repairing_settings(&self) -> bool {
+        self.startup_error.as_ref().is_some_and(|error| {
+            error.failure_where.as_deref() == Some(eliot_daemon::startup::CONFIG_STARTUP_LOCATION)
+        })
+    }
+
     /// Where the owner is now, for Back and Forward (nothing while the
     /// daemon is not reached).
     pub(super) fn location(&self) -> Option<Location> {
-        if self.startup_error {
+        if self.startup_error.is_some() && self.main != Main::Settings {
             return None;
         }
         Some(match self.main {
@@ -1525,7 +1554,7 @@ impl DesktopApp {
     /// too narrow to keep the task area at its minimum beside the sidebar
     /// (and the open panel); Settings always shows its navigation.
     fn rail_shown(&self) -> bool {
-        if self.main == Main::Settings || self.startup_error {
+        if self.main == Main::Settings || self.startup_error.is_some() {
             return false;
         }
         let panel = if self.panel_shown() {
@@ -1542,7 +1571,9 @@ impl DesktopApp {
     /// The right panel belongs to the conversation: Settings shows two
     /// columns (its navigation and the page), as in the Codex app.
     fn panel_shown(&self) -> bool {
-        self.panel != Panel::Closed && self.main == Main::Conversation && !self.startup_error
+        self.panel != Panel::Closed
+            && self.main == Main::Conversation
+            && self.startup_error.is_none()
     }
 
     /// Write an explicit theme or startup choice into `[desktop]` at once,
@@ -1604,8 +1635,7 @@ impl DesktopApp {
                 }
                 let read = config_client::read_settings(&data_dir).await?;
                 Ok((discovered, read))
-            })
-            .map_err(|error: eliot_core::Error| error.to_string());
+            });
             Message::Shell(ShellMsg::DaemonReady(result))
         });
     }
@@ -1839,7 +1869,9 @@ impl DesktopApp {
         m3::set_palette(palette);
 
         let main: View = match self.main {
-            _ if self.startup_error => self.startup_error_view(context, palette),
+            Main::Conversation if self.startup_error.is_some() => {
+                self.startup_error_view(context, palette)
+            }
             // Settings is drawn in the conversation's place, which keeps
             // its transcript (see `chat_view`).
             Main::Conversation | Main::Settings => self.chat_view(context, palette),
@@ -1868,7 +1900,7 @@ impl DesktopApp {
         };
         // Settings replaces the sidebar with its own navigation.
         let side: View = match self.main {
-            Main::Settings if !self.startup_error => self.settings_nav(context, palette),
+            Main::Settings => self.settings_nav(context, palette),
             _ if rail => self.rail_view(context, palette),
             _ => View::component::<sidebar_ui::Sidebar>(self.sidebar_input(context, palette)),
         };
@@ -2233,7 +2265,10 @@ impl DesktopApp {
     /// root is owned by another principal). Nothing is moved; the owner may
     /// select a fresh private directory, which is remembered.
     fn startup_error_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
-        let error = self.alert.clone().unwrap_or_default();
+        let error = self
+            .startup_error
+            .as_ref()
+            .map_or_else(String::new, ToString::to_string);
         StackPanel::new()
             .max_width(tokens::layout::READING_WIDTH)
             .horizontal_alignment(HorizontalAlignment::Center)
@@ -2241,15 +2276,28 @@ impl DesktopApp {
             .spacing(tokens::spacing::MD)
             .margin(Thickness::uniform(tokens::spacing::LG))
             .children((
-                m3::page_title("Swarm could not start here"),
-                m3::text(
-                    "Swarm could not open this data directory. Existing settings have not been moved.",
-                    tokens::text::BODY,
-                )
-                .text_wrapping(TextWrapping::Wrap),
+                m3::page_title("Swarm daemon could not start"),
                 m3::secondary(error)
                     .text_wrapping(TextWrapping::Wrap)
                     .is_text_selection_enabled(true),
+                if self.repairing_settings() {
+                    StackPanel::new().spacing(tokens::spacing::SM).children((
+                        m3::filled(palette)
+                            .automation_name("Repair settings")
+                            .on_click(context.message(Message::Shell(ShellMsg::RepairSettings)))
+                            .content(m3::label("Repair settings")),
+                        m3::text_button(palette)
+                            .automation_name("Open config.toml")
+                            .on_click(context.message(Message::Shell(ShellMsg::OpenStartupConfig)))
+                            .content(m3::link_content("Open config.toml")),
+                    ))
+                } else {
+                    View::empty()
+                },
+                m3::text_button(palette)
+                    .automation_name("Retry startup")
+                    .on_click(context.message(Message::Shell(ShellMsg::RetryStartup)))
+                    .content(m3::label("Retry startup")),
                 m3::filled(palette)
                     .automation_name("Use fresh private directory")
                     .on_click(context.message(Message::Shell(ShellMsg::UseFreshDirectory)))

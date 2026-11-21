@@ -8,6 +8,7 @@ use crate::native_child::{
 use eliot_core::{
     ChildRegistration, ContextItem, Error, ProviderRestriction, Result, SecretPolicy,
     SessionTokenTotals, SessionUsage, TurnUsage,
+    api::{NativeNotice, NativeNoticeKind},
     limits::{MAX_TOOL_COMMAND_BYTES, MAX_TOOL_ERROR_TAIL_BYTES},
     turn_started_data,
 };
@@ -33,8 +34,9 @@ use crate::native::{
     NativeClient, NativeFrame, StreamState,
     requests::{self, CorePending},
     types::{
-        NativeCommandExecutionItem, NativeFileChangeItem, NativeItemCompletedNotification,
-        NativePatchChangeKind, NativeServerRequestResolvedNotification, NativeThreadTokenUsage,
+        NativeCommandExecutionItem, NativeErrorNotification, NativeFileChangeItem,
+        NativeItemCompletedNotification, NativePatchChangeKind,
+        NativeServerRequestResolvedNotification, NativeThreadTokenUsage,
         NativeThreadTokenUsageUpdatedNotification, NativeTokenUsageDelta,
         NativeTurnCompletedNotification, NativeTurnError, NativeTurnStartedNotification,
         NativeTurnStatus,
@@ -205,6 +207,8 @@ struct EventProcessor {
     /// Monotonic counter for `session.usage` native ids so each accepted
     /// update commits under a unique identity.
     session_usage_seq: u64,
+    /// Unique native id sequence for transient retry/error notices.
+    notice_seq: u64,
     native_scope: String,
     child_bindings: HashMap<String, ChildBinding>,
     child_states: HashMap<String, ChildState>,
@@ -372,6 +376,7 @@ impl EventProcessor {
             session_usage: None,
             session_usage_committed: None,
             session_usage_seq: 0,
+            notice_seq: 0,
             native_scope: config.native_scope.clone(),
             child_bindings: HashMap::new(),
             child_states: HashMap::new(),
@@ -1113,6 +1118,40 @@ impl EventProcessor {
         }
     }
 
+    async fn note_native_error(&mut self, params: Value) -> Result<()> {
+        let Ok(notification) = serde_json::from_value::<NativeErrorNotification>(params) else {
+            return Ok(());
+        };
+        let (Some(thread_id), Some(turn_id), Some(error)) = (
+            notification.thread_id.as_deref(),
+            notification.turn_id.as_deref(),
+            notification.error.as_ref(),
+        ) else {
+            return Ok(());
+        };
+        if self.status.active_turn_id.as_deref() != Some(turn_id)
+            || self.status.active_command_id.is_none()
+        {
+            return Ok(());
+        }
+        validate_thread_and_turn(&self.status, thread_id, turn_id)?;
+
+        self.notice_seq = self
+            .notice_seq
+            .checked_add(1)
+            .ok_or_else(|| Error::new("source_integrity", "Codex notice sequence overflow"))?;
+        let kind = native_error_notice_kind(error, notification.will_retry == Some(true));
+        let secrets = SecretPolicy::new(self.secrets.iter().cloned());
+        let data = native_notice_data(turn_id, kind, error, &secrets)?;
+        let native_id = event_id(
+            thread_id,
+            turn_id,
+            &format!("error-{}", self.notice_seq),
+            "turn.notice",
+        )?;
+        self.commit_event("turn.notice", native_id, data).await
+    }
+
     async fn process_notification(&mut self, method: &str, params: Value) -> Result<()> {
         match method {
             "turn/started" => {
@@ -1243,20 +1282,7 @@ impl EventProcessor {
                 self.observe_thread_started(&params).await?;
             }
             "error" => {
-                let thread_id = params
-                    .get("threadId")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                let turn_id = params
-                    .get("turnId")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                if !thread_id.is_empty()
-                    && !turn_id.is_empty()
-                    && self.status.active_turn_id.as_deref() == Some(turn_id)
-                {
-                    validate_thread_and_turn(&self.status, thread_id, turn_id)?;
-                }
+                self.note_native_error(params).await?;
             }
             _ => {}
         }
@@ -1763,6 +1789,56 @@ async fn run(
 /// tests.
 fn attach_native_error(data: &mut Value, error: Option<&NativeTurnError>, policy: &SecretPolicy) {
     shared_attach_native_error(data, error.map(|error| error.message.as_str()), policy);
+}
+
+fn native_error_notice_kind(error: &NativeTurnError, will_retry: bool) -> NativeNoticeKind {
+    if !will_retry {
+        return NativeNoticeKind::Error;
+    }
+    let reconnecting = error
+        .codex_error_info
+        .as_ref()
+        .and_then(Value::as_object)
+        .filter(|variants| variants.len() == 1)
+        .is_some_and(|variants| {
+            variants.keys().any(|variant| {
+                matches!(
+                    variant.as_str(),
+                    "httpConnectionFailed"
+                        | "responseStreamConnectionFailed"
+                        | "responseStreamDisconnected"
+                )
+            })
+        });
+    if reconnecting {
+        NativeNoticeKind::Reconnecting
+    } else {
+        NativeNoticeKind::Retrying
+    }
+}
+
+fn native_notice_data(
+    turn_id: &str,
+    kind: NativeNoticeKind,
+    error: &NativeTurnError,
+    policy: &SecretPolicy,
+) -> Result<Value> {
+    let mut data = json!({});
+    shared_attach_native_error(&mut data, Some(&error.message), policy);
+    let native_error = &data["native_error"];
+    serde_json::to_value(NativeNotice {
+        turn_id: turn_id.to_owned(),
+        kind,
+        provider_kind: error
+            .provider_restriction()
+            .map(|restriction| restriction.kind),
+        message: native_error["message"]
+            .as_str()
+            .filter(|message| !message.trim().is_empty())
+            .map(str::to_owned),
+        truncated: native_error["truncated"].as_bool().unwrap_or(false),
+    })
+    .map_err(|_| Error::new("internal", "Codex native notice could not be encoded"))
 }
 
 /// Turn-start baseline from the first observed update: cumulative `total`

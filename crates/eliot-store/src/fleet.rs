@@ -1,3 +1,4 @@
+use super::status_views::{AgentStatusLookup, AgentStatusProjection};
 use super::*;
 use eliot_core::api::{
     AGENT_LIST_STATES, AgentListOrder, AgentStateTotal, AgentSummary, decode_recent_cursor,
@@ -95,7 +96,7 @@ impl Store {
             filter,
             page,
             limit,
-            |record| self.summary_from_record(record, now_ms, growth_thresholds),
+            |records| self.summaries_from_records(records, now_ms, growth_thresholds),
             |scoped, projection| {
                 agent_list_select(scoped, caller, None, None, projection, custody.as_deref())
             },
@@ -112,21 +113,25 @@ impl Store {
         filter: &AgentListFilter,
         page: AgentListSelect,
         limit: usize,
-        summarize: impl Fn(AgentRecord) -> Result<AgentSummary>,
+        summarize: impl Fn(Vec<AgentRecord>) -> Result<Vec<AgentSummary>>,
         select_page: impl Fn(&AgentListFilter, AgentListProjection) -> Result<AgentListSelect>,
         next_cursor: impl Fn(&AgentSummary) -> String,
     ) -> Result<AgentListPage> {
-        let mut statement = self.connection.prepare(&page.sql).map_err(sql_error)?;
-        let rows = statement
-            .query_map(
-                rusqlite::params_from_iter(page.params.iter()),
-                agent_record_from_row,
-            )
-            .map_err(sql_error)?;
-        let mut summaries = Vec::new();
-        for row in rows {
-            summaries.push(summarize(row.map_err(sql_error)?)?);
-        }
+        let records = {
+            let mut statement = self.connection.prepare(&page.sql).map_err(sql_error)?;
+            let rows = statement
+                .query_map(
+                    rusqlite::params_from_iter(page.params.iter()),
+                    agent_record_from_row,
+                )
+                .map_err(sql_error)?;
+            let mut records = Vec::new();
+            for row in rows {
+                records.push(row.map_err(sql_error)?);
+            }
+            records
+        };
+        let mut summaries = summarize(records)?;
         let total_page = select_page(filter, AgentListProjection::Count)?;
         let total: i64 = self
             .connection
@@ -226,7 +231,7 @@ impl Store {
             filter,
             page,
             limit,
-            |record| self.summary_from_record(record, now_ms, growth_thresholds),
+            |records| self.summaries_from_records(records, now_ms, growth_thresholds),
             |scoped, projection| {
                 agent_list_select_recent(scoped, caller, None, None, projection, custody.as_deref())
             },
@@ -234,17 +239,65 @@ impl Store {
         )
     }
 
+    fn summaries_from_records(
+        &self,
+        records: Vec<AgentRecord>,
+        now_ms: i64,
+        growth_thresholds: &core::SessionGrowthThresholds,
+    ) -> Result<Vec<AgentSummary>> {
+        let agents: Vec<_> = records
+            .iter()
+            .map(|record| (record.id, record.generation))
+            .collect();
+        let progress = native_children::native_progress_for_page(&self.connection, &agents)?;
+        if progress.len() != records.len() {
+            return Err(Error::new("internal", "Agent progress page is incomplete"));
+        }
+        let mut lookups = Vec::with_capacity(records.len());
+        for (record, &last_progress_at) in records.iter().zip(&progress) {
+            let profile_snapshot: Value = decode_json(&record.profile_snapshot)?;
+            lookups.push(AgentStatusLookup {
+                agent_num: record.id,
+                generation: record.generation,
+                active_turn: record.active_turn.clone(),
+                last_progress_at,
+                provider_scope: core::frozen_provider_scope_for(
+                    &record.profile,
+                    &profile_snapshot,
+                )?,
+            });
+        }
+        let statuses = self.project_agent_statuses(&lookups)?;
+        if statuses.len() != records.len() {
+            return Err(Error::new("internal", "Agent status page is incomplete"));
+        }
+        records
+            .into_iter()
+            .zip(progress)
+            .zip(statuses)
+            .map(|((record, last_progress_at), status)| {
+                self.summary_from_record(
+                    record,
+                    now_ms,
+                    growth_thresholds,
+                    last_progress_at,
+                    status,
+                )
+            })
+            .collect()
+    }
+
     fn summary_from_record(
         &self,
         record: AgentRecord,
         now_ms: i64,
         growth_thresholds: &core::SessionGrowthThresholds,
+        last_progress_at: Option<i64>,
+        status: AgentStatusProjection,
     ) -> Result<AgentSummary> {
         let state: AgentState = parse_enum(&record.state, "Agent state")?;
         let id = format_agent_id(record.id);
         let terminal = self.last_terminal_turn(record.id, record.generation, &record.harness)?;
-        let last_progress_at =
-            native_children::native_progress(&self.connection, record.id, record.generation)?;
         // Fleet usage prefers the newest terminal turn's native turn usage.
         // When the last turn carries none (Muse never sends turn usage), fall
         // back to the generation's latest retained session snapshot so a
@@ -349,6 +402,8 @@ impl Store {
             organization_revision,
             model,
             work,
+            provider_hold: status.provider_hold,
+            native_notice: status.native_notice,
         })
     }
 

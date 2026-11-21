@@ -116,29 +116,12 @@ impl Router {
         let policy = self.secret_policy_snapshot();
         // Resolve the candidate before publication, including dry runs. Keep
         // Git I/O outside the Store lock and bind its result to the source CAS.
-        let projects = if request
-            .sections
-            .contains_key(&eliot_core::api::SettingsSection::Projects)
-        {
-            let (source, candidate) = crate::config::settings::prepare_candidate(
-                &self.inner.data_root,
-                request.expected_revision.as_deref(),
-                &request.sections,
-                &policy,
-            )?;
-            Some(crate::config::settings::ResolvedProjects {
-                source_revision: source
-                    .as_deref()
-                    .map(crate::config::profiles_edit::revision_of),
-                candidate_revision: crate::config::profiles_edit::revision_of(&candidate),
-                inputs: crate::automation::project_registration_inputs(
-                    crate::config::settings::project_configs(&candidate)?,
-                )
-                .await?,
-            })
-        } else {
-            None
-        };
+        let projects = crate::config::recovery::resolve_projects_for_save(
+            &self.inner.data_root,
+            &request,
+            &policy,
+        )
+        .await?;
         let mut store = self.inner.store.lock().await;
         let (reply, events) = crate::config::settings::save(
             &self.inner.data_root,
@@ -154,6 +137,11 @@ impl Router {
                 .contains_key(&eliot_core::api::SettingsSection::Automation)
         {
             crate::config::load_automation_config_snapshot(&self.inner.data_root)
+                .or_else(|_| {
+                    crate::config::settings::automation_config_snapshot_for_settings(
+                        &self.inner.data_root,
+                    )
+                })
                 .and_then(|(revision, config)| {
                     if revision != reply.revision {
                         return Err(Error::new(

@@ -5,16 +5,18 @@ use super::{
     encode_json, load_agent_by_num, require_nonempty, sql_error, validate_id_age, write_binding,
 };
 mod admin;
-use admin::{clear_hold_tx, get, list_page};
+use admin::{clear_hold_tx, get, get_many, list_page};
 
 use eliot_core::{
     self as core, Agent, Command, CommandState, ProviderHold, ProviderHoldState,
     ProviderRestriction, ProviderRestrictionKind, TurnState,
+    api::AgentProviderHold,
     api::{ProviderClearHoldRequest, ProviderClearHoldResponse, ProviderHoldsResponse},
     parse_agent_id,
 };
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
 const CLEAR_HOLD_METHOD: &str = "provider.clear_hold";
 const INTERVENING_RESTRICTION_BATCH: i64 = 64;
@@ -27,6 +29,29 @@ impl Store {
         limit: usize,
     ) -> Result<ProviderHoldsResponse> {
         list_page(&self.connection, after, limit)
+    }
+
+    /// Resolve the holds for the distinct scopes captured by one status page.
+    /// Scope and probe-command identity remain owner-only.
+    pub(super) fn agent_provider_holds(
+        &self,
+        scopes: &[String],
+    ) -> Result<BTreeMap<String, AgentProviderHold>> {
+        Ok(get_many(&self.connection, scopes)?
+            .into_iter()
+            .map(|(scope, hold)| {
+                (
+                    scope,
+                    AgentProviderHold {
+                        kind: hold.kind,
+                        retry_after: hold.retry_after,
+                        state: hold.state,
+                        updated_at: hold.updated_at,
+                        waiting_for_active_turn: false,
+                    },
+                )
+            })
+            .collect())
     }
 
     /// Clear a hold using the Core request's closed corrective evidence and

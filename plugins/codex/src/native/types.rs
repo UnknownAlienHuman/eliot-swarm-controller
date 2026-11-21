@@ -572,6 +572,21 @@ pub struct NativeTurnCompletedNotification {
     pub turn: NativeTurn,
 }
 
+/// Installed app-server `error` notification. Some process-level errors do
+/// not carry a turn, so those optional correlations stay unprojected.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeErrorNotification {
+    #[serde(default)]
+    pub thread_id: Option<String>,
+    #[serde(default)]
+    pub turn_id: Option<String>,
+    #[serde(default)]
+    pub error: Option<NativeTurnError>,
+    #[serde(default)]
+    pub will_retry: Option<bool>,
+}
+
 /// One per-update token breakdown from installed 0.167.1
 /// `thread/tokenUsage/updated` (`tokenUsage.last` / `tokenUsage.total`).
 /// `total` is the cumulative per-thread snapshot (accumulated session

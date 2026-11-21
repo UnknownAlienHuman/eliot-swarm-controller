@@ -1086,6 +1086,11 @@ window closes, and only when it changed. It reads `window` from the file before 
 exists, so the window opens at that size, place and maximized state with no move after the
 first frame; a place no longer on an attached monitor is clamped into the nearest one's work
 area, and without `x`/`y` Windows chooses the place.
+When configuration prevents daemon startup, the local Owner can open Settings
+from the startup error. Repair uses the daemon's settings reader and
+revision-checked writer under the private daemon lock. After a repair save
+succeeds and Settings reads the saved file back successfully, Settings offers
+Retry startup through the existing startup action.
 The new-task composer writes `recent_models` after an admitted model launch,
 `favorite_models` from the model picker (Ctrl+F or the row's star), `last_access`
 from the access chip or Settings › Default access, and `collapsed_projects` when a
@@ -1239,14 +1244,28 @@ only a successful `configure` changes a live Agent's next-turn model/effort. Dae
 settings loaded once at startup (`[daemon]` worker limits and `[mail]`) still require a
 restart after the save.
 
-The whole `settings.read` is refused (`not_allowed`) when the file is not
-valid TOML, when profiles are defined outside `[profiles.*]` tables, when the profile
-text contains a value the daemon's secret policy knows, or when the profiles fail the
-daemon's strict field and URL validation (unknown fields and credential-bearing URLs are
-never handed to the editor). Profile sections carry environment and credential names,
-never values. The daemon keeps one revision-keyed validated snapshot per router: an
-admission whose file revision matches reuses it, and any byte change re-reads and
-re-validates, so the saved file is still what the next launch uses.
+`settings.read` returns every safely readable section plus bounded issues for sections
+that fail parsing, validation or the daemon's redaction policy. A TOML syntax diagnostic
+identifies the affected top-level section when the parser can locate it; other section
+blocks remain available in Settings. A section withheld for safety never includes its
+source or values. Diagnostics identify the section the daemon locates as their
+source. The desktop can edit readable section drafts. The Remove action replaces
+a section with an empty object when the daemon verifies a failure in that
+section itself. The revision remains the hash of the complete `config.toml`,
+including while another section is invalid.
+
+`settings.save` keeps the complete-section replacement and revision-CAS contract. The
+daemon validates the changed section and its dependencies with the same strict parser
+and validators used for launch configuration, preserves all unselected source blocks,
+and reports remaining issues on the next read. A section cannot be saved when its own
+validation fails; an unrelated broken section does not hide or block a usable section.
+The desktop performs no configuration validation. Profile source still follows the
+existing safety rule: profiles defined outside `[profiles.*]`, known secret values,
+unknown fields and credential-bearing URLs are never handed to the editor. Profile
+sections carry environment and credential names, never values. The daemon keeps one
+revision-keyed validated snapshot per router: an admission whose file revision matches
+reuses it, and any byte change re-reads and re-validates, so the saved file is still
+what the next task uses.
 
 ## Frozen files
 

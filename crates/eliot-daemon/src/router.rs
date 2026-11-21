@@ -3640,12 +3640,13 @@ impl Router {
         let request: AgentGetRequest = eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         let id = request.id.as_str();
-        let (agent, source_states, observer_active) = {
+        let (agent, source_states, observer_active, provider_hold, native_notice) = {
             let store = self.inner.store.lock().await;
             hierarchy::authorize_agent_read(&store, principal, id, None)?;
             let agent = store
                 .get_agent(id)?
                 .ok_or_else(|| Error::new("not_found", format!("Agent {id} was not found")))?;
+            let (provider_hold, native_notice) = store.agent_status_projection(&agent)?;
             let mut source_states = store.list_source_states(id, agent.generation)?;
             if let Some(workspace) = store.get_workspace(id)?
                 && workspace.target_generation != agent.generation
@@ -3654,7 +3655,13 @@ impl Router {
             }
             let observer_active =
                 agent.observe_only && store.observer_active(&agent.id, agent.generation)?;
-            (agent, source_states, observer_active)
+            (
+                agent,
+                source_states,
+                observer_active,
+                provider_hold,
+                native_notice,
+            )
         };
         let live_presence = if agent.observe_only {
             self.inner
@@ -3729,6 +3736,8 @@ impl Router {
             heavy,
             session_growth,
             work,
+            provider_hold,
+            native_notice,
         };
         display_agent_get_response(&mut response);
         serde_json::to_value(response)

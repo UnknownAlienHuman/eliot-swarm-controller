@@ -104,6 +104,7 @@ impl DesktopApp {
                                 generation: row.generation,
                                 harness: row.harness.clone(),
                                 state: row.state,
+                                status_line: row.status_line.clone(),
                                 project_id: row.project.clone(),
                                 project_scope: row.project_scope.clone(),
                                 repo_common_dir: None,
@@ -418,37 +419,36 @@ impl DesktopApp {
         // under.
         let note = if row.resumable() {
             data.loss_words(row).map(monitor_view::RowNote::Ended)
-        } else if no_code.is_some() {
+        } else if incident.is_some() {
             None
         } else {
-            incident
-                .map(|incident| incident.words(now))
-                .or_else(|| {
-                    tree.filter(|_| !data.needs_attention(row))
-                        .and_then(|tree| tree.worker_attention_words(&row.id))
-                })
+            tree.filter(|_| !data.needs_attention(row))
+                .and_then(|tree| tree.worker_attention_words(&row.id))
                 .map(monitor_view::RowNote::Attention)
         }
         .or_else(|| {
-            (no_code.is_none() && data.needs_attention(row))
+            (incident.is_none() && data.needs_attention(row))
                 .then(|| monitor_view::RowNote::Attention(row.status_words().to_owned()))
         })
         .or_else(|| parent.map(monitor_view::RowNote::Under));
-        // The second line: the attention sentence, else the work line of a
-        // controlled Agent that has not stopped (`docs/spec/monitoring.md`,
-        // Git-aware work summary). A failed or lost one shows it only when
-        // measured: its Git is never read again, so a reason would stay.
-        let line = match no_code {
-            Some(incident) => {
-                let text = incident.words(now);
-                Some(monitor_view::RowLine {
-                    words: format!("needs attention: {text}"),
-                    text,
-                    attention: true,
-                })
-            }
-            None => row
-                .work
+        // The second line leads with the active incident, then the
+        // projected status, then measured work.
+        let group = row.group(data.incident(row));
+        let line = if let Some(incident) = incident {
+            let text = incident.words(now);
+            Some(monitor_view::RowLine {
+                words: format!("needs attention: {text}"),
+                text,
+                attention: true,
+            })
+        } else if let Some(status) = &row.status_line {
+            Some(monitor_view::RowLine {
+                text: status.clone(),
+                words: status.clone(),
+                attention: group == monitor::Group::Attention,
+            })
+        } else {
+            row.work
                 .as_ref()
                 .filter(|work| {
                     !row.native_child
@@ -459,10 +459,9 @@ impl DesktopApp {
                     text: monitor::work_line(work, now),
                     words: monitor::work_words(work, now),
                     attention: false,
-                }),
+                })
         };
         let quiet = row.quiet(now);
-        let group = row.group(data.incident(row));
         // A failure, an unconfirmed outcome or a wait for the owner keeps
         // its own mark in any group (a native subagent's failure sits under
         // Recently stopped); otherwise the group decides, a start excepted.

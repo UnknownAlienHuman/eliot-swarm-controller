@@ -13,7 +13,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use eliot_core::{
-    ContextItem, ContextOutcome, Error, InjectPoint, Result, SecretPolicy, TurnUsage,
+    ContextItem, ContextOutcome, Error, InjectPoint, ProviderRestrictionKind, Result, SecretPolicy,
+    TurnUsage,
+    api::{AGENT_NOTICE_MESSAGE_CHARS, NativeNotice, NativeNoticeKind},
     limits::MAX_TOOL_COMMAND_BYTES,
 };
 use eliot_plugin::{
@@ -46,8 +48,8 @@ use crate::native::{
         AgentSelectedData, AssistantContent, AssistantTokens, EliotContextHook,
         EliotContextResolveInput, ExecutionEventData, FormCancelledData, FormCreatedData,
         FormRepliedData, InboxEventData, Message, ModelRef, ModelSelectedData, PermissionAskedData,
-        PermissionRepliedData, SessionLifecycleData, SseEnvelope, StepStartedData, StructuredError,
-        ToolEventData, ToolFailedData, ToolInputStartedData,
+        PermissionRepliedData, RetryScheduledData, SessionLifecycleData, SseEnvelope,
+        StepStartedData, StructuredError, ToolEventData, ToolFailedData, ToolInputStartedData,
     },
 };
 
@@ -947,6 +949,7 @@ impl EventProcessor {
             "session.execution.succeeded"
                 | "session.execution.failed"
                 | "session.execution.interrupted"
+                | "session.retry.scheduled"
                 | "session.step.started"
                 | "session.tool.input.started"
                 | "session.tool.called"
@@ -1594,6 +1597,11 @@ impl EventProcessor {
     }
 
     async fn process_envelope(&mut self, envelope: SseEnvelope) -> Result<()> {
+        let next_retry = envelope.event_type == "session.retry.scheduled"
+            && envelope.durable.as_ref().is_some_and(|durable| {
+                self.expected_seq == Some(durable.seq)
+                    && self.status.session_id.as_deref() == Some(durable.aggregate_id.as_str())
+            });
         self.check_sequence(&envelope).await?;
         match envelope.event_type.as_str() {
             "server.connected" => {
@@ -1606,6 +1614,9 @@ impl EventProcessor {
             "session.inbox.delivered" => self.observe_inbox(&envelope.data, true).await,
             "session.inbox.cancelled" => self.observe_inbox_cancelled(&envelope.data).await,
             "session.execution.started" => self.observe_execution_started(&envelope).await,
+            "session.retry.scheduled" if next_retry => {
+                self.observe_retry_scheduled(&envelope).await
+            }
             "session.step.started" => {
                 if self.status.active_turn_id.is_some()
                     && let Ok(step) = serde_json::from_value::<StepStartedData>(envelope.data)
@@ -1635,6 +1646,45 @@ impl EventProcessor {
             // never gaps.
             _ => Ok(()),
         }
+    }
+
+    async fn observe_retry_scheduled(&mut self, envelope: &SseEnvelope) -> Result<()> {
+        let (Some(turn_id), Ok(retry)) = (
+            self.status.active_turn_id.clone(),
+            serde_json::from_value::<RetryScheduledData>(envelope.data.clone()),
+        ) else {
+            return Ok(());
+        };
+        if self.status.session_id.as_deref() != Some(retry.session_id.as_str()) {
+            return Ok(());
+        }
+        let secrets = SecretPolicy::new(self.secrets.iter().cloned());
+        let message = secrets.redact_text(&retry.error.message);
+        let message = message.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut chars = message.chars();
+        let message: String = chars.by_ref().take(AGENT_NOTICE_MESSAGE_CHARS).collect();
+        let notice = NativeNotice {
+            turn_id,
+            kind: NativeNoticeKind::Retrying,
+            provider_kind: match retry.error.error_type.as_str() {
+                "provider.rate-limit" => Some(ProviderRestrictionKind::RateLimit),
+                "provider.quota" => Some(ProviderRestrictionKind::Quota),
+                _ => None,
+            },
+            message: (!message.is_empty()).then_some(message),
+            truncated: chars.next().is_some(),
+        };
+        let native_id = event_id(
+            &retry.session_id,
+            &notice.turn_id,
+            &envelope.id,
+            "turn.notice",
+            "opencode",
+            "OpenCode",
+        )?;
+        let data = serde_json::to_value(notice)
+            .map_err(|_| Error::new("internal", "OpenCode retry notice could not be encoded"))?;
+        self.commit_event("turn.notice", native_id, data).await
     }
 
     /// Durable envelopes of our session aggregate carry a contiguous

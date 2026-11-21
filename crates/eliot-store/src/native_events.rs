@@ -1,5 +1,243 @@
+use super::status_views::AgentStatusLookup;
 use super::*;
 use eliot_core::{is_request_reply_verb, is_start_verb};
+use std::collections::HashMap;
+
+const AGENT_NOTICE_BATCH_SQL: &str = "WITH request AS (
+        SELECT CAST(json_extract(value, '$[0]') AS INTEGER) AS agent,
+               CAST(json_extract(value, '$[1]') AS INTEGER) AS generation,
+               json_extract(value, '$[2]') AS active_turn,
+               CAST(json_extract(value, '$[3]') AS INTEGER) AS last_progress_at
+        FROM json_each(?1)
+    ), targets AS MATERIALIZED (
+        SELECT r.agent, r.generation, r.active_turn, r.last_progress_at,
+               COALESCE(r.active_turn,
+                        CASE WHEN json_type(t.data, '$.turn_id') = 'text'
+                             THEN json_extract(t.data, '$.turn_id') END) AS turn_id,
+               t.kind AS latest_kind, t.ts AS latest_ts, t.data AS latest_data
+        FROM request AS r
+        LEFT JOIN events AS t ON t.seq = (
+            SELECT e.seq FROM events AS e INDEXED BY events_agent
+            WHERE r.active_turn IS NULL
+              AND e.agent = r.agent AND e.generation = r.generation
+              AND e.kind IN ('turn.started', 'turn.completed', 'turn.unknown')
+            ORDER BY e.seq DESC LIMIT 1
+        )
+    )
+    SELECT t.agent, t.generation, t.active_turn, t.last_progress_at,
+           t.turn_id, t.latest_kind, t.latest_ts, t.latest_data,
+           n.ts, n.data
+    FROM targets AS t
+    LEFT JOIN events AS n ON n.seq = (
+        SELECT e.seq FROM events AS e INDEXED BY events_agent
+        WHERE t.turn_id IS NOT NULL AND e.agent = t.agent AND e.generation = t.generation
+          AND e.kind = 'turn.notice'
+          AND json_extract(e.data, '$.turn_id') = t.turn_id
+        ORDER BY e.seq DESC LIMIT 1
+    )";
+
+pub(super) struct NativeNoticeRead {
+    pub(super) notice: core::api::AgentNativeNotice,
+    pub(super) provider_failure: bool,
+}
+
+/// Resolve each requested Agent's latest relevant notice in one page-scoped
+/// query over the existing `(agent, seq)` event index.
+pub(super) fn agent_native_notices(
+    connection: &Connection,
+    lookups: &[AgentStatusLookup],
+) -> Result<Vec<Option<NativeNoticeRead>>> {
+    if lookups.is_empty() {
+        return Ok(Vec::new());
+    }
+    let request_rows: Vec<_> = lookups
+        .iter()
+        .map(|lookup| {
+            (
+                lookup.agent_num,
+                lookup.generation,
+                lookup.active_turn.as_deref(),
+                lookup.last_progress_at,
+            )
+        })
+        .collect();
+    let encoded = encode_json(&request_rows)?;
+    let mut statement = connection
+        .prepare(AGENT_NOTICE_BATCH_SQL)
+        .map_err(sql_error)?;
+    let rows = statement
+        .query_map(params![encoded], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<i64>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+            ))
+        })
+        .map_err(sql_error)?;
+
+    let mut notices = HashMap::with_capacity(lookups.len());
+    for row in rows {
+        let (
+            agent_num,
+            generation,
+            active_turn,
+            last_progress_at,
+            turn_id,
+            latest_kind,
+            latest_ts,
+            latest_data,
+            notice_ts,
+            notice_data,
+        ) = row.map_err(sql_error)?;
+        let latest_turn_data = if active_turn.is_none() {
+            latest_data.as_deref().map(decode_json).transpose()?
+        } else {
+            None
+        };
+        let completed = active_turn.is_none() && latest_kind.as_deref() == Some("turn.completed");
+        let terminal_outcome = latest_turn_data
+            .as_ref()
+            .and_then(|data| data.get("outcome"))
+            .and_then(Value::as_str);
+        if completed && terminal_outcome != Some("failure") {
+            notices.insert((agent_num, generation), None);
+            continue;
+        }
+        let mut notice = None;
+        if let Some(turn_id) = turn_id.as_deref() {
+            if completed
+                && let (Some(ts), Some(data)) = (latest_ts, latest_turn_data.as_ref())
+                && let Some(terminal) = terminal_native_notice(generation, ts, turn_id, data)
+            {
+                terminal.validate()?;
+                notice = Some(terminal);
+            }
+            if notice.is_none() {
+                notice = native_notice_from_event(generation, turn_id, notice_ts.zip(notice_data))?;
+            }
+        }
+        if active_turn.is_some()
+            && notice.as_ref().is_some_and(|notice| {
+                last_progress_at.is_some_and(|progress| progress > notice.observed_at)
+            })
+        {
+            notice = None;
+        }
+        let provider_origin = latest_turn_data
+            .as_ref()
+            .and_then(|data| data.get("origin"))
+            .and_then(Value::as_str)
+            == Some(core::FailureOrigin::Provider.as_str());
+        notices.insert(
+            (agent_num, generation),
+            notice.map(|notice| NativeNoticeRead {
+                provider_failure: provider_origin || notice.provider_kind.is_some(),
+                notice,
+            }),
+        );
+    }
+
+    lookups
+        .iter()
+        .map(|lookup| {
+            notices
+                .remove(&(lookup.agent_num, lookup.generation))
+                .ok_or_else(|| Error::new("internal", "Agent notice page is incomplete"))
+        })
+        .collect()
+}
+
+fn native_notice_from_event(
+    generation: i64,
+    turn_id: &str,
+    event: Option<(i64, String)>,
+) -> Result<Option<eliot_core::api::AgentNativeNotice>> {
+    let Some((ts, raw)) = event else {
+        return Ok(None);
+    };
+    let data: Value = decode_json(&raw)?;
+    let notice: eliot_core::api::NativeNotice = serde_json::from_value(data)
+        .map_err(|_| Error::new("source_integrity", "retained native notice is invalid"))?;
+    notice.validate()?;
+    if notice.turn_id != turn_id {
+        return Err(Error::new(
+            "source_integrity",
+            "retained native notice turn binding changed",
+        ));
+    }
+    let (message, truncated) = bounded_notice_message(notice.message.as_deref(), notice.truncated);
+    let view = eliot_core::api::AgentNativeNotice {
+        generation,
+        turn_id: notice.turn_id,
+        kind: notice.kind,
+        provider_kind: notice.provider_kind,
+        message,
+        truncated,
+        observed_at: ts,
+    };
+    view.validate()?;
+    Ok(Some(view))
+}
+
+fn terminal_native_notice(
+    generation: i64,
+    ts: i64,
+    turn_id: &str,
+    data: &Value,
+) -> Option<eliot_core::api::AgentNativeNotice> {
+    let error = data.get("native_error")?;
+    let message = error.get("message").and_then(Value::as_str);
+    let truncated = error
+        .get("truncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let (message, truncated) = bounded_notice_message(message, truncated);
+    Some(eliot_core::api::AgentNativeNotice {
+        generation,
+        turn_id: turn_id.to_owned(),
+        kind: eliot_core::api::NativeNoticeKind::Error,
+        provider_kind: data
+            .get("provider_restriction")
+            .and_then(|value| {
+                serde_json::from_value::<eliot_core::ProviderRestriction>(value.clone()).ok()
+            })
+            .map(|restriction| restriction.kind),
+        message,
+        truncated,
+        observed_at: ts,
+    })
+}
+
+fn bounded_notice_message(
+    message: Option<&str>,
+    already_truncated: bool,
+) -> (Option<String>, bool) {
+    let Some(message) = message else {
+        return (None, already_truncated);
+    };
+    let normalized: String = message
+        .chars()
+        .filter(|character| !character.is_control() || character.is_whitespace())
+        .collect();
+    let normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return (None, already_truncated);
+    }
+    let mut chars = normalized.chars();
+    let bounded = chars
+        .by_ref()
+        .take(eliot_core::api::AGENT_NOTICE_MESSAGE_CHARS)
+        .collect::<String>();
+    let truncated = already_truncated || chars.next().is_some();
+    (Some(bounded), truncated)
+}
 
 pub(super) struct PendingCommandEvent {
     pub(super) command_id: String,

@@ -33,6 +33,7 @@ impl DesktopApp {
                         generation: binding.generation,
                         harness: detail.harness.clone(),
                         state: detail.state,
+                        status_line: None,
                         project_id: detail.project.clone(),
                         project_scope: None,
                         repo_common_dir: None,

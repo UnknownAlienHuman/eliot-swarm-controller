@@ -1129,6 +1129,14 @@ pub(crate) fn print_agent_table(
                 truncate_cell(&work_cell(summary), 22),
             );
         }
+        if let Some(status) = eliot_core::api::agent_status_line(
+            summary.active_turn.as_deref(),
+            summary.provider_hold.as_ref(),
+            summary.native_notice.as_ref(),
+            now_ms,
+        ) {
+            println!("       {status}");
+        }
     }
     if response.agents.is_empty() {
         if rejected_rows == 0 {
