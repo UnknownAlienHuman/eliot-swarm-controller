@@ -1916,7 +1916,7 @@ pub(crate) async fn reader_executable(
     let agy = harness == "antigravity";
     blocking_discovery(deadline, move || {
         let cmd = resolve_native_executable(&cmd, agy)?;
-        let version = probe_native_version(&cmd, agy, deadline)?;
+        let version = probe_optional_native_version(&cmd, agy, deadline)?;
         if agy && version.is_none() {
             return Err(antigravity_capability_error());
         }
@@ -1982,7 +1982,7 @@ pub(crate) fn harness_installation(harness: &str, deadline: Instant) -> Value {
         let discovered = discover_cmd_for_harness(harness, deadline)?;
         let agy = harness == "antigravity";
         let cmd = resolve_native_executable(discovered.as_deref().unwrap_or("codex"), agy)?;
-        let version = probe_native_version(&cmd, agy, deadline)?;
+        let version = probe_optional_native_version(&cmd, agy, deadline)?;
         if agy && version.is_none() {
             return Err(antigravity_capability_error());
         }
@@ -2040,6 +2040,13 @@ enum VersionProbeRole {
     Cached(Option<String>),
     Leader(std::sync::Arc<InflightVersionProbe>),
     Follower(std::sync::Arc<InflightVersionProbe>),
+}
+
+fn probe_optional_native_version(program: &str, agy: bool, deadline: Instant) -> VersionResult {
+    match probe_native_version(program, agy, deadline) {
+        Err(error) if error.code == "timeout" && Instant::now() < deadline => Ok(None),
+        result => result,
+    }
 }
 
 fn probe_native_version(program: &str, agy: bool, deadline: Instant) -> VersionResult {
