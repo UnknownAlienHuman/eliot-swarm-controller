@@ -22,6 +22,8 @@ use crate::{
     session::without_verbatim_prefix,
 };
 
+const ISOLATED_GEMINI_SCOPE: &str = ":isolated-gemini:";
+
 pub(crate) struct Plan {
     pub launch: NativeLaunch,
     pub policy: SecretPolicy,
@@ -237,40 +239,6 @@ impl Plan {
         let mut secrets = environment.secrets;
         secrets.push(credential.to_owned());
         secrets.push(hook_token.to_owned());
-        let mcp_root = if mcp_policy == eliot_core::McpPolicy::Minimal {
-            if !params
-                .agent_id
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
-            {
-                return Err(Error::new(
-                    "invalid",
-                    "Antigravity Agent id cannot name a config directory",
-                ));
-            }
-            Some(
-                hook_discovery_dir
-                    .parent()
-                    .ok_or_else(|| {
-                        Error::new("invalid", "Antigravity config parent is unavailable")
-                    })?
-                    .join(format!("{}-agy", params.agent_id)),
-            )
-        } else {
-            None
-        };
-        let mut scope = config_scope(&environment.variables)?;
-        if let Some(root) = &mcp_root {
-            let root = root.to_string_lossy();
-            scope.push_str(&format!(
-                ":isolated-gemini:{}",
-                if cfg!(windows) {
-                    root.to_lowercase()
-                } else {
-                    root.into_owned()
-                }
-            ));
-        }
         let resume = params
             .resume_from
             .as_ref()
@@ -284,6 +252,42 @@ impl Plan {
                 )
             })
             .transpose()?;
+        let mut scope = config_scope(&environment.variables)?;
+        let mcp_root = if mcp_policy == eliot_core::McpPolicy::Minimal {
+            if !params
+                .agent_id
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+            {
+                return Err(Error::new(
+                    "invalid",
+                    "Antigravity Agent id cannot name a config directory",
+                ));
+            }
+            let parent = hook_discovery_dir
+                .parent()
+                .ok_or_else(|| Error::new("invalid", "Antigravity config parent is unavailable"))?;
+            Some(isolated_gemini_root(
+                parent,
+                &params.agent_id,
+                params.generation,
+                &scope,
+                resume.as_ref().map(|subject| subject.native_scope.as_str()),
+            )?)
+        } else {
+            None
+        };
+        if let Some(root) = &mcp_root {
+            let root = root.to_string_lossy();
+            scope.push_str(&format!(
+                "{ISOLATED_GEMINI_SCOPE}{}",
+                if cfg!(windows) {
+                    root.to_lowercase()
+                } else {
+                    root.into_owned()
+                }
+            ));
+        }
         if resume
             .as_ref()
             .is_some_and(|subject| subject.native_scope != scope)
@@ -599,6 +603,54 @@ fn config_scope(environment: &[(OsString, OsString)]) -> Result<String> {
     serde_json::to_string(&paths)
         .map(|paths| format!("antigravity-config:{paths}"))
         .map_err(|_| Error::new("internal", "Could not encode Antigravity config namespace"))
+}
+
+/// Fresh generations own new roots. Resume selects only an earlier root for
+/// this Agent under the current private parent. Plan::new then verifies the
+/// full scope, including the environment and private parent.
+fn isolated_gemini_root(
+    parent: &Path,
+    agent: &str,
+    generation: i64,
+    base_scope: &str,
+    retained_scope: Option<&str>,
+) -> Result<PathBuf> {
+    let Some(retained_scope) = retained_scope else {
+        return Ok(parent.join(format!("{agent}-g{generation}-agy")));
+    };
+    let mismatch = || {
+        Error::new(
+            "profile_error",
+            "Antigravity resume scope differs from the selected config namespace",
+        )
+    };
+    let root = retained_scope
+        .strip_prefix(base_scope)
+        .and_then(|scope| scope.strip_prefix(ISOLATED_GEMINI_SCOPE))
+        .ok_or_else(mismatch)?;
+    let name = Path::new(root)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(mismatch)?;
+    let scope_agent = if cfg!(windows) {
+        agent.to_ascii_lowercase()
+    } else {
+        agent.to_owned()
+    };
+    let suffix = name
+        .strip_prefix(&scope_agent)
+        .and_then(|name| name.strip_suffix("-agy"))
+        .ok_or_else(mismatch)?;
+    if suffix.is_empty() {
+        // Legacy isolated sessions used the Agent ID without a generation.
+        return Ok(parent.join(format!("{agent}-agy")));
+    }
+    let origin = suffix
+        .strip_prefix("-g")
+        .and_then(|number| number.parse::<i64>().ok())
+        .filter(|origin| (1..generation).contains(origin))
+        .ok_or_else(mismatch)?;
+    Ok(parent.join(format!("{agent}-g{origin}-agy")))
 }
 
 /// A resolved `configure` target: the effective native selectors the

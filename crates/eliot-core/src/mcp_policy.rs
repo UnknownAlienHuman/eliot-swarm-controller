@@ -148,21 +148,9 @@ pub fn parse_snapshot_allow_list(
     }
 }
 
-/// Owner Swarm MCP server identity: a transport shape, not an entry name.
-/// A renamed owner entry (`swarm`, `owner-tools`, ...) is still the owner's
-/// daemon identity when its transport matches this rule; the Agent-scoped
-/// server Eliot generates is the only Swarm server a worker ever gets.
-///
-/// Stdio matches Swarm and `mcp` in the command or arguments unless the Agent
-/// flag is present. Shell text naming Swarm and missing argument readback
-/// cannot prove Agent scope.
-///
-/// HTTP matches the configured cloud host or a recognizable Swarm host when
-/// the snapshot lacks the hostname.
-///
-/// Owning contract: `docs/spec/configuration.md` worker MCP policy. Every
-/// harness plugin applies this rule in every policy, regardless of the
-/// configured entry name or any allow list.
+/// Best-effort config guard for direct Owner Swarm transports. Shell scripts
+/// and environment expansions are outside the scan. The owning contract is
+/// the worker MCP policy in `docs/spec/configuration.md`.
 pub fn is_owner_swarm_server(
     command: Option<&str>,
     args: Option<&[String]>,
@@ -182,24 +170,29 @@ pub fn is_owner_swarm_stdio(
     args: Option<&[String]>,
     controller_executable: Option<&str>,
 ) -> bool {
-    let mut swarm = false;
-    let mut shell = false;
-    let mut mcp = false;
-    let mut require_agent = false;
-    for text in command
-        .into_iter()
-        .chain(args.into_iter().flatten().map(String::as_str))
-    {
-        swarm |= is_swarm_executable_token(text, controller_executable);
-        shell |= is_shell_command(text);
-        for word in command_words(text) {
-            swarm |= is_swarm_executable_token(word, controller_executable);
-            shell |= is_shell_command(word);
-            mcp |= word == "mcp";
-            require_agent |= word == "--require-agent";
+    let Some(command) = command else {
+        return false;
+    };
+    let (program, mut inline) = command_parts(command, controller_executable);
+    if !is_swarm_executable_token(program, controller_executable) {
+        return false;
+    }
+    let mut argv = std::iter::from_fn(|| next_command_word(&mut inline))
+        .chain(args.into_iter().flatten().map(String::as_str));
+    // Recognize the subcommand after Swarm's global options. An option value
+    // named "mcp" is ordinary data.
+    while let Some(word) = argv.next() {
+        match word {
+            "mcp" => return !argv.any(|arg| arg == "--require-agent"),
+            "--data-dir" | "--id" => {
+                argv.next();
+            }
+            "--json" => (),
+            word if word.starts_with("--data-dir=") || word.starts_with("--id=") => (),
+            _ => return false,
         }
     }
-    swarm && (shell || ((mcp || args.is_none()) && !require_agent))
+    false
 }
 
 /// Match the configured cloud host. With no hostname, reject hosts with a
@@ -223,8 +216,10 @@ pub fn is_owner_swarm_http(url: Option<&str>, cloud_mcp_hostname: Option<&str>) 
 /// without `.exe`, any case) or equality with the active controller binary
 /// path (covers a renamed controller binary). Empty commands never match.
 pub fn is_swarm_executable_command(command: &str, controller_executable: Option<&str>) -> bool {
-    is_swarm_executable_token(command, controller_executable)
-        || command_words(command).any(|word| is_swarm_executable_token(word, controller_executable))
+    is_swarm_executable_token(
+        command_parts(command, controller_executable).0,
+        controller_executable,
+    )
 }
 
 fn is_swarm_executable_token(command: &str, controller_executable: Option<&str>) -> bool {
@@ -243,25 +238,35 @@ fn is_swarm_executable_token(command: &str, controller_executable: Option<&str>)
     }
 }
 
-// Scan literal tokens in argv and shell text without interpreting shell
-// expansions. A backslash can be a Windows path separator.
-fn command_words(text: &str) -> impl Iterator<Item = &str> {
-    text.split(|c: char| {
-        c.is_whitespace()
-            || matches!(
-                c,
-                '\'' | '"' | '`' | '&' | '|' | ';' | '(' | ')' | '<' | '>'
-            )
-    })
-    .filter(|word| !word.is_empty())
+fn command_parts<'a>(command: &'a str, controller: Option<&str>) -> (&'a str, &'a str) {
+    if controller.is_some_and(|path| {
+        !path.is_empty() && normalize_executable_path(command) == normalize_executable_path(path)
+    }) {
+        return (command, "");
+    }
+    let mut tail = command;
+    (next_command_word(&mut tail).unwrap_or_default(), tail)
 }
 
-fn is_shell_command(text: &str) -> bool {
-    let name = command_file_name(text).to_ascii_lowercase();
-    matches!(
-        name.strip_suffix(".exe").unwrap_or(&name),
-        "cmd" | "powershell" | "pwsh" | "sh" | "bash" | "dash" | "zsh" | "ksh" | "ash" | "fish"
-    )
+// Only the direct command string needs tokenization. Native argv is already
+// split, and its values need no interpretation.
+fn next_command_word<'a>(tail: &mut &'a str) -> Option<&'a str> {
+    let text = tail.trim_start();
+    *tail = "";
+    if text.is_empty() {
+        return None;
+    }
+    if let Some(quote) = text.chars().next().filter(|c| matches!(c, '\'' | '"')) {
+        let (word, rest) = text[1..].split_once(quote)?;
+        if rest.starts_with(char::is_whitespace) || rest.is_empty() {
+            *tail = rest;
+            return Some(word);
+        }
+        return None;
+    }
+    let (word, rest) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
+    *tail = rest;
+    Some(word)
 }
 
 /// Whether `url` points at `hostname`: the parsed URL host equals the

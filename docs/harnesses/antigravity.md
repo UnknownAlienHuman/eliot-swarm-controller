@@ -400,10 +400,10 @@ field. See the vendor docs for [MCP](https://antigravity.google/docs/mcp),
 [plugin MCP servers](https://antigravity.google/docs/build-plugins/#mcp-servers)
 and [customization discovery](https://antigravity.google/docs/customization-discovery/).
 
-Before launch and resume the daemon checks the user, workspace and standard
-plugin MCP files for Owner Swarm transports and reserved Swarm names.
-This check includes disabled entries and the Gemini CLI `httpUrl` spelling.
-AGY documents `serverUrl` and `url` for remote connections.
+Before launch and resume the daemon checks enabled entries in the user,
+workspace and standard plugin MCP files for direct Owner Swarm transports
+and reserved Swarm names. AGY suspends connections for `disabled: true`.
+The scan recognizes AGY's `serverUrl` and `url` and Gemini CLI's `httpUrl` spelling.
 AGY 1.5.14 has no documented per-session exclusion for an individual
 discovered server. A match refuses startup and identifies the server and file.
 Plugin manifests or personal customization redirects that the daemon cannot
@@ -415,15 +415,16 @@ When a user entry is allow-listed, a workspace entry with the same name
 refuses startup. The daemon atomically publishes the prepared MCP file in the
 private instance directory and removes abandoned MCP temporary files at startup.
 The plugin installs that prepared file at
-`<private-plugins>/<Agent>-agy/config/mcp_config.json` and selects the root with
+`<private-plugins>/<Agent>-g<generation>-agy/config/mcp_config.json` and selects the root with
 `acp --gemini-dir`. Exclusion of the user MCP file and user plugins from the
 effective ACP session inventory is unverified. Workspace MCP servers outside the allow list, workspace
 plugin directories or manifests, and personal customization directory redirects
 refuse startup with the source path when the CLI cannot suppress them.
 A missing allowed name or an allowed owner Swarm transport also refuses startup.
 
-The private Gemini root persists as part of the native scope for exact resume.
-Fresh starts clear a stale private root before installing the prepared file.
+Fresh starts create a new root for their generation and refuse an occupied
+root. The native scope retains the original root for exact resume, including
+older sessions with an `<Agent>-agy` root.
 The plugin removes the staged MCP file after native exit and retains native
 conversations. `inherit` resumes in the original native store. The private
 Gemini root is outside the `--add-dir` workspace roots. `--app-data-dir` stays

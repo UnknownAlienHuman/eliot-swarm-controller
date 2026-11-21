@@ -278,10 +278,25 @@ impl Sources<'_> {
                 )
             })?;
             let allowed = self.allow.contains(name);
+            if minimal && allowed {
+                if source == Source::Global {
+                    self.global_names.insert(name.clone());
+                } else if self.global_names.contains(name) {
+                    return Err(mcp_refusal(
+                        "Antigravity minimal refuses workspace override of global MCP server",
+                        name,
+                        path,
+                    ));
+                }
+            }
+            // AGY suspends disabled entries before connecting any server.
+            if table.get("disabled") == Some(&Value::Bool(true)) {
+                continue;
+            }
             let (command, args) =
                 owner_scan::project_string_command_args(table.get("command"), table.get("args"));
             // AGY documents serverUrl and url. Scan the Gemini CLI spelling
-            // too, and check each supplied alias before considering disabled.
+            // too, and check each supplied alias.
             let owner_http = ["serverUrl", "url", "httpUrl"]
                 .iter()
                 .filter_map(|key| table.get(*key).and_then(Value::as_str))
@@ -299,20 +314,6 @@ impl Sources<'_> {
                     name,
                     path,
                 ));
-            }
-            if minimal && allowed {
-                if source == Source::Global {
-                    self.global_names.insert(name.clone());
-                } else if self.global_names.contains(name) {
-                    return Err(mcp_refusal(
-                        "Antigravity minimal refuses workspace override of global MCP server",
-                        name,
-                        path,
-                    ));
-                }
-            }
-            if table.get("disabled") == Some(&Value::Bool(true)) {
-                continue;
             }
             if minimal && !allowed {
                 if source == Source::Workspace {

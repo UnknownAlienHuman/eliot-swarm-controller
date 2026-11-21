@@ -359,13 +359,17 @@ endpoints stay `unsupported`. See the
 Every profile selects a worker MCP policy in `mcp`: `minimal` (the default
 where the harness maps it) or `inherit` (explicit opt-in, and the default for
 Muse, which has no minimal mapping), plus an optional `mcp_allow` list of native
-server names. Where a harness filters native sources, it identifies Owner
-transports with `eliot_core::is_owner_swarm_server`. The rule scans literal
-command and argument words for `swarm`, `swarm.exe` or the active controller
-binary and `mcp` without the `--require-agent` flag. Shell text naming Swarm
-also matches. HTTP matches the configured `cloud_mcp` hostname, or a Swarm
-service label when the hostname is absent. The owner endpoint carries Owner
-authority through Access. The server Eliot generates always carries `--require-agent`
+server names. Antigravity, Claude, and OpenCode scan MCP configuration as a
+best-effort guard for direct Owner entries. Daemon authentication owns the
+authority boundary. The shared rule checks the executable of a direct
+invocation for `swarm`, `swarm.exe`, or the active controller binary, then
+matches the `mcp` subcommand without `--require-agent`. Shell scripts, command
+wrappers, and variable expansion are outside the scan.
+HTTP matches the configured `cloud_mcp` hostname exactly, ignoring case and
+trailing dots. With no configured hostname, it matches a parsed host
+containing an exact DNS label `swarm`, `eliot-swarm`, or `eliot_swarm`.
+The owner endpoint carries Owner authority through Access.
+The server Eliot generates always carries `--require-agent`
 and requires the generation-bound Agent credential. Swarm MCP names
 (`eliot_swarm`, `eliot-swarm` and the per-session prefixes) are reserved and
 cannot be allow-listed. A renamed Owner entry still matches by transport.
@@ -398,9 +402,8 @@ Agent-scoped server and the explicitly allowed native servers.
   transport-carrying per-run `-c` override (exact owner names stay covered
   by synthetic transport-carrying stubs as backstop). An allow-listed name
   that matches the identity is rejected at launch (`profile_error`)
-  instead of re-admitted. An entry whose argument vector the native layer
-  does not report counts as unknown and fails closed toward suppression;
-  an absent vector means the entry carries no argv. `minimal` additionally
+  instead of re-admitted. Matching a direct stdio transport requires a
+  visible `mcp` subcommand. `minimal` additionally
   disables every other non-allowed entry, the known MCP-serving bundled
   plugins (`computer-use`, `unified-computer-use`, `codex-app-tools`) when
   present and enabled, and the ChatGPT-backed Apps runtime (`codex_apps`)
@@ -429,8 +432,8 @@ Agent-scoped server and the explicitly allowed native servers.
   Agent-scoped entry connected.
 - Antigravity bootstrap profiles use `inherit`. Explicit and legacy `inherit`
   preserve user and workspace discovery, including standard plugin sources,
-  after the daemon checks their MCP files for Owner Swarm transports and
-  reserved names. Without a native per-session exclusion, a match refuses
+  after the daemon checks enabled entries for direct Owner Swarm transports
+  and reserved names. Without a native per-session exclusion, a match refuses
   startup and identifies the server and file. Uncheckable discovery redirects
   refuse startup and identify the declaring file. Swarm adds its
   generation-bound Agent bridge through ACP session setup. For `minimal`,
@@ -438,8 +441,9 @@ Agent-scoped server and the explicitly allowed native servers.
   files and rejects missing names, Owner Swarm transports, and workspace
   entries that duplicate allow-listed global names. The daemon atomically
   publishes the prepared file. The plugin installs
-  the prepared file under an Agent-owned Gemini root selected via `acp --gemini-dir`.
-  The root persists for exact resume. Exclusion of user MCP and plugin sources
+  the prepared file under a generation-named Gemini root selected via
+  `acp --gemini-dir`. Fresh launches create their own root and exact resume
+  reuses the retained session's root. Exclusion of user MCP and plugin sources
   from the effective ACP inventory is unverified.
   A workspace MCP server outside the allow list, a workspace plugin source, or
   a personal customization directory redirect refuses startup with its source

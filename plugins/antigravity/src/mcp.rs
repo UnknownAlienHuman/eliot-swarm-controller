@@ -47,18 +47,12 @@ pub(crate) fn install(plan: &Plan, instance: &Path) -> Result<Option<OwnedConfig
     }
     match fs::create_dir(root) {
         Ok(()) => (),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists && plan.resume().is_some() => {}
         Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-            check_root(root)?;
-            if plan.resume().is_none() {
-                // This fresh launch owns the Agent's private slot and has no
-                // retained session to load. Never follow a redirected root.
-                fs::remove_dir_all(root).map_err(|_| {
-                    Error::new("io_error", "Could not clear stale Antigravity MCP root")
-                })?;
-                fs::create_dir(root).map_err(|_| {
-                    Error::new("io_error", "Could not recreate owned Antigravity MCP root")
-                })?;
-            }
+            return Err(Error::new(
+                "already_exists",
+                "Fresh Antigravity MCP root already exists for this generation",
+            ));
         }
         Err(_) => {
             return Err(Error::new(
