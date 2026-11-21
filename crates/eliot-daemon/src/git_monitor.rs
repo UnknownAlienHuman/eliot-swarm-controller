@@ -1124,6 +1124,10 @@ impl GitProbe {
             ("gc.auto", "0"),
             ("maintenance.auto", "false"),
             ("color.ui", "false"),
+            // Under core.autocrlf a dirty LF file makes Git warn about CRLF
+            // conversion on stderr, which the leaf fence would read as a
+            // failed probe. Reads never write, so the warning is dropped.
+            ("core.safecrlf", "false"),
         ] {
             command.arg("-c").arg(format!("{key}={value}"));
         }
