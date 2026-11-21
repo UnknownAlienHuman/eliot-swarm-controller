@@ -6,6 +6,7 @@ mod assignment;
 mod canonical;
 mod capacity;
 mod launch_queue;
+mod online_backup;
 pub use launch_queue::{ArbitratedTimer, PendingLaunch, TimerWait};
 mod cleanup;
 pub use cleanup::{CleanupInventoryPage, cleanup_worktree_command_id};
@@ -1184,6 +1185,13 @@ impl Store {
             )
             .map_err(sql_error)?;
         Ok(active || self.count_unsettled_commands_excluding_retained()? != 0)
+    }
+
+    /// Freeze the old writer before handing a backup to the replacement.
+    pub fn seal_for_restart(&self) -> Result<()> {
+        self.connection
+            .pragma_update(None, "query_only", true)
+            .map_err(sql_error)
     }
 
     /// Total unsettled commands ignoring the drain list bound and the page

@@ -26,6 +26,7 @@ pub(crate) mod scripts;
 mod setup;
 mod skill;
 pub mod startup;
+mod update_backup;
 mod workspace_git;
 mod workspaces;
 

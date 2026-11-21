@@ -19,6 +19,7 @@ fn main() -> ExitCode {
             serde_json::json!({
                 "version": concat!("swarm ", env!("CARGO_PKG_VERSION")),
                 "store_schema": eliot_daemon::operator::STORE_SCHEMA_VERSION,
+                "backup_update": true,
             })
         );
         return ExitCode::SUCCESS;

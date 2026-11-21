@@ -4,7 +4,11 @@ use crate::platform::data_dir::DataDir;
 use eliot_core::{Error, Result};
 use std::path::{Path, PathBuf};
 
+pub use crate::daemon::run_for_update;
 pub use crate::platform::data_dir::{DaemonInfo, DaemonLock, OperatorLock};
+pub use crate::update_backup::{
+    discard_update_backup, lock_update_publication, restore_update_backup, update_backup_path,
+};
 pub const STORE_SCHEMA_VERSION: i64 = eliot_store::Store::SCHEMA_VERSION;
 
 pub fn daemon_info(path: &Path) -> Result<Option<DaemonInfo>> {

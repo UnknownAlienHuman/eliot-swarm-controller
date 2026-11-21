@@ -609,7 +609,7 @@ fn private_file_options() -> OpenOptions {
     options
 }
 
-fn create_new_private_file(path: &Path) -> std::io::Result<File> {
+pub(crate) fn create_new_private_file(path: &Path) -> std::io::Result<File> {
     #[cfg(windows)]
     {
         super::windows::create_private_file_new(path)
@@ -954,7 +954,7 @@ pub(crate) fn read_private_bytes(path: &Path, max: usize) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn replace_file(source: &Path, target: &Path) -> Result<()> {
+pub(crate) fn replace_file(source: &Path, target: &Path) -> Result<()> {
     #[cfg(windows)]
     {
         super::windows::replace_file(source, target)
@@ -965,7 +965,7 @@ fn replace_file(source: &Path, target: &Path) -> Result<()> {
     }
 }
 
-fn sync_directory(path: &Path) -> Result<()> {
+pub(crate) fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         File::open(path)

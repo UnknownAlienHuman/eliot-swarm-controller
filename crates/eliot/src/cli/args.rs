@@ -1059,6 +1059,8 @@ pub(crate) struct DaemonArgs {
     /// Run the daemon in this process instead of detaching it.
     #[arg(long)]
     pub(crate) foreground: bool,
+    #[arg(long, hide = true, requires = "foreground")]
+    pub(crate) upgrade_attempt: Option<String>,
     #[command(subcommand)]
     pub(crate) action: Option<DaemonAction>,
 }

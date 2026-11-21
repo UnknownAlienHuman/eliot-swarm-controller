@@ -142,6 +142,8 @@ pub struct DaemonShutdownRequest {
     pub mode: ShutdownMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restart_id: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub backup: bool,
 }
 
 impl DaemonShutdownRequest {
@@ -150,11 +152,18 @@ impl DaemonShutdownRequest {
             id: id.into(),
             mode,
             restart_id: None,
+            backup: false,
         }
     }
 
     pub fn validate(&self) -> Result<()> {
         validate_shutdown_id(&self.id)?;
+        if self.backup && self.mode != ShutdownMode::Restart {
+            return Err(Error::new(
+                "invalid",
+                "Store backup requires a committed restart",
+            ));
+        }
         match (self.mode, &self.restart_id) {
             (ShutdownMode::Restart | ShutdownMode::CancelRestart, Some(id)) => {
                 validate_shutdown_id(id)

@@ -2513,12 +2513,14 @@ success.
 ### Local operator commands
 
 **Daemon update (#836).** The local Owner supplies a release directory or
-Swarm executable. Both releases must report the same Store schema to permit
-rollback. The running daemon must support the planned-restart
+Swarm executable. Both releases must support Store backup updates. A schema
+downgrade is refused before the admission fence. The running daemon uses the planned-restart
 `daemon.shutdown` modes. `prepare_restart` records a bounded admission
 fence. The writer accepts `restart` under that fence only after admitted
 turns and workers finish. If the wait expires, `cancel_restart` reopens the
-same daemon. The fence also expires if its client disappears.
+same daemon. The fence also expires if its client disappears. Before
+committing the restart, the writer checks free space, creates an online
+SQLite backup next to `eliot.db`, and seals further writes to the old Store.
 
 After commit, the old daemon retires its owned idle processes and leaves
 the existing Store recovery facts for the next boot. Startup and rollback
@@ -2527,10 +2529,12 @@ Stop or Resume commands during update. The output identifies the previous
 and running release and includes observed Agent state. Boot recovery can
 still be settling when that state is read.
 
-The replacement must report healthy open admission. If startup fails,
-update proves the candidate no longer holds the directory and restarts
-the previous executable. The report retains the replacement failure and
-the rollback result. On Windows the restart preserves the running daemon's
+The replacement publishes its endpoint before admitting RPC or background
+work. A failure before publication restores the backup under the exclusive
+daemon lock and restarts the previous executable. Once publication is
+recorded, failure retains the backup and leaves the Store in place because
+replacement writes may exist. Healthy open admission throughout a short
+health check removes the temporary backup. On Windows the restart preserves the running daemon's
 explicit absolute directory spelling and starts an included companion
 detached with the same target data directory. For subsequent updates, the
 operator closes a changed companion only when it can verify the process it

@@ -13,6 +13,24 @@ use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
+pub(crate) fn available_disk_space(path: &Path) -> Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| Error::new("invalid", "Store backup directory contains NUL"))?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: the path is NUL-terminated and the statvfs buffer is writable.
+    if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return Err(io_error(
+            "query Store backup disk space",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: statvfs returned success and initialized the structure.
+    let stats = unsafe { stats.assume_init() };
+    let bytes = u128::from(stats.f_bavail) * u128::from(stats.f_frsize);
+    Ok(u64::try_from(bytes).unwrap_or(u64::MAX))
+}
+
 pub(crate) fn ensure_private_root(path: &Path) -> Result<()> {
     check_path_components(path)?;
     match fs::symlink_metadata(path) {

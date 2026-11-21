@@ -39,8 +39,8 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
     FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_FLAG_OVERLAPPED, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_DISK,
-    GetFileInformationByHandle, GetFileType, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    MoveFileExW, OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
+    GetDiskFreeSpaceExW, GetFileInformationByHandle, GetFileType, MOVEFILE_REPLACE_EXISTING,
+    MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
@@ -2019,6 +2019,19 @@ fn current_user_pipe_descriptor() -> Result<*mut c_void> {
     } else {
         Ok(descriptor)
     }
+}
+
+pub(crate) fn available_disk_space(path: &Path) -> Result<u64> {
+    let path = wide_path(path);
+    let mut available = 0;
+    // SAFETY: the path is NUL-terminated and the one requested output is writable.
+    if unsafe { GetDiskFreeSpaceExW(path.as_ptr(), &mut available, null_mut(), null_mut()) } == 0 {
+        return Err(io_error(
+            "query Store backup disk space",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(available)
 }
 
 fn wide_path(path: &Path) -> Vec<u16> {

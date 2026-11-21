@@ -88,7 +88,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    sync::{Mutex as AsyncMutex, broadcast, watch},
+    sync::{Mutex as AsyncMutex, RwLock, broadcast, watch},
     time::{Instant, timeout_at},
 };
 
@@ -153,6 +153,7 @@ struct RouterInner {
     worker_tasks: Mutex<Vec<WorkerTaskStatus>>,
     mode: AtomicU8,
     restart_lease: Mutex<Option<String>>,
+    restart_writes: RwLock<()>,
     shutdown_ready: AtomicBool,
     progress: watch::Sender<u64>,
     run_cancellation: watch::Sender<bool>,
@@ -415,6 +416,7 @@ impl Router {
                 ),
                 mode: AtomicU8::new(MODE_OPEN),
                 restart_lease: Mutex::new(None),
+                restart_writes: RwLock::new(()),
                 shutdown_ready: AtomicBool::new(false),
                 progress,
                 run_cancellation,
@@ -447,6 +449,18 @@ impl Router {
             .transpose()
             .map_err(|_| Error::new("not_allowed", "invalid remote context"))?;
         authorize_rpc_method(&principal, method)?;
+        let _write = if method != "daemon.shutdown" && discovery::is_mutation(method) {
+            let guard = self.inner.restart_writes.read().await;
+            if self.is_restart_requested() {
+                return Err(Error::new(
+                    "unavailable",
+                    "the Store is sealed for replacement",
+                ));
+            }
+            Some(guard)
+        } else {
+            None
+        };
         // Debug mode times every RPC at this single choke point. Standard
         // mode pays one Instant read and a branch; no parameters, prompts or
         // results ever enter the record.
@@ -5411,6 +5425,16 @@ impl Router {
         request: DaemonShutdownRequest,
         principal: &Principal,
     ) -> Result<Value> {
+        // In-flight RPC mutations may write settings as well as the Store.
+        // Keep the backup behind their completion boundary.
+        let _write_barrier =
+            if request.backup {
+                Some(self.inner.restart_writes.try_write().map_err(|_| {
+                    Error::new("restart_busy", "an admitted mutation is still running")
+                })?)
+            } else {
+                None
+            };
         let mut store = self.inner.store.lock().await;
         let mut lease = self.inner.restart_lease.lock_recover();
         let mode = self.inner.mode.load(Ordering::SeqCst);
@@ -5437,14 +5461,34 @@ impl Router {
             return Err(Error::new("restart_busy", "admitted work is still running"));
         }
         let result = json!({"state": "applied", "mode": action});
+        if request.backup {
+            crate::update_backup::create(&self.inner.data_root, &request.id, &store)?;
+        }
         let admission = store.record_write(
             &request.id,
             &principal_name(principal),
             "daemon.shutdown",
-            &json!({"mode": action, "restart_id": request.restart_id}),
+            &json!({"mode": action, "restart_id": request.restart_id, "backup": request.backup}),
             &result,
             now_ms(),
-        )?;
+        ).and_then(|admission| {
+            if request.backup && admission.is_new {
+                store.seal_for_restart()?;
+            }
+            Ok(admission)
+        });
+        let admission = match admission {
+            Ok(admission) => admission,
+            Err(error) => {
+                if request.backup {
+                    crate::update_backup::discard_update_backup(
+                        &self.inner.data_root,
+                        &request.id,
+                    )?;
+                }
+                return Err(error);
+            }
+        };
         if admission.is_new {
             match action {
                 ShutdownMode::PrepareRestart => {

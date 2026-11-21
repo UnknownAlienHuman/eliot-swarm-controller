@@ -87,9 +87,11 @@ pub(crate) async fn run_daemon(
             super::autostart::uninstall(&data_dir, json_output).await
         }
         None if foreground => {
-            eliot_daemon::run(data_dir)
-                .await
-                .map_err(Failure::for_read)?;
+            let result = match args.upgrade_attempt.as_deref() {
+                Some(attempt) => eliot_daemon::operator::run_for_update(data_dir, attempt).await,
+                None => eliot_daemon::run(data_dir).await,
+            };
+            result.map_err(Failure::for_read)?;
             Ok(0)
         }
         None => {

@@ -198,6 +198,22 @@ pub(super) async fn read_agent(data_dir: &Path, id: &str) -> Result<AgentGetResp
 }
 
 pub(super) async fn start_owned(data_dir: &Path, binary: &Path) -> Result<u32, Failure> {
+    start_owned_inner(data_dir, binary, None).await
+}
+
+pub(super) async fn start_update(
+    data_dir: &Path,
+    binary: &Path,
+    attempt: &str,
+) -> Result<u32, Failure> {
+    start_owned_inner(data_dir, binary, Some(attempt)).await
+}
+
+async fn start_owned_inner(
+    data_dir: &Path,
+    binary: &Path,
+    attempt: Option<&str>,
+) -> Result<u32, Failure> {
     let start_ms = daemon_now_ms();
     let previous = daemon_info(data_dir).map_err(Failure::for_read)?;
     if let Some(info) = &previous
@@ -208,12 +224,18 @@ pub(super) async fn start_owned(data_dir: &Path, binary: &Path) -> Result<u32, F
             format!("daemon PID {} is already running", info.pid),
         ));
     }
-    let args = [
+    let mut args = vec![
         std::ffi::OsStr::new("--data-dir"),
         data_dir.as_os_str(),
         std::ffi::OsStr::new("daemon"),
         std::ffi::OsStr::new("--foreground"),
     ];
+    if let Some(attempt) = attempt {
+        args.extend([
+            std::ffi::OsStr::new("--upgrade-attempt"),
+            std::ffi::OsStr::new(attempt),
+        ]);
+    }
     #[cfg(windows)]
     let (pid, birth) = {
         let pid = eliot_daemon::operator::start_detached(binary, &args, true, None)
@@ -269,6 +291,18 @@ pub(super) async fn start_owned(data_dir: &Path, binary: &Path) -> Result<u32, F
 
     let result = wait_for_ready(data_dir, pid, previous.as_ref(), start_ms).await;
     if let Err(mut failure) = result {
+        let _publication = if let Some(attempt) = attempt {
+            match eliot_daemon::operator::lock_update_publication(data_dir, attempt) {
+                Ok(guard) if daemon_info(data_dir).is_ok_and(|info| info == previous) => {
+                    Some(guard)
+                }
+                // The candidate may already be admitting writes. Leave it to
+                // the operator rather than terminating it on a timeout.
+                _ => return Err(failure),
+            }
+        } else {
+            None
+        };
         #[cfg(windows)]
         let cleanup = eliot_daemon::operator::stop_candidate(pid, birth).map_err(Failure::for_read);
         #[cfg(unix)]

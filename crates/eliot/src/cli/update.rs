@@ -2,13 +2,14 @@
 
 use super::daemon::shutdown_daemon;
 use super::operator::{
-    agents, check_same_daemon, require_running, start_owned, status, wait_for_exit,
+    agents, check_same_daemon, require_running, start_owned, start_update, status, wait_for_exit,
 };
 use super::support::{Failure, mutation_id, print_value};
 use eliot_core::api::{DaemonShutdownRequest, ShutdownMode};
 use eliot_daemon::operator::{
-    DaemonInfo, binary_sha256, daemon_alive, lock_offline, lock_transition, replacement_data_dir,
-    running_binary,
+    DaemonInfo, binary_sha256, daemon_alive, daemon_info, discard_update_backup, lock_offline,
+    lock_transition, replacement_data_dir, restore_update_backup, running_binary,
+    update_backup_path,
 };
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -28,13 +29,19 @@ pub(crate) async fn run(
     let binary = release_binary(&source)?;
     let previous = release_info(&previous_binary).await?;
     let candidate = release_info(&binary).await?;
-    if previous.store_schema != candidate.store_schema {
+    if candidate.store_schema < previous.store_schema {
         return Err(Failure::new(
             2,
             format!(
-                "update would change Store schema from {} to {}; reversible rollback requires the same schema",
-                previous.store_schema, candidate.store_schema
+                "Store downgrade refused: replacement schema {} is older than current schema {}",
+                candidate.store_schema, previous.store_schema
             ),
+        ));
+    }
+    if !previous.backup_update || !candidate.backup_update {
+        return Err(Failure::new(
+            2,
+            "both releases must support updates with a Store backup",
         ));
     }
     let sha256 = binary_sha256(&binary).map_err(Failure::for_read)?;
@@ -50,6 +57,16 @@ pub(crate) async fn run(
     let prepare = DaemonShutdownRequest::new(mutation_id(None)?, ShutdownMode::PrepareRestart);
     let mut commit = DaemonShutdownRequest::new(mutation_id(None)?, ShutdownMode::Restart);
     commit.restart_id = Some(prepare.id.clone());
+    commit.backup = true;
+    let backup = StoreBackup {
+        id: &commit.id,
+        path: update_backup_path(&startup_path, &commit.id).map_err(Failure::for_read)?,
+    };
+    let previous = PreviousRelease {
+        binary: &previous_binary,
+        sha256: &previous_hash,
+        daemon: &old,
+    };
     let mut cancel = DaemonShutdownRequest::new(mutation_id(None)?, ShutdownMode::CancelRestart);
     cancel.restart_id = Some(prepare.id.clone());
 
@@ -73,9 +90,9 @@ pub(crate) async fn run(
             Preparation::Exited => {
                 return Ok(rollback(
                     &startup_path,
-                    &previous_binary,
-                    &previous_hash,
-                    &old,
+                    &previous,
+                    &backup,
+                    false,
                     error.message,
                     before,
                     json_output,
@@ -89,19 +106,28 @@ pub(crate) async fn run(
     if let Err(error) = wait_for_exit(&old, Duration::from_secs(120)).await {
         print_value(
             &json!({"state":"restart_exit_unknown","previous_pid":old.pid,
-            "error":error.message,"agents_before":before}),
+            "error":error.message,"agents_before":before,"backup":backup.retained()}),
             json_output,
         );
         return Ok(error.exit_code);
     }
-    let pid = match start_owned(&startup_path, &binary).await {
+    let pid = match start_update(&startup_path, &binary, backup.id).await {
         Ok(pid) => pid,
         Err(error) => {
+            let admission = match daemon_info(&startup_path) {
+                Ok(Some(info)) if info == old => None,
+                Ok(Some(_)) => Some("failed_after_admission"),
+                _ => Some("admission_unknown"),
+            };
+            if let Some(state) = admission {
+                report_retained(state, &backup, error, json_output);
+                return Ok(4);
+            }
             return Ok(rollback(
                 &startup_path,
-                &previous_binary,
-                &previous_hash,
-                &old,
+                &previous,
+                &backup,
+                true,
                 error.message,
                 before,
                 json_output,
@@ -109,6 +135,11 @@ pub(crate) async fn run(
             .await);
         }
     };
+    if let Err(error) = check_health(&startup_path, pid).await {
+        report_retained("failed_after_admission", &backup, error, json_output);
+        return Ok(4);
+    }
+    let backup_cleanup = discard_update_backup(&startup_path, backup.id).err();
 
     #[cfg(windows)]
     let (desktop, desktop_failed) = start_companion(&data_dir, desktop);
@@ -116,17 +147,64 @@ pub(crate) async fn run(
     let (desktop, desktop_failed) = (None::<Value>, false);
     print_value(
         &json!({
-            "state": if desktop_failed { "partial" } else { "ready" },
+            "state": if desktop_failed || backup_cleanup.is_some() { "partial" } else { "ready" },
             "previous_pid": old.pid, "pid": pid,
             "commit_reply_uncertain": commit_reply_uncertain,
         "binary": eliot_core::display_path(&binary.to_string_lossy()), "version": candidate.version,
             "sha256": sha256, "desktop": desktop,
+            "backup": backup.retained(), "backup_cleanup_error": backup_cleanup.as_ref().map(ToString::to_string),
             "agents_before": before, "agents_after": observe_agents(&data_dir, &before).await,
             "continuation": "boot recovery applies the configured on_restart policy",
         }),
         json_output,
     );
-    Ok(u8::from(desktop_failed))
+    Ok(u8::from(desktop_failed || backup_cleanup.is_some()))
+}
+
+struct PreviousRelease<'a> {
+    binary: &'a Path,
+    sha256: &'a str,
+    daemon: &'a DaemonInfo,
+}
+
+struct StoreBackup<'a> {
+    id: &'a str,
+    path: PathBuf,
+}
+
+impl StoreBackup<'_> {
+    fn retained(&self) -> Option<String> {
+        self.path
+            .exists()
+            .then(|| eliot_core::display_path(&self.path.to_string_lossy()))
+    }
+}
+
+fn report_retained(state: &str, backup: &StoreBackup<'_>, error: Failure, json_output: bool) {
+    print_value(
+        &json!({
+            "state": state, "error": error.message, "backup": backup.retained(),
+            "message": "The Store was preserved because replacement writes may exist",
+        }),
+        json_output,
+    );
+}
+
+async fn check_health(path: &Path, pid: u32) -> Result<(), Failure> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let (current, status) = require_running(path).await?;
+        if current.pid != pid || status.admission != "open" || status.store_write_faulted {
+            return Err(Failure::new(
+                4,
+                "replacement lost healthy admission during the health check",
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Ok(());
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -202,7 +280,8 @@ async fn quiesce(
 }
 
 async fn call_shutdown(path: &Path, request: &DaemonShutdownRequest) -> Result<(), Failure> {
-    timeout(Duration::from_secs(5), shutdown_daemon(path, request))
+    let wait = Duration::from_secs(if request.backup { 155 } else { 5 });
+    timeout(wait, shutdown_daemon(path, request))
         .await
         .map_err(|_| Failure::timeout())??;
     Ok(())
@@ -210,35 +289,49 @@ async fn call_shutdown(path: &Path, request: &DaemonShutdownRequest) -> Result<(
 
 async fn rollback(
     path: &Path,
-    previous_binary: &Path,
-    previous_hash: &str,
-    old: &DaemonInfo,
+    previous: &PreviousRelease<'_>,
+    backup: &StoreBackup<'_>,
+    restore: bool,
     update_error: String,
     before: Vec<Value>,
     json_output: bool,
 ) -> u8 {
+    let mut store_restored = false;
     let restored = async {
         // Do not race a surviving candidate or open a second writer.
         let offline = lock_offline(path).map_err(Failure::for_read)?;
-        if binary_sha256(previous_binary).map_err(Failure::for_read)? != previous_hash {
+        if binary_sha256(previous.binary).map_err(Failure::for_read)? != previous.sha256 {
             return Err(Failure::new(
                 4,
                 "the previous release binary changed on disk",
             ));
         }
+        if restore {
+            restore_update_backup(path, backup.id, previous.daemon, &offline)
+                .map_err(Failure::for_read)?;
+            store_restored = true;
+        }
         drop(offline);
-        start_owned(path, previous_binary).await
+        start_owned(path, previous.binary).await
     }
     .await;
     let (state, pid, rollback_error) = match restored {
         Ok(pid) => ("rolled_back", Some(pid), None),
         Err(error) => ("rollback_failed", None, Some(error.message)),
     };
+    let cleanup = if pid.is_some() && !restore {
+        discard_update_backup(path, backup.id)
+            .err()
+            .map(|error| error.to_string())
+    } else {
+        None
+    };
     print_value(
         &json!({
-            "state": state, "previous_pid": old.pid, "pid": pid, "update_error": update_error,
-            "rollback_error": rollback_error, "binary": eliot_core::display_path(&previous_binary.to_string_lossy()),
-            "sha256": previous_hash, "agents_before": before,
+            "state": state, "previous_pid": previous.daemon.pid, "pid": pid, "update_error": update_error,
+            "rollback_error": rollback_error, "binary": eliot_core::display_path(&previous.binary.to_string_lossy()),
+            "sha256": previous.sha256, "agents_before": before,
+            "store_restored": store_restored, "backup": backup.retained(), "backup_cleanup_error": cleanup,
             "agents_after": if pid.is_some() { observe_agents(path, &before).await } else { Value::Null },
             "continuation": "boot recovery applies the configured on_restart policy",
         }),
@@ -283,6 +376,8 @@ fn release_binary(source: &Path) -> Result<PathBuf, Failure> {
 struct ReleaseInfo {
     version: String,
     store_schema: i64,
+    #[serde(default)]
+    backup_update: bool,
 }
 
 async fn release_info(binary: &Path) -> Result<ReleaseInfo, Failure> {
