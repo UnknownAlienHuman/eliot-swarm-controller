@@ -278,6 +278,122 @@ pub(crate) struct ProcessGroupIdentity {
 }
 
 #[cfg(target_os = "linux")]
+impl ProcessGroupIdentity {
+    pub(crate) fn contains(&self, peer: &InspectedLocalPeer) -> Result<bool> {
+        if peer
+            .lineage
+            .iter()
+            .any(|(pid, stat)| *pid == self.pid && stat.start_ticks == self.start_ticks)
+        {
+            return Ok(true);
+        }
+        if peer.lineage.iter().any(|(_, stat)| stat.pgid == self.pgid) {
+            return process_group_leader_matches(self);
+        }
+        Ok(false)
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct LocalPeer {
+    pid: u32,
+    proc_dir: fs::File,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct InspectedLocalPeer {
+    peer: LocalPeer,
+    lineage: Vec<(u32, LinuxProcessStat)>,
+}
+
+#[cfg(target_os = "linux")]
+impl LocalPeer {
+    pub(crate) fn capture(stream: &tokio::net::UnixStream) -> Option<Self> {
+        let credentials = stream.peer_cred().ok()?;
+        let pid = u32::try_from(credentials.pid()?)
+            .ok()
+            .filter(|pid| *pid != 0)?;
+        if credentials.uid() != effective_uid() {
+            return None;
+        }
+        // Keep the proc directory open so later reads stay bound to this
+        // process rather than reopening a numeric PID that may be reused.
+        let proc_dir = fs::File::open(format!("/proc/{pid}")).ok()?;
+        Some(Self { pid, proc_dir })
+    }
+
+    fn stat(&self) -> Result<LinuxProcessStat> {
+        use std::os::fd::AsRawFd;
+
+        let path = format!("/proc/self/fd/{}/stat", self.proc_dir.as_raw_fd());
+        let stat = fs::read(path)
+            .and_then(|bytes| parse_linux_process_stat_bytes(self.pid, &bytes))
+            .map_err(|error| io_error("read Unix socket client identity", error))?;
+        if stat.state != ProcessState::Running {
+            return Err(Error::new(
+                "process_identity",
+                "Unix socket client is no longer live",
+            ));
+        }
+        Ok(stat)
+    }
+
+    pub(crate) fn inspect(self, owned_agents: bool) -> Result<InspectedLocalPeer> {
+        let mut lineage = vec![(self.pid, self.stat()?)];
+        if owned_agents {
+            loop {
+                let (pid, stat) = lineage[lineage.len() - 1];
+                if stat.parent == 0 {
+                    break;
+                }
+                if stat.parent == pid || lineage.len() >= 256 {
+                    return Err(Error::new(
+                        "process_identity",
+                        "Unix socket client ancestry is incomplete",
+                    ));
+                }
+                let parent = read_linux_process_stat(stat.parent)
+                    .map_err(|error| io_error("read Unix socket client ancestry", error))?;
+                if parent.start_ticks > stat.start_ticks {
+                    return Err(Error::new(
+                        "process_identity",
+                        "Unix socket client ancestry changed",
+                    ));
+                }
+                lineage.push((stat.parent, parent));
+            }
+        }
+        Ok(InspectedLocalPeer {
+            peer: self,
+            lineage,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl InspectedLocalPeer {
+    pub(crate) fn verify(&self) -> Result<()> {
+        for (index, (pid, expected)) in self.lineage.iter().enumerate() {
+            let current = if index == 0 {
+                self.peer.stat()?
+            } else {
+                read_linux_process_stat(*pid)
+                    .map_err(|error| io_error("verify Unix socket client ancestry", error))?
+            };
+            if (current.start_ticks, current.parent, current.pgid)
+                != (expected.start_ticks, expected.parent, expected.pgid)
+            {
+                return Err(Error::new(
+                    "process_identity",
+                    "Unix socket client ancestry changed",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
 const MAX_PROC_SCAN_ENTRIES: usize = 65_536;
 
 /// One bounded host-process enumeration shared by a monitoring sweep.
@@ -395,16 +511,21 @@ pub(crate) fn terminate_process_group(identity: &ProcessGroupIdentity) -> Result
 
 #[cfg(target_os = "linux")]
 fn validate_process_group_leader(identity: &ProcessGroupIdentity) -> Result<()> {
-    let (pgid, start_ticks) = read_linux_process_identity(identity.pid).map_err(|error| {
-        unknown_process_identity("cannot revalidate process-group leader", error)
-    })?;
-    if pgid != identity.pgid || start_ticks != identity.start_ticks {
+    if !process_group_leader_matches(identity)? {
         return Err(Error::new(
             "process_custody_unknown",
             "process-group leader PID birth or PGID changed; no signal was sent",
         ));
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn process_group_leader_matches(identity: &ProcessGroupIdentity) -> Result<bool> {
+    let (pgid, start_ticks) = read_linux_process_identity(identity.pid).map_err(|error| {
+        unknown_process_identity("cannot revalidate process-group leader", error)
+    })?;
+    Ok(pgid == identity.pgid && start_ticks == identity.start_ticks)
 }
 
 /// Observe the retained direct child without consuming its wait status. The
@@ -637,6 +758,9 @@ fn parse_linux_process_stat_bytes(pid: u32, stat: &[u8]) -> std::io::Result<Linu
         // positive, birth-checked leader validation.
         .filter(|value| *value >= 0)
         .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "invalid process PGID"))?;
+    let parent = field(1)
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "invalid process parent PID"))?;
     let start_ticks = field(19)
         .and_then(|value| value.parse::<u64>().ok())
         .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "invalid process start time"))?;
@@ -670,6 +794,7 @@ fn parse_linux_process_stat_bytes(pid: u32, stat: &[u8]) -> std::io::Result<Linu
         .zip(page_size)
         .and_then(|(pages, size)| pages.checked_mul(size));
     Ok(LinuxProcessStat {
+        parent,
         pgid,
         start_ticks,
         state,

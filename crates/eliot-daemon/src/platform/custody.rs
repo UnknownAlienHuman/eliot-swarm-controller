@@ -1,9 +1,11 @@
 use eliot_core::{Error, FailureOrigin, Result};
 use eliot_plugin::sync::LockExt;
 use std::process::ExitStatus;
+use std::sync::{Arc, Mutex, Weak};
 #[cfg(any(windows, target_os = "linux"))]
 use std::time::Duration;
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+use tokio::sync::Notify;
 
 /// How strongly the operating system contains this child family.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,6 +31,165 @@ pub struct OwnedChild {
     #[cfg(unix)]
     identity: Option<super::unix::ProcessGroupIdentity>,
     observation: std::sync::Mutex<Option<super::CustodyObserver>>,
+    // Keep membership discoverable until the owning Job or group is released.
+    local_custody: Option<Arc<LiveAgentCustody>>,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) use super::unix::LocalPeer;
+#[cfg(target_os = "linux")]
+use super::unix::ProcessGroupIdentity as Membership;
+#[cfg(windows)]
+use super::windows::JobMembership as Membership;
+#[cfg(windows)]
+pub(crate) use super::windows::LocalPeer;
+#[cfg(not(any(windows, target_os = "linux")))]
+pub(crate) struct LocalPeer;
+#[cfg(not(any(windows, target_os = "linux")))]
+type Membership = ();
+
+struct LiveAgentCustody {
+    agent: String,
+    membership: Membership,
+}
+
+/// A daemon-local view of owned Agent generations, independent of sampled
+/// process records, control credentials, and other daemons' Jobs or groups.
+#[derive(Default)]
+pub(crate) struct AgentCustodies {
+    state: Mutex<CustodyState>,
+    started: Notify,
+}
+
+#[derive(Default)]
+struct CustodyState {
+    starting: usize,
+    agents: Vec<Weak<LiveAgentCustody>>,
+}
+
+struct CustodyStart<'a>(&'a AgentCustodies);
+
+impl Drop for CustodyStart<'_> {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock_recover();
+        state.starting -= 1;
+        if state.starting == 0 {
+            self.0.started.notify_waiters();
+        }
+    }
+}
+
+impl AgentCustodies {
+    pub(crate) fn spawn(
+        &self,
+        agent: &str,
+        spawn: impl FnOnce() -> std::result::Result<OwnedChild, AgentSpawnError>,
+    ) -> std::result::Result<OwnedChild, AgentSpawnError> {
+        // A peer accepted while spawn is in flight must wait for registration.
+        // Keep only that publication fence while creating the process.
+        self.state.lock_recover().starting += 1;
+        let _start = CustodyStart(self);
+        let mut child = spawn()?;
+        #[cfg(windows)]
+        let membership = child.job.membership();
+        #[cfg(target_os = "linux")]
+        let membership = child.identity.ok_or_else(|| {
+            Error::new(
+                "process_custody_unknown",
+                "cannot read the Agent plugin's process-group identity",
+            )
+        });
+        #[cfg(not(any(windows, target_os = "linux")))]
+        let membership = Ok(());
+        let membership = match membership {
+            Ok(membership) => membership,
+            Err(error) => {
+                // The plugin has not been initialized. Stop the direct child
+                // and drop its custody, while retaining startup uncertainty.
+                let _ = child.child.start_kill();
+                return Err(AgentSpawnError::Uncertain(
+                    error.with_where("swarm.start.agent_custody"),
+                ));
+            }
+        };
+        let custody = Arc::new(LiveAgentCustody {
+            agent: agent.to_owned(),
+            membership,
+        });
+        {
+            let mut state = self.state.lock_recover();
+            state.agents.retain(|agent| agent.strong_count() != 0);
+            state.agents.push(Arc::downgrade(&custody));
+        }
+        child.local_custody = Some(custody);
+        Ok(child)
+    }
+
+    pub(crate) async fn authorize_owner(&self, peer: Option<LocalPeer>) -> Result<()> {
+        let agents = loop {
+            let registered = self.started.notified();
+            let snapshot = {
+                let mut state = self.state.lock_recover();
+                (state.starting == 0).then(|| {
+                    state.agents.retain(|agent| agent.strong_count() != 0);
+                    state
+                        .agents
+                        .iter()
+                        .filter_map(Weak::upgrade)
+                        .collect::<Vec<_>>()
+                })
+            };
+            if let Some(snapshot) = snapshot {
+                break snapshot;
+            }
+            registered.await;
+        };
+
+        #[cfg(windows)]
+        if agents.is_empty() {
+            return Ok(());
+        }
+        let peer = peer.ok_or_else(owner_peer_unknown)?;
+
+        #[cfg(any(windows, target_os = "linux"))]
+        {
+            let process = peer
+                .inspect(!agents.is_empty())
+                .map_err(|_| owner_peer_unknown())?;
+            let mut unknown = false;
+            for agent in agents {
+                match agent.membership.contains(&process) {
+                    Ok(true) => {
+                        return Err(Error::new(
+                            "not_allowed",
+                            format!(
+                                "This client runs inside Agent {}; use the Agent-scoped Swarm tool.",
+                                agent.agent
+                            ),
+                        ));
+                    }
+                    Ok(false) => {}
+                    Err(_) => unknown = true,
+                }
+            }
+            if unknown || process.verify().is_err() {
+                return Err(owner_peer_unknown());
+            }
+            Ok(())
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
+        {
+            let _ = (agents, peer);
+            Err(owner_peer_unknown())
+        }
+    }
+}
+
+fn owner_peer_unknown() -> Error {
+    Error::new(
+        "not_allowed",
+        "The daemon could not verify this local client process; Owner access was refused.",
+    )
 }
 
 /// Whether an unsuccessful spawn ever returned an OS child. A suspended
@@ -36,17 +197,9 @@ pub struct OwnedChild {
 #[derive(Debug)]
 pub enum AgentSpawnError {
     NotSpawned(Error),
-    #[cfg_attr(
-        not(windows),
-        expect(
-            dead_code,
-            reason = "only the Windows suspended spawn can return a child whose cleanup failed"
-        )
-    )]
     Uncertain(Error),
 }
 
-#[cfg(windows)]
 impl AgentSpawnError {
     pub fn into_error(self) -> Error {
         match self {
@@ -283,6 +436,7 @@ impl OwnedChild {
             job,
             child,
             observation: std::sync::Mutex::new(None),
+            local_custody: None,
         })
     }
 
@@ -312,6 +466,7 @@ impl OwnedChild {
                 child,
                 identity,
                 observation: std::sync::Mutex::new(None),
+                local_custody: None,
             })
         }
 

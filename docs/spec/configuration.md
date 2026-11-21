@@ -360,9 +360,12 @@ Every profile selects a worker MCP policy in `mcp`: `minimal` (the default
 where the harness maps it) or `inherit` (explicit opt-in, and the default for
 Muse, which has no minimal mapping), plus an optional `mcp_allow` list of native
 server names. Antigravity, Claude, and OpenCode scan MCP configuration as a
-best-effort guard for direct Owner entries. Daemon authentication owns the
-authority boundary. The shared rule checks the executable of a direct
-invocation for `swarm`, `swarm.exe`, or the active controller binary, then
+best-effort guard for direct Owner entries. The daemon enforces the
+[local Owner process boundary](api.md#transport-and-principal-identity) using
+its own Agent custody. Windows checks exact Job membership and Linux uses
+degraded process-group and ancestry checks. The shared scan checks the
+executable of a direct invocation for `swarm`, `swarm.exe`, or the active
+controller binary, then
 matches the `mcp` subcommand without `--require-agent`. Shell scripts, command
 wrappers, and variable expansion are outside the scan.
 HTTP matches the configured `cloud_mcp` hostname exactly, ignoring case and
@@ -373,7 +376,6 @@ The server Eliot generates always carries `--require-agent`
 and requires the generation-bound Agent credential. Swarm MCP names
 (`eliot_swarm`, `eliot-swarm` and the per-session prefixes) are reserved and
 cannot be allow-listed. A renamed Owner entry still matches by transport.
-A worker that talks to the owner daemon with the owner identity is an authority leak.
 
 ```toml
 [profiles.codex-minimal]

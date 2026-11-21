@@ -21,8 +21,37 @@ Every call has an explicit principal. Owner CLI outside a managed Agent/rule env
 reads the private owner token automatically. Agents send id/generation/token; managed
 scripts use scoped run tokens; plugins have instance credentials. Missing/incomplete/
 revoked credentials reject, never become owner. No manual `--owner` step is required.
-This prevents accidental attribution errors; it is not isolation from hostile processes
-of the same OS user. Reads are scoped as well as writes.
+Reads are scoped as well as writes.
+
+Before granting Owner authority on a local connection, the daemon checks the OS-reported
+client process against its own live Agent custody. Windows uses the client PID from
+the accepted named pipe and checks its process handle against the daemon's Agent Jobs.
+Linux uses Unix socket peer credentials and checks its Agent process groups and the
+client's observable ancestry. Linux custody remains degraded if a descendant has left
+its group and its ancestry is no longer observable. Agent tokens keep their ordinary
+scope and generation checks.
+
+A match rejects with `not_allowed` and names the Agent. If peer or custody identity
+cannot be verified, the daemon also refuses Owner access. A valid Owner credential
+proves possession only, so an inconclusive OS check cannot establish that the process
+is outside Agent custody. Supported targets are Windows and the Linux Docker image.
+macOS and BSD have no supported Owner IPC. Each daemon checks its own custody, so an
+Agent can still own a separate private daemon. The local trust boundary remains one OS user.
+
+On Windows, a valid Owner credential suffices when the daemon has no live Agent
+custody. Otherwise `GetNamedPipeClientProcessId` must supply a nonzero PID. The
+daemon tries to open it with `PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE`.
+With a process handle, both zero-time liveness checks must return `WAIT_TIMEOUT`
+and the daemon uses `IsProcessInJob` to verify membership. On `ERROR_ACCESS_DENIED`,
+it uses the PID from the pipe and the daemon's exact Job member lists. Only a
+complete list establishes absence from a Job. An unavailable PID, another open
+failure, a failed liveness check, or unresolved membership leaves identity or
+custody unknown. A confirmed Job match returns a refusal naming the Agent.
+
+The same rules apply at every Windows integrity level. An elevated Owner
+client proceeds when the checks establish that it is outside the daemon's Agent
+Jobs. The credential-only path applies at every integrity level when the daemon
+has no live Agent custody.
 
 For Agent-originated commands, Store checks the caller's generation and live
 identity again in the transactions that admit and dispatch work. A missing,
@@ -265,6 +294,8 @@ tool, `swarm`, with required `method` (non-empty string) and `params` (object), 
 forwards calls through the existing authenticated local client. Ordinary mode uses
 [`eliot_daemon::client_call`](../../crates/eliot-daemon/src/daemon.rs); `--require-agent`
 uses [`eliot_daemon::client_call_with_agent_identity`](../../crates/eliot-daemon/src/daemon.rs).
+Ordinary stdio authenticates with `api.identity` before MCP initialization so the
+daemon's local Owner refusal is reported when the bridge connects.
 Both reuse the daemon methods and shared Core DTOs. Discovery is available through
 the same tool: start with `api.identity` and `{}`, then `api.methods` with optional
 `query`, `after` and `limit` (default 20, maximum 50), and `api.help` with a canonical
@@ -286,7 +317,7 @@ requires a complete inherited Agent ID/generation/token before the MCP server in
 and before any Owner token lookup. Missing, partial, conflicting, Owner, and Run contexts
 fail with `not_allowed`. Each tool call still uses the existing local client and Router path,
 which validates the Agent credential and current generation. `--require-agent --http` is a
-usage error; ordinary Owner MCP stdio and StreamableHTTP behavior are unchanged.
+usage error. StreamableHTTP uses its separate remote identity checks.
 
 A mutation call may omit `params.id`: the MCP server mints one fresh ULID for that
 call and forwards it to the daemon. Both success and structured daemon errors return

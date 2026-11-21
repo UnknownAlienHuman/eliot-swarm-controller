@@ -91,7 +91,7 @@ impl PluginHost {
         let known = vec![self.state.owner_token.clone(), credential.clone()];
         let secrets = source_secret_snapshot(profile, environment, known.clone());
         let metadata_secrets = metadata_secret_snapshot(profile, environment, known);
-        let mut child = match self.spawn_plugin_process(harness, &instance_dir) {
+        let mut child = match self.spawn_plugin_process(harness, &instance_dir, observation) {
             Ok(child) => child,
             Err(error) => {
                 remove_empty_instance_dir(&instance_dir);
