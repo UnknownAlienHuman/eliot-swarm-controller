@@ -8,7 +8,13 @@ use eliot_core::api::*;
 use std::path::{Component, Path};
 use tokio::time::timeout;
 
+mod delete;
 mod projects;
+
+const CLEANUP_BACKFILL_BATCH: usize = 8;
+const CLEANUP_BACKFILL_LIMIT: usize = 1_024;
+const CLEANUP_BACKFILL_BUDGET: Duration = Duration::from_secs(8);
+const CLEANUP_PLAN_MAX_PREFLIGHT: Duration = Duration::from_secs(15);
 
 fn encoded(value: impl serde::Serialize) -> Result<Value> {
     serde_json::to_value(value)
@@ -206,7 +212,9 @@ impl Router {
         let mut known = Vec::new();
         if let Some(workspace) = workspace
             && workspace.target_generation == agent.generation
-            && workspace.phase == WorkspacePhase::Ready
+            && (workspace.phase == WorkspacePhase::Ready
+                || workspace.phase == WorkspacePhase::Failed
+                    && std::fs::symlink_metadata(&workspace.worktree_path).is_ok())
         {
             let probe = crate::git_monitor::GitProbe::new()?;
             let admin = probe
@@ -364,21 +372,8 @@ impl Router {
                 });
             }
         }
-        if let (Some(scope), Some(reference)) = (&agent.native_scope, &agent.native_ref) {
-            known.push(ArtifactView {
-                id: ulid::Ulid::new().to_string(),
-                agent: agent.id.clone(),
-                generation: agent.generation,
-                project: agent.project.clone(),
-                tree: Vec::new(),
-                path: format!("native:{scope}:{reference}"),
-                kind: ArtifactKind::NativeSession,
-                purpose: agent.harness.clone(),
-                identity: scope.clone(),
-                created_at: agent.created_at,
-                state: "registered".to_owned(),
-                git: None,
-            });
+        if let Some(session) = native_session_artifact(agent) {
+            known.push(session);
         }
         // Branches outlive their worktree: re-resolve every retained tip
         // through its own binding so the ledger tracks the live branch even
@@ -573,6 +568,7 @@ impl Router {
         params: &Value,
         principal: &Principal,
     ) -> Result<Value> {
+        let call_deadline = Instant::now() + Duration::from_secs(25);
         let request: CleanupPlanRequest = coordination::decode_coordination_request(
             params,
             &self.inner.secrets,
@@ -580,7 +576,7 @@ impl Router {
             CleanupPlanRequest::validate,
         )?;
         let name = principal_name(principal);
-        let continued = request
+        let mut page = request
             .continuation
             .as_deref()
             .map(PlanContinuation::decode)
@@ -594,59 +590,38 @@ impl Router {
                 safe_ids: None,
                 kept_ids: None,
                 backfill_after: None,
+                inventory_rank: None,
+                inventory_seq_after: None,
+                request_binding: None,
             });
-        // Backfill only facts already retained by Swarm, not arbitrary files.
-        // Every page resumes after the previous backfill position instead of
-        // restarting from the first row, so a persistently capped fleet
-        // still terminates instead of repeating the same empty page.
-        let (agents, agents_truncated) = self
-            .inner
-            .store
-            .lock()
-            .await
-            .list_agents(continued.backfill_after.as_deref(), 1000)?;
-        let mut inventory_incomplete = agents_truncated || agents.len() == 1000;
-        let mut backfill_after = continued.backfill_after.clone();
-        for agent in &agents {
-            backfill_after = Some(agent.id.clone());
-            if request
-                .project
-                .as_ref()
-                .is_some_and(|p| p != &agent.project)
-            {
-                continue;
-            }
-            let allowed = self
-                .inner
-                .store
-                .lock()
-                .await
-                .cleanup_visible_agent(&name, agent)?;
-            if allowed {
-                inventory_incomplete |= self.record_agent_artifacts(agent).await.is_err();
-            }
-        }
-        if !inventory_incomplete {
-            backfill_after = None;
-        }
-        // The Store pages the final candidate order once: ordinary rows,
-        // then worktrees, then branches and native sessions, each oldest
-        // insertion first. The router never re-sorts; it only merges the
-        // ephemeral project rows around the pinned artifact page.
-        let (artifacts, artifacts_truncated, snapshot_seq) = self
-            .inner
-            .store
-            .lock()
-            .await
-            .cleanup_inventory(&name, &request)?;
-        let page = continued;
         let mut plan = CleanupPlan {
             plan_id: ulid::Ulid::new().to_string(),
             created_at: now_ms(),
             items: Vec::new(),
-            truncated: artifacts_truncated || inventory_incomplete,
+            truncated: false,
             continuation: None,
         };
+        let binding = cleanup_plan_request_binding(&name, &request)?;
+        if page
+            .request_binding
+            .as_deref()
+            .is_some_and(|saved| saved != binding.as_str())
+        {
+            return Err(Error::new("invalid", "cleanup continuation is stale"));
+        }
+        if page.snapshot_seq.is_none() {
+            // Backfill within one slice, then freeze the inventory on the
+            // first candidate page. Large or slow fleets resume the backfill.
+            page.backfill_after = self
+                .backfill_cleanup_inventory(&name, &request, page.backfill_after)
+                .await?;
+            if page.backfill_after.is_some() {
+                page.request_binding = Some(binding);
+                plan.truncated = true;
+                plan.continuation = Some(page.encode()?);
+                return encoded(plan);
+            }
+        }
         let (safe_projects, kept_projects, regs_revision): (Vec<_>, Vec<_>, Option<String>) =
             if matches!(principal, Principal::Owner) {
                 let (registrations, revision) = self.plan_project_registrations(&request).await?;
@@ -711,12 +686,22 @@ impl Router {
         {
             shown_safe.push(item);
         }
+        let artifact_limit = MAX_CLEANUP_ITEMS - shown_safe.len();
+        let eliot_store::CleanupInventoryPage {
+            artifacts,
+            truncated: artifacts_truncated,
+            snapshot_seq,
+            next_rank,
+            next_seq,
+        } = self.inner.store.lock().await.cleanup_inventory(
+            &name,
+            &request,
+            &page,
+            artifact_limit,
+        )?;
         let artifacts_total = artifacts.len();
         let mut middle = Vec::new();
-        for artifact in artifacts
-            .into_iter()
-            .take(MAX_CLEANUP_ITEMS - shown_safe.len())
-        {
+        for artifact in artifacts {
             let mut candidate = CleanupCandidate {
                 artifact,
                 bytes: None,
@@ -726,6 +711,11 @@ impl Router {
             if candidate.artifact.state != "registered" {
                 candidate.reason = candidate.artifact.state.clone();
             } else if candidate.artifact.kind == ArtifactKind::Worktree {
+                if call_deadline.saturating_duration_since(tokio::time::Instant::now())
+                    < CLEANUP_PLAN_MAX_PREFLIGHT
+                {
+                    break;
+                }
                 self.classify_worktree(&mut candidate).await;
             } else if candidate.artifact.kind == ArtifactKind::Branch {
                 let Some(git) = candidate.artifact.git.as_ref() else {
@@ -733,6 +723,11 @@ impl Router {
                     middle.push(candidate);
                     continue;
                 };
+                if call_deadline.saturating_duration_since(tokio::time::Instant::now())
+                    < CLEANUP_PLAN_MAX_PREFLIGHT
+                {
+                    break;
+                }
                 if !self
                     .inner
                     .store
@@ -745,7 +740,11 @@ impl Router {
                     continue;
                 }
                 match self
-                    .cleanup_branch_classification(&candidate.artifact, git)
+                    .cleanup_branch_classification_with_deadline(
+                        &candidate.artifact,
+                        git,
+                        Instant::now() + CLEANUP_PLAN_MAX_PREFLIGHT,
+                    )
                     .await
                 {
                     Ok(classification) => {
@@ -760,7 +759,14 @@ impl Router {
                     Err(error) => candidate.reason = error.code,
                 }
             } else if candidate.artifact.kind == ArtifactKind::NativeSession {
-                if candidate.artifact.purpose.as_str() != "codex" {
+                let swarm_created = self
+                    .inner
+                    .store
+                    .lock()
+                    .await
+                    .get_agent(&candidate.artifact.agent)?
+                    .is_some_and(|agent| swarm_created_session_agent(&agent));
+                if !swarm_created || !native_archive_supported(&candidate.artifact.purpose) {
                     candidate.reason = "no_native_archive".to_owned();
                 } else if !self
                     .inner
@@ -782,6 +788,11 @@ impl Router {
                 .await
                 .cleanup_agent_quiescent(&candidate.artifact)?
             {
+                if call_deadline.saturating_duration_since(tokio::time::Instant::now())
+                    < CLEANUP_PLAN_MAX_PREFLIGHT
+                {
+                    break;
+                }
                 match self.cleanup_preflight(&candidate.artifact).await {
                     Ok(bytes) => {
                         candidate.verdict = "safe".to_owned();
@@ -800,16 +811,10 @@ impl Router {
         // Project rows consume page slots: when they displace artifact rows
         // off a full Store page, the listing continues even though the
         // Store reported no truncation of its own.
-        plan.truncated |= artifact_listing_truncated(
-            artifacts_truncated,
-            inventory_incomplete,
-            artifacts_total,
-            middle_len,
-            safe_total,
-            page.safe_skipped + safe_shown,
-            kept_total,
-            page.kept_skipped + kept_shown,
-        );
+        plan.truncated = artifacts_truncated
+            || middle_len < artifacts_total
+            || page.safe_skipped + safe_shown < safe_total
+            || page.kept_skipped + kept_shown < kept_total;
         if plan.truncated {
             // The next page resumes after the last shown artifact inside the
             // same ledger snapshot, skipping the project rows already
@@ -824,6 +829,7 @@ impl Router {
                 .find(|item| item.artifact.kind != ArtifactKind::ProjectRegistration)
                 .map(|item| item.artifact.id.clone())
                 .or(page.artifact_after);
+            let keep_scan_cursor = artifacts_total == 0 || middle_len == artifacts_total;
             plan.continuation = Some(
                 PlanContinuation {
                     artifact_after: last_artifact,
@@ -833,17 +839,88 @@ impl Router {
                     snapshot_seq: Some(snapshot_seq),
                     safe_ids,
                     kept_ids,
-                    backfill_after,
+                    backfill_after: None,
+                    inventory_rank: keep_scan_cursor.then_some(next_rank),
+                    inventory_seq_after: if keep_scan_cursor { next_seq } else { None },
+                    request_binding: Some(binding),
                 }
                 .encode()?,
             );
         }
-        self.inner
-            .store
-            .lock()
-            .await
-            .retain_cleanup_plan(&name, &plan, now_ms())?;
+        if !plan.items.is_empty() || !plan.truncated {
+            self.inner
+                .store
+                .lock()
+                .await
+                .retain_cleanup_plan(&name, &plan, now_ms())?;
+        }
         encoded(plan)
+    }
+
+    async fn backfill_cleanup_inventory(
+        &self,
+        principal: &str,
+        request: &CleanupPlanRequest,
+        mut after: Option<String>,
+    ) -> Result<Option<String>> {
+        let deadline = Instant::now() + CLEANUP_BACKFILL_BUDGET;
+        let initial_after = after.clone();
+        for _ in (0..CLEANUP_BACKFILL_LIMIT).step_by(CLEANUP_BACKFILL_BATCH) {
+            let (agents, truncated) = self
+                .inner
+                .store
+                .lock()
+                .await
+                .list_agents(after.as_deref(), CLEANUP_BACKFILL_BATCH)?;
+            let mut eligible = Vec::new();
+            for agent in &agents {
+                if request
+                    .project
+                    .as_ref()
+                    .is_none_or(|project| project == &agent.project)
+                    && self
+                        .inner
+                        .store
+                        .lock()
+                        .await
+                        .cleanup_visible_agent(principal, agent)?
+                {
+                    eligible.push(agent);
+                }
+            }
+            let backfill =
+                futures_util::future::try_join_all(eligible.into_iter().map(|agent| async move {
+                    self.record_agent_artifacts(agent).await.map_err(|error| {
+                        let message = format!(
+                            "Cleanup inventory could not read {}. {}",
+                            agent.id, error.message
+                        );
+                        error.with_message(message)
+                    })
+                }));
+            match timeout_at(deadline, backfill).await {
+                Ok(result) => {
+                    result?;
+                }
+                // A partial batch can leave idempotent ownership records,
+                // but only completed batches advance the continuation.
+                Err(_) if after != initial_after => break,
+                Err(_) => {
+                    return Err(Error::new(
+                        "unavailable",
+                        "Cleanup inventory probe timed out",
+                    ));
+                }
+            }
+            if !truncated && agents.len() < CLEANUP_BACKFILL_BATCH {
+                return Ok(None);
+            }
+            after = agents.last().map(|agent| agent.id.clone()).or(after);
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+        Ok(after)
     }
 
     async fn classify_worktree(&self, candidate: &mut CleanupCandidate) {
@@ -1018,14 +1095,57 @@ impl Router {
             self.apply_project_registrations(&mut store, &request, &plan, &mut response)?;
             (plan, response)
         };
-        for (index, item) in plan.items.iter().enumerate() {
+        self.apply_cleanup_artifacts(&name, &request, &plan, &mut response, false)
+            .await?;
+        encoded(response)
+    }
+
+    async fn apply_cleanup_artifacts(
+        &self,
+        name: &str,
+        request: &CleanupApplyRequest,
+        plan: &CleanupPlan,
+        response: &mut CleanupApplyResponse,
+        entire_tree: bool,
+    ) -> Result<()> {
+        // A native reader may need the managed workspace as its directory.
+        let (sessions, other): (Vec<_>, Vec<_>) = plan
+            .items
+            .iter()
+            .enumerate()
+            .partition(|(_, item)| item.artifact.kind == ArtifactKind::NativeSession);
+        for (index, item) in sessions.into_iter().chain(other) {
             if item.artifact.kind == ArtifactKind::ProjectRegistration
                 || item.verdict != "safe"
                 || response.items[index].outcome != "unknown"
             {
                 continue;
             }
-            let outcome = match self.cleanup_remove(&name, &item.artifact, &request).await {
+            let blocked_worktree = item.artifact.kind == ArtifactKind::Worktree
+                && plan
+                    .items
+                    .iter()
+                    .zip(&response.items)
+                    .any(|(session, outcome)| {
+                        session.artifact.kind == ArtifactKind::NativeSession
+                            && session.verdict == "safe"
+                            && request.selects(&session.artifact.id)
+                            && outcome.outcome != "removed"
+                            && (entire_tree
+                                || session.artifact.agent == item.artifact.agent
+                                || cleanup_tree_root(&session.artifact).is_some_and(|root| {
+                                    cleanup_tree_root(&item.artifact) == Some(root)
+                                }))
+                    });
+            let removal = if blocked_worktree {
+                Err(Error::new(
+                    "native_session_kept",
+                    "The tree's native session cleanup did not complete",
+                ))
+            } else {
+                self.cleanup_remove(name, &item.artifact, request).await
+            };
+            let outcome = match removal {
                 Ok(bytes) => CleanupItemOutcome {
                     artifact_id: item.artifact.id.clone(),
                     outcome: "removed".to_owned(),
@@ -1050,14 +1170,14 @@ impl Router {
             response.bytes_reclaimed += outcome.bytes_reclaimed;
             response.items[index] = outcome.clone();
             self.inner.store.lock().await.settle_cleanup_item(
-                &name,
-                &request,
-                &response,
+                name,
+                request,
+                response,
                 &item.artifact,
                 &outcome,
             )?;
         }
-        encoded(response)
+        Ok(())
     }
 
     async fn cleanup_remove(
@@ -1106,14 +1226,12 @@ impl Router {
         }
         if artifact.kind == ArtifactKind::NativeSession {
             // Local native stores are never deleted as files. Codex threads
-            // are archived through the harness app-server API; every other
-            // harness has no documented archive surface and stays kept.
-            if artifact.purpose.as_str() != "codex" {
-                return Err(Error::new(
-                    "no_native_archive",
-                    "harness has no native archive method",
-                ));
-            }
+            // are archived through the harness app-server API and OpenCode
+            // sessions are deleted through the harness's documented session
+            // delete on the retained per-Agent store; every other harness
+            // has no documented archive surface and stays kept. Only a
+            // Swarm-created Agent's session is ever archived: attached or
+            // observed sessions belong to their own producer.
             let agent = self
                 .inner
                 .store
@@ -1121,6 +1239,13 @@ impl Router {
                 .await
                 .get_agent(&artifact.agent)?
                 .ok_or_else(|| Error::new("not_found", "Agent absent"))?;
+            if !swarm_created_session_agent(&agent) || !native_archive_supported(&artifact.purpose)
+            {
+                return Err(Error::new(
+                    "no_native_archive",
+                    "harness has no native archive method",
+                ));
+            }
             {
                 let store = self.inner.store.lock().await;
                 if !store.cleanup_authorized(principal, artifact)?
@@ -1136,7 +1261,7 @@ impl Router {
             return self
                 .inner
                 .plugin_host
-                .archive_native_session(profile, &native_ref)
+                .archive_native_session(profile, &native_ref, &agent)
                 .await
                 .map_err(|error| {
                     if matches!(
@@ -1368,6 +1493,20 @@ impl Router {
         artifact: &ArtifactView,
         git: &CleanupGitBinding,
     ) -> Result<BranchClassification> {
+        self.cleanup_branch_classification_with_deadline(
+            artifact,
+            git,
+            Instant::now() + Duration::from_secs(60),
+        )
+        .await
+    }
+
+    async fn cleanup_branch_classification_with_deadline(
+        &self,
+        artifact: &ArtifactView,
+        git: &CleanupGitBinding,
+        deadline: Instant,
+    ) -> Result<BranchClassification> {
         let workspace = self
             .inner
             .store
@@ -1384,7 +1523,7 @@ impl Router {
                 "the retained worktree still uses this branch",
             ));
         }
-        Self::classify_branch(&self.inner.data_root, git).await
+        Self::classify_branch(&self.inner.data_root, git, deadline).await
     }
 
     /// Fetch the branch upstream and classify the local branch. `safe` means
@@ -1395,6 +1534,7 @@ impl Router {
     async fn classify_branch(
         data_root: &Path,
         git: &CleanupGitBinding,
+        deadline: Instant,
     ) -> Result<BranchClassification> {
         use crate::git_actions::{CleanupTransportOp, run_cleanup_transport};
         if !crate::git_actions::valid_cleanup_branch(&git.branch) {
@@ -1405,7 +1545,6 @@ impl Router {
         }
         let repo = Path::new(&git.common);
         let probe = crate::git_monitor::GitProbe::new()?;
-        let deadline = Instant::now() + Duration::from_secs(60);
         let branch_ref = format!("refs/heads/{}", git.branch);
         let remote = Self::branch_upstream_remote(&probe, repo, &branch_ref, deadline).await?;
         let url = Self::branch_remote_url(&probe, repo, &remote, deadline).await?;
@@ -1900,6 +2039,24 @@ fn project_ids(candidates: &[CleanupCandidate]) -> Vec<String> {
         .collect()
 }
 
+fn cleanup_plan_request_binding(principal: &str, request: &CleanupPlanRequest) -> Result<String> {
+    let value = json!({
+        "principal": principal,
+        "scope": request.scope,
+        "project": request.project.as_deref(),
+        "older_than": request.older_than,
+    });
+    let digest = eliot_core::canonical_json_sha256(&value)
+        .map_err(|_| Error::new("internal", "cleanup request binding could not encode"))?;
+    let mut binding = String::with_capacity(64);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in digest {
+        binding.push(HEX[(byte >> 4) as usize] as char);
+        binding.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    Ok(binding)
+}
+
 /// Whether a continued page may reuse its offsets: the settings revision
 /// matches and the ordered project ids and verdict bands are unchanged. A
 /// checkout appearing or disappearing reclassifies its project without
@@ -1914,27 +2071,6 @@ fn continuation_order_valid(
     page.regs_revision == *revision
         && page.safe_ids.as_ref() == Some(&project_ids(safe))
         && page.kept_ids.as_ref() == Some(&project_ids(kept))
-}
-
-/// Whether the artifact listing continues: the Store still holds eligible
-/// rows, the agent backfill is capped, project rows remain, or project
-/// rows displaced artifact rows off this page.
-#[allow(clippy::too_many_arguments)]
-fn artifact_listing_truncated(
-    artifacts_truncated: bool,
-    inventory_incomplete: bool,
-    artifacts_total: usize,
-    middle_len: usize,
-    safe_total: usize,
-    safe_consumed: usize,
-    kept_total: usize,
-    kept_consumed: usize,
-) -> bool {
-    artifacts_truncated
-        || inventory_incomplete
-        || artifacts_total > middle_len
-        || safe_total > safe_consumed
-        || kept_total > kept_consumed
 }
 
 /// Splice one listing page in final candidate order: the already-offset
@@ -1999,37 +2135,81 @@ fn native_session_reference(artifact: &ArtifactView) -> Result<String> {
 fn frozen_archive_profile(agent: &Agent, artifact: &ArtifactView) -> Result<(Value, String)> {
     let reference = native_session_reference(artifact)?;
     let profile = agent.profile_snapshot.clone();
-    let binding: eliot_core::NativeStoreBinding = profile
-        .get("native_store_binding")
-        .cloned()
-        .ok_or_else(|| {
-            Error::new(
-                "native_scope_unverified",
-                "archive requires the frozen native store",
-            )
-        })
-        .and_then(|value| {
-            serde_json::from_value(value).map_err(|_| {
-                Error::new(
-                    "native_scope_unverified",
-                    "frozen archive store is malformed",
-                )
-            })
-        })?;
-    if agent.id != artifact.agent
+    if !swarm_created_session_agent(agent)
+        || agent.id != artifact.agent
         || agent.generation != artifact.generation
         || agent.native_scope.as_deref() != Some(artifact.identity.as_str())
         || agent.native_ref.as_deref() != Some(reference.as_str())
-        || binding.native_scope != artifact.identity
-        || agent.harness != "codex"
-        || profile["harness"] != "codex"
+        || !native_archive_supported(&agent.harness)
+        || artifact.purpose != agent.harness
+        || profile["harness"] != agent.harness.as_str()
     {
         return Err(Error::new(
             "native_scope_unverified",
             "archive identity differs from the frozen native store",
         ));
     }
+    if agent.harness == "codex" {
+        let binding: eliot_core::NativeStoreBinding = profile
+            .get("native_store_binding")
+            .cloned()
+            .ok_or_else(|| {
+                Error::new(
+                    "native_scope_unverified",
+                    "archive requires the frozen native store",
+                )
+            })
+            .and_then(|value| {
+                serde_json::from_value(value).map_err(|_| {
+                    Error::new(
+                        "native_scope_unverified",
+                        "frozen archive store is malformed",
+                    )
+                })
+            })?;
+        if binding.native_scope != artifact.identity {
+            return Err(Error::new(
+                "native_scope_unverified",
+                "archive identity differs from the frozen native store",
+            ));
+        }
+    }
     Ok((profile, reference))
+}
+
+/// Only a Swarm-created Agent's retained session may be archived: a
+/// launched Agent, never an attached or observed session (including
+/// observed native children) that belongs to its own producer.
+fn swarm_created_session_agent(agent: &Agent) -> bool {
+    !agent.observe_only && matches!(agent.origin, eliot_core::AgentOrigin::Eliot)
+}
+
+fn native_archive_supported(harness: &str) -> bool {
+    matches!(harness, "codex" | "opencode")
+}
+
+fn cleanup_tree_root(artifact: &ArtifactView) -> Option<&str> {
+    let (agent, _) = artifact.tree.last()?.split_once(':')?;
+    Some(agent)
+}
+
+fn native_session_artifact(agent: &Agent) -> Option<ArtifactView> {
+    let scope = agent.native_scope.as_ref()?;
+    let reference = agent.native_ref.as_ref()?;
+    Some(ArtifactView {
+        id: ulid::Ulid::new().to_string(),
+        agent: agent.id.clone(),
+        generation: agent.generation,
+        project: agent.project.clone(),
+        tree: Vec::new(),
+        path: format!("native:{scope}:{reference}"),
+        kind: ArtifactKind::NativeSession,
+        purpose: agent.harness.clone(),
+        identity: scope.clone(),
+        created_at: agent.created_at,
+        state: "registered".to_owned(),
+        git: None,
+    })
 }
 
 impl Router {

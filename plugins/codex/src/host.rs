@@ -644,8 +644,9 @@ impl CodexPlugin {
     /// Archive one thread through the documented `thread/archive` method. A
     /// dedicated reader plugin instance performs the call with no turn and
     /// no inference; raw session files are never touched. Used by Swarm
-    /// cleanup for terminal Codex Agents; every other harness reports no
-    /// native archive surface and keeps its sessions.
+    /// cleanup for terminal Swarm-created Codex Agents; harnesses without a
+    /// documented archive surface report no native archive and keep their
+    /// sessions.
     async fn native_archive(&self, raw: &Value) -> Result<Value> {
         ensure_dedicated_reader(
             self.session.is_some() || self.failed_start.is_some() || self.observer.is_some(),

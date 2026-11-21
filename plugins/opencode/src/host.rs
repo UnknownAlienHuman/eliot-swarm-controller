@@ -4,7 +4,10 @@ use crate::{
         AuthSetup, AuthTransfer, HttpOutcome, IntegrationSelector, OpenCodeHttp, OwnedServer,
         SWARM_MCP_SERVER_NAME, ServerLaunch,
         models::{MAX_MODEL_ID_BYTES, ReaderContext, run_model_metadata, run_models},
-        server::{provider_config, validate_local_provider, validate_local_provider_environment},
+        server::{
+            ArchiveServerLaunch, provider_config, validate_local_provider,
+            validate_local_provider_environment,
+        },
         transfer_selected_integration,
         types::{
             ConfigEntry, ConfigMcpServer, InboxUser, McpServerReadback, ModelRef, NativeModelEntry,
@@ -17,7 +20,9 @@ use eliot_core::{ContextItem, Error, FailureOrigin, InjectPoint, McpPolicy, Resu
 use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
     MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
-    protocol::{AgentModelsParams, ModelListParams, ModelListPart, stream_sources},
+    protocol::{
+        AgentModelsParams, ModelListParams, ModelListPart, NativeArchiveParams, stream_sources,
+    },
     session::{
         ResumeSubject, TargetEnvironment, attach_reply_diagnostics, begin_stop, decode,
         ensure_dedicated_reader, ensure_reader_harness, initialize_fields_valid, native_no_write,
@@ -90,6 +95,18 @@ const START_SETTLE_RESERVE: std::time::Duration = std::time::Duration::from_secs
 /// crates/eliot-daemon/src/plugin_host/host.rs (`START_TIMEOUT`): the start
 /// envelope plus the settlement reserve must fit inside it.
 const DAEMON_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// Total bound for one `native.archive` reader dispatch: the owned reader
+/// server spawn/readiness, the store-scope proof, one session read, exhaustive
+/// childless-list preflight, one DELETE and complete post-delete readback. The
+/// shutdown share below is reserved after it, and the pair fits inside the
+/// daemon's 25 s reader deadline; cancellation kills the helper and never replays.
+const ARCHIVE_ENVELOPE: std::time::Duration = std::time::Duration::from_secs(18);
+
+/// Spawn/readiness share of the archive envelope: the retained store is
+/// already warm and no auth transfer runs, so readiness needs no credential
+/// import time.
+const ARCHIVE_SPAWN_BUDGET: std::time::Duration = std::time::Duration::from_secs(12);
 
 /// Clamp one start-phase budget to the dispatch envelope: the phase gets its
 /// full budget when the envelope has room, otherwise whatever is left. A
@@ -551,6 +568,7 @@ impl OpenCodePlugin {
             "initialize" => self.initialize(&request.params),
             "model.list" => self.model_list(&request.params).await,
             "quota.read" => crate::quota::read(&request.params).await,
+            "native.archive" => self.native_archive(&request.params).await,
             "agent.start" => self.start(&request.params, client).await,
             "agent.command" => self.command(&request.params).await,
             "agent.models" => self.session_models(&request.params).await,
@@ -631,6 +649,216 @@ impl OpenCodePlugin {
     fn retain_failed_start(&mut self, error: Error) -> Error {
         self.failed_start = Some(FailedStart);
         error
+    }
+
+    /// Remove one terminal Swarm-created OpenCode session through the
+    /// documented `DELETE /api/session/{id}` call. A dedicated reader plugin
+    /// instance runs a short-lived owned server on the exact retained per-Agent
+    /// store and directory, proves that store derives the retained native scope,
+    /// and proves the exact target's presence against a complete inventory.
+    /// An absent target is already archived; a present target with native
+    /// children is refused because OpenCode DELETE recursively removes them.
+    /// The stopped isolated reader has no live Agent turn. Raw store files are
+    /// never touched.
+    async fn native_archive(&self, raw: &Value) -> Result<Value> {
+        ensure_dedicated_reader(
+            self.session.is_some() || self.failed_start.is_some(),
+            "OpenCode",
+            "native.archive",
+        )?;
+        let params: NativeArchiveParams =
+            decode(raw, "OpenCode native.archive params are invalid")?;
+        ensure_reader_harness(&params.profile, "opencode", "OpenCode", "native.archive")?;
+        if params.native_ref.is_empty()
+            || params.native_ref.len() > 512
+            || params.native_ref.chars().any(char::is_control)
+        {
+            return Err(Error::new(
+                "invalid",
+                "OpenCode native.archive needs a native session reference",
+            ));
+        }
+        let agent_id = params
+            .agent_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                Error::new(
+                    "invalid",
+                    "OpenCode native.archive needs the retained Agent id",
+                )
+            })?;
+        let native_scope = params
+            .native_scope
+            .as_deref()
+            .filter(|scope| !scope.is_empty())
+            .ok_or_else(|| {
+                Error::new(
+                    "invalid",
+                    "OpenCode native.archive needs the retained native scope",
+                )
+            })?;
+        let workspace = params.workspace.as_deref().ok_or_else(|| {
+            Error::new(
+                "invalid",
+                "OpenCode native.archive needs the retained Agent workspace",
+            )
+        })?;
+        let program = required_native_cmd(
+            &params.profile,
+            "OpenCode native.archive requires a discovered native cmd",
+        )?;
+        let initialized = self
+            .initialized
+            .as_ref()
+            .ok_or_else(|| not_initialized("OpenCode"))?;
+        let TargetEnvironment {
+            variables: environment,
+            mut secrets,
+        } = target_environment(None, params.profile.get("pass_env"), "OpenCode")?;
+        secrets.push(initialized.credential.clone());
+        let envelope = Instant::now() + ARCHIVE_ENVELOPE;
+        let mut server = OwnedServer::spawn_archive_reader(
+            ArchiveServerLaunch {
+                program: OsString::from(program),
+                workspace: PathBuf::from(workspace),
+                instance_dir: PathBuf::from(&initialized.instance_dir),
+                store_root: PathBuf::from(&initialized.store_root),
+                agent_id: agent_id.to_owned(),
+                environment,
+            },
+            &secrets,
+            phase_deadline(envelope, ARCHIVE_SPAWN_BUDGET),
+        )
+        .await?;
+        let result =
+            Self::archive_retained_session(&server, native_scope, &params.native_ref, envelope)
+                .await;
+        // The reader server is ours: end it on every path. An unconfirmed
+        // termination after a successful delete leaves the outcome unknown,
+        // never a claimed archive.
+        let stopped = server
+            .terminate(true, Instant::now() + START_SHUTDOWN_BUDGET)
+            .await;
+        match (result, stopped) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Ok(_), Err(error)) => Err(Error::new(
+                "unknown",
+                format!(
+                    "OpenCode native.archive server cleanup is unconfirmed ({})",
+                    error.message
+                ),
+            )),
+            (Err(error), _) => Err(server.diagnostic_error(error)),
+        }
+    }
+
+    /// Reconcile exact session reads with a complete unfiltered inventory on
+    /// the reader serving the exact retained store. An absent target is
+    /// archived independently of retained children. A present target with any
+    /// native child is refused before recursive DELETE; after DELETE, proven
+    /// target absence establishes this target's archive even if child rows
+    /// remain. HTTP 400/401 and a proven child of a present target are
+    /// definitive refusals; every other uncertain outcome stays unknown,
+    /// never replayed.
+    async fn archive_retained_session(
+        server: &OwnedServer,
+        native_scope: &str,
+        native_ref: &str,
+        envelope: Instant,
+    ) -> Result<Value> {
+        if opencode_scope(server.data_dir()) != native_scope {
+            return Err(Error::new(
+                "source_integrity",
+                "OpenCode archive reader store differs from the retained native scope",
+            ));
+        }
+        let http = server.http();
+        let present = http
+            .archive_session_present(native_ref, phase_deadline(envelope, RPC_TIMEOUT))
+            .await
+            .map_err(|error| {
+                Error::new(
+                    "unknown",
+                    format!(
+                        "OpenCode archive session readback is unconfirmed ({}); no replay",
+                        error.message
+                    ),
+                )
+            })?;
+        let before = http
+            .archive_session_inventory(native_ref, phase_deadline(envelope, RPC_TIMEOUT))
+            .await
+            .map_err(|error| {
+                Error::new(
+                    "unknown",
+                    format!(
+                        "OpenCode complete childless-list proof failed ({}); no replay",
+                        error.message
+                    ),
+                )
+            })?;
+        if before.target_present != present {
+            return Err(Error::new(
+                "unknown",
+                "OpenCode exact session readback disagreed with the complete session list; no replay",
+            ));
+        }
+        if !present {
+            return Ok(json!({"archived": true}));
+        }
+        if before.has_children {
+            return Err(Error::new(
+                "native_archive_refused",
+                "OpenCode session has native child sessions and was kept",
+            ));
+        }
+
+        let delete_deadline = envelope
+            .checked_sub(START_SHUTDOWN_BUDGET)
+            .unwrap_or_else(Instant::now);
+        match http.delete_session(native_ref, delete_deadline).await {
+            Ok(_) => {
+                let after = http
+                    .archive_session_inventory(native_ref, phase_deadline(envelope, RPC_TIMEOUT))
+                    .await
+                    .map_err(|error| {
+                        Error::new(
+                            "unknown",
+                            format!(
+                                "OpenCode delete readback is unconfirmed ({}); no replay",
+                                error.message
+                            ),
+                        )
+                    })?;
+                if after.target_present {
+                    return Err(Error::new(
+                        "unknown",
+                        "OpenCode DELETE completed without proving the target absent; no replay",
+                    ));
+                }
+                Ok(json!({"archived": true}))
+            }
+            Err(HttpOutcome::Rejected {
+                status: Some(400 | 401),
+                reason,
+            }) => Err(Error::new(
+                "native_archive_refused",
+                format!("OpenCode definitively refused session delete ({reason})"),
+            )),
+            Err(HttpOutcome::Rejected { reason, .. }) => Err(Error::new(
+                "unknown",
+                format!("OpenCode delete refusal was not authoritative ({reason}); no replay"),
+            )),
+            Err(HttpOutcome::Unknown { reason }) => Err(Error::new(
+                "unknown",
+                format!("OpenCode session delete is unconfirmed ({reason}); no replay"),
+            )),
+            Err(HttpOutcome::NotDispatched { reason }) => Err(Error::new(
+                "unknown",
+                format!("OpenCode session delete was not dispatched ({reason}); no replay"),
+            )),
+        }
     }
 
     /// One read-only `harness.models` phase: `models --standalone` ids or

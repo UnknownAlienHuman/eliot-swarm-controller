@@ -193,6 +193,31 @@ pub struct ProfileStoreParams {
     pub workspace: String,
 }
 
+/// `native.archive`: delete or archive exactly one retained native session
+/// of a terminal Swarm-created Agent through a dedicated reader instance
+/// with no turn and no inference. The daemon owns cleanup policy; the plugin
+/// only maps the harness's documented native call (Codex `thread/archive`,
+/// OpenCode `DELETE /api/session/{id}`). Raw store files are never touched.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeArchiveParams {
+    pub profile: Value,
+    pub native_ref: String,
+    /// The Agent whose frozen store the reader must prove it serves before
+    /// the delete. Required by harnesses whose sessions live in a per-Agent
+    /// store (OpenCode); Codex pins its store through the frozen binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// The frozen native scope recorded with the session. The reader proves
+    /// its served store derives this exact scope before the delete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_scope: Option<String>,
+    /// The Agent workspace the per-Agent server binds its directory context
+    /// to (OpenCode). Absent for harnesses without a directory-bound server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+}
+
 /// One catalogue phase per owned reader lifetime. OpenCode's native CLI uses
 /// separate commands for ids and metadata. The host closes each family before
 /// starting the next phase. Other harnesses use the default complete inventory.

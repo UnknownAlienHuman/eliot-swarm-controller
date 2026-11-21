@@ -50,8 +50,9 @@ or all. Terminal means Stopped or Failed with no open native source, pending
 command or retained non-exited owned process. Lost remains conservative.
 Clean managed worktrees require exact reciprocal Git/common-directory identity;
 tracked, untracked and ignored changes keep the worktree. Native stores are never
-deleted as files. A Codex session of a terminal Agent is `safe` with reason
-`native_archive_pending`; every other harness stays `keep(no_native_archive)`.
+deleted as files. A Codex or OpenCode session of a terminal Swarm-created Agent
+is `safe` with reason `native_archive_pending`; attached or observed sessions
+and every other harness stay `keep(no_native_archive)`.
 The plan snapshot anchors the freshly classified branch tip (the backfill also refreshes the stored row), and apply re-verifies that exact tip. A branch is `safe` only after a fresh upstream fetch proves the tip is
 contained in the upstream default branch with no unpushed commits (a remote
 branch already deleted upstream counts as merged only together with that
@@ -97,17 +98,49 @@ separate explicit Owner-only flag (`delete_remote`) on `cleanup.apply` and
 never automatic: the remote branch is verified absent before and after the
 push, and a remote failure after local deletion is `unknown`, never `skipped`.
 Native sessions are archived at apply through the harness documented archive
-method (Codex `thread/archive`) using the Agent's frozen profile and store
-binding. Artifact scope/reference must match that generation's native subject,
-and the initialized reader verifies its effective home/SQLite root against the
-frozen binding before dispatch. A legacy Codex home scope derived from an
-alias missing from the frozen binding remains ineligible for Swarm archive.
-Only a new launch can capture a verified binding for its own session. A
-malformed or secret-bearing acknowledgement after dispatch is `unknown` and
-retains the durable retry fence. Raw
+method (Codex `thread/archive`, OpenCode session delete on the retained
+per-Agent store) using the Agent's frozen profile. Only a Swarm-created Agent's
+session is eligible. Attached and observe-only sessions stay with their producer.
+Claude Code's [background-session removal](https://code.claude.com/docs/en/agent-view#what-deleting-a-session-removes)
+keeps the transcript. Muse keeps its durable host sessions. Antigravity 1.5.14
+advertises ACP close, load, list and resume, and keeps its chat history.
+Artifact
+scope/reference must match that generation's native subject. The Codex reader
+verifies its effective home/SQLite root against the frozen store binding before
+dispatch; a legacy Codex home scope derived from an alias missing from the
+frozen binding remains ineligible for Swarm archive, and only a new launch can
+capture a verified binding for its own session. The OpenCode reader proves its
+served store derives the exact retained native scope before the delete. The
+reader records a proven-absent target as removed even if its former children
+remain. A present target with native children stays in place because the
+vendor delete would also remove the children. Each child needs its own
+Swarm-created retained session artifact to qualify for cleanup. A delete
+acknowledgement or 404 counts as removed only if the same server, store and
+directory give a complete session list with the exact target absent. An authoritative
+refusal settles as skipped and keeps the session. A timeout or malformed or
+secret-bearing readback after dispatch is `unknown` and retains the durable
+retry fence. The metadata reader owns the vendor helper through shutdown. Raw
 native store files are never touched. Logical reclaimed bytes count only fully
 confirmed removed trees; partial attempts report unknown and zero confirmed
 bytes.
+
+`agent.delete` runs the same guarded effects for the selected task tree's
+eligible native sessions and managed worktrees before retiring the task records.
+It records cleanup outcomes before retiring ownership and keeps the task records
+if an attempted effect is refused or uncertain. Session cleanup runs first.
+If a selected session is kept or uncertain, pending worktrees in that task
+tree settle as `skipped(native_session_kept)`. This also applies to a
+`cleanup.apply` selection that includes both effects.
+
+Continue a cleanup review with the opaque `continuation` string from the previous
+response and the same scope, project and age cutoff. The CLI passes it as
+`--continuation <token>` and MCP passes the string as `params.continuation`.
+The daemon also accepts legacy JSON continuations. A progress page can contain
+zero candidates with a continuation while the daemon scans the retained inventory.
+The backfill cursor advances only across completed probe batches. A failed probe
+rejects the page. A time slice that ends mid-batch can return progress through
+the last completed batch, with the unfinished batch retried on continuation.
+The desktop advances through those pages and offers Next page for more candidates.
 
 Owner plans with scope `all` or a registration ID in scope `project` include
 project registrations from the current settings revision. A creation-time cutoff

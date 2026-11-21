@@ -269,6 +269,20 @@ pub struct ServerLaunch {
     pub native_subagents: Option<String>,
 }
 
+/// Launch of a short-lived archive reader server: the same owned `serve`
+/// lifecycle on the exact retained per-Agent store, with a minimal
+/// per-reader config (no model turn, no inference, no MCP server, no
+/// context-hook plugin, no skill copy). Credentials already live in the
+/// retained store from the Agent's own launches, so no auth transfer runs.
+pub struct ArchiveServerLaunch {
+    pub program: OsString,
+    pub workspace: PathBuf,
+    pub instance_dir: PathBuf,
+    pub store_root: PathBuf,
+    pub agent_id: String,
+    pub environment: Vec<(OsString, OsString)>,
+}
+
 /// A running owned server: its child, HTTP client, and addresses.
 pub struct OwnedServer {
     child: Child,
@@ -676,6 +690,131 @@ impl OwnedServer {
 
     pub fn pid(&self) -> Option<u32> {
         self.child.id()
+    }
+
+    /// Spawn the archive reader server on the retained per-Agent store.
+    /// Readiness proves our password and our per-reader config document,
+    /// exactly like a start; the caller additionally proves the served store
+    /// derives the retained native scope before any delete. Every failure
+    /// leaves no running child behind.
+    pub async fn spawn_archive_reader(
+        launch: ArchiveServerLaunch,
+        secrets: &[String],
+        envelope: Instant,
+    ) -> Result<Self> {
+        let native_directory = server_native_directory(&launch.workspace).map_err(|_| {
+            Error::new(
+                "native_spawn",
+                "OpenCode archive workspace directory could not be canonicalized",
+            )
+        })?;
+        let config_root = launch.instance_dir.join("config");
+        let config_dir = config_root.join("opencode");
+        let data_dir = stable_store_dir(&launch.store_root, &launch.agent_id)?;
+        // The retained store must already exist: the reader never creates a
+        // fresh store a delete could then be pointed at.
+        if !data_dir.is_dir() {
+            return Err(Error::new(
+                "native_spawn",
+                "OpenCode archive reader has no retained per-Agent store",
+            ));
+        }
+        std::fs::create_dir_all(&config_dir).map_err(|error| {
+            Error::new(
+                "native_spawn",
+                format!("OpenCode archive reader config directory could not be created: {error}"),
+            )
+        })?;
+        std::fs::write(
+            config_dir.join("opencode.jsonc"),
+            provider_config(None, None).to_string(),
+        )
+        .map_err(|error| {
+            Error::new(
+                "native_spawn",
+                format!("OpenCode archive reader config could not be written: {error}"),
+            )
+        })?;
+        let port = TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|error| {
+                Error::new(
+                    "native_spawn",
+                    format!("OpenCode loopback port could not be reserved: {error}"),
+                )
+            })?
+            .local_addr()
+            .map_err(|error| {
+                Error::new(
+                    "native_spawn",
+                    format!("OpenCode loopback port could not be read: {error}"),
+                )
+            })?
+            .port();
+        let password = format!("eliot-{}-{}", ulid::Ulid::new(), ulid::Ulid::new());
+        let mut capture = secrets.to_vec();
+        capture.push(password.clone());
+        let capture = SecretPolicy::new(capture);
+        let http = OpenCodeHttp::new(port, password.clone(), &native_directory)?;
+        let mut command = Command::new(&launch.program);
+        apply_environment(&mut command, &launch.environment, false);
+        command
+            .arg("serve")
+            .arg("--hostname")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .current_dir(&native_directory)
+            .env("OPENCODE_PASSWORD", &password)
+            .env("XDG_CONFIG_HOME", &config_root)
+            .env("XDG_DATA_HOME", &data_dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            // The daemon's 25 s reader deadline can cancel this future. Kill
+            // the direct helper on drop; its reader process remains inside the
+            // daemon-owned Job for Windows family cleanup.
+            .kill_on_drop(true);
+        let mut child = command.spawn().map_err(|error| {
+            Error::new(
+                "native_spawn",
+                capture.redact_text(&format!(
+                    "could not start the configured OpenCode serve: {error}"
+                )),
+            )
+            .with_where("plugin.opencode.archive.spawn")
+            .with_origin(
+                FailureOrigin::Environment,
+                "OS could not start the native serve binary",
+            )
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            Error::new("native_spawn", "OpenCode serve stdout was not piped")
+                .with_where("plugin.opencode.archive.spawn")
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            Error::new("native_spawn", "OpenCode serve stderr was not piped")
+                .with_where("plugin.opencode.archive.spawn")
+        })?;
+        let capture = std::sync::Arc::new(capture);
+        let stdout = spawn_stderr(stdout, capture.clone());
+        let stderr = spawn_stderr(stderr, capture);
+        let mut server = Self {
+            child,
+            stdout: Some(stdout),
+            stderr: Some(stderr),
+            http,
+            config_dir,
+            data_dir,
+        };
+        let ready_deadline = (Instant::now() + READINESS_TIMEOUT).min(envelope);
+        if let Err(error) = server.await_ready(ready_deadline).await {
+            let _ = server
+                .terminate(true, Instant::now() + Duration::from_secs(5))
+                .await;
+            return Err(error);
+        }
+        Ok(server)
     }
 
     pub fn http(&self) -> &OpenCodeHttp {

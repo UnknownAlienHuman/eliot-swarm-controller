@@ -71,7 +71,7 @@ impl DesktopApp {
             if groups.is_empty() {
                 parts.push(KeyedView::new(
                     "empty",
-                    m3::secondary("Nothing to clean up: Swarm holds no finished work.")
+                    m3::secondary("No cleanup items on this page.")
                         .text_wrapping(TextWrapping::Wrap),
                 ));
             }
@@ -225,7 +225,7 @@ impl DesktopApp {
                     ),
                 ));
             }
-            if plan.truncated {
+            if plan.truncated && plan.continuation.is_none() {
                 parts.push(KeyedView::new(
                     "truncated",
                     m3::secondary(
@@ -234,6 +234,24 @@ impl DesktopApp {
                     .text_wrapping(TextWrapping::Wrap),
                 ));
             }
+        }
+        let page = state
+            .cleanup_plan
+            .as_ref()
+            .or_else(|| state.cleanup_result.as_ref().map(|(plan, _)| plan));
+        if let Some(continuation) = page.and_then(|plan| plan.continuation.clone()) {
+            parts.push(KeyedView::new(
+                "next-page",
+                m3::outlined(palette)
+                    .automation_name("Next cleanup page")
+                    .is_enabled(!state.cleanup_busy)
+                    .on_click(
+                        context.message(Message::Settings(SettingsMsg::CleanupPlan(Some(
+                            continuation,
+                        )))),
+                    )
+                    .content(m3::label("Next page")),
+            ));
         }
         StackPanel::new()
             .spacing(tokens::spacing::SM)
@@ -353,7 +371,9 @@ impl DesktopApp {
                         m3::outlined(palette)
                             .automation_name("Review cleanup")
                             .is_enabled(!self.settings.cleanup_busy)
-                            .on_click(context.message(Message::Settings(SettingsMsg::CleanupPlan)))
+                            .on_click(
+                                context.message(Message::Settings(SettingsMsg::CleanupPlan(None))),
+                            )
                             .content(m3::label(if self.settings.cleanup_plan.is_some() {
                                 "Review again"
                             } else {

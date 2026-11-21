@@ -9,6 +9,17 @@ const MAX_CLEANUP_PLANS: i64 = 1_024;
 /// Reclaimable plans deleted per self-heal batch: fully settled consumed
 /// plans and abandoned never-consumed previews, oldest first.
 const CLEANUP_PLAN_RECLAIM_BATCH: i64 = 64;
+/// Ledger rows inspected by one cleanup inventory page, including rows that
+/// are settled or filtered out.
+const CLEANUP_INVENTORY_SCAN: usize = 256;
+
+pub struct CleanupInventoryPage {
+    pub artifacts: Vec<ArtifactView>,
+    pub truncated: bool,
+    pub snapshot_seq: i64,
+    pub next_rank: u8,
+    pub next_seq: Option<i64>,
+}
 
 /// An apply can read back its exact workspace command even after a crash
 /// between native removal and cleanup receipt settlement.
@@ -72,6 +83,14 @@ impl Store {
             serde_json::from_str(&s).map_err(|_| Error::new("source_integrity", "invalid artifact"))
         })
         .transpose()
+    }
+
+    pub fn known_native_session_artifact(
+        &self,
+        agent: &str,
+        path: &str,
+    ) -> Result<Option<ArtifactView>> {
+        known_native_session_artifact(&self.connection, parse_agent_id(agent)?, path)
     }
 
     /// Internal, non-deletable custody row committed before the native Agent
@@ -175,6 +194,22 @@ impl Store {
                 "worktree artifact custody changed",
             ));
         }
+        let agent_num = parse_agent_id(&artifact.agent)?;
+        if artifact.kind == ArtifactKind::NativeSession
+            && let Some(previous) = known_native_session_artifact(&tx, agent_num, &artifact.path)?
+        {
+            // A resume may carry the same native session into the new
+            // generation. Updating custody must preserve the attempt fence.
+            if previous.state == "registered" && previous.generation < artifact.generation {
+                artifact.id = previous.id;
+                tx.execute(
+                    "UPDATE artifacts SET generation=?1,body=?2 WHERE id=?3",
+                    params![artifact.generation, encode_json(&artifact)?, artifact.id],
+                )
+                .map_err(sql_error)?;
+            }
+            return commit_transaction(tx, &self.write_faulted);
+        }
         let count: i64 = tx
             .query_row("SELECT COUNT(*) FROM artifacts", [], |r| r.get(0))
             .map_err(sql_error)?;
@@ -186,7 +221,7 @@ impl Store {
                 r.get(0)
             })
             .map_err(sql_error)?;
-        let changed = tx.execute("INSERT OR IGNORE INTO artifacts(id,agent,generation,path,body,seq) VALUES (?1,?2,?3,?4,?5,?6)",params![artifact.id,parse_agent_id(&artifact.agent)?,artifact.generation,artifact.path,encode_json(&artifact)?,seq]).map_err(sql_error)?;
+        let changed = tx.execute("INSERT OR IGNORE INTO artifacts(id,agent,generation,path,body,seq) VALUES (?1,?2,?3,?4,?5,?6)",params![artifact.id,agent_num,artifact.generation,artifact.path,encode_json(&artifact)?,seq]).map_err(sql_error)?;
         if changed == 0 && artifact.kind == ArtifactKind::Branch {
             // Branches move as their agent commits: refresh the tracked tip
             // so the plan snapshot anchors exactly what apply re-verifies.
@@ -319,21 +354,25 @@ impl Store {
 
     /// Eligible cleanup candidates in final candidate order: ordinary rows
     /// first, then worktrees, then branches and native sessions, each oldest
-    /// insertion first. Only `registered` rows paginate: settled rows
-    /// (`removed`, `unknown`, `skipped(...)`) are attempt history, not
-    /// candidates, and their readback lives in the retained plans. Filtering
-    /// them before the page cap keeps a settled prefix from starving later
-    /// eligible rows. The page is pinned to a ledger snapshot: rows inserted
-    /// after the snapshot land on a fresh listing, never inside a page, and
-    /// the cursor resolves against the same snapshot, so a concurrent
-    /// registration can neither hide behind nor repeat a candidate. Returns
-    /// the page, whether eligible rows remain, and the snapshot to echo.
+    /// insertion first. A bounded raw-row scan advances by rank and sequence,
+    /// including through settled/filtered rows, so an empty page still makes
+    /// progress. The page is pinned to a ledger snapshot: later registrations
+    /// appear only in a fresh listing. Returns the candidates, whether more
+    /// inventory remains, the snapshot, and the next raw-row cursor.
     pub fn cleanup_inventory(
         &self,
         principal: &str,
         request: &CleanupPlanRequest,
-    ) -> Result<(Vec<ArtifactView>, bool, i64)> {
+        page: &PlanContinuation,
+        limit: usize,
+    ) -> Result<CleanupInventoryPage> {
         request.validate()?;
+        if limit > MAX_CLEANUP_ITEMS {
+            return Err(Error::new(
+                "invalid",
+                "cleanup inventory page exceeds bound",
+            ));
+        }
         let caller = parse_sender(principal, "cleanup")?;
         if !matches!(caller, Sender::Owner) && request.scope != CleanupScope::SelfTree {
             return Err(Error::new(
@@ -344,21 +383,6 @@ impl Store {
         if matches!(caller, Sender::Owner) && request.scope == CleanupScope::SelfTree {
             return Err(Error::new("invalid", "Owner must select project or all"));
         }
-        let page = request
-            .continuation
-            .as_deref()
-            .map(PlanContinuation::decode)
-            .transpose()?
-            .unwrap_or(PlanContinuation {
-                artifact_after: None,
-                safe_skipped: 0,
-                kept_skipped: 0,
-                regs_revision: None,
-                snapshot_seq: None,
-                safe_ids: None,
-                kept_ids: None,
-                backfill_after: None,
-            });
         let snapshot: i64 = match page.snapshot_seq {
             Some(snapshot) => snapshot,
             None => self
@@ -368,84 +392,127 @@ impl Store {
                 })
                 .map_err(sql_error)?,
         };
-        let cursor: Option<(u8, i64)> = match &page.artifact_after {
-            None => None,
-            Some(id) => {
-                let (kind, seq): (String, i64) = self
-                    .connection
-                    .query_row(
-                        "SELECT json_extract(body, '$.kind'), seq FROM artifacts WHERE id = ?1",
-                        [id],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
-                    )
-                    .map_err(|error| match error {
-                        rusqlite::Error::QueryReturnedNoRows => {
-                            Error::new("invalid", "cleanup continuation is stale")
-                        }
-                        other => sql_error(other),
-                    })?;
-                let kind: ArtifactKind = serde_json::from_value(Value::String(kind))
-                    .map_err(|_| Error::new("source_integrity", "invalid artifact ledger row"))?;
-                Some((kind.cleanup_rank(), seq))
-            }
+        let (mut rank, mut after_seq) = match page.inventory_rank {
+            Some(rank) => (rank, page.inventory_seq_after),
+            None => match page.artifact_after.as_deref() {
+                None => (0, None),
+                Some(id) => {
+                    let (kind, seq): (String, i64) = self
+                        .connection
+                        .query_row(
+                            "SELECT json_extract(body, '$.kind'), seq FROM artifacts WHERE id = ?1",
+                            [id],
+                            |r| Ok((r.get(0)?, r.get(1)?)),
+                        )
+                        .map_err(|error| match error {
+                            rusqlite::Error::QueryReturnedNoRows => {
+                                Error::new("invalid", "cleanup continuation is stale")
+                            }
+                            other => sql_error(other),
+                        })?;
+                    let kind: ArtifactKind =
+                        serde_json::from_value(Value::String(kind)).map_err(|_| {
+                            Error::new("source_integrity", "invalid artifact ledger row")
+                        })?;
+                    if seq > snapshot {
+                        return Err(Error::new("invalid", "cleanup continuation is stale"));
+                    }
+                    (kind.cleanup_rank(), Some(seq))
+                }
+            },
         };
-        let mut statement = self
-            .connection
-            .prepare("SELECT body, seq FROM artifacts WHERE seq <= ?1 ORDER BY seq ASC LIMIT 4097")
-            .map_err(sql_error)?;
-        let bodies = statement
-            .query_map([snapshot], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-            })
-            .map_err(sql_error)?;
+        if after_seq.is_some_and(|seq| seq > snapshot) {
+            return Err(Error::new("invalid", "cleanup continuation is stale"));
+        }
+        if rank == 3 {
+            return Ok(CleanupInventoryPage {
+                artifacts: Vec::new(),
+                truncated: false,
+                snapshot_seq: snapshot,
+                next_rank: rank,
+                next_seq: None,
+            });
+        }
+
         let mut scanned = 0_usize;
-        let mut eligible: Vec<(u8, i64, ArtifactView)> = Vec::new();
-        for body in bodies {
-            scanned += 1;
-            let (body, seq) = body.map_err(sql_error)?;
-            let artifact: ArtifactView = serde_json::from_str(&body)
-                .map_err(|_| Error::new("source_integrity", "invalid artifact ledger row"))?;
-            let rank = artifact.kind.cleanup_rank();
-            if artifact.state != "registered"
-                || cursor
-                    .is_some_and(|(rank_after, seq_after)| (rank, seq) <= (rank_after, seq_after))
-            {
-                continue;
+        let mut eligible = Vec::with_capacity(limit);
+        let mut truncated = false;
+        'scan: while rank < 3 && scanned < CLEANUP_INVENTORY_SCAN {
+            let remaining = CLEANUP_INVENTORY_SCAN - scanned;
+            let mut statement = self
+                .connection
+                .prepare(
+                    "SELECT body, seq FROM artifacts
+                     WHERE seq > ?1 AND seq <= ?2 ORDER BY seq ASC LIMIT ?3",
+                )
+                .map_err(sql_error)?;
+            let rows = statement
+                .query_map(
+                    params![after_seq.unwrap_or(0), snapshot, (remaining + 1) as i64],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .map_err(sql_error)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(sql_error)?;
+            let fetched = rows.len();
+            for (body, seq) in rows.into_iter().take(remaining) {
+                let previous_seq = after_seq;
+                after_seq = Some(seq);
+                scanned += 1;
+                let artifact: ArtifactView = serde_json::from_str(&body)
+                    .map_err(|_| Error::new("source_integrity", "invalid artifact ledger row"))?;
+                if artifact.kind.cleanup_rank() != rank || artifact.state != "registered" {
+                    continue;
+                }
+                if request
+                    .project
+                    .as_ref()
+                    .is_some_and(|project| project != &artifact.project)
+                    || request
+                        .older_than
+                        .is_some_and(|cutoff| artifact.created_at >= cutoff)
+                {
+                    continue;
+                }
+                // Frozen and live subtree membership is checked before the
+                // target's assignment gate: unrelated rows skip, while a
+                // real assignment refusal still aborts the page.
+                if !self.cleanup_subtree_member(&caller, &artifact)? {
+                    continue;
+                }
+                if !self.cleanup_authorized(principal, &artifact)? {
+                    continue;
+                }
+                if eligible.len() == limit {
+                    // Do not consume the first candidate that does not fit.
+                    after_seq = previous_seq;
+                    truncated = true;
+                    break 'scan;
+                }
+                eligible.push(artifact);
             }
-            if request
-                .project
-                .as_ref()
-                .is_some_and(|p| p != &artifact.project)
-                || request.older_than.is_some_and(|t| artifact.created_at >= t)
-            {
-                continue;
+            if fetched > remaining {
+                truncated = true;
+                break;
             }
-            // Frozen and live subtree membership is checked before the
-            // target's assignment gate: a later row from another managed
-            // project must skip, never abort the page with `not_allowed`.
-            // Only rows in the caller's own subtree reach the gate in
-            // `cleanup_authorized`, where a real assignment refusal aborts.
-            if !self.cleanup_subtree_member(&caller, &artifact)? {
-                continue;
-            }
-            if !self.cleanup_authorized(principal, &artifact)? {
-                continue;
-            }
-            eligible.push((rank, seq, artifact));
+            // Fewer than remaining + 1 rows means this rank's raw tail is
+            // exhausted. Continue at the next final-order rank.
+            rank += 1;
+            after_seq = None;
         }
-        eligible.sort_by_key(|item| (item.0, item.1));
-        let mut truncated = scanned > 4096;
-        let items = if eligible.len() > MAX_CLEANUP_ITEMS {
+        if rank < 3 {
             truncated = true;
-            eligible.truncate(MAX_CLEANUP_ITEMS);
-            eligible
         } else {
-            eligible
+            rank = 3;
+            after_seq = None;
         }
-        .into_iter()
-        .map(|(_, _, artifact)| artifact)
-        .collect();
-        Ok((items, truncated, snapshot))
+        Ok(CleanupInventoryPage {
+            artifacts: eligible,
+            truncated,
+            snapshot_seq: snapshot,
+            next_rank: rank,
+            next_seq: after_seq,
+        })
     }
 
     /// Retirement candidates for one exact Agent generation. The Agent,
@@ -608,12 +675,12 @@ impl Store {
         let root = self
             .agent_artifact_root(&agent.id, generation)?
             .ok_or_else(|| Error::new("not_allowed", "Agent has no Swarm-created artifact root"))?;
-        let normalized = |value: &str| {
-            std::path::PathBuf::from(if cfg!(windows) {
-                value.to_lowercase()
+        let normalized = |path: &str| {
+            if cfg!(windows) {
+                cleanup_path(&path.to_lowercase())
             } else {
-                value.to_owned()
-            })
+                cleanup_path(path)
+            }
         };
         let proposed = normalized(path);
         let owned = normalized(&root.path);
@@ -655,36 +722,6 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
-        {
-            let mut query = tx
-                .prepare("SELECT path FROM artifacts LIMIT 4096")
-                .map_err(sql_error)?;
-            let paths = query
-                .query_map([], |r| r.get::<_, String>(0))
-                .map_err(sql_error)?;
-            for existing in paths {
-                let existing = existing.map_err(sql_error)?;
-                if existing == root.path {
-                    continue;
-                }
-                let existing = std::path::PathBuf::from(if cfg!(windows) {
-                    existing.to_lowercase()
-                } else {
-                    existing
-                });
-                let proposed = std::path::PathBuf::from(if cfg!(windows) {
-                    path.to_lowercase()
-                } else {
-                    path.to_owned()
-                });
-                if existing.starts_with(&proposed) || proposed.starts_with(&existing) {
-                    return Err(Error::new(
-                        "conflict",
-                        "artifact overlaps an existing ownership record",
-                    ));
-                }
-            }
-        }
         let count: i64 = tx
             .query_row("SELECT COUNT(*) FROM artifacts", [], |r| r.get(0))
             .map_err(sql_error)?;
@@ -693,6 +730,23 @@ impl Store {
                 "unavailable",
                 "artifact ledger is full (4096 entries)",
             ));
+        }
+        {
+            let mut query = tx
+                .prepare("SELECT path FROM artifacts WHERE id <> ?1")
+                .map_err(sql_error)?;
+            let paths = query
+                .query_map([&root.id], |r| r.get::<_, String>(0))
+                .map_err(sql_error)?;
+            for existing in paths {
+                let existing = normalized(&existing.map_err(sql_error)?);
+                if existing.starts_with(&proposed) || proposed.starts_with(&existing) {
+                    return Err(Error::new(
+                        "conflict",
+                        "artifact overlaps an existing ownership record",
+                    ));
+                }
+            }
         }
         let body = encode_json(&artifact)?;
         let seq: i64 = tx
@@ -1107,7 +1161,8 @@ impl Store {
                 params![
                     encode_json(&updated)?,
                     artifact.id,
-                    if outcome.outcome == "removed" {
+                    if outcome.outcome == "removed" && artifact.kind != ArtifactKind::NativeSession
+                    {
                         format!("retired:{}", artifact.id)
                     } else {
                         artifact.path.clone()
@@ -1152,6 +1207,29 @@ impl Store {
         }
         commit_transaction(tx, &self.write_faulted)
     }
+}
+
+fn known_native_session_artifact(
+    connection: &Connection,
+    agent: i64,
+    path: &str,
+) -> Result<Option<ArtifactView>> {
+    let body: Option<String> = connection
+        .query_row(
+            "SELECT body FROM artifacts WHERE agent=?1
+             AND json_extract(body,'$.kind')='native_session'
+             AND (path=?2 OR (path='retired:'||id AND json_extract(body,'$.path')=?2))
+             ORDER BY (json_extract(body,'$.state')='removed') ASC, generation DESC LIMIT 1",
+            params![agent, path],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    body.map(|body| {
+        serde_json::from_str(&body)
+            .map_err(|_| Error::new("source_integrity", "invalid native session artifact"))
+    })
+    .transpose()
 }
 
 /// Bounded self-heal for a full cleanup-plan ledger, oldest first. Deletes
@@ -1305,13 +1383,14 @@ fn cleanup_terminal(state: AgentState) -> bool {
     matches!(state, AgentState::Stopped | AgentState::Failed)
 }
 
-/// Fence resume at admission and dispatch while an attempted cleanup is unknown.
+/// Fence resume at admission and dispatch while cleanup is unknown, or after
+/// the current native session has been removed but before its Agent is deleted.
 pub(super) fn require_no_cleanup_attempt(connection: &Connection, agent: &Agent) -> Result<()> {
-    let pending: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM artifacts WHERE agent=?1 AND generation=?2 AND json_extract(body,'$.state')='unknown')",params![parse_agent_id(&agent.id)?,agent.generation],|r|r.get(0)).map_err(sql_error)?;
+    let pending: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM artifacts WHERE agent=?1 AND generation=?2 AND (json_extract(body,'$.state')='unknown' OR (json_extract(body,'$.kind')='native_session' AND json_extract(body,'$.state')='removed')))",params![parse_agent_id(&agent.id)?,agent.generation],|r|r.get(0)).map_err(sql_error)?;
     if pending {
         return Err(Error::new(
             "bad_state",
-            "Agent has an unresolved cleanup attempt",
+            "Agent has a cleanup attempt or removed native session",
         ));
     }
     Ok(())

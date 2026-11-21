@@ -128,7 +128,8 @@ Leave any uncertain cleanup `unknown` and retry only the identical write
 to read its retained result.
 
 Native stores stay out of filesystem cleanup. Apply archives a terminal
-Codex session through the harness's `thread/archive`. Other harnesses
+Swarm-created Codex or OpenCode session through the harness's documented
+archive/delete call. Attached or observed sessions and other harnesses
 stay `keep(no_native_archive)`. A branch is safe only after a fresh
 upstream fetch proves it merged into the upstream default with no unpushed
 commits. Apply re-verifies and uses Git's safe local deletion. The Owner

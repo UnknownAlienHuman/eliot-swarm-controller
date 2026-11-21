@@ -832,8 +832,7 @@ of the explicitly selected release scope.
       here, Open folder, Rename, Collapse/Expand, Archive finished tasks,
       Delete stopped tasks, Remove project) and on tasks and chats (Rename,
       Stop while live, idle included, Archive/Unarchive, Delete after a
-      confirmation naming it, a live one's "Stop and delete" stopping, waiting
-      until stopped, then deleting, with a refused step's typed error, Copy
+      confirmation naming it, with a refused step's typed error, Copy
       Agent ID, Open folder) are drawn in the window; archiving the open chat
       returns to a new task with "Archived · Undo", and the fleet line counts
       live archived Agents; Rename writes `[desktop]
@@ -863,9 +862,17 @@ of the explicitly selected release scope.
       (everything) and each project's menu archive finished root trees or delete
       stopped root trees, including archived roots for deletion. Scoped actions
       use daemon-verified checkout membership. Delete confirms trees and affected
-      tasks. Each `agent.archive`/`agent.delete` tree refusal is reported, and
-      files and native sessions stay. Worktrees & cleanup's "Select all safe" checks every
+      tasks. Each `agent.archive`/`agent.delete` tree refusal is reported.
+      Worktrees & cleanup's "Select all safe" checks every
       group with something safe to remove before `cleanup.apply`. (Refs #407)
+
+- [x] **Per-item desktop cleanup and full cleanup paging (2026-11-21).** Task row
+      and header actions archive, unarchive and delete eligible trees, and
+      Show archived is visible in the sidebar. Remove from Swarm unregisters
+      a project and leaves its checkout on disk. Task deletion uses the same
+      worktree and native session cleanup guards as the cleanup API, including
+      OpenCode native session deletion. Cleanup previews continue through a
+      large inventory using the same opaque token in the CLI and MCP.
 
 - [ ] **K92 Backend quota and chat lifecycle (#407).** Implemented provider
       readers, durable archive/delete, settings project removal and private chats.

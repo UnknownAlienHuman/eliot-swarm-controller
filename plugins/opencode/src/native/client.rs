@@ -7,7 +7,10 @@
 //! is the server's `OPENCODE_PASSWORD`. The client never retries (a repeat
 //! would be a second native write) and never follows redirects.
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
 use eliot_core::{Error, Result};
 use eliot_plugin::native_stdio::{NativeStreamFault, StreamState};
@@ -17,6 +20,7 @@ use tokio::{
     time::{Instant, timeout_at},
 };
 
+use super::types::SessionPage;
 use crate::native::{
     sse::{SseFrame, SseParser},
     types::{
@@ -83,6 +87,13 @@ pub enum HttpOutcome {
     Rejected { status: Option<u16>, reason: String },
     Unknown { reason: String },
     NotDispatched { reason: String },
+}
+
+/// Validated facts from one complete, unfiltered native session listing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArchiveSessionInventory {
+    pub target_present: bool,
+    pub has_children: bool,
 }
 
 impl HttpOutcome {
@@ -334,9 +345,165 @@ impl OpenCodeHttp {
         Err(readback_error("session absence", &response))
     }
 
-    /// `DELETE /api/session/{id}`: the native close operation. `Ok(true)`
-    /// proves removal (204), `Ok(false)` proves the session is already gone
-    /// (404); anything else is `Unknown`.
+    /// One `GET /api/session` (`session.list`) page on this client's owned
+    /// server and store. It sends only the 100-row page size and optional native
+    /// cursor: no directory, search, parent, project, subpath, or archived
+    /// filters. The fixed `x-opencode-directory` header still binds the native
+    /// directory context. A complete inventory must follow every `cursor.next`.
+    pub async fn list_sessions(
+        &self,
+        cursor: Option<&str>,
+        deadline: Instant,
+    ) -> Result<SessionPage> {
+        let query: Vec<(&str, &str)> = match cursor {
+            Some(cursor) => vec![("limit", "100"), ("cursor", cursor)],
+            None => vec![("limit", "100")],
+        };
+        let response = self
+            .send(reqwest::Method::GET, "/api/session", &query, None, deadline)
+            .await
+            .map_err(readback_outcome_as_error)?;
+        if response.status != 200 {
+            return Err(readback_error("session list", &response));
+        }
+        serde_json::from_slice(&response.body)
+            .map_err(|_| Error::new("native_readback", "OpenCode session list was invalid"))
+    }
+
+    /// Read the exact retained session. A 404 is only a candidate absence;
+    /// the caller must validate it against a complete session inventory.
+    pub async fn archive_session_present(
+        &self,
+        session_id: &str,
+        deadline: Instant,
+    ) -> Result<bool> {
+        let path = format!(
+            "/api/session/{}",
+            verified_segment(session_id)
+                .map_err(|_| Error::new("invalid", "OpenCode session identity is invalid"))?
+        );
+        let response = self
+            .send(reqwest::Method::GET, &path, &[], None, deadline)
+            .await
+            .map_err(readback_outcome_as_error)?;
+        if response.status == 404 {
+            return Ok(false);
+        }
+        if response.status != 200 {
+            return Err(readback_error("session archive lookup", &response));
+        }
+        let envelope: DataEnvelope<SessionInfo> = serde_json::from_slice(&response.body)
+            .map_err(|_| Error::new("native_readback", "OpenCode session readback was invalid"))?;
+        if envelope.data.id != session_id || !self.session_matches_directory(&envelope.data) {
+            return Err(Error::new(
+                "native_readback",
+                "OpenCode session readback did not match the retained id and directory",
+            ));
+        }
+        Ok(true)
+    }
+
+    /// Exhaust the unfiltered native session list on this same server/store
+    /// and directory-bound client. The OpenCode contract defaults to 50 rows,
+    /// so each request asks for 100 and follows every opaque `cursor.next`
+    /// without an aggregate row/page cap. It validates page cursors, unique
+    /// session identities, parent identities, locations, target binding, and
+    /// child relationships before returning any facts.
+    pub async fn archive_session_inventory(
+        &self,
+        session_id: &str,
+        deadline: Instant,
+    ) -> Result<ArchiveSessionInventory> {
+        if verified_segment(session_id).is_err() {
+            return Err(Error::new(
+                "invalid",
+                "OpenCode session identity is invalid",
+            ));
+        }
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = HashSet::new();
+        let mut seen_ids = HashSet::new();
+        let mut inventory = ArchiveSessionInventory {
+            target_present: false,
+            has_children: false,
+        };
+
+        loop {
+            let page = self.list_sessions(cursor.as_deref(), deadline).await?;
+            for session in page.data {
+                if verified_segment(&session.id).is_err() || !seen_ids.insert(session.id.clone()) {
+                    return Err(Error::new(
+                        "native_readback",
+                        "OpenCode session list contained an invalid or duplicate identity",
+                    ));
+                }
+                if session
+                    .parent_id
+                    .as_deref()
+                    .is_some_and(|parent| verified_segment(parent).is_err())
+                {
+                    return Err(Error::new(
+                        "native_readback",
+                        "OpenCode session list contained an invalid parent identity",
+                    ));
+                }
+                let Some(location) = session.location.as_ref() else {
+                    return Err(Error::new(
+                        "native_readback",
+                        "OpenCode session list omitted a required directory location",
+                    ));
+                };
+                if location.directory.trim().is_empty()
+                    || location.directory.chars().any(char::is_control)
+                    || !Path::new(&location.directory).is_absolute()
+                {
+                    return Err(Error::new(
+                        "native_readback",
+                        "OpenCode session list contained an invalid directory location",
+                    ));
+                }
+                if session.id == session_id {
+                    if !self.session_matches_directory(&session) {
+                        return Err(Error::new(
+                            "native_readback",
+                            "OpenCode session list id did not match the retained directory",
+                        ));
+                    }
+                    inventory.target_present = true;
+                }
+                if session.parent_id.as_deref() == Some(session_id) {
+                    inventory.has_children = true;
+                }
+            }
+
+            match page.cursor.next {
+                None => return Ok(inventory),
+                Some(next)
+                    if next.trim().is_empty()
+                        || next.chars().any(char::is_control)
+                        || !seen_cursors.insert(next.clone()) =>
+                {
+                    return Err(Error::new(
+                        "native_readback",
+                        "OpenCode session list cursor was empty or repeated",
+                    ));
+                }
+                Some(next) => cursor = Some(next),
+            }
+        }
+    }
+
+    fn session_matches_directory(&self, session: &SessionInfo) -> bool {
+        session
+            .location
+            .as_ref()
+            .is_some_and(|location| location.directory == self.directory)
+    }
+
+    /// `DELETE /api/session/{id}` removes the session and any child sessions.
+    /// The caller first proves the exact retained session has no children.
+    /// `Ok(true)` is the native 204; `Ok(false)` is a native 404 that still
+    /// requires complete-list confirmation.
     pub async fn delete_session(
         &self,
         session_id: &str,

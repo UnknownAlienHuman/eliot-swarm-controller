@@ -230,7 +230,7 @@ fn search_settings(query: &str) -> Vec<(Page, &'static str)> {
 #[derive(Clone, Debug)]
 pub(super) enum SettingsMsg {
     /// Clean up finished work: read a plan (nothing is removed).
-    CleanupPlan,
+    CleanupPlan(Option<String>),
     CleanupPlanned(Fallible<(eliot_core::api::CleanupPlan, HashMap<String, String>)>),
     /// Check (true) or uncheck one group of the plan.
     CleanupGroupToggled(crate::worktrees::CleanupGroup, bool),
@@ -697,15 +697,17 @@ impl DesktopApp {
     pub(super) fn settings_update(&mut self, msg: SettingsMsg, context: &ComponentContext<Self>) {
         let s = &mut self.settings;
         match msg {
-            SettingsMsg::CleanupPlan => {
+            SettingsMsg::CleanupPlan(continuation) => {
                 if s.cleanup_busy {
                     return;
                 }
                 s.cleanup_busy = true;
-                s.cleanup_plan = None;
+                if continuation.is_none() {
+                    s.cleanup_plan = None;
+                    s.cleanup_result = None;
+                }
                 s.cleanup_error = None;
                 s.cleanup_confirm = false;
-                s.cleanup_result = None;
                 let Ok(data) = self.data_dir.clone() else {
                     s.cleanup_busy = false;
                     s.cleanup_error = Some("Daemon data directory unavailable".to_owned());
@@ -716,12 +718,13 @@ impl DesktopApp {
                         scope: eliot_core::api::CleanupScope::All,
                         project: None,
                         older_than: None,
-                        continuation: None,
+                        continuation,
                     };
                     let result = client::block_on(async {
-                        let plan: eliot_core::api::CleanupPlan =
-                            eliot_daemon::client_call_typed(&data, "cleanup.plan", &request)
-                                .await?;
+                        let plan = client::cleanup_plan_page(&data, request, |page| {
+                            !page.items.is_empty()
+                        })
+                        .await?;
                         let wanted: HashSet<_> = plan
                             .items
                             .iter()
@@ -769,6 +772,7 @@ impl DesktopApp {
                 s.cleanup_busy = false;
                 match result {
                     Ok((plan, titles)) => {
+                        s.cleanup_result = None;
                         s.cleanup_titles = titles;
                         s.cleanup_unchecked =
                             crate::worktrees::CleanupGroup::unchecked_by_default();

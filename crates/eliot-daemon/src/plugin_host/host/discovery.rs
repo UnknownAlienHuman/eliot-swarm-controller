@@ -9,7 +9,7 @@ use eliot_core::{
     api::{DiscoverPage, is_supported_harness},
 };
 use eliot_plugin::protocol::{
-    ModelListParams, ModelListPart, ProfileStoreParams, ProfileStoreResult,
+    ModelListParams, ModelListPart, NativeArchiveParams, ProfileStoreParams, ProfileStoreResult,
 };
 use eliot_plugin::sync::LockExt;
 use serde_json::{Value, json};
@@ -150,21 +150,26 @@ impl PluginHost {
             .map_err(|_| Error::new("unavailable", "discovery reader stopped"))?
     }
 
-    /// Archive one terminal Codex native session through the harness's own
-    /// `thread/archive` method. A dedicated metadata reader calls
-    /// `native.archive` with no turn and no inference. Only the codex
-    /// harness documents a native archive surface; every other harness
-    /// stays `unsupported` without spawning a reader, and the caller keeps
-    /// the session. Never deletes raw native store files.
+    /// Archive one terminal native session through the harness's own
+    /// documented method (Codex `thread/archive`, OpenCode
+    /// `DELETE /api/session/{id}` on the retained per-Agent store). A
+    /// dedicated metadata reader calls `native.archive` with no turn and no
+    /// inference. Every other harness stays `unsupported` without spawning
+    /// a reader, and the caller keeps the session. Never deletes raw native
+    /// store files.
     pub(crate) async fn archive_native_session(
         &self,
         profile: Value,
         native_ref: &str,
+        agent: &eliot_core::Agent,
     ) -> Result<()> {
-        if profile.get("harness").and_then(Value::as_str) != Some("codex") {
+        if !matches!(
+            profile.get("harness").and_then(Value::as_str),
+            Some("codex") | Some("opencode")
+        ) {
             return Err(Error::new(
                 "unsupported",
-                "native archive needs a codex profile",
+                "native archive needs a codex or opencode profile",
             ));
         }
         if native_ref.is_empty()
@@ -177,10 +182,11 @@ impl PluginHost {
         let (id, stop_rx, done_tx) = self.register_metadata_reader()?;
         let host = self.clone();
         let native_ref = native_ref.to_owned();
+        let agent = agent.clone();
         let (reply, response) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let completion = host
-                .read_archive(profile, environment, native_ref, stop_rx)
+                .read_archive(profile, environment, native_ref, &agent, stop_rx)
                 .await;
             host.finish_metadata_reader(&id, done_tx, completion.cleanup);
             let _ = reply.send(completion.result);
@@ -478,6 +484,7 @@ impl PluginHost {
         profile: Value,
         environment: Value,
         native_ref: String,
+        agent: &eliot_core::Agent,
         mut stop: watch::Receiver<Option<Instant>>,
     ) -> MetadataRead<()> {
         if stop.borrow().is_some() {
@@ -522,7 +529,20 @@ impl PluginHost {
         let read = async {
             let manifest = reader.initialize(&harness, until).await?;
             require_proxy_capability(&profile, &manifest)?;
-            let request = serde_json::json!({"profile": profile, "native_ref": native_ref});
+            // The OpenCode reader proves its served store derives this exact
+            // retained scope before the delete; the workspace binds the
+            // server's directory context. Codex pins its store through the
+            // frozen binding inside the profile.
+            let opencode = harness == "opencode";
+            let request = NativeArchiveParams {
+                profile,
+                native_ref,
+                agent_id: opencode.then(|| agent.id.clone()),
+                native_scope: opencode.then(|| agent.native_scope.clone()).flatten(),
+                workspace: opencode.then(|| agent.workspace.clone()).flatten(),
+            };
+            let request = serde_json::to_value(&request)
+                .map_err(|_| Error::new("invalid", "native.archive params cannot encode"))?;
             archive_dispatched = true;
             let value = reader.client.call("native.archive", request, until).await?;
             reject_reserved_metadata(&value, &metadata_secrets, "native.archive")?;
@@ -535,7 +555,7 @@ impl PluginHost {
             if !archived {
                 return Err(Error::new(
                     "native_archive_failed",
-                    "native archive did not confirm the thread",
+                    "native archive did not confirm the session",
                 ));
             }
             Ok(())
@@ -546,7 +566,8 @@ impl PluginHost {
             _ = stop.changed() => Err(Error::new("cancelled", "native.archive was cancelled")),
         };
         let result = result.map_err(|error| {
-            let error = if archive_dispatched {
+            let refused = harness == "opencode" && error.code == "native_archive_refused";
+            let error = if archive_dispatched && !refused {
                 Error::new("unknown", "native.archive may have taken effect; no replay")
             } else {
                 error

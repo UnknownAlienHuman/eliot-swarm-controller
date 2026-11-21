@@ -18,7 +18,595 @@ macro_rules! delete_db {
     };
 }
 
+const AGENT_DELETE_RECEIPT_KEY: &str = "__eliot_agent_delete";
+
+enum AgentDeleteReceipt {
+    Pending,
+    Completed(Value),
+    Refused(Error),
+}
+
+fn agent_delete_payload(agent: &str) -> Value {
+    json!({"agent":agent,"archived":null})
+}
+
+fn agent_delete_pending_value() -> Value {
+    json!({"__eliot_agent_delete":{"state":"pending"}})
+}
+
+fn agent_delete_error_value(error: &Error) -> Value {
+    json!({
+        "__eliot_agent_delete": {
+            "state": "refused",
+            "error": {
+                "code": &error.code,
+                "message": error.message.as_str()
+            }
+        }
+    })
+}
+
+fn parse_agent_delete_receipt(value: Value) -> Result<AgentDeleteReceipt> {
+    let Some(receipt) = value.get(AGENT_DELETE_RECEIPT_KEY) else {
+        return Ok(AgentDeleteReceipt::Completed(value));
+    };
+    match receipt.get("state").and_then(Value::as_str) {
+        Some("pending") => Ok(AgentDeleteReceipt::Pending),
+        Some("refused") => {
+            let error = receipt.get("error").ok_or_else(|| {
+                Error::new("source_integrity", "retained Agent delete error is absent")
+            })?;
+            let code = error.get("code").and_then(Value::as_str).ok_or_else(|| {
+                Error::new(
+                    "source_integrity",
+                    "retained Agent delete error code is invalid",
+                )
+            })?;
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    Error::new(
+                        "source_integrity",
+                        "retained Agent delete error message is invalid",
+                    )
+                })?;
+            Ok(AgentDeleteReceipt::Refused(Error::new(code, message)))
+        }
+        _ => Err(Error::new(
+            "source_integrity",
+            "retained Agent delete receipt is invalid",
+        )),
+    }
+}
+
+fn agent_delete_replay_result(value: Value) -> Result<Value> {
+    match parse_agent_delete_receipt(value)? {
+        AgentDeleteReceipt::Pending => Err(Error::new(
+            "unknown",
+            "Agent deletion has an unsettled external cleanup receipt",
+        )),
+        AgentDeleteReceipt::Completed(value) => Ok(value),
+        AgentDeleteReceipt::Refused(error) => Err(error),
+    }
+}
+
+fn agent_delete_receipt_tx(
+    tx: &Transaction<'_>,
+    id: &str,
+    digest: &[u8],
+) -> Result<Option<AgentDeleteReceipt>> {
+    if let Some((principal, method, old_digest, result)) = write_binding(tx, id)? {
+        if principal != "owner" || method != "agent.delete" || old_digest.as_slice() != digest {
+            return Err(Error::new(
+                "id_conflict",
+                "cleanup write id has another binding",
+            ));
+        }
+        return parse_agent_delete_receipt(decode_json(&result)?).map(Some);
+    }
+    if command_binding(tx, id)?.is_some() || digest_id_bound(tx, id)? {
+        return Err(Error::new("id_conflict", "cleanup id is already in use"));
+    }
+    Ok(None)
+}
+
+fn current_agent_tree_tx(
+    tx: &Transaction<'_>,
+    root: i64,
+    archived: Option<bool>,
+    before_cleanup: bool,
+) -> Result<(Vec<i64>, Vec<Agent>)> {
+    if load_agent_by_num(tx, root)?.is_none() {
+        return Err(Error::new("not_found", "Agent was not found"));
+    }
+    let members = hierarchy::subtree_member_nums(tx, root, MAX_PAGE_ENTRIES as i64)?;
+    if members.len() > MAX_PAGE_ENTRIES {
+        return Err(Error::new(
+            "unavailable",
+            "Agent tree exceeds operation bound",
+        ));
+    }
+    let method = if archived.is_some() {
+        "agent.archive"
+    } else {
+        "agent.delete"
+    };
+    let mut agents = Vec::with_capacity(members.len());
+    for num in &members {
+        let row = load_agent_by_num(tx, *num)?
+            .ok_or_else(|| Error::new("source_integrity", "Agent tree changed"))?;
+        // Archive hides a tree that is not working: idle, ended
+        // (stopped, failed or lost), or detached external observation.
+        // Delete needs a settled end or a detached observer. A detached
+        // observer is an observe-only Unknown row with no live reader:
+        // the custody check below still refuses an attached observer
+        // with an open source, and the turn/command checks still apply.
+        // Native observed children keep their own rule: live ones are
+        // Unknown and stay blocked here; ended ones are stopped.
+        let detached_observer = row.observe_only
+            && row.origin == core::AgentOrigin::External
+            && row.state == AgentState::Unknown;
+        let allowed = if archived.is_some() {
+            matches!(
+                row.state,
+                AgentState::Idle | AgentState::Stopped | AgentState::Failed | AgentState::Lost
+            ) || detached_observer
+        } else {
+            matches!(row.state, AgentState::Stopped | AgentState::Failed) || detached_observer
+        };
+        if !allowed {
+            return Err(Error::new(
+                "busy",
+                format!(
+                    "{} is {:?}; {} requires {}",
+                    row.id,
+                    row.state,
+                    method,
+                    if archived.is_some() {
+                        "idle or ended (stopped, failed or lost)"
+                    } else {
+                        "stopped or failed"
+                    },
+                ),
+            ));
+        }
+        if archived.is_none() {
+            project_transfer::require_deletable(tx, &row)?;
+            workspace::require_workspace_owner_deletable(tx, &row)?;
+        }
+        if let Some(turn) = row.active_turn.as_deref() {
+            return Err(Error::new(
+                "busy",
+                format!(
+                    "{} generation {} has active turn {turn}",
+                    row.id, row.generation
+                ),
+            ));
+        }
+        if !row.pending.is_empty() {
+            return Err(Error::new(
+                "busy",
+                format!(
+                    "{} generation {} has {} pending requests",
+                    row.id,
+                    row.generation,
+                    row.pending.len()
+                ),
+            ));
+        }
+        let command: Option<(String, String, Option<i64>)> = tx.query_row(
+            "SELECT id,state,generation FROM commands WHERE target=?1 AND state IN ('accepted','queued','dispatched','unknown') ORDER BY created_at,id LIMIT 1",
+            [num], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).optional().map_err(sql_error)?;
+        if let Some((command, state, generation)) = command {
+            let generation =
+                generation.map_or_else(|| "unassigned".to_owned(), |value| value.to_string());
+            return Err(Error::new(
+                "busy",
+                format!(
+                    "{} has {state} command {command} (generation {generation})",
+                    row.id
+                ),
+            ));
+        }
+        let turn: Option<(String, String, i64)> = tx.query_row(
+            "SELECT turn_id,state,generation FROM turns WHERE agent=?1 AND state IN ('running','unknown') ORDER BY generation,turn_id LIMIT 1",
+            [num], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).optional().map_err(sql_error)?;
+        if let Some((turn, state, generation)) = turn {
+            // Ended native observation keeps its unknown turn as retained
+            // evidence, not a live gate: the child reaches stopped only
+            // through the ended-with-parent sweep, whose producer check
+            // proves the granting generation ended, so no live source
+            // remains to complete it. The other guards (no active turn,
+            // no pending or live commands, drained custody) still apply,
+            // and running turns still block everywhere.
+            let ended_observation = state == "unknown"
+                && row.observe_only
+                && row.origin == core::AgentOrigin::Native
+                && row.state == AgentState::Stopped;
+            if !ended_observation {
+                return Err(Error::new(
+                    "busy",
+                    format!(
+                        "{} generation {generation} has {state} turn {turn}; stopped lifecycle does not resolve an uncertain turn",
+                        row.id
+                    ),
+                ));
+            }
+        }
+        // Delete needs drained custody. Archive of an ended member needs
+        // resolved custody, so it never hides a process, artifact or
+        // native source the owner must still resolve; Eliot's own os, git
+        // and workspace-process observers of a resumable Agent may stay
+        // open. An idle member keeps its live custody (archive never
+        // stops a generation); unarchive only reveals.
+        let guard = match archived {
+            None => Some(true),
+            Some(true) if row.state != AgentState::Idle => Some(false),
+            Some(_) => None,
+        };
+        let workspace_cleanup_generation = if before_cleanup {
+            workspace::load_workspace(tx, *num)?
+                .filter(|workspace| {
+                    workspace.target_generation == row.generation
+                        && matches!(
+                            workspace.phase,
+                            core::WorkspacePhase::Ready | core::WorkspacePhase::Failed
+                        )
+                })
+                .map(|workspace| workspace.target_generation)
+        } else {
+            None
+        };
+        if let Some(observers) = guard
+            && let Some(blocker) =
+                custody_blocker_tx(tx, *num, observers, workspace_cleanup_generation)?
+        {
+            return Err(Error::new(
+                "busy",
+                format!(
+                    "{} still has {blocker}; {method} requires {} custody",
+                    row.id,
+                    if observers { "drained" } else { "resolved" }
+                ),
+            ));
+        }
+        agents.push(row);
+    }
+    Ok((members, agents))
+}
+
+fn verify_agent_delete_snapshot(expected: &[Agent], current: &[Agent]) -> Result<()> {
+    let mut expected_ids = expected
+        .iter()
+        .map(|agent| Ok((parse_agent_id(&agent.id)?, agent.generation)))
+        .collect::<Result<Vec<_>>>()?;
+    let mut current_ids = current
+        .iter()
+        .map(|agent| Ok((parse_agent_id(&agent.id)?, agent.generation)))
+        .collect::<Result<Vec<_>>>()?;
+    expected_ids.sort_unstable();
+    current_ids.sort_unstable();
+    if expected_ids.windows(2).any(|pair| pair[0].0 == pair[1].0) || expected_ids != current_ids {
+        return Err(Error::new(
+            "stale_generation",
+            "Agent tree membership or generation changed since delete inspection",
+        ));
+    }
+    Ok(())
+}
+
 impl Store {
+    /// Read and preflight a tree before the manager plans external cleanup.
+    /// An exact completed write replays; a reserved write stays unknown until
+    /// the manager settles it.
+    pub fn inspect_agent_delete(
+        &mut self,
+        id: &str,
+        agent: &str,
+        now: i64,
+    ) -> Result<(Option<Value>, Vec<Agent>)> {
+        self.ensure_committed_reads()?;
+        let payload = agent_delete_payload(agent);
+        if let Some(result) = self.cleanup_replay("owner", id, "agent.delete", &payload)? {
+            return Ok((Some(agent_delete_replay_result(result)?), Vec::new()));
+        }
+        self.ensure_writer_healthy()?;
+
+        let digest = canonical::digest(&payload)?;
+        let outcome = (|| {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            if let Some(receipt) = agent_delete_receipt_tx(&tx, id, &digest)? {
+                return match receipt {
+                    AgentDeleteReceipt::Pending => Err(Error::new(
+                        "unknown",
+                        "Agent deletion has an unsettled external cleanup receipt",
+                    )),
+                    AgentDeleteReceipt::Completed(result) => Ok((Some(result), Vec::new())),
+                    AgentDeleteReceipt::Refused(error) => Err(error),
+                };
+            }
+            validate_id_age(id, now)?;
+            let root = parse_agent_id(agent)?;
+            let (members, current) = current_agent_tree_tx(&tx, root, None, true)?;
+            prepare_delete_tree_tx(&tx, &members)?;
+            tx.rollback().map_err(sql_error)?;
+            Ok((None, current))
+        })();
+        if outcome.is_err() && !self.connection.is_autocommit() {
+            self.write_faulted.set(true);
+            return Err(Error::new(
+                "unknown",
+                "Agent delete inspection rollback could not be verified",
+            ));
+        }
+        outcome
+    }
+
+    /// Recheck the inspected tree and reserve its agent.delete write before
+    /// the manager dispatches native or worktree cleanup.
+    pub fn reserve_agent_delete(
+        &mut self,
+        id: &str,
+        agent: &str,
+        expected: &[Agent],
+        now: i64,
+    ) -> Result<()> {
+        self.ensure_committed_reads()?;
+        let payload = agent_delete_payload(agent);
+        if let Some(result) = self.cleanup_replay("owner", id, "agent.delete", &payload)? {
+            return match parse_agent_delete_receipt(result)? {
+                AgentDeleteReceipt::Pending => Err(Error::new(
+                    "unknown",
+                    "Agent deletion already has an unsettled external cleanup receipt",
+                )),
+                AgentDeleteReceipt::Completed(_) => Err(Error::new(
+                    "bad_state",
+                    "Agent deletion is already complete; inspect its retained result",
+                )),
+                AgentDeleteReceipt::Refused(error) => Err(error),
+            };
+        }
+        self.ensure_writer_healthy()?;
+        let outcome = self.reserve_agent_delete_inner(id, agent, expected, now, &payload);
+        if outcome.is_err() && !self.connection.is_autocommit() {
+            self.write_faulted.set(true);
+            return Err(Error::new(
+                "unknown",
+                "Agent delete reservation rollback could not be verified",
+            ));
+        }
+        outcome
+    }
+
+    fn reserve_agent_delete_inner(
+        &mut self,
+        id: &str,
+        agent: &str,
+        expected: &[Agent],
+        now: i64,
+        payload: &Value,
+    ) -> Result<()> {
+        let digest = canonical::digest(payload)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        if let Some(receipt) = agent_delete_receipt_tx(&tx, id, &digest)? {
+            return match receipt {
+                AgentDeleteReceipt::Pending => Err(Error::new(
+                    "unknown",
+                    "Agent deletion already has an unsettled external cleanup receipt",
+                )),
+                AgentDeleteReceipt::Completed(_) => Err(Error::new(
+                    "bad_state",
+                    "Agent deletion is already complete; inspect its retained result",
+                )),
+                AgentDeleteReceipt::Refused(error) => Err(error),
+            };
+        }
+        validate_id_age(id, now)?;
+        let root = parse_agent_id(agent)?;
+        let (members, current) = current_agent_tree_tx(&tx, root, None, true)?;
+        verify_agent_delete_snapshot(expected, &current)?;
+        prepare_delete_tree_tx(&tx, &members)?;
+        tx.execute_batch("DELETE FROM deleted_agents; DELETE FROM deleted_commands;")
+            .map_err(sql_error)?;
+        tx.execute(
+            "INSERT INTO writes(id,principal,method,payload_digest,result,created_at)
+             VALUES (?1,'owner','agent.delete',?2,?3,?4)",
+            params![id, digest, encode_json(&agent_delete_pending_value())?, now],
+        )
+        .map_err(sql_error)?;
+        commit_transaction(tx, &self.write_faulted)
+    }
+
+    /// Finish a reserved delete after external cleanup. The retained write,
+    /// generation snapshot, lifecycle guards and tree command preflight are
+    /// all rechecked in the deletion transaction.
+    pub fn finish_agent_delete(
+        &mut self,
+        id: &str,
+        agent: &str,
+        expected: &[Agent],
+        now: i64,
+    ) -> Result<Value> {
+        self.ensure_committed_reads()?;
+        let payload = agent_delete_payload(agent);
+        if let Some(result) = self.cleanup_replay("owner", id, "agent.delete", &payload)? {
+            match parse_agent_delete_receipt(result)? {
+                AgentDeleteReceipt::Pending => {}
+                AgentDeleteReceipt::Completed(result) => return Ok(result),
+                AgentDeleteReceipt::Refused(error) => return Err(error),
+            }
+        }
+        self.ensure_writer_healthy()?;
+        let outcome = self.finish_agent_delete_inner(id, agent, expected, now, &payload);
+        if outcome.is_err() && !self.connection.is_autocommit() {
+            self.write_faulted.set(true);
+            return Err(Error::new(
+                "unknown",
+                "Agent deletion rollback could not be verified",
+            ));
+        }
+        outcome
+    }
+
+    fn finish_agent_delete_inner(
+        &mut self,
+        id: &str,
+        agent: &str,
+        expected: &[Agent],
+        now: i64,
+        payload: &Value,
+    ) -> Result<Value> {
+        let digest = canonical::digest(payload)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        match agent_delete_receipt_tx(&tx, id, &digest)? {
+            Some(AgentDeleteReceipt::Pending) => {}
+            Some(AgentDeleteReceipt::Completed(result)) => return Ok(result),
+            Some(AgentDeleteReceipt::Refused(error)) => return Err(error),
+            None => {
+                return Err(Error::new(
+                    "bad_state",
+                    "Agent deletion has no cleanup reservation",
+                ));
+            }
+        }
+        let root = parse_agent_id(agent)?;
+        let (members, current) = current_agent_tree_tx(&tx, root, None, false)?;
+        verify_agent_delete_snapshot(expected, &current)?;
+        delete_tree_tx(&tx, &members, now)?;
+        let result = serde_json::to_value(AgentTreeResponse {
+            agent: agent.to_owned(),
+            affected: members.len(),
+            archived: None,
+            deleted: true,
+        })
+        .map_err(|_| Error::new("internal", "Agent tree result encoding failed"))?;
+        let changed = tx
+            .execute(
+                "UPDATE writes SET result=?1
+                 WHERE id=?2 AND principal='owner' AND method='agent.delete'
+                   AND payload_digest=?3 AND result=?4",
+                params![
+                    encode_json(&result)?,
+                    id,
+                    digest,
+                    encode_json(&agent_delete_pending_value())?
+                ],
+            )
+            .map_err(delete_sql_error)?;
+        if changed != 1 {
+            return Err(Error::new(
+                "bad_state",
+                "Agent delete reservation changed before settlement",
+            ));
+        }
+        if let Err(error) = commit_sql(&tx) {
+            if tx.is_autocommit()
+                && error.sqlite_error_code() != Some(rusqlite::ErrorCode::ConstraintViolation)
+            {
+                self.write_faulted.set(true);
+                return Err(Error::new(
+                    "unknown",
+                    "Agent deletion commit outcome is unknown",
+                ));
+            }
+            return Err(delete_sql_error(error));
+        }
+        Ok(result)
+    }
+
+    /// Retain a definite cleanup refusal while leaving the Agent tree intact.
+    /// An unknown outcome deliberately leaves the reservation unsettled.
+    pub fn fail_agent_delete(&mut self, id: &str, agent: &str, error: &Error) -> Result<()> {
+        self.ensure_committed_reads()?;
+        let payload = agent_delete_payload(agent);
+        let Some(result) = self.cleanup_replay("owner", id, "agent.delete", &payload)? else {
+            return Err(Error::new(
+                "bad_state",
+                "Agent deletion has no cleanup reservation to fail",
+            ));
+        };
+        match parse_agent_delete_receipt(result)? {
+            AgentDeleteReceipt::Pending if error.code == "unknown" => return Ok(()),
+            AgentDeleteReceipt::Pending => {}
+            AgentDeleteReceipt::Completed(_) | AgentDeleteReceipt::Refused(_) => return Ok(()),
+        }
+        self.ensure_writer_healthy()?;
+        let outcome = self.fail_agent_delete_inner(id, agent, error, &payload);
+        if outcome.is_err() && !self.connection.is_autocommit() {
+            self.write_faulted.set(true);
+            return Err(Error::new(
+                "unknown",
+                "Agent delete refusal rollback could not be verified",
+            ));
+        }
+        outcome
+    }
+
+    fn fail_agent_delete_inner(
+        &mut self,
+        id: &str,
+        agent: &str,
+        error: &Error,
+        payload: &Value,
+    ) -> Result<()> {
+        let digest = canonical::digest(payload)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        match agent_delete_receipt_tx(&tx, id, &digest)? {
+            Some(AgentDeleteReceipt::Pending) => {}
+            Some(AgentDeleteReceipt::Completed(_) | AgentDeleteReceipt::Refused(_)) => {
+                return Ok(());
+            }
+            None => {
+                return Err(Error::new(
+                    "bad_state",
+                    "Agent deletion has no cleanup reservation to fail",
+                ));
+            }
+        }
+        let root = parse_agent_id(agent)?;
+        if load_agent_by_num(&tx, root)?.is_none() {
+            return Err(Error::new(
+                "unknown",
+                "Agent deletion is reserved but its Agent row is absent",
+            ));
+        }
+        let changed = tx
+            .execute(
+                "UPDATE writes SET result=?1
+                 WHERE id=?2 AND principal='owner' AND method='agent.delete'
+                   AND payload_digest=?3 AND result=?4",
+                params![
+                    encode_json(&agent_delete_error_value(error))?,
+                    id,
+                    digest,
+                    encode_json(&agent_delete_pending_value())?
+                ],
+            )
+            .map_err(sql_error)?;
+        if changed != 1 {
+            return Err(Error::new(
+                "bad_state",
+                "Agent delete reservation changed before refusal settlement",
+            ));
+        }
+        commit_transaction(tx, &self.write_faulted)
+    }
+
     /// First retained unknown of each kind across all generations. Lifecycle
     /// deletion checks historical work too; diagnosis must use the same scope,
     /// independent of its bounded recent-turn page.
@@ -56,13 +644,13 @@ impl Store {
             "agent.delete"
         };
         self.ensure_committed_reads()?;
-        if let Some(result) = self.cleanup_replay(
-            "owner",
-            id,
-            method,
-            &json!({"agent":agent,"archived":archived}),
-        )? {
-            return Ok(result);
+        let payload = json!({"agent":agent,"archived":archived});
+        if let Some(result) = self.cleanup_replay("owner", id, method, &payload)? {
+            return if archived.is_none() {
+                agent_delete_replay_result(result)
+            } else {
+                Ok(result)
+            };
         }
         self.ensure_writer_healthy()?;
         let result = self.change_agent_tree_inner(id, agent, archived, now);
@@ -106,146 +694,15 @@ impl Store {
             if principal != "owner" || old_method != method || old_digest != digest {
                 return Err(Error::new("id_conflict", "id belongs to another mutation"));
             }
-            return decode_json(&result);
+            let result = decode_json(&result)?;
+            return if archived.is_none() {
+                agent_delete_replay_result(result)
+            } else {
+                Ok(result)
+            };
         }
         validate_id_age(id, now)?;
-        if load_agent_by_num(&tx, root)?.is_none() {
-            return Err(Error::new("not_found", "Agent was not found"));
-        }
-        let members = hierarchy::subtree_member_nums(&tx, root, MAX_PAGE_ENTRIES as i64)?;
-        if members.len() > MAX_PAGE_ENTRIES {
-            return Err(Error::new(
-                "unavailable",
-                "Agent tree exceeds operation bound",
-            ));
-        }
-        for num in &members {
-            let row = load_agent_by_num(&tx, *num)?
-                .ok_or_else(|| Error::new("source_integrity", "Agent tree changed"))?;
-            // Archive hides a tree that is not working: idle, ended
-            // (stopped, failed or lost), or detached external observation.
-            // Delete needs a settled end or a detached observer. A detached
-            // observer is an observe-only Unknown row with no live reader:
-            // the custody check below still refuses an attached observer
-            // with an open source, and the turn/command checks still apply.
-            // Native observed children keep their own rule: live ones are
-            // Unknown and stay blocked here; ended ones are stopped.
-            let detached_observer = row.observe_only
-                && row.origin == core::AgentOrigin::External
-                && row.state == AgentState::Unknown;
-            let allowed = if archived.is_some() {
-                matches!(
-                    row.state,
-                    AgentState::Idle | AgentState::Stopped | AgentState::Failed | AgentState::Lost
-                ) || detached_observer
-            } else {
-                matches!(row.state, AgentState::Stopped | AgentState::Failed) || detached_observer
-            };
-            if !allowed {
-                return Err(Error::new(
-                    "busy",
-                    format!(
-                        "{} is {:?}; {} requires {}",
-                        row.id,
-                        row.state,
-                        method,
-                        if archived.is_some() {
-                            "idle or ended (stopped, failed or lost)"
-                        } else {
-                            "stopped or failed"
-                        },
-                    ),
-                ));
-            }
-            if archived.is_none() {
-                project_transfer::require_deletable(&tx, &row)?;
-                workspace::require_workspace_owner_deletable(&tx, &row)?;
-            }
-            if let Some(turn) = row.active_turn.as_deref() {
-                return Err(Error::new(
-                    "busy",
-                    format!(
-                        "{} generation {} has active turn {turn}",
-                        row.id, row.generation
-                    ),
-                ));
-            }
-            if !row.pending.is_empty() {
-                return Err(Error::new(
-                    "busy",
-                    format!(
-                        "{} generation {} has {} pending requests",
-                        row.id,
-                        row.generation,
-                        row.pending.len()
-                    ),
-                ));
-            }
-            let command: Option<(String, String, Option<i64>)> = tx.query_row(
-                "SELECT id,state,generation FROM commands WHERE target=?1 AND state IN ('accepted','queued','dispatched','unknown') ORDER BY created_at,id LIMIT 1",
-                [num], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            ).optional().map_err(sql_error)?;
-            if let Some((command, state, generation)) = command {
-                let generation =
-                    generation.map_or_else(|| "unassigned".to_owned(), |value| value.to_string());
-                return Err(Error::new(
-                    "busy",
-                    format!(
-                        "{} has {state} command {command} (generation {generation})",
-                        row.id
-                    ),
-                ));
-            }
-            let turn: Option<(String, String, i64)> = tx.query_row(
-                "SELECT turn_id,state,generation FROM turns WHERE agent=?1 AND state IN ('running','unknown') ORDER BY generation,turn_id LIMIT 1",
-                [num], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            ).optional().map_err(sql_error)?;
-            if let Some((turn, state, generation)) = turn {
-                // Ended native observation keeps its unknown turn as retained
-                // evidence, not a live gate: the child reaches stopped only
-                // through the ended-with-parent sweep, whose producer check
-                // proves the granting generation ended, so no live source
-                // remains to complete it. The other guards (no active turn,
-                // no pending or live commands, drained custody) still apply,
-                // and running turns still block everywhere.
-                let ended_observation = state == "unknown"
-                    && row.observe_only
-                    && row.origin == core::AgentOrigin::Native
-                    && row.state == AgentState::Stopped;
-                if !ended_observation {
-                    return Err(Error::new(
-                        "busy",
-                        format!(
-                            "{} generation {generation} has {state} turn {turn}; stopped lifecycle does not resolve an uncertain turn",
-                            row.id
-                        ),
-                    ));
-                }
-            }
-            // Delete needs drained custody. Archive of an ended member needs
-            // resolved custody, so it never hides a process, artifact or
-            // native source the owner must still resolve; Eliot's own os, git
-            // and workspace-process observers of a resumable Agent may stay
-            // open. An idle member keeps its live custody (archive never
-            // stops a generation); unarchive only reveals.
-            let guard = match archived {
-                None => Some(true),
-                Some(true) if row.state != AgentState::Idle => Some(false),
-                Some(_) => None,
-            };
-            if let Some(observers) = guard
-                && let Some(blocker) = custody_blocker_tx(&tx, *num, observers)?
-            {
-                return Err(Error::new(
-                    "busy",
-                    format!(
-                        "{} still has {blocker}; {method} requires {} custody",
-                        row.id,
-                        if observers { "drained" } else { "resolved" }
-                    ),
-                ));
-            }
-        }
+        let (members, _) = current_agent_tree_tx(&tx, root, archived, false)?;
         if let Some(value) = archived {
             for num in &members {
                 db!(tx.execute(
@@ -292,24 +749,6 @@ impl Store {
     }
 }
 
-/// Unresolved custody of the Agent whose numeric id is the SQL expression
-/// `agent`, across its generations, one blocker in words per row: an
-/// unexited owned process, an `unknown` artifact or an open non-daemon
-/// source. Eliot's os, git and workspace-process observers count only where
-/// the SQL boolean `observers` holds (delete's drain). Archive's guard and
-/// the default `agent.list` filter share it.
-pub(crate) fn custody_blockers_sql(agent: &str, observers: &str) -> String {
-    format!(
-        "SELECT state||' '||role||' process '||pid||' ('||owner||')' FROM processes
-             WHERE state IN ('running','unknown')
-               AND (owner GLOB 'agent:a'||{agent}||'#*' OR owner GLOB 'workspace:a'||{agent}||'#*')
-         UNION ALL SELECT 'unknown artifact '||id FROM artifacts WHERE agent={agent} AND json_extract(body,'$.state')='unknown'
-         UNION ALL SELECT 'open '||source||' source (generation '||generation||')' FROM source_state
-             WHERE agent={agent} AND state='open' AND source!='daemon'
-               AND ({observers} OR source NOT IN ('os','git','workspace_process'))"
-    )
-}
-
 /// The ended states in which a custody-held archived Agent stays visible
 /// under the default archived exclusion. `agent.list` rows and counts and
 /// the organization projection's members and totals all apply this list
@@ -318,7 +757,7 @@ pub(crate) fn custody_blockers_sql(agent: &str, observers: &str) -> String {
 pub(crate) const CUSTODY_VISIBLE_STATES: &str = "'stopped','failed','lost'";
 
 /// Distinct Agent numbers holding unresolved custody for the default
-/// `agent.list` exclusion (the same blockers as [`custody_blockers_sql`]
+/// `agent.list` exclusion (the same blockers as [`custody_blocker_tx`]
 /// with observers disabled): an unexited owned process, an `unknown`
 /// artifact, or an open non-daemon, non-observer source. Each leg seeks its
 /// own table instead of scanning archived history per row, so the archived
@@ -371,18 +810,33 @@ pub(crate) fn default_list_custody_agents(connection: &Connection) -> Result<Vec
     Ok(agents.into_iter().collect())
 }
 
-/// First unresolved custody of an Agent ([`custody_blockers_sql`]).
-fn custody_blocker_tx(tx: &Transaction<'_>, agent: i64, observers: bool) -> Result<Option<String>> {
+/// A settled managed workspace keeps its process source open until removal.
+/// Only delete preflight can defer that exact generation's source. Every
+/// live process remains a blocker, and record deletion requires closure.
+fn custody_blocker_tx(
+    tx: &Transaction<'_>,
+    agent: i64,
+    observers: bool,
+    workspace_cleanup_generation: Option<i64>,
+) -> Result<Option<String>> {
     tx.query_row(
-        &format!("{} LIMIT 1", custody_blockers_sql("?1", "?2")),
-        params![agent, observers],
+        "SELECT state||' '||role||' process '||pid||' ('||owner||')' FROM processes
+             WHERE state IN ('running','unknown')
+               AND (owner GLOB 'agent:a'||?1||'#*' OR owner GLOB 'workspace:a'||?1||'#*')
+         UNION ALL SELECT 'unknown artifact '||id FROM artifacts WHERE agent=?1 AND json_extract(body,'$.state')='unknown'
+         UNION ALL SELECT 'open '||source||' source (generation '||generation||')' FROM source_state
+             WHERE agent=?1 AND state='open' AND source!='daemon'
+               AND (?2 OR source NOT IN ('os','git','workspace_process'))
+               AND NOT (source='workspace_process' AND generation IS ?3)
+         LIMIT 1",
+        params![agent, observers, workspace_cleanup_generation],
         |row| row.get(0),
     )
     .optional()
     .map_err(sql_error)
 }
 
-fn delete_tree_tx(tx: &Transaction<'_>, members: &[i64], now: i64) -> Result<()> {
+fn prepare_delete_tree_tx(tx: &Transaction<'_>, members: &[i64]) -> Result<Vec<String>> {
     const MAX_DELETE_COMMANDS: usize = 10_000;
     // Temporary selection is transaction-local and is never a second deletion ledger.
     delete_db!(tx.execute_batch(
@@ -484,6 +938,11 @@ fn delete_tree_tx(tx: &Transaction<'_>, members: &[i64], now: i64) -> Result<()>
             "command tree is incomplete or exceeds its depth bound",
         ));
     }
+    Ok(ids)
+}
+
+fn delete_tree_tx(tx: &Transaction<'_>, members: &[i64], now: i64) -> Result<()> {
+    let ids = prepare_delete_tree_tx(tx, members)?;
     delete_db!(tx.execute("DELETE FROM processes WHERE EXISTS(SELECT 1 FROM deleted_agents d WHERE processes.owner GLOB 'agent:a'||d.id||'#*' OR processes.owner GLOB 'workspace:a'||d.id||'#*')",[]));
     // Preserve existing mutation receipts. Create retry tombstones only
     // for commands whose identities would otherwise disappear.

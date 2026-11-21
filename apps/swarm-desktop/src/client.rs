@@ -8,22 +8,26 @@
 //! rules, scripts) live in [`crate::config_client`], the Settings page's one
 //! client module.
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
 use eliot_core::api::{
     AgentArchiveRequest, AgentDeleteRequest, AgentGetRequest, AgentGetResponse, AgentListRequest,
     AgentListResponse, AgentResultRequest, AgentResultResponse, AgentTreeResponse, ArchivedFilter,
     ChatAttachRequest, ChatDetachRequest, ChatOrganizationMutationResponse,
-    ChatOrganizationRequest, ChatOrganizationResponse, ChatTagRequest, CommandCancelRequest,
-    CommandCancelResponse, CommandChildrenRequest, CommandChildrenResponse, CommandGetRequest,
-    CommandResolution, CommandResolveRequest, CommandResolveResponse, CommandSubmitRequest,
-    CommandSubmitResponse, DiagnoseRequest, DiagnoseResponse, EventsBoundsRequest,
-    EventsBoundsResponse, EventsFilter, EventsReadRequest, EventsReadResponse,
-    EventsSubscribeRequest, EventsSubscribeResponse, HandoffRequest, HandoffResponse,
-    HarnessModelsRequest, HarnessModelsResponse, LaunchIntentGetRequest, LaunchIntentView,
-    LaunchQueueListRequest, LaunchQueueRequest, LaunchQueueView, ORGANIZATION_CHANGED_KIND,
-    OrgGroupView, OrgRowChange, OrganizationChangedEvent, ReparentRequest, ReparentResponse,
-    SwitchRequest, SwitchResponse, UsageSummaryRequest, UsageSummaryResponse,
+    ChatOrganizationRequest, ChatOrganizationResponse, ChatTagRequest, CleanupPlan,
+    CleanupPlanRequest, CommandCancelRequest, CommandCancelResponse, CommandChildrenRequest,
+    CommandChildrenResponse, CommandGetRequest, CommandResolution, CommandResolveRequest,
+    CommandResolveResponse, CommandSubmitRequest, CommandSubmitResponse, DiagnoseRequest,
+    DiagnoseResponse, EventsBoundsRequest, EventsBoundsResponse, EventsFilter, EventsReadRequest,
+    EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse, HandoffRequest,
+    HandoffResponse, HarnessModelsRequest, HarnessModelsResponse, LaunchIntentGetRequest,
+    LaunchIntentView, LaunchQueueListRequest, LaunchQueueRequest, LaunchQueueView,
+    ORGANIZATION_CHANGED_KIND, OrgGroupView, OrgRowChange, OrganizationChangedEvent,
+    ReparentRequest, ReparentResponse, SwitchRequest, SwitchResponse, UsageSummaryRequest,
+    UsageSummaryResponse,
 };
 use eliot_core::{Command, Error, Result};
 use futures_util::StreamExt;
@@ -140,9 +144,8 @@ pub async fn archive_agent(
     Ok(reply.affected)
 }
 
-/// `agent.delete` (Owner only, stopped or failed trees): removes the tree's
-/// records from the Store; never the workspace, native store files or
-/// branches.
+/// `agent.delete` cleans up eligible task worktrees and native chats before
+/// removing the stopped or failed tree's records.
 pub async fn delete_agent(data_dir: &Path, mutation_id: String, agent: &str) -> Result<usize> {
     let request = AgentDeleteRequest {
         id: mutation_id,
@@ -151,6 +154,29 @@ pub async fn delete_agent(data_dir: &Path, mutation_id: String, agent: &str) -> 
     request.validate()?;
     let reply: AgentTreeResponse = typed_call(data_dir, "agent.delete", &request).await?;
     Ok(reply.affected)
+}
+
+/// Follow progress pages until there is a review the caller can show or use.
+pub async fn cleanup_plan_page(
+    data_dir: &Path,
+    mut request: CleanupPlanRequest,
+    accept: impl Fn(&CleanupPlan) -> bool,
+) -> Result<CleanupPlan> {
+    let mut cursors: HashSet<_> = request.continuation.iter().cloned().collect();
+    loop {
+        let page: CleanupPlan =
+            eliot_daemon::client_call_typed(data_dir, "cleanup.plan", &request).await?;
+        let Some(next) = page.continuation.as_ref().filter(|_| !accept(&page)) else {
+            return Ok(page);
+        };
+        if !cursors.insert(next.clone()) {
+            return Err(Error::new(
+                "source_integrity",
+                "Cleanup review did not advance",
+            ));
+        }
+        request.continuation = Some(next.clone());
+    }
 }
 
 async fn typed_call<Req: serde::Serialize, Resp: serde::de::DeserializeOwned>(
