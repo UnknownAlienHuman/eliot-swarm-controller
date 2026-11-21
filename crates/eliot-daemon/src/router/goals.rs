@@ -21,8 +21,8 @@ use crate::{
 use eliot_core::{
     AgentState, Error, Event, Result, SecretPolicy, StderrSnapshot,
     api::{
-        GoalClearRequest, GoalDefinition, GoalGetRequest, GoalMode, GoalPauseRequest,
-        GoalResumeRequest, GoalRoundRequest, GoalSetRequest, GoalStatus,
+        GoalClearRequest, GoalContinuationStage, GoalDefinition, GoalGetRequest, GoalMode,
+        GoalPauseRequest, GoalResumeRequest, GoalRoundRequest, GoalSetRequest, GoalStatus,
         MAX_GOAL_OBSERVATION_BYTES, inference::sha256_hex, truncate_bytes,
     },
     limits::MAX_FRAME_BYTES,
@@ -538,7 +538,14 @@ impl Router {
         if check.exit_code != Some(0) {
             // The next round's baseline includes whatever this check wrote.
             let fingerprint_after = work_fingerprint(probe.workspace.as_deref()).await;
-            let text = goal_continuation_text(&definition, &check, &policy);
+            let (_, stage) = probe.view.counters.failure_stage(
+                &definition,
+                check.output_complete,
+                check.output_digest.as_deref(),
+            );
+            let text = goal_continuation_text(&definition, &check, stage, &policy);
+            let escalation_id =
+                (stage == GoalContinuationStage::Escalate).then(|| ulid::Ulid::new().to_string());
             let commit = GoalRoundCommit {
                 id: request.id.clone(),
                 principal: principal.clone(),
@@ -556,6 +563,8 @@ impl Router {
                 continuation: Some(GoalContinuation {
                     id: continuation_id,
                     text,
+                    stage,
+                    escalation_id,
                 }),
             };
             let result = self.commit_goal_round(&principal, &request, commit).await;
@@ -718,12 +727,22 @@ impl Router {
                     }
                 }
             };
+            if let Some(escalation) = &result.escalation {
+                self.publish_locked(&escalation.events);
+            }
             if let Some(admission) = &result.admission {
                 self.publish_locked(&admission.events);
             }
             self.publish_locked(&result.events);
             result
         };
+        // The escalation configure was admitted first and is scheduled
+        // first; the settings lane keeps the continuation behind it.
+        if let Some(escalation) = &result.escalation
+            && escalation.is_new
+        {
+            self.schedule_command(escalation.command.id.clone(), None);
+        }
         if let Some(admission) = &result.admission {
             if admission.command.state == eliot_core::CommandState::Unknown {
                 self.inner
@@ -1608,12 +1627,33 @@ async fn work_fingerprint(workspace: Option<&str>) -> Option<String> {
 fn goal_continuation_text(
     definition: &GoalDefinition,
     check: &GoalCheckResult,
+    stage: GoalContinuationStage,
     policy: &SecretPolicy,
 ) -> String {
-    let goal_text = match scope_reminder(definition) {
+    let mut goal_text = match scope_reminder(definition) {
         Some(reminder) => format!("{}\n\n{reminder}", definition.text),
         None => definition.text.clone(),
     };
+    match (stage, &definition.escalation) {
+        (GoalContinuationStage::Diagnose, _) => goal_text.push_str(
+            "\n\nDiagnosis step: the check failed with the same output twice in a row, so the last approach did not change the result. Before changing more, compare the attempts, name the cause they share and run one observation that tells the remaining causes apart. Then take one different approach and say what the observation showed.",
+        ),
+        (GoalContinuationStage::Escalate, Some(escalation)) => {
+            let target = [
+                escalation.model.as_deref().map(|model| format!("model {model}")),
+                escalation.effort.as_deref().map(|effort| format!("effort {effort}")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" and ");
+            goal_text.push_str(&format!(
+                "\n\nEscalation: the same failure repeated after the diagnosis step. Swarm asked to switch this Agent to {target} before this turn, as the Owner authorized: {}. The switch applies only if the harness accepted it. Use what the diagnosis established and do not repeat an approach that already failed.",
+                escalation.reason
+            ));
+        }
+        _ => {}
+    }
     let argv = definition.check.join(" ");
     let exit = check
         .exit_code

@@ -71,9 +71,11 @@ engine, second scheduler or critic loop.
       since `set` in its verbatim unit from a baseline snapshot; incomplete,
       stale, mixed-unit, reset or decreasing data is `cost_unverified` and
       blocks, never zero.
-- [ ] **A8 Bounded escalation.** After two failed approaches a diagnosis step,
-      then one Owner-authorized profile/model change by stated reason; never a
-      model ladder, wider rights or a replayed unknown.
+- [x] **A8 Bounded escalation.** The second identical Goal failure in a row
+      gets one diagnosis continuation; an identical failure after it applies
+      the Goal's one Owner-authorized `escalation` (a model/effort `configure`
+      with its reason, admitted before the continuation); never a model ladder,
+      wider rights or a replayed unknown.
 - [ ] **A9 Flow control and review digest.** Assignment pause and manager budget
       follow integration capacity; a short patch digest (files, packages, new
       dependencies, public interface, checker/lint changes, new suppressions)
