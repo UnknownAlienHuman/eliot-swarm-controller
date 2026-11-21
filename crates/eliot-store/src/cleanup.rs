@@ -675,8 +675,15 @@ impl Store {
         let root = self
             .agent_artifact_root(&agent.id, generation)?
             .ok_or_else(|| Error::new("not_allowed", "Agent has no Swarm-created artifact root"))?;
-        let proposed = cleanup_path(path);
-        let owned = cleanup_path(&root.path);
+        let normalized = |path: &str| {
+            if cfg!(windows) {
+                cleanup_path(&path.to_lowercase())
+            } else {
+                cleanup_path(path)
+            }
+        };
+        let proposed = normalized(path);
+        let owned = normalized(&root.path);
         if proposed == owned || !proposed.starts_with(&owned) {
             return Err(Error::new(
                 "not_allowed",
@@ -726,16 +733,13 @@ impl Store {
         }
         {
             let mut query = tx
-                .prepare("SELECT path FROM artifacts")
+                .prepare("SELECT path FROM artifacts WHERE id <> ?1")
                 .map_err(sql_error)?;
             let paths = query
-                .query_map([], |r| r.get::<_, String>(0))
+                .query_map([&root.id], |r| r.get::<_, String>(0))
                 .map_err(sql_error)?;
             for existing in paths {
-                let existing = cleanup_path(&existing.map_err(sql_error)?);
-                if existing == owned {
-                    continue;
-                }
+                let existing = normalized(&existing.map_err(sql_error)?);
                 if existing.starts_with(&proposed) || proposed.starts_with(&existing) {
                     return Err(Error::new(
                         "conflict",

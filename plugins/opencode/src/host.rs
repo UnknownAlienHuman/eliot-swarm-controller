@@ -819,18 +819,6 @@ impl OpenCodePlugin {
             .unwrap_or_else(Instant::now);
         match http.delete_session(native_ref, delete_deadline).await {
             Ok(_) => {
-                let after_present = http
-                    .archive_session_present(native_ref, phase_deadline(envelope, RPC_TIMEOUT))
-                    .await
-                    .map_err(|error| {
-                        Error::new(
-                            "unknown",
-                            format!(
-                                "OpenCode delete target readback is unconfirmed ({}); no replay",
-                                error.message
-                            ),
-                        )
-                    })?;
                 let after = http
                     .archive_session_inventory(native_ref, phase_deadline(envelope, RPC_TIMEOUT))
                     .await
@@ -843,13 +831,7 @@ impl OpenCodePlugin {
                             ),
                         )
                     })?;
-                if after.target_present != after_present {
-                    return Err(Error::new(
-                        "unknown",
-                        "OpenCode delete target readback disagreed with the complete session list; no replay",
-                    ));
-                }
-                if after_present {
+                if after.target_present {
                     return Err(Error::new(
                         "unknown",
                         "OpenCode DELETE completed without proving the target absent; no replay",
