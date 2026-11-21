@@ -1380,8 +1380,8 @@ impl PluginHost {
         })
     }
 
-    pub(crate) fn authorize_local_owner(&self, peer: Option<LocalPeer>) -> Result<()> {
-        self.state.agent_custodies.authorize_owner(peer)
+    pub(crate) async fn authorize_local_owner(&self, peer: Option<LocalPeer>) -> Result<()> {
+        self.state.agent_custodies.authorize_owner(peer).await
     }
 
     fn spawn_plugin_process(

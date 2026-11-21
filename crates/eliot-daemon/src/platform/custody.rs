@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex, Weak};
 #[cfg(any(windows, target_os = "linux"))]
 use std::time::Duration;
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+use tokio::sync::Notify;
 
 /// How strongly the operating system contains this child family.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,7 +56,28 @@ struct LiveAgentCustody {
 /// A daemon-local view of owned Agent generations, independent of sampled
 /// process records, control credentials, and other daemons' Jobs or groups.
 #[derive(Default)]
-pub(crate) struct AgentCustodies(Mutex<Vec<Weak<LiveAgentCustody>>>);
+pub(crate) struct AgentCustodies {
+    state: Mutex<CustodyState>,
+    started: Notify,
+}
+
+#[derive(Default)]
+struct CustodyState {
+    starting: usize,
+    agents: Vec<Weak<LiveAgentCustody>>,
+}
+
+struct CustodyStart<'a>(&'a AgentCustodies);
+
+impl Drop for CustodyStart<'_> {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock_recover();
+        state.starting -= 1;
+        if state.starting == 0 {
+            self.0.started.notify_waiters();
+        }
+    }
+}
 
 impl AgentCustodies {
     pub(crate) fn spawn(
@@ -63,8 +85,10 @@ impl AgentCustodies {
         agent: &str,
         spawn: impl FnOnce() -> std::result::Result<OwnedChild, AgentSpawnError>,
     ) -> std::result::Result<OwnedChild, AgentSpawnError> {
-        // Exclude Owner authorization between creation and registration.
-        let mut agents = self.0.lock_recover();
+        // A peer accepted while spawn is in flight must wait for registration.
+        // Keep only that publication fence while creating the process.
+        self.state.lock_recover().starting += 1;
+        let _start = CustodyStart(self);
         let mut child = spawn()?;
         #[cfg(windows)]
         let membership = child.job.membership();
@@ -88,20 +112,44 @@ impl AgentCustodies {
                 ));
             }
         };
-        agents.retain(|agent| agent.strong_count() != 0);
         let custody = Arc::new(LiveAgentCustody {
             agent: agent.to_owned(),
             membership,
         });
-        agents.push(Arc::downgrade(&custody));
+        {
+            let mut state = self.state.lock_recover();
+            state.agents.retain(|agent| agent.strong_count() != 0);
+            state.agents.push(Arc::downgrade(&custody));
+        }
         child.local_custody = Some(custody);
         Ok(child)
     }
 
-    pub(crate) fn authorize_owner(&self, peer: Option<LocalPeer>) -> Result<()> {
+    pub(crate) async fn authorize_owner(&self, peer: Option<LocalPeer>) -> Result<()> {
+        let agents = loop {
+            let registered = self.started.notified();
+            let snapshot = {
+                let mut state = self.state.lock_recover();
+                (state.starting == 0).then(|| {
+                    state.agents.retain(|agent| agent.strong_count() != 0);
+                    state
+                        .agents
+                        .iter()
+                        .filter_map(Weak::upgrade)
+                        .collect::<Vec<_>>()
+                })
+            };
+            if let Some(snapshot) = snapshot {
+                break snapshot;
+            }
+            registered.await;
+        };
+
+        #[cfg(windows)]
+        if agents.is_empty() {
+            return Ok(());
+        }
         let peer = peer.ok_or_else(owner_peer_unknown)?;
-        let mut agents = self.0.lock_recover();
-        agents.retain(|agent| agent.strong_count() != 0);
 
         #[cfg(any(windows, target_os = "linux"))]
         {
@@ -109,7 +157,7 @@ impl AgentCustodies {
                 .inspect(!agents.is_empty())
                 .map_err(|_| owner_peer_unknown())?;
             let mut unknown = false;
-            for agent in agents.iter().filter_map(Weak::upgrade) {
+            for agent in agents {
                 match agent.membership.contains(&process) {
                     Ok(true) => {
                         return Err(Error::new(
@@ -131,7 +179,7 @@ impl AgentCustodies {
         }
         #[cfg(not(any(windows, target_os = "linux")))]
         {
-            let _ = peer;
+            let _ = (agents, peer);
             Err(owner_peer_unknown())
         }
     }

@@ -288,8 +288,7 @@ impl ProcessGroupIdentity {
             return Ok(true);
         }
         if peer.lineage.iter().any(|(_, stat)| stat.pgid == self.pgid) {
-            validate_process_group_leader(self)?;
-            return Ok(true);
+            return process_group_leader_matches(self);
         }
         Ok(false)
     }
@@ -512,16 +511,21 @@ pub(crate) fn terminate_process_group(identity: &ProcessGroupIdentity) -> Result
 
 #[cfg(target_os = "linux")]
 fn validate_process_group_leader(identity: &ProcessGroupIdentity) -> Result<()> {
-    let (pgid, start_ticks) = read_linux_process_identity(identity.pid).map_err(|error| {
-        unknown_process_identity("cannot revalidate process-group leader", error)
-    })?;
-    if pgid != identity.pgid || start_ticks != identity.start_ticks {
+    if !process_group_leader_matches(identity)? {
         return Err(Error::new(
             "process_custody_unknown",
             "process-group leader PID birth or PGID changed; no signal was sent",
         ));
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn process_group_leader_matches(identity: &ProcessGroupIdentity) -> Result<bool> {
+    let (pgid, start_ticks) = read_linux_process_identity(identity.pid).map_err(|error| {
+        unknown_process_identity("cannot revalidate process-group leader", error)
+    })?;
+    Ok(pgid == identity.pgid && start_ticks == identity.start_ticks)
 }
 
 /// Observe the retained direct child without consuming its wait status. The

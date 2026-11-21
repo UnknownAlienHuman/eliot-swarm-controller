@@ -123,7 +123,9 @@ spawn and keeps it while it owns the child. Unavailable custody identity fails
 startup before plugin initialization, with the usual cleanup and uncertainty
 rules. Windows checks exact Job membership.
 Linux checks the owned group and observable parent lineage and retains the existing
-degraded custody guarantee. Neither another daemon's custody nor periodic process
+degraded custody guarantee. Owner checks wait for in-flight custody registration,
+then inspect OS membership outside the custody registry lock.
+Neither another daemon's custody nor periodic process
 samples decide local Owner authority. See [local principals](api.md#transport-and-principal-identity).
 
 No-Agent discovery (catalogue, quota, profile-store and installation/auth probes)

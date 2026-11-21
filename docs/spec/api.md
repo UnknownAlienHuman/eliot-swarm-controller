@@ -34,9 +34,24 @@ scope and generation checks.
 A match rejects with `not_allowed` and names the Agent. If peer or custody identity
 cannot be verified, the daemon also refuses Owner access. A valid Owner credential
 proves possession only, so an inconclusive OS check cannot establish that the process
-is outside Agent custody. Owner access on Unix platforms without this process check
-is unavailable. Each daemon checks its own custody, so an Agent can still own a
-separate private daemon. The local trust boundary remains one OS user.
+is outside Agent custody. Supported targets are Windows and the Linux Docker image.
+macOS and BSD have no supported Owner IPC. Each daemon checks its own custody, so an
+Agent can still own a separate private daemon. The local trust boundary remains one OS user.
+
+On Windows, a valid Owner credential suffices when the daemon has no live Agent
+custody. Otherwise `GetNamedPipeClientProcessId` must supply a nonzero PID. The
+daemon tries to open it with `PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE`.
+With a process handle, both zero-time liveness checks must return `WAIT_TIMEOUT`
+and the daemon uses `IsProcessInJob` to verify membership. On `ERROR_ACCESS_DENIED`,
+it uses the PID from the pipe and the daemon's exact Job member lists. Only a
+complete list establishes absence from a Job. An unavailable PID, another open
+failure, a failed liveness check, or unresolved membership leaves identity or
+custody unknown. A confirmed Job match returns a refusal naming the Agent.
+
+The same rules apply at every Windows integrity level. An elevated Owner
+client proceeds when the checks establish that it is outside the daemon's Agent
+Jobs. The credential-only path applies at every integrity level when the daemon
+has no live Agent custody.
 
 For Agent-originated commands, Store checks the caller's generation and live
 identity again in the transactions that admit and dispatch work. A missing,

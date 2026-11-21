@@ -564,7 +564,10 @@ pub(crate) struct Job {
     family_empty_confirmed: Arc<AtomicBool>,
 }
 
-pub(crate) struct LocalPeer(QueryHandle);
+pub(crate) struct LocalPeer {
+    pid: u32,
+    process: Option<QueryHandle>,
+}
 
 impl LocalPeer {
     pub(crate) fn capture(pipe: &tokio::net::windows::named_pipe::NamedPipeServer) -> Option<Self> {
@@ -582,9 +585,14 @@ impl LocalPeer {
             )
         };
         if handle.is_null() {
-            return None;
+            // SAFETY: this is the thread's error from the failed OpenProcess.
+            return (unsafe { GetLastError() } == ERROR_ACCESS_DENIED)
+                .then_some(Self { pid, process: None });
         }
-        Some(Self(QueryHandle(handle)))
+        Some(Self {
+            pid,
+            process: Some(QueryHandle(handle)),
+        })
     }
 
     pub(crate) fn inspect(self, _owned_agents: bool) -> Result<Self> {
@@ -593,8 +601,13 @@ impl LocalPeer {
     }
 
     pub(crate) fn verify(&self) -> Result<()> {
+        let Some(process) = &self.process else {
+            // With a denied process handle, every Job must resolve the
+            // kernel-reported client PID through its own member list.
+            return Ok(());
+        };
         // SAFETY: the process handle has synchronize access and outlives the wait.
-        if unsafe { WaitForSingleObject(self.0.0, 0) } != WAIT_TIMEOUT {
+        if unsafe { WaitForSingleObject(process.0, 0) } != WAIT_TIMEOUT {
             return Err(Error::new(
                 "process_identity",
                 "named-pipe client is no longer live",
@@ -615,9 +628,22 @@ impl JobMembership {
                 "owned Job query handle is closed",
             )
         })?;
+        let Some(process) = &peer.process else {
+            let (pids, complete) = job_members(job.0)?;
+            if pids.contains(&peer.pid) {
+                return Ok(true);
+            }
+            if !complete {
+                return Err(Error::new(
+                    "process_custody_unknown",
+                    "owned Job member list is incomplete",
+                ));
+            }
+            return Ok(false);
+        };
         let mut contained = 0;
         // SAFETY: both handles remain live during this read-only membership query.
-        if unsafe { IsProcessInJob(peer.0.0, job.0, &mut contained) } == 0 {
+        if unsafe { IsProcessInJob(process.0, job.0, &mut contained) } == 0 {
             return Err(io_error(
                 "verify owned Job membership",
                 std::io::Error::last_os_error(),

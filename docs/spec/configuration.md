@@ -362,9 +362,10 @@ Muse, which has no minimal mapping), plus an optional `mcp_allow` list of native
 server names. Antigravity, Claude, and OpenCode scan MCP configuration as a
 best-effort guard for direct Owner entries. The daemon enforces the
 [local Owner process boundary](api.md#transport-and-principal-identity) using
-its own Agent custody on every local connection, including those started by
-shell commands or wrappers. The shared scan checks the executable of a direct
-invocation for `swarm`, `swarm.exe`, or the active controller binary, then
+its own Agent custody. Windows checks exact Job membership and Linux uses
+degraded process-group and ancestry checks. The shared scan checks the
+executable of a direct invocation for `swarm`, `swarm.exe`, or the active
+controller binary, then
 matches the `mcp` subcommand without `--require-agent`. Shell scripts, command
 wrappers, and variable expansion are outside the scan.
 HTTP matches the configured `cloud_mcp` hostname exactly, ignoring case and

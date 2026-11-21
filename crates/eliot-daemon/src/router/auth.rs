@@ -110,7 +110,7 @@ impl Router {
             }
             "owner" => {
                 if secure_eq(credential, &self.inner.owner_token) {
-                    self.inner.plugin_host.authorize_local_owner(peer)?;
+                    self.inner.plugin_host.authorize_local_owner(peer).await?;
                     if let Some(remote) = auth.get("remote_call") {
                         let remote: eliot_core::RemoteCallContext =
                             serde_json::from_value(remote.clone())
