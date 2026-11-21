@@ -655,10 +655,11 @@ impl OpenCodePlugin {
     /// documented `DELETE /api/session/{id}` call. A dedicated reader plugin
     /// instance runs a short-lived owned server on the exact retained per-Agent
     /// store and directory, proves that store derives the retained native scope,
-    /// and proves the session has no native children before deletion. OpenCode
-    /// DELETE recursively removes children, so any child definitively refuses
-    /// cleanup. The stopped isolated reader has no live Agent turn. Raw store
-    /// files are never touched.
+    /// and proves the exact target's presence against a complete inventory.
+    /// An absent target is already archived; a present target with native
+    /// children is refused because OpenCode DELETE recursively removes them.
+    /// The stopped isolated reader has no live Agent turn. Raw store files are
+    /// never touched.
     async fn native_archive(&self, raw: &Value) -> Result<Value> {
         ensure_dedicated_reader(
             self.session.is_some() || self.failed_start.is_some(),
@@ -752,12 +753,14 @@ impl OpenCodePlugin {
         }
     }
 
-    /// Prove the reader serves the exact retained store, validate a complete
-    /// unfiltered session inventory and refuse any native child before the
-    /// recursive DELETE. A 204 or 404 is settled only after the same
-    /// server/store/directory-bound inventory confirms both target and children
-    /// are absent. HTTP 400/401 and a proven child are definitive refusals;
-    /// every other uncertain outcome stays unknown, never replayed.
+    /// Reconcile exact session reads with a complete unfiltered inventory on
+    /// the reader serving the exact retained store. An absent target is
+    /// archived independently of retained children. A present target with any
+    /// native child is refused before recursive DELETE; after DELETE, proven
+    /// target absence establishes this target's archive even if child rows
+    /// remain. HTTP 400/401 and a proven child of a present target are
+    /// definitive refusals; every other uncertain outcome stays unknown,
+    /// never replayed.
     async fn archive_retained_session(
         server: &OwnedServer,
         native_scope: &str,
@@ -795,12 +798,6 @@ impl OpenCodePlugin {
                     ),
                 )
             })?;
-        if before.has_children {
-            return Err(Error::new(
-                "native_archive_refused",
-                "OpenCode session has native child sessions and was kept",
-            ));
-        }
         if before.target_present != present {
             return Err(Error::new(
                 "unknown",
@@ -810,12 +807,30 @@ impl OpenCodePlugin {
         if !present {
             return Ok(json!({"archived": true}));
         }
+        if before.has_children {
+            return Err(Error::new(
+                "native_archive_refused",
+                "OpenCode session has native child sessions and was kept",
+            ));
+        }
 
         let delete_deadline = envelope
             .checked_sub(START_SHUTDOWN_BUDGET)
             .unwrap_or_else(Instant::now);
         match http.delete_session(native_ref, delete_deadline).await {
             Ok(_) => {
+                let after_present = http
+                    .archive_session_present(native_ref, phase_deadline(envelope, RPC_TIMEOUT))
+                    .await
+                    .map_err(|error| {
+                        Error::new(
+                            "unknown",
+                            format!(
+                                "OpenCode delete target readback is unconfirmed ({}); no replay",
+                                error.message
+                            ),
+                        )
+                    })?;
                 let after = http
                     .archive_session_inventory(native_ref, phase_deadline(envelope, RPC_TIMEOUT))
                     .await
@@ -828,10 +843,16 @@ impl OpenCodePlugin {
                             ),
                         )
                     })?;
-                if after.target_present || after.has_children {
+                if after.target_present != after_present {
                     return Err(Error::new(
                         "unknown",
-                        "OpenCode DELETE completed without proving target and children absent; no replay",
+                        "OpenCode delete target readback disagreed with the complete session list; no replay",
+                    ));
+                }
+                if after_present {
+                    return Err(Error::new(
+                        "unknown",
+                        "OpenCode DELETE completed without proving the target absent; no replay",
                     ));
                 }
                 Ok(json!({"archived": true}))
