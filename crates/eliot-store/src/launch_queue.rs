@@ -733,6 +733,12 @@ impl Store {
                     "priority is outside the Owner's delegated range",
                 ));
             }
+            if request.paused == Some(true) && policy.manager_assignment.is_none() {
+                return Err(Error::new(
+                    "not_allowed",
+                    "a pause needs the Owner's manager_max_live ceiling for this project",
+                ));
+            }
             let priority = request.priority.unwrap_or(old_priority);
             let max_live = request.max_live.or(old_max);
             let paused = request.paused.unwrap_or(old_paused);

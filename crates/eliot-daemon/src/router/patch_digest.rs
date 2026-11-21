@@ -16,6 +16,10 @@ use std::{collections::BTreeSet, path::Path};
 const MAX_ENTRIES: usize = 100;
 /// Longest quoted line in a digest entry.
 const MAX_LINE_CHARS: usize = 160;
+/// Most bytes of untracked file text one digest scans.
+const MAX_UNTRACKED_BYTES: u64 = 1024 * 1024;
+/// Largest manifest read to resolve tables.
+const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 /// Package manifests that mark a package directory.
 const MANIFESTS: &[&str] = &["Cargo.toml", "package.json", "pyproject.toml", "go.mod"];
 /// Checker, lint, toolchain and CI configuration, by file name.
@@ -122,13 +126,18 @@ fn digest(root: &Path, read: &PatchRead) -> AgentPatchDigestResponse {
     let mut files: Vec<PatchDigestFile> = Vec::new();
     let mut current: Option<String> = None;
     let mut new_line = 0_usize;
+    let mut in_hunk = false;
     let mut sections: Vec<Option<String>> = Vec::new();
+    // Manifest keys a hunk removed: an entry removed and re-added (a version
+    // bump, a trailing comma) is not a new dependency.
+    let mut removed_keys: BTreeSet<String> = BTreeSet::new();
     for line in read.diff.lines() {
         if let Some(rest) = line.strip_prefix("diff --git ") {
-            let path = rest
-                .rsplit_once(" b/")
-                .map(|(_, path)| unquote(path))
-                .unwrap_or_else(|| unquote(rest));
+            in_hunk = false;
+            let Some(path) = header_path(rest) else {
+                current = None;
+                continue;
+            };
             sections = manifest_sections(root, &path);
             files.push(PatchDigestFile {
                 path: path.clone(),
@@ -149,13 +158,15 @@ fn digest(root: &Path, read: &PatchRead) -> AgentPatchDigestResponse {
                 file.change = "deleted".to_owned();
             }
         } else if let Some(hunk) = line.strip_prefix("@@ ") {
+            in_hunk = true;
             new_line = hunk
                 .split_whitespace()
                 .find_map(|part| part.strip_prefix('+'))
                 .and_then(|range| range.split(',').next())
                 .and_then(|start| start.parse().ok())
                 .unwrap_or(0);
-        } else if line.starts_with("+++") || line.starts_with("---") {
+        } else if !in_hunk {
+            // File header lines (`---`/`+++`, modes, index) before the first hunk.
         } else if let Some(added) = line.strip_prefix('+') {
             classify(
                 &mut out,
@@ -166,15 +177,44 @@ fn digest(root: &Path, read: &PatchRead) -> AgentPatchDigestResponse {
             );
             new_line += 1;
         } else if let Some(removed) = line.strip_prefix('-') {
+            if let Some(key) = manifest_key(path, removed) {
+                removed_keys.insert(format!("{path}: {key}"));
+            }
             classify(&mut out, path, '-', removed, None);
         }
     }
+    // Untracked files are new in full: their text counts as added lines,
+    // within a total read bound; past it the digest says it is incomplete.
+    let mut untracked_bytes = 0_u64;
     for path in &read.untracked {
         files.push(PatchDigestFile {
             path: path.clone(),
             change: "untracked".to_owned(),
         });
+        match read_text(
+            root,
+            path,
+            MAX_UNTRACKED_BYTES - untracked_bytes.min(MAX_UNTRACKED_BYTES),
+        ) {
+            Some(Ok(text)) => {
+                untracked_bytes += text.len() as u64;
+                let sections = manifest_sections(root, path);
+                for (index, line) in text.lines().enumerate() {
+                    classify(
+                        &mut out,
+                        path,
+                        '+',
+                        line,
+                        sections.get(index + 1).cloned().flatten(),
+                    );
+                }
+            }
+            Some(Err(())) => out.complete = false,
+            None => {}
+        }
     }
+    out.new_dependencies
+        .retain(|entry| !removed_keys.contains(entry));
     let mut packages = BTreeSet::new();
     for file in &files {
         packages.insert(package_of(root, &file.path));
@@ -214,19 +254,33 @@ fn classify(
     }
     let file = file_name(path);
     let dependency = match file {
+        // `[dependencies.serde]` names the dependency in the table header;
+        // the keys inside such a table are its fields, not dependencies.
+        "Cargo.toml" if text.trim_start().starts_with('[') => text
+            .trim()
+            .trim_matches(|c| c == '[' || c == ']')
+            .split_once("dependencies.")
+            .map(|(_, name)| name.trim_matches('"').to_owned()),
         "Cargo.toml"
-            if section
-                .as_deref()
-                .is_some_and(|name| name.contains("dependencies")) =>
+            if section.as_deref().is_some_and(|name| {
+                name == "dependencies"
+                    || name.ends_with("-dependencies")
+                    || name.ends_with(".dependencies")
+            }) =>
         {
             key_of(text)
         }
-        "package.json" => text
-            .trim()
-            .strip_prefix('"')
-            .and_then(|rest| rest.split_once("\":"))
-            .filter(|(_, value)| value.trim().starts_with('"'))
-            .map(|(name, _)| name.to_owned()),
+        "package.json"
+            if section
+                .as_deref()
+                .is_some_and(|name| name.ends_with("ependencies")) =>
+        {
+            text.trim()
+                .strip_prefix('"')
+                .and_then(|rest| rest.split_once("\":"))
+                .filter(|(_, value)| value.trim().starts_with('"'))
+                .map(|(name, _)| name.to_owned())
+        }
         "Cargo.lock" => text
             .trim()
             .strip_prefix("name = \"")
@@ -301,22 +355,114 @@ fn is_checker_file(path: &str) -> bool {
 /// For a changed Cargo manifest, the TOML table each current line sits in
 /// (index = 1-based line number); empty for any other file.
 fn manifest_sections(root: &Path, path: &str) -> Vec<Option<String>> {
-    if file_name(path) != "Cargo.toml" {
+    let name = file_name(path);
+    if name != "Cargo.toml" && name != "package.json" {
         return Vec::new();
     }
-    let Ok(text) = std::fs::read_to_string(root.join(path)) else {
+    let Some(Ok(text)) = read_text(root, path, MAX_MANIFEST_BYTES) else {
         return Vec::new();
     };
     let mut sections = vec![None];
-    let mut section = None;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') {
-            section = Some(trimmed.trim_matches(|c| c == '[' || c == ']').to_owned());
+    if name == "Cargo.toml" {
+        let mut section = None;
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') {
+                section = Some(trimmed.trim_matches(|c| c == '[' || c == ']').to_owned());
+            }
+            sections.push(section.clone());
         }
-        sections.push(section.clone());
+        return sections;
+    }
+    // package.json: the innermost object key, by brace depth.
+    let mut stack: Vec<Option<String>> = Vec::new();
+    for line in text.lines() {
+        sections.push(stack.last().cloned().flatten());
+        let trimmed = line.trim();
+        let key = trimmed
+            .strip_prefix('"')
+            .and_then(|rest| rest.split_once("\":"))
+            .map(|(key, _)| key.to_owned());
+        for c in trimmed.chars() {
+            match c {
+                '{' => stack.push(key.clone()),
+                '}' => {
+                    stack.pop();
+                }
+                _ => {}
+            }
+        }
     }
     sections
+}
+
+/// Text of a regular, non-link file under `root` of at most `max` bytes;
+/// `None` when absent or binary, `Some(Err)` when over the bound.
+fn read_text(root: &Path, path: &str, max: u64) -> Option<std::result::Result<String, ()>> {
+    let full = root.join(path);
+    let meta = std::fs::symlink_metadata(&full).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    if meta.len() > max {
+        return Some(Err(()));
+    }
+    let bytes = std::fs::read(&full).ok()?;
+    if bytes.contains(&0) {
+        return None;
+    }
+    String::from_utf8(bytes).ok().map(Ok)
+}
+
+/// The path of a `diff --git a/P b/P` header. Without renames both sides
+/// name the same path, so an unquoted header splits exactly in the middle
+/// even when the path contains spaces or " b/"; a quoted header is
+/// C-unquoted.
+fn header_path(rest: &str) -> Option<String> {
+    if rest.starts_with('"') {
+        let (first, tail) = c_unquote(rest)?;
+        let (second, _) = c_unquote(tail.trim_start())?;
+        let path = second.strip_prefix("b/")?;
+        return (first.strip_prefix("a/") == Some(path)).then(|| path.to_owned());
+    }
+    let half = rest.len().checked_sub(5)? / 2;
+    let path = rest.get(2..2 + half)?;
+    (rest.starts_with("a/") && rest.get(2 + half..)? == format!(" b/{path}"))
+        .then(|| path.to_owned())
+}
+
+/// Decode one C-quoted Git path at the start of `text`; returns it and the
+/// rest after the closing quote.
+fn c_unquote(text: &str) -> Option<(String, &str)> {
+    let body = text.strip_prefix('"')?;
+    let mut bytes = Vec::new();
+    let mut chars = body.char_indices();
+    while let Some((index, c)) = chars.next() {
+        match c {
+            '"' => return Some((String::from_utf8(bytes).ok()?, &body[index + 1..])),
+            '\\' => {
+                let (_, escaped) = chars.next()?;
+                match escaped {
+                    'n' => bytes.push(b'\n'),
+                    't' => bytes.push(b'\t'),
+                    '"' | '\\' => bytes.push(escaped as u8),
+                    '0'..='7' => {
+                        let mut value = escaped.to_digit(8)?;
+                        for _ in 0..2 {
+                            value = value * 8 + chars.next()?.1.to_digit(8)?;
+                        }
+                        bytes.push(u8::try_from(value).ok()?);
+                    }
+                    _ => return None,
+                }
+            }
+            _ => {
+                let mut buffer = [0; 4];
+                bytes.extend_from_slice(c.encode_utf8(&mut buffer).as_bytes());
+            }
+        }
+    }
+    None
 }
 
 /// The nearest directory holding a package manifest, or `.` for the root.
@@ -336,6 +482,19 @@ fn package_of(root: &Path, path: &str) -> String {
     ".".to_owned()
 }
 
+/// The entry key of a Cargo or npm manifest line, whatever its table.
+fn manifest_key(path: &str, text: &str) -> Option<String> {
+    match file_name(path) {
+        "Cargo.toml" => key_of(text),
+        "package.json" => text
+            .trim()
+            .strip_prefix('"')
+            .and_then(|rest| rest.split_once("\":"))
+            .map(|(key, _)| key.to_owned()),
+        _ => None,
+    }
+}
+
 fn key_of(text: &str) -> Option<String> {
     let (key, _) = text.split_once('=')?;
     let key = key.trim().trim_matches('"');
@@ -348,10 +507,6 @@ fn key_of(text: &str) -> Option<String> {
 
 fn file_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
-}
-
-fn unquote(path: &str) -> String {
-    path.trim_matches('"').to_owned()
 }
 
 fn clip(text: &str) -> String {

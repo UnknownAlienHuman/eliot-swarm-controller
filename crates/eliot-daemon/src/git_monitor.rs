@@ -927,6 +927,9 @@ impl GitProbe {
             .clone()
             .or_else(|| status.head.clone())
             .ok_or_else(|| unavailable("the patch needs a base commit or a HEAD"))?;
+        // Non-ASCII paths stay readable instead of octal-quoted.
+        let mut overrides = overrides;
+        overrides.push(("core.quotepath".to_owned(), "false".to_owned()));
         let (diff, complete) = match self
             .run(
                 &root,
@@ -957,7 +960,8 @@ impl GitProbe {
         if !complete {
             // Over the bound: keep the changed paths so the digest still
             // names every file and package.
-            let names = self
+            // Even the name list may exceed the bound: then no paths.
+            if let Ok(names) = self
                 .checked(
                     &root,
                     &["diff", "--name-only", "--no-renames", "-z", &from, "--"],
@@ -965,9 +969,11 @@ impl GitProbe {
                     &[],
                     deadline,
                 )
-                .await?;
-            for path in parse_paths(&names)? {
-                diff.push_str(&format!("diff --git a/{path} b/{path}\n"));
+                .await
+            {
+                for path in parse_paths(&names)? {
+                    diff.push_str(&format!("diff --git a/{path} b/{path}\n"));
+                }
             }
         }
         Ok(PatchRead {
