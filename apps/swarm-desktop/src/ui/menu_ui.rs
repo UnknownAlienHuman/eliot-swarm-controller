@@ -242,8 +242,6 @@ const REMOVAL_POLL_MS: u64 = 400;
 /// How long the "Archived · Undo" notice stays.
 const ARCHIVED_NOTICE_MS: u64 = 10_000;
 
-/// The menu's width.
-const MENU_WIDTH: f64 = 248.0;
 /// Between bringing the highlighted row into view and retrying it:
 /// one frame later (see `reveal_highlight`).
 const MENU_REVEAL_RETRY_MS: u64 = 16;
@@ -1562,7 +1560,8 @@ const MENU_VERTICAL_PADDING: f64 = 2.0 * tokens::spacing::XS;
 /// its padding included, never runs past the client edge (#683). It
 /// never collapses below one row's height.
 fn menu_width(client_width: f64) -> f64 {
-    MENU_WIDTH.min((client_width - 2.0 * tokens::spacing::SM).max(MENU_ROW_HEIGHT))
+    tokens::layout::CONTEXT_MENU_WIDTH
+        .min((client_width - 2.0 * tokens::spacing::SM).max(MENU_ROW_HEIGHT))
 }
 
 /// The menu's top edge in window DIPs and its visible height cap: the

@@ -24,9 +24,6 @@ const MANAGE_GROUP_ROWS: usize = 150;
 /// requests and the notice row, down to the composer.
 pub(super) const POPOVER_ROWS: i32 = 4;
 
-/// A popover starts this much smaller and settles to its size.
-const ENTRANCE_SCALE: f64 = 0.97;
-
 impl DesktopApp {
     /// A new task composer's first row, inside its card (Codex's): the
     /// project selector as a borderless chip, and the folder field for a
@@ -236,7 +233,11 @@ impl DesktopApp {
             .horizontal_alignment(HorizontalAlignment::Center)
             .opacity(if entering { 0.0 } else { 1.0 })
             .opacity_transition(Some(entrance))
-            .scale(Some(if entering { ENTRANCE_SCALE } else { 1.0 }))
+            .scale(Some(if entering {
+                tokens::motion::POPOVER_START_SCALE
+            } else {
+                1.0
+            }))
             .scale_transition(Some(entrance))
             .content(content)
     }

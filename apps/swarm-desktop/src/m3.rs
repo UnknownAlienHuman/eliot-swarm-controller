@@ -714,7 +714,7 @@ pub fn pane_tab(palette: Palette, selected: bool) -> Button {
 pub fn pane_tab_label(label: &str) -> View {
     text(label.to_owned(), style::LABEL)
         .font_size(style::CHIP.size)
-        .margin(Thickness::xy(14.0 - spacing::ROW, 0.0))
+        .margin(Thickness::xy(spacing::TEXT_INSET - spacing::ROW, 0.0))
         .vertical_alignment(VerticalAlignment::Center)
         .into()
 }
@@ -724,7 +724,6 @@ pub fn pane_tab_label(label: &str) -> View {
 pub fn search_field(fill: Brush, field: TextBox) -> View {
     // WinUI's text box insets its text by 10 DIPs; the margin puts the text
     // 8 DIPs after the icon, as the design does.
-    const TEXT_BOX_INSET: f64 = 10.0;
     Border::new()
         .height(height::CONTROL)
         .corner_radius(radius::PILL)
@@ -733,7 +732,7 @@ pub fn search_field(fill: Brush, field: TextBox) -> View {
         .content(
             Grid::new()
                 .columns([GridLength::Auto, GridLength::STAR])
-                .column_spacing(spacing::SM - TEXT_BOX_INSET)
+                .column_spacing(spacing::SM - spacing::FIELD_LEADING_INSET)
                 .children((
                     Border::new()
                         .vertical_alignment(VerticalAlignment::Center)
@@ -815,7 +814,10 @@ pub fn suggestion_content(palette: Palette, glyph: &str, label: &str) -> View {
     StackPanel::new()
         .orientation(Orientation::Horizontal)
         .spacing(spacing::ROW)
-        .margin(Thickness::xy(14.0 - spacing::INSET, spacing::INSET))
+        .margin(Thickness::xy(
+            spacing::TEXT_INSET - spacing::INSET,
+            spacing::INSET,
+        ))
         .children((
             icon(glyph),
             body(label.to_owned())
@@ -836,7 +838,7 @@ pub fn bubble(palette: Palette, content: impl Into<View>, max_width: Option<f64>
             radius::BUBBLE_TAIL,
             radius::BUBBLE,
         ))
-        .padding(Thickness::xy(14.0, spacing::ROW))
+        .padding(Thickness::xy(spacing::TEXT_INSET, spacing::ROW))
         .horizontal_alignment(HorizontalAlignment::Right)
         .max_width(max_width)
         .content(content)
@@ -854,7 +856,7 @@ pub fn steer_bubble(palette: Palette, text_value: &str, max_width: Option<f64>) 
             radius::BUBBLE_TAIL,
             radius::BUBBLE,
         ))
-        .padding(Thickness::xy(14.0, spacing::ROW))
+        .padding(Thickness::xy(spacing::TEXT_INSET, spacing::ROW))
         .horizontal_alignment(HorizontalAlignment::Right)
         .max_width(max_width)
         .content(
@@ -1164,7 +1166,7 @@ pub fn status_ring(status: Brush) -> View {
         .width(layout::RING)
         .height(layout::RING)
         .corner_radius(layout::RING / 2.0)
-        .border_thickness(Thickness::uniform(2.0))
+        .border_thickness(Thickness::uniform(layout::USAGE_RING_STROKE))
         .border_brush(status)
         .vertical_alignment(VerticalAlignment::Center)
         .into()

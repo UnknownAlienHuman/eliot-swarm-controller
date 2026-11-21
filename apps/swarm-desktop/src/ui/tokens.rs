@@ -100,16 +100,22 @@ pub mod spacing {
     pub const SM: f64 = 8.0;
     /// Icon-to-label gap inside a chip.
     pub const CHIP_GAP: f64 = 6.0;
+    /// Leading padding of WinUI's text field template.
+    pub const FIELD_LEADING_INSET: f64 = 10.0;
     /// A row's inset from its pill and the gap from its icon to its label
     /// ("every sidebar row starts its icon at 10 DIP inside an 8-DIP
     /// gutter").
     pub const ROW: f64 = 10.0;
     /// The content inset of a control, card or menu.
     pub const INSET: f64 = 12.0;
+    /// The text inset of tabs, suggestion cards and message bubbles.
+    pub const TEXT_INSET: f64 = 14.0;
     /// Between groups.
     pub const MD: f64 = 16.0;
     /// The conversation's side padding, page padding.
     pub const LG: f64 = 24.0;
+    /// Between the Home title, suggestions and composer.
+    pub const HOME_GROUP_GAP: f64 = 28.0;
     /// The main area's side padding.
     pub const XL: f64 = 32.0;
 }
@@ -135,6 +141,7 @@ pub mod motion {
     pub const POPOVER_MS: u64 = 250;
     pub const PRESS_SCALE: f64 = 0.97;
     pub const FAB_PRESS_SCALE: f64 = 0.94;
+    pub const POPOVER_START_SCALE: f64 = 0.97;
     pub const EMPHASIZED: &str = "0.2,0 0,1";
     pub const DECELERATE: &str = "0.05,0.7 0.1,1";
 }
@@ -181,6 +188,8 @@ pub mod layout {
     pub const DIALOG_WIDTH: f64 = 420.0;
     /// A list of items inside a dialog before it scrolls.
     pub const DIALOG_LIST_MAX_HEIGHT: f64 = 240.0;
+    pub const MOVE_DIALOG_WIDTH: f64 = 480.0;
+    pub const MOVE_LIST_MAX_HEIGHT: f64 = 320.0;
     /// A theme's swatch in Settings › Appearance.
     pub const SWATCH_WIDTH: f64 = 48.0;
     pub const SWATCH_HEIGHT: f64 = 24.0;
@@ -204,12 +213,20 @@ pub mod layout {
     /// What runs an Agent (`Codex · qwen4-max`) at most in a Monitor row or
     /// the conversation header; a longer label trims.
     pub const RUNS_LABEL_WIDTH: f64 = 200.0;
+    pub const HEADER_TITLE_MIN_WIDTH: f64 = 96.0;
+    pub const HEADER_STATUS_MIN_WIDTH: f64 = 64.0;
     /// The widest trailing word of a Monitor row (model, need or age).
     pub const MONITOR_TRAILING_WIDTH: f64 = 112.0;
     /// The composer's field grows with its text up to this height.
     pub const COMPOSER_MAX_HEIGHT: f64 = 200.0;
     /// The composer's field below its first line (the design's 44 DIP).
     pub const COMPOSER_MIN_HEIGHT: f64 = 44.0;
+    /// Hide the keyboard hint in a composer narrower than this.
+    pub const COMPOSER_HINT_MIN_WIDTH: f64 = 560.0;
+    /// Bottom row space reserved for fixed controls, padding and gaps.
+    pub const COMPOSER_ACTIONS_WIDTH: f64 = 190.0;
+    pub const COMPOSER_ACCESS_WIDTH: f64 = 112.0;
+    pub const COMPOSER_LABEL_MIN_WIDTH: f64 = 80.0;
     /// A multiline source editor (TOML, JSON, a script).
     pub const SOURCE_MIN_HEIGHT: f64 = 240.0;
     pub const SOURCE_MAX_HEIGHT: f64 = 420.0;
@@ -246,6 +263,9 @@ pub mod layout {
     pub const PROJECT_CHIP_WIDTH: f64 = 280.0;
     /// The access and project menus above the composer.
     pub const MENU_WIDTH: f64 = 420.0;
+    pub const CONTEXT_MENU_WIDTH: f64 = 248.0;
+    pub const USAGE_MENU_WIDTH: f64 = 320.0;
+    pub const EFFORT_MENU_MIN_WIDTH: f64 = 300.0;
     /// The scrolling list of a popover.
     pub const POPOVER_LIST_HEIGHT: f64 = 360.0;
     /// The check column of a popover row.

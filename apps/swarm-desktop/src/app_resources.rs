@@ -313,6 +313,7 @@ fn text_field(s: &Roles) -> Vec<(&'static str, Value)> {
         ),
         ("TextControlElevationBorderBrush", opaque(s.border)),
         ("TextControlElevationBorderFocusedBrush", opaque(s.primary)),
+        ("TextControlBackgroundPointerOver", layer(s.text, state::HOVER)),
         ("TextControlForegroundDisabled", opaque(s.secondary_text)),
         (
             "TextControlPlaceholderForegroundDisabled",
@@ -341,7 +342,6 @@ fn text_field(s: &Roles) -> Vec<(&'static str, Value)> {
     all.extend(every(
         &[
             "TextControlBackground",
-            "TextControlBackgroundPointerOver",
             "TextControlBackgroundFocused",
             "TextControlBackgroundDisabled",
             "TextControlButtonBackground",
@@ -759,6 +759,9 @@ fn switches(s: &Roles) -> Vec<(&'static str, Value)> {
 fn overlays(s: &Roles) -> Vec<(&'static str, Value)> {
     let mut all = vec![
         ("MenuFlyoutPresenterBackground", opaque(s.tonal)),
+        ("NumberBoxPopupBackground", opaque(s.tonal)),
+        ("NumberBoxPopupBorderBrush", opaque(s.outline)),
+        ("NumberBoxPopupIndicatorForeground", opaque(s.variant)),
         ("AutoSuggestBoxSuggestionsListBackground", opaque(s.tonal)),
         (
             "AutoSuggestBoxSuggestionsListBorderBrush",

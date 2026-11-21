@@ -10,7 +10,6 @@ use crate::monitor::{
     self, DetailRead, GRAPH_BARS, Monitor, MonitorRow, bytes_label, cpu_time_label, group,
     state_words, tokens_label,
 };
-use crate::theme;
 use crate::theme::winui::Palette;
 use crate::ui::tokens;
 
@@ -279,7 +278,6 @@ fn chart_card(
                     .background(bar),
                 None => Border::new()
                     .height(tokens::layout::PLOT_STUB)
-                    .opacity(theme::MUTED_OPACITY)
                     .background(palette.outline()),
             };
             KeyedView::new(
@@ -311,7 +309,7 @@ fn chart_card(
                     .columns((0..GRAPH_BARS).map(|_| GridLength::STAR))
                     .keyed_children(bars),
             ),
-        small(format!("{scale} · {note}")).opacity(theme::MUTED_OPACITY),
+        small(format!("{scale} · {note}")).foreground(palette.muted()),
     ))
 }
 
@@ -473,7 +471,7 @@ pub fn resource_views(monitor: &Monitor, id: &str, palette: Palette) -> Vec<Keye
     if row.is_some_and(|row| row.ended() && row.obs.live_processes() == 0) {
         views.push(KeyedView::new(
             "ended",
-            small("No live process.").opacity(theme::MUTED_OPACITY),
+            small("No live process.").foreground(palette.muted()),
         ));
         return views;
     }
@@ -494,7 +492,7 @@ pub fn resource_views(monitor: &Monitor, id: &str, palette: Palette) -> Vec<Keye
         views.push(KeyedView::new("now", small(now)));
         views.push(KeyedView::new(
             "fresh",
-            small(row.obs.freshness()).opacity(theme::MUTED_OPACITY),
+            small(row.obs.freshness()).foreground(palette.muted()),
         ));
     }
     match monitor.series.get(id) {
@@ -553,14 +551,14 @@ pub fn resource_views(monitor: &Monitor, id: &str, palette: Palette) -> Vec<Keye
                     eliot_core::count_words(series.points().len() as u64, "sample", "samples"),
                     monitor::RING_CAPACITY
                 ))
-                .opacity(theme::MUTED_OPACITY),
+                .foreground(palette.muted()),
             ));
         }
         // The freshness line already says nothing was sampled.
         _ if row.is_some() => {}
         _ => views.push(KeyedView::new(
             "no-series",
-            small("No process samples yet.").opacity(theme::MUTED_OPACITY),
+            small("No process samples yet.").foreground(palette.muted()),
         )),
     }
     views
