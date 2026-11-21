@@ -432,6 +432,8 @@ pub(super) struct SettingsState {
     /// Pages whose save was refused for a stale revision: the next read
     /// decides whether each goes again (see [`SettingsState::take`]).
     retry: Vec<Page>,
+    /// The saved revision of the last cold-start repair.
+    repair_saved_revision: Option<String>,
     /// Numbers every typed change.
     edit_seq: u64,
     /// Each page's latest typed change still waiting for its pause: typing
@@ -714,6 +716,7 @@ impl SettingsState {
 
 impl DesktopApp {
     pub(super) fn settings_update(&mut self, msg: SettingsMsg, context: &ComponentContext<Self>) {
+        let repairing = self.repairing_settings();
         let s = &mut self.settings;
         match msg {
             SettingsMsg::CleanupPlan(continuation) => {
@@ -1029,6 +1032,9 @@ impl DesktopApp {
                 }
                 match &result {
                     Ok(reply) => {
+                        if repairing && reply.saved {
+                            self.settings.repair_saved_revision = reply.revision.clone();
+                        }
                         if reply.saved {
                             // The read that follows shows these values, maybe
                             // normalised; the drafts that sent them follow it.
@@ -1813,6 +1819,10 @@ impl DesktopApp {
                             ),
                             KeyedView::new("settings-read-status", status),
                             KeyedView::new(
+                                "repair-startup-retry",
+                                self.repair_startup_retry_view(context, palette),
+                            ),
+                            KeyedView::new(
                                 "settings-section-issues",
                                 self.settings_issues_view(page, context, palette),
                             ),
@@ -1836,6 +1846,27 @@ impl DesktopApp {
                     .grid_row(2)
                     .content(self.save_status(page, width, palette)),
             ))
+    }
+
+    fn repair_startup_retry_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+        if !self.repairing_settings()
+            || self.settings.repair_saved_revision.is_none()
+            || self.settings.repair_saved_revision != self.settings.revision
+            || self.settings.busy()
+            || self.prefs_saving
+        {
+            return View::empty();
+        }
+        m3::settings_card(
+            palette,
+            vec![KeyedView::new(
+                "repair-startup-retry-action",
+                m3::text_button(palette)
+                    .automation_name("Retry startup")
+                    .on_click(context.message(Message::Shell(ShellMsg::RetryStartup)))
+                    .content(m3::label("Retry startup")),
+            )],
+        )
     }
 
     fn settings_issues_view(

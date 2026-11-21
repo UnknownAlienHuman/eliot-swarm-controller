@@ -1086,8 +1086,9 @@ first frame; a place no longer on an attached monitor is clamped into the neares
 area, and without `x`/`y` Windows chooses the place.
 When configuration prevents daemon startup, the local Owner can open Settings
 from the startup error. Repair uses the daemon's settings reader and
-revision-checked writer under the private daemon lock. The owner can retry
-startup after saving the repair.
+revision-checked writer under the private daemon lock. After a repair save
+succeeds and Settings reads the saved file back successfully, Settings offers
+Retry startup through the existing startup action.
 The new-task composer writes `recent_models` after an admitted model launch,
 `favorite_models` from the model picker (Ctrl+F or the row's star), `last_access`
 from the access chip or Settings › Default access, and `collapsed_projects` when a
@@ -1245,9 +1246,11 @@ restart after the save.
 that fail parsing, validation or the daemon's redaction policy. A TOML syntax diagnostic
 identifies the affected top-level section when the parser can locate it; other section
 blocks remain available in Settings. A section withheld for safety never includes its
-source or values. The desktop can edit readable section drafts or replace a listed
-section with an empty object to remove it. The revision remains the hash of the complete
-`config.toml`, including while another section is invalid.
+source or values. Diagnostics identify the section the daemon locates as their
+source. The desktop can edit readable section drafts. The Remove action replaces
+a section with an empty object when the daemon verifies a failure in that
+section itself. The revision remains the hash of the complete `config.toml`,
+including while another section is invalid.
 
 `settings.save` keeps the complete-section replacement and revision-CAS contract. The
 daemon validates the changed section and its dependencies with the same strict parser
