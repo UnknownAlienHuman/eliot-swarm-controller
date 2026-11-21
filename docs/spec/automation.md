@@ -486,7 +486,9 @@ assignment's slot with its code. A slot with no next brief advances to the next 
 Every scheduled timer slot that is skipped or rejected (no next brief is `not_found`, a
 routing miss is `routing_unavailable`) commits that code as the timer's `last_outcome`
 with the slot, and an admitted slot clears it, so timer reads show why the last check
-started nothing. A manual run changes neither `last_outcome` nor `last_key`.
+started nothing. A scheduled skip emits `rule.skipped` when its reason changes or
+the slot carries a capacity diagnostic. Repeated skips with the same bare reason
+still advance the timer cursor. A manual run changes neither `last_outcome` nor `last_key`.
 A capacity, provider, workspace or transfer wait keeps the due slot and its brief cursor.
 Settings generate a global interval timer
 rule and an ordinary completion rule. Before admitting cleanup, Store verifies that
