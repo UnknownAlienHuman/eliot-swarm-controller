@@ -190,12 +190,26 @@ async fn matching_project(
 fn same_git_path(left: &str, right: &str) -> bool {
     #[cfg(windows)]
     {
-        left.eq_ignore_ascii_case(right)
+        // `fs::canonicalize` on Windows yields the verbatim \\?\ form while a
+        // Git identity readback reports the drive-letter form. The same checkout
+        // must compare equal however each side was produced, or a registration
+        // that already matches is refused as changed and discovery fails.
+        strip_verbatim_prefix(left).eq_ignore_ascii_case(&strip_verbatim_prefix(right))
     }
     #[cfg(not(windows))]
     {
         left == right
     }
+}
+
+#[cfg(windows)]
+fn strip_verbatim_prefix(path: &str) -> std::borrow::Cow<'_, str> {
+    std::borrow::Cow::Borrowed(path.strip_prefix(r#"\\?\"#).unwrap_or(path))
+}
+
+#[cfg(not(windows))]
+fn strip_verbatim_prefix(path: &str) -> &str {
+    path
 }
 
 async fn workspace_identity(workspace: &Path) -> Result<Option<(String, String, bool)>> {
