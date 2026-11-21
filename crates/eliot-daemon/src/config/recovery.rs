@@ -72,9 +72,9 @@ pub(crate) async fn resolve_projects_for_save(
     Ok(Some(settings::ResolvedProjects {
         source_revision: source.as_deref().map(profiles_edit::revision_of),
         candidate_revision: profiles_edit::revision_of(&candidate),
-        inputs: crate::automation::project_registration_inputs(settings::project_configs(
-            &candidate,
-        )?)
+        inputs: crate::automation::project_registration_inputs(
+            settings::project_configs_for_settings(&candidate)?,
+        )
         .await?,
     }))
 }

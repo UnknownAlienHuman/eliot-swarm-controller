@@ -1458,8 +1458,7 @@ fn read_config(data_root: &Path) -> core::Result<Option<(FileConfig, String)>> {
 /// The one `config.toml` parser: strict (`deny_unknown_fields`) with
 /// located errors.
 fn parse_config(source: &str) -> core::Result<FileConfig> {
-    let config: FileConfig =
-        toml::from_str(source).map_err(|error| map_toml_error(source, error))?;
+    let config = parse_config_document(source)?;
     config.desktop.validate()?;
     let mut role_candidates = Vec::with_capacity(config.routing.roles.len() + 1);
     role_candidates.push(("default", &config.routing.default));
@@ -1521,6 +1520,13 @@ fn parse_config(source: &str) -> core::Result<FileConfig> {
         }
     }
     Ok(config)
+}
+
+/// Deserialize the strict configuration shape without applying the semantic
+/// checks below. Settings uses this distinction to keep safely parsed fields
+/// editable when a section-level value is out of bounds.
+fn parse_config_document(source: &str) -> core::Result<FileConfig> {
+    toml::from_str(source).map_err(|error| map_toml_error(source, error))
 }
 
 pub(crate) fn validate_routing_role(role: &str) -> core::Result<()> {

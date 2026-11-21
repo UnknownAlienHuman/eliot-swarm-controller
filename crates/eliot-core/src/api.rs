@@ -67,8 +67,8 @@ pub use config_views::{
     CONFIG_REVISION_HEX_LEN, MAX_LISTED_PROFILES, MAX_PROFILES_SOURCE_BYTES, ProfileListRequest,
     ProfileListResponse, ProfileSummary, REDACTION_MARKER, RoutingPreviewRequest,
     RoutingPreviewResponse, RuleListEntry, RuleListRequest, RuleListResponse, SettingsClientSource,
-    SettingsHistoryEntry, SettingsHistoryStatus, SettingsReadRequest, SettingsReadResponse,
-    SettingsSaveRequest, SettingsSaveResponse, SettingsSection,
+    SettingsHistoryEntry, SettingsHistoryStatus, SettingsReadIssue, SettingsReadRequest,
+    SettingsReadResponse, SettingsSaveRequest, SettingsSaveResponse, SettingsSection,
 };
 pub use coordination::{
     ClaimConflict, ClaimListRequest, ClaimListResponse, ClaimReleaseRequest, ClaimReleaseResponse,

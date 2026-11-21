@@ -137,6 +137,11 @@ impl Router {
                 .contains_key(&eliot_core::api::SettingsSection::Automation)
         {
             crate::config::load_automation_config_snapshot(&self.inner.data_root)
+                .or_else(|_| {
+                    crate::config::settings::automation_config_snapshot_for_settings(
+                        &self.inner.data_root,
+                    )
+                })
                 .and_then(|(revision, config)| {
                     if revision != reply.revision {
                         return Err(Error::new(

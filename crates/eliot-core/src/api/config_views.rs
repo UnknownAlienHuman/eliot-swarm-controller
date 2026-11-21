@@ -156,6 +156,21 @@ pub enum SettingsSection {
     Proxies,
 }
 
+impl SettingsSection {
+    pub const ALL: [Self; 10] = [
+        Self::Profiles,
+        Self::Routing,
+        Self::Projects,
+        Self::Daemon,
+        Self::Automation,
+        Self::Mail,
+        Self::CloudMcp,
+        Self::Desktop,
+        Self::Accounts,
+        Self::Proxies,
+    ];
+}
+
 /// Which owner-facing client initiated a settings save.
 #[derive(
     schemars::JsonSchema, Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize,
@@ -216,12 +231,38 @@ impl SettingsReadRequest {
     pub fn validate_response(&self, reply: &SettingsReadResponse) -> Result<()> {
         validate_revision(&reply.revision)?;
         if reply.history.len() > 100
+            || reply.issues.len() > 16
             || reply.sections.values().any(|value| !value.is_object())
-            || self.sections.as_ref().is_some_and(|sections| {
-                reply.sections.len() != sections.len()
-                    || sections
-                        .iter()
-                        .any(|section| !reply.sections.contains_key(section))
+            || reply
+                .restart_required
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != reply.restart_required.len()
+        {
+            return Err(Error::new(
+                "invalid",
+                "settings read response does not match its request",
+            ));
+        }
+        let requested: std::collections::BTreeSet<_> = self
+            .sections
+            .as_ref()
+            .map(|sections| sections.iter().copied().collect())
+            .unwrap_or_else(|| SettingsSection::ALL.into_iter().collect());
+        if reply
+            .sections
+            .keys()
+            .any(|section| !requested.contains(section))
+            || reply.issues.iter().any(|issue| {
+                issue
+                    .section
+                    .is_some_and(|section| !requested.contains(&section))
+                    || issue.code.is_empty()
+                    || issue.code.len() > 128
+                    || issue.message.is_empty()
+                    || issue.message.len() > 4096
+                    || issue.message.contains('\0')
             })
         {
             return Err(Error::new(
@@ -229,8 +270,59 @@ impl SettingsReadRequest {
                 "settings read response does not match its request",
             ));
         }
+        let issue_sections: std::collections::BTreeSet<_> = reply
+            .issues
+            .iter()
+            .filter_map(|issue| issue.section)
+            .collect();
+        if issue_sections.len()
+            != reply
+                .issues
+                .iter()
+                .filter(|issue| issue.section.is_some())
+                .count()
+            || reply
+                .issues
+                .iter()
+                .filter(|issue| issue.section.is_none())
+                .count()
+                > 1
+        {
+            return Err(Error::new(
+                "invalid",
+                "settings read response contains duplicate issues",
+            ));
+        }
+        let represented: std::collections::BTreeSet<_> = reply
+            .sections
+            .keys()
+            .copied()
+            .chain(issue_sections)
+            .collect();
+        let has_global_issue = reply.issues.iter().any(|issue| issue.section.is_none());
+        if !has_global_issue
+            && requested
+                .iter()
+                .any(|section| !represented.contains(section))
+        {
+            return Err(Error::new(
+                "invalid",
+                "settings read response omits a requested section without an issue",
+            ));
+        }
         Ok(())
     }
+}
+
+/// A daemon-owned diagnostic for one invalid or safely withheld section.
+/// `section: None` identifies a file-level error that cannot be assigned to a
+/// Settings section.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SettingsReadIssue {
+    pub section: Option<SettingsSection>,
+    pub code: String,
+    pub message: String,
 }
 
 /// Response for `settings.read`.
@@ -239,6 +331,8 @@ impl SettingsReadRequest {
 pub struct SettingsReadResponse {
     pub revision: Option<String>,
     pub sections: std::collections::BTreeMap<SettingsSection, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub issues: Vec<SettingsReadIssue>,
     pub restart_required: Vec<SettingsSection>,
     pub history: Vec<SettingsHistoryEntry>,
 }

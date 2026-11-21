@@ -3,8 +3,8 @@
 use super::*;
 use eliot_core::SecretPolicy;
 use eliot_core::api::{
-    SettingsClientSource, SettingsHistoryStatus, SettingsReadResponse, SettingsSaveRequest,
-    SettingsSaveResponse, SettingsSection,
+    SettingsClientSource, SettingsHistoryStatus, SettingsReadIssue, SettingsReadResponse,
+    SettingsSaveRequest, SettingsSaveResponse, SettingsSection,
 };
 use eliot_store::Store;
 use serde_json::{Map as JsonMap, Value as JsonValue};
@@ -97,12 +97,179 @@ fn carries_redaction(value: &JsonValue) -> bool {
 }
 
 fn section_json(source: &str, name: &str) -> core::Result<JsonValue> {
-    section_value(&parse_generic(source)?, name)
+    match toml::from_str::<toml::Table>(source) {
+        Ok(parsed) => section_value(&parsed, name),
+        Err(_) => {
+            let (parsed, invalid) = recovered_sections(source);
+            if invalid.contains_key(name) {
+                return Err(core::Error::new(
+                    "profile_error",
+                    format!("config.toml: [{name}] is not valid TOML"),
+                ));
+            }
+            section_value(&parsed, name)
+        }
+    }
 }
 
-fn parse_generic(source: &str) -> core::Result<toml::Table> {
-    toml::from_str(source)
-        .map_err(|_| core::Error::new("profile_error", "config.toml is not valid TOML"))
+fn setting_section(name: &str) -> Option<SettingsSection> {
+    SettingsSection::ALL
+        .into_iter()
+        .find(|section| section_name(*section) == name)
+}
+
+fn source_offset_from_message(source: &str, message: &str) -> Option<usize> {
+    let location = message.strip_prefix("config.toml:")?;
+    let (line, rest) = location.split_once(':')?;
+    let line = line.parse::<usize>().ok()?;
+    let (column, _) = rest.split_once(':')?;
+    let column = column.parse::<usize>().ok()?;
+    if line == 0 || column == 0 {
+        return None;
+    }
+    let mut offset = 0;
+    for (index, text) in source.split_inclusive('\n').enumerate() {
+        if index + 1 == line {
+            let content = text.strip_suffix('\n').unwrap_or(text);
+            let content = content.strip_suffix('\r').unwrap_or(content);
+            let byte_column = content
+                .char_indices()
+                .nth(column - 1)
+                .map_or(content.len(), |(byte, _)| byte);
+            return Some(offset + byte_column);
+        }
+        offset += text.len();
+    }
+    None
+}
+
+fn section_for_error(source: &str, error: &core::Error) -> Option<SettingsSection> {
+    if let Some(offset) = source_offset_from_message(source, &error.message)
+        && let Some(section) = profiles_edit::section_at_offset(source, offset)
+        && let Some(section) = setting_section(&section)
+    {
+        return Some(section);
+    }
+
+    let message = error
+        .message
+        .strip_prefix("config.toml: ")
+        .unwrap_or(&error.message);
+    let key = message.split([':', '.', ' ']).next()?;
+    setting_section(key.trim_matches(['[', ']']))
+}
+
+fn issue_from_error(source: &str, error: &core::Error, policy: &SecretPolicy) -> SettingsReadIssue {
+    let message: String = policy
+        .redact_text(&error.message)
+        .chars()
+        .take(4096)
+        .collect();
+    SettingsReadIssue {
+        section: section_for_error(source, error),
+        code: error.code.clone(),
+        message,
+    }
+}
+
+fn add_issue(issues: &mut Vec<SettingsReadIssue>, issue: SettingsReadIssue) {
+    if let Some(section) = issue.section {
+        if issues
+            .iter()
+            .any(|existing| existing.section == Some(section))
+        {
+            return;
+        }
+    } else if issues.iter().any(|existing| existing.section.is_none()) {
+        return;
+    }
+    issues.push(issue);
+}
+
+fn add_error_issue(
+    issues: &mut Vec<SettingsReadIssue>,
+    source: &str,
+    error: &core::Error,
+    requested: &BTreeSet<SettingsSection>,
+    policy: &SecretPolicy,
+) {
+    let issue = issue_from_error(source, error, policy);
+    if issue
+        .section
+        .is_none_or(|section| requested.contains(&section))
+    {
+        add_issue(issues, issue);
+    }
+}
+
+fn add_section_error_issue(
+    issues: &mut Vec<SettingsReadIssue>,
+    error: &core::Error,
+    section: SettingsSection,
+    requested: &BTreeSet<SettingsSection>,
+    policy: &SecretPolicy,
+) {
+    if requested.contains(&section) {
+        let message = error.message.as_str();
+        let message = message
+            .strip_prefix("config.toml:")
+            .and_then(|location| location.split_once(':'))
+            .and_then(|(line, rest)| {
+                line.parse::<usize>().ok()?;
+                let (column, rest) = rest.split_once(':')?;
+                column.parse::<usize>().ok()?;
+                Some(rest.trim_start())
+            })
+            .unwrap_or(message);
+        let message: String = policy.redact_text(message).chars().take(4096).collect();
+        add_issue(
+            issues,
+            SettingsReadIssue {
+                section: Some(section),
+                code: error.code.clone(),
+                message,
+            },
+        );
+    }
+}
+
+fn recovered_sections(source: &str) -> (toml::Table, BTreeMap<String, String>) {
+    let mut table = toml::Table::new();
+    let mut invalid = BTreeMap::new();
+    for section in SettingsSection::ALL {
+        let name = section_name(section);
+        let Some(section_source) = profiles_edit::section_source(source, name) else {
+            continue;
+        };
+        match toml::from_str::<toml::Table>(&section_source) {
+            Ok(parsed) => {
+                if let Some(value) = parsed.get(name) {
+                    table.insert(name.to_owned(), value.clone());
+                }
+            }
+            Err(error) => {
+                invalid.insert(name.to_owned(), error.message().trim().to_owned());
+            }
+        }
+    }
+    (table, invalid)
+}
+
+fn project_source_sections(source: &str, sections: &[&str]) -> String {
+    let mut projected = String::new();
+    for block in profiles_edit::split_blocks(source) {
+        if block
+            .section
+            .as_deref()
+            .is_some_and(|section| sections.contains(&section))
+        {
+            if !projected.is_empty() && !projected.ends_with('\n') {
+                projected.push('\n');
+            }
+            projected.push_str(block.text);
+        }
+    }
+    projected
 }
 
 /// One section of an already-parsed file as the settings reader shows it.
@@ -167,15 +334,15 @@ pub(crate) fn reconcile_at_startup(data_root: &Path, store: &mut Store) -> core:
     store.reconcile_settings_history(current_revision.as_deref())
 }
 
-/// The file half of `settings.read`: one read of `config.toml` and one
-/// parse of each kind (the generic table for the section values, the strict
-/// config for validation), so the gate, the checks and the returned values
-/// all describe the same bytes under one revision. It needs no Store, so a
-/// caller holding the Store lock can run it first.
+/// The file half of `settings.read`: one bounded read of `config.toml`, strict
+/// daemon validation, and safe per-section recovery when the whole document
+/// is broken. Diagnostics and values share the same bytes and revision. It
+/// needs no Store, so a caller holding the Store lock can run it first.
 pub(crate) struct SettingsSnapshot {
     revision: Option<String>,
     sections: Vec<SettingsSection>,
     values: BTreeMap<SettingsSection, JsonValue>,
+    issues: Vec<SettingsReadIssue>,
 }
 
 impl SettingsSnapshot {
@@ -186,6 +353,7 @@ impl SettingsSnapshot {
             revision: self.revision,
             restart_required: restart_required(self.sections),
             sections: self.values,
+            issues: self.issues,
             history: store.list_settings_history(HISTORY_LIMIT)?,
         })
     }
@@ -208,21 +376,138 @@ pub(crate) fn read_snapshot(
     let original = read_config_source(data_root)?;
     let source = original.as_deref().unwrap_or_default();
     let revision = original.as_deref().map(profiles_edit::revision_of);
-    let table = parse_generic(source).ok();
-    let config = parse_config(source);
-    if profiles_edit::editability(source, table.as_ref(), config.as_ref().ok(), policy).is_some() {
-        return Err(core::Error::new(
-            "not_allowed",
-            "settings include a profile section that is not safe to expose",
-        ));
-    }
-    validate_parsed(&config?, source)?;
-    let table =
-        table.ok_or_else(|| core::Error::new("profile_error", "config.toml is not valid TOML"))?;
     let sections = requested.map_or_else(|| all_sections().to_vec(), ToOwned::to_owned);
+    let requested: BTreeSet<_> = sections.iter().copied().collect();
+    let mut issues = Vec::new();
+    let mut unreadable_sections = BTreeSet::new();
+    let (table, invalid_sections, syntax_error) = match toml::from_str::<toml::Table>(source) {
+        Ok(table) => (table, BTreeMap::new(), false),
+        Err(error) => {
+            let offset = error.span().map(|span| span.start);
+            let section = offset
+                .and_then(|offset| profiles_edit::section_at_offset(source, offset))
+                .as_deref()
+                .and_then(setting_section);
+            if let Some(section) = section {
+                unreadable_sections.insert(section_name(section).to_owned());
+            }
+            let mapped = super::map_toml_error(source, error);
+            let mut issue = issue_from_error(source, &mapped, policy);
+            issue.section = section.or(issue.section);
+            if issue
+                .section
+                .is_none_or(|section| requested.contains(&section))
+            {
+                add_issue(&mut issues, issue);
+            }
+            let (table, invalid_sections) = recovered_sections(source);
+            unreadable_sections.extend(invalid_sections.keys().cloned());
+            for (name, reason) in &invalid_sections {
+                let Some(section) = setting_section(name) else {
+                    continue;
+                };
+                if requested.contains(&section) {
+                    let reason: String = policy.redact_text(reason).chars().take(3500).collect();
+                    add_issue(
+                        &mut issues,
+                        SettingsReadIssue {
+                            section: Some(section),
+                            code: "profile_error".to_owned(),
+                            message: format!("config.toml: [{name}]: {reason}"),
+                        },
+                    );
+                }
+            }
+            (table, invalid_sections, true)
+        }
+    };
+
+    let mut strict_config = None;
+    let mut full_invalid = syntax_error;
+    if !syntax_error {
+        match parse_config(source) {
+            Ok(config) => {
+                if let Err(error) = validate_parsed(&config, source) {
+                    add_error_issue(&mut issues, source, &error, &requested, policy);
+                    full_invalid = true;
+                }
+                strict_config = Some(config);
+            }
+            Err(error) => {
+                if super::parse_config_document(source).is_err()
+                    && let Some(section) = section_for_error(source, &error)
+                {
+                    unreadable_sections.insert(section_name(section).to_owned());
+                }
+                add_error_issue(&mut issues, source, &error, &requested, policy);
+                full_invalid = true;
+            }
+        }
+    }
+
+    if full_invalid {
+        for section in &sections {
+            let name = section_name(*section);
+            if invalid_sections.contains_key(name) {
+                continue;
+            }
+            let projected = project_source_sections(source, validation_dependencies(*section));
+            if super::parse_config_document(&projected).is_err() {
+                unreadable_sections.insert(section_name(*section).to_owned());
+            }
+            if let Err(error) = validate_candidate(&projected) {
+                add_section_error_issue(&mut issues, &error, *section, &requested, policy);
+            }
+        }
+    }
+
+    let profile_projection = project_source_sections(source, &["profiles", "accounts", "proxies"]);
+    let projected_profile_config = parse_config(&profile_projection).ok();
+    let profile_config = strict_config.as_ref().or(projected_profile_config.as_ref());
+    let profile_reason = profiles_edit::editability(source, Some(&table), profile_config, policy);
+    let profiles_withheld = profile_reason.is_some();
+    if let Some(reason) = profile_reason
+        && requested.contains(&SettingsSection::Profiles)
+    {
+        add_issue(
+            &mut issues,
+            SettingsReadIssue {
+                section: Some(SettingsSection::Profiles),
+                code: "not_allowed".to_owned(),
+                message: reason.to_owned(),
+            },
+        );
+    }
+
     let mut values = BTreeMap::new();
     for section in &sections {
-        let mut value = section_value(&table, section_name(*section))?;
+        let name = section_name(*section);
+        let section_has_issue = issues.iter().any(|issue| issue.section == Some(*section));
+        let section_withheld = unreadable_sections.contains(name)
+            || (*section == SettingsSection::Accounts && section_has_issue)
+            || (*section == SettingsSection::Proxies && section_has_issue)
+            || (*section == SettingsSection::Profiles && profiles_withheld);
+        if invalid_sections.contains_key(name) || section_withheld {
+            continue;
+        }
+        let mut value = match section_value(&table, name) {
+            Ok(value) => value,
+            Err(error) => {
+                add_error_issue(&mut issues, source, &error, &requested, policy);
+                continue;
+            }
+        };
+        if !value.is_object() {
+            add_issue(
+                &mut issues,
+                SettingsReadIssue {
+                    section: Some(*section),
+                    code: "profile_error".to_owned(),
+                    message: format!("config.toml: [{name}] must be a table"),
+                },
+            );
+            continue;
+        }
         if *section == SettingsSection::Daemon {
             // Explicit and default roots resolve through the same
             // launch-time validator, so a stored root inside the owner
@@ -231,21 +516,45 @@ pub(crate) fn read_snapshot(
                 None => None,
                 Some(JsonValue::String(root)) => Some(root.as_str()),
                 Some(_) => {
-                    return Err(core::Error::new(
-                        "profile_error",
-                        "daemon.chats_root must be a string",
-                    ));
+                    add_issue(
+                        &mut issues,
+                        SettingsReadIssue {
+                            section: Some(SettingsSection::Daemon),
+                            code: "profile_error".to_owned(),
+                            message: "daemon.chats_root must be a string".to_owned(),
+                        },
+                    );
+                    values.insert(*section, value);
+                    continue;
                 }
             };
-            value["chats_root"] = serde_json::json!(
-                super::validate_chats_location(data_root, configured)?.to_string_lossy()
-            );
+            match super::validate_chats_location(data_root, configured) {
+                Ok(root) => value["chats_root"] = serde_json::json!(root.to_string_lossy()),
+                Err(error) => {
+                    add_section_error_issue(
+                        &mut issues,
+                        &error,
+                        SettingsSection::Daemon,
+                        &requested,
+                        policy,
+                    );
+                    continue;
+                }
+            }
         }
         if policy.contains_value(&value) {
-            return Err(core::Error::new(
-                "not_allowed",
-                "a settings section contains a value withheld by the current secret policy",
-            ));
+            add_issue(
+                &mut issues,
+                SettingsReadIssue {
+                    section: Some(*section),
+                    code: "not_allowed".to_owned(),
+                    message: format!(
+                        "the {} section contains a value withheld by the current secret policy",
+                        name
+                    ),
+                },
+            );
+            continue;
         }
         values.insert(*section, value);
     }
@@ -253,6 +562,7 @@ pub(crate) fn read_snapshot(
         revision,
         sections,
         values,
+        issues,
     })
 }
 
@@ -429,18 +739,13 @@ fn save_internal_locked(
         prepare_candidate(data_root, expected_revision, sections, policy)?;
     let original = original_file.as_deref().unwrap_or_default();
     let current_revision = original_file.as_deref().map(profiles_edit::revision_of);
-    let before = parse_generic(original).ok();
-    let after = parse_generic(&candidate).ok();
-    let shown = |table: &Option<toml::Table>, section: SettingsSection| {
-        table
-            .as_ref()
-            .and_then(|table| section_value(table, section_name(section)).ok())
-    };
+    let shown =
+        |source: &str, section: SettingsSection| section_json(source, section_name(section)).ok();
     let changed_sections = sections
         .keys()
         .copied()
         .filter(|section| {
-            shown(&before, *section) != shown(&after, *section)
+            shown(original, *section) != shown(&candidate, *section)
                 || (*section == SettingsSection::Desktop
                     && has_desktop_section(original) != has_desktop_section(&candidate))
         })
@@ -503,16 +808,47 @@ pub(crate) fn prepare_candidate(
         ));
     }
     validate_unselected_sections(original, &candidate, sections.keys().copied())?;
-    validate_candidate(&candidate)?;
-    super::validate_chats_location(
-        data_root,
-        parse_config(&candidate)?.daemon.chats_root.as_deref(),
-    )?;
+    validate_candidate_for_sections(original, &candidate, sections)?;
+    if sections.contains_key(&SettingsSection::Daemon) {
+        let daemon_source = project_source_sections(&candidate, &["daemon"]);
+        let daemon = parse_config(&daemon_source)?;
+        super::validate_chats_location(data_root, daemon.daemon.chats_root.as_deref())?;
+    }
     Ok((original_file, candidate))
 }
 
 pub(crate) fn project_configs(source: &str) -> core::Result<Vec<ProjectRegistrationConfig>> {
     project_registrations_in(&parse_config(source)?, source)
+}
+
+/// Project settings replacement validation can proceed while another
+/// section is awaiting repair. The project, profile and route credential
+/// checks still use the daemon's strict parser and validators.
+pub(crate) fn project_configs_for_settings(
+    source: &str,
+) -> core::Result<Vec<ProjectRegistrationConfig>> {
+    let projected =
+        project_source_sections(source, &["projects", "profiles", "proxies", "accounts"]);
+    let config = parse_config(&projected)?;
+    validate_parsed(&config, &projected)?;
+    project_registrations_in(&config, &projected)
+}
+
+pub(crate) fn automation_config_snapshot_for_settings(
+    data_root: &Path,
+) -> core::Result<(Option<String>, super::AutomationConfig)> {
+    let source = read_config_source(data_root)?;
+    let revision = source.as_deref().map(profiles_edit::revision_of);
+    let source = source.as_deref().unwrap_or_default();
+    let projected = project_source_sections(source, &["automation", "proxies"]);
+    let config = parse_config(&projected)?;
+    validate_parsed(&config, &projected)?;
+    let credentials = super::configured_route_credential_env_names(&config.proxies);
+    let automation = config
+        .automation
+        .clone()
+        .validate(&projected, &credentials)?;
+    Ok((revision, automation))
 }
 
 /// Read a single settings source for Git resolution and its later CAS.
@@ -696,8 +1032,30 @@ fn validate_unselected_sections(
     selected: impl IntoIterator<Item = SettingsSection>,
 ) -> core::Result<()> {
     let selected: BTreeSet<&str> = selected.into_iter().map(section_name).collect();
-    let mut before: toml::Table = toml::from_str(before)
-        .map_err(|_| core::Error::new("profile_error", "config.toml is not valid TOML"))?;
+    let mut before: toml::Table = match toml::from_str(before) {
+        Ok(before) => before,
+        Err(_) => {
+            let retained = |source: &str| {
+                profiles_edit::split_blocks(source)
+                    .into_iter()
+                    .filter(|block| {
+                        block
+                            .section
+                            .as_deref()
+                            .is_none_or(|name| !selected.contains(name))
+                    })
+                    .map(|block| block.text)
+                    .collect::<String>()
+            };
+            if retained(before) != retained(after) {
+                return Err(core::Error::new(
+                    "profile_error",
+                    "settings splice changed an unselected section",
+                ));
+            }
+            return Ok(());
+        }
+    };
     let mut after: toml::Table = toml::from_str(after)
         .map_err(|_| core::Error::new("profile_error", "settings draft is not valid TOML"))?;
     before.retain(|key, _| !selected.contains(key));
@@ -709,6 +1067,48 @@ fn validate_unselected_sections(
         ));
     }
     Ok(())
+}
+
+fn validation_dependencies(section: SettingsSection) -> &'static [&'static str] {
+    const PROFILE_REFERENCES: &[&str] = &["profiles", "accounts", "proxies", "projects", "routing"];
+    match section {
+        SettingsSection::Profiles | SettingsSection::Accounts => PROFILE_REFERENCES,
+        SettingsSection::Routing => &["routing", "profiles", "accounts", "proxies"],
+        SettingsSection::Projects => &["projects", "profiles", "accounts", "proxies"],
+        SettingsSection::Daemon => &["daemon"],
+        SettingsSection::Automation => &["automation", "proxies"],
+        SettingsSection::Mail => &["mail"],
+        SettingsSection::CloudMcp => &["cloud_mcp"],
+        SettingsSection::Desktop => &["desktop"],
+        SettingsSection::Proxies => &[
+            "proxies",
+            "profiles",
+            "accounts",
+            "projects",
+            "routing",
+            "automation",
+        ],
+    }
+}
+
+fn validate_candidate_for_sections(
+    original: &str,
+    candidate: &str,
+    sections: &BTreeMap<SettingsSection, JsonValue>,
+) -> core::Result<()> {
+    let Err(error) = validate_candidate(candidate) else {
+        return Ok(());
+    };
+    if validate_candidate(original).is_ok() {
+        return Err(error);
+    }
+    let names: BTreeSet<&str> = sections
+        .keys()
+        .flat_map(|section| validation_dependencies(*section).iter().copied())
+        .collect();
+    let names: Vec<_> = names.into_iter().collect();
+    let projected = project_source_sections(candidate, &names);
+    validate_candidate(&projected)
 }
 
 fn is_default_section(section: SettingsSection, value: &JsonValue) -> bool {
@@ -723,7 +1123,10 @@ fn is_default_section(section: SettingsSection, value: &JsonValue) -> bool {
 }
 
 fn has_desktop_section(source: &str) -> bool {
-    toml::from_str::<toml::Table>(source).is_ok_and(|table| table.contains_key("desktop"))
+    match toml::from_str::<toml::Table>(source) {
+        Ok(table) => table.contains_key("desktop"),
+        Err(_) => profiles_edit::section_source(source, "desktop").is_some(),
+    }
 }
 
 fn restart_required_for_change(

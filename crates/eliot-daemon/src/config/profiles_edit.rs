@@ -5,10 +5,11 @@
 //! are resolved from the file at every launch admission, so a saved file is
 //! what the next launch uses; running Agents keep their frozen snapshots.
 //!
-//! `settings.read` exposes the profile section only when `editability` finds no reason to refuse: a
-//! file whose profile tables mix in other sections, hold a known secret value,
-//! or fail strict validation (including credential-bearing proxy URLs) is never
-//! handed out as source. Profile saves go through `settings.save`.
+//! `settings.read` exposes the profile section only when `editability` finds no
+//! reason to refuse: profile tables that mix in other sections, hold a known
+//! secret value, or fail strict validation (including credential-bearing proxy
+//! URLs) are never handed out as source. Other readable settings sections stay
+//! available. Profile saves go through `settings.save`.
 
 use std::path::Path;
 
@@ -141,6 +142,33 @@ pub(super) fn split_blocks(source: &str) -> Vec<Block<'_>> {
         }
     }
     blocks
+}
+
+/// The bytes owned by one top-level section, retained in source order.
+pub(super) fn section_source(source: &str, name: &str) -> Option<String> {
+    let mut found = false;
+    let mut text = String::new();
+    for block in split_blocks(source) {
+        if block.section.as_deref() == Some(name) {
+            found = true;
+            text.push_str(block.text);
+        }
+    }
+    found.then_some(text)
+}
+
+/// The top-level section that owns a byte offset, when the offset falls
+/// inside a table block.
+pub(super) fn section_at_offset(source: &str, offset: usize) -> Option<String> {
+    let mut start = 0;
+    for block in split_blocks(source) {
+        let end = start + block.text.len();
+        if offset >= start && offset < end {
+            return block.section.clone();
+        }
+        start = end;
+    }
+    None
 }
 
 fn with_newline(text: &str) -> String {

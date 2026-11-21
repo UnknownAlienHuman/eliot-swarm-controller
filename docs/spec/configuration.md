@@ -1241,14 +1241,26 @@ only a successful `configure` changes a live Agent's next-turn model/effort. Dae
 settings loaded once at startup (`[daemon]` worker limits and `[mail]`) still require a
 restart after the save.
 
-The whole `settings.read` is refused (`not_allowed`) when the file is not
-valid TOML, when profiles are defined outside `[profiles.*]` tables, when the profile
-text contains a value the daemon's secret policy knows, or when the profiles fail the
-daemon's strict field and URL validation (unknown fields and credential-bearing URLs are
-never handed to the editor). Profile sections carry environment and credential names,
-never values. The daemon keeps one revision-keyed validated snapshot per router: an
-admission whose file revision matches reuses it, and any byte change re-reads and
-re-validates, so the saved file is still what the next launch uses.
+`settings.read` returns every safely readable section plus bounded issues for sections
+that fail parsing, validation or the daemon's redaction policy. A TOML syntax diagnostic
+identifies the affected top-level section when the parser can locate it; other section
+blocks remain available in Settings. A section withheld for safety never includes its
+source or values. The desktop can edit readable section drafts or replace a listed
+section with an empty object to remove it. The revision remains the hash of the complete
+`config.toml`, including while another section is invalid.
+
+`settings.save` keeps the complete-section replacement and revision-CAS contract. The
+daemon validates the changed section and its dependencies with the same strict parser
+and validators used for launch configuration, preserves all unselected source blocks,
+and reports remaining issues on the next read. A section cannot be saved when its own
+validation fails; an unrelated broken section does not hide or block a usable section.
+The desktop performs no configuration validation. Profile source still follows the
+existing safety rule: profiles defined outside `[profiles.*]`, known secret values,
+unknown fields and credential-bearing URLs are never handed to the editor. Profile
+sections carry environment and credential names, never values. The daemon keeps one
+revision-keyed validated snapshot per router: an admission whose file revision matches
+reuses it, and any byte change re-reads and re-validates, so the saved file is still
+what the next task uses.
 
 ## Frozen files
 
