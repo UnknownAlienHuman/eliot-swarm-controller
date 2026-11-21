@@ -3,15 +3,11 @@
 //! Archive finished tasks, Delete stopped tasks and Remove from Swarm (k142,
 //! through [`super::bulk_ui`]); a chat's or task's Rename, Stop (while it is live, idle
 //! included), Move under another task (k113, [`super::move_ui`]), Resume
-//! (a lost one), Archive or Unarchive, Delete (stopped or failed trees only), Copy Agent ID and Open
-//! folder.
+//! (a lost one), Archive or Unarchive, Delete, Copy Agent ID and Open folder.
 //!
 //! Delete follows the Store's rule (`docs/spec/core.md`, explicit Agent
-//! tree removal): only a stopped or failed tree, once drained. It asks
-//! once, naming the chat. A live chat's Delete is "Stop and delete" (k98):
-//! stop, wait until the Agent reads stopped or failed, then `agent.delete`;
-//! the dialog shows each step and a refused step's typed error. A lost
-//! task cannot be deleted: its menu offers Resume or Archive instead.
+//! tree removal): only a stopped or failed tree, once drained. Its
+//! confirmation names the records, worktrees and native chats in scope.
 //! Archiving the open chat returns to New task with an "Archived · Undo"
 //! notice (the Codex app's archive).
 //!
@@ -133,16 +129,6 @@ pub(super) enum MenuMsg {
     Done(String, MutationResult<String>),
     /// Put the keyboard in the rename field (tries left).
     FocusRename(u8),
-    /// Stop and delete: the stop was submitted (its outcome).
-    RemovalStopped(MutationResult<String>),
-    /// Stop and delete: the Agent reads stopped (its state), or not.
-    RemovalSettled(MutationResult<String>),
-    /// Stop and delete: `agent.delete` settled.
-    RemovalDeleted(MutationResult<String>),
-    /// Close the Stop and delete dialog after a refused step.
-    RemovalClosed,
-    /// Stop and delete: a second passed; the progress line's seconds move.
-    RemovalTick,
     /// `agent.archive` settled (the Agent, archived or not, whether to
     /// reopen its conversation, the outcome).
     Archived(UiAgent, bool, bool, MutationResult<usize>),
@@ -181,8 +167,6 @@ pub(super) struct MenuState {
     /// Renders composed when the latest highlight move ran: the reveal
     /// waits for the render that binds the row.
     reveal_after: u64,
-    /// A live Agent's Stop and delete in progress (its dialog stays open).
-    pub(super) removal: Option<Removal>,
     /// "Move under another task…" is open.
     pub(super) moving: Option<super::move_ui::MoveDialog>,
     /// "Archived · Undo" after an archive: the Agent, whether it was the
@@ -191,54 +175,6 @@ pub(super) struct MenuState {
     pub(super) archived_epoch: u64,
 }
 
-/// A live Agent's Stop and delete: the step it is at, and a refused step's
-/// typed error.
-#[derive(Clone, Debug)]
-pub(super) struct Removal {
-    pub(super) agent: UiAgent,
-    /// The stop command's id: `agent.delete` refuses while it is open.
-    pub(super) command: String,
-    pub(super) step: RemovalStep,
-    pub(super) error: Option<String>,
-    /// When Stop was clicked: the progress line counts from here.
-    pub(super) started: std::time::Instant,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum RemovalStep {
-    Stopping,
-    Waiting,
-    Deleting,
-}
-
-impl RemovalStep {
-    /// The dialog's honest progress line: what is happening, whose
-    /// shutdown it waits for, and for how long ("Stopping Codex… 2 s").
-    fn progress(self, harness: &str, elapsed: std::time::Duration) -> String {
-        let harness = crate::picker::harness_label(harness);
-        let seconds = elapsed.as_secs();
-        match self {
-            Self::Stopping => format!("Stopping {harness}… {seconds} s"),
-            Self::Waiting => {
-                format!("Waiting for {harness} to exit and release its files… {seconds} s")
-            }
-            Self::Deleting => format!("Deleting… {seconds} s"),
-        }
-    }
-
-    fn what(self) -> &'static str {
-        match self {
-            Self::Stopping => "Stop",
-            Self::Waiting => "Waiting for the stop",
-            Self::Deleting => "Delete",
-        }
-    }
-}
-
-/// How long Stop and delete waits for the Agent to read stopped.
-const REMOVAL_WAIT_MS: u64 = 60_000;
-/// Between two reads of the stopping Agent.
-const REMOVAL_POLL_MS: u64 = 400;
 /// How long the "Archived · Undo" notice stays.
 const ARCHIVED_NOTICE_MS: u64 = 10_000;
 
@@ -412,50 +348,6 @@ impl DesktopApp {
                     self.focus_rename(tries - 1, context);
                 }
             }
-            MenuMsg::RemovalStopped(outcome) => self.removal_stopped(outcome, context),
-            MenuMsg::RemovalSettled(outcome) => self.removal_settled(outcome, context),
-            MenuMsg::RemovalDeleted(outcome) => {
-                self.settle_mutation(
-                    outcome
-                        .as_ref()
-                        .err()
-                        .is_none_or(|error| !crate::state::uncertain(error)),
-                );
-                match outcome {
-                    Ok(note) => {
-                        let removed = self.menu.removal.take();
-                        if let Some(removal) = removed.as_ref() {
-                            // The Agent is gone: its unresolved snapshot can
-                            // never be retried, so release its ledger key too.
-                            super::chat_ui::abandon_retry(
-                                &mut self.chat.pending_retry,
-                                &mut self.ledger,
-                                &removal.agent.id,
-                            );
-                        }
-                        let title = removed
-                            .map(|removal| self.agent_label(&removal.agent))
-                            .unwrap_or_default();
-                        self.set_status(format!("Stopped and deleted “{title}”: {note}."));
-                    }
-                    Err(error) => self.removal_failed(error),
-                }
-                self.shell_update(ShellMsg::RefreshRequested, context);
-            }
-            MenuMsg::RemovalTick => {
-                if self
-                    .menu
-                    .removal
-                    .as_ref()
-                    .is_some_and(|removal| removal.error.is_none())
-                {
-                    self.post_removal_tick(context);
-                }
-            }
-            MenuMsg::RemovalClosed => {
-                self.menu.removal = None;
-                self.shell_update(ShellMsg::RefreshRequested, context);
-            }
             MenuMsg::Archived(agent, archived, reopen, outcome) => {
                 self.settle_mutation(
                     outcome
@@ -515,211 +407,6 @@ impl DesktopApp {
             }
             MenuMsg::Ignored => {}
         }
-    }
-
-    /// Stop and delete of a live Agent, step one: submit its stop.
-    fn start_removal(&mut self, agent: UiAgent, context: &ComponentContext<Self>) {
-        if self.submitting() {
-            self.alert("Waiting for the last action to settle.");
-            return;
-        }
-        let Ok(data_dir) = self.data_dir.clone() else {
-            return;
-        };
-        let bound = BoundAction::agent_control(&agent.id, agent.generation);
-        let key = format!("stop:{}:{}:false", bound.agent, bound.generation);
-        let mutation_id = self.ledger.id_for(&key);
-        self.in_flight_key = Some(key);
-        self.set_status(format!("Stop ({mutation_id})…"));
-        self.menu.removal = Some(Removal {
-            agent,
-            command: mutation_id.clone(),
-            step: RemovalStep::Stopping,
-            error: None,
-            started: std::time::Instant::now(),
-        });
-        self.post_removal_tick(context);
-        let _task = context.spawn_background(move |_| {
-            Message::Menu(MenuMsg::RemovalStopped(
-                client::block_on(client::submit_stop(
-                    &data_dir,
-                    mutation_id,
-                    &bound.agent,
-                    bound.generation,
-                    false,
-                ))
-                .map(|reply| submit_note(&reply)),
-            ))
-        });
-    }
-
-    /// Re-render the progress line's seconds once a second while the
-    /// Stop and delete dialog shows progress.
-    fn post_removal_tick(&self, context: &ComponentContext<Self>) {
-        let _task = context.spawn_background(move |cancel| {
-            let cancelled = || cancel.is_cancelled();
-            let _ = feed::backoff(1_000, &cancelled);
-            Message::Menu(MenuMsg::RemovalTick)
-        });
-    }
-
-    /// Step two: wait until the stop command has settled and the Agent
-    /// reads stopped (bounded): `agent.delete` refuses `busy` while either
-    /// is still open.
-    fn removal_stopped(
-        &mut self,
-        outcome: MutationResult<String>,
-        context: &ComponentContext<Self>,
-    ) {
-        self.settle_mutation(
-            outcome
-                .as_ref()
-                .err()
-                .is_none_or(|error| !crate::state::uncertain(error)),
-        );
-        if let Err(error) = outcome {
-            self.removal_failed(error);
-            return;
-        }
-        let (Some(removal), Ok(data_dir)) = (self.menu.removal.as_mut(), self.data_dir.clone())
-        else {
-            return;
-        };
-        removal.step = RemovalStep::Waiting;
-        let id = removal.agent.id.clone();
-        let command = removal.command.clone();
-        let _task = context.spawn_background(move |cancel| {
-            let cancelled = || cancel.is_cancelled();
-            let mut waited = 0;
-            let outcome = loop {
-                let read = client::block_on(async {
-                    let stop = client::read_command(&data_dir, &command).await?;
-                    let agent = client::get_agent(&data_dir, &id).await?;
-                    Ok::<_, eliot_core::Error>((stop.state, agent.agent.state))
-                });
-                match read {
-                    Ok((stop, state)) => {
-                        use eliot_core::{AgentState, CommandState};
-                        if matches!(stop, CommandState::Rejected | CommandState::Failed) {
-                            break Err(eliot_core::Error::new(
-                                format!("stop_{}", format!("{stop:?}").to_lowercase()),
-                                "the stop did not apply; nothing was deleted",
-                            ));
-                        }
-                        // The Store deletes only a stopped or failed tree;
-                        // one lost on the way out stays (Resume or Archive).
-                        if stop.is_terminal() && state == AgentState::Lost {
-                            break Err(eliot_core::Error::new(
-                                "lost",
-                                "it was lost while stopping, so Swarm cannot delete it; nothing was deleted. Resume it, or archive it to hide it",
-                            ));
-                        }
-                        let stopped = matches!(state, AgentState::Stopped | AgentState::Failed);
-                        if stop.is_terminal() && stopped {
-                            break Ok(format!("{state:?}").to_lowercase());
-                        }
-                        if waited >= REMOVAL_WAIT_MS {
-                            break Err(eliot_core::Error::new(
-                                "timeout",
-                                format!(
-                                    "Agent {}, stop {} after {} s; nothing was deleted",
-                                    format!("{state:?}").to_lowercase(),
-                                    format!("{stop:?}").to_lowercase(),
-                                    REMOVAL_WAIT_MS / 1000
-                                ),
-                            ));
-                        }
-                    }
-                    Err(error) => break Err(error),
-                }
-                if !feed::backoff(REMOVAL_POLL_MS, &cancelled) {
-                    break Err(eliot_core::Error::new(
-                        "cancelled",
-                        "the window stopped waiting",
-                    ));
-                }
-                waited += REMOVAL_POLL_MS;
-            };
-            Message::Menu(MenuMsg::RemovalSettled(outcome))
-        });
-    }
-
-    /// Step three: the Agent is stopped, so `agent.delete` it. The Store
-    /// refuses `busy` until the stopped generation's processes and sources
-    /// are released; such a definite refusal records nothing, so the same
-    /// mutation id asks again (bounded) and any other outcome is final.
-    fn removal_settled(
-        &mut self,
-        outcome: MutationResult<String>,
-        context: &ComponentContext<Self>,
-    ) {
-        if let Err(error) = outcome {
-            self.removal_failed(error);
-            return;
-        }
-        let Some(agent) = self
-            .menu
-            .removal
-            .as_ref()
-            .map(|removal| removal.agent.clone())
-        else {
-            return;
-        };
-        if self.submitting() {
-            self.removal_failed(eliot_core::Error::new(
-                "busy",
-                "waiting for the last action to settle",
-            ));
-            return;
-        }
-        let Ok(data_dir) = self.data_dir.clone() else {
-            return;
-        };
-        if self.selected_agent_id().as_deref() == Some(agent.id.as_str()) {
-            self.new_task(context);
-        }
-        if let Some(removal) = self.menu.removal.as_mut() {
-            removal.step = RemovalStep::Deleting;
-        }
-        let key = format!("delete:{}", agent.id);
-        let mutation_id = self.ledger.id_for(&key);
-        self.in_flight_key = Some(key);
-        let id = agent.id;
-        let _task = context.spawn_background(move |cancel| {
-            let cancelled = || cancel.is_cancelled();
-            let mut waited = 0;
-            let outcome = loop {
-                match client::block_on(client::delete_agent(&data_dir, mutation_id.clone(), &id)) {
-                    Ok(count) => break Ok(format!("{count} record tree(s) removed")),
-                    Err(error) if error.code == "busy" && waited < REMOVAL_WAIT_MS => {}
-                    Err(error) => break Err(error),
-                }
-                if !feed::backoff(REMOVAL_POLL_MS, &cancelled) {
-                    break Err(eliot_core::Error::new(
-                        "cancelled",
-                        "the window stopped waiting",
-                    ));
-                }
-                waited += REMOVAL_POLL_MS;
-            };
-            Message::Menu(MenuMsg::RemovalDeleted(outcome))
-        });
-    }
-
-    /// A refused (or unconfirmed) step: its typed error, in the dialog.
-    fn removal_failed(&mut self, error: eliot_core::Error) {
-        let Some(removal) = self.menu.removal.as_mut() else {
-            self.alert(error.to_string());
-            return;
-        };
-        let what = removal.step.what();
-        removal.error = Some(if crate::state::uncertain(&error) {
-            format!("{what}: not confirmed (trying again reuses its id): {error}")
-        } else {
-            format!("{what} refused: {error}")
-        });
-        let line = removal.error.clone().unwrap_or_default();
-        self.set_status(line);
     }
 
     /// `agent.archive` (or unarchive) with a ledger-held mutation id.
@@ -793,9 +480,7 @@ impl DesktopApp {
                 self.menu.renaming = Some((target, current));
                 self.focus_rename(5, context);
             }
-            (Action::Delete, Target::Agent(agent))
-                if !agent.native_child && agent.deletable() =>
-            {
+            (Action::Delete, Target::Agent(agent)) if !agent.native_child && agent.deletable() => {
                 self.menu.confirm = Some((target, action));
             }
             (Action::Delete, Target::Agent(_)) => {
@@ -923,9 +608,6 @@ impl DesktopApp {
         context: &ComponentContext<Self>,
     ) {
         match (action, target) {
-            (Action::Delete, Target::Agent(agent)) if agent.live() => {
-                self.start_removal(agent, context);
-            }
             (Action::Delete, Target::Agent(agent)) => {
                 if self.selected_agent_id().as_deref() == Some(agent.id.as_str()) {
                     self.new_task(context);
@@ -1289,9 +971,6 @@ impl DesktopApp {
     }
 
     pub(super) fn task_dialog(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
-        if let Some(removal) = &self.menu.removal {
-            return self.removal_dialog(removal, context, palette);
-        }
         if let Some((target, action)) = &self.menu.confirm {
             return self.confirm_dialog(target, *action, context, palette);
         }
@@ -1386,21 +1065,26 @@ impl DesktopApp {
         context: &mut ViewContext<Self>,
         palette: Palette,
     ) -> View {
-        let live = matches!(target, Target::Agent(agent) if agent.live());
-        let (title, body, button) = match action {
-            Action::Delete if live => (
-                format!("Stop and delete “{}”?", target.title()),
-                "Swarm stops it, waits until it has stopped, then removes its conversation and records for good. Its folder, files and branches stay.",
-                "Stop and delete",
-            ),
-            Action::Delete => (
-                format!("Delete “{}” and its task tree?", target.title()),
-                "Swarm removes this task and its descendant tasks and records. Swarm workspace files and Git branches stay. Eligible Swarm-created Codex sessions are archived and eligible OpenCode sessions are deleted. Claude Code, Muse and Antigravity keep their own history; attached or observed sessions are left untouched.",
-                "Delete",
-            ),
+        let (title, body, button) = match target {
+            Target::Agent(agent) if action == Action::Delete => {
+                let history = match agent.harness.as_str() {
+                    "claude" => "Claude Code keeps its own chat history.",
+                    "muse" => "Muse keeps its own chat history.",
+                    "antigravity" => "Antigravity keeps its own chat history.",
+                    _ => "Claude Code, Muse and Antigravity keep their own chat history.",
+                };
+                let body = format!(
+                    "Swarm removes this task tree, its records and clean, merged worktrees it created. Project checkouts and Git branches stay on disk. Swarm archives eligible Codex chats and deletes eligible OpenCode chats it created. Attached and observed chats stay with their app. {history}"
+                );
+                (
+                    format!("Delete “{}” and its task tree?", target.title()),
+                    body,
+                    "Delete",
+                )
+            }
             _ => (
                 format!("Remove “{}” from Swarm?", target.title()),
-                "Swarm removes this project registration. The checkout, workspace files, branches and task records stay; you can add the checkout again in Settings › Projects.",
+                "Swarm removes this project registration. The checkout stays on disk.".to_owned(),
                 "Remove from Swarm",
             ),
         };
@@ -1422,61 +1106,6 @@ impl DesktopApp {
                     .on_click(context.message(Message::Menu(MenuMsg::Confirmed(true))))
                     .content(m3::label(button)),
             ),
-            tokens::layout::DIALOG_WIDTH,
-        )
-    }
-
-    /// Stop and delete in progress: the step it is at, or a refused step's
-    /// typed error and Close.
-    fn removal_dialog(
-        &self,
-        removal: &Removal,
-        context: &mut ViewContext<Self>,
-        palette: Palette,
-    ) -> View {
-        let title = format!("Stop and delete “{}”", self.agent_label(&removal.agent));
-        let status: View = match &removal.error {
-            Some(error) => m3::body(error.clone())
-                .foreground(palette.attention())
-                .text_wrapping(TextWrapping::Wrap)
-                .is_text_selection_enabled(true)
-                .into(),
-            None => StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(tokens::spacing::SM)
-                .children((
-                    ProgressRing::new()
-                        .is_indeterminate(true)
-                        .width(tokens::layout::RING)
-                        .height(tokens::layout::RING)
-                        .vertical_alignment(VerticalAlignment::Center),
-                    m3::secondary(
-                        removal
-                            .step
-                            .progress(&removal.agent.harness, removal.started.elapsed()),
-                    )
-                    .vertical_alignment(VerticalAlignment::Center),
-                )),
-        };
-        let close: View = if removal.error.is_some() {
-            StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .horizontal_alignment(HorizontalAlignment::Right)
-                .children((m3::text_button(palette)
-                    .element_ref(&self.dialog.close)
-                    .automation_name("Close")
-                    .on_click(context.message(Message::Menu(MenuMsg::RemovalClosed)))
-                    .content(m3::label("Close")),))
-        } else {
-            View::empty()
-        };
-        super::dialog_ui::surface(
-            context,
-            self.dialog.epoch,
-            palette,
-            title,
-            status,
-            close,
             tokens::layout::DIALOG_WIDTH,
         )
     }

@@ -535,15 +535,7 @@ fn place_row(place: &PlaceEntry, input: &SidebarInput, context: &mut ViewContext
             ))
         } else {
             toggle.clone()
-        }))
-        .content(m3::project_content(
-            name,
-            place.subproject.as_deref(),
-            count,
-        ))
-        .tooltip(full);
-    // On hover: fold, then one '…' at the rows' fixed place; a missing
-    // folder offers its one-click removal instead.
+        }));
     let hover_key = format!("project:{}", section.key);
     let over = input.hovered.as_deref() == Some(hover_key.as_str());
     let mut actions: Vec<KeyedView> = Vec::new();
@@ -567,7 +559,9 @@ fn place_row(place: &PlaceEntry, input: &SidebarInput, context: &mut ViewContext
                     m3::glyph::CHEVRON_DOWN
                 })),
         ));
-        if section.missing {
+    }
+    if section.missing {
+        if over {
             actions.push(KeyedView::new(
                 "remove",
                 m3::icon_button(palette)
@@ -583,24 +577,37 @@ fn place_row(place: &PlaceEntry, input: &SidebarInput, context: &mut ViewContext
                     ))))
                     .content(m3::icon(m3::glyph::DELETE)),
             ));
-        } else if section.key != nav::OTHER_LOCATIONS {
-            actions.push(KeyedView::new(
-                "more",
-                m3::icon_button(palette)
-                    .automation_name(format!("Actions for {name}"))
-                    .on_click(
-                        context.message(Message::Menu(MenuMsg::Opened(Target::Project {
-                            key: section.key.clone(),
-                            name: name.to_owned(),
-                            checkout: section.checkout.clone(),
-                            checkouts: section.checkouts.clone(),
-                            collapsed: section.collapsed,
-                        }))),
-                    )
-                    .content(m3::icon(m3::glyph::MORE)),
-            ));
         }
+    } else if section.key != nav::OTHER_LOCATIONS {
+        actions.push(KeyedView::new(
+            "more",
+            m3::icon_button(palette)
+                .automation_name(format!("Project actions for {name}"))
+                .on_click(
+                    context.message(Message::Menu(MenuMsg::Opened(Target::Project {
+                        key: section.key.clone(),
+                        name: name.to_owned(),
+                        checkout: section.checkout.clone(),
+                        checkouts: section.checkouts.clone(),
+                        collapsed: section.collapsed,
+                    }))),
+                )
+                .content(m3::icon(m3::glyph::MORE))
+                .tooltip("Project actions"),
+        ));
     }
+    let reserve = (tokens::height::CONTROL * actions.len() as f64 - tokens::spacing::ROW).max(0.0);
+    let row = row
+        .content(
+            Border::new()
+                .padding(Thickness::new(0.0, 0.0, reserve, 0.0))
+                .content(m3::project_content(
+                    name,
+                    place.subproject.as_deref(),
+                    count,
+                )),
+        )
+        .tooltip(full);
     hover_area(hover_key, row_with_actions(row, actions), context)
 }
 
@@ -693,50 +700,44 @@ fn agent_row(task: &TaskEntry, input: &SidebarInput, context: &mut ViewContext<S
     let hover_key = format!("agent:{}", agent.id);
     let over = selected || input.hovered.as_deref() == Some(hover_key.as_str());
     let mut actions: Vec<KeyedView> = Vec::new();
-    if over {
-        if row.expandable() {
-            actions.push(KeyedView::new(
-                "workers",
-                m3::icon_button(palette)
-                    .automation_name(if row.expanded {
-                        format!("Collapse workers of {title}")
-                    } else {
-                        format!(
-                            "Show {} of {title}",
-                            eliot_core::count_words(row.children as u64, "worker", "workers")
-                        )
-                    })
-                    .on_click(context.message(Message::Shell(ShellMsg::ExpandToggled(
-                        agent.id.clone(),
-                        !row.expanded,
-                    ))))
-                    .content(m3::icon(if row.expanded {
-                        m3::glyph::CHEVRON_DOWN
-                    } else {
-                        m3::glyph::CHEVRON_RIGHT
-                    })),
-            ));
-        }
+    if over && row.expandable() {
         actions.push(KeyedView::new(
-            "more",
+            "workers",
             m3::icon_button(palette)
-                .automation_name(format!("Actions for {title}"))
-                .on_click(
-                    context.message(Message::Menu(MenuMsg::Opened(Target::Agent(agent.clone())))),
-                )
-                .content(m3::icon(m3::glyph::MORE))
-                .tooltip("Task actions"),
+                .automation_name(if row.expanded {
+                    format!("Collapse workers of {title}")
+                } else {
+                    format!(
+                        "Show {} of {title}",
+                        eliot_core::count_words(row.children as u64, "worker", "workers")
+                    )
+                })
+                .on_click(context.message(Message::Shell(ShellMsg::ExpandToggled(
+                    agent.id.clone(),
+                    !row.expanded,
+                ))))
+                .content(m3::icon(if row.expanded {
+                    m3::glyph::CHEVRON_DOWN
+                } else {
+                    m3::glyph::CHEVRON_RIGHT
+                })),
         ));
     }
-    // Shown actions take the trailing place, so the title trims before
-    // them instead of running under them.
-    let trailing: View = if over {
-        Border::new()
-            .width(tokens::height::CONTROL * actions.len() as f64 - tokens::spacing::ROW)
-            .into()
-    } else {
-        trailing
-    };
+    actions.push(KeyedView::new(
+        "more",
+        m3::icon_button(palette)
+            .automation_name(format!("Task actions for {title}, Agent {}", agent.id))
+            .on_click(context.message(Message::Menu(MenuMsg::Opened(Target::Agent(agent.clone())))))
+            .content(m3::icon(m3::glyph::MORE))
+            .tooltip("Task actions"),
+    ));
+    let trailing = StackPanel::new()
+        .orientation(Orientation::Horizontal)
+        .children((
+            if over { View::empty() } else { trailing },
+            Border::new()
+                .width(tokens::height::CONTROL * actions.len() as f64 - tokens::spacing::ROW),
+        ));
     let row_button = m3::sub_row(palette, selected);
     let row_button = if line.is_some() {
         row_button
@@ -752,7 +753,7 @@ fn agent_row(task: &TaskEntry, input: &SidebarInput, context: &mut ViewContext<S
             row.depth + 1,
             title,
             quiet,
-            trailing,
+            trailing.into(),
             line,
         ));
     hover_area(hover_key, row_with_actions(row_button, actions), context)

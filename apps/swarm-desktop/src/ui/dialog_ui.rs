@@ -60,8 +60,6 @@ impl DesktopApp {
             1
         } else if self.menu.confirm.is_some() {
             2
-        } else if self.menu.removal.is_some() {
-            3
         } else if self.menu.moving.is_some() {
             4
         } else if self.settings.cleanup_confirm {
@@ -143,14 +141,6 @@ impl DesktopApp {
         match self.dialog_kind() {
             1 => self.handoff_update(handoff_ui::HandoffMsg::Closed, context),
             2 => self.menu_update(MenuMsg::Confirmed(false), context),
-            3 if self
-                .menu
-                .removal
-                .as_ref()
-                .is_some_and(|removal| removal.error.is_some()) =>
-            {
-                self.menu_update(MenuMsg::RemovalClosed, context)
-            }
             4 => self.move_update(MoveMsg::Closed, context),
             5 => self.settings_update(SettingsMsg::CleanupConfirmed(false), context),
             6 => {

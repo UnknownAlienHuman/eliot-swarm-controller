@@ -78,11 +78,10 @@ impl Router {
     }
 
     async fn plan_agent_deletion(&self, agents: &[Agent]) -> Result<CleanupPlan> {
-        let mut sessions = Vec::new();
-        let mut worktrees = Vec::new();
+        let mut items = Vec::new();
         for agent in agents {
             if let Some(artifact) = self.agent_delete_session(agent).await? {
-                sessions.push(CleanupCandidate {
+                items.push(CleanupCandidate {
                     artifact,
                     bytes: None,
                     verdict: "safe".to_owned(),
@@ -92,26 +91,24 @@ impl Router {
 
             if let Some(artifact) = self.agent_delete_worktree(agent).await? {
                 self.worktree_cleanup_preflight(&artifact).await?;
-                worktrees.push(CleanupCandidate {
+                items.push(CleanupCandidate {
                     artifact,
                     bytes: None,
                     verdict: "safe".to_owned(),
                     reason: "terminal_owned_artifact".to_owned(),
                 });
             }
-            if sessions.len() + worktrees.len() > MAX_CLEANUP_ITEMS {
+            if items.len() > MAX_CLEANUP_ITEMS {
                 return Err(Error::new(
                     "unavailable",
                     "Agent cleanup exceeds operation bound",
                 ));
             }
         }
-        // OpenCode's native scope is bound to the existing worktree directory.
-        sessions.extend(worktrees);
         Ok(CleanupPlan {
             plan_id: ulid::Ulid::new().to_string(),
             created_at: now_ms(),
-            items: sessions,
+            items,
             truncated: false,
             continuation: None,
         })
@@ -184,7 +181,7 @@ impl Router {
 }
 
 fn require_agent_delete_cleanup(plan: &CleanupPlan, response: &CleanupApplyResponse) -> Result<()> {
-    if let Some((item, outcome)) = plan
+    if let Some((item, _)) = plan
         .items
         .iter()
         .zip(&response.items)
@@ -192,7 +189,10 @@ fn require_agent_delete_cleanup(plan: &CleanupPlan, response: &CleanupApplyRespo
     {
         return Err(Error::new(
             "unknown",
-            format!("{} cleanup is uncertain; task kept", item.artifact.agent),
+            format!(
+                "{} cleanup is uncertain. Swarm kept the task.",
+                item.artifact.agent
+            ),
         ));
     }
     if let Some((item, outcome)) = plan
@@ -209,7 +209,7 @@ fn require_agent_delete_cleanup(plan: &CleanupPlan, response: &CleanupApplyRespo
         return Err(Error::new(
             reason,
             format!(
-                "{} {object} cleanup was refused; task kept",
+                "{} {object} cleanup was refused. Swarm kept the task.",
                 item.artifact.agent
             ),
         ));

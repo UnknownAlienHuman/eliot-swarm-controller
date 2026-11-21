@@ -957,7 +957,7 @@ impl DesktopApp {
                             "Archived tasks leave the list; Show archived brings them back, and Unarchive restores one."
                         }
                         BulkOp::DeleteStopped => {
-                            "Swarm removes each listed task tree and its records. Swarm workspace files and Git branches stay. Eligible Swarm-created Codex sessions are archived and eligible OpenCode sessions are deleted. Claude Code, Muse and Antigravity keep their own history; attached or observed sessions are left untouched."
+                            "Swarm removes each listed task tree, its records and clean, merged worktrees Swarm created. Project checkouts and Git branches stay on disk. Swarm archives eligible Codex chats and deletes eligible OpenCode chats it created. Claude Code, Muse and Antigravity keep their own history. Attached and observed chats stay with their app."
                         }
                     })
                     .text_wrapping(TextWrapping::Wrap)

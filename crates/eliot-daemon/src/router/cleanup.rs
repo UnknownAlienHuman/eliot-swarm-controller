@@ -1027,7 +1027,13 @@ impl Router {
         plan: &CleanupPlan,
         response: &mut CleanupApplyResponse,
     ) -> Result<()> {
-        for (index, item) in plan.items.iter().enumerate() {
+        // A native reader may need the managed workspace as its directory.
+        let (sessions, other): (Vec<_>, Vec<_>) = plan
+            .items
+            .iter()
+            .enumerate()
+            .partition(|(_, item)| item.artifact.kind == ArtifactKind::NativeSession);
+        for (index, item) in sessions.into_iter().chain(other) {
             if item.artifact.kind == ArtifactKind::ProjectRegistration
                 || item.verdict != "safe"
                 || response.items[index].outcome != "unknown"

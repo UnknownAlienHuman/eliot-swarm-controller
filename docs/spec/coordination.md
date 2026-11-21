@@ -111,8 +111,10 @@ dispatch; a legacy Codex home scope derived from an alias missing from the
 frozen binding remains ineligible for Swarm archive, and only a new launch can
 capture a verified binding for its own session. The OpenCode reader proves its
 served store derives the exact retained native scope before the delete. An
-OpenCode 404 counts as removed only if the same server, store and directory
-give a complete session list with the exact session absent. An authoritative
+OpenCode session with native children stays in place because the vendor
+delete would also remove the children. A delete acknowledgement or 404
+counts as removed only if the same server, store and directory give a
+complete session list with the exact session absent. An authoritative
 refusal settles as skipped and keeps the session. A timeout or malformed or
 secret-bearing readback after dispatch is `unknown` and retains the durable
 retry fence. The metadata reader owns the vendor helper through shutdown. Raw

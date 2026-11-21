@@ -824,7 +824,7 @@ fn custody_blocker_tx(tx: &Transaction<'_>, agent: i64, observers: bool) -> Resu
     .map_err(sql_error)
 }
 
-fn prepare_delete_tree_tx(tx: &Transaction<'_>, members: &[i64]) -> Result<()> {
+fn prepare_delete_tree_tx(tx: &Transaction<'_>, members: &[i64]) -> Result<Vec<String>> {
     const MAX_DELETE_COMMANDS: usize = 10_000;
     // Temporary selection is transaction-local and is never a second deletion ledger.
     delete_db!(tx.execute_batch(
@@ -926,11 +926,11 @@ fn prepare_delete_tree_tx(tx: &Transaction<'_>, members: &[i64]) -> Result<()> {
             "command tree is incomplete or exceeds its depth bound",
         ));
     }
-    Ok(())
+    Ok(ids)
 }
 
 fn delete_tree_tx(tx: &Transaction<'_>, members: &[i64], now: i64) -> Result<()> {
-    prepare_delete_tree_tx(tx, members)?;
+    let ids = prepare_delete_tree_tx(tx, members)?;
     delete_db!(tx.execute("DELETE FROM processes WHERE EXISTS(SELECT 1 FROM deleted_agents d WHERE processes.owner GLOB 'agent:a'||d.id||'#*' OR processes.owner GLOB 'workspace:a'||d.id||'#*')",[]));
     // Preserve existing mutation receipts. Create retry tombstones only
     // for commands whose identities would otherwise disappear.
