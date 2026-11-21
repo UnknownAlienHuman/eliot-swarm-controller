@@ -9,9 +9,9 @@ use super::support::read_and_print;
 use super::support::{Failure, command_value, mutation_id, print_value, response_exit_code};
 use eliot_core::Command as CoreCommand;
 use eliot_core::api::{
-    DEFAULT_GOAL_CHECK_TIMEOUT_MS, GoalClearRequest, GoalCostLimit, GoalDefinition, GoalGetRequest,
-    GoalMode, GoalPauseRequest, GoalResumeRequest, GoalRoundRequest, GoalRoundResponse,
-    GoalSetRequest, GoalView, ProjectOverviewRequest, ProjectOverviewResponse,
+    DEFAULT_GOAL_CHECK_TIMEOUT_MS, GoalClearRequest, GoalCostLimit, GoalDefinition, GoalEscalation,
+    GoalGetRequest, GoalMode, GoalPauseRequest, GoalResumeRequest, GoalRoundRequest,
+    GoalRoundResponse, GoalSetRequest, GoalView, ProjectOverviewRequest, ProjectOverviewResponse,
     ProjectRegistrationView, ProviderClearHoldRequest, ProviderClearHoldResponse,
     ProviderCorrectiveEvidence, ProviderHoldsRequest, ProviderHoldsResponse, RuleCatchUpRequest,
     RuleGetRequest, RuleStateView, TimerGetRequest, TimerRunRequest, TimerStateView,
@@ -293,7 +293,15 @@ pub(crate) async fn run_goal(
                 check_inputs,
                 max_cost,
                 cost_unit,
+                escalate_model,
+                escalate_effort,
+                escalate_reason,
             } = *args;
+            let escalation = escalate_reason.map(|reason| GoalEscalation {
+                model: escalate_model,
+                effort: escalate_effort,
+                reason,
+            });
             let max_cost = match (max_cost, cost_unit) {
                 (Some(amount), Some(unit)) => Some(GoalCostLimit {
                     unit,
@@ -317,6 +325,7 @@ pub(crate) async fn run_goal(
                     scope,
                     check_inputs,
                     max_cost,
+                    escalation,
                 },
             };
             request.validate().map_err(Failure::for_mutation)?;

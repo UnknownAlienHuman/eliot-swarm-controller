@@ -1276,6 +1276,24 @@ same session against a non-zero baseline. A handoff does not carry the baseline,
 because it belongs to the source Agent's session: the destination's next failed round
 blocks as `cost_unverified` until the Owner sets the Goal again.
 
+**Diagnosis and escalation.** A failed round whose fully captured check output repeats the
+previous round's counts toward `consecutive_same_failure`, whatever the workspace did.
+A new output, or one captured only in part, resets it. The second identical failure in a row
+means two approaches failed the same way. That round's continuation, once per Goal
+revision, is the diagnosis step: compare the attempts, name the shared cause, run one
+observation that tells the remaining causes apart, then take one different approach.
+A Goal may carry one Owner-authorized `escalation {model?, effort?, reason}`. `set`
+refuses it unless the Agent's harness can apply that `configure`. When the same failure
+repeats after the diagnosis step, the round commit admits that one `configure` (Owner
+principal, the Goal's generation) immediately before the continuation, in the same
+transaction. The settings lane therefore dispatches the configure first, and the
+continuation names the change and the Owner's reason. It happens at most once per
+revision. There is no model ladder, no change of authority fields, and nothing to
+replay: an `unknown` configure holds the lane as usual. The Router derives the stage
+from the counters bound to the claimed revision, and the commit re-derives it,
+refusing a mismatch as `stale_round`. The output digest is the stage's notion of "the
+same failure": a check that prints a changing value, such as a timestamp, never repeats.
+
 `goal show` reports the exact status, counters (with a live turn count and the spent
 cost), budgets, limits and the unresolved round marker if any. `cost_status` is
 `untracked` without a budget, otherwise the spent and budgeted amounts or why the spent

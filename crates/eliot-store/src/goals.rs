@@ -3,9 +3,9 @@
 
 use super::*;
 use eliot_core::api::{
-    CommandSubmitResponse, GoalCounters, GoalDefinition, GoalMarkerState, GoalMode,
-    GoalRoundMarker, GoalRoundOutcome, GoalRoundRequest, GoalRoundResponse, GoalStatus, GoalView,
-    MAX_GOAL_OBSERVATION_BYTES,
+    CommandSubmitResponse, GoalContinuationStage, GoalCounters, GoalDefinition, GoalMarkerState,
+    GoalMode, GoalRoundMarker, GoalRoundOutcome, GoalRoundRequest, GoalRoundResponse, GoalStatus,
+    GoalView, MAX_GOAL_OBSERVATION_BYTES,
 };
 use serde::{Deserialize, Serialize};
 
@@ -46,6 +46,12 @@ pub struct GoalCheckResult {
 pub struct GoalContinuation {
     pub id: String,
     pub text: String,
+    /// The stage the Router built the text for; the commit re-derives it
+    /// from the same counters and refuses a mismatch as stale.
+    pub stage: GoalContinuationStage,
+    /// Fresh command id of the escalation `configure`, set only with
+    /// [`GoalContinuationStage::Escalate`].
+    pub escalation_id: Option<String>,
 }
 
 /// One round-key form. Idle keys name an exact idle event seq; slot keys
@@ -188,6 +194,9 @@ pub struct GoalRoundCommitResult {
     pub view: GoalView,
     pub admission: Option<Admission>,
     pub response: GoalRoundResponse,
+    /// The escalation `configure`, admitted just before the continuation so
+    /// it dispatches first on the Agent's settings lane.
+    pub escalation: Option<Admission>,
     /// Committed facts of the round itself (an assignment Goal's terminal
     /// `goal.changed`); the continuation's events stay on `admission`.
     pub events: Vec<Event>,
@@ -214,6 +223,7 @@ impl GoalRoundCommitResult {
             view: response.view.clone(),
             admission: None,
             response,
+            escalation: None,
             events: Vec::new(),
         })
     }
@@ -1075,6 +1085,15 @@ impl Store {
                 "observe-only Agents take no Goals",
             ));
         }
+        // The one escalation must be a configure this Agent's harness can
+        // apply; refuse it now rather than at the round that needs it.
+        if let Some(escalation) = &definition.escalation {
+            admission::resolve_configure(
+                &escalation.configure_args(),
+                &agent_row.harness,
+                &agent_row.profile_snapshot,
+            )?;
+        }
         let encoded = encode_json(definition)?;
         if encoded.len() > MAX_EVENT_BYTES {
             return Err(Error::new(
@@ -1661,6 +1680,9 @@ impl Store {
         }
         if let Some(continuation) = &commit.continuation {
             validate_ulid(&continuation.id)?;
+            if let Some(id) = &continuation.escalation_id {
+                validate_ulid(id)?;
+            }
             require_nonempty(&continuation.text, "continuation text")?;
             check_input(&continuation.text)?;
         }
@@ -1834,8 +1856,15 @@ impl Store {
                 .saturating_add(turn_count.saturating_sub(counters.turns_at_set)),
         );
         let mut admission: Option<Admission> = None;
+        let mut escalation_admission: Option<Admission> = None;
         let mut learned_cost_source = None;
         let outcome = if let Some(check) = &commit.check {
+            let (same_failure, stage) = row.state.counters.failure_stage(
+                &row.definition,
+                check.output_complete,
+                check.output_digest.as_deref(),
+            );
+            counters.consecutive_same_failure = same_failure;
             counters.rounds += 1;
             counters.last_exit_code = check.exit_code;
             counters.last_check_at = Some(now);
@@ -1911,6 +1940,55 @@ impl Store {
             {
                 GoalCommitOutcome::Blocked { reason }
             } else if let Some(continuation) = &commit.continuation {
+                if continuation.stage != stage {
+                    return Err(Error::new(
+                        "stale_round",
+                        "goal continuation stage no longer matches the round",
+                    ));
+                }
+                let limits = self.hierarchy_limits;
+                match stage {
+                    GoalContinuationStage::Repair => {}
+                    GoalContinuationStage::Diagnose => {
+                        counters.diagnosis_round = Some(counters.rounds)
+                    }
+                    GoalContinuationStage::Escalate => {
+                        let escalation = row.definition.escalation.as_ref().ok_or_else(|| {
+                            Error::new("stale_round", "goal escalation is no longer defined")
+                        })?;
+                        let id = continuation.escalation_id.clone().ok_or_else(|| {
+                            Error::new("invalid", "goal escalation needs a configure command id")
+                        })?;
+                        if command_binding(&tx, &id)?.is_some() || write_exists(&tx, &id)? {
+                            return Err(Error::new(
+                                "id_conflict",
+                                "goal escalation id is already used",
+                            ));
+                        }
+                        let configure = SubmitCommand {
+                            id,
+                            target: Some(commit.agent.clone()),
+                            selector: None,
+                            verb: "configure".to_owned(),
+                            args: escalation.configure_args(),
+                            expected_generation: Some(row.generation),
+                            expected_turn_id: None,
+                            request_id: None,
+                            probe: false,
+                        };
+                        escalation_admission = Some(admission::submit_tx(
+                            &tx,
+                            &commit.principal,
+                            configure,
+                            None,
+                            now,
+                            false,
+                            limits,
+                            None,
+                        )?);
+                        counters.escalation_round = Some(counters.rounds);
+                    }
+                }
                 let request = SubmitCommand {
                     id: continuation.id.clone(),
                     target: Some(commit.agent.clone()),
@@ -1922,7 +2000,6 @@ impl Store {
                     request_id: None,
                     probe: false,
                 };
-                let limits = self.hierarchy_limits;
                 if command_binding(&tx, &request.id)?.is_some() || write_exists(&tx, &request.id)? {
                     return Err(Error::new(
                         "id_conflict",
@@ -2082,6 +2159,7 @@ impl Store {
             view,
             admission,
             response,
+            escalation: escalation_admission,
             events,
         })
     }

@@ -129,6 +129,7 @@ impl AssignmentGoal {
             scope: Vec::new(),
             check_inputs: Vec::new(),
             max_cost: None,
+            escalation: None,
         }
     }
 
@@ -175,6 +176,74 @@ pub struct GoalDefinition {
     /// that native unit (never converted). Checked after each failed check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_cost: Option<GoalCostLimit>,
+    /// One Owner-authorized model or effort change, applied once when the
+    /// same failure repeats after the diagnosis step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalation: Option<GoalEscalation>,
+}
+
+/// A Goal's one escalation: a `configure` of model and/or effort with the
+/// Owner's stated reason. Never a ladder and never wider rights.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GoalEscalation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    pub reason: String,
+}
+
+impl GoalEscalation {
+    fn validate(&self) -> Result<()> {
+        if self.model.is_none() && self.effort.is_none() {
+            return Err(Error::new(
+                "invalid",
+                "goal escalation needs a model or an effort",
+            ));
+        }
+        for value in [&self.model, &self.effort].into_iter().flatten() {
+            if value.trim().is_empty() || value.len() > 128 || value.chars().any(char::is_control) {
+                return Err(Error::new(
+                    "invalid",
+                    "goal escalation model and effort must be short names",
+                ));
+            }
+        }
+        if self.reason.trim().is_empty()
+            || self.reason.len() > 256
+            || self.reason.chars().any(char::is_control)
+        {
+            return Err(Error::new(
+                "invalid",
+                "goal escalation needs a one-line reason of at most 256 bytes",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The `configure` args this escalation submits.
+    pub fn configure_args(&self) -> serde_json::Value {
+        let mut args = serde_json::Map::new();
+        if let Some(model) = &self.model {
+            args.insert("model".to_owned(), model.clone().into());
+        }
+        if let Some(effort) = &self.effort {
+            args.insert("effort".to_owned(), effort.clone().into());
+        }
+        serde_json::Value::Object(args)
+    }
+}
+
+/// What a failed round's continuation asks of the Agent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GoalContinuationStage {
+    /// Fix what the check reports.
+    Repair,
+    /// Two approaches failed the same way: diagnose before changing more.
+    Diagnose,
+    /// The same failure followed the diagnosis: the one escalation applies.
+    Escalate,
 }
 
 /// A Goal's money budget: millionths of one verbatim native cost unit, such
@@ -276,6 +345,9 @@ impl GoalDefinition {
         if let Some(limit) = &self.max_cost {
             limit.validate()?;
         }
+        if let Some(escalation) = &self.escalation {
+            escalation.validate()?;
+        }
         for (name, globs) in [("scope", &self.scope), ("check_inputs", &self.check_inputs)] {
             if globs.len() > MAX_GOAL_SCOPE_GLOBS {
                 return Err(Error::new(
@@ -348,15 +420,58 @@ pub struct GoalCounters {
     /// Why the spent cost could not be verified at the last round.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_unverified: Option<String>,
+    /// Consecutive failed rounds whose fully captured check output repeated
+    /// the previous one, whatever the workspace did.
+    #[serde(default)]
+    pub consecutive_same_failure: i64,
+    /// Round whose continuation was the diagnosis step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnosis_round: Option<i64>,
+    /// Round whose continuation followed the one escalation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalation_round: Option<i64>,
 }
 
 impl GoalCounters {
+    /// The same-failure streak after a failed check with this output, and
+    /// the continuation it calls for: the second identical failure in a row
+    /// (two failed approaches) asks for one diagnosis, and an identical
+    /// failure after that applies the Goal's one escalation, if any.
+    pub fn failure_stage(
+        &self,
+        definition: &GoalDefinition,
+        output_complete: bool,
+        output_digest: Option<&str>,
+    ) -> (i64, GoalContinuationStage) {
+        let same = output_complete
+            && output_digest.is_some()
+            && self.last_output_digest.as_deref() == output_digest;
+        let streak = if same {
+            self.consecutive_same_failure.saturating_add(1)
+        } else {
+            0
+        };
+        let stage = if streak >= 2
+            && self.diagnosis_round.is_some()
+            && self.escalation_round.is_none()
+            && definition.escalation.is_some()
+        {
+            GoalContinuationStage::Escalate
+        } else if streak >= 1 && self.diagnosis_round.is_none() {
+            GoalContinuationStage::Diagnose
+        } else {
+            GoalContinuationStage::Repair
+        };
+        (streak, stage)
+    }
+
     pub fn validate(&self) -> Result<()> {
         for (name, value) in [
             ("rounds", self.rounds),
             ("turns_at_set", self.turns_at_set),
             ("turns_used", self.turns_used),
             ("consecutive_same_output", self.consecutive_same_output),
+            ("consecutive_same_failure", self.consecutive_same_failure),
         ] {
             if value < 0 {
                 return Err(Error::new(

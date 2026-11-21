@@ -1404,6 +1404,16 @@ pub(crate) struct GoalSetArgs {
     /// usd_estimate).
     #[arg(long, value_name = "UNIT", requires = "max_cost")]
     pub(crate) cost_unit: Option<String>,
+    /// Model for the Goal's one escalation, applied when the same failure
+    /// repeats after the diagnosis step; needs --escalate-reason.
+    #[arg(long, value_name = "MODEL", requires = "escalate_reason")]
+    pub(crate) escalate_model: Option<String>,
+    /// Effort for the Goal's one escalation; needs --escalate-reason.
+    #[arg(long, value_name = "EFFORT", requires = "escalate_reason")]
+    pub(crate) escalate_effort: Option<String>,
+    /// The Owner's reason for the escalation, shown to the Agent.
+    #[arg(long, value_name = "TEXT")]
+    pub(crate) escalate_reason: Option<String>,
 }
 
 #[derive(Args)]
