@@ -166,6 +166,12 @@ pub struct GoalRoundCommit {
     pub blocked_reason: Option<String>,
     /// Bounded observation of a block decided without a check.
     pub observation: Option<String>,
+    /// Workspace fingerprint read just before the check, compared with the
+    /// previous round's baseline; absent when that read failed.
+    pub fingerprint_before: Option<String>,
+    /// Workspace fingerprint read right after a failed check: the next
+    /// round's baseline, so the check's own writes are never progress.
+    pub fingerprint_after: Option<String>,
     pub continuation: Option<GoalContinuation>,
 }
 
@@ -1815,7 +1821,12 @@ impl Store {
                 && let Some(digest) = &check.output_digest
             {
                 let same_output = counters.last_output_digest.as_deref() == Some(digest.as_str());
-                match goal_fingerprint_tx(&tx, agent_num, row.generation)? {
+                match goal_fingerprint_tx(
+                    &tx,
+                    agent_num,
+                    row.generation,
+                    commit.fingerprint_before.as_deref(),
+                )? {
                     GoalFingerprint::None => {
                         // No Git observation exists for this generation;
                         // check output alone decides the streak.
@@ -1828,7 +1839,7 @@ impl Store {
                     GoalFingerprint::Incomplete => {
                         // An incomplete fingerprint never proves no progress.
                         counters.consecutive_same_output = 0;
-                        counters.last_fingerprint = None;
+                        counters.last_fingerprint = commit.fingerprint_after.clone();
                     }
                     GoalFingerprint::Complete(fingerprint) => {
                         let same_fingerprint =
@@ -1838,7 +1849,7 @@ impl Store {
                         } else {
                             counters.consecutive_same_output = 0;
                         }
-                        counters.last_fingerprint = Some(fingerprint);
+                        counters.last_fingerprint = commit.fingerprint_after.clone();
                     }
                 }
                 counters.last_output_digest = Some(digest.clone());
@@ -2438,17 +2449,18 @@ fn subject_is_idle(subject: Option<&str>) -> bool {
     })
 }
 
-/// Read-only workspace fingerprint over committed Git observation: the
-/// latest complete `git.changed` HEAD plus dirty set, and the attributed
-/// edit paths. Pure read; it never touches the workspace.
+/// No-progress fingerprint of the round's workspace. The Store decides only
+/// whether Git applies (a Git binding of this generation); the fingerprint
+/// itself is the Router's fresh read, so a shell edit of an already dirty
+/// file changes it and a stale or partial observation never stands in.
 enum GoalFingerprint {
-    /// No Git observation exists for this generation: the streak falls
-    /// back to check output alone.
+    /// No Git binding exists for this generation: the streak falls back to
+    /// check output alone.
     None,
-    /// A Git binding exists but its observation is missing, partial,
-    /// gapped, truncated or unhealthy. Never proves no progress.
+    /// The fresh read failed or exceeded its bounds. Never proves no progress.
     Incomplete,
-    /// Canonical digest of HEAD, dirty set and attributed edit paths.
+    /// Digest of HEAD and the content `dirty_digest`, read before the check.
+    /// It is compared with the read after the previous failed check.
     Complete(String),
 }
 
@@ -2456,6 +2468,7 @@ fn goal_fingerprint_tx(
     tx: &Transaction<'_>,
     agent_num: i64,
     generation: i64,
+    fresh: Option<&str>,
 ) -> Result<GoalFingerprint> {
     let owners: i64 = tx
         .query_row(
@@ -2468,65 +2481,10 @@ fn goal_fingerprint_tx(
     if owners == 0 {
         return Ok(GoalFingerprint::None);
     }
-    if owners != 2 {
-        return Ok(GoalFingerprint::Incomplete);
-    }
-    let healthy: bool = tx
-        .query_row(
-            "SELECT state = 'open' AND health = 'ok' FROM source_state
-             WHERE agent = ?1 AND generation = ?2 AND source = 'git'",
-            params![agent_num, generation],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(sql_error)?
-        .unwrap_or(false);
-    if !healthy {
-        return Ok(GoalFingerprint::Incomplete);
-    }
-    let data: Option<String> = tx
-        .query_row(
-            "SELECT data FROM events WHERE agent = ?1 AND generation = ?2
-             AND source = 'git' AND kind = 'git.changed' ORDER BY seq DESC LIMIT 1",
-            params![agent_num, generation],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(sql_error)?;
-    let Some(data) = data else {
-        return Ok(GoalFingerprint::Incomplete);
-    };
-    let data = decode_json(&data)?;
-    if data.get("complete").and_then(Value::as_bool) != Some(true)
-        || data.get("history_gap").and_then(Value::as_bool) == Some(true)
-    {
-        return Ok(GoalFingerprint::Incomplete);
-    }
-    let mut statement = tx
-        .prepare(
-            "SELECT path FROM agent_edits WHERE agent = ?1 AND generation = ?2
-             ORDER BY path LIMIT ?3",
-        )
-        .map_err(sql_error)?;
-    let paths = statement
-        .query_map(
-            params![agent_num, generation, MAX_PAGE_ENTRIES as i64 + 1],
-            |row| row.get::<_, String>(0),
-        )
-        .map_err(sql_error)?
-        .collect::<rusqlite::Result<Vec<String>>>()
-        .map_err(sql_error)?;
-    if paths.len() > MAX_PAGE_ENTRIES {
-        return Ok(GoalFingerprint::Incomplete);
-    }
-    let digest = canonical::digest(&json!({
-        "head": data.get("head").unwrap_or(&Value::Null),
-        "dirty": data.get("dirty").unwrap_or(&Value::Null),
-        "edits": paths,
-    }))?;
-    Ok(GoalFingerprint::Complete(
-        digest.iter().map(|byte| format!("{byte:02x}")).collect(),
-    ))
+    Ok(match fresh {
+        Some(fingerprint) => GoalFingerprint::Complete(fingerprint.to_owned()),
+        None => GoalFingerprint::Incomplete,
+    })
 }
 
 fn load_goal_row(connection: &Connection, agent_num: i64, mode: &str) -> Result<Option<GoalRow>> {

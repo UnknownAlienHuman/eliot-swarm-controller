@@ -15,6 +15,7 @@ use super::{
 };
 use crate::{
     common::now_ms,
+    git_monitor::GitProbe,
     scripts::process::{ProcessCapture, ProcessFailure, ProcessOutcome, run_owned_process},
 };
 use eliot_core::{
@@ -483,6 +484,10 @@ impl Router {
                 return claimed.complete(result);
             }
         }
+        // The no-progress fingerprint is read now, while the Agent is idle
+        // and before the check can write anything; it is compared with the
+        // read taken right after the previous failed check.
+        let fingerprint_before = work_fingerprint(probe.workspace.as_deref()).await;
         let policy = self.secret_policy_snapshot();
         let mut command = TokioCommand::new(&definition.check[0]);
         command.args(&definition.check[1..]);
@@ -531,6 +536,8 @@ impl Router {
             }
         };
         if check.exit_code != Some(0) {
+            // The next round's baseline includes whatever this check wrote.
+            let fingerprint_after = work_fingerprint(probe.workspace.as_deref()).await;
             let text = goal_continuation_text(&definition, &check, &policy);
             let commit = GoalRoundCommit {
                 id: request.id.clone(),
@@ -544,6 +551,8 @@ impl Router {
                 check: Some(check),
                 blocked_reason: None,
                 observation: None,
+                fingerprint_before,
+                fingerprint_after,
                 continuation: Some(GoalContinuation {
                     id: continuation_id,
                     text,
@@ -612,6 +621,8 @@ impl Router {
             check: Some(check),
             blocked_reason,
             observation: None,
+            fingerprint_before,
+            fingerprint_after: None,
             continuation: None,
         };
         let result = self.commit_goal_round(&principal, &request, commit).await;
@@ -641,6 +652,8 @@ impl Router {
             check: None,
             blocked_reason: Some(reason.to_owned()),
             observation,
+            fingerprint_before: None,
+            fingerprint_after: None,
             continuation: None,
         };
         self.commit_goal_round(principal, request, commit).await
@@ -1583,6 +1596,13 @@ fn custody_proven_for_capture(_: &ProcessCapture) -> bool {
 #[cfg(unix)]
 fn custody_proven_for_capture(capture: &ProcessCapture) -> bool {
     !matches!(capture.custody, crate::platform::CustodyGuarantee::Unknown)
+}
+
+/// The Goal workspace's no-progress fingerprint read now; absent when the
+/// Agent has no workspace or the read failed.
+async fn work_fingerprint(workspace: Option<&str>) -> Option<String> {
+    let git = GitProbe::new().ok()?;
+    git.work_fingerprint(workspace?).await.ok()
 }
 
 fn goal_continuation_text(

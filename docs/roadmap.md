@@ -60,9 +60,10 @@ engine, second scheduler or critic loop.
 - [x] **A4 Assignment owns completion.** A brief-queue assignment declares one
       turn or Goal-owned work before dispatch; Goal-owned work retires on the
       Goal's terminal state, not on the first `turn.completed`.
-- [ ] **A5 Honest no-progress.** The Goal fingerprint reuses the Git monitor's
-      content `dirty_digest` with workspace, freshness and completeness checks;
-      an unproven observation never extends the no-progress streak.
+- [x] **A5 Honest no-progress.** The Goal fingerprint is a fresh read of the
+      round's workspace before the check: HEAD plus the Git monitor's content
+      `dirty_digest`; a failed or capped read never extends the no-progress
+      streak.
 - [x] **A6 Short handoff state.** The handoff brief adds Store facts, the
       current instruction and limits, and the executor's last decisions and
       next step, keeping machine facts and model claims distinct.

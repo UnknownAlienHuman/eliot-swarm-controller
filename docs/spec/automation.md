@@ -1310,14 +1310,20 @@ the generation, and the same revision never rerounds a consumed key —
 repeated set/retry, reads and daemon restart cannot create another
 round.
 
-No-progress compares check output digests and the read-only workspace
-fingerprint together. The fingerprint digests the committed Git observation —
-the latest `git.changed` HEAD plus dirty set and the attributed edit paths —
-without touching the workspace. It is complete only with a Git binding, a
-complete gap-free latest snapshot, an open healthy Git source and an
-untruncated edit page; without any Git observation the streak falls back to
-check output alone. An incomplete fingerprint never proves no progress: it
-resets the streak instead of extending it.
+No-progress compares check output digests and the workspace fingerprint
+together. The fingerprint is HEAD plus the Git monitor's content `dirty_digest`
+over the dirty set (path, status and file content of files Git does not ignore,
+within the monitor's caps), read from the round's workspace while the Agent is
+idle. Just before each check the daemon reads it and compares it with the read
+taken right after the previous failed check, so a shell edit of an already dirty
+file counts as progress even when no edit is attributed, and files the check
+itself writes never do. A failed read, a read past the caps or a workspace that
+is not an exact Git root is incomplete; past the caps every round is incomplete
+and only the round and turn budgets stop the Goal. Without a Git binding for the
+Agent's generation the streak falls back to check output alone. An incomplete
+fingerprint never proves no progress: it resets the streak instead of extending
+it. A change by any process to a file Git does not ignore counts; the streak
+exists to stop blind repeats, not to attribute work.
 
 Checks are arbitrary explicit commands, not magically read-only. Check outcomes
 use the same frozen inputs/custody/no-blind-retry rules. Incomplete
