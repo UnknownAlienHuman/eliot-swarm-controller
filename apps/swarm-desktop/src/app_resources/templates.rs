@@ -2,13 +2,15 @@
 //! Material button styles and Material Components' state layers as the
 //! pattern: the container takes the button's own background, border and
 //! corner; a state layer in the content color fades in on hover (8 %) and
-//! press (12 %); a ripple in the content color grows from the centre on
-//! press and fades on release; things that lift cast the theme's shadow
-//! (or ring) and glow, deeper under the pointer; every change runs on the
-//! design's emphasized easing, 150 ms for states.
+//! press (12 %); a ripple in the content color grows on press from its
+//! `RenderTransformOrigin`, which `crate::motion` moves to the press point
+//! (the centre when that is unknown), and fades on release; things that
+//! lift cast the theme's shadow (or ring) and glow, deeper under the
+//! pointer; every change runs on the design's emphasized easing, 150 ms
+//! for states.
 //!
 //! WinUI's `ThemeShadow` draws nothing outside a popup unless code adds
-//! receivers (observed live), so shadows are drawn layers
+//! receivers (observed live), so shadows are drawn as Gaussian bands
 //! ([`crate::theme::elevation`]) whose brushes are theme resources
 //! (`LIFT_KEY`, `LIFT_AMBIENT`, `LIFT_RING`, `GLOW`): the scheme
 //! dictionary rewrites them per theme. The colors stay the
@@ -18,15 +20,15 @@
 //! (`theme::winui::Palette`) color it. Values are fixed numbers and
 //! identifiers, so nothing here needs escaping.
 
-use crate::theme::elevation::{self, Level};
+use crate::theme::elevation::{self, Band, Level};
 use crate::theme::state;
 use crate::ui::tokens::motion::{DECELERATE, EMPHASIZED, PRESS_MS, RIPPLE_MS, STATE_MS};
-use crate::ui::tokens::{layout, spacing};
+use crate::ui::tokens::{icon, layout, radius, spacing};
 
-/// The theme brushes of a lift: the key and ambient shadow layers (each
-/// already at its layer's share of the theme's opacity), the hairline ring
-/// of the true-black themes and the night themes' glow. Transparent where
-/// a theme has none.
+/// The theme brushes of a lift: the key and ambient shadows at the theme's
+/// opacity (each band takes its share as its own opacity), the hairline
+/// ring of the true-black themes and the night themes' glow. Transparent
+/// where a theme has none.
 pub(super) const LIFT_KEY: &str = "EliotLiftKey";
 pub(super) const LIFT_AMBIENT: &str = "EliotLiftAmbient";
 pub(super) const LIFT_RING: &str = "EliotLiftRing";
@@ -100,30 +102,37 @@ fn scale(to: f64, ms: u64, spline: &str) -> String {
     animate("Press", "ScaleX", to, ms, spline) + &animate("Press", "ScaleY", to, ms, spline)
 }
 
-/// A pill grown by `spread` and fallen by `offset`, in `brush`.
-fn layer_border(radius: f64, spread: f64, offset: f64, brush: &str) -> String {
+/// One band of a drawn shadow ([`elevation::bands`]) around a corner of
+/// `radius`, in `brush` at the band's share: the filled core, or a ring.
+fn band_border(radius: f64, band: Band, brush: &str) -> String {
+    let paint = match band.width {
+        None => format!("Background=\"{{ThemeResource {brush}}}\""),
+        Some(width) => {
+            format!("BorderThickness=\"{width}\" BorderBrush=\"{{ThemeResource {brush}}}\"")
+        }
+    };
     format!(
         "<Border CornerRadius=\"{corner}\" Margin=\"{left},{top},{left},{bottom}\" \
-           Background=\"{{ThemeResource {brush}}}\"/>",
-        corner = radius + spread,
-        left = -spread,
-        top = offset - spread,
-        bottom = -offset - spread,
+           Opacity=\"{share:.4}\" {paint}/>",
+        corner = (radius + band.reach).max(0.0),
+        left = -band.reach,
+        top = band.offset - band.reach,
+        bottom = -band.offset - band.reach,
+        share = band.share,
     )
 }
 
 /// One elevation level as a named group under the container: the theme's
-/// shadow layers and its ring.
+/// ambient and key shadows and its ring.
 fn shadow(name: &str, level: Level, radius: f64, opacity: f64) -> String {
     let mut out =
         format!("<Grid x:Name=\"{name}\" Opacity=\"{opacity}\" IsHitTestVisible=\"False\">");
-    for (spread, offset, is_key) in elevation::geometry(level) {
-        out += &layer_border(
-            radius,
-            spread,
-            offset,
-            if is_key { LIFT_KEY } else { LIFT_AMBIENT },
-        );
+    let [key, ambient] = elevation::level_bands(level);
+    for band in ambient {
+        out += &band_border(radius, *band, LIFT_AMBIENT);
+    }
+    for band in key {
+        out += &band_border(radius, *band, LIFT_KEY);
     }
     out += &format!(
         "<Border CornerRadius=\"{corner}\" Margin=\"-{stroke}\" BorderThickness=\"{stroke}\" \
@@ -134,11 +143,11 @@ fn shadow(name: &str, level: Level, radius: f64, opacity: f64) -> String {
     out + "</Grid>"
 }
 
-/// The FAB's glow: three layers reaching 12 DIPs, a blur's steps.
+/// The FAB's glow: a centred 12-DIP blur (the Neon board's).
 fn glow(radius: f64) -> String {
     let mut out = "<Grid IsHitTestVisible=\"False\">".to_owned();
-    for spread in [spacing::XS, spacing::SM, spacing::INSET] {
-        out += &layer_border(radius, spread, 0.0, GLOW);
+    for band in elevation::bands(elevation::glow(spacing::INSET)) {
+        out += &band_border(radius, band, GLOW);
     }
     out + "</Grid>"
 }
@@ -251,4 +260,17 @@ pub(super) fn button(look: Look) -> String {
         over = release(state::HOVER, true),
         ripple_inset = layout::RIPPLE_INSET,
     )
+}
+
+/// WinUI's ComboBox template (`combo_box.xaml`, MIT) at the design's
+/// dropdown chevron (14 DIPs; WinUI's is 12) with the focus highlight
+/// following the pill: the highlight sits 4 DIPs outside the field.
+pub(super) fn combo_box() -> String {
+    const HIGHLIGHT_OUTSET: f64 = 4.0;
+    include_str!("combo_box.xaml")
+        .replace("@CHEVRON@", &icon::CHEVRON.to_string())
+        .replace(
+            "@HIGHLIGHT_RADIUS@",
+            &(radius::PILL + HIGHLIGHT_OUTSET).to_string(),
+        )
 }

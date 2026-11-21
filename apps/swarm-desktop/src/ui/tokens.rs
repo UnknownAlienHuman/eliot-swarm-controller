@@ -143,9 +143,10 @@ pub mod motion {
     pub const PRESS_MS: u64 = 100;
     pub const RIPPLE_MS: u64 = 300;
     pub const POPOVER_MS: u64 = 250;
+    /// How far a popover rises into place while it fades in.
+    pub const POPOVER_RISE: f64 = 4.0;
     pub const PRESS_SCALE: f64 = 0.97;
     pub const FAB_PRESS_SCALE: f64 = 0.94;
-    pub const POPOVER_START_SCALE: f64 = 0.97;
     pub const EMPHASIZED: &str = "0.2,0 0,1";
     pub const DECELERATE: &str = "0.05,0.7 0.1,1";
 }
@@ -213,9 +214,6 @@ pub mod layout {
     /// A nested row's indent (a task under its project, a worker under its
     /// manager): its label starts under its parent's label.
     pub const TREE_INDENT: f64 = 28.0;
-    /// What runs an Agent (`Codex · qwen4-max`) at most in a Monitor row or
-    /// the conversation header; a longer label trims.
-    pub const RUNS_LABEL_WIDTH: f64 = 200.0;
     pub const HEADER_TITLE_MIN_WIDTH: f64 = 96.0;
     pub const HEADER_STATUS_MIN_WIDTH: f64 = 64.0;
     /// The widest trailing word of a Monitor row (model, need or age).

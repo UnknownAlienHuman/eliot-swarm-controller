@@ -23,11 +23,17 @@ pub(super) fn surface(
     footer: View,
     width: f64,
 ) -> View {
+    // The card is painted here, in the window's scheme: a ContentDialog
+    // resolves its own background from the Windows theme (and keeps it
+    // across a scheme change), which left a Light card under Dark text.
+    // The ContentDialog style makes its own background transparent.
     ContentDialog::new()
         .is_open(true)
         .on_closed(context.callback(move |_| Message::DialogClosed(epoch)))
         .content(
             Border::new()
+                .background(palette.container())
+                .corner_radius(tokens::radius::DIALOG)
                 .padding(Thickness::uniform(tokens::spacing::LG))
                 .max_width(width)
                 .automation_name(title.clone())

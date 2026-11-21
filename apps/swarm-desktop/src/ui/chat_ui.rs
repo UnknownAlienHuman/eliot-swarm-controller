@@ -1053,10 +1053,14 @@ impl DesktopApp {
                     )),
             ));
         }
-        // The design's cards keep their width (a third of the home column);
-        // with no last task to continue, the two left stay centred.
+        // The design's cards keep their width (a third of the home column,
+        // narrower with a narrow window); with no last task to continue,
+        // the two left stay centred.
         let gap = tokens::spacing::INSET;
-        let card = (tokens::layout::HOME_WIDTH - 2.0 * gap) / 3.0;
+        let column = self
+            .column_width(tokens::layout::HOME_WIDTH)
+            .unwrap_or(tokens::layout::HOME_WIDTH);
+        let card = (column - 2.0 * gap) / 3.0;
         let count = cards.len();
         StackPanel::new()
             .grid_row(1)

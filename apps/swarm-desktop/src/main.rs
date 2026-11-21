@@ -25,6 +25,8 @@ mod m3;
 #[cfg(windows)]
 mod monitor_view;
 #[cfg(windows)]
+mod motion;
+#[cfg(windows)]
 mod reparent;
 #[cfg(windows)]
 mod scroll_end;
@@ -36,6 +38,8 @@ mod ui;
 mod views;
 #[cfg(windows)]
 mod window_place;
+#[cfg(windows)]
+mod winrt;
 
 #[cfg_attr(not(windows), allow(dead_code))]
 mod attachments;

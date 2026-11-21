@@ -36,9 +36,9 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetActiveWindow, GetKeyState, VK_BROWSER_BACK, VK_BROWSER_FORWARD, VK_CONTROL, VK_DOWN,
-    VK_ESCAPE, VK_F, VK_K, VK_LEFT, VK_M, VK_N, VK_OEM_COMMA, VK_RETURN, VK_RIGHT, VK_SHIFT,
-    VK_TAB, VK_UP,
+    GetActiveWindow, GetKeyState, VK_APPS, VK_BROWSER_BACK, VK_BROWSER_FORWARD, VK_CONTROL,
+    VK_DOWN, VK_ESCAPE, VK_F, VK_F10, VK_K, VK_LEFT, VK_M, VK_N, VK_OEM_COMMA, VK_RETURN, VK_RIGHT,
+    VK_SHIFT, VK_TAB, VK_UP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, GetCursorPos, GetForegroundWindow, GetWindowThreadProcessId, HC_ACTION, MSG,
@@ -85,6 +85,12 @@ pub enum Shortcut {
     /// A pointer press on the composer's message field while a popover is
     /// open; the press itself goes on to the field.
     ComposerPressed,
+    /// Keyboard focus moved (`crate::motion::resolve_focused_row` says
+    /// whether a sidebar row holds it).
+    FocusMoved,
+    /// Shift+F10 or the context-menu key on the focused sidebar row
+    /// (`crate::motion::focused_row_anchor` says where).
+    RowMenu,
 }
 
 /// Which popover is open: none, the model picker (all popover keys), a
@@ -118,6 +124,9 @@ static POPOVER: AtomicU8 = AtomicU8::new(Popover::None as u8);
 /// since the last `PointerExited`). Cleared whenever a popover opens or
 /// closes, so a field rebuilt under a still pointer never reads as hovered.
 static COMPOSER_OVER: AtomicU8 = AtomicU8::new(0);
+/// A sidebar row holds keyboard focus (Shift+F10 and the context-menu key
+/// open its menu; elsewhere they go on to the focused control).
+static ROW_FOCUSED: AtomicU8 = AtomicU8::new(0);
 static LAST_INPUT: AtomicU8 = AtomicU8::new(0);
 static LAST_INPUT_MS: AtomicU64 = AtomicU64::new(0);
 /// Counts inputs that end a keyboard walk through suggestions: any key
@@ -312,6 +321,26 @@ fn popover_key(popover: u8, key: u16, ctrl: bool, shift: bool, alt: bool) -> Opt
     }
 }
 
+/// Keyboard focus moved (`crate::motion`).
+pub fn focus_moved() {
+    send(Shortcut::FocusMoved);
+}
+
+/// Whether a sidebar row holds keyboard focus now (`crate::motion`).
+pub fn set_row_focused(inside: bool) {
+    ROW_FOCUSED.store(u8::from(inside), Ordering::SeqCst);
+}
+
+/// Shift+F10 or the context-menu key while a sidebar row holds focus and
+/// no popover is open.
+fn row_menu_key(key: u16, ctrl: bool, shift: bool, alt: bool) -> bool {
+    ROW_FOCUSED.load(Ordering::SeqCst) != 0
+        && POPOVER.load(Ordering::SeqCst) == Popover::None as u8
+        && !ctrl
+        && !alt
+        && ((key == VK_F10 && shift) || key == VK_APPS)
+}
+
 fn send(found: Shortcut) {
     if let Some(chords) = CHORDS.get()
         && let Ok(sender) = chords.lock()
@@ -333,6 +362,14 @@ unsafe extern "system" fn keyboard(code: i32, wparam: WPARAM, lparam: LPARAM) ->
         let first = pressed && flags & (1 << 30) == 0;
         let key = wparam as u16;
         let (ctrl, shift) = (held(VK_CONTROL), held(VK_SHIFT));
+        if row_menu_key(key, ctrl, shift, alt) {
+            if first {
+                send(Shortcut::RowMenu);
+            }
+            // Taken, press and release: F10 would otherwise enter the
+            // window's menu mode on its release.
+            return 1;
+        }
         let popover = POPOVER.load(Ordering::SeqCst);
         let taken = popover_key(popover, key, ctrl, shift, alt)
             .map(Shortcut::Popover)

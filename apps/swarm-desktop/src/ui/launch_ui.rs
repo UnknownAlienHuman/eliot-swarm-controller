@@ -561,7 +561,10 @@ impl DesktopApp {
                 }
             }
             LaunchMsg::WorktreeToggled => self.launch.worktree = !self.launch.worktree,
-            LaunchMsg::Entered => self.launch.entering = false,
+            LaunchMsg::Entered => {
+                self.launch.entering = false;
+                crate::motion::popover_entered();
+            }
             LaunchMsg::ComposerPointer { over, pressed } => {
                 crate::shortcuts::set_composer_over(over);
                 if over && pressed {

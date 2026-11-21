@@ -692,9 +692,10 @@ of the explicitly selected release scope.
       Components' state layers as the pattern): a state layer in the
       content color on hover (8 %) and press (12 %), a ripple from the press
       point, a slight press scale on M3's emphasized motion (150 ms for states,
-      250 ms for a popover's entrance), the FAB's key and ambient shadows drawn
-      under it (WinUI's ThemeShadow draws nothing outside a popup without
-      receivers), deeper on hover; the composer, popovers and in-window menus
+      250 ms for a popover's entrance, a fade and a 4-DIP rise), the FAB's key
+      and ambient shadows drawn under it as the design's CSS shadows render
+      (each blur a Gaussian falloff; WinUI's ThemeShadow draws nothing outside
+      a popup without receivers), deeper on hover; the composer, popovers and in-window menus
       lifted the same way (elevation 0 to 3). Shapes: everything pressed is a
       pill (buttons, icon buttons, chips, rows, segments, dropdowns; radius half
       the height), cards and tool rows 12, the composer 20, dialogs 28. The
@@ -833,7 +834,9 @@ of the explicitly selected release scope.
       Delete stopped tasks, Remove project) and on tasks and chats (Rename,
       Stop while live, idle included, Archive/Unarchive, Delete after a
       confirmation naming it, with a refused step's typed error, Copy
-      Agent ID, Open folder) are drawn in the window; archiving the open chat
+      Agent ID, Open folder) are drawn in the window and open from a right
+      click, the row's "⋯" (shown under the pointer, with keyboard focus in
+      the row and on the open task), Shift+F10 or the context-menu key; archiving the open chat
       returns to a new task with "Archived · Undo", and the fleet line counts
       live archived Agents; Rename writes `[desktop]
       display_names`, Remove project the `projects` section. A Chats section

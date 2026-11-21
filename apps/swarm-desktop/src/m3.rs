@@ -306,35 +306,60 @@ pub fn lifted(
     place: Grid,
     view: impl Into<View>,
 ) -> View {
+    use crate::theme::elevation::{self, Band};
     let Some(roles) = palette.roles() else {
         return place.keyed_children(vec![KeyedView::new("content", view.into())]);
     };
-    let tint = match roles.lift {
-        crate::theme::Lift::Shadow { .. } => crate::theme::SHADOW_COLOR,
-        crate::theme::Lift::Ring(color) => color,
+    let paint = |band: Band, tint: crate::theme::Rgb8, opacity: f64| {
+        let brush = Brush::Solid(Color::argb(
+            (opacity * band.share * 255.0).round() as u8,
+            tint.r,
+            tint.g,
+            tint.b,
+        ));
+        let border = Border::new()
+            .corner_radius((radius + band.reach).max(0.0))
+            .margin(Thickness::new(
+                -band.reach,
+                band.offset - band.reach,
+                -band.reach,
+                -band.offset - band.reach,
+            ));
+        match band.width {
+            None => border.background(brush),
+            Some(width) => border
+                .border_brush(brush)
+                .border_thickness(Thickness::uniform(width)),
+        }
     };
-    let mut cells: Vec<KeyedView> = crate::theme::elevation::layers(level, roles.lift)
+    let bands: Vec<Border> = match roles.lift {
+        crate::theme::Lift::Shadow { key, ambient } => {
+            let [key_bands, ambient_bands] = elevation::level_bands(level);
+            let shadow = |bands: &'static [Band], opacity| {
+                bands
+                    .iter()
+                    .map(move |band| paint(*band, crate::theme::SHADOW_COLOR, opacity))
+            };
+            shadow(ambient_bands, ambient)
+                .chain(shadow(key_bands, key))
+                .collect()
+        }
+        // A ring theme: one hairline around the element, no blur.
+        crate::theme::Lift::Ring(color) => vec![paint(
+            Band {
+                reach: layout::HAIRLINE,
+                width: None,
+                offset: 0.0,
+                share: 1.0,
+            },
+            color,
+            1.0,
+        )],
+    };
+    let mut cells: Vec<KeyedView> = bands
         .into_iter()
         .enumerate()
-        .map(|(index, layer)| {
-            KeyedView::new(
-                format!("lift:{index}"),
-                Border::new()
-                    .corner_radius(radius + layer.spread)
-                    .margin(Thickness::new(
-                        -layer.spread,
-                        layer.offset - layer.spread,
-                        -layer.spread,
-                        -layer.offset - layer.spread,
-                    ))
-                    .background(Brush::Solid(Color::argb(
-                        layer.alpha,
-                        tint.r,
-                        tint.g,
-                        tint.b,
-                    ))),
-            )
-        })
+        .map(|(index, band)| KeyedView::new(format!("lift:{index}"), band))
         .collect();
     cells.push(KeyedView::new("content", view.into()));
     place.keyed_children(cells)
@@ -891,7 +916,8 @@ pub fn composer_card(palette: Palette, place: Grid, content: impl Into<View>) ->
 }
 
 /// The header's status pill: 24 DIPs, the tone's container, a 6-DIP dot
-/// and a caption trimmed at `label_width`.
+/// and a caption of at most `label_width` that also trims to the room the
+/// pill is given (a grid, as a horizontal stack never trims).
 pub fn status_pill(palette: Palette, tone: StatusTone, label: &str, label_width: f64) -> View {
     let (container, on) = palette.status_chip(tone);
     Border::new()
@@ -899,15 +925,19 @@ pub fn status_pill(palette: Palette, tone: StatusTone, label: &str, label_width:
         .corner_radius(radius::BADGE)
         .background(container)
         .padding(Thickness::xy(spacing::ROW, 0.0))
+        .horizontal_alignment(HorizontalAlignment::Left)
         .vertical_alignment(VerticalAlignment::Center)
         .automation_name(label.to_owned())
         .content(
-            StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(spacing::CHIP_GAP)
+            Grid::new()
+                .columns([GridLength::Auto, GridLength::STAR])
+                .column_spacing(spacing::CHIP_GAP)
                 .children((
-                    status_mark(palette, tone, layout::BADGE_DOT),
+                    Border::new()
+                        .vertical_alignment(VerticalAlignment::Center)
+                        .content(status_mark(palette, tone, layout::BADGE_DOT)),
                     text(label.to_owned(), style::CAPTION)
+                        .grid_column(1)
                         .foreground(on)
                         .vertical_alignment(VerticalAlignment::Center)
                         .max_width(label_width)

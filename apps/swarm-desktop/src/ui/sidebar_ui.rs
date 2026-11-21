@@ -31,6 +31,8 @@ pub(super) struct SidebarInput {
     pub(super) filtered: bool,
     /// The row under the pointer (its actions show).
     pub(super) hovered: Option<String>,
+    /// The row holding keyboard focus (its actions show too).
+    pub(super) focused: Option<String>,
     /// A failed organization or queue read, in words.
     pub(super) errors: Vec<String>,
     /// The line shown without projects.
@@ -537,7 +539,7 @@ fn place_row(place: &PlaceEntry, input: &SidebarInput, context: &mut ViewContext
             toggle.clone()
         }));
     let hover_key = format!("project:{}", section.key);
-    let over = input.hovered.as_deref() == Some(hover_key.as_str());
+    let over = shows_actions(input, &hover_key);
     let mut actions: Vec<KeyedView> = Vec::new();
     if over {
         actions.push(KeyedView::new(
@@ -578,7 +580,7 @@ fn place_row(place: &PlaceEntry, input: &SidebarInput, context: &mut ViewContext
                     .content(m3::icon(m3::glyph::DELETE)),
             ));
         }
-    } else if section.key != nav::OTHER_LOCATIONS {
+    } else if over && section.key != nav::OTHER_LOCATIONS {
         actions.push(KeyedView::new(
             "more",
             m3::icon_button(palette)
@@ -703,7 +705,7 @@ fn agent_row(task: &TaskEntry, input: &SidebarInput, context: &mut ViewContext<S
     let quiet = dot.is_none();
     let trailing: View = dot.unwrap_or_else(|| m3::secondary(task.age.clone()).into());
     let hover_key = format!("agent:{}", agent.id);
-    let over = selected || input.hovered.as_deref() == Some(hover_key.as_str());
+    let over = selected || shows_actions(input, &hover_key);
     let mut actions: Vec<KeyedView> = Vec::new();
     if over && row.expandable() {
         actions.push(KeyedView::new(
@@ -728,21 +730,29 @@ fn agent_row(task: &TaskEntry, input: &SidebarInput, context: &mut ViewContext<S
                 })),
         ));
     }
-    actions.push(KeyedView::new(
-        "more",
-        m3::icon_button(palette)
-            .automation_name(format!("Task actions for {title}, Agent {}", agent.id))
-            .on_click(context.message(Message::Menu(MenuMsg::Opened(Target::Agent(agent.clone())))))
-            .content(m3::icon(m3::glyph::MORE))
-            .tooltip("Task actions"),
-    ));
-    let trailing = StackPanel::new()
-        .orientation(Orientation::Horizontal)
-        .children((
-            if over { View::empty() } else { trailing },
-            Border::new()
-                .width(tokens::height::CONTROL * actions.len() as f64 - tokens::spacing::ROW),
+    // The design and Codex: a row's actions show under the pointer, with
+    // keyboard focus in the row and on the open task, in place of its dot
+    // or age; a right click, Shift+F10 or the context-menu key opens the
+    // same menu at any time.
+    if over {
+        actions.push(KeyedView::new(
+            "more",
+            m3::icon_button(palette)
+                .automation_name(format!("Task actions for {title}, Agent {}", agent.id))
+                .on_click(
+                    context.message(Message::Menu(MenuMsg::Opened(Target::Agent(agent.clone())))),
+                )
+                .content(m3::icon(m3::glyph::MORE))
+                .tooltip("Task actions"),
         ));
+    }
+    let trailing: View = if over {
+        Border::new()
+            .width(tokens::height::CONTROL * actions.len() as f64 - tokens::spacing::ROW)
+            .into()
+    } else {
+        trailing
+    };
     let row_button = m3::sub_row(palette, selected);
     let row_button = if line.is_some() {
         row_button
@@ -948,8 +958,16 @@ fn with_menu(row: View, target: Target, context: &mut ViewContext<Sidebar>) -> V
 /// A row's pointer area: entering it shows its actions (hover or
 /// selection), leaving hides them. The row inside keeps its identity, so a
 /// click that follows the hover is never lost.
+/// A row's actions show under the pointer and with keyboard focus inside it.
+fn shows_actions(input: &SidebarInput, key: &str) -> bool {
+    input.hovered.as_deref() == Some(key) || input.focused.as_deref() == Some(key)
+}
+
+/// A row's pointer area; its automation id lets `crate::motion` find the
+/// row that holds keyboard focus.
 fn hover_area(key: String, view: impl Into<View>, context: &mut ViewContext<Sidebar>) -> View {
     Border::new()
+        .automation_id(format!("{}{key}", crate::motion::ROW_ID_PREFIX))
         .on_pointer_entered(context.callback(move |_: PointerEventInfo| {
             Message::Menu(MenuMsg::Hovered(Some(key.clone())))
         }))

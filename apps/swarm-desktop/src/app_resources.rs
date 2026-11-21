@@ -57,7 +57,7 @@ use std::ffi::c_void;
 use std::fmt::Write as _;
 
 use windows_collections::IMap;
-use windows_core::{GUID, HRESULT, HSTRING, IInspectable, IUnknown, Interface, RuntimeName};
+use windows_core::{GUID, HRESULT, HSTRING, IInspectable, Interface, RuntimeName};
 use windows_reference::IReference;
 use windows_sys::Win32::Foundation::{HWND, LPARAM};
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
@@ -68,6 +68,7 @@ use windows_sys::core::BOOL;
 
 use crate::theme::{Rgb8, Roles, SHADOW_COLOR, Theme, state};
 use crate::ui::tokens::{height, layout, motion, radius, spacing, text};
+use crate::winrt::{Getter, InspectableSlots, get, winrt_interface};
 
 /// A theme resource value.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -123,20 +124,22 @@ pub fn entries(s: &Roles) -> Vec<(&'static str, Value)> {
 }
 
 /// The brushes of the templates' drawn lift (`templates::LIFT_KEY` and
-/// friends): each shadow layer at its share of the theme's key and ambient
-/// opacity, the ring of the true-black themes, the night themes' glow.
+/// friends): the theme's key and ambient shadow opacity (each band of
+/// `theme::elevation` takes its share), the ring of the true-black themes,
+/// the night themes' glow.
 fn lift(s: &Roles) -> Vec<(&'static str, Value)> {
     use crate::theme::Lift;
-    use crate::theme::elevation::STEPS;
-    let black = Rgb8::new(0, 0, 0);
-    let share = |opacity: f64| layer(black, opacity / STEPS as f64);
     let (key, ambient, ring) = match s.lift {
-        Lift::Shadow { key, ambient } => (share(key), share(ambient), clear(s)),
+        Lift::Shadow { key, ambient } => (
+            layer(SHADOW_COLOR, key),
+            layer(SHADOW_COLOR, ambient),
+            clear(s),
+        ),
         Lift::Ring(color) => (clear(s), clear(s), opaque(color)),
     };
-    let glow = s.glow.map_or(clear(s), |glow| {
-        layer(glow.color, glow.alpha / STEPS as f64)
-    });
+    let glow = s
+        .glow
+        .map_or(clear(s), |glow| layer(glow.color, glow.alpha));
     vec![
         (templates::LIFT_KEY, key),
         (templates::LIFT_AMBIENT, ambient),
@@ -1009,6 +1012,7 @@ pub fn styles_xaml() -> String {
          <Style TargetType=\"ComboBox\">\
            {control}\
            <Setter Property=\"CornerRadius\" Value=\"{pill}\"/>\
+           <Setter Property=\"Template\"><Setter.Value>{combo_box}</Setter.Value></Setter>\
          </Style>\
          <Style TargetType=\"ComboBoxItem\">\
            {control}\
@@ -1039,6 +1043,7 @@ pub fn styles_xaml() -> String {
          <Style TargetType=\"ContentDialog\">\
            {font}\
            <Setter Property=\"CornerRadius\" Value=\"{dialog}\"/>\
+           <Setter Property=\"Background\" Value=\"Transparent\"/>\
          </Style>\
          <Style TargetType=\"ScrollView\">\
            <Setter Property=\"VerticalAnchorRatio\" Value=\"1\"/>\
@@ -1090,6 +1095,7 @@ pub fn styles_xaml() -> String {
         family = text::FAMILY,
         font_size = text::BODY.size,
         switch_width = layout::SWITCH_WIDTH,
+        combo_box = templates::combo_box(),
     )
 }
 
@@ -1155,28 +1161,6 @@ fn insert_parsed(own: &OwnEntries, xaml: &str) -> windows_core::Result<()> {
     Ok(())
 }
 
-// A WinRT interface pointer with a hand-declared vtable.
-macro_rules! winrt_interface {
-    ($name:ident, $vtable:ident, $iid:literal) => {
-        #[repr(transparent)]
-        #[derive(Clone, PartialEq, Eq, Debug)]
-        struct $name(IUnknown);
-
-        // SAFETY: a transparent wrapper over an owned COM pointer whose
-        // vtable begins with the six IInspectable slots, as declared below;
-        // the IID is the interface's id from Microsoft.UI.Xaml.winmd.
-        unsafe impl Interface for $name {
-            type Vtable = $vtable;
-            const IID: GUID = GUID::from_u128($iid);
-        }
-    };
-}
-
-type Getter = unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT;
-
-/// IUnknown and IInspectable slots 0–5, never called through these structs.
-type InspectableSlots = [usize; 6];
-
 #[repr(C)]
 struct ApplicationStaticsVtbl {
     base: InspectableSlots,
@@ -1198,17 +1182,17 @@ struct XamlReaderStaticsVtbl {
 winrt_interface!(
     IApplicationStatics,
     ApplicationStaticsVtbl,
-    0x4e0d09f5_4358_512c_a987_503b52848e95
+    GUID::from_u128(0x4e0d09f5_4358_512c_a987_503b52848e95)
 );
 winrt_interface!(
     IApplication,
     ApplicationVtbl,
-    0x06a8f4e7_1146_55af_820d_ebd55643b021
+    GUID::from_u128(0x06a8f4e7_1146_55af_820d_ebd55643b021)
 );
 winrt_interface!(
     IXamlReaderStatics,
     XamlReaderStaticsVtbl,
-    0x82a4cd9e_435e_5aeb_8c4f_300cece45cae
+    GUID::from_u128(0x82a4cd9e_435e_5aeb_8c4f_300cece45cae)
 );
 
 struct Application;
@@ -1219,22 +1203,6 @@ impl RuntimeName for Application {
 struct XamlReader;
 impl RuntimeName for XamlReader {
     const NAME: &'static str = "Microsoft.UI.Xaml.Markup.XamlReader";
-}
-
-/// Call a getter slot and take ownership of the returned object.
-///
-/// # Safety
-/// `getter` must be a slot of `this`'s vtable that returns one owned
-/// IInspectable-derived pointer.
-unsafe fn get<T: Interface>(this: &T, getter: Getter) -> windows_core::Result<IInspectable> {
-    let mut out = std::ptr::null_mut();
-    // SAFETY: the caller guarantees `getter` belongs to `this`.
-    unsafe { getter(this.as_raw(), &mut out) }.ok()?;
-    if out.is_null() {
-        return Err(windows_core::Error::empty());
-    }
-    // SAFETY: the getter returned one owned reference.
-    Ok(unsafe { IInspectable::from_raw(out) })
 }
 
 fn current_application() -> windows_core::Result<IApplication> {
@@ -1505,17 +1473,17 @@ struct AppWindowTitleBarVtbl {
 winrt_interface!(
     IAppWindowStatics,
     AppWindowStaticsVtbl,
-    0x3c315c24_d540_5d72_b518_b226b83627cb
+    GUID::from_u128(0x3c315c24_d540_5d72_b518_b226b83627cb)
 );
 winrt_interface!(
     IAppWindow,
     AppWindowVtbl,
-    0xcfa788b3_643b_5c5e_ad4e_321d48a82acd
+    GUID::from_u128(0xcfa788b3_643b_5c5e_ad4e_321d48a82acd)
 );
 winrt_interface!(
     IAppWindowTitleBar,
     AppWindowTitleBarVtbl,
-    0x5574efa2_c91c_5700_a363_539c71a7aaf4
+    GUID::from_u128(0x5574efa2_c91c_5700_a363_539c71a7aaf4)
 );
 
 struct AppWindow;

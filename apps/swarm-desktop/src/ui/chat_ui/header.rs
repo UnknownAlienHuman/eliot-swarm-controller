@@ -161,16 +161,18 @@ impl DesktopApp {
             let task = self
                 .find_agent(agent)
                 .map(|agent| menu_ui::Target::Agent(agent.clone()));
-            let mut items: Vec<MenuItem> = task
+            // The row menu's entries, its destructive one last (after More).
+            let (regular, destructive): (Vec<_>, Vec<_>) = task
                 .as_ref()
-                .map(|target| {
-                    self.menu_entries(target)
-                        .into_iter()
-                        .filter(|(action, _, _, _)| *action != menu_ui::Action::More)
-                        .map(|(_, label, _, _)| MenuItem::item(label.clone(), label))
-                        .collect()
-                })
-                .unwrap_or_default();
+                .map(|target| self.menu_entries(target))
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|(action, _, _, _)| *action != menu_ui::Action::More)
+                .partition(|(_, _, _, destructive)| !destructive);
+            let item = |(_, label, _, _): (menu_ui::Action, String, &str, bool)| {
+                MenuItem::item(label.clone(), label)
+            };
+            let mut items: Vec<MenuItem> = regular.into_iter().map(item).collect();
             let mut more = vec![MenuItem::item("details", MENU_DETAILS)];
             if !self.submitting() {
                 more.push(MenuItem::item("handoff", MENU_HANDOFF));
@@ -189,6 +191,7 @@ impl DesktopApp {
                 );
             }
             items.push(MenuItem::submenu("more", "More", more));
+            items.extend(destructive.into_iter().map(item));
             items
         });
         // The status pill: the state in words, then what runs it, and the
@@ -216,13 +219,9 @@ impl DesktopApp {
             tone,
             pill,
             menu,
-            widths: self.main_width().map_or(
-                (
-                    tokens::layout::READING_WIDTH,
-                    tokens::layout::RUNS_LABEL_WIDTH,
-                ),
-                header_widths,
-            ),
+            title_width: self
+                .main_width()
+                .map_or(tokens::layout::READING_WIDTH, title_width),
             send: context.forward(),
         })
     }
@@ -309,30 +308,25 @@ pub(super) struct HeaderInput {
     /// The "…" entries; `None` while the detail is read (the button is
     /// shown, not active).
     menu: Option<Vec<MenuItem>>,
-    /// The widest the title and the pill's label take ([`header_widths`]).
-    widths: (f64, f64),
+    /// The widest the title takes ([`title_width`]).
+    title_width: f64,
     send: Callback<Message>,
 }
 
-/// The widest the header's title and status-pill label take in a main area
-/// `main` DIPs wide: the reading width and the pill's full label when they
-/// fit; a narrow window trims the title first, then the label, so the two
-/// actions always keep their room.
-fn header_widths(main: f64) -> (f64, f64) {
+/// The widest the header's title takes in a main area `main` DIPs wide:
+/// everything but the actions and the status pill at its shortest (its
+/// dot and the start of its label). The title is what the header is for,
+/// so the pill's label trims first (in the star column the title leaves),
+/// then the title.
+fn title_width(main: f64) -> f64 {
     let chrome = tokens::spacing::LG + tokens::spacing::MD + 2.0 * tokens::spacing::ROW;
     let pill_chrome =
         tokens::layout::BADGE_DOT + tokens::spacing::CHIP_GAP + 2.0 * tokens::spacing::ROW;
     let actions = 2.0 * tokens::height::CONTROL + tokens::spacing::ROW_GAP;
-    let room = main - chrome - pill_chrome - actions;
-    let label = (room - tokens::layout::HEADER_TITLE_MIN_WIDTH).clamp(
-        tokens::layout::HEADER_STATUS_MIN_WIDTH,
-        tokens::layout::RUNS_LABEL_WIDTH,
-    );
-    let title = (room - label).clamp(
+    (main - chrome - pill_chrome - actions - tokens::layout::HEADER_STATUS_MIN_WIDTH).clamp(
         tokens::layout::HEADER_TITLE_MIN_WIDTH,
         tokens::layout::READING_WIDTH,
-    );
-    (title, label)
+    )
 }
 
 /// One line: the title, the status pill, then the details toggle and the
@@ -379,9 +373,12 @@ impl Component for Header {
                 .content(m3::icon(m3::glyph::MORE)),
         };
         // The design's header: a full-width 52-DIP bar on a hairline, the
-        // title at 15/500, the status pill, then Details and More. The
-        // actions take their own column, so a narrow window trims the title
-        // and then the pill's label, never the actions.
+        // title at 15/500, the status pill right after it, then Details and
+        // More. The actions take their own column. In the left-aligned
+        // grid the title keeps its width (up to `title_width`) and the
+        // pill's star column hugs a short label and trims a long one to the
+        // room the title leaves: a narrow window trims the pill's label
+        // first, then the title, never the actions.
         Border::new()
             .grid_row(0)
             .height(tokens::height::HEADER)
@@ -399,12 +396,12 @@ impl Component for Header {
                     .column_spacing(tokens::spacing::ROW)
                     .children((
                         Grid::new()
-                            .columns([GridLength::Auto, GridLength::Auto])
+                            .columns([GridLength::Auto, GridLength::STAR])
                             .column_spacing(tokens::spacing::ROW)
                             .horizontal_alignment(HorizontalAlignment::Left)
                             .children((
                                 m3::section_title(input.title.clone())
-                                    .max_width(input.widths.0)
+                                    .max_width(input.title_width)
                                     .vertical_alignment(VerticalAlignment::Center)
                                     .text_trimming(TextTrimming::CharacterEllipsis)
                                     .is_text_selection_enabled(true),
@@ -415,7 +412,7 @@ impl Component for Header {
                                         palette,
                                         input.tone,
                                         &input.pill,
-                                        input.widths.1,
+                                        tokens::layout::READING_WIDTH,
                                     )),
                             )),
                         // Details and More, 2 DIPs apart at the right end.

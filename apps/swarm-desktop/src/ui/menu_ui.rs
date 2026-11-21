@@ -151,6 +151,8 @@ pub(super) struct MenuState {
     /// captured them, `(project, name)`.
     pub(super) attach: Option<Vec<(String, String)>>,
     pub(super) hovered: Option<String>,
+    /// The sidebar row holding keyboard focus (`crate::motion`).
+    pub(super) focused: Option<String>,
     /// The target being renamed and the text typed so far.
     pub(super) renaming: Option<(Target, String)>,
     /// The tag editor's fields, one per tag (while `renaming` holds
@@ -924,6 +926,13 @@ impl DesktopApp {
                 if agent.live() && !agent.native_child {
                     entries.push((Action::Stop, "Stop".to_owned(), m3::glyph::STOP, false));
                 }
+                entries.push((
+                    Action::More,
+                    "More".to_owned(),
+                    m3::glyph::CHEVRON_RIGHT,
+                    false,
+                ));
+                // The destructive action ends the menu.
                 if !agent.native_child && agent.deletable() {
                     entries.push((
                         Action::Delete,
@@ -932,12 +941,6 @@ impl DesktopApp {
                         true,
                     ));
                 }
-                entries.push((
-                    Action::More,
-                    "More".to_owned(),
-                    m3::glyph::CHEVRON_RIGHT,
-                    false,
-                ));
                 entries
             }
         }
