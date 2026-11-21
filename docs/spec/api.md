@@ -864,6 +864,9 @@ eligible Swarm-created worktrees. It uses the same worktree ownership, clean and
 checks as `cleanup.apply`. Ordinary checkouts, Git branches, external sessions and
 Claude Code, Muse and Antigravity chat history stay in place. The desktop confirms
 the scope and offers Delete only for eligible stopped or failed task trees.
+Preflight can defer a settled managed workspace's process source to worktree
+removal. Open or uncertain processes still block preflight, and the source must
+close before the task records are removed.
 If cleanup is refused or uncertain, Delete keeps the task records. Earlier confirmed
 cleanup in the same request still stands. Uncertain effects are fenced, and an exact
 retry reads the retained outcome. A successful Delete supersedes unapplied cleanup

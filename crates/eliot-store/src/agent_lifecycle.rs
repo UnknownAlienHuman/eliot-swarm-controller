@@ -115,6 +115,7 @@ fn current_agent_tree_tx(
     tx: &Transaction<'_>,
     root: i64,
     archived: Option<bool>,
+    before_cleanup: bool,
 ) -> Result<(Vec<i64>, Vec<Agent>)> {
     if load_agent_by_num(tx, root)?.is_none() {
         return Err(Error::new("not_found", "Agent was not found"));
@@ -246,8 +247,22 @@ fn current_agent_tree_tx(
             Some(true) if row.state != AgentState::Idle => Some(false),
             Some(_) => None,
         };
+        let workspace_cleanup_generation = if before_cleanup {
+            workspace::load_workspace(tx, *num)?
+                .filter(|workspace| {
+                    workspace.target_generation == row.generation
+                        && matches!(
+                            workspace.phase,
+                            core::WorkspacePhase::Ready | core::WorkspacePhase::Failed
+                        )
+                })
+                .map(|workspace| workspace.target_generation)
+        } else {
+            None
+        };
         if let Some(observers) = guard
-            && let Some(blocker) = custody_blocker_tx(tx, *num, observers)?
+            && let Some(blocker) =
+                custody_blocker_tx(tx, *num, observers, workspace_cleanup_generation)?
         {
             return Err(Error::new(
                 "busy",
@@ -318,7 +333,7 @@ impl Store {
             }
             validate_id_age(id, now)?;
             let root = parse_agent_id(agent)?;
-            let (members, current) = current_agent_tree_tx(&tx, root, None)?;
+            let (members, current) = current_agent_tree_tx(&tx, root, None, true)?;
             prepare_delete_tree_tx(&tx, &members)?;
             tx.rollback().map_err(sql_error)?;
             Ok((None, current))
@@ -397,7 +412,7 @@ impl Store {
         }
         validate_id_age(id, now)?;
         let root = parse_agent_id(agent)?;
-        let (members, current) = current_agent_tree_tx(&tx, root, None)?;
+        let (members, current) = current_agent_tree_tx(&tx, root, None, true)?;
         verify_agent_delete_snapshot(expected, &current)?;
         prepare_delete_tree_tx(&tx, &members)?;
         tx.execute_batch("DELETE FROM deleted_agents; DELETE FROM deleted_commands;")
@@ -467,7 +482,7 @@ impl Store {
             }
         }
         let root = parse_agent_id(agent)?;
-        let (members, current) = current_agent_tree_tx(&tx, root, None)?;
+        let (members, current) = current_agent_tree_tx(&tx, root, None, false)?;
         verify_agent_delete_snapshot(expected, &current)?;
         delete_tree_tx(&tx, &members, now)?;
         let result = serde_json::to_value(AgentTreeResponse {
@@ -687,7 +702,7 @@ impl Store {
             };
         }
         validate_id_age(id, now)?;
-        let (members, _) = current_agent_tree_tx(&tx, root, archived)?;
+        let (members, _) = current_agent_tree_tx(&tx, root, archived, false)?;
         if let Some(value) = archived {
             for num in &members {
                 db!(tx.execute(
@@ -734,24 +749,6 @@ impl Store {
     }
 }
 
-/// Unresolved custody of the Agent whose numeric id is the SQL expression
-/// `agent`, across its generations, one blocker in words per row: an
-/// unexited owned process, an `unknown` artifact or an open non-daemon
-/// source. Eliot's os, git and workspace-process observers count only where
-/// the SQL boolean `observers` holds (delete's drain). Archive's guard and
-/// the default `agent.list` filter share it.
-pub(crate) fn custody_blockers_sql(agent: &str, observers: &str) -> String {
-    format!(
-        "SELECT state||' '||role||' process '||pid||' ('||owner||')' FROM processes
-             WHERE state IN ('running','unknown')
-               AND (owner GLOB 'agent:a'||{agent}||'#*' OR owner GLOB 'workspace:a'||{agent}||'#*')
-         UNION ALL SELECT 'unknown artifact '||id FROM artifacts WHERE agent={agent} AND json_extract(body,'$.state')='unknown'
-         UNION ALL SELECT 'open '||source||' source (generation '||generation||')' FROM source_state
-             WHERE agent={agent} AND state='open' AND source!='daemon'
-               AND ({observers} OR source NOT IN ('os','git','workspace_process'))"
-    )
-}
-
 /// The ended states in which a custody-held archived Agent stays visible
 /// under the default archived exclusion. `agent.list` rows and counts and
 /// the organization projection's members and totals all apply this list
@@ -760,7 +757,7 @@ pub(crate) fn custody_blockers_sql(agent: &str, observers: &str) -> String {
 pub(crate) const CUSTODY_VISIBLE_STATES: &str = "'stopped','failed','lost'";
 
 /// Distinct Agent numbers holding unresolved custody for the default
-/// `agent.list` exclusion (the same blockers as [`custody_blockers_sql`]
+/// `agent.list` exclusion (the same blockers as [`custody_blocker_tx`]
 /// with observers disabled): an unexited owned process, an `unknown`
 /// artifact, or an open non-daemon, non-observer source. Each leg seeks its
 /// own table instead of scanning archived history per row, so the archived
@@ -813,11 +810,26 @@ pub(crate) fn default_list_custody_agents(connection: &Connection) -> Result<Vec
     Ok(agents.into_iter().collect())
 }
 
-/// First unresolved custody of an Agent ([`custody_blockers_sql`]).
-fn custody_blocker_tx(tx: &Transaction<'_>, agent: i64, observers: bool) -> Result<Option<String>> {
+/// A settled managed workspace keeps its process source open until removal.
+/// Only delete preflight can defer that exact generation's source. Every
+/// live process remains a blocker, and record deletion requires closure.
+fn custody_blocker_tx(
+    tx: &Transaction<'_>,
+    agent: i64,
+    observers: bool,
+    workspace_cleanup_generation: Option<i64>,
+) -> Result<Option<String>> {
     tx.query_row(
-        &format!("{} LIMIT 1", custody_blockers_sql("?1", "?2")),
-        params![agent, observers],
+        "SELECT state||' '||role||' process '||pid||' ('||owner||')' FROM processes
+             WHERE state IN ('running','unknown')
+               AND (owner GLOB 'agent:a'||?1||'#*' OR owner GLOB 'workspace:a'||?1||'#*')
+         UNION ALL SELECT 'unknown artifact '||id FROM artifacts WHERE agent=?1 AND json_extract(body,'$.state')='unknown'
+         UNION ALL SELECT 'open '||source||' source (generation '||generation||')' FROM source_state
+             WHERE agent=?1 AND state='open' AND source!='daemon'
+               AND (?2 OR source NOT IN ('os','git','workspace_process'))
+               AND NOT (source='workspace_process' AND generation IS ?3)
+         LIMIT 1",
+        params![agent, observers, workspace_cleanup_generation],
         |row| row.get(0),
     )
     .optional()
