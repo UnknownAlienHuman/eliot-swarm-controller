@@ -148,25 +148,9 @@ pub fn parse_snapshot_allow_list(
     }
 }
 
-/// Owner Swarm MCP server identity: a transport shape, not an entry name.
-/// A renamed owner entry (`swarm`, `owner-tools`, ...) is still the owner's
-/// daemon identity when its transport matches this rule; the Agent-scoped
-/// server Eliot generates is the only Swarm server a worker ever gets.
-///
-/// stdio: the command resolves to a Swarm executable -- by file name
-/// `swarm`/`swarm.exe` or by equality with the active controller binary
-/// path -- and the argument vector contains `mcp` without
-/// `--require-agent`. The Agent-scoped server always carries
-/// `--require-agent`, so it never matches; an unreported argument vector
-/// cannot prove that flag and counts as a match (fail closed).
-///
-/// HTTP: the server URL host equals a configured `cloud_mcp` hostname. The
-/// owner's cloud endpoint carries Owner authority through Access, so a
-/// worker must never inherit it under any name.
-///
-/// Owning contract: `docs/spec/configuration.md` worker MCP policy. Every
-/// harness plugin applies this rule in every policy, regardless of the
-/// configured entry name or any allow list.
+/// Best-effort config guard for direct Owner Swarm transports. Shell scripts
+/// and environment expansions are outside the scan. The owning contract is
+/// the worker MCP policy in `docs/spec/configuration.md`.
 pub fn is_owner_swarm_server(
     command: Option<&str>,
     args: Option<&[String]>,
@@ -186,28 +170,59 @@ pub fn is_owner_swarm_stdio(
     args: Option<&[String]>,
     controller_executable: Option<&str>,
 ) -> bool {
-    match command {
-        Some(command) => {
-            is_swarm_executable_command(command, controller_executable) && is_owner_swarm_argv(args)
-        }
-        None => false,
+    let Some(command) = command else {
+        return false;
+    };
+    let (program, mut inline) = command_parts(command, controller_executable);
+    if !is_swarm_executable_token(program, controller_executable) {
+        return false;
     }
+    let mut argv = std::iter::from_fn(|| next_command_word(&mut inline))
+        .chain(args.into_iter().flatten().map(String::as_str));
+    // Recognize the subcommand after Swarm's global options. An option value
+    // named "mcp" is ordinary data.
+    while let Some(word) = argv.next() {
+        match word {
+            "mcp" => return !argv.any(|arg| arg == "--require-agent"),
+            "--data-dir" | "--id" => {
+                argv.next();
+            }
+            "--json" => (),
+            word if word.starts_with("--data-dir=") || word.starts_with("--id=") => (),
+            _ => return false,
+        }
+    }
+    false
 }
 
-/// Whether an HTTP server entry carries the owner Swarm identity: its URL
-/// host equals the configured `cloud_mcp` hostname. Both sides must be
-/// present and the URL must parse; anything else is not a match.
+/// Match the configured cloud host. With no hostname, reject hosts with a
+/// Swarm service label, including the owner endpoint documented in the vision.
 pub fn is_owner_swarm_http(url: Option<&str>, cloud_mcp_hostname: Option<&str>) -> bool {
-    match (url, cloud_mcp_hostname) {
-        (Some(url), Some(hostname)) => url_host_equals(url, hostname),
-        _ => false,
+    let Some(url) = url else {
+        return false;
+    };
+    if let Some(hostname) = cloud_mcp_hostname.filter(|host| !host.trim().is_empty()) {
+        return url_host_equals(url, hostname);
     }
+    url::Url::parse(url.trim()).ok().is_some_and(|parsed| {
+        parsed.host_str().is_some_and(|host| {
+            host.split('.')
+                .any(|label| matches!(label, "swarm" | "eliot-swarm" | "eliot_swarm"))
+        })
+    })
 }
 
 /// Whether `command` names a Swarm executable: file name `swarm` (with or
 /// without `.exe`, any case) or equality with the active controller binary
 /// path (covers a renamed controller binary). Empty commands never match.
 pub fn is_swarm_executable_command(command: &str, controller_executable: Option<&str>) -> bool {
+    is_swarm_executable_token(
+        command_parts(command, controller_executable).0,
+        controller_executable,
+    )
+}
+
+fn is_swarm_executable_token(command: &str, controller_executable: Option<&str>) -> bool {
     if command.trim().is_empty() {
         return false;
     }
@@ -223,18 +238,35 @@ pub fn is_swarm_executable_command(command: &str, controller_executable: Option<
     }
 }
 
-/// Whether a stdio argument vector selects the owner shape: it contains
-/// `mcp` without `--require-agent`. `None` (unreported arguments) cannot
-/// prove the Agent flag and counts as a match; an explicitly empty vector
-/// selects no subcommand and does not match.
-fn is_owner_swarm_argv(args: Option<&[String]>) -> bool {
-    let Some(args) = args else {
-        return true;
-    };
-    if args.is_empty() {
-        return false;
+fn command_parts<'a>(command: &'a str, controller: Option<&str>) -> (&'a str, &'a str) {
+    if controller.is_some_and(|path| {
+        !path.is_empty() && normalize_executable_path(command) == normalize_executable_path(path)
+    }) {
+        return (command, "");
     }
-    args.iter().any(|arg| arg == "mcp") && !args.iter().any(|arg| arg == "--require-agent")
+    let mut tail = command;
+    (next_command_word(&mut tail).unwrap_or_default(), tail)
+}
+
+// Only the direct command string needs tokenization. Native argv is already
+// split, and its values need no interpretation.
+fn next_command_word<'a>(tail: &mut &'a str) -> Option<&'a str> {
+    let text = tail.trim_start();
+    *tail = "";
+    if text.is_empty() {
+        return None;
+    }
+    if let Some(quote) = text.chars().next().filter(|c| matches!(c, '\'' | '"')) {
+        let (word, rest) = text[1..].split_once(quote)?;
+        if rest.starts_with(char::is_whitespace) || rest.is_empty() {
+            *tail = rest;
+            return Some(word);
+        }
+        return None;
+    }
+    let (word, rest) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
+    *tail = rest;
+    Some(word)
 }
 
 /// Whether `url` points at `hostname`: the parsed URL host equals the
@@ -247,9 +279,10 @@ pub fn url_host_equals(url: &str, hostname: &str) -> bool {
     let Ok(parsed) = url::Url::parse(url.trim()) else {
         return false;
     };
-    parsed
-        .host_str()
-        .is_some_and(|host| host.eq_ignore_ascii_case(hostname.trim()))
+    parsed.host_str().is_some_and(|host| {
+        host.trim_end_matches('.')
+            .eq_ignore_ascii_case(hostname.trim().trim_end_matches('.'))
+    })
 }
 
 /// File name of a command path: the text after the last `/` or `\`, with
@@ -291,8 +324,8 @@ fn clean_command_text(command: &str) -> &str {
 
 /// Read the frozen `mcp_cloud_hostname` snapshot field back. Absent, null,
 /// non-string or blank means the daemon has no cloud MCP hostname
-/// configured (or the snapshot predates it): the HTTP arm of the identity
-/// rule stays inert. A present value is trimmed.
+/// configured (or the snapshot predates it). The identity rule then checks
+/// recognizable Swarm host labels. A present value is trimmed.
 pub fn parse_snapshot_cloud_hostname(
     profile: &serde_json::Map<String, serde_json::Value>,
 ) -> Option<String> {

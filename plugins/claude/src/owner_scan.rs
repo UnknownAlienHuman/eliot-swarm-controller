@@ -1,7 +1,9 @@
 //! Owner MCP source scan for the Claude `inherit` policy.
 //!
-//! `inherit` keeps ordinary native MCP precedence. Preflight refuses
-//! recognizable owner Swarm stdio/HTTP servers and sources it cannot scan.
+//! `inherit` keeps ordinary native MCP precedence. Preflight uses the shared
+//! `eliot_core::is_owner_swarm_server` rule as a best-effort guard for direct
+//! Owner transports and refuses sources it cannot scan. Daemon authentication
+//! owns the authority boundary.
 //! The native launch additionally denies the configured owner HTTP hostname
 //! across settings scopes; the daemon-generated Agent server stays stdio.
 //!
@@ -111,10 +113,7 @@ fn same_project_scope(left: &Path, right: &Path) -> bool {
     }
 }
 
-/// Owner-identity entries among the scanned sources: stdio entries
-/// selecting `swarm mcp` without `--require-agent` (by file name or
-/// controller path) and HTTP entries on the configured cloud hostname.
-/// The Agent-scoped shape (`--require-agent`) never matches.
+/// Entries that match the shared best-effort guard for direct Owner transports.
 pub fn find_owner_entries<'a>(
     entries: &'a [OwnerMcpEntry],
     controller_executable: Option<&str>,

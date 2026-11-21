@@ -359,20 +359,21 @@ endpoints stay `unsupported`. See the
 Every profile selects a worker MCP policy in `mcp`: `minimal` (the default
 where the harness maps it) or `inherit` (explicit opt-in, and the default for
 Muse, which has no minimal mapping), plus an optional `mcp_allow` list of native
-server names. Owner Swarm servers are identified by transport, not by name
-(`eliot_core::is_owner_swarm_server`, shared by every harness plugin in
-every policy, regardless of name or allow list): a stdio server whose
-command resolves to a Swarm executable -- by file name `swarm`/`swarm.exe`
-or the active controller binary path -- with arguments containing `mcp` but
-not `--require-agent`, or an HTTP server whose URL host equals a configured
-`cloud_mcp` hostname (the owner cloud endpoint carries Owner authority
-through Access). The Agent-scoped server Eliot generates is the only Swarm
-server a worker gets; it always carries `--require-agent`, so the identity
-rule never matches it. Swarm MCP names (`eliot_swarm`, `eliot-swarm` and the
-per-session prefix) stay reserved in every policy and can never be
-allow-listed, but the rule applies whatever the entry is named: a renamed
-owner entry is still the owner daemon identity. A worker that talks to the
-owner daemon with the owner identity is an authority leak.
+server names. Antigravity, Claude, and OpenCode scan MCP configuration as a
+best-effort guard for direct Owner entries. Daemon authentication owns the
+authority boundary. The shared rule checks the executable of a direct
+invocation for `swarm`, `swarm.exe`, or the active controller binary, then
+matches the `mcp` subcommand without `--require-agent`. Shell scripts, command
+wrappers, and variable expansion are outside the scan.
+HTTP matches the configured `cloud_mcp` hostname exactly, ignoring case and
+trailing dots. With no configured hostname, it matches a parsed host
+containing an exact DNS label `swarm`, `eliot-swarm`, or `eliot_swarm`.
+The owner endpoint carries Owner authority through Access.
+The server Eliot generates always carries `--require-agent`
+and requires the generation-bound Agent credential. Swarm MCP names
+(`eliot_swarm`, `eliot-swarm` and the per-session prefixes) are reserved and
+cannot be allow-listed. A renamed Owner entry still matches by transport.
+A worker that talks to the owner daemon with the owner identity is an authority leak.
 
 ```toml
 [profiles.codex-minimal]
@@ -388,24 +389,21 @@ The resolved policy and allow list are frozen in the profile snapshot
 requested policy is reported in secret-free diagnostics and effective
 settings. Frozen snapshots without the key keep their recorded meaning
 (`inherit`); snapshots that predate `mcp_cloud_hostname` read it back as
-absent, leaving the identity HTTP arm inert. Unknown policies and reserved
+absent and use the Swarm service label check. Unknown policies and reserved
 Swarm names in `mcp_allow` are rejected at config load, and a non-empty
 allow list requires `minimal`.
 
-`inherit` is an explicit opt-in to the previous behavior: the worker receives
-Eliot's Agent-scoped server in addition to the owner native MCP surface,
-minus every owner Swarm identity. `minimal` starts only the intended MCP
-surface: Eliot's Agent-scoped server plus the explicitly allowed native
-servers. By harness:
+`inherit` exposes native MCP configuration alongside Eliot's Agent-scoped
+server, subject to each harness mapping below. `minimal` exposes Eliot's
+Agent-scoped server and the explicitly allowed native servers.
 
 - Codex enumerates the effective `mcp_servers` surface pre-spawn in both
   policies and disables every owner-identity match with a
   transport-carrying per-run `-c` override (exact owner names stay covered
   by synthetic transport-carrying stubs as backstop). An allow-listed name
   that matches the identity is rejected at launch (`profile_error`)
-  instead of re-admitted. An entry whose argument vector the native layer
-  does not report counts as unknown and fails closed toward suppression;
-  an absent vector means the entry carries no argv. `minimal` additionally
+  instead of re-admitted. Matching a direct stdio transport requires a
+  visible `mcp` subcommand. `minimal` additionally
   disables every other non-allowed entry, the known MCP-serving bundled
   plugins (`computer-use`, `unified-computer-use`, `codex-app-tools`) when
   present and enabled, and the ChatGPT-backed Apps runtime (`codex_apps`)
@@ -432,21 +430,25 @@ servers. By harness:
   unexpected server, `inherit` refuses reserved Swarm names, and
   `mcp_servers_verified` is reported only after the gate passes with the
   Agent-scoped entry connected.
-- Antigravity defaults to `minimal`. Before spawn the plugin writes only allowed
-  native MCP definitions to an Agent-owned `<plugins>/<Agent>-agy/config/mcp_config.json`,
-  selects that root with agy 1.5.10's `acp --gemini-dir`, and supplies the Swarm
-  Agent bridge through ACP session setup. This native root persists across
-  generations for exact session resume and is part of the native scope; legacy
-  `inherit` sessions retain their original root. Sign-in uses the OS keyring
-  without copying credentials. The MCP file is removed after native exit.
-  `mcp_allow` selects enabled names from the native global/workspace MCP files;
-  missing names or owner Swarm identities fail startup. Workspace definitions
-  outside that list cannot be suppressed by these flags and reject as
-  `unsupported` before spawn. Workspace plugin sources and personal customization
-  directory redirects also reject as unsupported rather than claiming isolation
-  over unenumerated sources. Explicit or legacy `inherit` keeps native discovery,
-  with pre-spawn owner Swarm checks and refusal of unenumerated plugin sources.
-  Policy and allow list are reported separately from the unknown ACP inventory.
+- Antigravity bootstrap profiles use `inherit`. Explicit and legacy `inherit`
+  preserve user and workspace discovery, including standard plugin sources,
+  after the daemon checks enabled entries for direct Owner Swarm transports
+  and reserved names. Without a native per-session exclusion, a match refuses
+  startup and identifies the server and file. Uncheckable discovery redirects
+  refuse startup and identify the declaring file. Swarm adds its
+  generation-bound Agent bridge through ACP session setup. For `minimal`,
+  the daemon resolves enabled `mcp_allow` entries from global and workspace MCP
+  files and rejects missing names, Owner Swarm transports, and workspace
+  entries that duplicate allow-listed global names. The daemon atomically
+  publishes the prepared file. The plugin installs
+  the prepared file under a generation-named Gemini root selected via
+  `acp --gemini-dir`. Fresh launches create their own root and exact resume
+  reuses the retained session's root. Exclusion of user MCP and plugin sources
+  from the effective ACP inventory is unverified.
+  A workspace MCP server outside the allow list, a workspace plugin source, or
+  a personal customization directory redirect refuses startup with its source
+  path when it cannot be filtered. The staged MCP file is removed after native
+  exit. ACP does not expose the effective MCP inventory.
 
 The file-based MCP scans read regular files only, with a 256 KiB cap per source.
 Missing sources contribute no entries. Unreadable, oversized or malformed sources

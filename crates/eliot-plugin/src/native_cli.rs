@@ -176,6 +176,9 @@ pub fn require_agent_mcp_root(
 /// Agent identity, never the owner's.
 pub const WORKER_SWARM_MCP_SERVER_NAME: &str = "eliot-swarm";
 
+/// Name of the daemon-resolved MCP file in an Antigravity plugin instance.
+pub const ANTIGRAVITY_MCP_CONFIG_FILE: &str = "mcp_config.json";
+
 /// The Agent-scoped worker MCP argv tail after the executable:
 /// `--data-dir <root> mcp --require-agent`. `--require-agent` fails closed
 /// without the inherited Agent identity and never falls back to Owner auth.

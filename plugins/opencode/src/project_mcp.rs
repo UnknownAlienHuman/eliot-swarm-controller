@@ -6,10 +6,10 @@
 //! ancestor directory's direct `opencode.json` / `opencode.jsonc` files
 //! plus its `.opencode/` project directory, each read as a native document
 //! (the `mcp.servers` table plus the legacy `mcp.<name>` server spelling).
-//! Every start therefore scans those layers for owner-identity entries
-//! before the native session exists: a stdio entry selecting `swarm mcp`
-//! without `--require-agent`, or an HTTP entry on the configured cloud
-//! hostname. A match fails the start with the entry and layer named, in
+//! The shared `eliot_core::is_owner_swarm_server` rule checks those layers
+//! before the native session exists as a best-effort guard for direct Owner
+//! transports. Daemon authentication owns the authority boundary.
+//! A match fails the start with the entry and layer named, in
 //! every policy and regardless of entry name. Managed, system and global
 //! layers are not files here; the effective configuration proves their
 //! absence after the session exists (see `host.rs`). No project or user
@@ -133,10 +133,7 @@ pub fn owner_refusal_reason(entry: &ProjectMcpEntry) -> String {
     .message
 }
 
-/// Owner-identity entries among the scanned project layer: stdio entries
-/// selecting `swarm mcp` without `--require-agent` (by file name or
-/// controller path) and HTTP entries on the configured cloud hostname.
-/// The Agent-scoped shape (`--require-agent`) never matches.
+/// Entries that match the shared best-effort guard for direct Owner transports.
 pub fn find_owner_entries<'a>(
     entries: &'a [ProjectMcpEntry],
     controller_executable: Option<&str>,

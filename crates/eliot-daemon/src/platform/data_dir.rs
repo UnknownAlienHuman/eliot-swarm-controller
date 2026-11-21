@@ -696,6 +696,84 @@ pub(crate) fn replace_private_file(dir: &Path, name: &str, bytes: &[u8]) -> Resu
     replace_file_atomically(dir, name, bytes, true)
 }
 
+/// The daemon is the only writer of the private MCP handoff. Scan only while
+/// holding its lock and before taking commands, so a live write cannot lose
+/// its temporary file. The plugin receives only the published file.
+pub(crate) fn remove_abandoned_mcp_temps(data: &DataDir, lock: &DaemonLock) -> Result<()> {
+    if lock.root != data.path {
+        return Err(Error::new(
+            "invalid",
+            "daemon lock belongs to another data directory",
+        ));
+    }
+    let plugins = fs::canonicalize(data.path())
+        .map_err(|error| io_error("resolve data directory", error))?
+        .join("plugins");
+    let metadata = match fs::symlink_metadata(&plugins) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(io_error("inspect plugin directory", error)),
+    };
+    if !metadata.is_dir() || fs::canonicalize(&plugins).ok().as_ref() != Some(&plugins) {
+        return Err(Error::new("not_allowed", "plugin directory was redirected"));
+    }
+    let entries =
+        fs::read_dir(&plugins).map_err(|error| io_error("read plugin directory", error))?;
+    let prefix = format!(
+        ".{}.",
+        eliot_plugin::native_cli::ANTIGRAVITY_MCP_CONFIG_FILE
+    );
+    for entry in entries {
+        let entry = entry.map_err(|error| io_error("read plugin instance", error))?;
+        let name = entry.file_name();
+        if !name.to_str().is_some_and(is_plugin_instance_name)
+            || !entry.file_type().is_ok_and(|kind| kind.is_dir())
+        {
+            continue;
+        }
+        let instance = plugins.join(&name);
+        if fs::canonicalize(&instance).ok().as_ref() != Some(&instance) {
+            continue;
+        }
+        for file in
+            fs::read_dir(&instance).map_err(|error| io_error("read plugin instance", error))?
+        {
+            let file = file.map_err(|error| io_error("read plugin instance entry", error))?;
+            let name = file.file_name();
+            let is_mcp_temp = name
+                .to_str()
+                .and_then(|name| name.strip_prefix(&prefix)?.strip_suffix(".tmp"))
+                .is_some_and(|id| ulid::Ulid::from_string(id).is_ok());
+            if is_mcp_temp && file.file_type().is_ok_and(|kind| kind.is_file()) {
+                match fs::remove_file(file.path()) {
+                    Ok(()) => (),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                    Err(error) => {
+                        return Err(io_error("remove abandoned MCP temporary file", error));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_plugin_instance_name(name: &str) -> bool {
+    let Some((subject, suffix)) = name.rsplit_once('-') else {
+        return false;
+    };
+    let Some((agent, generation)) = subject.rsplit_once("-g") else {
+        return false;
+    };
+    !agent.is_empty()
+        && agent
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
+        && generation.bytes().all(|c| c.is_ascii_digit())
+        && generation.parse::<i64>().is_ok_and(|n| n > 0)
+        && ulid::Ulid::from_string(suffix).is_ok()
+}
+
 /// Atomically replace one existing-or-new file directly under `dir`: a new
 /// temporary file in the same directory is written and synced, then renamed
 /// over the target. With `private`, both files must stay current-user-only

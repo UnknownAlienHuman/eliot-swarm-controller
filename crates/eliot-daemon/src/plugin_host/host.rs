@@ -1,6 +1,7 @@
 use super::{PluginClient, PluginConnection};
 use eliot_core::is_start_verb;
 mod actor;
+mod antigravity_mcp;
 mod discovery;
 mod native_children;
 mod observation;
@@ -308,6 +309,7 @@ struct AgentActorConfig {
     instance_dir: String,
     store_root: PathBuf,
     plugin_credential: String,
+    _prepared_mcp: Option<antigravity_mcp::PreparedConfig>,
     target_environment: Value,
     source_credentials: Arc<[String]>,
     resume_from: Option<Value>,
@@ -588,6 +590,17 @@ impl PluginHost {
             ));
         }
         let (instance_dir, credential) = self.create_instance_dir(&key)?;
+        let prepared_mcp = if agent.harness == "antigravity" {
+            match antigravity_mcp::prepare(&agent, &target_environment, &instance_dir) {
+                Ok(config) => config,
+                Err(error) => {
+                    remove_empty_instance_dir(&instance_dir);
+                    return Err(error.with_code("native_not_dispatched"));
+                }
+            }
+        } else {
+            None
+        };
         let source_credentials = source_secret_snapshot(
             &agent.profile_snapshot,
             &target_environment,
@@ -616,6 +629,7 @@ impl PluginHost {
         // generated directory, never recursively.
         let monitoring_started = Instant::now();
         if let Err(error) = self.state.monitoring.prepare_generation(&agent).await {
+            drop(prepared_mcp);
             remove_empty_instance_dir(&instance_dir);
             return Err(error);
         }
@@ -627,6 +641,7 @@ impl PluginHost {
                 child
             }
             Err(error) => {
+                drop(prepared_mcp);
                 remove_empty_instance_dir(&instance_dir);
                 return Err(match error {
                     AgentSpawnError::NotSpawned(error) => error,
@@ -757,6 +772,7 @@ impl PluginHost {
             instance_dir: instance_dir.to_string_lossy().into_owned(),
             store_root: self.state.data_root.join("plugins"),
             plugin_credential: credential.clone(),
+            _prepared_mcp: prepared_mcp,
             target_environment,
             source_credentials: Arc::clone(&source_credentials),
             resume_from,
