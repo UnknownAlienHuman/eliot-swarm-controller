@@ -926,8 +926,8 @@ impl DesktopApp {
                     .children((
                         ProgressRing::new()
                             .is_indeterminate(true)
-                            .width(16.0)
-                            .height(16.0),
+                            .width(tokens::layout::RING)
+                            .height(tokens::layout::RING),
                         m3::secondary("Reading every task and project…"),
                     )),
             ),
@@ -973,8 +973,8 @@ impl DesktopApp {
                     .children((
                         ProgressRing::new()
                             .is_indeterminate(true)
-                            .width(16.0)
-                            .height(16.0),
+                            .width(tokens::layout::RING)
+                            .height(tokens::layout::RING),
                         m3::secondary(if stopping {
                             "Stopping after this one…"
                         } else {
@@ -992,7 +992,7 @@ impl DesktopApp {
                     "summary".to_owned(),
                     m3::text(
                         format!("{} {}.", dialog.op.done(), dialog.op.noun(done)),
-                        tokens::text::SECTION_TITLE,
+                        tokens::text::HEADER,
                     )
                     .into(),
                 );
@@ -1061,7 +1061,7 @@ impl DesktopApp {
         if !dialog.plan.kept.is_empty() && dialog.phase != Phase::Reading {
             line(
                 "kept-title".to_owned(),
-                m3::text("Kept", tokens::text::SECTION_TITLE).into(),
+                m3::text("Kept", tokens::text::HEADER).into(),
             );
             for (index, kept) in dialog.plan.kept.iter().enumerate() {
                 line(

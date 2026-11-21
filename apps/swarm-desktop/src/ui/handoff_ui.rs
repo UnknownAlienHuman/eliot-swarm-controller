@@ -687,7 +687,7 @@ impl DesktopApp {
             push(
                 "status",
                 small(state.status.clone())
-                    .opacity(theme::MUTED_OPACITY)
+                    .foreground(palette.muted())
                     .into(),
             );
         }
@@ -732,7 +732,7 @@ impl DesktopApp {
                 push(
                 "no-sends",
                 small("None are waiting in this run: the transfer carries context, claims, Goal and children only.")
-                    .opacity(theme::MUTED_OPACITY)
+                    .foreground(palette.muted())
                     .into(),
             );
             } else {
@@ -743,7 +743,7 @@ impl DesktopApp {
                         eliot_core::api::MAX_HANDOFF_SENDS,
                         state.from
                     ))
-                    .opacity(theme::MUTED_OPACITY)
+                    .foreground(palette.muted())
                     .into(),
                 );
             }
@@ -772,7 +772,7 @@ impl DesktopApp {
                 push(
                     "existing-none",
                     small("No other live Agent can take this work.")
-                        .opacity(theme::MUTED_OPACITY)
+                        .foreground(palette.muted())
                         .into(),
                 );
             }
@@ -806,7 +806,7 @@ impl DesktopApp {
                 push(
                     "profile-none",
                     small("No configured profile was read.")
-                        .opacity(theme::MUTED_OPACITY)
+                        .foreground(palette.muted())
                         .into(),
                 );
             }
@@ -842,10 +842,9 @@ impl DesktopApp {
                 ),
             );
             let labelled = |label: &str, control: View| -> View {
-                StackPanel::new().spacing(tokens::spacing::XS).children((
-                    small(label.to_owned()).opacity(theme::MUTED_OPACITY),
-                    control,
-                ))
+                StackPanel::new()
+                    .spacing(tokens::spacing::XS)
+                    .children((small(label.to_owned()).foreground(palette.muted()), control))
             };
             // The effort steps as segments (the effort popover's control):
             // each shows the short word and is named in full words, and its
@@ -955,7 +954,7 @@ impl DesktopApp {
             push(
                 "catalog",
                 small(catalog_line)
-                    .opacity(theme::MUTED_OPACITY)
+                    .foreground(palette.muted())
                     .margin(Thickness::new(RADIO_INDENT, 0.0, 0.0, 0.0))
                     .into(),
             );
@@ -980,7 +979,7 @@ impl DesktopApp {
                         SlotView::new(ExpanderSlot::Header, small("Readback details (ids)")),
                         SlotView::new(
                             ExpanderSlot::Content,
-                            small(lines.join("\n")).opacity(theme::MUTED_OPACITY),
+                            small(lines.join("\n")).foreground(palette.muted()),
                         ),
                     ]),
             );
@@ -1014,11 +1013,11 @@ impl DesktopApp {
                 let mut add = |key: String, label: String, message: HandoffMsg| {
                     owner.push(KeyedView::new(
                         key,
-                        Button::new()
+                        m3::text_button(palette)
                             .is_enabled(!self.submitting())
                             .automation_name(label.clone())
                             .on_click(context.message(Message::Handoff(message)))
-                            .content(TextBlock::new().text(label)),
+                            .content(m3::label(&label)),
                     ));
                 };
                 if is_brief && child.state == CommandState::Unknown {
@@ -1052,7 +1051,7 @@ impl DesktopApp {
             if !owner.is_empty() {
                 push(
                     "reason",
-                    TextBox::new()
+                    m3::field()
                         .text(state.reason.clone())
                         .placeholder_text("Reason for an Owner assertion (required)")
                         .automation_name("Owner reason")
@@ -1293,9 +1292,7 @@ fn heading(text: &str) -> TextBlock {
 }
 
 fn small(text: impl Into<String>) -> TextBlock {
-    TextBlock::new()
-        .text(text.into())
-        .font_size(tokens::text::BODY.size)
+    m3::body(text)
         .text_wrapping(TextWrapping::Wrap)
         .is_text_selection_enabled(true)
 }

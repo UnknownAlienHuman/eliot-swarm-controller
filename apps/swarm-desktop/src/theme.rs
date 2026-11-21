@@ -6,41 +6,14 @@
 //! container, composer, selected, primary, on-primary, text, muted,
 //! outline, attention, and the lift and glow of raised things. Every
 //! component reads roles, never a raw color; the few in-between tones the
-//! design draws (a chip's outline, a tool row's tint, a selected row's
-//! hover) are fixed mixes of two roles ([`Roles::new`]), so all six themes
-//! get them. Layout, density and motion never change with the theme.
+//! design draws (a chip's outline or a tool row's tint) use the reference
+//! tones in Light and derive the corresponding tones for the other themes.
+//! Layout, density and motion never change with the theme.
 //! [`winui`] resolves the roles to WinUI brushes and to the theme
 //! resource keys of the real controls; under Windows High Contrast it maps
 //! nothing, so the system colors apply.
 
-/// The design's type roles in DIPs: one family (Segoe UI Variable, the
-/// design's fallback for Roboto Flex, which Windows does not ship).
-pub mod typography {
-    #[derive(Clone, Copy, Debug, PartialEq)]
-    pub struct TypeStyle {
-        pub size: f64,
-        pub weight: u16,
-    }
-    const fn style(size: f64, weight: u16) -> TypeStyle {
-        TypeStyle { size, weight }
-    }
-    /// The home greeting and a Settings page title.
-    pub const HERO: TypeStyle = style(28.0, 500);
-    /// The app title in the sidebar.
-    pub const TITLE: TypeStyle = style(16.0, 600);
-    /// The conversation header, a card or section title.
-    pub const HEADER: TypeStyle = style(15.0, 500);
-    /// Body text and rows.
-    pub const BODY: TypeStyle = style(14.0, 400);
-    /// Button labels and a project's name.
-    pub const BUTTON: TypeStyle = style(14.0, 500);
-    /// Chips, tool rows and the Monitor's rows.
-    pub const CHIP: TypeStyle = style(13.0, 400);
-    /// Section labels ("Projects").
-    pub const LABEL: TypeStyle = style(12.0, 500);
-    /// Hints, trailing counts and ages ("Ctrl+N", "2h").
-    pub const CAPTION: TypeStyle = style(12.0, 400);
-}
+pub use crate::tokens::state;
 
 /// The design's elevation: level 1 (a pressable under the pointer), 2
 /// (menus, popovers, the FAB under the pointer) and 3 (the composer), each
@@ -113,23 +86,6 @@ pub mod elevation {
     }
 }
 
-/// State layers of the content color over a container (the design: hover
-/// 8 %, pressed 12 %).
-pub mod state {
-    pub const HOVER: f64 = 0.08;
-    pub const PRESSED: f64 = 0.12;
-    /// The ripple of a press at its start, fading on release.
-    pub const RIPPLE: f64 = 0.12;
-    /// A disabled container: text at this opacity.
-    pub const DISABLED_CONTAINER: f64 = 0.12;
-    /// Disabled content: text at this opacity.
-    pub const DISABLED_CONTENT: f64 = 0.38;
-}
-
-/// Secondary text lowers emphasis with opacity on the theme text brush, so
-/// High Contrast still resolves the system color.
-pub const MUTED_OPACITY: f64 = 0.72;
-
 /// An opaque sRGB color.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rgb8 {
@@ -160,8 +116,37 @@ impl Rgb8 {
     }
 }
 
+fn luminance(color: Rgb8) -> f64 {
+    let linear = |channel: u8| {
+        let srgb = f64::from(channel) / 255.0;
+        if srgb <= 0.04045 {
+            srgb / 12.92
+        } else {
+            ((srgb + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * linear(color.r) + 0.7152 * linear(color.g) + 0.0722 * linear(color.b)
+}
+
+/// Keep the approved hue where it is readable as text. Otherwise move it
+/// toward on-surface until it also works beneath a pressed row.
+fn readable(color: Rgb8, on_surface: Rgb8, backgrounds: &[f64]) -> Rgb8 {
+    const MIN_TEXT_CONTRAST: f64 = 4.5;
+    (0..=100)
+        .map(|step| color.mix(on_surface, f64::from(step) / 100.0))
+        .find(|foreground| {
+            let foreground = luminance(*foreground) + 0.05;
+            backgrounds.iter().all(|&background| {
+                let background = background + 0.05;
+                foreground.max(background) / foreground.min(background) >= MIN_TEXT_CONTRAST
+            })
+        })
+        .expect("desktop palette must provide 4.5:1 text contrast")
+}
+
 const BLACK: Rgb8 = Rgb8::new(0, 0, 0);
 const WHITE: Rgb8 = Rgb8::new(255, 255, 255);
+pub const SHADOW_COLOR: Rgb8 = BLACK;
 
 /// The six themes of the design's Themes board.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -230,11 +215,16 @@ pub struct Roles {
     pub composer: Rgb8,
     pub selected: Rgb8,
     pub primary: Rgb8,
+    /// Primary as text on a neutral or selected surface.
+    pub primary_text: Rgb8,
     pub on_primary: Rgb8,
     pub text: Rgb8,
     pub muted: Rgb8,
+    /// Muted text, adjusted to clear 4.5:1 on app surfaces.
+    pub secondary_text: Rgb8,
     pub outline: Rgb8,
     pub attention: Rgb8,
+    pub attention_text: Rgb8,
     pub lift: Lift,
     pub glow: Option<Glow>,
     /// Text between `text` and `muted`: chips, icon buttons, an ended
@@ -245,12 +235,8 @@ pub struct Roles {
     /// A tool row, suggestion card or search field: halfway from surface to
     /// container (#F0EFF7 in Light).
     pub tonal: Rgb8,
-    /// A selected row under the pointer (#D4D6FB in Light).
-    pub selected_hover: Rgb8,
     /// A running tool row (#E8E9FF in Light).
     pub running: Rgb8,
-    /// Placeholder text (#8F909A in Light).
-    pub placeholder: Rgb8,
     /// The surface of an error or warning banner.
     pub attention_container: Rgb8,
     /// WinUI's accent ramp (`SystemAccentColorDark3`…`Light3`). WinUI fills
@@ -361,6 +347,29 @@ impl Roles {
                 primary.mix(WHITE, 0.6),
             ]
         };
+        let [variant, border, tonal, running] = match theme {
+            Theme::Light => crate::tokens::color::LIGHT_SUPPORTING.map(Rgb8::hex),
+            Theme::Dark => crate::tokens::color::DARK_SUPPORTING.map(Rgb8::hex),
+            _ => [
+                text.mix(muted, 0.5),
+                outline.mix(muted, 0.25),
+                surface.mix(container, 0.5),
+                surface.mix(selected, 0.6),
+            ],
+        };
+        let attention_container = surface.mix(attention, 0.12);
+        let backgrounds = [
+            surface,
+            sidebar,
+            container,
+            composer,
+            selected,
+            tonal,
+            running,
+            attention_container,
+        ]
+        .map(|background| luminance(background.mix(text, state::PRESSED)));
+        let readable_text = |color| readable(color, text, &backgrounds);
         Self {
             theme,
             dark,
@@ -370,20 +379,21 @@ impl Roles {
             composer,
             selected,
             primary,
+            primary_text: readable_text(primary),
             on_primary,
             text,
             muted,
+            secondary_text: readable_text(muted),
             outline,
             attention,
+            attention_text: readable_text(attention),
             lift,
             glow,
-            variant: text.mix(muted, 0.5),
-            border: outline.mix(muted, 0.25),
-            tonal: surface.mix(container, 0.5),
-            selected_hover: selected.mix(primary, 0.08),
-            running: surface.mix(selected, 0.6),
-            placeholder: muted.mix(surface, 0.25),
-            attention_container: surface.mix(attention, 0.12),
+            variant: readable_text(variant),
+            border,
+            tonal,
+            running,
+            attention_container,
             accent_ramp,
         }
     }
@@ -393,7 +403,7 @@ impl Roles {
         match tone {
             StatusTone::Active | StatusTone::Pending => (self.selected, self.text),
             StatusTone::Attention | StatusTone::Failed | StatusTone::Unknown => {
-                (self.attention_container, self.attention)
+                (self.attention_container, self.attention_text)
             }
             StatusTone::Ready | StatusTone::Neutral => (self.container, self.variant),
         }
@@ -529,7 +539,7 @@ pub mod winui {
 
         /// Hints, counts, section labels.
         pub fn muted(self) -> Brush {
-            self.role(|r| r.muted, ThemeBrush::PrimaryText)
+            self.role(|r| r.secondary_text, ThemeBrush::PrimaryText)
         }
 
         /// Hairlines and dividers.
@@ -553,7 +563,7 @@ pub mod winui {
 
         /// Errors, failures, low quota, Full access.
         pub fn attention(self) -> Brush {
-            self.role(|r| r.attention, ThemeBrush::SystemCritical)
+            self.role(|r| r.attention_text, ThemeBrush::SystemCritical)
         }
 
         /// An error or warning banner's surface.
@@ -600,7 +610,7 @@ pub mod winui {
             self.with(|r| {
                 Family {
                     outline: Some(r.muted),
-                    ..Family::new(None, r.primary)
+                    ..Family::new(None, r.primary_text)
                 }
                 .overrides(r)
             })
@@ -608,12 +618,12 @@ pub mod winui {
 
         /// Text: the primary color, no container.
         pub fn text_button(self) -> ResourceOverrides {
-            self.with(|r| Family::new(None, r.primary).overrides(r))
+            self.with(|r| Family::new(None, r.primary_text).overrides(r))
         }
 
         /// Destructive: a text button in the attention color.
         pub fn destructive(self) -> ResourceOverrides {
-            self.with(|r| Family::new(None, r.attention).overrides(r))
+            self.with(|r| Family::new(None, r.attention_text).overrides(r))
         }
 
         /// An icon button: the variant text color, no container.
@@ -634,9 +644,11 @@ pub mod winui {
             })
         }
 
-        /// A row in the attention color (Full access in a menu).
-        pub fn attention_row(self) -> ResourceOverrides {
-            self.with(|r| Family::new(None, r.attention).overrides(r))
+        /// A destructive menu action, including the keyboard selection.
+        pub fn destructive_row(self, selected: bool) -> ResourceOverrides {
+            self.with(|r| {
+                Family::new(selected.then_some(r.selected), r.attention_text).overrides(r)
+            })
         }
 
         /// A chip: the variant text in an outline of the border tone.
@@ -688,7 +700,7 @@ pub mod winui {
             self.with(|r| {
                 Family {
                     outline: Some(r.attention.mix(r.surface, 0.55)),
-                    ..Family::new(None, r.attention)
+                    ..Family::new(None, r.attention_text)
                 }
                 .overrides(r)
             })
@@ -821,10 +833,7 @@ pub mod winui {
                 .set(key("BackgroundPointerOver"), hover)
                 .set(key("BackgroundPressed"), pressed)
                 .set(key("BackgroundDisabled"), disabled)
-                .set(
-                    key("ForegroundDisabled"),
-                    layer(r.text, state::DISABLED_CONTENT),
-                )
+                .set(key("ForegroundDisabled"), color(r.secondary_text))
                 .set(key("BorderBrushDisabled"), disabled_border);
             for state in ["", "PointerOver", "Pressed"] {
                 overrides = overrides

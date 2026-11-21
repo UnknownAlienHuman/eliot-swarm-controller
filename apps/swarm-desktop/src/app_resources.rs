@@ -66,8 +66,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 use windows_sys::core::BOOL;
 
-use crate::theme::{Rgb8, Roles, Theme, state};
-use crate::ui::tokens::{height, radius, spacing};
+use crate::theme::{Rgb8, Roles, SHADOW_COLOR, Theme, state};
+use crate::ui::tokens::{height, layout, motion, radius, spacing, text};
 
 /// A theme resource value.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -173,22 +173,13 @@ fn accent(s: &Roles) -> Vec<(&'static str, Value)> {
         // Text without its own brush takes the theme's text roles.
         ("TextFillColorPrimaryBrush", opaque(s.text)),
         ("TextFillColorSecondaryBrush", opaque(s.variant)),
-        ("TextFillColorTertiaryBrush", opaque(s.muted)),
-        (
-            "TextFillColorDisabledBrush",
-            layer(s.text, state::DISABLED_CONTENT),
-        ),
-        ("AccentTextFillColorPrimaryBrush", opaque(s.primary)),
-        ("AccentTextFillColorSecondaryBrush", opaque(s.primary)),
-        (
-            "AccentTextFillColorTertiaryBrush",
-            Value::Brush(s.primary, alpha(0.8)),
-        ),
+        ("TextFillColorTertiaryBrush", opaque(s.secondary_text)),
+        ("TextFillColorDisabledBrush", opaque(s.secondary_text)),
+        ("AccentTextFillColorPrimaryBrush", opaque(s.primary_text)),
+        ("AccentTextFillColorSecondaryBrush", opaque(s.primary_text)),
+        ("AccentTextFillColorTertiaryBrush", opaque(s.primary_text)),
         ("TextOnAccentFillColorPrimaryBrush", opaque(s.on_primary)),
-        (
-            "TextOnAccentFillColorSecondaryBrush",
-            Value::Brush(s.on_primary, alpha(0.7)),
-        ),
+        ("TextOnAccentFillColorSecondaryBrush", opaque(s.on_primary)),
         (
             "TextOnAccentFillColorSelectedTextBrush",
             opaque(s.on_primary),
@@ -215,14 +206,14 @@ fn buttons(s: &Roles) -> Vec<(&'static str, Value)> {
         ("ButtonBackground", clear(s)),
         (
             "ButtonBackgroundPointerOver",
-            layer(s.primary, state::HOVER),
+            layer(s.primary_text, state::HOVER),
         ),
-        ("ButtonBackgroundPressed", layer(s.primary, state::PRESSED)),
-        ("ButtonBackgroundDisabled", clear(s)),
         (
-            "ButtonForegroundDisabled",
-            layer(s.text, state::DISABLED_CONTENT),
+            "ButtonBackgroundPressed",
+            layer(s.primary_text, state::PRESSED),
         ),
+        ("ButtonBackgroundDisabled", clear(s)),
+        ("ButtonForegroundDisabled", opaque(s.secondary_text)),
         ("AccentButtonBackground", opaque(s.primary)),
         (
             "AccentButtonBackgroundPointerOver",
@@ -236,10 +227,7 @@ fn buttons(s: &Roles) -> Vec<(&'static str, Value)> {
             "AccentButtonBackgroundDisabled",
             layer(s.text, state::DISABLED_CONTAINER),
         ),
-        (
-            "AccentButtonForegroundDisabled",
-            layer(s.text, state::DISABLED_CONTENT),
-        ),
+        ("AccentButtonForegroundDisabled", opaque(s.secondary_text)),
     ];
     all.extend(every(
         &[
@@ -247,7 +235,7 @@ fn buttons(s: &Roles) -> Vec<(&'static str, Value)> {
             "ButtonForegroundPointerOver",
             "ButtonForegroundPressed",
         ],
-        opaque(s.primary),
+        opaque(s.primary_text),
     ));
     all.extend(every(
         &[
@@ -326,17 +314,18 @@ fn text_field(s: &Roles) -> Vec<(&'static str, Value)> {
         ("TextControlElevationBorderBrush", opaque(s.border)),
         ("TextControlElevationBorderFocusedBrush", opaque(s.primary)),
         (
-            "TextControlForegroundDisabled",
-            layer(s.text, state::DISABLED_CONTENT),
+            "TextControlBackgroundPointerOver",
+            layer(s.text, state::HOVER),
         ),
+        ("TextControlForegroundDisabled", opaque(s.secondary_text)),
         (
             "TextControlPlaceholderForegroundDisabled",
-            layer(s.text, state::DISABLED_CONTENT),
+            opaque(s.secondary_text),
         ),
         ("TextControlHeaderForeground", opaque(s.variant)),
         (
             "TextControlHeaderForegroundDisabled",
-            layer(s.text, state::DISABLED_CONTENT),
+            opaque(s.secondary_text),
         ),
         ("TextControlSelectionHighlightColor", opaque(s.primary)),
         (
@@ -347,13 +336,15 @@ fn text_field(s: &Roles) -> Vec<(&'static str, Value)> {
             "TextControlButtonBackgroundPressed",
             layer(s.text, state::PRESSED),
         ),
-        ("TextControlBorderThemeThickness", uniform(1.0)),
-        ("TextControlBorderThemeThicknessFocused", uniform(2.0)),
+        ("TextControlBorderThemeThickness", uniform(layout::HAIRLINE)),
+        (
+            "TextControlBorderThemeThicknessFocused",
+            uniform(layout::FOCUS_RING),
+        ),
     ];
     all.extend(every(
         &[
             "TextControlBackground",
-            "TextControlBackgroundPointerOver",
             "TextControlBackgroundFocused",
             "TextControlBackgroundDisabled",
             "TextControlButtonBackground",
@@ -380,7 +371,7 @@ fn text_field(s: &Roles) -> Vec<(&'static str, Value)> {
             "TextControlButtonForegroundPointerOver",
             "TextControlButtonForegroundPressed",
         ],
-        opaque(s.variant),
+        opaque(s.secondary_text),
     ));
     all
 }
@@ -400,20 +391,14 @@ fn dropdown(s: &Roles) -> Vec<(&'static str, Value)> {
         ),
         ("ComboBoxBackgroundBorderBrushFocused", opaque(s.primary)),
         ("ComboBoxBackgroundBorderBrushUnfocused", opaque(s.border)),
-        ("ComboBoxBorderThemeThickness", uniform(1.0)),
-        (
-            "ComboBoxForegroundDisabled",
-            layer(s.text, state::DISABLED_CONTENT),
-        ),
+        ("ComboBoxBorderThemeThickness", uniform(layout::HAIRLINE)),
+        ("ComboBoxForegroundDisabled", opaque(s.secondary_text)),
         (
             "ComboBoxPlaceHolderForegroundDisabled",
-            layer(s.text, state::DISABLED_CONTENT),
+            opaque(s.secondary_text),
         ),
         ("ComboBoxHeaderForeground", opaque(s.variant)),
-        (
-            "ComboBoxHeaderForegroundDisabled",
-            layer(s.text, state::DISABLED_CONTENT),
-        ),
+        ("ComboBoxHeaderForegroundDisabled", opaque(s.secondary_text)),
         (
             "ComboBoxDropDownBackgroundPointerOver",
             layer(s.text, state::HOVER),
@@ -448,20 +433,15 @@ fn dropdown(s: &Roles) -> Vec<(&'static str, Value)> {
             "ComboBoxItemBackgroundSelectedPressed",
             opaque(selected_pressed),
         ),
-        (
-            "ComboBoxItemForegroundDisabled",
-            layer(s.text, state::DISABLED_CONTENT),
-        ),
+        ("ComboBoxItemForegroundDisabled", opaque(s.secondary_text)),
         (
             "ComboBoxItemForegroundSelectedDisabled",
-            layer(s.text, state::DISABLED_CONTENT),
+            opaque(s.secondary_text),
         ),
     ];
     all.extend(every(
         &[
             "ComboBoxBackground",
-            "ComboBoxBackgroundPointerOver",
-            "ComboBoxBackgroundPressed",
             "ComboBoxBackgroundFocused",
             "ComboBoxBackgroundUnfocused",
             "ComboBoxBackgroundDisabled",
@@ -483,6 +463,10 @@ fn dropdown(s: &Roles) -> Vec<(&'static str, Value)> {
         ],
         clear(s),
     ));
+    all.extend([
+        ("ComboBoxBackgroundPointerOver", layer(s.text, state::HOVER)),
+        ("ComboBoxBackgroundPressed", layer(s.text, state::PRESSED)),
+    ]);
     all.extend(every(
         &[
             "ComboBoxForeground",
@@ -528,18 +512,19 @@ fn dropdown(s: &Roles) -> Vec<(&'static str, Value)> {
 /// Radio buttons and check boxes in M3 selection-control roles: an
 /// on-surface-variant ring or box at rest, primary when selected (a primary
 /// ring with a primary dot; a primary box with an on-primary check), the
-/// label in on-surface, disabled at 38% on-surface.
+/// label in on-surface, with a readable disabled text role.
 fn selection_controls(s: &Roles) -> Vec<(&'static str, Value)> {
     let disabled = layer(s.text, state::DISABLED_CONTENT);
+    let disabled_text = opaque(s.secondary_text);
     let mut all = vec![
-        ("RadioButtonForegroundDisabled", disabled),
+        ("RadioButtonForegroundDisabled", disabled_text),
         ("RadioButtonOuterEllipseStrokeDisabled", disabled),
         ("RadioButtonOuterEllipseCheckedStrokeDisabled", disabled),
         ("RadioButtonCheckGlyphFillDisabled", disabled),
         ("RadioButtonsHeaderForeground", opaque(s.variant)),
-        ("CheckBoxForegroundUncheckedDisabled", disabled),
-        ("CheckBoxForegroundCheckedDisabled", disabled),
-        ("CheckBoxForegroundIndeterminateDisabled", disabled),
+        ("CheckBoxForegroundUncheckedDisabled", disabled_text),
+        ("CheckBoxForegroundCheckedDisabled", disabled_text),
+        ("CheckBoxForegroundIndeterminateDisabled", disabled_text),
         ("CheckBoxCheckBackgroundStrokeUncheckedDisabled", disabled),
         ("CheckBoxCheckBackgroundFillCheckedDisabled", disabled),
         ("CheckBoxCheckBackgroundFillIndeterminateDisabled", disabled),
@@ -617,8 +602,6 @@ fn selection_controls(s: &Roles) -> Vec<(&'static str, Value)> {
     all.extend(every(
         &[
             "RadioButtonBackground",
-            "RadioButtonBackgroundPointerOver",
-            "RadioButtonBackgroundPressed",
             "RadioButtonBackgroundDisabled",
             "RadioButtonBorderBrush",
             "RadioButtonBorderBrushPointerOver",
@@ -641,16 +624,10 @@ fn selection_controls(s: &Roles) -> Vec<(&'static str, Value)> {
             "RadioButtonCheckGlyphStrokeCheckedPressed",
             "RadioButtonCheckGlyphStrokeCheckedDisabled",
             "CheckBoxBackgroundUnchecked",
-            "CheckBoxBackgroundUncheckedPointerOver",
-            "CheckBoxBackgroundUncheckedPressed",
             "CheckBoxBackgroundUncheckedDisabled",
             "CheckBoxBackgroundChecked",
-            "CheckBoxBackgroundCheckedPointerOver",
-            "CheckBoxBackgroundCheckedPressed",
             "CheckBoxBackgroundCheckedDisabled",
             "CheckBoxBackgroundIndeterminate",
-            "CheckBoxBackgroundIndeterminatePointerOver",
-            "CheckBoxBackgroundIndeterminatePressed",
             "CheckBoxBackgroundIndeterminateDisabled",
             "CheckBoxBorderBrushUnchecked",
             "CheckBoxBorderBrushUncheckedPointerOver",
@@ -677,6 +654,24 @@ fn selection_controls(s: &Roles) -> Vec<(&'static str, Value)> {
         ],
         clear(s),
     ));
+    all.extend(every(
+        &[
+            "RadioButtonBackgroundPointerOver",
+            "CheckBoxBackgroundUncheckedPointerOver",
+            "CheckBoxBackgroundCheckedPointerOver",
+            "CheckBoxBackgroundIndeterminatePointerOver",
+        ],
+        layer(s.text, state::HOVER),
+    ));
+    all.extend(every(
+        &[
+            "RadioButtonBackgroundPressed",
+            "CheckBoxBackgroundUncheckedPressed",
+            "CheckBoxBackgroundCheckedPressed",
+            "CheckBoxBackgroundIndeterminatePressed",
+        ],
+        layer(s.text, state::PRESSED),
+    ));
     all.extend(switches(s));
     all
 }
@@ -688,8 +683,6 @@ fn switches(s: &Roles) -> Vec<(&'static str, Value)> {
     let mut all = every(
         &[
             "ToggleSwitchFillOn",
-            "ToggleSwitchFillOnPointerOver",
-            "ToggleSwitchFillOnPressed",
             "ToggleSwitchStrokeOn",
             "ToggleSwitchStrokeOnPointerOver",
             "ToggleSwitchStrokeOnPressed",
@@ -704,14 +697,33 @@ fn switches(s: &Roles) -> Vec<(&'static str, Value)> {
         ],
         opaque(s.on_primary),
     ));
-    all.extend(every(
-        &[
-            "ToggleSwitchFillOff",
+    all.extend([
+        ("ToggleSwitchFillOff", opaque(s.container)),
+        (
+            "ToggleSwitchFillOnPointerOver",
+            opaque(s.primary.mix(s.on_primary, state::HOVER)),
+        ),
+        (
+            "ToggleSwitchFillOnPressed",
+            opaque(s.primary.mix(s.on_primary, state::PRESSED)),
+        ),
+        (
             "ToggleSwitchFillOffPointerOver",
+            opaque(s.container.mix(s.text, state::HOVER)),
+        ),
+        (
             "ToggleSwitchFillOffPressed",
-        ],
-        opaque(s.container),
-    ));
+            opaque(s.container.mix(s.text, state::PRESSED)),
+        ),
+        (
+            "ToggleSwitchContentForegroundDisabled",
+            opaque(s.secondary_text),
+        ),
+        (
+            "ToggleSwitchHeaderForegroundDisabled",
+            opaque(s.secondary_text),
+        ),
+    ]);
     all.extend(every(
         &[
             "ToggleSwitchStrokeOff",
@@ -750,6 +762,14 @@ fn switches(s: &Roles) -> Vec<(&'static str, Value)> {
 fn overlays(s: &Roles) -> Vec<(&'static str, Value)> {
     let mut all = vec![
         ("MenuFlyoutPresenterBackground", opaque(s.tonal)),
+        ("NumberBoxPopupBackground", opaque(s.tonal)),
+        ("NumberBoxPopupBorderBrush", opaque(s.outline)),
+        ("NumberBoxPopupIndicatorForeground", opaque(s.variant)),
+        ("AutoSuggestBoxSuggestionsListBackground", opaque(s.tonal)),
+        (
+            "AutoSuggestBoxSuggestionsListBorderBrush",
+            opaque(s.outline),
+        ),
         ("MenuFlyoutPresenterBorderBrush", opaque(s.outline)),
         ("MenuFlyoutSeparatorBackground", opaque(s.outline)),
         (
@@ -772,27 +792,22 @@ fn overlays(s: &Roles) -> Vec<(&'static str, Value)> {
             "MenuFlyoutSubItemBackgroundSubMenuOpened",
             layer(s.text, state::HOVER),
         ),
-        (
-            "MenuFlyoutItemForegroundDisabled",
-            layer(s.text, state::DISABLED_CONTENT),
-        ),
+        ("MenuFlyoutItemForegroundDisabled", opaque(s.secondary_text)),
         (
             "MenuFlyoutSubItemForegroundDisabled",
-            layer(s.text, state::DISABLED_CONTENT),
+            opaque(s.secondary_text),
         ),
         (
             "MenuFlyoutSubItemChevronDisabled",
             layer(s.text, state::DISABLED_CONTENT),
         ),
         ("ContentDialogBackground", opaque(s.container)),
-        ("ContentDialogTopOverlay", opaque(s.container)),
+        ("ContentDialogTopOverlay", clear(s)),
+        ("ContentDialogPadding", uniform(0.0)),
         ("ContentDialogForeground", opaque(s.text)),
         ("ContentDialogContentForegroundBrush", opaque(s.variant)),
         // The M3 scrim: black at 32%.
-        (
-            "ContentDialogSmokeFill",
-            Value::Brush(Rgb8::new(0, 0, 0), alpha(0.32)),
-        ),
+        ("ContentDialogSmokeFill", layer(SHADOW_COLOR, state::SCRIM)),
         ("ContentDialogBorderWidth", uniform(0.0)),
         ("ToolTipBackground", opaque(s.text)),
         ("ToolTipForeground", opaque(s.surface)),
@@ -883,8 +898,7 @@ pub fn dictionary_xaml(scheme: &Roles) -> String {
 ///   (control corner, 12-DIP content inset, 32 DIPs, body weight);
 /// - `SubtleButtonStyle`: icon buttons (control corner, no padding);
 /// - `TextBlockButtonStyle`: the one circle, the icon-only Send button;
-/// - `AccentButtonStyle`: the hand-off dialog's primary, which keeps the
-///   theme's filled colors there (based on WinUI's own AccentButtonStyle).
+/// - `AccentButtonStyle`: suggestion cards and tool rows with hover lift.
 ///
 /// Switches carry no On/Off words and no 154-DIP minimum: a Manage
 /// models row ends in the bare switch (OpenCode's dialog).
@@ -894,9 +908,8 @@ pub fn dictionary_xaml(scheme: &Roles) -> String {
 /// `IsSpellCheckEnabled` false: owner review 2026-11-16, prediction junk in
 /// a model id). Text fields, dropdowns and number boxes take the control
 /// corner and height, check boxes the M3 default corner, menu items the control
-/// height, menus and dialogs the container corner. None of these sets a template: WinUI applies the
-/// control's built-in style underneath, so every control keeps its states
-/// and focus visuals.
+/// height, menus the container corner and dialogs their larger corner. The
+/// native templates retain each control's focus, input and selection behavior.
 pub fn styles_xaml() -> String {
     use templates::{Lift, Look, button};
     let (pill, field, container, dialog, check, fab_radius) = (
@@ -910,30 +923,39 @@ pub fn styles_xaml() -> String {
     // Menu items are control-height rows: WinUI pads them from a
     // StaticResource (11,9,11,10), so only a style sets their height.
     let (min, inset, row) = (height::CONTROL, spacing::INSET, spacing::ROW);
+    let font = format!(
+        "<Setter Property=\"FontFamily\" Value=\"{}\"/>\
+         <Setter Property=\"FontSize\" Value=\"{}\"/>",
+        text::FAMILY,
+        text::BODY.size,
+    );
+    let min_height = format!("<Setter Property=\"MinHeight\" Value=\"{min}\"/>");
+    let control = format!("{font}{min_height}");
+    let button_font = format!("{font}<Setter Property=\"FontWeight\" Value=\"Medium\"/>");
     let template = |look: Look| {
         format!(
             "<Setter Property=\"Template\"><Setter.Value>{}</Setter.Value></Setter>",
             button(look)
         )
     };
-    // Rows, chips, segments and labelled buttons: flat pills (the design's
-    // rows change only their state layer). Icon buttons: flat circles.
+    // Rows, chips, segments and labelled buttons: flat pills. Icon buttons
+    // use the same state animation on a circle.
     let flat = template(Look {
         lift: Lift::Flat,
-        press: 1.0,
+        press: motion::PRESS_SCALE,
         radius: pill,
     });
     // The FAB: level 1 at rest, 2 under the pointer, a press to 0.94.
     let fab = template(Look {
         lift: Lift::Fab,
-        press: 0.94,
+        press: motion::FAB_PRESS_SCALE,
         radius: fab_radius,
     });
     // Card pressables (suggestion cards, tool rows): the card corner,
     // lifting to level 1 under the pointer, a press to 0.97.
     let card = template(Look {
         lift: Lift::Hover,
-        press: 0.97,
+        press: motion::PRESS_SCALE,
         radius: container,
     });
     // The transcript is the app's only ScrollView: anchored at its far
@@ -941,18 +963,28 @@ pub fn styles_xaml() -> String {
     // content grows, so a conversation opens at its newest turn.
     format!(
         "{XAML_ROOT}\
+         <FontFamily x:Key=\"ContentControlThemeFontFamily\">{family}</FontFamily>\
+         <x:Double x:Key=\"ControlContentThemeFontSize\">{font_size}</x:Double>\
+         <Style TargetType=\"TextBlock\">{font}</Style>\
+         <Style TargetType=\"RichTextBlock\">\
+           {font}\
+           <Setter Property=\"Foreground\" Value=\"{{ThemeResource TextFillColorPrimaryBrush}}\"/>\
+         </Style>\
          <Style TargetType=\"Button\">\
+           {button_font}\
            <Setter Property=\"CornerRadius\" Value=\"{pill}\"/>\
            <Setter Property=\"Padding\" Value=\"{row},0,{row},0\"/>\
-           <Setter Property=\"MinHeight\" Value=\"{min}\"/>\
+           {min_height}\
            {flat}\
          </Style>\
          <Style x:Key=\"SubtleButtonStyle\" TargetType=\"Button\">\
+           {button_font}\
            <Setter Property=\"CornerRadius\" Value=\"{pill}\"/>\
            <Setter Property=\"Padding\" Value=\"0\"/>\
            {flat}\
          </Style>\
          <Style x:Key=\"TextBlockButtonStyle\" TargetType=\"Button\">\
+           {button_font}\
            <Setter Property=\"CornerRadius\" Value=\"{fab_radius}\"/>\
            <Setter Property=\"Padding\" Value=\"0\"/>\
            <Setter Property=\"BorderThickness\" Value=\"0\"/>\
@@ -961,41 +993,65 @@ pub fn styles_xaml() -> String {
            {fab}\
          </Style>\
          <Style x:Key=\"AccentButtonStyle\" TargetType=\"Button\">\
+           {button_font}\
            <Setter Property=\"CornerRadius\" Value=\"{container}\"/>\
            <Setter Property=\"Padding\" Value=\"{inset},0,{inset},0\"/>\
-           <Setter Property=\"MinHeight\" Value=\"{min}\"/>\
+           {min_height}\
            <Setter Property=\"BorderThickness\" Value=\"0\"/>\
            {card}\
          </Style>\
          <Style TargetType=\"TextBox\">\
+           {control}\
            <Setter Property=\"CornerRadius\" Value=\"{field}\"/>\
-           <Setter Property=\"MinHeight\" Value=\"{min}\"/>\
            <Setter Property=\"IsTextPredictionEnabled\" Value=\"False\"/>\
            <Setter Property=\"IsSpellCheckEnabled\" Value=\"False\"/>\
          </Style>\
          <Style TargetType=\"ComboBox\">\
+           {control}\
            <Setter Property=\"CornerRadius\" Value=\"{pill}\"/>\
-           <Setter Property=\"MinHeight\" Value=\"{min}\"/>\
+         </Style>\
+         <Style TargetType=\"ComboBoxItem\">\
+           {control}\
+           <Setter Property=\"CornerRadius\" Value=\"{pill}\"/>\
+         </Style>\
+         <Style TargetType=\"AutoSuggestBox\">\
+           {control}\
+           <Setter Property=\"CornerRadius\" Value=\"{pill}\"/>\
+         </Style>\
+         <Style TargetType=\"NumberBox\">\
+           {control}\
          </Style>\
          <Style TargetType=\"CheckBox\">\
+           {control}\
            <Setter Property=\"CornerRadius\" Value=\"{check}\"/>\
          </Style>\
+         <Style TargetType=\"RadioButton\">\
+           {control}\
+           <Setter Property=\"CornerRadius\" Value=\"{pill}\"/>\
+         </Style>\
          <Style TargetType=\"ToggleSwitch\">\
+           {control}\
+           <Setter Property=\"Width\" Value=\"{switch_width}\"/>\
            <Setter Property=\"OnContent\" Value=\"\"/>\
            <Setter Property=\"OffContent\" Value=\"\"/>\
            <Setter Property=\"MinWidth\" Value=\"0\"/>\
          </Style>\
          <Style TargetType=\"ContentDialog\">\
+           {font}\
            <Setter Property=\"CornerRadius\" Value=\"{dialog}\"/>\
          </Style>\
          <Style TargetType=\"ScrollView\">\
            <Setter Property=\"VerticalAnchorRatio\" Value=\"1\"/>\
          </Style>\
          <Style TargetType=\"MenuFlyoutItem\">\
+           {font}\
+           <Setter Property=\"CornerRadius\" Value=\"{pill}\"/>\
            <Setter Property=\"Padding\" Value=\"{inset},0,{inset},0\"/>\
            <Setter Property=\"Height\" Value=\"{min}\"/>\
          </Style>\
          <Style TargetType=\"MenuFlyoutSubItem\">\
+           {font}\
+           <Setter Property=\"CornerRadius\" Value=\"{pill}\"/>\
            <Setter Property=\"Padding\" Value=\"{inset},0,{inset},0\"/>\
            <Setter Property=\"Height\" Value=\"{min}\"/>\
          </Style>\
@@ -1030,7 +1086,10 @@ pub fn styles_xaml() -> String {
              </ControlTemplate>\
            </Setter.Value></Setter>\
          </Style>\
-         </ResourceDictionary>"
+         </ResourceDictionary>",
+        family = text::FAMILY,
+        font_size = text::BODY.size,
+        switch_width = layout::SWITCH_WIDTH,
     )
 }
 

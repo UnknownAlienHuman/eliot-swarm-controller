@@ -76,6 +76,9 @@ mod state;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod theme;
 #[cfg_attr(not(windows), allow(dead_code))]
+#[path = "ui/tokens.rs"]
+mod tokens;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod worktrees;
 
 #[cfg(windows)]

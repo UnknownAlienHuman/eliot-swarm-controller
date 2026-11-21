@@ -35,6 +35,7 @@ pub mod radius {
     pub const BUBBLE_TAIL: f64 = 4.0;
     /// The Stop square inside the FAB.
     pub const STOP: f64 = 3.0;
+    pub const STATUS_MARK: f64 = 2.0;
     /// Check boxes keep the M3 corner.
     pub const CHECK_BOX: f64 = 2.0;
 }
@@ -59,14 +60,38 @@ pub mod height {
     pub const FORM_ROW: f64 = 40.0;
     /// A picker row with a supporting line under its title.
     pub const TWO_LINE_ROW: f64 = 48.0;
+    pub const SUGGESTION: f64 = 44.0;
 }
 
-/// The design's type roles.
+/// The design's type roles. Segoe UI Variable is the Windows fallback
+/// specified for Roboto Flex in the design.
 pub mod text {
-    pub use crate::theme::typography::{
-        BODY, BUTTON, CAPTION, CAPTION as SECONDARY, CHIP, HEADER, HEADER as SECTION_TITLE, HERO,
-        LABEL, TITLE, TypeStyle,
-    };
+    pub const FAMILY: &str = "Segoe UI Variable";
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct TypeStyle {
+        pub size: f64,
+        pub weight: u16,
+    }
+
+    const fn style(size: f64, weight: u16) -> TypeStyle {
+        TypeStyle { size, weight }
+    }
+
+    pub const HERO: TypeStyle = style(28.0, 500);
+    pub const TITLE: TypeStyle = style(16.0, 600);
+    pub const HEADER: TypeStyle = style(15.0, 500);
+    pub const BODY: TypeStyle = style(14.0, 400);
+    pub const BUTTON: TypeStyle = style(14.0, 500);
+    pub const CHIP: TypeStyle = style(13.0, 400);
+    pub const LABEL: TypeStyle = style(12.0, 500);
+    pub const CAPTION: TypeStyle = style(12.0, 400);
+}
+
+/// Supporting roles in variant, border, tonal and running order.
+pub mod color {
+    pub const LIGHT_SUPPORTING: [u32; 4] = [0x46464f, 0xc6c5d0, 0xf0eff7, 0xe8e9ff];
+    pub const DARK_SUPPORTING: [u32; 4] = [0xd5d3dd, 0x595860, 0x1f1e24, 0x272a47];
 }
 
 /// The 4-DIP grid in DIPs.
@@ -77,16 +102,24 @@ pub mod spacing {
     pub const XS: f64 = 4.0;
     /// Inside a group: between chips, a glyph and its label.
     pub const SM: f64 = 8.0;
+    /// Icon-to-label gap inside a chip.
+    pub const CHIP_GAP: f64 = 6.0;
+    /// Leading padding of WinUI's text field template.
+    pub const FIELD_LEADING_INSET: f64 = 10.0;
     /// A row's inset from its pill and the gap from its icon to its label
     /// ("every sidebar row starts its icon at 10 DIP inside an 8-DIP
     /// gutter").
     pub const ROW: f64 = 10.0;
     /// The content inset of a control, card or menu.
     pub const INSET: f64 = 12.0;
+    /// The text inset of tabs, suggestion cards and message bubbles.
+    pub const TEXT_INSET: f64 = 14.0;
     /// Between groups.
     pub const MD: f64 = 16.0;
     /// The conversation's side padding, page padding.
     pub const LG: f64 = 24.0;
+    /// Between the Home title, suggestions and composer.
+    pub const HOME_GROUP_GAP: f64 = 28.0;
     /// The main area's side padding.
     pub const XL: f64 = 32.0;
 }
@@ -107,7 +140,25 @@ pub mod icon {
 /// popover's entrance (a fade and a 4-DIP rise).
 pub mod motion {
     pub const STATE_MS: u64 = 150;
+    pub const PRESS_MS: u64 = 100;
+    pub const RIPPLE_MS: u64 = 300;
     pub const POPOVER_MS: u64 = 250;
+    pub const PRESS_SCALE: f64 = 0.97;
+    pub const FAB_PRESS_SCALE: f64 = 0.94;
+    pub const POPOVER_START_SCALE: f64 = 0.97;
+    pub const EMPHASIZED: &str = "0.2,0 0,1";
+    pub const DECELERATE: &str = "0.05,0.7 0.1,1";
+}
+
+/// State layers of the content color over a container.
+pub mod state {
+    pub const HOVER: f64 = 0.08;
+    pub const PRESSED: f64 = 0.12;
+    pub const DISABLED_CONTAINER: f64 = 0.12;
+    /// Disabled selection marks and other non-text affordances.
+    pub const DISABLED_CONTENT: f64 = 0.38;
+    pub const SCRIM: f64 = 0.32;
+    pub const PLOT_STUB_OPACITY: f64 = 0.72;
 }
 
 /// Widths and the few fixed sizes of the shell.
@@ -140,6 +191,8 @@ pub mod layout {
     pub const DIALOG_WIDTH: f64 = 420.0;
     /// A list of items inside a dialog before it scrolls.
     pub const DIALOG_LIST_MAX_HEIGHT: f64 = 240.0;
+    pub const MOVE_DIALOG_WIDTH: f64 = 480.0;
+    pub const MOVE_LIST_MAX_HEIGHT: f64 = 320.0;
     /// A theme's swatch in Settings › Appearance.
     pub const SWATCH_WIDTH: f64 = 48.0;
     pub const SWATCH_HEIGHT: f64 = 24.0;
@@ -163,12 +216,20 @@ pub mod layout {
     /// What runs an Agent (`Codex · qwen4-max`) at most in a Monitor row or
     /// the conversation header; a longer label trims.
     pub const RUNS_LABEL_WIDTH: f64 = 200.0;
+    pub const HEADER_TITLE_MIN_WIDTH: f64 = 96.0;
+    pub const HEADER_STATUS_MIN_WIDTH: f64 = 64.0;
     /// The widest trailing word of a Monitor row (model, need or age).
     pub const MONITOR_TRAILING_WIDTH: f64 = 112.0;
     /// The composer's field grows with its text up to this height.
     pub const COMPOSER_MAX_HEIGHT: f64 = 200.0;
     /// The composer's field below its first line (the design's 44 DIP).
     pub const COMPOSER_MIN_HEIGHT: f64 = 44.0;
+    /// Hide the keyboard hint in a composer narrower than this.
+    pub const COMPOSER_HINT_MIN_WIDTH: f64 = 560.0;
+    /// Bottom row space reserved for fixed controls, padding and gaps.
+    pub const COMPOSER_ACTIONS_WIDTH: f64 = 190.0;
+    pub const COMPOSER_ACCESS_WIDTH: f64 = 112.0;
+    pub const COMPOSER_LABEL_MIN_WIDTH: f64 = 80.0;
     /// A multiline source editor (TOML, JSON, a script).
     pub const SOURCE_MIN_HEIGHT: f64 = 240.0;
     pub const SOURCE_MAX_HEIGHT: f64 = 420.0;
@@ -182,6 +243,10 @@ pub mod layout {
     pub const BADGE_DOT: f64 = 6.0;
     /// Dividers.
     pub const HAIRLINE: f64 = 1.0;
+    /// Extend the ripple past the control so its final frame fills the shape.
+    pub const RIPPLE_INSET: f64 = 24.0;
+    pub const FOCUS_RING: f64 = 2.0;
+    pub const STATUS_STROKE: f64 = 1.5;
     /// The indeterminate progress bar of a running turn.
     pub const PROGRESS_WIDTH: f64 = 160.0;
     /// A monitor chart's plot, and the stub of an unknown sample.
@@ -203,6 +268,9 @@ pub mod layout {
     pub const PROJECT_CHIP_WIDTH: f64 = 280.0;
     /// The access and project menus above the composer.
     pub const MENU_WIDTH: f64 = 420.0;
+    pub const CONTEXT_MENU_WIDTH: f64 = 248.0;
+    pub const USAGE_MENU_WIDTH: f64 = 320.0;
+    pub const EFFORT_MENU_MIN_WIDTH: f64 = 300.0;
     /// The scrolling list of a popover.
     pub const POPOVER_LIST_HEIGHT: f64 = 360.0;
     /// The check column of a popover row.

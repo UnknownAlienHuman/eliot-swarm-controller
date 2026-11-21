@@ -23,7 +23,7 @@ fn small(text: impl Into<String>) -> TextBlock {
 
 /// A failure note: the secondary size at full emphasis in the error color.
 fn error_note(text: impl Into<String>, palette: Palette) -> TextBlock {
-    crate::m3::text(text, tokens::text::SECONDARY)
+    crate::m3::text(text, tokens::text::CAPTION)
         .foreground(palette.attention())
         .text_wrapping(TextWrapping::Wrap)
         .is_text_selection_enabled(true)
@@ -107,7 +107,6 @@ fn switch(key: &str, on: bool, enabled: bool, name: String, toggled: Callback<bo
         ToggleSwitch::new()
             .is_on(on)
             .is_enabled(enabled)
-            .width(tokens::layout::SWITCH_WIDTH)
             .automation_name(name)
             .on_toggled(toggled),
     )])

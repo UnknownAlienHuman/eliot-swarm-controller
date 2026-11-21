@@ -70,7 +70,7 @@ mod scripts_ui;
 mod settings_ui;
 mod shell_ui;
 mod sidebar_ui;
-pub(crate) mod tokens;
+pub(crate) use crate::tokens;
 
 use automation_ui::AutomationMsg;
 use bulk_ui::BulkMsg;

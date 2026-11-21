@@ -7,23 +7,8 @@ use crate::state::Drafts;
 use eliot_core::api::{HarnessModelsResponse, ModelsCatalogResponse};
 use launch_ui::Pop;
 
-/// The usage popover's width (Codex's usage popover).
-const USAGE_WIDTH: f64 = 320.0;
 /// Limits the usage popover lists (the tightest first).
 const USAGE_ROWS: usize = 3;
-/// The effort popover's least width (its steps set the rest).
-const EFFORT_MIN_WIDTH: f64 = 300.0;
-/// Below this composer width the hint before the buttons is left out.
-const HINT_MIN_WIDTH: f64 = 560.0;
-/// What the composer's bottom row takes besides the chip labels: the card's
-/// padding (16 + 12), the row's gap (8), the usage ring and the FAB 10
-/// apart (32 + 10 + 36), the + button and its gap (32 + 6), and a chip's
-/// padding, gap and chevron (10 + 6 + 12 + 10).
-const BOTTOM_ROW_CHROME: f64 = 190.0;
-/// Home's access chip beside the model chip, with its gap.
-const ACCESS_CHIP: f64 = 112.0;
-/// The narrowest a chip's label trims to.
-const MIN_CHIP_LABEL: f64 = 80.0;
 
 impl DesktopApp {
     /// What Send (the button, or Enter) does now: retry the unresolved
@@ -99,15 +84,21 @@ impl DesktopApp {
         };
         // A narrow composer drops its hint and trims its chips' labels to
         // the room left, so the buttons and the chevrons stay whole.
-        let hint = width.is_none_or(|width| width >= HINT_MIN_WIDTH);
+        let hint = width.is_none_or(|width| width >= tokens::layout::COMPOSER_HINT_MIN_WIDTH);
         let label = |others: f64| {
             width.map_or(tokens::layout::PROJECT_CHIP_WIDTH, |width| {
-                (width - BOTTOM_ROW_CHROME - others)
-                    .clamp(MIN_CHIP_LABEL, tokens::layout::PROJECT_CHIP_WIDTH)
+                (width - tokens::layout::COMPOSER_ACTIONS_WIDTH - others).clamp(
+                    tokens::layout::COMPOSER_LABEL_MIN_WIDTH,
+                    tokens::layout::PROJECT_CHIP_WIDTH,
+                )
             })
         };
         let chips: View = match (agent.as_deref(), detail) {
-            (None, _) => self.composer_chips(label(ACCESS_CHIP), context, palette),
+            (None, _) => self.composer_chips(
+                label(tokens::layout::COMPOSER_ACCESS_WIDTH),
+                context,
+                palette,
+            ),
             (Some(_), Some(detail)) => self.model_chip(detail, label(0.0), context, palette),
             (Some(_), None) => View::empty(),
         };
@@ -377,7 +368,7 @@ impl DesktopApp {
             crate::theme::elevation::Level::Two,
             tokens::radius::CONTAINER,
             Grid::new()
-                .min_width(EFFORT_MIN_WIDTH)
+                .min_width(tokens::layout::EFFORT_MENU_MIN_WIDTH)
                 .horizontal_alignment(HorizontalAlignment::Left),
             m3::popover(palette)
                 .automation_name("Model and effort")
@@ -456,7 +447,7 @@ impl DesktopApp {
             crate::theme::elevation::Level::Two,
             tokens::radius::CONTAINER,
             Grid::new()
-                .width(USAGE_WIDTH)
+                .width(tokens::layout::USAGE_MENU_WIDTH)
                 .horizontal_alignment(HorizontalAlignment::Right),
             m3::popover(palette).automation_name("Usage").content(
                 StackPanel::new().spacing(tokens::spacing::XS).children((
@@ -799,7 +790,12 @@ impl Component for Composer {
         let mut field_cells = vec![KeyedView::new(
             "field",
             Border::new()
-                .margin(Thickness::new(-WINUI_TEXT_PADDING, 0.0, 0.0, 0.0))
+                .margin(Thickness::new(
+                    -tokens::spacing::FIELD_LEADING_INSET,
+                    0.0,
+                    0.0,
+                    0.0,
+                ))
                 .content(field),
         )];
         // A click into the field closes an open popover. WinUI's text box
@@ -823,7 +819,7 @@ impl Component for Composer {
         // The design: + (attach files), then the chips, 6 DIPs apart.
         let chips = StackPanel::new()
             .orientation(Orientation::Horizontal)
-            .spacing(6.0)
+            .spacing(tokens::spacing::CHIP_GAP)
             .children((
                 m3::icon_button(palette)
                     .automation_name("Attach files")
@@ -867,7 +863,11 @@ impl Component for Composer {
                 0.0,
                 tokens::spacing::INSET,
                 0.0,
-                if home { 28.0 } else { tokens::spacing::LG },
+                if home {
+                    tokens::spacing::HOME_GROUP_GAP
+                } else {
+                    tokens::spacing::LG
+                },
             ))
             .content(m3::composer_card(
                 palette,
@@ -1018,7 +1018,7 @@ fn attachment_chips(
                     .content(
                         StackPanel::new()
                             .orientation(Orientation::Horizontal)
-                            .spacing(6.0)
+                            .spacing(tokens::spacing::CHIP_GAP)
                             .children((
                                 m3::chip_content(
                                     Some(m3::glyph::FILE),
@@ -1035,6 +1035,6 @@ fn attachment_chips(
         .collect();
     StackPanel::new()
         .orientation(Orientation::Horizontal)
-        .spacing(6.0)
+        .spacing(tokens::spacing::CHIP_GAP)
         .keyed_children(chips)
 }

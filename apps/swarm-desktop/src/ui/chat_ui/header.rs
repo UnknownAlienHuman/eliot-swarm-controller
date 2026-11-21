@@ -263,7 +263,7 @@ impl DesktopApp {
                                         "Ends Agent {} (run {}) at once instead of a clean stop; an active turn is cut off.",
                                         bound.agent, bound.generation
                                     ),
-                                    tokens::text::SECONDARY,
+                                    tokens::text::CAPTION,
                                 )
                                 .foreground(palette.attention())
                                 .text_wrapping(TextWrapping::Wrap),
@@ -313,22 +313,24 @@ pub(super) struct HeaderInput {
     send: Callback<Message>,
 }
 
-/// The narrowest a title trims to; the pill's label trims after it.
-const MIN_TITLE: f64 = 96.0;
-/// The narrowest the pill's label trims to.
-const MIN_PILL_LABEL: f64 = 64.0;
-
 /// The widest the header's title and status-pill label take in a main area
 /// `main` DIPs wide: the reading width and the pill's full label when they
 /// fit; a narrow window trims the title first, then the label, so the two
 /// actions always keep their room.
 fn header_widths(main: f64) -> (f64, f64) {
     let chrome = tokens::spacing::LG + tokens::spacing::MD + 2.0 * tokens::spacing::ROW;
-    let pill_chrome = tokens::layout::BADGE_DOT + 6.0 + 2.0 * tokens::spacing::ROW;
+    let pill_chrome =
+        tokens::layout::BADGE_DOT + tokens::spacing::CHIP_GAP + 2.0 * tokens::spacing::ROW;
     let actions = 2.0 * tokens::height::CONTROL + tokens::spacing::ROW_GAP;
     let room = main - chrome - pill_chrome - actions;
-    let label = (room - MIN_TITLE).clamp(MIN_PILL_LABEL, tokens::layout::RUNS_LABEL_WIDTH);
-    let title = (room - label).clamp(MIN_TITLE, tokens::layout::READING_WIDTH);
+    let label = (room - tokens::layout::HEADER_TITLE_MIN_WIDTH).clamp(
+        tokens::layout::HEADER_STATUS_MIN_WIDTH,
+        tokens::layout::RUNS_LABEL_WIDTH,
+    );
+    let title = (room - label).clamp(
+        tokens::layout::HEADER_TITLE_MIN_WIDTH,
+        tokens::layout::READING_WIDTH,
+    );
     (title, label)
 }
 

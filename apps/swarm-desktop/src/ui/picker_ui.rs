@@ -24,9 +24,6 @@ const MANAGE_GROUP_ROWS: usize = 150;
 /// requests and the notice row, down to the composer.
 pub(super) const POPOVER_ROWS: i32 = 4;
 
-/// A popover starts this much smaller and settles to its size.
-const ENTRANCE_SCALE: f64 = 0.97;
-
 impl DesktopApp {
     /// A new task composer's first row, inside its card (Codex's): the
     /// project selector as a borderless chip, and the folder field for a
@@ -113,7 +110,7 @@ impl DesktopApp {
         };
         StackPanel::new()
             .orientation(Orientation::Horizontal)
-            .spacing(6.0)
+            .spacing(tokens::spacing::CHIP_GAP)
             .children((chip, worktree, folder))
     }
 
@@ -193,7 +190,7 @@ impl DesktopApp {
         // The design: the access chip, then the model chip.
         StackPanel::new()
             .orientation(Orientation::Horizontal)
-            .spacing(6.0)
+            .spacing(tokens::spacing::CHIP_GAP)
             .children((access, model))
     }
 
@@ -236,7 +233,11 @@ impl DesktopApp {
             .horizontal_alignment(HorizontalAlignment::Center)
             .opacity(if entering { 0.0 } else { 1.0 })
             .opacity_transition(Some(entrance))
-            .scale(Some(if entering { ENTRANCE_SCALE } else { 1.0 }))
+            .scale(Some(if entering {
+                tokens::motion::POPOVER_START_SCALE
+            } else {
+                1.0
+            }))
             .scale_transition(Some(entrance))
             .content(content)
     }
@@ -534,32 +535,24 @@ impl DesktopApp {
                                 .content(chip_text(
                                     picker::effort_label(effort),
                                     &picker::effort_name(effort),
+                                    false,
                                 )),
                         )
                     })
                     .collect();
-            Border::new()
-                .height(tokens::height::CHIP)
-                .corner_radius(tokens::height::CHIP / 2.0)
-                .background(palette.container())
-                .vertical_alignment(VerticalAlignment::Center)
-                .content(
-                    StackPanel::new()
-                        .orientation(Orientation::Horizontal)
-                        .keyed_children(segments),
-                )
+            effort_chip(
+                palette,
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .keyed_children(segments),
+            )
         } else if let Some((label, name)) = match item.effort.as_deref() {
             Some(effort) => Some((picker::effort_label(effort), picker::effort_name(effort))),
             // Display only: the row's choice still carries no effort.
             None if model_row => Some(("Default", DEFAULT_EFFORT.to_owned())),
             None => None,
         } {
-            Border::new()
-                .height(tokens::height::CHIP)
-                .corner_radius(tokens::height::CHIP / 2.0)
-                .background(palette.container())
-                .vertical_alignment(VerticalAlignment::Center)
-                .content(chip_text(label, &name).opacity(theme::MUTED_OPACITY))
+            effort_chip(palette, chip_text(label, &name, true))
         } else {
             View::empty()
         };
@@ -646,7 +639,7 @@ impl DesktopApp {
             let icon = m3::icon(access_glyph(access));
             let row = Button::new()
                 .resource_overrides(if warn {
-                    palette.attention_row()
+                    palette.destructive_row(false)
                 } else {
                     palette.row(false)
                 })
@@ -873,7 +866,6 @@ impl DesktopApp {
                                 .text_trimming(TextTrimming::CharacterEllipsis),
                             ToggleSwitch::new()
                                 .grid_column(2)
-                                .width(tokens::layout::SWITCH_WIDTH)
                                 .is_on(model.visible)
                                 .vertical_alignment(VerticalAlignment::Center)
                                 .automation_name(format!(
@@ -987,7 +979,6 @@ fn manage_group_row(
     let group_key = group.key.clone();
     let check = ToggleSwitch::new()
         .grid_column(1)
-        .width(tokens::layout::SWITCH_WIDTH)
         .is_on(group.visible)
         .vertical_alignment(VerticalAlignment::Center)
         .automation_name(format!("Show every {} model", group.title))
@@ -1016,8 +1007,7 @@ fn group_heading(
     } else {
         (m3::glyph::CHEVRON_DOWN, "expanded")
     };
-    let label =
-        m3::section_label(title.to_owned()).font_weight(m3::weight(tokens::text::SECTION_TITLE));
+    let label = m3::section_label(title.to_owned()).font_weight(m3::weight(tokens::text::HEADER));
     m3::sub_row(palette, false)
         .margin(Thickness::new(indent, 0.0, 0.0, 0.0))
         .automation_name(format!("{title} models, {state}"))
@@ -1038,11 +1028,24 @@ fn group_heading(
         )
 }
 
-/// The label of a picker row's effort chip or segment: the short effort in
-/// the secondary type, inset from the chip's edges, named in full words.
-fn chip_text(label: &str, name: &str) -> TextBlock {
-    m3::text(label.to_owned(), tokens::text::SECONDARY)
-        .automation_name(name.to_owned())
+/// A filled effort chip container, shared by its static tag and segments.
+fn effort_chip(palette: Palette, content: impl Into<View>) -> View {
+    Border::new()
+        .height(tokens::height::CHIP)
+        .corner_radius(tokens::radius::CHIP)
+        .background(palette.container())
+        .vertical_alignment(VerticalAlignment::Center)
+        .content(content)
+}
+
+/// The short effort label, named in full words for accessibility.
+fn chip_text(label: &str, name: &str, muted: bool) -> TextBlock {
+    let text = if muted {
+        m3::muted(label.to_owned(), tokens::text::CHIP)
+    } else {
+        m3::text(label.to_owned(), tokens::text::CHIP)
+    };
+    text.automation_name(name.to_owned())
         .margin(Thickness::xy(tokens::spacing::SM, 0.0))
         .vertical_alignment(VerticalAlignment::Center)
 }
@@ -1068,8 +1071,7 @@ fn heading(title: &str, note: &str) -> View {
             tokens::spacing::XS,
         ))
         .children((
-            m3::section_label(title.to_owned())
-                .font_weight(m3::weight(tokens::text::SECTION_TITLE)),
+            m3::section_label(title.to_owned()).font_weight(m3::weight(tokens::text::HEADER)),
             if note.is_empty() {
                 View::empty()
             } else {

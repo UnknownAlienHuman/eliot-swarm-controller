@@ -16,11 +16,6 @@
 use super::*;
 use crate::theme::winui::Palette;
 
-/// The picker list's height before it scrolls.
-const LIST_HEIGHT: f64 = 320.0;
-/// The picker's width.
-const DIALOG_WIDTH: f64 = 480.0;
-
 #[derive(Clone, Debug)]
 pub(super) enum MoveMsg {
     /// Open the picker for this task, bound to the generation shown.
@@ -323,7 +318,7 @@ impl DesktopApp {
                     .into()
             }
             Search::Read(_) => ScrollViewer::new()
-                .max_height(LIST_HEIGHT)
+                .max_height(tokens::layout::MOVE_LIST_MAX_HEIGHT)
                 .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
                 .automation_name("Tasks to move under")
                 .content(StackPanel::new().keyed_children(rows)),
@@ -404,7 +399,7 @@ impl DesktopApp {
                     .content(m3::label("Cancel")),
                 confirm,
             ),
-            DIALOG_WIDTH,
+            tokens::layout::MOVE_DIALOG_WIDTH,
         )
     }
 }

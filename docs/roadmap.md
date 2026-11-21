@@ -479,10 +479,10 @@ of the explicitly selected release scope.
 
 - [x] **D1 Styled real chat.** One optional Windows package (`apps/swarm-desktop`,
       binary `swarm-desktop`) on WinUI 3 through `windows-reactor`: native window with
-      one shell (see D7) and Material 3 roles generated from one seed (tonal palettes
-      through `material-colors`, written as WinUI lightweight-styling resources at
-      the application root for the shown scheme; system colors under High Contrast;
-      a System/Light/Dark switch saved per user); project/profile selection and an
+      one shell (see D7) and the owner-approved Material 3 theme roles, written as
+      WinUI lightweight-styling resources at the application root for the shown
+      scheme (system colors under High Contrast; theme choice saved per user);
+      project/profile selection and an
       Agent list grouped by project with children under their manager (branches
       read through `agent.list` `parent`);
       `launch(text)` with its linked command; send to an existing Agent; the real
@@ -701,9 +701,11 @@ of the explicitly selected release scope.
       28/16/15/14/13/12 in one family (Segoe UI Variable), buttons 14/500; a
       4-DIP grid; icons 18 in rows and icon buttons, 16 in chips, 14 for a
       dropdown's chevron, Stop a rounded square. One action pattern: filled primary (one per page),
-      outlined secondary, text tertiary, destructive text in the error color;
-      orange and red appear only for the Full access warning and destructive
-      actions. The Details panel has only a close button. (Refs #407)
+      outlined secondary, text tertiary and destructive text in the error color.
+      Text roles keep at least 4.5:1 contrast against their surfaces in Light and
+      Dark, including secondary text, placeholders and disabled labels.
+      The attention role marks warnings, errors, failures, low quota and
+      destructive actions. The Details panel has only a close button. (Refs #407)
 - [x] **D8 Settings and routing in the desktop.** Every Settings page reads and
       writes the unified `settings.read/save` (S1) through `config_client`; the
       desktop has no other store. Settings reopens on its last document

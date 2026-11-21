@@ -8,7 +8,6 @@ impl DesktopApp {
             format!("cloud:{enabled}"),
             ToggleSwitch::new()
                 .is_on(enabled)
-                .width(tokens::layout::SWITCH_WIDTH)
                 .automation_name("Cloud MCP configured")
                 .on_toggled(
                     context.callback(|on: bool| Message::Settings(SettingsMsg::CloudEnabled(on))),

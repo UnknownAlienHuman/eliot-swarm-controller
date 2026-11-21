@@ -22,7 +22,6 @@ use windows_reactor::*;
 
 use crate::chat::{self, Part, PartKind, TurnItem, text_hash};
 use crate::markdown::{Block, Doc, Inline};
-use crate::theme;
 use crate::theme::winui::Palette;
 use crate::ui::tokens;
 
@@ -156,9 +155,7 @@ fn list_view(items: &[(usize, String, RichText)]) -> View {
                                 GridLength::STAR,
                             ])
                             .children((
-                                TextBlock::new()
-                                    .text(marker.clone())
-                                    .font_size(tokens::text::BODY.size),
+                                crate::m3::body(marker.clone()),
                                 rich_block(text).grid_column(1),
                             )),
                     )
@@ -250,13 +247,11 @@ fn label(text: &str) -> TextBlock {
 }
 
 /// Message text: body.
-fn body_text(text: &str, foreground: Brush) -> TextBlock {
-    TextBlock::new()
-        .text(text.to_owned())
-        .font_size(tokens::text::BODY.size)
+fn body_text(text: &str, palette: Palette) -> TextBlock {
+    crate::m3::body(text.to_owned())
+        .foreground(palette.text())
         .text_wrapping(TextWrapping::Wrap)
         .is_text_selection_enabled(true)
-        .foreground(foreground)
 }
 
 /// An inline icon button is pulled back by this so its glyph lines up
@@ -293,10 +288,7 @@ fn block_views(
     palette: Palette,
 ) -> Vec<KeyedView> {
     let Some(blocks) = part.blocks.as_ref() else {
-        return vec![KeyedView::new(
-            "plain",
-            body_text(&part.plain, palette.text()),
-        )];
+        return vec![KeyedView::new("plain", body_text(&part.plain, palette))];
     };
     blocks
         .iter()
@@ -308,8 +300,8 @@ fn block_views(
                 RenderedBlock::Heading(level, text) => crate::m3::text(
                     text.clone(),
                     match level {
-                        1 => theme::typography::TITLE,
-                        _ => theme::typography::HEADER,
+                        1 => tokens::text::TITLE,
+                        _ => tokens::text::HEADER,
                     },
                 )
                 .text_wrapping(TextWrapping::Wrap)
@@ -334,9 +326,7 @@ fn block_views(
                                     .horizontal_scroll_bar_visibility(ScrollBarVisibility::Auto)
                                     .vertical_scroll_bar_visibility(ScrollBarVisibility::Disabled)
                                     .content(
-                                        TextBlock::new()
-                                            .text(text.clone())
-                                            .font_size(tokens::text::BODY.size)
+                                        crate::m3::body(text.clone())
                                             .text_wrapping(TextWrapping::NoWrap)
                                             .is_text_selection_enabled(true),
                                     ),
@@ -378,7 +368,7 @@ fn part_view(
             .horizontal_alignment(HorizontalAlignment::Right)
             .max_width(tokens::layout::READING_WIDTH * tokens::layout::BUBBLE_SHARE)
             .children((
-                crate::m3::bubble(palette, body_text(&part.plain, palette.text()), None),
+                crate::m3::bubble(palette, body_text(&part.plain, palette), None),
                 if part.attachments.is_empty() {
                     View::empty()
                 } else {
@@ -515,9 +505,7 @@ fn part_view(
                 View::empty()
             };
             StackPanel::new().spacing(tokens::spacing::XS).children((
-                TextBlock::new()
-                    .text(format!("{} · {}", part.label, part.plain))
-                    .font_size(tokens::text::BODY.size)
+                crate::m3::body(format!("{} · {}", part.label, part.plain))
                     .text_wrapping(TextWrapping::Wrap)
                     .is_text_selection_enabled(true)
                     .foreground(palette.attention()),
@@ -1013,7 +1001,7 @@ fn path_actions(part: &str, paths: &[String], callbacks: &RowCallbacks, palette:
     StackPanel::new().spacing(tokens::spacing::XS).children((
         StackPanel::new()
             .orientation(Orientation::Horizontal)
-            .spacing(6.0)
+            .spacing(tokens::spacing::CHIP_GAP)
             .keyed_children(chips),
         note,
     ))
@@ -1033,7 +1021,7 @@ fn file_glyph(path: &str) -> &'static str {
 pub fn attached_chips(files: &[String], palette: Palette) -> View {
     StackPanel::new()
         .orientation(Orientation::Horizontal)
-        .spacing(6.0)
+        .spacing(tokens::spacing::CHIP_GAP)
         .horizontal_alignment(HorizontalAlignment::Right)
         .keyed_children(
             files

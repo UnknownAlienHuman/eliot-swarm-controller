@@ -114,7 +114,6 @@ impl DesktopApp {
             format!("reopen:{reopen}"),
             ToggleSwitch::new()
                 .is_on(reopen)
-                .width(tokens::layout::SWITCH_WIDTH)
                 .automation_name("Reopen the last task at start")
                 .on_toggled(context.callback(|on: bool| {
                     Message::Shell(ShellMsg::StartupChosen(if on {

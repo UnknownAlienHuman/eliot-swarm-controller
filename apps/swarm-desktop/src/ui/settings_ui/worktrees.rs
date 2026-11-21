@@ -44,7 +44,7 @@ impl DesktopApp {
                 .enumerate()
                 .map(|(index, line)| {
                     let text = if index == 0 {
-                        m3::text(line.clone(), tokens::text::SECTION_TITLE)
+                        m3::text(line.clone(), tokens::text::HEADER)
                     } else {
                         m3::body(line.clone())
                     };
@@ -99,12 +99,12 @@ impl DesktopApp {
                         }))
                         .content(m3::text(
                             format!("{} · {summary}", group.title()),
-                            tokens::text::SECTION_TITLE,
+                            tokens::text::HEADER,
                         ))
                 } else {
                     m3::text(
                         format!("{} · {summary}", group.title()),
-                        tokens::text::SECTION_TITLE,
+                        tokens::text::HEADER,
                     )
                     .into()
                 };
