@@ -15,6 +15,7 @@ mod git_monitor;
 pub(crate) mod logging;
 mod maintenance;
 mod monitor;
+pub mod operator;
 mod platform;
 mod plugin_host;
 mod proxy;

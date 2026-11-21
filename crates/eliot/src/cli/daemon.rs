@@ -33,18 +33,24 @@ pub(crate) async fn run_daemon(
             "daemon autostart requires an Owner CLI outside an Agent session",
         )));
     }
+    if foreground && args.action.is_some() {
+        return Err(Failure::new(
+            2,
+            "--foreground is only valid when starting the daemon",
+        ));
+    }
     match args.action {
+        Some(DaemonAction::Update { release }) => {
+            if id.is_some() {
+                return Err(Failure::new(2, "--id is not valid with daemon update"));
+            }
+            super::update::run(release, data_dir, json_output).await
+        }
         Some(DaemonAction::Stop(args)) => {
             if args.drain == args.force {
                 return Err(Failure::new(
                     2,
                     "daemon stop requires exactly one of --drain or --force",
-                ));
-            }
-            if foreground {
-                return Err(Failure::new(
-                    2,
-                    "--foreground is only valid when starting the daemon",
                 ));
             }
             let mode = if args.drain {

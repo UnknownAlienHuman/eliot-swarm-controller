@@ -137,60 +137,14 @@ must explicitly request `--delete-remote` for remote branch deletion.
 
 ## Private live proof on Windows
 
-1. Use a fully isolated data directory within your bound artifact root.
-   Set `$proofDir` to its absolute path, distinct from production, and
-   create a fresh directory there. Use a group such as `qa-k123` for
-   temporary repos, with plain names like `app` and `library`. Never launch
-   Agents on a production copy. A separately authorized backup copy is
-   suitable only for Owner read-path checks because its store can share
-   production's Job custody namespace.
-2. Protect the new directory's ACL. Use the current Windows account even
-   when `USERNAME` is empty. Abort if account lookup or ACL setup fails.
+```powershell
+& $swarm stand up --root $proofDir --profile $proofConfig
+& $swarm --data-dir $proofDir launch --workspace "$proofDir\repo" --profile $proofProfile --wait $task
+& $swarm stand down $proofDir
+```
 
-   ```powershell
-   $proofUser = whoami
-   icacls $proofDir /inheritance:r /grant:r ('{0}:(OI)(CI)F' -f $proofUser)
-   ```
-
-3. From your Agent's issuing controller, register the private directory.
-   Write only the private configuration needed for the proof, using the
-   assignment's approved native profiles.
-
-   ```powershell
-   & $swarm artifact register $proofDir --kind data_dir --purpose 'Private live proof'
-   ```
-
-4. Start the private daemon. Check readiness and target identity, then
-   run the real task with the selected native profile. Pass
-   `--data-dir $proofDir` on every private command and leave the production
-   Agent environment intact.
-
-   ```powershell
-   & $swarm daemon --data-dir $proofDir
-   & $swarm identity --data-dir $proofDir
-   & $swarm launch --data-dir $proofDir --profile $proofProfile --workspace $proofWorkspace --wait --timeout-seconds 30 $task
-   ```
-
-5. Close test desktop windows immediately after taking screenshots.
-   If a screenshot is black, check whether the console display is off and
-   recapture usable evidence. Stop owned test Agents in the private
-   directory, request drain, and check status and owned process exit
-   before reporting teardown. If drain reports blockers, read the
-   blocker state and account for the exact owned processes. Never kill
-   processes by name or operate on the production daemon.
-
-   ```powershell
-   & $swarm stop $child --data-dir $proofDir --generation $childGeneration
-   & $swarm daemon stop --data-dir $proofDir --drain
-   & $swarm status --data-dir $proofDir
-   ```
-
-   From a private Owner MCP connection, `daemon.shutdown` with
-   `mode: "drain"` requests the same stop and `daemon.status` gives readback
-   while the daemon is reachable. Confirm exit separately. Keep the proof
-   and teardown in this turn. Use foreground commands with timeouts or
-   poll a running command while the turn is active. A native background
-   completion notification does not start a new Swarm turn.
+Choose a fresh path and supply only the private profile settings needed for the
+proof. Use the workspace printed by `stand up` and keep teardown in the same turn.
 
 ## Unknown outcomes
 

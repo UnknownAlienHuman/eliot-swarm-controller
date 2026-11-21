@@ -2510,9 +2510,43 @@ that already began retain their unknown-outcome semantics. Force terminates only
 custody, never adopted services. Degraded Unix reports possible orphans, not exact clean
 success.
 
+### Local operator commands
+
+**Daemon update (#836).** The local Owner supplies a release directory or
+Swarm executable. Update checks the candidate before it changes the fleet,
+stops controlled Agents through generation-bound commands, requires zero
+running turns and owned processes in status, then requests an ordinary drain.
+It waits for the recorded daemon process to exit before starting the specified
+binary against the same data directory. On Windows it preserves the running
+daemon's explicit absolute directory spelling so retained native sessions
+keep their scope. Success identifies the ready process and the new binary's SHA-256.
+
+Update uses promptless resume only for sessions it stopped from confirmed idle
+with an unchanged turn history. It reports which Agents resumed and the reason
+for each skip or failed resume. A turn active when stop began stays in retained
+history, and update never resubmits its input. It never uses force to get past
+a drain blocker. On Windows a companion included in the release can start
+detached with the same target data directory. For subsequent updates, the
+operator closes a changed companion only when it can verify the process it
+started for that directory.
+
+**Private stand (#837).** `stand up` creates a fresh private daemon directory
+and a scratch Git repository inside it. It accepts an optional private TOML
+file containing the `[profiles]` table and an optional alternate Swarm binary. It prints the new
+data and workspace paths after the daemon is ready. Operate on the printed
+directory through explicit `--data-dir`. The stand starts with a fresh Store.
+
+`stand down` accepts the creation-marked path printed by `stand up`. It stops
+the registered companion and controlled Agents, drains the daemon and proves
+owned process exit before removing the stand and its scratch repository. A
+path that cannot be tied to an owned stand, or a teardown with uncertain
+process exit, retains the files.
+
 ## CLI
 
-All commands accept `--json` and `--data-dir`; every mutation accepts `--id`.
+Daemon RPC commands accept `--json` and `--data-dir`, and RPC mutations accept
+`--id`. The local update and stand commands use individual IDs for their
+internal writes. Stand commands take the stand path directly.
 Generation/turn/request flags are optional for immediate calls, explicit for delayed ones.
 The synopsis is target grammar; later-layer forms are not an inventory of current help.
 
@@ -2520,6 +2554,9 @@ The synopsis is target grammar; later-layer forms are not an inventory of curren
 swarm daemon [--foreground]
 swarm daemon install | uninstall
 swarm daemon stop [--drain|--force]
+swarm daemon update <RELEASE>
+swarm stand up [--root PATH] [--profile FILE] [--binary PATH]
+swarm stand down <PATH>
 swarm status
 swarm launch --profile P --workspace PATH [--worktree BRANCH [--base REF]] [--parent AGENT] [--source PATH]... [PROMPT] [--wait] [--timeout-seconds N]
 swarm launch --workspace PATH [PROMPT] [--wait] [--timeout-seconds N]

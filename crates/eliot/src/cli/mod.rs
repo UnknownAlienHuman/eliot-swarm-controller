@@ -7,14 +7,17 @@ mod autostart;
 mod cleanup;
 mod coord;
 mod daemon;
+mod operator;
 mod organization;
 mod project_assignment;
 mod reads;
 mod rules;
 mod settings;
+mod stand;
 pub(crate) mod support;
+mod update;
 
-use self::args::CliCommand;
+use self::args::{CliCommand, StandAction};
 use self::support::Failure;
 use std::path::PathBuf;
 
@@ -25,6 +28,14 @@ pub(crate) async fn dispatch(
     id: Option<String>,
 ) -> Result<u8, Failure> {
     match command {
+        CliCommand::Stand(args) => match args.action {
+            StandAction::Up {
+                root,
+                profile,
+                binary,
+            } => stand::up(root, profile, binary, json_output).await,
+            StandAction::Down { path } => stand::down(path, json_output).await,
+        },
         CliCommand::Cleanup(args) => cleanup::run_cleanup(args, data_dir, json_output, id).await,
         CliCommand::Artifact(args) => cleanup::run_artifact(args, data_dir, json_output, id).await,
         CliCommand::Settings(args) => settings::run(args, data_dir, json_output).await,
