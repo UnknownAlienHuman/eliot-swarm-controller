@@ -200,7 +200,7 @@ impl Store {
             .prepare(
                 "SELECT t.principal, t.rule, t.schedule_revision, t.trigger, t.anchor,
                         t.last_key, t.next_due_at, t.catch_up,
-                        r.enabled AND p.rule IS NULL, r.paused_reason
+                        r.enabled AND p.rule IS NULL, r.paused_reason, t.last_outcome
                  FROM timers t
                  JOIN rule_state r ON r.principal = t.principal AND r.rule = t.rule
                  LEFT JOIN paused_assignment_timers p ON t.principal = 'owner' AND p.rule = t.rule
@@ -488,6 +488,9 @@ impl Store {
         let mut events = Vec::new();
         let mut parent = None;
         let mut child = None;
+        // What the owner reads back for this slot: the code that skipped or
+        // rejected it, or nothing once the action is admitted.
+        let mut outcome = None;
         if let Some(mut action) = slot.action {
             let action_rejection = if action.verb == "run" {
                 let expected_context = expected_timer_script_context(
@@ -544,6 +547,7 @@ impl Store {
                 }
             };
             if let Some(code) = rejected {
+                outcome = Some(code.clone());
                 let error = Error::new(code.clone(), code);
                 let (rejected_parent, event) = reject_timer_fire_tx(&tx, &key, &error, now)?;
                 parent = Some(rejected_parent);
@@ -603,6 +607,7 @@ impl Store {
                         });
                     }
                     Err(error) if core::is_deterministic_pre_admission_rejection(&error.code) => {
+                        outcome = Some(error.code.clone());
                         let (rejected_parent, rejected_events) =
                             reject_timer_fire_tx(&tx, &key, &error, now)?;
                         parent = Some(rejected_parent);
@@ -612,6 +617,7 @@ impl Store {
                 }
             }
         } else {
+            outcome = slot.skip_code.clone();
             let mut data = json!({
                 "rule": state.id,
                 "schedule_revision": state.schedule_revision,
@@ -635,6 +641,7 @@ impl Store {
             &stored,
             slot.scheduled_at_ms,
             slot.next_due_at_ms,
+            outcome,
         )?;
         commit_transaction(tx, &self.write_faulted)?;
         Ok(TimerSlotAdmission {
@@ -897,7 +904,8 @@ pub(super) fn ensure_timer_state_tx(
             .execute(
                 "UPDATE timers
                  SET schedule_revision = ?1, trigger = ?2, anchor = ?3,
-                     last_key = NULL, next_due_at = ?4, catch_up = ?5
+                     last_key = NULL, next_due_at = ?4, catch_up = ?5,
+                     last_outcome = NULL
                  WHERE principal = ?6 AND rule = ?7 AND schedule_revision = ?8",
                 params![
                     input.schedule_revision,
@@ -926,6 +934,7 @@ pub(super) fn ensure_timer_state_tx(
             last_key: None,
             next_due_at: input.initial_next_due_at,
             enabled: rule.view.enabled && rule.view.paused_reason.is_none(),
+            last_outcome: None,
         });
     }
 
@@ -964,6 +973,7 @@ pub(super) fn ensure_timer_state_tx(
         last_key: None,
         next_due_at: input.initial_next_due_at,
         enabled: rule.view.enabled && rule.view.paused_reason.is_none(),
+        last_outcome: None,
     })
 }
 
@@ -984,6 +994,7 @@ struct TimerRecord {
     catch_up: String,
     enabled: bool,
     paused_reason: Option<String>,
+    last_outcome: Option<String>,
 }
 
 fn timer_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TimerRecord> {
@@ -998,6 +1009,7 @@ fn timer_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TimerRecor
         catch_up: row.get(7)?,
         enabled: row.get(8)?,
         paused_reason: row.get(9)?,
+        last_outcome: row.get(10)?,
     })
 }
 
@@ -1014,6 +1026,7 @@ fn timer_view_from_record(record: TimerRecord) -> Result<core::api::TimerStateVi
         last_key: record.last_key,
         next_due_at: record.next_due_at,
         enabled: record.enabled && record.paused_reason.is_none(),
+        last_outcome: record.last_outcome,
     };
     view.validate()
         .map_err(|_| Error::new("source_integrity", "stored timer state is invalid"))?;
@@ -1029,7 +1042,7 @@ fn load_timer_state(
         .query_row(
             "SELECT t.principal, t.rule, t.schedule_revision, t.trigger, t.anchor,
                     t.last_key, t.next_due_at, t.catch_up,
-                    r.enabled AND p.rule IS NULL, r.paused_reason
+                    r.enabled AND p.rule IS NULL, r.paused_reason, t.last_outcome
              FROM timers t
              JOIN rule_state r ON r.principal = t.principal AND r.rule = t.rule
              LEFT JOIN paused_assignment_timers p ON t.principal = 'owner' AND p.rule = t.rule
@@ -1539,10 +1552,11 @@ fn update_timer_slot_tx(
     stored: &StoredTimerState,
     slot_ms: i64,
     next_due_at_ms: Option<i64>,
+    outcome: Option<String>,
 ) -> Result<core::api::TimerStateView> {
     let changed = tx
         .execute(
-            "UPDATE timers SET last_key = ?1, next_due_at = ?2
+            "UPDATE timers SET last_key = ?1, next_due_at = ?2, last_outcome = ?8
              WHERE principal = ?3 AND rule = ?4 AND schedule_revision = ?5
                AND last_key IS ?6 AND next_due_at IS ?7",
             params![
@@ -1553,6 +1567,7 @@ fn update_timer_slot_tx(
                 stored.view.schedule_revision,
                 stored.view.last_key,
                 stored.view.next_due_at,
+                outcome,
             ],
         )
         .map_err(sql_error)?;
@@ -1562,6 +1577,7 @@ fn update_timer_slot_tx(
     let mut view = stored.view.clone();
     view.last_key = Some(slot_ms);
     view.next_due_at = next_due_at_ms;
+    view.last_outcome = outcome;
     Ok(view)
 }
 

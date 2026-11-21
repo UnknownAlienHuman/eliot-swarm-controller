@@ -380,6 +380,7 @@ impl Store {
                     .and_then(|cause| cause.remote_call.clone()),
                 depth,
             };
+            let preparation = super::rules::rule_launch_preparation(&child_request)?;
             tx.execute_batch("SAVEPOINT rule_catch_up_action")
                 .map_err(sql_error)?;
             let limits = self.hierarchy_limits;
@@ -388,7 +389,7 @@ impl Store {
                 &tx,
                 principal,
                 child_request,
-                None,
+                preparation,
                 now,
                 true,
                 limits,

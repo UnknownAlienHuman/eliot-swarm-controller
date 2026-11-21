@@ -32,17 +32,57 @@ pub(super) fn approval_summary(tool_name: &str, input: Option<&Value>) -> String
     let mut parts = vec![format!("{tool_name} tool permission request")];
     let mut flattened = Vec::new();
     collect_summary_args(input, &mut flattened);
-    flattened.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    flattened.sort_by(|a, b| {
+        summary_rank(&a.0)
+            .cmp(&summary_rank(&b.0))
+            .then_with(|| a.0.cmp(&b.0))
+            .then_with(|| a.1.cmp(&b.1))
+    });
     // One field per line; a multi-line value (a file edit, a script) starts
     // on its own line so it reads as a block instead of running on.
     for (key, value) in flattened {
+        let label = summary_label(&key);
         if value.contains('\n') {
-            parts.push(format!("{key}:\n{}", value.trim_end()));
+            parts.push(format!("{label}:\n{}", value.trim_end()));
         } else {
-            parts.push(format!("{key}: {value}"));
+            parts.push(format!("{label}: {value}"));
         }
     }
     parts.join("\n")
+}
+
+/// Known tool-input keys in display order, with their owner-facing labels.
+/// Unknown keys sort after these and keep their raw key as the label.
+const SUMMARY_FIELDS: [(&str, &str); 15] = [
+    ("file_path", "File"),
+    ("notebook_path", "Notebook"),
+    ("path", "Path"),
+    ("paths", "Paths"),
+    ("command", "Command"),
+    ("description", "Description"),
+    ("url", "URL"),
+    ("query", "Query"),
+    ("pattern", "Pattern"),
+    ("prompt", "Prompt"),
+    ("old_string", "Replace"),
+    ("new_string", "With"),
+    ("content", "Content"),
+    ("cell_id", "Cell"),
+    ("new_source", "New source"),
+];
+
+fn summary_rank(key: &str) -> usize {
+    SUMMARY_FIELDS
+        .iter()
+        .position(|(raw, _)| *raw == key)
+        .unwrap_or(SUMMARY_FIELDS.len())
+}
+
+fn summary_label(key: &str) -> &str {
+    SUMMARY_FIELDS
+        .iter()
+        .find(|(raw, _)| *raw == key)
+        .map_or(key, |(_, label)| label)
 }
 
 /// Flatten the string leaves of a native input value into owned (key,

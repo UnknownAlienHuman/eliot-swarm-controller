@@ -642,7 +642,7 @@ pub fn scripts_screen(data: ScriptsData<'_>, actions: ScriptsActions, palette: P
             "none",
             crate::m3::form_row(
                 "Script",
-                small("No scripts. Add files under <data_dir>/scripts/ or a project's .eliot/scripts/.")
+                small("No scripts yet. Put them in the scripts folder of Swarm's data folder, or in a project's .eliot\\scripts folder.")
                     .into(),
                 Some(refresh),
             ),

@@ -258,13 +258,17 @@ fn ensure_bootstrap_settings(
 
     if read.revision.is_none() && profile_names.is_empty() {
         profile_names = profiles.keys().cloned().collect();
-        let default_profile = bootstrap_default_profile(&profile_names);
-        if let Some(profile) = profiles.get_mut(&default_profile) {
-            let workers = bootstrap_worker_profiles(&profile_names, &default_profile);
+        // Each manager can take the default route, so each one delegates
+        // to the other installed profiles.
+        for manager in bootstrap_managers(&profile_names) {
+            let workers = bootstrap_worker_profiles(&profile_names, &manager);
+            let Some(profile) = profiles.get_mut(&manager) else {
+                continue;
+            };
             // A manager whose harness cannot disable native subagents keeps
             // them explicitly; the derived `deny` would make the whole
             // bootstrap settings save (and daemon startup) fail.
-            if !workers.is_empty() && !manager_supports_native_deny(&default_profile) {
+            if !workers.is_empty() && !manager_supports_native_deny(&manager) {
                 profile["native_subagents"] = json!("allow");
             }
             profile["child_profiles"] = json!(workers);
@@ -286,16 +290,18 @@ fn ensure_bootstrap_settings(
             .is_none_or(|profiles| profiles.is_empty())
         && !profile_names.is_empty()
     {
-        let default_profile = bootstrap_default_profile(&profile_names);
-        let workers = bootstrap_worker_profiles(&profile_names, &default_profile);
+        // Routing walks this list in order, so a manager that cannot take
+        // the task (quota used up, provider hold) falls through to the next.
+        let candidates = bootstrap_default_candidates(&profile_names);
+        let workers = bootstrap_worker_profiles(&profile_names, &candidates[0]);
         // With only one installed harness the inherited profile still works.
         let workers = if workers.is_empty() {
-            vec![default_profile.clone()]
+            vec![candidates[0].clone()]
         } else {
             workers
         };
         let mut routing = current_routing.clone();
-        routing["default"] = json!([default_profile]);
+        routing["default"] = json!(candidates);
         if routing.get("worker").is_none() {
             routing["worker"] = json!(workers);
         }
@@ -322,15 +328,33 @@ fn ensure_bootstrap_settings(
 /// manager on one of them delegates through Swarm by default.
 const DENY_CAPABLE_MANAGERS: [&str; 3] = ["codex", "claude", "opencode"];
 
-/// The hot-start manager: the first installed deny-capable harness, else the
-/// first installed profile (Muse or Antigravity, which keep native subagents).
-fn bootstrap_default_profile(names: &[String]) -> String {
-    DENY_CAPABLE_MANAGERS
+/// The hot-start managers: every installed deny-capable harness in
+/// preference order, else the first installed profile (Muse or Antigravity,
+/// which keep native subagents).
+fn bootstrap_managers(names: &[String]) -> Vec<String> {
+    let managers: Vec<String> = DENY_CAPABLE_MANAGERS
         .iter()
-        .find_map(|preferred| names.iter().find(|name| name.as_str() == *preferred))
-        .or_else(|| names.first())
+        .filter_map(|preferred| names.iter().find(|name| name.as_str() == *preferred))
         .cloned()
-        .unwrap_or_default()
+        .collect();
+    if managers.is_empty() {
+        names.first().cloned().into_iter().collect()
+    } else {
+        managers
+    }
+}
+
+/// The default routing role: the managers, then the other installed
+/// profiles in name order. `names` is nonempty, so the list is too.
+fn bootstrap_default_candidates(names: &[String]) -> Vec<String> {
+    let mut candidates = bootstrap_managers(names);
+    let rest: Vec<String> = names
+        .iter()
+        .filter(|name| !candidates.contains(name))
+        .cloned()
+        .collect();
+    candidates.extend(rest);
+    candidates
 }
 
 /// Whether a hot-start manager on this profile can disable native subagents.
@@ -338,11 +362,12 @@ fn manager_supports_native_deny(profile: &str) -> bool {
     DENY_CAPABLE_MANAGERS.contains(&profile)
 }
 
+/// A manager's workers in the default routing order, so the harnesses that
+/// isolate a worker's MCP surface come before Muse and Antigravity.
 fn bootstrap_worker_profiles(names: &[String], manager: &str) -> Vec<String> {
-    names
-        .iter()
+    bootstrap_default_candidates(names)
+        .into_iter()
         .filter(|name| name.as_str() != manager)
-        .cloned()
         .collect()
 }
 

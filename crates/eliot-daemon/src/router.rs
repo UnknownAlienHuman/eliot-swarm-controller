@@ -5635,18 +5635,14 @@ fn validate_rule_launch_action(
     Ok(())
 }
 
+/// A prepared rule launch: the daemon may have frozen the standard managed
+/// worktree of a worktree-mode project (an Owner rule cannot name one), and
+/// Store prepares it exactly as for an interactive launch.
 fn validate_rule_launch_preparation(prepared: &PreparedSubmission) -> Result<()> {
     if prepared.request.verb != "launch" {
         return Ok(());
     }
-    validate_prepared_rule_launch_command(&prepared.request)?;
-    if prepared.workspace.is_some() {
-        return Err(Error::new(
-            "unsupported",
-            "rule launch requires an existing workspace without worktree preparation",
-        ));
-    }
-    Ok(())
+    validate_prepared_rule_launch_command(&prepared.request)
 }
 
 fn validate_prepared_rule_launch_command(request: &SubmitCommand) -> Result<()> {
@@ -5669,8 +5665,7 @@ fn validate_prepared_rule_launch_command(request: &SubmitCommand) -> Result<()> 
         .args
         .as_object()
         .ok_or_else(|| Error::new("invalid", "prepared rule launch args must be an object"))?;
-    if args.contains_key("workspace_preparation")
-        || args.contains_key("worktree")
+    if args.contains_key("worktree")
         || args.contains_key("base")
         || args
             .get("profile_snapshot")
@@ -5680,7 +5675,7 @@ fn validate_prepared_rule_launch_command(request: &SubmitCommand) -> Result<()> 
     {
         return Err(Error::new(
             "unsupported",
-            "rule launch cannot prepare a worktree or run profile setup",
+            "rule launch cannot name a worktree or base or run profile setup",
         ));
     }
     let workspace = args

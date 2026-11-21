@@ -1841,6 +1841,24 @@ fn valid_targetless_git_fetch_request(request: &SubmitCommand) -> bool {
         && super::projects::decode_frozen_git_fetch(&request.args).is_ok()
 }
 
+/// The managed worktree the daemon froze for an Owner rule launch into a
+/// worktree-mode project; it travels in the prepared args exactly as an
+/// interactive launch's does, and Store prepares it the same way.
+pub(super) fn rule_launch_preparation(
+    request: &SubmitCommand,
+) -> Result<Option<core::WorkspacePreparationInput>> {
+    match request.args.get("workspace_preparation") {
+        Some(value) if request.verb == "launch" => serde_json::from_value(value.clone())
+            .map(Some)
+            .map_err(|_| Error::new("invalid", "rule launch workspace preparation is malformed")),
+        Some(_) => Err(Error::new(
+            "invalid",
+            "workspace preparation requires a rule launch",
+        )),
+        None => Ok(None),
+    }
+}
+
 fn valid_targetless_rule_launch_request(request: &SubmitCommand) -> bool {
     request.validate().is_ok()
         && request.verb == "launch"
@@ -2565,24 +2583,33 @@ fn admit_rule_action_tx(
     let parent_cause = key.command_cause(&key.parent_id)?;
     let child_cause = key.command_cause(&key.child_id)?;
     request.id = key.child_id.clone();
+    let preparation = rule_launch_preparation(&request)?;
     // Ordinary admission may have inserted an Agent/cursor before a later
     // transactional capacity gate refuses it. A rejected firing must retain
     // none of those partial writes when its rejection is committed.
     tx.execute_batch("SAVEPOINT rule_child_admission")
         .map_err(sql_error)?;
-    let mut child_admission =
-        match admission::submit_tx(tx, key.principal, request, None, now, true, limits, policy) {
-            Ok(admission) => {
-                tx.execute_batch("RELEASE rule_child_admission")
-                    .map_err(sql_error)?;
-                admission
-            }
-            Err(error) => {
-                tx.execute_batch("ROLLBACK TO rule_child_admission; RELEASE rule_child_admission")
-                    .map_err(sql_error)?;
-                return Err(error);
-            }
-        };
+    let mut child_admission = match admission::submit_tx(
+        tx,
+        key.principal,
+        request,
+        preparation,
+        now,
+        true,
+        limits,
+        policy,
+    ) {
+        Ok(admission) => {
+            tx.execute_batch("RELEASE rule_child_admission")
+                .map_err(sql_error)?;
+            admission
+        }
+        Err(error) => {
+            tx.execute_batch("ROLLBACK TO rule_child_admission; RELEASE rule_child_admission")
+                .map_err(sql_error)?;
+            return Err(error);
+        }
+    };
     if !child_admission.is_new {
         return Err(Error::new(
             "source_integrity",

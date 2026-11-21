@@ -224,6 +224,8 @@ pub(super) enum CardState {
     Unreadable,
     /// Paused by the daemon, with the reason in words.
     Failed(String),
+    /// On, but its last scheduled check started nothing, with why in words.
+    Blocked(String),
 }
 
 impl CardState {
@@ -235,13 +237,20 @@ impl CardState {
             Self::Starting => "Starting…".to_owned(),
             Self::Unreadable => "Unknown".to_owned(),
             Self::Failed(_) => "Failed".to_owned(),
+            Self::Blocked(_) => "Needs attention".to_owned(),
         }
+    }
+
+    /// Whether its timer fires: Run now is offered and a down worker
+    /// overrides it.
+    pub(super) fn fires(&self) -> bool {
+        matches!(self, Self::Running | Self::Blocked(_))
     }
 
     /// Why it failed, for the line under the card's title.
     pub(super) fn reason(&self) -> Option<&str> {
         match self {
-            Self::Failed(reason) => Some(reason),
+            Self::Failed(reason) | Self::Blocked(reason) => Some(reason),
             Self::Unreadable => Some("Swarm's automation worker status could not be read."),
             _ => None,
         }
@@ -253,6 +262,7 @@ impl CardState {
         match self {
             Self::Running => StatusTone::Active,
             Self::Failed(_) => StatusTone::Failed,
+            Self::Blocked(_) => StatusTone::Attention,
             Self::Starting => StatusTone::Pending,
             Self::Paused | Self::Off | Self::Unreadable => StatusTone::Neutral,
         }
@@ -393,8 +403,14 @@ fn times(timer: &TimerStateView, assignment: bool) -> String {
     } else {
         ("Last scheduled run", "Next run")
     };
+    let note = match timer.last_outcome.as_deref() {
+        Some("not_found") if assignment => " (no new brief)",
+        Some("bad_state") if assignment => " (its tasks are at the limit)",
+        Some(_) => " (started nothing)",
+        None => "",
+    };
     let mut parts = vec![match timer.last_key {
-        Some(at) => format!("{last} {}", local_time(at)),
+        Some(at) => format!("{last} {}{note}", local_time(at)),
         None => format!("{last}: not yet"),
     }];
     if timer.enabled
@@ -403,6 +419,26 @@ fn times(timer: &TimerStateView, assignment: bool) -> String {
         parts.push(format!("{next} {}", local_time(at)));
     }
     parts.join(" · ")
+}
+
+/// A firing card: Running, or Blocked when its last scheduled check started
+/// nothing for a reason the Owner must act on. No new brief, or an
+/// assignment already at its limit, is normal.
+fn firing(timer: Option<&TimerStateView>, assignment: bool) -> CardState {
+    let Some(code) = timer.and_then(|timer| timer.last_outcome.as_deref()) else {
+        return CardState::Running;
+    };
+    if assignment && matches!(code, "not_found" | "bad_state") {
+        return CardState::Running;
+    }
+    let what = match code {
+        "routing_unavailable" => {
+            "no model could take the task. Pick one for this kind of task in Routing, or check Usage".to_owned()
+        }
+        "unavailable" if assignment => "the briefs folder could not be read".to_owned(),
+        code => eliot_core::reason_words(code).to_lowercase(),
+    };
+    CardState::Blocked(format!("Its last check started nothing: {what}."))
 }
 
 /// Every automation in scope as a card: the settings assignments first,
@@ -431,7 +467,7 @@ pub(super) fn cards(inputs: &CardInputs<'_>) -> Vec<Card> {
             (false, _) if inputs.global_rules_current && pause_confirmed => CardState::Paused,
             (true, Some(entry)) => match &entry.state.paused_reason {
                 Some(reason) => CardState::Failed(reason_words(reason)),
-                None if timer.is_some_and(|timer| timer.enabled) => CardState::Running,
+                None if timer.is_some_and(|timer| timer.enabled) => firing(timer, true),
                 None => CardState::Starting,
             },
             _ => CardState::Starting,
@@ -471,7 +507,7 @@ pub(super) fn cards(inputs: &CardInputs<'_>) -> Vec<Card> {
                 ("Works in", assignment.workspace.clone()),
             ],
             // A paused timer refuses a manual run: no button for it.
-            run: (state == CardState::Running).then_some(TimerKey(None, launch_id)),
+            run: state.fires().then_some(TimerKey(None, launch_id)),
             assignment: Some((assignment.key.clone(), assignment.enabled)),
             state,
             technical,
@@ -517,7 +553,7 @@ pub(super) fn cards(inputs: &CardInputs<'_>) -> Vec<Card> {
             let text = rule_text(entry);
             let state = match &rule.paused_reason {
                 Some(reason) => CardState::Failed(reason_words(reason)),
-                None if rule.enabled => CardState::Running,
+                None if rule.enabled => firing(entry.timer.as_ref(), false),
                 None => CardState::Off,
             };
             let rules_folder = match &project {
@@ -562,8 +598,7 @@ pub(super) fn cards(inputs: &CardInputs<'_>) -> Vec<Card> {
                     .map(|folder| ("Rules file in", folder.to_string_lossy().into_owned()))
                     .into_iter()
                     .collect(),
-                run: (entry.timer.as_ref().is_some_and(|timer| timer.enabled)
-                    && state == CardState::Running)
+                run: (entry.timer.as_ref().is_some_and(|timer| timer.enabled) && state.fires())
                     .then_some(key),
                 assignment: None,
                 state,
@@ -579,8 +614,8 @@ pub(super) fn cards(inputs: &CardInputs<'_>) -> Vec<Card> {
             RuleWorker::Down(down) => CardState::Failed(format!(
                 "Swarm's automation worker {down}; restart Swarm to run automations again."
             )),
-            RuleWorker::Starting if card.state == CardState::Running => CardState::Starting,
-            RuleWorker::Unreadable if card.state == CardState::Running => CardState::Unreadable,
+            RuleWorker::Starting if card.state.fires() => CardState::Starting,
+            RuleWorker::Unreadable if card.state.fires() => CardState::Unreadable,
             _ => continue,
         };
         card.run = None;

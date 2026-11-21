@@ -108,16 +108,19 @@ and Antigravity. Each profile selects one `harness` explicitly and may pin an ex
 the other four adapters require an explicit native executable in `cmd` in a
 stored profile. First use writes visible, editable native-default profiles for
 installed harnesses through the settings writer as `bootstrap`. On a fresh root,
-the default is the first installed of `codex`, `claude` and `opencode` (the
-harnesses that can disable native subagents per session), otherwise the first
-installed profile in name order. It has `control = "tree"` and `child_profiles`
-listing the other installed bootstrap profiles, so on those harnesses its omitted
-`native_subagents` resolves to `deny`. A Muse or Antigravity default, which has
-no per-session switch, is written with `native_subagents = "allow"` so the
-bootstrap settings stay valid. The `worker`
-routing role lists those profiles in name order (or the inherited default profile
-when it is the only installed harness). This makes Swarm delegation available on
-first use; existing profiles and routing choices are preserved. An omitted model
+the managers are the installed ones of `codex`, `claude` and `opencode` in that
+order (the harnesses that can disable native subagents per session), otherwise the
+first installed profile in name order. Each manager has `control = "tree"` and
+`child_profiles` listing the other installed bootstrap profiles, so on those
+harnesses its omitted `native_subagents` resolves to `deny`. A Muse or Antigravity
+manager, which has no per-session switch, is written with
+`native_subagents = "allow"` so the bootstrap settings stay valid. The `default`
+routing role lists the managers followed by the other installed profiles in name
+order, so routing passes over one whose quota is used up or whose provider is on
+hold and starts the task on the next. The `worker` routing role and each manager's
+`child_profiles` list the other profiles in that same order (the `worker` role names
+the first default when it is the only installed harness). This makes Swarm delegation available on first use; existing
+profiles and routing choices are preserved. An omitted model
 in these profiles requests the native default and retains requested/effective
 readback separately, as for an ad-hoc launch. There is no builtin fake profile.
 For Muse hot-start profiles the daemon enumerates installed `muse-bin-*.exe`
