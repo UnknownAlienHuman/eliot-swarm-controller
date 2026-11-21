@@ -5,16 +5,12 @@
 //! `data:` payloads are surfaced; `event:`/`id:`/`retry:` fields are
 //! ignored because the envelope carries its own `id` and `type`.
 //! A payload (including separators) or raw line larger than
-//! [`MAX_SSE_BYTES`], or a non-UTF-8 line, ends the stream as malformed
+//! [`MAX_NATIVE_INBOUND_FRAME_BYTES`], or a non-UTF-8 line, ends the stream as malformed
 //! rather than growing without bound.
 
-use crate::native::types::SseEnvelope;
+use eliot_core::limits::MAX_NATIVE_INBOUND_FRAME_BYTES;
 
-/// Largest single SSE payload accepted before the stream is declared
-/// malformed. Envelopes are small control records; message bodies travel
-/// over the readback endpoints, never the stream. The same bound caps each
-/// raw line, excluding its LF terminator.
-pub const MAX_SSE_BYTES: usize = 256 * 1024;
+use crate::native::types::SseEnvelope;
 
 /// One parsed stream item: either an envelope or a malformed payload
 /// marker (the pump converts the marker into the stream state and ends).
@@ -49,7 +45,7 @@ impl SseParser {
         for part in bytes.split_inclusive(|&byte| byte == b'\n') {
             let complete = part.strip_suffix(b"\n");
             let raw = complete.unwrap_or(part);
-            if pending.len().saturating_add(raw.len()) > MAX_SSE_BYTES {
+            if pending.len().saturating_add(raw.len()) > MAX_NATIVE_INBOUND_FRAME_BYTES {
                 self.spent = true;
                 frames.push(SseFrame::Malformed);
                 break;
@@ -97,7 +93,7 @@ impl SseParser {
         let value = line.strip_prefix("data:")?;
         let value = value.strip_prefix(' ').unwrap_or(value);
         let prefix_len = self.data.as_ref().map_or(0, |data| data.len() + 1);
-        if prefix_len + value.len() > MAX_SSE_BYTES {
+        if prefix_len + value.len() > MAX_NATIVE_INBOUND_FRAME_BYTES {
             return Some(SseFrame::Malformed);
         }
         match &mut self.data {

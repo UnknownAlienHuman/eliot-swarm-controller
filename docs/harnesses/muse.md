@@ -17,9 +17,8 @@ remain parent-attributed unless an isolated child environment can actually be in
 Resume requests `excludeItems=true` so it receives only session metadata and live resume
 state; the installed stable and experimental schemas define this history-exclusion option.
 
-Native frame budget: the inbound NDJSON frame cap for the Muse host is 8 MiB
-(`MuseStdioConfig::MAX_FRAME_BYTES`; every other adapter keeps the shared 1 MiB
-default). The cap covers `view/page` readback (Eliot requests `limit: 1000`)
+The [shared 8 MiB inbound frame cap](../spec/plugin-protocol.md#lifecycle-hooks-and-qualification)
+covers Muse `view/page` readback (Eliot requests `limit: 1000`)
 plus envelope overhead, along with the single bounded `item/readOutput` patch
 page below (128 KiB of stored bytes). What still does not size this cap is the
 full `item/readOutput` surface (6 MiB of stored bytes per page, exactly 8 MiB of

@@ -219,6 +219,27 @@ impl Router {
             ntstatus: None,
             at: (row.updated_at >= 0).then_some(row.updated_at),
         }];
+        if let Some(gap) = store.latest_stream_gap(agent, generation)?
+            && let Some(message) = gap.data.get("reason").and_then(Value::as_str)
+            && [
+                "Antigravity stream ended on an oversized frame (frame_oversized ",
+                "Antigravity stream contained an invalid frame (frame_oversized ",
+            ]
+            .iter()
+            .any(|prefix| message.starts_with(prefix))
+        {
+            steps.push(DiagnoseStep {
+                kind: "source".to_owned(),
+                code: Some("frame_oversized".to_owned()),
+                message: Some(bound_chars(message, 1024)),
+                failure_where: None,
+                origin: None,
+                origin_evidence: None,
+                exit_code: None,
+                ntstatus: None,
+                at: (gap.ts >= 0).then_some(gap.ts),
+            });
+        }
         let mut preceded_by = None;
         let mut commands = std::collections::HashSet::new();
         let mut unresolved = Vec::new();

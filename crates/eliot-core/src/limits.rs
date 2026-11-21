@@ -3,6 +3,8 @@
 
 /// Private host/plugin JSON-RPC frame, including its NDJSON newline.
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+/// Maximum inbound frame or response body from a native harness.
+pub const MAX_NATIVE_INBOUND_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// Inline command input before JSON escaping; the encoded frame is also bounded.
 pub const MAX_TEXT_BYTES: usize = 512 * 1024;
 /// Persisted event data and final text.

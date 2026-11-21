@@ -13,6 +13,7 @@
 //! readback; no substitution is ever made for an unavailable requested model.
 
 use core::api::native_profile::{CodexApprovalPolicy, CodexPermissions};
+use core::limits::MAX_NATIVE_INBOUND_FRAME_BYTES;
 use eliot_core as core;
 use eliot_plugin::session::split_provider_model;
 use eliot_plugin::sync::LockExt;
@@ -1300,8 +1301,8 @@ fn parse_muse_version_triple(text: &str) -> Option<(u64, u64, u64)> {
 
 const MUSE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 const MUSE_SELECTION_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
-const MUSE_PROBE_FRAME_BYTES: usize = 1024 * 1024;
-const MUSE_PROBE_TOTAL_BYTES: u64 = 4 * 1024 * 1024;
+// Leave room for a full model/list reply after initialization and notifications.
+const MUSE_PROBE_TOTAL_BYTES: u64 = MAX_NATIVE_INBOUND_FRAME_BYTES as u64 + 4 * 1024 * 1024;
 const MUSE_PROBE_FRAMES: usize = 100;
 
 fn default_muse_launcher_dir() -> std::path::PathBuf {
@@ -1360,7 +1361,7 @@ async fn muse_probe_catalogue(
     // frames across both initialize and model/list (including notifications).
     let mut lines = FramedRead::with_capacity(
         stdout.take(MUSE_PROBE_TOTAL_BYTES),
-        LinesCodec::new_with_max_length(MUSE_PROBE_FRAME_BYTES),
+        LinesCodec::new_with_max_length(MAX_NATIVE_INBOUND_FRAME_BYTES - 1),
         4096,
     );
     let init = json!({

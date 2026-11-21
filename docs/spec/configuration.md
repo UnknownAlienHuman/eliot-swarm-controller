@@ -131,8 +131,9 @@ catalogue is non-empty and records skipped empty-catalogue builds
 catalogue, with an 8-second per-build probe and one 20-second selection budget.
 When that budget expires, `bootstrap.muse_catalogue_budget_exhausted` is recorded
 and startup continues without a Muse default. Each probe uses scoped process
-custody and kill-on-drop, with at most 100 inbound frames, 1 MiB per line and
-4 MiB total before parsing. The launcher-marked 1.4.20 build serves
+custody and kill-on-drop, with at most 100 inbound frames. It uses the
+[shared 8 MiB inbound frame cap](plugin-protocol.md#lifecycle-hooks-and-qualification)
+and a total byte budget of one full frame plus 4 MiB. The launcher-marked 1.4.20 build serves
 an empty `bundledCatalog` and is skipped in favor of the 1.4.0 build with a live
 catalogue; `--cmd` still pins an explicit binary for ad-hoc launch.
 Before admission, an omitted profile selects the first available ordered role candidate. There is no post-dispatch harness/model/route/account

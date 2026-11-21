@@ -11,7 +11,8 @@ use eliot_core::{
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, MAX_FRAME_BYTES, PeerClient,
     native_transport::{
-        ProcessBirthIdentity, StreamState, process_birth_boundary, process_birth_identity,
+        NativeStreamFault, ProcessBirthIdentity, StreamState, process_birth_boundary,
+        process_birth_identity,
     },
     protocol::{HookEvent, HookResponse},
     session::{
@@ -165,14 +166,14 @@ struct CancellationIntent {
 /// text at all. The second keeps the native `end_turn` fact but marks the
 /// missing message instead of presenting a normal answer; consumers tell it
 /// from a real reply by the absent `message.completed` plus this marker.
-fn reply_unavailable(truncated: bool, status: &str, text: &str) -> Option<&'static str> {
-    if truncated {
-        Some("event_budget")
-    } else if status == "completed" && is_blank_native_text(text) {
-        Some("empty_native_response")
-    } else {
-        None
-    }
+fn reply_unavailable(
+    reason: Option<&'static str>,
+    status: &str,
+    text: &str,
+) -> Option<&'static str> {
+    reason.or_else(|| {
+        (status == "completed" && is_blank_native_text(text)).then_some("empty_native_response")
+    })
 }
 
 /// The ACP `cancelled` permission outcome: the prompt turn ended before
@@ -253,7 +254,7 @@ pub(crate) struct State {
     unbound_updates: VecDeque<QueuedUpdate>,
     unbound_update_bytes: usize,
     text_accum: String,
-    text_truncated: bool,
+    text_unavailable: Option<&'static str>,
     idle_message_gap_reported: bool,
     idle_tool_gap_reported: bool,
     writes_blocked: bool,
@@ -339,7 +340,7 @@ impl State {
             unbound_updates: VecDeque::new(),
             unbound_update_bytes: 0,
             text_accum: String::new(),
-            text_truncated: false,
+            text_unavailable: None,
             idle_message_gap_reported: false,
             idle_tool_gap_reported: false,
             writes_blocked: false,
@@ -667,7 +668,7 @@ impl State {
         self.tools.clear();
         self.clear_fenced();
         self.text_accum.clear();
-        self.text_truncated = false;
+        self.text_unavailable = None;
         Ok(result)
     }
 
@@ -1343,6 +1344,19 @@ impl State {
             return Ok(());
         }
         match frame {
+            AgyFrame::OversizedUpdate(detail) => {
+                if self.pending.is_some() {
+                    self.text_unavailable = Some("native_update_gap");
+                }
+                self.record_coverage_gap(
+                    &format!(
+                        "Antigravity omitted a native update ({})",
+                        detail.describe()
+                    ),
+                    &["session", "message", "tool"],
+                )
+                .await
+            }
             AgyFrame::StreamFault(fault) => {
                 self.lose(&format!(
                     "Antigravity stream contained an invalid frame ({})",
@@ -1474,9 +1488,9 @@ impl State {
             }
             AcpUpdate::MessageChunk { text } => {
                 self.associate().await?;
-                if !self.text_truncated {
+                if self.text_unavailable.is_none() {
                     if self.text_accum.len().saturating_add(text.len()) > MAX_TURN_TEXT_BYTES {
-                        self.text_truncated = true;
+                        self.text_unavailable = Some("event_budget");
                     } else {
                         self.text_accum.push_str(&text);
                     }
@@ -1709,15 +1723,16 @@ impl State {
             .duration_since(std::time::UNIX_EPOCH)
             .ok()
             .and_then(|elapsed| i64::try_from(elapsed.as_millis()).ok());
-        let restriction = (!self.text_truncated && matches!(status, "completed" | "failed"))
-            .then(|| crate::quota::turn_restriction(&self.text_accum, observed_at.unwrap_or(0)))
-            .flatten()
-            .map(|mut restriction| {
-                if observed_at.is_none() {
-                    restriction.retry_after = None;
-                }
-                restriction
-            });
+        let restriction = (self.text_unavailable.is_none()
+            && matches!(status, "completed" | "failed"))
+        .then(|| crate::quota::turn_restriction(&self.text_accum, observed_at.unwrap_or(0)))
+        .flatten()
+        .map(|mut restriction| {
+            if observed_at.is_none() {
+                restriction.retry_after = None;
+            }
+            restriction
+        });
         if restriction.is_some() {
             status = "failed";
         }
@@ -1735,7 +1750,7 @@ impl State {
                 native_status: native_status.clone(),
                 final_text: String::new(),
                 final_text_unavailable: reply_unavailable(
-                    self.text_truncated,
+                    self.text_unavailable,
                     status,
                     &self.text_accum,
                 ),
@@ -1768,7 +1783,7 @@ impl State {
         // terminal commit, without a command binding.
         self.close_pending_requests(Some(&turn)).await?;
         let text = self.policy.redact_text(&self.text_accum);
-        let mut truncated = self.text_truncated;
+        let mut missing_text = self.text_unavailable;
         let mut data = json!({"command_id": command, "turn_id": turn,
             "status": status, "outcome": outcome, "native_status": native_status});
         if let Some(restriction) = restriction {
@@ -1796,7 +1811,7 @@ impl State {
             );
         }
         self.policy.redact_values(&mut data);
-        if !is_blank_native_text(&text) && !truncated {
+        if !is_blank_native_text(&text) && missing_text.is_none() {
             let id = event_id(
                 &self.conversation,
                 &turn,
@@ -1808,9 +1823,11 @@ impl State {
             let mut message = json!({"command_id": command, "turn_id": turn, "text": text});
             self.policy.redact_values(&mut message);
             // A reply over the persisted-event bound costs only itself.
-            truncated = self.source().commit_message(id, message).await? == MessageCommit::Gapped;
+            if self.source().commit_message(id, message).await? == MessageCommit::Gapped {
+                missing_text = Some("event_budget");
+            }
         }
-        let unavailable = reply_unavailable(truncated, status, &text);
+        let unavailable = reply_unavailable(missing_text, status, &text);
         if let Some(marker) = unavailable {
             data["final_text_unavailable"] = json!(marker);
         }
@@ -1823,7 +1840,10 @@ impl State {
         if let Some(usage) = prompt_turn_usage(result) {
             data["usage"] = json!(usage);
         }
-        if failed && data.get("final_text").is_none() && !is_blank_native_text(&text) && !truncated
+        if failed
+            && data.get("final_text").is_none()
+            && !is_blank_native_text(&text)
+            && missing_text.is_none()
         {
             attach_final_text(&mut data, &text, true, &self.policy);
         }
@@ -1836,7 +1856,7 @@ impl State {
         );
         let final_text = match data.get("final_text").and_then(Value::as_str) {
             Some(final_text) => final_text.to_owned(),
-            None if !failed && !truncated => text,
+            None if !failed && missing_text.is_none() => text,
             None => String::new(),
         };
         if let Some(last) = self.last_turn.as_mut() {
@@ -1966,7 +1986,7 @@ impl State {
         if let Some(reply) = self.pending.as_mut().and_then(|p| p.reply.take()) {
             let _ = reply.send(Err(Error::new(
                 "unknown",
-                "Antigravity input outcome is unknown",
+                format!("Antigravity input outcome is unknown: {reason}"),
             )));
         }
     }
@@ -2096,16 +2116,16 @@ pub(crate) fn spawn(
         hook_accept_task.abort();
         let _ = hook_accept_task.await;
         // All queued stdout is consumed before concluding loss or planned EOF.
-        let mut state = state.lock().await;
-        if matches!(
-            *stream.borrow(),
-            StreamState::Overflow | StreamState::Malformed(_)
-        ) {
-            state.lose("Antigravity output was incomplete").await;
-        } else if !state.stopping {
-            state
-                .lose("Antigravity stream closed outside a planned stop")
-                .await;
+        let current = *stream.borrow();
+        if matches!(current, StreamState::Overflow | StreamState::Malformed(_)) {
+            note_stream_fault(&state, current).await;
+        } else {
+            let mut state = state.lock().await;
+            if !state.stopping {
+                state
+                    .lose("Antigravity stream closed outside a planned stop")
+                    .await;
+            }
         }
     })
 }
@@ -2118,6 +2138,16 @@ async fn note_stream_fault(state: &Shared, current: StreamState) {
                 .await
                 .lose("Antigravity native queue overflowed")
                 .await
+        }
+        StreamState::Malformed(NativeStreamFault::FrameOversized(detail)) => {
+            state
+                .lock()
+                .await
+                .lose(&format!(
+                    "Antigravity stream ended on an oversized frame ({})",
+                    detail.describe(),
+                ))
+                .await;
         }
         StreamState::Malformed(fault) => {
             state

@@ -89,13 +89,7 @@ pub(crate) async fn run_top(
         if let Some(error) = &page.continuation_error {
             eprintln!("continuation withheld: {error}");
         }
-        Ok(
-            if page.rejected_rows.is_empty() && page.continuation_error.is_none() {
-                0
-            } else {
-                4
-            },
-        )
+        Ok(0)
     }
 }
 
@@ -950,24 +944,22 @@ async fn read_top_agent_list(
     let mut accepted_rows = Vec::with_capacity(raw_rows.len());
     let mut rejected_rows = Vec::new();
     let mut row_keys = Vec::with_capacity(raw_rows.len());
-    let mut cursor_key_error = None;
     for (index, raw_row) in raw_rows.iter().enumerate() {
         let agent_id = raw_row
             .get("id")
             .and_then(Value::as_str)
             .filter(|id| eliot_core::parse_agent_id(id).is_ok());
-        match (agent_id, raw_row.get("updated_at").and_then(Value::as_i64)) {
-            (Some(id), Some(updated_at)) if updated_at >= 0 => {
-                row_keys.push((id.to_owned(), updated_at));
-            }
-            _ => {
-                cursor_key_error.get_or_insert_with(|| {
-                    format!(
-                        "response.agents[{index}].id and updated_at must form a valid list cursor"
-                    )
-                });
-            }
-        }
+        row_keys.push((
+            raw_row
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            raw_row
+                .get("updated_at")
+                .and_then(Value::as_i64)
+                .unwrap_or(-1),
+        ));
 
         let decoded = eliot_core::api::discovery::decode_params_at::<AgentListRow>(
             raw_row.clone(),
@@ -984,17 +976,15 @@ async fn read_top_agent_list(
 
     response.agents = accepted_rows;
     let byte_limited = response.truncated && raw_rows.len() < params.limit;
-    let mut continuation_error = None;
-    if rejected_rows.is_empty() {
-        params
-            .validate_response(&response)
-            .map_err(Failure::invalid_response)?;
-    } else if let Some(error) = cursor_key_error {
+    let page = params.validate_response_page(&response, &row_keys);
+    let totals = params.validate_response_state_totals(&response);
+    let continuation_error = match (page, totals) {
+        (Ok(()), Ok(())) => None,
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Some(error.to_string()),
+        (Err(page), Err(totals)) => Some(format!("{page}. {totals}")),
+    };
+    if continuation_error.is_some() {
         response.next = None;
-        continuation_error = Some(error);
-    } else if let Err(error) = params.validate_response_page(&response, &row_keys) {
-        response.next = None;
-        continuation_error = Some(error.to_string());
     }
 
     Ok(TopListRead {

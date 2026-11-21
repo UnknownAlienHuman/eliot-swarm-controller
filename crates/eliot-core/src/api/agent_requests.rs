@@ -453,6 +453,15 @@ impl AgentListRequest {
             .map(|row| (row.summary.id.clone(), row.summary.updated_at))
             .collect::<Vec<_>>();
         self.validate_response_page(reply, &row_keys)?;
+        self.validate_response_state_totals(reply)?;
+        for (index, row) in reply.agents.iter().enumerate() {
+            self.validate_row(row, index)?;
+        }
+        Ok(())
+    }
+
+    /// Validate the state totals independently of the page and its continuation.
+    pub fn validate_response_state_totals(&self, reply: &AgentListResponse) -> Result<()> {
         match (&self.states, &reply.state_totals) {
             (Some(states), Some(totals)) => {
                 if totals.len() != super::AGENT_LIST_STATES.len()
@@ -488,9 +497,6 @@ impl AgentListRequest {
                     "must be present exactly when states were requested",
                 ));
             }
-        }
-        for (index, row) in reply.agents.iter().enumerate() {
-            self.validate_row(row, index)?;
         }
         Ok(())
     }

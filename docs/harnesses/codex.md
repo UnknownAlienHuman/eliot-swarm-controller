@@ -292,9 +292,8 @@ entry), `mcp_servers_verified = true`; a real small coding task under
 workspace-write) succeeds with the single Agent-scoped `eliot_swarm`
 server present and verified, producing exactly `hello` with no newline.
 
-Native frame budget: the inbound NDJSON frame cap for the Codex host is 8 MiB
-(`CodexStdioConfig::MAX_FRAME_BYTES`; Claude Code also uses 8 MiB; every other adapter except Muse keeps
-the shared 1 MiB default). The cap covers the minimal-policy
+The [shared 8 MiB inbound frame cap](../spec/plugin-protocol.md#lifecycle-hooks-and-qualification)
+covers the minimal-policy
 `mcpServerStatus/list` readback (Eliot requests `detail: toolsAndAuthOnly`,
 `limit: 100`, scoped to the owned thread): the installed 0.167.1 schema offers only `full` and
 `toolsAndAuthOnly`, and both embed every listed server's full tool catalogs

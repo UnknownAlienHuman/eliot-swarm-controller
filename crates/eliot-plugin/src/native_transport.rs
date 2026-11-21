@@ -31,23 +31,21 @@ use tokio_util::{
     codec::{Decoder, FramedRead, FramedWrite, LinesCodec},
 };
 
-use eliot_core::{Error, Result, SecretPolicy, StderrSnapshot, StderrSource};
+use eliot_core::{
+    Error, Result, SecretPolicy, StderrSnapshot, StderrSource,
+    limits::{MAX_FRAME_BYTES, MAX_NATIVE_INBOUND_FRAME_BYTES},
+};
 
 use crate::{StderrCapture, StderrView, spawn_stderr, sync::LockExt};
 
-/// Default inbound native frame cap (1 MiB), kept by every adapter without
-/// evidence of larger protocol frames.
-pub const DEFAULT_MAX_NATIVE_FRAME_BYTES: usize = 1024 * 1024;
-/// Largest per-adapter inbound frame cap the pump accepts (16 MiB).
-pub const MAX_SUPPORTED_NATIVE_FRAME_BYTES: usize = 16 * 1024 * 1024;
-/// Leading bytes of an oversized line kept for envelope diagnosis. The
-/// JSON-RPC `method`/`id` head always fits; bodies never do.
+/// Leading bytes inspected for an oversized record's envelope.
 const OVERSIZED_PREFIX_CAP: usize = 2048;
 /// Longest recorded JSON-RPC method name. Protocol tokens are short; longer
 /// or non-token input is treated as not parseable, never stored.
 const OVERSIZED_METHOD_CAP: usize = 64;
 const NATIVE_EVENT_QUEUE: usize = 64;
 const NATIVE_EXIT_DRAIN: Duration = Duration::from_secs(1);
+const OVERSIZED_DISCARD_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Kernel process birth identity. `start_time` is measured in the same OS
 /// clock domain as [`process_birth_boundary`]. On Windows, `process_start_key`
@@ -479,6 +477,7 @@ pub struct OversizedFrame {
     limit_bytes: u32,
     length_bytes: u64,
     kind: OversizedFrameKind,
+    jsonrpc_v2: bool,
     lower_bound: bool,
     method_len: u8,
     method_bytes: [u8; OVERSIZED_METHOD_CAP],
@@ -493,15 +492,9 @@ impl OversizedFrame {
         prefix: &[u8],
         known_methods: &[&str],
     ) -> Self {
-        let (kind, method) = parse_oversized_prefix(prefix);
-        Self::new(
-            limit_bytes,
-            length_bytes,
-            kind,
-            method.as_deref(),
-            known_methods,
-            false,
-        )
+        let mut envelope = OversizedEnvelopeScanner::default();
+        envelope.feed(prefix);
+        envelope.frame(limit_bytes, length_bytes, known_methods, false)
     }
 
     /// Diagnose from a bounded prefix while the line is still open: the
@@ -513,15 +506,9 @@ impl OversizedFrame {
         prefix: &[u8],
         known_methods: &[&str],
     ) -> Self {
-        let (kind, method) = parse_oversized_prefix(prefix);
-        Self::new(
-            limit_bytes,
-            length_bytes,
-            kind,
-            method.as_deref(),
-            known_methods,
-            true,
-        )
+        let mut envelope = OversizedEnvelopeScanner::default();
+        envelope.feed(prefix);
+        envelope.frame(limit_bytes, length_bytes, known_methods, true)
     }
 
     /// Fallback when the line itself is in hand but no prefix was captured.
@@ -531,6 +518,7 @@ impl OversizedFrame {
             limit_bytes,
             length_bytes,
             OversizedFrameKind::Unknown,
+            false,
             None,
             &[],
             false,
@@ -541,6 +529,7 @@ impl OversizedFrame {
         limit_bytes: usize,
         length_bytes: u64,
         kind: OversizedFrameKind,
+        jsonrpc_v2: bool,
         method: Option<&str>,
         known_methods: &[&str],
         lower_bound: bool,
@@ -560,6 +549,7 @@ impl OversizedFrame {
             limit_bytes: u32::try_from(limit_bytes).unwrap_or(u32::MAX),
             length_bytes,
             kind,
+            jsonrpc_v2,
             lower_bound,
             method_len,
             method_bytes,
@@ -576,6 +566,11 @@ impl OversizedFrame {
 
     pub fn kind(self) -> OversizedFrameKind {
         self.kind
+    }
+
+    /// Whether the bounded prefix proved the JSON-RPC 2.0 version field.
+    pub fn is_jsonrpc_v2(self) -> bool {
+        self.jsonrpc_v2
     }
 
     /// The parsed JSON-RPC method, if one parsed and matched the adapter's
@@ -620,119 +615,243 @@ fn is_oversized_method_char(byte: u8) -> bool {
     )
 }
 
-/// Parse a bounded line prefix for the JSON-RPC envelope head. Tracks brace
-/// depth and string state so nested values or string bodies cannot fake
-/// top-level `method`/`id` keys. Returns the envelope kind and the raw
-/// method text (charsets are enforced by [`OversizedFrame`], not here).
-fn parse_oversized_prefix(prefix: &[u8]) -> (OversizedFrameKind, Option<String>) {
-    let mut rest = prefix;
-    while rest.first().is_some_and(|byte| byte.is_ascii_whitespace()) {
-        rest = &rest[1..];
-    }
-    if rest.first() != Some(&b'{') {
-        return (OversizedFrameKind::Unknown, None);
-    }
-    let mut depth = 0u32;
-    let mut in_string = false;
-    let mut escaped = false;
-    let mut has_id = false;
-    let mut method: Option<String> = None;
-    let mut index = 0;
-    while index < prefix.len() {
-        let byte = prefix[index];
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == b'"' {
-                in_string = false;
-            }
-            index += 1;
-            continue;
-        }
-        match byte {
-            b'"' if depth == 1 => {
-                let Some((key, after_key)) = read_oversized_json_string(prefix, index) else {
-                    // Truncated or escaped: resume inside the string.
-                    in_string = true;
-                    index += 1;
-                    continue;
-                };
-                let mut next = after_key;
-                while next < prefix.len() && prefix[next].is_ascii_whitespace() {
-                    next += 1;
-                }
-                if prefix.get(next) != Some(&b':') {
-                    index = after_key;
-                    continue;
-                }
-                if key == "id" {
-                    has_id = true;
-                } else if key == "method" && method.is_none() {
-                    let mut value_at = next + 1;
-                    while value_at < prefix.len() && prefix[value_at].is_ascii_whitespace() {
-                        value_at += 1;
-                    }
-                    if prefix.get(value_at) == Some(&b'"')
-                        && let Some((value, _)) = read_oversized_json_string(prefix, value_at)
-                        && !value.is_empty()
-                        && value.len() <= OVERSIZED_METHOD_CAP
-                    {
-                        method = Some(value);
-                    }
-                }
-                index = after_key;
-            }
-            b'"' => {
-                in_string = true;
-                index += 1;
-            }
-            b'{' | b'[' => {
-                depth = depth.saturating_add(1);
-                index += 1;
-            }
-            b'}' | b']' => {
-                depth = depth.saturating_sub(1);
-                index += 1;
-            }
-            _ => {
-                index += 1;
-            }
-        }
-    }
-    let kind = match (method.is_some(), has_id) {
-        (true, true) => OversizedFrameKind::Request,
-        (true, false) => OversizedFrameKind::Notification,
-        (false, true) => OversizedFrameKind::Response,
-        (false, false) => OversizedFrameKind::Unknown,
-    };
-    (kind, method)
+#[derive(Clone, Copy)]
+enum OversizedField {
+    JsonRpc,
+    Method,
 }
 
-/// Read one JSON string starting at the opening quote. Rejects escapes,
-/// control bytes, non-UTF-8, and truncation: envelope keys and method
-/// tokens never need them, so anything else is simply not parseable.
-fn read_oversized_json_string(bytes: &[u8], start: usize) -> Option<(String, usize)> {
-    if bytes.get(start) != Some(&b'"') {
-        return None;
-    }
-    let mut end = start + 1;
-    while end < bytes.len() {
-        match bytes[end] {
-            b'"' => {
-                let raw = bytes.get(start + 1..end)?;
-                if raw.contains(&b'\\') {
-                    return None;
-                }
-                let text = std::str::from_utf8(raw).ok()?.to_owned();
-                return Some((text, end + 1));
-            }
-            0x00..=0x1F => return None,
-            _ => end += 1,
+/// Incremental top-level JSON-RPC header scanner. It stores at most one
+/// short key or method token while discarded bodies stream past.
+#[derive(Default)]
+struct OversizedEnvelopeScanner {
+    object_depth: u32,
+    array_depth: u32,
+    root_seen: bool,
+    root_object: bool,
+    root_closed: bool,
+    in_string: bool,
+    escaped: bool,
+    string_top_level: bool,
+    string_field: Option<OversizedField>,
+    string_valid: bool,
+    string_overflow: bool,
+    string_bytes: Vec<u8>,
+    closed_string: Option<(Vec<u8>, bool)>,
+    pending_value: Option<OversizedField>,
+    has_id: bool,
+    jsonrpc_seen: bool,
+    jsonrpc_v2: bool,
+    method_seen: bool,
+    method_conflicted: bool,
+    method: Option<String>,
+    ambiguous: bool,
+}
+
+impl OversizedEnvelopeScanner {
+    fn feed(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.feed_byte(*byte);
         }
     }
-    None
+
+    fn feed_byte(&mut self, byte: u8) {
+        if self.in_string {
+            if self.escaped {
+                self.escaped = false;
+                self.string_valid = false;
+            } else if byte == b'\\' {
+                self.escaped = true;
+                self.string_valid = false;
+            } else if byte == b'"' {
+                self.finish_string();
+            } else if byte < 0x20 {
+                self.string_valid = false;
+            } else {
+                self.push_string_byte(byte);
+            }
+            return;
+        }
+
+        if self.root_closed {
+            self.ambiguous |= !matches!(byte, b' ' | b'\t' | b'\r');
+            return;
+        }
+
+        if let Some(field) = self.pending_value {
+            if byte.is_ascii_whitespace() {
+                return;
+            }
+            self.pending_value = None;
+            if byte == b'"' {
+                self.begin_string(false, Some(field));
+                return;
+            }
+            self.invalidate_value(field);
+        }
+
+        if self.closed_string.is_some() {
+            if byte.is_ascii_whitespace() {
+                return;
+            }
+            if byte == b':' {
+                let (key, valid) = self.closed_string.take().unwrap_or_default();
+                if !valid {
+                    self.ambiguous = true;
+                    return;
+                }
+                match key.as_slice() {
+                    b"id" => self.has_id = true,
+                    b"jsonrpc" => {
+                        if self.jsonrpc_seen {
+                            self.jsonrpc_v2 = false;
+                        } else {
+                            self.jsonrpc_seen = true;
+                            self.pending_value = Some(OversizedField::JsonRpc);
+                        }
+                    }
+                    b"method" => {
+                        if self.method_seen {
+                            self.method_conflicted = true;
+                            self.method = None;
+                        } else {
+                            self.method_seen = true;
+                            self.pending_value = Some(OversizedField::Method);
+                        }
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            self.closed_string = None;
+        }
+
+        if !self.root_seen {
+            if byte.is_ascii_whitespace() {
+                return;
+            }
+            self.root_seen = true;
+            self.root_object = byte == b'{';
+        }
+
+        match byte {
+            b'"' => {
+                let top_level = self.root_object && self.object_depth == 1 && self.array_depth == 0;
+                self.begin_string(top_level, None);
+            }
+            b'{' => self.object_depth = self.object_depth.saturating_add(1),
+            b'}' => {
+                if self.object_depth == 0 {
+                    self.ambiguous = true;
+                } else {
+                    self.object_depth -= 1;
+                    self.root_closed = self.object_depth == 0 && self.array_depth == 0;
+                }
+            }
+            b'[' => self.array_depth = self.array_depth.saturating_add(1),
+            b']' => {
+                if self.array_depth == 0 {
+                    self.ambiguous = true;
+                } else {
+                    self.array_depth -= 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn begin_string(&mut self, top_level: bool, field: Option<OversizedField>) {
+        self.in_string = true;
+        self.escaped = false;
+        self.string_top_level = top_level;
+        self.string_field = field;
+        self.string_valid = true;
+        self.string_overflow = false;
+        self.string_bytes.clear();
+    }
+
+    fn push_string_byte(&mut self, byte: u8) {
+        if self.string_field.is_some() || self.string_top_level {
+            if self.string_bytes.len() < OVERSIZED_METHOD_CAP {
+                self.string_bytes.push(byte);
+            } else {
+                self.string_overflow = true;
+            }
+        }
+    }
+
+    fn finish_string(&mut self) {
+        self.in_string = false;
+        let valid = self.string_valid && !self.string_overflow;
+        if let Some(field) = self.string_field.take() {
+            let bytes = std::mem::take(&mut self.string_bytes);
+            self.accept_value(field, valid, &bytes);
+        } else if self.string_top_level {
+            self.closed_string = Some((std::mem::take(&mut self.string_bytes), valid));
+        } else {
+            self.string_bytes.clear();
+        }
+    }
+
+    fn accept_value(&mut self, field: OversizedField, valid: bool, bytes: &[u8]) {
+        match field {
+            OversizedField::JsonRpc => {
+                self.jsonrpc_v2 = valid && bytes == b"2.0";
+            }
+            OversizedField::Method => {
+                let method = valid
+                    && !bytes.is_empty()
+                    && bytes.len() <= OVERSIZED_METHOD_CAP
+                    && bytes.iter().copied().all(is_oversized_method_char);
+                self.method = method
+                    .then(|| std::str::from_utf8(bytes).ok().map(ToOwned::to_owned))
+                    .flatten();
+            }
+        }
+    }
+
+    fn invalidate_value(&mut self, field: OversizedField) {
+        match field {
+            OversizedField::JsonRpc => self.jsonrpc_v2 = false,
+            OversizedField::Method => self.method = None,
+        }
+    }
+
+    fn kind(&self) -> OversizedFrameKind {
+        match (
+            self.method.is_some() && !self.method_conflicted,
+            self.has_id,
+        ) {
+            (true, true) => OversizedFrameKind::Request,
+            (true, false) => OversizedFrameKind::Notification,
+            (false, true) => OversizedFrameKind::Response,
+            (false, false) => OversizedFrameKind::Unknown,
+        }
+    }
+
+    fn frame(
+        &self,
+        limit_bytes: usize,
+        length_bytes: u64,
+        known_methods: &[&str],
+        lower_bound: bool,
+    ) -> OversizedFrame {
+        let header_valid = !self.ambiguous && !self.method_conflicted;
+        let method = header_valid.then_some(self.method.as_deref()).flatten();
+        OversizedFrame::new(
+            limit_bytes,
+            length_bytes,
+            if header_valid {
+                self.kind()
+            } else {
+                OversizedFrameKind::Unknown
+            },
+            header_valid && self.jsonrpc_v2,
+            method,
+            known_methods,
+            lower_bound,
+        )
+    }
 }
 
 /// One owned native child: process waiter, stdin writer queue, stdout-reader
@@ -1581,7 +1700,7 @@ pub fn encode_frame(server: &'static str, message: &impl Serialize) -> Result<St
             format!("{server} frame could not be encoded"),
         )
     })?;
-    if encoded.len().saturating_add(1) > DEFAULT_MAX_NATIVE_FRAME_BYTES {
+    if encoded.len().saturating_add(1) > MAX_FRAME_BYTES {
         return Err(Error::new(
             "frame_too_large",
             format!("{server} frame exceeds 1 MiB"),
@@ -1590,6 +1709,8 @@ pub fn encode_frame(server: &'static str, message: &impl Serialize) -> Result<St
     Ok(encoded)
 }
 
+type OversizedNotification<Frame> = Option<(&'static str, fn(OversizedFrame) -> Frame)>;
+
 /// Spawn a native child with its stdout pump armed in one step: process
 /// birth, the correlated-call map, the bounded frame queue, the stream-state
 /// watch and the reader task handed back for drain ownership. Both protocol
@@ -1597,14 +1718,13 @@ pub fn encode_frame(server: &'static str, message: &impl Serialize) -> Result<St
 /// once; each builds its own client over the returned writer/pending pair.
 /// The caller selects the pump mode explicitly: JSON-RPC keeps
 /// [`PumpMode::LossyOverflow`], only the reply-less stream-json caller
-/// selects [`PumpMode::LosslessBackpressure`]. The caller also selects the
-/// inbound frame cap: [`DEFAULT_MAX_NATIVE_FRAME_BYTES`] unless the
-/// adapter's native protocol documents larger frames (bounded by
-/// [`MAX_SUPPORTED_NATIVE_FRAME_BYTES`]). The caller also passes its
+/// selects [`PumpMode::LosslessBackpressure`]. The caller passes its
 /// static known-method allowlist for oversized-frame diagnosis: only these
 /// exact method names are ever recorded, everything else is omitted.
 /// Fenced event consumers may map record-local faults into this same ordered
 /// queue. Other consumers keep their existing watch-only fault contract.
+/// An adapter may also nominate a JSON-RPC notification to discard and report
+/// in order when an oversized record ends at a newline.
 #[allow(clippy::too_many_arguments)]
 pub async fn spawn_pumped<Frame, Classify>(
     launch: NativeLaunch,
@@ -1612,10 +1732,10 @@ pub async fn spawn_pumped<Frame, Classify>(
     labels: NativeLabels,
     id_prefix: &'static str,
     mode: PumpMode,
-    max_frame_bytes: usize,
     known_methods: &'static [&'static str],
     classify: Classify,
     ordered_fault: Option<fn(NativeStreamFault) -> Frame>,
+    oversized_notification: OversizedNotification<Frame>,
 ) -> Result<(
     NativeChild,
     PendingCalls,
@@ -1626,15 +1746,6 @@ where
     Frame: Send + 'static,
     Classify: FnMut(Value) -> PumpAction<Frame> + Send + 'static,
 {
-    if max_frame_bytes == 0 || max_frame_bytes > MAX_SUPPORTED_NATIVE_FRAME_BYTES {
-        return Err(Error::new(
-            "invalid",
-            format!(
-                "{server} native frame limit is out of bounds",
-                server = labels.server
-            ),
-        ));
-    }
     let (mut transport, stdout) = NativeChild::spawn(launch, policy, labels).await?;
     let process_exit = transport.process_exit_signal();
     let pending = PendingCalls::new(id_prefix, labels, transport.writer().reader_closed_flag());
@@ -1648,10 +1759,10 @@ where
         transport.writer(),
         process_exit,
         mode,
-        max_frame_bytes,
         known_methods,
         classify,
         ordered_fault,
+        oversized_notification,
     ));
     transport.set_output_reader(output_reader);
     Ok((transport, pending, frame_rx, stream_rx))
@@ -1744,18 +1855,20 @@ async fn send_held_frame<Frame>(
     }
 }
 
-/// What one raw stdout line decode produced. Oversized lines carry their
-/// measured length and a bounded head prefix; nothing else is retained.
-/// `lower_bound` is true when the threshold was crossed while the line was
-/// still open (no newline yet): the true line is at least this long.
+/// What one raw stdout line decode produced. Oversized lines carry bounded
+/// envelope metadata only. `lower_bound` is true when the threshold was
+/// crossed while the line was still open (no newline yet): the true line is
+/// at least this long.
 #[derive(Debug)]
 enum BoundedLineError {
-    Oversized {
-        length_bytes: u64,
-        prefix: Vec<u8>,
-        lower_bound: bool,
-    },
+    Oversized(OversizedFrame),
     Io(std::io::Error),
+}
+
+enum BoundedLineItem {
+    Text(String),
+    DiscardStarted,
+    Oversized(OversizedFrame),
 }
 
 impl From<std::io::Error> for BoundedLineError {
@@ -1767,104 +1880,188 @@ impl From<std::io::Error> for BoundedLineError {
 /// Length-checked NDJSON line codec with bounded oversized diagnosis.
 /// Lines within the limit decode exactly like [`LinesCodec`] (trailing
 /// `\r` stripped, UTF-8 enforced, and a final lone `\r` at EOF ignored).
-/// A line over the limit fails as soon as the threshold is crossed, even
-/// without a newline, keeping only the first [`OVERSIZED_PREFIX_CAP`]
-/// bytes; the pump reports it once as [`NativeStreamFault::FrameOversized`]
-/// with the observed length marked as a lower bound, so a host that keeps
-/// stdout open can never delay diagnosis or pending-call failure. Buffers
-/// never hold more than the limit plus one read, so a multi-gigabyte line
-/// still holds kilobytes of memory.
-#[derive(Debug)]
+/// A line over the limit fails at the threshold unless its bounded header
+/// identifies an approved opportunistic notification. Those records enter a
+/// bounded discard state and are emitted only after the newline proves their
+/// boundary; the body is never retained.
 struct BoundedLineCodec {
-    max_frame_bytes: usize,
+    known_methods: &'static [&'static str],
+    skippable_method: Option<&'static str>,
+    searched: usize,
+    discarding: Option<DiscardingLine>,
+}
+
+struct DiscardingLine {
+    envelope: OversizedEnvelopeScanner,
+    length_bytes: u64,
+    deadline: Instant,
 }
 
 impl BoundedLineCodec {
-    fn new(max_frame_bytes: usize) -> Self {
-        Self { max_frame_bytes }
+    fn new(known_methods: &'static [&'static str], skippable_method: Option<&'static str>) -> Self {
+        Self {
+            known_methods,
+            skippable_method,
+            searched: 0,
+            discarding: None,
+        }
     }
 
-    fn oversized(&self, total: u64, prefix: Vec<u8>, lower_bound: bool) -> BoundedLineError {
-        debug_assert!(prefix.len() <= OVERSIZED_PREFIX_CAP);
-        BoundedLineError::Oversized {
-            length_bytes: total,
-            prefix,
-            lower_bound,
+    fn can_skip(&self, detail: &OversizedFrame) -> bool {
+        detail.is_jsonrpc_v2()
+            && detail.kind() == OversizedFrameKind::Notification
+            && detail.method().is_some()
+            && detail.method() == self.skippable_method
+    }
+
+    fn unfinished_discard(&self, lower_bound: bool) -> Option<OversizedFrame> {
+        self.discarding.as_ref().map(|discard| {
+            discard.envelope.frame(
+                MAX_NATIVE_INBOUND_FRAME_BYTES,
+                discard.length_bytes,
+                self.known_methods,
+                lower_bound,
+            )
+        })
+    }
+
+    fn finish_discard(
+        &self,
+        discard: DiscardingLine,
+    ) -> std::result::Result<Option<BoundedLineItem>, BoundedLineError> {
+        let detail = discard.envelope.frame(
+            MAX_NATIVE_INBOUND_FRAME_BYTES,
+            discard.length_bytes,
+            self.known_methods,
+            false,
+        );
+        if discard.envelope.root_closed && self.can_skip(&detail) {
+            Ok(Some(BoundedLineItem::Oversized(detail)))
+        } else {
+            Err(BoundedLineError::Oversized(detail))
         }
     }
 
     fn decode_content(
-        &self,
         mut content: &[u8],
-    ) -> std::result::Result<Option<String>, BoundedLineError> {
-        if content.last() == Some(&b'\r') {
-            content = &content[..content.len().saturating_sub(1)];
+    ) -> std::result::Result<Option<BoundedLineItem>, BoundedLineError> {
+        if let Some(trimmed) = content.strip_suffix(b"\r") {
+            content = trimmed;
         }
-        match std::str::from_utf8(content) {
-            Ok(valid) => Ok(Some(valid.to_owned())),
-            Err(_) => Err(BoundedLineError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "native line is not valid UTF-8",
-            ))),
-        }
+        std::str::from_utf8(content)
+            .map(|valid| Some(BoundedLineItem::Text(valid.to_owned())))
+            .map_err(|_| {
+                BoundedLineError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "native line is not valid UTF-8",
+                ))
+            })
     }
 }
 
 impl Decoder for BoundedLineCodec {
-    type Item = String;
+    type Item = BoundedLineItem;
     type Error = BoundedLineError;
 
     fn decode(
         &mut self,
         src: &mut BytesMut,
-    ) -> std::result::Result<Option<String>, BoundedLineError> {
-        if let Some(newline) = src.iter().position(|byte| *byte == b'\n') {
-            let end = newline.saturating_add(1);
-            if newline.saturating_add(1) > self.max_frame_bytes {
-                let take = newline.min(OVERSIZED_PREFIX_CAP);
-                let prefix = src[..take].to_vec();
-                let _ = src.split_to(end);
-                return Err(self.oversized(end as u64, prefix, false));
+    ) -> std::result::Result<Option<BoundedLineItem>, BoundedLineError> {
+        let newline = src[self.searched..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|offset| self.searched + offset);
+        let bytes = newline.map_or(src.len(), |index| index + 1);
+        if let Some(mut discard) = self.discarding.take() {
+            discard.length_bytes = discard.length_bytes.saturating_add(bytes as u64);
+            discard.envelope.feed(&src[..newline.unwrap_or(bytes)]);
+            if newline.is_some() {
+                let _ = src.split_to(bytes);
+                return self.finish_discard(discard);
             }
-            let line = src.split_to(end);
-            return self.decode_content(&line[..newline]);
-        }
-        if src.len() > self.max_frame_bytes {
-            // No newline yet and already over the limit: publish the fault
-            // now instead of waiting for a newline or EOF that may never
-            // come. The true line is at least this long.
-            let take = src.len().min(OVERSIZED_PREFIX_CAP);
-            let prefix = src[..take].to_vec();
-            let total = src.len() as u64;
             src.clear();
-            return Err(self.oversized(total, prefix, true));
+            self.discarding = Some(discard);
+            return Ok(None);
         }
+
+        if bytes > MAX_NATIVE_INBOUND_FRAME_BYTES {
+            self.searched = 0;
+            let content = &src[..newline.unwrap_or(bytes)];
+            let prefix = content.len().min(OVERSIZED_PREFIX_CAP);
+            let mut envelope = OversizedEnvelopeScanner::default();
+            envelope.feed(&content[..prefix]);
+            let detail = envelope.frame(
+                MAX_NATIVE_INBOUND_FRAME_BYTES,
+                bytes as u64,
+                self.known_methods,
+                newline.is_none(),
+            );
+            if !self.can_skip(&detail) {
+                return Err(BoundedLineError::Oversized(detail));
+            }
+            envelope.feed(&content[prefix..]);
+            let discard = DiscardingLine {
+                envelope,
+                length_bytes: bytes as u64,
+                deadline: Instant::now() + OVERSIZED_DISCARD_TIMEOUT,
+            };
+            if newline.is_some() {
+                let _ = src.split_to(bytes);
+                return self.finish_discard(discard);
+            }
+            src.clear();
+            self.discarding = Some(discard);
+            return Ok(Some(BoundedLineItem::DiscardStarted));
+        }
+
+        if let Some(newline) = newline {
+            self.searched = 0;
+            let line = src.split_to(bytes);
+            return Self::decode_content(&line[..newline]);
+        }
+        self.searched = src.len();
         Ok(None)
     }
 
     fn decode_eof(
         &mut self,
         src: &mut BytesMut,
-    ) -> std::result::Result<Option<String>, BoundedLineError> {
-        if src.is_empty() {
-            return Ok(None);
+    ) -> std::result::Result<Option<BoundedLineItem>, BoundedLineError> {
+        if let Some(item) = self.decode(src)? {
+            return Ok(Some(item));
         }
-        if src.len() == 1 && src[0] == b'\r' {
-            // Match `LinesCodec` 0.7.20: a final lone `\r` at EOF is an
-            // encoding suffix, not an empty frame.
+        if let Some(detail) = self.unfinished_discard(false) {
+            self.discarding = None;
+            return Err(BoundedLineError::Oversized(detail));
+        }
+        self.searched = 0;
+        if src.is_empty() || &src[..] == b"\r" {
             src.clear();
             return Ok(None);
-        }
-        if src.len().saturating_add(1) > self.max_frame_bytes {
-            let take = src.len().min(OVERSIZED_PREFIX_CAP);
-            let prefix = src[..take].to_vec();
-            let total = src.len() as u64;
-            src.clear();
-            return Err(self.oversized(total, prefix, false));
         }
         let line = src.split_to(src.len());
-        self.decode_content(&line)
+        Self::decode_content(&line)
     }
+}
+
+async fn next_native_line(
+    reader: &mut FramedRead<ChildStdout, BoundedLineCodec>,
+) -> Option<std::result::Result<BoundedLineItem, BoundedLineError>> {
+    if let Some(deadline) = reader
+        .decoder()
+        .discarding
+        .as_ref()
+        .map(|line| line.deadline)
+    {
+        return match timeout_at(deadline, reader.next()).await {
+            Ok(line) => line,
+            Err(_) => reader
+                .decoder()
+                .unfinished_discard(true)
+                .map(|detail| Err(BoundedLineError::Oversized(detail))),
+        };
+    }
+    reader.next().await
 }
 
 /// Bounded stdout line pump: length-checked NDJSON lines, protocol
@@ -1880,17 +2077,23 @@ async fn pump_framed_lines<Frame, Classify>(
     writer: NativeWriter,
     mut process_exit: watch::Receiver<Option<ProcessExit>>,
     mode: PumpMode,
-    max_frame_bytes: usize,
     known_methods: &'static [&'static str],
     mut classify: Classify,
     ordered_fault: Option<fn(NativeStreamFault) -> Frame>,
+    oversized_notification: OversizedNotification<Frame>,
 ) -> Result<()>
 where
     Frame: Send + 'static,
     Classify: FnMut(Value) -> PumpAction<Frame>,
 {
     let server = writer.labels.server;
-    let mut reader = FramedRead::new(stdout, BoundedLineCodec::new(max_frame_bytes));
+    let mut reader = FramedRead::new(
+        stdout,
+        BoundedLineCodec::new(
+            known_methods,
+            oversized_notification.map(|(method, _)| method),
+        ),
+    );
     let mut overflowed = false;
     let mut exit_deadline = process_exit
         .borrow()
@@ -1914,10 +2117,13 @@ where
                         recorded_fault,
                     );
                 }
-                match reader.next().now_or_never() {
+                match next_native_line(&mut reader).now_or_never() {
                     Some(line) => {
                         post_deadline_ready_lines += 1;
                         line
+                    }
+                    None if let Some(detail) = reader.decoder().unfinished_discard(true) => {
+                        Some(Err(BoundedLineError::Oversized(detail)))
                     }
                     None => {
                         return finish_exit_drain_deadline(
@@ -1937,13 +2143,13 @@ where
                     // the deadline before every poll, so continuous output
                     // cannot starve it.
                     biased;
-                    line = reader.next() => line,
+                    line = next_native_line(&mut reader) => line,
                     _ = tokio::time::sleep_until(deadline) => continue,
                 }
             }
             None => {
                 tokio::select! {
-                    line = reader.next() => line,
+                    line = next_native_line(&mut reader) => line,
                     _ = process_exit.changed() => {
                         exit_deadline = Some(
                             process_exit
@@ -1961,39 +2167,19 @@ where
             break;
         };
         let line = match line {
-            Ok(line) if line.len().saturating_add(1) <= max_frame_bytes => line,
-            Ok(line) => {
-                // Unreachable through BoundedLineCodec, which rejects
-                // over-limit lines with a captured prefix; kept so no
-                // oversized line can pass undiagnosed.
-                let detail =
-                    OversizedFrame::unparsed(max_frame_bytes, line.len().saturating_add(1) as u64);
-                return Err(mark_stream_malformed(
-                    stream,
-                    pending,
-                    &writer,
-                    NativeStreamFault::FrameOversized(detail),
-                    &format!(
-                        "{server} stream ended on an oversized frame ({})",
-                        detail.describe()
-                    ),
-                ));
+            Ok(BoundedLineItem::Text(line)) => line,
+            Ok(BoundedLineItem::DiscardStarted) => continue,
+            Ok(BoundedLineItem::Oversized(detail)) => {
+                if let Some((_, make_frame)) = oversized_notification
+                    && !overflowed
+                    && frames.try_send(make_frame(detail)).is_err()
+                {
+                    overflowed = true;
+                    stream.send_replace(StreamState::Overflow);
+                }
+                continue;
             }
-            Err(BoundedLineError::Oversized {
-                length_bytes,
-                prefix,
-                lower_bound,
-            }) => {
-                let detail = if lower_bound {
-                    OversizedFrame::parse_lower_bound(
-                        max_frame_bytes,
-                        length_bytes,
-                        &prefix,
-                        known_methods,
-                    )
-                } else {
-                    OversizedFrame::parse(max_frame_bytes, length_bytes, &prefix, known_methods)
-                };
+            Err(BoundedLineError::Oversized(detail)) => {
                 return Err(mark_stream_malformed(
                     stream,
                     pending,

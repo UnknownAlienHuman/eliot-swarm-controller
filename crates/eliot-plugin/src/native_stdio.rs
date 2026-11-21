@@ -42,10 +42,6 @@ pub trait NativeStdioConfig: Clone + Send + Sync + 'static {
     const SHORT: &'static str;
     /// Request id prefix, e.g. `"codex"`.
     const ID_PREFIX: &'static str;
-    /// Inbound native frame cap for this host. The default 1 MiB stands
-    /// unless the host's wire protocol documents larger frames (bounded by
-    /// [`crate::native_transport::MAX_SUPPORTED_NATIVE_FRAME_BYTES`]).
-    const MAX_FRAME_BYTES: usize;
     /// Inbound method names this host can legitimately send (notifications
     /// and server requests Eliot consumes). Oversized-frame diagnosis
     /// records a method only on exact match here; everything else is
@@ -146,9 +142,9 @@ impl<C: NativeStdioConfig> StdioProcess<C> {
             labels,
             C::ID_PREFIX,
             PumpMode::LossyOverflow,
-            C::MAX_FRAME_BYTES,
             C::OVERSIZED_KNOWN_METHODS,
             classify_jsonrpc_frame::<C>,
+            None,
             None,
         )
         .await?;
