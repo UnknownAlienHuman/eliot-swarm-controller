@@ -193,8 +193,8 @@ the artifact and its exact finished generation must be older than the configured
 window. Archived Agents and their artifacts stay protected from automatic cleanup.
 An omitted `automation.auto_cleanup` runs plan-only pages, retaining no plans for
 apply and reserving no apply. Explicit `true` applies only after the first complete
-plan-only sweep of each daemon startup. Explicit `false` disables the automatic
-planner entirely, including the protected-copy benchmark. Each completed paged
+plan-only sweep of each daemon startup. Explicit `false` disables automatic
+planning and apply. Each completed paged
 sweep updates aggregate status and sends one Owner `notify` with would-remove and
 kept totals and enablement; intermediate pages do not send notices. Per-item
 `cleanup.automatic` reason events remain available. The sweep keeps dirty or

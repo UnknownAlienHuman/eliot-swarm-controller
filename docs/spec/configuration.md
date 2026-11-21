@@ -622,7 +622,7 @@ Backlog and automatic cleanup are root-level automation options.
 ```toml
 [automation]
 max_event_backlog = 100000
-auto_cleanup = true
+# auto_cleanup = true # Opt in to apply after the first preview.
 auto_cleanup_after = "7d"
 ```
 
@@ -631,7 +631,7 @@ negative, wrong-type and unknown automation values are invalid. Omitted `auto_cl
 means plan-only: the guarded paged planner runs and reports its completed sweep, but no
 plan is retained for apply. Explicit `true` enables automatic apply only after the first
 complete plan-only sweep of that daemon startup. Explicit `false` disables automatic
-cleanup entirely, including planning and the protected-copy benchmark. `auto_cleanup_after`
+planning and apply. `auto_cleanup_after`
 is a positive duration and defaults to seven days. Every automatic apply uses the
 [cleanup retention policy](coordination.md#registered-artifacts-and-cleanup-k69) through
 the same guarded plan and apply path as the cleanup UI and CLI.
