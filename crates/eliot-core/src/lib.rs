@@ -76,10 +76,11 @@ pub use observe::{
 pub use presentation::{count_words, origin_words, reason_message, reason_words};
 pub use remote_call::{RemoteCallContext, RemoteIdentity};
 pub use routing::{
-    CapacityScope, MAX_AUTOMATIC_PROVIDER_PROBES, PROVIDER_PROBE_LAUNCH_ARG, PROVIDER_PROBE_PROMPT,
-    ProviderHold, ProviderHoldState, ProviderRestriction, ProviderRestrictionKind, RouteBinding,
-    RouteQuotaStatus, RouteSkip, RouteSkipReason, RoutingDecision, frozen_provider_scope,
-    frozen_provider_scope_for, provider_switch_authority,
+    CapacityScope, MAX_AUTOMATIC_PROVIDER_PROBES, PROVIDER_LAUNCH_OVERRIDE_FIELDS,
+    PROVIDER_PROBE_LAUNCH_ARG, PROVIDER_PROBE_PROMPT, ProviderHold, ProviderHoldState,
+    ProviderRestriction, ProviderRestrictionKind, RouteBinding, RouteQuotaStatus, RouteSkip,
+    RouteSkipReason, RoutingDecision, frozen_provider_scope, frozen_provider_scope_for,
+    provider_switch_authority,
 };
 pub use secrets::SecretPolicy;
 pub use source_handoff::{SourceHandoff, SourceHandoffAck, SourceHandoffGap};

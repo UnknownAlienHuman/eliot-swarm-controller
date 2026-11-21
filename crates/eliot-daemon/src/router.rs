@@ -6812,6 +6812,16 @@ fn normalize_launch(request: &mut SubmitCommand, _principal: &Principal) -> Resu
                 ));
             }
         }
+        if !args.contains_key("profile")
+            && let Some(field) = eliot_core::PROVIDER_LAUNCH_OVERRIDE_FIELDS
+                .iter()
+                .find(|field| args.contains_key(**field))
+        {
+            return Err(Error::new(
+                "invalid",
+                format!("launch {field} requires an ad-hoc harness or saved role profile"),
+            ));
+        }
         if let Some(profile) = args.get("profile") {
             let Some(name) = profile.as_str().filter(|name| !name.trim().is_empty()) else {
                 return Err(Error::new(

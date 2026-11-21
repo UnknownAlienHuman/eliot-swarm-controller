@@ -206,10 +206,8 @@ fn provider_retry_allowed(tx: &Transaction<'_>, agent: &Agent, task: &str) -> Re
             WHERE c.id=?1 AND c.target=?2 AND c.generation=?3 AND c.principal='owner'
               AND c.verb='send' AND c.state='applied' AND c.ordinal=0
               AND ((c.link_kind='send' AND p.verb='launch' AND p.target=c.target
-                  AND json_type(p.args,'$.access') IS NULL AND json_type(p.args,'$.cmd') IS NULL
-                  AND json_type(p.args,'$.permissions') IS NULL AND json_type(p.args,'$.approval_policy') IS NULL
-                  AND json_type(p.args,'$.auth') IS NULL AND json_type(p.args,'$.model') IS NULL
-                  AND json_type(p.args,'$.effort') IS NULL)
+                  AND NOT EXISTS(SELECT 1 FROM json_each(p.args) field
+                    JOIN json_each(?4) explicit ON explicit.value=field.key))
                 OR (c.link_kind='handoff' AND p.method='swarm.handoff' AND EXISTS(
                     SELECT 1 FROM commands s
                     JOIN commands l ON l.parent_command=s.id AND l.ordinal=0 AND l.target=c.target
@@ -222,7 +220,7 @@ fn provider_retry_allowed(tx: &Transaction<'_>, agent: &Agent, task: &str) -> Re
               AND NOT EXISTS(SELECT 1 FROM commands other WHERE other.target=?2 AND other.generation=?3
                 AND other.id<>c.id AND other.verb<>'launch')
         )",
-        params![task, num, agent.generation],
+        params![task, num, agent.generation, encode_json(&core::PROVIDER_LAUNCH_OVERRIDE_FIELDS)?],
         |row| row.get(0),
     ).map_err(sql_error)
 }

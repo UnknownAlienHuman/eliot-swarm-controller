@@ -66,6 +66,38 @@ pub struct RouteSkip {
     pub quota_status: RouteQuotaStatus,
 }
 
+/// Explicit selectors belong to an ad-hoc launch or a saved role profile.
+pub const PROVIDER_LAUNCH_OVERRIDE_FIELDS: &[&str] = &[
+    "model",
+    "effort",
+    "access",
+    "auth",
+    "cmd",
+    "permissions",
+    "approval_policy",
+    "approval",
+    "permission_mode",
+    "mode",
+    "dangerously_skip_permissions",
+    "auth_integration",
+    "workspace_mode",
+    "inherit_env",
+    "secret_env_names",
+    "collaboration_mode",
+    "native_subagents",
+    "control",
+    "child_profiles",
+    "mcp",
+    "mcp_allow",
+    "sandbox",
+    "account",
+    "proxy",
+    "route_binding",
+    "api_key_env",
+    "pass_env",
+    "literal_env",
+];
+
 /// Authority must match exactly for an automatic switch. Profile order,
 /// model and effort can vary. The normal launch still verifies native
 /// readback against the selected frozen permissions and approval policy.
@@ -104,11 +136,18 @@ pub fn provider_switch_authority(snapshot: &Value) -> Result<[u8; 32]> {
         "cmd",
         "setup",
         "collaboration_mode",
+        "workspace_mode",
+        "inherit_env",
+        "secret_env_names",
     ];
     let authority = Value::Object(
         fields
             .into_iter()
-            .map(|key| (key.to_owned(), snapshot[key].clone()))
+            .filter_map(|key| {
+                snapshot
+                    .get(key)
+                    .map(|value| (key.to_owned(), value.clone()))
+            })
             .collect(),
     );
     crate::canonical_json_sha256(&authority)
