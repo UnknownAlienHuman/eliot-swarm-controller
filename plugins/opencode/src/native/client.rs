@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use eliot_core::{Error, Result};
+use eliot_core::{Error, Result, limits::MAX_NATIVE_INBOUND_FRAME_BYTES};
 use eliot_plugin::native_stdio::{NativeStreamFault, StreamState};
 use reqwest::{Client, header::HeaderValue, redirect, retry};
 use tokio::{
@@ -31,9 +31,6 @@ use crate::native::{
     },
 };
 
-/// Largest single HTTP body accepted. Prompt/readback payloads are small;
-/// anything larger is a protocol violation, never truncated into a decision.
-const MAX_HTTP_BYTES: usize = 1024 * 1024;
 const SSE_QUEUE: usize = 64;
 // OpenCode 2.2.7 uses this header to select the native directory context.
 const OPENCODE_DIRECTORY_HEADER: &str = "x-opencode-directory";
@@ -1118,7 +1115,7 @@ impl OpenCodeHttp {
             // The workspace reqwest has no `stream` feature; `chunk` is core.
             let mut body = Vec::new();
             while let Some(chunk) = response.chunk().await? {
-                if body.len().saturating_add(chunk.len()) > MAX_HTTP_BYTES {
+                if body.len().saturating_add(chunk.len()) > MAX_NATIVE_INBOUND_FRAME_BYTES {
                     return Err(HttpOutcome::unknown("OpenCode response exceeded its bound"));
                 }
                 body.extend_from_slice(&chunk);

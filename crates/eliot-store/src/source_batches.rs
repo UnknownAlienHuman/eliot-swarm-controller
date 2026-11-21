@@ -2,6 +2,24 @@ use super::native_events::{persist_effects, verified_native_event_cause_tx};
 use super::*;
 
 impl Store {
+    pub fn latest_stream_gap(&self, agent: &str, generation: i64) -> Result<Option<Event>> {
+        let agent_num = parse_agent_id(agent)?;
+        self.connection
+            .query_row(
+                "SELECT e.seq, e.ts, e.kind, e.agent, e.generation, e.source, e.native_id,
+                        e.data, e.subject, e.cause
+                 FROM source_state s JOIN events e ON e.seq = s.gap_seq
+                 WHERE s.agent = ?1 AND s.generation = ?2 AND s.source = 'stream'
+                   AND e.agent = s.agent AND e.generation = s.generation AND e.kind = 'source.gap'",
+                params![agent_num, generation],
+                event_record_from_row,
+            )
+            .optional()
+            .map_err(sql_error)?
+            .map(event_from_record)
+            .transpose()
+    }
+
     /// Safe diagnostic source views; controlled plugin acknowledgements retain
     /// their separate current-generation authorization in read_source_state.
     pub fn list_source_states(&self, agent: &str, generation: i64) -> Result<Vec<Value>> {

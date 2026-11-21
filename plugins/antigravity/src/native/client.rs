@@ -25,10 +25,9 @@ use eliot_core::{Error, Result, SecretPolicy, StderrSnapshot, StderrSource};
 use eliot_plugin::{
     StderrView,
     native_transport::{
-        DEFAULT_MAX_NATIVE_FRAME_BYTES, NativeChild, NativeLabels, NativeLaunch, NativeRpcError,
-        NativeStreamFault, NativeWriter, OutboundNotification, OutboundRequest, OutboundResponse,
-        OutboundResult, PendingCalls, PendingGuard, PumpAction, PumpMode, encode_frame,
-        spawn_pumped,
+        NativeChild, NativeLabels, NativeLaunch, NativeRpcError, NativeStreamFault, NativeWriter,
+        OutboundNotification, OutboundRequest, OutboundResponse, OutboundResult, PendingCalls,
+        PendingGuard, PumpAction, PumpMode, encode_frame, spawn_pumped,
     },
 };
 use serde_json::Value;
@@ -56,6 +55,7 @@ pub(crate) enum FencedKind {
 /// One ACP stream record for the event task, in wire order.
 #[derive(Debug)]
 pub(crate) enum AgyFrame {
+    OversizedUpdate(eliot_plugin::native_transport::OversizedFrame),
     /// Ordered record-local fault, behind every retained pre-fault frame.
     StreamFault(NativeStreamFault),
     /// A `session/update` notification body.
@@ -164,10 +164,10 @@ impl AgyProcess {
             LABELS,
             ID_PREFIX,
             PumpMode::LossyOverflow,
-            DEFAULT_MAX_NATIVE_FRAME_BYTES,
             OVERSIZED_KNOWN_METHODS,
             move |value| classify_agy_frame(value, &fenced_classify),
             Some(AgyFrame::StreamFault),
+            Some(("session/update", AgyFrame::OversizedUpdate)),
         )
         .await?;
         let client = AgyClient {
@@ -211,7 +211,21 @@ impl AgyProcess {
     /// The daemon's Job remains the sole force-custody path if this cannot be
     /// proven before the deadline.
     pub async fn close_gracefully(&mut self, deadline: Instant) -> Result<ExitStatus> {
-        self.transport.close_gracefully(deadline, true).await
+        let result = self.transport.close_gracefully(deadline, true).await;
+        if result.is_err()
+            && self.transport.process_exit_observed()
+            && matches!(
+                *self.stream.borrow(),
+                eliot_plugin::native_transport::StreamState::Malformed(
+                    NativeStreamFault::FrameOversized(_)
+                )
+            )
+        {
+            // The reader already reported the gap. An observed process exit
+            // can still close the session, without settling the lost reply.
+            return self.transport.wait_for_process_exit().await;
+        }
+        result
     }
 
     pub async fn terminate(&mut self, force: bool, deadline: Instant) -> Result<ExitStatus> {

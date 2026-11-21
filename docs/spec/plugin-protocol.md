@@ -673,8 +673,21 @@ output before declaring loss. Plugin replacement never rebinds an uncertain old 
 Persisted facts backpressure; ephemeral telemetry may drop with visible lag.
 
 
+Native harness inputs use the shared 8 MiB
+[`MAX_NATIVE_INBOUND_FRAME_BYTES`](../../crates/eliot-core/src/limits.rs) bound.
+For NDJSON it includes the newline. Antigravity can discard an oversized ACP
+`session/update` when a bounded header identifies the notification and the
+newline ends an envelope with no top-level `id`. The reader counts the bytes
+while discarding the record and queues one gap in wire order. The gap records
+the method, size and limit and leaves the native prompt reply authoritative.
+If an update was omitted during a turn, its final text is reported unavailable
+with `native_update_gap`. Oversized replies, requests and unclassified records
+are fatal. Discard ends in a fatal oversized-frame fault if the newline never
+arrives before the discard deadline. `swarm why` shows the retained reason for
+the Agent.
+
 Native reader faults split by proven line boundary. Fatal reader end (EOF,
-codec/UTF-8/IO fault, oversize without a proven line boundary, exit-drain
+codec/UTF-8/IO fault, a required oversized record, exit-drain
 deadline) atomically closes response-router registration and the write
 boundary: new RPC/notifications are rejected `native_not_dispatched` before
 any write, while requests already queued or written remain `unknown` — never

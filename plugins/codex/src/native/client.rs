@@ -18,16 +18,6 @@ impl NativeStdioConfig for CodexStdioConfig {
     const SERVER: &'static str = "Codex app-server";
     const SHORT: &'static str = "Codex";
     const ID_PREFIX: &'static str = "codex";
-    // Live-observed 2026-11-14: a minimal-policy `mcpServerStatus/list`
-    // (`detail: toolsAndAuthOnly`) response reached 1,990,613 bytes against
-    // the 1 MiB default and ended the stream. The installed 0.167.1 schema
-    // offers no names-only detail (`full` | `toolsAndAuthOnly`, both embed
-    // every server's full tool catalogs with input/output schemas), and the
-    // inventory read needs the whole list to prove no unexpected enabled
-    // server, so the 8 MiB cap covers the readback plus owner variance and
-    // envelope overhead. Anything larger stays an explicit oversized gap.
-    const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
-
     /// Inbound methods the Codex host can legitimately send: the
     /// notifications the event task consumes plus the three server-request
     /// families Eliot answers (`events.rs`, `native/requests.rs`).
