@@ -79,6 +79,7 @@ struct AvailableRoute {
 #[derive(Default)]
 struct RoutePreflight {
     arbitrated: bool,
+    automatic: bool,
     provider_switch: bool,
     provider_authority: Option<[u8; 32]>,
     held_accounts: HashMap<String, Value>,
@@ -101,7 +102,7 @@ impl RoutePreflight {
     }
 
     fn check_candidate_holds(&self) -> bool {
-        !self.arbitrated || self.quota_deadline.is_some()
+        !self.arbitrated || self.automatic
     }
 }
 
@@ -199,9 +200,10 @@ impl Router {
         // harness. Policy may still select a different native harness.
         let mut preflight = RoutePreflight {
             arbitrated: mode.arbitrated,
+            automatic: mode.automatic(principal),
             ..RoutePreflight::default()
         };
-        if mode.automatic(principal) {
+        if preflight.automatic {
             self.prepare_quota_policies(&mut preflight, &candidates, parent.as_ref());
         }
         self.choose_route(

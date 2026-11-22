@@ -139,7 +139,7 @@ pub(crate) async fn run_show(
                 format!("{:?}", agent.state).to_ascii_lowercase(),
                 agent.generation
             );
-            println!("Project: {}", agent.project);
+            println!("Project: {}", eliot_core::display_path(&agent.project));
             if let Some(reason) = &agent.policy_opt_out_reason {
                 println!("Policy opt-out: {reason}");
             }
@@ -1353,7 +1353,7 @@ pub(crate) fn print_agent_table(
                 truncate_cell(&summary.id, 6),
                 summary.generation,
                 truncate_cell(&summary.display_state(), 22),
-                truncate_cell(&summary.project, 14),
+                truncate_cell(&eliot_core::display_path(&summary.project), 14),
                 truncate_cell(&summary.harness, 9),
                 truncate_cell(turn, 12),
                 age,

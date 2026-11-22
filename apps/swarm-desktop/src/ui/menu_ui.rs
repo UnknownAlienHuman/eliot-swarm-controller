@@ -464,11 +464,9 @@ impl DesktopApp {
                 self.open_folder(&checkout);
             }
             (Action::OpenFolder, Target::Agent(agent)) => {
-                let folder = agent
-                    .workspace
-                    .clone()
-                    .unwrap_or_else(|| agent.project_id.clone());
-                self.open_folder(&folder);
+                if let Some(folder) = agent_folder(agent) {
+                    self.open_folder(folder);
+                }
             }
             (Action::ToggleCollapse, Target::Project { key, .. }) => {
                 self.shell_update(ShellMsg::ProjectToggled(key.clone()), context);
@@ -959,11 +957,9 @@ impl DesktopApp {
             m3::glyph::COPY,
             false,
         )];
-        // No-project chats never had Open folder: their workspace is a
-        // private daemon directory, not a place to open. A chat with a
-        // project keeps its old entry, as does any task with a folder.
-        let place = agent.workspace.as_deref().unwrap_or(&agent.project_id);
-        if !agent.project_id.is_empty() || (!agent.chat && !place.is_empty()) {
+        // No-project chats have only a private daemon workspace. Other
+        // tasks need a real workspace or an absolute legacy project path.
+        if agent_folder(agent).is_some() {
             entries.push((
                 Action::OpenFolder,
                 "Open folder".to_owned(),
@@ -1182,6 +1178,24 @@ impl DesktopApp {
             self.alert(note);
         }
     }
+}
+
+/// The filesystem location Open folder may reveal. A registered project
+/// identifier by itself is not a path; old rows may retain an absolute path.
+fn agent_folder(agent: &UiAgent) -> Option<&str> {
+    if agent.chat && agent.project_id.is_empty() {
+        return None;
+    }
+    agent
+        .workspace
+        .as_deref()
+        .filter(|workspace| !workspace.is_empty())
+        .or_else(|| {
+            let project = agent.project_id.as_str();
+            std::path::Path::new(project)
+                .is_absolute()
+                .then_some(project)
+        })
 }
 
 /// A menu row's height: a default button row.

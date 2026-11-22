@@ -335,7 +335,7 @@ pub fn place_of(label: &str, checkouts: &[Checkout]) -> (String, Option<String>)
             checkout_repository_name(checkout, checkouts),
             subproject_name(checkout),
         ),
-        None => (folder_name(label).to_owned(), None),
+        None => (folder_name(&display_path(label)).to_owned(), None),
     }
 }
 
@@ -471,7 +471,10 @@ pub fn agent_place_label(agent: &UiAgent, checkouts: &[Checkout]) -> String {
                 None => name,
             }
         }
-        None => folder_name(agent.workspace.as_deref().unwrap_or(&agent.project_id)).to_owned(),
+        None => {
+            let fallback = display_path(agent.workspace.as_deref().unwrap_or(&agent.project_id));
+            folder_name(&fallback).to_owned()
+        }
     }
 }
 

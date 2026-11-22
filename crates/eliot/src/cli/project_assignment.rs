@@ -95,12 +95,16 @@ pub(super) async fn transfer(
             intent,
             destination,
             generation,
+            task_command,
+            commands,
         } => ProjectTransferAction::Commit {
             intent,
             destination: ProjectManagerIdentity::Local {
                 agent: destination,
                 generation,
             },
+            task_command,
+            commands,
         },
         ProjectTransferCommand::Cancel { intent } => ProjectTransferAction::Cancel { intent },
     };

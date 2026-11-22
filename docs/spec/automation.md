@@ -694,8 +694,9 @@ and other projects still get a chance.
 
 After choosing a project, routing selects an eligible installed candidate using
 the [routing policy](configuration.md#routing-policy-s3). Waiting automatic role
-launches re-evaluate eligible candidates, including quota reserve and unknown
-readback. An explicit profile keeps its model, account and route binding. The
+launches re-evaluate candidate capacity and provider holds on every visit. They
+also evaluate quota reserve and unknown readback when configured. An explicit
+profile keeps its model, account and route binding. The
 manager's Owner-granted priority orders fresh heads from highest to lowest. Within
 each priority tier, projects rotate after the last successful admission. At 30 seconds
 of waiting, heads take precedence in a single project rotation, so repeated priority

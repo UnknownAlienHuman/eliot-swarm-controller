@@ -918,13 +918,23 @@ remain unsupported.
   unsettled queues block the transaction. Queues keep their
   retained principals and assignment epochs are preserved. Project-owned rules
   stay project-owned and targeted automation follows current membership.
+  Saved continuation context and any expressly selected source SENDs enter the
+  ordinary Handoff delivery gate in the same transaction. The Owner may cite a
+  retained original task and select ordered plain SENDs from the exact source
+  generation that the transfer drain fence rejected during dispatch preflight
+  or that source stop cancelled before dispatch. Their successors preserve
+  the original principals and wait for the brief to become Applied. The
+  retained handoff parent reports brief delivery and the original-to-successor
+  command links. Failed or unknown brief delivery keeps successors queued.
 - **Cancel** removes the intent and lifts its drain fence once any staged
   replacement has settled without open custody. Owner can stop a staged B
   through ordinary recovery.
 
-Saved context is available to the Owner in the retained result. Task brief
-delivery and selected SEND continuation use their own [Handoff](#handoff)
-contract.
+The transfer receipt links to the [Handoff](#handoff) command for current
+delivery state. Commit blockers roll back assignment and handoff writes
+together. Exact replay reads the same admission and schedules any accepted or
+queued handoff children while the daemon is open. Dispatch still checks their
+retained state and generation.
 
 ## Handoff
 
