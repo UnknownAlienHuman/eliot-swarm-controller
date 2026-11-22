@@ -151,6 +151,9 @@ impl Router {
         else {
             return Ok(None);
         };
+        if store.is_handoff_brief(&task_command)? {
+            return Ok(None);
+        }
         let request = SwitchRequest {
             id: id.to_owned(),
             from: agent.id.clone(),

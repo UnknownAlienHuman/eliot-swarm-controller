@@ -16,6 +16,10 @@ pub struct HandoffAdmission {
 }
 
 impl Store {
+    pub fn is_handoff_brief(&self, command_id: &str) -> Result<bool> {
+        is_brief_tx(&self.connection, command_id)
+    }
+
     /// Router preflight permits retained retries during drain, before new admission.
     pub fn replay_handoff(
         &self,
@@ -663,7 +667,7 @@ pub(super) fn quiescent(tx: &Transaction<'_>, agent: &Agent, destination: bool) 
 }
 
 /// Only ordinal-zero SEND is the brief; links are the existing command representation.
-pub(super) fn is_brief_tx(tx: &Transaction<'_>, id: &str) -> Result<bool> {
+pub(super) fn is_brief_tx(tx: &Connection, id: &str) -> Result<bool> {
     tx.query_row("SELECT EXISTS(SELECT 1 FROM commands c JOIN commands p ON p.id=c.parent_command
         WHERE c.id=?1 AND c.link_kind='handoff' AND c.ordinal=0 AND c.verb='send' AND p.method='swarm.handoff' AND p.verb='handoff')",[id],|row|row.get(0)).map_err(sql_error)
 }

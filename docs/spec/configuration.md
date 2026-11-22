@@ -201,6 +201,7 @@ resolution freezes the ceiling in the generation's `profile_snapshot`, so a conf
 edit affects a later generation. At the next idle boundary, the daemon compacts when
 the harness advertises native compaction. Otherwise it uses the same-profile safe
 session switch and A6 handoff brief when the source has a retained successful task.
+The brief alone does not trigger another transfer.
 The `session_growth.switch` opt-in applies to legacy ratio/file-size warnings; it does
 not gate a configured context ceiling. The existing
 `daemon.attention.session_growth.enabled` setting still gates automatic reactions.
