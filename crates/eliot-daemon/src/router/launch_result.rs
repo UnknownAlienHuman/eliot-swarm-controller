@@ -24,7 +24,9 @@ impl Router {
             .await
             .rule_action_trigger(&command.id)?;
         if let Some(event) = event
-            && self.rule_worktree_is_current(&event).await?
+            && self
+                .rule_worktree_is_current(&command.principal, &event)
+                .await?
         {
             return Ok(());
         }
@@ -34,7 +36,11 @@ impl Router {
         ))
     }
 
-    pub(crate) async fn rule_worktree_is_current(&self, event: &Event) -> Result<bool> {
+    pub(crate) async fn rule_worktree_is_current(
+        &self,
+        principal: &str,
+        event: &Event,
+    ) -> Result<bool> {
         if event.kind == "turn.completed" && event.data["project_check"] != "off" {
             return Ok(false);
         }
@@ -52,7 +58,11 @@ impl Router {
         };
         let current = self.inner.store.lock().await.get_agent(agent)?;
         if current.is_none_or(|agent| {
-            agent.generation != generation || agent.workspace.as_deref() != Some(workspace)
+            agent.generation != generation
+                || agent.workspace.as_deref() != Some(workspace)
+                || principal
+                    .strip_prefix("project:")
+                    .is_some_and(|project| project != agent.project)
         }) {
             return Ok(false);
         }
@@ -121,7 +131,7 @@ impl Router {
             .as_str()
             .filter(|text| !text.trim().is_empty())
             .ok_or_else(|| Error::new("invalid", "launch result has no retained final text"))?;
-        let state = if self.rule_worktree_is_current(&origin).await? {
+        let state = if self.rule_worktree_is_current(principal, &origin).await? {
             "Fingerprint still current at delivery check."
         } else {
             "Fingerprint changed or could not be confirmed at delivery check."

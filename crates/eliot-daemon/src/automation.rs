@@ -2684,7 +2684,7 @@ async fn evaluate_event_action(
     match definition::evaluate(definition, event)? {
         RuleEvaluation::Command(_)
             if definition.guards_launch_worktree()
-                && !router.rule_worktree_is_current(event).await? =>
+                && !router.rule_worktree_is_current(principal, event).await? =>
         {
             Ok(RuleEvaluation::NoMatch)
         }

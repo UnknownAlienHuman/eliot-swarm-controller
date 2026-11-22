@@ -272,6 +272,22 @@ when its requested history has already been pruned. A lagging
 rule cannot pin expired storage indefinitely. Rate-limit windows longer than
 command retention count only retained history.
 
+An event rule's optional `once_per` renders a key from captured event fields. The
+Store records the digest of the rendered value with an admitted action. The same
+rule in that namespace can fire for that value again after the bounded key
+retention expires. A suppression does not consume a new key. For example:
+
+```toml
+once_per = "${data.data.pull_number}@${data.data.head}"
+limit = { max = 2, per = "key", key = "${data.data.pull_number}", window = "24h", min_interval = "2h" }
+```
+
+`per = "key"` selects a rate bucket using `limit.key`, or the `once_per` key
+when `limit.key` is omitted. The optional `min_interval` spaces admissions in the
+same bucket and must fit within the configured window. An unavailable or invalid
+key skips the action. Keyed rules use live event traversal. Suppressed duplicates
+and rate-limited live events increment the rule's `suppressed_count`.
+
 During explicit history catch-up, project Run actions use the same freeze path as live firing,
 capturing each matching event and the validated current rule revision. Project authorization
 preflights the complete rendered request set; deterministic per-event preparation refusals emit
