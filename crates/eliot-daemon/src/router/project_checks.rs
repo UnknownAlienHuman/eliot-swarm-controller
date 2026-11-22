@@ -730,8 +730,12 @@ async fn check_after_edit(
     let prior_pass = prior_pass
         .filter(|pass| pass.fingerprint == before && work.check.as_ref() == Some(&pass.check));
     if prior_pass.is_some() || (review.is_none() && prior_fingerprint == Some(before.as_str())) {
-        if let Some(event) = review {
-            record_worktree_check_outcome(router, key, event, &work.config.id, None).await;
+        if let Some(event) = &edit.review
+            && prior_pass.is_some()
+        {
+            let changed =
+                (event.data["worktree"]["fingerprint"] != before).then_some(before.as_str());
+            record_worktree_check_outcome(router, key, event, &work.config.id, changed).await;
         }
         return CheckDisposition {
             uncertain: false,
@@ -864,11 +868,14 @@ async fn check_after_edit(
             &error,
         );
     }
-    if let Some(event) = review
+    if let Some(event) = &edit.review
         && fast_check_exit == Some(0)
         && let Some(observed) = checked_fingerprint.as_deref()
     {
-        if check_changed_worktree || event.data["worktree"]["fingerprint"] != observed {
+        if check_changed_worktree
+            || event.data["worktree"]["fingerprint"] != before
+            || event.data["worktree"]["fingerprint"] != observed
+        {
             record_worktree_check_outcome(router, key, event, &work.config.id, Some(observed))
                 .await;
         } else if passed.is_some() {
