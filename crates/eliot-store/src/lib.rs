@@ -216,6 +216,8 @@ pub use switch::{PROVIDER_SWITCH_QUEUED, PROVIDER_SWITCH_SETTLED, SwitchWork};
 mod swarm_usage;
 mod turn_recovery;
 pub(crate) mod usage;
+mod wakes;
+pub use wakes::{AgentWakeRecord, AgentWakeRunReceipt, AgentWakeTurnReadiness};
 mod workspace;
 
 fn sql_error(error: rusqlite::Error) -> Error {

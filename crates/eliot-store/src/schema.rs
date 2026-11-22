@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 81;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 82;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -1995,6 +1995,42 @@ impl Store {
                    AND set_by='owner' AND note='automation assignment cursor'
                    AND json_type(value,'$.cursor')='text';
                  INSERT INTO schema_migrations(version) VALUES (81);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 82 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE TABLE agent_wakes (
+                     id TEXT PRIMARY KEY,
+                     agent INTEGER NOT NULL REFERENCES agents(id),
+                     generation INTEGER NOT NULL CHECK(generation > 0),
+                     turn_id TEXT NOT NULL,
+                     condition TEXT NOT NULL CHECK(json_valid(condition)),
+                     state TEXT NOT NULL CHECK(state IN (
+                         'waiting', 'satisfied', 'delivery_pending',
+                         'delivered', 'not_matched', 'failed', 'unknown', 'stale', 'expired'
+                     )),
+                     fact TEXT,
+                     delivery_command_id TEXT NOT NULL UNIQUE,
+                     delivery_attempts INTEGER NOT NULL DEFAULT 0 CHECK(delivery_attempts >= 0),
+                     delivery_next_at INTEGER NOT NULL DEFAULT 0,
+                     created_at INTEGER NOT NULL,
+                     expires_at INTEGER NOT NULL CHECK(expires_at > created_at),
+                     settled_at INTEGER,
+                     FOREIGN KEY(agent, generation, turn_id)
+                         REFERENCES turns(agent, generation, turn_id)
+                 );
+                 CREATE INDEX agent_wakes_state_cursor
+                     ON agent_wakes(state, created_at, id);
+                 CREATE UNIQUE INDEX agent_wakes_one_open_per_generation
+                     ON agent_wakes(agent, generation)
+                     WHERE state IN ('waiting','satisfied','delivery_pending');
+                 INSERT INTO schema_migrations(version) VALUES (82);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;

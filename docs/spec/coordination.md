@@ -573,6 +573,72 @@ ack over them succeeds as already acked.
 The [Store migrations](../../crates/eliot-store/src/schema.rs) own the
 `messages` schema and inbox/thread indexes.
 
+## Agent self-wake (#833 item 3)
+
+`agent.wake {id,condition,timeout_secs}` is available only to the authenticated
+Agent. Store binds it to that Agent's current generation and exact running turn,
+retains the acknowledgement before returning, and reserves a separate stable
+`delivery_command_id`. The response lets the Agent end its turn immediately.
+There is one active wake per Agent generation and 1,024 active wakes daemon-wide.
+The default timeout is one hour; the maximum is 24 hours. Terminal wake records
+are retained for 25 hours.
+
+Conditions are one of:
+
+- `file_appears {path}`: relative to the caller's ready, retained managed
+  worktree, at most 4,096 bytes and 64 path components. Only a regular file
+  below that root can satisfy it; traversal, links, reparse points and
+  worktree/generation changes cannot. If it already exists at admission, it is
+  immediately satisfied.
+- `process_exit {identity}`: exact `host_boot_id`, `pid` and `start_time` from
+  the caller's current `agent.processes` or workspace-process scope. The Store
+  verifies the owner is that exact Agent generation; an unknown observation
+  does not count as exit.
+- `argv_exit0 {run_id}`: wait for an existing `run` command. Admission rechecks
+  the command's retained owner-approved rule origin and requires the frozen
+  event's Agent, generation and workspace to match the caller's exact current
+  binding. Timer runs and runs without that event binding are ineligible. Only
+  an applied `ScriptRunApplied` receipt with known zero exit, quiescent custody
+  and known custody satisfies it. This condition never starts an Agent-supplied
+  argv.
+- `child_completion {turn}`: one exact retained turn of a direct child in its
+  current generation. Reconciliation uses the same exact-turn projection as
+  `swarm.wait`; an unknown child turn does not count as finished.
+- `seconds {seconds}`: elapsed from durable admission time.
+
+A condition may become true while the caller's turn is still running. The
+daemon records one bounded fact, then waits until that exact turn is completed
+and the caller's generation is still current before submitting one ordinary
+`send` with the reserved delivery command id. The command id is checked before
+retry after a crash. A retained unknown command is never replayed; an outcome
+that cannot prove delivery remains `unknown`, and a definite rejected/failed
+delivery is retained as `failed`. Generation replacement or
+timeout retires the wake without delivering into another incarnation. The
+bounded worker scans keyset pages and reads the exact process, run, child-turn,
+workspace and due-time facts; it does not create a second rules engine.
+
+Example Agent MCP call, then end the current turn:
+
+```javascript
+swarm({
+  method: "agent.wake",
+  params: {
+    condition: { kind: "file_appears", path: "out/result.json" },
+    timeout_secs: 1800
+  }
+})
+```
+
+The response includes `delivery_command_id`. After the wake message arrives,
+read the retained delivery result with:
+
+```javascript
+swarm({
+  method: "command.get",
+  params: { id: "<delivery_command_id>" }
+})
+```
+
 ## Shared variables
 
 Scopes encode as `global` or `project:<name>`; tree scopes need hierarchy

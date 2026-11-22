@@ -45,6 +45,7 @@ mod switch;
 mod timers;
 mod usage;
 mod waits;
+mod wakes;
 mod workspaces;
 
 pub(crate) use string_list::deserialize_string_list;
@@ -216,6 +217,11 @@ pub use usage::{
 pub use waits::{
     MAX_SWARM_WAIT_MS, MAX_SWARM_WAIT_TARGETS, MAX_WAIT_FINAL_TEXT_BYTES, MAX_WAIT_FRAME_BYTES,
     SwarmWaitRequest, SwarmWaitResponse, WaitEntryResult, WaitTurnRef, truncate_bytes,
+};
+pub use wakes::{
+    AgentWakeCondition, AgentWakeRequest, AgentWakeResponse, DEFAULT_AGENT_WAKE_TIMEOUT_SECS,
+    MAX_AGENT_WAKE_ID_BYTES, MAX_AGENT_WAKE_PATH_BYTES, MAX_AGENT_WAKE_PATH_COMPONENTS,
+    MAX_AGENT_WAKE_RUN_ID_BYTES, MAX_AGENT_WAKE_TIMEOUT_SECS, MAX_AGENT_WAKE_TURN_ID_BYTES,
 };
 pub use workspaces::{ManagedWorkspaceView, WorkspaceListRequest, WorkspaceListResponse};
 

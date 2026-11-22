@@ -3,7 +3,7 @@ use eliot_core::{Error, Result, SecretPolicy};
 use std::{future::Future, sync::Arc, time::Duration};
 use tokio::{sync::watch, task::JoinSet, time::Instant};
 
-pub(crate) const WORKER_NAMES: [&str; 9] = [
+pub(crate) const WORKER_NAMES: [&str; 10] = [
     "rule_worker",
     "goal_driver",
     "maintenance",
@@ -12,6 +12,7 @@ pub(crate) const WORKER_NAMES: [&str; 9] = [
     "attention",
     "tool_failure_attention",
     "mail_reoffer",
+    "agent_wake",
     "completion_digest",
 ];
 
