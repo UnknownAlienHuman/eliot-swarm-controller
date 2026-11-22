@@ -479,19 +479,25 @@ pub(super) fn has_unhealthy_native_stream_tx(
     .map_err(sql_error)
 }
 
-/// Room a plugin needs around the context in its native hook response.
+/// Room a safe-point steer harness needs around the context in its native
+/// hook response.
 const HOOK_NATIVE_ENVELOPE_BYTES: usize = 1024;
 
-fn hook_response_fits(reply_id: &Value, items: &[ContextItem]) -> Result<bool> {
+fn hook_frame_limit(harness: &str) -> usize {
+    if eliot_core::harness_uses_turn_safe_point_steer(harness) {
+        MAX_FRAME_BYTES - HOOK_NATIVE_ENVELOPE_BYTES
+    } else {
+        MAX_FRAME_BYTES
+    }
+}
+
+fn hook_response_fits(reply_id: &Value, items: &[ContextItem], frame_limit: usize) -> Result<bool> {
     let reply = json!({
         "jsonrpc": "2.0",
         "id": reply_id,
         "result": {"context": items},
     });
-    Ok(encode_json(&reply)?
-        .len()
-        .saturating_add(1 + HOOK_NATIVE_ENVELOPE_BYTES)
-        <= MAX_FRAME_BYTES)
+    Ok(encode_json(&reply)?.len().saturating_add(1) <= frame_limit)
 }
 
 /// Refuse before acceptance a steer whose Agent has no safe-point consumer or
@@ -520,7 +526,11 @@ pub(super) fn validate_turn_safe_point_steer_admission(
         expires_at_ms: None,
     };
     let max_reply_id = Value::String("M".repeat(MAX_COMMAND_ID_BYTES));
-    if !hook_response_fits(&max_reply_id, std::slice::from_ref(&item))? {
+    if !hook_response_fits(
+        &max_reply_id,
+        std::slice::from_ref(&item),
+        hook_frame_limit(&agent.harness),
+    )? {
         return Err(Error::new(
             "frame_too_large",
             "framed steer exceeds the 1 MiB hook response bound",
@@ -1028,12 +1038,13 @@ impl Store {
             pending_candidates.extend(pending_turn_steers(&tx, agent_num, generation, turn_id)?);
             pending_candidates.sort_by_key(|(created_at, rowid, _)| (*created_at, *rowid));
         }
+        let frame_limit = hook_frame_limit(&agent.harness);
         for (_, _, record) in pending_candidates {
             if record.command.turn_id.as_deref() != Some(turn_id) {
                 continue;
             }
             let is_steer = record.command.verb == "steer";
-            let (text, expires_at_ms) = if is_steer {
+            let (text, rendered, expires_at_ms) = if is_steer {
                 if !steer_deliverable_tx(
                     &tx,
                     &record,
@@ -1045,7 +1056,12 @@ impl Store {
                 )? {
                     continue;
                 }
-                (required_string(&record.command.args, "text")?, None)
+                let Some((text, rendered)) =
+                    render_pending_steer_tx(&tx, &record, agent_num, generation, now, &mut events)?
+                else {
+                    continue;
+                };
+                (text, rendered, None)
             } else {
                 let args = decode_inject_args(&record.command.args)?;
                 if args.point != InjectPoint::TurnSafePoint {
@@ -1069,16 +1085,29 @@ impl Store {
                     )?;
                     continue;
                 }
-                (args.text, args.expires_at_ms)
+                let rendered = render_injection(&tx, &record.command, &args.text)?;
+                (args.text, rendered, args.expires_at_ms)
             };
             let item = ContextItem {
                 command_id: record.command.id.clone(),
-                text: render_injection(&tx, &record.command, &text)?,
+                text: rendered,
                 expires_at_ms,
             };
-            if text.len() > MAX_TEXT_BYTES
-                || !hook_response_fits(reply_id, std::slice::from_ref(&item))?
+            let mut candidate = selected.clone();
+            candidate.push(item.clone());
+            let candidate_bytes = payload_bytes.saturating_add(text.len());
+            if candidate_bytes > MAX_TEXT_BYTES
+                || !hook_response_fits(reply_id, &candidate, frame_limit)?
             {
+                // A steer that fits alone waits for the next hook of its turn,
+                // keeping FIFO order; anything else cannot be delivered.
+                if is_steer
+                    && !selected.is_empty()
+                    && text.len() <= MAX_TEXT_BYTES
+                    && hook_response_fits(reply_id, std::slice::from_ref(&item), frame_limit)?
+                {
+                    break;
+                }
                 if is_steer {
                     reject_pending_steer(
                         &tx,
@@ -1102,14 +1131,6 @@ impl Store {
                     )?;
                 }
                 continue;
-            }
-            let mut candidate = selected.clone();
-            candidate.push(item);
-            let candidate_bytes = payload_bytes.saturating_add(text.len());
-            if candidate_bytes > MAX_TEXT_BYTES || !hook_response_fits(reply_id, &candidate)? {
-                // Fits alone but not in this batch: it and later FIFO items
-                // wait for the next safe-point hook of this turn.
-                break;
             }
             selected = candidate;
             payload_bytes = candidate_bytes;
@@ -1467,9 +1488,11 @@ pub(super) fn settle_ended_turn_context_tx(
     now: i64,
 ) -> Result<Vec<super::native_events::PendingCommandEvent>> {
     let mut events = Vec::new();
-    let can_move = load_agent_by_num(tx, agent_num)?
+    let agent = load_agent_by_num(tx, agent_num)?;
+    let can_move = agent.as_ref().is_some_and(next_input_available);
+    let safe_point_steers = agent
         .as_ref()
-        .is_some_and(next_input_available);
+        .is_some_and(|agent| eliot_core::harness_uses_turn_safe_point_steer(&agent.harness));
     for command_id in pending_turn_context_command_ids(tx, agent_num, generation, turn_id)? {
         let record = load_command_record(tx, &command_id)?
             .ok_or_else(|| Error::new("source_integrity", "turn context disappeared"))?;
@@ -1509,7 +1532,12 @@ pub(super) fn settle_ended_turn_context_tx(
             }),
         });
     }
-    for command_id in pending_turn_steer_command_ids(tx, agent_num, generation, turn_id)? {
+    let pending_steers = if safe_point_steers {
+        pending_turn_steer_command_ids(tx, agent_num, generation, turn_id)?
+    } else {
+        Vec::new()
+    };
+    for command_id in pending_steers {
         let outcome = json!({
             "reason": "captured_turn_ended",
             "message": "turn ended before a safe point arrived for steer",
@@ -2254,6 +2282,38 @@ fn steer_deliverable_tx(
         events,
     )?;
     Ok(false)
+}
+
+/// Read and frame one pending steer. A steer that cannot be rendered is
+/// rejected alone so the rest of the hook batch is still delivered.
+fn render_pending_steer_tx(
+    tx: &Transaction<'_>,
+    record: &CommandRecord,
+    agent_num: i64,
+    generation: i64,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<Option<(String, String)>> {
+    let rendered = required_string(&record.command.args, "text").and_then(|text| {
+        let framed = render_injection(tx, &record.command, &text)?;
+        Ok((text, framed))
+    });
+    match rendered {
+        Ok(rendered) => Ok(Some(rendered)),
+        Err(error) => {
+            reject_pending_steer(
+                tx,
+                record,
+                agent_num,
+                generation,
+                &error.code,
+                &error.message,
+                now,
+                events,
+            )?;
+            Ok(None)
+        }
+    }
 }
 
 fn check_pending_steer_dispatch(

@@ -482,7 +482,7 @@ retry a lost acknowledgement and must report a gap/reconcile current state inste
 | launch | Agent/session start; optional prompt is a linked send |
 | attach / detach | exact subject control/observation transition, generation-fenced |
 | send | input-to-turn association; terminal result is separate |
-| steer / interrupt | exact captured active turn, no implicit fallback; an uncertain `steer` does not mask its turn's native completion |
+| steer / interrupt | exact captured active turn, no implicit fallback; an uncertain `steer` claimed at a `turn_safe_point` hook does not mask its turn's native completion |
 | inject | context at its requested next-input or exact-turn safe point; report the actual application point |
 | stop | end the controlled generation/session; not merely stop watching it |
 | resume | reopen the retained native subject as a new generation; new text only when explicitly supplied |

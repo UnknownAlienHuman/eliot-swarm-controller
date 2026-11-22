@@ -1899,25 +1899,27 @@ pub(super) fn admit_control_tx(
         }
     };
     if request.verb == "steer" {
-        if request.args.as_object().is_none_or(|args| args.len() != 1) {
-            return Err(Error::new("invalid", "steer accepts only args.text"));
-        }
         let text = required_string(&request.args, "text")?;
         check_input(&text)?;
-        if has_in_flight_stop_tx(tx, agent_num, agent.generation)? {
-            return Err(Error::new(
-                "bad_state",
-                "steer cannot be accepted while a stop is in flight for this generation",
-            ));
-        }
-        if context::has_unhealthy_native_stream_tx(tx, agent_num, agent.generation)? {
-            return Err(Error::new(
-                "bad_state",
-                "Agent event stream is unhealthy; turn cannot take a steer",
-            ));
-        }
         provider_holds::require_unheld_tx(tx, &agent)?;
+        // A safe-point steer waits durably for a hook, so a turn that cannot
+        // take it is refused here. Direct-RPC steers settle from their plugin.
         if eliot_core::harness_uses_turn_safe_point_steer(&agent.harness) {
+            if request.args.as_object().is_none_or(|args| args.len() != 1) {
+                return Err(Error::new("invalid", "steer accepts only args.text"));
+            }
+            if has_in_flight_stop_tx(tx, agent_num, agent.generation)? {
+                return Err(Error::new(
+                    "bad_state",
+                    "steer cannot be accepted while a stop is in flight for this generation",
+                ));
+            }
+            if context::has_unhealthy_native_stream_tx(tx, agent_num, agent.generation)? {
+                return Err(Error::new(
+                    "bad_state",
+                    "Agent event stream is unhealthy; turn cannot take a steer",
+                ));
+            }
             context::validate_turn_safe_point_steer_admission(
                 &agent,
                 principal,

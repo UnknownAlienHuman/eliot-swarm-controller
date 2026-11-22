@@ -2121,8 +2121,8 @@ impl Store {
     /// Set-based unknown-turn mask for one exact page: the subset of
     /// `turn_ids` with an unsettled command whose outcome is uncertain in
     /// Store or the daemon's write-fault overlay. Both id sets encode once
-    /// per page; the query rides the `commands_turn_unknown` partial covering
-    /// index instead of rescanning command history per turn.
+    /// per page; the query rides the `commands_turn_unknown` partial index
+    /// instead of rescanning command history per turn.
     pub fn turns_with_unknown_commands(
         &self,
         agent: &str,
@@ -6822,15 +6822,17 @@ fn terminalize_generation_commands(
         update_command_state(tx, &id, CommandState::Unknown, Some(&outcome), None, now)?;
     }
     let mut context_events = Vec::new();
+    let safe_point_steers = load_agent_by_num(tx, agent)?
+        .is_some_and(|agent| eliot_core::harness_uses_turn_safe_point_steer(&agent.harness));
     for id in pending_command_ids(tx, agent, generation)? {
         if handoff::held_successor_tx(tx, &id)? {
             continue;
         }
         let mut outcome = json!({"reason": reason});
         let record = load_command_record(tx, &id)?;
-        if let Some(record) =
-            record.filter(|record| matches!(record.command.verb.as_str(), "inject" | "steer"))
-        {
+        if let Some(record) = record.filter(|record| {
+            record.command.verb == "inject" || (safe_point_steers && record.command.verb == "steer")
+        }) {
             if record.command.verb == "inject" {
                 outcome["delivery"] = json!("cancelled");
                 if record

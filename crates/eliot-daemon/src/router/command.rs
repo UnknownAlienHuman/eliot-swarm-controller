@@ -1340,22 +1340,17 @@ impl Router {
         let mut command = command.clone();
         if command.verb == "inject" {
             let Some(text) = command.args.get("text").and_then(Value::as_str) else {
-                return Some(Err(Error::new(
-                    "native_not_dispatched",
-                    "context delivery requires text",
-                )));
+                return Some(Err(Error::new("invalid", "context delivery requires text")));
             };
             if text.len() > eliot_core::limits::MAX_TEXT_BYTES {
                 return Some(Err(Error::new(
-                    "native_not_dispatched",
+                    "frame_too_large",
                     "inject text exceeds 512 KiB",
                 )));
             }
             let text = match store.render_injection(&command, text) {
                 Ok(text) => text,
-                Err(error) => {
-                    return Some(Err(Error::new("native_not_dispatched", *error.message)));
-                }
+                Err(error) => return Some(Err(error)),
             };
             command.args["text"] = Value::String(text);
         }

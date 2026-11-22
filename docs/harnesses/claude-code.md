@@ -214,8 +214,9 @@ unassociated plugin input. After exact late association and turn completion,
 later distinct sends can proceed without restarting the Agent.
 
 If a turn ends before queued hook context or a queued steer is consumed, do not
-deliver the steer to a later turn: the steer settles `rejected` and the text is
-dropped (while `turn_safe_point` inject moves to `next_input` when supported).
+deliver the steer to a later turn: the steer settles `rejected`
+(`captured_turn_ended`), and the sender can resend with `send` (while
+`turn_safe_point` inject moves to `next_input` when supported).
 Neither is `active_turn` inject, which stays unsupported for this CLI.
 
 Terminal `result.usage` covers only the current user turn's main loop

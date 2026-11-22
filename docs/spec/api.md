@@ -1803,29 +1803,32 @@ entries exit 4, and plain failures exit 1.
 
 Exact turn reads check uncertain commands by Agent, generation and turn ID. A full
 fleet status page never makes an unrelated turn unavailable; durable and in-memory
-unknown outcomes for the exact turn still mask completion, except for `steer` commands:
-an uncertain `steer` keeps its own command state `unknown` while the turn keeps its
-native outcome.
+unknown outcomes for the exact turn still mask completion. The one exception is a `steer`
+claimed at a `turn_safe_point` hook (Claude): it keeps its own command state `unknown`
+while the turn keeps its native outcome. An uncertain direct-RPC steer still masks its turn.
 
 Transport/inbox admission is not send applied. Bind input to an exact native turn, then
 track its result independently. Unassociated dispatched/unknown input blocks later
 send/configure/Goal continuation; active/unknown turn blocks next turn; unknown transition
 blocks further takeover. Exact stop/interrupt/request replies/readback remain available.
 
-Steer is bound to the captured generation and active turn, accepts only `args.text`, and
-is validated before acceptance against live runtime support, active turn state, healthy
-native stream state, no in-flight stop, and provider holds. On harnesses that deliver
-`steer` through a direct native RPC, submitting to the plugin has a bounded response
-deadline; if that deadline expires, the command settles as `unknown` with a timeout reason
-and releases the pending call slot without repeating the steer or treating timeout as
-turn completion. On Claude, `steer` must also have `turn_safe_point` hook support, and its
-`#888` Swarm-note frame must fit the 1 MiB hook response at admission; Store rechecks the
-dispatch gates, including rule-action order, and claims
-pending Claude steers in FIFO order on the soonest `PreToolUse` or `PostToolUse` callback
-(`hook.event`) for that exact turn using the `#888` Swarm note frame (preserving Owner
-and manager sender identity), settles `rejected` (`captured_turn_ended`) if the turn ends
-before any safe point arrives, and settles `unknown` only if a claimed hook write outcome
-is unconfirmed without replaying or moving to `next_input`.
+Steer is bound to the captured generation and active turn and is checked against provider
+holds before acceptance. On harnesses that deliver `steer` through a direct native RPC,
+submitting to the plugin has a bounded response deadline; if that deadline expires, the
+command settles as `unknown` with a timeout reason and releases the pending call slot
+without repeating the steer or treating timeout as turn completion.
+
+Claude delivers `steer` at a `turn_safe_point` hook. Its admission also requires `args.text`
+alone, a live runtime with that hook support, a healthy native stream and no in-flight
+stop, and the `#888` Swarm-note frame must fit the 1 MiB hook response. Store rechecks the
+dispatch gates, including rule-action order, and claims pending Claude steers in FIFO order
+on the soonest `PreToolUse` or `PostToolUse` callback (`hook.event`) for that exact turn
+using the `#888` Swarm note frame (preserving Owner and manager sender identity). A steer
+that cannot be rendered is rejected alone, and the rest of the hook batch is delivered.
+The steer stays bound to its exact turn: if the turn ends without another tool call, it
+settles `rejected` (`captured_turn_ended`) and never moves to a later turn, so the sender
+sees the rejection and can resend with `send`. It settles `unknown` only if a claimed hook
+write outcome is unconfirmed, without replaying or moving to `next_input`.
 
 A dispatched or unknown `configure` also holds the settings lane: do not dispatch a
 later configure, new input or native/Eliot Goal start/resume until its exact outcome and
