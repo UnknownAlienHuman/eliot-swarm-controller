@@ -3,9 +3,10 @@
 
 use super::*;
 use eliot_core::api::{
-    CommandSubmitResponse, GoalContinuationStage, GoalCounters, GoalDefinition, GoalMarkerState,
-    GoalMode, GoalRoundEvent, GoalRoundEventOutcome, GoalRoundMarker, GoalRoundOutcome,
-    GoalRoundRequest, GoalRoundResponse, GoalStatus, GoalView, MAX_GOAL_OBSERVATION_BYTES,
+    CHECK_SPAWN_RETRYABLE, CommandSubmitResponse, GoalContinuationStage, GoalCounters,
+    GoalDefinition, GoalMarkerState, GoalMode, GoalRoundEvent, GoalRoundEventOutcome,
+    GoalRoundMarker, GoalRoundOutcome, GoalRoundRequest, GoalRoundResponse, GoalStatus, GoalView,
+    MAX_GOAL_OBSERVATION_BYTES,
 };
 use serde::{Deserialize, Serialize};
 
@@ -166,11 +167,10 @@ pub struct GoalRoundCommit {
     /// key itself instead.
     pub claim_seq: i64,
     pub check: Option<GoalCheckResult>,
-    /// A block the Router decided for this round. With a check result it
-    /// overrides that result (a scope finding after the check); without one
-    /// the round blocks before any check.
-    pub blocked_reason: Option<String>,
-    /// Bounded observation of a block decided without a check.
+    /// A Router decision for a round that cannot proceed. A scope block may
+    /// also override a passing check.
+    pub decision: Option<GoalRoundDecision>,
+    /// Bounded observation for a decision without a check result.
     pub observation: Option<String>,
     /// Workspace fingerprint read just before the check, compared with the
     /// previous round's baseline; absent when that read failed.
@@ -181,11 +181,18 @@ pub struct GoalRoundCommit {
     pub continuation: Option<GoalContinuation>,
 }
 
+#[derive(Clone, Debug)]
+pub enum GoalRoundDecision {
+    Block(String),
+    RetryCheck,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GoalCommitOutcome {
     Completed,
     Blocked { reason: String },
     Continued { command_id: String },
+    Retryable,
 }
 
 #[derive(Clone, Debug)]
@@ -217,6 +224,7 @@ impl GoalRoundCommitResult {
                     Error::new("internal", "stored continued round has no command id")
                 })?,
             },
+            GoalRoundOutcome::Retryable => GoalCommitOutcome::Retryable,
         };
         Ok(Self {
             outcome,
@@ -1893,7 +1901,18 @@ impl Store {
         }
         // A checked round decides its own block, except the Router's scope
         // finding on a passing check, which never carries a continuation.
-        if commit.blocked_reason.is_some()
+        let blocked_reason = match &commit.decision {
+            Some(GoalRoundDecision::Block(reason)) => Some(reason),
+            _ => None,
+        };
+        let retry_check = matches!(commit.decision, Some(GoalRoundDecision::RetryCheck));
+        if retry_check && commit.check.is_some() {
+            return Err(Error::new(
+                "internal",
+                "a retryable check has no direct result",
+            ));
+        }
+        if blocked_reason.is_some()
             && (commit.continuation.is_some()
                 || commit
                     .check
@@ -2130,7 +2149,7 @@ impl Store {
                 }
                 None => {}
             }
-            if let Some(reason) = &commit.blocked_reason {
+            if let Some(reason) = blocked_reason {
                 GoalCommitOutcome::Blocked {
                     reason: reason.clone(),
                 }
@@ -2238,7 +2257,16 @@ impl Store {
                     "failed goal check needs a block reason or a continuation",
                 ));
             }
-        } else if let Some(reason) = &commit.blocked_reason {
+        } else if retry_check {
+            counters.rounds = counters.rounds.saturating_add(1);
+            counters.last_exit_code = None;
+            counters.last_check_at = Some(now);
+            counters.last_observation = commit.observation.clone();
+            match goal_postcheck_block(&row.definition, &counters) {
+                Some(reason) => GoalCommitOutcome::Blocked { reason },
+                None => GoalCommitOutcome::Retryable,
+            }
+        } else if let Some(reason) = blocked_reason {
             if let Some(observation) = &commit.observation {
                 counters.last_observation = Some(observation.clone());
             }
@@ -2248,7 +2276,7 @@ impl Store {
         } else {
             return Err(Error::new(
                 "internal",
-                "goal round without a check can only block",
+                "goal round without a check requires a block or retry decision",
             ));
         };
         let mut state = row.state;
@@ -2279,6 +2307,7 @@ impl Store {
                         None
                     };
             }
+            GoalCommitOutcome::Retryable => {}
         }
         state.counters = counters;
         if let GoalRoundKey::Slot(slot) = commit.round_key {
@@ -2318,7 +2347,7 @@ impl Store {
             match &outcome {
                 GoalCommitOutcome::Completed => Some(("completed", None)),
                 GoalCommitOutcome::Blocked { reason } => Some(("blocked", Some(reason.clone()))),
-                GoalCommitOutcome::Continued { .. } => None,
+                GoalCommitOutcome::Continued { .. } | GoalCommitOutcome::Retryable => None,
             },
         ) {
             events.push(insert_daemon_event_input(
@@ -2345,6 +2374,11 @@ impl Store {
             GoalCommitOutcome::Continued { command_id } => {
                 (GoalRoundOutcome::Continued, None, Some(command_id.clone()))
             }
+            GoalCommitOutcome::Retryable => (
+                GoalRoundOutcome::Retryable,
+                Some(CHECK_SPAWN_RETRYABLE.to_owned()),
+                None,
+            ),
         };
         let response = GoalRoundResponse {
             id: request.id.clone(),
@@ -2970,6 +3004,9 @@ fn round_key_names_idle_event(connection: &Connection, goal: &GoalRow, seq: i64)
              ) AND (kind <> 'goal.round' OR (
                  json_extract(data, '$.outcome') IN ('blocked', 'completed')
                  AND json_extract(data, '$.revision') + 1 < ?3
+             ) OR (
+                 json_extract(data, '$.outcome') = 'retryable'
+                 AND json_extract(data, '$.revision') + 1 = ?3
              ))",
             params![seq, goal.state.last_continuation_command_id, goal.revision],
             |row| {

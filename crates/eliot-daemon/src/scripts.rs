@@ -185,7 +185,7 @@ pub(crate) async fn execute_dispatched(router: Router, command: Command) {
             )
             .await;
         }
-        ProcessOutcome::NotSpawned(_) => {
+        ProcessOutcome::NotSpawned(_) | ProcessOutcome::ProgramUnrunnable(_) => {
             settle_unknown(
                 &router,
                 &run_id,

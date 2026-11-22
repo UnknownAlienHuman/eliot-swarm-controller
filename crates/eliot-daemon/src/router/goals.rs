@@ -23,15 +23,17 @@ use crate::{
 use eliot_core::{
     AgentState, Error, Event, Result, SecretPolicy, StderrSnapshot,
     api::{
-        GoalClearRequest, GoalContinuationStage, GoalDefinition, GoalGetRequest, GoalMode,
-        GoalPauseRequest, GoalResumeRequest, GoalRoundRequest, GoalSetRequest, GoalStatus,
-        MAX_GOAL_OBSERVATION_BYTES, inference::sha256_hex, truncate_bytes,
+        CHECK_SPAWN_RETRYABLE, GoalClearRequest, GoalContinuationStage, GoalDefinition,
+        GoalGetRequest, GoalMode, GoalPauseRequest, GoalResumeRequest, GoalRoundRequest,
+        GoalSetRequest, GoalStatus, MAX_GOAL_OBSERVATION_BYTES, inference::sha256_hex,
+        truncate_bytes,
     },
     limits::MAX_FRAME_BYTES,
 };
 use eliot_plugin::sync::LockExt;
 use eliot_store::{
-    GoalCheckResult, GoalContinuation, GoalRoundClaim, GoalRoundCommit, GoalRoundKey,
+    GoalCheckResult, GoalContinuation, GoalRoundClaim, GoalRoundCommit, GoalRoundDecision,
+    GoalRoundKey,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -72,7 +74,7 @@ struct ClaimedGoalRound {
     cancellation: watch::Sender<bool>,
     check: Option<Pin<Box<dyn Future<Output = ProcessOutcome> + Send>>>,
     quiescent: bool,
-    pending_block: Option<GoalRoundCommit>,
+    pending_decision: Option<GoalRoundCommit>,
 }
 
 impl ClaimedGoalRound {
@@ -84,15 +86,15 @@ impl ClaimedGoalRound {
         result
     }
 
-    async fn commit_block(
+    async fn commit_decision(
         &mut self,
         probe: &eliot_store::GoalRoundProbe,
         key: GoalRoundKey,
         claim_seq: i64,
-        reason: &str,
+        decision: GoalRoundDecision,
         observation: Option<String>,
     ) -> Result<Value> {
-        let commit = self.pending_block.insert(GoalRoundCommit {
+        let commit = self.pending_decision.insert(GoalRoundCommit {
             id: self.request.id.clone(),
             principal: self.principal.clone(),
             agent: self.request.agent.clone(),
@@ -102,7 +104,7 @@ impl ClaimedGoalRound {
             round_key: key,
             claim_seq,
             check: None,
-            blocked_reason: Some(reason.to_owned()),
+            decision: Some(decision),
             observation,
             fingerprint_before: None,
             fingerprint_after: None,
@@ -112,7 +114,7 @@ impl ClaimedGoalRound {
             .router
             .commit_goal_round(&self.principal, &self.request, commit)
             .await;
-        self.pending_block = None;
+        self.pending_decision = None;
         self.complete(result)
     }
 }
@@ -129,10 +131,10 @@ impl Drop for ClaimedGoalRound {
         let mut quiescent = self.quiescent;
         self.cancellation.send_replace(true);
         let check = self.check.take();
-        let pending_block = self.pending_block.take();
+        let pending_decision = self.pending_decision.take();
         self.runtime.spawn(async move {
-            if let Some(commit) = pending_block {
-                // This exact block was decided before awaiting the Store.
+            if let Some(commit) = pending_decision {
+                // This exact decision was made before awaiting the Store.
                 let _ = router
                     .commit_goal_round(&principal, &request, &commit)
                     .await;
@@ -461,7 +463,7 @@ impl Router {
             cancellation: check_cancellation,
             check: None,
             quiescent: true,
-            pending_block: None,
+            pending_decision: None,
         };
         let turns_used = probe
             .turn_count
@@ -480,7 +482,13 @@ impl Router {
             && !probe.spent_by_goal_continuation
         {
             return claimed
-                .commit_block(&probe, key, claim_seq, "turn_limit", None)
+                .commit_decision(
+                    &probe,
+                    key,
+                    claim_seq,
+                    GoalRoundDecision::Block("turn_limit".to_owned()),
+                    None,
+                )
                 .await;
         }
         // The change scope is read while the Agent is idle, before the
@@ -506,7 +514,13 @@ impl Router {
             if !outside.is_empty() {
                 let observation = finding("Changed outside the Goal's scope", &outside);
                 return claimed
-                    .commit_block(&probe, key, claim_seq, "scope_violation", Some(observation))
+                    .commit_decision(
+                        &probe,
+                        key,
+                        claim_seq,
+                        GoalRoundDecision::Block("scope_violation".to_owned()),
+                        Some(observation),
+                    )
                     .await;
             }
         }
@@ -555,14 +569,22 @@ impl Router {
                 if claimed.quiescent
                     && matches!(
                         error.code.as_str(),
-                        "check_unrunnable" | "check_timeout" | "check_output_limit"
+                        "check_unrunnable"
+                            | "check_timeout"
+                            | "check_output_limit"
+                            | CHECK_SPAWN_RETRYABLE
                     ) =>
             {
                 let message = format!("{}. Check argv: {:?}", error.message, definition.check);
                 let (observation, _) =
                     truncate_bytes(&policy.redact_text(&message), MAX_GOAL_OBSERVATION_BYTES);
+                let decision = if error.code == CHECK_SPAWN_RETRYABLE {
+                    GoalRoundDecision::RetryCheck
+                } else {
+                    GoalRoundDecision::Block(error.code)
+                };
                 return claimed
-                    .commit_block(&probe, key, claim_seq, &error.code, Some(observation))
+                    .commit_decision(&probe, key, claim_seq, decision, Some(observation))
                     .await;
             }
             Err(error) => {
@@ -594,7 +616,7 @@ impl Router {
                 round_key: key,
                 claim_seq,
                 check: Some(check),
-                blocked_reason: None,
+                decision: None,
                 observation: None,
                 fingerprint_before,
                 fingerprint_after,
@@ -648,13 +670,13 @@ impl Router {
             }
             _ => None,
         };
-        let blocked_reason = block.map(|(reason, text)| {
+        let decision = block.map(|(reason, text)| {
             check.observation = Some(with_finding(
                 &text,
                 check.observation.as_deref(),
                 MAX_GOAL_OBSERVATION_BYTES,
             ));
-            reason.to_owned()
+            GoalRoundDecision::Block(reason.to_owned())
         });
         let commit = GoalRoundCommit {
             id: request.id.clone(),
@@ -666,7 +688,7 @@ impl Router {
             round_key: key,
             claim_seq,
             check: Some(check),
-            blocked_reason,
+            decision,
             observation: None,
             fingerprint_before,
             fingerprint_after: None,
@@ -1498,9 +1520,11 @@ fn goal_check_quiescent(outcome: &ProcessOutcome) -> bool {
 /// custody is a check result. Known execution failures can block the Goal.
 fn goal_check_result(outcome: ProcessOutcome, policy: &SecretPolicy) -> Result<GoalCheckResult> {
     match outcome {
-        ProcessOutcome::NotSpawned(mut error) => {
-            *error.message = truncate_bytes(&policy.redact_text(&error.message), 1024).0;
-            Err(error.with_code("check_unrunnable"))
+        ProcessOutcome::NotSpawned(error) => {
+            Err(goal_start_error(error, CHECK_SPAWN_RETRYABLE, policy))
+        }
+        ProcessOutcome::ProgramUnrunnable(error) => {
+            Err(goal_start_error(error, "check_unrunnable", policy))
         }
         ProcessOutcome::Completed(capture)
         | ProcessOutcome::Failed {
@@ -1520,7 +1544,7 @@ fn goal_check_result(outcome: ProcessOutcome, policy: &SecretPolicy) -> Result<G
         }
         ProcessOutcome::Failed { reason, .. } => Err(Error::new(
             match reason {
-                ProcessFailure::InputLimit | ProcessFailure::InvalidTimeout => "check_unrunnable",
+                ProcessFailure::InputLimit | ProcessFailure::InvalidTimeout => "invalid",
                 ProcessFailure::Timeout => "check_timeout",
                 ProcessFailure::OutputLimit => "check_output_limit",
                 ProcessFailure::Cancelled => "unavailable",
@@ -1533,6 +1557,11 @@ fn goal_check_result(outcome: ProcessOutcome, policy: &SecretPolicy) -> Result<G
             format!("goal check outcome is unknown: {}", reason.stable_code()),
         )),
     }
+}
+
+fn goal_start_error(mut error: Error, code: &str, policy: &SecretPolicy) -> Error {
+    *error.message = truncate_bytes(&policy.redact_text(&error.message), 1024).0;
+    error.with_code(code)
 }
 
 /// A completed capture is a result only with a definite exit code. A

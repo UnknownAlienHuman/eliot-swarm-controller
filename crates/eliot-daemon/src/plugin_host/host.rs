@@ -731,7 +731,8 @@ impl PluginHost {
                 drop(prepared_mcp);
                 remove_empty_instance_dir(&instance_dir);
                 return Err(match error {
-                    AgentSpawnError::NotSpawned(error) => error,
+                    AgentSpawnError::NotSpawned(error)
+                    | AgentSpawnError::ProgramUnrunnable(error) => error,
                     AgentSpawnError::Uncertain(error) => {
                         *may_have_spawned = true;
                         error

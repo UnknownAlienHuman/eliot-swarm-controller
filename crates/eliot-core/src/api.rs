@@ -102,12 +102,12 @@ pub use git::{
     is_git_oid,
 };
 pub use goals::{
-    AssignmentGoal, DEFAULT_GOAL_CHECK_TIMEOUT_MS, GoalClearRequest, GoalContinuationStage,
-    GoalCostLimit, GoalCounters, GoalDefinition, GoalEscalation, GoalGetRequest, GoalMarkerState,
-    GoalMode, GoalPauseRequest, GoalResumeRequest, GoalRoundEvent, GoalRoundEventOutcome,
-    GoalRoundMarker, GoalRoundOutcome, GoalRoundRequest, GoalRoundResponse, GoalScopeBase,
-    GoalScopeStart, GoalSetRequest, GoalStatus, GoalView, MAX_GOAL_CADENCE_MS, MAX_GOAL_LIMIT,
-    MAX_GOAL_OBSERVATION_BYTES, MAX_GOAL_SCOPE_BASE_PATHS, MIN_GOAL_CADENCE_MS,
+    AssignmentGoal, CHECK_SPAWN_RETRYABLE, DEFAULT_GOAL_CHECK_TIMEOUT_MS, GoalClearRequest,
+    GoalContinuationStage, GoalCostLimit, GoalCounters, GoalDefinition, GoalEscalation,
+    GoalGetRequest, GoalMarkerState, GoalMode, GoalPauseRequest, GoalResumeRequest, GoalRoundEvent,
+    GoalRoundEventOutcome, GoalRoundMarker, GoalRoundOutcome, GoalRoundRequest, GoalRoundResponse,
+    GoalScopeBase, GoalScopeStart, GoalSetRequest, GoalStatus, GoalView, MAX_GOAL_CADENCE_MS,
+    MAX_GOAL_LIMIT, MAX_GOAL_OBSERVATION_BYTES, MAX_GOAL_SCOPE_BASE_PATHS, MIN_GOAL_CADENCE_MS,
 };
 pub use handoff::{
     CommandCancelRequest, CommandCancelResponse, HandoffRequest, HandoffResponse,

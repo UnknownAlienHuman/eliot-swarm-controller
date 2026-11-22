@@ -1262,8 +1262,10 @@ still pending qualification.
 ## Goal loop
 
 A Goal is keyed by `(agent,generation,mode,revision)`; native and Eliot modes are
-independent. `set`, definition changes, pause, clear and resume advance revision;
-an identical `set` on the bound generation is a no-op. Generation change pauses
+independent. `set`, definition changes, pause, clear and resume advance revision.
+An identical `set` on an active Goal's bound generation is a no-op. A fresh
+`goal set` on a blocked Goal clears its reason and resets its budget, even with
+the same definition. Generation change pauses
 the old Goal on its next round attempt, and `resume` on a drifted generation is
 refused. Native mode parses but is `unsupported`: the installed harness plugins
 expose no Goal protocol. Observe-only Agents take no Goals. Automatic `on_idle`
@@ -1331,8 +1333,9 @@ generation on the envelope and the round id, revision, key, outcome, optional
 reason and known direct exit code in [GoalRoundEvent](../../crates/eliot-core/src/api/goals.rs).
 The event and the retained result commit together. Event readers, watch and rules
 can observe the result. The idle driver does not schedule itself from these events.
-Setting a fresh definition on an idle Agent can reconcile from the retained terminal
-result of its previous Goal. Continued and unknown round events supply no idle key.
+Setting a Goal on an idle Agent can reconcile from the retained terminal result of
+its previous Goal. A retryable result can supply a fresh idle key for its immediate
+successor revision. Continued and unknown round events supply no idle key.
 
 The check is the frozen explicit argv from `goal set`, run through the shared
 owned-process custody outside the Store lock with a bounded timeout, a small
@@ -1356,13 +1359,18 @@ block, or one continuation. Success always completes, even on a spent budget.
 If the Goal's own continuation is rejected before native dispatch, that
 rejection and any resulting context rejections cannot supply a new idle key
 for the same Goal. A later eligible Agent event can still drive a round.
-An OS refusal before spawn or a failure to prepare the command blocks the Goal as
-`check_unrunnable`. A timed-out check with proven closure blocks as `check_timeout`.
+An OS error that identifies a missing or invalid executable blocks the Goal as
+`check_unrunnable`. Other proved pre-spawn refusals, such as sharing violations,
+permission errors and resource failures, consume one round and release the marker.
+With budget left, the round records `retryable` with reason `check_spawn_retryable`.
+A later eligible idle event, explicit idle round or cadence slot can try the check
+again. The consumed key and mutation id retain the original result.
+A timed-out check with proven closure blocks as `check_timeout`.
 A check whose output exceeded the capture limit with proven closure blocks as
 `check_output_limit`. The Goal view retains a bounded, redacted observation with
 the command and the available cause. A blocked check consumes the round reservation
 and admits no continuation.
-If the caller drops after a block was decided, the finalizer commits that same
+If the caller drops after a block or retry was decided, the finalizer commits that same
 bound decision through the Store and does not run the check again.
 
 An unknown check outcome (including unproven custody or a check with no exit code

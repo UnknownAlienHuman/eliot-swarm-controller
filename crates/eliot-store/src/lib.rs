@@ -31,7 +31,7 @@ pub use fleet::{AgentListFilter, AgentListPage};
 pub use git::CodeProgressState;
 pub use goals::{
     GoalCheckResult, GoalCommitOutcome, GoalContinuation, GoalRoundClaim, GoalRoundCommit,
-    GoalRoundCommitResult, GoalRoundKey, GoalRoundProbe,
+    GoalRoundCommitResult, GoalRoundDecision, GoalRoundKey, GoalRoundProbe,
 };
 pub use handoff::HandoffAdmission;
 pub use projects::ProjectRegistrationInput;

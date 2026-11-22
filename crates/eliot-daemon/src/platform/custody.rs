@@ -197,13 +197,16 @@ fn owner_peer_unknown() -> Error {
 #[derive(Debug)]
 pub enum AgentSpawnError {
     NotSpawned(Error),
+    ProgramUnrunnable(Error),
     Uncertain(Error),
 }
 
 impl AgentSpawnError {
     pub fn into_error(self) -> Error {
         match self {
-            Self::NotSpawned(error) | Self::Uncertain(error) => error,
+            Self::NotSpawned(error) | Self::ProgramUnrunnable(error) | Self::Uncertain(error) => {
+                error
+            }
         }
     }
 }
@@ -423,9 +426,9 @@ impl OwnedChild {
         command
             .as_std_mut()
             .creation_flags(CREATE_SUSPENDED | CREATE_NO_WINDOW);
-        let mut child = command.spawn().map_err(|error| {
-            AgentSpawnError::NotSpawned(io_error("spawn suspended child", error))
-        })?;
+        let mut child = command
+            .spawn()
+            .map_err(|error| spawn_io_error("spawn suspended child", error))?;
         let process = match child.raw_handle() {
             Some(process) => process,
             None => {
@@ -466,9 +469,9 @@ impl OwnedChild {
             let _ = leaf;
             let mut command = command;
             command.process_group(0);
-            let child = command.spawn().map_err(|error| {
-                AgentSpawnError::NotSpawned(io_error("spawn process-group child", error))
-            })?;
+            let child = command
+                .spawn()
+                .map_err(|error| spawn_io_error("spawn process-group child", error))?;
             let identity = child
                 .id()
                 .and_then(|pid| super::unix::capture_process_group_identity(pid).ok());
@@ -709,6 +712,30 @@ pub fn restart_custody(generation: &eliot_store::RetainedGeneration) -> Result<R
         Ok(RestartCustody::Retained {
             missing: "custody_unsupported",
         })
+    }
+}
+
+#[cfg(any(windows, unix))]
+fn spawn_io_error(action: &str, error: std::io::Error) -> AgentSpawnError {
+    #[cfg(windows)]
+    let invalid_image = {
+        use windows_sys::Win32::Foundation::{
+            ERROR_BAD_EXE_FORMAT, ERROR_BAD_FORMAT, ERROR_EXE_MACHINE_TYPE_MISMATCH,
+        };
+        matches!(
+            error.raw_os_error().map(|code| code as u32),
+            Some(ERROR_BAD_EXE_FORMAT | ERROR_BAD_FORMAT | ERROR_EXE_MACHINE_TYPE_MISMATCH)
+        )
+    };
+    #[cfg(unix)]
+    let invalid_image = error.raw_os_error() == Some(libc::ENOEXEC);
+
+    let unrunnable = error.kind() == std::io::ErrorKind::NotFound || invalid_image;
+    let error = io_error(action, error);
+    if unrunnable {
+        AgentSpawnError::ProgramUnrunnable(error)
+    } else {
+        AgentSpawnError::NotSpawned(error)
     }
 }
 

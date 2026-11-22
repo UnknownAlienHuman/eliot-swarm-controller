@@ -116,6 +116,7 @@ impl ProcessUncertainty {
 pub(crate) enum ProcessOutcome {
     Completed(ProcessCapture),
     NotSpawned(Error),
+    ProgramUnrunnable(Error),
     Failed {
         reason: ProcessFailure,
         capture: Option<ProcessCapture>,
@@ -256,6 +257,9 @@ async fn run_owned_process_inner(
     let mut child = match OwnedChild::spawn_report(command) {
         Ok(child) => child,
         Err(AgentSpawnError::NotSpawned(error)) => return ProcessOutcome::NotSpawned(error),
+        Err(AgentSpawnError::ProgramUnrunnable(error)) => {
+            return ProcessOutcome::ProgramUnrunnable(error);
+        }
         Err(AgentSpawnError::Uncertain(_)) => {
             return ProcessOutcome::Unknown {
                 reason: ProcessUncertainty::Spawn,
