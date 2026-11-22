@@ -2120,8 +2120,17 @@ impl AppDataFolder {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(format!("list {}: {error}", packages.display())),
         };
+        // A cache that holds the probe is proof, so an unreadable package
+        // elsewhere only matters when no cache holds it.
+        let mut failure = None;
         for entry in entries {
-            let entry = entry.map_err(|error| format!("list {}: {error}", packages.display()))?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    failure.get_or_insert_with(|| format!("list {}: {error}", packages.display()));
+                    continue;
+                }
+            };
             let mut landed = entry.path().join("LocalCache");
             if !self.cache_child.is_empty() {
                 landed.push(self.cache_child);
@@ -2130,10 +2139,12 @@ impl AppDataFolder {
             match fs::symlink_metadata(&landed) {
                 Ok(_) => return Ok(Some(entry.file_name().to_string_lossy().into_owned())),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(format!("inspect {}: {error}", landed.display())),
+                Err(error) => {
+                    failure.get_or_insert_with(|| format!("inspect {}: {error}", landed.display()));
+                }
             }
         }
-        Ok(None)
+        failure.map_or(Ok(None), Err)
     }
 }
 
