@@ -7,7 +7,7 @@ use facts::{edit_note_text, edit_path_key, new_note_paths};
 
 use super::*;
 use eliot_core::{
-    ContextEditPath, ContextItem, ContextOutcome, InjectArgs, InjectPoint, TrustedReviewLabels,
+    ContextEditPath, ContextItem, ContextOutcome, InjectArgs, InjectPoint,
     api::harness::MAX_HARNESS_MODEL_ID_BYTES, swarm_note, swarm_note_with_trusted_review_labels,
     turn_started_data,
 };
@@ -423,7 +423,6 @@ impl Store {
                 seq: event.seq,
                 paths: &paths,
             }),
-            None,
         )?;
         if let Some(turn) = turn_id {
             for path in &paths {
@@ -463,7 +462,6 @@ pub(super) fn admit_tx(
     payload_digest: &[u8],
     now: i64,
     fact: Option<FactOrigin<'_>>,
-    trusted_review_labels: Option<&TrustedReviewLabels>,
 ) -> Result<Event> {
     if request.target.is_none()
         || request.selector.is_some()
@@ -567,7 +565,7 @@ pub(super) fn admit_tx(
     };
 
     let mut resolved = json!(args);
-    if let Some(labels) = trusted_review_labels {
+    if let Some(labels) = &request.trusted_review_labels {
         resolved["_trusted_review_labels"] = serde_json::to_value(labels)
             .map_err(|_| Error::new("internal", "trusted review labels could not be encoded"))?;
     }

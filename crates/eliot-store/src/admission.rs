@@ -2170,7 +2170,6 @@ fn submit_tx_mode(
                 &payload_digest,
                 now,
                 None,
-                request.trusted_review_labels.as_ref(),
             )?);
             None
         }

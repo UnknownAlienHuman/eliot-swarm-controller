@@ -152,7 +152,11 @@ pub(super) fn rule_launch_insertion_binding(
 }
 
 fn trusted_review_labels_match(labels: &core::TrustedReviewLabels, origin: &Event) -> bool {
-    event_worktree_fingerprint(origin) == Some(labels.worktree_fingerprint.as_str())
+    origin
+        .data
+        .pointer("/worktree/fingerprint")
+        .and_then(Value::as_str)
+        == Some(labels.worktree_fingerprint.as_str())
 }
 
 fn worktree_check_outcome_exists(
