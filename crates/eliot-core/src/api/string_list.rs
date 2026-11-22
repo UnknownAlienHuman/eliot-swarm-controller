@@ -1,8 +1,8 @@
 use serde::Deserialize;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 #[serde(untagged)]
-enum StringListInput {
+pub(crate) enum StringListInput {
     One(String),
     Many(Vec<String>),
 }

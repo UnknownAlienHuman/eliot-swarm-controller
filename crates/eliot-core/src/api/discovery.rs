@@ -40,6 +40,9 @@ pub struct MethodsRequest {
     #[serde(default)]
     #[schemars(range(min = 1, max = 50))]
     pub limit: Option<usize>,
+    /// Include one-line method summaries.
+    #[serde(default)]
+    pub full: bool,
 }
 
 impl MethodsRequest {
@@ -132,7 +135,8 @@ impl ProjectListRequest {
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct MethodSummary {
     pub method: String,
-    pub summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -145,6 +149,7 @@ pub struct MethodsResponse {
 pub struct MethodHelpResponse {
     pub method: String,
     pub summary: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub cli_aliases: Vec<String>,
     /// Sorted compact request field descriptors (`name (required|optional):
     /// type [bounds] - documented constraints`), derived from the request
@@ -156,9 +161,12 @@ pub struct MethodHelpResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_schema: Option<Value>,
     pub example: Value,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub mutation_id: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub scopes: Vec<String>,
     pub limits: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unsupported: Vec<String>,
 }
 

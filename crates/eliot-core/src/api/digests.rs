@@ -13,7 +13,9 @@ use crate::{Error, Result, parse_agent_id};
 use serde::{Deserialize, Serialize};
 
 use super::coordination::MAX_MAIL_TEXT_BYTES;
-use super::waits::{MAX_SWARM_WAIT_TARGETS, WaitEntryResult, WaitTurnRef, truncate_bytes};
+use super::waits::{
+    MAX_SWARM_WAIT_TARGETS, WaitEntryResult, WaitTurnRef, all_wait_mode, truncate_bytes,
+};
 
 /// Thread prefix for completion digests. Distinct from `attention-*` so a
 /// successful completion is never confused with an attention incident, and
@@ -32,9 +34,14 @@ pub struct SwarmDigestRequest {
         description = "Concrete canonical a<positive i64> parent Agent mailbox for the one coalesced result."
     )]
     pub to: String,
-    #[schemars(description = "Wait mode: all or any.")]
+    #[serde(default = "all_wait_mode")]
+    #[schemars(description = "Wait mode: all (default) or any.")]
     pub mode: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "super::deserialize_string_list")]
+    #[schemars(
+        with = "super::string_list::StringListInput",
+        description = "One command id or an array of command ids."
+    )]
     pub commands: Vec<String>,
     #[serde(default)]
     pub turns: Vec<WaitTurnRef>,

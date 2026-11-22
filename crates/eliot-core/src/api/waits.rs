@@ -58,13 +58,18 @@ impl WaitTurnRef {
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SwarmWaitRequest {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "super::deserialize_string_list")]
+    #[schemars(
+        with = "super::string_list::StringListInput",
+        description = "One command id or an array of command ids."
+    )]
     pub commands: Vec<String>,
     #[serde(default)]
     pub turns: Vec<WaitTurnRef>,
     /// `all` completes when every entry is terminal; `any` completes when any
     /// entry is terminal.
-    #[schemars(description = "Wait mode: all or any.")]
+    #[serde(default = "all_wait_mode")]
+    #[schemars(description = "Wait mode: all (default) or any.")]
     pub mode: String,
     #[serde(default, deserialize_with = "wait_ms")]
     #[schemars(
@@ -79,6 +84,10 @@ pub struct SwarmWaitRequest {
         description = "Agent callers only: also end the wait when mail arrives in the caller's own mailbox after the wait starts."
     )]
     pub mailbox: bool,
+}
+
+pub(super) fn all_wait_mode() -> String {
+    "all".to_owned()
 }
 
 impl SwarmWaitRequest {

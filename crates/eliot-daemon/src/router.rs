@@ -647,17 +647,21 @@ impl Router {
             "claim.set" => self.claim_set(&params, &principal).await,
             "claim.list" => self.claim_list(&params, &principal).await,
             "claim.release" => self.claim_release(&params, &principal).await,
-            _ => Err(Error::new(
-                "unsupported",
-                format!("daemon method {method} is not implemented"),
-            )),
+            _ => Err(discovery::unavailable_method(method, &principal)),
         };
         let result = result.map_err(|mut error| {
-            if error.code == "not_allowed"
+            if error.code == "invalid" && method == "agent.get" {
+                let id = match &principal {
+                    Principal::Agent { id, .. } => id.as_str(),
+                    _ => "a1",
+                };
+                let example = json!({"method":"agent.get","params":{"id":id}});
+                error.message = format!("{}. Try {example}.", error.message).into();
+            } else if error.code == "not_allowed"
                 && matches!(principal, Principal::Agent { .. })
                 && discovery::owner_only_read(method)
             {
-                error.message = "Owner-only read. Agent scope is available via api.identity, who, and agent.get on yourself; other Owner data is not needed for Agent work.".to_owned().into();
+                error.message = "Owner-only read. For Agent-scoped information, use api.identity, who, or agent.get on yourself.".to_owned().into();
             }
             error
         });

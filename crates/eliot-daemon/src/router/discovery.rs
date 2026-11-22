@@ -355,6 +355,9 @@ fn request_takes_id(method: &Method) -> bool {
 }
 
 fn method_suggestions(requested: &str, principal: &Principal) -> Vec<&'static str> {
+    if requested.len() > 128 {
+        return Vec::new();
+    }
     let normalized = requested.strip_prefix("swarm.").unwrap_or(requested);
     let mut candidates = METHODS
         .iter()
@@ -371,6 +374,19 @@ fn method_suggestions(requested: &str, principal: &Principal) -> Vec<&'static st
         .take(3)
         .map(|(_, name)| name)
         .collect()
+}
+
+pub(super) fn unavailable_method(requested: &str, principal: &Principal) -> Error {
+    let suggestions = method_suggestions(requested, principal);
+    let message = if suggestions.is_empty() {
+        "Method unavailable. Use api.methods for callable names.".to_owned()
+    } else {
+        format!(
+            "Method unavailable. Did you mean {}?",
+            suggestions.join(", ")
+        )
+    };
+    Error::new("unsupported", message)
 }
 
 fn edit_distance(left: &str, right: &str) -> usize {
@@ -493,7 +509,7 @@ impl Router {
                 .into_iter()
                 .map(|m| MethodSummary {
                     method: m.name.to_owned(),
-                    summary: m.summary.to_owned(),
+                    summary: request.full.then(|| m.summary.to_owned()),
                 })
                 .collect(),
             next,
@@ -536,21 +552,9 @@ impl Router {
             .iter()
             .find(|m| m.name == request.method && visible(m, principal))
         else {
-            let suggestions = method_suggestions(&request.method, principal);
-            let message = if suggestions.is_empty() {
-                "method is unavailable; use api.methods for callable canonical names".to_owned()
-            } else {
-                let names = suggestions
-                    .iter()
-                    .map(|name| format!("'{name}'"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!(
-                    "method is unavailable; did you mean {names}? Use api.methods for callable names"
-                )
-            };
-            return Err(Error::new("unsupported", message));
+            return Err(unavailable_method(&request.method, principal));
         };
+        let full = request.full.unwrap_or(false);
         let identity = self.identity(principal).await?;
         let aliases: &[&str] = match method.name {
             "api.identity" => &["swarm identity"],
@@ -617,14 +621,25 @@ impl Router {
         {
             example["agent"] = json!("a1");
         }
-        let scopes = method_scopes(method.name, principal, &identity);
+        if !full
+            && is_mutation_id_method(method.name)
+            && !method.name.starts_with("inference.")
+            && let Some(fields) = example.as_object_mut()
+        {
+            fields.remove("id");
+        }
+        let scopes = if full {
+            method_scopes(method.name, principal, &identity)
+        } else {
+            Vec::new()
+        };
         // Compact by default: compact field descriptors (requiredness,
         // types, enums, nested shapes and documented constraints) stand in
         // for the full JSON Schemas (fields, one example, limits).
         // `full: true` restores both schemas for callers that need exact
         // shapes.
         let fields: Vec<String> = compact_field_descriptors(&(method.input)());
-        let (request_schema, response_schema) = if request.full.unwrap_or(false) {
+        let (request_schema, response_schema) = if full {
             (Some((method.input)()), Some((method.output)()))
         } else {
             (None, None)
@@ -632,18 +647,25 @@ impl Router {
         encode(MethodHelpResponse {
             method: method.name.to_owned(),
             summary: method.summary.to_owned(),
-            cli_aliases: aliases.iter().map(|s| (*s).to_owned()).collect(),
+            cli_aliases: if full {
+                aliases.iter().map(|s| (*s).to_owned()).collect()
+            } else {
+                Vec::new()
+            },
             fields,
             request_schema,
             response_schema,
             example: json!({"method":method.name,"params":example}),
-            mutation_id: mutation_id_help(method).to_owned(),
+            mutation_id: if full || method.name.starts_with("inference.") {
+                mutation_id_help(method).to_owned()
+            } else if is_mutation_id_method(method.name) {
+                "MCP can mint id. Reuse it for exact retries.".to_owned()
+            } else {
+                String::new()
+            },
             scopes,
-            limits: format!(
-                "{} Responses retain their DTO pagination and daemon 4 MiB frame bounds; one help result is at most 256 KiB. Examples for existing resources require their actual retained ids/profile/source/view.",
-                method_limits(method.name)
-            ),
-            unsupported,
+            limits: method_limits(method.name).to_owned(),
+            unsupported: if full { unsupported } else { Vec::new() },
         })
     }
 }
