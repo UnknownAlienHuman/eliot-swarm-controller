@@ -1767,6 +1767,7 @@ pub struct DaemonBuildIdentity {
 }
 
 impl DaemonStatusResponse {
+    pub const MAX_AUTOMATION_TASKS: usize = 11;
     pub const MAX_PLUGIN_CRASHES: usize = 8;
 }
 
