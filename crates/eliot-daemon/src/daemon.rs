@@ -118,6 +118,7 @@ pub fn compact_store_offline(
         .chain(&RUN_IDENTITY_ENV)
         .any(|name| std::env::var_os(name).is_some())
         || std::env::var_os(AGENT_DATA_DIR_ENV).is_some()
+        || std::env::var_os(AGENT_DATA_SCOPE_ENV).is_some()
         || std::env::var_os(SHELL_IDENTITY_DISABLED_ENV).is_some()
     {
         return Err(Error::new(
@@ -2210,6 +2211,7 @@ const AGENT_IDENTITY_ENV: [&str; 3] = [
 /// Issuing data directory of the inherited Agent identity, normalized by the
 /// spawning daemon (see [`normalize_identity_data_dir`]).
 pub(crate) const AGENT_DATA_DIR_ENV: &str = "ELIOT_AGENT_DATA_DIR";
+pub(crate) const AGENT_DATA_SCOPE_ENV: &str = "ELIOT_AGENT_DATA_SCOPE";
 pub(crate) const SHELL_IDENTITY_DISABLED_ENV: &str = "ELIOT_SHELL_IDENTITY_DISABLED";
 const RUN_IDENTITY_ENV: [&str; 2] = ["ELIOT_RUN_COMMAND_ID", "ELIOT_RUN_TOKEN"];
 const OWNER_IDENTITY_ENV: [&str; 3] = [
@@ -2269,11 +2271,24 @@ pub(crate) fn identity_data_dirs_equal(left: &Path, right: &Path) -> bool {
     }
 }
 
+/// Carry the issuing root in the shell as a fingerprint rather than a path.
+pub(crate) fn identity_data_scope(path: &Path) -> String {
+    let path = normalize_identity_data_dir(path);
+    #[cfg(windows)]
+    let path = eliot_core::display_path(&path.to_string_lossy()).to_ascii_lowercase();
+    #[cfg(windows)]
+    let bytes = path.as_bytes();
+    #[cfg(not(windows))]
+    let bytes = path.as_os_str().as_encoded_bytes();
+    eliot_core::api::inference::sha256_hex(bytes)
+}
+
 fn caller_identity_for_target(target: &Path) -> Result<ClientIdentity> {
     let identity = caller_identity_from(
         target,
         AGENT_IDENTITY_ENV.map(std::env::var_os),
         std::env::var_os(AGENT_DATA_DIR_ENV),
+        std::env::var_os(AGENT_DATA_SCOPE_ENV),
         RUN_IDENTITY_ENV.map(std::env::var_os),
         OWNER_IDENTITY_ENV.map(std::env::var_os),
     )?;
@@ -2299,10 +2314,13 @@ fn caller_identity_from(
     target: &Path,
     agent_values: [Option<std::ffi::OsString>; 3],
     agent_data_dir: Option<std::ffi::OsString>,
+    agent_data_scope: Option<std::ffi::OsString>,
     run_values: [Option<std::ffi::OsString>; 2],
     owner_values: [Option<std::ffi::OsString>; 3],
 ) -> Result<ClientIdentity> {
-    let has_agent = agent_values.iter().any(Option::is_some) || agent_data_dir.is_some();
+    let has_agent = agent_values.iter().any(Option::is_some)
+        || agent_data_dir.is_some()
+        || agent_data_scope.is_some();
     let has_run = run_values.iter().any(Option::is_some);
     let has_owner = owner_values.iter().any(Option::is_some);
     if has_owner || (has_agent && has_run) {
@@ -2313,6 +2331,20 @@ fn caller_identity_from(
     }
 
     if has_agent {
+        if agent_data_dir.is_none() && agent_data_scope.is_none() {
+            return Err(Error::new(
+                "not_allowed",
+                "managed Agent credentials require an issuing data directory binding",
+            ));
+        }
+        if let Some(scope) = agent_data_scope.as_deref()
+            && scope != std::ffi::OsStr::new(&identity_data_scope(target))
+        {
+            return Err(Error::new(
+                "not_allowed",
+                "managed Agent credentials belong to another daemon data directory",
+            ));
+        }
         if let Some(issuing) = agent_data_dir.as_deref() {
             if issuing.is_empty() || !Path::new(issuing).is_absolute() {
                 return Err(Error::new(

@@ -1485,11 +1485,12 @@ Agent-bound MCP integration through its scoped process arguments or MCP environm
 `ELIOT_HOME` stays inside that integration scope, and `ELIOT_AGENT_DATA_DIR` is
 MCP-only. The client compares the resolved target (`--data-dir`, then `ELIOT_HOME`, then
 the default) with the issuing directory after lexical normalization and case-insensitively
-on Windows. A cross-root Agent identity rejects and never falls back to Owner authority.
-The shell receives `ELIOT_AGENT_ID`, `ELIOT_AGENT_GENERATION`, and `ELIOT_AGENT_TOKEN`
-only when `pass_agent_identity_to_shell` is enabled. Codex receives the Agent identity
-at its app-server boundary to configure the named MCP transport and filters it from
-shell tools.
+on Windows. The CLI refuses cross-root and unbound Agent credentials before connecting.
+When `pass_agent_identity_to_shell` is enabled, the shell receives the Agent ID,
+generation and token with a fingerprint of the issuing directory in
+`ELIOT_AGENT_DATA_SCOPE`. The CLI compares that fingerprint with the chosen root.
+Codex receives the Agent identity at its app-server boundary to configure the named
+MCP transport, with its issuing directory supplied in the MCP environment.
 It prepends the active controller executable's parent directory to `PATH`, preserving the
 native baseline entries, so bare `swarm` resolves to the current controller before ambient/legacy bins.
 A controller directory containing the OS `PATH` separator (`;` on Windows, `:` elsewhere)

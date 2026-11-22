@@ -3246,6 +3246,13 @@ fn build_target_environment(
             agent_token.to_owned(),
         );
     }
+    if pass_identity {
+        insert_environment(
+            &mut environment,
+            crate::daemon::AGENT_DATA_SCOPE_ENV,
+            crate::daemon::identity_data_scope(data_root),
+        );
+    }
     if !pass_identity {
         insert_environment(
             &mut environment,

@@ -250,6 +250,7 @@ fn scrub_role_environment(command: &mut tokio::process::Command) {
         "ELIOT_AGENT_GENERATION",
         "ELIOT_AGENT_TOKEN",
         crate::daemon::AGENT_DATA_DIR_ENV,
+        crate::daemon::AGENT_DATA_SCOPE_ENV,
         "ELIOT_OWNER_ID",
         "ELIOT_OWNER_TOKEN",
         "ELIOT_OWNER_CREDENTIAL",
