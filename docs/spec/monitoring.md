@@ -1106,6 +1106,10 @@ The attention worker samples liveness on startup and every three minutes.
 An unchanged Stuck candidate becomes reportable after two consecutive sweeps
 and produces one `daemon.liveness_stuck` log line for the episode.
 `daemon.status` and `owner.inbox` project current Store facts on read.
+For a stuck active Goal (`active_goal_without_round_or_timer`, #871, #904),
+`owner.inbox` offers a ready `goal.round` (`round`) action as the recommended
+choice alongside `goal.get` (`inspect`) when the Agent is cleanly idle with an
+unconsumed key or due cadence slot.
 Snooze hides the current inbox revision until its subject changes. The sweep
 prunes snoozes for subjects that no longer project.
 

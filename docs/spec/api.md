@@ -758,7 +758,11 @@ age in milliseconds, one-line reason, optional recommended action and offered
 choices. An action names the existing method and JSON arguments that implement
 the choice. The projection includes harness requests, unknown command/turn
 outcomes, owner-required holds, unarchived lost/failed Agents, blocked Goals,
-launch items waiting for the owner, and #871 stuck objects. Recommendations
+launch items waiting for the owner, and #871 stuck objects. For a stuck Goal
+(`active_goal_without_round_or_timer`, #871, #904), the item offers a ready
+`goal.round` action (`round`) as the recommended choice alongside `goal.get`
+(`inspect`) when the Agent is cleanly idle with an unconsumed key or due cadence
+slot. Recommendations
 are derived from retained facts. Send `owner.decide` with the item kind,
 subject, revision, and an offered choice name, `recommended`, or `snooze`.
 The daemon checks the revision under the Store writer when it admits the

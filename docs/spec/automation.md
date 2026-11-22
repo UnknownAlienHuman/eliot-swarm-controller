@@ -874,7 +874,9 @@ weaker send. `inject` requires an event trigger and is unsupported for timers.
 
 Swarm uses the same insertion path for notes about a confirmed edit outside the
 worktree or the frozen Goal scope, repeated command failures, and a turn with edits
-and no observed configured check before completion. Notes bind to the captured
+and no observed configured check before completion. Swarm does not queue
+`no_check_before_end` when an active automatic `on_idle` Goal round will run (or
+already ran) the same check for that idle point (#904, #868, #881). Notes bind to the captured
 Agent and generation. Git snapshots supply scope evidence when Swarm can bind
 the observation to a running turn. An edit note lists only paths not already
 noted for its kind in that generation. Up to four edit notes can be admitted
@@ -1651,8 +1653,11 @@ Agent state, pending requests, source health and unknown gates, and refuses
 unless the Agent is cleanly idle at that key: idle state, no active turn, no
 pending requests, every open harness source healthy (`daemon`/`os`/`git`/
 `workspace_process` monitors stay advisory), no unknown command, no open
-command, and the key is fresh — an idle key names an idle event of that
-Agent generation and is still its latest, a slot key names a due slot. A
+command (Swarm's own unclaimed `next_input` / `turn_safe_point` queued injections
+are excluded), and the key is fresh — an idle key names an idle event of that
+Agent generation and is still its latest (ignoring Swarm's own queued `next_input`
+notes, their moves/cancellations, and `stale_round` abandonment events, while a
+real newer turn or Owner/manager command still wins), a slot key names a due slot. A
 turn budget already spent outside any round blocks without running the check. A
 budget spent solely by the Goal's own last admitted continuation is not outside
 any round: that round still runs its final check, and the postcheck budgets
@@ -1689,7 +1694,10 @@ The event and the retained result commit together. Event readers, watch and rule
 can observe the result. The idle driver does not schedule itself from these events.
 Setting a Goal on an idle Agent can reconcile from the retained terminal result of
 its previous Goal. A retryable result can supply a fresh idle key for its immediate
-successor revision. Continued and unknown round events supply no idle key.
+successor revision. Continued round events and `stale_round` abandonment events
+supply no idle key. A non-`stale_round` `unknown` `goal.round` event at the current
+revision never triggers automatic reconciliation or automatic driving, but can supply
+an explicit Owner `goal.round` key after a burned round key (#904, #871).
 
 The check is the frozen explicit argv from `goal set`, run through the shared
 owned-process custody outside the Store lock with a bounded timeout, a small
@@ -1874,7 +1882,11 @@ skips cadenced Goals (slot-keyed), paused or terminal Goals, drifted
 generations, and anything while automation is draining; it waits while an
 active native Goal drives. The driver starts each automatic round in its own task
 and runs up to four across Goals. Automatic and explicit rounds share the same
-per-Goal single-flight marker. The driver follows up on a newer event for a Goal
+per-Goal single-flight marker. Swarm's own queued `next_input` note events do not
+schedule duplicate rounds or make a round stale; if an automatic round still hits
+`stale_round` while the Agent remains cleanly idle with no open commands, the driver
+retries with the fresh unconsumed idle key from Store without ever running twice for
+the same idle point (#904). The driver follows up on a newer event for a Goal
 when its in-flight round resolves. Bus events dropped past the cap or to
 bus lag are logged, as are queued waits and stale rounds. Other races
 against explicit rounds resolve through the

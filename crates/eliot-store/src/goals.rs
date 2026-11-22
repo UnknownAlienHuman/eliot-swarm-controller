@@ -12,6 +12,31 @@ use serde::{Deserialize, Serialize};
 
 const MAX_GOAL_CHECK_HISTORY_ROWS: i64 = 8_192;
 
+/// Swarm's own queued `next_input` notes and their moves or superseding
+/// cancellations/rejections. They must neither count as open Agent commands
+/// nor advance the idle-round sequence or make a Goal round stale.
+const SWARM_QUEUED_NOTE_EVENT_SQL: &str = "(
+    source = 'daemon' AND (
+        (kind = 'command.accepted'
+         AND json_extract(data, '$.verb') = 'inject'
+         AND json_extract(data, '$.application_point') = 'next_input'
+         AND (json_type(data, '$.note_kind') = 'text'
+              OR EXISTS (
+                  SELECT 1 FROM commands c
+                  WHERE c.id = json_extract(events.data, '$.command_id')
+                    AND c.verb = 'inject'
+                    AND (c.principal GLOB 'swarm_note:*' OR c.principal = 'project_check')
+              )))
+        OR (kind IN ('context.moved', 'command.rejected', 'command.cancelled')
+            AND EXISTS (
+                SELECT 1 FROM commands c
+                WHERE c.id = json_extract(events.data, '$.command_id')
+                  AND c.verb = 'inject'
+                  AND (c.principal GLOB 'swarm_note:*' OR c.principal = 'project_check')
+            ))
+    )
+)";
+
 /// Pre-round facts. The Router evaluates gates from this snapshot; the commit
 /// re-verifies generation, revision and round freshness atomically.
 #[derive(Clone, Debug)]
@@ -1156,12 +1181,13 @@ impl Store {
             let agent_row = load_agent_by_num(&self.connection, agent_num)?
                 .ok_or_else(|| Error::new("internal", "reconcile goal lost its Agent"))?;
             let max_seq = max_agent_seq(&self.connection, agent_num, generation)?;
-            let idle_seq =
-                if max_seq > 0 && round_key_names_idle_event(&self.connection, &goal, max_seq)? {
-                    Some(max_seq)
-                } else {
-                    None
-                };
+            let idle_seq = if max_seq > 0
+                && round_key_names_automatic_idle_event(&self.connection, &goal, max_seq)?
+            {
+                Some(max_seq)
+            } else {
+                None
+            };
             // Name the burn the probe and claim enforce, so the Router
             // skips spent subjects before taking a scheduler slot.
             let mut key_consumed = false;
@@ -1189,6 +1215,72 @@ impl Store {
             });
         }
         Ok(candidates)
+    }
+
+    /// Resolve a fresh unconsumed idle key after an automatic `on_idle` round
+    /// encountered `stale_round`. Returns `Some(seq)` only when the Agent is
+    /// cleanly idle with no open or unknown commands and the latest eligible
+    /// idle event differs from `tried_seq` and has not already been consumed.
+    pub fn goal_retry_idle_seq(
+        &self,
+        agent: &str,
+        generation: i64,
+        tried_seq: i64,
+    ) -> Result<Option<i64>> {
+        self.ensure_committed_reads()?;
+        if self.goal_native_driving(agent)? {
+            return Ok(None);
+        }
+        let agent_num = parse_agent_id(agent)?;
+        let Some(row) = load_goal_row(&self.connection, agent_num, "eliot")? else {
+            return Ok(None);
+        };
+        if row.state.status != GoalStatus::Active
+            || row.generation != generation
+            || row.definition.cadence_ms.is_some()
+        {
+            return Ok(None);
+        }
+        let Some(agent_row) = load_agent_by_num(&self.connection, agent_num)? else {
+            return Ok(None);
+        };
+        if agent_row.observe_only
+            || agent_row.generation != generation
+            || agent_row.state != AgentState::Idle
+            || agent_row.active_turn.is_some()
+            || !agent_row.pending.is_empty()
+            || !unhealthy_open_sources(&self.connection, agent_num, generation)?.is_empty()
+            || count_agent_commands(&self.connection, agent_num, generation, true)? > 0
+            || count_agent_commands(&self.connection, agent_num, generation, false)? > 0
+        {
+            return Ok(None);
+        }
+        if row.state.await_first_turn
+            && count_turns(&self.connection, agent_num, generation)?
+                <= row.state.counters.turns_at_set
+        {
+            return Ok(None);
+        }
+        let seq = max_agent_seq(&self.connection, agent_num, generation)?;
+        if seq <= 0
+            || seq == tried_seq
+            || !round_key_names_automatic_idle_event(&self.connection, &row, seq)?
+        {
+            return Ok(None);
+        }
+        let key = GoalRoundKey::Idle(seq);
+        if row.last_round_key.as_deref() == Some(&key.text()) {
+            return Ok(None);
+        }
+        let markers = load_goal_markers(&self.connection, agent_num, "eliot")?;
+        if markers.iter().any(|marker| {
+            marker.generation == generation
+                && (marker.is_live(&self.goal_holder)
+                    || (marker.round_key == key.value() && marker.kind == key.kind()))
+        }) {
+            return Ok(None);
+        }
+        Ok(Some(seq))
     }
 
     /// Read round facts, pausing a generation-drifted Goal. Fails before any
@@ -3419,30 +3511,61 @@ fn load_goal_marker_tx(
 
 /// The round key must name an idle event of this Agent generation: the
 /// event-time subject snapshot shows the Agent idle. A missing row, a row
-/// of another Agent/generation, or a non-idle subject is a stale key.
+/// of another Agent/generation, a Swarm queued note event, or a non-idle
+/// subject is a stale key.
 fn round_key_names_idle_event(connection: &Connection, goal: &GoalRow, seq: i64) -> Result<bool> {
+    round_key_names_idle_event_with(connection, goal, seq, true)
+}
+
+fn round_key_names_automatic_idle_event(
+    connection: &Connection,
+    goal: &GoalRow,
+    seq: i64,
+) -> Result<bool> {
+    round_key_names_idle_event_with(connection, goal, seq, false)
+}
+
+fn round_key_names_idle_event_with(
+    connection: &Connection,
+    goal: &GoalRow,
+    seq: i64,
+    allow_unknown_goal_round: bool,
+) -> Result<bool> {
     // A rejected continuation leaves the Agent idle without native progress.
     // Its rejection and the rejection of its claimed context cannot rearm
     // the same Goal. Use the retained event so this also holds after restart.
+    let sql = format!(
+        "SELECT agent, generation, subject FROM events
+         WHERE seq = ?1 AND NOT {SWARM_QUEUED_NOTE_EVENT_SQL} AND (
+             ?2 IS NULL OR source <> 'daemon' OR kind <> 'command.rejected'
+             OR CASE
+                 WHEN json_extract(data, '$.outcome.code') = 'native_not_dispatched'
+                     THEN json_extract(data, '$.command_id')
+                 WHEN json_extract(data, '$.outcome.reason') = 'consumer_input_unconfirmed'
+                     THEN json_extract(data, '$.outcome.claim.consumer_id')
+             END IS NOT ?2
+         ) AND (kind <> 'goal.round' OR (
+             json_extract(data, '$.outcome') IN ('blocked', 'completed')
+             AND json_extract(data, '$.revision') + 1 < ?3
+         ) OR (
+             json_extract(data, '$.outcome') = 'retryable'
+             AND json_extract(data, '$.revision') + 1 = ?3
+         ) OR (
+             ?4 = 1
+             AND json_extract(data, '$.outcome') = 'unknown'
+             AND json_extract(data, '$.reason') IS NOT 'stale_round'
+             AND json_extract(data, '$.revision') = ?3
+         ))"
+    );
     connection
         .query_row(
-            "SELECT agent, generation, subject FROM events
-             WHERE seq = ?1 AND (
-                 ?2 IS NULL OR source <> 'daemon' OR kind <> 'command.rejected'
-                 OR CASE
-                     WHEN json_extract(data, '$.outcome.code') = 'native_not_dispatched'
-                         THEN json_extract(data, '$.command_id')
-                     WHEN json_extract(data, '$.outcome.reason') = 'consumer_input_unconfirmed'
-                         THEN json_extract(data, '$.outcome.claim.consumer_id')
-                 END IS NOT ?2
-             ) AND (kind <> 'goal.round' OR (
-                 json_extract(data, '$.outcome') IN ('blocked', 'completed')
-                 AND json_extract(data, '$.revision') + 1 < ?3
-             ) OR (
-                 json_extract(data, '$.outcome') = 'retryable'
-                 AND json_extract(data, '$.revision') + 1 = ?3
-             ))",
-            params![seq, goal.state.last_continuation_command_id, goal.revision],
+            &sql,
+            params![
+                seq,
+                goal.state.last_continuation_command_id,
+                goal.revision,
+                i64::from(allow_unknown_goal_round),
+            ],
             |row| {
                 Ok((
                     row.get::<_, Option<i64>>(0)?,
@@ -3567,12 +3690,19 @@ fn count_turns(connection: &Connection, agent_num: i64, generation: i64) -> Resu
 }
 
 fn max_agent_seq(connection: &Connection, agent_num: i64, generation: i64) -> Result<i64> {
+    let sql = format!(
+        "SELECT COALESCE((
+             SELECT seq FROM events INDEXED BY events_agent
+             WHERE agent = ?1 AND generation = ?2
+               AND NOT {SWARM_QUEUED_NOTE_EVENT_SQL}
+               AND NOT (kind = 'goal.round'
+                        AND json_extract(data, '$.outcome') = 'unknown'
+                        AND json_extract(data, '$.reason') = 'stale_round')
+             ORDER BY seq DESC LIMIT 1
+         ), 0)"
+    );
     connection
-        .query_row(
-            "SELECT COALESCE(MAX(seq), 0) FROM events WHERE agent = ?1 AND generation = ?2",
-            params![agent_num, generation],
-            |row| row.get(0),
-        )
+        .query_row(&sql, params![agent_num, generation], |row| row.get(0))
         .map_err(sql_error)
 }
 
@@ -3623,7 +3753,8 @@ fn count_agent_commands(
         "state = 'unknown'"
     } else {
         "state IN ('accepted', 'queued', 'dispatched')
-         AND NOT (verb = 'inject' AND state IN ('accepted', 'queued') AND outcome IS NULL
+         AND NOT (verb = 'inject' AND state IN ('accepted', 'queued')
+                  AND json_extract(outcome, '$.claim') IS NULL
                   AND json_extract(args, '$.point') IN ('next_input', 'turn_safe_point'))"
     };
     let sql = format!(
@@ -3633,6 +3764,85 @@ fn count_agent_commands(
     connection
         .query_row(&sql, params![agent_num, generation], |row| row.get(0))
         .map_err(sql_error)
+}
+
+/// Build ready `goal.round` arguments for a stuck active Goal when its Agent
+/// is cleanly idle with an unconsumed round key. Returns `None` when a round
+/// is not currently admissible so the inbox falls back to inspection.
+pub(crate) fn stuck_goal_round_args(
+    connection: &Connection,
+    agent_num: i64,
+    mode: &str,
+    now: i64,
+) -> Result<Option<Value>> {
+    if mode != "eliot" {
+        return Ok(None);
+    }
+    let Some(row) = load_goal_row(connection, agent_num, mode)? else {
+        return Ok(None);
+    };
+    let Some(agent_row) = load_agent_by_num(connection, agent_num)? else {
+        return Ok(None);
+    };
+    if row.state.status != GoalStatus::Active
+        || agent_row.observe_only
+        || row.generation != agent_row.generation
+        || agent_row.state != AgentState::Idle
+        || agent_row.active_turn.is_some()
+        || !agent_row.pending.is_empty()
+        || !unhealthy_open_sources(connection, agent_num, row.generation)?.is_empty()
+        || count_agent_commands(connection, agent_num, row.generation, true)? > 0
+        || count_agent_commands(connection, agent_num, row.generation, false)? > 0
+    {
+        return Ok(None);
+    }
+    if row.state.await_first_turn
+        && count_turns(connection, agent_num, row.generation)? <= row.state.counters.turns_at_set
+    {
+        return Ok(None);
+    }
+    let markers = load_goal_markers(connection, agent_num, mode)?;
+    if markers.iter().any(|marker| marker.state == "running") {
+        return Ok(None);
+    }
+    let agent_id = format_agent_id(agent_num);
+    if row.definition.cadence_ms.is_some() {
+        let committed = row.state.last_committed_slot.unwrap_or(0);
+        let burned = markers
+            .iter()
+            .filter(|marker| marker.generation == row.generation && marker.kind == "slot")
+            .map(|marker| marker.round_key)
+            .max()
+            .unwrap_or(0);
+        let slot = committed.max(burned).saturating_add(1).max(1);
+        if require_slot_due(&row, slot, now).is_err() {
+            return Ok(None);
+        }
+        return Ok(Some(json!({
+            "agent": agent_id,
+            "mode": mode,
+            "slot": slot,
+        })));
+    }
+    let seq = max_agent_seq(connection, agent_num, row.generation)?;
+    if seq <= 0 || !round_key_names_idle_event(connection, &row, seq)? {
+        return Ok(None);
+    }
+    let key = GoalRoundKey::Idle(seq);
+    if row.last_round_key.as_deref() == Some(&key.text())
+        || markers.iter().any(|marker| {
+            marker.generation == row.generation
+                && marker.round_key == key.value()
+                && marker.kind == key.kind()
+        })
+    {
+        return Ok(None);
+    }
+    Ok(Some(json!({
+        "agent": agent_id,
+        "mode": mode,
+        "idle_seq": seq,
+    })))
 }
 
 /// Install the Goal frozen into a Goal-owned assignment launch, bound to the

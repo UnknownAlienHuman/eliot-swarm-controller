@@ -873,6 +873,13 @@ fn project_goals(
                 "goal.get",
                 json!({"agent":format!("a{agent}"),"mode":mode_name(mode)}),
             );
+            let round = crate::goals::stuck_goal_round_args(db, agent, mode_name(mode), now)?
+                .map(|args| action("round", "goal.round", args));
+            let (recommended, choices) = if let Some(round) = round {
+                (Some(round.clone()), vec![round, inspect])
+            } else {
+                (Some(inspect.clone()), vec![inspect])
+            };
             items.push(item(
                 OwnerInboxKind::Stuck,
                 format!("goal:{subject}"),
@@ -880,8 +887,8 @@ fn project_goals(
                 now,
                 since,
                 reason,
-                Some(inspect.clone()),
-                vec![inspect],
+                recommended,
+                choices,
             ));
         }
     }

@@ -545,6 +545,7 @@ impl Router {
         ulid::Ulid::from_string(&request.id).map_err(|_| Error::invalid_mutation_id())?;
         let principal = super::principal_name(principal);
         let mut store = self.inner.store.lock().await;
+        super::owner_inbox::check_binding(&store)?;
         if let Some(response) = store.goal_round_replay(&principal, &request, now_ms())? {
             return serde_json::to_value(response)
                 .map_err(|_| Error::new("internal", "goal.round result could not be encoded"));
@@ -589,6 +590,7 @@ impl Router {
             None
         };
         let mut store = self.inner.store.lock().await;
+        super::owner_inbox::check_binding(&store)?;
         // The claim re-validates the probe and commits the durable in-flight
         // marker. Everything after it resolves the marker exactly once: the
         // commit consumes it, every other exit abandons it to `unknown`.
@@ -1276,8 +1278,8 @@ pub(crate) async fn run_goal_driver(
                 .await;
             }
             Some(joined) = rounds.join_next(), if !rounds.is_empty() => {
-                let agent = match joined {
-                    Ok((agent, _)) => Some(agent),
+                let joined = match joined {
+                    Ok((agent, finished_seq)) => Some((agent, Some(finished_seq))),
                     Err(error) => {
                         // A panicked round must still free its Goal and cap
                         // slot; its durable marker keeps the Goal fenced.
@@ -1291,12 +1293,14 @@ pub(crate) async fn run_goal_driver(
                         in_flight
                             .iter()
                             .find(|(_, running)| running.task == error.id())
-                            .map(|(agent, _)| agent.clone())
+                            .map(|(agent, _)| (agent.clone(), None))
                     }
                 };
-                if let Some(agent) = agent {
+                if let Some((agent, finished_seq)) = joined {
                     in_flight.remove(&agent);
-                    if let Some(follow) = pending.remove(&agent) {
+                    if let Some(follow) = pending.remove(&agent)
+                        && finished_seq.is_none_or(|seq| follow.seq > seq)
+                    {
                         spawn_auto_round(
                             &router,
                             run_check,
@@ -1374,6 +1378,9 @@ async fn spawn_auto_round(
         });
     }
     if !idle_goal_is_eligible(router, &agent, event.generation).await {
+        return;
+    }
+    if is_swarm_next_input_note_event(&event) {
         return;
     }
     reserve_idle_round(
@@ -1520,7 +1527,7 @@ fn reserve_idle_round(
     let drive_agent = agent.clone();
     let task = rounds
         .spawn(async move {
-            drive_goal_at_idle(
+            let final_seq = drive_goal_at_idle(
                 &task_router,
                 run_check,
                 &drive_agent,
@@ -1529,7 +1536,7 @@ fn reserve_idle_round(
                 cancellation,
             )
             .await;
-            (task_agent, seq)
+            (task_agent, final_seq)
         })
         .id();
     in_flight.insert(agent, InFlightAutoRound { cancel, seq, task });
@@ -1561,64 +1568,102 @@ async fn idle_goal_is_eligible(router: &Router, agent: &str, generation: Option<
     true
 }
 
+/// Swarm's own queued `next_input` notes and their superseding rejections.
+/// They never make an idle Goal round stale or create a second idle key.
+fn is_swarm_next_input_note_event(event: &Event) -> bool {
+    event.source == "daemon"
+        && ((event.kind == "command.accepted"
+            && event.data["verb"] == "inject"
+            && event.data["application_point"] == "next_input"
+            && event.data["note_kind"].is_string())
+            || (event.kind == "command.rejected"
+                && matches!(
+                    event.data["outcome"]["code"].as_str(),
+                    Some("task_card_superseded" | "project_check_superseded")
+                )))
+}
+
 /// Shared automatic-round driver for one exact-generation idle subject:
 /// the same scope, enablement and single-flight checks whether the
 /// subject arrived on the bus or was retained from `goal.set`/`resume`.
 /// A busy Agent, a drifted generation or a consumed key stays silent and
 /// waits for the next real event; only the round path itself may pause a
 /// drifted Goal, so this returns before any probe when generations differ.
+/// If `stale_round` occurs while the Agent remains cleanly idle with no
+/// open commands, retry with the fresh unconsumed idle key from Store.
 async fn drive_goal_at_idle(
     router: &Router,
     run_check: GoalCheckRunner,
     agent: &str,
     generation: i64,
-    idle_seq: i64,
+    mut idle_seq: i64,
     cancellation: watch::Receiver<bool>,
-) {
-    if !router.rule_firings_open() {
-        return;
-    }
-    if !idle_goal_is_eligible(router, agent, Some(generation)).await {
-        return;
-    }
-    let params = json!({
-        "id": ulid::Ulid::new().to_string(),
-        "agent": agent,
-        "mode": "eliot",
-        "idle_seq": idle_seq,
-    });
-    match router
-        .goal_round_with_cancellation(&params, &Principal::Owner, run_check, cancellation)
-        .await
-    {
-        Ok(_) => {}
-        // A stale key means this Goal missed its round; the next idle
-        // event redrives it. Busy races, gate losses, shutdown cancels
-        // and vanished Goals stay silent.
-        Err(error) if error.code.as_str() == "stale_round" => {
-            let policy = router.secret_policy_snapshot();
-            crate::logging::record(
-                &policy,
-                "daemon.goal_auto_round_stale",
-                &[("agent", agent)],
-                Some(&error),
-            );
+) -> i64 {
+    let mut tried = std::collections::BTreeSet::new();
+    while tried.insert(idle_seq) && tried.len() <= 4 {
+        if !router.rule_firings_open() || *cancellation.borrow() {
+            return idle_seq;
         }
-        Err(error)
-            if matches!(
-                error.code.as_str(),
-                "busy" | "bad_state" | "not_found" | "stale_generation" | "unavailable"
-            ) => {}
-        Err(error) => {
-            let policy = router.secret_policy_snapshot();
-            crate::logging::record(
-                &policy,
-                "daemon.goal_auto_round_failed",
-                &[("agent", agent)],
-                Some(&error),
-            );
+        if !idle_goal_is_eligible(router, agent, Some(generation)).await {
+            return idle_seq;
+        }
+        let params = json!({
+            "id": ulid::Ulid::new().to_string(),
+            "agent": agent,
+            "mode": "eliot",
+            "idle_seq": idle_seq,
+        });
+        match router
+            .goal_round_with_cancellation(
+                &params,
+                &Principal::Owner,
+                run_check,
+                cancellation.clone(),
+            )
+            .await
+        {
+            Ok(_) => return idle_seq,
+            Err(error) if error.code.as_str() == "stale_round" => {
+                let policy = router.secret_policy_snapshot();
+                crate::logging::record(
+                    &policy,
+                    "daemon.goal_auto_round_stale",
+                    &[("agent", agent)],
+                    Some(&error),
+                );
+                let next_seq = {
+                    let store = router.inner.store.lock().await;
+                    store
+                        .goal_retry_idle_seq(agent, generation, idle_seq)
+                        .ok()
+                        .flatten()
+                };
+                let Some(next_seq) = next_seq.filter(|seq| !tried.contains(seq)) else {
+                    return idle_seq;
+                };
+                idle_seq = next_seq;
+            }
+            Err(error)
+                if matches!(
+                    error.code.as_str(),
+                    "busy" | "bad_state" | "not_found" | "stale_generation" | "unavailable"
+                ) =>
+            {
+                return idle_seq;
+            }
+            Err(error) => {
+                let policy = router.secret_policy_snapshot();
+                crate::logging::record(
+                    &policy,
+                    "daemon.goal_auto_round_failed",
+                    &[("agent", agent)],
+                    Some(&error),
+                );
+                return idle_seq;
+            }
         }
     }
+    idle_seq
 }
 
 /// Sweep the retained idle subjects after `goal.set`/`goal.resume`.
