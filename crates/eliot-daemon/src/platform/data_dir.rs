@@ -198,7 +198,14 @@ impl DataDir {
     /// Open or initialize a private data root and its persistent owner token.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = absolute_path(path.as_ref())?;
-        refuse_package_redirected(&path)?;
+        // A root that does not exist yet is new state other processes will read.
+        if fs::symlink_metadata(&path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            refuse_unverified_write(&path)?;
+        } else {
+            refuse_package_redirected(&path)?;
+        }
         ensure_private_root(&path).map_err(|error| {
             if error.code == "unsafe_data_dir" {
                 unsafe_data_dir_error(&path, error)
@@ -477,7 +484,7 @@ pub fn persist_selected_root(path: &Path) -> Result<()> {
 
 fn persist_selected_root_at(path: &Path, pointer_dir: &Path) -> Result<()> {
     let selected = DataDir::open_existing(path)?;
-    refuse_package_redirected(pointer_dir)?;
+    refuse_unverified_write(pointer_dir)?;
     ensure_private_root(pointer_dir)?;
     validate_private_root(pointer_dir)?;
     let root = selected.path().to_str().ok_or_else(|| {
@@ -941,12 +948,26 @@ fn open_or_create_lock_file(path: &Path) -> Result<File> {
     }
 }
 
-/// Refuse a directory Windows would redirect for this packaged process; see
-/// the packaged-process rule in `docs/spec/configuration.md`.
+/// Refuse a directory Windows definitely redirects for this process; see the
+/// packaged-process rule in `docs/spec/configuration.md`.
 pub(crate) fn refuse_package_redirected(path: &Path) -> Result<()> {
     #[cfg(windows)]
     {
         super::windows::refuse_package_redirected(path)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+/// Refuse new state at a location that is redirected for this process or whose
+/// redirection cannot be determined; see the same rule.
+pub(crate) fn refuse_unverified_write(path: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        super::windows::refuse_unverified_write(path)
     }
     #[cfg(not(windows))]
     {
@@ -961,7 +982,7 @@ pub(crate) fn refuse_package_redirected(path: &Path) -> Result<()> {
 /// failed profile lookup is an error, never a fallback to `current`'s folder.
 pub(crate) fn fresh_data_dir(current: &Path, name: &str) -> Result<PathBuf> {
     #[cfg(windows)]
-    if refuse_package_redirected(current).is_err() {
+    if refuse_unverified_write(current).is_err() {
         return super::windows::account_profile().map(|profile| profile.join(name));
     }
     Ok(current.with_file_name(name))

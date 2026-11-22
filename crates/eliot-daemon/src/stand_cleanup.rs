@@ -375,7 +375,11 @@ fn checked_stand_dir(base: PathBuf, create: bool) -> Result<PathBuf> {
             format!("resolve designated stand root: {error}"),
         )
     })?;
-    crate::platform::data_dir::refuse_package_redirected(&base)?;
+    if create {
+        crate::platform::data_dir::refuse_unverified_write(&base)?;
+    } else {
+        crate::platform::data_dir::refuse_package_redirected(&base)?;
+    }
     if base.components().any(|part| part == Component::ParentDir) {
         return Err(Error::new(
             "invalid",

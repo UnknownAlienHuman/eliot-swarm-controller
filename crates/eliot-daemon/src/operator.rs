@@ -157,7 +157,7 @@ pub fn lock_transition(path: &Path) -> Result<OperatorLock> {
 }
 
 pub fn create_stand_root(path: &Path) -> Result<()> {
-    crate::platform::data_dir::refuse_package_redirected(path)?;
+    crate::platform::data_dir::refuse_unverified_write(path)?;
     #[cfg(windows)]
     {
         if !crate::platform::windows::create_private_directory(path)? {

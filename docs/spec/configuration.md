@@ -32,15 +32,33 @@ process inside an MSIX package to that package's private cache, and a shell such
 an app starts can be redirected with no package identity of its own. Only
 processes in that tree see the result; a daemon or CLI outside it would use
 different files. Swarm detects this from where a transient delete-on-close probe
-file lands. It probes the folder the path belongs to, because each is redirected
-separately: Local, Roaming and LocalLow to the same-named folder of the package's
-`LocalCache`, and the `AppData` directory itself to `LocalCache`. A redirected
-process, or one whose probe cannot tell, refuses any data root under those
-folders, including the default root, before any ACL diagnosis, and refuses to
-write the selected-root pointer. Its remedies never name an AppData location: use
-`--data-dir` or `ELIOT_HOME` with a directory outside AppData. The desktop's
-fresh-directory choice is created in the account profile, and a failed profile
-lookup is reported rather than falling back beside the refused directory.
+file lands, once per process and only for a path under AppData. It probes the
+folder the path belongs to, because each is redirected separately: Local, Roaming
+and LocalLow to the same-named folder of the package's `LocalCache`, and the
+`AppData` directory itself to `LocalCache`. The probe has three answers:
+
+- **Redirected:** a package cache holds the probe. Every use of a data root under
+  those folders is refused, including the default root, before any ACL diagnosis,
+  and so is writing the selected-root pointer.
+- **Not redirected:** every package cache was inspected and none holds the probe.
+  Nothing is refused.
+- **Indeterminate:** the probe could not be created, or a cache could not be
+  inspected and none held the probe. Opening an existing root and read-only calls
+  proceed, so one unreadable package cannot disconnect the desktop or CLI. Creating
+  a new data root or stand directory under those folders and writing the
+  selected-root pointer are refused with the probe error. The cost is that those
+  creations stay blocked until the cause is fixed, and that a redirected process
+  whose probe fails can still open what it sees as an existing root.
+
+If the account's known folders cannot be read, no path can be classified: existing
+roots still open, and any new data root, stand directory or pointer write is
+refused with the lookup error, wherever it is.
+
+Remedies for a redirected caller never name an AppData location: use `--data-dir`
+or `ELIOT_HOME` with a directory outside AppData. The desktop's fresh-directory
+choice is created in the account profile when its usual location would be
+refused, and a failed profile lookup is reported rather than falling back beside
+the refused directory.
 
 Linux is distributed as the [supported Docker image](../../docker/README.md).
 It runs as UID/GID 10001 with `ELIOT_HOME=/data`, an owned mode-0700 volume;
