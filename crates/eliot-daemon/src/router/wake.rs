@@ -209,9 +209,14 @@ impl Router {
                     StoreRunReceipt::ExitZero => Ok(WakeFact::Satisfied(format!(
                         "authorized Run {run_id} has a retained exit-zero, quiescent receipt"
                     ))),
-                    StoreRunReceipt::ExitNonZero { exit_code, stderr } => Ok(WakeFact::Satisfied(
-                        agent_wake_run_nonzero_fact(run_id, exit_code, stderr, &self.inner.secrets),
-                    )),
+                    StoreRunReceipt::ExitNonZero { exit_code, stderr } => {
+                        Ok(WakeFact::Satisfied(agent_wake_run_nonzero_fact(
+                            run_id,
+                            exit_code,
+                            stderr,
+                            &self.secret_policy_snapshot(),
+                        )))
+                    }
                     StoreRunReceipt::NoMatch => Ok(WakeFact::NoMatch),
                     StoreRunReceipt::Unknown => Ok(WakeFact::Unknown),
                 }
@@ -363,19 +368,22 @@ impl Router {
             return Ok(());
         }
         let Err(error) = submitted else {
-            // The write response preceded the Store read. A missing row here
-            // is a consistency gap, so keep the stable id and check it again.
-            return Err(Error::new(
-                "source_integrity",
-                "wake delivery acknowledgement has no retained command",
-            ));
+            // An acknowledged admission without its retained row is an
+            // integrity gap, so its effect remains unknown.
+            self.inner.store.lock().await.agent_wake_mark_unknown(
+                &wake.id,
+                wake.generation,
+                Some(command_id),
+                now,
+            )?;
+            self.signal_progress();
+            return Ok(());
         };
         // Store commits admission before native dispatch. With an error and no
         // command row, this is a definite pre-admission refusal; retry only
         // this case and retain the same stable command id.
         let error_text = self
-            .inner
-            .secrets
+            .secret_policy_snapshot()
             .redact_bounded(&format!("{}: {}", error.code, error.message), 384);
         let failure_reason = error_text
             .chars()
@@ -620,7 +628,7 @@ fn agent_wake_run_nonzero_fact(
     let mut fact = format!("authorized Run {run_id} exited with nonzero code {exit_code}");
     match stderr {
         Some(stderr) => {
-            let redacted = secrets.redact_text(&stderr.text);
+            let redacted = secrets.redact_text(&stderr.text).replace('\0', "\u{fffd}");
             let tail = utf8_tail(&redacted, WAKE_RUN_STDERR_TAIL_BYTES);
             if !tail.is_empty() {
                 fact.push_str("\nredacted stderr tail:\n");

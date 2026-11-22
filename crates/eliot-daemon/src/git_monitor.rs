@@ -1114,48 +1114,13 @@ impl GitProbe {
         Ok(Captured { code, stdout })
     }
 
-    /// Run one explicitly dispatched local Git mutation under the same
-    /// sanitized config and leaf-process fence as Git observation. Callers
-    /// own durable dispatch and settlement around this one attempt.
-    pub(crate) async fn workspace_effect_command(
-        &self,
-        root: &Path,
-        args: &[&str],
-        timeout: Duration,
-        policy: std::sync::Arc<eliot_core::SecretPolicy>,
-        cancellation: tokio::sync::watch::Receiver<bool>,
-    ) -> Result<crate::scripts::process::ProcessOutcome> {
-        self.workspace_effect_command_scoped(root, args, None, timeout, policy, cancellation)
-            .await
-    }
-
     /// Run one explicitly dispatched local Git mutation with a private index
-    /// scoped to this command.
+    /// and the same sanitized config and process fence as Git observation.
     pub(crate) async fn workspace_effect_command_with_index(
         &self,
         root: &Path,
         args: &[&str],
         index_file: &Path,
-        timeout: Duration,
-        policy: std::sync::Arc<eliot_core::SecretPolicy>,
-        cancellation: tokio::sync::watch::Receiver<bool>,
-    ) -> Result<crate::scripts::process::ProcessOutcome> {
-        self.workspace_effect_command_scoped(
-            root,
-            args,
-            Some(index_file),
-            timeout,
-            policy,
-            cancellation,
-        )
-        .await
-    }
-
-    async fn workspace_effect_command_scoped(
-        &self,
-        root: &Path,
-        args: &[&str],
-        index_file: Option<&Path>,
         timeout: Duration,
         policy: std::sync::Arc<eliot_core::SecretPolicy>,
         cancellation: tokio::sync::watch::Receiver<bool>,
@@ -1167,7 +1132,8 @@ impl GitProbe {
         if Instant::now() >= deadline {
             return Err(unavailable("Git effect preparation deadline elapsed"));
         }
-        let command = self.build_command_with_index(root, args, &overrides, None, index_file)?;
+        let command =
+            self.build_command_with_index(root, args, &overrides, None, Some(index_file))?;
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(unavailable("Git effect preparation deadline elapsed"));

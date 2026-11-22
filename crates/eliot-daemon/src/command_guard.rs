@@ -84,7 +84,7 @@ impl CommandGuardPolicy {
     pub(crate) fn refusal(&self, commands: &[String]) -> Option<&str> {
         for command in commands {
             for rule in &self.rules {
-                if rule.matcher.is_match(command.trim())
+                if rule.matcher.is_match(command)
                     || command_segments(command).any(|segment| rule.matcher.is_match(segment))
                 {
                     return Some(rule.refusal.as_str());

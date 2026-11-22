@@ -784,7 +784,7 @@ allowlist. Project Run remains confined to its separate registered-checkout
 
 A registered project may define a static command refusal table with
 [[projects.ID.command_guards]]. Each entry has a pattern glob and a literal,
-single-line refusal. Globs match the trimmed command supplied by a native
+single-line refusal. Globs match the full command supplied by a native
 permission request and each trimmed segment separated by unquoted, unescaped
 `;`, `|`, `&`, or a newline. Matching uses the supplied text without shell
 expansion. Up to 64 entries are accepted; patterns are at most 1024 bytes and refusal

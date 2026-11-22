@@ -64,13 +64,14 @@ impl TemporaryGitIndex {
             )
         })?;
         let directory = data_root.join(format!("publish-index-{}", ulid::Ulid::new()));
-        let mut builder = fs::DirBuilder::new();
         #[cfg(unix)]
-        {
+        let create = {
             use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        builder.create(&directory).map_err(|_| {
+            fs::DirBuilder::new().mode(0o700).create(&directory)
+        };
+        #[cfg(not(unix))]
+        let create = fs::create_dir(&directory);
+        create.map_err(|_| {
             Error::new(
                 "unavailable",
                 "private Git publication index cannot be created",
