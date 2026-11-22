@@ -281,7 +281,9 @@ impl Router {
                     "expires_at_ms": expires_at_ms,
                 },
             });
-            let _ = self.submit(&notice, &Principal::Owner).await;
+            let _ = self
+                .submit(&notice, &Principal::Owner, "daemon.attribution_notice")
+                .await;
         }
     }
 }

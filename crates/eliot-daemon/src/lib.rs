@@ -3,6 +3,7 @@
 pub(crate) mod adhoc;
 pub(crate) mod automation;
 pub mod bootstrap;
+mod build_identity;
 mod bus;
 pub mod cloud_mcp;
 mod common;

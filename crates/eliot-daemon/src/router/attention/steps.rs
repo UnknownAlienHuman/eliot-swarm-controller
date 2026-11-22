@@ -296,7 +296,10 @@ async fn submit_step(router: &Router, request: CommandSubmitRequest, wait: bool)
     let id = request.id.clone();
     let params = serde_json::to_value(request)
         .map_err(|_| Error::new("internal", "attention command could not be encoded"))?;
-    if let Err(error) = router.submit(&params, &Principal::Owner).await {
+    if let Err(error) = router
+        .submit(&params, &Principal::Owner, "daemon.attention")
+        .await
+    {
         crate::logging::record(
             &router.secret_policy_snapshot(),
             "daemon.attention_action_failed",

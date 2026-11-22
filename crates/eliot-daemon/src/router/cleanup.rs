@@ -334,7 +334,8 @@ impl Router {
                 "message": message,
             },
         });
-        self.submit(&request, &Principal::Owner).await?;
+        self.submit(&request, &Principal::Owner, "daemon.archive")
+            .await?;
         timeout(Duration::from_secs(10), async {
             loop {
                 let state = self

@@ -1703,6 +1703,8 @@ pub struct AutomaticCleanupSweep {
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonStatusResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_identity: Option<DaemonBuildIdentity>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_probe_attention: Vec<crate::ProviderHold>,
     pub state: String,
@@ -1748,6 +1750,20 @@ pub struct DaemonStatusResponse {
     /// not panic. `swarm daemon` startup output reports the same marker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_crash: Option<CrashMarker>,
+}
+
+/// Compile-time release identity and the exact executable observed at daemon
+/// startup. Missing values are reported as unavailable instead of inferred.
+#[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonBuildIdentity {
+    pub version: String,
+    #[serde(default)]
+    pub executable_directory: Option<String>,
+    #[serde(default)]
+    pub git_sha: Option<String>,
+    #[serde(default)]
+    pub executable_sha256: Option<String>,
 }
 
 impl DaemonStatusResponse {
@@ -1863,6 +1879,11 @@ pub fn diagnosis_reason(steps: &[DiagnoseStep]) -> Option<&DiagnoseStep> {
         .or_else(|| steps.iter().find(|step| step.exit_code.is_some()))
         .or_else(|| steps.iter().find(|step| step.kind == "command"))
         .or_else(|| steps.iter().find(|step| step.kind == "turn"))
+        .or_else(|| {
+            steps
+                .iter()
+                .find(|step| step.kind == "goal" && step.code.as_deref() == Some("blocked"))
+        })
         .or(steps.first())
 }
 

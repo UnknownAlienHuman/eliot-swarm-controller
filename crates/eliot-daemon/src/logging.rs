@@ -152,6 +152,33 @@ pub(crate) fn record_debug(
     if !is_debug() {
         return;
     }
+    let detail = debug_detail(fields);
+    write_record(policy, code, ids, None, Some(detail), None)
+}
+
+/// Debug-only failure record. Keeps the same bounded numeric timing detail as
+/// `record_debug` while retaining the safe, typed failure explanation.
+pub(crate) fn record_debug_error(
+    policy: &SecretPolicy,
+    code: &str,
+    ids: &[(&str, &str)],
+    fields: &[(&str, u64)],
+    error: &Error,
+) {
+    if !is_debug() {
+        return;
+    }
+    write_record(
+        policy,
+        code,
+        ids,
+        None,
+        Some(debug_detail(fields)),
+        Some(error),
+    )
+}
+
+fn debug_detail(fields: &[(&str, u64)]) -> Map<String, Value> {
     let mut detail = Map::new();
     for (key, value) in fields.iter().take(8) {
         if key.len() <= 64
@@ -162,7 +189,7 @@ pub(crate) fn record_debug(
             detail.insert((*key).to_owned(), Value::from(*value));
         }
     }
-    write_record(policy, code, ids, None, Some(detail), None)
+    detail
 }
 
 /// Typed nonnegative counts for one concrete diagnostic command. Counts are
@@ -191,6 +218,46 @@ pub(crate) fn record_counts(
     error: Option<&Error>,
 ) {
     write_record(policy, code, &[], Some(counts), None, error)
+}
+
+pub(crate) struct CommandStormMetadata {
+    pub(crate) connection_count: u64,
+    pub(crate) connections_overflow: bool,
+}
+
+pub(crate) fn record_command_storm(
+    policy: &SecretPolicy,
+    ids: &[(&str, &str)],
+    attempts: u64,
+    refused: u64,
+    window_ms: u64,
+    metadata: CommandStormMetadata,
+) {
+    let detail = Map::from_iter([
+        ("attempts".to_owned(), Value::from(attempts)),
+        (
+            "accepted".to_owned(),
+            Value::from(attempts.saturating_sub(refused)),
+        ),
+        ("refused".to_owned(), Value::from(refused)),
+        ("window_ms".to_owned(), Value::from(window_ms)),
+        (
+            "connection_count".to_owned(),
+            Value::from(metadata.connection_count),
+        ),
+        (
+            "connections_overflow".to_owned(),
+            Value::from(metadata.connections_overflow),
+        ),
+    ]);
+    write_record(
+        policy,
+        "daemon.command_storm",
+        ids,
+        None,
+        Some(detail),
+        None,
+    );
 }
 
 fn write_record(
@@ -252,9 +319,21 @@ fn encode_record(
                 | "batch_id"
                 | "event_kind"
                 | "validation"
+                | "principal"
+                | "producer"
+                | "operation"
+                | "path"
+                | "project"
+                | "rule"
                 | "boot_id"
                 | "pid"
                 | "method"
+                | "error_code"
+                | "version"
+                | "executable_directory"
+                | "git_sha"
+                | "executable_sha256"
+                | "skipped"
                 | "worker"
                 | "restart_count"
                 | "attempt"
@@ -263,6 +342,26 @@ fn encode_record(
             context.insert(
                 key.to_owned(),
                 Value::String(bounded_text(policy, text, 256)),
+            );
+        }
+    }
+    let fallback_error_code = context
+        .remove("error_code")
+        .and_then(|value| value.as_str().map(str::to_owned));
+    let failure_record = error.is_some() || is_failure_record(code);
+    if failure_record {
+        context
+            .entry("principal".to_owned())
+            .or_insert_with(|| Value::String("system".to_owned()));
+        if context.get("principal").and_then(Value::as_str) == Some("system") {
+            context
+                .entry("producer".to_owned())
+                .or_insert_with(|| Value::String(bounded_text(policy, code, 128)));
+        }
+        if !context.contains_key("method") && !context.contains_key("command") {
+            context.insert(
+                "method".to_owned(),
+                Value::String(bounded_text(policy, code, 128)),
             );
         }
     }
@@ -292,13 +391,25 @@ fn encode_record(
         value["detail"] = Value::Object(detail);
     }
     if let Some(error) = error {
+        value["cause"] = json!(bounded_text(policy, &error.message, 1024));
         value["error_code"] = json!(bounded_text(policy, &error.code, 64));
-        if let Some(where_) = error.failure_where.as_deref() {
-            value["where"] = json!(bounded_text(policy, where_, 128));
+        let where_ = error.failure_where.as_deref().unwrap_or(code);
+        value["where"] = json!(bounded_text(policy, where_, 128));
+        if let Some(details) = error.details.as_deref() {
+            value["invalid_param"] = json!({
+                "field": bounded_text(policy, &details.field, 128),
+                "expected": bounded_text(policy, &details.expected.to_string(), 256),
+            });
         }
         value["origin"] = json!(error.origin_or_unknown().as_str());
         if let Some(evidence) = error.origin_evidence.as_deref() {
             value["origin_evidence"] = json!(bounded_text(policy, evidence, 512));
+        }
+        if let Some(exit_code) = error.exit_code.as_deref() {
+            value["exit_code"] = json!(exit_code);
+        }
+        if let Some(ntstatus) = error.ntstatus.as_deref() {
+            value["ntstatus"] = json!(bounded_text(policy, ntstatus, 16));
         }
         let mut diagnostics = (*error.diagnostics).clone();
         for diagnostic in &mut diagnostics {
@@ -309,6 +420,15 @@ fn encode_record(
         if !diagnostics.is_empty() {
             value["diagnostics"] = serde_json::to_value(diagnostics).ok()?;
         }
+    } else if failure_record {
+        value["where"] = json!(bounded_text(policy, code, 128));
+        value["cause"] = json!("no safe failure detail was available at the logging callsite");
+        value["error_code"] = json!(
+            fallback_error_code
+                .as_deref()
+                .map(|code| bounded_text(policy, code, 64))
+                .unwrap_or_else(|| "unknown".to_owned())
+        );
     }
     let mut bytes = serde_json::to_vec(&value).ok()?;
     if bytes.len() >= RECORD_BYTES {
@@ -316,6 +436,19 @@ fn encode_record(
     }
     bytes.push(b'\n');
     Some(bytes)
+}
+
+fn is_failure_record(code: &str) -> bool {
+    let event = code.rsplit('.').next().unwrap_or(code);
+    event == "error"
+        || event == "failed"
+        || event == "refused"
+        || event.ends_with("_error")
+        || event.ends_with("_failed")
+        || event.ends_with("_rejected")
+        || event.ends_with("_unavailable")
+        || event.ends_with("_exhausted")
+        || event.ends_with("_unexpectedly")
 }
 
 /// Exact-ID capacity preflight evidence when no command was admitted. These

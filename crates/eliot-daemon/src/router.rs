@@ -231,6 +231,12 @@ enum Principal {
         run_command_id: String,
     },
 }
+
+pub(crate) struct RpcLogContext {
+    pub(crate) principal: String,
+    pub(crate) method: String,
+}
+
 struct EventFilter {
     agents: HashSet<String>,
     kinds: HashSet<String>,
@@ -453,6 +459,7 @@ impl Router {
         method: &str,
         mut wire_params: Value,
         peer: Option<crate::platform::custody::LocalPeer>,
+        log_principal: &mut String,
     ) -> Result<Value> {
         let remote = wire_params
             .get("_auth")
@@ -463,6 +470,7 @@ impl Router {
             .and_then(Value::as_object_mut)
             .and_then(|auth| auth.remove("swarm_mcp_call_id"));
         let (principal, params) = self.authenticate(wire_params, peer).await?;
+        *log_principal = diagnostic_principal(&principal);
         let remote: Option<eliot_core::RemoteCallContext> = remote
             .map(serde_json::from_value)
             .transpose()
@@ -575,6 +583,7 @@ impl Router {
             "cleanup.apply" => self.cleanup_apply(&params, &principal).await,
             "command.submit" => {
                 let result = self.submit_bound(&params, &principal, remote).await;
+                self.note_command_submission(&principal, remote, "command.submit", &result);
                 // Capacity preflight can refuse before a command exists.
                 // Retain diagnostic metadata under the caller's exact ID in
                 // the existing bounded log; this grants no replay authority.
@@ -583,10 +592,15 @@ impl Router {
                     && let Some(id) = params.get("id").and_then(Value::as_str)
                     && ulid::Ulid::from_string(id).is_ok()
                 {
+                    let log_principal = diagnostic_principal(&principal);
                     crate::logging::record(
                         &self.secret_policy_snapshot(),
                         crate::logging::CAPACITY_REFUSAL_CODE,
-                        &[("command", id)],
+                        &[
+                            ("principal", log_principal.as_str()),
+                            ("method", "command.submit"),
+                            ("command", id),
+                        ],
                         Some(error),
                     );
                 }
@@ -722,46 +736,49 @@ impl Router {
                 fields[1].1 = 1;
             }
             let policy = SecretPolicy::new(self.daemon_secrets());
-            let (code, ids) = match &result {
-                Ok(_) => (
-                    "rpc.handled",
-                    [("method", method.to_owned()), ("code", String::new())],
-                ),
-                Err(error) => (
-                    "rpc.failed",
-                    [("method", method.to_owned()), ("code", error.code.clone())],
-                ),
-            };
-            crate::logging::record_debug(
-                &policy,
-                code,
-                &[("method", &ids[0].1), ("code", &ids[1].1)],
-                &fields,
-            );
+            let method = discovery::canonical_method(method).unwrap_or("unsupported");
+            let log_principal = diagnostic_principal(&principal);
+            let ids = [("principal", log_principal.as_str()), ("method", method)];
+            match &result {
+                Ok(_) => crate::logging::record_debug(&policy, "rpc.handled", &ids, &fields),
+                Err(error) => {
+                    crate::logging::record_debug_error(&policy, "rpc.failed", &ids, &fields, error)
+                }
+            }
         }
         result
     }
 
-    pub(crate) async fn handle_rpc(
+    pub(crate) async fn handle_rpc_with_log_context(
         &self,
         request: &eliot_plugin::RpcRequest,
         peer: Option<crate::platform::custody::LocalPeer>,
-    ) -> Result<Value> {
-        if let Some(remote) = request
+    ) -> (Result<Value>, RpcLogContext) {
+        let method = discovery::canonical_method(&request.method)
+            .unwrap_or("unsupported")
+            .to_owned();
+        let mut principal = "unauthenticated".to_owned();
+        let result = if let Some(remote) = request
             .params
             .get("_auth")
             .and_then(|a| a.get("remote_call"))
             && remote.get("call_id") != Some(&request.id)
         {
-            return Err(Error::new(
+            Err(Error::new(
                 "not_allowed",
                 "remote call does not match its RPC request",
-            ));
-        }
-        self.handle(&request.method, request.params.clone(), peer)
+            ))
+        } else {
+            self.handle(
+                &request.method,
+                request.params.clone(),
+                peer,
+                &mut principal,
+            )
             .await
+        };
+        (result, RpcLogContext { principal, method })
     }
-
     pub(crate) fn progress_receiver(&self) -> watch::Receiver<u64> {
         self.inner.progress.subscribe()
     }
@@ -1265,8 +1282,15 @@ impl Router {
         });
     }
 
-    async fn submit(&self, params: &Value, principal: &Principal) -> Result<Value> {
-        self.submit_bound(params, principal, None).await
+    async fn submit(
+        &self,
+        params: &Value,
+        principal: &Principal,
+        method: &'static str,
+    ) -> Result<Value> {
+        let result = self.submit_bound(params, principal, None).await;
+        self.note_command_submission(principal, None, method, &result);
+        result
     }
 
     async fn submit_bound(
@@ -5568,7 +5592,10 @@ impl Router {
                 crate::logging::record(
                     &self.secret_policy_snapshot(),
                     "daemon.owner_stop_mark_failed",
-                    &[],
+                    &[
+                        ("principal", diagnostic_principal(principal).as_str()),
+                        ("method", "daemon.shutdown"),
+                    ],
                     Some(&error),
                 );
             }
@@ -5727,6 +5754,7 @@ impl Router {
     }
 
     fn schedule_rule_admission(&self, admission: &eliot_store::Admission) {
+        self.note_rule_command_admission(admission);
         if let Some((id, linked_id)) = rule_admission_dispatch_plan(admission) {
             self.schedule_command(id, linked_id);
         }
@@ -7745,6 +7773,15 @@ fn require_owner(principal: &Principal) -> Result<()> {
     }
 }
 
+fn diagnostic_principal(principal: &Principal) -> String {
+    match principal {
+        Principal::Owner => "owner".to_owned(),
+        Principal::MemoryInference { client_id, .. } => format!("memory_inference:{client_id}"),
+        Principal::Agent { id, generation } => format!("{id}#{generation}"),
+        Principal::ProjectRule { registration } => format!("project:{}", registration.id),
+        Principal::Run { run_command_id } => format!("run:{run_command_id}"),
+    }
+}
 fn principal_name(principal: &Principal) -> String {
     match principal {
         Principal::Owner => "owner".to_owned(),

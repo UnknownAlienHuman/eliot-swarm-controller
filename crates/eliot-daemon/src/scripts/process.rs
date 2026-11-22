@@ -1,4 +1,4 @@
-use crate::platform::{CustodyGuarantee, CustodyObserver, OwnedChild};
+use crate::platform::{CustodyGuarantee, CustodyObserver, OwnedChild, custody::AgentSpawnError};
 use eliot_core::{Error, SecretPolicy, StderrSnapshot, limits::MAX_FRAME_BYTES};
 use eliot_plugin::{StderrCapture, spawn_stderr, spawn_stderr_prefix};
 use std::{ffi::OsStr, io, process::ExitStatus, process::Stdio, sync::Arc, time::Duration};
@@ -115,6 +115,8 @@ impl ProcessUncertainty {
 #[derive(Debug)]
 pub(crate) enum ProcessOutcome {
     Completed(ProcessCapture),
+    NotSpawned(Error),
+    ProgramUnrunnable(Error),
     Failed {
         reason: ProcessFailure,
         capture: Option<ProcessCapture>,
@@ -252,9 +254,13 @@ async fn run_owned_process_inner(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let mut child = match OwnedChild::spawn(command) {
+    let mut child = match OwnedChild::spawn_report(command) {
         Ok(child) => child,
-        Err(_) => {
+        Err(AgentSpawnError::NotSpawned(error)) => return ProcessOutcome::NotSpawned(error),
+        Err(AgentSpawnError::ProgramUnrunnable(error)) => {
+            return ProcessOutcome::ProgramUnrunnable(error);
+        }
+        Err(AgentSpawnError::Uncertain(_)) => {
             return ProcessOutcome::Unknown {
                 reason: ProcessUncertainty::Spawn,
                 quiescent: false,

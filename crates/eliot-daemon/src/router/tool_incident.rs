@@ -222,7 +222,9 @@ async fn process_event(router: &Router, event: &Event) -> Result<()> {
     request.validate()?;
     let params = serde_json::to_value(request)
         .map_err(|_| Error::new("internal", "repeated failure command could not be encoded"))?;
-    if let Err(error) = router.submit(&params, &Principal::Owner).await
+    if let Err(error) = router
+        .submit(&params, &Principal::Owner, "daemon.tool_incident")
+        .await
         && !matches!(
             error.code.as_str(),
             "stale_generation" | "stale_turn" | "bad_state" | "unsupported"

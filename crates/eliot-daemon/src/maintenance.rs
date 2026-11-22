@@ -4,7 +4,7 @@
 //! never replays an effect; row and space-reclaim outcomes are logged.
 
 use crate::{common::now_ms, config, daemon::workers::WorkerReporter, logging};
-use eliot_core::{Result, SecretPolicy};
+use eliot_core::{Error, Result, SecretPolicy};
 use eliot_store::{RetentionReport, Store};
 use std::{
     path::{Path, PathBuf},
@@ -20,6 +20,15 @@ pub(crate) const RETENTION_TICK_TIME_BUDGET: Duration = Duration::from_secs(30);
 
 /// Known provider resets and due probes are serviced within one second.
 pub(crate) const PROVIDER_HOLD_INTERVAL: Duration = Duration::from_secs(1);
+
+fn maintenance_join_error(task: &str, error: &tokio::task::JoinError) -> Error {
+    let (code, reason) = if error.is_cancelled() {
+        ("task_cancelled", "was cancelled")
+    } else {
+        ("task_panicked", "panicked")
+    };
+    Error::new(code, format!("{task} task {reason}"))
+}
 
 pub(crate) async fn run(
     store: Arc<Mutex<Store>>,
@@ -58,6 +67,7 @@ async fn run_provider_maintenance(
     loop {
         tokio::select! {
             _ = provider_ticker.tick() => {
+                router.flush_command_storms(false);
                 let available = eliot_store::PROVIDER_PROBE_BATCH_LIMIT
                     .saturating_sub(provider_probe_tasks.len());
                 let available = if reactions_enabled { available } else { 0 };
@@ -72,7 +82,15 @@ async fn run_provider_maintenance(
                         }
                     }
                     Err(error) => {
-                        logging::record(&policy, "daemon.provider_hold_maintenance_failed", &[], Some(&error));
+                        logging::record(
+                            &policy,
+                            "daemon.provider_hold_maintenance_failed",
+                            &[
+                                ("producer", "daemon.provider_maintenance"),
+                                ("method", "provider.hold.maintenance"),
+                            ],
+                            Some(&error),
+                        );
                     }
                 }
                 if reactions_enabled
@@ -85,10 +103,27 @@ async fn run_provider_maintenance(
             joined = provider_probe_tasks.join_next(), if !provider_probe_tasks.is_empty() => {
                 match joined {
                     Some(Ok(Err(error))) => {
-                        logging::record(&policy, "daemon.provider_probe_cleanup_failed", &[], Some(&error));
+                        logging::record(
+                            &policy,
+                            "daemon.provider_probe_cleanup_failed",
+                            &[
+                                ("producer", "daemon.provider_probe"),
+                                ("method", "provider.probe.cleanup"),
+                            ],
+                            Some(&error),
+                        );
                     }
-                    Some(Err(_)) => {
-                        logging::record(&policy, "daemon.provider_probe_cleanup_task_failed", &[], None);
+                    Some(Err(error)) => {
+                        let error = maintenance_join_error("provider probe cleanup", &error);
+                        logging::record(
+                            &policy,
+                            "daemon.provider_probe_cleanup_task_failed",
+                            &[
+                                ("producer", "daemon.provider_probe"),
+                                ("method", "provider.probe.cleanup.join"),
+                            ],
+                            Some(&error),
+                        );
                     }
                     _ => {}
                 }
@@ -96,6 +131,7 @@ async fn run_provider_maintenance(
             }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
+                    router.flush_command_storms(true);
                     while let Some(joined) = provider_probe_tasks.join_next().await {
                         if let Ok(Err(error)) = joined {
                             logging::record(&policy, "daemon.provider_probe_cleanup_failed", &[], Some(&error));
@@ -267,7 +303,15 @@ async fn run_epochs(
         let mut report = match run_once(store, retention, now).await {
             Ok(report) => report,
             Err(error) => {
-                logging::record(policy, "daemon.retention_failed", &[], Some(&error));
+                logging::record(
+                    policy,
+                    "daemon.retention_failed",
+                    &[
+                        ("producer", "daemon.retention"),
+                        ("method", "retention.run"),
+                    ],
+                    Some(&error),
+                );
                 return Err(error);
             }
         };
@@ -286,12 +330,24 @@ async fn run_epochs(
                     logging::record(
                         policy,
                         "daemon.retention_checkpoint_failed",
-                        &[],
+                        &[
+                            ("producer", "daemon.retention"),
+                            ("method", "retention.checkpoint"),
+                        ],
                         Some(&error),
                     );
                 }
-                Err(_) => {
-                    logging::record(policy, "daemon.retention_checkpoint_failed", &[], None);
+                Err(error) => {
+                    let error = maintenance_join_error("retention checkpoint", &error);
+                    logging::record(
+                        policy,
+                        "daemon.retention_checkpoint_failed",
+                        &[
+                            ("producer", "daemon.retention"),
+                            ("method", "retention.checkpoint.join"),
+                        ],
+                        Some(&error),
+                    );
                 }
             }
         }

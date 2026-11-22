@@ -357,6 +357,13 @@ pub(super) fn is_mutation(name: &str) -> bool {
         .any(|method| method.name == name && method.mutation)
 }
 
+pub(super) fn canonical_method(name: &str) -> Option<&'static str> {
+    METHODS
+        .iter()
+        .find(|method| method.name == name)
+        .map(|method| method.name)
+}
+
 fn request_takes_id(method: &Method) -> bool {
     (method.input)()
         .get("properties")

@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 
 /// Longest retained check-output snippet in a Goal view.
 pub const MAX_GOAL_OBSERVATION_BYTES: usize = 4 * 1024;
+pub const CHECK_SPAWN_RETRYABLE: &str = "check_spawn_retryable";
 /// Longest Goal objective text.
 pub const MAX_GOAL_TEXT_BYTES: usize = 64 * 1024;
 /// Longest single check argv element or cwd.
@@ -936,7 +937,7 @@ impl GoalRoundRequest {
                     ));
                 }
             }
-            GoalRoundOutcome::Blocked => {
+            GoalRoundOutcome::Blocked | GoalRoundOutcome::Retryable => {
                 if response
                     .reason
                     .as_ref()
@@ -946,7 +947,16 @@ impl GoalRoundRequest {
                 {
                     return Err(Error::new(
                         "unknown",
-                        "blocked goal.round response must carry only a reason",
+                        "blocked or retryable goal.round response must carry only a reason",
+                    ));
+                }
+                if response.outcome == GoalRoundOutcome::Retryable
+                    && (response.view.status != GoalStatus::Active
+                        || response.reason.as_deref() != Some(CHECK_SPAWN_RETRYABLE))
+                {
+                    return Err(Error::new(
+                        "unknown",
+                        "retryable goal.round response requires an active Goal and a start failure",
                     ));
                 }
             }
@@ -972,6 +982,42 @@ pub enum GoalRoundOutcome {
     Completed,
     Blocked,
     Continued,
+    Retryable,
+}
+
+/// Data of a retained `goal.round` event. The enclosing event binds the
+/// Agent and generation. Observations remain in the owner-only Goal view.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GoalRoundEvent {
+    pub id: String,
+    pub mode: GoalMode,
+    pub revision: i64,
+    pub round_key: String,
+    pub outcome: GoalRoundEventOutcome,
+    pub reason: Option<String>,
+    pub exit_code: Option<i32>,
+}
+
+#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalRoundEventOutcome {
+    Completed,
+    Blocked,
+    Continued,
+    Retryable,
+    Unknown,
+}
+
+impl From<GoalRoundOutcome> for GoalRoundEventOutcome {
+    fn from(outcome: GoalRoundOutcome) -> Self {
+        match outcome {
+            GoalRoundOutcome::Completed => Self::Completed,
+            GoalRoundOutcome::Blocked => Self::Blocked,
+            GoalRoundOutcome::Continued => Self::Continued,
+            GoalRoundOutcome::Retryable => Self::Retryable,
+        }
+    }
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -980,7 +1026,7 @@ pub struct GoalRoundResponse {
     /// The original round mutation id, separate from its optional SEND id.
     pub id: String,
     pub outcome: GoalRoundOutcome,
-    /// Blocked only.
+    /// Blocked or retryable only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     /// Continued only; the distinct SEND id frozen when the round was claimed.

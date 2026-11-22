@@ -74,7 +74,8 @@ impl Router {
         }
         if let Some(action) = action {
             if compact {
-                self.submit(&action, &Principal::Owner).await?;
+                self.submit(&action, &Principal::Owner, "daemon.session_growth")
+                    .await?;
             } else {
                 self.swarm_switch(&action, &Principal::Owner).await?;
             }

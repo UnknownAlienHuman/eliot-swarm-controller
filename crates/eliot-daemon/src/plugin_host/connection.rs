@@ -285,19 +285,28 @@ impl PluginClient {
             .await;
         if let Some(started) = debug_started {
             let elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-            let (code, error_code) = match &result {
-                Ok(_) => ("plugin.call.ok", String::new()),
-                Err(error) => ("plugin.call.error", error.code.clone()),
-            };
-            crate::logging::record_debug(
-                &SecretPolicy::default(),
-                code,
-                &[("method", method), ("code", error_code.as_str())],
-                &[
-                    ("elapsed_ms", elapsed_ms),
-                    ("ok", u64::from(result.is_ok())),
-                ],
-            );
+            let fields = [
+                ("elapsed_ms", elapsed_ms),
+                ("ok", u64::from(result.is_ok())),
+            ];
+            match &result {
+                Ok(_) => crate::logging::record_debug(
+                    &SecretPolicy::default(),
+                    "plugin.call.ok",
+                    &[("method", method)],
+                    &fields,
+                ),
+                Err(error) => crate::logging::record_debug(
+                    &SecretPolicy::default(),
+                    "plugin.call.error",
+                    &[
+                        ("producer", "daemon.plugin_host"),
+                        ("method", method),
+                        ("error_code", error.code.as_str()),
+                    ],
+                    &fields,
+                ),
+            }
         }
         result
     }

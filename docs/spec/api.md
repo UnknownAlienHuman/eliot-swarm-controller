@@ -740,6 +740,23 @@ When explicit Claude profile cmd paths no longer exist, status and doctor return
 `claude_profile_command_issues` with the configured path, discovered replacement
 path/version, and one-command repair when a replacement is installed.
 
+`daemon.status` includes `build_identity`: the package version with a short Git
+revision suffix (or `git-unknown` when built without an available repository),
+the full compile-time `git_sha`, the parent directory of the running executable,
+and its exact SHA-256. The version adds `-dirty` for tracked Git changes,
+including staged changes, unstaged edits and deletions. A failed status query with
+a valid `HEAD` adds `-tree-unknown`. Cargo watches the worktree index and the
+tracked paths from `git ls-files -z`, so edits and dirty-to-clean transitions
+refresh the marker even when `HEAD` stays the same.
+The daemon computes the executable hash once at startup and reuses that snapshot
+in status and the `daemon.build_identity` startup log record. `git_sha`,
+`executable_directory`, and `executable_sha256` are null when their source cannot
+be read; an archive build does not inherit an enclosing
+repository's commit. `swarm --version` and `daemon.json`'s `diagnostic_version`
+carry the same short revision suffix and literal `-dirty` marker. Human `swarm
+status` prints the identity in one line; JSON status retains the typed
+`build_identity` object.
+
 `daemon.status` also reports bounded, redacted runtime status for the two
 daemon-owned automation tasks (`rule_worker` and `goal_driver`) via Core
 `WorkerTaskStatus`/`WorkerTaskHealth`. `starting` means spawned but not yet past the
@@ -2569,7 +2586,8 @@ current blockers snapshot, while open it reflects the current fleet.
 `swarm daemon stop --drain` prints the retained `DaemonShutdownResponse` including
 `blockers` and `drain`; `swarm status` prints the typed `DaemonStatusResponse`
 including `blockers`, `unsettled_commands`, `unknown_commands`, `drain` and
-the retention view with store sizes, configured windows, SQLite page counts
+`build_identity`, and the retention view with store sizes, configured windows,
+SQLite page counts
 and `pruned_through`. It also reports the automatic cleanup policy and latest
 sweep outcome, and `claude_profile_command_issues` for missing explicit Claude
 profile executables.

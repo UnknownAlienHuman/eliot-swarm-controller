@@ -442,6 +442,10 @@ the connected product. Keep results in the PR/CI, not a permanent audit/readines
 - [x] Daemon update fences admission, waits for current work, starts the replacement
       or rolls back, and leaves continuation to boot recovery (#836).
 - [x] Explicit private stand creation and registered teardown of owned files (#837).
+- [x] Unrunnable Goal checks settle with a typed reason and retained round events
+      expose check outcomes (#802).
+- [x] Daemon logs attribute errors and count command storms. `swarm status` and
+      the startup log identify the executable directory, commit and hash (#806).
 - [ ] Automatic stand artifact registration and expiry, and cleanup of stand-created
       worktrees and branches in external repositories (#837).
 - [x] **Physical retention.** Wire retention settings to bounded Store cleanup invoked

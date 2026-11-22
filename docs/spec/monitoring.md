@@ -961,14 +961,37 @@ health, a bounded failure code while failed, and the restart count. A healthy
 run of at least one minute clears the consecutive-failure count. After five
 consecutive failures, the worker stays failed and the daemon records Owner
 attention. The daemon log retains the final error if the notice cannot be
-committed. Shutdown cancels pending retries. A worker restart reconciles
-retained state and keeps the normal Store and router gates on effects.
+committed. Failure records identify the authenticated principal, an
+unauthenticated caller, or the system producer, and name the RPC method or
+internal operation/command. Each carries a bounded, redacted cause and available
+typed failure diagnostics. Logs omit request payloads, credentials, and
+unrecognized method text. Shutdown cancels pending retries. A worker restart
+reconciles retained state and keeps the normal Store and router gates on effects.
 
 `watch`, `top`, `show`, `daemon.status` query projections/events. They expose generation,
 active/unknown turn/input/transition gate, source owner/cursor/gap, custody
 capability/orphans, provider hold, workspace phase, requested/effective route and
 Git/edit facts. A stale or unknown value is shown explicitly, never hidden or converted
 to zero.
+
+An Agent diagnosis includes its retained Eliot Goal status, pause or block reason,
+generation binding when it differs from the current Agent, and any running or unknown
+round marker. A blocked check includes its bounded observation and can explain the
+diagnosis of an otherwise idle Agent.
+
+The standard log records `daemon.command_storm` once when an authenticated
+principal/method pair accumulates at least 32 refused submissions in its ten-second
+window. Accepted attempts still contribute to the reported attempt and accepted
+counts. Remote connection ids are retained only in a bounded in-memory set for
+deduplication and never written to the log. The record includes numeric
+`connection_count`, exact through 64; a value of 65 with `connections_overflow` set
+means at least 65 distinct connections. One redacted representative rule id may use
+the existing `source` field. Direct internal producers keep their method labels,
+including internal mail and attribution notices, daemon archive, attention, and
+admitted rule actions. Later dispatch outcomes stay in command history. The daemon
+shares the existing 1024-entry repeated-failure counter and flushes qualifying storm
+windows on closure or maintenance shutdown. These diagnostics leave admission and
+retry behavior unchanged.
 
 Fleet usage cells (`agent.list`, `swarm ls`, `swarm top`, desktop Monitor)
 sum uncached input, cached input and output on the [shared usage basis](core.md).

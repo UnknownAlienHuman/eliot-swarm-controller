@@ -20,6 +20,7 @@ impl Router {
                 "message": message,
             }}),
             &Principal::Owner,
+            "daemon.attention",
         ))
         .await?;
         wait_for_applied(self, &id).await
@@ -310,6 +311,7 @@ async fn route_notice(
                     "title": title, "message": format!("{text} ({incident_id})")
                 }}),
                 &Principal::Owner,
+                "daemon.attention",
             )
             .await?;
         wait_for_applied(router, owner_id).await?;
