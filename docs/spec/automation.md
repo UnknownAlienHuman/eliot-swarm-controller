@@ -902,10 +902,12 @@ custody and picks one top-level [candidate](monitoring.md#background-process-wak
 started inside a native tool call of that completing turn: the first process still
 running from the newest such call. A process started
 outside every tool call, such as a harness notify helper at turn end, never arms.
-A process from an earlier turn does not arm either, nor does one bound only to a
-call the harness runs as its own background task (`native_background` on
-`tool.started`, Claude `run_in_background`), because the harness wakes itself when
-that task ends. Swarm retains one `waiting`
+A process from an earlier turn does not arm either. While the harness still runs a
+call as its own background task (`native_background` on `tool.started`, Claude
+`run_in_background`), a process bound only to that call does not arm, because the
+harness wakes itself when that task ends. When `tool.background_ended` commits for
+a completed turn, Swarm inspects custody again and arms for a process that outlived
+the task. Swarm retains one `waiting`
 row in `background_process_wakes`. Nothing arms when the turn ended with a stop or
 interrupt, when it ran no native tool (including a turn started by a wake), or
 when the Agent has an open or same-turn
@@ -922,8 +924,8 @@ When that exact process identity exits, Swarm delivers one note in the
 That is an `inject` into an active turn whose context points allow it, otherwise
 an ordinary `send` with the reserved delivery command id. The command journal
 attributes both to the Swarm principal `swarm_note:background_process_wake`, never
-`owner`. The note gives the pid, the exit code (or `unknown`), the redacted process
-command line (at most 512 bytes), and a bounded output tail when exactly one tool
+`owner`. The note gives the pid, the raw OS process exit code (or `unknown`; Git
+Bash `exit 7` reads 1792 on Windows), the redacted process command line (at most 512 bytes), and a bounded output tail when exactly one tool
 call contains the process start and its `tool.completed` captured one at arm time.
 When several tool calls contain the start, the note says the tail was omitted.
 Redaction of the command and tail masks known Swarm secrets literally plus common shapes: `--password`,

@@ -67,7 +67,9 @@ attributed to the foreground turn. A task-notification result without a current
 input UUID never settles that turn; with an exact UUID it may settle the
 consumed input, while the autonomous output remains omitted. A `tool_use` with
 `input.run_in_background = true` commits `native_background: true` on `tool.started`,
-because Claude wakes itself when that task ends.
+because Claude wakes itself when that task ends. The `task_notification` naming that
+`tool_use_id` commits `tool.background_ended` with the turn that started the call.
+`tool.started` and `tool.completed` carry the frame `timestamp` as `native_at_ms`.
 
 ## Transport
 

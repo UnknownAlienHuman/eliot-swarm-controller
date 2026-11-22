@@ -114,6 +114,13 @@ pub fn reset(value: Option<&Value>) -> Option<i64> {
         _ => None,
     }
 }
+/// Unix milliseconds of a native RFC 3339 frame timestamp.
+pub fn rfc3339_ms(value: Option<&Value>) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(value?.as_str()?)
+        .ok()
+        .map(|at| at.timestamp_millis())
+        .filter(|at| *at > 0)
+}
 pub fn window(
     label: &str,
     percent: Option<f64>,

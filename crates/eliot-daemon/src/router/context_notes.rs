@@ -78,7 +78,11 @@ impl Router {
         if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
             return Ok(());
         }
-        if event.kind == "turn.completed" && event.source == "stream" {
+        if matches!(
+            event.kind.as_str(),
+            "turn.completed" | "tool.background_ended"
+        ) && event.source == "stream"
+        {
             // Before the fact-note early return, and without the Store lock held.
             if let Err(error) = self.maybe_arm_background_wake(event).await {
                 crate::logging::record(

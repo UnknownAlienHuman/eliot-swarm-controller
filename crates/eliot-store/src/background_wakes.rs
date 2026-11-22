@@ -21,6 +21,7 @@ const MAX_PRE_ADMISSION_ATTEMPTS: u32 = 5;
 const MAX_DECLARATION_SCAN_ROWS: i64 = 128;
 const MAX_DECLARED_COMMAND_BYTES: i64 = 4_096;
 const MAX_TOOL_WINDOWS: i64 = 128;
+const MAX_ENDED_TASK_SCAN_ROWS: i64 = 1_024;
 const MAX_TAIL_SCAN_CHARS: i64 = 4_096;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -59,16 +60,20 @@ pub struct BackgroundWakeRecord {
     pub expires_at: i64,
 }
 
-/// One native tool call of the completing turn. `completed_at` is `None` while
-/// the call has no committed `tool.completed`.
+/// One native tool call of the completing turn. Times are the harness's own
+/// (`native_at_ms`) when it reports them, else the event commit time.
+/// `completed_at` is the end of the call, or of its harness background task;
+/// `None` while that end is not committed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BackgroundWakeToolWindow {
     pub item_id: String,
     pub started_at: i64,
     pub completed_at: Option<i64>,
-    /// The harness tracks this call as its own background task and wakes
-    /// itself when the task ends.
-    pub native_background: bool,
+    /// `started_at` is the harness's own clock reading, not a commit time.
+    pub native_clock: bool,
+    /// The harness still runs this call as its own background task and will
+    /// wake itself when the task ends.
+    pub harness_waiting: bool,
 }
 
 /// Everything the Router needs to pick a candidate, read in one short
@@ -143,9 +148,12 @@ impl Store {
         // The newest native tool calls of this completing turn. Each kind reads
         // its own partial-index range, newest first, so a long turn keeps the
         // calls most likely to have left a process running.
-        let read_tool_times = |kind: &str| -> Result<Vec<(String, i64, bool)>> {
+        let read_tool_times = |kind: &str| -> Result<Vec<(String, i64, bool, bool)>> {
             let sql = format!(
-                "SELECT json_extract(data, '$.item_id'), ts,
+                "SELECT json_extract(data, '$.item_id'),
+                        CASE json_type(data, '$.native_at_ms')
+                            WHEN 'integer' THEN json_extract(data, '$.native_at_ms') ELSE ts END,
+                        json_type(data, '$.native_at_ms') IS 'integer',
                         json_extract(data, '$.native_background') IS 1
                  FROM events INDEXED BY events_tool_turn
                  WHERE agent = ?1 AND generation = ?2
@@ -160,25 +168,53 @@ impl Store {
             let rows = statement
                 .query_map(
                     params![agent_num, generation, turn_id, MAX_TOOL_WINDOWS],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .map_err(sql_error)?;
             rows.collect::<rusqlite::Result<_>>().map_err(sql_error)
         };
         let completed: HashMap<String, i64> = read_tool_times("tool.completed")?
             .into_iter()
-            .map(|(item_id, completed_at, _)| (item_id, completed_at))
+            .map(|(item_id, completed_at, _, _)| (item_id, completed_at))
             .collect();
+        // Harness background tasks that have ended. The kind has few rows, so
+        // a bounded newest-first scan of its index stays short.
+        let mut ended_tasks = self
+            .connection
+            .prepare(
+                "SELECT json_extract(data, '$.item_id'), ts
+                 FROM (SELECT agent, generation, source, data, ts
+                       FROM events INDEXED BY events_kind
+                       WHERE kind = 'tool.background_ended' ORDER BY seq DESC LIMIT ?4)
+                 WHERE agent = ?1 AND generation = ?2 AND source = 'stream'
+                   AND json_extract(data, '$.turn_id') = ?3
+                   AND json_type(data, '$.item_id') = 'text'",
+            )
+            .map_err(sql_error)?;
+        let ended: HashMap<String, i64> = ended_tasks
+            .query_map(
+                params![agent_num, generation, turn_id, MAX_ENDED_TASK_SCAN_ROWS],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(sql_error)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(sql_error)?;
         context.tool_windows = read_tool_times("tool.started")?
             .into_iter()
-            .map(
-                |(item_id, started_at, native_background)| BackgroundWakeToolWindow {
-                    completed_at: completed.get(&item_id).copied(),
+            .map(|(item_id, started_at, native_clock, native_background)| {
+                let task_end = ended.get(&item_id).copied();
+                BackgroundWakeToolWindow {
+                    completed_at: if native_background {
+                        task_end
+                    } else {
+                        completed.get(&item_id).copied()
+                    },
+                    harness_waiting: native_background && task_end.is_none(),
                     item_id,
                     started_at,
-                    native_background,
-                },
-            )
+                    native_clock,
+                }
+            })
             .collect();
         if context.tool_windows.is_empty() {
             return Ok(None);

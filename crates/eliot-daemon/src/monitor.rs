@@ -2658,8 +2658,21 @@ fn refresh_process_timestamps(processes: &mut [ProcessRecord], cache: &Cache) {
     }
 }
 
-/// Linux converts start ticks with whole-second `btime`.
-const START_SKEW_MS: i64 = 1_000;
+/// How much earlier a recorded process start can read than the true spawn:
+/// one Windows system-time tick, or Linux's whole-second `btime`.
+#[cfg(windows)]
+const PROCESS_START_ROUNDING_MS: i64 = 16;
+#[cfg(not(windows))]
+const PROCESS_START_ROUNDING_MS: i64 = 1_000;
+/// Extra lower margin for a harness with no native tool times, whose
+/// `tool.started` time is the daemon commit. Measured commit lag was at most
+/// 6 ms with three concurrent Agents.
+const TOOL_COMMIT_LAG_MS: i64 = 100;
+/// How long after its start a call with no recorded end can still spawn.
+const OPEN_CALL_SPAWN_MS: i64 = 1_000;
+/// Windows custody is the Agent's Job, so every member descends from the
+/// session even after its launcher exits. A Linux process group proves less.
+const CUSTODY_PROVES_DESCENT: bool = cfg!(windows);
 
 fn harness_descendant_chain(
     pid: u32,
@@ -2670,7 +2683,8 @@ fn harness_descendant_chain(
     harness_pids: &HashMap<u32, u64>,
     plugin_pids: &HashMap<u32, u64>,
 ) -> Option<Vec<u32>> {
-    let after_harness = harness_pids.values().any(|&h_start| h_start <= start_time);
+    let after_harness =
+        CUSTODY_PROVES_DESCENT && harness_pids.values().any(|&h_start| h_start <= start_time);
     let mut chain = Vec::new();
     let mut seen = HashSet::from([pid]);
     let mut current_pid = pid;
@@ -2744,12 +2758,12 @@ fn matches_declared_command(
 /// The tool call binding of a process start: the item id when exactly one call
 /// contains it, and the start of the newest containing call.
 ///
-/// The lower bound allows for `tool.started` committing after the spawn and
-/// for Linux start-time rounding. The upper bound has no skew: `tool.completed`
-/// commits after the tool ended, so a post-turn harness helper never matches.
-/// A call still open at turn end covers only its own spawn, because the turn's
-/// end is when a harness starts its helpers. A process bound only to a call the
-/// harness runs as its own background task is skipped: the harness wakes itself.
+/// The lower bound allows for start-time rounding, plus commit lag when the
+/// harness reports no tool times. The upper bound is the call's end. A call
+/// with no recorded end covers only its own spawn, because the turn's end is
+/// when a harness starts its helpers. While the harness still runs a call as
+/// its own background task, a process bound only to that call is skipped: the
+/// harness wakes itself. Once that task ends, survivors are ordinary candidates.
 fn match_tool_window(
     proc_start_ms: i64,
     tool_windows: &[eliot_store::BackgroundWakeToolWindow],
@@ -2757,15 +2771,20 @@ fn match_tool_window(
     let containing: Vec<_> = tool_windows
         .iter()
         .filter(|window| {
+            let margin = if window.native_clock {
+                PROCESS_START_ROUNDING_MS
+            } else {
+                PROCESS_START_ROUNDING_MS + TOOL_COMMIT_LAG_MS
+            };
             let end = window
                 .completed_at
-                .unwrap_or_else(|| window.started_at.saturating_add(START_SKEW_MS));
-            proc_start_ms >= window.started_at.saturating_sub(START_SKEW_MS) && proc_start_ms <= end
+                .unwrap_or_else(|| window.started_at.saturating_add(OPEN_CALL_SPAWN_MS));
+            proc_start_ms >= window.started_at.saturating_sub(margin) && proc_start_ms <= end
         })
         .collect();
     match containing.as_slice() {
         [] => None,
-        [window] if window.native_background => None,
+        [window] if window.harness_waiting => None,
         [window] => Some((Some(window.item_id.clone()), window.started_at)),
         several => Some((None, several.iter().map(|window| window.started_at).max()?)),
     }

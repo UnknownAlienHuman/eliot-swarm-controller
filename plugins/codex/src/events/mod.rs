@@ -184,6 +184,8 @@ struct PendingNativeRequest {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct NativeItemStarted {
+    #[serde(default)]
+    started_at_ms: Option<i64>,
     item: Value,
     thread_id: String,
     turn_id: String,
@@ -1568,6 +1570,9 @@ impl EventProcessor {
                         "item_id": item_id,
                         "tool": item_type,
                     });
+                    if let Some(at) = notification.started_at_ms {
+                        data["native_at_ms"] = json!(at);
+                    }
                     if let Some(command) = command_text(&notification.item) {
                         data["command"] = Value::String(
                             SecretPolicy::new(self.secrets.iter().cloned())
@@ -1617,7 +1622,12 @@ impl EventProcessor {
                     self.complete_message(&notification.turn_id, &raw_item)
                         .await?;
                 } else if is_tool_type(item_type) {
-                    self.complete_tool(&notification.turn_id, &raw_item).await?;
+                    self.complete_tool(
+                        &notification.turn_id,
+                        &raw_item,
+                        notification.completed_at_ms,
+                    )
+                    .await?;
                 }
             }
             "turn/completed" => {
@@ -1677,7 +1687,12 @@ impl EventProcessor {
         Ok(())
     }
 
-    async fn complete_tool(&mut self, turn_id: &str, item: &Value) -> Result<()> {
+    async fn complete_tool(
+        &mut self,
+        turn_id: &str,
+        item: &Value,
+        completed_at_ms: i64,
+    ) -> Result<()> {
         let Some((item_id, item_type, native_status)) = tool_item(item) else {
             return self
                 .record_gap("Codex tool completion omitted its exact item id")
@@ -1700,6 +1715,7 @@ impl EventProcessor {
             "turn_id": turn_id,
             "item_id": item_id,
             "tool": item_type,
+            "native_at_ms": completed_at_ms,
         });
         if let Some(ref native_status) = native_status {
             data["status"] = Value::String(native_status.clone());

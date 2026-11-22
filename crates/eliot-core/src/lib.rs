@@ -2539,6 +2539,11 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
         "tool.file.edited" => {
             require_live_turn(agent, event)?;
         }
+        "tool.background_ended" => {
+            // A harness background task can outlive the turn that started it.
+            required_text(event, "turn_id")?;
+            required_text(event, "item_id")?;
+        }
         "hook.before_model" | "hook.after_tool" => {
             // Receipt authority stays in Store settlement: selection
             // (claim) requires the exact active turn, but a confirmed

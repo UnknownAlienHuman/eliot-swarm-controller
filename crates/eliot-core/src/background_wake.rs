@@ -160,7 +160,6 @@ pub fn is_harness_owned_process(
         if crate::CONSOLE_HOST_PROGRAMS.contains(&stem)
             || matches!(stem, "winpty-agent" | "conpty")
             || HARNESS_OWNED_STEMS.contains(&stem)
-            || stem.starts_with("codex-")
             || stem.starts_with("language_server_")
             || stem.starts_with("language-server-")
         {
@@ -345,7 +344,7 @@ pub fn format_background_wake_note_body(
         .map(|code| code.to_string())
         .unwrap_or_else(|| "unknown".to_owned());
     let mut body = format!(
-        "Background process exited (pid {pid}, exit code {code_str}).\n\
+        "Background process exited (pid {pid}, raw process exit code {code_str}).\n\
          Command: {command_line}{suffix}"
     );
     if let Some(tail) = output_tail.map(str::trim).filter(|tail| !tail.is_empty()) {

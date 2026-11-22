@@ -10,17 +10,23 @@ const BACKGROUND_WAKE_PAGE_SIZE: usize = 128;
 const BACKGROUND_WAKE_PRUNE_LIMIT: usize = 256;
 
 impl Router {
-    /// Inspect custody after a committed `turn.completed` and arm at most one
-    /// automatic background-process wake when an Agent-started process is still running.
+    /// Inspect custody after a committed `turn.completed`, or after a harness
+    /// background task of a completed turn ended, and arm at most one automatic
+    /// background-process wake when an Agent-started process is still running.
     pub(super) async fn maybe_arm_background_wake(&self, event: &Event) -> Result<()> {
-        if event.kind != "turn.completed" || event.source != "stream" {
+        if event.source != "stream" {
             return Ok(());
         }
         let outcome = event
             .data
             .get("outcome")
             .and_then(serde_json::Value::as_str);
-        if !matches!(outcome, Some("success" | "failure")) {
+        let arms = match event.kind.as_str() {
+            "turn.completed" => matches!(outcome, Some("success" | "failure")),
+            "tool.background_ended" => true,
+            _ => false,
+        };
+        if !arms {
             return Ok(());
         }
         let (Some(agent_id), Some(generation), Some(turn_id)) = (

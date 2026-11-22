@@ -147,15 +147,30 @@ attachment cannot issue either native stop or other control operations.
 The [automatic background-process wake](automation.md#automatic-background-process-wake)
 reads custody only. A candidate is a running `child` of the Agent generation with
 a complete fresh snapshot. Its OS start time (Unix ms) falls inside a native tool
-call window of the completing turn: from one second before the committed
-`tool.started` (commit lag and Linux `btime` rounding) up to the committed
-`tool.completed`. A call with no `tool.completed` covers only one second after its
-`tool.started`, because a harness starts its own helpers at turn end. A process
-whose only containing call has `native_background` is not a candidate. Sampling order
-and daemon restarts do not change this. Its parent chain reaches the live `harness`
-process without passing through the `plugin`, or breaks at an exited launcher for a
-process started after `harness`, as a detached job does. The chain has at most 16
-links. It must also not be harness-owned: console hosts, harness runtimes, language
+call window of the completing turn.
+
+Codex and Claude report their own tool start and end times (`native_at_ms`), so a
+helper they start after the call ended is outside the window under any daemon load.
+The lower bound allows for process start rounding: 16 ms on Windows, one second on
+Linux (whole-second `btime`). OpenCode, Muse and Antigravity report no tool times,
+so their window uses the commit times of `tool.started` and `tool.completed`, with
+100 ms more below the start. Measured commit lag was at most 7 ms with three
+concurrent Agents. On those harnesses, a job spawned more than that margin before
+its `tool.started` commit is missed, and a helper spawned after the tool ended but
+before `tool.completed` commits is admitted. A call with no recorded end covers one
+second after its start, because a harness starts its own helpers at turn end.
+
+While a harness still runs a call as its own background task (`native_background`
+on `tool.started`), a process bound only to that call is not a candidate, because
+the harness wakes itself when the task ends. When `tool.background_ended` commits,
+the window closes at that time and a process that outlived the task becomes a
+candidate. Sampling order and daemon restarts do not change this.
+
+On Windows custody is the Agent's Job, so every member descends from the session
+and a parent chain may break at an exited launcher, as a detached job's does. On
+Linux custody is a process group, so the exact chain (at most 16 links) must reach
+the live `harness`. Neither chain may pass through the `plugin`. A candidate must
+also not be harness-owned: console hosts, harness runtimes, language
 servers, or Swarm or configured MCP servers. When a candidate's ancestor also
 qualifies, the ancestor wins. On Windows Swarm opens a query handle to the armed
 identity and keeps it only once the wake commits, so the exact exit code survives the harness closing
