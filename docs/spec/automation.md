@@ -875,8 +875,9 @@ weaker send. `inject` requires an event trigger and is unsupported for timers.
 Swarm uses the same insertion path for notes about a confirmed edit outside the
 worktree or the frozen Goal scope, repeated command failures, and a turn with edits
 and no observed configured check before completion. Swarm does not queue
-`no_check_before_end` when an active automatic `on_idle` Goal round will run (or
-already ran) the same check for that idle point (#904, #868, #881). Notes bind to the captured
+`no_check_before_end` when the Goal's check already ran after the turn started, or
+when the automatic driver's own enablement, key, probe and gates admit a round for
+that idle point (#904, #868, #881). Notes bind to the captured
 Agent and generation. Git snapshots supply scope evidence when Swarm can bind
 the observation to a running turn. An edit note lists only paths not already
 noted for its kind in that generation. Up to four edit notes can be admitted
@@ -1653,11 +1654,13 @@ Agent state, pending requests, source health and unknown gates, and refuses
 unless the Agent is cleanly idle at that key: idle state, no active turn, no
 pending requests, every open harness source healthy (`daemon`/`os`/`git`/
 `workspace_process` monitors stay advisory), no unknown command, no open
-command (Swarm's own unclaimed `next_input` / `turn_safe_point` queued injections
-are excluded), and the key is fresh — an idle key names an idle event of that
-Agent generation and is still its latest (ignoring Swarm's own queued `next_input`
-notes, their moves/cancellations, and `stale_round` abandonment events, while a
-real newer turn or Owner/manager command still wins), a slot key names a due slot. A
+command, and the key is fresh — an idle key names an idle event of that
+Agent generation and is still its latest, a slot key names a due slot. A Swarm
+note is an `inject` from a `swarm_note:*` or `project_check` principal. An
+unclaimed queued note is not an open command, and no event of a note's lifecycle
+names an idle point or makes a key stale; neither does a `stale_round` abandonment
+event. An Owner or manager `next_input` inject stays an open command, so the round
+waits for it, and a real newer turn or command still wins. A
 turn budget already spent outside any round blocks without running the check. A
 budget spent solely by the Goal's own last admitted continuation is not outside
 any round: that round still runs its final check, and the postcheck budgets
@@ -1882,13 +1885,13 @@ skips cadenced Goals (slot-keyed), paused or terminal Goals, drifted
 generations, and anything while automation is draining; it waits while an
 active native Goal drives. The driver starts each automatic round in its own task
 and runs up to four across Goals. Automatic and explicit rounds share the same
-per-Goal single-flight marker. Swarm's own queued `next_input` note events do not
-schedule duplicate rounds or make a round stale; if an automatic round still hits
-`stale_round` while the Agent remains cleanly idle with no open commands, the driver
-retries with the fresh unconsumed idle key from Store without ever running twice for
-the same idle point (#904). The driver follows up on a newer event for a Goal
-when its in-flight round resolves. Bus events dropped past the cap or to
-bus lag are logged, as are queued waits and stale rounds. Other races
+per-Goal single-flight marker. Swarm note events schedule no round. After
+`stale_round`, the driver moves to the latest unspent idle key if it is strictly
+newer and sends it through the same gates, so no idle point runs twice and each
+retry needs a new real Agent event (#904). The driver follows up on a newer event for a Goal
+when its in-flight round resolves. An idle point past the cap waits for a free
+slot and then runs on the Goal's latest unspent key. Bus lag is logged and sweeps
+the retained idle subjects. Queued waits and stale rounds are logged. Other races
 against explicit rounds resolve through the
 single-flight marker and the burn and stay silent. Shutdown cancels every
 in-flight automatic check through its custody cancellation and waits only for

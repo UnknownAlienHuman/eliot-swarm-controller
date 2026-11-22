@@ -630,22 +630,7 @@ impl Router {
             pending_decision: None,
             workspace_permit,
         };
-        let turns_used = probe
-            .turn_count
-            .saturating_sub(probe.view.counters.turns_at_set);
-        // A turn budget spent outside any round blocks without running the
-        // check. A budget spent solely by this Goal's own last admitted
-        // continuation still gets its final check: success completes even
-        // on a spent budget, and a failure blocks at the postcheck below,
-        // admitting no further continuation. Round and no-progress budgets
-        // are decided after the check.
-        if probe
-            .view
-            .definition
-            .max_turns
-            .is_some_and(|max| turns_used >= max)
-            && !probe.spent_by_goal_continuation
-        {
+        if turn_budget_blocks_check(&probe) {
             return claimed
                 .commit_decision(
                     &probe,
@@ -1156,9 +1141,26 @@ fn goal_round_gates(probe: &eliot_store::GoalRoundProbe, key: GoalRoundKey) -> R
     Ok(())
 }
 
+/// A turn budget spent outside any round blocks without running the check.
+/// A budget spent solely by this Goal's own last admitted continuation still
+/// gets its final check: success completes even on a spent budget, and a
+/// failure blocks at the postcheck, admitting no further continuation. Round
+/// and no-progress budgets are decided after the check.
+fn turn_budget_blocks_check(probe: &eliot_store::GoalRoundProbe) -> bool {
+    let turns_used = probe
+        .turn_count
+        .saturating_sub(probe.view.counters.turns_at_set);
+    probe
+        .view
+        .definition
+        .max_turns
+        .is_some_and(|max| turns_used >= max)
+        && !probe.spent_by_goal_continuation
+}
+
 /// Most automatic Goal rounds in flight at once. One slow check must
-/// not stall other Goals' rounds; past the cap extra idle events are
-/// dropped (logged) until a round finishes.
+/// not stall other Goals' rounds; past the cap an idle point waits for a
+/// free slot.
 const MAX_CONCURRENT_AUTO_ROUNDS: usize = 4;
 
 /// One automatic round in flight: its check cancellation plus the key
@@ -1189,10 +1191,10 @@ struct PendingReconcile {
 /// driven as a follow-up when that round resolves, so the fresh key is
 /// never silently dropped. A `goal.set`/`goal.resume` notification sweeps
 /// the retained idle subjects through the same reservation without
-/// re-offering mail; a retained subject that finds its Goal busy or the
-/// cap full waits in revision-bound order and is revalidated when a round
-/// resolves. Bus lag, bus-event cap drops, queued waits and stale rounds
-/// are logged; other lost races stay silent. Shutdown cancels every
+/// re-offering mail; a subject that finds its Goal busy or the cap full
+/// waits in revision-bound order and is revalidated when a round resolves.
+/// Bus lag repeats that sweep. Bus lag, queued waits and stale rounds are
+/// logged; other lost races stay silent. Shutdown cancels every
 /// in-flight check through its custody cancellation and waits only for the
 /// rounds to resolve their markers (`unknown`, never rerun), never for a
 /// check to finish on its own.
@@ -1258,6 +1260,16 @@ pub(crate) async fn run_goal_driver(
                         &[("skipped", &skipped.to_string())],
                         None,
                     );
+                    // A skipped event may be a Goal's only idle signal.
+                    reconcile_idle_goals(
+                        &router,
+                        run_check,
+                        &mut rounds,
+                        &mut in_flight,
+                        &mut pending,
+                        &mut pending_reconcile,
+                    )
+                    .await;
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     return Err(Error::new("unavailable", "event bus is closed"));
@@ -1343,7 +1355,7 @@ enum IdleSubject {
 
 /// Start one automatic round for an idle event unless its Goal already
 /// has one in flight — then a newer event is remembered for a follow-up —
-/// or the global cap is reached (the event is dropped and logged).
+/// or the global cap is reached — then the idle point waits for a free slot.
 async fn spawn_auto_round(
     router: &Router,
     run_check: GoalCheckRunner,
@@ -1380,9 +1392,40 @@ async fn spawn_auto_round(
     if !idle_goal_is_eligible(router, &agent, event.generation).await {
         return;
     }
-    if is_swarm_next_input_note_event(&event) {
+    // A Swarm note never names an idle point. On a read error the round's own
+    // key check stays the authority.
+    if router
+        .inner
+        .store
+        .lock()
+        .await
+        .goal_event_is_swarm_note(event.seq)
+        .unwrap_or(false)
+    {
         return;
     }
+    let subject = match event.generation {
+        Some(generation)
+            if in_flight.len() >= MAX_CONCURRENT_AUTO_ROUNDS
+                && !in_flight.contains_key(&agent)
+                && event
+                    .subject
+                    .as_ref()
+                    .is_some_and(|subject| subject.state == AgentState::Idle) =>
+        {
+            let goal = router.inner.store.lock().await.goal_get(&agent, "eliot");
+            let Ok(Some(goal)) = goal else {
+                return;
+            };
+            IdleSubject::Retained {
+                agent,
+                generation,
+                revision: goal.revision,
+                seq: event.seq,
+            }
+        }
+        _ => IdleSubject::Event(Box::new(event)),
+    };
     reserve_idle_round(
         router,
         run_check,
@@ -1390,7 +1433,7 @@ async fn spawn_auto_round(
         in_flight,
         pending,
         pending_reconcile,
-        IdleSubject::Event(Box::new(event)),
+        subject,
     );
 }
 
@@ -1437,9 +1480,8 @@ fn remember_reconcile_wait(
 /// four Goals at once, through the same round path. A newer event for a
 /// Goal with a round in flight is remembered for a follow-up; a retained
 /// subject that loses its race waits in revision-bound order instead of
-/// going silent. A retained subject past the cap waits for a free slot
-/// instead of dropping — only bus events are dropped at the cap — and
-/// the Store single-flight marker covers explicit rounds.
+/// going silent. A subject past the cap waits for a free slot, and the
+/// Store single-flight marker covers explicit rounds.
 fn reserve_idle_round(
     router: &Router,
     run_check: GoalCheckRunner,
@@ -1510,14 +1552,6 @@ fn reserve_idle_round(
                 &[("agent", &agent)],
                 None,
             );
-        } else {
-            let policy = router.secret_policy_snapshot();
-            crate::logging::record(
-                &policy,
-                "daemon.goal_auto_round_dropped",
-                &[("agent", &agent)],
-                None,
-            );
         }
         return;
     }
@@ -1568,19 +1602,27 @@ async fn idle_goal_is_eligible(router: &Router, agent: &str, generation: Option<
     true
 }
 
-/// Swarm's own queued `next_input` notes and their superseding rejections.
-/// They never make an idle Goal round stale or create a second idle key.
-fn is_swarm_next_input_note_event(event: &Event) -> bool {
-    event.source == "daemon"
-        && ((event.kind == "command.accepted"
-            && event.data["verb"] == "inject"
-            && event.data["application_point"] == "next_input"
-            && event.data["note_kind"].is_string())
-            || (event.kind == "command.rejected"
-                && matches!(
-                    event.data["outcome"]["code"].as_str(),
-                    Some("task_card_superseded" | "project_check_superseded")
-                )))
+impl Router {
+    /// Whether the automatic driver will run this Goal's check at the Agent's
+    /// current idle point, or is already running it. Uses the driver's own
+    /// enablement, key, probe and gates. A scope violation is only known to
+    /// the round, which then blocks the Goal for the Owner.
+    pub(super) async fn goal_auto_round_will_check(&self, agent: &str, generation: i64) -> bool {
+        if !self.rule_firings_open() || !idle_goal_is_eligible(self, agent, Some(generation)).await
+        {
+            return false;
+        }
+        let mut store = self.inner.store.lock().await;
+        let Ok(Some(seq)) = store.goal_latest_idle_key(agent, generation) else {
+            return false;
+        };
+        let key = GoalRoundKey::Idle(seq);
+        match store.goal_round_probe(agent, "eliot", key, now_ms()) {
+            Ok(probe) => goal_round_gates(&probe, key).is_ok() && !turn_budget_blocks_check(&probe),
+            // Only a live round marker refuses the probe as busy.
+            Err(error) => error.code == "busy",
+        }
+    }
 }
 
 /// Shared automatic-round driver for one exact-generation idle subject:
@@ -1589,8 +1631,11 @@ fn is_swarm_next_input_note_event(event: &Event) -> bool {
 /// A busy Agent, a drifted generation or a consumed key stays silent and
 /// waits for the next real event; only the round path itself may pause a
 /// drifted Goal, so this returns before any probe when generations differ.
-/// If `stale_round` occurs while the Agent remains cleanly idle with no
-/// open commands, retry with the fresh unconsumed idle key from Store.
+/// After `stale_round` it moves to a strictly newer unspent idle key, so no
+/// idle point runs twice and each retry needs a new real Agent event. Events
+/// the driver does not schedule from, such as advisory attention, can make a
+/// round stale without a follow-up, so this retry is what keeps the Goal
+/// moving.
 async fn drive_goal_at_idle(
     router: &Router,
     run_check: GoalCheckRunner,
@@ -1599,8 +1644,7 @@ async fn drive_goal_at_idle(
     mut idle_seq: i64,
     cancellation: watch::Receiver<bool>,
 ) -> i64 {
-    let mut tried = std::collections::BTreeSet::new();
-    while tried.insert(idle_seq) && tried.len() <= 4 {
+    loop {
         if !router.rule_firings_open() || *cancellation.borrow() {
             return idle_seq;
         }
@@ -1631,17 +1675,18 @@ async fn drive_goal_at_idle(
                     &[("agent", agent)],
                     Some(&error),
                 );
-                let next_seq = {
-                    let store = router.inner.store.lock().await;
-                    store
-                        .goal_retry_idle_seq(agent, generation, idle_seq)
-                        .ok()
-                        .flatten()
-                };
-                let Some(next_seq) = next_seq.filter(|seq| !tried.contains(seq)) else {
-                    return idle_seq;
-                };
-                idle_seq = next_seq;
+                let next_seq = router
+                    .inner
+                    .store
+                    .lock()
+                    .await
+                    .goal_latest_idle_key(agent, generation)
+                    .ok()
+                    .flatten();
+                match next_seq {
+                    Some(seq) if seq > idle_seq => idle_seq = seq,
+                    _ => return idle_seq,
+                }
             }
             Err(error)
                 if matches!(
@@ -1663,7 +1708,6 @@ async fn drive_goal_at_idle(
             }
         }
     }
-    idle_seq
 }
 
 /// Sweep the retained idle subjects after `goal.set`/`goal.resume`.
@@ -1763,8 +1807,11 @@ async fn drain_pending_reconcile(
     joined: &str,
 ) {
     while in_flight.len() < MAX_CONCURRENT_AUTO_ROUNDS {
-        let next = pending_reconcile
-            .remove(joined)
+        // A joined Goal whose follow-up already runs keeps its wait until
+        // that round joins; taking it here would only park it again.
+        let next = (!in_flight.contains_key(joined))
+            .then(|| pending_reconcile.remove(joined))
+            .flatten()
             .map(|waiting| {
                 (
                     joined.to_owned(),
@@ -1785,18 +1832,21 @@ async fn drain_pending_reconcile(
         let Some((agent, generation, revision, seq)) = next else {
             break;
         };
-        let eligible = {
+        // A newer unspent key of the same revision replaces the one this
+        // subject waited on: events the driver skips can still advance it.
+        let latest = {
             let store = router.inner.store.lock().await;
             match store.goal_reconcile_candidates() {
                 Ok(candidates) => candidates
                     .into_iter()
-                    .find(|candidate| candidate.agent == agent)
-                    .is_some_and(|candidate| {
-                        candidate.generation == generation
+                    .find(|candidate| {
+                        candidate.agent == agent
+                            && candidate.generation == generation
                             && candidate.revision == revision
-                            && candidate.idle_seq == Some(seq)
                             && !candidate.key_consumed
-                    }),
+                    })
+                    .and_then(|candidate| candidate.idle_seq)
+                    .filter(|latest| *latest >= seq),
                 Err(error) => {
                     let policy = router.secret_policy_snapshot();
                     crate::logging::record(
@@ -1817,7 +1867,7 @@ async fn drain_pending_reconcile(
                 }
             }
         };
-        if !eligible {
+        let Some(seq) = latest else {
             let policy = router.secret_policy_snapshot();
             crate::logging::record(
                 &policy,
@@ -1826,7 +1876,7 @@ async fn drain_pending_reconcile(
                 None,
             );
             continue;
-        }
+        };
         spawn_reconcile_round(
             router,
             run_check,

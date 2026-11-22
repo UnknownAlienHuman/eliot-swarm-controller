@@ -35,7 +35,7 @@ impl Router {
             return Ok(Vec::new());
         };
 
-        let (agent, launch_goal, goal, native_driving, edits, turn, evidence) = {
+        let (agent, launch_goal, goal, edits, turn, evidence) = {
             let store = self.inner.store.lock().await;
             let Some(agent) = store.get_agent(agent_id)? else {
                 return Ok(Vec::new());
@@ -45,7 +45,6 @@ impl Router {
             }
             let launch_goal = store.launch_goal_definition(agent_id, generation)?;
             let goal = store.goal_get(agent_id, "eliot")?;
-            let native_driving = store.goal_native_driving(agent_id)?;
             let terminal = event.kind == "turn.completed";
             let edits = if terminal {
                 store.list_agent_edits(agent_id, generation, None, MAX_AGENT_EDITS_READ)?
@@ -69,15 +68,7 @@ impl Router {
                 }
                 _ => (Vec::new(), false),
             };
-            (
-                agent,
-                launch_goal,
-                goal,
-                native_driving,
-                edits,
-                turn,
-                evidence,
-            )
+            (agent, launch_goal, goal, edits, turn, evidence)
         };
 
         let workspace = agent.workspace.as_deref();
@@ -171,21 +162,17 @@ impl Router {
                     && edit.updated_at >= started_at
                     && edit.updated_at <= completed_at
             });
+            // No upper bound: a Goal round commits only while the Agent is
+            // idle, so its check always lands after this turn and covers the
+            // turn's final files. Bounding it by `completed_at` would report a
+            // finished round for this idle point as a missing check.
             let check_ran = check_observed
                 || goal
                     .counters
                     .last_check_at
                     .is_some_and(|checked_at| checked_at >= started_at);
-            let auto_round_will_check = !agent.observe_only
-                && !native_driving
-                && event
-                    .subject
-                    .as_ref()
-                    .is_some_and(|subject| subject.state == eliot_core::AgentState::Idle)
-                && goal.status == eliot_core::api::GoalStatus::Active
-                && goal.definition.cadence_ms.is_none()
-                && goal.definition.check == definition.check;
-            if edited && !check_ran && !auto_round_will_check {
+            if edited && !check_ran && !self.goal_auto_round_will_check(agent_id, generation).await
+            {
                 facts.push(InsertionFact::NoCheckBeforeEnd);
             }
         }
