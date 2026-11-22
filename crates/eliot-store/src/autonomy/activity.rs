@@ -227,49 +227,22 @@ fn read_notes(
     since: i64,
     until: i64,
 ) -> eliot_core::Result<AutonomyRow<AutonomyNotes>> {
-    let (injects, injects_over) = bounded_count(
-        tx,
-        concat!(
-            "SELECT COUNT(*), COALESCE(SUM(from_swarm), 0) FROM (
-                 SELECT json_type(e.cause, '$.rule') IS 'text'
-                        OR json_type(c.cause, '$.rule') IS 'text'
-                        OR c.principal IN ('project_check', 'swarm', 'attention') AS from_swarm
-                 FROM (
-                     SELECT data, cause FROM events INDEXED BY autonomy_activity_inject_window
-                     WHERE ",
-            inject_applied!(),
-            " AND ts BETWEEN ?1 AND ?2
-                     ORDER BY ts, seq LIMIT ?3
-                 ) e
-                 LEFT JOIN commands c ON c.id = json_extract(e.data, '$.command_id')
-             )",
-        ),
-        since,
-        until,
-    )?;
-    let (mail, mail_over) = bounded_count(
-        tx,
-        "SELECT COUNT(*), COALESCE(SUM(from_swarm), 0) FROM (
-             SELECT json_extract(data, '$.sender') IS 'swarm' AS from_swarm
-             FROM events INDEXED BY autonomy_activity_events_window
-             WHERE kind = 'mail.delivered' AND ts BETWEEN ?1 AND ?2
-             ORDER BY ts, seq LIMIT ?3
-         )",
-        since,
-        until,
-    )?;
-    let mut reasons =
-        vec!["command retention can remove principal attribution for applied injects".into()];
-    if injects_over || mail_over {
-        add_cap_reason(&mut reasons, "context and mail facts");
+    let (by_kind, truncated) = crate::context::notes::read_counters(tx, since, until)?;
+    let counts = AutonomyNotes {
+        delivered: by_kind.iter().map(|kind| kind.delivered).sum(),
+        moved: by_kind.iter().map(|kind| kind.moved).sum(),
+        cancelled: by_kind.iter().map(|kind| kind.cancelled).sum(),
+        by_kind,
+    };
+    let mut row = AutonomyRow::partial(
+        "retained fact-note settlements and context moves",
+        "older outcomes without fact-note provenance are outside this source",
+        counts,
+    );
+    if truncated {
+        row.limit_coverage("the fact-note outcome scan reached its limit");
     }
-    Ok(coverage_row(
-        "inject command.applied and mail.delivered sender swarm",
-        reasons,
-        AutonomyNotes {
-            delivered: injects + mail,
-        },
-    ))
+    Ok(row)
 }
 
 /// The probe row establishes truncation. Including it in the lower bound

@@ -39,6 +39,9 @@ const RPC_VERSION = 1;
 const HOOK_TTL_MS = 10_000;
 // Upper bound on one `next` poll so no handler waits unboundedly.
 const MAX_WAIT_MS = 120_000;
+// Once this input has accumulated a full RPC frame of context, offer no
+// further claims. The daemon can carry unclaimed notes to the next input.
+const CONTEXT_OFFER_LIMIT_BYTES = 4 * 1024 * 1024;
 
 const Definition = Rpc.define({
   id: RPC_ID,
@@ -152,6 +155,10 @@ export default Plugin.define({
     // instead of `mismatch`. Never a second live hook.
     let lastExpired = null;
     let sequence = 0;
+    let deliveredMessageID = null;
+    let deliveredParts = [];
+    let deliveredBytes = 0;
+    const utf8 = new TextEncoder();
 
     const describeHook = (record) => ({
       hookID: record.hookID,
@@ -191,6 +198,18 @@ export default Plugin.define({
         if (pending !== null) return;
         const messageID = lastUserMessageID(event.messages);
         if (messageID === null) return;
+        if (!Array.isArray(event.system)) return;
+        if (deliveredMessageID !== messageID) {
+          deliveredMessageID = messageID;
+          deliveredParts = [];
+          deliveredBytes = 0;
+        }
+        // OpenCode reconstructs the system draft after each tool call. Keep
+        // the already applied parts visible for this exact native input.
+        for (const part of deliveredParts) {
+          if (!event.system.includes(part)) event.system.push(part);
+        }
+        if (deliveredBytes >= CONTEXT_OFFER_LIMIT_BYTES) return;
         sequence += 1;
         const started = nowMs();
         let release = null;
@@ -321,7 +340,10 @@ export default Plugin.define({
             record.settle();
             throw new Error("eliot-context system unavailable");
           }
-          system.push({ type: "text", text: contextText });
+          const part = { type: "text", text: contextText };
+          system.push(part);
+          deliveredParts.push(part);
+          deliveredBytes += utf8.encode(contextText).length;
           record.settle();
           return { status: "applied" };
         }
@@ -341,6 +363,8 @@ export default Plugin.define({
     const hookRegistration = await ctx.session.hook("context", onContext);
     return async () => {
       closed = true;
+      deliveredParts = [];
+      deliveredMessageID = null;
       if (waiter !== null) {
         const current = waiter;
         waiter = null;

@@ -3,10 +3,35 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-/// The dispatch boundary at which an injected context item may be applied.
+/// Persisted file edit evidence never includes an absolute path.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ContextEditPath {
+    Relative { path: String },
+    OutsideOrUnverifiable { sha256: String, basename: String },
+}
+
+impl ContextEditPath {
+    pub fn outside(path: &str, policy: &crate::SecretPolicy) -> Self {
+        let basename = path
+            .rsplit(['/', '\\'])
+            .find(|part| !part.is_empty())
+            .filter(|name| !name.chars().any(char::is_control))
+            .unwrap_or("unavailable");
+        let basename = policy.redact_text(basename);
+        Self::OutsideOrUnverifiable {
+            sha256: crate::api::inference::sha256_hex(path.as_bytes()),
+            basename: crate::api::truncate_bytes(&basename, 240).0.to_owned(),
+        }
+    }
+}
+
+/// An injection request or its resolved application point. Only concrete
+/// points can be used in a native claim or receipt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InjectPoint {
+    Soonest,
     NextInput,
     TurnSafePoint,
     ActiveTurn,
@@ -17,9 +42,27 @@ pub enum InjectPoint {
 #[serde(deny_unknown_fields)]
 pub struct InjectArgs {
     pub text: String,
+    #[serde(alias = "at")]
     pub point: InjectPoint,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at_ms: Option<i64>,
+}
+
+#[derive(schemars::JsonSchema, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextWaitRequest {
+    pub id: String,
+    #[serde(default)]
+    pub wait_ms: u64,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextNoteCounters {
+    pub kind: String,
+    pub delivered: u64,
+    pub moved: u64,
+    pub cancelled: u64,
+    pub resolved: u64,
 }
 
 /// One durable item claimed by a context consumer.

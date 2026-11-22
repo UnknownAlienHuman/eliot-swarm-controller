@@ -245,6 +245,16 @@ pub(super) struct PendingCommandEvent {
     pub(super) data: Value,
 }
 
+impl PendingCommandEvent {
+    pub(super) fn kind(&self) -> String {
+        if self.data["outcome"]["delivery"] == "moved" {
+            "context.moved".to_owned()
+        } else {
+            format!("command.{}", command_state_name(self.state))
+        }
+    }
+}
+
 /// Inputs shared by the native-effect persistence helpers, in the caller's transaction.
 #[derive(Clone, Copy)]
 struct EffectScope<'a, 'b> {
@@ -277,7 +287,7 @@ pub(super) fn persist_effects(
     let mut provider_events = Vec::new();
     if matches!(
         native_event.kind.as_str(),
-        "hook.before_tool" | "hook.before_model"
+        "hook.before_tool" | "hook.after_tool" | "hook.before_model"
     ) {
         command_events.extend(context::settle_turn_safe_point_claims_tx(
             tx,
@@ -1073,7 +1083,7 @@ fn persist_turn_terminal(
             "terminal turn retains pending requests in the Agent projection",
         ));
     }
-    context::cancel_turn_safe_point_tx(tx, agent_num, generation, turn_id, now)
+    context::settle_ended_turn_context_tx(tx, agent_num, generation, turn_id, now)
 }
 
 /// Persist one `session.usage` snapshot as the latest for its Agent

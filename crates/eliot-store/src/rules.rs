@@ -308,8 +308,10 @@ impl Store {
         let last_outcome = load_last_rule_action_outcome(&tx, principal, id)?;
         let last_refusal =
             load_last_rule_refusal(&tx, principal, id, stored.view.project.as_deref())?;
+        let rate_limited_firings = load_rate_limited_firings(&tx, principal, id)?;
         let view = core::api::RuleShowView {
             state: stored.view,
+            rate_limited_firings,
             last_outcome,
             last_refusal,
         };
@@ -941,7 +943,7 @@ impl Store {
         )?;
         if rule_limit_reached(scoped_count, limit.max) || global_count >= GLOBAL_RULE_ACTION_LIMIT {
             let error = Error::new("rate_limited", "rule action rate limit reached");
-            return reject_rule_event(tx, &self.write_faulted, &key, &error, now);
+            return reject_rate_limited_rule_event(tx, &self.write_faulted, &key, &error, now);
         }
 
         if request.verb == "run" {
@@ -1160,6 +1162,18 @@ fn load_last_rule_refusal(
         code: code.to_owned(),
         reason: core::bound_chars(reason, core::api::MAX_RULE_REJECTION_MESSAGE_BYTES),
     }))
+}
+
+fn load_rate_limited_firings(tx: &Transaction<'_>, principal: &str, rule: &str) -> Result<u64> {
+    let count: i64 = tx
+        .query_row(
+            "SELECT rate_limited_firings FROM rule_state WHERE principal = ?1 AND rule = ?2",
+            params![principal, rule],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    u64::try_from(count)
+        .map_err(|_| Error::new("source_integrity", "stored rule limit counter is negative"))
 }
 
 fn validate_principal_rule(principal: &str, rule: &str) -> Result<()> {
@@ -2065,6 +2079,7 @@ fn valid_inject_request(request: &SubmitCommand) -> bool {
         return false;
     };
     match args.point {
+        eliot_core::InjectPoint::Soonest => true,
         eliot_core::InjectPoint::NextInput => request.expected_turn_id.is_none(),
         eliot_core::InjectPoint::TurnSafePoint => request
             .expected_turn_id
@@ -2923,6 +2938,35 @@ fn insert_rule_parent(
     outcome_kind: RuleParentOutcome<'_>,
     now: i64,
 ) -> Result<(Command, Event)> {
+    let (parent, event) = insert_rule_parent_with_event_mode(tx, key, outcome_kind, now, true)?;
+    let event =
+        event.ok_or_else(|| Error::new("source_integrity", "rule parent event is absent"))?;
+    Ok((parent, event))
+}
+
+fn insert_rule_parent_without_event(
+    tx: &Transaction<'_>,
+    key: &RuleFiringKey<'_>,
+    outcome_kind: RuleParentOutcome<'_>,
+    now: i64,
+) -> Result<Command> {
+    let (parent, event) = insert_rule_parent_with_event_mode(tx, key, outcome_kind, now, false)?;
+    if event.is_some() {
+        return Err(Error::new(
+            "source_integrity",
+            "silent rule parent unexpectedly emitted an event",
+        ));
+    }
+    Ok(parent)
+}
+
+fn insert_rule_parent_with_event_mode(
+    tx: &Transaction<'_>,
+    key: &RuleFiringKey<'_>,
+    outcome_kind: RuleParentOutcome<'_>,
+    now: i64,
+    emit_event: bool,
+) -> Result<(Command, Option<Event>)> {
     if write_exists(tx, &key.parent_id)? {
         return Err(Error::new("id_conflict", "rule parent id is already used"));
     }
@@ -2989,7 +3033,18 @@ fn insert_rule_parent(
         created_at: now,
         updated_at: now,
     };
-    let event = admit_command(tx, &command, key.command_event_data(child_ids.clone()))?;
+    let event = if emit_event {
+        Some(admit_command(
+            tx,
+            &command,
+            key.command_event_data(child_ids.clone()),
+        )?)
+    } else {
+        insert_command(tx, &command, &ordinary_command_cause(command.id))?;
+        let cause = key.command_cause(&key.parent_id)?;
+        bind_new_rule_parent_cause_without_event_tx(tx, command.id, &cause)?;
+        None
+    };
     Ok((
         Command {
             id: key.parent_id.clone(),
@@ -3013,6 +3068,35 @@ fn insert_rule_parent(
         },
         event,
     ))
+}
+
+fn bind_new_rule_parent_cause_without_event_tx(
+    tx: &Transaction<'_>,
+    command_id: &str,
+    cause: &core::EventCause,
+) -> Result<()> {
+    validate_event_cause_shape(cause, Some(command_id))?;
+    if cause.depth > 5 {
+        return Err(Error::new(
+            "bad_state",
+            "rule cause depth exceeds the firing limit",
+        ));
+    }
+    let default_cause = encode_json(&ordinary_command_cause(command_id))?;
+    let encoded_cause = encode_json(cause)?;
+    let updated = tx
+        .execute(
+            "UPDATE commands SET cause = ?1 WHERE id = ?2 AND cause = ?3",
+            params![encoded_cause, command_id, default_cause],
+        )
+        .map_err(sql_error)?;
+    if updated != 1 && command_cause_tx(tx, command_id)?.as_ref() != Some(cause) {
+        return Err(Error::new(
+            "source_integrity",
+            "new rule parent cause could not be bound to its command",
+        ));
+    }
+    Ok(())
 }
 
 fn admit_rule_action_tx(
@@ -3222,6 +3306,41 @@ fn reject_rule_event(
     error: &Error,
     now: i64,
 ) -> Result<RuleEventAdmission> {
+    reject_rule_event_with_record(tx, write_faulted, key, error, now, true)
+}
+
+fn reject_rate_limited_rule_event(
+    tx: Transaction<'_>,
+    write_faulted: &Cell<bool>,
+    key: &RuleFiringKey<'_>,
+    error: &Error,
+    now: i64,
+) -> Result<RuleEventAdmission> {
+    let updated = tx
+        .execute(
+            "UPDATE rule_state
+             SET rate_limited_firings = rate_limited_firings + 1
+             WHERE principal = ?1 AND rule = ?2",
+            params![key.principal, key.state.id],
+        )
+        .map_err(sql_error)?;
+    if updated != 1 {
+        return Err(Error::new(
+            "source_integrity",
+            "rate-limited rule state is absent",
+        ));
+    }
+    reject_rule_event_with_record(tx, write_faulted, key, error, now, false)
+}
+
+fn reject_rule_event_with_record(
+    tx: Transaction<'_>,
+    write_faulted: &Cell<bool>,
+    key: &RuleFiringKey<'_>,
+    error: &Error,
+    now: i64,
+    record_rejection: bool,
+) -> Result<RuleEventAdmission> {
     let RuleFiringIdentity::Event { event_seq } = key.identity else {
         return Err(Error::new(
             "internal",
@@ -3229,17 +3348,30 @@ fn reject_rule_event(
         ));
     };
     let parent_cause = key.command_cause(&key.parent_id)?;
-    let (parent, mut parent_event) =
-        insert_rule_parent(&tx, key, RuleParentOutcome::Rejected { error }, now)?;
-    annotate_new_command_cause_tx(&tx, &parent.id, &mut parent_event, parent_cause.clone())?;
-    let mut events = vec![parent_event];
-    events.push(insert_rule_event_with_cause(
-        &tx,
-        now,
-        "rule.rejected",
-        key.rejected_data(error),
-        Some(parent_cause),
-    )?);
+    let (parent, parent_event) = if record_rejection {
+        let (parent, event) =
+            insert_rule_parent(&tx, key, RuleParentOutcome::Rejected { error }, now)?;
+        (parent, Some(event))
+    } else {
+        (
+            insert_rule_parent_without_event(&tx, key, RuleParentOutcome::Rejected { error }, now)?,
+            None,
+        )
+    };
+    let mut events = Vec::new();
+    if let Some(mut parent_event) = parent_event {
+        annotate_new_command_cause_tx(&tx, &parent.id, &mut parent_event, parent_cause.clone())?;
+        events.push(parent_event);
+    }
+    if record_rejection {
+        events.push(insert_rule_event_with_cause(
+            &tx,
+            now,
+            "rule.rejected",
+            key.rejected_data(error),
+            Some(parent_cause),
+        )?);
+    }
     let view = update_rule_cursor_tx(&tx, key.principal, key.state, event_seq, now)?;
     commit_transaction(tx, write_faulted)?;
     Ok(RuleEventAdmission {

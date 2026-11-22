@@ -2,7 +2,7 @@
 use super::{Principal, Router};
 use eliot_core::api::inference::*;
 use eliot_core::{
-    Command, Error, Result, Turn,
+    Command, ContextWaitRequest, Error, Result, Turn,
     api::{discovery::*, *},
 };
 use serde_json::{Value, json};
@@ -156,6 +156,7 @@ const METHODS: &[Method] = &[
     ),
     method!("command.submit", CommandSubmitRequest, CommandSubmitResponse, false, true, "Submit a command with launch/send/wait child verbs.", {"id":EXAMPLE_ID,"verb":"send","target":"a1","args":{"text":"Report current progress."}}),
     method!("command.get", CommandGetRequest, Command, false, false, "Read a retained command in your authorized scope.", {"id":EXAMPLE_ID}),
+    method!("inject.wait", ContextWaitRequest, Command, false, false, "Wait up to 30 seconds for an exact insertion to be delivered, moved or cancelled.", {"id":EXAMPLE_ID,"wait_ms":30000}),
     method!("command.children", CommandChildrenRequest, CommandChildrenResponse, false, false, "Page the retained children of one command.", {"id":EXAMPLE_ID,"limit":20}),
     method!("command.resolve", CommandResolveRequest, CommandResolveResponse, true, true, "Record an owner resolution of an uncertain command; never replay its effect.", {"id":EXAMPLE_ID,"command_id":"previous-command","as":"failed","reason":"Owner verified failure."}),
     method!("command.settle_stopped", SettleStoppedRequest, SettleStoppedResponse, true, true, "Preview or settle a reviewed page of unknown stops backed by committed owned exit and reader drain.", {"id":EXAMPLE_ID}),
@@ -227,6 +228,7 @@ const METHODS: &[Method] = &[
     method!("project.assignment.claim", ProjectAssignmentClaimRequest, ProjectAssignmentResult, false, true, "Claim a project for an eligible local manager under Owner policy.", {"id":EXAMPLE_ID,"project":"project-1","manager":{"kind":"local","agent":"a1","generation":1}}),
     method!("project.assignment.launch", ProjectAssignmentLaunchRequest, ProjectAssignmentResult, true, true, "Reserve a free project and admit a manager launch in one transaction.", {"id":EXAMPLE_ID,"project":"project-1","profile":"chk-codex"}),
     method!("project.assignment.release", ProjectAssignmentReleaseRequest, ProjectAssignmentResult, false, true, "Release the current manager by expected epoch.", {"id":EXAMPLE_ID,"project":"project-1","expected_epoch":1}),
+    method!("project.broadcast", ProjectBroadcastRequest, ProjectBroadcastResponse, false, true, "Queue soonest context for each visible working Agent in a project; Owner or current manager.", {"id":EXAMPLE_ID,"project":"project-1","text":"Please report progress."}),
     method!("project.get", ProjectGetRequest, ProjectRegistrationView, true, false, "Read one approved project registration.", {"id":"project-1"}),
     method!("project.overview", ProjectOverviewRequest, ProjectOverviewResponse, false, false, "Read one project team or every team with workspaces, queue, capacity and whole-fleet totals.", {"project":"project-1"}),
     method!("workspace.list", WorkspaceListRequest, WorkspaceListResponse, true, false, "Page the managed worktrees Swarm created, with total and cursor.", {"limit":100}),
@@ -593,6 +595,7 @@ impl Router {
             "project.assignment.claim" => &["swarm project assignment claim"],
             "project.assignment.launch" => &["swarm project assignment launch"],
             "project.assignment.release" => &["swarm project assignment release"],
+            "project.broadcast" => &["swarm project broadcast"],
             "who" => &["swarm who"],
             "claim.set" => &["swarm claim set"],
             "claim.list" => &["swarm claim list"],

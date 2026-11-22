@@ -99,14 +99,14 @@ pub(crate) struct ControlCancelRequest {
 #[derive(Clone, Debug, Default, Serialize)]
 pub(crate) struct HookCallbackResponse {
     #[serde(rename = "hookSpecificOutput", skip_serializing_if = "Option::is_none")]
-    pub hook_specific_output: Option<PreToolUseHookOutput>,
+    pub hook_specific_output: Option<HookSpecificOutput>,
 }
 
 impl HookCallbackResponse {
-    pub fn with_context(additional_context: String) -> Self {
+    pub fn with_context(hook_event_name: &'static str, additional_context: String) -> Self {
         Self {
-            hook_specific_output: Some(PreToolUseHookOutput {
-                hook_event_name: "PreToolUse",
+            hook_specific_output: Some(HookSpecificOutput {
+                hook_event_name,
                 additional_context,
             }),
         }
@@ -115,7 +115,7 @@ impl HookCallbackResponse {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct PreToolUseHookOutput {
+pub(crate) struct HookSpecificOutput {
     pub hook_event_name: &'static str,
     pub additional_context: String,
 }

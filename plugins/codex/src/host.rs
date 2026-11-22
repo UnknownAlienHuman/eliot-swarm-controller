@@ -1932,8 +1932,9 @@ impl CodexPlugin {
         }
         let command_id = params.command_id.clone();
         let event_status = session.events.status();
+        // current_turn retains the last accepted input for teardown. The
+        // committed event state and native thread readback prove quiescence.
         if session.phase != SessionPhase::Ready
-            || session.current_turn.is_some()
             || !event_status.ready
             || event_status.active_turn_id.is_some()
             || event_status.source_unknown

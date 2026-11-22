@@ -24,7 +24,7 @@ pub use attribution::WhoWorkerRow;
 pub use capacity::{OwnedExitProof, RecordedProcess, RestartResumeCandidate, RetainedGeneration};
 pub use command_children::{CommandChildrenPage, history_expired};
 pub use config_overlay::AgentConfig;
-pub use context::{ContextDispatch, fenced_inject_text};
+pub use context::ContextDispatch;
 pub use coordination::{MailSendOutcome, MailSendResult, NoticeClaim};
 pub use digests::{DigestRegisterOutcome, DigestRow, DigestTurn};
 pub use fleet::{AgentListFilter, AgentListPage};
@@ -216,6 +216,7 @@ mod observer_live;
 mod organization;
 mod processes;
 mod project_assignment;
+mod project_broadcast;
 mod project_transfer;
 mod resolution;
 mod retention;
@@ -5693,14 +5694,19 @@ fn install_stream_source_plan(
 /// Resolve the Store-owned source family for a normalized native event kind.
 pub fn family_for_kind(kind: &str) -> Result<&'static str> {
     match kind {
-        "session.ready" | "session.ended" | "session.usage" | "quota.observed" => Ok("session"),
+        "session.ready"
+        | "session.ended"
+        | "session.usage"
+        | "session.context.compacted"
+        | "quota.observed" => Ok("session"),
         "turn.started"
         | "turn.completed"
         | "turn.unknown"
         | "turn.model_observed"
         | "turn.notice" => Ok("turn"),
         "message.completed" => Ok("message"),
-        "tool.started" | "tool.completed" | "hook.before_tool" => Ok("tool"),
+        "tool.started" | "tool.completed" | "tool.file.edited" | "hook.before_tool"
+        | "hook.after_tool" => Ok("tool"),
         "hook.before_model" => Ok("turn"),
         "request.opened" | "request.resolved" | "request.closed" => Ok("request"),
         other => Err(Error::new(
@@ -6340,7 +6346,7 @@ fn terminalize_generation_commands(
     now: i64,
     reason: &str,
     preserve_dispatched_stop: bool,
-) -> Result<()> {
+) -> Result<Vec<native_events::PendingCommandEvent>> {
     let mut statement = tx
         .prepare(
             "SELECT id, verb, outcome FROM commands
@@ -6375,14 +6381,31 @@ fn terminalize_generation_commands(
         let outcome = context::unknown_claim_outcome(previous.as_ref(), reason);
         update_command_state(tx, &id, CommandState::Unknown, Some(&outcome), None, now)?;
     }
+    let mut context_events = Vec::new();
     for id in pending_command_ids(tx, agent, generation)? {
         if handoff::held_successor_tx(tx, &id)? {
             continue;
         }
-        let outcome = json!({"reason": reason});
+        let mut outcome = json!({"reason": reason});
+        let record = load_command_record(tx, &id)?;
+        if let Some(record) = record.filter(|record| record.command.verb == "inject") {
+            outcome["delivery"] = json!("cancelled");
+            if record
+                .command
+                .outcome
+                .is_some_and(|value| value["delivery"] == "moved")
+            {
+                outcome["moved"] = json!(true);
+            }
+            context_events.push(native_events::PendingCommandEvent {
+                command_id: id.clone(),
+                state: CommandState::Cancelled,
+                data: json!({"command_id": id, "state": "cancelled", "outcome": outcome}),
+            });
+        }
         update_command_state(tx, &id, CommandState::Cancelled, Some(&outcome), None, now)?;
     }
-    Ok(())
+    Ok(context_events)
 }
 
 fn require_nonempty(value: &str, field: &str) -> Result<()> {

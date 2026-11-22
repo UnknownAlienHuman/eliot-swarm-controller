@@ -11,6 +11,7 @@ mod daemon;
 mod operator;
 mod organization;
 mod project_assignment;
+mod project_broadcast;
 mod reads;
 mod rules;
 mod settings;

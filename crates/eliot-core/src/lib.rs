@@ -39,7 +39,10 @@ pub use command::{
     is_request_reply_verb, is_start_verb, is_user_event_verb, validate_command_id,
     workspace_preparation_transition_allowed,
 };
-pub use context::{ContextItem, ContextOutcome, InjectArgs, InjectPoint, turn_started_data};
+pub use context::{
+    ContextEditPath, ContextItem, ContextNoteCounters, ContextOutcome, ContextWaitRequest,
+    InjectArgs, InjectPoint, turn_started_data,
+};
 pub use diagnostics::{
     MAX_STDERR_BYTES, MAX_STDERR_DIAGNOSTIC_BYTES, StderrDiagnostic, StderrSnapshot, StderrSource,
     bound_stderr_diagnostics,
@@ -76,7 +79,7 @@ pub use observe::{
 };
 pub use presentation::{
     count_words, fence_untrusted_prefix, fence_untrusted_text, origin_words, reason_message,
-    reason_words,
+    reason_words, swarm_note,
 };
 pub use remote_call::{RemoteCallContext, RemoteIdentity};
 pub use routing::{
@@ -2420,7 +2423,15 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
             }
             effects.push(Effect::SessionUsageUpdated { usage });
         }
-        "hook.before_model" => {
+        "session.context.compacted" => {
+            if event.data.get("turn_id").is_some() {
+                require_live_turn(agent, event)?;
+            }
+        }
+        "tool.file.edited" => {
+            require_live_turn(agent, event)?;
+        }
+        "hook.before_model" | "hook.after_tool" => {
             // Receipt authority stays in Store settlement: selection
             // (claim) requires the exact active turn, but a confirmed
             // receipt may reconcile a claimed Unknown after its native

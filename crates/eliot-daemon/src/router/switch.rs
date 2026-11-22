@@ -396,6 +396,7 @@ impl Router {
             if let Ok(change) = &result {
                 self.publish_locked(&change.events);
                 if let Some(handoff) = &change.value.handoff {
+                    self.queue_handoff_task_card(&mut store, handoff, &change.events);
                     for child in &handoff.children {
                         self.schedule_command(child.clone(), None);
                     }

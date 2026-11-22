@@ -1,6 +1,6 @@
 //! Synchronous hook translation, redaction and response framing.
 
-use eliot_core::SecretPolicy;
+use eliot_core::{ContextEditPath, SecretPolicy};
 use eliot_plugin::native_transport::encode_frame;
 use serde_json::Value;
 use std::{path::Path, time::Duration};
@@ -10,8 +10,8 @@ use crate::native::types::{
     HookCallbackResponse, OutboundControlResponse, OutboundControlResponseBody,
 };
 
-const HOOK_CALLBACK_TIMEOUT_MS: u64 = 30_000;
-/// Char bounds for the optional `hook.before_tool` progress diagnostics. The
+pub(crate) const TOOL_HOOK_TIMEOUT_SECONDS: u64 = 3;
+/// Char bounds for the optional tool-hook progress diagnostics. The
 /// committed event envelope stays under the shared `MAX_EVENT_BYTES` bound;
 /// these per-field caps keep each diagnostic small on its own. Redaction runs
 /// before truncation so a cap can never split a configured secret.
@@ -138,26 +138,35 @@ fn collect_summary_args_labeled(
     }
 }
 
-/// Extract the optional bounded progress diagnostics for one PreToolUse hook
+/// Extract the optional bounded progress diagnostics for one Claude tool hook
 /// input. Only the native tool name, the already-matched invocation id, a
-/// closed-vocabulary operation kind and a single workspace-relative file path
-/// survive: full command lines, file contents and every other argument are
-/// dropped here, never persisted. Every kept field is redacted before its
-/// char cap, so a cap cannot split a configured secret.
+/// closed-vocabulary operation kind, the workspace-relative path, and only for
+/// successful PostToolUse writes the bounded native `file_path` survive. Full
+/// command lines, file contents and every other argument are dropped here,
+/// never persisted. Every kept field is redacted before its char cap, so a cap
+/// cannot split a configured secret.
 pub(super) fn hook_tool_facts(
     input: &Value,
     native_tool_id: &str,
     workspace: &Path,
     policy: &SecretPolicy,
+    include_edit_path: bool,
 ) -> HookToolFacts {
     let tool_name = input
         .get("tool_name")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|name| !name.is_empty());
+    let operation = tool_name.and_then(hook_operation_for_tool);
+    let edit_path = (include_edit_path && operation.as_deref() == Some("write"))
+        .then(|| hook_edit_path(input.get("tool_input"), workspace, policy))
+        .flatten();
     HookToolFacts {
-        operation: tool_name.and_then(hook_operation_for_tool),
-        path: hook_tool_path(input.get("tool_input"), workspace, policy),
+        operation,
+        path: (!include_edit_path)
+            .then(|| hook_tool_path(input.get("tool_input"), workspace, policy))
+            .flatten(),
+        edit_path,
         tool: tool_name
             .map(|name| truncate_chars(&policy.redact_text(name), MAX_HOOK_TOOL_NAME_CHARS)),
         native_tool_id: {
@@ -205,6 +214,26 @@ fn hook_tool_path(
     let relative = normalize_hook_path(workspace, candidate)?;
     let safe = policy.redact_text(&relative);
     (!safe.trim().is_empty()).then(|| truncate_chars(&safe, MAX_HOOK_PATH_CHARS))
+}
+
+fn hook_edit_path(
+    input: Option<&Value>,
+    workspace: &Path,
+    policy: &SecretPolicy,
+) -> Option<ContextEditPath> {
+    let path = input
+        .and_then(Value::as_object)
+        .and_then(|fields| fields.get("file_path").or_else(|| fields.get("path")))
+        .and_then(Value::as_str)
+        .filter(|path| !path.trim().is_empty())?;
+    Some(
+        match eliot_plugin::edit_path::normalize(&workspace.to_string_lossy(), path) {
+            Ok(relative) if relative.len() <= 4096 && policy.redact_text(&relative) == relative => {
+                ContextEditPath::Relative { path: relative }
+            }
+            _ => ContextEditPath::outside(&workspace.join(path).to_string_lossy(), policy),
+        },
+    )
 }
 
 /// Lexical workspace-relative normalization mirroring the Store's native
@@ -285,7 +314,7 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
 }
 
-/// Optional bounded progress diagnostics for one `hook.before_tool` fact.
+/// Optional bounded progress diagnostics for one tool-hook fact.
 /// Every field is redacted and capped; absent native data stays absent, never
 /// an empty string. Only these fields are ever persisted from the native
 /// hook input: full command lines, contents and remaining arguments are
@@ -300,9 +329,14 @@ pub(super) struct HookToolFacts {
     operation: Option<String>,
     /// Workspace-relative file path, normalized like native file hints.
     path: Option<String>,
+    edit_path: Option<ContextEditPath>,
 }
 
 impl HookToolFacts {
+    pub(super) fn has_edit(&self) -> bool {
+        self.edit_path.is_some()
+    }
+
     pub(super) fn attach(&self, data: &mut Value) {
         let Some(fields) = data.as_object_mut() else {
             return;
@@ -322,13 +356,15 @@ impl HookToolFacts {
         if let Some(path) = &self.path {
             fields.insert("path".to_owned(), Value::String(path.clone()));
         }
+        if let Some(edit_path) = &self.edit_path {
+            fields.insert("edit_path".to_owned(), serde_json::json!(edit_path));
+        }
     }
 }
 
 pub(super) fn hook_deadline(deadline_ms: Option<u64>) -> Instant {
-    let timeout_ms = deadline_ms
-        .unwrap_or(HOOK_CALLBACK_TIMEOUT_MS)
-        .min(HOOK_CALLBACK_TIMEOUT_MS);
+    let limit = TOOL_HOOK_TIMEOUT_SECONDS * 1000;
+    let timeout_ms = deadline_ms.unwrap_or(limit).min(limit);
     Instant::now() + Duration::from_millis(timeout_ms)
 }
 

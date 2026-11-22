@@ -157,6 +157,12 @@ pub struct AutonomyWaits {
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct AutonomyNotes {
     pub delivered: u64,
+    #[serde(default)]
+    pub moved: u64,
+    #[serde(default)]
+    pub cancelled: u64,
+    #[serde(default)]
+    pub by_kind: Vec<crate::ContextNoteCounters>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]

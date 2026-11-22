@@ -963,9 +963,10 @@ impl Router {
             return None;
         }
         let mut command = command.clone();
-        if command.verb == "inject" {
+        let claude_steer = command.verb == "steer" && agent.harness == "claude";
+        if command.verb == "inject" || claude_steer {
             let Some(text) = command.args.get("text").and_then(Value::as_str) else {
-                return Some(Err(Error::new("invalid", "inject requires text")));
+                return Some(Err(Error::new("invalid", "context delivery requires text")));
             };
             if text.len() > eliot_core::limits::MAX_TEXT_BYTES {
                 return Some(Err(Error::new(
@@ -973,7 +974,14 @@ impl Router {
                     "inject text exceeds 512 KiB",
                 )));
             }
-            command.args["text"] = Value::String(eliot_store::fenced_inject_text(text));
+            let text = match store.render_injection(&command, text) {
+                Ok(text) => text,
+                Err(error) => return Some(Err(error)),
+            };
+            command.args["text"] = Value::String(text);
+        }
+        if claude_steer {
+            command.args["steer_hook"] = json!("before_tool");
         }
         let pending = self
             .inner

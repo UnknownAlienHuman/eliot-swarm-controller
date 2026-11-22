@@ -807,14 +807,14 @@ impl Store {
                 provider_events.extend(hold_events);
             }
             if next.is_terminal() {
-                terminalize_generation_commands(
+                command_events.extend(terminalize_generation_commands(
                     &tx,
                     agent_num,
                     batch.generation,
                     now,
                     "session_ended",
                     native_event.kind == "session.ended",
-                )?;
+                )?);
                 db!(tx.execute(
                     "UPDATE pending_requests SET state = 'stale'
                      WHERE agent = ?1 AND generation = ?2 AND state = 'pending'",
@@ -848,11 +848,10 @@ impl Store {
         // Keep native batch ACKs scoped to native rows; the associated command
         // event follows those rows but commits in the same transaction.
         for command_event in command_events {
-            let event_kind = format!("command.{}", command_state_name(command_event.state));
             committed_events.push(insert_daemon_command_event(
                 &tx,
                 now,
-                &event_kind,
+                &command_event.kind(),
                 Some(agent_num),
                 Some(batch.generation),
                 &command_event.command_id,

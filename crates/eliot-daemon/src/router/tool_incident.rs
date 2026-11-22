@@ -4,11 +4,11 @@
 //! joins the exact start/completion pair and bounds the evidence; the router
 //! owns settings, turn binding, durable step admission and the injected action.
 
-use super::{MODE_OPEN, Principal, Router};
+use super::{MODE_OPEN, Router};
 use crate::daemon::workers::WorkerReporter;
 use eliot_core::{
-    Agent, AgentState, AttentionStep, CommandState, Error, Event, InjectArgs, Result, SecretPolicy,
-    api::{CommandSubmitRequest, EmitDefinitionArgs},
+    Agent, AgentState, AttentionStep, CommandState, Error, Event, Result, SecretPolicy,
+    api::EmitDefinitionArgs,
 };
 use sha2::{Digest, Sha256};
 use std::time::Duration;
@@ -200,37 +200,15 @@ async fn process_event(router: &Router, event: &Event) -> Result<()> {
         }))
         .await?;
     wait_for_attention_report(router, &attention_id).await?;
-    let Some(point) = point else {
-        return Ok(());
-    };
-
-    let mut request = CommandSubmitRequest::new(inject_id, "inject");
-    request.target = Some(agent.to_owned());
-    request.expected_generation = Some(generation);
-    request.expected_turn_id = Some(turn_id.to_owned());
-    request.args = serde_json::to_value(InjectArgs {
-        text: message,
-        point,
-        expires_at_ms: None,
-    })
-    .map_err(|_| {
-        Error::new(
-            "internal",
-            "repeated failure injection could not be encoded",
-        )
-    })?;
-    request.validate()?;
-    let params = serde_json::to_value(request)
-        .map_err(|_| Error::new("internal", "repeated failure command could not be encoded"))?;
-    if let Err(error) = router
-        .submit(&params, &Principal::Owner, "daemon.tool_incident")
-        .await
-        && !matches!(
-            error.code.as_str(),
-            "stale_generation" | "stale_turn" | "bad_state" | "unsupported"
-        )
-    {
-        return Err(error);
+    if point.is_some() {
+        router
+            .queue_fact_note_with_id(
+                event,
+                "repeated_command_failure",
+                &message,
+                Some(&inject_id),
+            )
+            .await?;
     }
     Ok(())
 }

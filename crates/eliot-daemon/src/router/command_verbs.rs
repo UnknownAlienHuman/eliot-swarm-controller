@@ -553,6 +553,12 @@ impl Router {
                     let _ = self
                         .settle(id, CommandState::Applied, Some(json!({"state": "ready"})))
                         .await;
+                    if dispatched.verb == "resume"
+                        && let Some(generation) = dispatched.generation
+                    {
+                        self.queue_resume_task_card(&artifact_agent, generation)
+                            .await;
+                    }
                     if let Some(linked_id) = linked_id {
                         self.schedule_command(linked_id, None);
                     }

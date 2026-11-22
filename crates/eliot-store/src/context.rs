@@ -1,24 +1,32 @@
 //! Durable context-injection queue and exact consumer claims.
 
+mod facts;
+pub(super) mod notes;
+
+use facts::{edit_note_text, edit_path_key, new_note_paths};
+
 use super::*;
 use eliot_core::{
-    ContextItem, ContextOutcome, InjectArgs, InjectPoint, api::harness::MAX_HARNESS_MODEL_ID_BYTES,
-    turn_started_data,
+    ContextEditPath, ContextItem, ContextOutcome, InjectArgs, InjectPoint,
+    api::harness::MAX_HARNESS_MODEL_ID_BYTES, swarm_note, turn_started_data,
 };
 use serde::{Deserialize, Serialize};
 
 const CONTEXT_ITEMS_ARG: &str = "context_items";
 
-/// Render one claimed inject at the native input boundary.
-pub fn fenced_inject_text(text: &str) -> String {
-    format!(
-        "Swarm context (quoted data):\n{}",
-        eliot_core::fence_untrusted_text(text)
-    )
-}
 const MAX_CONTEXT_QUERY_ROWS: usize = 32;
 const MAX_CONTEXT_QUERY_BYTES: usize = MAX_FRAME_BYTES;
 const PROJECT_CHECK_PRINCIPAL: &str = "project_check";
+enum FactNote<'a> {
+    Text { text: &'a str, id: Option<&'a str> },
+    Edits(&'a [ContextEditPath]),
+}
+
+pub(super) struct FactOrigin<'a> {
+    seq: i64,
+    paths: &'a [ContextEditPath],
+}
+
 type ContextCursor = (i64, i64);
 type ContextPage = (Vec<CommandRecord>, Option<ContextCursor>);
 
@@ -43,6 +51,7 @@ struct ClaimedContextRecord {
     turn_id: Option<String>,
     state: CommandState,
     claim: ContextClaim,
+    moved: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -52,6 +61,120 @@ pub(super) struct ContextConsumer<'a> {
 }
 
 impl Store {
+    /// Most recent proven handoff input that this Agent has already accepted.
+    pub fn task_card_handoff_brief(&self, agent: &str, generation: i64) -> Result<Option<Command>> {
+        let id: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT id FROM commands INDEXED BY commands_target
+             WHERE target = ?1 AND generation <= ?2 AND verb = 'send'
+               AND link_kind = 'handoff' AND ordinal = 0
+             ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                params![parse_agent_id(agent)?, generation],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        id.map(|id| self.get_command(&id))
+            .transpose()
+            .map(|command| {
+                command
+                    .flatten()
+                    .filter(|command| command.state == CommandState::Applied)
+            })
+    }
+
+    pub fn session_ready_event(&self, agent: &str, generation: i64) -> Result<Option<Event>> {
+        let record = self
+            .connection
+            .query_row(
+                "SELECT seq, ts, kind, agent, generation, source, native_id, data, subject, cause
+             FROM events INDEXED BY events_agent
+             WHERE agent = ?1 AND generation = ?2 AND kind = 'session.ready' AND source = 'stream'
+             ORDER BY seq DESC LIMIT 1",
+                params![parse_agent_id(agent)?, generation],
+                event_record_from_row,
+            )
+            .optional()
+            .map_err(sql_error)?;
+        record.map(event_from_record).transpose()
+    }
+
+    /// Retained native edit paths and observed check execution for one turn.
+    pub fn turn_insertion_evidence(
+        &self,
+        turn: &Turn,
+        through: i64,
+        check: &[String],
+    ) -> Result<(Vec<String>, bool)> {
+        let agent = parse_agent_id(&turn.agent)?;
+        let Some(started) = turn.started_at else {
+            return Ok((Vec::new(), false));
+        };
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT path.value FROM events AS edit INDEXED BY events_agent
+             JOIN json_each(CASE
+                WHEN edit.kind IN ('hook.after_tool', 'tool.file.edited') THEN json_array(CASE
+                  WHEN json_extract(edit.data, '$.edit_path.kind') = 'relative' THEN json_extract(edit.data, '$.edit_path.path')
+                  WHEN json_type(edit.data, '$.edit_path') = 'text' THEN json_extract(edit.data, '$.edit_path')
+                  ELSE NULL END)
+                WHEN json_type(edit.data, '$.changed_paths') = 'array' THEN json_extract(edit.data, '$.changed_paths')
+                ELSE '[]' END) AS path
+             WHERE edit.agent = ?1 AND edit.generation = ?2 AND edit.seq < ?3
+               AND edit.source = 'stream' AND edit.native_id IS NOT NULL
+               AND json_extract(edit.data, '$.redacted') IS NOT 1
+               AND json_extract(edit.data, '$.turn_id') = ?4
+               AND (edit.kind IN ('hook.after_tool', 'tool.file.edited') OR (edit.kind = 'tool.completed'
+                    AND json_extract(edit.data, '$.tool') = 'fileChange'
+                    AND json_extract(edit.data, '$.status') = 'completed'))
+               AND path.type = 'text'
+             ORDER BY edit.seq DESC LIMIT 128",
+            )
+            .map_err(sql_error)?;
+        let paths = statement
+            .query_map(
+                params![agent, turn.generation, through, turn.turn_id],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?
+            .collect::<std::result::Result<Vec<String>, _>>()
+            .map_err(sql_error)?;
+        let checked = self.connection.query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM events AS e INDEXED BY events_agent
+                JOIN events AS changed ON changed.seq = json_extract(e.data, '$.edit_seq')
+                WHERE e.agent = ?1 AND e.generation = ?2 AND e.seq < ?3 AND e.ts >= ?4
+                  AND e.kind = 'project.check.finished' AND e.source = 'project'
+                  AND changed.agent = e.agent AND changed.generation = e.generation
+                  AND changed.ts >= ?4 AND json_type(e.data, '$.exit_code') = 'integer'
+             ) OR EXISTS (
+                SELECT 1 FROM events AS start INDEXED BY events_agent
+                JOIN events AS done INDEXED BY events_agent
+                  ON done.agent = start.agent AND done.generation = start.generation
+                  AND done.source = start.source AND done.native_id IS NOT NULL
+                  AND done.kind = 'tool.completed' AND done.seq > start.seq AND done.seq < ?3
+                  AND json_extract(done.data, '$.turn_id') = ?5
+                  AND json_extract(done.data, '$.item_id') = json_extract(start.data, '$.item_id')
+                  AND (json_extract(done.data, '$.status') = 'completed'
+                       OR json_type(done.data, '$.exit_code') = 'integer')
+                WHERE start.agent = ?1 AND start.generation = ?2 AND start.seq < ?3 AND start.ts >= ?4
+                  AND start.source = 'stream' AND start.native_id IS NOT NULL AND start.kind = 'tool.started'
+                  AND json_extract(start.data, '$.turn_id') = ?5
+                  AND json_extract(start.data, '$.command_truncated') = 0
+                  AND json_extract(start.data, '$.command') = ?6
+             )",
+            params![agent, turn.generation, through, started, turn.turn_id, check.join(" ")],
+            |row| row.get(0),
+        ).map_err(sql_error)?;
+        Ok((paths, checked))
+    }
+
+    pub fn render_injection(&self, command: &Command, text: &str) -> Result<String> {
+        render_injection(&self.connection, command, text)
+    }
+
     /// Replace one unclaimed project diagnostic. The live Agent row chooses
     /// the consumer in the transaction that admits the context.
     pub fn project_check_context(
@@ -59,12 +182,11 @@ impl Store {
         target: &str,
         generation: i64,
         failure: Option<String>,
-        fast_check_exit: Option<i32>,
+        fast_check: Option<(i64, i32)>,
         now: i64,
     ) -> Result<Change<Option<String>>> {
         self.ensure_writer_healthy()?;
-        let result =
-            self.project_check_context_inner(target, generation, failure, fast_check_exit, now);
+        let result = self.project_check_context_inner(target, generation, failure, fast_check, now);
         self.fault_on_persistence_error(&result);
         result
     }
@@ -74,7 +196,7 @@ impl Store {
         target: &str,
         generation: i64,
         failure: Option<String>,
-        fast_check_exit: Option<i32>,
+        fast_check: Option<(i64, i32)>,
         now: i64,
     ) -> Result<Change<Option<String>>> {
         let agent_num = parse_agent_id(target)?;
@@ -88,7 +210,7 @@ impl Store {
             && agent.generation == generation
             && !agent.is_terminal()
         {
-            if let Some(exit_code) = fast_check_exit {
+            if let Some((edit_seq, exit_code)) = fast_check {
                 events.push(insert_daemon_event(
                     &tx,
                     now,
@@ -96,7 +218,7 @@ impl Store {
                     "project",
                     Some(agent_num),
                     Some(generation),
-                    json!({"exit_code": exit_code}),
+                    json!({"edit_seq": edit_seq, "exit_code": exit_code}),
                 )?);
             }
             let previous: Option<String> = tx
@@ -124,32 +246,16 @@ impl Store {
                 )?;
             }
             if let Some(text) = failure {
-                let preferred = match agent.harness.as_str() {
-                    "claude" | "opencode" | "antigravity" => InjectPoint::TurnSafePoint,
-                    _ => InjectPoint::ActiveTurn,
-                };
-                let turn = agent
-                    .active_turn
-                    .as_ref()
-                    .filter(|_| {
-                        matches!(agent.state, AgentState::Busy | AgentState::Waiting)
-                            && require_context_point_available(&agent, preferred).is_ok()
-                    })
-                    .cloned();
-                let point = if turn.is_some() {
-                    preferred
-                } else {
-                    InjectPoint::NextInput
-                };
                 let mut request = SubmitCommand::new(ulid::Ulid::new().to_string(), "inject");
                 request.target = Some(target.to_owned());
                 request.expected_generation = Some(generation);
-                request.expected_turn_id = turn;
                 request.args = serde_json::to_value(InjectArgs {
                     text,
-                    point,
-                    expires_at_ms: (point != InjectPoint::NextInput)
-                        .then(|| now.saturating_add(10 * 60 * 1000)),
+                    point: InjectPoint::Soonest,
+                    expires_at_ms: agent
+                        .active_turn
+                        .as_ref()
+                        .map(|_| now.saturating_add(600_000)),
                 })
                 .map_err(|_| {
                     Error::new("internal", "project check context could not be encoded")
@@ -158,19 +264,189 @@ impl Store {
                     &request,
                     request.args.clone(),
                 )?)?;
-                events.push(admit_tx(
-                    &tx,
-                    PROJECT_CHECK_PRINCIPAL,
-                    &request,
-                    &digest,
-                    now,
-                )?);
-                value = (point == InjectPoint::ActiveTurn).then_some(request.id);
+                let event = admit_tx(&tx, PROJECT_CHECK_PRINCIPAL, &request, &digest, now, None)?;
+                value = (event.data["application_point"] == "active_turn").then_some(request.id);
+                events.push(event);
             }
         }
         commit_transaction(tx, &self.write_faulted)?;
         Ok(Change { value, events })
     }
+
+    /// Reserve a fact note once for the captured turn. Lifecycle notes without
+    /// a turn share one pending next-input slot per kind and generation.
+    pub fn queue_fact_note(
+        &mut self,
+        event: &Event,
+        kind: &str,
+        text: &str,
+        id: Option<&str>,
+        now: i64,
+    ) -> Result<Change<Option<String>>> {
+        self.ensure_writer_healthy()?;
+        let result = self.queue_fact_note_inner(event, kind, FactNote::Text { text, id }, now);
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    pub fn queue_edit_note(
+        &mut self,
+        event: &Event,
+        kind: &str,
+        paths: &[ContextEditPath],
+        now: i64,
+    ) -> Result<Change<Option<String>>> {
+        self.ensure_writer_healthy()?;
+        let result = self.queue_fact_note_inner(event, kind, FactNote::Edits(paths), now);
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    fn queue_fact_note_inner(
+        &mut self,
+        event: &Event,
+        kind: &str,
+        note: FactNote<'_>,
+        now: i64,
+    ) -> Result<Change<Option<String>>> {
+        let empty = Change {
+            value: None,
+            events: Vec::new(),
+        };
+        let (Some(target), Some(generation)) = (event.agent.as_deref(), event.generation) else {
+            return Ok(empty);
+        };
+        let agent_num = parse_agent_id(target)?;
+        let turn_id = event.data["turn_id"].as_str();
+        let principal = format!("swarm_note:{kind}");
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        let Some(agent) = load_agent_by_num(&tx, agent_num)?.filter(|agent| {
+            agent.generation == generation && !agent.is_terminal() && !agent.observe_only
+        }) else {
+            return Ok(empty);
+        };
+        if context_points(&agent).is_err() {
+            return Ok(empty);
+        }
+        let mut events = Vec::new();
+        if kind == "task_card" && event.data["verb"] == "handoff" {
+            let previous: Option<String> = tx
+                .query_row(
+                    "SELECT id FROM commands INDEXED BY commands_target
+                 WHERE target = ?1 AND generation = ?2 AND principal = ?3 AND verb = 'inject'
+                   AND turn_id IS NULL AND state IN ('accepted', 'queued') LIMIT 1",
+                    params![agent_num, generation, principal],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(sql_error)?;
+            if let Some(previous) = previous
+                && let Some(record) = load_command_record(&tx, &previous)?
+            {
+                reject_pending_context(
+                    &tx,
+                    &record,
+                    agent_num,
+                    generation,
+                    "task_card_superseded",
+                    now,
+                    &mut events,
+                )?;
+            }
+        }
+        let (text, id, paths) = match note {
+            FactNote::Text { text, id } => (text.to_owned(), id, Vec::new()),
+            FactNote::Edits(paths) => {
+                let Some(turn) = turn_id else {
+                    return Ok(empty);
+                };
+                let paths = new_note_paths(&tx, agent_num, generation, turn, kind, paths)?;
+                if paths.is_empty() {
+                    return Ok(empty);
+                }
+                (edit_note_text(kind, &paths), None, paths)
+            }
+        };
+        let duplicate: bool = if !paths.is_empty() {
+            false
+        } else if let Some(id) = id {
+            tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM commands WHERE id = ?1)",
+                [id],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?
+        } else {
+            tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM commands INDEXED BY commands_target
+                 WHERE target = ?1 AND generation = ?2 AND principal = ?3 AND verb = 'inject'
+                   AND ((?4 IS NOT NULL AND (turn_id = ?4 OR expected_turn_id = ?4))
+                        OR (turn_id IS NULL AND state IN ('accepted', 'queued', 'dispatched'))))
+                 OR EXISTS(SELECT 1 FROM events INDEXED BY events_agent
+                     WHERE agent=?1 AND generation=?2 AND kind='command.accepted'
+                       AND json_extract(data,'$.note_kind')=?5
+                       AND json_extract(data,'$.trigger_seq')=?6)",
+                params![agent_num, generation, principal, turn_id, kind, event.seq],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?
+        };
+        if duplicate {
+            return Ok(empty);
+        }
+        let id = id.map_or_else(|| ulid::Ulid::new().to_string(), str::to_owned);
+        let mut request = SubmitCommand::new(id, "inject");
+        request.target = Some(target.to_owned());
+        request.expected_generation = Some(generation);
+        request.expected_turn_id = turn_id.map(str::to_owned);
+        request.args = json!(InjectArgs {
+            text,
+            point: if turn_id.is_some() {
+                InjectPoint::Soonest
+            } else {
+                InjectPoint::NextInput
+            },
+            expires_at_ms: None,
+        });
+        let digest = admission::command_payload_digest(&request)?;
+        let accepted = admit_tx(
+            &tx,
+            &principal,
+            &request,
+            &digest,
+            now,
+            Some(FactOrigin {
+                seq: event.seq,
+                paths: &paths,
+            }),
+        )?;
+        if let Some(turn) = turn_id {
+            for path in &paths {
+                db!(tx.execute(
+                    "INSERT INTO context_noted_paths(agent,generation,kind,path_key,turn_id,note_id) VALUES(?1,?2,?3,?4,?5,?6)",
+                    params![agent_num, generation, kind, edit_path_key(path), turn, request.id],
+                ));
+            }
+        }
+        let value = (accepted.data["application_point"] == "active_turn").then_some(request.id);
+        events.push(accepted);
+        commit_transaction(tx, &self.write_faulted)?;
+        Ok(Change { value, events })
+    }
+}
+
+fn render_injection(connection: &Connection, command: &Command, text: &str) -> Result<String> {
+    let principal = if command.principal == "owner"
+        && command_cause_tx(connection, &command.id)?.is_some_and(|cause| cause.rule.is_some())
+    {
+        "swarm_rule"
+    } else {
+        &command.principal
+    };
+    Ok(swarm_note(text, principal))
 }
 
 pub(super) fn admit_tx(
@@ -179,6 +455,7 @@ pub(super) fn admit_tx(
     request: &SubmitCommand,
     payload_digest: &[u8],
     now: i64,
+    fact: Option<FactOrigin<'_>>,
 ) -> Result<Event> {
     if request.target.is_none()
         || request.selector.is_some()
@@ -190,7 +467,7 @@ pub(super) fn admit_tx(
             "inject requires an Agent target and has no request, selector, or probe binding",
         ));
     }
-    let args = serde_json::from_value::<InjectArgs>(request.args.clone())
+    let mut args = serde_json::from_value::<InjectArgs>(request.args.clone())
         .map_err(|_| Error::new("invalid", "inject args are malformed"))?;
     if args.point == InjectPoint::NextInput && request.expected_turn_id.is_some() {
         return Err(Error::new(
@@ -221,10 +498,35 @@ pub(super) fn admit_tx(
             "inject requires a live Agent generation",
         ));
     }
-    require_context_point_available(&agent, args.point)?;
+    let points = context_points(&agent)?;
+    if args.point == InjectPoint::Soonest {
+        if let Some(expected) = request.expected_turn_id.as_deref()
+            && agent.active_turn.as_deref() != Some(expected)
+            && !captured_turn_exists(tx, agent_num, agent.generation, expected)?
+        {
+            return Err(Error::new("stale_generation", "inject turn is unknown"));
+        }
+        let active = matches!(agent.state, AgentState::Busy | AgentState::Waiting)
+            && agent.active_turn.is_some()
+            && request
+                .expected_turn_id
+                .as_ref()
+                .is_none_or(|turn| agent.active_turn.as_ref() == Some(turn));
+        args.point = [InjectPoint::TurnSafePoint, InjectPoint::ActiveTurn]
+            .into_iter()
+            .find(|point| active && points.contains(point))
+            .unwrap_or(InjectPoint::NextInput);
+    }
+    if !points.contains(&args.point) {
+        return Err(Error::new(
+            "unsupported",
+            "Agent has no consumer for this context application point",
+        ));
+    }
 
     let turn_id = match args.point {
         InjectPoint::NextInput => None,
+        InjectPoint::Soonest => unreachable!("soonest was resolved above"),
         InjectPoint::TurnSafePoint | InjectPoint::ActiveTurn => {
             let point_name = match args.point {
                 InjectPoint::TurnSafePoint => "turn_safe_point",
@@ -256,10 +558,33 @@ pub(super) fn admit_tx(
         }
     };
 
+    let resolved = json!(args);
+    let initial_outcome = (args.point == InjectPoint::NextInput).then(|| {
+        let delivery = if request.expected_turn_id.is_some() {
+            "moved"
+        } else {
+            "queued"
+        };
+        json!({"delivery": delivery, "application_point": "next_input"})
+    });
+    let mut data =
+        json!({"command_id": request.id, "verb": "inject", "application_point": args.point});
+    if let Some(fact) = fact {
+        data["note_kind"] = json!(principal.trim_start_matches("swarm_note:"));
+        data["trigger_seq"] = json!(fact.seq);
+        if !fact.paths.is_empty() {
+            data["paths"] = json!(fact.paths);
+        }
+    }
+    if let Some(outcome) = &initial_outcome {
+        data["outcome"] = outcome.clone();
+    }
     let event = admit_command(
         tx,
         &CommandInsert {
             turn_id: turn_id.as_deref(),
+            args: &resolved,
+            outcome: initial_outcome.as_ref(),
             ..CommandInsert::admitted(
                 principal,
                 request,
@@ -268,7 +593,7 @@ pub(super) fn admit_tx(
                 now,
             )
         },
-        json!({"command_id": request.id, "verb": "inject"}),
+        data,
     )?;
     Ok(event)
 }
@@ -420,7 +745,7 @@ pub(super) fn claim_next_input_tx(
             }
             let item = ContextItem {
                 command_id: record.command.id.clone(),
-                text: fenced_inject_text(&args.text),
+                text: render_injection(tx, &record.command, &args.text)?,
                 expires_at_ms: args.expires_at_ms,
             };
             let lone = vec![item.clone()];
@@ -506,7 +831,7 @@ impl Store {
         self.ensure_writer_healthy()?;
         require_nonempty(consumer_id, "consumer_id")?;
         require_nonempty(turn_id, "turn_id")?;
-        if !matches!(callback.0, "before_tool" | "before_model") {
+        if !matches!(callback.0, "before_tool" | "after_tool" | "before_model") {
             return Err(Error::new("invalid", "context hook is not supported"));
         }
         let result = self.claim_turn_safe_point_context_inner(
@@ -640,7 +965,7 @@ impl Store {
             }
             let item = ContextItem {
                 command_id: record.command.id.clone(),
-                text: fenced_inject_text(&args.text),
+                text: render_injection(&tx, &record.command, &args.text)?,
                 expires_at_ms: args.expires_at_ms,
             };
             let mut candidate = selected.clone();
@@ -843,6 +1168,7 @@ pub(super) fn settle_turn_safe_point_claims_tx(
 fn hook_kind_for_event(kind: &str) -> Result<&'static str> {
     match kind {
         "hook.before_tool" => Ok("before_tool"),
+        "hook.after_tool" => Ok("after_tool"),
         "hook.before_model" => Ok("before_model"),
         other => Err(Error::new(
             "unsupported",
@@ -1011,7 +1337,7 @@ pub(super) fn settle_send_claims_tx(
     Ok(())
 }
 
-pub(super) fn cancel_turn_safe_point_tx(
+pub(super) fn settle_ended_turn_context_tx(
     tx: &Transaction<'_>,
     agent_num: i64,
     generation: i64,
@@ -1019,8 +1345,30 @@ pub(super) fn cancel_turn_safe_point_tx(
     now: i64,
 ) -> Result<Vec<super::native_events::PendingCommandEvent>> {
     let mut events = Vec::new();
-    for command_id in pending_turn_safe_point_command_ids(tx, agent_num, generation, turn_id)? {
-        let outcome = json!({"reason": "captured_turn_ended"});
+    let can_move = load_agent_by_num(tx, agent_num)?
+        .as_ref()
+        .is_some_and(next_input_available);
+    for command_id in pending_turn_context_command_ids(tx, agent_num, generation, turn_id)? {
+        let record = load_command_record(tx, &command_id)?
+            .ok_or_else(|| Error::new("source_integrity", "turn context disappeared"))?;
+        let expired = decode_inject_args(&record.command.args)?
+            .expires_at_ms
+            .is_some_and(|expires| expires <= now);
+        if can_move && !expired {
+            let outcome = move_context_to_next_input(tx, &command_id, now)?;
+            events.push(super::native_events::PendingCommandEvent {
+                command_id: command_id.clone(),
+                state: CommandState::Accepted,
+                data: json!({"command_id": command_id, "outcome": outcome}),
+            });
+            continue;
+        }
+        let reason = if expired {
+            "expired"
+        } else {
+            "captured_turn_ended"
+        };
+        let outcome = json!({"delivery": "cancelled", "reason": reason});
         update_command_state(
             tx,
             &command_id,
@@ -1065,9 +1413,35 @@ pub(super) fn cancel_turn_safe_point_tx(
     Ok(events)
 }
 
+pub(super) fn move_context_to_next_input(
+    tx: &Transaction<'_>,
+    id: &str,
+    now: i64,
+) -> Result<Value> {
+    let outcome = json!({"delivery": "moved", "application_point": "next_input"});
+    // The original request digest and captured request turn still govern replay.
+    db!(tx.execute(
+        "UPDATE commands SET args = json_set(args, '$.point', 'next_input'),
+            turn_id = NULL, state = 'accepted', outcome = ?2, updated_at = ?3 WHERE id = ?1",
+        params![id, encode_json(&outcome)?, now],
+    ));
+    Ok(outcome)
+}
+
+pub(super) fn next_input_available(agent: &Agent) -> bool {
+    !agent.is_terminal()
+        && context_points(agent).is_ok_and(|points| points.contains(&InjectPoint::NextInput))
+}
+
 pub(super) fn unknown_claim_outcome(outcome: Option<&Value>, reason: &str) -> Value {
     match outcome.and_then(|value| value.get("claim")) {
-        Some(claim) => json!({"reason": reason, "claim": claim}),
+        Some(claim) => {
+            let mut unknown = json!({"reason": reason, "claim": claim});
+            if outcome.is_some_and(|value| value["moved"] == true) {
+                unknown["moved"] = json!(true);
+            }
+            unknown
+        }
         None => json!({"reason": reason}),
     }
 }
@@ -1176,7 +1550,7 @@ fn read_pending_context_candidate(
     )))
 }
 
-fn pending_turn_safe_point_command_ids(
+fn pending_turn_context_command_ids(
     tx: &Transaction<'_>,
     agent_num: i64,
     generation: i64,
@@ -1187,7 +1561,7 @@ fn pending_turn_safe_point_command_ids(
             "SELECT id FROM commands INDEXED BY commands_context_pending
              WHERE target = ?1 AND generation = ?2 AND verb = 'inject'
                AND state IN ('accepted', 'queued')
-               AND json_extract(args, '$.point') = 'turn_safe_point'
+               AND json_extract(args, '$.point') IN ('turn_safe_point', 'active_turn')
                AND turn_id = ?3
              ORDER BY created_at, rowid",
         )
@@ -1213,6 +1587,9 @@ fn claimed_context_commands(
     turn_id: Option<&str>,
 ) -> Result<Vec<ClaimedContextRecord>> {
     let (sql, required_turn_id) = match point {
+        InjectPoint::Soonest => {
+            return Err(Error::new("source_integrity", "unresolved context point"));
+        }
         InjectPoint::NextInput => (
             "SELECT c.id, c.turn_id, c.state, c.outcome
              FROM commands AS c INDEXED BY commands_target
@@ -1304,6 +1681,7 @@ fn claimed_context_commands(
             turn_id: stored_turn_id,
             state,
             claim,
+            moved: outcome["moved"] == true,
         });
     }
     Ok(claims)
@@ -1452,6 +1830,9 @@ fn validate_context_consumer_tx(
 ) -> Result<()> {
     let target = record.target;
     match claim.application_point {
+        InjectPoint::Soonest => {
+            return Err(Error::new("source_integrity", "unresolved context receipt"));
+        }
         InjectPoint::NextInput => {
             let send_matches = tx
                 .query_row(
@@ -1510,8 +1891,16 @@ fn apply_context_receipt_tx(
     outcome: &ContextOutcome,
     now: i64,
 ) -> Result<super::native_events::PendingCommandEvent> {
-    let serialized = serde_json::to_value(outcome)
+    let mut serialized = serde_json::to_value(outcome)
         .map_err(|_| Error::new("internal", "context outcome could not be encoded"))?;
+    serialized["delivery"] = json!(if outcome.application_point == InjectPoint::NextInput {
+        "delivered_next_input"
+    } else {
+        "delivered_in_turn"
+    });
+    if record.moved {
+        serialized["moved"] = json!(true);
+    }
     update_command_state(
         tx,
         &record.command_id,
@@ -1560,7 +1949,15 @@ pub(super) fn claim_context_tx(
         consumer_id: consumer.id.to_owned(),
         application_point: consumer.point,
     };
-    let outcome = json!({"claim": claim});
+    let mut outcome = json!({"claim": claim});
+    if record
+        .command
+        .outcome
+        .as_ref()
+        .is_some_and(|value| value["delivery"] == "moved")
+    {
+        outcome["moved"] = json!(true);
+    }
     update_command_state(
         tx,
         command_id,
@@ -1618,7 +2015,15 @@ fn reject_pending_context(
     now: i64,
     events: &mut Vec<Event>,
 ) -> Result<()> {
-    let outcome = json!({"code": code});
+    let mut outcome = json!({"code": code, "delivery": "cancelled"});
+    if record
+        .command
+        .outcome
+        .as_ref()
+        .is_some_and(|value| value["delivery"] == "moved")
+    {
+        outcome["moved"] = json!(true);
+    }
     update_command_state(
         tx,
         &record.command.id,
@@ -1639,7 +2044,7 @@ fn reject_pending_context(
     Ok(())
 }
 
-fn require_context_point_available(agent: &Agent, point: InjectPoint) -> Result<()> {
+fn context_points(agent: &Agent) -> Result<Vec<InjectPoint>> {
     let Some(context_points) = agent
         .effective
         .as_ref()
@@ -1650,25 +2055,17 @@ fn require_context_point_available(agent: &Agent, point: InjectPoint) -> Result<
             "Agent has no consumer for this context application point",
         ));
     };
-    let context_points = serde_json::from_value::<Vec<InjectPoint>>(context_points.clone())
-        .map_err(|_| {
-            Error::new(
-                "source_integrity",
-                "Agent effective context points are malformed",
-            )
-        })?;
-    if context_points.contains(&point) {
-        Ok(())
-    } else {
-        Err(Error::new(
-            "unsupported",
-            "Agent has no consumer for this context application point",
-        ))
-    }
+    serde_json::from_value(context_points.clone()).map_err(|_| {
+        Error::new(
+            "source_integrity",
+            "Agent effective context points are malformed",
+        )
+    })
 }
 
 fn inject_point_name(point: InjectPoint) -> &'static str {
     match point {
+        InjectPoint::Soonest => "soonest",
         InjectPoint::NextInput => "next_input",
         InjectPoint::TurnSafePoint => "turn_safe_point",
         InjectPoint::ActiveTurn => "active_turn",

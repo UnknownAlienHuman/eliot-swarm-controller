@@ -132,6 +132,21 @@ pub fn fence_untrusted_text(text: &str) -> String {
     format!("{fence}text\n{text}\n{fence}")
 }
 
+/// Render an insertion using the verified submitting principal as its sender.
+pub fn swarm_note(text: &str, principal: &str) -> String {
+    let sender = match principal.split_once(':') {
+        Some(("agent", identity)) => identity.split(':').next().unwrap_or("Swarm"),
+        Some(("project", _)) => "project rule",
+        _ if principal == "owner" => "owner",
+        _ if principal == "swarm_rule" => "Swarm rule",
+        _ => "Swarm",
+    };
+    format!(
+        "[Swarm note from {sender}] This adds to your task and does not replace it.\n{}",
+        fence_untrusted_text(text)
+    )
+}
+
 fn fence_width(text: &str) -> usize {
     let longest = text.split(|ch| ch != '`').map(str::len).max().unwrap_or(0);
     3.max(longest + 1)
