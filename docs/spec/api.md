@@ -2926,9 +2926,10 @@ and branch-deletion proofs. A worktree or branch from the stand Store is touched
 only when the external creation record matches its repository common directory,
 branch, creation OID and worktree path; otherwise it is kept
 (`unregistered_worktree`, or `not_allowed` with the record path and failed step
-when the record exists but cannot be used). Dirty, unmerged, or uncertain external worktrees or
-branches keep the stand directory and registration (`retained`, CLI exit 4) so
-retried `stand down` after cleanup completes removal (CLI exit 0).
+when the record exists but cannot be used). Dirty, unmerged, or uncertain
+external worktrees or branches keep the stand directory and registration
+(`retained`, CLI exit 4) so retried `stand down` after cleanup completes removal
+(CLI exit 0).
 
 ## CLI
 
