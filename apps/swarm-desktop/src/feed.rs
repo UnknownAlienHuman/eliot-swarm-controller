@@ -158,7 +158,9 @@ pub fn snapshot(data_dir: &Path, agent: &str, depth: Depth) -> Fallible<Snapshot
         )
         .await?;
         let events = scan.events;
-        let inputs = client::input_texts(data_dir, resident_commands(&events)).await;
+        let deliveries = crate::chat::delivered_mail(&events, agent);
+        let inputs =
+            client::input_texts(data_dir, agent, resident_commands(&events), &deliveries).await;
         let docs = parse_docs(Conversation::markdown_texts(&results.turns, &events));
         Ok(Snapshot {
             coverage: Coverage {
@@ -187,6 +189,7 @@ pub fn reread(
     turns: bool,
     detail: bool,
     inputs: Vec<String>,
+    deliveries: Vec<String>,
 ) -> Fallible<Reread> {
     client::block_on(async {
         let detail = if detail {
@@ -199,7 +202,7 @@ pub fn reread(
         } else {
             None
         };
-        let inputs = client::input_texts(data_dir, inputs).await;
+        let inputs = client::input_texts(data_dir, agent, inputs, &deliveries).await;
         let docs = parse_docs(Conversation::markdown_texts(
             results
                 .as_ref()

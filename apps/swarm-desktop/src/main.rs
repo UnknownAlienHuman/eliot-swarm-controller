@@ -22,6 +22,8 @@ mod accessibility;
 #[cfg(windows)]
 mod app_resources;
 #[cfg(windows)]
+mod autonomy_view;
+#[cfg(windows)]
 mod clipboard;
 #[cfg(windows)]
 mod config_view;

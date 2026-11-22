@@ -69,7 +69,33 @@ pub const CHAT_KINDS: &[&str] = &[
     // A steer's acceptance names the turn it steers: its text joins that
     // turn (the design's "Steer:" bubble).
     "command.accepted",
+    // A delivered Swarm note (an `inject` command) settles here.
+    "command.applied",
+    // A mail delivery to the Agent (bodyless): an inline mail notice's
+    // text is redacted in its command, so its mails are read by delivery.
+    "mail.delivered",
 ];
+
+/// Mail deliveries remembered per conversation (newest kept).
+pub const MAX_DELIVERIES: usize = 64;
+
+/// The delivery ids of `agent`'s own `mail.delivered` events, newest last.
+pub fn delivered_mail(events: &[Event], agent: &str) -> Vec<String> {
+    let mut ids: VecDeque<String> = VecDeque::new();
+    for event in events {
+        if event.kind == "mail.delivered"
+            && event.agent.as_deref() == Some(agent)
+            && let Some(id) = data_str(event, "delivery_id")
+            && !ids.iter().any(|known| known == id)
+        {
+            ids.push_back(id.to_owned());
+            if ids.len() > MAX_DELIVERIES {
+                ids.pop_front();
+            }
+        }
+    }
+    ids.into()
+}
 
 /// FNV-1a over bytes: content revision and Markdown cache key.
 pub fn text_hash(text: &str) -> u64 {
@@ -154,6 +180,12 @@ enum Activity {
     /// the turn where it was accepted.
     Steer {
         command: String,
+    },
+    /// A Swarm note (an `inject` command) delivered into this turn, and
+    /// whether a project rule caused it (its frame then names the rule).
+    Note {
+        command: String,
+        rule: bool,
     },
     Tools {
         key: String,
@@ -241,7 +273,7 @@ impl TurnEntry {
             .iter()
             .map(|entry| match entry {
                 Activity::Message { text, .. } => text.len(),
-                Activity::Steer { command } => command.len(),
+                Activity::Steer { command } | Activity::Note { command, .. } => command.len(),
                 Activity::Tools { rows, .. } => rows
                     .iter()
                     .map(|row| {
@@ -448,7 +480,164 @@ fn is_success(status: &str) -> bool {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InputText {
     Loaded(String),
+    /// Text Swarm inserted into a send (a mail notice, a wake), block by
+    /// block: Swarm notes and owner mail.
+    Inserted(Vec<Inserted>),
+    /// A Swarm note (`inject`): its text, the principal that submitted it
+    /// and the turn it was applied in (`command.get`). The frame is Core's
+    /// own ([`eliot_core::swarm_note`]), so it reads as the Agent got it.
+    Note {
+        principal: String,
+        text: String,
+        turn: Option<String>,
+    },
     Unavailable(String),
+}
+
+impl InputText {
+    fn len(&self) -> usize {
+        match self {
+            Self::Loaded(text) | Self::Unavailable(text) => text.len(),
+            Self::Inserted(blocks) => blocks
+                .iter()
+                .map(|block| block.text.len() + block.frame.as_ref().map_or(0, String::len))
+                .sum(),
+            Self::Note {
+                principal, text, ..
+            } => principal.len() + text.len(),
+        }
+    }
+}
+
+/// One block Swarm put in front of the model: a Swarm note (its fixed
+/// frame line, then the quoted content) or owner mail (owner text, no
+/// frame).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Inserted {
+    pub frame: Option<String>,
+    pub text: String,
+}
+
+/// The words a mail notice starts with (`eliot_store` coordination).
+const MAIL_PREAMBLE: &str = "The bodies below are complete. Handle them here. Swarm acknowledges these deliveries when it observes model output or successful completion.\n\n";
+/// Between two mails of one notice.
+const MAIL_SEPARATOR: &str = "\n\n---\n\n";
+/// The first line of owner mail.
+const OWNER_MAIL: &str = "Mail from owner |";
+/// The first line of a wake delivery (`eliot_daemon` wake), with its break.
+pub const WAKE_FRAME: &str = "Swarm wake condition met (quoted data):\n";
+
+/// The body of Core's quoted-data fence (`eliot_core::fence_untrusted_text`:
+/// a line of 3+ backticks and `text`, the body, the same backticks alone on
+/// the last line); text without one comes back whole.
+pub fn unfence(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let opening = lines.iter().position(|line| {
+        line.strip_suffix("text")
+            .is_some_and(|run| run.len() >= 3 && run.chars().all(|ch| ch == '`'))
+    });
+    if let Some(open) = opening {
+        let run = &lines[open][..lines[open].len() - "text".len()];
+        if lines.len() > open + 1 && lines.last() == Some(&run) {
+            return lines[open + 1..lines.len() - 1].join("\n");
+        }
+    }
+    text.to_owned()
+}
+
+/// A framed Swarm insertion: its first line, then the quoted content.
+pub fn framed(text: &str) -> Inserted {
+    let (frame, rest) = text.split_once('\n').unwrap_or((text, ""));
+    Inserted {
+        frame: Some(frame.to_owned()),
+        text: unfence(rest),
+    }
+}
+
+/// The mails an inline notice presented (read by delivery, oldest first),
+/// framed with the Store's own mail headers: owner mail stays owner text;
+/// mail from `swarm` and from peer Agents are Swarm notes.
+pub fn presented_mail(mail: &[eliot_core::api::MailDelivery], command: &str) -> Vec<Inserted> {
+    let mut presented: Vec<&eliot_core::api::MailDelivery> = mail
+        .iter()
+        .filter(|delivery| delivery.presentation_command.as_deref() == Some(command))
+        .collect();
+    presented.sort_by_key(|delivery| (delivery.admitted_at, delivery.delivery_id.clone()));
+    if presented.is_empty() {
+        return vec![Inserted {
+            frame: Some("Mail delivered inline".to_owned()),
+            text: "Its text is in the Agent's mailbox and was not found among the deliveries read here.".to_owned(),
+        }];
+    }
+    presented
+        .into_iter()
+        .map(|delivery| {
+            let topic = delivery.thread.as_deref().unwrap_or("(no topic)");
+            let id = &delivery.delivery_id;
+            match delivery.sender.as_str() {
+                "owner" => Inserted {
+                    frame: None,
+                    text: bound_text(&delivery.text),
+                },
+                eliot_core::api::SWARM_MAIL_SENDER => Inserted {
+                    frame: Some(format!(
+                        "Mail from swarm (service) | topic {topic:?} | delivery {id}"
+                    )),
+                    text: bound_text(&delivery.text),
+                },
+                peer => Inserted {
+                    frame: Some(format!(
+                        "Mail from Agent {peer} (peer, not the owner) | topic {topic:?} | delivery {id}"
+                    )),
+                    text: bound_text(&delivery.text),
+                },
+            }
+        })
+        .collect()
+}
+
+/// The blocks of a mail notice (`notice_kind = "mail"`) as the Store wrote
+/// it: owner mail stays owner text (its header line dropped); mail from
+/// `swarm` and from peer Agents, and the unread count, are Swarm notes
+/// with their header line as the frame.
+pub fn mail_blocks(text: &str) -> Vec<Inserted> {
+    let body = text.strip_prefix(MAIL_PREAMBLE).unwrap_or(text);
+    let mut blocks: Vec<String> = Vec::new();
+    for piece in body.split(MAIL_SEPARATOR) {
+        // A separator inside a quoted body is not a new mail.
+        match blocks.last_mut() {
+            Some(last) if !piece.starts_with("Mail from ") => {
+                last.push_str(MAIL_SEPARATOR);
+                last.push_str(piece);
+            }
+            _ => blocks.push(piece.to_owned()),
+        }
+    }
+    let mut inserted = Vec::new();
+    for block in blocks {
+        // "N other unread: mail.inbox, then mail.ack" ends the last mail.
+        let (block, unread) = match block.rsplit_once("\n\n") {
+            Some((mail, tail)) if tail.ends_with(" other unread: mail.inbox, then mail.ack") => {
+                (mail.to_owned(), Some(tail.to_owned()))
+            }
+            _ => (block, None),
+        };
+        inserted.push(match block.strip_prefix(OWNER_MAIL) {
+            Some(rest) => Inserted {
+                frame: None,
+                text: rest
+                    .split_once('\n')
+                    .map_or("", |(_, body)| body)
+                    .to_owned(),
+            },
+            None => framed(&block),
+        });
+        inserted.extend(unread.map(|line| Inserted {
+            frame: Some(line),
+            text: String::new(),
+        }));
+    }
+    inserted
 }
 
 /// Explicit coverage of what the resident conversation contains.
@@ -572,6 +761,9 @@ pub enum PartKind {
     Unconfirmed,
     /// Where a new generation of the Agent starts, and why.
     Generation,
+    /// Text Swarm inserted (a Swarm note, service or peer mail): its frame
+    /// line as the label, the quoted content shown when expanded.
+    Note,
 }
 
 /// Why a local input did not start: the `swarm why` summary line and its
@@ -648,6 +840,9 @@ pub struct Conversation {
     evicted: HashSet<TurnKey>,
     /// Eviction order of `evicted`, so the no-resurrection index stays bounded.
     evicted_order: VecDeque<TurnKey>,
+    /// The Agent's mail deliveries seen in its events, newest last
+    /// (bounded by [`MAX_DELIVERIES`]).
+    deliveries: VecDeque<String>,
 }
 
 fn data_str<'a>(event: &'a Event, field: &str) -> Option<&'a str> {
@@ -660,13 +855,15 @@ fn data_str<'a>(event: &'a Event, field: &str) -> Option<&'a str> {
 
 impl TurnEntry {
     /// The commands whose input text this turn shows: the one that started
-    /// it, then every steer accepted into it.
+    /// it, then every steer accepted and every Swarm note delivered into it.
     fn commands(&self) -> impl Iterator<Item = &str> {
         self.command_id
             .as_deref()
             .into_iter()
             .chain(self.activity.iter().filter_map(|entry| match entry {
-                Activity::Steer { command } => Some(command.as_str()),
+                Activity::Steer { command } | Activity::Note { command, .. } => {
+                    Some(command.as_str())
+                }
                 _ => None,
             }))
     }
@@ -693,6 +890,11 @@ impl Conversation {
 
     pub fn coverage(&self) -> &Coverage {
         &self.coverage
+    }
+
+    /// The Agent's mail deliveries seen so far, newest last.
+    pub fn deliveries(&self) -> Vec<String> {
+        self.deliveries.iter().cloned().collect()
     }
 
     pub fn set_stale(&mut self, reason: Option<String>) {
@@ -774,6 +976,21 @@ impl Conversation {
                     invalidation.detail |= generation == self.coverage.generation;
                 }
                 _ => {}
+            }
+            if event.kind == "command.applied" {
+                self.note_delivered(event, generation, &mut invalidation);
+                continue;
+            }
+            if event.kind == "mail.delivered" {
+                if let Some(id) = data_str(event, "delivery_id")
+                    && !self.deliveries.iter().any(|known| known == id)
+                {
+                    self.deliveries.push_back(id.to_owned());
+                    if self.deliveries.len() > MAX_DELIVERIES {
+                        self.deliveries.pop_front();
+                    }
+                }
+                continue;
             }
             let Some(turn_id) = data_str(event, "turn_id") else {
                 continue;
@@ -886,6 +1103,80 @@ impl Conversation {
         invalidation
     }
 
+    /// A delivered Swarm note (`command.applied` whose outcome says
+    /// `delivered_in_turn` or `delivered_next_input`) joins the newest turn
+    /// of its generation started by then; its text and its own turn come
+    /// from `command.get`, which moves it if that turn differs
+    /// ([`Self::place_note`]). The event carries the rule cause of a rule's
+    /// note, as the Store frames it.
+    fn note_delivered(&mut self, event: &Event, generation: i64, invalidation: &mut Invalidation) {
+        let delivered = event
+            .data
+            .pointer("/outcome/delivery")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|delivery| delivery.starts_with("delivered_"));
+        let Some(command) = data_str(event, "command_id").filter(|_| delivered) else {
+            return;
+        };
+        if self.references(command) {
+            return;
+        }
+        let rule = event
+            .cause
+            .as_ref()
+            .is_some_and(|cause| cause.rule.is_some());
+        let Some(turn) = self
+            .turns
+            .values_mut()
+            .filter(|turn| {
+                turn.key.generation == generation
+                    && turn.first_seq.is_some_and(|seq| seq <= event.seq)
+            })
+            .max_by_key(|turn| turn.first_seq)
+        else {
+            return;
+        };
+        turn.activity.push(Activity::Note {
+            command: command.to_owned(),
+            rule,
+        });
+        if !self.inputs.contains_key(command) {
+            invalidation.inputs.push(command.to_owned());
+        }
+    }
+
+    /// Put a Swarm note into the turn `command.get` says it was applied in,
+    /// when that turn is resident and is not where it was placed.
+    fn place_note(&mut self, command: &str, turn_id: &str) {
+        let holder = self.turns.iter().find_map(|(key, turn)| {
+            turn.activity.iter().find_map(|entry| match entry {
+                Activity::Note {
+                    command: known,
+                    rule,
+                } if known == command => Some((key.clone(), *rule)),
+                _ => None,
+            })
+        });
+        let Some((from, rule)) = holder.filter(|(key, _)| key.id != turn_id) else {
+            return;
+        };
+        let target = TurnKey::new(from.generation, turn_id);
+        if !self.turns.contains_key(&target) {
+            return;
+        }
+        if let Some(turn) = self.turns.get_mut(&from) {
+            turn.activity.retain(
+                |entry| !matches!(entry, Activity::Note { command: known, .. } if known == command),
+            );
+        }
+        if let Some(turn) = self.turns.get_mut(&target) {
+            turn.activity.push(Activity::Note {
+                command: command.to_owned(),
+                rule,
+            });
+        }
+    }
+
     /// Apply authoritative state, outcome and public final text.
     pub fn apply_turns(&mut self, turns: &[Turn]) {
         for read in turns {
@@ -940,9 +1231,16 @@ impl Conversation {
             // waiting local input or a resident turn's command keeps text.
             let wanted =
                 self.local.iter().any(|known| known == &command) || self.references(&command);
-            if wanted {
-                self.inputs.insert(command, text);
+            if !wanted {
+                continue;
             }
+            if let InputText::Note {
+                turn: Some(turn), ..
+            } = &text
+            {
+                self.place_note(&command, turn);
+            }
+            self.inputs.insert(command, text);
         }
         // Inputs alone can exceed the budget, so the limit holds on
         // insertion instead of waiting for the next turn event.
@@ -1088,14 +1386,7 @@ impl Conversation {
         loop {
             self.prune_inputs();
             let bytes: usize = self.turns.values().map(TurnEntry::bytes).sum::<usize>()
-                + self
-                    .inputs
-                    .values()
-                    .map(|text| match text {
-                        InputText::Loaded(text) => text.len(),
-                        InputText::Unavailable(reason) => reason.len(),
-                    })
-                    .sum::<usize>()
+                + self.inputs.values().map(InputText::len).sum::<usize>()
                 + self.pending_exact.values().map(String::len).sum::<usize>();
             if self.turns.len() <= 1
                 || (self.turns.len() <= MAX_RESIDENT_TURNS && bytes <= MAX_RESIDENT_BYTES)
@@ -1201,21 +1492,27 @@ impl Conversation {
         let mut parts = Vec::new();
         match turn.command_id.as_deref() {
             Some(command) => {
-                let (label, text) = match self.inputs.get(command) {
-                    Some(InputText::Loaded(text)) => ("You".to_owned(), text.clone()),
-                    Some(InputText::Unavailable(reason)) => (
-                        "You".to_owned(),
-                        format!("(input text unavailable: {reason})"),
-                    ),
-                    None => ("You".to_owned(), "(loading input text…)".to_owned()),
+                let text = match self.inputs.get(command) {
+                    Some(InputText::Inserted(blocks)) => {
+                        parts.extend(inserted_parts(&format!("in:{command}"), blocks));
+                        None
+                    }
+                    Some(InputText::Loaded(text)) => Some(text.clone()),
+                    Some(InputText::Note { text, .. }) => Some(text.clone()),
+                    Some(InputText::Unavailable(reason)) => {
+                        Some(format!("(input text unavailable: {reason})"))
+                    }
+                    None => Some("(loading input text…)".to_owned()),
                 };
-                parts.push(Part::new(
-                    format!("in:{command}"),
-                    PartKind::Input,
-                    label,
-                    text,
-                    Vec::new(),
-                ));
+                if let Some(text) = text {
+                    parts.push(Part::new(
+                        format!("in:{command}"),
+                        PartKind::Input,
+                        "You".to_owned(),
+                        text,
+                        Vec::new(),
+                    ));
+                }
             }
             None => parts.push(Part::new(
                 format!("in:turn:{}", turn.key.id),
@@ -1254,7 +1551,14 @@ impl Conversation {
                     PartKind::Steer,
                     "You · steered".to_owned(),
                     match self.inputs.get(command) {
-                        Some(InputText::Loaded(text)) => text.clone(),
+                        Some(InputText::Loaded(text) | InputText::Note { text, .. }) => {
+                            text.clone()
+                        }
+                        Some(InputText::Inserted(blocks)) => blocks
+                            .iter()
+                            .map(|block| block.text.as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n\n"),
                         Some(InputText::Unavailable(reason)) => {
                             format!("(input text unavailable: {reason})")
                         }
@@ -1262,6 +1566,54 @@ impl Conversation {
                     },
                     Vec::new(),
                 )),
+                Activity::Note { command, rule } => {
+                    let key = format!("note:{command}");
+                    match self.inputs.get(command) {
+                        Some(InputText::Note {
+                            principal, text, ..
+                        }) => {
+                            // The Store frames a rule's note as the rule's.
+                            let principal = if *rule && principal == "owner" {
+                                "swarm_rule"
+                            } else {
+                                principal
+                            };
+                            let note = eliot_core::swarm_note(text, principal);
+                            let frame = note.lines().next().unwrap_or_default().to_owned();
+                            parts.push(Part::new(
+                                key,
+                                PartKind::Note,
+                                frame,
+                                text.clone(),
+                                Vec::new(),
+                            ));
+                        }
+                        Some(InputText::Inserted(blocks)) => {
+                            parts.extend(inserted_parts(&key, blocks));
+                        }
+                        Some(InputText::Loaded(text)) => parts.push(Part::new(
+                            key,
+                            PartKind::Note,
+                            "Swarm note".to_owned(),
+                            text.clone(),
+                            Vec::new(),
+                        )),
+                        Some(InputText::Unavailable(reason)) => parts.push(Part::new(
+                            key,
+                            PartKind::Note,
+                            "Swarm note".to_owned(),
+                            format!("(note text unavailable: {reason})"),
+                            Vec::new(),
+                        )),
+                        None => parts.push(Part::new(
+                            key,
+                            PartKind::Note,
+                            "Swarm note".to_owned(),
+                            "(loading note…)".to_owned(),
+                            Vec::new(),
+                        )),
+                    }
+                }
                 Activity::Tools {
                     key,
                     rows,
@@ -1703,4 +2055,36 @@ pub fn file_references(text: &str) -> Vec<String> {
         }
     });
     paths
+}
+
+/// The parts of inserted blocks under `key`: owner mail as the owner's
+/// message, every other block as a Swarm note.
+fn inserted_parts(key: &str, blocks: &[Inserted]) -> Vec<Part> {
+    blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| {
+            let key = if index == 0 {
+                key.to_owned()
+            } else {
+                format!("{key}:{index}")
+            };
+            match &block.frame {
+                Some(frame) => Part::new(
+                    key,
+                    PartKind::Note,
+                    frame.clone(),
+                    block.text.clone(),
+                    Vec::new(),
+                ),
+                None => Part::new(
+                    key,
+                    PartKind::Input,
+                    "You".to_owned(),
+                    block.text.clone(),
+                    Vec::new(),
+                ),
+            }
+        })
+        .collect()
 }

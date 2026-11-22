@@ -31,6 +31,25 @@ pub(super) enum MonitorMsg {
     SearchChanged(String),
     /// The state filter's choice (an index into `monitor::STATE_FILTERS`).
     StateChosen(Option<usize>),
+    /// Show or hide Swarm autonomy (read while shown).
+    AutonomyToggled,
+    /// Swarm autonomy's window: the last 7 days (true) or 24 hours.
+    AutonomyWindow(bool),
+    /// Read Swarm autonomy again now.
+    AutonomyRefresh,
+    /// A Swarm autonomy read (its sequence, for the window it was asked for).
+    AutonomyLoaded(u64, Box<Fallible<eliot_core::api::AutonomyResponse>>),
+}
+
+/// Swarm autonomy in the Monitor ([`crate::autonomy_view`]).
+#[derive(Default)]
+pub(super) struct AutonomyState {
+    pub(super) open: bool,
+    pub(super) week: bool,
+    /// Tags reads: a reply for an older request is dropped.
+    seq: u64,
+    reading: bool,
+    pub(super) report: Option<crate::autonomy_view::Report>,
 }
 
 /// The panel's refresh chain and the Agent whose details it reads.
@@ -56,6 +75,7 @@ pub(super) struct MonitorState {
     /// The sidebar's read of attention reports is running (only while the
     /// panel, and so its refresh, is closed).
     pub(super) sidebar_reading: bool,
+    pub(super) autonomy: AutonomyState,
 }
 
 /// Why the Details tab cannot open (its tooltip while disabled).
@@ -75,7 +95,7 @@ impl DesktopApp {
     pub(super) fn monitor_update(&mut self, msg: MonitorMsg, context: &ComponentContext<Self>) {
         match msg {
             MonitorMsg::MonitorLoaded(epoch, snapshot) => {
-                if epoch != self.monitor.epoch || self.panel == Panel::Closed {
+                if epoch != self.monitor.epoch || !self.monitor_panel() {
                     return;
                 }
                 self.monitor.refreshing = false;
@@ -175,6 +195,60 @@ impl DesktopApp {
             MonitorMsg::TechnicalToggled => {
                 self.monitor.technical_open = !self.monitor.technical_open
             }
+            MonitorMsg::AutonomyToggled => {
+                let autonomy = &mut self.monitor.autonomy;
+                autonomy.open = !autonomy.open;
+                if autonomy.open {
+                    self.read_autonomy(0, context);
+                } else {
+                    // A shown report waits for its next read; a hidden one
+                    // reads nothing.
+                    autonomy.seq += 1;
+                    autonomy.reading = false;
+                }
+            }
+            MonitorMsg::AutonomyWindow(week) => {
+                if self.monitor.autonomy.week != week {
+                    self.monitor.autonomy.week = week;
+                    self.monitor.autonomy.report = None;
+                    self.read_autonomy(0, context);
+                }
+            }
+            MonitorMsg::AutonomyRefresh => self.read_autonomy(0, context),
+            MonitorMsg::AutonomyLoaded(seq, read) => {
+                if seq != self.monitor.autonomy.seq {
+                    return;
+                }
+                self.monitor.autonomy.reading = false;
+                let now = crate::handoff::now_ms();
+                let checkouts = self.checkouts();
+                // A registration by the sidebar's name for it, else its id.
+                let project_name = |id: &str| {
+                    self.nav
+                        .projects
+                        .iter()
+                        .find(|project| project.id == id)
+                        .map_or_else(
+                            || id.to_owned(),
+                            |project| self.place_title_in(&project.workspace, &checkouts),
+                        )
+                };
+                let report = match *read {
+                    Ok(read) => crate::autonomy_view::Report::Read(views::Shared(Rc::new(
+                        crate::autonomy_view::lines(
+                            &read,
+                            |agent| self.agent_title(agent),
+                            project_name,
+                            now,
+                        ),
+                    ))),
+                    Err(error) => crate::autonomy_view::Report::Failed(error),
+                };
+                self.monitor.autonomy.report = Some(report);
+                if self.monitor.autonomy.open && self.panel == Panel::Monitor {
+                    self.read_autonomy(crate::autonomy_view::REFRESH_MS, context);
+                }
+            }
             MonitorMsg::PanelChosen(panel) => self.choose_panel(panel, context),
         }
     }
@@ -193,6 +267,19 @@ impl DesktopApp {
                 if self.panel != Panel::Monitor {
                     self.panel = Panel::Monitor;
                     self.start_monitor(context);
+                    if self.monitor.autonomy.open {
+                        self.read_autonomy(0, context);
+                    }
+                }
+            }
+            Panel::Inbox => {
+                if self.panel != Panel::Inbox {
+                    // The Monitor's refresh stops; the inbox reads with the
+                    // sidebar's poll.
+                    self.close_panel();
+                    self.panel = Panel::Inbox;
+                    self.read_inbox(context);
+                    self.read_inbox_counts(context);
                 }
             }
             Panel::Closed => {}
@@ -214,11 +301,17 @@ impl DesktopApp {
             self.monitor.data.detail_errors.clear();
             self.monitor.technical_open = false;
         }
-        let was_closed = self.panel == Panel::Closed;
+        let was_closed = !self.monitor_panel();
         self.panel = Panel::Details;
         if was_closed || changed {
             self.start_monitor(context);
         }
+    }
+
+    /// Whether the pane shown runs the Monitor's refresh chain (the
+    /// Monitor or the details; the Inbox reads with the sidebar's poll).
+    pub(super) fn monitor_panel(&self) -> bool {
+        matches!(self.panel, Panel::Monitor | Panel::Details)
     }
 
     /// Close the panel: no refresh, no render work.
@@ -234,6 +327,33 @@ impl DesktopApp {
     /// Read while the panel is open, keeping the last successful data visible.
     pub(super) fn start_monitor(&mut self, context: &ComponentContext<Self>) {
         self.read_monitor(0, context);
+    }
+
+    /// Read Swarm autonomy for the chosen window after `delay_ms` (the
+    /// shown report stays until the read lands). The daemon runs one report
+    /// at a time on a read-only snapshot; a shown report is read again
+    /// every [`crate::autonomy_view::REFRESH_MS`] while the Monitor shows it.
+    pub(super) fn read_autonomy(&mut self, delay_ms: u64, context: &ComponentContext<Self>) {
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        let autonomy = &mut self.monitor.autonomy;
+        autonomy.seq += 1;
+        autonomy.reading = delay_ms == 0;
+        let (seq, week) = (autonomy.seq, autonomy.week);
+        let _task = context.spawn_background(move |cancel| {
+            let cancelled = || cancel.is_cancelled();
+            if delay_ms > 0 && !feed::backoff(delay_ms, &cancelled) {
+                return Message::Monitor(MonitorMsg::AutonomyLoaded(
+                    seq,
+                    Box::new(Err("cancelled".to_owned())),
+                ));
+            }
+            let since = week.then(|| crate::handoff::now_ms() - crate::autonomy_view::WEEK_MS);
+            let read = client::block_on(client::autonomy(&data_dir, since))
+                .map_err(|error| error.user_message());
+            Message::Monitor(MonitorMsg::AutonomyLoaded(seq, Box::new(read)))
+        });
     }
 
     /// One refresh after `delay_ms` (the next one is planned when it lands).
@@ -320,42 +440,50 @@ impl DesktopApp {
 
     /// The pane's header: the Monitor and Details tabs and the close
     /// button.
-    fn panel_header(
+    pub(super) fn panel_header(
         &self,
         _title: &str,
         context: &mut ViewContext<Self>,
         palette: Palette,
     ) -> View {
-        let tabs: Vec<KeyedView> = [("Monitor", Panel::Monitor), ("Details", Panel::Details)]
-            .into_iter()
-            .map(|(label, panel)| {
-                let selected = self.panel == panel;
-                let enabled = panel != Panel::Details || self.details_agent().is_some();
-                let tab = m3::pane_tab(palette, selected)
-                    .is_enabled(enabled)
-                    .automation_name(if enabled {
-                        format!("Show {label}")
-                    } else {
-                        format!("Show {label}: {NO_DETAILS}")
-                    })
-                    .on_click(context.message(Message::Monitor(MonitorMsg::PanelChosen(panel))))
-                    .content(m3::pane_tab_label(label));
-                // WinUI shows no tooltip on a disabled control and does not
-                // hit-test it, so the reason sits on a hit-testable border
-                // behind it.
-                let tab: View = if enabled {
-                    tab
+        let inbox = match self.inbox.total() {
+            0 => "Inbox".to_owned(),
+            count => format!("Inbox · {count}"),
+        };
+        let tabs: Vec<KeyedView> = [
+            ("Monitor", Panel::Monitor),
+            (inbox.as_str(), Panel::Inbox),
+            ("Details", Panel::Details),
+        ]
+        .into_iter()
+        .map(|(label, panel)| {
+            let selected = self.panel == panel;
+            let enabled = panel != Panel::Details || self.details_agent().is_some();
+            let tab = m3::pane_tab(palette, selected)
+                .is_enabled(enabled)
+                .automation_name(if enabled {
+                    format!("Show {label}")
                 } else {
-                    Border::new()
-                        .background(Brush::Solid(Color::argb(0, 0, 0, 0)))
-                        .content(tab)
-                        .tooltip(NO_DETAILS)
-                };
-                // Keyed by its selection (k195 P2-5: the highlight follows
-                // the pane, however it opened) and by whether it can open.
-                KeyedView::new(format!("{label}:{selected}:{enabled}"), tab)
-            })
-            .collect();
+                    format!("Show {label}: {NO_DETAILS}")
+                })
+                .on_click(context.message(Message::Monitor(MonitorMsg::PanelChosen(panel))))
+                .content(m3::pane_tab_label(label));
+            // WinUI shows no tooltip on a disabled control and does not
+            // hit-test it, so the reason sits on a hit-testable border
+            // behind it.
+            let tab: View = if enabled {
+                tab
+            } else {
+                Border::new()
+                    .background(Brush::Solid(Color::argb(0, 0, 0, 0)))
+                    .content(tab)
+                    .tooltip(NO_DETAILS)
+            };
+            // Keyed by its selection (k195 P2-5: the highlight follows
+            // the pane, however it opened) and by whether it can open.
+            KeyedView::new(format!("{label}:{selected}:{enabled}"), tab)
+        })
+        .collect();
         Grid::new()
             .height(tokens::height::CONTROL)
             .columns([GridLength::STAR, GridLength::Auto])
@@ -559,6 +687,26 @@ impl DesktopApp {
                 .text_wrapping(TextWrapping::Wrap),
             ));
         }
+        let autonomy = &self.monitor.autonomy;
+        items.push(KeyedView::new(
+            "autonomy",
+            View::component::<crate::autonomy_view::Autonomy>(
+                crate::autonomy_view::AutonomyInput {
+                    open: autonomy.open,
+                    week: autonomy.week,
+                    report: autonomy
+                        .report
+                        .clone()
+                        .unwrap_or(crate::autonomy_view::Report::Reading),
+                    reading: autonomy.reading,
+                    palette,
+                    toggle: context.callback(|()| Message::Monitor(MonitorMsg::AutonomyToggled)),
+                    window: context
+                        .callback(|week: bool| Message::Monitor(MonitorMsg::AutonomyWindow(week))),
+                    refresh: context.callback(|()| Message::Monitor(MonitorMsg::AutonomyRefresh)),
+                },
+            ),
+        ));
         items.push(KeyedView::new(
             "search",
             self.monitor_search(context, palette),

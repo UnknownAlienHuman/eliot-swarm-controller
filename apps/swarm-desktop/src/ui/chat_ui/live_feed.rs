@@ -88,11 +88,11 @@ impl DesktopApp {
         if self.chat.reread_inflight || !self.chat.invalidated.any() || self.daemon_down() {
             return;
         }
-        let (Some(agent), Ok(data_dir)) = (
+        let (Some((agent, deliveries)), Ok(data_dir)) = (
             self.chat
                 .convo
                 .as_ref()
-                .map(|convo| convo.agent().to_owned()),
+                .map(|convo| (convo.agent().to_owned(), convo.deliveries())),
             self.data_dir.clone(),
         ) else {
             return;
@@ -109,6 +109,7 @@ impl DesktopApp {
                 work.turns,
                 work.detail,
                 work.inputs.clone(),
+                deliveries,
             );
             // A failed reread hands its work back so it is retried, not lost.
             Message::Chat(ChatMsg::RereadLoaded(

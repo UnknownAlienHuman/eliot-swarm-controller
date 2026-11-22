@@ -5,7 +5,9 @@
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 
-use super::sidebar_ui::{FleetEntry, PlaceEntry, Renaming, SearchField, SidebarInput, TaskEntry};
+use super::sidebar_ui::{
+    FleetEntry, InboxEntry, PlaceEntry, Renaming, SearchField, SidebarInput, TaskEntry,
+};
 use super::*;
 use crate::nav::{Branch, Checkout, Fleet, Row, Shown};
 use crate::settings::{Startup, ThemeChoice};
@@ -39,6 +41,8 @@ pub(super) enum Panel {
     Closed,
     /// Every Agent as a simple card.
     Monitor,
+    /// The Owner inbox: what waits for the owner's decision.
+    Inbox,
     /// The open conversation's Agent: settings, coverage, resources, usage
     /// and Change manager.
     Details,
@@ -74,6 +78,9 @@ pub(super) enum ShellMsg {
     /// The new data directory runs: whether it was remembered.
     RootRemembered(PathBuf, Result<(), String>),
     ProjectsLoaded(Fallible<Vec<UiProject>>),
+    /// A `project.list` read for the open policy editor's counter: only
+    /// each project's `policy_usage` is taken from it.
+    PolicyUsageLoaded(Fallible<Vec<UiProject>>),
     /// The sidebar's grouping readback (`chat.organization` groups with
     /// their headers and totals, and the `organization.changed` rows since
     /// the cursor). A failed read keeps the last server grouping with a
@@ -95,6 +102,8 @@ pub(super) enum ShellMsg {
     AttentionReports(Option<i64>, Fallible<monitor::AttentionRead>),
     /// The replies of one sidebar refresh, together: one window render.
     Refreshed(Vec<ShellMsg>),
+    /// An inbox read that replied with the sidebar's refresh.
+    Inbox(super::inbox_ui::InboxMsg),
     /// A sidebar-search page (`agent.list` with `query`): its read epoch,
     /// the query it answers, whether it appends, and the page.
     SearchLoaded(u64, String, bool, Fallible<AgentPage>),
@@ -408,7 +417,7 @@ impl DesktopApp {
                         if self.chat.convo.is_some() {
                             self.start_snapshot(context);
                         }
-                        if self.panel != Panel::Closed {
+                        if self.monitor_panel() {
                             self.read_monitor(0, context);
                         }
                     }
@@ -479,6 +488,20 @@ impl DesktopApp {
                 }
                 Err(error) => self.alert(format!("Projects not read: {error}")),
             },
+            ShellMsg::PolicyUsageLoaded(read) => {
+                // A failed read keeps the counter shown; the next poll reads again.
+                for fresh in read.into_iter().flatten() {
+                    if let Some(project) = self
+                        .nav
+                        .projects
+                        .iter_mut()
+                        .find(|project| project.id == fresh.id)
+                        .filter(|project| project.policy_usage != fresh.policy_usage)
+                    {
+                        project.policy_usage = fresh.policy_usage;
+                    }
+                }
+            }
             ShellMsg::AgentsLoaded(list_epoch, append, page) => {
                 // The composer's usage indicator reads every harness's quota
                 // once the daemon answers (Usage's Refresh reads again).
@@ -594,10 +617,11 @@ impl DesktopApp {
                     self.shell_update(reply, context);
                 }
             }
+            ShellMsg::Inbox(msg) => self.inbox_update(msg, context),
             ShellMsg::AttentionReports(cursor, read) => {
                 self.monitor.sidebar_reading = false;
                 // An open panel's refresh owns the cursor meanwhile.
-                if self.panel == Panel::Closed
+                if !self.monitor_panel()
                     && self.monitor.data.attention_cursor == cursor
                     && let Ok(read) = read
                 {
@@ -760,6 +784,7 @@ impl DesktopApp {
             // the pane's X closes the pane.
             ShellMsg::PanelToggled(panel) => match panel {
                 Panel::Monitor if self.panel == Panel::Monitor => self.close_panel(),
+                Panel::Inbox if self.panel == Panel::Inbox => self.close_panel(),
                 Panel::Closed => self.close_panel(),
                 panel => self.choose_panel(panel, context),
             },
@@ -1020,6 +1045,14 @@ impl DesktopApp {
                 if self.preferences_loaded {
                     self.load_organization(context);
                     self.load_queue(context);
+                }
+                // An open launch policy's counter follows new launches.
+                self.read_policy_usage(context);
+                // The navigation's inbox counts on every poll; the items
+                // only while the Inbox shows them.
+                self.read_inbox_counts(context);
+                if self.panel == Panel::Inbox {
+                    self.read_inbox(context);
                 }
                 let reads = self.nav.batch.take().unwrap_or_default();
                 if !reads.is_empty() {
@@ -1913,7 +1946,7 @@ impl DesktopApp {
         let Ok(data_dir) = self.data_dir.clone() else {
             return;
         };
-        if self.panel != Panel::Closed || self.monitor.sidebar_reading {
+        if self.monitor_panel() || self.monitor.sidebar_reading {
             return;
         }
         self.monitor.sidebar_reading = true;
@@ -1929,9 +1962,26 @@ impl DesktopApp {
         });
     }
 
+    /// Read the projects' launch policy use while a policy editor shows it
+    /// (Settings › Projects with a project open).
+    pub(super) fn read_policy_usage(&mut self, context: &ComponentContext<Self>) {
+        if self.main != Main::Settings
+            || self.settings_page != Page::Projects
+            || self.settings.policy.is_none()
+        {
+            return;
+        }
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        self.spawn_read(context, move || {
+            ShellMsg::PolicyUsageLoaded(load_projects_blocking(&data_dir))
+        });
+    }
+
     /// Run one sidebar read on a worker: on its own, or in the refresh
     /// being collected, whose reads reply together (`ShellMsg::Refreshed`).
-    fn spawn_read(
+    pub(super) fn spawn_read(
         &mut self,
         context: &ComponentContext<Self>,
         read: impl FnOnce() -> ShellMsg + Send + 'static,
@@ -2231,6 +2281,11 @@ impl DesktopApp {
                 tone,
                 open: self.panel == Panel::Monitor,
             },
+            inbox: InboxEntry {
+                counts: super::inbox_ui::counts_line(&self.inbox.counts),
+                total: self.inbox.total(),
+                open: self.panel == Panel::Inbox,
+            },
             renaming: self.menu.renaming.as_ref().map(|(target, typed)| Renaming {
                 target: target.clone(),
                 typed: typed.clone(),
@@ -2419,6 +2474,7 @@ impl DesktopApp {
     fn panel_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         match self.panel {
             Panel::Monitor => self.monitor_view(context, palette),
+            Panel::Inbox => self.inbox_view(context, palette),
             Panel::Details => self.details_view(context, palette),
             Panel::Closed => View::empty(),
         }

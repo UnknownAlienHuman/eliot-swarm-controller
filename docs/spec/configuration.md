@@ -941,9 +941,11 @@ retained reason. An ordinary switch within the same project carries it forward.
 
 The settings API reads and saves this same canonical policy with the other project
 settings. Legacy flat `check`, `check_at_turn_end` and `max_rounds` values are accepted
-as migration input; settings readback exposes the nested policy shape. The desktop
-consumes the existing settings and project DTO data; a policy editor is separate design
-work. Project registration readback uses the canonical Core [`ProjectRegistrationView`](../../crates/eliot-core/src/api/agent_views.rs);
+as migration input; settings readback exposes the nested policy shape. The desktop's
+project editor edits this block from the same settings data and saves it as one
+revision-checked projects save; Validate is a dry run, and a refusal shows the
+store's message. It shows `policy_usage` from `project.list`, read again while the
+editor is open. Project registration readback uses the canonical Core [`ProjectRegistrationView`](../../crates/eliot-core/src/api/agent_views.rs);
 project identity includes the canonical checkout and Git common directory. The registration ID names nothing a person reads: a project's name is the
 owner's `[desktop] display_names` entry, else the repository name of its `origin` remote
 (the readback's read-only `origin`, [api](api.md)), else the folder of the repository's

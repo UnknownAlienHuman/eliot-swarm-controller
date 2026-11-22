@@ -63,6 +63,8 @@ pub mod glyph {
     pub const STOP: &str = "\u{E978}";
     pub const MORE: &str = "\u{E712}";
     pub const INFO: &str = "\u{E946}";
+    /// The Owner inbox: Segoe Fluent Mail.
+    pub const INBOX: &str = "\u{E715}";
     pub const CLOSE: &str = "\u{E711}";
     pub const BACK: &str = "\u{E76B}";
     pub const FORWARD: &str = "\u{E76C}";

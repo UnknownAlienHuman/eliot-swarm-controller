@@ -163,7 +163,7 @@ impl DesktopApp {
                         }
                     }
                 }
-                if self.panel != Panel::Closed {
+                if self.monitor_panel() {
                     self.start_monitor(context);
                 }
                 // The sidebar's tree follows the new parent.
