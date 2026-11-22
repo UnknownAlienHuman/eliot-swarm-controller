@@ -22,6 +22,7 @@ use eliot_plugin::{
         event_id as shared_event_id, native_no_write, next_input_outcomes, rejected_control,
         request_reply_applied, unknown_control,
     },
+    usage::{FirstCallUsage, call_input_tokens},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -221,6 +222,7 @@ struct EventProcessor {
     /// repeated notification cannot double count and raw `last` values are
     /// never summed.
     turn_usage: Option<(String, NativeTokenUsageDelta, NativeTokenUsageDelta)>,
+    first_call_usage: FirstCallUsage,
     thread_model: Option<String>,
     usage_window: ContextWindowTracker,
     /// Latest merged session-scoped snapshot from
@@ -441,6 +443,7 @@ impl EventProcessor {
             final_text: None,
             turn_has_work_or_uncertain_effects: false,
             turn_usage: None,
+            first_call_usage: FirstCallUsage::default(),
             thread_model: None,
             usage_window: ContextWindowTracker::default(),
             session_usage: None,
@@ -839,6 +842,7 @@ impl EventProcessor {
         self.final_text = None;
         self.turn_has_work_or_uncertain_effects = false;
         self.turn_usage = None;
+        self.first_call_usage = FirstCallUsage::default();
         self.usage_window
             .associate_turn(&turn_id, model.as_deref().or(self.thread_model.as_deref()));
         let thread_id = self.status.thread_id.as_deref().unwrap_or_default();
@@ -1778,10 +1782,14 @@ impl EventProcessor {
                 )
             })?;
         validate_thread_and_turn(&self.status, &notification.thread_id, &notification.turn_id)?;
-        if self.status.active_turn_id.as_deref() == Some(notification.turn_id.as_str())
-            && notification.token_usage.last.has_response_counters()
-            && let Some(total) = notification.token_usage.total.clone()
-        {
+        let last = &notification.token_usage.last;
+        let response = self.status.active_turn_id.as_deref() == Some(notification.turn_id.as_str())
+            && last.has_response_counters();
+        self.first_call_usage.observe(
+            response,
+            call_input_tokens("codex", last.input_tokens, None, None),
+        );
+        if response && let Some(total) = notification.token_usage.total.clone() {
             match self.turn_usage.as_mut() {
                 Some((turn_id, _, latest)) if turn_id == &notification.turn_id => {
                     *latest = total;
@@ -1898,7 +1906,7 @@ impl EventProcessor {
             .take()
             .filter(|(turn_id, _, _)| *turn_id == notification.turn.id)
             .and_then(|(_, baseline, latest)| turn_expenditure(&baseline, &latest));
-        if let Some(usage) = turn_usage {
+        if let Some(usage) = self.first_call_usage.finish("turn", turn_usage) {
             data["usage"] = serde_json::to_value(&usage).unwrap_or(Value::Null);
         }
         attach_native_error(&mut data, notification.turn.error.as_ref(), &secrets);
@@ -2046,6 +2054,7 @@ impl EventProcessor {
         self.status.active_command_id = None;
         self.status.active_turn_id = None;
         self.turn_usage = None;
+        self.first_call_usage = FirstCallUsage::default();
         Ok(())
     }
 

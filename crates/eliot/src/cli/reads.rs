@@ -421,6 +421,26 @@ pub(crate) fn print_doctor_table(response: &HarnessDoctorResponse) {
             println!("  no installed Claude replacement was discovered");
         }
     }
+    println!("First-call input by profile (tokens)");
+    if response.profile_first_calls.is_empty() {
+        println!("  No measured profile samples");
+    }
+    for sample in &response.profile_first_calls {
+        println!(
+            "  {} ({}, MCP {}) average {} over {} turns",
+            sample.profile,
+            sample.harness,
+            sample.mcp_policy.as_deref().unwrap_or("unknown"),
+            sample.average_input_tokens,
+            sample.sampled_turns,
+        );
+    }
+    if response.profile_first_calls_truncated {
+        println!(
+            "  Limited to the newest {} retained turn rows",
+            eliot_core::api::PROFILE_FIRST_CALL_WINDOW
+        );
+    }
 }
 
 pub(crate) async fn run_heavy(
@@ -1358,6 +1378,22 @@ pub(crate) fn print_usage_table(response: &UsageSummaryResponse) {
     }
     if response.swarm_mcp_truncated {
         println!("  swarm MCP usage limited to the most recent {MAX_SWARM_MCP_TURNS} turns");
+    }
+    println!("  first-call input (tokens)");
+    if response.first_calls.is_empty() {
+        println!("    No measured turns");
+    }
+    for sample in &response.first_calls {
+        println!(
+            "    {}#{} turn {} input {}",
+            sample.agent, sample.generation, sample.turn_id, sample.input_tokens
+        );
+    }
+    if response.first_calls_truncated {
+        println!(
+            "    Limited to {} measured turns in Agent, generation and turn ID order",
+            eliot_core::api::MAX_FIRST_CALL_TURNS
+        );
     }
     println!(
         "  {:<14} {:<7} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",

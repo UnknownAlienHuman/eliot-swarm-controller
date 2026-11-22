@@ -1573,6 +1573,15 @@ swarm usage <agent> and swarm usage --agent <agent> for the same Agent scope;
 project and root scopes retain their flags. `swarm usage` renders this response as a compact table;
 `--json` keeps printing the raw response.
 
+`first_calls` reports known first-call input for exact retained Agent generations
+and turns within that same usage scope. The list is bounded in Agent, generation
+and turn ID order. `first_calls_truncated` marks measured turns left out.
+`swarm doctor` reports the average first-call input and sample count by profile,
+harness and frozen MCP policy. It samples terminal turns from a bounded window of
+the newest retained turn rows and uses profile facts for exact current generations.
+Inherit and minimal are separate observed samples. Their values include the task's
+input and the harness context.
+
 Required IDs must be strings whose trimmed value is nonempty and are preserved without
 trimming or normalization. Command references use the [Core command ID validator](../../crates/eliot-core/src/command.rs).
 `turn.get` requires a nonnegative integer generation. An `agent.result` self-read

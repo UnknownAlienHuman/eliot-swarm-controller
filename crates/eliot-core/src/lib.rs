@@ -918,12 +918,17 @@ pub struct TurnUsage {
     pub cache_write_tokens: Option<i64>,
     #[serde(default)]
     pub total_tokens: Option<i64>,
+    /// Input of the first measured model call, including cache reads and
+    /// writes counted once. Session and whole-turn totals cannot fill it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_call_input_tokens: Option<i64>,
 }
 
 impl TurnUsage {
     /// Project the retained vendor counters onto uncached input, cached
     /// input, and output. Native totals can include overlapping categories.
     pub fn normalized(mut self, harness: &str) -> Self {
+        self.first_call_input_tokens = self.first_call_input_tokens.filter(|n| *n >= 0);
         self.input_tokens = uncached_input(
             harness,
             self.input_tokens,

@@ -5019,6 +5019,7 @@ fn session_fallback_usage(snapshot: &SessionUsage) -> Option<TurnUsage> {
         cache_read_tokens: tokens.cache_read_tokens,
         cache_write_tokens: tokens.cache_write_tokens,
         total_tokens: None,
+        first_call_input_tokens: None,
     })
 }
 

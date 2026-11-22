@@ -4306,10 +4306,13 @@ impl Router {
                 contract_mismatch,
             });
         }
+        let (profile_first_calls, profile_first_calls_truncated) = store.profile_first_calls()?;
         drop(store);
         let response = HarnessDoctorResponse {
             harnesses,
             claude_profile_command_issues,
+            profile_first_calls,
+            profile_first_calls_truncated,
         };
         request
             .validate_response(&response)

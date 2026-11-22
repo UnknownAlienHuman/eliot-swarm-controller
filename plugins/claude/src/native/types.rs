@@ -318,22 +318,23 @@ pub(crate) fn result_session_tokens(record: &Value) -> Option<SessionTokenTotals
 /// cache-creation input. All four nonnegative counters describe one call's
 /// context footprint; omitted cache buckets mean zero, while missing or
 /// malformed required counters and overflow leave the sample unavailable.
-pub(crate) fn assistant_context_used(record: &Value) -> Option<i64> {
+pub(crate) fn assistant_call_input(record: &Value) -> Option<i64> {
     let usage = record.get("message")?.get("usage")?.as_object()?;
-    let required = |key: &str| {
-        usage
-            .get(key)
-            .and_then(Value::as_i64)
-            .filter(|value| *value >= 0)
-    };
     let optional_cache = |key: &str| match usage.get(key) {
         Some(Value::Null) | None => Some(0),
-        Some(value) => value.as_i64().filter(|count| *count >= 0),
+        value => usage_counter(value),
     };
-    required("input_tokens")?
-        .checked_add(optional_cache("cache_read_input_tokens")?)?
-        .checked_add(optional_cache("cache_creation_input_tokens")?)?
-        .checked_add(required("output_tokens")?)
+    eliot_plugin::usage::call_input_tokens(
+        "claude",
+        usage_counter(usage.get("input_tokens")),
+        optional_cache("cache_read_input_tokens"),
+        optional_cache("cache_creation_input_tokens"),
+    )
+}
+
+pub(crate) fn assistant_context_used(record: &Value) -> Option<i64> {
+    let usage = record.get("message")?.get("usage")?;
+    assistant_call_input(record)?.checked_add(usage_counter(usage.get("output_tokens"))?)
 }
 
 /// Model context window from an init or result frame: the installed

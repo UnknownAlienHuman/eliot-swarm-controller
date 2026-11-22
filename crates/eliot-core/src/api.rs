@@ -214,6 +214,7 @@ pub use switch::{
 };
 pub use timers::{CatchUp, TimerGetRequest, TimerRunRequest, TimerSchedule, TimerStateView};
 pub use usage::{
+    FirstCallInput, MAX_FIRST_CALL_TURNS, PROFILE_FIRST_CALL_WINDOW, ProfileFirstCallInput,
     SessionCostTotal, SessionCumulativeTotals, SessionFacts, SessionTokenSubtotal,
     TurnCounterMissing, TurnCounterTotals, TurnExpenditure, TurnScopeTotals, UsageScopeView,
     UsageSummaryRequest, UsageSummaryResponse,

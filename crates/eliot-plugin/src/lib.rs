@@ -17,6 +17,7 @@ pub mod skill;
 pub mod start_classification;
 mod stderr;
 pub mod sync;
+pub mod usage;
 
 pub use debug::{DebugRecord, parse_debug_line};
 pub use file_identity::{FileIdentity, file_final_path, file_identity};

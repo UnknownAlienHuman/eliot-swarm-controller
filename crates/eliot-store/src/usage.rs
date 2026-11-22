@@ -17,6 +17,7 @@
 use super::*;
 use super::{hierarchy, retention};
 use eliot_core::api::{
+    FirstCallInput, MAX_FIRST_CALL_TURNS, PROFILE_FIRST_CALL_WINDOW, ProfileFirstCallInput,
     SessionCostTotal, SessionCumulativeTotals, SessionFacts, SessionTokenSubtotal,
     TurnCounterMissing, TurnCounterTotals, TurnExpenditure, TurnScopeTotals, UsageScopeView,
     UsageSummaryRequest, UsageSummaryResponse,
@@ -284,6 +285,8 @@ impl Store {
         let mut overall_supplied = [0_usize; TURN_COUNTERS];
         let mut overall_sums = [0_i128; TURN_COUNTERS];
         let mut scopes: BTreeMap<String, ScopeAccum> = BTreeMap::new();
+        let mut first_calls = Vec::new();
+        let mut first_calls_truncated = false;
         let mut observed_native_agents = 0i64;
         if !wanted.is_empty() {
             let nums: BTreeSet<i64> = wanted.iter().map(|(num, _)| *num).collect();
@@ -301,9 +304,10 @@ impl Store {
                 )
                 .map_err(sql_error)?;
             let sql = format!(
-                "SELECT t.agent, t.generation, t.state, t.usage, a.harness
+                "SELECT t.agent, t.generation, t.state, t.usage, a.harness, t.turn_id
                  FROM turns t JOIN agents a ON a.id = t.agent
-                 WHERE t.agent IN ({placeholders})"
+                 WHERE t.agent IN ({placeholders})
+                 ORDER BY t.agent, t.generation, t.turn_id"
             );
             let mut statement = self.connection.prepare(&sql).map_err(sql_error)?;
             let rows = statement
@@ -314,11 +318,12 @@ impl Store {
                         row.get::<_, String>(2)?,
                         row.get::<_, Option<String>>(3)?,
                         row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
                     ))
                 })
                 .map_err(sql_error)?;
             for row in rows {
-                let (agent, generation, state, usage, harness) = row.map_err(sql_error)?;
+                let (agent, generation, state, usage, harness, turn_id) = row.map_err(sql_error)?;
                 if !wanted.contains(&(agent, generation)) {
                     continue;
                 }
@@ -340,6 +345,18 @@ impl Store {
                     continue;
                 };
                 let usage = decode_turn_usage(&usage, &harness)?;
+                if let Some(input_tokens) = usage.first_call_input_tokens {
+                    if first_calls.len() < MAX_FIRST_CALL_TURNS {
+                        first_calls.push(FirstCallInput {
+                            agent: format_agent_id(agent),
+                            generation,
+                            turn_id,
+                            input_tokens,
+                        });
+                    } else {
+                        first_calls_truncated = true;
+                    }
+                }
                 let accum = scopes
                     .entry(normalize_turn_scope(&usage.scope))
                     .or_default();
@@ -383,9 +400,75 @@ impl Store {
                 by_scope,
             },
             sessions,
+            first_calls,
+            first_calls_truncated,
             swarm_mcp,
             swarm_mcp_truncated,
         })
+    }
+
+    /// The newest retained turn rows give doctor a fixed-size observation
+    /// window. Only the current generation has the exact profile snapshot.
+    pub fn profile_first_calls(&self) -> Result<(Vec<ProfileFirstCallInput>, bool)> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT a.profile, a.harness, json_extract(a.profile_snapshot, '$.mcp'),
+                        t.usage, t.state
+                 FROM (
+                     SELECT rowid AS sequence, agent, generation, usage, state FROM turns
+                     ORDER BY rowid DESC LIMIT ?1
+                 ) t
+                 LEFT JOIN agents a ON a.id = t.agent AND a.generation = t.generation
+                      AND a.origin = 'eliot'
+                 ORDER BY t.sequence DESC",
+            )
+            .map_err(sql_error)?;
+        let mut rows = statement
+            .query(params![PROFILE_FIRST_CALL_WINDOW as i64 + 1])
+            .map_err(sql_error)?;
+        let mut examined = 0;
+        let mut truncated = false;
+        let mut by_profile = BTreeMap::new();
+        while let Some(row) = rows.next().map_err(sql_error)? {
+            if examined == PROFILE_FIRST_CALL_WINDOW {
+                truncated = true;
+                break;
+            }
+            examined += 1;
+            if row.get::<_, String>(4).map_err(sql_error)? != "completed" {
+                continue;
+            }
+            let (Some(profile), Some(harness), Some(usage)) = (
+                row.get::<_, Option<String>>(0).map_err(sql_error)?,
+                row.get::<_, Option<String>>(1).map_err(sql_error)?,
+                row.get::<_, Option<String>>(3).map_err(sql_error)?,
+            ) else {
+                continue;
+            };
+            let Some(input) = decode_turn_usage(&usage, &harness)?.first_call_input_tokens else {
+                continue;
+            };
+            let policy = row.get::<_, Option<String>>(2).map_err(sql_error)?;
+            let (sum, count) = by_profile
+                .entry((profile, harness, policy))
+                .or_insert((0_i128, 0));
+            *sum += i128::from(input);
+            *count += 1;
+        }
+        let profiles = by_profile
+            .into_iter()
+            .map(
+                |((profile, harness, mcp_policy), (sum, count))| ProfileFirstCallInput {
+                    profile,
+                    harness,
+                    mcp_policy,
+                    sampled_turns: count,
+                    average_input_tokens: (sum / count as i128) as i64,
+                },
+            )
+            .collect();
+        Ok((profiles, truncated))
     }
 }
 
