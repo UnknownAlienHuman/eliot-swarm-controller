@@ -20,7 +20,8 @@ pub(crate) mod unix;
 pub(crate) mod windows;
 
 pub use custody::{CustodyGuarantee, OwnedChild, RestartCustody, restart_custody};
-pub use data_dir::DataDir;
+pub(crate) use data_dir::repair_managed_dir_acl;
+pub use data_dir::{DataDir, ForeignDataDirAce};
 pub use ipc::{IpcListener, IpcStream};
 pub(crate) use process_observation::CommandClass;
 pub use process_observation::CustodyObserver;

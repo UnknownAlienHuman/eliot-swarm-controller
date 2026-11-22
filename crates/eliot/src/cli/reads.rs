@@ -451,28 +451,117 @@ pub(crate) async fn run_usage(
     }
 }
 
-pub(crate) async fn run_doctor(data_dir: PathBuf, json_output: bool) -> Result<u8, Failure> {
+pub(crate) async fn run_doctor(
+    data_dir: PathBuf,
+    json_output: bool,
+    acl_report: Option<eliot_core::Result<Vec<eliot_daemon::ForeignDataDirAce>>>,
+) -> Result<u8, Failure> {
     let params = HarnessDoctorRequest {};
+    params.validate().map_err(Failure::for_read)?;
+    let acl_report = match acl_report {
+        Some(Ok(entries)) => Ok(entries),
+        Some(Err(_)) | None => eliot_daemon::data_dir_acl_report(&data_dir),
+    };
+    let response: HarnessDoctorResponse =
+        match eliot_daemon::client_call_typed(&data_dir, "harness.doctor", &params).await {
+            Ok(response) => response,
+            Err(error) => {
+                if eliot_daemon::startup::repairable_data_dir_acl(&error)
+                    && !inherited_identity_context()
+                {
+                    report_doctor_acl(&acl_report, json_output);
+                }
+                return Err(Failure::for_read(error));
+            }
+        };
+    params
+        .validate_response(&response)
+        .map_err(Failure::invalid_response)?;
+    let acl_entries = match acl_report {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!("data directory ACL report unavailable: {}", error.message);
+            Vec::new()
+        }
+    };
     if json_output {
-        read_and_print!(
-            &data_dir,
-            json_output,
-            "harness.doctor",
-            params,
-            HarnessDoctorResponse
-        )
+        let mut value = serde_json::to_value(&response)
+            .map_err(|_| Failure::new(4, "harness.doctor response is invalid"))?;
+        if !acl_entries.is_empty() {
+            let entries = serde_json::to_value(&acl_entries)
+                .map_err(|_| Failure::new(4, "data directory ACL report is invalid"))?;
+            let Some(object) = value.as_object_mut() else {
+                return Err(Failure::new(4, "harness.doctor response is invalid"));
+            };
+            object.insert("foreign_data_dir_aces".to_owned(), entries);
+        }
+        print_value(&value, true);
     } else {
-        params.validate().map_err(Failure::for_read)?;
-        let response: HarnessDoctorResponse =
-            eliot_daemon::client_call_typed(&data_dir, "harness.doctor", &params)
-                .await
-                .map_err(Failure::for_read)?;
-        params
-            .validate_response(&response)
-            .map_err(Failure::invalid_response)?;
         print_doctor_table(&response);
-        Ok(0)
+        print_foreign_data_dir_aces(&acl_entries);
     }
+    Ok(0)
+}
+
+pub(crate) fn report_doctor_acl(
+    report: &eliot_core::Result<Vec<eliot_daemon::ForeignDataDirAce>>,
+    json_output: bool,
+) {
+    match report {
+        Ok(entries) => {
+            if entries.is_empty() {
+                return;
+            }
+            if json_output {
+                print_value(&serde_json::json!({"foreign_data_dir_aces": entries}), true);
+            } else {
+                eprintln!("{}", format_foreign_data_dir_aces(entries));
+            }
+        }
+        Err(error) => eprintln!("data directory ACL report unavailable: {}", error.message),
+    }
+}
+
+pub(crate) fn format_foreign_data_dir_aces(entries: &[eliot_daemon::ForeignDataDirAce]) -> String {
+    let mut output = String::from("Foreign data-directory ACL entries:");
+    for entry in entries {
+        let rights = entry
+            .rights
+            .map(|rights| format!("0x{rights:08X}"))
+            .unwrap_or_else(|| "-".to_owned());
+        let sid = entry.sid.as_deref().unwrap_or("-");
+        let verdict = if entry.allowed { "allowed" } else { "refused" };
+        output.push_str(&format!(
+            "\n  path={} rights={} sid={} type=0x{:02X} flags=0x{:02X} verdict={verdict}",
+            entry.path.display(),
+            rights,
+            sid,
+            entry.ace_type,
+            entry.flags
+        ));
+    }
+    output
+}
+
+fn print_foreign_data_dir_aces(entries: &[eliot_daemon::ForeignDataDirAce]) {
+    if !entries.is_empty() {
+        println!("{}", format_foreign_data_dir_aces(entries));
+    }
+}
+
+fn inherited_identity_context() -> bool {
+    [
+        "ELIOT_AGENT_ID",
+        "ELIOT_AGENT_GENERATION",
+        "ELIOT_AGENT_TOKEN",
+        "ELIOT_AGENT_DATA_DIR",
+        "ELIOT_AGENT_DATA_SCOPE",
+        "ELIOT_SHELL_IDENTITY_DISABLED",
+        "ELIOT_RUN_COMMAND_ID",
+        "ELIOT_RUN_TOKEN",
+    ]
+    .iter()
+    .any(|name| std::env::var_os(name).is_some())
 }
 
 pub(crate) fn print_doctor_table(response: &HarnessDoctorResponse) {

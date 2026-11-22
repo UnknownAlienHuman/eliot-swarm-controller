@@ -195,6 +195,9 @@ pub(crate) async fn run_maintenance(
 pub(crate) async fn run_status(data_dir: PathBuf, json_output: bool) -> Result<u8, Failure> {
     let params = DaemonStatusRequest::default();
     params.validate().map_err(Failure::for_read)?;
+    #[cfg(windows)]
+    let acl_repair_was_pending = eliot_daemon::DataDir::open_existing(&data_dir)
+        .is_err_and(|error| eliot_daemon::startup::repairable_data_dir_acl(&error));
     let response: DaemonStatusResponse =
         eliot_daemon::client_call_typed(&data_dir, "daemon.status", &params)
             .await
@@ -202,6 +205,10 @@ pub(crate) async fn run_status(data_dir: PathBuf, json_output: bool) -> Result<u
     params
         .validate_response(&response)
         .map_err(Failure::invalid_response)?;
+    #[cfg(windows)]
+    if acl_repair_was_pending {
+        eprintln!("data directory ACL repaired");
+    }
     let build_line = response.build_identity.as_ref().map(|identity| {
         format!(
             "Build identity | version={} | executable_directory={} | git_sha={} | executable_sha256={}",
@@ -334,6 +341,15 @@ fn print_status_summary(response: &DaemonStatusResponse, data_dir: &Path) {
 pub(crate) async fn start_daemon(data_dir: &Path, json_output: bool) -> Result<u8, Failure> {
     let start_ms = daemon_now_ms();
     #[cfg(windows)]
+    let acl_problem = eliot_daemon::DataDir::open_existing(data_dir)
+        .err()
+        .filter(eliot_daemon::startup::repairable_data_dir_acl);
+    #[cfg(windows)]
+    if let Some(error) = acl_problem.as_ref() {
+        eliot_daemon::startup::check_acl_repair_target(data_dir, error.clone())
+            .map_err(Failure::for_read)?;
+    }
+    #[cfg(windows)]
     eliot_daemon::start_background_daemon(data_dir)
         .map_err(|error| Failure::new(1, format!("cannot start daemon: {error}")))?;
     #[cfg(not(windows))]
@@ -386,7 +402,12 @@ pub(crate) async fn start_daemon(data_dir: &Path, json_output: bool) -> Result<u
             log_path.display()
         );
     }
-    wait_for_daemon_ready(data_dir, &log_path, start_ms, json_output).await
+    let outcome = wait_for_daemon_ready(data_dir, &log_path, start_ms, json_output).await?;
+    #[cfg(windows)]
+    if acl_problem.is_some() && outcome == 0 {
+        eprintln!("data directory ACL repaired");
+    }
+    Ok(outcome)
 }
 
 pub(crate) fn daemon_now_ms() -> u128 {
@@ -474,14 +495,19 @@ pub(crate) async fn wait_for_daemon_ready(
                 }
                 return Ok(0);
             }
-            Ok(Err(error)) if probe_rejection_is_final(&error.code) => {
-                return Err(probe_rejection(
+            Ok(Err(error))
+                if probe_rejection_is_final(&error.code)
+                    || eliot_daemon::startup::repairable_data_dir_acl(&error) =>
+            {
+                let repairable = eliot_daemon::startup::repairable_data_dir_acl(&error);
+                let failure = probe_rejection(
                     &error.code,
                     &error.message,
                     data_dir,
                     log_path,
                     agent_credentials_inherited(),
-                ));
+                );
+                return Err(append_acl_report(failure, data_dir, repairable));
             }
             Ok(Err(error)) => {
                 last_probe = Some(probe_summary(&error.code, &error.message));
@@ -618,6 +644,28 @@ pub(crate) fn startup_failure(
         eliot_core::MAX_STDERR_DIAGNOSTIC_BYTES,
     );
     result
+}
+
+fn append_acl_report(mut failure: Failure, data_dir: &Path, repairable: bool) -> Failure {
+    if !repairable {
+        return failure;
+    }
+    match eliot_daemon::data_dir_acl_report(data_dir) {
+        Ok(entries) if !entries.is_empty() => {
+            failure.message.push('\n');
+            failure
+                .message
+                .push_str(&super::reads::format_foreign_data_dir_aces(&entries));
+        }
+        Err(error) => {
+            failure.message.push_str(&format!(
+                "\nData directory ACL report unavailable: {}",
+                error.message
+            ));
+        }
+        Ok(_) => {}
+    }
+    failure
 }
 
 pub(crate) async fn shutdown_daemon(

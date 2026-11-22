@@ -361,6 +361,7 @@ impl PendingCommand {
 }
 
 struct HostState {
+    acl_notices: Arc<crate::acl_notice::AclNotices>,
     data_root: PathBuf,
     owner_token: String,
     store: StoreHandle,
@@ -486,6 +487,7 @@ impl PluginHost {
         unknown_commands: UnknownCommands,
         progress: watch::Sender<u64>,
         monitoring: Monitoring,
+        acl_notices: Arc<crate::acl_notice::AclNotices>,
     ) -> Self {
         let PluginHostOptions {
             data_root,
@@ -493,6 +495,7 @@ impl PluginHost {
         } = options;
         Self {
             state: Arc::new(HostState {
+                acl_notices,
                 data_root,
                 owner_token,
                 store,
@@ -747,10 +750,17 @@ impl PluginHost {
             )?;
         }
         let (instance_dir, credential) = self.create_instance_dir(&key)?;
-        if let Err(error) = self
+        let instance_dir = match self
             .register_plugin_instance_dir(&agent, &instance_dir)
             .await
         {
+            Ok(path) => path,
+            Err(error) => {
+                remove_empty_instance_dir(&instance_dir);
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.repair_plugin_instance_dir(&agent, &instance_dir).await {
             remove_empty_instance_dir(&instance_dir);
             return Err(error);
         }
@@ -1516,9 +1526,8 @@ impl PluginHost {
         }
     }
 
-    async fn register_plugin_instance_dir(&self, agent: &Agent, path: &Path) -> Result<()> {
-        let path = std::fs::canonicalize(path)
-            .map_err(|_| Error::new("unavailable", "plugin instance directory unavailable"))?;
+    async fn register_plugin_instance_dir(&self, agent: &Agent, path: &Path) -> Result<PathBuf> {
+        let path = self.canonical_plugin_instance_dir(path)?;
         let path_text = path.to_string_lossy().into_owned();
         let identity = crate::platform::script_file::directory_identity(&path)?;
         let mut store = self.state.store.lock().await;
@@ -1563,7 +1572,77 @@ impl PluginHost {
                 "plugin instance ownership readback changed",
             ));
         }
+        Ok(path)
+    }
+
+    async fn repair_plugin_instance_dir(&self, agent: &Agent, path: &Path) -> Result<()> {
+        let path = self.canonical_plugin_instance_dir(path)?;
+        let path_text = path.to_string_lossy().into_owned();
+        let identity = crate::platform::script_file::directory_identity(&path)?;
+        {
+            let store = self.state.store.lock().await;
+            let Some(readback) = store.known_artifact_path(&path_text)? else {
+                return Err(Error::new(
+                    "source_integrity",
+                    "plugin instance ownership is absent before ACL repair",
+                ));
+            };
+            if readback.agent != agent.id
+                || readback.generation != agent.generation
+                || readback.kind != ArtifactKind::Other
+                || readback.purpose != "Swarm plugin instance directory"
+                || readback.identity != identity
+            {
+                return Err(Error::new(
+                    "source_integrity",
+                    "plugin instance ownership changed before ACL repair",
+                ));
+            }
+        }
+
+        let foreign_aces = crate::platform::repair_managed_dir_acl(&path)?;
+        if foreign_aces.is_empty() {
+            return Ok(());
+        }
+        let secrets: Vec<_> = self.state.secrets.lock_recover().iter().cloned().collect();
+        let policy = SecretPolicy::new(secrets);
+        self.state
+            .acl_notices
+            .report(&self.state.store, &self.state.bus, &policy, foreign_aces)
+            .await;
         Ok(())
+    }
+
+    fn plugin_instance_root(&self) -> Result<PathBuf> {
+        let data_root = std::fs::canonicalize(&self.state.data_root)
+            .map_err(|_| Error::new("unavailable", "daemon data root is unavailable"))?;
+        let path = self.state.data_root.join("plugins");
+        crate::git_monitor::reject_links(&path)?;
+        let plugins = std::fs::canonicalize(&path)
+            .map_err(|_| Error::new("unavailable", "plugin instance root is unavailable"))?;
+        crate::git_monitor::reject_links(&plugins)?;
+        if plugins.parent() != Some(data_root.as_path()) {
+            return Err(Error::new(
+                "not_allowed",
+                "plugin instance root is outside the daemon data directory",
+            ));
+        }
+        Ok(plugins)
+    }
+
+    fn canonical_plugin_instance_dir(&self, path: &Path) -> Result<PathBuf> {
+        crate::git_monitor::reject_links(path)?;
+        let plugins = self.plugin_instance_root()?;
+        let path = std::fs::canonicalize(path)
+            .map_err(|_| Error::new("unavailable", "plugin instance directory unavailable"))?;
+        crate::git_monitor::reject_links(&path)?;
+        if path.parent() != Some(plugins.as_path()) {
+            return Err(Error::new(
+                "not_allowed",
+                "plugin instance directory is outside the daemon-managed plugin root",
+            ));
+        }
+        Ok(path)
     }
 
     fn create_instance_dir_with(
@@ -1585,6 +1664,7 @@ impl PluginHost {
                         format!("create plugin instance root: {error}"),
                     )
                 })?;
+            self.plugin_instance_root()?;
             if parent.is_dir() {
                 std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).map_err(
                     |error| {
@@ -1604,6 +1684,7 @@ impl PluginHost {
                     format!("create plugin instance root: {error}"),
                 )
             })?;
+            self.plugin_instance_root()?;
         }
         let instance_dir = parent.join(format!("{}-g{}-{}", key.id, key.generation, Ulid::new()));
         #[cfg(unix)]

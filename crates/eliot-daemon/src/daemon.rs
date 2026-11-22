@@ -37,6 +37,7 @@ use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
 pub const MAX_RPC_FRAME_BYTES: usize = 4 * 1024 * 1024;
+const MANAGED_ACL_DIRECTORIES: [&str; 3] = ["logs", "plugins", "worktrees"];
 
 /// Nonsemantic IPC timings. Handler time includes authentication, lock waits and
 /// Store work; the remaining round trip includes framing/serialization and I/O.
@@ -129,6 +130,7 @@ pub fn compact_store_offline(
     let data_dir = DataDir::open_existing(path)?;
     let _daemon_lock = data_dir.acquire_daemon_lock()?;
     let store_path = data_dir.path().join("eliot.db");
+    crate::platform::data_dir::validate_store_files(data_dir.path())?;
     let metadata = fs::symlink_metadata(&store_path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             Error::new("unavailable", "store database does not exist")
@@ -234,13 +236,21 @@ async fn run_with_update(path: PathBuf, attempt: Option<&str>) -> Result<()> {
     // (0600 files, 0700 directories) at each creation site; the process umask
     // is left alone so Agents' files in shared workspaces keep the ambient
     // mask. Windows keeps its ACL checks.
+    use crate::platform::data_dir::{repair_existing_managed_dir_acl, repair_startup_data_root};
+
+    let mut removed = repair_startup_data_root(&path)?;
     let data_dir = DataDir::open(&path)?;
     let daemon_lock = data_dir.acquire_daemon_lock()?;
     if let Some(attempt) = attempt {
         let backup = crate::update_backup::update_backup_path(data_dir.path(), attempt)?;
         crate::platform::data_dir::validate_private_file(&backup)?;
     }
-    crate::skill::materialize(data_dir.path())?;
+    removed.extend(crate::skill::materialize(data_dir.path())?);
+    // The log must be initialized before the periodic checks can report.
+    // Plugin and worktree parents can wait for the first live check.
+    removed.extend(repair_existing_managed_dir_acl(
+        &data_dir.path().join("logs"),
+    )?);
     let _log = logging::init(&data_dir, &daemon_lock)?;
     let policy = Arc::new(SecretPolicy::new([data_dir.owner_token()]));
     let build_identity = crate::build_identity::current();
@@ -320,6 +330,7 @@ async fn run_with_update(path: PathBuf, attempt: Option<&str>) -> Result<()> {
         Arc::clone(&policy),
         attempt,
         daemon_config,
+        removed,
     )
     .await;
     logging::record(
@@ -341,10 +352,15 @@ async fn run_owned(
     policy: Arc<SecretPolicy>,
     attempt: Option<&str>,
     daemon_config: crate::config::DaemonConfig,
+    removed: Vec<crate::platform::ForeignDataDirAce>,
 ) -> Result<()> {
     let runtime = initialize_runtime(data_dir, policy, daemon_config).await?;
+    runtime
+        .router
+        .report_acl_repairs(&runtime.policy, removed)
+        .await;
     let supervision = spawn_workers(data_dir, daemon_lock, runtime, attempt).await?;
-    let (outcome, supervision) = supervise(supervision).await;
+    let (outcome, supervision) = supervise(supervision, data_dir.path()).await;
     shutdown_supervision(supervision, outcome).await
 }
 
@@ -398,6 +414,7 @@ async fn initialize_runtime(
     daemon_config: crate::config::DaemonConfig,
 ) -> Result<DaemonRuntime> {
     let store_path = data_dir.path().join("eliot.db");
+    crate::platform::data_dir::validate_store_files(data_dir.path())?;
     logging::record(&policy, "daemon.store_opening", &[], None);
     let mut store = eliot_store::Store::open_with_observer(&store_path, |phase| match phase {
         eliot_store::StoreOpenPhase::ConnectionOpened => {
@@ -1003,9 +1020,45 @@ async fn spawn_workers(
     })
 }
 
+struct AclCheck {
+    path: PathBuf,
+    due: Instant,
+    last_problem: Instant,
+    delay: Duration,
+}
+
+impl AclCheck {
+    fn new(path: PathBuf) -> Self {
+        let now = Instant::now();
+        Self {
+            path,
+            due: now,
+            last_problem: now,
+            delay: Duration::from_secs(1),
+        }
+    }
+
+    /// Defer retries for this path and report when the backoff advances.
+    fn defer(&mut self) -> bool {
+        let now = Instant::now();
+        let previous = if now.duration_since(self.last_problem) >= Duration::from_secs(60) {
+            Duration::from_secs(1)
+        } else {
+            self.delay
+        };
+        self.delay = (previous * 2).min(Duration::from_secs(30));
+        self.due = now + self.delay;
+        self.last_problem = now;
+        self.delay != previous
+    }
+}
+
 /// Drive the accept loop and worker supervision. Returns the loop outcome with
 /// supervision intact so the shutdown drain releases workers in order.
-async fn supervise(mut supervision: DaemonSupervision) -> (Result<()>, DaemonSupervision) {
+async fn supervise(
+    mut supervision: DaemonSupervision,
+    data_root: &Path,
+) -> (Result<()>, DaemonSupervision) {
     let DaemonSupervision {
         router,
         policy,
@@ -1023,13 +1076,59 @@ async fn supervise(mut supervision: DaemonSupervision) -> (Result<()>, DaemonSup
     let policy = Arc::clone(policy);
     let mut accept_failures = 0_u32;
     let mut accept_retry_at: Option<Instant> = None;
-    let outcome = loop {
+    let mut acl_tick = tokio::time::interval(Duration::from_secs(1));
+    acl_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut acl_checks: Vec<_> = std::iter::once(data_root.to_path_buf())
+        .chain(MANAGED_ACL_DIRECTORIES.map(|name| data_root.join(name)))
+        .map(AclCheck::new)
+        .collect();
+    let outcome = 'serve: loop {
         match router.should_exit().await {
             Ok(true) => break Ok(()),
             Ok(false) => {}
             Err(error) => break Err(error),
         }
         tokio::select! {
+            _ = acl_tick.tick(), if cfg!(windows) => {
+                for check in &mut acl_checks {
+                    if Instant::now() < check.due {
+                        continue;
+                    }
+                    let root = check.path.as_path() == data_root;
+                    let repaired = if root {
+                        crate::platform::data_dir::repair_live_data_root(&check.path)
+                    } else {
+                        crate::platform::data_dir::repair_existing_managed_dir_acl(&check.path)
+                    };
+                    match repaired {
+                        Ok(removed) => {
+                            if router.report_acl_repairs(&policy, removed).await
+                                && check.defer()
+                            {
+                                let operation = format!("Recurring grant. Next ACL check in {} s", check.delay.as_secs());
+                                logging::record(
+                                    &policy,
+                                    "daemon.data_dir_acl_backoff",
+                                    &[("path", &check.path.to_string_lossy()), ("operation", &operation)],
+                                    None,
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            logging::record(
+                                &policy,
+                                "daemon.data_dir_acl_check_failed",
+                                &[("path", &check.path.to_string_lossy())],
+                                Some(&error),
+                            );
+                            if root && crate::platform::data_dir::unrepairable_root_acl(&error) {
+                                break 'serve Err(error);
+                            }
+                            check.defer();
+                        }
+                    }
+                }
+            }
             accepted = listener.accept(), if accept_retry_at.is_none() => {
                 let (stream, error) = match accepted {
                     Ok(stream) => (Some(stream), listener.take_replacement_error()),
@@ -1467,7 +1566,9 @@ async fn client_call_with_identity_measured(
     timings: Option<&mut CallTimings>,
     swarm_mcp_call_id: Option<&str>,
 ) -> Result<Value> {
-    let data_dir = DataDir::open_existing(path).map_err(|error| with_connect_hint(path, error))?;
+    let data_dir = crate::startup::open_client_data_dir(path)
+        .await
+        .map_err(|error| with_connect_hint(path, error))?;
     let info = data_dir
         .read_daemon_info()
         .map_err(|error| with_connect_hint(path, error))?
@@ -1537,7 +1638,9 @@ pub async fn client_call_with_owner_credential(
             "daemon RPC requires a method and object params",
         ));
     }
-    let data_dir = DataDir::open_existing(path).map_err(|error| with_connect_hint(path, error))?;
+    let data_dir = crate::startup::open_client_data_dir(path)
+        .await
+        .map_err(|error| with_connect_hint(path, error))?;
     let info = data_dir
         .read_daemon_info()
         .map_err(|error| with_connect_hint(path, error))?
@@ -1566,7 +1669,9 @@ pub async fn client_call_with_remote_context(
     if method.trim().is_empty() || !params.is_object() {
         return Err(Error::new("invalid", "invalid remote RPC"));
     }
-    let data_dir = DataDir::open_existing(path).map_err(|error| with_connect_hint(path, error))?;
+    let data_dir = crate::startup::open_client_data_dir(path)
+        .await
+        .map_err(|error| with_connect_hint(path, error))?;
     let info = data_dir
         .read_daemon_info()
         .map_err(|error| with_connect_hint(path, error))?
@@ -1605,7 +1710,9 @@ pub async fn client_call_with_remote_mcp_tool(
     if Ulid::from_string(&remote.call_id).is_err() {
         return Err(Error::new("invalid", "Swarm MCP call id is invalid"));
     }
-    let data_dir = DataDir::open_existing(path).map_err(|error| with_connect_hint(path, error))?;
+    let data_dir = crate::startup::open_client_data_dir(path)
+        .await
+        .map_err(|error| with_connect_hint(path, error))?;
     let info = data_dir
         .read_daemon_info()
         .map_err(|error| with_connect_hint(path, error))?

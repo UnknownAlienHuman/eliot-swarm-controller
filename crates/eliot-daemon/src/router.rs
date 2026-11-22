@@ -157,6 +157,7 @@ pub(crate) struct Router {
 }
 
 struct RouterInner {
+    acl_notices: Arc<crate::acl_notice::AclNotices>,
     data_root: PathBuf,
     store: StoreHandle,
     autonomy_reader: Arc<tokio::sync::Semaphore>,
@@ -405,6 +406,7 @@ impl Router {
         let (goal_reconcile, _) = watch::channel(0_u64);
         let (launch_arbitration, _) = watch::channel(0_u64);
         let monitoring = Monitoring::new(Arc::clone(&store), bus.clone(), Arc::clone(&secrets));
+        let acl_notices = Arc::new(crate::acl_notice::AclNotices::default());
         let workspaces = WorkspaceManager::new(
             data_root.clone(),
             Arc::clone(&store),
@@ -412,6 +414,7 @@ impl Router {
             Arc::clone(&secrets),
             progress.clone(),
             monitoring.clone(),
+            Arc::clone(&acl_notices),
         );
         let plugin_host = PluginHost::new(
             PluginHostOptions::new(data_root.clone(), owner_token.clone()),
@@ -422,9 +425,11 @@ impl Router {
             Arc::clone(&unknown_commands),
             progress.clone(),
             monitoring.clone(),
+            Arc::clone(&acl_notices),
         );
         Self {
             inner: Arc::new(RouterInner {
+                acl_notices,
                 data_root,
                 store,
                 autonomy_reader: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -1386,6 +1391,17 @@ impl Router {
     pub(crate) fn note_events(&self, events: &[Event]) {
         self.note_unknown(events);
         self.signal_progress();
+    }
+
+    pub(crate) async fn report_acl_repairs(
+        &self,
+        policy: &SecretPolicy,
+        removed: Vec<crate::platform::ForeignDataDirAce>,
+    ) -> bool {
+        self.inner
+            .acl_notices
+            .report(&self.inner.store, &self.inner.bus, policy, removed)
+            .await
     }
 
     fn signal_progress(&self) {

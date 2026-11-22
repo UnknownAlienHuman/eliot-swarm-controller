@@ -97,6 +97,12 @@ async fn run_inner(cli: Cli) -> ExitCode {
         return ExitCode::SUCCESS;
     };
 
+    let mut doctor_acl_report = if matches!(&command, CliCommand::Doctor) {
+        Some(eliot_daemon::data_dir_acl_report(&data_dir))
+    } else {
+        None
+    };
+
     let result = match command {
         CliCommand::Plugin(PluginArgs { command }) => run_plugin_command(command).await,
         command => {
@@ -113,13 +119,29 @@ async fn run_inner(cli: Cli) -> ExitCode {
                     Ok(path) => path,
                     Err(error) => return report_failure(Failure::new(1, error.to_string())),
                 };
-                if let Err(error) =
-                    eliot_daemon::startup::ensure_running(&data_dir, &executable).await
+                let root_acl_repaired =
+                    match eliot_daemon::startup::ensure_running(&data_dir, &executable).await {
+                        Ok(repaired) => repaired,
+                        Err(error) => {
+                            if matches!(&command, CliCommand::Doctor)
+                                && eliot_daemon::startup::repairable_data_dir_acl(&error)
+                                && let Some(report) = doctor_acl_report.as_ref()
+                            {
+                                cli::report_doctor_acl(report, json_output);
+                            }
+                            return report_failure(Failure::from_core(error, false));
+                        }
+                    };
+                if root_acl_repaired {
+                    eprintln!("data directory ACL repaired during startup");
+                }
+                if let Some(report) = doctor_acl_report.as_mut()
+                    && (root_acl_repaired || report.is_err())
                 {
-                    return report_failure(Failure::from_core(error, false));
+                    *report = eliot_daemon::data_dir_acl_report(&data_dir);
                 }
             }
-            cli::dispatch(command, data_dir, json_output, id).await
+            cli::dispatch(command, data_dir, json_output, id, doctor_acl_report).await
         }
     };
     match result {

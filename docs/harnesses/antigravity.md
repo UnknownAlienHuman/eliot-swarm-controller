@@ -243,10 +243,14 @@ Native tool-access restrictions stay at the existing posture: the ACP
 `auth.terminal: false`; unchanged against installed agy 1.5.9, whose
 `session/request_permission` round-trip this page bridges instead), so
 `fs/*` and `terminal/*` agent-to-client requests stay explicitly
-rejected. The CLI also offers `--sandbox`, which is not enabled: it would change
-execution semantics beyond hook discovery. Same-user filesystem access is not
-a hostile-agent boundary; the guarantee is that secrets and state are never
-under a writable native root, not a sandbox.
+rejected. Eliot leaves terminal sandbox selection to Antigravity. Antigravity's
+`auto` mode enables terminal sandboxing, which uses an AppContainer on supported
+Windows versions. Its permission auto-approval flag controls prompts. The vendor
+documents controls for the sandbox and permission prompts, and gives no controls
+specific to filesystem ACEs. Eliot keeps private state outside writable native
+roots and preserves the exact AppContainer traversal grant defined by the
+[private data directory contract](../spec/configuration.md#private-data-directory).
+[Antigravity terminal sandbox documentation](https://antigravity.google/docs/sandbox?tab=cli)
 
 Each managed ACP generation receives `ELIOT_AGY_HOOK_HELPER` pointing to the
 current Eliot executable plus its own loopback endpoint

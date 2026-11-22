@@ -23,6 +23,7 @@ mod update;
 
 use self::args::{CliCommand, StandAction};
 use self::support::Failure;
+pub(crate) use reads::report_doctor_acl;
 use std::path::PathBuf;
 
 pub(crate) async fn dispatch(
@@ -30,6 +31,7 @@ pub(crate) async fn dispatch(
     data_dir: PathBuf,
     json_output: bool,
     id: Option<String>,
+    doctor_acl_report: Option<eliot_core::Result<Vec<eliot_daemon::ForeignDataDirAce>>>,
 ) -> Result<u8, Failure> {
     match command {
         CliCommand::Stand(args) => match args.action {
@@ -86,7 +88,7 @@ pub(crate) async fn dispatch(
         CliCommand::Processes(args) => reads::run_processes(args, data_dir, json_output).await,
         CliCommand::Stats(args) => reads::run_stats(args, data_dir, json_output).await,
         CliCommand::Usage(args) => reads::run_usage(args, data_dir, json_output).await,
-        CliCommand::Doctor => reads::run_doctor(data_dir, json_output).await,
+        CliCommand::Doctor => reads::run_doctor(data_dir, json_output, doctor_acl_report).await,
         CliCommand::Heavy(args) => reads::run_heavy(args, data_dir, json_output).await,
         CliCommand::Git(args) => git::run(args.command, &data_dir, json_output, id).await,
         CliCommand::GitStatus(args) => reads::run_git_status(args, data_dir, json_output).await,

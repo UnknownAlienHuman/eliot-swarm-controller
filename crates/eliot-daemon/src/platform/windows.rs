@@ -3,9 +3,14 @@
     reason = "Windows process custody requires Job and process-handle FFI."
 )]
 
+mod data_acl;
+
+use super::data_dir::{DATA_DIR_ACL_UNREPAIRABLE_LOCATION, DATA_DIR_OWNER_LOCATION};
 use super::process_observation::{
     CommandClass, MAX_PROCESS_SAMPLES, exited_sample, same_identity, unknown_sample,
 };
+use data_acl::validate_current_user_acl;
+pub(crate) use data_acl::{check_acl_write_access, data_dir_acl_report, repair_managed_dir_acl};
 use eliot_core::{
     Error, ProcessIdentity, ProcessRecord, ProcessSample, ProcessSnapshot, ProcessState, Result,
     verbatim_path,
@@ -31,11 +36,9 @@ use windows_sys::Win32::Security::Authorization::{
     SE_FILE_OBJECT, SetSecurityInfo,
 };
 use windows_sys::Win32::Security::{
-    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL_SIZE_INFORMATION, AclSizeInformation,
-    CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation,
-    GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetTokenInformation,
-    OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
-    SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    DACL_SECURITY_INFORMATION, EqualSid, GetSecurityDescriptorDacl, GetTokenInformation,
+    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SECURITY_ATTRIBUTES,
+    TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ALL_ACCESS,
@@ -378,17 +381,19 @@ fn validate_new_or_raced_directory(path: &Path, created: bool) -> Result<()> {
     } else {
         "concurrently existing"
     };
-    ensure_current_owner(path, true).map_err(|error| {
-        Error::new(
-            "unsafe_data_dir",
-            format!("{context} data directory failed owner validation: {error}"),
-        )
+    ensure_current_owner(path, true).map_err(|mut error| {
+        *error.message = format!(
+            "{context} data directory failed owner validation: {}",
+            error.message
+        );
+        error
     })?;
-    validate_current_user_acl(path, true).map_err(|error| {
-        Error::new(
-            "unsafe_data_dir",
-            format!("{context} data directory failed ACL validation: {error}"),
-        )
+    validate_current_user_acl(path, true).map_err(|mut error| {
+        *error.message = format!(
+            "{context} data directory failed ACL validation: {}",
+            error.message
+        );
+        error
     })
 }
 
@@ -441,16 +446,31 @@ pub(crate) fn validate_private_root(path: &Path) -> Result<()> {
 }
 
 pub(crate) fn validate_private_file(path: &Path) -> Result<()> {
+    check_private_file_shape(path)?;
+    validate_current_user_acl(path, false)
+}
+
+/// Validate the daemon store file, including the original SQLite-created ACL
+/// shape that has only an inherited full-access entry for its current owner.
+pub(crate) fn validate_store_file(path: &Path) -> Result<()> {
+    check_private_file_shape(path)?;
+    data_acl::validate_store_file_acl(path)
+}
+
+fn check_private_file_shape(path: &Path) -> Result<()> {
     reject_reparse(path)?;
     let metadata = fs::symlink_metadata(path)
-        .map_err(|error| io_error("inspect existing private file", error))?;
+        .map_err(|error| io_error(&format!("inspect {}", path.display()), error))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(Error::new(
             "unsafe_private_file",
-            "private data files must be regular files, not reparse points or devices",
+            format!(
+                "private data file {} must be a regular file",
+                path.display()
+            ),
         ));
     }
-    validate_current_user_acl(path, false)
+    Ok(())
 }
 
 /// How long `replace_file` waits out readers that hold the target open.
@@ -1657,7 +1677,10 @@ fn check_no_reparse_components(path: &Path) -> Result<()> {
             Ok(attributes) if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 => {
                 return Err(Error::new(
                     "unsafe_data_dir",
-                    "data directory path may not pass through a reparse point",
+                    format!(
+                        "data directory path passes through a reparse point at {}",
+                        eliot_core::display_path(&component.to_string_lossy())
+                    ),
                 ));
             }
             Ok(_) => {}
@@ -1671,10 +1694,12 @@ fn check_no_reparse_components(path: &Path) -> Result<()> {
 }
 
 fn reject_reparse(path: &Path) -> Result<()> {
-    match file_attributes(path).map_err(|error| io_error("inspect private data file", error))? {
+    match file_attributes(path)
+        .map_err(|error| io_error(&format!("inspect {}", path.display()), error))?
+    {
         attributes if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 => Err(Error::new(
             "unsafe_private_file",
-            "private data files may not be reparse points",
+            format!("private data file {} is a reparse point", path.display()),
         )),
         _ => Ok(()),
     }
@@ -1724,7 +1749,7 @@ fn ensure_current_owner(path: &Path, directory: bool) -> Result<()> {
         {
             Ok(())
         }
-        Ok(user_sid) => Err(foreign_owner(path, owner, &user_sid)),
+        Ok(user_sid) => Err(foreign_owner(path, owner, &user_sid, directory)),
         Err(error) => Err(error),
     };
     // SAFETY: GetNamedSecurityInfoW allocated this descriptor for the caller.
@@ -1735,137 +1760,28 @@ fn ensure_current_owner(path: &Path, directory: bool) -> Result<()> {
 /// Name the object and both SIDs: Windows CI runners intermittently report
 /// this mismatch, and the bare message did not say which file or owner.
 /// `owner` must point into a live security descriptor.
-fn foreign_owner(path: &Path, owner: *mut c_void, user_sid: &[usize]) -> Error {
+fn foreign_owner(path: &Path, owner: *mut c_void, user_sid: &[usize], directory: bool) -> Error {
     let owner = if owner.is_null() {
         "none".to_owned()
     } else {
         sid_text(owner).unwrap_or_else(|_| "unreadable".to_owned())
     };
     let user = sid_to_string(user_sid).unwrap_or_else(|_| "unreadable".to_owned());
-    let name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    Error::new(
-        "unsafe_data_dir",
-        format!(
-            "data root or private file is owned by another Windows user \
-             ({name}: owner {owner}, current user {user})"
-        ),
-    )
-}
-
-fn validate_current_user_acl(path: &Path, directory: bool) -> Result<()> {
-    let handle = open_security_handle(path, READ_CONTROL, directory)?;
-    let mut owner = null_mut();
-    let mut dacl = null_mut();
-    let mut descriptor = null_mut();
-    // SAFETY: output pointers are writable; the owner and DACL pointers are
-    // backed by the returned security descriptor until it is freed below.
-    let status = unsafe {
-        GetSecurityInfo(
-            handle.0,
-            SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-            &mut owner,
-            null_mut(),
-            &mut dacl,
-            null_mut(),
-            &mut descriptor,
+    let path = eliot_core::display_path(&path.to_string_lossy());
+    if directory {
+        Error::new(
+            "unsafe_data_dir",
+            format!("data directory {path} has owner SID {owner}, expected SID {user}"),
         )
-    };
-    if status != 0 {
-        return Err(io_error(
-            "read private data ACL",
-            std::io::Error::from_raw_os_error(status as i32),
-        ));
+        .with_where(DATA_DIR_OWNER_LOCATION)
+    } else {
+        Error::new(
+            "unsafe_private_file",
+            format!(
+                "private data file {path} has owner SID {owner}, expected SID {user} with rights 0x{FILE_ALL_ACCESS:08x}"
+            ),
+        )
     }
-
-    let result = (|| {
-        let user_sid = current_user_sid()?;
-        if owner.is_null()
-            // SAFETY: owner and current-user SID remain valid during this closure.
-            || unsafe { EqualSid(owner, sid_pointer(&user_sid)) } == 0
-        {
-            return Err(foreign_owner(path, owner, &user_sid));
-        }
-        if dacl.is_null() {
-            return Err(Error::new(
-                "unsafe_data_dir",
-                "private data path has no access-control list",
-            ));
-        }
-
-        let mut control = 0u16;
-        let mut revision = 0u32;
-        // SAFETY: descriptor is valid and both outputs are writable.
-        if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0
-            || control & SE_DACL_PROTECTED == 0
-        {
-            return Err(Error::new(
-                "unsafe_data_dir",
-                "private data ACL is not protected from inherited access",
-            ));
-        }
-
-        let mut acl_info = ACL_SIZE_INFORMATION::default();
-        // SAFETY: dacl is valid and acl_info is writable.
-        if unsafe {
-            GetAclInformation(
-                dacl,
-                (&mut acl_info as *mut ACL_SIZE_INFORMATION).cast(),
-                std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
-                AclSizeInformation,
-            )
-        } == 0
-            || acl_info.AceCount != 1
-        {
-            return Err(Error::new(
-                "unsafe_data_dir",
-                "private data ACL must contain only the current-user entry",
-            ));
-        }
-
-        let mut ace_pointer: *mut c_void = null_mut();
-        // SAFETY: dacl contains exactly one ACE and ace_pointer is writable.
-        if unsafe { GetAce(dacl, 0, &mut ace_pointer) } == 0 || ace_pointer.is_null() {
-            return Err(io_error(
-                "read private data ACL entry",
-                std::io::Error::last_os_error(),
-            ));
-        }
-        // SAFETY: GetAce returned the first ACE in this validated ACL.
-        let header = unsafe { *(ace_pointer.cast::<ACE_HEADER>()) };
-        let expected_flags = if directory {
-            (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8
-        } else {
-            0
-        };
-        if header.AceType != 0 || header.AceFlags != expected_flags {
-            return Err(Error::new(
-                "unsafe_data_dir",
-                "private data ACL entry has an unexpected type or inheritance",
-            ));
-        }
-
-        // SAFETY: the ACE type was checked and GetAce returned a full ACE.
-        let ace = unsafe { &*ace_pointer.cast::<ACCESS_ALLOWED_ACE>() };
-        // SAFETY: SidStart begins the SID bytes in ACCESS_ALLOWED_ACE.
-        let ace_sid = std::ptr::addr_of!(ace.SidStart).cast_mut().cast::<c_void>();
-        // SAFETY: both SID pointers are valid while their parent buffers live.
-        if ace.Mask != FILE_ALL_ACCESS || unsafe { EqualSid(ace_sid, sid_pointer(&user_sid)) } == 0
-        {
-            return Err(Error::new(
-                "unsafe_data_dir",
-                "private data ACL does not grant full access exclusively to the current user",
-            ));
-        }
-        Ok(())
-    })();
-
-    // SAFETY: GetNamedSecurityInfoW allocated this descriptor for the caller.
-    unsafe { windows_sys::Win32::Foundation::LocalFree(descriptor as HLOCAL) };
-    result
 }
 
 fn set_current_user_acl(path: &Path, directory: bool) -> Result<()> {
@@ -1876,6 +1792,16 @@ fn set_current_user_acl(path: &Path, directory: bool) -> Result<()> {
     } else {
         format!("D:P(A;;FA;;;{sid})")
     };
+    let handle = open_security_handle(path, READ_CONTROL | WRITE_DAC, directory)?;
+    write_protected_dacl(path, &handle, &sddl, directory)
+}
+
+fn write_protected_dacl(
+    path: &Path,
+    handle: &SecurityHandle,
+    sddl: &str,
+    directory: bool,
+) -> Result<()> {
     let sddl_wide: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
     let mut descriptor: *mut c_void = null_mut();
     // SAFETY: sddl_wide is NUL-terminated and descriptor is writable.
@@ -1894,27 +1820,27 @@ fn set_current_user_acl(path: &Path, directory: bool) -> Result<()> {
         ));
     }
 
+    let descriptor = LocalSecurityDescriptor(descriptor);
     let mut present = 0;
     let mut defaulted = 0;
     let mut dacl = null_mut();
     // SAFETY: descriptor is valid and output pointers are writable.
     let dacl_ok =
-        unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted) }
+        unsafe { GetSecurityDescriptorDacl(descriptor.0, &mut present, &mut dacl, &mut defaulted) }
             != 0
             && present != 0
             && !dacl.is_null();
     if !dacl_ok {
-        // SAFETY: descriptor was allocated by the conversion API.
-        unsafe { windows_sys::Win32::Foundation::LocalFree(descriptor as HLOCAL) };
         return Err(Error::new(
             "platform_acl",
-            "Windows did not produce a private data DACL",
+            format!(
+                "Windows did not produce a private data DACL for {}",
+                eliot_core::display_path(&path.to_string_lossy())
+            ),
         ));
     }
 
-    let handle = open_security_handle(path, READ_CONTROL | WRITE_DAC, directory)?;
-    // SAFETY: handle, user SID buffer and DACL remain live for this call. The
-    // protected DACL replaces inherited access with a single user ACE.
+    // SAFETY: the handle and the descriptor backing the DACL stay live.
     let status = unsafe {
         SetSecurityInfo(
             handle.0,
@@ -1926,13 +1852,19 @@ fn set_current_user_acl(path: &Path, directory: bool) -> Result<()> {
             null(),
         )
     };
-    // SAFETY: descriptor was allocated by the conversion API.
-    unsafe { windows_sys::Win32::Foundation::LocalFree(descriptor as HLOCAL) };
     if status != 0 {
-        Err(io_error(
-            "apply current-user ACL",
+        let error = io_error(
+            &format!(
+                "apply current-user ACL to {}",
+                eliot_core::display_path(&path.to_string_lossy())
+            ),
             std::io::Error::from_raw_os_error(status as i32),
-        ))
+        );
+        if directory && status == ERROR_ACCESS_DENIED {
+            Err(error.with_where(DATA_DIR_ACL_UNREPAIRABLE_LOCATION))
+        } else {
+            Err(error)
+        }
     } else {
         Ok(())
     }
@@ -2114,11 +2046,37 @@ pub(crate) fn directory_identity(path: &Path) -> Option<(u64, u64)> {
 /// Uniquely owned handle for a handle-based private-data security call.
 struct SecurityHandle(HANDLE);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SecurityFileIdentity {
+    volume_serial: u32,
+    file_index: u64,
+}
+
 impl Drop for SecurityHandle {
     fn drop(&mut self) {
         // SAFETY: the handle came from CreateFileW and closes exactly once here.
         unsafe { CloseHandle(self.0) };
     }
+}
+
+/// Identify the opened object by volume serial and the complete 64-bit file
+/// index. Both handles remain open while the caller compares these values.
+fn security_handle_identity(path: &Path, handle: &SecurityHandle) -> Result<SecurityFileIdentity> {
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: the owned handle is valid and info is writable storage.
+    if unsafe { GetFileInformationByHandle(handle.0, &mut info) } == 0 {
+        return Err(io_error(
+            &format!(
+                "read file identity for {} before ACL repair",
+                eliot_core::display_path(&path.to_string_lossy())
+            ),
+            std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(SecurityFileIdentity {
+        volume_serial: info.dwVolumeSerialNumber,
+        file_index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+    })
 }
 
 /// Open a private-data file or directory for a handle-based security call.
@@ -2143,10 +2101,24 @@ fn open_security_handle(path: &Path, access: u32, directory: bool) -> Result<Sec
         )
     };
     if handle == INVALID_HANDLE_VALUE {
-        return Err(io_error(
-            "open private data path for ACL inspection",
-            std::io::Error::last_os_error(),
-        ));
+        let error = std::io::Error::last_os_error();
+        let permanent_acl_access_failure = directory
+            && access & (READ_CONTROL | WRITE_DAC) != 0
+            && error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32);
+        let mut failure = io_error(
+            &format!(
+                "open {} with ACL access 0x{access:08x}",
+                eliot_core::display_path(&path.to_string_lossy())
+            ),
+            error,
+        );
+        if permanent_acl_access_failure {
+            // A path that became a reparse point is a retryable path race, not
+            // a permanent inability to read or repair the root DACL.
+            check_no_reparse_components(path)?;
+            failure = failure.with_where(DATA_DIR_ACL_UNREPAIRABLE_LOCATION);
+        }
+        return Err(failure);
     }
     let guard = SecurityHandle(handle);
     validate_security_handle(&guard, directory)?;

@@ -786,6 +786,12 @@ When explicit Claude profile cmd paths no longer exist, status and doctor return
 `claude_profile_command_issues` with the configured path, discovered replacement
 path/version, and one-command repair when a replacement is installed.
 
+On Windows, `swarm doctor` lists non-baseline ACEs on the selected data root. It
+reports SID, ACE type, rights mask, and flags and identifies the capability ACEs
+accepted by the directory rule. When an ACL deviation prevents Owner startup or
+RPC, doctor includes a local read-only ACL report with the error. The inspection
+reads Windows ACL metadata before any endpoint or credential access.
+
 `autonomy.get` is an Owner-only read for CLI, desktop and authenticated cloud
 MCP callers. Its [Core request and response](../../crates/eliot-core/src/api/autonomy.rs)
 use Unix milliseconds. Omit `since_ms` for the last 24 hours. An explicit
@@ -2981,21 +2987,32 @@ The set wait takes 1 through 30 seconds. Command and turn resolution use
 `--status`. A completed command maps to the stored `applied` outcome.
 
 `swarm daemon` (background) prints `starting` with the resolved data directory
-and log path, then polls `daemon.status` for up to 30 s. It prints `ready`
-with the resolved data directory and boot id on success, or fails nonzero
-with the logged `daemon.failed` code newer than this start plus the last
-bounded sanitized diagnostics and the log path. The tail is read boundedly
-(64 KiB, 64 records) from the resolved private data directory only, and only
-codes, ids and the existing sanitized diagnostics are printed. `--foreground`
-runs the daemon in this process and is unchanged. No ACL bypass and no
-automatic store migration or repair occur.
+and log path, then polls `daemon.status` for up to 30 s. It prints `ready` with the
+resolved data directory and boot id on success. If Windows startup observed root
+ACL repair, it reports that repair on stderr. ACL refusals identify the offending
+SID and rights where available. Other startup failures include the logged
+`daemon.failed` code newer than this start and bounded sanitized diagnostics with
+the log path, when available. The tail is read boundedly (64 KiB, 64 records)
+from the resolved private data directory only, and only codes, ids and existing
+sanitized diagnostics are printed. `--foreground` uses the same startup and active
+ACL checks. No ACL bypass or automatic Store migration or Store-data repair occurs.
+Desktop startup reports the same repair outcome or exact refusal reason.
+
+`swarm status` is a read-only probe: it neither starts the daemon nor changes ACLs.
+When a shared startup wait expires and the root still has a repairable ACL deviation,
+the client error preserves the current path/SID/rights diagnosis and names the
+Owner-only retry command `swarm --data-dir '<path>' daemon`. The path is escaped for
+PowerShell by doubling embedded single quotes. The local Owner startup path performs
+that repair; Agent and Run callers keep their inherited identity and do not use their
+credentials to probe Owner-only status or start the daemon.
 
 `swarm status` and the start output include the resolved data directory, so
-`--data-dir`, `ELIOT_HOME` and default-location differences are visible. When
-a client cannot reach the daemon pipe, the error names whether daemon
-metadata, lock and log files exist for that data directory and includes the
-last `daemon.failed` code from the bounded log tail when present and recent.
-It never prints secrets.
+`--data-dir`, `ELIOT_HOME` and default-location differences are visible. Local
+clients briefly wait for the active Windows root check before endpoint or credential
+access. If a client cannot reach the daemon pipe, the error names whether daemon
+metadata, lock and log files exist for that data directory and includes the last
+`daemon.failed` code from the bounded log tail when present and recent. It never
+prints secrets.
 
 `resume --wait` accepts the same `--timeout-seconds` handling as
 `launch`/`send`. When a launch or resume with new text fails and its linked
