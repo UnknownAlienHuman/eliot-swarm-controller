@@ -51,8 +51,8 @@ pub use command::{
 };
 pub use context::{
     ContextEditPath, ContextItem, ContextNoteCounters, ContextOutcome, ContextWaitRequest,
-    InjectArgs, InjectPoint, RetainedInjectArgs, ReviewWorktreeState, TrustedReviewLabels,
-    decode_retained_inject_args, turn_started_data,
+    InjectArgs, InjectPoint, RetainedInjectArgs, ReviewWorktreeState, STEER_DELIVERY_FIELD,
+    TrustedReviewLabels, decode_retained_inject_args, turn_started_data,
 };
 pub use diagnostics::{
     MAX_STDERR_BYTES, MAX_STDERR_DIAGNOSTIC_BYTES, StderrDiagnostic, StderrSnapshot, StderrSource,
@@ -2835,7 +2835,10 @@ fn optional_native_ref(event: &NativeEvent) -> Result<Option<String>> {
 fn optional_effective(event: &NativeEvent) -> Result<Option<Value>> {
     match event.data.get("effective") {
         None | Some(Value::Null) => Ok(None),
-        Some(Value::Object(_)) => Ok(Some(event.data["effective"].clone())),
+        Some(effective @ Value::Object(_)) => {
+            context::validate_steer_delivery(effective)?;
+            Ok(Some(effective.clone()))
+        }
         Some(_) => Err(Error::new(
             "invalid",
             format!("{} field effective must be an object", event.kind),

@@ -1453,6 +1453,30 @@ impl PluginHost {
         validate_models_catalog_result(result, &key)
     }
 
+    pub(crate) fn check_steer_target(&self, agent: &Agent) -> Result<()> {
+        if !agent.steers_at_turn_safe_point() {
+            return Ok(());
+        }
+        let key = AgentKey {
+            id: agent.id.clone(),
+            generation: agent.generation,
+        };
+        let running = self.state.running.lock_recover();
+        let Some(entry) = running.get(&key) else {
+            return Err(Error::new(
+                "bad_state",
+                "Agent has no live runtime to receive steer",
+            ));
+        };
+        if !entry.verbs.contains("steer") {
+            return Err(Error::new(
+                "unsupported",
+                format!("{} Agent does not support steer", agent.harness),
+            ));
+        }
+        Ok(())
+    }
+
     fn sender(
         &self,
         key: &AgentKey,

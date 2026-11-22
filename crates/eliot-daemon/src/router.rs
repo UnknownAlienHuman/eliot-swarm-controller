@@ -3098,6 +3098,7 @@ impl Router {
         if !project_authority_preverified {
             self.verify_native_control_target(&request).await?;
         }
+        self.check_safe_point_steer_target(&request).await?;
         self.check_command_admission_mode(&request.verb)?;
         if request.verb == "detach" {
             self.hydrate_detach_generation(&mut request).await?;
@@ -3279,6 +3280,44 @@ impl Router {
                     ));
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// A safe-point steer waits in Store for a hook, so a live runtime that
+    /// cannot take it is refused before acceptance (#906). Stale generation
+    /// and turn bindings keep their Store errors; direct-RPC steers settle
+    /// from their plugin. A read failure here refuses nothing: Store admission
+    /// still owns the decision.
+    async fn check_safe_point_steer_target(&self, request: &SubmitCommand) -> Result<()> {
+        if request.verb != "steer" {
+            return Ok(());
+        }
+        let Some(target) = request.target.as_deref() else {
+            return Ok(());
+        };
+        let agent = {
+            let store = self.inner.store.lock().await;
+            if !matches!(store.get_command(&request.id), Ok(None)) {
+                return Ok(());
+            }
+            let Ok(Some(agent)) = store.get_agent(target) else {
+                return Ok(());
+            };
+            agent
+        };
+        if request
+            .expected_generation
+            .is_none_or(|expected| expected == agent.generation)
+            && matches!(agent.state, AgentState::Busy | AgentState::Waiting)
+            && agent.active_turn.as_deref().is_some_and(|turn| {
+                request
+                    .expected_turn_id
+                    .as_deref()
+                    .is_none_or(|expected| expected == turn)
+            })
+        {
+            self.inner.plugin_host.check_steer_target(&agent)?;
         }
         Ok(())
     }

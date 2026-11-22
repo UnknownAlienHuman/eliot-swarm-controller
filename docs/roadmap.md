@@ -439,8 +439,8 @@ Codex or for unrelated adapters.
       never substitute a weaker SEND. Claude Code 2.1.278
       `PreToolUse.additionalContext` was the first native consumer. Antigravity
       supports `before_model`, `turn_safe_point`, and exact-turn steer/interrupt.
-      Delivered: Claude exact-turn hook steer with controls served while a steer
-      reply is pending, proven no-effect refusals settled `rejected`, and actual
+      Delivered: Claude exact-turn hook steer held in Store until the soonest tool
+      hook of that turn (#906), proven no-effect refusals settled `rejected`, and actual
       FIFO/safepoint/active-turn contexts consumed on installed-agent runtime.
 
 The selected local scope remains in progress while the applicable L7

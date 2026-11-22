@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 99;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 100;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -2382,6 +2382,20 @@ impl Store {
                      WHERE verb IN ('launch', 'resume')
                        AND state IN ('accepted', 'queued', 'dispatched');
                  INSERT INTO schema_migrations(version) VALUES (99);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 100 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE INDEX IF NOT EXISTS commands_turn_steer_pending
+                     ON commands(target, generation, turn_id, created_at)
+                     WHERE verb = 'steer' AND state IN ('accepted', 'queued');
+                 INSERT INTO schema_migrations(version) VALUES (100);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;

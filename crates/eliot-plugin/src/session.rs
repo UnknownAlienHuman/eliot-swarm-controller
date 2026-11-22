@@ -429,6 +429,18 @@ pub fn with_context_points(mut effective: Value, points: &[InjectPoint]) -> Valu
     effective
 }
 
+/// Declare in a `session.ready` effective object that this session has no
+/// native steer and takes `steer` at a turn safe point.
+pub fn with_safe_point_steer(mut effective: Value) -> Value {
+    if let Some(object) = effective.as_object_mut() {
+        object.insert(
+            eliot_core::STEER_DELIVERY_FIELD.to_owned(),
+            serde_json::to_value(InjectPoint::TurnSafePoint).unwrap_or(Value::Null),
+        );
+    }
+    effective
+}
+
 /// `bad_state` for a request that arrived before `initialize`.
 pub fn not_initialized(harness: &str) -> Error {
     Error::new(

@@ -1,5 +1,5 @@
 use crate::{
-    events::{self, EventConfig, EventHandle, EventStatus, SteerOutcome, TurnOutcome},
+    events::{self, EventConfig, EventHandle, EventStatus, TurnOutcome},
     native::{
         ClaudeClient, ClaudeMcpConfigFile, ClaudeProcess,
         types::{InitializeReadback, OutboundUserInput, OutboundUserMessage},
@@ -16,7 +16,7 @@ use eliot_plugin::{
         ensure_dedicated_reader, initialize_fields_valid, native_no_write, not_initialized,
         optional_profile_text, parse_resume_subject, register_native_process, rejected_control,
         request_reply_ids, unknown_control, unknown_snapshot, validate_binding, validate_identity,
-        validate_source_plan, with_claimed_context, with_context_points,
+        validate_source_plan, with_claimed_context, with_context_points, with_safe_point_steer,
     },
     skill,
 };
@@ -41,7 +41,6 @@ struct ClaudePlugin {
     initialized: Option<Initialized>,
     session: Option<AgentSession>,
     failed_start: Option<FailedStart>,
-    deferred_steer: Option<DeferredSteer>,
 }
 
 struct Initialized {
@@ -305,39 +304,8 @@ fn select_rollback_failure(
     }
 }
 
-/// A steer whose exact-turn waiter is registered with the event task while
-/// its RPC reply stays deferred: the same host loop keeps serving ordinary
-/// control/status/shutdown requests and settles this waiter when it resolves
-/// (hook confirmation, turn end, stop, stream loss) or its deadline passes.
-/// At most one is ever deferred: the event task holds a single queue slot.
-struct DeferredSteer {
-    request_id: Value,
-    command_id: String,
-    turn_id: String,
-    outcome: oneshot::Receiver<SteerOutcome>,
-    deadline: Instant,
-    cancel_ack: Option<oneshot::Receiver<bool>>,
-}
-
-/// What one dispatch produced: an immediate reply, or a deferred steer reply
-/// the run loop settles once its waiter resolves.
-enum DispatchOutcome {
-    Ready(Result<Value>),
-    Deferred(DeferredSteer),
-}
-
-/// What woke the run loop while a steer reply was deferred. A dropped
-/// waiter sender (`None`) means the event task died without settling.
-enum SteerWake {
-    NativeExit,
-    Request(Option<RpcRequest>),
-    Outcome(Option<SteerOutcome>),
-    Deadline,
-    CancelAcknowledged(bool),
-}
-
-/// Serve one request (or settle one deferred steer), then continue the loop
-/// or end it, with whether a shutdown reply completed.
+/// Serve one request, then continue the loop or end it, with whether a
+/// shutdown reply completed.
 enum Serve {
     Continue,
     End(bool),
@@ -375,110 +343,28 @@ pub(crate) async fn run() -> Result<()> {
             native_endpoint_retired = true;
             break;
         }
-        let Some(mut waiter) = plugin.deferred_steer.take() else {
-            let request = if let Some(request) = pending_request.take() {
-                Some(request)
-            } else {
-                tokio::select! {
-                    biased;
-                    () = eliot_plugin::native_lifecycle::wait_for_native_exit(
-                        plugin.session.as_mut().map(|session| &mut session.native.transport)
-                    ) => {
-                        native_endpoint_retired = true;
-                        None
-                    }
-                    request = requests.recv() => request,
-                }
-            };
-            let Some(request) = request else {
-                break;
-            };
-            let (serve, next) =
-                serve_request_preemptible(&mut plugin, &client, &mut requests, request).await;
-            if let Some(next) = next {
-                pending_request = Some(next);
-            }
-            match serve {
-                Serve::Continue => continue,
-                Serve::End(done) => {
-                    completed_shutdown = done;
-                    break;
-                }
-            }
-        };
-        // One steer reply is deferred: race ordinary requests against its
-        // exact-turn settlement in this same task, so interrupt, stop,
-        // snapshot, and shutdown are never blocked behind the hook wait.
-        // The select resolves to a value first so no waiter borrow crosses
-        // the settling code below.
-        // A snapshot preempted on the previous iteration already holds its
-        // preempting host request: serve it next without another recv, so
-        // the retained control is never dropped.
-        let wake = if let Some(pending) = pending_request.take() {
-            SteerWake::Request(Some(pending))
-        } else if let Some(cancel_ack) = waiter.cancel_ack.as_mut() {
-            tokio::select! {
-                biased;
-                () = eliot_plugin::native_lifecycle::wait_for_native_exit(
-                    plugin.session.as_mut().map(|session| &mut session.native.transport)
-                ) => SteerWake::NativeExit,
-                request = requests.recv() => SteerWake::Request(request),
-                outcome = &mut waiter.outcome => SteerWake::Outcome(outcome.ok()),
-                acknowledged = cancel_ack => {
-                    SteerWake::CancelAcknowledged(acknowledged.unwrap_or(false))
-                },
-            }
+        let request = if let Some(request) = pending_request.take() {
+            Some(request)
         } else {
             tokio::select! {
                 biased;
                 () = eliot_plugin::native_lifecycle::wait_for_native_exit(
                     plugin.session.as_mut().map(|session| &mut session.native.transport)
-                ) => SteerWake::NativeExit,
-                request = requests.recv() => SteerWake::Request(request),
-                outcome = &mut waiter.outcome => SteerWake::Outcome(outcome.ok()),
-                _ = tokio::time::sleep_until(waiter.deadline) => SteerWake::Deadline,
+                ) => {
+                    native_endpoint_retired = true;
+                    None
+                }
+                request = requests.recv() => request,
             }
         };
-        let serve = match wake {
-            SteerWake::NativeExit => {
-                plugin.deferred_steer = Some(waiter);
-                native_endpoint_retired = true;
-                break;
-            }
-            SteerWake::Request(request) => {
-                let Some(request) = request else { break };
-                plugin.deferred_steer = Some(waiter);
-                let (serve, next) =
-                    serve_request_preemptible(&mut plugin, &client, &mut requests, request).await;
-                if let Some(next) = next {
-                    pending_request = Some(next);
-                }
-                serve
-            }
-            SteerWake::Outcome(outcome) => {
-                plugin.settle_deferred_steer(&client, waiter, outcome).await
-            }
-            SteerWake::Deadline => {
-                if let Some(session) = plugin.session.as_ref() {
-                    waiter.cancel_ack = Some(
-                        session
-                            .events
-                            .request_cancel_steer(waiter.command_id.clone()),
-                    );
-                    plugin.deferred_steer = Some(waiter);
-                    Serve::Continue
-                } else {
-                    plugin
-                        .settle_deferred_deadline(&client, waiter, false)
-                        .await
-                }
-            }
-            SteerWake::CancelAcknowledged(acknowledged) => {
-                plugin
-                    .settle_deferred_deadline(&client, waiter, acknowledged)
-                    .await
-            }
+        let Some(request) = request else {
+            break;
         };
+        let (serve, next) =
+            serve_request_preemptible(&mut plugin, &client, &mut requests, request).await;
+        if let Some(next) = next {
+            pending_request = Some(next);
+        }
         match serve {
             Serve::Continue => {}
             Serve::End(done) => {
@@ -500,10 +386,6 @@ pub(crate) async fn run() -> Result<()> {
             )
             .await;
         }
-        if let Some(mut waiter) = plugin.deferred_steer.take() {
-            let arrived = waiter.outcome.try_recv().ok();
-            let _ = plugin.settle_deferred_steer(&client, waiter, arrived).await;
-        }
     } else if !completed_shutdown {
         plugin.shutdown_owned().await;
     }
@@ -521,43 +403,24 @@ pub(crate) async fn run() -> Result<()> {
     }
 }
 
-/// Serve one ordinary request: dispatch it, reply unless it deferred a steer
-/// waiter, and report whether the loop must end.
+/// Serve one ordinary request: dispatch it, reply, and report whether the loop
+/// must end.
 async fn serve_request(
     plugin: &mut ClaudePlugin,
     client: &PeerClient,
     request: RpcRequest,
 ) -> Serve {
     let is_shutdown = request.method == "shutdown";
-    match plugin.dispatch(&request, client).await {
-        DispatchOutcome::Ready(result) => {
-            if is_shutdown && let Some(mut waiter) = plugin.deferred_steer.take() {
-                // Shutdown serializes BeginStop behind any hook write that
-                // may have just confirmed Applied: the outcome receiver is
-                // now ready. Settle and reply the known deferred result
-                // before the shutdown ack so Applied is not discarded with
-                // the session; unknown only when truly empty/closed.
-                let arrived = waiter.outcome.try_recv().ok();
-                let settled = plugin.settle_deferred_steer(client, waiter, arrived).await;
-                if matches!(settled, Serve::End(_)) {
-                    return Serve::End(false);
-                }
-            }
-            let response = client
-                .respond(request.id, result, Instant::now() + RPC_TIMEOUT)
-                .await;
-            if is_shutdown {
-                Serve::End(response.is_ok())
-            } else if response.is_err() {
-                Serve::End(false)
-            } else {
-                Serve::Continue
-            }
-        }
-        DispatchOutcome::Deferred(waiter) => {
-            plugin.deferred_steer = Some(waiter);
-            Serve::Continue
-        }
+    let result = plugin.dispatch(&request, client).await;
+    let response = client
+        .respond(request.id, result, Instant::now() + RPC_TIMEOUT)
+        .await;
+    if is_shutdown {
+        Serve::End(response.is_ok())
+    } else if response.is_err() {
+        Serve::End(false)
+    } else {
+        Serve::Continue
     }
 }
 
@@ -576,7 +439,7 @@ async fn serve_request_preemptible(
         return (serve_request(plugin, client, request).await, None);
     }
     match eliot_plugin::preemptible_snapshot(requests, plugin.dispatch(&request, client)).await {
-        eliot_plugin::SnapshotDispatch::Ready(DispatchOutcome::Ready(result)) => {
+        eliot_plugin::SnapshotDispatch::Ready(result) => {
             let response = client
                 .respond(request.id, result, Instant::now() + RPC_TIMEOUT)
                 .await;
@@ -585,10 +448,6 @@ async fn serve_request_preemptible(
             } else {
                 (Serve::Continue, None)
             }
-        }
-        eliot_plugin::SnapshotDispatch::Ready(DispatchOutcome::Deferred(waiter)) => {
-            plugin.deferred_steer = Some(waiter);
-            (Serve::Continue, None)
         }
         eliot_plugin::SnapshotDispatch::Preempted(next) => {
             let preempted = client
@@ -609,17 +468,6 @@ async fn serve_request_preemptible(
                 (Serve::End(false), None)
             }
         }
-    }
-}
-
-/// Answer one deferred steer reply; a dead transport ends the loop.
-async fn respond_deferred(client: &PeerClient, request_id: Value, result: Result<Value>) -> Serve {
-    match client
-        .respond(request_id, result, Instant::now() + RPC_TIMEOUT)
-        .await
-    {
-        Ok(()) => Serve::Continue,
-        Err(_) => Serve::End(false),
     }
 }
 
@@ -705,16 +553,13 @@ impl ClaudePlugin {
         self.retain_proven_no_effect_start(params, error.with_message(reason))
     }
 
-    async fn dispatch(&mut self, request: &RpcRequest, client: &PeerClient) -> DispatchOutcome {
+    async fn dispatch(&mut self, request: &RpcRequest, client: &PeerClient) -> Result<Value> {
         let result = match request.method.as_str() {
             "initialize" => self.initialize(&request.params),
             "quota.read" => crate::quota::read(&request.params).await,
             "model.list" => self.model_list(&request.params).await,
             "agent.start" => self.start(&request.params, client).await,
-            "agent.command" => match self.command(request).await {
-                DispatchOutcome::Ready(result) => result,
-                deferred => return deferred,
-            },
+            "agent.command" => self.command(request).await,
             "agent.snapshot" => self.snapshot(&request.params).await,
             "agent.stop" => self.stop(&request.params).await,
             "shutdown" => self.shutdown().await,
@@ -723,11 +568,10 @@ impl ClaudePlugin {
                 "Claude plugin method is not implemented",
             )),
         };
-        DispatchOutcome::Ready(self.post_process(&request.method, result))
+        self.post_process(&request.method, result)
     }
 
-    /// Redact and attach diagnostics to one reply, exactly as the serial
-    /// path: immediate replies here, deferred steer replies at settle time.
+    /// Redact and attach diagnostics to one reply.
     fn post_process(&self, method: &str, result: Result<Value>) -> Result<Value> {
         let Some(session) = self.session.as_ref() else {
             return result;
@@ -1326,31 +1170,28 @@ impl ClaudePlugin {
         Ok(())
     }
 
-    async fn command(&mut self, request: &RpcRequest) -> DispatchOutcome {
-        let raw = &request.params;
+    async fn command(&mut self, request: &RpcRequest) -> Result<Value> {
         let params: AgentCommandParams =
-            match decode(raw, "Claude agent.command params are invalid") {
-                Ok(params) => params,
-                Err(error) => return DispatchOutcome::Ready(Err(error)),
-            };
-        if let Err(error) = validate_identity(
+            decode(&request.params, "Claude agent.command params are invalid")?;
+        validate_identity(
             &params.agent_id,
             params.generation,
             &params.command_id,
             "Claude",
-        ) {
-            return DispatchOutcome::Ready(Err(error));
-        }
+        )?;
         match params.verb.as_str() {
-            "send" => DispatchOutcome::Ready(self.send_command(params).await),
-            "configure" => DispatchOutcome::Ready(self.configure_command(params).await),
-            "steer" => self.steer_command(request.id.clone(), params).await,
-            "interrupt" => DispatchOutcome::Ready(self.interrupt_command(params).await),
-            "approve" | "deny" => DispatchOutcome::Ready(self.reply_request(params).await),
-            _ => DispatchOutcome::Ready(Err(Error::new(
+            "send" => self.send_command(params).await,
+            "configure" => self.configure_command(params).await,
+            "steer" => Err(Error::new(
+                "native_not_dispatched",
+                "Claude steer is delivered through turn_safe_point tool hooks",
+            )),
+            "interrupt" => self.interrupt_command(params).await,
+            "approve" | "deny" => self.reply_request(params).await,
+            _ => Err(Error::new(
                 "unsupported",
                 "Claude plugin command verb is not implemented",
-            ))),
+            )),
         }
     }
 
@@ -1500,236 +1341,6 @@ impl ClaudePlugin {
             Some(model) if !model.trim().is_empty() => Ok(model.to_owned()),
             _ => Err(Error::new("invalid", "Claude configure needs a model")),
         }
-    }
-
-    /// Steer the exact captured turn through the installed CLI's existing
-    /// PreToolUse `additionalContext` hook response (it has no named steer
-    /// method). The text queues behind any terminal frame and rides the next
-    /// live hook callback for that turn only, combined after any FIFO hook
-    /// context; applied is retained only after the native response confirms
-    /// it. A turn that ends first drops the text (stale, never leaked into
-    /// another turn); an uncertain write settles unknown without a replay.
-    /// Registration returns immediately with the waiter deferred: the host
-    /// loop keeps serving ordinary requests and settles the reply when the
-    /// exact-turn waiter resolves, so this hook wait never blocks
-    /// interrupt, stop, snapshot, or shutdown behind it.
-    async fn steer_command(
-        &mut self,
-        request_id: Value,
-        params: AgentCommandParams,
-    ) -> DispatchOutcome {
-        let ready = |result: Result<Value>| DispatchOutcome::Ready(result);
-        if params.request_id.is_some() {
-            return ready(Err(Error::new(
-                "invalid",
-                "Claude steer does not address a native request",
-            )));
-        }
-        let turn_id = match params
-            .turn_id
-            .as_deref()
-            .filter(|turn_id| !turn_id.trim().is_empty())
-        {
-            Some(turn_id) => turn_id,
-            None => {
-                return ready(Err(Error::new(
-                    "stale_turn",
-                    "Claude steer requires a captured turn id",
-                )));
-            }
-        };
-        let text = match params.args.get("text").and_then(Value::as_str) {
-            Some(text) => text,
-            None => {
-                return ready(Err(Error::new(
-                    "invalid",
-                    "Claude steer requires args.text",
-                )));
-            }
-        };
-        {
-            let session = match self.session.as_mut() {
-                Some(session) => session,
-                None => {
-                    return ready(Err(Error::new(
-                        "bad_state",
-                        "Claude Agent session has not started",
-                    )));
-                }
-            };
-            if let Err(error) = validate_binding(
-                &session.agent_id,
-                session.generation,
-                &params.agent_id,
-                params.generation,
-                "Claude",
-            ) {
-                return ready(Err(error));
-            }
-            // Proven no-effect: a fresh steer that never queues has no native
-            // effect even when a prior session outcome is unresolved, so the
-            // authoritative refusal is `rejected`, never Unknown.
-            if session.phase != SessionPhase::Ready {
-                return ready(Ok(rejected_control(
-                    "Claude session or event source outcome is unresolved",
-                )));
-            }
-            if text.trim().is_empty() {
-                return ready(Err(Error::new("invalid", "Claude steer text is empty")));
-            }
-            if text.len() > MAX_TEXT_BYTES {
-                let result = rejected_control("Claude steer input exceeds 512 KiB");
-                return ready(Ok(result));
-            }
-        }
-        // One deferred reply at a time: the event task holds the single
-        // queue slot, so a second steer waits for this one's reply instead
-        // of queueing behind an unanswered waiter.
-        if self.deferred_steer.is_some() {
-            // Proven no-effect: never queued, so the authoritative refusal is
-            // `rejected`, not an error Core would classify Unknown. Transient:
-            // a later command id may steer once this reply settles.
-            return ready(Ok(rejected_control(
-                "Claude already has a steer reply deferred",
-            )));
-        }
-        let session = match self.session.as_mut() {
-            Some(session) => session,
-            None => {
-                return ready(Err(Error::new(
-                    "bad_state",
-                    "Claude Agent session has not started",
-                )));
-            }
-        };
-        // Proven no-effect like the phase refusal above: the steer never
-        // queues, so a prior event-source gap refuses it as `rejected` with
-        // the exact gap reason instead of Unknown.
-        if let Some(reason) = session.events.status().failure {
-            return ready(Ok(rejected_control(&reason)));
-        }
-        // The event task answers behind any queued terminal frame, so a
-        // steer racing completion refuses instead of queueing behind it.
-        match session.events.check_turn(turn_id).await {
-            Ok(true) => {}
-            Ok(false) => {
-                // Proven no-effect: never queued behind the finished turn.
-                return ready(Ok(rejected_control("Claude turn is not the active turn")));
-            }
-            Err(error) => return ready(Err(error)),
-        }
-        let outcome = match session
-            .events
-            .steer(
-                params.command_id.clone(),
-                turn_id.to_owned(),
-                text.to_owned(),
-                params.args["steer_hook"].as_str().unwrap_or_default(),
-            )
-            .await
-        {
-            Ok(outcome) => outcome,
-            // Actor busy/stale/`native_not_dispatched` prove pre-insertion
-            // refusal (never queued; only register_steer emits these codes),
-            // so they refuse as `rejected` with the exact reason.
-            // Request-shape `invalid` and channel/write uncertainty keep their
-            // error codes.
-            Err(error)
-                if matches!(
-                    error.code.as_str(),
-                    "busy" | "stale_turn" | "native_not_dispatched"
-                ) =>
-            {
-                return ready(Ok(rejected_control(&error.message)));
-            }
-            Err(error) => return ready(Err(error)),
-        };
-        DispatchOutcome::Deferred(DeferredSteer {
-            request_id,
-            command_id: params.command_id.clone(),
-            turn_id: turn_id.to_owned(),
-            outcome,
-            deadline: Instant::now() + RPC_TIMEOUT,
-            cancel_ack: None,
-        })
-    }
-
-    /// Settle a deferred steer reply after its exact-turn waiter resolved.
-    /// Report the confirmed outcome with the exact command and native turn.
-    async fn settle_deferred_steer(
-        &mut self,
-        client: &PeerClient,
-        waiter: DeferredSteer,
-        arrived: Option<SteerOutcome>,
-    ) -> Serve {
-        let DeferredSteer {
-            request_id,
-            command_id,
-            turn_id,
-            ..
-        } = waiter;
-        let outcome = match arrived {
-            Some(outcome) => outcome,
-            None => {
-                // The queued sender closed without an authoritative outcome.
-                let result =
-                    unknown_control("Claude steer outcome was lost; it will not be repeated");
-                let result = self.post_process("agent.command", Ok(result));
-                return respond_deferred(client, request_id, result).await;
-            }
-        };
-        let result = match outcome {
-            SteerOutcome::Applied(hook) => Ok(json!({
-                "state": "applied",
-                "command_id": command_id,
-                "turn_id": turn_id,
-                "mechanism": format!("claude.{hook}.additionalContext"),
-            })),
-            SteerOutcome::Rejected(reason) => Ok(rejected_control(&reason)),
-            SteerOutcome::Unknown(reason) => Ok(unknown_control(&reason)),
-            SteerOutcome::Stale => Ok(rejected_control(
-                "Claude turn ended before the steer applied",
-            )),
-        };
-        let result = self.post_process("agent.command", result);
-        respond_deferred(client, request_id, result).await
-    }
-
-    /// Settle after the deadline withdrawal was processed by the event task.
-    /// The host kept both receivers live while continuing to serve controls;
-    /// a confirmed steer outcome wins before a timeout is retained.
-    async fn settle_deferred_deadline(
-        &mut self,
-        client: &PeerClient,
-        mut waiter: DeferredSteer,
-        cancellation_acknowledged: bool,
-    ) -> Serve {
-        // The event task serializes cancellation behind any callback write.
-        // Its outcome sender runs before the cancellation acknowledgement, so
-        // inspect the still-live receiver before retaining a timeout result.
-        if let Ok(outcome) = waiter.outcome.try_recv() {
-            return self
-                .settle_deferred_steer(client, waiter, Some(outcome))
-                .await;
-        }
-        let request_id = waiter.request_id;
-        if self.session.is_some() {
-            let result = session::unconfirmed_control(
-                cancellation_acknowledged,
-                "Claude steer was not confirmed before its deadline; it will not be repeated",
-                "Claude steer withdrawal was not confirmed before its deadline; it will not be repeated",
-            );
-            let result = self.post_process("agent.command", Ok(result));
-            return respond_deferred(client, request_id, result).await;
-        }
-        let result = self.post_process(
-            "agent.command",
-            Err(Error::new(
-                "bad_state",
-                "Claude Agent session has not started",
-            )),
-        );
-        respond_deferred(client, request_id, result).await
     }
 
     async fn interrupt_command(&mut self, params: AgentCommandParams) -> Result<Value> {
@@ -2726,7 +2337,7 @@ fn start_effective_settings(
 ) -> Value {
     // Initialize has no effective effort field. The environment can override
     // --effort, and a model or maxEffortLevel setting can cap the result.
-    with_context_points(
+    with_safe_point_steer(with_context_points(
         json!({
             "model": null,
             "effort": null,
@@ -2739,7 +2350,7 @@ fn start_effective_settings(
             "mcp_servers_verified": false,
         }),
         &[InjectPoint::NextInput, InjectPoint::TurnSafePoint],
-    )
+    ))
 }
 
 /// The shared start/input/stop commands plus the Claude-only interrupt,

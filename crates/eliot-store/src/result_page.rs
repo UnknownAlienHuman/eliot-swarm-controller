@@ -144,7 +144,9 @@ impl Store {
 
     /// Set-based unknown-turn mask for a result page spanning generations.
     /// Generation stays part of each join key so reused turn IDs cannot mask
-    /// a different generation's result.
+    /// a different generation's result. A `steer` claimed at a turn safe point
+    /// keeps its own `unknown` without masking the turn's native outcome; a
+    /// direct-RPC steer carries no such claim and still masks its turn.
     pub fn turns_with_unknown_commands_for_page(
         &self,
         agent: &str,
@@ -168,6 +170,9 @@ impl Store {
                  WHERE commands.target = ?1
                    AND commands.generation = json_extract(requested.value, '$[0]')
                    AND commands.turn_id = json_extract(requested.value, '$[1]')
+                   AND NOT (commands.verb = 'steer'
+                            AND json_extract(commands.outcome, '$.claim.application_point')
+                                IS 'turn_safe_point')
                    AND commands.state IN ('accepted','queued','dispatched','unknown')
                    AND (commands.state = 'unknown'
                         OR commands.id IN (SELECT value FROM json_each(?3)))",

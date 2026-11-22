@@ -11,7 +11,7 @@ use eliot_core::{
     requests::{ApprovalChoice, ApprovalDecision, ApprovalRequest},
 };
 use eliot_plugin::{
-    CommitSink, MAX_EVENT_BYTES, MAX_TEXT_BYTES, PeerClient,
+    CommitSink, MAX_EVENT_BYTES, PeerClient,
     event_actor::EventActor,
     native_stdio::StreamState,
     protocol::{HookEvent, HookResponse},
@@ -112,17 +112,6 @@ pub(crate) enum TurnOutcome {
     Unknown(String),
 }
 
-/// Outcome of one queued steer wait, decided by the exact hook facts. Only
-/// `Applied` means the native `PreToolUse.additionalContext` response carried
-/// the steer text; `Stale` means the captured turn ended first and the text
-/// was dropped, never leaked into another turn.
-pub(crate) enum SteerOutcome {
-    Applied(&'static str),
-    Rejected(String),
-    Unknown(String),
-    Stale,
-}
-
 enum Control {
     Ready {
         native_scope: String,
@@ -139,18 +128,6 @@ enum Control {
         outcome: oneshot::Sender<TurnOutcome>,
     },
     CancelTurn {
-        command_id: String,
-        reply: oneshot::Sender<()>,
-    },
-    Steer {
-        command_id: String,
-        turn_id: String,
-        text: String,
-        hook: HookPoint,
-        registered: oneshot::Sender<Result<()>>,
-        outcome: oneshot::Sender<SteerOutcome>,
-    },
-    CancelSteer {
         command_id: String,
         reply: oneshot::Sender<()>,
     },
@@ -197,17 +174,6 @@ struct PendingTurn {
     turn_id: String,
     context: Vec<ContextItem>,
     outcome: Option<oneshot::Sender<TurnOutcome>>,
-}
-
-/// One steer queued for its exact captured turn. The text rides the next live
-/// `PreToolUse.additionalContext` response for that turn only; turn end,
-/// stop, or stream loss settles it without ever carrying it forward.
-struct PendingSteer {
-    command_id: String,
-    turn_id: String,
-    text: String,
-    hook: HookPoint,
-    outcome: Option<oneshot::Sender<SteerOutcome>>,
 }
 
 /// One open `can_use_tool` permission, keyed by the CLI's exact native
@@ -413,7 +379,6 @@ struct EventProcessor {
     buffer_bytes: usize,
     gap_number: u64,
     pending_turn: Option<PendingTurn>,
-    pending_steer: Option<PendingSteer>,
     empty_after_tool_hooks: u64,
     interrupted_turn: Option<String>,
     pending_requests: HashMap<String, PendingNativeRequest>,
@@ -583,67 +548,6 @@ impl EventHandle {
             .actor
             .call(|reply| Control::CancelTurn { command_id, reply })
             .await;
-    }
-
-    /// Queue one steer for its exact captured turn. Registration is
-    /// synchronous behind any queued terminal frame, so a steer racing
-    /// completion refuses instead of queueing behind a dead turn. The
-    /// returned waiter resolves only when the native hook response confirms
-    /// the text rode it (`Applied`), the turn ends first (`Stale`), or the
-    /// write proves itself unapplied or unresolved.
-    pub async fn steer(
-        &self,
-        command_id: String,
-        turn_id: String,
-        text: String,
-        hook: &str,
-    ) -> Result<oneshot::Receiver<SteerOutcome>> {
-        let hook = match hook {
-            "before_tool" => HookPoint::BeforeTool,
-            "after_tool" => HookPoint::AfterTool,
-            _ => {
-                return Err(Error::new(
-                    "native_not_dispatched",
-                    "Claude requires a supported runtime steer hook",
-                ));
-            }
-        };
-        let (outcome_tx, outcome_rx) = oneshot::channel();
-        self.actor
-            .call(|registered| Control::Steer {
-                command_id,
-                turn_id,
-                text,
-                hook,
-                registered,
-                outcome: outcome_tx,
-            })
-            .await??;
-        Ok(outcome_rx)
-    }
-
-    /// Queue exact-command steer withdrawal on the event task without making
-    /// the host control dispatcher wait behind a native callback write/receipt.
-    /// The returned receiver resolves when that task processes the request.
-    pub fn request_cancel_steer(&self, command_id: String) -> oneshot::Receiver<bool> {
-        let actor = self.actor.clone();
-        let (completed_tx, completed_rx) = oneshot::channel();
-        tokio::spawn(async move {
-            let completed = actor
-                .call(|reply| Control::CancelSteer { command_id, reply })
-                .await
-                .is_ok();
-            let _ = completed_tx.send(completed);
-        });
-        completed_rx
-    }
-
-    /// Whether `turn_id` is the exact live turn, answered behind any queued
-    /// terminal frame so a control never targets a finished turn.
-    pub async fn check_turn(&self, turn_id: &str) -> Result<bool> {
-        self.turn_interrupt_status(turn_id)
-            .await
-            .map(|status| status.is_some())
     }
 
     /// The exact live turn's interrupt status, or None if the turn ended.
@@ -839,23 +743,6 @@ async fn dispatch_control(
             publish(processor, status);
             let _ = reply.send(());
         }
-        Control::Steer {
-            command_id,
-            turn_id,
-            text,
-            hook,
-            registered,
-            outcome,
-        } => {
-            let result = processor.register_steer(command_id, turn_id, text, hook, outcome);
-            publish(processor, status);
-            let _ = registered.send(result);
-        }
-        Control::CancelSteer { command_id, reply } => {
-            processor.cancel_steer(&command_id);
-            publish(processor, status);
-            let _ = reply.send(());
-        }
         Control::CheckTurn { turn_id, reply } => {
             let live = processor.status.active_turn_id.as_deref() == Some(turn_id.as_str())
                 && processor.status.failure.is_none()
@@ -904,11 +791,6 @@ async fn dispatch_control(
             processor.planned_stop = true;
             processor.accept_frames = false;
             processor.cancel_all_hook_callbacks();
-            // Still-queued here proves never written (same as cancel): the
-            // serial actor settles every taken steer before this control runs.
-            processor.fail_pending_steer(SteerOutcome::Rejected(
-                "Claude stopped before PreToolUse confirmed steer".to_owned(),
-            ));
             publish(processor, status);
             let _ = reply.send(Ok(()));
         }
@@ -938,9 +820,6 @@ async fn dispatch_control(
                     ),
                 );
             }
-            processor.fail_pending_steer(SteerOutcome::Rejected(
-                "Claude event task closed before PreToolUse confirmed steer".to_owned(),
-            ));
             processor.finish_pending_end_stop().await;
             let _ = reply.send(());
             return true;
@@ -972,7 +851,6 @@ impl EventProcessor {
             buffer_bytes: 0,
             gap_number: 0,
             pending_turn: None,
-            pending_steer: None,
             empty_after_tool_hooks: 0,
             interrupted_turn: None,
             pending_requests: HashMap::new(),
@@ -1139,117 +1017,6 @@ impl EventProcessor {
             // The caller already answered, so the dropped outcome is unheard.
             self.pending_turn = None;
             self.cancelled_hook_requests.clear();
-        }
-    }
-
-    /// Queue one steer behind any queued terminal frame: only the exact live
-    /// turn is accepted, and only one steer waits at a time (a second is
-    /// `busy`, never silently dropped or reordered).
-    fn register_steer(
-        &mut self,
-        command_id: String,
-        turn_id: String,
-        text: String,
-        hook: HookPoint,
-        outcome: oneshot::Sender<SteerOutcome>,
-    ) -> Result<()> {
-        if !self.status.ready
-            || self.status.session_id.is_none()
-            || command_id.trim().is_empty()
-            || turn_id.trim().is_empty()
-            || text.trim().is_empty()
-        {
-            return Err(Error::new(
-                "invalid",
-                "Claude steer requires a ready exact session, turn, and text",
-            ));
-        }
-        if self.pending_steer.is_some() {
-            return Err(Error::new(
-                "busy",
-                "Claude already has a steer waiting for a tool hook",
-            ));
-        }
-        if self.status.active_turn_id.as_deref() != Some(turn_id.as_str()) {
-            return Err(Error::new(
-                "stale_turn",
-                "Claude steer does not match the exact active turn",
-            ));
-        }
-        // All three refusals below fire before insertion, so no native write
-        // is possible: they carry the explicit `native_not_dispatched` proof
-        // (reasons preserved) instead of generic unknown.
-        if self.planned_stop || self.closed {
-            return Err(Error::new(
-                "native_not_dispatched",
-                "Claude session is stopping; steer will not be applied",
-            ));
-        }
-        if self.writes_blocked {
-            return Err(Error::new(
-                "native_not_dispatched",
-                "Claude event source acknowledgement is unresolved",
-            ));
-        }
-        if self.status.failure.is_some() {
-            return Err(Error::new(
-                "native_not_dispatched",
-                "Claude event source has an unresolved gap",
-            ));
-        }
-        self.pending_steer = Some(PendingSteer {
-            command_id,
-            turn_id,
-            text,
-            hook,
-            outcome: Some(outcome),
-        });
-        Ok(())
-    }
-
-    /// Withdraw the exact queued steer at the host's deadline, so a later hook
-    /// cannot apply text the caller no longer owns. The serial actor settles
-    /// every taken steer before this cancel runs, so a still-queued steer
-    /// provably never rode a hook response: its removal reports an explicit
-    /// no-effect rejection, never a dropped sender (which would misclassify as
-    /// Unknown). A settled or foreign command is untouched.
-    fn cancel_steer(&mut self, command_id: &str) {
-        let pending_matches = self
-            .pending_steer
-            .as_ref()
-            .is_some_and(|pending| pending.command_id == command_id);
-        if pending_matches && let Some(steer) = self.pending_steer.take() {
-            Self::settle_steer(
-                steer,
-                SteerOutcome::Rejected(
-                    "Claude steer was withdrawn before the selected hook applied it".to_owned(),
-                ),
-            );
-        }
-    }
-
-    /// Take the queued steer for the exact turn about to be written.
-    fn take_pending_steer(&mut self, turn_id: &str, hook: HookPoint) -> Option<PendingSteer> {
-        if self
-            .pending_steer
-            .as_ref()
-            .is_some_and(|steer| steer.turn_id == turn_id && steer.hook == hook)
-        {
-            self.pending_steer.take()
-        } else {
-            None
-        }
-    }
-
-    fn settle_steer(steer: PendingSteer, outcome: SteerOutcome) {
-        if let Some(sender) = steer.outcome {
-            let _ = sender.send(outcome);
-        }
-    }
-
-    fn fail_pending_steer(&mut self, outcome: SteerOutcome) {
-        if let Some(steer) = self.pending_steer.take() {
-            Self::settle_steer(steer, outcome);
         }
     }
 
@@ -2280,7 +2047,6 @@ impl EventProcessor {
         let deadline = pending.deadline;
         let tool_use_id = pending.tool_use_id.clone();
         let consumer_id = pending.consumer_id.clone();
-        let hook_turn_id = pending.turn_id.clone();
         let hook = pending.hook;
         let context = match result {
             Ok(context) => context,
@@ -2290,120 +2056,39 @@ impl EventProcessor {
                 return self.write_hook_pass(&native, request_id, deadline).await;
             }
         };
-        let context_text = if context.is_empty() {
-            String::new()
-        } else {
-            match with_claimed_context("", &context, "Claude") {
-                Ok(text) => text.strip_suffix("\n\n").unwrap_or(&text).to_owned(),
-                Err(_) => {
-                    self.pending_hooks.remove(request_id);
-                    self.finish_tool_use_hook(&tool_use_id, hook, &consumer_id);
-                    return self.write_hook_pass(&native, request_id, deadline).await;
-                }
+        if context.is_empty() {
+            return self
+                .finish_hook_pass(
+                    request_id,
+                    &native,
+                    deadline,
+                    hook,
+                    &tool_use_id,
+                    &consumer_id,
+                )
+                .await;
+        }
+        let context_text = match with_claimed_context("", &context, "Claude") {
+            Ok(text) => text.strip_suffix("\n\n").unwrap_or(&text).to_owned(),
+            Err(_) => {
+                self.pending_hooks.remove(request_id);
+                self.finish_tool_use_hook(&tool_use_id, hook, &consumer_id);
+                return self.write_hook_pass(&native, request_id, deadline).await;
             }
         };
-        // Neither FIFO context nor a queued steer for this exact turn: the
-        // existing pass path below. A queued steer takes the combined path
-        // even when the hook selected no context.
-        let steer_waiting = self
-            .pending_steer
-            .as_ref()
-            .is_some_and(|steer| steer.turn_id == hook_turn_id && steer.hook == hook);
-        if context.is_empty() && !steer_waiting {
-            return self
-                .finish_hook_pass(
-                    request_id,
-                    &native,
-                    deadline,
-                    hook,
-                    &tool_use_id,
-                    &consumer_id,
-                )
-                .await;
-        }
-        if !self.hook_callback_is_live(request_id) {
-            // Not live: the steer (if any) stays queued for the next
-            // tool hook of this same turn; turn end settles it, never
-            // leaks it into another turn.
-            self.pending_hooks.remove(request_id);
-            self.finish_tool_use_hook(&tool_use_id, hook, &consumer_id);
-            return self.write_hook_pass(&native, request_id, deadline).await;
-        }
-        // Take the queued steer only now, immediately before the only native
-        // write that can carry additionalContext. FIFO context comes first,
-        // then the steer text; a raw-text or complete-frame overflow rejects
-        // the steer and keeps the full FIFO context when its frame fits.
-        let mut steer = self.take_pending_steer(&hook_turn_id, hook);
-        let mut combined = context_text.clone();
-        if let Some(waiting) = steer.as_ref() {
-            combined = if combined.trim().is_empty() {
-                waiting.text.clone()
-            } else {
-                format!("{}\n\n{}", combined, waiting.text)
-            };
-            if combined.len() > MAX_TEXT_BYTES {
-                if let Some(waiting) = steer.take() {
-                    Self::settle_steer(
-                        waiting,
-                        SteerOutcome::Rejected(
-                            "Claude steer with hook context exceeds 512 KiB".to_owned(),
-                        ),
-                    );
-                }
-                combined = context_text.clone();
-            }
-        }
-        let mut response =
-            HookCallbackResponse::with_context(hook.native_event_name(), combined.clone());
-        if !hook_callback_response_fits(request_id, &response)
-            && let Some(waiting) = steer.take()
-        {
-            Self::settle_steer(
-                waiting,
-                SteerOutcome::Rejected(
-                    "Claude steer with hook context exceeds the 1 MiB encoded response bound"
-                        .to_owned(),
-                ),
-            );
-            combined = context_text.clone();
-            response =
-                HookCallbackResponse::with_context(hook.native_event_name(), combined.clone());
-        }
-        if context.is_empty() && steer.is_none() {
-            return self
-                .finish_hook_pass(
-                    request_id,
-                    &native,
-                    deadline,
-                    hook,
-                    &tool_use_id,
-                    &consumer_id,
-                )
-                .await;
-        }
+        let response = HookCallbackResponse::with_context(hook.native_event_name(), context_text);
         if !hook_callback_response_fits(request_id, &response) {
             self.pending_hooks.remove(request_id);
             self.finish_tool_use_hook(&tool_use_id, hook, &consumer_id);
             return Err(Error::new(
                 "frame_too_large",
-                "Claude FIFO hook context exceeds the 1 MiB encoded response bound",
+                "Claude hook context exceeds the 1 MiB encoded response bound",
             ));
         }
         // Recheck the monotonic deadline, cancellation (pending-map membership),
         // generation and exact invocation-to-turn binding immediately before
         // the only native write that can carry additionalContext.
         if !self.hook_callback_is_live(request_id) {
-            if let Some(waiting) = steer.take() {
-                // The callback died between the take and the write without
-                // the turn ending: no write happened, so the steer is
-                // rejected (proven unapplied), never silently requeued.
-                Self::settle_steer(
-                    waiting,
-                    SteerOutcome::Rejected(
-                        "Claude hook callback ended before steer applied".to_owned(),
-                    ),
-                );
-            }
             self.pending_hooks.remove(request_id);
             self.finish_tool_use_hook(&tool_use_id, hook, &consumer_id);
             return self.write_hook_pass(&native, request_id, deadline).await;
@@ -2414,27 +2099,11 @@ impl EventProcessor {
         {
             Ok(()) => {}
             Err(error) if native_no_write(&error.code) => {
-                if let Some(waiting) = steer.take() {
-                    Self::settle_steer(
-                        waiting,
-                        SteerOutcome::Rejected(
-                            "Claude steer response was not dispatched".to_owned(),
-                        ),
-                    );
-                }
                 self.pending_hooks.remove(request_id);
                 self.finish_tool_use_hook(&tool_use_id, hook, &consumer_id);
                 return self.write_hook_pass(&native, request_id, deadline).await;
             }
             Err(_) => {
-                if let Some(waiting) = steer.take() {
-                    Self::settle_steer(
-                        waiting,
-                        SteerOutcome::Unknown(
-                            "Claude steer response write outcome is unknown".to_owned(),
-                        ),
-                    );
-                }
                 self.pending_hooks.remove(request_id);
                 self.finish_tool_use_hook(&tool_use_id, hook, &consumer_id);
                 return Err(Error::new(
@@ -2444,57 +2113,12 @@ impl EventProcessor {
             }
         }
         let Some(pending) = self.pending_hooks.remove(request_id) else {
-            if let Some(waiting) = steer.take() {
-                Self::settle_steer(
-                    waiting,
-                    SteerOutcome::Unknown(
-                        "Claude hook binding disappeared after the steer write".to_owned(),
-                    ),
-                );
-            }
             return Err(Error::new(
                 "unknown",
                 "Claude hook binding disappeared after the native response write",
             ));
         };
-        if context.is_empty() {
-            if !self.hook_empty_selection_was_claimed(&pending) {
-                if let Some(waiting) = steer.take() {
-                    Self::settle_steer(
-                        waiting,
-                        SteerOutcome::Unknown(
-                            "Claude steer lost its exact callback binding".to_owned(),
-                        ),
-                    );
-                }
-                self.finish_tool_use_hook(&pending.tool_use_id, pending.hook, &pending.consumer_id);
-                return Err(Error::new(
-                    "unknown",
-                    "Claude empty hook selection lost its exact callback binding",
-                ));
-            }
-            self.finish_tool_use_hook(&pending.tool_use_id, pending.hook, &pending.consumer_id);
-            if let Some(waiting) = steer.take() {
-                Self::settle_steer(waiting, SteerOutcome::Applied(hook.native_event_name()));
-            }
-            return self
-                .commit_empty_hook_event(
-                    pending.hook,
-                    pending.turn_id,
-                    pending.consumer_id,
-                    &pending.tool,
-                )
-                .await;
-        }
         if !self.hook_context_was_claimed(&context, &pending) {
-            if let Some(waiting) = steer.take() {
-                Self::settle_steer(
-                    waiting,
-                    SteerOutcome::Unknown(
-                        "Claude steer lost its exact callback binding".to_owned(),
-                    ),
-                );
-            }
             self.finish_tool_use_hook(&pending.tool_use_id, pending.hook, &pending.consumer_id);
             return Err(Error::new(
                 "unknown",
@@ -2502,9 +2126,6 @@ impl EventProcessor {
             ));
         }
         self.finish_tool_use_hook(&pending.tool_use_id, pending.hook, &pending.consumer_id);
-        if let Some(waiting) = steer.take() {
-            Self::settle_steer(waiting, SteerOutcome::Applied(hook.native_event_name()));
-        }
         let Some(session_id) = self.status.session_id.as_deref() else {
             return Err(Error::new(
                 "unknown",
@@ -2512,7 +2133,10 @@ impl EventProcessor {
             ));
         };
         let outcome = ContextOutcome {
-            mechanism: "hook_callback".to_owned(),
+            mechanism: format!(
+                "claude.{}.additionalContext",
+                pending.hook.native_event_name()
+            ),
             application_point: InjectPoint::TurnSafePoint,
             consumer_id: pending.consumer_id.clone(),
         };
@@ -2534,9 +2158,8 @@ impl EventProcessor {
             .await
     }
 
-    /// The pass path for a hook that selected no context and carries no
-    /// steer: write the empty response and commit the empty receipt. This is
-    /// the original empty-context block, unchanged.
+    /// The pass path for a hook that selected no context: write the empty
+    /// response and commit the empty receipt.
     async fn finish_hook_pass(
         &mut self,
         request_id: &str,
@@ -3307,9 +2930,6 @@ impl EventProcessor {
                 .await;
         };
         self.cancel_hook_callbacks_for_turn(&turn_id);
-        // A steer the turn ended before its next PreToolUse never applies:
-        // drop it here so no text leaks into another turn.
-        self.fail_pending_steer(SteerOutcome::Stale);
         // Unanswered asks die with their turn: close them before the terminal
         // commit, without a command binding.
         self.close_pending_requests(Some(&turn_id)).await?;
@@ -3482,14 +3102,6 @@ impl EventProcessor {
     async fn note_frames_drained(&mut self) {
         self.frames_drained = true;
         self.cancel_all_hook_callbacks();
-        // No hook will ever confirm a queued steer after the drain: planned
-        // stop already settled it at BeginStop; an unplanned loss settles it
-        // rejected here (still queued proves never written), never replayed.
-        if !self.planned_stop && !self.closed {
-            self.fail_pending_steer(SteerOutcome::Rejected(
-                "Claude event stream was lost before PreToolUse confirmed steer".to_owned(),
-            ));
-        }
         if self.planned_stop || self.closed {
             // A sticky record-local fault survives planned stop: flush its
             // gap before end-stop settlement instead of erasing it.
@@ -3619,10 +3231,6 @@ impl EventProcessor {
                 ),
             );
         }
-        // BeginStop already settled this; the take is a no-op then.
-        self.fail_pending_steer(SteerOutcome::Rejected(
-            "Claude stopped before PreToolUse confirmed steer".to_owned(),
-        ));
         self.status.stopped = true;
         self.status.ready = false;
         self.status.active_command_id = None;

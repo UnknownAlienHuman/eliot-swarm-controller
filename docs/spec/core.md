@@ -482,7 +482,7 @@ retry a lost acknowledgement and must report a gap/reconcile current state inste
 | launch | Agent/session start; optional prompt is a linked send |
 | attach / detach | exact subject control/observation transition, generation-fenced |
 | send | input-to-turn association; terminal result is separate |
-| steer / interrupt | exact captured active turn, no implicit fallback |
+| steer / interrupt | exact captured active turn, no implicit fallback; an uncertain `steer` claimed at a `turn_safe_point` hook does not mask its turn's native completion |
 | inject | context at its requested next-input or exact-turn safe point; report the actual application point |
 | stop | end the controlled generation/session; not merely stop watching it |
 | resume | reopen the retained native subject as a new generation; new text only when explicitly supplied |
@@ -538,7 +538,11 @@ weaker SEND.
 Before dispatch, an expired item or one whose generation or captured turn is stale is
 cancelled. Once claimed/dispatched, an uncertain native effect is `unknown` and is never
 requeued. A late hook response is discarded rather than carried into a later callback or
-turn.
+turn. On harnesses that deliver `steer` through `turn_safe_point` hooks (Claude), pending
+exact-turn `steer` commands share the `hook.event` FIFO safe-point claim with
+`turn_safe_point` injects in the `#888` Swarm note frame without using `InjectArgs` or
+moving to `next_input`: if the captured turn ends before any safe point arrives, an
+unclaimed `steer` settles `rejected`.
 
 ## Commands and narrow gates
 
