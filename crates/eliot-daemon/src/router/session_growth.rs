@@ -83,7 +83,6 @@ impl Router {
             };
             let mut action_claimed = false;
             {
-                let thresholds = self.inner.observe.lock_recover().growth;
                 let mut store = self.inner.store.lock().await;
                 let current = store.get_agent(&agent.id)?;
                 let agent_is_current = current.is_some_and(|current| {
@@ -142,16 +141,16 @@ impl Router {
                 )
                 .await?;
             let dispatch_result = match (action_claimed, action.as_ref()) {
-                (true, Some(action)) if compact => {
-                    self.submit(action, &Principal::Owner, "daemon.session_growth")
-                        .await
-                }
+                (true, Some(action)) if compact => self
+                    .submit(action, &Principal::Owner, "daemon.session_growth")
+                    .await
+                    .map(|_| ()),
                 (true, Some(action)) => {
                     match eliot_core::provider_switch_authority(&agent.profile_snapshot) {
-                        Ok(authority) => {
-                            self.swarm_switch(action, &Principal::Owner, None, Some(authority))
-                                .await
-                        }
+                        Ok(authority) => self
+                            .swarm_switch(action, &Principal::Owner, None, Some(authority))
+                            .await
+                            .map(|_| ()),
                         Err(error) => Err(error),
                     }
                 }
