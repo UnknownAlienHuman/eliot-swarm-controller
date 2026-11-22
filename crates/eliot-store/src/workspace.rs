@@ -266,7 +266,7 @@ fn finalize_generated_naming(
     if branch.starts_with('-') || branch.contains('\0') {
         return Err(Error::new("invalid", "invalid generated workspace branch"));
     }
-    require_branch_namespace_free(connection, &branch)?;
+    require_branch_namespace_free(connection, &input.repo_common_dir, &branch)?;
     let parent = std::path::Path::new(&input.worktree_path)
         .parent()
         .ok_or_else(|| Error::new("invalid", "generated worktree path has no parent"))?;
@@ -318,11 +318,15 @@ fn finalize_generated_naming(
 /// managed `atlas/a1-task` blocks a new `atlas`. Git-level collisions were
 /// already refused at freeze time for the placeholder prefix; this guards
 /// the finalized leaf admitted here.
-fn require_branch_namespace_free(connection: &Connection, branch: &str) -> Result<()> {
+fn require_branch_namespace_free(
+    connection: &Connection,
+    repo_common_dir: &str,
+    branch: &str,
+) -> Result<()> {
     let mut statement = connection
-        .prepare("SELECT requested_branch FROM workspaces")
+        .prepare("SELECT requested_branch FROM workspaces WHERE repo_common_dir = ?1 AND phase <> 'removed'")
         .map_err(sql_error)?;
-    let mut rows = statement.query([]).map_err(sql_error)?;
+    let mut rows = statement.query([repo_common_dir]).map_err(sql_error)?;
     let mut existing: Vec<String> = Vec::new();
     while let Some(row) = rows.next().map_err(sql_error)? {
         existing.push(row.get(0).map_err(sql_error)?);
@@ -850,6 +854,20 @@ pub(super) fn admit_workspace_preparation(
             Some(naming) => finalize_generated_naming(tx, input, &agent.id, naming)?,
             None => (input.requested_branch.clone(), input.worktree_path.clone()),
         };
+        let branch_reserved = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM workspaces
+             WHERE repo_common_dir = ?1 AND requested_branch = ?2 AND phase <> 'removed')",
+                params![input.repo_common_dir, requested_branch],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(sql_error)?;
+        if branch_reserved {
+            return Err(Error::new(
+                "already_exists",
+                "workspace branch is already reserved by a managed worktree in this repository",
+            ));
+        }
         let workspace = WorkspacePreparation {
             agent: agent.id,
             target_generation: target,

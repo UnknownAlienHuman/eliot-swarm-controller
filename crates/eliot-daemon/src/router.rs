@@ -357,7 +357,7 @@ struct PendingEntry {
     bound: Option<usize>,
     command_unknown: bool,
     excerpt_allowed: bool,
-    branch: Option<String>,
+    branch: Result<Option<String>>,
 }
 
 /// Digest options for one wait snapshot; the default is a plain wait.
@@ -3341,6 +3341,12 @@ impl Router {
         parent_workspace_shared: bool,
         routing: routing::LaunchRouting,
     ) -> Result<Option<WorkspacePreparationInput>> {
+        if matches!(principal, Principal::Agent { .. })
+            && request.args.get("base").is_some()
+            && request.args.get("worktree").is_none()
+        {
+            return Err(Error::new("invalid", "base requires worktree"));
+        }
         if self
             .freeze_launch_profile(principal, request, routing)
             .await?
@@ -5860,7 +5866,7 @@ impl Router {
             bound: None,
             command_unknown: false,
             excerpt_allowed: false,
-            branch: None,
+            branch: Ok(None),
         };
         for (idx, id) in request.commands.iter().enumerate() {
             if hidden.is_some_and(|mask| mask.get(idx).copied().unwrap_or(false)) {
@@ -5950,7 +5956,7 @@ impl Router {
                             bound: Some(bounds.len() - 1),
                             command_unknown,
                             excerpt_allowed,
-                            branch: None,
+                            branch: Ok(None),
                         });
                     }
                     // A command bound to a missing turn reads unknown, never
@@ -5991,7 +5997,7 @@ impl Router {
                         hierarchy::authorize_agent_read(store, rp, target, Some(generation)).is_ok()
                     }))
             {
-                entry.branch = store.child_worktree_branch(target, generation)?;
+                entry.branch = store.child_worktree_branch(target, generation);
             }
             pending.push(entry);
         }
@@ -6042,7 +6048,7 @@ impl Router {
                         bound: Some(bounds.len() - 1),
                         command_unknown: false,
                         excerpt_allowed,
-                        branch: None,
+                        branch: Ok(None),
                     });
                 }
                 None => pending.push(leaf_entry("turn", id, "not_found".to_owned())),
@@ -6104,9 +6110,10 @@ impl Router {
         let mut results = Vec::with_capacity(pending.len());
         for entry in pending {
             let Some(index) = entry.bound else {
-                let mut result = WaitEntryResult::new(entry.kind, entry.id, entry.leaf);
-                result.branch = entry.branch;
-                results.push(result);
+                results.push(
+                    WaitEntryResult::new(entry.kind, entry.id, entry.leaf)
+                        .with_branch(entry.branch),
+                );
                 continue;
             };
             let bound = &bounds[index];
@@ -6119,13 +6126,10 @@ impl Router {
                 results.push(WaitEntryResult::new(entry.kind, entry.id, status));
                 continue;
             }
-            let mut result = WaitEntryResult::new(entry.kind, entry.id, status).with_turn(
-                bound.agent.clone(),
-                bound.generation,
-                bound.turn_id.clone(),
-            );
+            let mut result = WaitEntryResult::new(entry.kind, entry.id, status)
+                .with_turn(bound.agent.clone(), bound.generation, bound.turn_id.clone())
+                .with_branch(store.child_worktree_branch(&bound.agent, bound.generation));
             result.resolution_source = bound.turn.resolution_source;
-            result.branch = store.child_worktree_branch(&bound.agent, bound.generation)?;
             if bound.turn.state == TurnState::Completed
                 && let Some(text) = bound.turn.final_text.as_deref()
             {

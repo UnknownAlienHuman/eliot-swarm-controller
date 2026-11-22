@@ -766,7 +766,8 @@ worktree and branch in the same repository. A supplied workspace must match the
 parent's. Creating a child worktree requires the parent to be on a local branch.
 The frozen base is the parent's `HEAD` by default. An explicit base must resolve
 to that branch tip or one of its ancestors. Swarm applies the integration branch
-name rules and refuses an existing branch for a new child.
+name rules and refuses an existing branch for a new child. The Store verifies the
+parent's retained repository identity and reserves the branch at admission.
 It creates the branch and checkout under the usual managed-worktree preparation
 path, leaves the parent's checkout and index intact, and retains the child's branch
 for integration and proof-based cleanup. Children inherit the project policy in
@@ -848,7 +849,8 @@ wake, including after a daemon restart. A digest retry reuses its registration
 and mail identity.
 
 The compact response contains the exact input status, bound Agent/generation
-when visible, the retained managed `branch` when available, bounded retained
+when visible, the retained managed `branch` when available, a `branch_error` code
+when that read fails, bounded retained
 `final_text`, `truncated` and the shared bounded
 `ChildRunFacts`. The same facts appear on visible settled child results in
 `swarm.wait`. Visible waits for the child's launch, input or turn can also return

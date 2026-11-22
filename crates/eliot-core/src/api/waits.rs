@@ -222,6 +222,9 @@ pub struct WaitEntryResult {
     /// Retained managed worktree branch for the visible child command or turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// Error code if this entry's retained branch could not be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_error: Option<String>,
     /// Bound turn id, when the entry resolved to a turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
@@ -249,6 +252,7 @@ impl WaitEntryResult {
             agent: None,
             generation: None,
             branch: None,
+            branch_error: None,
             turn_id: None,
             final_text: None,
             truncated: false,
@@ -266,6 +270,14 @@ impl WaitEntryResult {
         self.agent = Some(agent.into());
         self.generation = Some(generation);
         self.turn_id = Some(turn_id.into());
+        self
+    }
+
+    pub fn with_branch(mut self, branch: Result<Option<String>>) -> Self {
+        match branch {
+            Ok(branch) => self.branch = branch,
+            Err(error) => self.branch_error = Some(error.code),
+        }
         self
     }
 
@@ -294,6 +306,12 @@ impl WaitEntryResult {
         }
         if self.id.trim().is_empty() {
             return Err(Error::new("invalid", "wait entry id must be nonempty"));
+        }
+        if self.branch.is_some() && self.branch_error.is_some() {
+            return Err(Error::new(
+                "invalid",
+                "wait branch conflicts with its read error",
+            ));
         }
         match self.status.as_str() {
             "succeeded" | "failed" | "interrupted" | "unknown" | "still_running" | "not_found"

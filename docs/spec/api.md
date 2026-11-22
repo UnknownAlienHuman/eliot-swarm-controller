@@ -1534,8 +1534,10 @@ The child keeps the parent's recorded project ID and policy. An explicit `worksp
 must match the parent's. `worktree` optionally requests a managed checkout in the
 same Git repository. The daemon freezes `base` at the parent's branch tip or at an
 explicit ref that resolves to an ancestor of that tip. An omitted `base` uses the
-parent's `HEAD`. An explicit child branch must meet the local name rules of
-`git.integrate` and be unused for a new launch. A bare `--worktree` generates a branch.
+parent's `HEAD`. A child request with `base` requires `worktree`. An explicit child
+branch must meet the local name rules of `git.integrate` and be unused for a new
+launch. Admission reserves the name within the repository before any Git write.
+A bare `--worktree` generates a branch.
 Same-harness children inherit native authority and captured credential bindings
 verbatim. An approved
 same-harness profile can set its model, effort, and daemon context ceiling.
@@ -2061,7 +2063,8 @@ scope. A direct or command-bound turn can also carry its
 [resolution provenance](#input-turn-and-unknown-gates). Every entry that
 resolved to a turn also carries that turn's identity (`agent`, `generation`,
 `turn_id`). A visible child launch, input, or turn can also carry its retained
-managed worktree `branch`. A completed turn carries its retained `final_text`,
+managed worktree `branch`. A branch read failure returns `branch_error` on that
+entry with its command or turn status. A completed turn carries its retained `final_text`,
 cut to 16 KiB per entry within one 64 KiB response budget, with `truncated`
 marking a cut or a text withheld by the budget (`agent.result` reads the whole
 text). `mailbox: true` (Agent callers only; the owner has no mailbox) also ends

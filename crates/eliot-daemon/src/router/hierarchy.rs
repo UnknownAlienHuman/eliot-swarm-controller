@@ -353,7 +353,16 @@ pub(super) fn check_agent_launch_authority(
             &parent.profile,
         )?;
     }
-    if parent.workspace.as_deref() != request.args.get("workspace").and_then(Value::as_str) {
+    if parent
+        .workspace
+        .as_deref()
+        .map(eliot_core::workspace_path_key)
+        != request
+            .args
+            .get("workspace")
+            .and_then(Value::as_str)
+            .map(eliot_core::workspace_path_key)
+    {
         return Err(Error::new(
             "not_allowed",
             "Agent child launches must use their parent's workspace as the source",

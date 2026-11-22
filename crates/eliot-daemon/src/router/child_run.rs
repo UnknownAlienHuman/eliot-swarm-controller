@@ -186,6 +186,7 @@ impl Router {
                 agent: None,
                 generation: None,
                 branch: None,
+                branch_error: None,
                 turn_id: None,
                 final_text: None,
                 truncated: false,
@@ -246,6 +247,11 @@ impl Router {
         };
         let truncated = !hidden && entry.truncated;
         let branch = if hidden { None } else { entry.branch.clone() };
+        let branch_error = if hidden {
+            None
+        } else {
+            entry.branch_error.clone()
+        };
 
         let facts = if hidden {
             ChildRunFacts::unobserved()
@@ -268,6 +274,7 @@ impl Router {
             agent,
             generation,
             branch,
+            branch_error,
             turn_id,
             final_text,
             truncated,

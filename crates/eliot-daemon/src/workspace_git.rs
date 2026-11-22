@@ -5,7 +5,7 @@ use crate::git_monitor::{GitBinding, GitProbe, canonical_root, git_path_argument
 use eliot_core::api::{is_git_oid, validate_integration_branch};
 use eliot_core::{
     Error, Result, WorkspaceCreationOutcome, WorkspacePhase, WorkspacePreparation,
-    WorkspaceRemovalOutcome,
+    WorkspaceRemovalOutcome, workspace_path_key,
 };
 use std::{
     collections::BTreeSet,
@@ -41,11 +41,26 @@ pub(crate) struct WorkspaceGit {
     git: GitProbe,
 }
 
-#[derive(PartialEq, Eq)]
 struct Repository {
     root: PathBuf,
     git_dir: PathBuf,
     common_dir: PathBuf,
+}
+
+impl Repository {
+    fn same_identity(&self, other: &Self) -> bool {
+        git_path_matches(&self.root, &other.root)
+            && git_path_matches(&self.git_dir, &other.git_dir)
+            && git_path_matches(&self.common_dir, &other.common_dir)
+    }
+}
+
+fn git_path_matches(left: &Path, right: &Path) -> bool {
+    left == right
+        || left
+            .to_str()
+            .zip(right.to_str())
+            .is_some_and(|(left, right)| workspace_path_key(left) == workspace_path_key(right))
 }
 
 struct WorktreeEntry {
@@ -165,7 +180,7 @@ impl WorkspaceGit {
                 let base = self
                     .workspace_repository(path, !require_parent_ancestry, deadline)
                     .await?;
-                if base.common_dir != source.common_dir {
+                if !git_path_matches(&base.common_dir, &source.common_dir) {
                     return Err(problem(
                         "source_integrity",
                         "workspace base repository differs from project checkout",
@@ -211,7 +226,7 @@ impl WorkspaceGit {
         let verified = self
             .workspace_repository(repo_path, !source_is_parent_workspace, deadline)
             .await?;
-        if source != verified {
+        if !source.same_identity(&verified) {
             return Err(problem(
                 "source_integrity",
                 "source repository identity changed during freeze",
@@ -221,7 +236,7 @@ impl WorkspaceGit {
             let verified_base = self
                 .workspace_repository(base_path, !require_parent_ancestry, deadline)
                 .await?;
-            if *base != verified_base {
+            if !base.same_identity(&verified_base) {
                 return Err(problem(
                     "source_integrity",
                     "base workspace identity changed during freeze",
@@ -1001,7 +1016,10 @@ impl WorkspaceGit {
             ));
         }
         let source = self.repository(&preparation.repo_path, deadline).await?;
-        if source.common_dir != canonical_root(&preparation.repo_common_dir)? {
+        if !git_path_matches(
+            &source.common_dir,
+            &canonical_root(&preparation.repo_common_dir)?,
+        ) {
             return Err(problem(
                 "source_integrity",
                 "source repository common directory differs from the frozen identity",
@@ -1040,7 +1058,13 @@ impl WorkspaceGit {
             .await?;
         let (actual_root, git_dir, common_dir) = identity_lines(&bytes)?;
         let root = canonical_root(&actual_root)?;
-        if (require_root && root != workspace) || !workspace.starts_with(&root) {
+        let root_text = path_text(&root)?;
+        let workspace_text = path_text(&workspace)?;
+        let root_key = workspace_path_key(&root_text);
+        let workspace_key = workspace_path_key(&workspace_text);
+        if (require_root && workspace_key != root_key)
+            || !Path::new(workspace_key.as_ref()).starts_with(Path::new(root_key.as_ref()))
+        {
             return Err(problem(
                 "source_integrity",
                 "workspace path is not the exact repository root",

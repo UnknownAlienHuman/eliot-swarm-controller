@@ -893,14 +893,6 @@ fn admit_launch_tx(
     let parent_link = hierarchy::resolve_launch_parent(tx, principal, &request.args)?;
     if let Some(parent) = parent_link.as_ref() {
         hierarchy::check_child_fanout(tx, parent, limits)?;
-        if principal.starts_with("agent:")
-            && parent.workspace.as_deref() != request.args.get("workspace").and_then(Value::as_str)
-        {
-            return Err(Error::new(
-                "not_allowed",
-                "Agent child launches must use their parent's workspace as the source",
-            ));
-        }
     }
     let chat = request
         .args
@@ -971,18 +963,53 @@ fn admit_launch_tx(
             // callers cannot forge it through `reject_launch_derived_keys`.
             // The workspace record keeps the canonical checkout; the project
             // ID travels separately in `registered_project`.
-            let registered = optional_string(&request.args, "registered_project")?;
-            let mut matches =
-                input.project == scope || Some(input.project.as_str()) == registered.as_deref();
-            if !matches
-                && let Some(project) = registered.as_deref()
-                && let Some(registration) = projects::project_registration_tx(tx, project)?
-            {
-                matches = input.project == registration.checkout;
-            } else if !matches && principal.starts_with("agent:") && parent_link.is_some() {
-                // For an unregistered checkout the scope can be a subdirectory
-                // or linked worktree. The daemon verified the shared Git identity.
-                matches = request.args.get("worktree").is_some();
+            let agent_parent = parent_link
+                .as_ref()
+                .filter(|parent| parent.launched_by_agent);
+            let registered = match agent_parent {
+                Some(parent) => Some(parent.project.clone()),
+                None => optional_string(&request.args, "registered_project")?,
+            };
+            let registration = registered
+                .as_deref()
+                .filter(|id| !id.is_empty())
+                .map(|id| projects::project_registration_tx(tx, id))
+                .transpose()?
+                .flatten();
+            let mut matches = input.project == scope
+                || Some(input.project.as_str()) == registered.as_deref()
+                || registration.as_ref().is_some_and(|registered| {
+                    core::workspace_path_key(&input.project)
+                        == core::workspace_path_key(&registered.checkout)
+                });
+            if let Some(parent) = agent_parent {
+                let managed = parent
+                    .workspace
+                    .as_deref()
+                    .map(|path| workspace::load_workspace_by_path(tx, path))
+                    .transpose()?
+                    .flatten();
+                let common_dir = managed
+                    .as_ref()
+                    .map(|workspace| workspace.repo_common_dir.as_str())
+                    .or_else(|| {
+                        registration
+                            .as_ref()
+                            .map(|project| project.repo_common_dir.as_str())
+                    });
+                if common_dir.is_none_or(|expected| {
+                    core::workspace_path_key(expected)
+                        != core::workspace_path_key(&input.repo_common_dir)
+                }) {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "child worktree repository differs from the parent's retained repository",
+                    ));
+                }
+                if let Some(managed) = managed.filter(|_| registration.is_none()) {
+                    matches |= core::workspace_path_key(&input.project)
+                        == core::workspace_path_key(&managed.repo_path);
+                }
             }
             if !matches {
                 return Err(Error::new(

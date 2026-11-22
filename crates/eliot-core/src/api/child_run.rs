@@ -299,6 +299,9 @@ pub struct ChildRunResponse {
     /// Retained managed worktree branch for this child generation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// Error code if this child's retained branch could not be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -317,6 +320,7 @@ impl ChildRunResponse {
             || self.generation.is_some_and(|generation| generation < 0)
             || self.agent.is_some() != self.generation.is_some()
             || (self.branch.is_some() && self.agent.is_none())
+            || (self.branch_error.is_some() && (self.agent.is_none() || self.branch.is_some()))
             || ((self.final_text.is_some() || self.truncated) && self.turn_id.is_none())
             || self
                 .final_text
