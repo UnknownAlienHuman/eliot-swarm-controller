@@ -811,8 +811,9 @@ the registered checkout as before. Any other value is invalid.
 `format` and `check` are optional explicit argv arrays (1–32 nonempty
 arguments, at most 4 KiB each); the daemon never parses them through a shell.
 After a Git-confirmed `file.changed` hint or dirty `git.changed` snapshot
-settles, `format` runs in the Agent's verified worktree and then `check` runs there. `max_rounds` is
-required with `check` and must be 1–16; it bounds the automatic project Goal.
+settles, the daemon runs `format` and then `check` in the Agent's managed
+worktree. Set `check_at_turn_end = true` for a heavy check that runs through
+the idle Goal driver. `max_rounds` is required with `check` and must be 1–16.
 Project registration readback uses the canonical Core [`ProjectRegistrationView`](../../crates/eliot-core/src/api/agent_views.rs);
 project identity includes the canonical checkout and Git common directory. The registration ID names nothing a person reads: a project's name is the
 owner's `[desktop] display_names` entry, else the repository name of its `origin` remote

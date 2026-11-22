@@ -16,7 +16,7 @@ use crate::{
 };
 use eliot_core::{
     Agent, Error, Event, InjectArgs, InjectPoint, Result, SecretPolicy, SubmitCommand,
-    api::{DEFAULT_GOAL_CHECK_TIMEOUT_MS, GoalDefinition, GoalStatus},
+    api::{DEFAULT_GOAL_CHECK_TIMEOUT_MS, GoalDefinition},
 };
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -93,9 +93,9 @@ struct ProjectWork {
 pub(super) async fn attach_default_goal(
     router: &Router,
     request: &mut SubmitCommand,
+    manager_assignment: bool,
 ) -> Result<()> {
     if request.verb != "launch"
-        || (!request.args.get("role").is_some() && request.args.get("assignment").is_none())
         || request
             .args
             .get(eliot_core::PROJECT_CHECK_GOAL_ARG)
@@ -124,6 +124,17 @@ pub(super) async fn attach_default_goal(
     let Some(registration) = registration else {
         return Ok(());
     };
+    let assigned_or_routed = manager_assignment
+        || request.args.get("assignment").is_some()
+        || request.args.get("profile_choice").is_some();
+    if !assigned_or_routed
+        && !registration
+            .actions
+            .iter()
+            .any(|action| action == "git.publish")
+    {
+        return Ok(());
+    }
     crate::automation::verify_project_registration(&router.inner.data_root, &registration).await?;
     let config = crate::config::load_project_registration_config(&router.inner.data_root)?
         .into_iter()
@@ -615,7 +626,7 @@ async fn load_project_work(
     key: &WorkKey,
     expected_workspace: &str,
 ) -> Result<Option<ProjectWork>> {
-    let (agent, registration, goal) = {
+    let (agent, registration) = {
         let store = router.inner.store.lock().await;
         let Some(agent) = store.get_agent(&key.agent)? else {
             return Ok(None);
@@ -623,6 +634,8 @@ async fn load_project_work(
         if agent.generation != key.generation
             || agent.is_terminal()
             || agent.observe_only
+            || agent.branch.is_none()
+            || agent.parent.is_some()
             || agent.workspace.as_deref() != Some(expected_workspace)
         {
             return Ok(None);
@@ -630,8 +643,7 @@ async fn load_project_work(
         let Some(registration) = store.get_project_registration("owner", &agent.project)? else {
             return Ok(None);
         };
-        let goal = store.goal_get(&key.agent, "eliot")?;
-        (agent, registration, goal)
+        (agent, registration)
     };
     let config = crate::config::load_project_registration_config(&router.inner.data_root)?
         .into_iter()
@@ -648,13 +660,14 @@ async fn load_project_work(
             "project check argv contains a known credential",
         ));
     }
-    if config.format.is_empty() && config.check.is_empty() {
+    let check = if config.check_at_turn_end {
+        Vec::new()
+    } else {
+        config.check.clone()
+    };
+    if config.format.is_empty() && check.is_empty() {
         return Ok(None);
     }
-    let check = goal
-        .filter(|goal| goal.generation == key.generation && goal.status == GoalStatus::Active)
-        .map(|goal| goal.definition.check)
-        .unwrap_or_else(|| config.check.clone());
     let Some(workspace) = agent.workspace.as_deref() else {
         return Ok(None);
     };

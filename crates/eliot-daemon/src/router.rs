@@ -2410,7 +2410,7 @@ impl Router {
                             arbitrated,
                         )
                         .await?;
-                    project_checks::attach_default_goal(self, &mut request).await?;
+                    project_checks::attach_default_goal(self, &mut request, false).await?;
                     Ok(input)
                 }
                 .await;

@@ -194,6 +194,8 @@ impl Router {
                     Error::new("internal", "manager worktree was not frozen")
                 })?)
             };
+            launch.args["registered_project"] = json!(registration.id);
+            super::project_checks::attach_default_goal(self, &mut launch, true).await?;
             if contains_known_secret(&launch.args, &self.inner.secrets) {
                 return Err(Error::new(
                     "secret_in_payload",

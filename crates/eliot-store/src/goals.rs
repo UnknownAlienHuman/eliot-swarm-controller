@@ -452,6 +452,8 @@ struct GoalStatePersist {
     /// Turns consumed before the current Agent baseline (task handoff).
     #[serde(default)]
     transferred_turns: i64,
+    #[serde(default)]
+    await_first_turn: bool,
     status: GoalStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     paused_reason: Option<String>,
@@ -1067,6 +1069,12 @@ impl Store {
             }
         }
         let turn_count = count_turns(&self.connection, agent_num, agent_row.generation)?;
+        if row.state.await_first_turn && turn_count <= row.state.counters.turns_at_set {
+            return Err(Error::new(
+                "bad_state",
+                "the default project Goal awaits the Agent's first turn",
+            ));
+        }
         let spent_by_goal_continuation = goal_continuation_spent_budget(
             &self.connection,
             agent_num,
@@ -1312,6 +1320,7 @@ impl Store {
         if let Some(row) = load_goal_row(&tx, agent_num, mode)? {
             if row.generation == agent_row.generation
                 && row.state.status == GoalStatus::Active
+                && !row.state.await_first_turn
                 && encode_json(&row.definition)? == encoded
             {
                 let view = goal_view_on(&tx, &goal_holder, row)?;
@@ -1324,6 +1333,7 @@ impl Store {
             let revision = row.revision + 1;
             let state = GoalStatePersist {
                 transferred_turns: 0,
+                await_first_turn: false,
                 status: GoalStatus::Active,
                 paused_reason: None,
                 blocked_reason: None,
@@ -1364,6 +1374,7 @@ impl Store {
             goal_cost_base_tx(&tx, agent_num, agent_row.generation, definition, turn_count)?;
         let state = GoalStatePersist {
             transferred_turns: 0,
+            await_first_turn: false,
             status: GoalStatus::Active,
             paused_reason: None,
             blocked_reason: None,
@@ -1499,6 +1510,7 @@ impl Store {
         } else {
             let state = GoalStatePersist {
                 transferred_turns: row.state.transferred_turns,
+                await_first_turn: row.state.await_first_turn,
                 status: GoalStatus::Cleared,
                 paused_reason: None,
                 blocked_reason: None,
@@ -1615,6 +1627,7 @@ impl Store {
             .map_err(sql_error)?;
         let state = GoalStatePersist {
             transferred_turns: row.state.transferred_turns,
+            await_first_turn: row.state.await_first_turn,
             status: GoalStatus::Paused,
             paused_reason: Some(reason.to_owned()),
             blocked_reason: row.state.blocked_reason.clone(),
@@ -1674,6 +1687,7 @@ impl Store {
             if row.state.status == GoalStatus::Active {
                 let state = GoalStatePersist {
                     transferred_turns: row.state.transferred_turns,
+                    await_first_turn: row.state.await_first_turn,
                     status: GoalStatus::Paused,
                     paused_reason: Some("Agent generation advanced".to_owned()),
                     blocked_reason: row.state.blocked_reason.clone(),
@@ -2280,6 +2294,7 @@ impl Store {
             ));
         };
         let mut state = row.state;
+        state.await_first_turn = false;
         // A zero baseline (no session yet at set) binds the first session seen.
         if let (Some(base), Some(source)) = (state.cost_base.as_mut(), learned_cost_source)
             && base.source.is_none()
@@ -3210,12 +3225,14 @@ pub(super) fn install_assignment_goal_tx(
     generation: i64,
     definition: &GoalDefinition,
     cause: core::EventCause,
+    await_first_turn: bool,
     now: i64,
 ) -> Result<()> {
     definition.validate()?;
     definition.require_auto_bound()?;
     let state = GoalStatePersist {
         transferred_turns: 0,
+        await_first_turn,
         status: GoalStatus::Active,
         paused_reason: None,
         blocked_reason: None,

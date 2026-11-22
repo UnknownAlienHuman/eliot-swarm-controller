@@ -37,6 +37,7 @@ pub(crate) struct ProjectRegistrationConfig {
     pub run_env: Vec<String>,
     pub format: Vec<String>,
     pub check: Vec<String>,
+    pub check_at_turn_end: bool,
     pub max_rounds: Option<i64>,
     pub workspace: ProjectWorkspaceMode,
 }
@@ -315,6 +316,9 @@ pub(super) struct ProjectEntry {
     /// Explicit argv used for fast checks and the project default Goal.
     #[serde(default)]
     check: Vec<String>,
+    /// Run a heavy check only through the idle Goal driver.
+    #[serde(default)]
+    check_at_turn_end: bool,
     /// Required when `check` is configured; bounds automatic Goal rounds.
     #[serde(default)]
     max_rounds: Option<i64>,
@@ -471,6 +475,7 @@ pub(super) fn project_registrations_in(
             run_env: run_grant.run_env,
             format,
             check,
+            check_at_turn_end: entry.check_at_turn_end,
             max_rounds: entry.max_rounds,
             workspace: entry.workspace,
         });

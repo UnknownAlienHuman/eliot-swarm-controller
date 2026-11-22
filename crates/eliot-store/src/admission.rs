@@ -1027,7 +1027,16 @@ fn admit_launch_tx(
     }
     if let Some((goal, cause)) = assignment::record_admission_tx(tx, principal, request, now)? {
         // A first launch starts generation 1; its Goal binds to it now.
-        goals::install_assignment_goal_tx(tx, agent_num, 1, &goal, cause, now)?;
+        let default_project_goal = request.args.get(core::PROJECT_CHECK_GOAL_ARG).is_some();
+        goals::install_assignment_goal_tx(
+            tx,
+            agent_num,
+            1,
+            &goal,
+            cause,
+            default_project_goal,
+            now,
+        )?;
     } else if let Some(goal) = assignment::project_check_goal(request)? {
         // Role launches have no folder-assignment cause, but their project
         // check Goal still binds atomically before native dispatch.
@@ -1042,6 +1051,7 @@ fn admit_launch_tx(
                 depth: 0,
                 remote_call: None,
             },
+            true,
             now,
         )?;
     }

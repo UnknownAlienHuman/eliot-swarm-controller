@@ -162,17 +162,18 @@ script/process environment. Events in the same debounce window coalesce. Only a
 definite nonzero exit is delivered:
 Claude, OpenCode and Antigravity receive it at their existing exact-turn hook context
 point; Codex and Muse receive it through exact-turn active-turn inject/steer.
-When an exact-generation Eliot Goal is active, the fast path uses that Goal's frozen
-check argv, so a manual Goal retains priority; otherwise it uses the current project
-check. Successful fast checks stay silent and are not final-check receipts. Unknown process
+The fast path uses the current project check. A project can set
+`check_at_turn_end = true` to reserve a heavy check for its Goal. Manual Goal
+checks also run at turn end. Successful fast checks stay silent. Unknown process
 outcomes are not reported as passes or failures and fence further fast checks for that
 Agent generation, so the daemon never retries an uncertain invocation.
 
 A launch into a registered project by assignment or routing role receives a default
-Eliot Goal when the project has `check`. An explicit assignment Goal takes
-priority, and a later manual `goal.set` uses the ordinary Goal revision and
-replaces the default. The Goal runs the same project check after each turn ends,
-through the existing idle Goal driver; `max_rounds` bounds repair continuations.
+Eliot Goal when the project has `check`. Projects that enable `git.publish` also
+receive it on profile-selected launches. An explicit assignment Goal takes
+priority, and a later manual `goal.set` replaces the default through the ordinary
+Goal revision. The first round waits for the Agent's first turn to settle. The
+idle Goal driver runs the check at turn end and enforces `max_rounds`.
 A successful final Goal round persists in the existing Store `goals` row: the
 frozen `definition.check` and state counters including `last_exit_code`,
 `last_check_at` and `last_output_digest`, together with completed status. The
