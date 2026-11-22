@@ -2675,7 +2675,18 @@ for managed proofs is explicit and there is no automatic expiry.
 
 Daemon RPC commands accept `--json` and `--data-dir`, and RPC mutations accept
 `--id`. The local update and stand commands use individual IDs for their
-internal writes. Stand commands take the stand path directly.
+internal writes. Stand commands take the stand path directly. CLI Agent targets
+are positional; `--to` remains the named-recipient selector for `msg send` and
+`digest`. Pagination uses `--after` and `--limit`; `--data-dir`, `--json`,
+`--generation`, and `--project` keep one spelling across command families.
+For one compatibility release, the former pagination flags remain aliases:
+`events --since`, `discover --cursor`, `history --cursor`,
+`project overview --cursor`, and `cleanup plan --continuation`.
+The default presentation is concise human-readable output for status, Agent,
+command, project, Goal and timer details, rule/timer lists, daemon update, Store
+compaction and stop settlement. `--json` keeps each command's existing response
+shape and prints it as compact JSON. `result` starts with the newest retained
+final answer and includes its turn status. Use `--json` for the full page.
 Generation/turn/request flags are optional for immediate calls, explicit for delayed ones.
 The synopsis is target grammar; later-layer forms are not an inventory of current help.
 
@@ -2687,6 +2698,8 @@ swarm daemon update <RELEASE> [--wait-seconds N]
 swarm stand up [--root PATH] [--profile FILE] [--binary PATH]
 swarm stand down <PATH>
 swarm status
+swarm store compact
+swarm cleanup plan [--after TOKEN]
 swarm launch --profile P --workspace PATH [--worktree BRANCH [--base REF]] [--parent AGENT] [--source PATH]... [PROMPT] [--wait] [--timeout-seconds N]
 swarm launch --workspace PATH [PROMPT] [--wait] [--timeout-seconds N]
 swarm settings read
@@ -2694,6 +2707,9 @@ swarm settings save FILE [--dry-run]
 swarm settings claude-cmd PROFILE (--cmd PATH|--latest)
 swarm worktree remove AGENT [--generation N]
 swarm ls | show A | watch [A|SELECTOR] [--after SEQ] | top
+swarm usage [A] [--generation N] [--project P] [--root A]
+swarm heavy [A] [--generation N] [--window-secs N]
+swarm models [A] [--harness H] [--profile P] [--workspace DIR] [--query Q] [--after CURSOR] [--limit N]
 swarm processes A [--scope agent|workspace] [--generation N] [--after CURSOR] [--limit N]
 swarm stats A [--generation N]
 swarm git-status A [--generation N]
@@ -2706,20 +2722,23 @@ swarm interrupt|abort A [--generation N] [--turn ID]
 swarm stop A [--force] [--tree | --generation N]
 swarm resume A [PROMPT] [--wait] [--timeout-seconds N]
 swarm wait --all|--any --timeout-seconds N ID...
+swarm wait --all|--any [--command ID]... [--turn AGENT/GENERATION/TURN_ID]...
 swarm result A [--generation N] [--before CURSOR_JSON | --turn-id TURN] [--limit N] [--metadata]
-swarm turn show|resolve ...
+swarm turn resolve A --generation N --turn ID --status completed|failed|interrupted --reason TEXT
 swarm approve|deny A [--request R] [--choice ID] [--feedback TEXT] | answer ... [--request R]
 swarm configure A [--model MODEL] [--effort EFFORT] [--generation N]
 swarm compact|fork|background ...
-swarm cmd show|children|cancel|resolve ...
+swarm cmd show|children|cancel|resolve|settle-stopped ...
+swarm cmd resolve ID --status completed|failed --reason TEXT
 swarm why CMD|AGENT|AGENT:TURN
-swarm events [--since SEQ] [--allow-gap]
-swarm msg send ... | msg show ... | msg ack ... | inbox [AGENT] [--wait SECS]
-swarm var set KEY [VALUE | --value-file PATH] [--as-json] [...] | var get ... | who [--project P] [--history] | claim set|list|release ...
+swarm events [--after SEQ] [--limit N]
+swarm msg send --to RECIPIENT... TEXT | msg show DELIVERY [AGENT] | msg ack [AGENT] --delivery DELIVERY...
+swarm inbox [AGENT] [--wait SECS]
+swarm var set KEY [VALUE | --value-file PATH] [--as-json] [...] | var get ... | who [--project P] [--history]
+swarm claim set GLOB [AGENT] [--note TEXT] [--ttl-secs N] | claim list [AGENT] [--project P] | claim release GLOB [AGENT]
 swarm project list | show ID
 swarm rule list [--project PROJECT] [--after ID] [--limit N]
 swarm rule show ID [--project PROJECT]
-swarm rule list [--project PROJECT] [--after ID] [--limit N]
 swarm rule read NAME.toml [--project PROJECT]
 swarm rule save NAME.toml --file FILE [--expected-revision SHA256] [--project PROJECT]
 swarm rule delete NAME.toml --expected-revision SHA256 [--project PROJECT]
@@ -2729,9 +2748,9 @@ swarm timer list [--project PROJECT] [--after ID] [--limit N]
 swarm goal set A --text TEXT --check CMD [ARGS...] [--mode eliot|native] [--check-cwd PATH] [--check-timeout-ms MS] [--max-turns N] [--max-rounds N] [--max-without-progress N] [--cadence-ms MS] [--scope GLOB]... [--check-input GLOB]... [--max-cost AMOUNT --cost-unit UNIT] [--escalate-model M] [--escalate-effort E] [--escalate-reason TEXT]
 swarm goal show|pause|clear|resume A [--mode eliot|native] [--reason R]
 swarm goal round A (--idle-seq SEQ | --slot N) [--mode eliot|native]
-swarm discover --profile P [--harness H] [--scope S] [--cursor C] [--archived] [--limit N]
+swarm discover --profile P [--harness H] [--scope S] [--after C] [--archived] [--limit N]
 swarm attach --profile P --harness H --scope S --ref R [--project LABEL]
-swarm history A --view subject|turns|items [--source native|rollout] [--turn-id ID] [--cursor C] [--limit N]
+swarm history A --view subject|turns|items [--source native|rollout] [--turn-id ID] [--after C] [--limit N]
 swarm detach A [--generation N]
 swarm chat organization [--project P] [--after P] [--archived]
 swarm chat attach CHAT... --project P
@@ -2739,6 +2758,7 @@ swarm chat detach CHAT...
 swarm chat tag AGENT... [--tag TAG]...
 swarm provider holds [--after SCOPE] [--limit N]
 swarm provider clear-hold SCOPE --corrective-evidence credentials_updated|configuration_updated|owner_verified [--expected-probe-command ID]
+swarm project assignment claim PROJECT [AGENT] [--generation N]
 swarm plugin NAME | plugin-test ... | hook ... | mcp
 ```
 
@@ -2746,6 +2766,8 @@ swarm plugin NAME | plugin-test ... | hook ... | mcp
 `cmd children`, `cmd resolve`, and `turn resolve` are available; `turn show`
 remains unavailable. `swarm wait` implements only the frozen `--all`/`--any` set form
 above; single-target `--for turn|idle|stopped|goal` forms remain future (`agent.wait`).
+The set wait takes 1 through 30 seconds. Command and turn resolution use
+`--status`. A completed command maps to the stored `applied` outcome.
 
 `swarm daemon` (background) prints `starting` with the resolved data directory
 and log path, then polls `daemon.status` for up to 30 s. It prints `ready`

@@ -4,7 +4,7 @@ use super::daemon::shutdown_daemon;
 use super::operator::{
     agents, check_same_daemon, require_running, start_owned, start_update, status, wait_for_exit,
 };
-use super::support::{Failure, mutation_id, print_value};
+use super::support::{Failure, mutation_id, print_value_or_human};
 use eliot_core::api::{DaemonShutdownRequest, ShutdownMode};
 use eliot_daemon::operator::{
     DaemonInfo, binary_sha256, daemon_alive, daemon_info, discard_update_backup, lock_offline,
@@ -16,6 +16,89 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::time::{Instant, sleep, timeout};
+
+fn print_update_value(value: &Value, json_output: bool) {
+    print_value_or_human(value, json_output, || {
+        println!(
+            "Daemon update: {}",
+            value["state"].as_str().unwrap_or("outcome unavailable")
+        );
+        for (key, label) in [
+            ("previous_pid", "Previous daemon PID"),
+            ("pid", "Daemon PID"),
+            ("admission", "Admission"),
+            ("version", "Release"),
+            ("binary", "Binary"),
+            ("sha256", "Binary SHA-256"),
+            ("backup_cleanup_error", "Backup cleanup error"),
+            ("error", "Error"),
+            ("update_error", "Update error"),
+            ("rollback_error", "Rollback error"),
+            ("message", "Note"),
+            ("continuation", "Next"),
+        ] {
+            if let Some(field) = value.get(key) {
+                if let Some(text) = field.as_str() {
+                    println!("{label}: {text}");
+                } else if let Some(number) = field.as_u64() {
+                    println!("{label}: {number}");
+                }
+            }
+        }
+        if let Some(backup) = value.get("backup") {
+            println!("Store backup retained: {}", backup.as_str().unwrap_or("no"));
+        }
+        for key in [
+            "commit_reply_uncertain",
+            "store_restored",
+            "backup_retained",
+        ] {
+            if let Some(flag) = value.get(key).and_then(Value::as_bool) {
+                println!("{}: {flag}", key.replace('_', " "));
+            }
+        }
+        if let Some(agents) = value.get("agents_before").and_then(Value::as_array) {
+            println!("Agents before restart: {}", agents.len());
+            print_update_agents(agents);
+        }
+        if let Some(agents) = value.get("agents_after").and_then(Value::as_array) {
+            println!("Agents observed after restart: {}", agents.len());
+            print_update_agents(agents);
+        } else if let Some(error) = value
+            .get("agents_after")
+            .and_then(|after| after.get("read_error"))
+            .and_then(Value::as_str)
+        {
+            println!("Agent readback unavailable: {error}");
+        }
+        if let Some(desktop) = value.get("desktop") {
+            if let Some(pid) = desktop.get("pid").and_then(Value::as_u64) {
+                println!("Desktop companion PID: {pid}");
+            }
+            if let Some(hash) = desktop.get("sha256").and_then(Value::as_str) {
+                println!("Desktop companion SHA-256: {hash}");
+            }
+            if let Some(reason) = desktop.get("reason").and_then(Value::as_str) {
+                println!("Desktop companion: {reason}");
+            }
+        }
+    });
+}
+
+fn print_update_agents(agents: &[Value]) {
+    for agent in agents {
+        let id = agent.get("agent").and_then(Value::as_str).unwrap_or("?");
+        let generation = agent
+            .get("generation")
+            .map(Value::to_string)
+            .unwrap_or_else(|| "?".to_owned());
+        let state = agent
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        println!("  {id} · generation {generation} · state {state}");
+    }
+}
 
 pub(crate) async fn run(
     source: PathBuf,
@@ -82,7 +165,7 @@ pub(crate) async fn run(
                 } else {
                     None
                 };
-                print_value(
+                print_update_value(
                     &json!({
                         "state": if recovered { "update_cancelled" } else { "update_cancel_unconfirmed" },
                         "pid": old.pid, "error": error.message,
@@ -117,7 +200,7 @@ pub(crate) async fn run(
     }
 
     if let Err(error) = wait_for_exit(&old, Duration::from_secs(120)).await {
-        print_value(
+        print_update_value(
             &json!({"state":"restart_exit_unknown","previous_pid":old.pid,
             "error":error.message,"agents_before":before,"backup":backup.retained()}),
             json_output,
@@ -158,7 +241,7 @@ pub(crate) async fn run(
     let (desktop, desktop_failed) = start_companion(&data_dir, desktop);
     #[cfg(not(windows))]
     let (desktop, desktop_failed) = (None::<Value>, false);
-    print_value(
+    print_update_value(
         &json!({
             "state": if desktop_failed || backup_cleanup.is_some() { "partial" } else { "ready" },
             "previous_pid": old.pid, "pid": pid,
@@ -194,7 +277,7 @@ impl StoreBackup<'_> {
 }
 
 fn report_retained(state: &str, backup: &StoreBackup<'_>, error: Failure, json_output: bool) {
-    print_value(
+    print_update_value(
         &json!({
             "state": state, "error": error.message, "backup": backup.retained(),
             "message": "The Store was preserved because replacement writes may exist",
@@ -337,7 +420,7 @@ async fn rollback(
     } else {
         None
     };
-    print_value(
+    print_update_value(
         &json!({
             "state": state, "previous_pid": previous.daemon.pid, "pid": pid, "update_error": update_error,
             "rollback_error": rollback_error, "binary": eliot_core::display_path(&previous.binary.to_string_lossy()),

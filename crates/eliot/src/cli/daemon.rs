@@ -9,7 +9,7 @@ use eliot_core::api::{
     AutomaticCleanupPolicy, DaemonShutdownRequest, DaemonShutdownResponse, DaemonStatusRequest,
     DaemonStatusResponse, MaintenancePurgeLegacyAttentionRequest,
     MaintenancePurgeLegacyAttentionResponse, MaintenanceRunRequest, MaintenanceRunResponse,
-    ShutdownMode,
+    ShutdownMode, StatusBlocker,
 };
 use serde_json::Value;
 use serde_json::json;
@@ -236,26 +236,92 @@ pub(crate) async fn run_status(data_dir: PathBuf, json_output: bool) -> Result<u
             None => format!("Automatic cleanup {policy}"),
         }
     });
-    let mut value = serde_json::to_value(response)
-        .map_err(|_| Failure::new(4, "daemon.status response is invalid"))?;
-    if let Some(object) = value.as_object_mut() {
-        if !json_output {
-            object.remove("automatic_cleanup");
-            object.remove("build_identity");
+    if json_output {
+        let mut value = serde_json::to_value(&response)
+            .map_err(|_| Failure::new(4, "daemon.status response is invalid"))?;
+        value["data_dir"] = Value::String(data_dir.to_string_lossy().into_owned());
+        print_value(&value, true);
+    } else {
+        print_status_summary(&response, &data_dir);
+        if let Some(line) = build_line {
+            println!("{line}");
         }
-        object.insert(
-            "data_dir".to_owned(),
-            Value::String(data_dir.to_string_lossy().into_owned()),
-        );
-    }
-    print_value(&value, json_output);
-    if !json_output && let Some(line) = build_line {
-        println!("{line}");
-    }
-    if !json_output && let Some(line) = cleanup_line {
-        println!("{line}");
+        if let Some(line) = cleanup_line {
+            println!("{line}");
+        }
     }
     Ok(0)
+}
+
+fn print_status_summary(response: &DaemonStatusResponse, data_dir: &Path) {
+    println!(
+        "Daemon: {} · admission {}",
+        response.state, response.admission
+    );
+    println!(
+        "Agents: {} · owned plugins: {} · observers: {} · discovery readers: {}",
+        response.agents,
+        response.owned_plugins,
+        response.observer_readers,
+        response.discovery_readers
+    );
+    println!(
+        "Store writes: {}",
+        if response.store_write_faulted {
+            "faulted"
+        } else {
+            "healthy"
+        }
+    );
+    println!(
+        "Commands: {} unknown · {} unsettled",
+        response.unknown_commands_count, response.unsettled_commands_count
+    );
+    if response.blockers.is_empty() {
+        println!("Blocking work: none");
+    } else {
+        println!("Blocking work:");
+        for blocker in &response.blockers {
+            match blocker {
+                StatusBlocker::WorkspaceProcesses => println!("  owned workspace processes"),
+                StatusBlocker::DiscoveryReaders { count } => {
+                    println!("  {count} discovery reader(s)")
+                }
+                StatusBlocker::AgentLive {
+                    agent,
+                    generation,
+                    state,
+                    active_turn,
+                } => println!(
+                    "  Agent {agent} generation {generation}: {state:?}{}",
+                    active_turn
+                        .as_deref()
+                        .map(|turn| format!(" (turn {turn})"))
+                        .unwrap_or_default()
+                ),
+                StatusBlocker::CommandUnsettled { command_id, state } => {
+                    println!("  command {command_id}: {state:?}")
+                }
+                StatusBlocker::CommandUnsettledMore { count } => {
+                    println!("  {count} more unsettled command(s)")
+                }
+                StatusBlocker::ScriptRunActive { run_id } => {
+                    println!("  script run {run_id} is still active")
+                }
+                StatusBlocker::StoreWriteFaulted => println!("  Store writes are faulted"),
+                StatusBlocker::CommandUnknown { command_id } => {
+                    println!("  command {command_id} has an unknown outcome")
+                }
+                StatusBlocker::CommandUnknownMore { count } => {
+                    println!("  {count} more command outcome(s) are unknown")
+                }
+            }
+        }
+    }
+    if let Some(error) = response.workspace_recovery_error.as_deref() {
+        println!("Workspace recovery: {error}");
+    }
+    println!("Data directory: {}", data_dir.display());
 }
 
 pub(crate) async fn start_daemon(data_dir: &Path, json_output: bool) -> Result<u8, Failure> {

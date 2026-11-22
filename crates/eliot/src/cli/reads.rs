@@ -5,7 +5,7 @@ use super::args::{
     UsageArgs, WatchArgs, WhyArgs,
 };
 use super::support::read_and_print;
-use super::support::{Failure, PAGE_SIZE, print_value, validate_limit};
+use super::support::{Failure, PAGE_SIZE, print_value, print_value_or_human, validate_limit};
 use eliot_core::api::{
     AgentEditsRequest, AgentEditsResponse, AgentGetRequest, AgentGetResponse, AgentGitRequest,
     AgentGitResponse, AgentHistoryRequest, AgentListRequest, AgentListResponse, AgentListRow,
@@ -116,22 +116,39 @@ pub(crate) async fn run_show(
         params
             .validate_response(&response)
             .map_err(Failure::invalid_response)?;
-        if let Some(activity) = response.agent.activity.as_ref() {
-            if response.agent.state == AgentState::Stopped {
+        let value = serde_json::to_value(&response)
+            .map_err(|_| Failure::new(4, "agent.get response is invalid"))?;
+        print_value_or_human(&value, false, || {
+            let agent = &response.agent;
+            println!(
+                "Agent {}: {} (generation {})",
+                agent.id,
+                format!("{:?}", agent.state).to_ascii_lowercase(),
+                agent.generation
+            );
+            println!("Project: {}", agent.project);
+            println!("Harness/profile: {}/{}", agent.harness, agent.profile);
+            if let Some(workspace) = &agent.workspace {
+                println!("Workspace: {workspace}");
+            }
+            if let Some(turn) = &agent.active_turn {
+                println!("Active turn: {turn}");
+            }
+            if let Some(activity) = response.agent.activity.as_ref() {
                 println!(
-                    "state: stopped (ended with parent; last activity {})",
-                    activity_state_name(activity.state)
-                );
-            } else {
-                println!(
-                    "state: {} (observed) (lifecycle state=unknown)",
-                    activity_state_name(activity.state)
+                    "Native activity: {} (lifecycle state: {})",
+                    activity_state_name(activity.state),
+                    if response.agent.state == AgentState::Stopped {
+                        "stopped"
+                    } else {
+                        "not established by activity alone"
+                    }
                 );
             }
-        }
-        let value = serde_json::to_value(response)
-            .map_err(|_| Failure::new(4, "agent.get response is invalid"))?;
-        print_value(&value, false);
+            if !agent.pending.is_empty() {
+                println!("Pending native requests: {}", agent.pending.len());
+            }
+        });
         Ok(0)
     }
 }
@@ -563,13 +580,62 @@ pub(crate) async fn run_result(
         limit,
         metadata,
     };
-    read_and_print!(
-        &data_dir,
-        json_output,
-        "agent.result",
-        params,
-        AgentResultResponse
-    )
+    params.validate().map_err(Failure::for_read)?;
+    let response: AgentResultResponse =
+        eliot_daemon::client_call_typed(&data_dir, "agent.result", &params)
+            .await
+            .map_err(Failure::for_read)?;
+    params
+        .validate_response(&response)
+        .map_err(Failure::invalid_response)?;
+    let value = serde_json::to_value(&response)
+        .map_err(|_| Failure::new(4, "agent.result response is invalid"))?;
+    print_value_or_human(&value, json_output, || {
+        let newest = response.turns.iter().find_map(|turn| {
+            turn.final_text
+                .as_deref()
+                .filter(|text| !text.is_empty())
+                .map(|text| (turn, text))
+        });
+        if let Some((_, text)) = newest {
+            print!("{text}");
+            if !text.ends_with('\n') {
+                println!();
+            }
+        } else if response.turns.is_empty() {
+            println!("No retained turns for Agent {}.", response.agent);
+        } else {
+            println!("No retained final answer text.");
+        }
+        println!();
+        println!(
+            "Agent: {} · generation: {}",
+            response.agent, response.generation
+        );
+        if let Some(turn) = newest
+            .map(|(turn, _)| turn)
+            .or_else(|| response.turns.first())
+        {
+            let outcome = turn
+                .outcome
+                .as_ref()
+                .map(|value| format!("{value:?}").to_lowercase());
+            println!(
+                "Turn {} · generation {} · state {} · status {}",
+                turn.turn_id,
+                turn.generation,
+                format!("{:?}", turn.state).to_lowercase(),
+                outcome
+                    .as_deref()
+                    .or(turn.status.as_deref())
+                    .unwrap_or("pending")
+            );
+        }
+        if response.turns.len() > 1 || response.next.is_some() {
+            println!("Use --json to read additional turns and the page cursor.");
+        }
+    });
+    Ok(0)
 }
 
 pub(crate) async fn run_history(
@@ -579,7 +645,7 @@ pub(crate) async fn run_history(
         source,
         view,
         turn_id,
-        cursor,
+        after,
         page: PageArgs { limit },
     }: HistoryArgs,
     data_dir: PathBuf,
@@ -592,7 +658,7 @@ pub(crate) async fn run_history(
         source,
         view,
         turn_id,
-        cursor,
+        cursor: after,
         limit,
     };
     read_and_print!(
@@ -606,14 +672,14 @@ pub(crate) async fn run_history(
 
 pub(crate) async fn run_events(
     EventsArgs {
-        since,
+        after,
         page: PageArgs { limit },
     }: EventsArgs,
     data_dir: PathBuf,
     json_output: bool,
 ) -> Result<u8, Failure> {
     validate_limit(limit)?;
-    let after = match since {
+    let after = match after {
         Some(after) => after,
         None => {
             let bounds: EventsBoundsResponse = eliot_daemon::client_call_typed(

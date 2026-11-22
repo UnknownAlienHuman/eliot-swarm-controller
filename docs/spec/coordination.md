@@ -134,7 +134,7 @@ tree settle as `skipped(native_session_kept)`. This also applies to a
 
 Continue a cleanup review with the opaque `continuation` string from the previous
 response and the same scope, project and age cutoff. The CLI passes it as
-`--continuation <token>` and MCP passes the string as `params.continuation`.
+`--after <token>` and MCP passes the string as `params.continuation`.
 The daemon also accepts legacy JSON continuations. A progress page can contain
 zero candidates with a continuation while the daemon scans the retained inventory.
 The backfill cursor advances only across completed probe batches. A failed probe

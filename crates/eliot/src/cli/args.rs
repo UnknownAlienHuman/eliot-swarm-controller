@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 #[derive(Args)]
 pub(crate) struct GenerationArgs {
-    #[arg(long, value_name = "GENERATION")]
+    #[arg(long, value_name = "GENERATION", value_parser = clap::value_parser!(i64).range(0..))]
     pub(crate) generation: Option<i64>,
 }
 
@@ -25,7 +25,8 @@ pub(crate) struct PageArgs {
 #[command(
     name = "swarm",
     version = env!("ELIOT_BUILD_VERSION"),
-    about = "Local controller for coding-agent sessions"
+    about = "Local controller for coding-agent sessions",
+    after_help = "Exit codes:\n  0  Success or accepted\n  1  Definite failure or missing result\n  2  Invalid input\n  3  Rejected before effect\n  4  Unknown outcome or invalid response\n  5  Wait expired\n  6  Still pending\n  7  Interrupted or cancelled"
 )]
 pub(crate) struct Cli {
     #[arg(long, hide = true, exclusive = true)]
@@ -35,7 +36,7 @@ pub(crate) struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub(crate) data_dir: Option<PathBuf>,
 
-    /// Print compact JSON instead of the default readable output.
+    /// Print the command's machine-readable response as compact JSON.
     #[arg(long, global = true)]
     pub(crate) json: bool,
 
@@ -214,10 +215,11 @@ pub(crate) enum CleanupCommand {
         /// previous plan response. Legacy JSON text and continuation
         /// objects are accepted; the emitted token is PowerShell-safe.
         #[arg(
-            long,
+            long = "after",
+            alias = "continuation",
             help = "Opaque token from the previous cleanup plan (PowerShell-safe)"
         )]
-        continuation: Option<String>,
+        after: Option<String>,
     },
     Apply {
         plan_id: String,
@@ -340,8 +342,8 @@ pub(crate) struct DiscoverArgs {
     pub(crate) harness: Option<String>,
     #[arg(long, value_name = "SCOPE")]
     pub(crate) scope: Option<String>,
-    #[arg(long, value_name = "CURSOR")]
-    pub(crate) cursor: Option<String>,
+    #[arg(long = "after", alias = "cursor", value_name = "CURSOR")]
+    pub(crate) after: Option<String>,
     #[arg(long)]
     pub(crate) archived: bool,
     #[command(flatten)]
@@ -359,12 +361,7 @@ pub(crate) struct ModelsArgs {
     #[arg(long, value_name = "PROFILE")]
     pub(crate) profile: Option<String>,
     /// Read a live Agent's catalogue. Only with --harness.
-    #[arg(
-        long,
-        value_name = "AGENT",
-        requires = "harness",
-        conflicts_with = "profile"
-    )]
+    #[arg(value_name = "AGENT", requires = "harness", conflicts_with = "profile")]
     pub(crate) agent: Option<String>,
     /// Existing workspace for an OpenCode catalogue preview.
     #[arg(
@@ -688,7 +685,7 @@ pub(crate) struct StatsArgs {
 
 #[derive(Args)]
 pub(crate) struct HeavyArgs {
-    #[arg(long, value_name = "AGENT")]
+    #[arg(value_name = "AGENT")]
     pub(crate) agent: Option<String>,
     #[command(flatten)]
     pub(crate) generation: ReadGenerationArgs,
@@ -708,6 +705,7 @@ pub(crate) struct UsageArgs {
     pub(crate) agent_positional: Option<String>,
     #[arg(
         long,
+        hide = true,
         value_name = "AGENT",
         conflicts_with = "agent_positional",
         conflicts_with = "project",
@@ -779,8 +777,8 @@ pub(crate) struct HistoryArgs {
     pub(crate) view: String,
     #[arg(long, value_name = "TURN")]
     pub(crate) turn_id: Option<String>,
-    #[arg(long, value_name = "CURSOR")]
-    pub(crate) cursor: Option<String>,
+    #[arg(long = "after", alias = "cursor", value_name = "CURSOR")]
+    pub(crate) after: Option<String>,
     #[command(flatten)]
     pub(crate) page: PageArgs,
 }
@@ -846,8 +844,8 @@ pub(crate) struct WhyArgs {
 #[derive(Args)]
 pub(crate) struct EventsArgs {
     /// Exclusive sequence cursor. Omit to begin at the retained history floor.
-    #[arg(long, value_name = "SEQ")]
-    pub(crate) since: Option<i64>,
+    #[arg(long = "after", alias = "since", value_name = "SEQ")]
+    pub(crate) after: Option<i64>,
     #[command(flatten)]
     pub(crate) page: PageArgs,
 }
@@ -1001,6 +999,7 @@ pub(crate) struct WaitArgs {
     /// Complete when any entry is terminal.
     #[arg(long, conflicts_with = "all")]
     pub(crate) any: bool,
+    /// Wait from 1 to 30 seconds for this set of commands or turns.
     #[arg(long, default_value_t = DEFAULT_WAIT_SECONDS, value_name = "SECONDS")]
     pub(crate) timeout_seconds: u64,
     /// Command ids, or `agent/generation/turn_id` for exact turn bindings.
@@ -1063,10 +1062,9 @@ pub(crate) struct InboxArgs {
     /// Narrow the page to one exact `reply_to_delivery` reference.
     #[arg(long, value_name = "DELIVERY")]
     pub(crate) reply_to: Option<String>,
-    /// Wait up to SECS for the first delivery (0 returns after a single
-    /// read; extreme values are rejected). Each wait RPC long-polls the
-    /// server for up to 30 seconds; every wait RPC and sleep is bounded by
-    /// one checked absolute deadline.
+    /// Wait up to SECS for the first delivery. With 0, read once and exit
+    /// 5 if the inbox is empty. Positive waits use one absolute deadline
+    /// with server polls of up to 30 seconds each.
     #[arg(long, value_name = "SECS")]
     pub(crate) wait: Option<u64>,
 }
@@ -1236,8 +1234,9 @@ pub(crate) struct CmdChildrenArgs {
 pub(crate) struct CmdResolveArgs {
     #[arg(value_name = "COMMAND_ID", value_parser = command_id)]
     pub(crate) command_id: String,
-    #[arg(long = "as", value_name = "STATE")]
-    pub(crate) resolution: String,
+    /// Assert a completed command effect or a definite failure.
+    #[arg(long, value_parser = ["completed", "failed"])]
+    pub(crate) status: String,
     #[arg(long, value_name = "TEXT")]
     pub(crate) reason: String,
 }
@@ -1270,7 +1269,7 @@ pub(crate) struct TurnResolveArgs {
     pub(crate) generation: i64,
     #[arg(long, value_name = "TURN")]
     pub(crate) turn_id: String,
-    #[arg(long, value_name = "STATUS")]
+    #[arg(long, value_parser = ["completed", "failed", "interrupted"])]
     pub(crate) status: String,
     #[arg(long, value_name = "TEXT")]
     pub(crate) reason: String,
@@ -1304,16 +1303,16 @@ pub(crate) struct MsgSendArgs {
 pub(crate) struct MsgShowArgs {
     #[arg(value_name = "DELIVERY")]
     pub(crate) delivery: String,
-    #[arg(long, value_name = "AGENT")]
+    #[arg(value_name = "AGENT")]
     pub(crate) agent: Option<String>,
 }
 
 #[derive(Args)]
 pub(crate) struct MsgAckArgs {
+    #[arg(value_name = "AGENT")]
+    pub(crate) agent: Option<String>,
     #[arg(long, value_name = "DELIVERY")]
     pub(crate) delivery: Vec<String>,
-    #[arg(long, value_name = "AGENT")]
-    pub(crate) agent: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -1362,7 +1361,8 @@ pub(crate) struct VarGetArgs {
     pub(crate) after_version: Option<i64>,
     /// Wait up to SECS for the version change (0 reads once; extreme values
     /// are rejected). Each wait RPC long-polls the server for up to 30
-    /// seconds under one checked absolute deadline.
+    /// seconds under one checked absolute deadline. A positive wait requires
+    /// --after-version.
     #[arg(long, value_name = "SECS")]
     pub(crate) wait: Option<u64>,
 }
@@ -1381,7 +1381,7 @@ pub(crate) enum ClaimCommand {
 pub(crate) struct ClaimSetArgs {
     #[arg(value_name = "GLOB")]
     pub(crate) glob: String,
-    #[arg(long, value_name = "AGENT")]
+    #[arg(value_name = "AGENT")]
     pub(crate) agent: Option<String>,
     #[arg(long, value_name = "TEXT")]
     pub(crate) note: Option<String>,
@@ -1394,7 +1394,7 @@ pub(crate) struct ClaimSetArgs {
 pub(crate) struct ClaimListArgs {
     #[arg(long, value_name = "PROJECT")]
     pub(crate) project: Option<String>,
-    #[arg(long, value_name = "AGENT")]
+    #[arg(value_name = "AGENT")]
     pub(crate) agent: Option<String>,
 }
 
@@ -1402,7 +1402,7 @@ pub(crate) struct ClaimListArgs {
 pub(crate) struct ClaimReleaseArgs {
     #[arg(value_name = "GLOB")]
     pub(crate) glob: String,
-    #[arg(long, value_name = "AGENT")]
+    #[arg(value_name = "AGENT")]
     pub(crate) agent: Option<String>,
 }
 
@@ -1736,7 +1736,7 @@ pub(crate) enum ProjectAssignmentCommand {
     /// Claim as the current Agent, or explicitly name an Agent as Owner.
     Claim {
         project: String,
-        #[arg(long, requires = "generation")]
+        #[arg(value_name = "AGENT", requires = "generation")]
         agent: Option<String>,
         #[arg(long, requires = "agent", value_parser = clap::value_parser!(i64).range(1..))]
         generation: Option<i64>,
