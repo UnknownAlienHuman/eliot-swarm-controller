@@ -75,13 +75,17 @@ vendor-owned. Eliot is not another coding harness.
 
 ## Non-goals
 
-No Task/Issue/review/acceptance/publication engine, multi-user security platform,
+No Task/Issue/review/acceptance engine, multi-user security platform,
 proof packets, readiness registers or operational document-hash ceremony. The former
 GUI non-goal is superseded: one optional Windows desktop companion (`swarm-desktop`,
 driven by the daemon) is approved; the daemon/CLI remains the headless authority and
 default build. Protocol
 acknowledgement and mutation idempotency are ordinary implementation correctness, not
 permission to construct a generic receipt/provenance platform.
+
+The daemon can perform repository operations, including branch integration, when an
+authorized manager requests them or an applicable automation rule is configured.
+Repository integration has no default trigger.
 
 One OS user is the local trust boundary for local control; the cloud endpoint is an
 authenticated owner MCP caller, distinct from a locally controlled native harness.
