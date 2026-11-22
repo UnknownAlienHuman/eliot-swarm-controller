@@ -568,12 +568,20 @@ impl Router {
             let mut store = self.inner.store.lock().await;
             match store.record_owner_submission(method, mutation_id, process, now_ms()) {
                 Ok(event) => self.publish_locked(&[event]),
-                Err(error) => crate::logging::record(
-                    &self.secret_policy_snapshot(),
-                    "owner.submission_record_failed",
-                    &[("method", method)],
-                    Some(&error),
-                ),
+                Err(error) => {
+                    let pid = process.pid.map(|pid| pid.to_string()).unwrap_or_default();
+                    crate::logging::record(
+                        &self.secret_policy_snapshot(),
+                        "owner.submission_record_failed",
+                        &[
+                            ("method", method),
+                            ("command_id", mutation_id.unwrap_or_default()),
+                            ("pid", &pid),
+                            ("path", process.image_path.as_deref().unwrap_or_default()),
+                        ],
+                        Some(&error),
+                    );
+                }
             }
         }
         // Debug mode times every RPC at this single choke point. Standard

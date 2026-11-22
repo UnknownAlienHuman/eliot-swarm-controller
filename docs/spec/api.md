@@ -406,6 +406,8 @@ For cloud MCP the process is the local bridge, and `remote_call` identifies
 the cloud caller. Commands and queued launches retain the original submission
 metadata on admission. A retry has its own submission event and preserves
 earlier admission events.
+If the Store cannot accept the event, the daemon records a bounded diagnostic
+with the submission's process metadata.
 
 Session handling is native rmcp negotiation with no override: pre-2026 clients get
 stateful in-memory SDK sessions (`LocalSessionManager`); clients negotiating

@@ -486,13 +486,13 @@ impl Store {
         generation: i64,
         turn_id: &str,
         consumer_id: &str,
-        hook: &str,
+        callback: (&str, &Value),
         now: i64,
     ) -> Result<Change<Vec<ContextItem>>> {
         self.ensure_writer_healthy()?;
         require_nonempty(consumer_id, "consumer_id")?;
         require_nonempty(turn_id, "turn_id")?;
-        if !matches!(hook, "before_tool" | "before_model") {
+        if !matches!(callback.0, "before_tool" | "before_model") {
             return Err(Error::new("invalid", "context hook is not supported"));
         }
         let result = self.claim_turn_safe_point_context_inner(
@@ -500,7 +500,7 @@ impl Store {
             generation,
             turn_id,
             consumer_id,
-            hook,
+            callback,
             now,
         );
         self.fault_on_persistence_error(&result);
@@ -513,7 +513,7 @@ impl Store {
         generation: i64,
         turn_id: &str,
         consumer_id: &str,
-        hook: &str,
+        (hook, reply_id): (&str, &Value),
         now: i64,
     ) -> Result<Change<Vec<ContextItem>>> {
         let agent_num = parse_agent_id(agent_id)?;
@@ -632,7 +632,12 @@ impl Store {
             let mut candidate = selected.clone();
             candidate.push(item.clone());
             let candidate_bytes = payload_bytes.saturating_add(args.text.len());
-            let encoded_len = encode_json(&json!({"context": &candidate}))?.len();
+            let reply = json!({
+                "jsonrpc": "2.0",
+                "id": reply_id,
+                "result": {"context": &candidate},
+            });
+            let encoded_len = encode_json(&reply)?.len().saturating_add(1);
             if candidate_bytes > MAX_TEXT_BYTES || encoded_len > MAX_FRAME_BYTES {
                 reject_pending_context(
                     &tx,
