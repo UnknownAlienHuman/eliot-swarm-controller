@@ -29,7 +29,8 @@ pub(super) struct FactOrigin<'a> {
 }
 
 type ContextCursor = (i64, i64);
-type ContextPage = (Vec<CommandRecord>, Option<ContextCursor>);
+type KeyedCommand = (i64, i64, CommandRecord);
+type ContextPage = (Vec<KeyedCommand>, Option<ContextCursor>);
 
 /// One send dispatch and the FIFO context items committed to that send.
 #[derive(Clone, Debug, PartialEq)]
@@ -47,6 +48,7 @@ struct ContextClaim {
 
 struct ClaimedContextRecord {
     command_id: String,
+    verb: String,
     target: i64,
     generation: i64,
     turn_id: Option<String>,
@@ -447,12 +449,113 @@ fn render_injection(connection: &Connection, command: &Command, text: &str) -> R
     } else {
         &command.principal
     };
-    match decode_inject_args(&command.args)?.trusted_review_labels {
+    let labels = if command.verb == "inject" {
+        decode_inject_args(&command.args)?.trusted_review_labels
+    } else {
+        None
+    };
+    match labels {
         Some(labels) => Ok(swarm_note_with_trusted_review_labels(
             text, principal, &labels,
         )),
         None => Ok(swarm_note(text, principal)),
     }
+}
+
+pub(super) fn has_unhealthy_native_stream_tx(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    generation: i64,
+) -> Result<bool> {
+    tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM source_state
+             WHERE agent = ?1 AND generation = ?2 AND source = ?3
+               AND (state <> 'open' OR health <> 'ok')
+         )",
+        params![agent_num, generation, INITIAL_SOURCE],
+        |row| row.get(0),
+    )
+    .map_err(sql_error)
+}
+
+fn claude_hook_event_name(hook: &str) -> &'static str {
+    match hook {
+        "before_tool" => "PreToolUse",
+        "after_tool" => "PostToolUse",
+        _ => "PostToolUse",
+    }
+}
+
+fn hook_response_fits(reply_id: &Value, items: &[ContextItem]) -> Result<bool> {
+    let reply = json!({
+        "jsonrpc": "2.0",
+        "id": reply_id,
+        "result": {"context": items},
+    });
+    Ok(encode_json(&reply)?.len().saturating_add(1) <= MAX_FRAME_BYTES)
+}
+
+fn claude_hook_callback_fits(hook_event_name: &str, additional_context: &str) -> Result<bool> {
+    let max_request_id = "R".repeat(MAX_COMMAND_ID_BYTES);
+    let frame = json!({
+        "type": "control_response",
+        "response": {
+            "subtype": "success",
+            "request_id": max_request_id,
+            "response": {
+                "hookSpecificOutput": {
+                    "hookEventName": hook_event_name,
+                    "additionalContext": additional_context,
+                }
+            }
+        }
+    });
+    Ok(encode_json(&frame)?.len().saturating_add(1) <= MAX_FRAME_BYTES)
+}
+
+pub(super) fn validate_turn_safe_point_steer_admission(
+    agent: &Agent,
+    principal: &str,
+    command_id: &str,
+    text: &str,
+) -> Result<()> {
+    let points = context_points(agent)?;
+    if !points.contains(&InjectPoint::TurnSafePoint) {
+        return Err(Error::new(
+            "unsupported",
+            "Claude steer requires turn_safe_point tool hooks",
+        ));
+    }
+    // Rule-caused owner steers render as "Swarm rule", which is wider than
+    // "owner", so check that upper bound before admitting.
+    let frame_principal = if principal == "owner" {
+        "swarm_rule"
+    } else {
+        principal
+    };
+    let framed = swarm_note(text, frame_principal);
+    if framed.len() > MAX_TEXT_BYTES {
+        return Err(Error::new(
+            "frame_too_large",
+            "framed steer text exceeds 512 KiB",
+        ));
+    }
+    let item = ContextItem {
+        command_id: command_id.to_owned(),
+        text: framed.clone(),
+        expires_at_ms: None,
+    };
+    let max_reply_id = Value::String("M".repeat(MAX_COMMAND_ID_BYTES));
+    if !hook_response_fits(&max_reply_id, std::slice::from_ref(&item))?
+        || !claude_hook_callback_fits("PostToolUse", &framed)?
+    {
+        return Err(Error::new(
+            "frame_too_large",
+            "framed steer exceeds the 1 MiB hook response bound",
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn admit_tx(
@@ -718,7 +821,7 @@ pub(super) fn claim_next_input_tx(
         if records.is_empty() {
             break;
         }
-        for record in records {
+        for (_, _, record) in records {
             let args = decode_inject_args(&record.command.args)?;
             if args.point != InjectPoint::NextInput {
                 continue;
@@ -939,68 +1042,158 @@ impl Store {
         validate_id_age(consumer_id, now)?;
 
         let mut events = Vec::new();
-        let mut selected = Vec::new();
+        let mut selected: Vec<ContextItem> = Vec::new();
         let mut selected_ids = Vec::new();
         let mut payload_bytes = 0_usize;
-        for record in pending_context_batch(
+        let mut joined_text = String::new();
+        let in_flight_stop = has_in_flight_stop_tx(&tx, agent_num, generation)?;
+        let claude_hook_name = (agent.harness == "claude").then(|| claude_hook_event_name(hook));
+        let mut pending_candidates = pending_context_batch(
             &tx,
             agent_num,
             generation,
             InjectPoint::TurnSafePoint,
             Some(turn_id),
-        )? {
-            let args = decode_inject_args(&record.command.args)?;
-            if args.point != InjectPoint::TurnSafePoint
-                || record.command.turn_id.as_deref() != Some(turn_id)
-            {
+        )?;
+        if eliot_core::harness_uses_turn_safe_point_steer(&agent.harness) {
+            pending_candidates.extend(pending_turn_steers(&tx, agent_num, generation, turn_id)?);
+            pending_candidates.sort_by_key(|(created_at, rowid, _)| (*created_at, *rowid));
+        }
+        for (_, _, record) in pending_candidates {
+            if record.command.turn_id.as_deref() != Some(turn_id) {
                 continue;
             }
-            if reject_stale_assignment(&tx, &record, agent_num, generation, now, &mut events)? {
-                continue;
-            }
-            if args
-                .expires_at_ms
-                .is_some_and(|expires_at| expires_at <= now)
-            {
-                reject_pending_context(
-                    &tx,
-                    &record,
-                    agent_num,
-                    generation,
-                    "expired",
-                    now,
-                    &mut events,
-                )?;
-                continue;
-            }
-            let item = ContextItem {
-                command_id: record.command.id.clone(),
-                text: render_injection(&tx, &record.command, &args.text)?,
-                expires_at_ms: args.expires_at_ms,
+            let is_steer = record.command.verb == "steer";
+            let (item, raw_len) = if is_steer {
+                if in_flight_stop {
+                    reject_pending_steer(
+                        &tx,
+                        &record,
+                        agent_num,
+                        generation,
+                        "bad_state",
+                        "steer cannot be delivered while a stop is in flight",
+                        now,
+                        &mut events,
+                    )?;
+                    continue;
+                }
+                if let Err(error) = check_pending_steer_dispatch(&tx, &record, &agent) {
+                    if matches!(
+                        error.code.as_str(),
+                        "stale_assignment" | "not_allowed" | "stale_generation" | "provider_held"
+                    ) {
+                        reject_pending_steer(
+                            &tx,
+                            &record,
+                            agent_num,
+                            generation,
+                            &error.code,
+                            &error.message,
+                            now,
+                            &mut events,
+                        )?;
+                        continue;
+                    }
+                    return Err(error);
+                }
+                let text = required_string(&record.command.args, "text")?;
+                let rendered = render_injection(&tx, &record.command, &text)?;
+                let rendered_len = rendered.len();
+                (
+                    ContextItem {
+                        command_id: record.command.id.clone(),
+                        text: rendered,
+                        expires_at_ms: None,
+                    },
+                    rendered_len,
+                )
+            } else {
+                let args = decode_inject_args(&record.command.args)?;
+                if args.point != InjectPoint::TurnSafePoint {
+                    continue;
+                }
+                if reject_stale_assignment(&tx, &record, agent_num, generation, now, &mut events)? {
+                    continue;
+                }
+                if args
+                    .expires_at_ms
+                    .is_some_and(|expires_at| expires_at <= now)
+                {
+                    reject_pending_context(
+                        &tx,
+                        &record,
+                        agent_num,
+                        generation,
+                        "expired",
+                        now,
+                        &mut events,
+                    )?;
+                    continue;
+                }
+                let rendered = render_injection(&tx, &record.command, &args.text)?;
+                (
+                    ContextItem {
+                        command_id: record.command.id.clone(),
+                        text: rendered,
+                        expires_at_ms: args.expires_at_ms,
+                    },
+                    args.text.len(),
+                )
             };
+            let lone_fits = raw_len <= MAX_TEXT_BYTES
+                && hook_response_fits(reply_id, std::slice::from_ref(&item))?
+                && claude_hook_name
+                    .map(|name| claude_hook_callback_fits(name, &item.text))
+                    .transpose()?
+                    .unwrap_or(true);
+            if !lone_fits {
+                if is_steer {
+                    reject_pending_steer(
+                        &tx,
+                        &record,
+                        agent_num,
+                        generation,
+                        "frame_too_large",
+                        "framed steer exceeds the 1 MiB hook response bound",
+                        now,
+                        &mut events,
+                    )?;
+                } else {
+                    reject_pending_context(
+                        &tx,
+                        &record,
+                        agent_num,
+                        generation,
+                        "frame_too_large",
+                        now,
+                        &mut events,
+                    )?;
+                }
+                continue;
+            }
             let mut candidate = selected.clone();
             candidate.push(item.clone());
-            let candidate_bytes = payload_bytes.saturating_add(args.text.len());
-            let reply = json!({
-                "jsonrpc": "2.0",
-                "id": reply_id,
-                "result": {"context": &candidate},
-            });
-            let encoded_len = encode_json(&reply)?.len().saturating_add(1);
-            if candidate_bytes > MAX_TEXT_BYTES || encoded_len > MAX_FRAME_BYTES {
-                reject_pending_context(
-                    &tx,
-                    &record,
-                    agent_num,
-                    generation,
-                    "frame_too_large",
-                    now,
-                    &mut events,
-                )?;
-                continue;
+            let candidate_bytes = payload_bytes.saturating_add(raw_len);
+            let mut candidate_joined = joined_text.clone();
+            if !candidate_joined.is_empty() {
+                candidate_joined.push_str("\n\n");
+            }
+            candidate_joined.push_str(&item.text);
+            let batch_fits = candidate_bytes <= MAX_TEXT_BYTES
+                && hook_response_fits(reply_id, &candidate)?
+                && claude_hook_name
+                    .map(|name| claude_hook_callback_fits(name, &candidate_joined))
+                    .transpose()?
+                    .unwrap_or(true);
+            if !batch_fits {
+                // Fits alone but overflows with this batch: stop scanning so it
+                // and any later FIFO items wait for the next safe-point hook.
+                break;
             }
             selected = candidate;
             payload_bytes = candidate_bytes;
+            joined_text = candidate_joined;
             selected_ids.push(record.command.id.clone());
         }
         for command_id in &selected_ids {
@@ -1397,6 +1590,29 @@ pub(super) fn settle_ended_turn_context_tx(
             }),
         });
     }
+    for command_id in pending_turn_steer_command_ids(tx, agent_num, generation, turn_id)? {
+        let outcome = json!({
+            "reason": "captured_turn_ended",
+            "message": "turn ended before a safe point arrived for steer",
+        });
+        update_command_state(
+            tx,
+            &command_id,
+            CommandState::Rejected,
+            Some(&outcome),
+            None,
+            now,
+        )?;
+        events.push(super::native_events::PendingCommandEvent {
+            command_id: command_id.clone(),
+            state: CommandState::Rejected,
+            data: json!({
+                "command_id": command_id,
+                "state": "rejected",
+                "outcome": outcome,
+            }),
+        });
+    }
     for (command_id, prior_outcome) in
         dispatched_turn_safe_point_claims(tx, agent_num, generation, turn_id)?
     {
@@ -1468,7 +1684,7 @@ fn pending_context_batch(
     generation: i64,
     point: InjectPoint,
     turn_id: Option<&str>,
-) -> Result<Vec<CommandRecord>> {
+) -> Result<Vec<KeyedCommand>> {
     pending_context_batch_page(tx, agent_num, generation, point, turn_id, None)
         .map(|(records, _)| records)
 }
@@ -1535,15 +1751,65 @@ fn pending_context_batch_page(
             break;
         }
         materialized_bytes += args_bytes;
-        records.push(
-            load_command_record(tx, &id)?
-                .ok_or_else(|| Error::new("source_integrity", "context command disappeared"))?,
-        );
+        let record = load_command_record(tx, &id)?
+            .ok_or_else(|| Error::new("source_integrity", "context command disappeared"))?;
+        records.push((created_at, rowid, record));
         visited += 1;
         cursor = Some((created_at, rowid));
     }
 
     Ok((records, cursor))
+}
+
+fn pending_turn_steers(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    generation: i64,
+    turn_id: &str,
+) -> Result<Vec<KeyedCommand>> {
+    let mut statement = tx
+        .prepare(
+            "SELECT id, created_at, rowid, length(CAST(args AS BLOB))
+             FROM commands INDEXED BY commands_turn_steer_pending
+             WHERE target = ?1 AND generation = ?2 AND verb = 'steer'
+               AND state IN ('accepted', 'queued')
+               AND turn_id = ?3
+             ORDER BY created_at, rowid LIMIT ?4",
+        )
+        .map_err(sql_error)?;
+    let mut rows = statement
+        .query(params![
+            agent_num,
+            generation,
+            turn_id,
+            MAX_CONTEXT_QUERY_ROWS as i64
+        ])
+        .map_err(sql_error)?;
+    let mut materialized_bytes = 0_usize;
+    let mut records = Vec::new();
+    while let Some((id, created_at, rowid, args_bytes)) = read_pending_context_candidate(&mut rows)?
+    {
+        let args_bytes = usize::try_from(args_bytes).map_err(|_| {
+            Error::new(
+                "source_integrity",
+                "pending steer has an invalid stored argument length",
+            )
+        })?;
+        if args_bytes > MAX_CONTEXT_QUERY_BYTES {
+            return Err(Error::new(
+                "source_integrity",
+                "pending steer exceeds the maximum command frame size",
+            ));
+        }
+        if args_bytes > MAX_CONTEXT_QUERY_BYTES.saturating_sub(materialized_bytes) {
+            break;
+        }
+        materialized_bytes += args_bytes;
+        let record = load_command_record(tx, &id)?
+            .ok_or_else(|| Error::new("source_integrity", "steer command disappeared"))?;
+        records.push((created_at, rowid, record));
+    }
+    Ok(records)
 }
 
 fn read_pending_context_candidate(
@@ -1588,6 +1854,33 @@ fn pending_turn_context_command_ids(
     Ok(command_ids)
 }
 
+fn pending_turn_steer_command_ids(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    generation: i64,
+    turn_id: &str,
+) -> Result<Vec<String>> {
+    let mut statement = tx
+        .prepare(
+            "SELECT id FROM commands INDEXED BY commands_turn_steer_pending
+             WHERE target = ?1 AND generation = ?2 AND verb = 'steer'
+               AND state IN ('accepted', 'queued')
+               AND turn_id = ?3
+             ORDER BY created_at, rowid",
+        )
+        .map_err(sql_error)?;
+    let rows = statement
+        .query_map(params![agent_num, generation, turn_id], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(sql_error)?;
+    let mut command_ids = Vec::new();
+    for row in rows {
+        command_ids.push(row.map_err(sql_error)?);
+    }
+    Ok(command_ids)
+}
+
 fn claimed_context_commands(
     tx: &Transaction<'_>,
     agent_num: i64,
@@ -1601,7 +1894,7 @@ fn claimed_context_commands(
             return Err(Error::new("source_integrity", "unresolved context point"));
         }
         InjectPoint::NextInput => (
-            "SELECT c.id, c.turn_id, c.state, c.outcome
+            "SELECT c.id, c.verb, c.turn_id, c.state, c.outcome
              FROM commands AS c INDEXED BY commands_target
              WHERE c.target = ?1 AND c.generation = ?2 AND c.verb = 'inject'
                AND c.state IN ('dispatched', 'unknown') AND c.turn_id IS NULL
@@ -1616,9 +1909,9 @@ fn claimed_context_commands(
             false,
         ),
         InjectPoint::TurnSafePoint => (
-            "SELECT c.id, c.turn_id, c.state, c.outcome
+            "SELECT c.id, c.verb, c.turn_id, c.state, c.outcome
              FROM commands AS c INDEXED BY commands_target
-             WHERE c.target = ?1 AND c.generation = ?2 AND c.verb = 'inject'
+             WHERE c.target = ?1 AND c.generation = ?2 AND c.verb IN ('inject', 'steer')
                AND c.state IN ('dispatched', 'unknown') AND c.turn_id = ?4
                AND json_extract(c.outcome, '$.claim.consumer_id') = ?3
                AND json_extract(c.outcome, '$.claim.application_point') = 'turn_safe_point'
@@ -1626,7 +1919,7 @@ fn claimed_context_commands(
             true,
         ),
         InjectPoint::ActiveTurn => (
-            "SELECT c.id, c.turn_id, c.state, c.outcome
+            "SELECT c.id, c.verb, c.turn_id, c.state, c.outcome
              FROM commands AS c INDEXED BY commands_target
              WHERE c.target = ?1 AND c.generation = ?2 AND c.verb = 'inject'
                AND c.state IN ('dispatched', 'unknown') AND c.turn_id = ?4
@@ -1649,16 +1942,17 @@ fn claimed_context_commands(
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
                 ))
             },
         )
         .map_err(sql_error)?;
     let mut claims = Vec::new();
     for row in rows {
-        let (command_id, stored_turn_id, state, encoded_outcome) = row.map_err(sql_error)?;
+        let (command_id, verb, stored_turn_id, state, encoded_outcome) = row.map_err(sql_error)?;
         let state = match state.as_str() {
             "dispatched" => CommandState::Dispatched,
             "unknown" => CommandState::Unknown,
@@ -1686,6 +1980,7 @@ fn claimed_context_commands(
         }
         claims.push(ClaimedContextRecord {
             command_id,
+            verb,
             target: agent_num,
             generation,
             turn_id: stored_turn_id,
@@ -1706,7 +2001,7 @@ fn dispatched_turn_safe_point_claims(
     let mut statement = tx
         .prepare(
             "SELECT id, outcome FROM commands INDEXED BY commands_target
-             WHERE target = ?1 AND generation = ?2 AND verb = 'inject'
+             WHERE target = ?1 AND generation = ?2 AND verb IN ('inject', 'steer')
                AND state = 'dispatched'
                AND turn_id = ?3
                AND json_extract(outcome, '$.claim.application_point') = 'turn_safe_point'
@@ -1908,6 +2203,10 @@ fn apply_context_receipt_tx(
     } else {
         "delivered_in_turn"
     });
+    if record.verb == "steer" {
+        serialized["command_id"] = json!(record.command_id);
+        serialized["turn_id"] = json!(turn_id);
+    }
     if record.moved {
         serialized["moved"] = json!(true);
     }
@@ -1945,10 +2244,15 @@ pub(super) fn claim_context_tx(
 ) -> Result<()> {
     let record = load_command_record(tx, command_id)?
         .ok_or_else(|| Error::new("source_integrity", "pending context command disappeared"))?;
+    let point_matches = match record.command.verb.as_str() {
+        "inject" => decode_inject_args(&record.command.args)?.point == consumer.point,
+        "steer" => consumer.point == InjectPoint::TurnSafePoint && record.command.turn_id.is_some(),
+        _ => false,
+    };
     if !matches!(record.state, CommandState::Accepted | CommandState::Queued)
         || record.target != Some(agent_num)
         || record.command.generation != Some(generation)
-        || decode_inject_args(&record.command.args)?.point != consumer.point
+        || !point_matches
     {
         return Err(Error::new(
             "stale_generation",
@@ -1985,10 +2289,61 @@ pub(super) fn claim_context_tx(
         command_id,
         json!({
             "command_id": command_id,
-            "verb": "inject",
+            "verb": record.command.verb,
             "consumer_id": consumer.id,
             "application_point": consumer.point,
         }),
+    )?);
+    Ok(())
+}
+
+fn check_pending_steer_dispatch(
+    tx: &Transaction<'_>,
+    record: &CommandRecord,
+    agent: &Agent,
+) -> Result<()> {
+    project_assignment::check_dispatch(tx, record)?;
+    projects::validate_project_command_dispatch_tx(tx, record)?;
+    admission::require_reply_authority(&record.command.principal, &record.command.verb, agent)?;
+    if record.command.principal.starts_with("agent:") {
+        let caller = hierarchy::parse_caller(tx, &record.command.principal)?;
+        hierarchy::caller_may_command(tx, &caller, agent)?;
+    }
+    provider_holds::require_dispatch_tx(tx, agent, &record.command)?;
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The operation's distinct inputs remain explicit at its established call boundary."
+)]
+fn reject_pending_steer(
+    tx: &Transaction<'_>,
+    record: &CommandRecord,
+    agent_num: i64,
+    generation: i64,
+    code: &str,
+    message: &str,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<()> {
+    let outcome = json!({"code": code, "reason": message});
+    update_command_state(
+        tx,
+        &record.command.id,
+        CommandState::Rejected,
+        Some(&outcome),
+        None,
+        now,
+    )?;
+    events.push(insert_daemon_command_event(
+        tx,
+        now,
+        "command.rejected",
+        Some(agent_num),
+        Some(generation),
+        &record.command.id,
+        json!({"command_id": record.command.id, "state": "rejected", "outcome": outcome}),
     )?);
     Ok(())
 }

@@ -145,13 +145,16 @@ plugin-side cleanup and drain. Adapters supply their native close and readback
 steps. Antigravity waits for notification of its exact turn's settlement after
 dispatching cancellation. Only an observed cancellation terminal confirms it.
 
-Steer uses an ordered, bounded write followed by a correlated response wait: the host
-writes its `agent.command` frame in dispatch order under the writer deadline. The host
-then waits up to the plugin RPC response deadline while continuing to process
-`interrupt`, `stop`, `agent.snapshot`, and lifecycle messages. A timeout releases
-the correlation slot and settles the command as `unknown` with the elapsed deadline
-as its reason. An unresolved transport or generation teardown also settles as
-`unknown`. The host never replays the steer.
+Steer on harnesses with a direct native steer RPC uses an ordered, bounded write followed
+by a correlated response wait: the host writes its `agent.command` frame in dispatch order
+under the writer deadline. The host then waits up to the plugin RPC response deadline
+while continuing to process `interrupt`, `stop`, `agent.snapshot`, and lifecycle messages.
+A timeout releases the correlation slot and settles the command as `unknown` with the
+elapsed deadline as its reason. An unresolved transport or generation teardown also settles
+as `unknown`. The host never replays the steer. On Claude, `steer` does not use
+`agent.command`; Store claims pending exact-turn steers alongside `turn_safe_point`
+injects through the authenticated `hook.event` callback and settles them from the
+committed hook receipt.
 
 An optional shared Core `RouteBinding` travels inside the frozen profile snapshot; it
 does not add a service RPC or a new harness. The controlled Codex process must apply the
@@ -787,11 +790,14 @@ Add hooks only for a missing native fact/decision. Config is session-scoped; dec
 bind exact generation/request/deadline. Timeout uses the safe native default; late
 approval is discarded, not queued. Hooks do not duplicate the authoritative stream.
 
-Claude Code delivers `turn_safe_point` context through `PreToolUse.additionalContext`
-and `PostToolUse.additionalContext`. The daemon chooses `before_tool` for a Claude
-steer and frames its text using the shared Swarm note format. The adapter writes
-the supplied text on the selected callback for the exact turn and reports its
-native mechanism. Existing approval callbacks retain permission decisions.
+Claude Code delivers `turn_safe_point` context and exact-turn `steer` commands through
+`PreToolUse.additionalContext` and `PostToolUse.additionalContext`. Store frames each
+claimed item using the shared Swarm note format (preserving Owner and manager sender
+identity) and supplies it to the soonest `before_tool` or `after_tool` `hook.event`
+callback for that exact turn. The adapter writes the supplied text on the selected
+callback and reports `claude.PreToolUse.additionalContext` or
+`claude.PostToolUse.additionalContext` on the committed `hook.before_tool` /
+`hook.after_tool` receipt. Existing approval callbacks retain permission decisions.
 
 Both Claude tool hooks have a three-second native timeout and matching adapter deadlines.
 Empty responses contribute to `empty_after_tool_hooks` on the turn terminal.

@@ -322,7 +322,7 @@ pub(super) async fn serve_plugin_requests(mut connection: PluginConnection, sour
                                 {
                                     Err(Error::new(
                                         "invalid",
-                                        "hook.event requires before_tool or before_model with an exact turn and consumer",
+                                        "hook.event requires before_tool, after_tool, or before_model with an exact turn and consumer",
                                     ))
                                 }
                                 Ok(event) => match timeout_at(request_deadline, store.lock()).await

@@ -52,7 +52,7 @@ pub use command::{
 pub use context::{
     ContextEditPath, ContextItem, ContextNoteCounters, ContextOutcome, ContextWaitRequest,
     InjectArgs, InjectPoint, RetainedInjectArgs, ReviewWorktreeState, TrustedReviewLabels,
-    decode_retained_inject_args, turn_started_data,
+    decode_retained_inject_args, harness_uses_turn_safe_point_steer, turn_started_data,
 };
 pub use diagnostics::{
     MAX_STDERR_BYTES, MAX_STDERR_DIAGNOSTIC_BYTES, StderrDiagnostic, StderrSnapshot, StderrSource,

@@ -20,7 +20,7 @@ impl Router {
         request.target = Some(agent.to_owned());
         request.expected_generation = Some(generation);
         let prepared = self.prepare_submission(request, &Principal::Owner).await;
-        let admission = {
+        let (admission, needs_worker) = {
             let mut store = self.inner.store.lock().await;
             if !store.process_loss_resume_evidence(agent, generation, event_seq)? {
                 return Ok(());
@@ -53,9 +53,10 @@ impl Router {
                 SubmissionContext::default(),
             )?;
             self.publish_locked(&admission.events);
-            admission
+            let needs_worker = admission.is_new && command_needs_worker(&store, &admission.command);
+            (admission, needs_worker)
         };
-        if admission.is_new && command_needs_worker(&admission.command) {
+        if needs_worker {
             self.schedule_admission(&admission);
         }
         self.signal_progress();

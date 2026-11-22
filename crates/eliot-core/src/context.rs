@@ -3,6 +3,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+pub fn harness_uses_turn_safe_point_steer(harness: &str) -> bool {
+    harness == "claude"
+}
+
 /// Persisted file edit evidence never includes an absolute path.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]

@@ -1072,12 +1072,16 @@ impl Router {
             let mut resumes = Vec::with_capacity(RESTART_RESUME_BATCH_SIZE);
             for (id, created_at, rowid) in keys {
                 after = Some((created_at, rowid));
-                let admission = {
+                let (admission, needs_worker) = {
                     let store = self.inner.store.lock().await;
-                    store.recover_accepted_admission(&id)?
+                    let admission = store.recover_accepted_admission(&id)?;
+                    let needs_worker = admission
+                        .as_ref()
+                        .is_some_and(|admission| command_needs_worker(&store, &admission.command));
+                    (admission, needs_worker)
                 };
                 if let Some(admission) = admission
-                    && command_needs_worker(&admission.command)
+                    && needs_worker
                 {
                     if admission.command.verb == "resume" {
                         let candidate = admission
@@ -1124,7 +1128,7 @@ impl Router {
             for candidate in candidates {
                 if let Some(admission) = self.prepare_restart_idle_resume(&candidate).await
                     && admission.is_new
-                    && command_needs_worker(&admission.command)
+                    && command_needs_worker(&*self.inner.store.lock().await, &admission.command)
                 {
                     self.queue_boot_resume(&mut workers, &admission, Some(candidate))
                         .await?;
@@ -1612,7 +1616,7 @@ impl Router {
                 return Err(error);
             }
         };
-        let submitted = {
+        let (submitted, needs_worker) = {
             let mut store = self.inner.store.lock().await;
             let principal = principal_name(principal);
             let submitted =
@@ -1622,9 +1626,11 @@ impl Router {
                     if !admission.events.is_empty() {
                         self.publish_locked(&admission.events);
                     }
-                    Ok(admission)
+                    let needs_worker =
+                        admission.is_new && command_needs_worker(&store, &admission.command);
+                    (Ok(admission), needs_worker)
                 }
-                Err(error) => Err(error),
+                Err(error) => (Err(error), false),
             }
         };
         let admission = match submitted {
@@ -1647,7 +1653,7 @@ impl Router {
                 .insert(admission.command.id.clone());
         }
 
-        if admission.is_new && command_needs_worker(&admission.command) {
+        if needs_worker {
             self.schedule_admission(&admission);
         }
         self.signal_progress();
@@ -2199,7 +2205,7 @@ impl Router {
         let prepared = self
             .prepare_submission_after_authorization(request, &Principal::Owner, false, true)
             .await?;
-        let submitted = {
+        let (submitted, needs_worker) = {
             let mut store = self.inner.store.lock().await;
             let submitted = self.admit_prepared_submission(
                 &mut store,
@@ -2212,9 +2218,11 @@ impl Router {
                     if !admission.events.is_empty() {
                         self.publish_locked(&admission.events);
                     }
-                    Ok(admission)
+                    let needs_worker =
+                        admission.is_new && command_needs_worker(&store, &admission.command);
+                    (Ok(admission), needs_worker)
                 }
-                Err(error) => Err(error),
+                Err(error) => (Err(error), false),
             }
         };
         let admission = submitted?;
@@ -2224,7 +2232,7 @@ impl Router {
                 .lock_recover()
                 .insert(admission.command.id.clone());
         }
-        if admission.is_new && command_needs_worker(&admission.command) {
+        if needs_worker {
             self.schedule_admission(&admission);
         }
         self.signal_progress();
@@ -3095,7 +3103,7 @@ impl Router {
             self.authorize_submission_scope(&mut request, principal)
                 .await?;
         }
-        if !project_authority_preverified {
+        if !project_authority_preverified || request.verb == "steer" {
             self.verify_native_control_target(&request).await?;
         }
         self.check_command_admission_mode(&request.verb)?;
@@ -3265,10 +3273,13 @@ impl Router {
         if is_native_control_verb(&request.verb)
             && let Some(target) = request.target.as_deref()
         {
-            let store = self.inner.store.lock().await;
-            // Preserve idempotent command retries; Store checks new controls
-            // transactionally after resolving an existing command binding.
-            if store.get_command(&request.id)?.is_none() {
+            let agent = {
+                let store = self.inner.store.lock().await;
+                // Preserve idempotent command retries; Store checks new controls
+                // transactionally after resolving an existing command binding.
+                if store.get_command(&request.id)?.is_some() {
+                    return Ok(());
+                }
                 let agent = store.get_agent(target)?.ok_or_else(|| {
                     Error::new("not_found", format!("Agent {target} was not found"))
                 })?;
@@ -3278,6 +3289,21 @@ impl Router {
                         "native control is unavailable for an observe-only Agent",
                     ));
                 }
+                agent
+            };
+            if request.verb == "steer"
+                && request
+                    .expected_generation
+                    .is_none_or(|expected| expected == agent.generation)
+                && matches!(agent.state, AgentState::Busy | AgentState::Waiting)
+                && agent.active_turn.as_deref().is_some_and(|turn| {
+                    request
+                        .expected_turn_id
+                        .as_deref()
+                        .is_none_or(|expected| expected == turn)
+                })
+            {
+                self.inner.plugin_host.check_steer_target(&agent)?;
             }
         }
         Ok(())
@@ -7191,10 +7217,18 @@ fn freeze_attach_profile(
     install_frozen_profile(request, &harness, snapshot, true)
 }
 
-fn command_needs_worker(command: &Command) -> bool {
-    command.verb != "inject"
-        || eliot_core::decode_retained_inject_args(&command.args)
-            .is_ok_and(|args| args.point == eliot_core::InjectPoint::ActiveTurn)
+fn command_needs_worker(store: &eliot_store::Store, command: &Command) -> bool {
+    if command.verb == "inject" {
+        return eliot_core::decode_retained_inject_args(&command.args)
+            .is_ok_and(|args| args.point == eliot_core::InjectPoint::ActiveTurn);
+    }
+    if command.verb == "steer"
+        && let Some(target) = command.target.as_deref()
+        && let Ok(Some(agent)) = store.get_agent(target)
+    {
+        return !eliot_core::harness_uses_turn_safe_point_steer(&agent.harness);
+    }
+    true
 }
 
 fn attention_inject_point(agent: &Agent) -> Option<eliot_core::InjectPoint> {

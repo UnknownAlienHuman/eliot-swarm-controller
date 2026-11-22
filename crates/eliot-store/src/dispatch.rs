@@ -890,6 +890,14 @@ fn dispatch_control_tx(
     }
     // Control-verb support is owned by the PluginHost manifest
     // check; only generation, state, turn and request are rechecked.
+    if command.command.verb == "steer"
+        && eliot_core::harness_uses_turn_safe_point_steer(&agent.harness)
+    {
+        return Err(Error::new(
+            "bad_state",
+            "Claude steer commands are claimed by turn safe-point hooks, not dispatched directly",
+        ));
+    }
     if !matches!(agent.state, AgentState::Busy | AgentState::Waiting) {
         return Err(Error::new(
             "bad_state",

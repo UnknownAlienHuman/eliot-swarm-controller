@@ -205,6 +205,13 @@ impl Router {
                 return None;
             }
         }
+        if command.verb == "steer"
+            && let Some(target) = command.target.as_deref()
+            && let Ok(Some(agent)) = self.inner.store.lock().await.get_agent(target)
+            && eliot_core::harness_uses_turn_safe_point_steer(&agent.harness)
+        {
+            return None;
+        }
         if !self.check_script_dispatch_gate(id, &command).await {
             return None;
         }
@@ -1331,25 +1338,26 @@ impl Router {
             return None;
         }
         let mut command = command.clone();
-        let claude_steer = command.verb == "steer" && agent.harness == "claude";
-        if command.verb == "inject" || claude_steer {
+        if command.verb == "inject" {
             let Some(text) = command.args.get("text").and_then(Value::as_str) else {
-                return Some(Err(Error::new("invalid", "context delivery requires text")));
+                return Some(Err(Error::new(
+                    "native_not_dispatched",
+                    "context delivery requires text",
+                )));
             };
             if text.len() > eliot_core::limits::MAX_TEXT_BYTES {
                 return Some(Err(Error::new(
-                    "frame_too_large",
+                    "native_not_dispatched",
                     "inject text exceeds 512 KiB",
                 )));
             }
             let text = match store.render_injection(&command, text) {
                 Ok(text) => text,
-                Err(error) => return Some(Err(error)),
+                Err(error) => {
+                    return Some(Err(Error::new("native_not_dispatched", *error.message)));
+                }
             };
             command.args["text"] = Value::String(text);
-        }
-        if claude_steer {
-            command.args["steer_hook"] = json!("before_tool");
         }
         let pending = self
             .inner
