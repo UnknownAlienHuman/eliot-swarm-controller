@@ -564,62 +564,7 @@ paths, dot traversal and alternate streams are rejected lexically. Execution mus
 recheck containment and symlink/reparse safety. Removal may delete only untracked or
 ignored content within these frozen directories, never tracked dirt.
 
-## Later configuration example
-
-```toml
-[daemon]
-idempotency_window = "24h"
-limits.max_depth = 8
-limits.max_children_per_agent = 20
-limits.max_tree_agents = 100
-limits.max_selector_targets = 1000
-automation.max_actions_per_minute = 120
-automation.max_parallel_checks = 2
-automation.check_timeout = "10m"
-
-[mail]
-max_unread_bytes_per_agent = 10485760
-max_unread_messages_per_agent = 10000
-
-[process]
-scan_interval = "2s"
-terminal_drain_timeout = "10s"
-
-[git]
-poll_interval = "15s"
-remote_poll = "off"
-fingerprint_max_files = 5000
-fingerprint_max_bytes = 67108864
-
-[projects.app]
-path = "C:/src/app"
-profiles = ["codex-luna"]
-actions = ["run", "interrupt", "send", "stop", "git.fetch"]
-run_env = ["CI"]
-workspace = "worktree"
-
-[projects.app.git]
-fetch_remotes = { origin = "https://github.com/example/app.git" }
-credential_helper = "manager"
-
-[projects.app.interpreters.pwsh]
-program = "C:/Program Files/PowerShell/7/pwsh.exe"
-argv_prefix = ["-NoProfile", "-NonInteractive", "-File"]
-
-[accounts.codex-main]
-max_live = 8
-
-[proxies.opencodex]
-attach = "http://127.0.0.1:10300"
-health = "/readyz"
-base_url_for = { codex = "http://127.0.0.1:10300/v1" }
-max_live = 8
-
-[profiles.codex-opencodex]
-extends = "codex-luna"
-proxy = "opencodex"
-account = "codex-main"
-```
+## Daemon and automation settings
 
 Backlog and automatic cleanup are root-level automation options.
 

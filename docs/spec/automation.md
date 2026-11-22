@@ -1339,7 +1339,12 @@ successor revision. Continued and unknown round events supply no idle key.
 
 The check is the frozen explicit argv from `goal set`, run through the shared
 owned-process custody outside the Store lock with a bounded timeout, a small
-round-context stdin and the daemon environment. Both check streams are
+round-context stdin and the daemon environment. The timeout accepts 1s through
+10m and defaults to 60s. Its deadline starts immediately before spawning the
+check child, after round preparation. Timeout cleanup and custody settlement use
+their own limits. See the [Goal API bounds](../../crates/eliot-core/src/api/goals.rs#L19-L22).
+
+Both check streams are
 secret-redacted into one bounded observation: labelled `[stdout]` and `[stderr]`
 sections, each label stating that stream's own completeness (stderr is the
 capture's bounded tail), and each section keeping its beginning and end around an
@@ -1493,10 +1498,10 @@ seq as an idle key through the same `goal round` path — same probe, gates,
 check custody and conditional commit — under a fresh owner mutation id. It
 skips cadenced Goals (slot-keyed), paused or terminal Goals, drifted
 generations, and anything while automation is draining; it waits while an
-active native Goal drives. Each automatic round runs in its own task, at most
-one per Goal and four Goals at once, so a slow check never stalls another
-Goal's round; a newer event for a Goal with a round in flight is driven as
-a follow-up when that round resolves. Bus events dropped past the cap or to
+active native Goal drives. The driver starts each automatic round in its own task
+and runs up to four across Goals. Automatic and explicit rounds share the same
+per-Goal single-flight marker. The driver follows up on a newer event for a Goal
+when its in-flight round resolves. Bus events dropped past the cap or to
 bus lag are logged, as are queued waits and stale rounds. Other races
 against explicit rounds resolve through the
 single-flight marker and the burn and stay silent. Shutdown cancels every

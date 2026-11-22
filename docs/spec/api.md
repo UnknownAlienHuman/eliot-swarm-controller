@@ -774,7 +774,7 @@ the optional command and mail windows, and the retained-event watermark
 `pruned_through`. The event and exited-child windows have finite defaults.
 When `config.toml` cannot be read, status stays available with a redacted
 `config_error` (`code: message`) and unknown window values. See
-[configuration](configuration.md#later-configuration-example) for the defaults
+[configuration](configuration.md#daemon-and-automation-settings) for the defaults
 and the older-Store conversion.
 
 `maintenance.run` is owner-only and accepts an empty object. It reloads the
