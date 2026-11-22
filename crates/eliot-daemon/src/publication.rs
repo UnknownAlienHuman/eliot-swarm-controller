@@ -8,7 +8,7 @@ use crate::{
     automation,
     common::now_ms,
     git_actions,
-    git_monitor::{GitProbe, work_fingerprint_from_snapshot},
+    git_monitor::{GitProbe, scope_digests, work_fingerprint_from_snapshot},
     workspace_git::WorkspaceGit,
 };
 use eliot_core::{
@@ -20,6 +20,7 @@ use eliot_core::{
 };
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -304,6 +305,30 @@ pub(crate) async fn execute(context: GitPublishExecutionContext<'_>) -> GitPubli
     } else {
         None
     };
+    let checked_contents = if existing_commit {
+        None
+    } else {
+        match changed_contents(root, &snapshot) {
+            Ok(contents)
+                if git
+                    .work_fingerprint(&frozen.workspace)
+                    .await
+                    .ok()
+                    .as_deref()
+                    == Some(frozen.check.fingerprint.as_str()) =>
+            {
+                Some(contents)
+            }
+            _ => {
+                return execution(
+                    CommandState::Rejected,
+                    "git_publish_snapshot_changed",
+                    json!({}),
+                    None,
+                );
+            }
+        }
+    };
     let stage_args = ["add", "--all"];
     let staged = if existing_commit {
         None
@@ -469,14 +494,35 @@ pub(crate) async fn execute(context: GitPublishExecutionContext<'_>) -> GitPubli
         .await;
     }
 
+    let Some(contents) = checked_contents.as_ref() else {
+        return execution(
+            CommandState::Failed,
+            "git_publish_contents_unavailable",
+            json!({}),
+            None,
+        );
+    };
+    let tree = match checked_commit_tree(&git, root, frozen, contents, timeout).await {
+        Ok(tree) => tree,
+        Err(_) => {
+            return execution(
+                CommandState::Failed,
+                "git_publish_staged_tree_changed",
+                json!({"code":"git_publish_staged_tree_changed"}),
+                None,
+            );
+        }
+    };
     let subject = frozen.check.subject.as_str();
     let commit_args = [
         "-c",
         "commit.gpgSign=false",
-        "commit",
+        "commit-tree",
+        tree.as_str(),
+        "-p",
+        frozen.head_oid.as_str(),
         "--no-gpg-sign",
-        "--cleanup=verbatim",
-        "--message",
+        "-m",
         subject,
     ];
     let committed = match git
@@ -499,17 +545,63 @@ pub(crate) async fn execute(context: GitPublishExecutionContext<'_>) -> GitPubli
             );
         }
     };
-    if !effect_quiescent(&committed) {
+    let commit_object = match &committed {
+        ProcessOutcome::Completed(capture) if capture.stdout_complete => {
+            std::str::from_utf8(&capture.stdout).ok().map(str::trim)
+        }
+        _ => None,
+    };
+    let Some(commit_object) = commit_object.filter(|oid| is_git_oid(oid)) else {
+        let state = if effect_is_definite_exit(&committed) {
+            CommandState::Failed
+        } else {
+            CommandState::Unknown
+        };
+        return execution(state, "git_publish_commit_object_unproven", json!({}), None);
+    };
+    if router.verify_git_publish_state(frozen).await.is_err()
+        || automation::verify_project_registration(data_root, registration)
+            .await
+            .is_err()
+        || *cancellation.borrow()
+    {
         return execution(
-            CommandState::Unknown,
-            "git_publish_commit_quiescence_unknown",
-            json!({"code":"git_publish_commit_outcome_unknown"}),
+            CommandState::Failed,
+            "git_publish_authority_changed_before_ref",
+            json!({}),
             None,
         );
     }
+    let branch_ref = format!("refs/heads/{}", frozen.branch);
+    let updated = match git
+        .workspace_effect_command(
+            root,
+            &[
+                "update-ref",
+                "--no-deref",
+                &branch_ref,
+                commit_object,
+                &frozen.head_oid,
+            ],
+            timeout,
+            Arc::clone(&secret_policy),
+            cancellation.clone(),
+        )
+        .await
+    {
+        Ok(outcome) if effect_quiescent(&outcome) => outcome,
+        _ => {
+            return execution(
+                CommandState::Unknown,
+                "git_publish_commit_ref_unknown",
+                json!({}),
+                None,
+            );
+        }
+    };
     let commit_oid = match verify_commit_readback(&git, root, frozen, timeout).await {
-        Ok(Some(oid)) => oid,
-        Ok(None) if effect_is_definite_exit(&committed) => {
+        Ok(Some(oid)) if oid == commit_object => oid,
+        Ok(None) if effect_is_definite_exit(&updated) => {
             return execution(
                 CommandState::Failed,
                 "git_publish_commit_failed",
@@ -1037,6 +1129,53 @@ fn endpoint_matches_github(endpoint: &str, gh: &ProjectGitHubCliView) -> Result<
         path = without_git.to_owned();
     }
     Ok(path == gh.repository)
+}
+
+fn changed_contents(root: &Path, snapshot: &GitSnapshot) -> Result<BTreeMap<String, String>> {
+    let contents = scope_digests(
+        root,
+        snapshot.dirty.iter().flat_map(|entry| {
+            std::iter::once(entry.path.as_str()).chain(entry.original_path.as_deref())
+        }),
+    )?;
+    if contents.values().any(|digest| digest == "other") {
+        return Err(Error::new(
+            "unsupported",
+            "publication contains a non-file change",
+        ));
+    }
+    Ok(contents)
+}
+
+async fn checked_commit_tree(
+    git: &GitProbe,
+    root: &Path,
+    frozen: &FrozenGitPublish,
+    contents: &BTreeMap<String, String>,
+    timeout: Duration,
+) -> Result<String> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| Error::new("invalid", "git.publish timeout is out of range"))?;
+    let tree = read_git_line(git, root, &["write-tree"], deadline).await?;
+    if !is_git_oid(&tree) {
+        return Err(Error::new("source_integrity", "Git staged tree is invalid"));
+    }
+    let snapshot = capture_workspace_snapshot(&frozen.workspace).await?;
+    let diff = git
+        .workspace_command(root, &["diff", "--quiet", &tree, "--"], deadline)
+        .await?;
+    if diff.code != 0
+        || snapshot.head.as_deref() != Some(frozen.head_oid.as_str())
+        || snapshot.branch.as_deref() != Some(frozen.branch.as_str())
+        || changed_contents(root, &snapshot)? != *contents
+    {
+        return Err(Error::new(
+            "stale_generation",
+            "Git staged tree differs from the checked worktree",
+        ));
+    }
+    Ok(tree)
 }
 
 async fn read_branch_and_head(

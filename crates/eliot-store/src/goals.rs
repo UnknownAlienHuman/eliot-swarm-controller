@@ -2482,13 +2482,19 @@ fn project_check_passed_event(
         .final_text
         .as_deref()
         .and_then(|text| text.lines().next())
-        .filter(|line| {
-            !line.trim().is_empty() && line.len() <= 1024 && !line.chars().any(char::is_control)
-        })
     else {
         return Ok(None);
     };
     if turn.state != TurnState::Completed || turn.outcome != Some(core::TurnOutcome::Success) {
+        return Ok(None);
+    }
+    let receipt = core::api::ProjectCheckPassed {
+        project: project.to_owned(),
+        turn_id,
+        fingerprint: fingerprint.to_owned(),
+        subject: subject.to_owned(),
+    };
+    if receipt.validate().is_err() {
         return Ok(None);
     }
     insert_daemon_event(
@@ -2498,12 +2504,8 @@ fn project_check_passed_event(
         "goal",
         Some(agent_num),
         Some(agent.generation),
-        json!({
-            "project": project,
-            "turn_id": turn_id,
-            "fingerprint": fingerprint,
-            "subject": subject,
-        }),
+        serde_json::to_value(receipt)
+            .map_err(|_| Error::new("internal", "project check receipt could not be encoded"))?,
     )
     .map(Some)
 }

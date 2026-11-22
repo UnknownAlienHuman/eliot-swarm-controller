@@ -174,13 +174,10 @@ receive it on profile-selected launches. An explicit assignment Goal takes
 priority, and a later manual `goal.set` replaces the default through the ordinary
 Goal revision. The first round waits for the Agent's first turn to settle. The
 idle Goal driver runs the check at turn end and enforces `max_rounds`.
-A successful final Goal round persists in the existing Store `goals` row: the
-frozen `definition.check` and state counters including `last_exit_code`,
-`last_check_at` and `last_output_digest`, together with completed status. The
-`goal_markers` reservation is deleted on commit. This readback is not a project
-publication receipt because it does not bind the checked tree and answer turn.
-Projects without such a Goal need a separate final-check result before a future
-publication action can use that result as a gate.
+A successful final round records the frozen check and its result in the Goal.
+With publication enabled, the same transaction records a
+[`project.check.passed` receipt](#final-project-check-publication) after the
+configured project check passes against the same worktree state.
 
 Load project rules only from the registered canonical checkout's `.eliot/rules/*.toml`,
 never from an Agent worktree. Their principal is `project:ID`. Router authorization and
@@ -975,8 +972,7 @@ are not turned into Owner RPC clients.
 This increment connects `git.fetch` and the check-bound `git.publish` recipe below through
 the existing Router/Store command path. `git.fetch` remains available to Owner and
 registered-project event/timer rules. `git.publish` is project-rule-only and requires the
-exact `project.check.passed` event; a generic `goal.changed`, manual Goal completion,
-ordinary turn event, or script result cannot trigger it. The dedicated event is committed
+exact `project.check.passed` event. The dedicated event is committed
 atomically with the final project-check success and carries Core `ProjectCheckPassed`
 (`project`, `turn_id`, `fingerprint`, `subject`). Its envelope binds the Agent generation
 and workspace. `subject` is the first line of that same retained final answer; the Router
@@ -994,9 +990,11 @@ identity. A clean tree never creates an empty commit. If HEAD equals the managed
 performs no push or PR; if the checked branch already contains commits ahead of its base,
 a configured remote may publish that exact HEAD without creating another commit.
 
-`git.publish` commits all nonignored staged, modified, deleted, and untracked files from
-the exact passed snapshot using the answer subject. It uses bounded Git argv and existing
-process custody with hooks disabled. A named `remote` selects only an Owner-approved
+`git.publish` commits the nonignored changes from the passed snapshot using the
+answer subject. It verifies the staged contents, writes the commit from that
+immutable tree, and updates the managed branch only if it still points to the
+checked parent. It uses bounded Git argv and existing process custody with hooks
+disabled. A named `remote` selects only an Owner-approved
 `[projects.ID.git.publication].remotes` endpoint; the endpoint is frozen, direct, and never
 derived from `origin` or `pushurl`. The push targets only
 `refs/heads/<managed-branch>` without force. `create_pr = true` additionally requires the
@@ -1129,16 +1127,6 @@ host = "github.com"
 repository = "example/app-qa"
 base_ref = "main"
 ```
-
-For a private bare push proof, create a disposable bare repository under the manager's
-fresh QA root, point `qa` at its absolute path, and use the rule above without
-`create_pr`. After the real final-check event, compare
-`git --git-dir C:/qa-833/app.git rev-parse refs/heads/<branch>` with the durable command
-outcome's `commit_oid`. This proves only the local bare push. PR qualification uses a
-separate disposable private GitHub repository and an explicitly selected QA `gh` config
-directory; verify the resulting `pull_request_url` and `gh pr view` against the exact
-branch/base, then remove the QA PR/repository/config. Never point the proof at a production
-remote or copy credentials into Eliot or the Agent environment.
 
 After proving the process stopped, read back the tracking ref through the same frozen
 configuration and canonical common directory. Unknown settlement is read-only: it never
