@@ -398,7 +398,7 @@ fn encode_record(
         if let Some(details) = error.details.as_deref() {
             value["invalid_param"] = json!({
                 "field": bounded_text(policy, &details.field, 128),
-                "expected": bounded_text(policy, &details.expected, 256),
+                "expected": bounded_text(policy, &details.expected.to_string(), 256),
             });
         }
         value["origin"] = json!(error.origin_or_unknown().as_str());
