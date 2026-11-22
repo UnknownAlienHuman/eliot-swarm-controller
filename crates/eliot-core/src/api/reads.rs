@@ -230,6 +230,10 @@ pub struct AgentResultRequest {
     )]
     #[schemars(range(min = 1, max = 1000))]
     pub limit: usize,
+    /// Include the current Agent DTO; omitted metadata keeps result reads compact.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[schemars(description = "Include agent_metadata; defaults to false.")]
+    pub metadata: bool,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -246,6 +250,7 @@ impl AgentResultRequest {
             generation: None,
             turn_id: None,
             limit: super::DEFAULT_LIMIT,
+            metadata: false,
             before: None,
         }
     }
@@ -345,10 +350,12 @@ pub struct AgentResultResponse {
     /// The credential's generation for a self-read, the requested generation
     /// for an explicit filter, or the Agent's current generation otherwise.
     pub generation: i64,
+    /// The current generation, also available without the full Agent DTO.
+    pub current_generation: i64,
     #[serde(deserialize_with = "object_turns")]
     pub turns: Vec<Turn>,
-    #[serde(deserialize_with = "object_agent")]
-    pub agent_metadata: Agent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_metadata: Option<Agent>,
     #[schemars(description = "Cursor for the next older page, or null when complete.")]
     #[serde(deserialize_with = "nullable")]
     pub next: Option<ResultCursor>,
@@ -434,13 +441,6 @@ fn present_result_cursor<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<Option<ResultCursor>, D::Error> {
     ResultCursor::deserialize(deserializer).map(Some)
-}
-
-fn object_agent<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> std::result::Result<Agent, D::Error> {
-    let object = Map::<String, Value>::deserialize(deserializer)?;
-    serde_json::from_value(Value::Object(object)).map_err(serde::de::Error::custom)
 }
 
 fn object_turns<'de, D: serde::Deserializer<'de>>(

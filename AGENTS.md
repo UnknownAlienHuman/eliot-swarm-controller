@@ -70,3 +70,17 @@ product uses the five native adapters (Codex, Claude, OpenCode, Muse,
 Antigravity) with explicit profiles and frozen captured selectors. Do not
 restore the fake path or any synthetic runtime. Automation, mail and
 additional harnesses follow in the order defined by the roadmap.
+
+## Private QA, desktop and live proof
+
+- Start a fresh [private stand](docs/spec/api.md#cli) with
+  `swarm stand up --root <qa-directory> --profile <private-config>`. Clear inherited
+  `ELIOT_*` variables first and use private app-data paths on Windows. Use the printed
+  directory for every daemon command and keep production data, harness sessions and
+  global harness configuration outside the stand.
+- Use plain repository names under one QA directory. Run the QA desktop minimized
+  without activation and drive its PID through UI Automation. If a screenshot is
+  black, check whether the console display is off. Close the QA desktop after capture.
+- Register owned proof artifacts under the bound `ELIOT_ARTIFACT_ROOT`. Drain and
+  remove the stand with `swarm stand down <qa-directory>` in the same turn. Clean up
+  only the files and processes the proof owns.

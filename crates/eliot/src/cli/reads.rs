@@ -14,8 +14,8 @@ use eliot_core::api::{
     AgentStatsResponse, DiagnoseRequest, DiagnoseResponse, EventsBoundsRequest,
     EventsBoundsResponse, EventsFilter, EventsReadRequest, EventsReadResponse,
     EventsSubscribeRequest, EventsSubscribeResponse, HarnessDoctorRequest, HarnessDoctorResponse,
-    ObservationPage, ObserveHeavyRequest, ObserveHeavyResponse, TurnCounterMissing,
-    UsageSummaryRequest, UsageSummaryResponse,
+    MAX_SWARM_MCP_TURNS, ObservationPage, ObserveHeavyRequest, ObserveHeavyResponse,
+    TurnCounterMissing, UsageSummaryRequest, UsageSummaryResponse,
 };
 use eliot_core::api::{AgentSummary, activity_state_name};
 use eliot_core::{AgentState, Error as CoreError};
@@ -288,6 +288,7 @@ pub(crate) fn work_cell(summary: &eliot_core::api::AgentSummary) -> String {
 pub(crate) async fn run_usage(
     UsageArgs {
         agent,
+        agent_positional,
         generation: ReadGenerationArgs { generation },
         project,
         root,
@@ -296,7 +297,7 @@ pub(crate) async fn run_usage(
     json_output: bool,
 ) -> Result<u8, Failure> {
     let params = UsageSummaryRequest {
-        agent,
+        agent: agent.or(agent_positional),
         generation,
         project,
         root,
@@ -543,6 +544,7 @@ pub(crate) async fn run_result(
         turn_id,
         before,
         page: PageArgs { limit },
+        metadata,
     }: ResultArgs,
     data_dir: PathBuf,
     json_output: bool,
@@ -559,6 +561,7 @@ pub(crate) async fn run_result(
         turn_id,
         before,
         limit,
+        metadata,
     };
     read_and_print!(
         &data_dir,
@@ -610,8 +613,24 @@ pub(crate) async fn run_events(
     json_output: bool,
 ) -> Result<u8, Failure> {
     validate_limit(limit)?;
+    let after = match since {
+        Some(after) => after,
+        None => {
+            let bounds: EventsBoundsResponse = eliot_daemon::client_call_typed(
+                &data_dir,
+                "events.bounds",
+                &EventsBoundsRequest {
+                    filter: EventsFilter::default(),
+                },
+            )
+            .await
+            .map_err(Failure::for_read)?;
+            bounds.validate().map_err(Failure::for_read)?;
+            bounds.pruned_through
+        }
+    };
     let params = EventsReadRequest {
-        after: since.unwrap_or(0),
+        after,
         limit,
         filter: EventsFilter::default(),
     };
@@ -1236,6 +1255,20 @@ pub(crate) fn print_usage_table(response: &UsageSummaryResponse) {
         response.turns.turns_unknown_excluded,
         response.turns.turns_running_excluded,
     );
+    if response.swarm_mcp.is_empty() {
+        println!("  swarm MCP calls per turn: none retained");
+    } else {
+        println!("  swarm MCP calls per turn:");
+        for usage in &response.swarm_mcp {
+            println!(
+                "    {}#{} turn {} calls {} refusals {}",
+                usage.agent, usage.generation, usage.turn_id, usage.calls, usage.refusals
+            );
+        }
+    }
+    if response.swarm_mcp_truncated {
+        println!("  swarm MCP usage limited to the most recent {MAX_SWARM_MCP_TURNS} turns");
+    }
     println!(
         "  {:<14} {:<7} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
         "SCOPE", "COUNTED", "INPUT", "OUTPUT", "REASON", "THINK", "CACHE_R", "CACHE_W", "TOTAL"

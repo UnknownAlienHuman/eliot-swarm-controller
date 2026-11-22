@@ -563,27 +563,29 @@ impl Store {
             "DELETE FROM claims WHERE agent = ?1 AND generation = ?2 AND glob = ?3",
             params![target_num, target.generation, glob],
         ));
-        if removed == 0 {
-            return Err(Error::new("not_found", "claim was not found"));
-        }
-        let event = insert_daemon_event(
-            &tx,
-            now,
-            "claim.changed",
-            "coordination",
-            Some(target_num),
-            Some(target.generation),
-            json!({
-                "agent": target.id,
-                "generation": target.generation,
-                "glob": glob,
-                "live": false,
-            }),
-        )?;
+        let events = if removed == 0 {
+            Vec::new()
+        } else {
+            vec![insert_daemon_event(
+                &tx,
+                now,
+                "claim.changed",
+                "coordination",
+                Some(target_num),
+                Some(target.generation),
+                json!({
+                    "agent": target.id,
+                    "generation": target.generation,
+                    "glob": glob,
+                    "live": false,
+                }),
+            )?]
+        };
         let value = ClaimReleaseResponse {
             agent: target.id.clone(),
             generation: target.generation,
             glob,
+            released: removed,
         };
         request.validate_response(&value)?;
         retain_write_tx(
@@ -597,10 +599,7 @@ impl Store {
             now,
         )?;
         commit_transaction(tx, &self.write_faulted)?;
-        Ok(Change {
-            value,
-            events: vec![event],
-        })
+        Ok(Change { value, events })
     }
 }
 

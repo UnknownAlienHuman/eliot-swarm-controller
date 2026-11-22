@@ -6,7 +6,7 @@
 //! startup (private ACL, atomic replace); each harness plugin then exposes
 //! the materialized files through that harness's own per-session mechanism
 //! (plugin directory, skill roots, isolated config) or, where the harness
-//! offers none, through the launch-time first-turn system context. No skill
+//! offers none, through a pointer in the first turn. No skill
 //! file is ever written into a user checkout or a global directory.
 
 use std::path::{Path, PathBuf};

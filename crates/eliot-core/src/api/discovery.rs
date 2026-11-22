@@ -40,6 +40,9 @@ pub struct MethodsRequest {
     #[serde(default)]
     #[schemars(range(min = 1, max = 50))]
     pub limit: Option<usize>,
+    /// Include one-line method summaries.
+    #[serde(default)]
+    pub full: bool,
 }
 
 impl MethodsRequest {
@@ -132,7 +135,8 @@ impl ProjectListRequest {
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct MethodSummary {
     pub method: String,
-    pub summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -145,18 +149,24 @@ pub struct MethodsResponse {
 pub struct MethodHelpResponse {
     pub method: String,
     pub summary: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub cli_aliases: Vec<String>,
     /// Sorted compact request field descriptors (`name (required|optional):
     /// type [bounds] - documented constraints`), derived from the request
     /// DTO schema. Compact help carries these instead of the full JSON
     /// Schemas.
     pub fields: Vec<String>,
-    pub request_schema: Value,
-    pub response_schema: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_schema: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_schema: Option<Value>,
     pub example: Value,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub mutation_id: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub scopes: Vec<String>,
     pub limits: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unsupported: Vec<String>,
 }
 
@@ -245,23 +255,65 @@ pub fn decode_params_at<T: DeserializeOwned + JsonSchema>(params: Value, root: &
         node = resolve(&schema, node);
         if unknown_field {
             path.push_str(".<unknown-field>");
+            return Error::invalid_field_schema(path, unknown_field_expectation(node));
         }
-        let mut expectation = json!({
-            "allowed_fields": node.get("properties").and_then(Value::as_object).map(|properties| properties.keys().collect::<Vec<_>>()),
-            "type": node.get("type"), "enum": node.get("enum"),
-            "minimum": node.get("minimum"), "maximum": node.get("maximum"),
-            "description": node.get("description"), "required": node.get("required"),
-        });
-        if let Some(object) = expectation.as_object_mut() {
-            object.retain(|_, value| !value.is_null());
-            for key in ["anyOf", "oneOf", "minItems", "maxItems", "minLength", "maxLength", "pattern", "x-maxBytes", "x-maxEncodedBytes"] {
-                if let Some(value) = node.get(key) { object.insert(key.to_owned(), value.clone()); }
+        let mut expectation = serde_json::Map::new();
+        for key in [
+            "type",
+            "enum",
+            "minimum",
+            "maximum",
+            "description",
+            "anyOf",
+            "oneOf",
+            "minItems",
+            "maxItems",
+            "minLength",
+            "maxLength",
+            "pattern",
+            "x-maxBytes",
+            "x-maxEncodedBytes",
+        ] {
+            if let Some(value) = node.get(key) {
+                expectation.insert(key.to_owned(), value.clone());
             }
         }
-        let expected =
-            serde_json::to_string(&expectation).unwrap_or_else(|_| "DTO field shape".to_owned());
-        Error::invalid_field(path, expected.chars().take(512).collect::<String>())
+        if expectation.is_empty() {
+            expectation.insert(
+                "description".to_owned(),
+                json!("Use api.help for the field constraints."),
+            );
+        }
+        Error::invalid_field_schema(path, Value::Object(expectation))
     })
+}
+
+fn unknown_field_expectation(node: &Value) -> Value {
+    let mut expectation = json!({"type": "object", "additionalProperties": false});
+    if let Some(properties) = node.get("properties").and_then(Value::as_object) {
+        let required = node
+            .get("required")
+            .and_then(Value::as_array)
+            .map_or(&[][..], Vec::as_slice);
+        let allowed_fields = bounded_field_names(properties.keys().map(String::as_str));
+        let required_fields = bounded_field_names(required.iter().filter_map(Value::as_str));
+        if allowed_fields.len() < properties.len() || required_fields.len() < required.len() {
+            expectation["fields_truncated"] = Value::Bool(true);
+        }
+        expectation["allowed_fields"] = json!(allowed_fields);
+        expectation["required"] = json!(required_fields);
+    }
+    expectation
+}
+
+fn bounded_field_names<'a>(names: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
+    // Leave room for both lists and the surrounding fragment within the 512-byte limit.
+    names
+        .scan(192_usize, |remaining, name| {
+            *remaining = remaining.checked_sub(json!(name).to_string().len() + 1)?;
+            Some(name)
+        })
+        .collect()
 }
 
 fn resolve<'a>(root: &'a Value, mut node: &'a Value) -> &'a Value {

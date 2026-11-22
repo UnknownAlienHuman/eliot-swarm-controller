@@ -10,7 +10,7 @@ impl Store {
     /// generation when `generation` is supplied.
     pub fn agent_result_page(
         &self,
-        agent: Agent,
+        agent: &Agent,
         generation_filter: Option<i64>,
         request: &AgentResultRequest,
     ) -> Result<AgentResultResponse> {
@@ -21,8 +21,9 @@ impl Store {
         let mut response = AgentResultResponse {
             agent: request.id.clone(),
             generation,
+            current_generation: agent.generation,
             turns: Vec::new(),
-            agent_metadata: agent,
+            agent_metadata: request.metadata.then(|| agent.clone()),
             next: None,
             generation_boundaries: Vec::new(),
         };
@@ -30,7 +31,7 @@ impl Store {
             let mut turn = self
                 .get_turn(&response.agent, generation, turn_id)?
                 .ok_or_else(|| Error::new("not_found", format!("turn {turn_id} was not found")))?;
-            self.fill_turn_readback(&response.agent_metadata, &mut turn)?;
+            self.fill_turn_readback(agent, &mut turn)?;
             let mask_growth = unknown_status_growth(&turn);
             response.turns.push(turn);
             response
@@ -41,12 +42,12 @@ impl Store {
         }
 
         let before = request.before.as_ref();
-        if before.is_none() && generation > 0 && generation == response.agent_metadata.generation {
+        if before.is_none() && generation > 0 && generation == agent.generation {
             response
                 .generation_boundaries
                 .push(self.generation_boundary(agent_num, generation)?);
         }
-        // Includes the metadata, response fields, empty arrays and null cursor.
+        // Includes the response fields, optional metadata, empty arrays and null cursor.
         let mut bytes = encode_json(&response)?.len();
         ensure_result_budget(bytes)?;
 
@@ -88,8 +89,8 @@ impl Store {
         while response.turns.len() < limit {
             let Some(row) = rows.next() else { break };
             let (record, insertion_seq, reason) = row.map_err(sql_error)?;
-            let mut turn = turn_from_record(record, &response.agent_metadata.harness)?;
-            self.fill_turn_readback(&response.agent_metadata, &mut turn)?;
+            let mut turn = turn_from_record(record, &agent.harness)?;
+            self.fill_turn_readback(agent, &mut turn)?;
             let boundary = response
                 .generation_boundaries
                 .last()

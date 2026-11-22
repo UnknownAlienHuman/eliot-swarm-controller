@@ -67,9 +67,12 @@ impl MailLimits {
     }
 }
 
-#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    schemars::JsonSchema, Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum MailMode {
+    #[default]
     Queue,
     Send,
     Steer,
@@ -87,6 +90,18 @@ impl MailMode {
     }
 }
 
+#[derive(schemars::JsonSchema)]
+#[schemars(untagged)]
+#[doc(hidden)]
+#[allow(dead_code)] // Used only through Schemars field overrides.
+enum MailIdentifierListSchema {
+    One(#[schemars(length(min = 1))] String),
+    Many(
+        #[schemars(length(min = 1, max = MAX_MAIL_RECIPIENTS), extend("uniqueItems" = true))]
+        Vec<String>,
+    ),
+}
+
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MailSendRequest {
@@ -94,10 +109,15 @@ pub struct MailSendRequest {
         description = "Caller-retained mutation id; MCP callers may omit id and the server mints a ULID, returned for retry. Otherwise use a fresh ULID for a new write."
     )]
     pub id: String,
-    #[schemars(length(min = 1, max = MAX_MAIL_RECIPIENTS), extend("uniqueItems" = true), description = "Distinct concrete canonical a<positive i64> Agent ids.")]
-    pub to: Vec<String>,
+    #[serde(deserialize_with = "super::deserialize_string_list")]
     #[schemars(
-        description = "Only queue is implemented; send/steer/inject parse but return unsupported."
+        with = "MailIdentifierListSchema",
+        description = "One concrete canonical a<positive i64> Agent id or an array of 1 to 100 distinct ids."
+    )]
+    pub to: Vec<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Defaults to queue. Only queue is implemented; send/steer/inject parse but return unsupported."
     )]
     pub mode: MailMode,
     #[schemars(extend("x-maxBytes" = MAX_MAIL_TEXT_BYTES), description = "Mail body, at most 32768 UTF-8 bytes, no NUL; empty text is allowed.")]
@@ -181,6 +201,11 @@ impl MailSendRequest {
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MailDefinitionArgs {
+    #[serde(deserialize_with = "super::deserialize_string_list")]
+    #[schemars(
+        with = "MailIdentifierListSchema",
+        description = "One concrete canonical a<positive i64> Agent id or an array of 1 to 100 distinct ids."
+    )]
     pub to: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread: Option<String>,
@@ -468,7 +493,11 @@ pub struct MailAckRequest {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
-    #[schemars(length(min = 1, max = MAX_MAIL_ACK_IDS), extend("uniqueItems" = true), description = "Distinct exact delivery ids; reading a delivery never acknowledges it.")]
+    #[serde(deserialize_with = "super::deserialize_string_list")]
+    #[schemars(
+        with = "MailIdentifierListSchema",
+        description = "One exact delivery id or an array of 1 to 100 distinct delivery ids; reading a delivery never acknowledges it."
+    )]
     pub deliveries: Vec<String>,
 }
 
@@ -1297,6 +1326,7 @@ impl ClaimReleaseRequest {
         }
         if response.glob != normalize_claim_glob(&self.glob).map_err(|_| unproven())?
             || response.generation < 0
+            || response.released > 1
         {
             return Err(unproven());
         }
@@ -1318,6 +1348,14 @@ pub struct ClaimReleaseResponse {
     pub agent: String,
     pub generation: i64,
     pub glob: String,
+    #[serde(default = "previous_claim_release_count")]
+    #[schemars(range(max = 1))]
+    pub released: usize,
+}
+
+// Successful receipts retained before the count was added always removed one claim.
+fn previous_claim_release_count() -> usize {
+    1
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

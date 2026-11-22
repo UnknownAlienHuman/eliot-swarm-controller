@@ -97,7 +97,7 @@ const METHODS: &[Method] = &[
     method!("inference.cancel", InferenceCancelRequest, InferenceMutationResponse, false, true, "Cancel an own queued call; sending calls honestly report too_late.", {"id":EXAMPLE_ID,"call_id":EXAMPLE_ID}),
     method!("inference.release", InferenceReleaseRequest, InferenceMutationResponse, false, true, "Fence publication and clean owned copies after backup classification.", {"id":EXAMPLE_ID,"call_id":EXAMPLE_ID,"disposition":"abandon_for_erasure","result_sha256":null,"backup_dependency":"no_backup_dependencies"}),
     method!("api.methods", MethodsRequest, MethodsResponse, false, false, "List/search callable canonical methods in bounded pages.", {"query":"mail", "limit":20}),
-    method!("api.help", MethodHelpRequest, MethodHelpResponse, false, false, "Read a method's DTO schemas, example and limits.", {"method":"mail.send"}),
+    method!("api.help", MethodHelpRequest, MethodHelpResponse, false, false, "Read compact DTO fields and an example; full schemas are opt-in.", {"method":"mail.send"}),
     method!(
         "api.identity",
         IdentityRequest,
@@ -205,6 +205,7 @@ const METHODS: &[Method] = &[
     ),
     method!("events.read", EventsReadRequest, EventsReadResponse, false, false, "Read a bounded event page; history gaps remain explicit.", {"after":0,"limit":20}),
     method!("events.subscribe", EventsSubscribeRequest, EventsSubscribeResponse, false, false, "Long-poll a bounded event page, at most 30 seconds.", {"after":0,"limit":20,"wait_ms":1000}),
+    method!("child.run", ChildRunRequest, ChildRunResponse, false, true, "Launch one child with its first input and return the exact result; wait_ms:0 registers a durable completion wake.", {"id":EXAMPLE_ID,"text":"Review the requested source and summarize the result.","wait_ms":0}),
     method!("swarm.wait", SwarmWaitRequest, SwarmWaitResponse, false, false, "Wait up to 30 s for frozen child commands/turns (all/any); completed turns return final_text.", {"commands":[EXAMPLE_ID],"turns":[],"mode":"all","wait_ms":30000}),
     method!("swarm.digest", SwarmDigestRequest, SwarmDigestResponse, false, true, "Register a durable completion digest with the standard mail wake.", {"id":EXAMPLE_ID,"to":"a1","mode":"all","commands":[EXAMPLE_ID],"turns":[]}),
     method!("swarm.reparent", ReparentRequest, ReparentResponse, true, true, "Move one Agent subtree or all children to a controlled manager; Owner only.", {"id":EXAMPLE_ID,"agent":"a2","expected_generation":1,"parent":"a3","parent_generation":1}),
@@ -363,7 +364,71 @@ fn request_takes_id(method: &Method) -> bool {
         .is_some()
 }
 
+fn method_suggestions(requested: &str, principal: &Principal) -> Vec<&'static str> {
+    if requested.len() > 128 {
+        return Vec::new();
+    }
+    let normalized = requested.strip_prefix("swarm.").unwrap_or(requested);
+    let mut candidates = METHODS
+        .iter()
+        .filter(|method| visible(method, principal))
+        .filter_map(|method| {
+            let distance =
+                edit_distance(normalized, method.name).min(edit_distance(requested, method.name));
+            (distance <= 3).then_some((distance, method.name))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|(distance, name)| (*distance, *name));
+    candidates
+        .into_iter()
+        .take(3)
+        .map(|(_, name)| name)
+        .collect()
+}
+
+pub(super) fn unavailable_method(requested: &str, principal: &Principal) -> Error {
+    let suggestions = method_suggestions(requested, principal);
+    let message = if suggestions.is_empty() {
+        "Method unavailable. Use api.methods for callable names.".to_owned()
+    } else {
+        format!(
+            "Method unavailable. Did you mean {}?",
+            suggestions.join(", ")
+        )
+    };
+    Error::new("unsupported", message)
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let left = left.chars().collect::<Vec<_>>();
+    let right = right.chars().collect::<Vec<_>>();
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    for (row, left_char) in left.iter().enumerate() {
+        let mut current = Vec::with_capacity(right.len() + 1);
+        current.push(row + 1);
+        for (column, right_char) in right.iter().enumerate() {
+            let substitution = previous[column] + if left_char == right_char { 0 } else { 1 };
+            current.push(
+                (current[column] + 1)
+                    .min(previous[column + 1] + 1)
+                    .min(substitution),
+            );
+        }
+        previous = current;
+    }
+    previous[right.len()]
+}
+
+pub(super) fn owner_only_read(name: &str) -> bool {
+    METHODS
+        .iter()
+        .any(|method| method.name == name && method.owner_only && !method.mutation)
+}
+
 fn visible(method: &Method, principal: &Principal) -> bool {
+    if method.name == "child.run" && !matches!(principal, Principal::Agent { .. }) {
+        return false;
+    }
     // Discovery lists callable methods, so it shares the RPC gate's own
     // principal/method classification: Memory-only entries such as
     // `client.identity` and `inference.*` (except `inference.client.*`) are
@@ -457,7 +522,7 @@ impl Router {
                 .into_iter()
                 .map(|m| MethodSummary {
                     method: m.name.to_owned(),
-                    summary: m.summary.to_owned(),
+                    summary: request.full.then(|| m.summary.to_owned()),
                 })
                 .collect(),
             next,
@@ -496,15 +561,13 @@ impl Router {
     pub(super) async fn method_help(&self, params: &Value, principal: &Principal) -> Result<Value> {
         let request: MethodHelpRequest = decode_params(params.clone())?;
         request.validate()?;
-        let method = METHODS
+        let Some(method) = METHODS
             .iter()
             .find(|m| m.name == request.method && visible(m, principal))
-            .ok_or_else(|| {
-                Error::new(
-                    "unsupported",
-                    "method is unavailable; use api.methods for callable canonical names",
-                )
-            })?;
+        else {
+            return Err(unavailable_method(&request.method, principal));
+        };
+        let full = request.full.unwrap_or(false);
         let identity = self.identity(principal).await?;
         let aliases: &[&str] = match method.name {
             "api.identity" => &["swarm identity"],
@@ -571,33 +634,44 @@ impl Router {
         {
             example["agent"] = json!("a1");
         }
-        let scopes = method_scopes(method.name, principal, &identity);
+        let scopes = if full {
+            method_scopes(method.name, principal, &identity)
+        } else {
+            Vec::new()
+        };
         // Compact by default: compact field descriptors (requiredness,
         // types, enums, nested shapes and documented constraints) stand in
         // for the full JSON Schemas (fields, one example, limits).
         // `full: true` restores both schemas for callers that need exact
         // shapes.
         let fields: Vec<String> = compact_field_descriptors(&(method.input)());
-        let (request_schema, response_schema) = if request.full.unwrap_or(false) {
-            ((method.input)(), (method.output)())
+        let (request_schema, response_schema) = if full {
+            (Some((method.input)()), Some((method.output)()))
         } else {
-            (Value::Null, Value::Null)
+            (None, None)
         };
         encode(MethodHelpResponse {
             method: method.name.to_owned(),
             summary: method.summary.to_owned(),
-            cli_aliases: aliases.iter().map(|s| (*s).to_owned()).collect(),
+            cli_aliases: if full {
+                aliases.iter().map(|s| (*s).to_owned()).collect()
+            } else {
+                Vec::new()
+            },
             fields,
             request_schema,
             response_schema,
             example: json!({"method":method.name,"params":example}),
-            mutation_id: mutation_id_help(method).to_owned(),
+            mutation_id: if full || method.name.starts_with("inference.") {
+                mutation_id_help(method).to_owned()
+            } else if is_mutation_id_method(method.name) {
+                "Direct callers supply a fresh ULID in id. MCP can mint one. Reuse the same id for exact retries.".to_owned()
+            } else {
+                String::new()
+            },
             scopes,
-            limits: format!(
-                "{} Responses retain their DTO pagination and daemon 4 MiB frame bounds; one help result is at most 256 KiB. Examples for existing resources require their actual retained ids/profile/source/view.",
-                method_limits(method.name)
-            ),
-            unsupported,
+            limits: method_limits(method.name).to_owned(),
+            unsupported: if full { unsupported } else { Vec::new() },
         })
     }
 }

@@ -214,6 +214,7 @@ mod source_handoff;
 mod source_install;
 mod switch;
 pub use switch::{PROVIDER_SWITCH_QUEUED, PROVIDER_SWITCH_SETTLED, SwitchWork};
+mod swarm_usage;
 mod turn_recovery;
 pub(crate) mod usage;
 mod workspace;
@@ -2004,7 +2005,9 @@ impl Store {
         if after < retained {
             return Err(Error::new(
                 "history_gap",
-                "requested event history is no longer fully retained",
+                format!(
+                    "requested event history is no longer fully retained. Earliest resume cursor is {retained}."
+                ),
             ));
         }
         Ok(())

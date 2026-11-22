@@ -85,9 +85,7 @@ impl TurnGetRequest {
 
 impl AgentResultRequest {
     pub fn validate_response(&self, response: &AgentResultResponse) -> Result<()> {
-        let expected_generation = self
-            .generation
-            .unwrap_or(response.agent_metadata.generation);
+        let expected_generation = self.generation.unwrap_or(response.current_generation);
         let mut turn_keys = HashSet::new();
         let upper_generation = self.before.as_ref().map_or(response.generation, |before| {
             turn_keys.insert((before.generation, before.turn_id.as_str()));
@@ -95,9 +93,12 @@ impl AgentResultRequest {
         });
         if self.validate().is_err()
             || response.agent != self.id
-            || response.agent_metadata.id != self.id
+            || self.metadata != response.agent_metadata.is_some()
+            || response.agent_metadata.as_ref().is_some_and(|agent| {
+                agent.id != self.id || agent.generation != response.current_generation
+            })
             || response.generation < 0
-            || response.agent_metadata.generation < 0
+            || response.current_generation < 0
             || response.generation != expected_generation
             || upper_generation > response.generation
             || response.turns.len() > self.limit
@@ -132,7 +133,7 @@ impl AgentResultRequest {
         if self.before.is_none()
             && self.turn_id.is_none()
             && response.generation > 0
-            && response.generation == response.agent_metadata.generation
+            && response.generation == response.current_generation
         {
             generations.insert(0, response.generation);
         }

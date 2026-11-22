@@ -2,6 +2,7 @@ mod attention;
 mod attribution;
 mod auth;
 mod catalog;
+mod child_run;
 mod cleanup;
 mod command;
 mod command_verbs;
@@ -29,6 +30,7 @@ mod rules;
 mod session_growth;
 mod sources;
 mod status;
+mod swarm_usage;
 mod switch;
 mod tool_incident;
 
@@ -449,18 +451,53 @@ impl Router {
     async fn handle(
         &self,
         method: &str,
-        wire_params: Value,
+        mut wire_params: Value,
         peer: Option<crate::platform::custody::LocalPeer>,
     ) -> Result<Value> {
         let remote = wire_params
             .get("_auth")
             .and_then(|a| a.get("remote_call"))
             .cloned();
+        let mcp_call_id = wire_params
+            .get_mut("_auth")
+            .and_then(Value::as_object_mut)
+            .and_then(|auth| auth.remove("swarm_mcp_call_id"));
         let (principal, params) = self.authenticate(wire_params, peer).await?;
         let remote: Option<eliot_core::RemoteCallContext> = remote
             .map(serde_json::from_value)
             .transpose()
             .map_err(|_| Error::new("not_allowed", "invalid remote context"))?;
+        let mcp_trace = if let Some(call_id) = mcp_call_id.as_ref() {
+            let call_id = call_id
+                .as_str()
+                .filter(|id| ulid::Ulid::from_string(id).is_ok())
+                .ok_or_else(|| Error::new("invalid", "Swarm MCP call id is invalid"))?;
+            self.begin_swarm_mcp_tool_call(&principal, remote.as_ref(), call_id, method)
+                .await
+        } else {
+            None
+        };
+        let result = self
+            .handle_authorized(method, params, principal, remote.as_ref())
+            .await;
+        if let Some(trace) = mcp_trace {
+            self.finish_swarm_mcp_tool_call(&trace, result.is_err())
+                .await;
+        }
+        let result = result?;
+        Ok(match remote {
+            Some(remote) => json!({"result": result, "remote_call": remote}),
+            None => result,
+        })
+    }
+
+    async fn handle_authorized(
+        &self,
+        method: &str,
+        params: Value,
+        principal: Principal,
+        remote: Option<&eliot_core::RemoteCallContext>,
+    ) -> Result<Value> {
         authorize_rpc_method(&principal, method)?;
         let _write = if method != "daemon.shutdown" && discovery::is_mutation(method) {
             let guard = self.inner.restart_writes.read().await;
@@ -537,9 +574,7 @@ impl Router {
             "cleanup.plan" => self.cleanup_plan(&params, &principal).await,
             "cleanup.apply" => self.cleanup_apply(&params, &principal).await,
             "command.submit" => {
-                let result = self
-                    .submit_bound(&params, &principal, remote.as_ref())
-                    .await;
+                let result = self.submit_bound(&params, &principal, remote).await;
                 // Capacity preflight can refuse before a command exists.
                 // Retain diagnostic metadata under the caller's exact ID in
                 // the existing bounded log; this grants no replay authority.
@@ -557,10 +592,7 @@ impl Router {
                 }
                 result
             }
-            "launch.enqueue" => {
-                self.enqueue_launch(&params, &principal, remote.as_ref())
-                    .await
-            }
+            "launch.enqueue" => self.enqueue_launch(&params, &principal, remote).await,
             "launch.intent.get" => self.read_launch_intent(&params, &principal).await,
             "launch.queue" => self.read_launch_queue(&params, &principal).await,
             "project.budget.set" => self.set_manager_budget(&params, &principal).await,
@@ -604,6 +636,7 @@ impl Router {
             "events.bounds" => self.events_bounds(&params, &principal).await,
             "events.read" => self.events_read(&params, &principal).await,
             "events.subscribe" => self.events_subscribe(&params, &principal).await,
+            "child.run" => self.child_run(&params, &principal).await,
             "swarm.wait" => self.swarm_wait(&params, &principal).await,
             "swarm.digest" => self.swarm_digest(&params, &principal).await,
             "swarm.reparent" => self.swarm_reparent(&params, &principal).await,
@@ -661,11 +694,24 @@ impl Router {
             "claim.set" => self.claim_set(&params, &principal).await,
             "claim.list" => self.claim_list(&params, &principal).await,
             "claim.release" => self.claim_release(&params, &principal).await,
-            _ => Err(Error::new(
-                "unsupported",
-                format!("daemon method {method} is not implemented"),
-            )),
+            _ => Err(discovery::unavailable_method(method, &principal)),
         };
+        let result = result.map_err(|mut error| {
+            if error.code == "invalid" && method == "agent.get" {
+                let id = match &principal {
+                    Principal::Agent { id, .. } => id.as_str(),
+                    _ => "a1",
+                };
+                let example = json!({"method":"agent.get","params":{"id":id}});
+                error.message = format!("{}. Try {example}.", error.message).into();
+            } else if error.code == "not_allowed"
+                && matches!(principal, Principal::Agent { .. })
+                && discovery::owner_only_read(method)
+            {
+                error.message = "Owner-only read. For Agent-scoped information, use api.identity, who, or agent.get on yourself.".to_owned().into();
+            }
+            error
+        });
         // Every RPC is timed here for debug mode: method, elapsed
         // milliseconds and ok/error. The method vocabulary is ours; params
         // and results never enter the record.
@@ -693,11 +739,7 @@ impl Router {
                 &fields,
             );
         }
-        let result = result?;
-        Ok(match remote {
-            Some(remote) => json!({"result": result, "remote_call": remote}),
-            None => result,
-        })
+        result
     }
 
     pub(crate) async fn handle_rpc(
@@ -4657,7 +4699,7 @@ impl Router {
                     "result cursor generation is outside the requested generation scope",
                 ));
             }
-            store.agent_result_page(agent, generation_filter, &request)?
+            store.agent_result_page(&agent, generation_filter, &request)?
         };
         self.mask_unknown_turns(id, &mut response.turns).await?;
         request

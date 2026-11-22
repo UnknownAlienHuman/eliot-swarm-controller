@@ -165,7 +165,7 @@ pub(crate) enum CliCommand {
     Turn(TurnArgs),
     /// Explain why and where a command, Agent or turn failed (owner only).
     Why(WhyArgs),
-    /// Read committed events after a sequence number.
+    /// Read committed events from the retained history, or after --since SEQ.
     Events(EventsArgs),
     /// Wait for a frozen set of child commands/turns with all/any semantics.
     Wait(WaitArgs),
@@ -700,8 +700,16 @@ pub(crate) struct HeavyArgs {
 #[derive(Args)]
 pub(crate) struct UsageArgs {
     #[arg(
+        value_name = "AGENT",
+        conflicts_with = "agent",
+        conflicts_with = "project",
+        conflicts_with = "root"
+    )]
+    pub(crate) agent_positional: Option<String>,
+    #[arg(
         long,
         value_name = "AGENT",
+        conflicts_with = "agent_positional",
         conflicts_with = "project",
         conflicts_with = "root"
     )]
@@ -755,6 +763,9 @@ pub(crate) struct ResultArgs {
     pub(crate) before: Option<String>,
     #[command(flatten)]
     pub(crate) page: PageArgs,
+    /// Include current Agent metadata; by default result output contains turns only.
+    #[arg(long)]
+    pub(crate) metadata: bool,
 }
 
 #[derive(Args)]
@@ -834,6 +845,7 @@ pub(crate) struct WhyArgs {
 
 #[derive(Args)]
 pub(crate) struct EventsArgs {
+    /// Exclusive sequence cursor. Omit to begin at the retained history floor.
     #[arg(long, value_name = "SEQ")]
     pub(crate) since: Option<i64>,
     #[command(flatten)]
