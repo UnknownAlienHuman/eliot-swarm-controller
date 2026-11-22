@@ -49,36 +49,37 @@ impl Router {
         };
 
         let configured_mcp = eliot_core::extract_configured_mcp_programs(&agent.profile_snapshot);
-        let harness_helpers = eliot_core::extract_harness_helper_commands(agent.effective.as_ref());
         let secrets = self.secret_policy_snapshot();
         let Some(candidate) = self
             .inner
             .monitoring
-            .inspect_running_background_processes(
-                &agent,
-                &configured_mcp,
-                &harness_helpers,
-                &context,
-                &secrets,
-            )
+            .inspect_running_background_processes(&agent, &configured_mcp, &context, &secrets)
             .await?
         else {
             return Ok(());
         };
 
-        let (tool_turn, tool_item_id) = candidate.tool_item;
-        let output_tail = self
-            .inner
-            .store
-            .lock()
-            .await
-            .background_wake_tool_output_tail(
-                &agent.id,
-                agent.generation,
-                &tool_turn,
-                &tool_item_id,
-            )?
-            .map(|text| bounded_redacted_tail(&text, &secrets));
+        let (tool_item_id, output_tail) = match candidate.tool_item {
+            Some((tool_turn, item_id)) => {
+                let tail = self
+                    .inner
+                    .store
+                    .lock()
+                    .await
+                    .background_wake_tool_output_tail(
+                        &agent.id,
+                        agent.generation,
+                        &tool_turn,
+                        &item_id,
+                    )?
+                    .map(|text| bounded_redacted_tail(&text, &secrets))
+                    .filter(|text| !text.is_empty());
+                (Some(item_id), tail)
+            }
+            // Empty tail marks an ambiguous process start covered by multiple
+            // concurrent tool windows, so delivery omits any output tail and explains why.
+            None => (None, Some(String::new())),
+        };
         // Held locally and installed only after the wake commits, so every
         // refusal or error drops (closes) the handle.
         let pinned = self

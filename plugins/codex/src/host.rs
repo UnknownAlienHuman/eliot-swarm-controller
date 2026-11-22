@@ -40,7 +40,7 @@ use eliot_plugin::{
         register_native_process, rejected_control, request_reply_ids,
         target_environment as shared_target_environment, unknown_control, unknown_snapshot,
         validate_binding, validate_identity, validate_source_plan, with_claimed_context,
-        with_context_points, with_harness_helpers,
+        with_context_points,
     },
     skill,
 };
@@ -185,15 +185,7 @@ struct DispatchedThread {
     session: AgentSession,
     selected_model: String,
     selected_effort: Option<String>,
-    harness_helpers: Vec<Vec<String>>,
     readback: ThreadStartReadback,
-}
-
-struct InitializedNative {
-    model: String,
-    effort: Option<String>,
-    native_scope: String,
-    harness_helpers: Vec<Vec<String>>,
 }
 
 /// Outcome of the dispatch phase: either a live dispatched thread ready for
@@ -977,7 +969,6 @@ impl CodexPlugin {
                     thread.readback,
                     thread.selected_model,
                     thread.selected_effort,
-                    thread.harness_helpers,
                 )
                 .await
             }
@@ -1197,7 +1188,7 @@ impl CodexPlugin {
         params: &AgentStartParams,
         plan: &ValidatedStartPlan,
     ) -> Result<DispatchOutcome> {
-        let initialized_native = match Self::initialize_native(
+        let (selected_model, selected_effort, native_scope) = match Self::initialize_native(
             &session.native_client,
             &plan.workspace,
             plan.requested_model.as_deref(),
@@ -1212,7 +1203,7 @@ impl CodexPlugin {
         )
         .await
         {
-            Ok(initialized_native) => initialized_native,
+            Ok((model, effort, scope)) => (model, effort, scope),
             Err(error) => {
                 let error = discard_failed_start(&mut session, error).await;
                 return self
@@ -1225,10 +1216,6 @@ impl CodexPlugin {
                     .map(DispatchOutcome::Settled);
             }
         };
-        let selected_model = initialized_native.model;
-        let selected_effort = initialized_native.effort;
-        let native_scope = initialized_native.native_scope;
-        let harness_helpers = initialized_native.harness_helpers;
         session.selected_model = selected_model.clone();
         session.selected_effort = selected_effort.clone();
         session.native_scope = native_scope;
@@ -1418,7 +1405,6 @@ impl CodexPlugin {
             session,
             selected_model,
             selected_effort,
-            harness_helpers,
             readback,
         })))
     }
@@ -1426,10 +1412,6 @@ impl CodexPlugin {
     /// Settle start readiness for the dispatched thread: deliver the
     /// coordination skill, read back the MCP inventory, verify the
     /// effective profile against the frozen plan, commit ready and report.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "Readiness settlement takes the dispatched thread facts as explicit parameters."
-    )]
     async fn settle_start_readiness(
         &mut self,
         mut session: AgentSession,
@@ -1438,7 +1420,6 @@ impl CodexPlugin {
         readback: ThreadStartReadback,
         selected_model: String,
         selected_effort: Option<String>,
-        harness_helpers: Vec<Vec<String>>,
     ) -> Result<Value> {
         // Expose the daemon-materialized coordination skill before any
         // input is sent: without it the Agent would start believing it has
@@ -1521,7 +1502,6 @@ impl CodexPlugin {
             effective,
             &[InjectPoint::NextInput, InjectPoint::ActiveTurn],
         );
-        let effective = with_harness_helpers(effective, &harness_helpers);
         // An omitted request accepts the native-selected model as
         // effective; an explicit request must match exactly.
         let settings_match = plan.requested_model
@@ -1640,7 +1620,7 @@ impl CodexPlugin {
         requested_effort: Option<&str>,
         experimental_api: bool,
         context: NativeStartContext<'_>,
-    ) -> Result<InitializedNative> {
+    ) -> Result<(String, Option<String>, String)> {
         let init_params = NativeInitializeParams {
             client_info: NativeClientInfo {
                 name: "eliot".to_owned(),
@@ -1774,10 +1754,6 @@ impl CodexPlugin {
         context
             .route
             .verify_config(effective_config, context.metadata_secrets)?;
-        let harness_helpers: Vec<Vec<String>> =
-            extract_notify_helper(effective_config, context.metadata_secrets)
-                .into_iter()
-                .collect();
 
         // Requested vs observed MCP surface is read after thread dispatch
         // (see `read_mcp_status`): the installed `mcpServerStatus/list`
@@ -1793,12 +1769,11 @@ impl CodexPlugin {
                     "Codex Responses route requires an explicit model id",
                 )
             })?;
-            return Ok(InitializedNative {
-                model: requested.to_owned(),
-                effort: context.route.optional_effort(requested_effort)?,
+            return Ok((
+                requested.to_owned(),
+                context.route.optional_effort(requested_effort)?,
                 native_scope,
-                harness_helpers,
-            });
+            ));
         }
 
         // The daemon freezes the native default in `daemon_model` before any
@@ -1827,12 +1802,7 @@ impl CodexPlugin {
             // selected model exists; no medium/xhigh value is fabricated.
             None => None,
         };
-        Ok(InitializedNative {
-            model: model.id.clone(),
-            effort,
-            native_scope,
-            harness_helpers,
-        })
+        Ok((model.id.clone(), effort, native_scope))
     }
 
     /// Read the native MCP inventory for requested-vs-observed reporting,
@@ -3400,44 +3370,6 @@ fn frozen_store_binding(profile: &serde_json::Map<String, Value>) -> Result<Nati
             "Codex admitted native store binding is malformed",
         )
     })
-}
-
-fn extract_notify_helper(config: &Value, metadata_secrets: &[String]) -> Option<Vec<String>> {
-    let raw_tokens: Vec<String> = match config.get("notify") {
-        Some(Value::Array(items)) => {
-            if items.is_empty() || items.len() > eliot_core::MAX_HARNESS_HELPER_ARGV {
-                return None;
-            }
-            let mut parsed = Vec::with_capacity(items.len());
-            for item in items {
-                parsed.push(item.as_str()?.to_owned());
-            }
-            parsed
-        }
-        Some(Value::String(command)) if !command.trim().is_empty() => {
-            let parsed = eliot_core::split_windows_command_line(command);
-            if parsed.is_empty() || parsed.len() > eliot_core::MAX_HARNESS_HELPER_ARGV {
-                return None;
-            }
-            parsed
-        }
-        _ => return None,
-    };
-    let policy = eliot_core::SecretPolicy::new(metadata_secrets.iter().map(String::as_str));
-    let mut clean = Vec::with_capacity(raw_tokens.len());
-    for token in raw_tokens {
-        let trimmed = token.trim();
-        if trimmed.is_empty()
-            || trimmed.len() > eliot_core::MAX_HARNESS_HELPER_TOKEN_BYTES
-            || trimmed.chars().any(char::is_control)
-            || policy.contains_text(trimmed)
-            || eliot_core::redact_secret_shapes(trimmed) != trimmed
-        {
-            return None;
-        }
-        clean.push(trimmed.to_owned());
-    }
-    Some(clean)
 }
 
 pub(crate) fn native_scope(codex_home: &str) -> String {

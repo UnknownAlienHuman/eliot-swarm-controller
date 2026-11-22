@@ -14,10 +14,6 @@ pub const BACKGROUND_WAKE_PRINCIPAL: &str = "swarm_note:background_process_wake"
 pub const MAX_BACKGROUND_WAKE_COMMAND_BYTES: usize = 512;
 pub const MAX_BACKGROUND_WAKE_OUTPUT_TAIL_BYTES: usize = 1_024;
 pub const BACKGROUND_SERVER_TOPIC: &str = "background.server";
-pub const HARNESS_HELPER_COMMANDS_FIELD: &str = "harness_helpers";
-pub const MAX_HARNESS_HELPER_COMMANDS: usize = 16;
-pub const MAX_HARNESS_HELPER_ARGV: usize = 16;
-pub const MAX_HARNESS_HELPER_TOKEN_BYTES: usize = 512;
 
 const SWARM_INFRA_SUBCOMMANDS: &[&str] = &["mcp", "hook", "plugin", "daemon"];
 
@@ -142,127 +138,16 @@ pub fn extract_configured_mcp_programs(profile_snapshot: &Value) -> Vec<String> 
     programs
 }
 
-/// Whether `harness` attaches the native shell command string (`data.command`)
-/// to command `tool.started` events.
-pub fn harness_emits_tool_commands(harness: &str) -> bool {
-    matches!(harness, "codex" | "claude" | "opencode")
-}
-
-/// Extract plugin-reported harness helper argv prefixes from `Agent.effective`.
-/// Any entry whose length exceeds `MAX_HARNESS_HELPER_ARGV` or whose elements are
-/// invalid is dropped as a whole rather than truncated to a broader prefix.
-pub fn extract_harness_helper_commands(effective: Option<&Value>) -> Vec<Vec<String>> {
-    let Some(entries) = effective
-        .and_then(|value| value.get(HARNESS_HELPER_COMMANDS_FIELD))
-        .and_then(Value::as_array)
-    else {
-        return Vec::new();
-    };
-    entries
-        .iter()
-        .take(MAX_HARNESS_HELPER_COMMANDS)
-        .filter_map(|entry| {
-            let argv = entry.as_array()?;
-            if argv.is_empty() || argv.len() > MAX_HARNESS_HELPER_ARGV {
-                return None;
-            }
-            let mut tokens = Vec::with_capacity(argv.len());
-            for item in argv {
-                let token = item.as_str().map(str::trim)?;
-                if token.is_empty()
-                    || token.len() > MAX_HARNESS_HELPER_TOKEN_BYTES
-                    || token.chars().any(char::is_control)
-                {
-                    return None;
-                }
-                tokens.push(token.to_owned());
-            }
-            Some(tokens)
-        })
-        .collect()
-}
-
-fn has_path_sep(raw: &str) -> bool {
-    raw.contains(['/', '\\'])
-}
-
-fn normalize_helper_path(raw: &str) -> String {
-    let trimmed = raw.trim().trim_matches(|ch| ch == '"' || ch == '\'');
-    let stripped = trimmed
-        .strip_prefix("\\\\?\\")
-        .or_else(|| trimmed.strip_prefix("//?/"))
-        .unwrap_or(trimmed);
-    stripped.replace('\\', "/").to_ascii_lowercase()
-}
-
-fn normalize_helper_executable_path(raw: &str) -> String {
-    let normalized = normalize_helper_path(raw);
-    for ext in [".exe", ".cmd", ".bat", ".com"] {
-        if let Some(stem) = normalized.strip_suffix(ext)
-            && !stem.is_empty()
-        {
-            return stem.to_owned();
-        }
-    }
-    normalized
-}
-
-fn helper_prog_matches(helper_prog: &str, proc_prog: &str) -> bool {
-    if has_path_sep(helper_prog) && has_path_sep(proc_prog) {
-        normalize_helper_executable_path(helper_prog) == normalize_helper_executable_path(proc_prog)
-    } else {
-        executable_stem(helper_prog)
-            .is_some_and(|stem| executable_stem(proc_prog).as_deref() == Some(stem.as_str()))
-    }
-}
-
-fn matches_harness_helper(
-    image_path: Option<&str>,
-    tokens: &[String],
-    harness_helpers: &[Vec<String>],
-) -> bool {
-    harness_helpers.iter().any(|helper| {
-        let Some(helper_prog) = helper.first() else {
-            return false;
-        };
-        let prog_matches = image_path.is_some_and(|path| helper_prog_matches(helper_prog, path))
-            || tokens
-                .first()
-                .is_some_and(|prog| helper_prog_matches(helper_prog, prog));
-        if !prog_matches {
-            return false;
-        }
-        if helper.len() > 1 {
-            if tokens.len() < helper.len() {
-                return false;
-            }
-            for (expected, actual) in helper.iter().zip(tokens.iter()).skip(1) {
-                let arg_matches = actual == expected
-                    || ((has_path_sep(expected) || has_path_sep(actual))
-                        && normalize_helper_path(actual) == normalize_helper_path(expected));
-                if !arg_matches {
-                    return false;
-                }
-            }
-        }
-        true
-    })
-}
-
 /// Whether the process belongs to the harness runtime, console host plumbing,
-/// LSP, telemetry helper, plugin-reported harness helper, or Swarm/configured
-/// MCP infrastructure.
+/// LSP, telemetry helper, or Swarm/configured MCP infrastructure.
 pub fn is_harness_owned_process(
     image_path: Option<&str>,
     argv: &[String],
     command_line: Option<&str>,
     configured_mcp_programs: &[String],
-    harness_helpers: &[Vec<String>],
 ) -> bool {
     let tokens = owned_tokens(image_path, argv, command_line);
-    if is_swarm_infra_tokens(&tokens)
-        || matches_harness_helper(image_path, &tokens, harness_helpers)
-    {
+    if is_swarm_infra_tokens(&tokens) {
         return true;
     }
     let stem = image_path
@@ -459,9 +344,20 @@ pub fn format_background_wake_note_body(
         "Background process exited (pid {pid}, exit code {code_str}).\n\
          Command: {command_line}{suffix}"
     );
-    if let Some(tail) = output_tail.map(str::trim).filter(|tail| !tail.is_empty()) {
-        body.push_str("\nOutput tail:\n");
-        body.push_str(tail);
+    match output_tail {
+        Some("") => {
+            body.push_str(
+                "\nOutput tail: omitted (multiple concurrent tools overlapped process start).",
+            );
+        }
+        Some(tail) => {
+            let trimmed = tail.trim();
+            if !trimmed.is_empty() {
+                body.push_str("\nOutput tail:\n");
+                body.push_str(trimmed);
+            }
+        }
+        None => {}
     }
     body
 }

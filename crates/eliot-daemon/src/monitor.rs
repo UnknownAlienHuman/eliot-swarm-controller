@@ -156,9 +156,10 @@ pub(crate) struct BackgroundProcessCandidate {
     pub(crate) identity: ProcessIdentity,
     pub(crate) command_line: String,
     pub(crate) command_truncated: bool,
-    /// `(turn_id, item_id)` of the completing turn's native tool whose command
-    /// matched the OS command line.
-    pub(crate) tool_item: (String, String),
+    /// `(turn_id, item_id)` of the completing turn's unique native tool window
+    /// covering the process start; `None` when multiple overlapping tool
+    /// windows contain the process start.
+    pub(crate) tool_item: Option<(String, String)>,
 }
 
 #[derive(Clone, Default)]
@@ -548,13 +549,11 @@ impl Monitoring {
 
     /// Fresh-sample `agent`'s custody tree and pick the newest running
     /// non-server descendant under its verified native harness session whose
-    /// start time lies inside the arm context's window and whose command line
-    /// matches a native tool of the completing turn.
+    /// start time falls inside a native tool call window of the completing turn.
     pub(crate) async fn inspect_running_background_processes(
         &self,
         agent: &Agent,
         configured_mcp_programs: &[String],
-        harness_helpers: &[Vec<String>],
         context: &eliot_store::BackgroundWakeArmContext,
         secrets: &eliot_core::SecretPolicy,
     ) -> Result<Option<BackgroundProcessCandidate>> {
@@ -661,7 +660,7 @@ impl Monitoring {
             chain: Vec<u32>,
             command_line: String,
             command_truncated: bool,
-            tool_item: (String, String),
+            tool_item: Option<(String, String)>,
         }
         let mut qualifying: Vec<QualifiedCandidate<'_>> = Vec::new();
         let mut server_ancestor_pids: HashSet<u32> = HashSet::new();
@@ -683,6 +682,11 @@ impl Monitoring {
             {
                 continue;
             }
+            let tool_item = match match_tool_window(proc_start_ms, &context.tool_windows) {
+                ToolWindowMatch::None => continue,
+                ToolWindowMatch::Unique(tool_turn, item_id) => Some((tool_turn, item_id)),
+                ToolWindowMatch::Ambiguous => None,
+            };
             let Some(chain) = harness_descendant_chain(
                 sample.record.identity.pid,
                 sample.record.identity.start_time,
@@ -702,7 +706,6 @@ impl Monitoring {
                 &node.argv,
                 node.command_line.as_deref(),
                 configured_mcp_programs,
-                harness_helpers,
             ) {
                 continue;
             }
@@ -712,22 +715,8 @@ impl Monitoring {
                 server_ancestor_pids.extend(chain);
                 continue;
             }
-            let (command_line, command_truncated, tool_item) =
-                if let Some(matched) = match_tool_command(node, &context.tool_commands, secrets) {
-                    matched
-                } else if !eliot_core::harness_emits_tool_commands(&agent.harness)
-                    && !context.tool_items.is_empty()
-                {
-                    fallback_tool_item_candidate(
-                        node,
-                        sample.record.identity.pid,
-                        proc_start_ms,
-                        &context.tool_items,
-                        secrets,
-                    )
-                } else {
-                    continue;
-                };
+            let (command_line, command_truncated) =
+                format_process_command_line(node, sample.record.identity.pid, secrets);
             qualifying.push(QualifiedCandidate {
                 sample,
                 chain,
@@ -2682,12 +2671,13 @@ fn harness_descendant_chain(
     harness_pids: &HashMap<u32, u64>,
     plugin_pids: &HashMap<u32, u64>,
 ) -> Option<Vec<u32>> {
+    let after_harness = harness_pids.values().any(|&h_start| h_start <= start_time);
     let mut chain = Vec::new();
     let mut seen = HashSet::from([pid]);
     let mut current_pid = pid;
     let mut current_start = start_time;
     for _ in 0..16 {
-        let parent_pid = nodes
+        let Some(parent_pid) = nodes
             .get(&current_pid)
             .and_then(|node| node.parent_pid)
             .or_else(|| {
@@ -2695,15 +2685,11 @@ fn harness_descendant_chain(
                     .get(&current_pid)
                     .filter(|(st, _)| *st == current_start)
                     .and_then(|(_, pp)| *pp)
-            })?;
+            })
+        else {
+            return after_harness.then_some(chain);
+        };
         if parent_pid == 0 || !seen.insert(parent_pid) {
-            return None;
-        }
-        let parent_start = sample_starts
-            .get(&parent_pid)
-            .copied()
-            .or_else(|| ancestry.get(&parent_pid).map(|(st, _)| *st));
-        if parent_start.is_some_and(|st| st > current_start) {
             return None;
         }
         if plugin_pids
@@ -2718,13 +2704,21 @@ fn harness_descendant_chain(
         {
             return Some(chain);
         }
+        let Some(parent_start) = sample_starts
+            .get(&parent_pid)
+            .copied()
+            .or_else(|| ancestry.get(&parent_pid).map(|(st, _)| *st))
+        else {
+            return after_harness.then_some(chain);
+        };
+        if parent_start > current_start {
+            return after_harness.then_some(chain);
+        }
         chain.push(parent_pid);
         current_pid = parent_pid;
-        if let Some(st) = parent_start {
-            current_start = st;
-        }
+        current_start = parent_start;
     }
-    None
+    after_harness.then_some(chain)
 }
 
 fn matches_declared_command(
@@ -2748,336 +2742,52 @@ fn matches_declared_command(
     })
 }
 
-fn is_segment_word_char(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || ch == '_'
+enum ToolWindowMatch {
+    None,
+    Unique(String, String),
+    Ambiguous,
 }
 
-fn find_command_segment(haystack: &str, min_offset: usize, needle: &str) -> Option<usize> {
-    let needle = needle.trim();
-    if needle.is_empty() || min_offset > haystack.len() {
-        return None;
-    }
-    let starts_word = needle.chars().next().is_some_and(is_segment_word_char);
-    let ends_word = needle.chars().next_back().is_some_and(is_segment_word_char);
-    let has_ws = needle.chars().any(char::is_whitespace);
-    for (rel_start, _) in haystack[min_offset..].match_indices(needle) {
-        let start = min_offset + rel_start;
-        let end = start + needle.len();
-        let before_ok = !starts_word
-            || haystack[..start]
-                .chars()
-                .next_back()
-                .is_none_or(|ch| !is_segment_word_char(ch));
-        if !before_ok {
-            continue;
+fn match_tool_window(
+    proc_start_ms: i64,
+    tool_windows: &[eliot_store::BackgroundWakeToolWindow],
+) -> ToolWindowMatch {
+    const TOOL_WINDOW_EXACT_SKEW_MS: i64 = 25;
+    #[cfg(windows)]
+    const TOOL_WINDOW_START_SKEW_MS: i64 = 500;
+    #[cfg(not(windows))]
+    const TOOL_WINDOW_START_SKEW_MS: i64 = 1_500;
+    const TOOL_WINDOW_END_SKEW_MS: i64 = 50;
+
+    let classify = |start_skew: i64, end_skew: i64| -> ToolWindowMatch {
+        let mut matched: Option<&eliot_store::BackgroundWakeToolWindow> = None;
+        for window in tool_windows {
+            if proc_start_ms >= window.started_at.saturating_sub(start_skew)
+                && proc_start_ms <= window.completed_at.saturating_add(end_skew)
+            {
+                if matched.is_some() {
+                    return ToolWindowMatch::Ambiguous;
+                }
+                matched = Some(window);
+            }
         }
-        let after_ok = !ends_word
-            || haystack[end..].chars().next().is_none_or(|ch| {
-                !is_segment_word_char(ch) && (has_ws || !matches!(ch, '/' | '\\'))
-            });
-        if after_ok {
-            return Some(end);
+        match matched {
+            Some(window) => ToolWindowMatch::Unique(window.turn_id.clone(), window.item_id.clone()),
+            None => ToolWindowMatch::None,
         }
-    }
-    None
-}
-
-fn contains_command_segment(haystack: &str, needle: &str) -> bool {
-    find_command_segment(haystack, 0, needle).is_some()
-}
-
-fn is_redirect_operator(token: &str) -> bool {
-    matches!(
-        token,
-        ">" | ">>" | "<" | "1>" | "1>>" | "2>" | "2>>" | "&>" | "&>>" | "<>"
-    )
-}
-
-fn is_standalone_redirect(token: &str) -> bool {
-    if token.starts_with("&>") && token.len() > 2 {
-        return true;
-    }
-    let after_fd = if token.as_bytes().first().is_some_and(u8::is_ascii_digit) {
-        &token[1..]
-    } else {
-        token
     };
-    (after_fd.starts_with('>') || after_fd.starts_with('<')) && after_fd.len() > 1
+
+    match classify(TOOL_WINDOW_EXACT_SKEW_MS, TOOL_WINDOW_EXACT_SKEW_MS) {
+        ToolWindowMatch::None => classify(TOOL_WINDOW_START_SKEW_MS, TOOL_WINDOW_END_SKEW_MS),
+        other => other,
+    }
 }
 
-fn unquoted_token_spans(input: &str) -> (Vec<(usize, usize)>, bool) {
-    let bytes = input.as_bytes();
-    let mut spans = Vec::new();
-    let mut tok_start: Option<usize> = None;
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut idx = 0;
-    while idx < bytes.len() {
-        let byte = bytes[idx];
-        if in_single {
-            if byte == b'\'' {
-                in_single = false;
-            }
-            idx += 1;
-            continue;
-        }
-        if in_double {
-            if byte == b'\\' && idx + 1 < bytes.len() && bytes[idx + 1].is_ascii() {
-                idx += 2;
-                continue;
-            }
-            if byte == b'"' {
-                in_double = false;
-            }
-            idx += 1;
-            continue;
-        }
-        if byte.is_ascii_whitespace() {
-            if let Some(start) = tok_start.take() {
-                spans.push((start, idx));
-            }
-            idx += 1;
-            continue;
-        }
-        tok_start.get_or_insert(idx);
-        match byte {
-            b'\'' => {
-                in_single = true;
-                idx += 1;
-            }
-            b'"' => {
-                in_double = true;
-                idx += 1;
-            }
-            b'\\' if idx + 1 < bytes.len() && bytes[idx + 1].is_ascii() => idx += 2,
-            _ => idx += 1,
-        }
-    }
-    if let Some(start) = tok_start {
-        spans.push((start, bytes.len()));
-    }
-    (spans, !in_single && !in_double)
-}
-
-fn strip_trailing_shell_artifacts(raw: &str) -> &str {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return "";
-    }
-    let (mut spans, ended_unquoted) = unquoted_token_spans(trimmed);
-    let mut checked_attached_amp = false;
-    while let Some(&(last_start, last_end)) = spans.last() {
-        let last = &trimmed[last_start..last_end];
-        if last == "&" {
-            spans.pop();
-            continue;
-        }
-        if !checked_attached_amp
-            && ended_unquoted
-            && last.len() > 1
-            && last.ends_with('&')
-            && !last.ends_with("&&")
-            && !last.ends_with(">&")
-            && !last.ends_with("<&")
-        {
-            checked_attached_amp = true;
-            if let Some(span) = spans.last_mut() {
-                span.1 -= 1;
-            }
-            continue;
-        }
-        if spans.len() >= 2 && is_standalone_redirect(last) {
-            spans.pop();
-            continue;
-        }
-        if spans.len() >= 3 {
-            let (prev_start, prev_end) = spans[spans.len() - 2];
-            if is_redirect_operator(&trimmed[prev_start..prev_end]) {
-                spans.truncate(spans.len() - 2);
-                continue;
-            }
-        }
-        break;
-    }
-    let Some(&(_, end)) = spans.last() else {
-        return "";
-    };
-    trimmed[..end].trim()
-}
-
-fn split_and_strip_command_segments(cmd: &str) -> Vec<String> {
-    let mut raw_segments = Vec::new();
-    let bytes = cmd.as_bytes();
-    let mut start = 0;
-    let mut idx = 0;
-    let mut in_single = false;
-    let mut in_double = false;
-    while idx < bytes.len() {
-        let byte = bytes[idx];
-        if in_single {
-            if byte == b'\'' {
-                in_single = false;
-            }
-            idx += 1;
-            continue;
-        }
-        if in_double {
-            if byte == b'\\' && idx + 1 < bytes.len() && bytes[idx + 1].is_ascii() {
-                idx += 2;
-                continue;
-            }
-            if byte == b'"' {
-                in_double = false;
-            }
-            idx += 1;
-            continue;
-        }
-        match byte {
-            b'\'' => {
-                in_single = true;
-                idx += 1;
-            }
-            b'"' => {
-                in_double = true;
-                idx += 1;
-            }
-            b'\\' if idx + 1 < bytes.len() && bytes[idx + 1].is_ascii() => idx += 2,
-            b'\n' | b';' => {
-                raw_segments.push(&cmd[start..idx]);
-                idx += 1;
-                start = idx;
-            }
-            b'&' if idx + 1 < bytes.len() && bytes[idx + 1] == b'&' => {
-                raw_segments.push(&cmd[start..idx]);
-                idx += 2;
-                start = idx;
-            }
-            b'|' if idx + 1 < bytes.len() && bytes[idx + 1] == b'|' => {
-                raw_segments.push(&cmd[start..idx]);
-                idx += 2;
-                start = idx;
-            }
-            _ => idx += 1,
-        }
-    }
-    raw_segments.push(&cmd[start..]);
-
-    raw_segments
-        .into_iter()
-        .filter_map(|segment| {
-            let cleaned = strip_trailing_shell_artifacts(segment);
-            (!cleaned.is_empty()
-                && cleaned.contains(|ch: char| ch.is_whitespace() || ch == '/' || ch == '\\'))
-            .then(|| cleaned.to_owned())
-        })
-        .collect()
-}
-
-fn ordered_substrings_match(haystack: &str, needles: &[&str]) -> bool {
-    let mut offset = 0;
-    for needle in needles {
-        let Some(next) = find_command_segment(haystack, offset, needle) else {
-            return false;
-        };
-        offset = next;
-    }
-    true
-}
-
-fn os_command_matches_tool(
-    normalized_raw: &str,
-    unescaped_single: &str,
-    tool_command: &str,
-) -> bool {
-    let normalized_cmd = tool_command.replace("\r\n", "\n");
-    let cmd = normalized_cmd.trim();
-    if cmd.is_empty() {
-        return false;
-    }
-    if contains_command_segment(normalized_raw, cmd)
-        || (cmd.contains('\'') && contains_command_segment(unescaped_single, cmd))
-    {
-        return true;
-    }
-    if cmd.contains('\n') {
-        let lines: Vec<&str> = cmd
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .collect();
-        if lines.len() >= 2
-            && (ordered_substrings_match(normalized_raw, &lines)
-                || (cmd.contains('\'') && ordered_substrings_match(unescaped_single, &lines)))
-        {
-            return true;
-        }
-    }
-    split_and_strip_command_segments(cmd).iter().any(|segment| {
-        contains_command_segment(normalized_raw, segment)
-            || (segment.contains('\'') && contains_command_segment(unescaped_single, segment))
-    })
-}
-
-fn sanitize_and_bound_command(raw: &str, secrets: &eliot_core::SecretPolicy) -> (String, bool) {
-    let sanitized: String = raw
-        .chars()
-        .map(|ch| if ch.is_control() { ' ' } else { ch })
-        .collect();
-    let redacted = eliot_core::redact_secret_shapes(&secrets.redact_text(sanitized.trim()));
-    let limit = eliot_core::MAX_BACKGROUND_WAKE_COMMAND_BYTES;
-    if redacted.len() <= limit {
-        return (redacted, false);
-    }
-    let end = redacted.floor_char_boundary(limit);
-    (redacted[..end].to_owned(), true)
-}
-
-/// Match the secret-redacted OS process command line against one native tool
-/// command of the completing turn. Candidates with no matched tool command are
-/// refused (`None`), and the display text comes from the matched native command.
-fn match_tool_command(
-    node: &crate::platform::ProcessNodeInfo,
-    tool_commands: &[eliot_store::BackgroundWakeToolCommand],
-    secrets: &eliot_core::SecretPolicy,
-) -> Option<(String, bool, (String, String))> {
-    let raw = node
-        .command_line
-        .as_deref()
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-        .map(str::to_owned)
-        .or_else(|| (!node.argv.is_empty()).then(|| node.argv.join(" ")))?;
-    let redacted_raw = secrets.redact_text(&raw);
-    let normalized_raw = redacted_raw.replace("\r\n", "\n");
-    let unescaped_single = normalized_raw.replace("'\\''", "'");
-    let native = tool_commands
-        .iter()
-        .filter(|tool| os_command_matches_tool(&normalized_raw, &unescaped_single, &tool.command))
-        .max_by_key(|tool| tool.command.len())?;
-    let (command_line, command_truncated) = sanitize_and_bound_command(&native.command, secrets);
-    if command_line.is_empty() {
-        return None;
-    }
-    Some((
-        command_line,
-        command_truncated,
-        (native.turn_id.clone(), native.item_id.clone()),
-    ))
-}
-
-/// Bind a running background candidate on harnesses whose `tool.started` omits
-/// `data.command` (Antigravity, Muse) to the completing turn's committed tool item.
-fn fallback_tool_item_candidate(
+fn format_process_command_line(
     node: &crate::platform::ProcessNodeInfo,
     pid: u32,
-    proc_start_ms: i64,
-    tool_items: &[eliot_store::BackgroundWakeToolItem],
     secrets: &eliot_core::SecretPolicy,
-) -> (String, bool, (String, String)) {
-    let item = tool_items
-        .iter()
-        .find(|item| item.started_at <= proc_start_ms.saturating_add(START_SKEW_MS))
-        .unwrap_or(&tool_items[0]);
+) -> (String, bool) {
     let raw = node
         .command_line
         .as_deref()
@@ -3091,15 +2801,18 @@ fn fallback_tool_item_candidate(
                 .map(|path| path.rsplit(['/', '\\']).next().unwrap_or(path).to_owned())
         })
         .unwrap_or_else(|| format!("pid {pid}"));
-    let (command_line, command_truncated) = sanitize_and_bound_command(&raw, secrets);
-    let command_line = if command_line.is_empty() {
-        format!("pid {pid}")
-    } else {
-        command_line
-    };
-    (
-        command_line,
-        command_truncated,
-        (item.turn_id.clone(), item.item_id.clone()),
-    )
+    let sanitized: String = raw
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    let redacted = eliot_core::redact_secret_shapes(&secrets.redact_text(sanitized.trim()));
+    if redacted.is_empty() {
+        return (format!("pid {pid}"), false);
+    }
+    let limit = eliot_core::MAX_BACKGROUND_WAKE_COMMAND_BYTES;
+    if redacted.len() <= limit {
+        return (redacted, false);
+    }
+    let end = redacted.floor_char_boundary(limit);
+    (redacted[..end].to_owned(), true)
 }

@@ -899,13 +899,12 @@ For [#879](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/87
 while a process it started is still running. When a `turn.completed` with outcome
 `success` or `failure` commits, the note worker freshly samples that generation's
 custody and picks the newest top-level [candidate](monitoring.md#background-process-wake-candidates)
-attributed to a committed native `tool.started` item of that completing turn. A
-candidate with no tool item in that completing turn never arms, and Store verifies
-that exact committed tool item before arming. For harnesses whose command
-`tool.started` carries `command` (Codex, Claude, OpenCode), matching requires that
-committed command; for harnesses whose `tool.started` omits `command` (Antigravity,
-Muse), custody binds to a committed `tool.started` item of the completing turn after
-filtering harness-owned and helper processes. It retains one `waiting` row in
+whose OS creation time falls within a committed native tool call window
+(`tool.started` to `tool.completed`, or turn completion while open) of that
+completing turn. A candidate outside every tool window of that turn (such as a
+post-turn harness notify hook) never arms, and Store verifies at least one
+committed native `tool.started` item in that completing turn (plus the matching
+tool item when unique) before arming. It retains one `waiting` row in
 `background_process_wakes`. Nothing arms when the
 turn ended with a stop or interrupt, when the completing turn ran no native tool
 (including turns started by an automatic background wake or self-wake), or when the Agent has an open or same-turn
@@ -924,12 +923,10 @@ an ordinary `send` with the reserved delivery command id. Both `inject` and `sen
 deliveries are attributed in the command journal to the Swarm background-wake
 principal (`swarm_note:background_process_wake`), never `owner`, and appear as
 `[Swarm note from Swarm]`. The note gives the pid,
-the exit code (or `unknown`), the command, and a bounded output tail when the native
-`tool.completed` with the same item id captured one at arm time. On harnesses whose
-`tool.started` carries `command`, the command always comes from the matched native
-tool command (never another process's raw argv); on harnesses whose `tool.started`
-omits `command`, it uses the bounded, redacted OS command line (or process name),
-at most 512 bytes. Redaction of the command and
+the exit code (or `unknown`), the redacted process command line (at most 512 bytes),
+and a bounded output tail only when exactly one tool window contains the process
+start and its `tool.completed` captured one at arm time; when multiple concurrent
+tool windows overlap the process start, any tail is omitted and the note says so. Redaction of the command and
 tail masks known Swarm secrets literally plus common shapes: `--password`,
 `--token`, `--secret` and `--api-key` style flag values, `Authorization:` and
 `Bearer` credentials, and `NAME=value` where NAME contains TOKEN, SECRET,
@@ -943,11 +940,8 @@ retained unknown.
 `swarm show` prints the pending automatic wake (`pending_background_wake` in
 `agent.get`). The `swarm autonomy` Swarm fact notes row counts settled automatic
 wakes as kind `background_process_wake`: delivered, expired, and cancelled (stop,
-stale generation or failed delivery). Plugins add no policy; they keep translating
-native tool starts and exits ([#881](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/881))
-and report configured harness helper argv prefixes (such as Codex's `notify`) in
-`session.ready` effective settings so shared daemon code skips them; malformed or
-secret-bearing helper entries are dropped rather than truncated.
+stale generation or failed delivery). Plugins add nothing; they keep translating
+native tool starts and exits ([#881](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/881)).
 
 ## Outcome chaining
 

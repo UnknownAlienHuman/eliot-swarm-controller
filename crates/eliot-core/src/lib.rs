@@ -37,12 +37,10 @@ mod verbatim;
 pub use agent_start::AgentStartParams;
 pub use background_wake::{
     BACKGROUND_SERVER_TOPIC, BACKGROUND_WAKE_NOTE_KIND, BACKGROUND_WAKE_PRINCIPAL,
-    DEFAULT_BACKGROUND_WAKE_MAX_WAIT_SECS, HARNESS_HELPER_COMMANDS_FIELD,
-    MAX_BACKGROUND_WAKE_COMMAND_BYTES, MAX_BACKGROUND_WAKE_MAX_WAIT_SECS,
-    MAX_BACKGROUND_WAKE_OUTPUT_TAIL_BYTES, MAX_HARNESS_HELPER_ARGV, MAX_HARNESS_HELPER_COMMANDS,
-    MAX_HARNESS_HELPER_TOKEN_BYTES, extract_configured_mcp_programs,
-    extract_harness_helper_commands, format_background_wake_note_body, harness_emits_tool_commands,
-    is_harness_owned_process, redact_secret_shapes,
+    DEFAULT_BACKGROUND_WAKE_MAX_WAIT_SECS, MAX_BACKGROUND_WAKE_COMMAND_BYTES,
+    MAX_BACKGROUND_WAKE_MAX_WAIT_SECS, MAX_BACKGROUND_WAKE_OUTPUT_TAIL_BYTES,
+    extract_configured_mcp_programs, format_background_wake_note_body, is_harness_owned_process,
+    redact_secret_shapes,
 };
 pub use canonical::canonical_json_sha256;
 pub use command::{
