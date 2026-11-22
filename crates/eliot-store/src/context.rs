@@ -479,13 +479,8 @@ pub(super) fn has_unhealthy_native_stream_tx(
     .map_err(sql_error)
 }
 
-fn claude_hook_event_name(hook: &str) -> &'static str {
-    match hook {
-        "before_tool" => "PreToolUse",
-        "after_tool" => "PostToolUse",
-        _ => "PostToolUse",
-    }
-}
+/// Room a plugin needs around the context in its native hook response.
+const HOOK_NATIVE_ENVELOPE_BYTES: usize = 1024;
 
 fn hook_response_fits(reply_id: &Value, items: &[ContextItem]) -> Result<bool> {
     let reply = json!({
@@ -493,63 +488,39 @@ fn hook_response_fits(reply_id: &Value, items: &[ContextItem]) -> Result<bool> {
         "id": reply_id,
         "result": {"context": items},
     });
-    Ok(encode_json(&reply)?.len().saturating_add(1) <= MAX_FRAME_BYTES)
+    Ok(encode_json(&reply)?
+        .len()
+        .saturating_add(1 + HOOK_NATIVE_ENVELOPE_BYTES)
+        <= MAX_FRAME_BYTES)
 }
 
-fn claude_hook_callback_fits(hook_event_name: &str, additional_context: &str) -> Result<bool> {
-    let max_request_id = "R".repeat(MAX_COMMAND_ID_BYTES);
-    let frame = json!({
-        "type": "control_response",
-        "response": {
-            "subtype": "success",
-            "request_id": max_request_id,
-            "response": {
-                "hookSpecificOutput": {
-                    "hookEventName": hook_event_name,
-                    "additionalContext": additional_context,
-                }
-            }
-        }
-    });
-    Ok(encode_json(&frame)?.len().saturating_add(1) <= MAX_FRAME_BYTES)
-}
-
+/// Refuse before acceptance a steer whose Agent has no safe-point consumer or
+/// whose framed text can never fit one hook response.
 pub(super) fn validate_turn_safe_point_steer_admission(
     agent: &Agent,
     principal: &str,
     command_id: &str,
     text: &str,
 ) -> Result<()> {
-    let points = context_points(agent)?;
-    if !points.contains(&InjectPoint::TurnSafePoint) {
+    if !context_points(agent)?.contains(&InjectPoint::TurnSafePoint) {
         return Err(Error::new(
             "unsupported",
-            "Claude steer requires turn_safe_point tool hooks",
+            "this Agent has no turn safe point to receive a steer",
         ));
     }
-    // Rule-caused owner steers render as "Swarm rule", which is wider than
-    // "owner", so check that upper bound before admitting.
+    // Rule-caused owner steers render as "Swarm rule", wider than "owner".
     let frame_principal = if principal == "owner" {
         "swarm_rule"
     } else {
         principal
     };
-    let framed = swarm_note(text, frame_principal);
-    if framed.len() > MAX_TEXT_BYTES {
-        return Err(Error::new(
-            "frame_too_large",
-            "framed steer text exceeds 512 KiB",
-        ));
-    }
     let item = ContextItem {
         command_id: command_id.to_owned(),
-        text: framed.clone(),
+        text: swarm_note(text, frame_principal),
         expires_at_ms: None,
     };
     let max_reply_id = Value::String("M".repeat(MAX_COMMAND_ID_BYTES));
-    if !hook_response_fits(&max_reply_id, std::slice::from_ref(&item))?
-        || !claude_hook_callback_fits("PostToolUse", &framed)?
-    {
+    if !hook_response_fits(&max_reply_id, std::slice::from_ref(&item))? {
         return Err(Error::new(
             "frame_too_large",
             "framed steer exceeds the 1 MiB hook response bound",
@@ -1045,9 +1016,7 @@ impl Store {
         let mut selected: Vec<ContextItem> = Vec::new();
         let mut selected_ids = Vec::new();
         let mut payload_bytes = 0_usize;
-        let mut joined_text = String::new();
         let in_flight_stop = has_in_flight_stop_tx(&tx, agent_num, generation)?;
-        let claude_hook_name = (agent.harness == "claude").then(|| claude_hook_event_name(hook));
         let mut pending_candidates = pending_context_batch(
             &tx,
             agent_num,
@@ -1064,50 +1033,19 @@ impl Store {
                 continue;
             }
             let is_steer = record.command.verb == "steer";
-            let (item, raw_len) = if is_steer {
-                if in_flight_stop {
-                    reject_pending_steer(
-                        &tx,
-                        &record,
-                        agent_num,
-                        generation,
-                        "bad_state",
-                        "steer cannot be delivered while a stop is in flight",
-                        now,
-                        &mut events,
-                    )?;
+            let (text, expires_at_ms) = if is_steer {
+                if !steer_deliverable_tx(
+                    &tx,
+                    &record,
+                    &agent,
+                    in_flight_stop,
+                    agent_num,
+                    now,
+                    &mut events,
+                )? {
                     continue;
                 }
-                if let Err(error) = check_pending_steer_dispatch(&tx, &record, &agent) {
-                    if matches!(
-                        error.code.as_str(),
-                        "stale_assignment" | "not_allowed" | "stale_generation" | "provider_held"
-                    ) {
-                        reject_pending_steer(
-                            &tx,
-                            &record,
-                            agent_num,
-                            generation,
-                            &error.code,
-                            &error.message,
-                            now,
-                            &mut events,
-                        )?;
-                        continue;
-                    }
-                    return Err(error);
-                }
-                let text = required_string(&record.command.args, "text")?;
-                let rendered = render_injection(&tx, &record.command, &text)?;
-                let rendered_len = rendered.len();
-                (
-                    ContextItem {
-                        command_id: record.command.id.clone(),
-                        text: rendered,
-                        expires_at_ms: None,
-                    },
-                    rendered_len,
-                )
+                (required_string(&record.command.args, "text")?, None)
             } else {
                 let args = decode_inject_args(&record.command.args)?;
                 if args.point != InjectPoint::TurnSafePoint {
@@ -1131,23 +1069,16 @@ impl Store {
                     )?;
                     continue;
                 }
-                let rendered = render_injection(&tx, &record.command, &args.text)?;
-                (
-                    ContextItem {
-                        command_id: record.command.id.clone(),
-                        text: rendered,
-                        expires_at_ms: args.expires_at_ms,
-                    },
-                    args.text.len(),
-                )
+                (args.text, args.expires_at_ms)
             };
-            let lone_fits = raw_len <= MAX_TEXT_BYTES
-                && hook_response_fits(reply_id, std::slice::from_ref(&item))?
-                && claude_hook_name
-                    .map(|name| claude_hook_callback_fits(name, &item.text))
-                    .transpose()?
-                    .unwrap_or(true);
-            if !lone_fits {
+            let item = ContextItem {
+                command_id: record.command.id.clone(),
+                text: render_injection(&tx, &record.command, &text)?,
+                expires_at_ms,
+            };
+            if text.len() > MAX_TEXT_BYTES
+                || !hook_response_fits(reply_id, std::slice::from_ref(&item))?
+            {
                 if is_steer {
                     reject_pending_steer(
                         &tx,
@@ -1173,27 +1104,15 @@ impl Store {
                 continue;
             }
             let mut candidate = selected.clone();
-            candidate.push(item.clone());
-            let candidate_bytes = payload_bytes.saturating_add(raw_len);
-            let mut candidate_joined = joined_text.clone();
-            if !candidate_joined.is_empty() {
-                candidate_joined.push_str("\n\n");
-            }
-            candidate_joined.push_str(&item.text);
-            let batch_fits = candidate_bytes <= MAX_TEXT_BYTES
-                && hook_response_fits(reply_id, &candidate)?
-                && claude_hook_name
-                    .map(|name| claude_hook_callback_fits(name, &candidate_joined))
-                    .transpose()?
-                    .unwrap_or(true);
-            if !batch_fits {
-                // Fits alone but overflows with this batch: stop scanning so it
-                // and any later FIFO items wait for the next safe-point hook.
+            candidate.push(item);
+            let candidate_bytes = payload_bytes.saturating_add(text.len());
+            if candidate_bytes > MAX_TEXT_BYTES || !hook_response_fits(reply_id, &candidate)? {
+                // Fits alone but not in this batch: it and later FIFO items
+                // wait for the next safe-point hook of this turn.
                 break;
             }
             selected = candidate;
             payload_bytes = candidate_bytes;
-            joined_text = candidate_joined;
             selected_ids.push(record.command.id.clone());
         }
         for command_id in &selected_ids {
@@ -2295,6 +2214,46 @@ pub(super) fn claim_context_tx(
         }),
     )?);
     Ok(())
+}
+
+/// Recheck a pending steer at its safe point with the gates a dispatched
+/// command passes. `false` means it is held by its rule order or was settled.
+fn steer_deliverable_tx(
+    tx: &Transaction<'_>,
+    record: &CommandRecord,
+    agent: &Agent,
+    in_flight_stop: bool,
+    agent_num: i64,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<bool> {
+    let refusal = match rules::gate_rule_action_dispatch_tx(tx, &record.command.id, now, events) {
+        Ok(rules::RuleActionDispatchGate::Ready) if in_flight_stop => Some(Error::new(
+            "bad_state",
+            "steer cannot be delivered while a stop is in flight",
+        )),
+        Ok(rules::RuleActionDispatchGate::Ready) => {
+            check_pending_steer_dispatch(tx, record, agent).err()
+        }
+        Ok(rules::RuleActionDispatchGate::Held | rules::RuleActionDispatchGate::Cancelled) => {
+            return Ok(false);
+        }
+        Err(error) => Some(error),
+    };
+    let Some(error) = refusal else {
+        return Ok(true);
+    };
+    reject_pending_steer(
+        tx,
+        record,
+        agent_num,
+        agent.generation,
+        &error.code,
+        &error.message,
+        now,
+        events,
+    )?;
+    Ok(false)
 }
 
 fn check_pending_steer_dispatch(

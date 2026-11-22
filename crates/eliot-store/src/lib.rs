@@ -6828,14 +6828,18 @@ fn terminalize_generation_commands(
         }
         let mut outcome = json!({"reason": reason});
         let record = load_command_record(tx, &id)?;
-        if let Some(record) = record.filter(|record| record.command.verb == "inject") {
-            outcome["delivery"] = json!("cancelled");
-            if record
-                .command
-                .outcome
-                .is_some_and(|value| value["delivery"] == "moved")
-            {
-                outcome["moved"] = json!(true);
+        if let Some(record) =
+            record.filter(|record| matches!(record.command.verb.as_str(), "inject" | "steer"))
+        {
+            if record.command.verb == "inject" {
+                outcome["delivery"] = json!("cancelled");
+                if record
+                    .command
+                    .outcome
+                    .is_some_and(|value| value["delivery"] == "moved")
+                {
+                    outcome["moved"] = json!(true);
+                }
             }
             context_events.push(native_events::PendingCommandEvent {
                 command_id: id.clone(),

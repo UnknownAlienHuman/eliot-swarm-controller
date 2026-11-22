@@ -1818,8 +1818,9 @@ native stream state, no in-flight stop, and provider holds. On harnesses that de
 `steer` through a direct native RPC, submitting to the plugin has a bounded response
 deadline; if that deadline expires, the command settles as `unknown` with a timeout reason
 and releases the pending call slot without repeating the steer or treating timeout as
-turn completion. On Claude, `steer` must also satisfy `turn_safe_point` hook support and
-the `#888` Swarm-note framed text and 1 MiB hook-response bounds at admission; Store claims
+turn completion. On Claude, `steer` must also have `turn_safe_point` hook support, and its
+`#888` Swarm-note frame must fit the 1 MiB hook response at admission; Store rechecks the
+dispatch gates, including rule-action order, and claims
 pending Claude steers in FIFO order on the soonest `PreToolUse` or `PostToolUse` callback
 (`hook.event`) for that exact turn using the `#888` Swarm note frame (preserving Owner
 and manager sender identity), settles `rejected` (`captured_turn_ended`) if the turn ends

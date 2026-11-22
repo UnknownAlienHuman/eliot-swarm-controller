@@ -192,7 +192,7 @@ impl Router {
     }
 
     async fn admit_provider_command(&self, prepared: PreparedSubmission) -> Result<Admission> {
-        let (admission, needs_worker) = {
+        let admission = {
             let mut store = self.inner.store.lock().await;
             let admission = self.admit_prepared_submission(
                 &mut store,
@@ -201,8 +201,7 @@ impl Router {
                 SubmissionContext::default(),
             )?;
             self.publish_locked(&admission.events);
-            let needs_worker = admission.is_new && command_needs_worker(&store, &admission.command);
-            (admission, needs_worker)
+            admission
         };
         if admission.command.state == CommandState::Unknown {
             self.inner
@@ -210,7 +209,7 @@ impl Router {
                 .lock_recover()
                 .insert(admission.command.id.clone());
         }
-        if needs_worker {
+        if admission.is_new && command_needs_worker(&admission.command) {
             self.schedule_admission(&admission);
         }
         self.signal_progress();

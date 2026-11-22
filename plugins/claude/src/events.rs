@@ -550,14 +550,6 @@ impl EventHandle {
             .await;
     }
 
-    /// Whether `turn_id` is the exact live turn, answered behind any queued
-    /// terminal frame so a control never targets a finished turn.
-    pub async fn check_turn(&self, turn_id: &str) -> Result<bool> {
-        self.turn_interrupt_status(turn_id)
-            .await
-            .map(|status| status.is_some())
-    }
-
     /// The exact live turn's interrupt status, or None if the turn ended.
     /// An actor timeout or loss remains an error, never proof of a finished turn.
     pub async fn turn_interrupt_status(&self, turn_id: &str) -> Result<Option<bool>> {
@@ -2134,6 +2126,12 @@ impl EventProcessor {
             ));
         }
         self.finish_tool_use_hook(&pending.tool_use_id, pending.hook, &pending.consumer_id);
+        let Some(session_id) = self.status.session_id.as_deref() else {
+            return Err(Error::new(
+                "unknown",
+                "Claude session identity disappeared after the hook response write",
+            ));
+        };
         let outcome = ContextOutcome {
             mechanism: format!(
                 "claude.{}.additionalContext",
@@ -2160,9 +2158,8 @@ impl EventProcessor {
             .await
     }
 
-    /// The pass path for a hook that selected no context and carries no
-    /// steer: write the empty response and commit the empty receipt. This is
-    /// the original empty-context block, unchanged.
+    /// The pass path for a hook that selected no context: write the empty
+    /// response and commit the empty receipt.
     async fn finish_hook_pass(
         &mut self,
         request_id: &str,
