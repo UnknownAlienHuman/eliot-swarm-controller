@@ -24,7 +24,8 @@ pub fn emit() {
         Some(sha) => {
             let dirty_marker = match git_dirty {
                 Some(false) => "",
-                Some(true) | None => "-dirty",
+                Some(true) => "-dirty",
+                None => "-tree-unknown",
             };
             format!("{package_version}+g{}{dirty_marker}", &sha[..8])
         }
@@ -117,18 +118,14 @@ fn watch_worktree_inputs(workspace_root: &Path) {
     let Some(files) = git_output(workspace_root, &["ls-files", "-z"]) else {
         return;
     };
-    for relative in nul_paths(&files) {
-        watch(&workspace_root.join(relative));
-    }
-}
-
-fn nul_paths(output: &Output) -> Vec<PathBuf> {
-    output
+    for relative in files
         .stdout
         .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty())
-        .filter_map(|path| std::str::from_utf8(path).ok().map(PathBuf::from))
-        .collect()
+        .filter_map(|path| std::str::from_utf8(path).ok())
+        .filter(|path| !path.is_empty() && !path.contains(['\r', '\n']))
+    {
+        watch(&workspace_root.join(relative));
+    }
 }
 
 fn watch_git_markers(workspace_root: &Path) {

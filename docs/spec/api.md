@@ -743,13 +743,11 @@ path/version, and one-command repair when a replacement is installed.
 `daemon.status` includes `build_identity`: the package version with a short Git
 revision suffix (or `git-unknown` when built without an available repository),
 the full compile-time `git_sha`, the parent directory of the running executable,
-and its exact SHA-256. The version metadata adds the literal `-dirty` suffix
-when Git reports a staged change or an unstaged tracked-path change or deletion;
-untracked-only changes, including Git-ignored private build outputs, are excluded.
-If Git status cannot be read despite a valid `HEAD`, the build conservatively adds
-`-dirty`. Cargo watches the worktree's actual index and each tracked path returned
-by `git ls-files -z`, so same-HEAD tracked edits and dirty-to-clean transitions
-refresh the marker without recursively watching the worktree root or `target/`.
+and its exact SHA-256. The version adds `-dirty` for tracked Git changes,
+including staged changes, unstaged edits and deletions. A failed status query with
+a valid `HEAD` adds `-tree-unknown`. Cargo watches the worktree index and the
+tracked paths from `git ls-files -z`, so edits and dirty-to-clean transitions
+refresh the marker even when `HEAD` stays the same.
 The daemon computes the executable hash once at startup and reuses that snapshot
 in status and the `daemon.build_identity` startup log record. `git_sha`,
 `executable_directory`, and `executable_sha256` are null when their source cannot
