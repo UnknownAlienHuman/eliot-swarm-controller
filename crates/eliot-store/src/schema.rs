@@ -2137,7 +2137,8 @@ impl Store {
             tx.commit().map_err(sql_error)?;
         }
         if current < 89 {
-            let tx = self.connection
+            let tx = self
+                .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_error)?;
             tx.execute_batch(
