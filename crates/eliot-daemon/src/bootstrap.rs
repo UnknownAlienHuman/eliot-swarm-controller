@@ -15,7 +15,7 @@ use tokio::sync::Mutex;
 
 /// Where a new private data directory named `name` goes for this process:
 /// beside `current`, unless Windows would redirect that location.
-pub fn fresh_data_dir(current: &Path, name: &str) -> PathBuf {
+pub fn fresh_data_dir(current: &Path, name: &str) -> Result<PathBuf> {
     crate::platform::data_dir::fresh_data_dir(current, name)
 }
 

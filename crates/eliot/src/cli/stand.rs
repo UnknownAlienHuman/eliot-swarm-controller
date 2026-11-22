@@ -600,17 +600,13 @@ pub(crate) async fn prune(json_output: bool) -> Result<u8, Failure> {
                 item["data_dir"].as_str().unwrap_or(""),
                 item["outcome"].as_str().unwrap_or(""),
             );
-            if let Some(path) = item
-                .get("former_registry")
-                .and_then(Value::as_str)
-                .or_else(|| item["former_registration"]["path"].as_str())
-            {
-                println!(
-                    "  former-location registration {path}: {}",
-                    item["former_registration"]["action"]
-                        .as_str()
-                        .unwrap_or("not moved")
-                );
+            if let (Some(path), Some(action)) = (
+                item["former_registration"]["path"].as_str(),
+                item["former_registration"]["action"].as_str(),
+            ) {
+                println!("  former-location registration {path}: {action}");
+            } else if let Some(path) = item["former_registry"].as_str() {
+                println!("  registered at the former location {path}");
             }
             for key in ["external_worktrees", "external_branches"] {
                 for detail in item[key]

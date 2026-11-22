@@ -2072,70 +2072,108 @@ pub(crate) fn account_profile() -> Result<PathBuf> {
     known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_Profile)
 }
 
-/// The MSIX package whose private cache receives this process's AppData
-/// writes, checked once per process. Package identity cannot answer this: a
-/// shell started by a packaged app can be redirected with no identity of its
-/// own. A failed probe reports no redirection.
-fn redirecting_package() -> Option<&'static str> {
-    static PACKAGE: OnceLock<Option<String>> = OnceLock::new();
-    PACKAGE.get_or_init(probe_redirecting_package).as_deref()
+/// One AppData folder Windows redirects on its own.
+struct AppDataFolder {
+    path: PathBuf,
+    key: String,
+    /// Where a package's `LocalCache` receives this folder's writes.
+    cache_child: &'static str,
+    /// The definite probe answer. A failed probe is never stored, so a
+    /// long-lived process can recover from a transient failure.
+    redirected_to: OnceLock<Option<String>>,
 }
 
-/// Create a delete-on-close file in Local AppData and look for it in each
-/// package's cache. Windows removes it when the handle closes, even on a crash.
-fn probe_redirecting_package() -> Option<String> {
-    use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
-    use windows_sys::Win32::Storage::FileSystem::{
-        DELETE, FILE_FLAG_DELETE_ON_CLOSE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    };
-    let local = account_local_app_data().ok()?;
-    let name = format!(".eliot-redirect-probe-{}", ulid::Ulid::new());
-    let _probe = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-        .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
-        .open(local.join(&name))
-        .ok()?;
-    fs::read_dir(local.join("Packages"))
-        .ok()?
-        .flatten()
-        .find(|package| {
-            fs::symlink_metadata(package.path().join("LocalCache").join("Local").join(&name))
-                .is_ok()
-        })
-        .map(|package| package.file_name().to_string_lossy().into_owned())
+impl AppDataFolder {
+    /// The MSIX package whose cache receives this process's writes here.
+    /// Package identity cannot answer this: a shell started by a packaged app
+    /// can be redirected with no identity of its own.
+    fn redirecting_package(&self) -> std::result::Result<Option<&str>, String> {
+        if let Some(found) = self.redirected_to.get() {
+            return Ok(found.as_deref());
+        }
+        let found = self.probe()?;
+        Ok(self.redirected_to.get_or_init(|| found).as_deref())
+    }
+
+    /// Create a delete-on-close file here and look for it in each package's
+    /// cache. `Ok(None)` means every cache was checked and none holds it.
+    fn probe(&self) -> std::result::Result<Option<String>, String> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            DELETE, FILE_FLAG_DELETE_ON_CLOSE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        let packages = account_local_app_data()
+            .map_err(|error| error.message.to_string())?
+            .join("Packages");
+        let name = format!(".eliot-redirect-probe-{}", ulid::Ulid::new());
+        let _probe = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
+            .open(self.path.join(&name))
+            .map_err(|error| format!("create probe file in {}: {error}", self.path.display()))?;
+        let entries = match fs::read_dir(&packages) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("list {}: {error}", packages.display())),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| format!("list {}: {error}", packages.display()))?;
+            let mut landed = entry.path().join("LocalCache");
+            if !self.cache_child.is_empty() {
+                landed.push(self.cache_child);
+            }
+            landed.push(&name);
+            match fs::symlink_metadata(&landed) {
+                Ok(_) => return Ok(Some(entry.file_name().to_string_lossy().into_owned())),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("inspect {}: {error}", landed.display())),
+            }
+        }
+        Ok(None)
+    }
 }
 
-/// Comparison keys of the account's AppData directory and known folders.
-/// Windows also redirects a directory created directly under AppData, and
-/// each known folder can be relocated away from it.
-fn appdata_keys() -> Result<&'static [String]> {
+/// The account's AppData folders, most specific first. Windows also redirects
+/// a directory created directly under AppData, and each known folder can be
+/// relocated away from it.
+fn appdata_folders() -> Result<&'static [AppDataFolder]> {
     use windows_sys::Win32::UI::Shell::{
         FOLDERID_LocalAppData, FOLDERID_LocalAppDataLow, FOLDERID_RoamingAppData,
     };
-    static KEYS: OnceLock<Vec<String>> = OnceLock::new();
-    if let Some(keys) = KEYS.get() {
-        return Ok(keys);
+    static FOLDERS: OnceLock<Vec<AppDataFolder>> = OnceLock::new();
+    if let Some(folders) = FOLDERS.get() {
+        return Ok(folders);
     }
-    let mut folders = vec![account_profile()?.join("AppData")];
-    for id in [
-        &FOLDERID_LocalAppData,
-        &FOLDERID_RoamingAppData,
-        &FOLDERID_LocalAppDataLow,
-    ] {
-        folders.push(known_folder(id)?);
-    }
-    let keys = folders
-        .into_iter()
-        .map(|folder| {
-            let folder = fs::canonicalize(&folder).unwrap_or(folder);
-            eliot_core::workspace_path_key(&folder.to_string_lossy()).into_owned()
-        })
-        .collect();
-    Ok(KEYS.get_or_init(|| keys))
+    let folders = [
+        (known_folder(&FOLDERID_LocalAppData)?, "Local"),
+        (known_folder(&FOLDERID_RoamingAppData)?, "Roaming"),
+        (known_folder(&FOLDERID_LocalAppDataLow)?, "LocalLow"),
+        (account_profile()?.join("AppData"), ""),
+    ]
+    .into_iter()
+    .map(|(path, cache_child)| {
+        let path = fs::canonicalize(&path).unwrap_or(path);
+        AppDataFolder {
+            key: eliot_core::workspace_path_key(&path.to_string_lossy()).into_owned(),
+            path,
+            cache_child,
+            redirected_to: OnceLock::new(),
+        }
+    })
+    .collect();
+    Ok(FOLDERS.get_or_init(|| folders))
+}
+
+fn outside_appdata_remedy() -> String {
+    let example = account_profile().map_or_else(
+        |_| String::new(),
+        |profile| format!(", for example {}", profile.join("swarm-data").display()),
+    );
+    format!("use a directory outside AppData with --data-dir, ELIOT_HOME or --root{example}")
 }
 
 /// `path` with its longest existing prefix resolved, for a path that may not
@@ -2155,35 +2193,48 @@ fn resolved_through_existing(path: &Path) -> PathBuf {
 
 /// Refuse a path under AppData when this process's writes there are redirected
 /// to an MSIX package's private cache, where a process outside the package,
-/// such as a WMI-started daemon, cannot see them.
+/// such as a WMI-started daemon, cannot see them. A path under AppData whose
+/// redirection cannot be determined is refused too.
 pub(crate) fn refuse_package_redirected(path: &Path) -> Result<()> {
-    // This check must never make an ordinary data directory unusable, so a
-    // process that cannot read its own known folders is not refused here.
-    let Ok(appdata) = appdata_keys() else {
-        return Ok(());
-    };
     let resolved = resolved_through_existing(path);
     let resolved = eliot_core::workspace_path_key(&resolved.to_string_lossy()).into_owned();
-    if !appdata
+    let folders = match appdata_folders() {
+        Ok(folders) => folders,
+        // Without the account's folders, only the path's spelling can show it
+        // is under AppData; any other data directory stays usable.
+        Err(error) if resolved.split('/').any(|part| part == "appdata") => {
+            return Err(Error::new(
+                "not_allowed",
+                format!(
+                    "{} looks like an AppData path, and the account's folders needed to check Windows redirection cannot be read: {}; {}",
+                    path.display(),
+                    error.message,
+                    outside_appdata_remedy()
+                ),
+            ));
+        }
+        Err(_) => return Ok(()),
+    };
+    let Some(folder) = folders
         .iter()
-        .any(|folder| Path::new(&resolved).starts_with(Path::new(folder)))
-    {
-        return Ok(());
-    }
-    let Some(package) = redirecting_package() else {
+        .find(|folder| Path::new(&resolved).starts_with(Path::new(&folder.key)))
+    else {
         return Ok(());
     };
-    let example = account_profile().map_or_else(
-        |_| String::new(),
-        |profile| format!(", for example {}", profile.join("swarm-data").display()),
-    );
-    Err(Error::new(
-        "not_allowed",
-        format!(
-            "{} is under AppData, which Windows redirects for this process into the private cache of MSIX package {package}, so processes outside the package cannot see it; use a directory outside AppData with --data-dir, ELIOT_HOME or --root{example}",
-            path.display()
+    let message = match folder.redirecting_package() {
+        Ok(None) => return Ok(()),
+        Ok(Some(package)) => format!(
+            "{} is under AppData, which Windows redirects for this process into the private cache of MSIX package {package}, so processes outside the package cannot see it; {}",
+            path.display(),
+            outside_appdata_remedy()
         ),
-    ))
+        Err(probe) => format!(
+            "{} is under AppData, and whether Windows redirects it for this process could not be determined: {probe}; {}",
+            path.display(),
+            outside_appdata_remedy()
+        ),
+    };
+    Err(Error::new("not_allowed", message))
 }
 
 fn known_folder(id: &windows_sys::core::GUID) -> Result<PathBuf> {

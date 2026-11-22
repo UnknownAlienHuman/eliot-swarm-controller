@@ -555,6 +555,11 @@ fn former_registry() -> Result<Option<PathBuf>> {
     }
 }
 
+/// One wording for a former registry whose location cannot be resolved.
+fn former_unavailable(error: &Error) -> String {
+    format!("cannot be located: {}", error.message)
+}
+
 /// Add the stands an earlier build registered at the former location, each
 /// with that path, and report every former file that cannot be used.
 pub fn add_former_registrations(scan: &mut StandRegistryScan) {
@@ -564,7 +569,7 @@ pub fn add_former_registrations(scan: &mut StandRegistryScan) {
         Err(error) => {
             scan.unusable.push(UnusableStandRegistration {
                 registry_path: FORMER_REGISTRY_LABEL.to_owned(),
-                detail: format!("former stand registry cannot be located: {}", error.message),
+                detail: format!("former stand registry {}", former_unavailable(&error)),
             });
             return;
         }
@@ -712,7 +717,7 @@ pub fn settle_former_registration(
         Err(error) if located.former => return Err(error),
         Err(error) => {
             return keep(Some((
-                format!("could not be checked: {}", error.message),
+                former_unavailable(&error),
                 FORMER_REGISTRY_LABEL.to_owned(),
             )));
         }
@@ -743,10 +748,55 @@ pub fn settle_former_registration(
         };
         return keep(note.map(|action| (action, former_file.display().to_string())));
     }
-    let former_records = read_former_worktree_records(&worktree_records_dir(&former, &name))?;
+    match move_former_registration(&former, &name, record, located.former) {
+        Ok(registry) => Ok(SettledRegistration {
+            registry,
+            former: Some((
+                "migrated to the current registry".to_owned(),
+                former_file.display().to_string(),
+            )),
+        }),
+        Err(error) if located.former => Err(error),
+        Err(error) => keep(Some((
+            format!("could not be retired, left in place: {}", error.message),
+            former_file.display().to_string(),
+        ))),
+    }
+}
+
+/// Copy the former worktree records and, when the stand is not yet in the
+/// current registry, its registration, then remove the former files. Every
+/// record is checked before the first write.
+fn move_former_registration(
+    former: &Path,
+    name: &str,
+    record: &StandRegistration,
+    write_registration: bool,
+) -> Result<PathBuf> {
+    let former_records = read_former_worktree_records(&worktree_records_dir(former, name))?;
     let registry = stand_registry(true)?;
-    if !former_records.is_empty() {
-        let dir = worktree_records_dir(&registry, &name);
+    let dir = worktree_records_dir(&registry, name);
+    let mut to_write = Vec::new();
+    for (file, moved) in &former_records {
+        let path = dir.join(file);
+        match read_record::<StandWorktreeRecord>(&path) {
+            Ok(existing) if existing == *moved => {}
+            Ok(_) => {
+                return Err(Error::new(
+                    "identity_changed",
+                    format!(
+                        "stand worktree record at {} differs from the former record",
+                        path.display()
+                    ),
+                ));
+            }
+            Err(RecordFailure::Unusable(detail)) => {
+                return Err(unusable_record("stand worktree record", &path, &detail));
+            }
+            Err(RecordFailure::Missing) => to_write.push((file, moved)),
+        }
+    }
+    if !to_write.is_empty() {
         if !dir.exists()
             && let Err(error) = create_stand_root(&dir)
             && !dir.exists()
@@ -755,40 +805,17 @@ pub fn settle_former_registration(
         }
         check_directory_chain(&dir)?;
         validate_stand_directory(&dir)?;
-        for (file, moved) in &former_records {
-            let path = dir.join(file);
-            match read_record::<StandWorktreeRecord>(&path) {
-                Ok(existing) if existing == *moved => continue,
-                Ok(_) => {
-                    return Err(Error::new(
-                        "identity_changed",
-                        format!(
-                            "stand worktree record at {} differs from the former record",
-                            path.display()
-                        ),
-                    ));
-                }
-                Err(RecordFailure::Unusable(detail)) => {
-                    return Err(unusable_record("stand worktree record", &path, &detail));
-                }
-                Err(RecordFailure::Missing) => {}
-            }
+        for (file, moved) in to_write {
             let bytes = serde_json::to_vec(moved)
                 .map_err(|_| Error::new("internal", "encode stand worktree record"))?;
             write_stand_record(&dir, file, &bytes)?;
         }
     }
-    if located.former {
-        write_stand_registration(&registry, &name, record)?;
+    if write_registration {
+        write_stand_registration(&registry, name, record)?;
     }
-    remove_stand_registration(&former, &name)?;
-    Ok(SettledRegistration {
-        registry,
-        former: Some((
-            "migrated to the current registry".to_owned(),
-            former_file.display().to_string(),
-        )),
-    })
+    remove_stand_registration(former, name)?;
+    Ok(registry)
 }
 
 /// Every former worktree record, or a refusal naming the first unusable one,

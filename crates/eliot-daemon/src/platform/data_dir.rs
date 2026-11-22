@@ -435,11 +435,21 @@ fn unsafe_data_dir_error(path: &Path, mut error: Error) -> Error {
         .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty())
         .unwrap_or("Eliot");
-    let fresh_path = fresh_data_dir(path, &format!("{name}-{}", ulid::Ulid::new()));
-    // PowerShell single-quoted literals double embedded apostrophes.
-    let command_path = fresh_path.to_string_lossy().replace('\'', "''");
+    let remedy = match fresh_data_dir(path, &format!("{name}-{}", ulid::Ulid::new())) {
+        Ok(fresh_path) => {
+            // PowerShell single-quoted literals double embedded apostrophes.
+            let command_path = fresh_path.to_string_lossy().replace('\'', "''");
+            format!(
+                "Create a fresh private directory with `swarm --data-dir '{command_path}' daemon` (the desktop offers the same remedy)"
+            )
+        }
+        Err(lookup) => format!(
+            "Use --data-dir or ELIOT_HOME with a fresh private directory outside AppData ({})",
+            lookup.message
+        ),
+    };
     *error.message = format!(
-        "the selected data directory is unsafe and was not changed: {}. Create a fresh private directory with `swarm --data-dir '{command_path}' daemon` (the desktop offers the same remedy)",
+        "the selected data directory is unsafe and was not changed: {}. {remedy}",
         error.message
     );
     error
@@ -947,15 +957,14 @@ pub(crate) fn refuse_package_redirected(path: &Path) -> Result<()> {
 
 /// Where a new private data directory named `name` goes: beside `current`, or
 /// in the account profile when Windows would redirect that location for this
-/// process, so a remedy never names a directory the process must refuse.
-pub(crate) fn fresh_data_dir(current: &Path, name: &str) -> PathBuf {
+/// process, so a remedy never names a directory the process must refuse. A
+/// failed profile lookup is an error, never a fallback to `current`'s folder.
+pub(crate) fn fresh_data_dir(current: &Path, name: &str) -> Result<PathBuf> {
     #[cfg(windows)]
-    if refuse_package_redirected(current).is_err()
-        && let Ok(profile) = super::windows::account_profile()
-    {
-        return profile.join(name);
+    if refuse_package_redirected(current).is_err() {
+        return super::windows::account_profile().map(|profile| profile.join(name));
     }
-    current.with_file_name(name)
+    Ok(current.with_file_name(name))
 }
 
 /// Check the former AppData stand registry before trusting a record in it. A
