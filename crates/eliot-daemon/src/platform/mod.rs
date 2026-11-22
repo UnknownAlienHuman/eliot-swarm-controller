@@ -78,7 +78,6 @@ pub(crate) fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
 /// Bounded live metadata for one inspected process node.
 #[derive(Clone, Debug)]
 pub(crate) struct ProcessNodeInfo {
-    pub(crate) pid: u32,
     pub(crate) parent_pid: Option<u32>,
     pub(crate) image_path: Option<String>,
     pub(crate) command_line: Option<String>,

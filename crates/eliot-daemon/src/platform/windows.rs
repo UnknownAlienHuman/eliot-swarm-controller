@@ -1195,7 +1195,6 @@ pub(crate) fn inspect_process_node(pid: u32) -> Option<super::ProcessNodeInfo> {
         argv.truncate(MAX_HEAVY_ARGV_TOKENS);
     }
     Some(super::ProcessNodeInfo {
-        pid,
         parent_pid,
         image_path,
         command_line,

@@ -1330,7 +1330,6 @@ pub(crate) fn inspect_process_node(pid: u32) -> Option<super::ProcessNodeInfo> {
     }
     let command_line = (!argv.is_empty()).then(|| argv.join(" "));
     Some(super::ProcessNodeInfo {
-        pid,
         parent_pid,
         image_path,
         command_line,

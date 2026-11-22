@@ -13,6 +13,9 @@ pub const BACKGROUND_WAKE_NOTE_KIND: &str = "background_process_wake";
 pub const BACKGROUND_WAKE_PRINCIPAL: &str = "swarm_note:background_process_wake";
 pub const MAX_BACKGROUND_WAKE_COMMAND_BYTES: usize = 512;
 pub const MAX_BACKGROUND_WAKE_OUTPUT_TAIL_BYTES: usize = 1_024;
+/// Stored in place of a tail when several tool windows contain the process start.
+pub const BACKGROUND_WAKE_AMBIGUOUS_TAIL: &str =
+    "(omitted: several tool calls overlapped this process start)";
 pub const BACKGROUND_SERVER_TOPIC: &str = "background.server";
 
 const SWARM_INFRA_SUBCOMMANDS: &[&str] = &["mcp", "hook", "plugin", "daemon"];
@@ -38,6 +41,43 @@ const HARNESS_OWNED_STEMS: &[&str] = &[
     "pylsp",
     "lua-language-server",
     "crashpad_handler",
+];
+
+/// Programs that run other programs: their name says nothing about the job.
+const GENERIC_LAUNCHER_STEMS: &[&str] = &[
+    "bash",
+    "bun",
+    "bunx",
+    "cargo",
+    "cmd",
+    "dash",
+    "deno",
+    "docker",
+    "dotnet",
+    "env",
+    "go",
+    "java",
+    "node",
+    "npm",
+    "npx",
+    "perl",
+    "php",
+    "pip",
+    "pipx",
+    "pnpm",
+    "pnpx",
+    "podman",
+    "powershell",
+    "pwsh",
+    "py",
+    "python",
+    "python3",
+    "ruby",
+    "sh",
+    "uv",
+    "uvx",
+    "yarn",
+    "zsh",
 ];
 
 fn executable_stem(raw: &str) -> Option<String> {
@@ -106,36 +146,69 @@ fn is_swarm_infra_tokens(tokens: &[String]) -> bool {
     false
 }
 
-/// Extract configured MCP server program stems/names from a frozen profile snapshot.
-pub fn extract_configured_mcp_programs(profile_snapshot: &Value) -> Vec<String> {
-    let mut programs = Vec::new();
+/// One MCP server from a frozen profile: its program stem and exact arguments.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfiguredMcpServer {
+    program: String,
+    args: Vec<String>,
+}
+
+impl ConfiguredMcpServer {
+    /// Whether a process runs this server. A generic launcher rewrites its own
+    /// argv (`npx` runs `node`), so its server is identified by the configured
+    /// arguments alone, and only when they name more than flags. Any other
+    /// program must match too.
+    fn matches(&self, program: Option<&str>, tokens: &[String]) -> bool {
+        if GENERIC_LAUNCHER_STEMS.contains(&self.program.as_str()) {
+            if self.args.iter().all(|arg| arg.starts_with('-')) {
+                return false;
+            }
+        } else if program != Some(self.program.as_str()) {
+            return false;
+        }
+        self.args.is_empty()
+            || tokens.windows(self.args.len()).any(|window| {
+                window.iter().zip(&self.args).all(|(token, arg)| {
+                    token
+                        .trim_matches(|ch| ch == '"' || ch == '\'')
+                        .eq_ignore_ascii_case(arg)
+                })
+            })
+    }
+}
+
+/// Extract configured MCP servers from a frozen profile snapshot.
+pub fn extract_configured_mcp_servers(profile_snapshot: &Value) -> Vec<ConfiguredMcpServer> {
+    let mut servers = Vec::new();
     let Some(root) = profile_snapshot.as_object() else {
-        return programs;
+        return servers;
     };
     for key in ["mcp_servers", "mcpServers", "servers"] {
         let Some(entries) = root.get(key).and_then(Value::as_object) else {
             continue;
         };
         for server in entries.values() {
-            if let Some(command) = server.get("command").and_then(Value::as_str)
-                && let Some(stem) = executable_stem(command)
-            {
-                programs.push(stem);
-            }
-            if let Some(args) = server.get("args").and_then(Value::as_array) {
-                for arg in args.iter().filter_map(Value::as_str) {
-                    if let Some(stem) = executable_stem(arg)
-                        && (stem.contains("mcp") || arg.contains(['/', '\\']))
-                    {
-                        programs.push(stem);
-                    }
-                }
-            }
+            let Some(program) = server
+                .get("command")
+                .and_then(Value::as_str)
+                .and_then(executable_stem)
+            else {
+                continue;
+            };
+            let args = server
+                .get("args")
+                .and_then(Value::as_array)
+                .map(|args| {
+                    args.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            servers.push(ConfiguredMcpServer { program, args });
         }
     }
-    programs.sort();
-    programs.dedup();
-    programs
+    servers
 }
 
 /// Whether the process belongs to the harness runtime, console host plumbing,
@@ -144,7 +217,7 @@ pub fn is_harness_owned_process(
     image_path: Option<&str>,
     argv: &[String],
     command_line: Option<&str>,
-    configured_mcp_programs: &[String],
+    configured_mcp_servers: &[ConfiguredMcpServer],
 ) -> bool {
     let tokens = owned_tokens(image_path, argv, command_line);
     if is_swarm_infra_tokens(&tokens) {
@@ -165,12 +238,12 @@ pub fn is_harness_owned_process(
         if stem == "esbuild" && tokens.iter().any(|token| token.starts_with("--service=")) {
             return true;
         }
-        if configured_mcp_programs
-            .iter()
-            .any(|entry| !entry.is_empty() && entry.eq_ignore_ascii_case(stem))
-        {
-            return true;
-        }
+    }
+    if configured_mcp_servers
+        .iter()
+        .any(|server| server.matches(stem.as_deref(), &tokens))
+    {
+        return true;
     }
     let mut saw_mcp = false;
     let mut saw_stdio = false;
@@ -190,14 +263,6 @@ pub fn is_harness_owned_process(
         }
         if matches!(lower.as_str(), "--stdio" | "stdio") {
             saw_stdio = true;
-        }
-        if !configured_mcp_programs.is_empty()
-            && let Some(token_stem) = executable_stem(token)
-            && configured_mcp_programs
-                .iter()
-                .any(|entry| !entry.is_empty() && entry.eq_ignore_ascii_case(&token_stem))
-        {
-            return true;
         }
     }
     saw_mcp && saw_stdio
@@ -341,7 +406,7 @@ pub fn format_background_wake_note_body(
         .map(|code| code.to_string())
         .unwrap_or_else(|| "unknown".to_owned());
     let mut body = format!(
-        "Background process exited (pid {pid}, exit code {code_str}).\n\
+        "Background process exited (pid {pid}, raw process exit code {code_str}).\n\
          Command: {command_line}{suffix}"
     );
     if let Some(tail) = output_tail.map(str::trim).filter(|tail| !tail.is_empty()) {

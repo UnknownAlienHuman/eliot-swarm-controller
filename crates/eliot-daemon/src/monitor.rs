@@ -156,9 +156,11 @@ pub(crate) struct BackgroundProcessCandidate {
     pub(crate) identity: ProcessIdentity,
     pub(crate) command_line: String,
     pub(crate) command_truncated: bool,
-    /// `(turn_id, item_id)` of the native tool whose exact command the OS
-    /// command line contains.
-    pub(crate) tool_item: Option<(String, String)>,
+    /// Item id of the completing turn's only tool window containing the process
+    /// start; `None` when several windows contain it.
+    pub(crate) tool_item: Option<String>,
+    /// The binding used the harness's own tool times, not commit times.
+    pub(crate) native_times: bool,
 }
 
 #[derive(Clone, Default)]
@@ -546,13 +548,13 @@ impl Monitoring {
         }
     }
 
-    /// Fresh-sample `agent`'s custody tree and pick the newest running
-    /// non-server descendant under its verified native harness session whose
-    /// start time lies inside the arm context's window.
+    /// Fresh-sample `agent`'s custody tree and pick the first running
+    /// non-server descendant of the newest native tool call of the completing
+    /// turn that contains a process start.
     pub(crate) async fn inspect_running_background_processes(
         &self,
         agent: &Agent,
-        configured_mcp_programs: &[String],
+        configured_mcp_servers: &[eliot_core::ConfiguredMcpServer],
         context: &eliot_store::BackgroundWakeArmContext,
         secrets: &eliot_core::SecretPolicy,
     ) -> Result<Option<BackgroundProcessCandidate>> {
@@ -654,23 +656,31 @@ impl Monitoring {
             tracker.ancestry.clone()
         };
 
-        let mut qualifying: Vec<(&ProcessSample, &crate::platform::ProcessNodeInfo, Vec<u32>)> =
-            Vec::new();
+        struct QualifiedCandidate<'a> {
+            sample: &'a ProcessSample,
+            chain: Vec<u32>,
+            command_line: String,
+            command_truncated: bool,
+            binding: ToolBinding,
+        }
+        let mut qualifying: Vec<QualifiedCandidate<'_>> = Vec::new();
         let mut server_ancestor_pids: HashSet<u32> = HashSet::new();
 
         for sample in &snapshot.samples {
             if sample.record.role != "child" || sample.record.state != ProcessState::Running {
                 continue;
             }
-            if context.woken.contains(&sample.record.identity)
-                || !crate::platform::process_start_unix_ms(sample.record.identity.start_time)
-                    .is_some_and(|started| {
-                        started >= context.window_start.saturating_sub(START_SKEW_MS)
-                            && started <= context.window_end.saturating_add(START_SKEW_MS)
-                    })
-            {
+            if context.woken.contains(&sample.record.identity) {
                 continue;
             }
+            let Some(proc_start_ms) =
+                crate::platform::process_start_unix_ms(sample.record.identity.start_time)
+            else {
+                continue;
+            };
+            let Some(binding) = match_tool_window(proc_start_ms, &context.tool_windows) else {
+                continue;
+            };
             let Some(chain) = harness_descendant_chain(
                 sample.record.identity.pid,
                 sample.record.identity.start_time,
@@ -689,7 +699,7 @@ impl Monitoring {
                 node.image_path.as_deref(),
                 &node.argv,
                 node.command_line.as_deref(),
-                configured_mcp_programs,
+                configured_mcp_servers,
             ) {
                 continue;
             }
@@ -699,35 +709,49 @@ impl Monitoring {
                 server_ancestor_pids.extend(chain);
                 continue;
             }
-            qualifying.push((sample, node, chain));
+            let (command_line, command_truncated) =
+                format_process_command_line(node, sample.record.identity.pid, secrets);
+            qualifying.push(QualifiedCandidate {
+                sample,
+                chain,
+                command_line,
+                command_truncated,
+                binding,
+            });
         }
 
-        qualifying
-            .retain(|(sample, _, _)| !server_ancestor_pids.contains(&sample.record.identity.pid));
+        qualifying.retain(|candidate| {
+            !server_ancestor_pids.contains(&candidate.sample.record.identity.pid)
+        });
         let qualifying_pids: HashSet<u32> = qualifying
             .iter()
-            .map(|(sample, _, _)| sample.record.identity.pid)
+            .map(|candidate| candidate.sample.record.identity.pid)
             .collect();
-        qualifying.retain(|(_, _, chain)| !chain.iter().any(|pid| qualifying_pids.contains(pid)));
+        qualifying.retain(|candidate| {
+            !candidate
+                .chain
+                .iter()
+                .any(|pid| qualifying_pids.contains(pid))
+        });
 
-        let Some((winner_sample, winner_node, _)) =
-            qualifying.into_iter().max_by_key(|(sample, _, _)| {
-                (
-                    sample.record.identity.start_time,
-                    sample.record.identity.pid,
-                )
-            })
-        else {
+        // The newest tool call's first surviving process is the job root even
+        // when a shell runtime (Git Bash) does not keep Windows parent links.
+        let Some(winner) = qualifying.into_iter().max_by_key(|candidate| {
+            (
+                candidate.binding.started_at,
+                std::cmp::Reverse(candidate.sample.record.identity.start_time),
+                std::cmp::Reverse(candidate.sample.record.identity.pid),
+            )
+        }) else {
             return Ok(None);
         };
 
-        let (command_line, command_truncated, tool_item) =
-            bounded_command_line(winner_node, &context.tool_commands, secrets);
         Ok(Some(BackgroundProcessCandidate {
-            identity: winner_sample.record.identity.clone(),
-            command_line,
-            command_truncated,
-            tool_item,
+            identity: winner.sample.record.identity.clone(),
+            command_line: winner.command_line,
+            command_truncated: winner.command_truncated,
+            tool_item: winner.binding.item_id,
+            native_times: winner.binding.native_times,
         }))
     }
 
@@ -2633,8 +2657,20 @@ fn refresh_process_timestamps(processes: &mut [ProcessRecord], cache: &Cache) {
     }
 }
 
-/// Linux converts start ticks with whole-second `btime`.
-const START_SKEW_MS: i64 = 1_000;
+/// How much earlier a recorded process start can read than the true spawn:
+/// one Windows system-time tick, or Linux's whole-second `btime`.
+#[cfg(windows)]
+const PROCESS_START_ROUNDING_MS: i64 = 16;
+#[cfg(not(windows))]
+const PROCESS_START_ROUNDING_MS: i64 = 1_000;
+/// Extra lower margin for a call without native tool times: its `tool.started`
+/// time is the daemon commit, which can trail the spawn under Store load.
+const TOOL_COMMIT_LAG_MS: i64 = 1_000;
+/// How long after its start a call with no recorded end can still spawn.
+const OPEN_CALL_SPAWN_MS: i64 = 1_000;
+/// Windows custody is the Agent's Job, so every member descends from the
+/// session even after its launcher exits. A Linux process group proves less.
+const CUSTODY_PROVES_DESCENT: bool = cfg!(windows);
 
 fn harness_descendant_chain(
     pid: u32,
@@ -2645,12 +2681,14 @@ fn harness_descendant_chain(
     harness_pids: &HashMap<u32, u64>,
     plugin_pids: &HashMap<u32, u64>,
 ) -> Option<Vec<u32>> {
+    let after_harness =
+        CUSTODY_PROVES_DESCENT && harness_pids.values().any(|&h_start| h_start <= start_time);
     let mut chain = Vec::new();
     let mut seen = HashSet::from([pid]);
     let mut current_pid = pid;
     let mut current_start = start_time;
     for _ in 0..16 {
-        let parent_pid = nodes
+        let Some(parent_pid) = nodes
             .get(&current_pid)
             .and_then(|node| node.parent_pid)
             .or_else(|| {
@@ -2658,15 +2696,11 @@ fn harness_descendant_chain(
                     .get(&current_pid)
                     .filter(|(st, _)| *st == current_start)
                     .and_then(|(_, pp)| *pp)
-            })?;
+            })
+        else {
+            return after_harness.then_some(chain);
+        };
         if parent_pid == 0 || !seen.insert(parent_pid) {
-            return None;
-        }
-        let parent_start = sample_starts
-            .get(&parent_pid)
-            .copied()
-            .or_else(|| ancestry.get(&parent_pid).map(|(st, _)| *st));
-        if parent_start.is_some_and(|st| st > current_start) {
             return None;
         }
         if plugin_pids
@@ -2681,11 +2715,19 @@ fn harness_descendant_chain(
         {
             return Some(chain);
         }
+        let Some(parent_start) = sample_starts
+            .get(&parent_pid)
+            .copied()
+            .or_else(|| ancestry.get(&parent_pid).map(|(st, _)| *st))
+        else {
+            return after_harness.then_some(chain);
+        };
+        if parent_start > current_start {
+            return after_harness.then_some(chain);
+        }
         chain.push(parent_pid);
         current_pid = parent_pid;
-        if let Some(st) = parent_start {
-            current_start = st;
-        }
+        current_start = parent_start;
     }
     None
 }
@@ -2711,14 +2753,61 @@ fn matches_declared_command(
     })
 }
 
-/// Display text for the woken process: the exact plugin-reported native tool
-/// command (and its item id) when the OS command line contains it verbatim,
-/// else the OS command line. Known secrets and common secret shapes are masked.
-fn bounded_command_line(
+/// The tool call binding of a process start.
+struct ToolBinding {
+    /// The item id when exactly one call contains the start.
+    item_id: Option<String>,
+    /// The start of the newest containing call.
+    started_at: i64,
+    /// Every containing call used the harness's own times.
+    native_times: bool,
+}
+
+/// The lower bound allows for start-time rounding, plus commit lag when a call
+/// has no native tool times. The upper bound is the call's end. A call
+/// with no recorded end covers only its own spawn, because the turn's end is
+/// when a harness starts its helpers. While the harness still runs a call as
+/// its own background task, a process bound only to that call is skipped: the
+/// harness wakes itself. Once that task ends, survivors are ordinary candidates.
+fn match_tool_window(
+    proc_start_ms: i64,
+    tool_windows: &[eliot_store::BackgroundWakeToolWindow],
+) -> Option<ToolBinding> {
+    let containing: Vec<_> = tool_windows
+        .iter()
+        .filter(|window| {
+            let margin = if window.native_clock {
+                PROCESS_START_ROUNDING_MS
+            } else {
+                PROCESS_START_ROUNDING_MS + TOOL_COMMIT_LAG_MS
+            };
+            let end = window
+                .completed_at
+                .unwrap_or_else(|| window.started_at.saturating_add(OPEN_CALL_SPAWN_MS));
+            proc_start_ms >= window.started_at.saturating_sub(margin) && proc_start_ms <= end
+        })
+        .collect();
+    match containing.as_slice() {
+        [] => None,
+        [window] if window.harness_waiting => None,
+        [window] => Some(ToolBinding {
+            item_id: Some(window.item_id.clone()),
+            started_at: window.started_at,
+            native_times: window.native_clock,
+        }),
+        several => Some(ToolBinding {
+            item_id: None,
+            started_at: several.iter().map(|window| window.started_at).max()?,
+            native_times: several.iter().all(|window| window.native_clock),
+        }),
+    }
+}
+
+fn format_process_command_line(
     node: &crate::platform::ProcessNodeInfo,
-    tool_commands: &[eliot_store::BackgroundWakeToolCommand],
+    pid: u32,
     secrets: &eliot_core::SecretPolicy,
-) -> (String, bool, Option<(String, String)>) {
+) -> (String, bool) {
     let raw = node
         .command_line
         .as_deref()
@@ -2731,22 +2820,19 @@ fn bounded_command_line(
                 .as_deref()
                 .map(|path| path.rsplit(['/', '\\']).next().unwrap_or(path).to_owned())
         })
-        .unwrap_or_else(|| format!("pid {}", node.pid));
-    let native = tool_commands
-        .iter()
-        .filter(|tool| !tool.command.is_empty() && raw.contains(tool.command.as_str()))
-        .max_by_key(|tool| tool.command.len());
-    let item_id = native.map(|tool| (tool.turn_id.clone(), tool.item_id.clone()));
-    let raw = native.map_or(raw.clone(), |tool| tool.command.clone());
+        .unwrap_or_else(|| format!("pid {pid}"));
     let sanitized: String = raw
         .chars()
         .map(|ch| if ch.is_control() { ' ' } else { ch })
         .collect();
     let redacted = eliot_core::redact_secret_shapes(&secrets.redact_text(sanitized.trim()));
+    if redacted.is_empty() {
+        return (format!("pid {pid}"), false);
+    }
     let limit = eliot_core::MAX_BACKGROUND_WAKE_COMMAND_BYTES;
     if redacted.len() <= limit {
-        return (redacted, false, item_id);
+        return (redacted, false);
     }
     let end = redacted.floor_char_boundary(limit);
-    (redacted[..end].to_owned(), true, item_id)
+    (redacted[..end].to_owned(), true)
 }

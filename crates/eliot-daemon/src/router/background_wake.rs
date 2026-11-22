@@ -10,17 +10,23 @@ const BACKGROUND_WAKE_PAGE_SIZE: usize = 128;
 const BACKGROUND_WAKE_PRUNE_LIMIT: usize = 256;
 
 impl Router {
-    /// Inspect custody after a committed `turn.completed` and arm at most one
-    /// automatic background-process wake when an Agent-started process is still running.
+    /// Inspect custody after a committed `turn.completed`, or after a harness
+    /// background task of a completed turn ended, and arm at most one automatic
+    /// background-process wake when an Agent-started process is still running.
     pub(super) async fn maybe_arm_background_wake(&self, event: &Event) -> Result<()> {
-        if event.kind != "turn.completed" || event.source != "stream" {
+        if event.source != "stream" {
             return Ok(());
         }
         let outcome = event
             .data
             .get("outcome")
             .and_then(serde_json::Value::as_str);
-        if !matches!(outcome, Some("success" | "failure")) {
+        let arms = match event.kind.as_str() {
+            "turn.completed" => matches!(outcome, Some("success" | "failure")),
+            "tool.background_ended" => true,
+            _ => false,
+        };
+        if !arms {
             return Ok(());
         }
         let (Some(agent_id), Some(generation), Some(turn_id)) = (
@@ -48,7 +54,7 @@ impl Router {
             (agent, context)
         };
 
-        let configured_mcp = eliot_core::extract_configured_mcp_programs(&agent.profile_snapshot);
+        let configured_mcp = eliot_core::extract_configured_mcp_servers(&agent.profile_snapshot);
         let secrets = self.secret_policy_snapshot();
         let Some(candidate) = self
             .inner
@@ -59,15 +65,26 @@ impl Router {
             return Ok(());
         };
 
-        let output_tail = match &candidate.tool_item {
-            Some((tool_turn, item_id)) => self
-                .inner
-                .store
-                .lock()
-                .await
-                .background_wake_tool_output_tail(&agent.id, agent.generation, tool_turn, item_id)?
-                .map(|text| bounded_redacted_tail(&text, &secrets)),
-            None => None,
+        let (tool_item_id, output_tail) = match candidate.tool_item {
+            Some(item_id) => {
+                let tail = self
+                    .inner
+                    .store
+                    .lock()
+                    .await
+                    .background_wake_tool_output_tail(
+                        &agent.id,
+                        agent.generation,
+                        turn_id,
+                        &item_id,
+                    )?
+                    .map(|text| bounded_redacted_tail(&text, &secrets));
+                (Some(item_id), tail)
+            }
+            None => (
+                None,
+                Some(eliot_core::BACKGROUND_WAKE_AMBIGUOUS_TAIL.to_owned()),
+            ),
         };
         // Held locally and installed only after the wake commits, so every
         // refusal or error drops (closes) the handle.
@@ -84,6 +101,8 @@ impl Router {
                 agent: agent.id.clone(),
                 generation: agent.generation,
                 turn_id: turn_id.to_owned(),
+                tool_item_id,
+                native_times: candidate.native_times,
                 process: candidate.identity,
                 command_line: candidate.command_line,
                 command_truncated: candidate.command_truncated,
@@ -419,7 +438,11 @@ impl Router {
             "args": { "text": framed },
         });
         let submitted = self
-            .submit(&params, &Principal::Owner, "command.submit")
+            .submit(
+                &params,
+                &Principal::Swarm(eliot_core::BACKGROUND_WAKE_PRINCIPAL),
+                "daemon.background_wake",
+            )
             .await;
         let command = self.inner.store.lock().await.get_command(command_id)?;
         if let Some(command) = command {
@@ -527,6 +550,7 @@ impl Router {
 
 fn matches_background_wake_command(command: &Command, wake: &BackgroundWakeRecord) -> bool {
     command.id == wake.delivery_command_id
+        && command.principal == eliot_core::BACKGROUND_WAKE_PRINCIPAL
         && command.target.as_deref() == Some(wake.agent.as_str())
         && command.expected_generation == Some(wake.generation)
         && matches!(command.verb.as_str(), "send" | "inject")

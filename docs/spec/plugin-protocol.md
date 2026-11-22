@@ -469,7 +469,11 @@ only the families its implemented handlers support. Muse `tool` facts are the
 normalized `toolCall`/turn-bound `userShell` item revisions; a completed edit-family `toolCall`
 attaches bounded `changed_paths` from the inline `args` target (`path`), else from one bounded
 `item/readOutput` fetch of the stored `patchRef` headers, with `changed_paths_truncated` on any
-coverage gap. A command tool's `tool.started` may carry `command`, the command text the
+coverage gap. `tool.started` and `tool.completed` may carry `native_at_ms`, the harness's
+own time for that edge of the call (Codex `startedAtMs`/`completedAtMs`, Claude frame
+`timestamp`). `native_background: true` on `tool.started` marks a call the harness runs as
+its own background task; `tool.background_ended` (`turn_id`, `item_id`) reports that the
+task ended and may commit after that turn. A command tool's `tool.started` may carry `command`, the command text the
 harness reports (Codex: its parsed `commandActions[].command`, one per line, else the raw
 `command`; Claude: the `tool_use` `input.command`; OpenCode: the
 `session.tool.called` tool input string `command`, the shell tool), redacted with the secret policy and

@@ -52,6 +52,7 @@ const EARLY_EVENT_BYTES: usize = 256 * 1024;
 const MAX_PENDING_REQUESTS: usize = 16;
 const MAX_PENDING_HOOKS: usize = 16;
 const MAX_TOOL_USE_BINDINGS: usize = 128;
+const MAX_BACKGROUND_TOOLS: usize = 64;
 const DENY_MESSAGE: &str = "Eliot denied this tool call.";
 const APPROVE_CHOICE_ID: &str = "approve";
 const DENY_CHOICE_ID: &str = "deny";
@@ -393,6 +394,9 @@ struct EventProcessor {
     tools_started: HashSet<String>,
     /// Invocations with a committed `tool.completed` in this turn.
     tools_completed: HashSet<String>,
+    /// Running `run_in_background` calls and the turn that started each.
+    /// Unlike the per-turn sets, these outlive their turn.
+    background_tools: HashMap<String, String>,
     /// At most one tool-coverage gap per turn; it does not invalidate the
     /// separately associated native terminal or future input.
     tool_coverage_gap_reported: bool,
@@ -860,6 +864,7 @@ impl EventProcessor {
             tool_names: HashMap::new(),
             tools_started: HashSet::new(),
             tools_completed: HashSet::new(),
+            background_tools: HashMap::new(),
             tool_coverage_gap_reported: false,
             task_notification_pending: false,
             autonomous_output: false,
@@ -1173,6 +1178,7 @@ impl EventProcessor {
                 ));
             }
             self.observe_task_boundary(record);
+            self.commit_background_task_end(record).await?;
             self.retain_init_mcp_servers(record);
             return self.observe_compaction_boundary(record, session_id).await;
         }
@@ -1555,6 +1561,16 @@ impl EventProcessor {
                 "item_id": tool_use.id,
                 "tool": tool_use.name,
             });
+            if let Some(at) = eliot_plugin::quota::rfc3339_ms(record.get("timestamp")) {
+                data["native_at_ms"] = json!(at);
+            }
+            // Past the bound the end of this task could not be reported, so
+            // the call stays an ordinary one: a duplicate wake, never a lost one.
+            if tool_use.run_in_background && self.background_tools.len() < MAX_BACKGROUND_TOOLS {
+                data["native_background"] = json!(true);
+                self.background_tools
+                    .insert(tool_use.id.clone(), turn_id.clone());
+            }
             if let Some(command) = &tool_use.command {
                 let policy = SecretPolicy::new(self.secrets.iter().cloned());
                 let redacted = policy.redact_text(command);
@@ -1634,6 +1650,9 @@ impl EventProcessor {
                 "tool": tool,
                 "status": tool_result_status(result.is_error),
             });
+            if let Some(at) = eliot_plugin::quota::rfc3339_ms(record.get("timestamp")) {
+                data["native_at_ms"] = json!(at);
+            }
             if result.is_error == Some(true) {
                 attach_native_error(
                     &mut data,
@@ -1658,6 +1677,26 @@ impl EventProcessor {
                 .await?;
         }
         Ok(())
+    }
+
+    /// Commit the end of a native background task started by a tracked
+    /// `run_in_background` call. The task can outlive its turn, so the fact
+    /// names the turn that started it.
+    async fn commit_background_task_end(&mut self, record: &Value) -> Result<()> {
+        if record.get("subtype").and_then(Value::as_str) != Some("task_notification") {
+            return Ok(());
+        }
+        let Some(item_id) = record.get("tool_use_id").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        let Some(turn_id) = self.background_tools.remove(item_id) else {
+            return Ok(());
+        };
+        let session_id = self.status.session_id.as_deref().unwrap_or_default();
+        let native_id = format!("claude:{session_id}:{turn_id}:tool.background_ended:{item_id}");
+        let data = json!({ "turn_id": turn_id, "item_id": item_id });
+        self.commit_event("tool.background_ended", native_id, data)
+            .await
     }
 
     /// Drop this turn's tool-name and tool-record tracking. Runs wherever

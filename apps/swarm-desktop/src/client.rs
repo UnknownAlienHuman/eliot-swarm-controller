@@ -584,6 +584,12 @@ fn input_text(read: &Command) -> InputText {
     {
         return InputText::Inserted(vec![crate::chat::framed(&text)]);
     }
+    if read.principal == eliot_core::BACKGROUND_WAKE_PRINCIPAL
+        && let Some((_, rest)) = text.split_once('\n')
+        && crate::chat::unfence(rest) != rest
+    {
+        return InputText::Inserted(vec![crate::chat::framed(&text)]);
+    }
     InputText::Loaded(text)
 }
 

@@ -12,7 +12,7 @@ use eliot_core::{
 };
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 const MAX_ACTIVE_BACKGROUND_WAKES: i64 = 1_024;
 pub const MAX_BACKGROUND_WAKE_PAGE: usize = 128;
@@ -20,9 +20,8 @@ const BACKGROUND_WAKE_RETENTION_MS: i64 = 31 * 24 * 60 * 60 * 1_000;
 const MAX_PRE_ADMISSION_ATTEMPTS: u32 = 5;
 const MAX_DECLARATION_SCAN_ROWS: i64 = 128;
 const MAX_DECLARED_COMMAND_BYTES: i64 = 4_096;
-const MAX_TURN_EVENT_SCAN_ROWS: i64 = 4_096;
-const MAX_TOOL_COMMAND_BYTES: i64 = 8_192;
-const MAX_TOOL_COMMANDS: i64 = 64;
+const MAX_TOOL_WINDOWS: i64 = 128;
+const MAX_ENDED_TASK_SCAN_ROWS: i64 = 1_024;
 const MAX_TAIL_SCAN_CHARS: i64 = 4_096;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -30,6 +29,9 @@ pub struct BackgroundWakeArmInput {
     pub agent: String,
     pub generation: i64,
     pub turn_id: String,
+    pub tool_item_id: Option<String>,
+    /// The tool binding used the harness's own times, not commit times.
+    pub native_times: bool,
     pub process: ProcessIdentity,
     pub command_line: String,
     pub command_truncated: bool,
@@ -60,26 +62,30 @@ pub struct BackgroundWakeRecord {
     pub expires_at: i64,
 }
 
-/// One native shell command the plugin reported (`tool.started`).
+/// One native tool call of the completing turn. Times are the harness's own
+/// (`native_at_ms`) when it reports them, else the event commit time.
+/// `completed_at` is the end of the call, or of its harness background task;
+/// `None` while that end is not committed.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BackgroundWakeToolCommand {
-    pub turn_id: String,
+pub struct BackgroundWakeToolWindow {
     pub item_id: String,
-    pub command: String,
+    pub started_at: i64,
+    pub completed_at: Option<i64>,
+    /// Both recorded edges are the harness's own clock, not commit times.
+    pub native_clock: bool,
+    /// The harness still runs this call as its own background task and will
+    /// wake itself when the task ends.
+    pub harness_waiting: bool,
 }
 
 /// Everything the Router needs to pick a candidate, read in one short
 /// Store call. Only bounded fields are selected; no event payload is decoded.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BackgroundWakeArmContext {
-    /// Earliest process start (Unix ms): the generation's first turn start.
-    pub window_start: i64,
-    /// Latest process start (Unix ms): this turn's completion.
-    pub window_end: i64,
     pub declared_pids: HashSet<u32>,
     pub declared_commands: Vec<String>,
-    /// Recent native `tool.started` facts of this generation, newest first.
-    pub tool_commands: Vec<BackgroundWakeToolCommand>,
+    /// Committed native tool call windows belonging strictly to this completing turn.
+    pub tool_windows: Vec<BackgroundWakeToolWindow>,
     /// Identities that already had an automatic wake in this generation.
     pub woken: HashSet<ProcessIdentity>,
 }
@@ -97,25 +103,7 @@ impl Store {
         if !background_wake_arm_eligible_tx(&self.connection, agent_num, generation, turn_id)? {
             return Ok(None);
         }
-        let window: Option<(Option<i64>, Option<i64>)> = self
-            .connection
-            .query_row(
-                "SELECT (SELECT MIN(started_at) FROM turns WHERE agent = ?1 AND generation = ?2),
-                        completed_at
-                 FROM turns WHERE agent = ?1 AND generation = ?2 AND turn_id = ?3",
-                params![agent_num, generation, turn_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(sql_error)?;
-        let Some((Some(window_start), Some(window_end))) = window else {
-            return Ok(None);
-        };
-        let mut context = BackgroundWakeArmContext {
-            window_start,
-            window_end,
-            ..Default::default()
-        };
+        let mut context = BackgroundWakeArmContext::default();
 
         let mut declared = self
             .connection
@@ -159,49 +147,80 @@ impl Store {
             }
         }
 
-        // The process may have started in an earlier turn of this generation
-        // (a queued input began the next turn first). Those tool facts are among
-        // the Agent's newest events: scan a bounded window backwards.
-        let mut tools = self
+        // The newest native tool calls of this completing turn. Each kind reads
+        // its own partial-index range, newest first, so a long turn keeps the
+        // calls most likely to have left a process running.
+        let read_tool_times = |kind: &str| -> Result<Vec<(String, i64, bool, bool)>> {
+            let sql = format!(
+                "SELECT json_extract(data, '$.item_id'),
+                        CASE json_type(data, '$.native_at_ms')
+                            WHEN 'integer' THEN json_extract(data, '$.native_at_ms') ELSE ts END,
+                        json_type(data, '$.native_at_ms') IS 'integer',
+                        json_extract(data, '$.native_background') IS 1
+                 FROM events INDEXED BY events_tool_turn
+                 WHERE agent = ?1 AND generation = ?2
+                   AND kind = '{kind}'
+                   AND json_extract(data, '$.turn_id') = ?3
+                   AND source = 'stream'
+                   AND json_type(data, '$.item_id') = 'text'
+                   AND length(trim(json_extract(data, '$.item_id'))) > 0
+                 ORDER BY seq DESC LIMIT ?4"
+            );
+            let mut statement = self.connection.prepare(&sql).map_err(sql_error)?;
+            let rows = statement
+                .query_map(
+                    params![agent_num, generation, turn_id, MAX_TOOL_WINDOWS],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .map_err(sql_error)?;
+            rows.collect::<rusqlite::Result<_>>().map_err(sql_error)
+        };
+        let completed: HashMap<String, (i64, bool)> = read_tool_times("tool.completed")?
+            .into_iter()
+            .map(|(item_id, completed_at, native, _)| (item_id, (completed_at, native)))
+            .collect();
+        // Harness background tasks that have ended. The kind has few rows, so
+        // a bounded newest-first scan of its index stays short.
+        let mut ended_tasks = self
             .connection
             .prepare(
-                "SELECT json_extract(data, '$.turn_id'), json_extract(data, '$.item_id'),
-                        json_extract(data, '$.command')
-                 FROM (SELECT seq, kind, generation, data FROM events INDEXED BY events_agent
-                       WHERE agent = ?1 ORDER BY seq DESC LIMIT ?3)
-                 WHERE kind = 'tool.started' AND generation = ?2
-                   AND json_type(data, '$.turn_id') = 'text'
-                   AND json_type(data, '$.item_id') = 'text'
-                   AND json_type(data, '$.command') = 'text'
-                   AND length(trim(json_extract(data, '$.command'))) BETWEEN 1 AND ?4
-                 ORDER BY seq DESC LIMIT ?5",
+                "SELECT json_extract(data, '$.item_id'), ts
+                 FROM (SELECT agent, generation, source, data, ts
+                       FROM events INDEXED BY events_kind
+                       WHERE kind = 'tool.background_ended' ORDER BY seq DESC LIMIT ?4)
+                 WHERE agent = ?1 AND generation = ?2 AND source = 'stream'
+                   AND json_extract(data, '$.turn_id') = ?3
+                   AND json_type(data, '$.item_id') = 'text'",
             )
             .map_err(sql_error)?;
-        let rows = tools
+        let ended: HashMap<String, i64> = ended_tasks
             .query_map(
-                params![
-                    agent_num,
-                    generation,
-                    MAX_TURN_EVENT_SCAN_ROWS,
-                    MAX_TOOL_COMMAND_BYTES,
-                    MAX_TOOL_COMMANDS,
-                ],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                },
+                params![agent_num, generation, turn_id, MAX_ENDED_TASK_SCAN_ROWS],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
+            .map_err(sql_error)?
+            .collect::<rusqlite::Result<_>>()
             .map_err(sql_error)?;
-        for row in rows {
-            let (turn_id, item_id, command) = row.map_err(sql_error)?;
-            context.tool_commands.push(BackgroundWakeToolCommand {
-                turn_id,
-                item_id,
-                command: command.trim().to_owned(),
-            });
+        context.tool_windows = read_tool_times("tool.started")?
+            .into_iter()
+            .map(|(item_id, started_at, native_start, native_background)| {
+                let task_end = ended.get(&item_id).copied();
+                let call_end = completed.get(&item_id).copied();
+                BackgroundWakeToolWindow {
+                    completed_at: if native_background {
+                        task_end
+                    } else {
+                        call_end.map(|(at, _)| at)
+                    },
+                    native_clock: native_start && call_end.is_none_or(|(_, native)| native),
+                    harness_waiting: native_background && task_end.is_none(),
+                    item_id,
+                    started_at,
+                }
+            })
+            .collect();
+        if context.tool_windows.is_empty() {
+            return Ok(None);
         }
 
         let mut woken = self
@@ -255,20 +274,14 @@ impl Store {
                             json_extract(data, '$.stderr_tail'),
                             json_extract(data, '$.stdout_tail'),
                             json_extract(data, '$.native_error.message')), -?5)
-                 FROM (SELECT kind, generation, data FROM events INDEXED BY events_agent
-                       WHERE agent = ?1 ORDER BY seq DESC LIMIT ?6)
-                 WHERE kind = 'tool.completed' AND generation = ?2
+                 FROM events INDEXED BY events_tool_turn
+                 WHERE agent = ?1 AND generation = ?2
+                   AND kind = 'tool.completed'
                    AND json_extract(data, '$.turn_id') = ?3
+                   AND source = 'stream'
                    AND json_extract(data, '$.item_id') = ?4
                  LIMIT 1",
-                params![
-                    agent_num,
-                    generation,
-                    turn_id,
-                    item_id,
-                    MAX_TAIL_SCAN_CHARS,
-                    MAX_TURN_EVENT_SCAN_ROWS,
-                ],
+                params![agent_num, generation, turn_id, item_id, MAX_TAIL_SCAN_CHARS,],
                 |row| row.get(0),
             )
             .optional()
@@ -288,6 +301,10 @@ impl Store {
     ) -> Result<Option<BackgroundWakeRecord>> {
         if input.generation <= 0
             || input.turn_id.trim().is_empty()
+            || input
+                .tool_item_id
+                .as_deref()
+                .is_some_and(|id| id.trim().is_empty())
             || input.process.host_boot_id.trim().is_empty()
             || input.process.pid == 0
             || input.process.start_time == 0
@@ -318,6 +335,17 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
         if !background_wake_arm_eligible_tx(&tx, agent_num, input.generation, &input.turn_id)? {
+            return Ok(None);
+        }
+        if let Some(tool_item_id) = input.tool_item_id.as_deref()
+            && !has_turn_tool_tx(
+                &tx,
+                agent_num,
+                input.generation,
+                &input.turn_id,
+                Some(tool_item_id),
+            )?
+        {
             return Ok(None);
         }
         let owner = format!("agent:{}#{}", input.agent, input.generation);
@@ -380,8 +408,8 @@ impl Store {
             "INSERT INTO background_process_wakes (
                  id, agent, generation, turn_id, host_boot_id, pid, start_time,
                  command_line, command_truncated, output_tail, state, delivery_command_id,
-                 created_at, expires_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'waiting', ?11, ?12, ?13)",
+                 created_at, expires_at, tool_time_basis
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'waiting', ?11, ?12, ?13, ?14)",
             params![
                 id,
                 agent_num,
@@ -396,6 +424,11 @@ impl Store {
                 delivery_command_id,
                 now,
                 input.expires_at,
+                if input.native_times {
+                    "native"
+                } else {
+                    "commit"
+                },
             ],
         )
         .map_err(sql_error)?;
@@ -772,6 +805,32 @@ impl Store {
     }
 }
 
+fn has_turn_tool_tx(
+    connection: &rusqlite::Connection,
+    agent_num: i64,
+    generation: i64,
+    turn_id: &str,
+    item_id: Option<&str>,
+) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM events INDEXED BY events_tool_turn
+                 WHERE agent = ?1 AND generation = ?2
+                   AND kind = 'tool.started'
+                   AND json_extract(data, '$.turn_id') = ?3
+                   AND source = 'stream'
+                   AND json_type(data, '$.item_id') = 'text'
+                   AND length(trim(json_extract(data, '$.item_id'))) > 0
+                   AND (?4 IS NULL OR json_extract(data, '$.item_id') = ?4)
+             )",
+            params![agent_num, generation, turn_id, item_id],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)
+}
+
+/// Whether the completing turn is eligible for automatic background-process wake arming.
 fn background_wake_arm_eligible_tx(
     connection: &rusqlite::Connection,
     agent_num: i64,
@@ -864,7 +923,14 @@ fn background_wake_arm_eligible_tx(
             |row| row.get(0),
         )
         .map_err(sql_error)?;
-    Ok(!auto_wake_open)
+    if auto_wake_open {
+        return Ok(false);
+    }
+    // Requiring at least one committed native `tool.started` item belonging to
+    // this completing turn enforces both tool attribution (#903 item 1) and the
+    // wake loop guard (#903 item 3: any turn started by a wake that ran no
+    // native tool arms no new wake).
+    has_turn_tool_tx(connection, agent_num, generation, turn_id, None)
 }
 
 fn agent_has_active_stop_tx(
