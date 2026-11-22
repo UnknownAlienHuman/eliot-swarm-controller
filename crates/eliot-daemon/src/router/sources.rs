@@ -191,7 +191,11 @@ fn available_block_bytes(text: &str) -> usize {
 }
 
 fn quote_source_path(path: &str) -> String {
-    serde_json::to_string(path).expect("serializing a string to JSON cannot fail")
+    serde_json::to_string(path)
+        .expect("serializing a string to JSON cannot fail")
+        .replace('\u{85}', "\\u0085")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
 }
 
 fn parse_sources(value: &Value) -> Result<Vec<String>> {
