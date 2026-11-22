@@ -75,6 +75,7 @@ impl Router {
             .to_owned();
         crate::config::validate_routing_role(&role)?;
         let routing = crate::config::load_routing_config(&self.inner.data_root)?;
+        let provider_reactions = self.inner.attention.provider_refusal.enabled;
         let parent = if matches!(principal, Principal::Agent { .. }) {
             let store = self.inner.store.lock().await;
             let id = required_text(&request.args, "parent")?;
@@ -104,7 +105,8 @@ impl Router {
             reason: "no available candidate".into(),
             skipped: Vec::new(),
             quota_status: RouteQuotaStatus::Unknown,
-            provider_failover: (routing.provider_failover()
+            provider_failover: (provider_reactions
+                && routing.provider_failover()
                 && matches!(principal, Principal::Owner)
                 && !arbitrated
                 && request.args.get("chat") != Some(&Value::Bool(true)))
@@ -134,6 +136,12 @@ impl Router {
         kind: eliot_core::ProviderRestrictionKind,
         authority: [u8; 32],
     ) -> Result<(String, Value)> {
+        if !self.inner.attention.provider_refusal.enabled {
+            return Err(Error::new(
+                "not_allowed",
+                "automatic provider reactions are disabled",
+            ));
+        }
         let mut decision = source.profile_choice.clone().ok_or_else(|| {
             Error::new("source_integrity", "provider switch has no retained route")
         })?;

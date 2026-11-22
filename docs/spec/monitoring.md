@@ -722,8 +722,8 @@ native lifecycle source becomes unhealthy or a validated `agent.lost` event is
 committed.
 Those triggers do not wait for the no-progress window. A busy Agent with a
 healthy authoritative source becomes a no-progress suspicion after
-`daemon.attention_suspicion_secs` (default 900 seconds). This is a diagnostic
-threshold, never a timeout verdict that the Agent died.
+`daemon.attention.no_progress.threshold_secs` (default 900 seconds). This starts the
+reaction ladder for the affected turn.
 Stopped Agents do not open source-unhealthy incidents; existing ones retire
 without a recovery claim, while no-progress may still recover on explicit stop.
 
@@ -744,7 +744,8 @@ typed `x.user.agent.attention` event whose top-level Agent/generation binding an
 event-time subject snapshot are captured from the current generation in the same
 Store transaction as its Applied settlement; stale evidence (unknown Agent or
 generation drift) is rejected and never mailed. The wire shape stays compatible:
-kind `x.user.agent.attention` with the report at `event.data.data`. A valid
+kind `x.user.agent.attention` with the report at `event.data.data` and its exact
+active turn at `event.data.turn_id` when available. A valid
 explicit `on.event` rule can target the incident through that binding without
 weakening stale-generation checks. Child-cohort reports go to the live manager
 responsible for that cohort. Other reports go to the subject's live manager.
@@ -778,9 +779,7 @@ turn changes, mail wakes, manager progress and child fanout do not rearm it. It 
 only after no observed child turn remains open, without recovery mail that would wake
 the manager again. Unknown source health alone never clears open work. This shares
 the existing bounded incident set, reservations and exact-ID delivery retries; no
-per-child incident registry or unbounded report fanout is introduced. Suspicion
-and child-cohort incidents deduplicate transiently across daemon restart; only
-loss-evidence reports reuse durable identity (see below).
+per-child incident registry or unbounded report fanout is introduced.
 
 Before reporting, capture the Agent generation, active turn, pending requests,
 source owners/health, and model-progress time from Store. Child-cohort reports
@@ -804,9 +803,8 @@ Pending approvals/questions remain `waiting`; waiting for a user response alone
 is not a no-progress suspicion. A known active tool is reported as
 `active_tool` with progress `unknown`. It does not suppress suspicion
 indefinitely: if that observation remains unchanged through the configured
-window, emit an advisory `active_tool` diagnosis with progress `unknown`. This
-diagnosis never proves death. Tool coverage that is missing, gapped, or
-truncated remains unknown and cannot be called stalled.
+window, report `active_tool` with progress `unknown`. Tool coverage that is missing,
+gapped, or truncated remains unknown.
 Only one report is emitted per active incident. Recovery requires positive
 progress or state evidence; loss of observability or an unhealthy/unknown source
 alone does not produce recovery. Superseded-generation incident state retires
@@ -815,8 +813,7 @@ remains explicitly unconfirmed. The bounded transient incident set is in-memory;
 there is no separate status registry. Each incident/phase freezes its report
 and mutation IDs until event and notice delivery settle, so retries reuse
 the same facts and command bindings. Inbox/owner notices carry a short bounded
-diagnosis and link to the structured report. Attention does not call a model,
-replay work, or restart a harness. A public `emit` naming the reserved
+diagnosis and link to the structured report. A public `emit` naming the reserved
 `agent.attention` topic is rejected; only the internal attention producer may
 use the bound commit.
 At startup attention drains retained loss evidence (currently-`lost` Agents
@@ -858,6 +855,30 @@ set cannot generate further wakes until new evidence arrives on a new thread.
 Retained pre-fix subject copies (bare attention threads with no bound
 incident event) never wake.
 
+### Automatic reactions
+
+The daemon uses the ordinary command router for each of these reactions. Settings
+are per kind under [daemon attention](configuration.md#automatic-attention-settings).
+
+| Incident | Reaction |
+| --- | --- |
+| `no_progress` | Read native status, queue one short question for the bound turn, and route one attention notice. With `interrupt = true`, wait another full quiet window before interrupting and routing the notice. A newer Owner send or steer bound to that turn vetoes the automatic interrupt. |
+| `no_code_progress` | Ask once with the duration since the last worktree change and the available tool and message counts, then route one attention notice. |
+| Process loss | After exact custody exit and reader drain, reopen the retained idle session without input once. Startup uses the existing promptless restart reconciliation and honors `on_restart`. Unresolved work stays fenced. |
+| Provider refusal | Keep the existing provider hold, opt-in next-preset routing and bounded due probes. If the hold's automatic probe budget is exhausted or a probe stays unresolved, send one Owner notice. |
+| `session.growth` | At an idle boundary, compact through the native operation where supported and route one attention notice. With `switch = true`, an adapter without compact can switch through the existing handoff brief when the source is safe and the completed task is retained. |
+| Repeated command failure | Three matching failures of the same command and output in one turn put one concise fact and question into that turn. |
+| `children_unattended` | Queue one report for the manager. |
+
+Reactions bind the incident's Agent generation and, where applicable, its exact
+turn. On a hook-based adapter, the question waits for the next native safe point.
+Ending the turn cancels a question that is still queued. Each step uses a retained
+claim or command identity. Later timed stall episodes in the same turn share one
+question and one routed notice. An uncertain effect stays unknown. `swarm why` shows
+recent steps with command outcomes when retained.
+Its JSON `attention_steps` includes the incident id, generation, turn, step, and
+available command id.
+
 ### Git-aware work summary
 
 The Git monitor computes a bounded per-Agent work summary exposed as `WorkSummaryView` ([observe.rs](../../crates/eliot-core/src/api/observe.rs)) on `agent get`, `agent stats` and the `swarm ls` WORK column.
@@ -875,7 +896,7 @@ The work probe runs inside the ordinary Git probe: only after the workspace watc
 
 ### Git-aware attention: no_code_progress
 
-A busy Agent whose tool and message activity continues but whose worktree has had no write and no commit for daemon.attention_suspicion_secs gets a distinct no_code_progress diagnostic (IncidentKind::CodeProgress). The window counts from the later of the last write or commit and the active turn's start, so a new turn is never reported at once; a turn with no activity for the window is no_progress instead. It is a diagnostic, never a verdict:
+A busy Agent whose tool and message activity continues but whose worktree has had no write and no commit for `daemon.attention.no_code_progress.threshold_secs` gets a distinct `no_code_progress` diagnostic. The window counts from the later of the last write or commit and the active turn's start. Complete model inactivity uses the `no_progress` window.
 - suppressed for read-only and audit profiles (is_read_only_or_audit_profile) and for Agents without a worktree;
 - requires a current Git observation: while the work probe is unavailable (for example a capped digest), the retained last write or commit time stays history only and no no_code_progress is raised from it;
 - retires as soon as a write or commit lands (last_code_progress_at advances);
@@ -968,7 +989,7 @@ blocking on them; the stored outcome stays `unknown`.
 
 ## Heavy work, session growth and harness drift
 
-Three advisory event families name what matters without new native control:
+Three event families capture heavy work, session growth, and vendor drift.
 
 - `activity.heavy`: one event per command whose wall time, CPU or peak RSS
   crossed a `daemon.heavy_*` threshold. Attribution walks the observed tree to
@@ -983,9 +1004,9 @@ Three advisory event families name what matters without new native control:
   integration owns any promotion.
 - `session.growth`: one warning per basis (context occupancy at
   `daemon.session_growth_ratio_permille`, native session file size at
-  `daemon.session_file_bytes`) with no auto-compact; the warning clears only when
+  `daemon.session_file_bytes`). The warning clears when
   the retained signal drops back under threshold. Suppliers are harness-native
-  only: Codex `thread/tokenUsage/updated` (cumulative total against
+  only: Codex `thread/tokenUsage/updated` (latest context occupancy against
   `modelContextWindow`), Claude stream-json `usage` plus the frame-reported
   model window plus the transcript file size, Muse `session/contextUsage`,
   Antigravity ACP `usage_update`. OpenCode exposes no session-level signal

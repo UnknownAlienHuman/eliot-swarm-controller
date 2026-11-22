@@ -779,7 +779,19 @@ pub struct NativeItemCompletedNotification {
 // L2.2 control and server-request DTOs
 // ---------------------------------------------------------------------------
 
-/// Minimal installed-schema v2 `thread/resume` params.
+/// Installed app-server request for native thread history compaction.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeThreadCompactStartParams {
+    pub thread_id: String,
+}
+
+/// The app-server acknowledges thread/compact/start immediately with an empty object.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeThreadCompactStartResponse {}
+
+/// Minimal installed-schema v2 thread/resume params.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeThreadResumeParams {

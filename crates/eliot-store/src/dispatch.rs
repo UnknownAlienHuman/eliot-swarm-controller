@@ -877,6 +877,9 @@ fn dispatch_control_tx(
             "control command no longer targets the exact active turn",
         ));
     }
+    if command.command.verb == "interrupt" {
+        attention_lookup::guard_attention_interrupt(tx, agent_num, agent.generation, turn_id, id)?;
+    }
     if is_request_reply_verb(command.command.verb.as_str()) {
         let request_id = command.command.request_id.as_deref().ok_or_else(|| {
             Error::new(
@@ -1149,6 +1152,26 @@ impl Store {
                 now,
                 &mut events,
             )?,
+            "compact" => {
+                if command_generation != agent.generation {
+                    return Err(Error::new(
+                        "stale_generation",
+                        "compact Agent generation changed",
+                    ));
+                }
+                admission::require_idle_compaction(&tx, &agent, agent_num, id)?;
+                update_command_state(&tx, id, CommandState::Dispatched, None, None, now)?;
+                events.push(insert_daemon_command_event(
+                    &tx,
+                    now,
+                    "command.dispatched",
+                    Some(agent_num),
+                    Some(agent.generation),
+                    id,
+                    json!({"command_id": id, "verb": "compact"}),
+                )?);
+                None
+            }
             "inject" => {
                 dispatch_inject_tx(
                     &tx,

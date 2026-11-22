@@ -674,10 +674,13 @@ fn admit_notify_emit_tx(
             serde_json::from_value::<core::api::EmitDefinitionArgs>(request.args.clone())
                 .map_err(|_| Error::new("invalid", "emit definition is malformed"))?;
         definition.validate()?;
-        if definition.topic == ATTENTION_RESERVED_TOPIC {
+        if matches!(
+            definition.topic.as_str(),
+            ATTENTION_RESERVED_TOPIC | "agent.attention_step"
+        ) {
             return Err(Error::new(
                 "invalid",
-                "agent.attention is reserved for the internal attention producer",
+                "monitoring topics are reserved for the internal attention producer",
             ));
         }
     }
@@ -1449,6 +1452,95 @@ fn admit_configure_tx(
     Ok(())
 }
 
+pub(super) fn require_idle_compaction(
+    tx: &Transaction<'_>,
+    agent: &Agent,
+    agent_num: i64,
+    command_id: &str,
+) -> Result<()> {
+    observer::require_controlled(agent)?;
+    if !matches!(agent.harness.as_str(), "codex" | "opencode") {
+        return Err(Error::new(
+            "unsupported",
+            "Agent harness has no native compaction",
+        ));
+    }
+    if agent.generation < 1 || !send_gate_open(tx, agent_num, agent.generation)? {
+        return Err(Error::new(
+            "bad_state",
+            "compact requires an idle Agent with settled input",
+        ));
+    }
+    let pending: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM commands
+            WHERE target = ?1 AND generation = ?2 AND id <> ?3
+              AND state IN ('accepted','queued','dispatched','unknown')
+              AND verb IN ('send','stop','configure','compact'))",
+            params![agent_num, agent.generation, command_id],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    if pending {
+        return Err(Error::new("busy", "compact requires an idle command lane"));
+    }
+    provider_holds::require_unheld_tx(tx, agent)
+}
+
+fn admit_compact_tx(
+    tx: &Transaction<'_>,
+    principal: &str,
+    request: &SubmitCommand,
+    payload_digest: &[u8],
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<()> {
+    if principal != "owner" {
+        return Err(Error::new(
+            "not_allowed",
+            "compact requires the Owner principal",
+        ));
+    }
+    let target = request
+        .target
+        .as_deref()
+        .ok_or_else(|| Error::new("invalid", "compact requires an Agent target"))?;
+    if request.expected_generation.is_none()
+        || request.expected_turn_id.is_some()
+        || request.request_id.is_some()
+        || request.selector.is_some()
+        || request.probe
+        || request.args != json!({})
+    {
+        return Err(Error::new(
+            "invalid",
+            "compact requires an exact generation and no other arguments",
+        ));
+    }
+    let agent_num = parse_agent_id(target)?;
+    let agent = load_agent_by_num(tx, agent_num)?
+        .ok_or_else(|| Error::new("not_found", "compact Agent was not found"))?;
+    if request.expected_generation != Some(agent.generation) {
+        return Err(Error::new(
+            "stale_generation",
+            "compact Agent generation changed",
+        ));
+    }
+    require_idle_compaction(tx, &agent, agent_num, &request.id)?;
+    events.push(admit_command(
+        tx,
+        &CommandInsert::admitted(
+            principal,
+            request,
+            payload_digest,
+            (agent_num, agent.generation),
+            now,
+        ),
+        json!({"command_id": request.id, "verb": "compact"}),
+    )?);
+    Ok(())
+}
+
 /// Owner-only replies for the target generation's frozen ask policy, shared
 /// by admission and dispatch so retained commands cannot bypass the policy.
 pub(super) fn require_reply_authority(principal: &str, verb: &str, agent: &Agent) -> Result<()> {
@@ -1858,6 +1950,10 @@ fn submit_tx_mode(
         "resume" => admit_resume_tx(tx, principal, &request, &payload_digest, now, &mut events)?,
         "configure" => {
             admit_configure_tx(tx, principal, &request, &payload_digest, now, &mut events)?;
+            None
+        }
+        "compact" => {
+            admit_compact_tx(tx, principal, &request, &payload_digest, now, &mut events)?;
             None
         }
         "steer" | "interrupt" | "approve" | "deny" | "answer" => {

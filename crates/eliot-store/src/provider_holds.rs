@@ -25,6 +25,75 @@ const AUTOMATIC_PROBE_BACKOFF_MS: [i64; 3] = [60_000, 300_000, 1_800_000];
 const PROVIDER_HOLD_RELEASE_BATCH: usize = 64;
 
 impl Store {
+    /// Bind the final owner notice to the live hold in the same transaction
+    /// that admits its ordinary local notify command.
+    pub fn admit_provider_attention_notices(
+        &mut self,
+        now: i64,
+        policy: &core::SecretPolicy,
+    ) -> Result<Vec<super::Admission>> {
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let due = {
+                let mut query = tx.prepare(
+                    "SELECT scope, kind, probe_outcome_unknown FROM provider_holds
+                     WHERE attention_notified = 0 AND state = 'held'
+                       AND (probe_outcome_unknown = 1 OR (retry_after IS NULL AND automatic_probes >= ?1))
+                     ORDER BY held_since, scope LIMIT 4",
+                ).map_err(sql_error)?;
+                query
+                    .query_map([core::MAX_AUTOMATIC_PROVIDER_PROBES], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, bool>(2)?,
+                        ))
+                    })
+                    .map_err(sql_error)?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(sql_error)?
+            };
+            let mut admitted = Vec::with_capacity(due.len());
+            for (scope, kind, unknown) in due {
+                let reason = if unknown {
+                    "last probe is unresolved"
+                } else {
+                    "probe budget exhausted"
+                };
+                let mut request = core::SubmitCommand::new(ulid::Ulid::new().to_string(), "notify");
+                let message = policy.redact_text(&format!(
+                    "Provider {kind} hold for {} needs attention ({reason}).",
+                    core::bound_chars(&scope, 256),
+                ));
+                request.args = json!({"title": "Provider attention", "message": message});
+                let admission = super::admission::submit_tx(
+                    &tx,
+                    "owner",
+                    request,
+                    None,
+                    now,
+                    false,
+                    self.hierarchy_limits,
+                    self.capacity_policy.as_deref(),
+                )?;
+                tx.execute(
+                    "UPDATE provider_holds SET attention_notified = 1 WHERE scope = ?1",
+                    [&scope],
+                )
+                .map_err(sql_error)?;
+                admitted.push(admission);
+            }
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(admitted)
+        })();
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
     /// Return the Core-owned bounded page, ordered by the frozen provider scope.
     pub fn list_provider_holds(
         &self,
@@ -840,9 +909,19 @@ pub(super) fn terminal_tx(
     let mut events = Vec::new();
     if let Some(value) = native_event.data.get("provider_restriction")
         && let Some(restriction) = parse_restriction(value)
-        && let Some(event) = record_restriction_tx(tx, agent, &restriction, now)?
+        && let Some(event) = record_restriction_tx(tx, agent, turn_id, &restriction, now)?
     {
+        let reaction = core::AttentionStep {
+            incident_id: format!("provider-refusal-{}", event.seq),
+            step: "hold_provider".to_owned(),
+            outcome: event.data["state"].as_str().unwrap_or("unknown").to_owned(),
+            command_id: None,
+            turn_id: Some(turn_id.clone()),
+        };
         events.push(event);
+        events.push(super::attention_steps::insert_attention_step(
+            tx, agent_num, generation, &reaction, now,
+        )?);
     }
 
     if command.command.probe {
@@ -1011,6 +1090,7 @@ pub(super) fn command_terminal_tx(
 fn record_restriction_tx(
     tx: &Transaction<'_>,
     agent: &Agent,
+    turn_id: &str,
     restriction: &ProviderRestriction,
     now: i64,
 ) -> Result<Option<core::Event>> {
@@ -1109,6 +1189,7 @@ fn record_restriction_tx(
         Some(parse_agent_id(&agent.id)?),
         Some(agent.generation),
         json!({
+            "turn_id": turn_id,
             "scope": hold.scope,
             "kind": hold.kind.as_str(),
             "retry_after": hold.retry_after,

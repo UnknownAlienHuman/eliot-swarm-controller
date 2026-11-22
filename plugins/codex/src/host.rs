@@ -11,6 +11,7 @@ use crate::{
             NativeClientInfo, NativeCollaborationMode, NativeCollaborationModeKind,
             NativeCollaborationSettings, NativeInitializeCapabilities, NativeInitializeParams,
             NativeInitializeResponse, NativeModelEntry, NativeSandboxMode, NativeTextUserInput,
+            NativeThreadCompactStartParams, NativeThreadCompactStartResponse,
             NativeThreadConfigOverrides, NativeThreadResumeParams, NativeThreadStartParams,
             NativeTurnInterruptParams, NativeTurnStartParams, NativeTurnStartResponse,
             NativeTurnSteerParams, NativeTurnSteerResponse, NativeUserInput, ThreadReadback,
@@ -56,6 +57,7 @@ use tokio::{
 };
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+const COMPACTION_TIMEOUT: Duration = Duration::from_secs(120);
 const LIVE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const LIVE_POLL_DEADLINE: Duration = Duration::from_secs(2);
 const TURN_PAGE_SIZE: u32 = 1000;
@@ -1882,6 +1884,7 @@ impl CodexPlugin {
         )?;
         match params.verb.as_str() {
             "send" => self.send_command(params).await,
+            "compact" => self.compact_command(params).await,
             "steer" => self.steer(params).await,
             "inject" => self.inject_active_turn(params).await,
             "interrupt" => self.interrupt(params).await,
@@ -1893,6 +1896,264 @@ impl CodexPlugin {
         }
     }
 
+    async fn compact_command(&mut self, params: AgentCommandParams) -> Result<Value> {
+        let Some(session) = self.session.as_mut() else {
+            return Err(Error::new(
+                "bad_state",
+                "Codex Agent session has not started",
+            ));
+        };
+        validate_binding(
+            &session.agent_id,
+            session.generation,
+            &params.agent_id,
+            params.generation,
+            "Codex",
+        )?;
+        if params.turn_id.is_some() || params.request_id.is_some() {
+            return Err(Error::new(
+                "invalid",
+                "compact requires an idle generation and takes no turn or request binding",
+            ));
+        }
+        let command_id = params.command_id.clone();
+        let event_status = session.events.status();
+        if session.phase != SessionPhase::Ready
+            || session.current_turn.is_some()
+            || !event_status.ready
+            || event_status.active_turn_id.is_some()
+            || event_status.source_unknown
+            || event_status.batch_unknown
+        {
+            return Ok(json!({
+                "state": "rejected",
+                "command_id": command_id,
+                "reason": "Codex compact requires a ready idle session",
+            }));
+        }
+        let Some(thread_id) = session
+            .thread_id
+            .as_deref()
+            .filter(|thread_id| event_status.thread_id.as_deref() == Some(*thread_id))
+            .map(str::to_owned)
+        else {
+            return Ok(json!({
+                "state": "rejected",
+                "command_id": command_id,
+                "reason": "Codex compact has no exact owned thread",
+            }));
+        };
+        let thread = match read_owned_thread(&session.native_client, &thread_id).await {
+            Ok(thread) => thread,
+            Err(_) => {
+                return Ok(json!({
+                    "state": "rejected",
+                    "command_id": command_id,
+                    "reason": "Codex thread/read did not prove an idle owned thread",
+                }));
+            }
+        };
+        if thread_state(&thread) != "idle" {
+            return Ok(json!({
+                "state": "rejected",
+                "command_id": command_id,
+                "reason": "Codex native thread is not idle",
+            }));
+        }
+        let previous_turn =
+            match read_latest_native_turn_status(&session.native_client, &thread_id).await {
+                Ok(turn) => turn,
+                Err(_) => {
+                    return Ok(json!({
+                        "state": "rejected",
+                        "command_id": command_id,
+                        "reason": "Codex newest native turn readback is unavailable",
+                    }));
+                }
+            };
+        if previous_turn.as_ref().is_some_and(|(_, status)| {
+            !matches!(status.as_str(), "completed" | "failed" | "interrupted")
+        }) {
+            return Ok(json!({
+                "state": "rejected",
+                "command_id": command_id,
+                "reason": "Codex newest native turn is not terminal",
+            }));
+        }
+        if let Err(error) = session
+            .events
+            .begin_compaction(command_id.clone(), previous_turn.map(|(turn, _)| turn))
+            .await
+        {
+            return Ok(json!({
+                "state": "rejected",
+                "command_id": command_id,
+                "reason": error.code,
+            }));
+        }
+        let compact_params = NativeThreadCompactStartParams {
+            thread_id: thread_id.clone(),
+        };
+        let response = match session
+            .native_client
+            .call(
+                "thread/compact/start",
+                serde_json::to_value(compact_params).map_err(|_| {
+                    Error::new("internal", "Codex compact params could not be encoded")
+                })?,
+                Instant::now() + RPC_TIMEOUT,
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(error)
+                if matches!(
+                    error.code.as_str(),
+                    "native_not_dispatched" | "native_rejected" | "frame_too_large" | "busy"
+                ) =>
+            {
+                if session
+                    .events
+                    .clear_compaction(command_id.clone())
+                    .await
+                    .is_err()
+                {
+                    session.phase = SessionPhase::Unknown;
+                    return Ok(json!({
+                        "state": "unknown",
+                        "command_id": command_id,
+                        "compaction": {"completed": false},
+                    }));
+                }
+                return Ok(json!({
+                    "state": "rejected",
+                    "command_id": command_id,
+                    "reason": "Codex rejected native compaction before acceptance",
+                }));
+            }
+            Err(_) => {
+                session.phase = SessionPhase::Unknown;
+                return Ok(json!({
+                    "state": "unknown",
+                    "command_id": command_id,
+                    "compaction": {"completed": false},
+                }));
+            }
+        };
+        if serde_json::from_value::<NativeThreadCompactStartResponse>(response).is_err() {
+            session.phase = SessionPhase::Unknown;
+            return Ok(json!({
+                "state": "unknown",
+                "command_id": command_id,
+                "compaction": {"completed": false},
+            }));
+        }
+        if session
+            .events
+            .accept_compaction(command_id.clone())
+            .await
+            .is_err()
+        {
+            session.phase = SessionPhase::Unknown;
+            return Ok(json!({
+                "state": "unknown",
+                "command_id": command_id,
+                "compaction": {"completed": false},
+            }));
+        }
+        let progress = match session
+            .events
+            .wait_compaction(&command_id, Instant::now() + COMPACTION_TIMEOUT)
+            .await
+        {
+            Ok(progress) => progress,
+            Err(_) => {
+                session.phase = SessionPhase::Unknown;
+                return Ok(json!({
+                    "state": "unknown",
+                    "command_id": command_id,
+                    "compaction": {"completed": false},
+                }));
+            }
+        };
+        let Some(turn_id) = progress.turn_id.as_deref() else {
+            session.phase = SessionPhase::Unknown;
+            return Ok(json!({
+                "state": "unknown",
+                "command_id": command_id,
+                "compaction": {"completed": false},
+            }));
+        };
+        match progress.terminal_status.as_deref() {
+            Some("failed" | "interrupted") => Ok(json!({
+                "state": "failed",
+                "command_id": command_id,
+                "compaction": {"completed": false, "receipt_id": turn_id},
+            })),
+            Some("completed")
+                if progress.item_started
+                    && progress.item_completed
+                    && progress
+                        .item_id
+                        .as_deref()
+                        .is_some_and(|id| !id.trim().is_empty()) =>
+            {
+                let thread = match read_owned_thread(&session.native_client, &thread_id).await {
+                    Ok(thread) => thread,
+                    Err(_) => {
+                        session.phase = SessionPhase::Unknown;
+                        return Ok(json!({
+                            "state": "unknown",
+                            "command_id": command_id,
+                            "compaction": {"completed": false, "receipt_id": turn_id},
+                        }));
+                    }
+                };
+                let latest = match read_latest_native_turn_status(
+                    &session.native_client,
+                    &thread_id,
+                )
+                .await
+                {
+                    Ok(latest) => latest,
+                    Err(_) => {
+                        session.phase = SessionPhase::Unknown;
+                        return Ok(json!({
+                            "state": "unknown",
+                            "command_id": command_id,
+                            "compaction": {"completed": false, "receipt_id": turn_id},
+                        }));
+                    }
+                };
+                if thread_state(&thread) == "idle"
+                    && latest.as_ref().is_some_and(|(latest_id, status)| {
+                        latest_id == turn_id && status == "completed"
+                    })
+                {
+                    Ok(json!({
+                        "state": "applied",
+                        "command_id": command_id,
+                        "compaction": {"completed": true, "receipt_id": turn_id},
+                    }))
+                } else {
+                    session.phase = SessionPhase::Unknown;
+                    Ok(json!({
+                        "state": "unknown",
+                        "command_id": command_id,
+                        "compaction": {"completed": false, "receipt_id": turn_id},
+                    }))
+                }
+            }
+            _ => {
+                session.phase = SessionPhase::Unknown;
+                Ok(json!({
+                    "state": "unknown",
+                    "command_id": command_id,
+                    "compaction": {"completed": false, "receipt_id": turn_id},
+                }))
+            }
+        }
+    }
     /// Build one native `turn/start` request from the effective model and
     /// effort. Omitted effort omits the wire field (schema: effort
     /// optional, anyOf ReasoningEffort|null), preserving the native
@@ -3113,6 +3374,7 @@ fn codex_manifest() -> PluginManifest {
             "launch",
             "resume",
             "send",
+            "compact",
             "steer",
             "interrupt",
             "approve",

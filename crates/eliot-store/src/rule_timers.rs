@@ -564,9 +564,11 @@ impl Store {
                 let admission = if let Some(arbitration) = &arbitration {
                     action.args["admission_mode"] = json!("arbitrated");
                     crate::launch_queue::check_arbitrated_project(&tx, &arbitration.project)
-                        .and_then(|()| admit_rule_action_tx(&tx, &key, action, now, limits, policy))
+                        .and_then(|()| {
+                            admit_rule_action_tx(&tx, &key, action, now, limits, policy, None)
+                        })
                 } else {
-                    admit_rule_action_tx(&tx, &key, action, now, limits, policy)
+                    admit_rule_action_tx(&tx, &key, action, now, limits, policy, None)
                 };
                 match admission {
                     Ok((admitted_parent, admitted_child, admitted_events)) => {
@@ -826,7 +828,7 @@ impl Store {
         }
         let limits = self.hierarchy_limits;
         let policy = self.capacity_policy.as_deref();
-        match admit_rule_action_tx(&tx, &key, action, now, limits, policy) {
+        match admit_rule_action_tx(&tx, &key, action, now, limits, policy, None) {
             Ok((parent, child, events)) => {
                 commit_transaction(tx, &self.write_faulted)?;
                 Ok(TimerSlotAdmission {

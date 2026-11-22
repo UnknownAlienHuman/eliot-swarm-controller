@@ -48,6 +48,7 @@ use tokio::{
 use ulid::Ulid;
 
 const RPC_DEADLINE: Duration = Duration::from_secs(30);
+const COMPACT_RPC_DEADLINE: Duration = Duration::from_secs(180);
 /// Bound for one `agent.start` round trip and its outer absolute wait.
 /// Cold native startup is sequential inside that single RPC: credential
 /// transfer (up to its own 30 s budget) then serve readiness (up to its own
@@ -325,15 +326,13 @@ pub(crate) struct PendingCommand {
     response: oneshot::Receiver<Result<Value>>,
     stderr: StderrView,
     credentials: Arc<[String]>,
-    wait_for_steer: bool,
+    response_timeout: Option<Duration>,
 }
 
 impl PendingCommand {
     pub(crate) async fn wait(self) -> Result<Value> {
-        let result = if self.wait_for_steer {
-            self.response.await
-        } else {
-            match timeout_at(Instant::now() + RPC_DEADLINE + RPC_GRACE, self.response).await {
+        let result = if let Some(timeout) = self.response_timeout {
+            match timeout_at(Instant::now() + timeout + RPC_GRACE, self.response).await {
                 Ok(result) => result,
                 Err(_) => {
                     return Err(Error::new(
@@ -342,6 +341,8 @@ impl PendingCommand {
                     ));
                 }
             }
+        } else {
+            self.response.await
         };
         result
             .unwrap_or_else(|_| {
@@ -951,7 +952,11 @@ impl PluginHost {
             _ => {}
         }
         let (sender, stderr, credentials) = self.sender(&key, &command.verb)?;
-        let wait_for_steer = command.verb == "steer";
+        let response_timeout = match command.verb.as_str() {
+            "steer" => None,
+            "compact" => Some(COMPACT_RPC_DEADLINE),
+            _ => Some(RPC_DEADLINE),
+        };
         let (reply, response) = oneshot::channel();
         sender
             .try_send(RuntimeMessage::Command {
@@ -970,7 +975,7 @@ impl PluginHost {
             response,
             stderr,
             credentials,
-            wait_for_steer,
+            response_timeout,
         })
     }
 
@@ -2421,6 +2426,14 @@ fn plugin_command_args(command: &Command) -> Result<Value> {
             // Antigravity) and proves it before the Router stores anything.
             // A configure carries no turn or request binding.
         }
+        "compact" => {
+            if !args.is_empty() || command.turn_id.is_some() || command.request_id.is_some() {
+                return Err(Error::new(
+                    "native_not_dispatched",
+                    "compact requires an idle session binding",
+                ));
+            }
+        }
         "steer" | "interrupt" => {
             command.turn_id.as_ref().ok_or_else(|| {
                 Error::new("stale_generation", "turn control has no captured turn id")
@@ -2799,6 +2812,7 @@ fn manifest_source_plan(manifest: &PluginManifest, harness: &str) -> Result<Valu
         "attach",
         "detach",
         "configure",
+        "compact",
     ];
     if verbs.len() != manifest.verbs.len()
         || verbs.len() < 3
@@ -2820,6 +2834,9 @@ fn manifest_source_plan(manifest: &PluginManifest, harness: &str) -> Result<Valu
         harness,
         "codex" | "muse" | "claude" | "opencode" | "antigravity"
     ) {
+        return Err(unsupported_manifest());
+    }
+    if verbs.contains("compact") && !matches!(harness, "codex" | "opencode") {
         return Err(unsupported_manifest());
     }
     let mandatory_families = ["message", "session", "turn"];

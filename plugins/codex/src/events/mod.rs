@@ -62,6 +62,19 @@ pub(crate) struct EventStatus {
     pub batch_unknown: bool,
     pub source_unknown: bool,
     pub stopped: bool,
+    pub compaction: Option<CompactionProgress>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CompactionProgress {
+    pub command_id: String,
+    pub baseline_turn_id: Option<String>,
+    pub accepted: bool,
+    pub turn_id: Option<String>,
+    pub item_id: Option<String>,
+    pub item_started: bool,
+    pub item_completed: bool,
+    pub terminal_status: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -99,6 +112,19 @@ enum Control {
         context: Vec<ContextItem>,
         model: Option<String>,
         effort: Option<String>,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    BeginCompaction {
+        command_id: String,
+        baseline_turn_id: Option<String>,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    AcceptCompaction {
+        command_id: String,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    ClearCompaction {
+        command_id: String,
         reply: oneshot::Sender<Result<()>>,
     },
     BeginStop {
@@ -277,6 +303,61 @@ impl EventHandle {
         .await
     }
 
+    pub async fn begin_compaction(
+        &self,
+        command_id: String,
+        baseline_turn_id: Option<String>,
+    ) -> Result<()> {
+        self.send(|reply| Control::BeginCompaction {
+            command_id,
+            baseline_turn_id,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn accept_compaction(&self, command_id: String) -> Result<()> {
+        self.send(|reply| Control::AcceptCompaction { command_id, reply })
+            .await
+    }
+
+    pub async fn clear_compaction(&self, command_id: String) -> Result<()> {
+        self.send(|reply| Control::ClearCompaction { command_id, reply })
+            .await
+    }
+
+    pub async fn wait_compaction(
+        &self,
+        command_id: &str,
+        deadline: Instant,
+    ) -> Result<CompactionProgress> {
+        let mut status = self.status.clone();
+        loop {
+            let snapshot = status.borrow().clone();
+            if let Some(progress) = snapshot.compaction
+                && progress.command_id == command_id
+                && progress.terminal_status.is_some()
+            {
+                return Ok(progress);
+            }
+            if snapshot.source_unknown || snapshot.failure.is_some() {
+                return Err(Error::new(
+                    "unknown",
+                    "Codex event source became uncertain during compaction",
+                ));
+            }
+            timeout_at(deadline, status.changed())
+                .await
+                .map_err(|_| Error::new("unknown", "Codex compaction lifecycle deadline elapsed"))?
+                .map_err(|_| {
+                    Error::new(
+                        "unknown",
+                        "Codex event status stream closed during compaction",
+                    )
+                })?;
+        }
+    }
+
     pub async fn begin_stop(&self) -> Result<()> {
         self.send(|reply| Control::BeginStop { reply }).await
     }
@@ -416,6 +497,25 @@ impl EventProcessor {
                 let result = self
                     .associate_turn(command_id, turn_id, context, model, effort)
                     .await;
+                let _ = reply.send(result);
+                true
+            }
+            Control::BeginCompaction {
+                command_id,
+                baseline_turn_id,
+                reply,
+            } => {
+                let result = self.begin_compaction(command_id, baseline_turn_id);
+                let _ = reply.send(result);
+                true
+            }
+            Control::AcceptCompaction { command_id, reply } => {
+                let result = self.accept_compaction(&command_id).await;
+                let _ = reply.send(result);
+                true
+            }
+            Control::ClearCompaction { command_id, reply } => {
+                let result = self.clear_compaction(&command_id).await;
                 let _ = reply.send(result);
                 true
             }
@@ -616,6 +716,9 @@ impl EventProcessor {
         if method == "thread/tokenUsage/updated" {
             return !self.status.ready;
         }
+        if self.compaction_notification_matches(method, params) {
+            return false;
+        }
         (matches!(
             method,
             "turn/started"
@@ -763,6 +866,218 @@ impl EventProcessor {
         );
         self.commit_event("turn.started", native_id, data).await?;
         self.flush_buffer().await
+    }
+
+    fn begin_compaction(
+        &mut self,
+        command_id: String,
+        baseline_turn_id: Option<String>,
+    ) -> Result<()> {
+        if !self.status.ready
+            || self.status.thread_id.is_none()
+            || self.status.active_turn_id.is_some()
+            || command_id.trim().is_empty()
+            || self.writes_blocked
+            || self.status.source_unknown
+            || self
+                .status
+                .compaction
+                .as_ref()
+                .is_some_and(|progress| progress.terminal_status.is_none())
+        {
+            return Err(Error::new(
+                "bad_state",
+                "Codex compact requires a ready idle thread and resolved event source",
+            ));
+        }
+        self.status.compaction = Some(CompactionProgress {
+            command_id,
+            baseline_turn_id,
+            ..CompactionProgress::default()
+        });
+        Ok(())
+    }
+
+    async fn accept_compaction(&mut self, command_id: &str) -> Result<()> {
+        let progress = self
+            .status
+            .compaction
+            .as_mut()
+            .filter(|progress| progress.command_id == command_id)
+            .ok_or_else(|| Error::new("bad_state", "Codex compact reservation is missing"))?;
+        if progress.accepted {
+            return Err(Error::new(
+                "bad_state",
+                "Codex compact was already accepted",
+            ));
+        }
+        progress.accepted = true;
+        self.flush_buffer().await
+    }
+
+    async fn clear_compaction(&mut self, command_id: &str) -> Result<()> {
+        let Some(progress) = self.status.compaction.as_ref() else {
+            return Ok(());
+        };
+        if progress.command_id != command_id {
+            return Err(Error::new("bad_state", "Codex compact reservation changed"));
+        }
+        if progress.turn_id.is_some() || progress.terminal_status.is_some() {
+            return Err(Error::new(
+                "unknown",
+                "Codex compact already has native lifecycle evidence",
+            ));
+        }
+        self.status.compaction = None;
+        self.flush_buffer().await
+    }
+
+    fn compaction_notification_matches(&self, method: &str, params: &Value) -> bool {
+        if method == "thread/tokenUsage/updated" {
+            return false;
+        }
+        let Some(progress) = self
+            .status
+            .compaction
+            .as_ref()
+            .filter(|progress| progress.accepted)
+        else {
+            return false;
+        };
+        if params.get("threadId").and_then(Value::as_str) != self.status.thread_id.as_deref() {
+            return false;
+        }
+        if method == "turn/started" {
+            let Some(turn_id) = params.pointer("/turn/id").and_then(Value::as_str) else {
+                return false;
+            };
+            return progress.baseline_turn_id.as_deref() != Some(turn_id)
+                && progress
+                    .turn_id
+                    .as_deref()
+                    .is_none_or(|known| known == turn_id);
+        }
+        let turn_id = params
+            .get("turnId")
+            .and_then(Value::as_str)
+            .or_else(|| params.pointer("/turn/id").and_then(Value::as_str));
+        progress
+            .turn_id
+            .as_deref()
+            .is_some_and(|known| Some(known) == turn_id)
+    }
+
+    fn process_compaction_notification(&mut self, method: &str, params: &Value) -> Result<bool> {
+        if !self.compaction_notification_matches(method, params) {
+            return Ok(false);
+        }
+        match method {
+            "turn/started" => {
+                let notification: NativeTurnStartedNotification =
+                    serde_json::from_value(params.clone()).map_err(|_| {
+                        Error::new(
+                            "native_protocol",
+                            "Codex compact turn/started did not match the installed schema",
+                        )
+                    })?;
+                if notification.turn.status != NativeTurnStatus::InProgress {
+                    let progress = self.status.compaction.as_mut().unwrap();
+                    progress.turn_id = Some(notification.turn.id);
+                    progress.terminal_status = Some("unknown".to_owned());
+                    return Ok(true);
+                }
+                self.status.compaction.as_mut().unwrap().turn_id = Some(notification.turn.id);
+            }
+            "item/started" => {
+                let notification: NativeItemStarted = serde_json::from_value(params.clone())
+                    .map_err(|_| {
+                        Error::new(
+                            "native_protocol",
+                            "Codex compact item/started did not match the installed schema",
+                        )
+                    })?;
+                if notification.item.get("type").and_then(Value::as_str)
+                    == Some("contextCompaction")
+                {
+                    let item_id = notification
+                        .item
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.trim().is_empty())
+                        .ok_or_else(|| {
+                            Error::new(
+                                "native_protocol",
+                                "Codex contextCompaction start omitted its item id",
+                            )
+                        })?;
+                    let progress = self.status.compaction.as_mut().unwrap();
+                    if progress.item_started || progress.item_completed {
+                        progress.terminal_status = Some("unknown".to_owned());
+                    } else {
+                        progress.item_id = Some(item_id.to_owned());
+                        progress.item_started = true;
+                    }
+                }
+            }
+            "item/completed" => {
+                let notification: NativeItemCompletedNotification =
+                    serde_json::from_value(params.clone()).map_err(|_| {
+                        Error::new(
+                            "native_protocol",
+                            "Codex compact item/completed did not match the installed schema",
+                        )
+                    })?;
+                let raw_item = params.get("item").cloned().unwrap_or(Value::Null);
+                if raw_item.get("type").and_then(Value::as_str) == Some("contextCompaction") {
+                    let item_id = raw_item
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.trim().is_empty())
+                        .ok_or_else(|| {
+                            Error::new(
+                                "native_protocol",
+                                "Codex contextCompaction completion omitted its item id",
+                            )
+                        })?;
+                    let progress = self.status.compaction.as_mut().unwrap();
+                    if !progress.item_started || progress.item_id.as_deref() != Some(item_id) {
+                        progress.terminal_status = Some("unknown".to_owned());
+                    } else {
+                        progress.item_completed = true;
+                    }
+                }
+                let _ = notification;
+            }
+            "turn/completed" => {
+                let notification: NativeTurnCompletedNotification =
+                    serde_json::from_value(params.clone()).map_err(|_| {
+                        Error::new(
+                            "native_protocol",
+                            "Codex compact turn/completed did not match the installed schema",
+                        )
+                    })?;
+                let progress = self.status.compaction.as_mut().unwrap();
+                let status = match notification.turn.status {
+                    NativeTurnStatus::Completed => "completed",
+                    NativeTurnStatus::Failed => "failed",
+                    NativeTurnStatus::Interrupted => "interrupted",
+                    NativeTurnStatus::InProgress => "unknown",
+                };
+                progress.terminal_status =
+                    Some(
+                        if status == "completed"
+                            && (!progress.item_started || !progress.item_completed)
+                        {
+                            "lifecycle_missing"
+                        } else {
+                            status
+                        }
+                        .to_owned(),
+                    );
+            }
+            _ => {}
+        }
+        Ok(true)
     }
 
     async fn flush_buffer(&mut self) -> Result<()> {
@@ -1161,6 +1476,9 @@ impl EventProcessor {
     }
 
     async fn process_notification(&mut self, method: &str, params: Value) -> Result<()> {
+        if self.process_compaction_notification(method, &params)? {
+            return Ok(());
+        }
         if turn_activity_notification(method)
             && let Some(turn) = self.status.active_turn_id.as_deref()
             && params.get("turnId").and_then(Value::as_str) == Some(turn)

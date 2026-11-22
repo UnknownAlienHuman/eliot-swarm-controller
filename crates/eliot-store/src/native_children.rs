@@ -43,7 +43,7 @@ const CHILDREN_ATTENTION_PAGE_SQL: &str = "SELECT r.child, c.generation, c.origi
     ORDER BY r.child LIMIT ?5";
 
 /// A bounded sample plus complete counts; no transcript text or native identity.
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NativeChildrenAttention {
     pub unfinished: usize,
     pub lost: usize,

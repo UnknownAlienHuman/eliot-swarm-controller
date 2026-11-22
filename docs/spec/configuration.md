@@ -673,21 +673,55 @@ requires free space of about twice the combined current `eliot.db` and WAL size.
 uses the same preflight before the daemon serves requests. Routine retention
 does not run compaction in the live request path.
 
-The automatic attention no-progress suspicion window is optional:
+### Automatic attention settings
+
+Automatic attention uses per-kind settings. Each listed attention kind is
+enabled by default. Set its `enabled` value to `false` to disable it.
+The daemon loads these settings at startup. No-progress attention queues a
+question and notifies the live manager, or the Owner when no manager can act.
+Automatic interruption and a
+session-growth switch are additional opt-in steps.
 
 ```toml
-[daemon]
-attention_suspicion_secs = 900
+[daemon.attention.no_progress]
+enabled = true
+threshold_secs = 900
+interrupt = false
+
+[daemon.attention.no_code_progress]
+enabled = true
+threshold_secs = 900
+
+[daemon.attention.children_unattended]
+enabled = true
+threshold_secs = 900
+
+[daemon.attention.session_growth]
+enabled = true
+switch = false
 ```
 
-It defaults to 900 seconds and must be a positive signed 64-bit integer whose
-millisecond value fits in `i64`. This setting controls when a busy Agent
-with a healthy native source and no known request/tool activity is diagnosed;
-source-health failures are diagnosed promptly regardless of this window. The
-same window bounds how long a `busy` recovery snapshot read may defer settling a
-turn whose source is unhealthy ([plugin protocol](plugin-protocol.md)).
+`no_progress.interrupt` and `session_growth.switch` default to `false`. Set
+either to `true` to opt into that additional operation. Reading settings emits
+these defaults while retaining any configured per-kind threshold; when a
+per-kind threshold is omitted, the legacy `attention_suspicion_secs` value
+continues to supply it.
 
-Observe-what-matters thresholds are optional:
+Time windows must be positive integers whose millisecond value fits in `i64`.
+An older `daemon.attention_suspicion_secs` supplies the default for omitted
+per-kind windows. Source-health failures are observed promptly. The `no_progress`
+window also bounds recovery for an unhealthy source ([plugin protocol](plugin-protocol.md)).
+
+`agent_lost`, `source_unhealthy`, `provider_refusal`, `session_growth`, and
+`repeated_command_failure` each have an `enabled` setting under
+`[daemon.attention.<kind>]`. Repeated-command detection uses three matching
+failures in one turn. Provider eligibility and budgets still follow
+[routing](#routing) and provider holds. The `agent_lost` setting and `on_restart`
+govern automatic promptless resume.
+
+### Observation thresholds
+
+The observation thresholds are optional.
 
 ```toml
 [daemon]
@@ -701,7 +735,9 @@ session_file_bytes = 67108864
 A child-process tree whose wall time, consumed CPU or peak RSS crosses any one
 heavy threshold closes as one `activity.heavy` event (defaults: 30 s wall, 60 s CPU,
 1 GiB RSS). Session growth warns at 0.8 context occupancy or a 64 MiB native session
-file where the harness exposes a documented size source; there is no auto-compact.
+file where the harness exposes a documented size source. The
+[session growth reaction](monitoring.md#automatic-reactions) uses a quiescent
+session boundary.
 `swarm doctor` compares live installed harness versions and contract markers against
 the pinned `VERIFIED_HARNESSES` table without blocking launch. It also reports
 Claude profiles whose explicitly pinned executable is missing, with the current

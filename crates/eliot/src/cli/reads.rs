@@ -1431,6 +1431,15 @@ fn print_why_diagnosis(response: &DiagnoseResponse) {
     if let Some(preceded_by) = response.preceded_by.as_deref() {
         println!("  preceded by: {preceded_by}");
     }
+    for entry in &response.attention_steps {
+        let reaction = &entry.reaction;
+        println!(
+            "  [monitoring, generation {}] {} ({})",
+            entry.generation,
+            reaction.step.replace('_', " "),
+            reaction.outcome.replace('_', " "),
+        );
+    }
     if let Some(crash) = response.previous_crash.as_ref() {
         println!("  previous crash: {}", crash.summary());
     }

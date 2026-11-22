@@ -24,10 +24,11 @@ use super::types::SessionPage;
 use crate::native::{
     sse::{SseFrame, SseParser},
     types::{
-        AgentList, ConfigEntry, DataEnvelope, ErrorBody, FormInfo, FormReplyRequest, InboxPage,
-        InboxUser, InterruptResponse, LocationRef, McpServerReadback, MessagePage, ModelRef,
-        NativeModelEntry, PermissionReplyRequest, PermissionRequest, PermissionRule, PromptRequest,
-        SessionCreateRequest, SessionInfo, SwitchAgentRequest, SwitchModelRequest,
+        AgentList, ConfigEntry, DataEnvelope, ErrorBody, FormInfo, FormReplyRequest,
+        InboxCompaction, InboxPage, InboxUser, InterruptResponse, LocationRef, McpServerReadback,
+        MessagePage, ModelRef, NativeModelEntry, PermissionReplyRequest, PermissionRequest,
+        PermissionRule, PromptRequest, SessionCreateRequest, SessionInfo, SwitchAgentRequest,
+        SwitchModelRequest,
     },
 };
 
@@ -566,6 +567,26 @@ impl OpenCodeHttp {
         Err(map_write_error("session/prompt", &response))
     }
 
+    /// Admit one compaction on the session's ordinary inbox. The stream
+    /// independently proves which execution consumed this receipt.
+    pub async fn compact(
+        &self,
+        session_id: &str,
+        deadline: Instant,
+    ) -> std::result::Result<InboxCompaction, HttpOutcome> {
+        let path = format!("/api/session/{}/compact", verified_segment(session_id)?);
+        let body = serde_json::json!({"delivery": "queue"});
+        let response = self
+            .send(reqwest::Method::POST, &path, &[], Some(body), deadline)
+            .await?;
+        if response.status != 200 {
+            return Err(map_write_error("session/compact", &response));
+        }
+        serde_json::from_slice::<DataEnvelope<InboxCompaction>>(&response.body)
+            .map(|envelope| envelope.data)
+            .map_err(|_| HttpOutcome::unknown("OpenCode returned no exact compaction receipt"))
+    }
+
     /// `POST /api/session/{id}/interrupt` (`session.interrupt`):
     /// abort the session's current execution. The 200 body is unwrapped
     /// (`{"interrupted": bool}`), unlike every other success body: `true`
@@ -949,6 +970,29 @@ impl OpenCodeHttp {
             return Ok(page);
         }
         Err(readback_error("message list", &response))
+    }
+
+    pub async fn compaction_outcome(
+        &self,
+        session_id: &str,
+        receipt: &str,
+        deadline: Instant,
+    ) -> Result<Option<bool>> {
+        use crate::native::types::Message;
+        let page = self.list_messages(session_id, None, deadline).await?;
+        if !matches!(page.data.first(), Some(Message::Idle(_))) {
+            return Ok(None);
+        }
+        Ok(page.data.iter().find_map(|message| match message {
+            Message::Compaction(message) if message.id == receipt => {
+                match message.status.as_str() {
+                    "completed" => Some(true),
+                    "failed" => Some(false),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }))
     }
 
     /// `POST /api/rpc/eliot-context/bind` over the existing authenticated

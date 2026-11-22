@@ -107,9 +107,10 @@ remains for local control.
 
 Stalled or unhealthy agents are detected and diagnosed from read-only native, process,
 turn and event facts. Native process statistics alone do not prove model progress, and
-silence is not completion. An unhealthy or no-progress result triggers read-only
-diagnosis and delivery through the existing router/bus mail/notify path to the
-responsible manager or Owner. It never authorizes automatic resend of a job or a false Done result.
+silence is not completion. The daemon runs per-kind monitoring reactions through the
+existing router and uses exact generation and turn bindings for controls. The
+[monitoring contract](spec/monitoring.md#automatic-reactions) defines the allowed
+actions and notices routed to the responsible manager or Owner.
 
 ## State and effects
 

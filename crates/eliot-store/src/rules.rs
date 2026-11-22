@@ -729,9 +729,11 @@ impl Store {
         event_seq: i64,
         request: SubmitCommand,
         now: i64,
+        secret_policy: &core::SecretPolicy,
     ) -> Result<RuleEventAdmission> {
         self.ensure_writer_healthy()?;
-        let result = self.admit_rule_action_inner(principal, state, event_seq, request, now);
+        let result =
+            self.admit_rule_action_inner(principal, state, event_seq, request, now, secret_policy);
         self.fault_on_persistence_error(&result);
         result
     }
@@ -765,6 +767,7 @@ impl Store {
         event_seq: i64,
         mut request: SubmitCommand,
         now: i64,
+        secret_policy: &core::SecretPolicy,
     ) -> Result<RuleEventAdmission> {
         require_nonempty(principal, "principal")?;
         require_nonempty(&state.id, "rule id")?;
@@ -954,14 +957,21 @@ impl Store {
         // the surrounding transaction rolls every write back on persistence failure.
         let limits = self.hierarchy_limits;
         let policy = self.capacity_policy.as_deref();
-        let (parent, child_admission, events) =
-            match admit_rule_action_tx(&tx, &key, request, now, limits, policy) {
-                Ok(admission) => admission,
-                Err(error) if core::is_deterministic_pre_admission_rejection(&error.code) => {
-                    return reject_rule_event(tx, &self.write_faulted, &key, &error, now);
-                }
-                Err(error) => return Err(error),
-            };
+        let (parent, child_admission, events) = match admit_rule_action_tx(
+            &tx,
+            &key,
+            request,
+            now,
+            limits,
+            policy,
+            Some(secret_policy),
+        ) {
+            Ok(admission) => admission,
+            Err(error) if core::is_deterministic_pre_admission_rejection(&error.code) => {
+                return reject_rule_event(tx, &self.write_faulted, &key, &error, now);
+            }
+            Err(error) => return Err(error),
+        };
         let view = update_rule_cursor_tx(&tx, key.principal, &stored.view, event_seq, now)?;
         commit_transaction(tx, &self.write_faulted)?;
 
@@ -1242,6 +1252,14 @@ fn validate_project_rule_action_tx(
     principal: &str,
     request: &SubmitCommand,
 ) -> Result<Option<core::api::ProjectRegistrationView>> {
+    if (request.probe || matches!(request.verb.as_str(), "compact" | "switch"))
+        && principal != "owner"
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "provider probes, compact and switch rule actions require the Owner principal",
+        ));
+    }
     if request.verb == "launch" {
         return super::projects::validate_project_rule_launch_action_tx(
             tx,
@@ -1965,6 +1983,15 @@ fn valid_event_rule_action_request(request: &SubmitCommand) -> bool {
     if request.verb == "inject" {
         return valid_inject_request(request);
     }
+    if request.verb == "compact" {
+        return valid_compact_rule_action_request(request);
+    }
+    if request.verb == "switch" {
+        return valid_switch_rule_action_request(request);
+    }
+    if request.probe {
+        return valid_probe_send_rule_action_request(request);
+    }
     let reply = is_request_reply_verb(request.verb.as_str());
     if request.verb != "steer" && !reply {
         return valid_rule_action_request(request, true);
@@ -2024,7 +2051,7 @@ fn valid_inject_request(request: &SubmitCommand) -> bool {
             .expected_turn_id
             .as_deref()
             .is_some_and(|turn_id| !turn_id.is_empty()),
-        eliot_core::InjectPoint::ActiveTurn => false,
+        eliot_core::InjectPoint::ActiveTurn => request.expected_turn_id.is_some(),
     }
 }
 
@@ -2440,6 +2467,95 @@ struct StoredRuleTrigger {
     cause: Option<core::EventCause>,
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuleSwitchActionArgs {
+    #[serde(default)]
+    commands: Vec<String>,
+    launch: core::api::SwitchLaunch,
+}
+
+fn parse_rule_switch_args(args: &Value) -> Result<RuleSwitchActionArgs> {
+    let parsed: RuleSwitchActionArgs = serde_json::from_value(args.clone())
+        .map_err(|_| Error::new("invalid", "switch action args are malformed"))?;
+    if parsed.commands.len() > core::api::MAX_HANDOFF_SENDS {
+        return Err(Error::new(
+            "fanout_limit",
+            "switch action exceeds the handoff command limit",
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    if parsed
+        .commands
+        .iter()
+        .any(|id| core::validate_command_id(id).is_err() || !seen.insert(id))
+    {
+        return Err(Error::new(
+            "invalid",
+            "switch action commands must be distinct valid command IDs",
+        ));
+    }
+    parsed.launch.validate()?;
+    Ok(parsed)
+}
+
+fn valid_compact_rule_action_request(request: &SubmitCommand) -> bool {
+    request.validate().is_ok()
+        && request.verb == "compact"
+        && request
+            .target
+            .as_deref()
+            .is_some_and(|target| core::parse_agent_id(target).is_ok())
+        && request
+            .expected_generation
+            .is_some_and(|generation| generation > 0)
+        && request.expected_turn_id.is_none()
+        && request.request_id.is_none()
+        && request.selector.is_none()
+        && !request.probe
+        && request.args.as_object().is_some_and(|args| args.is_empty())
+}
+
+fn valid_probe_send_rule_action_request(request: &SubmitCommand) -> bool {
+    request.validate().is_ok()
+        && request.verb == "send"
+        && request
+            .target
+            .as_deref()
+            .is_some_and(|target| core::parse_agent_id(target).is_ok())
+        && request
+            .expected_generation
+            .is_some_and(|generation| generation > 0)
+        && request.expected_turn_id.is_none()
+        && request.request_id.is_none()
+        && request.selector.is_none()
+        && request.probe
+        && request
+            .args
+            .as_object()
+            .is_some_and(|args| args.len() == 1 && args.get("text").is_some_and(Value::is_string))
+}
+
+fn valid_switch_rule_action_request(request: &SubmitCommand) -> bool {
+    request.validate().is_ok()
+        && request.verb == "switch"
+        && request
+            .target
+            .as_deref()
+            .is_some_and(|target| core::parse_agent_id(target).is_ok())
+        && request
+            .expected_generation
+            .is_some_and(|generation| generation > 0)
+        && request
+            .expected_turn_id
+            .as_deref()
+            .is_some_and(|turn_id| !turn_id.is_empty())
+        && request.request_id.is_none()
+        && request.selector.is_none()
+        && !request.probe
+        && parse_rule_switch_args(&request.args).is_ok()
+}
+
 fn rule_action_binding_error(event: &StoredRuleTrigger, request: &SubmitCommand) -> Option<String> {
     if !valid_event_rule_action_request(request) {
         return Some("rule_action_binding_invalid".to_owned());
@@ -2454,8 +2570,8 @@ fn rule_action_binding_error(event: &StoredRuleTrigger, request: &SubmitCommand)
         || request.expected_generation != event.generation
         || ((matches!(
             request.verb.as_str(),
-            "interrupt" | "steer" | "approve" | "deny" | "answer"
-        ) || (request.verb == "inject" && request.args["point"] == "turn_safe_point"))
+            "interrupt" | "steer" | "approve" | "deny" | "answer" | "switch"
+        ) || (request.verb == "inject" && request.args["point"] != "next_input"))
             && request.expected_turn_id.as_deref() != event.turn_id.as_deref())
         || (is_request_reply_verb(request.verb.as_str())
             && (event.kind != "request.opened"
@@ -2859,26 +2975,111 @@ fn admit_rule_action_tx(
     now: i64,
     limits: core::api::HierarchyLimits,
     policy: Option<&capacity::PolicyLoader>,
+    secret_policy: Option<&core::SecretPolicy>,
 ) -> Result<(Command, Admission, Vec<Event>)> {
+    if (request.probe || matches!(request.verb.as_str(), "compact" | "switch"))
+        && key.principal != "owner"
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "provider probes, compact and switch rule actions require the Owner principal",
+        ));
+    }
     let parent_cause = key.command_cause(&key.parent_id)?;
     let child_cause = key.command_cause(&key.child_id)?;
     request.id = key.child_id.clone();
-    let preparation = rule_launch_preparation(&request)?;
-    // Ordinary admission may have inserted an Agent/cursor before a later
-    // transactional capacity gate refuses it. A rejected firing must retain
-    // none of those partial writes when its rejection is committed.
+    // Reserve a Switch through its existing Owner-only durable workflow. The
+    // exact event turn resolves to its committed original SEND in this
+    // transaction; no prompt is reconstructed or replayed here.
     tx.execute_batch("SAVEPOINT rule_child_admission")
         .map_err(sql_error)?;
-    let mut child_admission = match admission::submit_tx(
-        tx,
-        key.principal,
-        request,
-        preparation,
-        now,
-        true,
-        limits,
-        policy,
-    ) {
+    let child_admission_result = if request.verb == "switch" {
+        (|| {
+            let secret_policy = secret_policy.ok_or_else(|| {
+                Error::new(
+                    "not_allowed",
+                    "rule switch requires the Owner secret policy",
+                )
+            })?;
+            let RuleFiringIdentity::Event { .. } = key.identity else {
+                return Err(Error::new(
+                    "unsupported",
+                    "switch actions require an event rule",
+                ));
+            };
+            let from = request
+                .target
+                .as_deref()
+                .ok_or_else(|| Error::new("invalid", "switch action target is missing"))?;
+            let from_generation = request
+                .expected_generation
+                .ok_or_else(|| Error::new("invalid", "switch action generation is missing"))?;
+            let turn_id = request
+                .expected_turn_id
+                .as_deref()
+                .ok_or_else(|| Error::new("invalid", "switch action turn binding is missing"))?;
+            let agent_num = core::parse_agent_id(from)?;
+            let task_command: Option<String> = tx
+                .query_row(
+                    "SELECT json_extract(data, '$.command_id') FROM events
+                     WHERE agent = ?1 AND generation = ?2 AND kind = 'turn.started'
+                       AND json_extract(data, '$.turn_id') = ?3
+                     ORDER BY seq DESC LIMIT 1",
+                    params![agent_num, from_generation, turn_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(sql_error)?;
+            let task_command = task_command.ok_or_else(|| {
+                Error::new(
+                    "not_found",
+                    "switch event turn has no retained original command",
+                )
+            })?;
+            let action = parse_rule_switch_args(&request.args)?;
+            let switch_request = core::api::SwitchRequest {
+                id: request.id.clone(),
+                from: from.to_owned(),
+                from_generation,
+                task_command,
+                commands: action.commands,
+                launch: action.launch,
+            };
+            let change = super::switch::reserve_rule_switch_tx(
+                tx,
+                key.principal,
+                &switch_request,
+                limits,
+                secret_policy,
+                now,
+            )?;
+            let command = load_command(tx, &request.id)?.ok_or_else(|| {
+                Error::new(
+                    "source_integrity",
+                    "reserved rule switch command disappeared",
+                )
+            })?;
+            Ok(Admission {
+                command,
+                linked_command: None,
+                events: change.events,
+                is_new: true,
+            })
+        })()
+    } else {
+        let preparation = rule_launch_preparation(&request)?;
+        admission::submit_tx(
+            tx,
+            key.principal,
+            request,
+            preparation,
+            now,
+            true,
+            limits,
+            policy,
+        )
+    };
+    let mut child_admission = match child_admission_result {
         Ok(admission) => {
             tx.execute_batch("RELEASE rule_child_admission")
                 .map_err(sql_error)?;
