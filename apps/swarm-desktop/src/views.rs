@@ -513,6 +513,44 @@ fn part_view(
                 action,
             ))
         }
+        // What Swarm inserted (a Swarm note, service or peer mail): never
+        // the owner's bubble. One low-emphasis row with its fixed frame
+        // line, the quoted content below it when expanded.
+        PartKind::Note => {
+            let toggle = callbacks.toggle_tools.clone();
+            let key = part.key.clone();
+            let row = crate::m3::tool_row(palette, false)
+                .automation_name(format!(
+                    "{} ({})",
+                    part.label,
+                    if expanded { "expanded" } else { "collapsed" }
+                ))
+                .on_click(move || {
+                    let _ = toggle.call((key.clone(), !expanded));
+                })
+                .content(crate::m3::tool_content(
+                    crate::m3::glyph::INFO,
+                    &part.label,
+                    View::empty(),
+                ));
+            let detail: View = if expanded && !part.plain.is_empty() {
+                Border::new()
+                    .background(palette.composer())
+                    .corner_radius(tokens::radius::CONTAINER)
+                    .padding(Thickness::uniform(tokens::spacing::MD))
+                    .content(
+                        crate::m3::secondary(part.plain.clone())
+                            .text_wrapping(TextWrapping::Wrap)
+                            .is_text_selection_enabled(true)
+                            .automation_name(format!("Swarm note content: {}", part.plain)),
+                    )
+            } else {
+                View::empty()
+            };
+            StackPanel::new()
+                .spacing(tokens::spacing::XS)
+                .children((row, detail))
+        }
         PartKind::Notice => crate::m3::secondary(format!("{} · {}", part.label, part.plain))
             .text_wrapping(TextWrapping::Wrap)
             .into(),

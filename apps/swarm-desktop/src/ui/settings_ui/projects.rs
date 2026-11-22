@@ -1,6 +1,68 @@
 use super::*;
 use crate::ui::bulk_ui::{BulkMsg, BulkOp, Pick};
 
+/// A policy field's message: every control reports through one mapper.
+fn edit(edit: PolicyEdit) -> Message {
+    Message::Settings(SettingsMsg::PolicyEdited(edit))
+}
+
+/// One policy list as the tag editor shows tags: a field per entry with its
+/// Remove button, then a blank field that adds one. Nothing is split, so
+/// an argument with spaces stays one argument (and a multi-line box, whose
+/// first frame drops every line after the first, is not needed).
+fn policy_list(
+    fields: &model::PolicyFields,
+    list: model::PolicyList,
+    (entry, add): (&str, &str),
+    name: &str,
+    context: &mut ViewContext<DesktopApp>,
+    palette: Palette,
+) -> View {
+    let entries = fields.list(list);
+    let blank = String::new();
+    let rows: Vec<KeyedView> = entries
+        .iter()
+        .chain(std::iter::once(&blank))
+        .enumerate()
+        .map(|(index, text)| {
+            let new = index == entries.len();
+            let field = m3::field()
+                .text(text.clone())
+                .placeholder_text(if new { add } else { entry })
+                .automation_name(if new {
+                    format!("{name}: {add}")
+                } else {
+                    format!("{name}: {entry} {}", index + 1)
+                })
+                .on_text_changed(
+                    context.callback(move |text| edit(PolicyEdit::Entry(list, index, text))),
+                );
+            let remove: View = if new {
+                View::empty()
+            } else {
+                m3::icon_button(palette)
+                    .grid_column(1)
+                    .width(tokens::height::CONTROL)
+                    .height(tokens::height::CONTROL)
+                    .automation_name(format!("{name}: remove {entry} {}", index + 1))
+                    .on_click(context.message(edit(PolicyEdit::Remove(list, index))))
+                    .content(m3::icon(m3::glyph::CLOSE))
+            };
+            KeyedView::new(
+                format!("{list:?}:{index}"),
+                Grid::new()
+                    .columns([GridLength::STAR, GridLength::Pixel(tokens::height::CONTROL)])
+                    .column_spacing(tokens::spacing::XS)
+                    .children((field, remove)),
+            )
+        })
+        .collect();
+    StackPanel::new()
+        .spacing(tokens::spacing::XS)
+        .margin(Thickness::xy(0.0, tokens::spacing::XS))
+        .keyed_children(rows)
+}
+
 impl DesktopApp {
     /// Settings › Projects: every registration by its logical name (the
     /// project, and "project › subproject" for a linked worktree, never
@@ -179,6 +241,7 @@ impl DesktopApp {
                             .into(),
                         None,
                     ),
+                    self.policy_editor(&id, &name, context, palette),
                     m3::destructive(palette)
                         .margin(Thickness::new(
                             tokens::layout::FIELD_INDENT,
@@ -275,5 +338,243 @@ impl DesktopApp {
                 .spacing(tokens::spacing::SM)
                 .children((m3::section_heading("Add a project", "", None), add)),
         ))
+    }
+
+    /// The open project's launch policy (`[projects.ID.policy]`): the
+    /// check and Goal defaults Swarm applies to every Agent launched here,
+    /// saved together with Save on the read revision (Validate asks the
+    /// store without saving), the store's message when it refuses, and how
+    /// many of the last day's launches took the policy, with the newest
+    /// opt-outs and their reasons (`project.list` `policy_usage`).
+    fn policy_editor(
+        &self,
+        id: &str,
+        name: &str,
+        context: &mut ViewContext<Self>,
+        palette: Palette,
+    ) -> View {
+        let Some(policy) = self
+            .settings
+            .policy
+            .as_ref()
+            .filter(|policy| policy.project == id)
+        else {
+            return View::empty();
+        };
+        let fields = &policy.fields;
+        let busy = self.settings.busy() || self.prefs_saving;
+        let dirty = policy.dirty();
+        let saving = policy.saving && busy;
+        let number = |text: &str| {
+            m3::field()
+                .text(text.to_owned())
+                .width(tokens::layout::NUMBER_WIDTH)
+                .horizontal_alignment(HorizontalAlignment::Left)
+        };
+        let note: View = match &policy.note {
+            Some(note) => {
+                let text = m3::secondary(note.text.clone())
+                    .text_wrapping(TextWrapping::Wrap)
+                    .is_text_selection_enabled(true)
+                    .automation_name(format!("Policy status: {}", note.text));
+                if note.error {
+                    text.foreground(palette.attention()).into()
+                } else {
+                    text.into()
+                }
+            }
+            None if dirty => m3::secondary("Unsaved changes.").into(),
+            None => View::empty(),
+        };
+        let now = crate::handoff::now_ms();
+        let usage = self
+            .nav
+            .projects
+            .iter()
+            .find(|project| project.id == id)
+            .map(|project| &project.policy_usage);
+        let counter = match usage {
+            None => "Launch counts are read with the project list.".to_owned(),
+            Some(usage) if usage.total == 0 => {
+                "No Agents launched in this project in the last 24 h.".to_owned()
+            }
+            Some(usage) => format!(
+                "Applied to {} of {} Agents launched in the last 24 h · {} opted out",
+                usage.applied, usage.total, usage.opted_out
+            ),
+        };
+        let opt_outs: Vec<KeyedView> = usage
+            .map(|usage| usage.opt_outs.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .map(|opt_out| {
+                let line = format!(
+                    "{} · {} · {}",
+                    self.agent_title(&opt_out.agent),
+                    opt_out.reason,
+                    crate::nav::short_age(now, opt_out.created_at)
+                );
+                KeyedView::new(
+                    opt_out.agent.clone(),
+                    m3::secondary(line.clone())
+                        .text_wrapping(TextWrapping::Wrap)
+                        .is_text_selection_enabled(true)
+                        .automation_name(format!("Opted out: {line}")),
+                )
+            })
+            .collect();
+        let field_row = |label: &str, control: View| m3::form_row(label, control, None);
+        StackPanel::new()
+            .spacing(tokens::spacing::XS)
+            .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
+            .children((
+                m3::section_heading(
+                    "Launch policy",
+                    "The check and limits Swarm applies to every Agent launched in this project.",
+                    None,
+                ),
+                field_row(
+                    "Check command",
+                    policy_list(
+                        fields,
+                        model::PolicyList::Argv,
+                        ("Argument", "Add an argument"),
+                        &format!("Policy check command of {name}"),
+                        context,
+                        palette,
+                    ),
+                ),
+                field_row(
+                    "Check deadline (s)",
+                    number(&fields.deadline_s)
+                        .placeholder_text("Default")
+                        .automation_name(format!("Policy check deadline of {name}"))
+                        .on_text_changed(context.callback(|text| edit(PolicyEdit::Deadline(text))))
+                        .into(),
+                ),
+                field_row(
+                    "When",
+                    CheckBox::new()
+                        .is_checked(fields.at_turn_end)
+                        .automation_name(format!("Run the policy check at turn end in {name}"))
+                        .on_is_checked_changed(
+                            context.callback(|on: bool| edit(PolicyEdit::AtTurnEnd(on))),
+                        )
+                        .content(m3::body("Run the check when a turn ends")),
+                ),
+                field_row(
+                    "Timeout retry",
+                    CheckBox::new()
+                        .is_checked(fields.retry_safe)
+                        .automation_name(format!(
+                            "The policy check of {name} is safe to repeat after a timeout"
+                        ))
+                        .on_is_checked_changed(
+                            context.callback(|on: bool| edit(PolicyEdit::RetrySafe(on))),
+                        )
+                        .content(m3::body("Safe to repeat after a timeout")),
+                ),
+                field_row(
+                    "Rounds",
+                    number(&fields.max_rounds)
+                        .automation_name(format!("Policy rounds of {name}"))
+                        .on_text_changed(context.callback(|text| edit(PolicyEdit::Rounds(text))))
+                        .into(),
+                ),
+                field_row(
+                    "Cost limit",
+                    StackPanel::new()
+                        .orientation(Orientation::Horizontal)
+                        .spacing(tokens::spacing::SM)
+                        .children((
+                            number(&fields.cost_amount)
+                                .placeholder_text("Amount")
+                                .automation_name(format!("Policy cost limit of {name}"))
+                                .on_text_changed(
+                                    context.callback(|text| edit(PolicyEdit::CostAmount(text))),
+                                ),
+                            number(&fields.cost_unit)
+                                .placeholder_text("Unit")
+                                .automation_name(format!("Policy cost unit of {name}"))
+                                .on_text_changed(
+                                    context.callback(|text| edit(PolicyEdit::CostUnit(text))),
+                                ),
+                        )),
+                ),
+                field_row(
+                    "Scope",
+                    policy_list(
+                        fields,
+                        model::PolicyList::Scope,
+                        ("Glob", "Add a project-relative glob"),
+                        &format!("Policy scope of {name}"),
+                        context,
+                        palette,
+                    ),
+                ),
+                field_row(
+                    "Check inputs",
+                    policy_list(
+                        fields,
+                        model::PolicyList::CheckInputs,
+                        ("Glob", "Add a protected glob"),
+                        &format!("Policy check inputs of {name}"),
+                        context,
+                        palette,
+                    ),
+                ),
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(tokens::spacing::SM)
+                    .margin(Thickness::new(
+                        tokens::layout::FIELD_INDENT,
+                        tokens::spacing::XS,
+                        0.0,
+                        0.0,
+                    ))
+                    .children((
+                        m3::filled(palette)
+                            .is_enabled(dirty && !busy)
+                            .automation_name(format!("Save the launch policy of {name}"))
+                            .on_click(
+                                context.message(Message::Settings(SettingsMsg::PolicySave(false))),
+                            )
+                            .content(m3::label(if saving { "Saving…" } else { "Save policy" })),
+                        m3::outlined(palette)
+                            .is_enabled(!busy)
+                            .automation_name(format!("Validate the launch policy of {name}"))
+                            .on_click(
+                                context.message(Message::Settings(SettingsMsg::PolicySave(true))),
+                            )
+                            .content(m3::label("Validate")),
+                        m3::text_button(palette)
+                            .is_enabled(dirty && !busy)
+                            .automation_name(format!("Discard policy changes of {name}"))
+                            .on_click(
+                                context.message(Message::Settings(SettingsMsg::PolicyDiscard)),
+                            )
+                            .content(m3::label("Discard")),
+                    )),
+                Border::new()
+                    .margin(Thickness::new(tokens::layout::FIELD_INDENT, 0.0, 0.0, 0.0))
+                    .content(note),
+                Border::new()
+                    .margin(Thickness::new(
+                        tokens::layout::FIELD_INDENT,
+                        tokens::spacing::SM,
+                        0.0,
+                        0.0,
+                    ))
+                    .content(
+                        StackPanel::new().spacing(tokens::spacing::XS).children((
+                            m3::body(counter.clone())
+                                .text_wrapping(TextWrapping::Wrap)
+                                .automation_name(format!("Policy use: {counter}")),
+                            StackPanel::new()
+                                .spacing(tokens::spacing::XS)
+                                .keyed_children(opt_outs),
+                        )),
+                    ),
+            ))
     }
 }

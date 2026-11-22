@@ -59,6 +59,7 @@ mod chat_ui;
 mod configure_ui;
 mod dialog_ui;
 mod handoff_ui;
+mod inbox_ui;
 mod launch_ui;
 mod link_ui;
 mod menu_ui;
@@ -125,6 +126,8 @@ struct UiProject {
     git_checkouts: Vec<eliot_core::api::ProjectCheckoutView>,
     /// The registered folder is gone.
     missing: bool,
+    /// Launch policy use in the last 24 hours (`project.list`).
+    policy_usage: eliot_core::api::ProjectPolicyUsageView,
 }
 
 /// One page of the navigation list with its honest counters.
@@ -241,6 +244,7 @@ enum Message {
     Chat(ChatMsg),
     Configure(ConfigureMsg),
     Monitor(MonitorMsg),
+    Inbox(inbox_ui::InboxMsg),
     Profiles(ProfilesMsg),
     Automation(AutomationMsg),
     Scripts(ScriptsMsg),
@@ -373,6 +377,8 @@ struct DesktopApp {
     launch: launch_ui::LaunchState,
     chat: chat_ui::ChatState,
     monitor: monitor_ui::MonitorState,
+    /// The Owner inbox: its items and the navigation's counts.
+    inbox: inbox_ui::InboxState,
     automation: automation_ui::AutomationState,
     /// The sidebar's right-click menu, rename and confirmation.
     menu: menu_ui::MenuState,
@@ -428,6 +434,7 @@ fn load_projects_blocking(data_dir: &Path) -> Fallible<Vec<UiProject>> {
                 origin: registration.origin,
                 id: registration.id,
                 git_checkouts: registration.checkouts,
+                policy_usage: registration.policy_usage,
             })
             .collect())
     })
@@ -903,6 +910,7 @@ impl Component for DesktopApp {
                 loss: None,
             },
             monitor: monitor_ui::MonitorState::default(),
+            inbox: inbox_ui::InboxState::default(),
             automation: automation_ui::AutomationState::default(),
             menu: menu_ui::MenuState::default(),
             bulk: None,
@@ -949,6 +957,7 @@ impl Component for DesktopApp {
             Message::Chat(msg) => self.chat_update(msg, context),
             Message::Configure(msg) => self.configure_update(msg, context),
             Message::Monitor(msg) => self.monitor_update(msg, context),
+            Message::Inbox(msg) => self.inbox_update(msg, context),
             Message::Profiles(msg) => self.profiles_update(msg, context),
             Message::Settings(msg) => self.settings_update(msg, context),
             Message::Automation(msg) => self.automation_update(msg, context),

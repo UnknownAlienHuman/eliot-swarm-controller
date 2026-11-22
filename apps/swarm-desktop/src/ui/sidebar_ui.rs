@@ -42,6 +42,7 @@ pub(super) struct SidebarInput {
     pub(super) more: Option<(String, bool)>,
     pub(super) show_archived: bool,
     pub(super) fleet: FleetEntry,
+    pub(super) inbox: InboxEntry,
     /// The rename or tag editor in a row's place.
     pub(super) renaming: Option<Renaming>,
     /// No bulk action is open (a missing folder's Remove is enabled).
@@ -95,6 +96,15 @@ pub(super) struct FleetEntry {
     pub(super) line: String,
     pub(super) summary: String,
     pub(super) tone: StatusTone,
+    pub(super) open: bool,
+}
+
+/// The Inbox row: the per-kind counts, their total and whether the Inbox
+/// pane is open.
+#[derive(Clone, PartialEq)]
+pub(super) struct InboxEntry {
+    pub(super) counts: String,
+    pub(super) total: usize,
     pub(super) open: bool,
 }
 
@@ -415,6 +425,12 @@ impl Component for Sidebar {
             ))
             .keyed_children(vec![
                 KeyedView::new("divider", m3::divider(palette)),
+                KeyedView::new(
+                    format!("inbox:{}", input.inbox.open),
+                    Border::new()
+                        .margin(Thickness::new(0.0, tokens::spacing::SM - gap, 0.0, 0.0))
+                        .content(inbox_row(&input.inbox, context, palette)),
+                ),
                 KeyedView::new(
                     format!("fleet:{}", input.fleet.open),
                     Border::new()
@@ -772,6 +788,46 @@ fn agent_row(task: &TaskEntry, input: &SidebarInput, context: &mut ViewContext<S
             line,
         ));
     hover_area(hover_key, row_with_actions(row_button, actions), context)
+}
+
+/// The Owner inbox in one row: its glyph, "Inbox", the per-kind counts
+/// ("2 requests · 1 stuck", "Nothing waiting") and the total; it opens the
+/// Inbox pane.
+fn inbox_row(inbox: &InboxEntry, context: &mut ViewContext<Sidebar>, palette: Palette) -> View {
+    let open = inbox.open;
+    m3::row(palette, open)
+        .automation_name(format!(
+            "Inbox: {} ({})",
+            inbox.counts,
+            if open { "open" } else { "closed" }
+        ))
+        .on_click(context.message(Message::Shell(ShellMsg::PanelToggled(Panel::Inbox))))
+        .content(
+            Grid::new()
+                .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
+                .column_spacing(tokens::spacing::ROW)
+                .children((
+                    Border::new()
+                        .width(tokens::icon::ROW)
+                        .vertical_alignment(VerticalAlignment::Center)
+                        .content(m3::icon(m3::glyph::INBOX)),
+                    StackPanel::new()
+                        .grid_column(1)
+                        .vertical_alignment(VerticalAlignment::Center)
+                        .children((
+                            TextBlock::new()
+                                .text("Inbox")
+                                .text_trimming(TextTrimming::CharacterEllipsis),
+                            m3::secondary(inbox.counts.clone())
+                                .text_trimming(TextTrimming::CharacterEllipsis),
+                        )),
+                    if inbox.total > 0 {
+                        m3::badge(palette, &inbox.total.to_string())
+                    } else {
+                        View::empty()
+                    },
+                )),
+        )
 }
 
 /// The fleet in one calm row ("2 working · 1 needs attention", "All

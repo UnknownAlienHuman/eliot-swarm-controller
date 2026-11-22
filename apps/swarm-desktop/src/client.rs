@@ -489,21 +489,102 @@ pub async fn seq_before(
 
 /// Input texts of retained commands, at most `MAX_CONCURRENT_READS` at once.
 /// A failed read is reported per command, never retried as a new action.
-pub async fn input_texts(data_dir: &Path, commands: Vec<String>) -> Vec<(String, InputText)> {
-    futures_util::stream::iter(commands)
+/// An inline mail notice reads back redacted (`command.get`), so its mails
+/// come from `agent`'s own `deliveries` (read-only `mail.read`): those whose
+/// `presentation_command` is that notice.
+pub async fn input_texts(
+    data_dir: &Path,
+    agent: &str,
+    commands: Vec<String>,
+    deliveries: &[String],
+) -> Vec<(String, InputText)> {
+    let reads: Vec<(String, Result<Command>)> = futures_util::stream::iter(commands)
         .map(|command| async move {
-            let text = match read_command(data_dir, &command).await {
-                Ok(read) => match read.args.get("text").and_then(Value::as_str) {
-                    Some(text) => InputText::Loaded(bound_text(text)),
-                    None => InputText::Unavailable("the command carries no text".to_owned()),
-                },
+            let read = read_command(data_dir, &command).await;
+            (command, read)
+        })
+        .buffer_unordered(MAX_CONCURRENT_READS)
+        .collect()
+        .await;
+    let redacted = reads
+        .iter()
+        .any(|(_, read)| read.as_ref().is_ok_and(redacted_mail));
+    let mail: Vec<eliot_core::api::MailDelivery> = if redacted {
+        futures_util::stream::iter(deliveries)
+            .map(|delivery| read_mail(data_dir, agent, delivery))
+            .buffer_unordered(MAX_CONCURRENT_READS)
+            .filter_map(|read| async move { read.ok() })
+            .collect()
+            .await
+    } else {
+        Vec::new()
+    };
+    reads
+        .into_iter()
+        .map(|(command, read)| {
+            let text = match read {
+                Ok(read) if redacted_mail(&read) => {
+                    InputText::Inserted(crate::chat::presented_mail(&mail, &read.id))
+                }
+                Ok(read) => input_text(&read),
                 Err(error) => InputText::Unavailable(error.to_string()),
             };
             (command, text)
         })
-        .buffer_unordered(MAX_CONCURRENT_READS)
         .collect()
-        .await
+}
+
+/// A mail notice whose text the daemon redacts on read (`redacted: true`).
+fn redacted_mail(read: &Command) -> bool {
+    read.args.get("notice_kind").and_then(Value::as_str) == Some("mail")
+        && read.args.get("redacted").and_then(Value::as_bool) == Some(true)
+}
+
+/// One delivery of `agent`'s mailbox (`mail.read`, read-only; the Owner
+/// names the mailbox).
+pub async fn read_mail(
+    data_dir: &Path,
+    agent: &str,
+    delivery: &str,
+) -> Result<eliot_core::api::MailDelivery> {
+    let request = eliot_core::api::MailReadRequest {
+        agent: Some(agent.to_owned()),
+        delivery_id: delivery.to_owned(),
+    };
+    request.validate()?;
+    let read: eliot_core::api::MailDelivery =
+        eliot_daemon::client_call_typed(data_dir, "mail.read", &request).await?;
+    request.validate_response(&read)?;
+    Ok(read)
+}
+
+/// What a retained command put in front of the model: a Swarm note
+/// (`inject`), Swarm's mail notice (`send` with `notice_kind = "mail"`) or
+/// wake delivery, both split into Swarm notes and owner mail, else the
+/// owner's own text.
+fn input_text(read: &Command) -> InputText {
+    let Some(text) = read.args.get("text").and_then(Value::as_str) else {
+        return InputText::Unavailable("the command carries no text".to_owned());
+    };
+    let text = bound_text(text);
+    if read.verb == "inject" {
+        return InputText::Note {
+            principal: read.principal.clone(),
+            text,
+            turn: read.turn_id.clone(),
+        };
+    }
+    if read.args.get("notice_kind").and_then(Value::as_str) == Some("mail") {
+        return InputText::Inserted(crate::chat::mail_blocks(&text));
+    }
+    // A wake delivery is its exact frame line and a quoted-data fence.
+    if read.principal == "owner"
+        && let Some(fenced) = text.strip_prefix(crate::chat::WAKE_FRAME)
+        && crate::chat::unfence(fenced) != fenced
+    {
+        return InputText::Inserted(vec![crate::chat::framed(&text)]);
+    }
+    InputText::Loaded(text)
 }
 
 fn submit_request(
@@ -538,6 +619,52 @@ fn unverified(error: Error) -> Error {
 }
 
 /// One retained command with its admitted args and state.
+/// Swarm autonomy (`autonomy.get`, Owner only): the daemon's last 24 hours
+/// when `since_ms` is `None`, else from `since_ms` to now.
+pub async fn autonomy(
+    data_dir: &Path,
+    since_ms: Option<i64>,
+) -> Result<eliot_core::api::AutonomyResponse> {
+    let request = eliot_core::api::AutonomyRequest { since_ms };
+    eliot_daemon::client_call_typed(data_dir, "autonomy.get", &request).await
+}
+
+/// One page of the Owner decision queue (`owner.inbox`).
+pub async fn owner_inbox(
+    data_dir: &Path,
+    after: Option<String>,
+) -> Result<eliot_core::api::OwnerInboxResponse> {
+    let request = eliot_core::api::OwnerInboxRequest {
+        after,
+        limit: Some(eliot_core::api::OwnerInboxRequest::MAX_ROWS),
+    };
+    request.effective_limit()?;
+    eliot_daemon::client_call_typed(data_dir, "owner.inbox", &request).await
+}
+
+/// The visible inbox items by kind (`daemon.status` `owner_inbox`).
+pub async fn owner_inbox_counts(
+    data_dir: &Path,
+) -> Result<std::collections::BTreeMap<eliot_core::api::OwnerInboxKind, usize>> {
+    let request = eliot_core::api::DaemonStatusRequest::default();
+    request.validate()?;
+    let status: eliot_core::api::DaemonStatusResponse =
+        eliot_daemon::client_call_typed(data_dir, "daemon.status", &request).await?;
+    request.validate_response(&status)?;
+    Ok(status.owner_inbox)
+}
+
+/// Decide one inbox item (`owner.decide`): an offered choice, `recommended`
+/// or `snooze`, bound to the revision shown. The caller keeps `id` and
+/// sends it again on retry; a stale item comes back as `stale_item`.
+pub async fn owner_decide(
+    data_dir: &Path,
+    request: &eliot_core::api::OwnerDecideRequest,
+) -> Result<eliot_core::api::OwnerDecideResponse> {
+    request.validate()?;
+    eliot_daemon::client_call_typed(data_dir, "owner.decide", request).await
+}
+
 pub async fn read_command(data_dir: &Path, id: &str) -> Result<Command> {
     let params = CommandGetRequest::new(id);
     params.validate()?;

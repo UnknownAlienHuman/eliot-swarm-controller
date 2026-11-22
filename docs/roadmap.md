@@ -947,6 +947,17 @@ of the explicitly selected release scope.
       Retry first and a confirmed new empty data directory last; a new directory is
       remembered only once its daemon answers.
 
+- [x] **Owner pages for autonomous Swarm (#883, 2026-11-22).** The project editor
+      edits the launch policy (#868) with Validate and Save on the read revision,
+      shows the store's refusal, and counts the last day's launches with policy
+      and their opt-outs. The Monitor shows `autonomy.get` rows with source and
+      coverage for 24 h or 7 days. The transcript shows Swarm notes, Swarm and
+      peer mail as collapsed notes and owner mail as owner text (inline mail
+      read by delivery, since its command text is redacted). The Inbox pane
+      replaces the Monitor's Attention filter: `owner.inbox` items by kind with
+      the recommended action, other choices and Snooze through `owner.decide`,
+      the daemon's refusal of a stale choice, and per-kind counts in the sidebar.
+
 - [ ] **K92 Backend quota and chat lifecycle (#407).** Implemented provider
       readers, durable archive/delete, settings project removal and private chats.
       Private Windows Owner proof covers real Codex/Claude desktop launch/send,

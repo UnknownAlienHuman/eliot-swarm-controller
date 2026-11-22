@@ -3,10 +3,12 @@
 //! Each draft is the JSON value `settings.read` returned for one section
 //! (`routing`, `projects`, `automation`, `cloud_mcp`), changed in place and
 //! sent back whole by `settings.save`, which is a complete replacement of the
-//! named section. Fields the page does not show (a project's policy, Git
-//! remotes or interpreters, the automation backlog limit and Run grant) ride along
+//! named section. Fields the page does not show (a project's Git remotes or
+//! interpreters, the automation backlog limit and Run grant) ride along
 //! unchanged. Nothing here decides validity: the daemon validates every save,
-//! dry run first when asked. Wire shapes: [`eliot_core::api::config_views`].
+//! dry run first when asked. Wire shapes: [`eliot_core::api::config_views`];
+//! a project's `policy` block is the canonical `[projects.ID.policy]` shape
+//! of `docs/spec/configuration.md`.
 
 use eliot_core::api::{SettingsHistoryEntry, SettingsHistoryStatus, SettingsSaveResponse};
 use eliot_core::{RouteQuotaStatus, RouteSkipReason, RoutingDecision};
@@ -219,6 +221,254 @@ pub fn set_project_actions(draft: &mut Value, id: &str, text: &str) {
     if let Some(project) = project_mut(draft, id) {
         project.insert("actions".to_owned(), json!(actions));
     }
+}
+
+/// One project's launch policy as the editor shows it: text the owner
+/// types, turned into the settings shape only on Validate or Save. Which
+/// combinations are valid is the settings store's decision.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PolicyFields {
+    /// The check's explicit argv, one argument per entry (never a shell
+    /// line: the daemon runs it without a shell).
+    pub argv: Vec<String>,
+    /// The check deadline in seconds (`check.deadline_ms` / 1000); empty
+    /// uses the Goal check default.
+    pub deadline_s: String,
+    pub at_turn_end: bool,
+    /// `check.check_timeout_retry_safe`: the check is safe to repeat after
+    /// a timeout.
+    pub retry_safe: bool,
+    pub max_rounds: String,
+    /// `budget.max_cost`: an amount in the native unit and that unit.
+    pub cost_amount: String,
+    pub cost_unit: String,
+    /// Project-relative globs, one per entry.
+    pub scope: Vec<String>,
+    pub check_inputs: Vec<String>,
+}
+
+/// The lists of a policy that the editor shows one entry per field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolicyList {
+    Argv,
+    Scope,
+    CheckInputs,
+}
+
+impl PolicyFields {
+    /// Whether nothing is set: saving removes the policy block.
+    pub fn is_empty(&self) -> bool {
+        Self {
+            argv: entries(&self.argv),
+            scope: entries(&self.scope),
+            check_inputs: entries(&self.check_inputs),
+            deadline_s: self.deadline_s.trim().to_owned(),
+            max_rounds: self.max_rounds.trim().to_owned(),
+            cost_amount: self.cost_amount.trim().to_owned(),
+            cost_unit: self.cost_unit.trim().to_owned(),
+            ..self.clone()
+        } == Self::default()
+    }
+
+    pub fn list(&self, list: PolicyList) -> &[String] {
+        match list {
+            PolicyList::Argv => &self.argv,
+            PolicyList::Scope => &self.scope,
+            PolicyList::CheckInputs => &self.check_inputs,
+        }
+    }
+
+    pub fn list_mut(&mut self, list: PolicyList) -> &mut Vec<String> {
+        match list {
+            PolicyList::Argv => &mut self.argv,
+            PolicyList::Scope => &mut self.scope,
+            PolicyList::CheckInputs => &mut self.check_inputs,
+        }
+    }
+}
+
+/// `amount` with `scale` implied decimals, exactly ("1.5", 3 → 1500).
+fn parse_fixed(text: &str, scale: u32, what: &str) -> Result<i64, String> {
+    let text = text.trim();
+    let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
+    let digits = |part: &str| part.chars().all(|ch| ch.is_ascii_digit());
+    if whole.is_empty() && fraction.is_empty()
+        || !digits(whole)
+        || !digits(fraction)
+        || fraction.len() > scale as usize
+    {
+        return Err(format!(
+            "{what} must be a number with at most {scale} decimals."
+        ));
+    }
+    let fraction = format!("{fraction:0<width$}", width = scale as usize);
+    format!("{whole}{fraction}")
+        .trim_start_matches('0')
+        .parse::<i64>()
+        .or_else(|error| match error.kind() {
+            std::num::IntErrorKind::Empty => Ok(0),
+            _ => Err(format!("{what} is too large.")),
+        })
+}
+
+/// `value` with `scale` implied decimals as text, trailing zeros dropped.
+fn format_fixed(value: i64, scale: u32) -> String {
+    if value < 0 {
+        return format!("-{}", format_fixed(value.saturating_neg(), scale));
+    }
+    let divisor = 10_i64.pow(scale);
+    let fraction = format!(
+        "{:0width$}",
+        value.rem_euclid(divisor),
+        width = scale as usize
+    );
+    let fraction = fraction.trim_end_matches('0');
+    if fraction.is_empty() {
+        value.div_euclid(divisor).to_string()
+    } else {
+        format!("{}.{fraction}", value.div_euclid(divisor))
+    }
+}
+
+/// A list's entries as saved: each trimmed, blank entries dropped; nothing
+/// is split, so every entry round-trips as typed.
+fn entries(list: &[String]) -> Vec<String> {
+    list.iter()
+        .map(|entry| entry.trim())
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// A project's policy as read (`policy` of its settings entry).
+pub fn policy_fields(draft: &Value, id: &str) -> PolicyFields {
+    let Some(policy) = draft.get(id).and_then(|project| project.get("policy")) else {
+        return PolicyFields::default();
+    };
+    let check = policy.get("check");
+    let cost = policy
+        .get("budget")
+        .and_then(|budget| budget.get("max_cost"));
+    PolicyFields {
+        argv: strings(check.and_then(|check| check.get("argv"))),
+        deadline_s: check
+            .and_then(|check| check.get("deadline_ms"))
+            .and_then(Value::as_i64)
+            .map(|ms| format_fixed(ms, 3))
+            .unwrap_or_default(),
+        at_turn_end: check
+            .and_then(|check| check.get("at_turn_end"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        retry_safe: check
+            .and_then(|check| check.get("check_timeout_retry_safe"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        max_rounds: policy
+            .get("budget")
+            .and_then(|budget| budget.get("max_rounds"))
+            .and_then(Value::as_i64)
+            .map(|rounds| rounds.to_string())
+            .unwrap_or_default(),
+        cost_amount: cost
+            .and_then(|cost| cost.get("amount_micros"))
+            .and_then(Value::as_i64)
+            .map(|micros| format_fixed(micros, 6))
+            .unwrap_or_default(),
+        cost_unit: cost
+            .and_then(|cost| cost.get("unit"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        scope: strings(policy.get("scope")),
+        check_inputs: strings(policy.get("check_inputs")),
+    }
+}
+
+/// Write the editor's fields as the project's `policy` block (removed when
+/// every field is empty). Only text that has no settings shape at all (a
+/// deadline that is not a number) is refused here; the store judges the rest.
+pub fn set_policy(draft: &mut Value, id: &str, fields: &PolicyFields) -> Result<(), String> {
+    let Some(project) = project_mut(draft, id) else {
+        return Err("The project is no longer in the settings.".to_owned());
+    };
+    if fields.is_empty() {
+        project.remove("policy");
+        return Ok(());
+    }
+    // Edit the stored block in place: keys this editor does not show stay.
+    let mut policy = match project.get("policy") {
+        Some(Value::Object(policy)) => policy.clone(),
+        _ => Map::new(),
+    };
+    let argv = entries(&fields.argv);
+    if argv.is_empty()
+        && fields.deadline_s.trim().is_empty()
+        && !fields.at_turn_end
+        && !fields.retry_safe
+    {
+        policy.remove("check");
+    } else {
+        let mut check = match policy.get("check") {
+            Some(Value::Object(check)) => check.clone(),
+            _ => Map::new(),
+        };
+        check.insert("argv".to_owned(), json!(argv));
+        if fields.deadline_s.trim().is_empty() {
+            check.remove("deadline_ms");
+        } else {
+            check.insert(
+                "deadline_ms".to_owned(),
+                json!(parse_fixed(&fields.deadline_s, 3, "The deadline")?),
+            );
+        }
+        for (key, on) in [
+            ("at_turn_end", fields.at_turn_end),
+            ("check_timeout_retry_safe", fields.retry_safe),
+        ] {
+            if on {
+                check.insert(key.to_owned(), json!(true));
+            } else {
+                check.remove(key);
+            }
+        }
+        policy.insert("check".to_owned(), Value::Object(check));
+    }
+    let mut budget = match policy.get("budget") {
+        Some(Value::Object(budget)) => budget.clone(),
+        _ => Map::new(),
+    };
+    if fields.max_rounds.trim().is_empty() {
+        budget.remove("max_rounds");
+    } else {
+        let rounds = fields
+            .max_rounds
+            .trim()
+            .parse::<i64>()
+            .map_err(|_| "Rounds must be a whole number.".to_owned())?;
+        budget.insert("max_rounds".to_owned(), json!(rounds));
+    }
+    match (fields.cost_amount.trim(), fields.cost_unit.trim()) {
+        ("", "") => {
+            budget.remove("max_cost");
+        }
+        ("", _) => return Err("Give the cost limit's amount.".to_owned()),
+        (_, "") => return Err("Give the cost limit's unit.".to_owned()),
+        (amount, unit) => {
+            budget.insert(
+                "max_cost".to_owned(),
+                json!({"unit": unit, "amount_micros": parse_fixed(amount, 6, "The cost limit")?}),
+            );
+        }
+    }
+    policy.insert("budget".to_owned(), Value::Object(budget));
+    policy.insert("scope".to_owned(), json!(entries(&fields.scope)));
+    policy.insert(
+        "check_inputs".to_owned(),
+        json!(entries(&fields.check_inputs)),
+    );
+    project.insert("policy".to_owned(), Value::Object(policy));
+    Ok(())
 }
 
 /// Derive a bounded valid ID from a checkout name, avoiding saved IDs.

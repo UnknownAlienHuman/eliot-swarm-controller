@@ -286,6 +286,12 @@ pub(super) enum SettingsMsg {
     ProjectProfile(String, String, bool),
     ProjectActions(String, String),
     ProjectRemoved(String),
+    /// One field of the open project's policy editor.
+    PolicyEdited(PolicyEdit),
+    /// Validate (true) or save the open project's policy.
+    PolicySave(bool),
+    /// Put the policy editor back to the saved policy.
+    PolicyDiscard,
     /// Check (true) or uncheck one project for a bulk removal.
     ProjectSelected(String, bool),
     /// Check every project (true) or none.
@@ -312,6 +318,56 @@ pub(super) enum SettingsMsg {
     /// Every managed worktree (`workspace.list`), the total and whether
     /// the read reached the end.
     WorktreesLoaded(Box<Fallible<ManagedWorktrees>>),
+}
+
+/// One field of the policy editor, as its control reports it.
+#[derive(Clone, Debug)]
+pub(super) enum PolicyEdit {
+    /// One entry of a list (an index past its end adds one).
+    Entry(model::PolicyList, usize, String),
+    /// Remove one entry of a list.
+    Remove(model::PolicyList, usize),
+    Deadline(String),
+    AtTurnEnd(bool),
+    RetrySafe(bool),
+    Rounds(String),
+    CostAmount(String),
+    CostUnit(String),
+}
+
+/// The open project's policy editor: typed fields, saved together with
+/// Save (the store refuses invalid combinations, so a field-by-field
+/// auto-save would discard half-typed policies).
+#[derive(Clone, Debug, Default)]
+pub(super) struct PolicyDraft {
+    pub(super) project: String,
+    pub(super) fields: model::PolicyFields,
+    /// The policy as last read: the editor has changes when they differ.
+    pub(super) base: model::PolicyFields,
+    /// The last Validate or Save result, the store's message on refusal.
+    pub(super) note: Option<Note>,
+    /// This editor's Validate or Save is running.
+    pub(super) saving: bool,
+    /// The fields a running Save sent.
+    sent: Option<model::PolicyFields>,
+    /// A Save landed with these fields: the next read replaces them with
+    /// the stored (normalised) policy unless they were edited since.
+    reprime: Option<model::PolicyFields>,
+}
+
+impl PolicyDraft {
+    fn new(project: String, read: model::PolicyFields) -> Self {
+        Self {
+            project,
+            fields: read.clone(),
+            base: read,
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn dirty(&self) -> bool {
+        self.fields != self.base
+    }
 }
 
 /// `workspace.list` read to the end (or to the page bound).
@@ -458,6 +514,8 @@ pub(super) struct SettingsState {
     all_from: BTreeMap<Section, Value>,
     new_role: String,
     project_open: Option<String>,
+    /// The open project's policy editor.
+    pub(super) policy: Option<PolicyDraft>,
     /// Projects checked for Remove selected (registration IDs).
     pub(super) project_selected: std::collections::BTreeSet<String>,
     history_open: bool,
@@ -575,6 +633,14 @@ impl SettingsState {
         for page in refused {
             self.typing.remove(&page);
             self.notes.insert(page, Note::error(CHANGED_ELSEWHERE));
+            if let Some(policy) = self
+                .policy
+                .as_mut()
+                .filter(|policy| policy.saving && page == Page::Projects)
+            {
+                policy.saving = false;
+                policy.note = Some(Note::error(CHANGED_ELSEWHERE));
+            }
         }
         // The JSON draft follows the read unless it holds edits not saved
         // yet; its edited sections are judged when it is sent
@@ -593,6 +659,24 @@ impl SettingsState {
         }
         self.all_base = all;
         self.base = read.sections;
+        // An unchanged policy editor follows the read; a saved one takes
+        // the stored (normalised) policy; typed changes stay.
+        let projects = self.base(Section::Projects);
+        if let Some(policy) = self.policy.as_mut() {
+            let read = model::policy_fields(&projects, &policy.project);
+            let saved = policy.reprime.take();
+            if saved.is_some_and(|saved| saved == policy.fields) || !policy.dirty() {
+                policy.fields = read.clone();
+            }
+            // A retried save whose policy the read already holds is done
+            // (no further result arrives for it).
+            if policy.saving && read == policy.fields {
+                policy.saving = false;
+                policy.sent = None;
+                policy.note = Some(Note::info("Saved."));
+            }
+            policy.base = read;
+        }
         self.issues = read.issues;
         self.revision = read.revision;
         self.restart_required = read.restart_required;
@@ -1016,6 +1100,7 @@ impl DesktopApp {
                 self.settings.notes.insert(page, Note::of(dry_run, &result));
                 if dry_run {
                     self.drain_saves(context);
+                    self.policy_saved(page, true, &result);
                     return;
                 }
                 if page == Page::Automations
@@ -1104,6 +1189,7 @@ impl DesktopApp {
                         self.drain_saves(context);
                     }
                 }
+                self.policy_saved(page, false, &result);
             }
             SettingsMsg::Discard(page) => {
                 if page == Page::Models {
@@ -1149,6 +1235,54 @@ impl DesktopApp {
                 } else {
                     Some(id)
                 };
+                s.policy = s.project_open.clone().map(|id| {
+                    let read = model::policy_fields(&s.base(Section::Projects), &id);
+                    PolicyDraft::new(id, read)
+                });
+                self.read_policy_usage(context);
+            }
+            SettingsMsg::PolicyEdited(edit) => {
+                if let Some(policy) = s.policy.as_mut() {
+                    // A control reports the value it already shows; only a
+                    // real change edits the draft. WinUI line breaks are .
+                    let mut fields = policy.fields.clone();
+                    match edit {
+                        PolicyEdit::Entry(list, index, text) => {
+                            let entries = fields.list_mut(list);
+                            match entries.get_mut(index) {
+                                Some(entry) => *entry = text,
+                                // The blank field after the last entry adds one.
+                                None if !text.is_empty() => entries.push(text),
+                                None => {}
+                            }
+                        }
+                        PolicyEdit::Remove(list, index) => {
+                            let entries = fields.list_mut(list);
+                            if index < entries.len() {
+                                entries.remove(index);
+                            }
+                        }
+                        PolicyEdit::Deadline(text) => fields.deadline_s = text,
+                        PolicyEdit::AtTurnEnd(on) => fields.at_turn_end = on,
+                        PolicyEdit::RetrySafe(on) => fields.retry_safe = on,
+                        PolicyEdit::Rounds(text) => fields.max_rounds = text,
+                        PolicyEdit::CostAmount(text) => fields.cost_amount = text,
+                        PolicyEdit::CostUnit(text) => fields.cost_unit = text,
+                    }
+                    if fields != policy.fields {
+                        policy.fields = fields;
+                        if !policy.saving {
+                            policy.note = None;
+                        }
+                    }
+                }
+            }
+            SettingsMsg::PolicySave(dry_run) => self.save_policy(dry_run, context),
+            SettingsMsg::PolicyDiscard => {
+                if let Some(policy) = s.policy.as_mut() {
+                    policy.fields = policy.base.clone();
+                    policy.note = None;
+                }
             }
             // Every control reports its own value when it is created or
             // re-rendered; only a real change edits the draft (and saves).
@@ -1424,6 +1558,72 @@ impl DesktopApp {
             }
         }
         editor.select_existing();
+    }
+
+    /// Validate or save the open project's policy: the projects section
+    /// with this policy, on the read revision. Validate leaves the page's
+    /// draft as it is; a refused save puts it back to the stored values
+    /// while the editor keeps the typed policy and the store's message.
+    fn save_policy(&mut self, dry_run: bool, context: &ComponentContext<Self>) {
+        let busy = self.settings.busy() || self.prefs_saving || !self.settings.loaded;
+        let s = &mut self.settings;
+        let Some(policy) = s.policy.as_mut() else {
+            return;
+        };
+        if busy {
+            policy.note = Some(Note::info(
+                "Another save is running; try again in a moment.",
+            ));
+            return;
+        }
+        let mut projects = s.projects.clone();
+        if let Err(error) = model::set_policy(&mut projects, &policy.project, &policy.fields) {
+            policy.note = Some(Note::error(error));
+            return;
+        }
+        policy.saving = true;
+        policy.note = Some(Note::info(if dry_run {
+            "Validating…"
+        } else {
+            "Saving…"
+        }));
+        if dry_run {
+            let sections = BTreeMap::from([(Section::Projects, projects)]);
+            self.start_settings_save(Page::Projects, sections, true, context);
+        } else {
+            policy.sent = Some(policy.fields.clone());
+            s.projects = projects;
+            self.save_page(Page::Projects, false, context);
+        }
+    }
+
+    /// A Projects save finished: when the policy editor sent it, its
+    /// result (the store's own message on refusal) goes to the editor
+    /// instead of the page's status line. A stale revision is retried by
+    /// the read that follows, still on the editor's behalf.
+    fn policy_saved(
+        &mut self,
+        page: Page,
+        dry_run: bool,
+        result: &MutationResult<SettingsSaveResponse>,
+    ) {
+        let s = &mut self.settings;
+        let Some(policy) = s
+            .policy
+            .as_mut()
+            .filter(|policy| policy.saving && page == Page::Projects)
+        else {
+            return;
+        };
+        policy.saving = !dry_run && matches!(result, Err(error) if error.code == "conflict");
+        policy.note = Some(Note::of(dry_run, result));
+        if !dry_run && !policy.saving {
+            let sent = policy.sent.take();
+            if matches!(result, Ok(reply) if reply.saved) {
+                policy.reprime = sent;
+            }
+        }
+        s.notes.remove(&page);
     }
 
     /// Validate or save one section from its draft. A save asked for

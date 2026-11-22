@@ -1247,12 +1247,8 @@ pub struct Filter {
 
 /// The states the Monitor's state filter offers, in its order (`None`:
 /// every state).
-pub const STATE_FILTERS: [Option<Group>; 4] = [
-    None,
-    Some(Group::Working),
-    Some(Group::Attention),
-    Some(Group::Idle),
-];
+/// The Monitor's state filter; what needs the owner is the Inbox pane.
+pub const STATE_FILTERS: [Option<Group>; 3] = [None, Some(Group::Working), Some(Group::Idle)];
 
 impl Filter {
     pub fn is_active(&self) -> bool {
