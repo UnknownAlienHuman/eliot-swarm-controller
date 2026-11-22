@@ -2556,6 +2556,17 @@ impl EventProcessor {
         let Some(session_id) = self.status.session_id.clone() else {
             return Err(Error::new("unknown", "OpenCode session is unresolved"));
         };
+        let command_id = self
+            .status
+            .active_command_id
+            .clone()
+            .filter(|_| self.status.active_turn_id.as_deref() == Some(pending.turn_id.as_str()))
+            .ok_or_else(|| {
+                Error::new(
+                    "source_integrity",
+                    "OpenCode native request matched no exact active input",
+                )
+            })?;
         let native_id = event_id(
             &session_id,
             &pending.turn_id,
@@ -2576,6 +2587,7 @@ impl EventProcessor {
             "request.opened",
             native_id,
             json!({
+                "command_id": command_id,
                 "request_id": pending.id,
                 "turn_id": pending.turn_id,
                 "kind": public_kind,
