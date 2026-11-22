@@ -1719,7 +1719,7 @@ pub(crate) enum QuotaMapping {
     Unmapped,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct QuotaProjection {
     pub provider: String,
     pub scope: String,
@@ -1728,6 +1728,34 @@ pub(crate) struct QuotaProjection {
     pub available: bool,
     pub mapping: QuotaMapping,
     pub provenance: &'static str,
+    pub headroom: QuotaHeadroom,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct QuotaHeadroom {
+    pub max_used: Option<f64>,
+    pub weekly_used: Option<f64>,
+}
+
+impl QuotaHeadroom {
+    fn observe(&mut self, window: &Value, now: i64, weekly: bool) {
+        let Some(used) = window_used_percent(window)
+            .filter(|_| window_reset_ms(window).is_none_or(|reset| reset > now))
+        else {
+            return;
+        };
+        self.max_used = Some(self.max_used.map_or(used, |prior| prior.max(used)));
+        if weekly
+            || window.get("windowDurationMins").and_then(Value::as_u64) == Some(10_080)
+            || window
+                .get("label")
+                .and_then(Value::as_str)
+                .and_then(|label| label.split_ascii_whitespace().last())
+                .is_some_and(|period| period.eq_ignore_ascii_case("weekly"))
+        {
+            self.weekly_used = Some(self.weekly_used.map_or(used, |prior| prior.max(used)));
+        }
+    }
 }
 
 /// Typed quota observation: the provider whose native schema was consumed,
@@ -1757,7 +1785,15 @@ pub(crate) fn project_quota(
     match observation.provider {
         "muse" => {
             let (windows, complete, provenance) = muse_window_set(details)?;
-            windows_projection(observation, &windows, complete, model, now, provenance)
+            let mut projection =
+                windows_projection(observation, &windows, complete, model, now, provenance)?;
+            if provenance != "muse:windows"
+                && let Some(weekly) = details.get("usage").unwrap_or(details).get("weekly")
+                && window_mapping(weekly, model) != QuotaMapping::Unmapped
+            {
+                projection.headroom.observe(weekly, now, true);
+            }
+            Some(projection)
         }
         "codex" => codex_projection(observation, details, model, now),
         "opencode" => opencode_projection(observation, details, model, now),
@@ -2007,6 +2043,7 @@ fn summarize_windows(
             available: false,
             mapping: QuotaMapping::Unmapped,
             provenance,
+            headroom: QuotaHeadroom::default(),
         });
     }
     let exhausted = applicable
@@ -2028,6 +2065,10 @@ fn summarize_windows(
                 .next()
         })
         .unwrap_or(applicable[0].1);
+    let mut headroom = QuotaHeadroom::default();
+    for (window, _) in applicable {
+        headroom.observe(window, now, false);
+    }
     Some(QuotaProjection {
         provider: observation.provider.to_owned(),
         scope: observation.scope.to_owned(),
@@ -2039,6 +2080,7 @@ fn summarize_windows(
                 .all(|(window, _)| window_headroom(window, now)),
         mapping,
         provenance,
+        headroom,
     })
 }
 
@@ -2141,6 +2183,14 @@ fn codex_projection(
         }
         _ => QuotaMapping::Group("primary"),
     };
+    let mut headroom = QuotaHeadroom::default();
+    for bucket in std::iter::once(rates)
+        .chain(model.and_then(|model| details.get("rateLimitsByLimitId")?.get(model)))
+    {
+        for key in ["primary", "secondary"] {
+            headroom.observe(&bucket[key], now, false);
+        }
+    }
     Some(QuotaProjection {
         provider: observation.provider.to_owned(),
         scope: observation.scope.to_owned(),
@@ -2149,6 +2199,7 @@ fn codex_projection(
         available,
         mapping,
         provenance: "codex:rateLimits",
+        headroom,
     })
 }
 

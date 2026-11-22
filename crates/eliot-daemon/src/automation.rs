@@ -2421,7 +2421,14 @@ async fn reconcile_timer(
                                             .await
                                     }
                                     None if arbitration.is_some() => {
-                                        router.prepare_assignment_launch(action).await
+                                        router
+                                            .prepare_assignment_launch(
+                                                action,
+                                                arbitration
+                                                    .as_ref()
+                                                    .and_then(|arb| arb.route.as_deref()),
+                                            )
+                                            .await
                                     }
                                     None => router.prepare_owner_submission(action).await,
                                 },

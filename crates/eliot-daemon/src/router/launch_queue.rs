@@ -175,10 +175,11 @@ impl Router {
     pub(crate) async fn prepare_assignment_launch(
         &self,
         request: SubmitCommand,
+        route: Option<&str>,
     ) -> Result<PreparedSubmission> {
         validate_rule_launch_action(&request, None)?;
         let prepared = self
-            .prepare_arbitrated_launch(request, &Principal::Owner)
+            .prepare_arbitrated_launch(request, &Principal::Owner, true, route)
             .await?;
         validate_rule_launch_preparation(&prepared)?;
         Ok(prepared)
@@ -188,6 +189,8 @@ impl Router {
         &self,
         request: SubmitCommand,
         principal: &Principal,
+        owner_automation: bool,
+        route: Option<&str>,
     ) -> Result<PreparedSubmission> {
         if request
             .args
@@ -200,8 +203,21 @@ impl Router {
                 "queued launch workspace is unavailable",
             ));
         }
-        self.prepare_submission_with_routing(request, principal, false, false, true, false)
-            .await
+        let bound_profile =
+            route.and_then(|route| route.rsplit_once(':').map(|(profile, _)| profile));
+        self.prepare_submission_with_routing(
+            request,
+            principal,
+            false,
+            false,
+            routing::LaunchRouting {
+                arbitrated: true,
+                owner_automation,
+                bound_profile,
+            },
+            false,
+        )
+        .await
     }
 
     pub(crate) async fn try_launch_intent_in_pass(
@@ -228,7 +244,12 @@ impl Router {
         let mut route = intent.route.clone();
         let outcome = async {
             let prepared = self
-                .prepare_arbitrated_launch(intent.request.clone(), &principal)
+                .prepare_arbitrated_launch(
+                    intent.request.clone(),
+                    &principal,
+                    false,
+                    route.as_deref(),
+                )
                 .await?;
             let project = if prepared.request.args.get("parent").is_some() {
                 self.queued_launch_project(&prepared.request).await?
@@ -336,6 +357,10 @@ pub(crate) enum LaunchArbitrationAttempt {
 
 pub(crate) fn checked_route(request: &SubmitCommand, previous: Option<&str>) -> Result<String> {
     let mut snapshot = request.args["profile_snapshot"].clone();
+    if let Some(snapshot) = snapshot.as_object_mut() {
+        snapshot.remove("quota_reserve_percent");
+        snapshot.remove("quota_unknown");
+    }
     if let Some(scopes) = snapshot["capacity_scopes"].as_array_mut() {
         for scope in scopes {
             if let Some(object) = scope.as_object_mut() {
@@ -365,13 +390,18 @@ pub(crate) fn checked_route(request: &SubmitCommand, previous: Option<&str>) -> 
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    if previous.is_some_and(|previous| previous != digest) {
+    let profile = request
+        .args
+        .get("profile_choice")
+        .and_then(|_| request.args["profile"].as_str());
+    let route = profile.map_or_else(|| digest.clone(), |profile| format!("{profile}:{digest}"));
+    if previous.is_some_and(|previous| previous != route && previous != digest) {
         return Err(Error::new(
             "bad_state",
             "queued launch route changed; submit a new intent",
         ));
     }
-    Ok(digest)
+    Ok(route)
 }
 
 fn encode(value: impl serde::Serialize) -> Result<Value> {

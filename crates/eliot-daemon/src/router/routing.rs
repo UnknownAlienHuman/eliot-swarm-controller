@@ -2,6 +2,77 @@
 use super::*;
 use eliot_core::{RouteQuotaStatus, RouteSkip, RouteSkipReason, RoutingDecision};
 
+#[derive(Clone, Copy, Default)]
+pub(super) struct LaunchRouting<'a> {
+    pub(super) arbitrated: bool,
+    pub(super) owner_automation: bool,
+    pub(super) bound_profile: Option<&'a str>,
+}
+
+impl LaunchRouting<'_> {
+    fn automatic(self, principal: &Principal) -> bool {
+        self.owner_automation
+            || matches!(
+                principal,
+                Principal::Agent { .. } | Principal::ProjectRule { .. }
+            )
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct QuotaPolicy {
+    reserve: u8,
+    hold_unknown: bool,
+}
+
+impl QuotaPolicy {
+    fn from_snapshot(snapshot: &Value) -> Self {
+        Self {
+            reserve: snapshot["quota_reserve_percent"]
+                .as_u64()
+                .and_then(|value| u8::try_from(value).ok())
+                .filter(|value| *value <= 100)
+                .unwrap_or_default(),
+            hold_unknown: snapshot["quota_unknown"] == "hold",
+        }
+    }
+
+    fn enabled(self) -> bool {
+        self.reserve > 0 || self.hold_unknown
+    }
+
+    fn refusal(self, headroom: Option<&catalog::QuotaHeadroom>) -> Option<RouteSkipReason> {
+        match headroom.and_then(|headroom| headroom.max_used) {
+            Some(used) if self.reserve > 0 && used > f64::from(100 - self.reserve) => {
+                Some(RouteSkipReason::QuotaReserve)
+            }
+            None if self.hold_unknown => Some(RouteSkipReason::QuotaUnknown),
+            _ => None,
+        }
+    }
+}
+
+struct CandidateQuota {
+    status: RouteQuotaStatus,
+    exhausted: bool,
+    headroom: Option<catalog::QuotaHeadroom>,
+}
+
+impl CandidateQuota {
+    fn weekly_used(&self) -> Option<f64> {
+        self.headroom
+            .as_ref()
+            .and_then(|headroom| headroom.weekly_used)
+    }
+}
+
+struct AvailableRoute {
+    name: String,
+    harness: String,
+    snapshot: Value,
+    quota: CandidateQuota,
+}
+
 #[derive(Default)]
 struct RoutePreflight {
     arbitrated: bool,
@@ -9,6 +80,10 @@ struct RoutePreflight {
     provider_authority: Option<[u8; 32]>,
     held_accounts: HashMap<String, Value>,
     capacity_refusal: Option<Error>,
+    provider_refusal: Option<Error>,
+    quota_policies: HashMap<String, QuotaPolicy>,
+    quota_deadline: Option<std::time::Instant>,
+    bound_candidate: bool,
 }
 
 impl RoutePreflight {
@@ -18,8 +93,13 @@ impl RoutePreflight {
             RouteSkipReason::CapacityFull
         } else {
             self.held_accounts.insert(harness, account);
+            self.provider_refusal.get_or_insert(refusal);
             RouteSkipReason::ProviderHold
         }
+    }
+
+    fn check_candidate_holds(&self) -> bool {
+        !self.arbitrated || self.quota_deadline.is_some() && !self.bound_candidate
     }
 }
 
@@ -41,7 +121,7 @@ impl Router {
             probe.args = json!({ "role": role });
         }
         let decision = match self
-            .route_launch_profile(principal, &mut probe, false)
+            .route_launch_profile(principal, &mut probe, LaunchRouting::default())
             .await
         {
             Ok(_) => serde_json::from_value(probe.args["profile_choice"].take())
@@ -61,7 +141,7 @@ impl Router {
         &self,
         principal: &Principal,
         request: &mut SubmitCommand,
-        arbitrated: bool,
+        mode: LaunchRouting<'_>,
     ) -> Result<(String, String, Value)> {
         let role = request
             .args
@@ -90,7 +170,7 @@ impl Router {
         let candidates = routing.candidates(&role).unwrap_or_default().to_vec();
         // An unconfigured child default preserves the established inherited
         // profile path. An explicitly configured role is always intersected.
-        let candidates = if candidates.is_empty()
+        let mut candidates = if candidates.is_empty()
             && role == "default"
             && let Some(parent) = parent.as_ref()
         {
@@ -98,6 +178,27 @@ impl Router {
         } else {
             candidates
         };
+        let bound = mode.bound_profile.filter(|_| mode.automatic(principal));
+        if let Some(bound) = bound {
+            candidates.retain(|candidate| candidate == bound);
+        }
+        let quota_policies: HashMap<_, _> = if mode.automatic(principal) {
+            candidates
+                .iter()
+                .filter_map(|name| {
+                    let inherited = parent.as_ref().filter(|parent| parent.profile == *name);
+                    let policy = self.launch_quota_policy(
+                        name,
+                        inherited.map(|parent| &parent.profile_snapshot),
+                    );
+                    policy.enabled().then(|| (name.clone(), policy))
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        };
+        let quota_deadline = (!quota_policies.is_empty())
+            .then(|| std::time::Instant::now() + crate::adhoc::DISCOVERY_BUDGET);
         let decision = RoutingDecision {
             role: role.clone(),
             profile: None,
@@ -108,14 +209,17 @@ impl Router {
             provider_failover: (provider_reactions
                 && routing.provider_failover()
                 && matches!(principal, Principal::Owner)
-                && !arbitrated
+                && !mode.arbitrated
                 && request.args.get("chat") != Some(&Value::Bool(true)))
             .then(Vec::new),
         };
         // A held account is never replaced with another account of the same
         // harness. Policy may still select a different native harness.
         let preflight = RoutePreflight {
-            arbitrated,
+            arbitrated: mode.arbitrated,
+            quota_policies,
+            quota_deadline,
+            bound_candidate: bound.is_some(),
             ..RoutePreflight::default()
         };
         self.choose_route(
@@ -127,6 +231,53 @@ impl Router {
             preflight,
         )
         .await
+    }
+
+    fn launch_quota_policy(&self, profile: &str, inherited: Option<&Value>) -> QuotaPolicy {
+        match self.resolve_profile_cached(profile) {
+            Ok(snapshot) => QuotaPolicy::from_snapshot(&snapshot),
+            Err(_) => inherited
+                .map(QuotaPolicy::from_snapshot)
+                .unwrap_or_default(),
+        }
+    }
+
+    pub(super) async fn check_explicit_launch_quota(
+        &self,
+        principal: &Principal,
+        mode: LaunchRouting<'_>,
+        profile: &str,
+        harness: &str,
+        snapshot: &Value,
+    ) -> Result<()> {
+        if !mode.automatic(principal) {
+            return Ok(());
+        }
+        let policy = self.launch_quota_policy(profile, Some(snapshot));
+        if !policy.enabled() {
+            return Ok(());
+        }
+        let deadline = std::time::Instant::now() + crate::adhoc::DISCOVERY_BUDGET;
+        let quota = self
+            .read_candidate_quota(profile, harness, snapshot, deadline)
+            .await;
+        if let Some(reason) = policy.refusal(quota.headroom.as_ref()) {
+            let message = match (
+                reason,
+                quota
+                    .headroom
+                    .as_ref()
+                    .and_then(|headroom| headroom.max_used),
+            ) {
+                (RouteSkipReason::QuotaReserve, Some(used)) => format!(
+                    "{profile}: provider window usage {used:.2}% exceeds the automatic launch threshold of {}%",
+                    100 - policy.reserve,
+                ),
+                _ => format!("{profile}: {}", reason.user_message()),
+            };
+            return Err(Error::new(quota_wait_code(reason), message));
+        }
+        Ok(())
     }
 
     pub(super) async fn route_provider_switch(
@@ -191,6 +342,8 @@ impl Router {
         mut decision: RoutingDecision,
         mut preflight: RoutePreflight,
     ) -> Result<(String, String, Value)> {
+        let rank_by_quota = preflight.quota_deadline.is_some();
+        let mut selected: Option<AvailableRoute> = None;
         let mut candidates = candidates.into_iter();
         while let Some(name) = candidates.next() {
             let mut quota_status = RouteQuotaStatus::Unknown;
@@ -205,26 +358,17 @@ impl Router {
                 )
                 .await?;
             match evaluated {
-                Ok((harness, snapshot)) => {
-                    decision.profile = Some(name.clone());
-                    decision.reason = if decision
-                        .skipped
-                        .iter()
-                        .any(|skip| skip.reason == RouteSkipReason::ProviderFailure)
-                    {
-                        format!("{}. Continuing on {name}", decision.reason)
-                    } else if preflight.arbitrated {
-                        "first policy candidate for the selected project".into()
-                    } else {
-                        "first available candidate".into()
-                    };
-                    if decision.provider_failover.is_some() {
-                        decision.provider_failover = Some(candidates.collect());
+                Ok(candidate) => {
+                    if selected.as_ref().is_none_or(|prior| {
+                        candidate.quota.weekly_used().is_some_and(|used| {
+                            prior.quota.weekly_used().is_none_or(|first| used < first)
+                        })
+                    }) {
+                        selected = Some(candidate);
                     }
-                    decision.quota_status = quota_status;
-                    request.args["profile_choice"] = serde_json::to_value(decision)
-                        .map_err(|_| Error::new("internal", "routing decision encoding failed"))?;
-                    return Ok((name, harness, snapshot));
+                    if !rank_by_quota {
+                        break;
+                    }
                 }
                 Err(reason) => {
                     decision.skipped.push(RouteSkip {
@@ -235,10 +379,50 @@ impl Router {
                 }
             }
         }
-        let mut error = match preflight.capacity_refusal {
+        if let Some(AvailableRoute {
+            name,
+            harness,
+            snapshot,
+            quota,
+        }) = selected
+        {
+            decision.profile = Some(name.clone());
+            decision.reason = if preflight.provider_switch {
+                format!("{}. Continuing on {name}", decision.reason)
+            } else if rank_by_quota && quota.weekly_used().is_some() {
+                "lowest observed weekly quota usage among available candidates".into()
+            } else if preflight.arbitrated {
+                "first policy candidate for the selected project".into()
+            } else {
+                "first available candidate".into()
+            };
+            if decision.provider_failover.is_some() {
+                decision.provider_failover = Some(candidates.collect());
+            }
+            decision.quota_status = quota.status;
+            request.args["profile_choice"] = serde_json::to_value(decision)
+                .map_err(|_| Error::new("internal", "routing decision encoding failed"))?;
+            return Ok((name, harness, snapshot));
+        }
+        let quota_wait = decision
+            .skipped
+            .iter()
+            .map(|skip| skip.reason)
+            .find(|reason| {
+                matches!(
+                    reason,
+                    RouteSkipReason::QuotaReserve | RouteSkipReason::QuotaUnknown
+                )
+            });
+        let wait = preflight.capacity_refusal.or_else(|| {
+            (preflight.arbitrated && quota_wait.is_none())
+                .then_some(preflight.provider_refusal)
+                .flatten()
+        });
+        let mut error = match wait {
             Some(error) => error,
             None => Error::new(
-                "routing_unavailable",
+                quota_wait.map_or("routing_unavailable", quota_wait_code),
                 serde_json::to_string(&decision)
                     .map_err(|_| Error::new("internal", "routing refusal encoding failed"))?,
             ),
@@ -255,7 +439,7 @@ impl Router {
         parent: Option<&Agent>,
         quota_status: &mut RouteQuotaStatus,
         preflight: &mut RoutePreflight,
-    ) -> Result<std::result::Result<(String, Value), RouteSkipReason>> {
+    ) -> Result<std::result::Result<AvailableRoute, RouteSkipReason>> {
         if let Some(parent) = parent
             && name != parent.profile
             && !parent
@@ -328,46 +512,75 @@ impl Router {
         if !native_installed(&harness, &snapshot) {
             return Ok(Err(RouteSkipReason::NotInstalled));
         }
-        if preflight.arbitrated {
-            return Ok(Ok((harness, snapshot)));
-        }
-        {
+        if preflight.check_candidate_holds() {
             let store = self.inner.store.lock().await;
             if let Some(error) = store.routing_refusal(name, &harness, &snapshot)? {
                 return Ok(Err(preflight.record(error, harness, account)));
             }
         }
-        // Every harness with an implemented quota reader is probed through
-        // the one normalized projection, so retained Muse windows and other
-        // adapters' limits skip routes exactly like live reads. Unsupported
-        // readers keep `Unknown`/`Unsupported` without skipping.
-        let deadline = std::time::Instant::now() + crate::adhoc::DISCOVERY_BUDGET;
-        if let Ok(evidence) = self
+        let quota = if preflight.arbitrated && preflight.quota_deadline.is_none() {
+            CandidateQuota {
+                status: RouteQuotaStatus::Unknown,
+                exhausted: false,
+                headroom: None,
+            }
+        } else {
+            let deadline = preflight
+                .quota_deadline
+                .unwrap_or_else(|| std::time::Instant::now() + crate::adhoc::DISCOVERY_BUDGET);
+            self.read_candidate_quota(name, &harness, &snapshot, deadline)
+                .await
+        };
+        *quota_status = quota.status;
+        if let Some(reason) = preflight
+            .quota_policies
+            .get(name)
+            .and_then(|policy| policy.refusal(quota.headroom.as_ref()))
+        {
+            return Ok(Err(reason));
+        }
+        if preflight.check_candidate_holds() && quota.exhausted {
+            preflight.held_accounts.insert(harness, account);
+            preflight.provider_refusal.get_or_insert_with(|| {
+                Error::new("provider_held", "routing candidate is quota exhausted")
+            });
+            return Ok(Err(RouteSkipReason::QuotaExhausted));
+        }
+        // Passive reads can take time. Recheck live state before freezing.
+        if preflight.check_candidate_holds() {
+            let store = self.inner.store.lock().await;
+            if let Some(error) = store.routing_refusal(name, &harness, &snapshot)? {
+                return Ok(Err(preflight.record(error, harness, account)));
+            }
+        }
+        Ok(Ok(AvailableRoute {
+            name: name.to_owned(),
+            harness,
+            snapshot,
+            quota,
+        }))
+    }
+
+    async fn read_candidate_quota(
+        &self,
+        profile: &str,
+        harness: &str,
+        snapshot: &Value,
+        deadline: std::time::Instant,
+    ) -> CandidateQuota {
+        let model = snapshot["model"]
+            .as_str()
+            .or_else(|| snapshot["daemon_model"].as_str());
+        let evidence = self
             .quota_for_snapshot(
-                harness.clone(),
+                harness.to_owned(),
                 Some(snapshot.clone()),
-                name.to_owned(),
+                profile.to_owned(),
                 deadline,
             )
             .await
-        {
-            let (status, exhausted) = route_quota(
-                &evidence,
-                snapshot.get("model").and_then(Value::as_str),
-                now_ms(),
-            );
-            *quota_status = status;
-            if exhausted {
-                preflight.held_accounts.insert(harness, account);
-                return Ok(Err(RouteSkipReason::QuotaExhausted));
-            }
-        }
-        // Passive reads can take time. Recheck live state before freezing.
-        let store = self.inner.store.lock().await;
-        if let Some(error) = store.routing_refusal(name, &harness, &snapshot)? {
-            return Ok(Err(preflight.record(error, harness, account)));
-        }
-        Ok(Ok((harness, snapshot)))
+            .ok();
+        route_quota(evidence.as_ref(), model, now_ms())
     }
 }
 
@@ -416,19 +629,39 @@ fn native_installed(harness: &str, snapshot: &Value) -> bool {
 }
 
 fn route_quota(
-    quota: &catalog::ScopedQuota,
+    quota: Option<&catalog::ScopedQuota>,
     model: Option<&str>,
     now: i64,
-) -> (RouteQuotaStatus, bool) {
-    if let Some(projection) = catalog::projected_quota(quota, model, now)
+) -> CandidateQuota {
+    if let Some(projection) = quota.and_then(|quota| catalog::projected_quota(quota, model, now))
         && projection.mapping != catalog::QuotaMapping::Unmapped
     {
-        return (RouteQuotaStatus::Supported, projection.exhausted);
+        return CandidateQuota {
+            status: if projection.exhausted || projection.headroom.max_used.is_some() {
+                RouteQuotaStatus::Supported
+            } else {
+                RouteQuotaStatus::Unknown
+            },
+            exhausted: projection.exhausted,
+            headroom: Some(projection.headroom),
+        };
     }
-    let status = if quota.response.status == "unsupported" {
+    let status = if quota.is_some_and(|quota| quota.response.status == "unsupported") {
         RouteQuotaStatus::Unsupported
     } else {
         RouteQuotaStatus::Unknown
     };
-    (status, false)
+    CandidateQuota {
+        status,
+        exhausted: false,
+        headroom: None,
+    }
+}
+
+fn quota_wait_code(reason: RouteSkipReason) -> &'static str {
+    match reason {
+        RouteSkipReason::QuotaReserve => "quota_reserve",
+        RouteSkipReason::QuotaUnknown => "quota_unknown",
+        _ => "routing_unavailable",
+    }
 }

@@ -36,6 +36,8 @@ pub fn is_deterministic_pre_admission_rejection(code: &str) -> bool {
             | "not_allowed"
             | "not_found"
             | "provider_held"
+            | "quota_reserve"
+            | "quota_unknown"
             | "routing_unavailable"
             | "secret_in_payload"
             | "stale_generation"

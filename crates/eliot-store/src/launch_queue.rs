@@ -59,6 +59,7 @@ impl TimerWait {
                 .strip_prefix("provider scope ")
                 .and_then(|text| text.split_once(" is held"))
                 .map_or("profile", |(scope, _)| scope),
+            "quota_reserve" | "quota_unknown" => "profile",
             "transfer_in_progress" => "transfer",
             "workspace_unavailable" => "workspace",
             _ => return None,

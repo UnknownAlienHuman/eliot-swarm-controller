@@ -230,7 +230,7 @@ impl Router {
                     &Principal::Owner,
                     false,
                     false,
-                    false,
+                    routing::LaunchRouting::default(),
                     true,
                 )
                 .await?;
