@@ -16,19 +16,20 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     path::Path,
-    sync::{
-        Arc, Mutex as StdMutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, watch};
+use tokio::{
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore, watch},
+    time::timeout,
+};
 
 const MAX_ASSERTION_BYTES: usize = 16 * 1024;
 const MAX_JWKS_BYTES: usize = 256 * 1024;
 const MAX_SESSIONS: usize = 1024;
 const KEY_LIFETIME: Duration = Duration::from_secs(300);
 const REFRESH_BACKOFF: Duration = Duration::from_secs(30);
+const KEY_REFRESH_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Deserialize, Serialize)]
 struct Claims {
@@ -45,14 +46,6 @@ struct Keys {
     set: JwkSet,
     valid_until: Instant,
     retry_after: Instant,
-}
-
-struct RefreshInProgress<'a>(&'a AtomicBool);
-
-impl Drop for RefreshInProgress<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
 }
 
 struct Session {
@@ -120,7 +113,6 @@ pub(super) struct OriginAuth {
     client: reqwest::Client,
     keys: Mutex<Keys>,
     key_refresh: Mutex<()>,
-    key_refresh_in_progress: AtomicBool,
     sessions: Mutex<HashMap<String, Session>>,
     slots: Arc<Semaphore>,
     sdk_sessions: Arc<LocalSessionManager>,
@@ -226,7 +218,6 @@ impl OriginAuth {
             audience,
             client,
             key_refresh: Mutex::new(()),
-            key_refresh_in_progress: AtomicBool::new(false),
             keys: Mutex::new(Keys {
                 set: JwkSet { keys: Vec::new() },
                 valid_until: Instant::now(),
@@ -273,31 +264,42 @@ impl OriginAuth {
     }
 
     async fn refresh(&self) -> Result<(), StatusCode> {
-        let _refresh = self.key_refresh.lock().await;
-        self.fetch_and_cache_keys().await
+        timeout(KEY_REFRESH_TIMEOUT, async {
+            let _refresh = self.key_refresh.lock().await;
+            self.fetch_and_cache_keys().await
+        })
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
     }
 
     async fn refresh_for_key(&self, kid: &str) -> Result<(), StatusCode> {
-        let _refresh = self.key_refresh.lock().await;
-        {
-            let keys = self.keys.lock().await;
-            let now = Instant::now();
-            if now < keys.valid_until && keys.set.find(kid).is_some() {
-                return Ok(());
+        timeout(KEY_REFRESH_TIMEOUT, async {
+            let _refresh = self.key_refresh.lock().await;
+            {
+                let keys = self.keys.lock().await;
+                let now = Instant::now();
+                if now < keys.valid_until && keys.set.find(kid).is_some() {
+                    return Ok(());
+                }
+                if now < keys.retry_after {
+                    return if now < keys.valid_until {
+                        Ok(())
+                    } else {
+                        Err(StatusCode::SERVICE_UNAVAILABLE)
+                    };
+                }
             }
-            if now < keys.retry_after {
-                return Ok(());
-            }
-        }
-        self.fetch_and_cache_keys().await
+            // The cache lock is released before the bounded network refresh.
+            self.fetch_and_cache_keys().await
+        })
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
     }
 
     async fn fetch_and_cache_keys(&self) -> Result<(), StatusCode> {
-        let _refresh_in_progress = RefreshInProgress(&self.key_refresh_in_progress);
         {
             let mut keys = self.keys.lock().await;
             keys.retry_after = Instant::now() + REFRESH_BACKOFF;
-            self.key_refresh_in_progress.store(true, Ordering::Release);
         }
         let set = self.fetch_keys().await?;
         let mut keys = self.keys.lock().await;
@@ -329,9 +331,7 @@ impl OriginAuth {
             .ok_or(StatusCode::UNAUTHORIZED)?;
         let key = {
             let keys = self.keys.lock().await;
-            if Instant::now() < keys.valid_until
-                || self.key_refresh_in_progress.load(Ordering::Acquire)
-            {
+            if Instant::now() < keys.valid_until {
                 keys.set.find(&kid).map(Self::decoding_key).transpose()?
             } else {
                 None
