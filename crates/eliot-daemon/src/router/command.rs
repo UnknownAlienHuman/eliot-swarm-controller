@@ -561,6 +561,15 @@ impl Router {
         {
             return false;
         }
+        if command.verb == "launch"
+            && command
+                .args
+                .get(eliot_core::PROJECT_CHECK_GOAL_ARG)
+                .is_some()
+            && !self.capture_launch_goal_baseline(id, command).await
+        {
+            return false;
+        }
         true
     }
 
@@ -664,6 +673,50 @@ impl Router {
                 false
             }
         }
+    }
+
+    /// Record A3's starting point in the final workspace before native start.
+    async fn capture_launch_goal_baseline(&self, id: &str, command: &Command) -> bool {
+        let result = async {
+            let agent = command.target.as_deref().ok_or_else(|| {
+                Error::new("source_integrity", "scoped launch has no Agent target")
+            })?;
+            let (goal, workspace) = {
+                let store = self.inner.store.lock().await;
+                let Some(goal) = store.launch_goal_scope_target(agent, id)? else {
+                    return Ok::<_, Error>(());
+                };
+                let workspace = store
+                    .get_agent(agent)?
+                    .and_then(|agent| agent.workspace)
+                    .ok_or_else(|| {
+                        Error::new("invalid", "a scoped launch Goal needs an Agent workspace")
+                    })?;
+                (goal, workspace)
+            };
+            let base = self
+                .goal_scope_base_for_workspace(&workspace, &goal.definition)
+                .await?;
+            self.inner.store.lock().await.set_launch_goal_scope(
+                id,
+                agent,
+                &workspace,
+                goal.revision,
+                base,
+                now_ms(),
+            )
+        }
+        .await;
+        if let Err(error) = result {
+            let write_faulted = self.inner.store.lock().await.is_write_faulted();
+            if write_faulted {
+                self.abandon_unreadable_command(id, &error).await;
+            } else {
+                self.reject_undispatched_error(id, &error).await;
+            }
+            return false;
+        }
+        true
     }
 
     /// Capture launch and resume start inputs: the admitted launch Agent,

@@ -6,12 +6,13 @@ use eliot_core::{is_attachment_verb, is_request_reply_verb, is_start_verb};
 pub(super) const ATTENTION_RESERVED_TOPIC: &str = "agent.attention";
 
 pub(super) fn command_semantic_payload(request: &SubmitCommand, mut args: Value) -> Result<Value> {
-    // Project-check Goals are frozen from owner configuration during launch
-    // preparation; callers omit them on an exact same-ID replay.
+    // The resolved Goal is daemon-owned. Replays still bind the original
+    // explicit Goal fields and opt-out reason carried by the caller.
     if request.verb == "launch"
         && let Some(args) = args.as_object_mut()
     {
         args.remove(core::PROJECT_CHECK_GOAL_ARG);
+        args.remove(core::PROJECT_POLICY_APPLIED_ARG);
     }
     let mut payload = json!({
         "target": request.target,
@@ -993,12 +994,50 @@ fn admit_launch_tx(
         }
         None => false,
     };
+    let policy_applied = match request.args.get(core::PROJECT_POLICY_APPLIED_ARG) {
+        None => false,
+        Some(Value::Bool(true)) => true,
+        _ => {
+            return Err(Error::new(
+                "invalid",
+                "project policy applied marker must be true",
+            ));
+        }
+    };
+    let policy_opt_out_reason = optional_string(&request.args, "no_policy")?;
+    let policy_opt_out_reason = policy_opt_out_reason.as_deref();
+    if let Some(reason) = policy_opt_out_reason
+        && !core::api::valid_project_policy_opt_out_reason(reason)
+    {
+        return Err(Error::new(
+            "invalid",
+            "invalid project policy opt-out reason",
+        ));
+    }
+    if policy_applied && policy_opt_out_reason.is_some() {
+        return Err(Error::new(
+            "invalid",
+            "a project launch cannot apply policy and opt out",
+        ));
+    }
+    if (policy_applied || policy_opt_out_reason.is_some())
+        && !db!(tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM project_registrations WHERE id = ?1)",
+            [&project],
+            |row| row.get::<_, bool>(0),
+        ))
+    {
+        return Err(Error::new(
+            "invalid",
+            "project policy requires a registered project",
+        ));
+    }
     db!(tx.execute(
         "INSERT INTO agents(generation, project, harness, profile,
                                 profile_snapshot, workspace, state,
                                 parent, depth, control, profile_inherited,
-                                created_at, updated_at, project_scope)
-             VALUES (0, ?1, ?2, ?3, ?4, ?5, 'created', ?6, ?7, ?8, ?9, ?10, ?10, ?11)",
+                                created_at, updated_at, project_scope, policy_applied, policy_opt_out_reason)
+             VALUES (0, ?1, ?2, ?3, ?4, ?5, 'created', ?6, ?7, ?8, ?9, ?10, ?10, ?11, ?12, ?13)",
         params![
             project,
             harness,
@@ -1011,6 +1050,8 @@ fn admit_launch_tx(
             i64::from(profile_inherited),
             now,
             project_scope,
+            policy_applied,
+            policy_opt_out_reason,
         ],
     ));
     let agent_num = tx.last_insert_rowid();
@@ -1052,21 +1093,23 @@ fn admit_launch_tx(
             params![encode_json(&choice)?, agent_num]
         ));
     }
+    let project_check_default = request.args.get(core::PROJECT_CHECK_GOAL_ARG).is_some()
+        && request.args.get("no_policy").is_none()
+        && request.args.pointer("/goal/check").is_none()
+        && request.args.pointer("/assignment/goal/check").is_none();
     if let Some((goal, cause)) = assignment::record_admission_tx(tx, principal, request, now)? {
         // A first launch starts generation 1; its Goal binds to it now.
-        let default_project_goal = request.args.get(core::PROJECT_CHECK_GOAL_ARG).is_some();
         goals::install_assignment_goal_tx(
             tx,
             agent_num,
             1,
             &goal,
             cause,
-            default_project_goal,
+            project_check_default,
             now,
         )?;
-    } else if let Some(goal) = assignment::project_check_goal(request)? {
-        // Role launches have no folder-assignment cause, but their project
-        // check Goal still binds atomically before native dispatch.
+    } else if let Some(goal) = assignment::launch_goal(request)? {
+        // Launch Goals without a folder assignment bind the same way.
         goals::install_assignment_goal_tx(
             tx,
             agent_num,
@@ -1078,7 +1121,7 @@ fn admit_launch_tx(
                 depth: 0,
                 remote_call: None,
             },
-            true,
+            project_check_default,
             now,
         )?;
     }
@@ -1134,17 +1177,35 @@ fn admit_launch_tx(
     let cause = ordinary_command_cause(command.id);
     insert_command(tx, &command, &cause)?;
     events.push(insert_daemon_event_for_command(
+        tx,
+        command.id,
+        DaemonEventInput::new(
+            now,
+            "agent.created",
+            "agent",
+            Some(agent_num),
+            Some(0),
+            json!({"agent_id": agent_id, "project": project, "harness": harness, "profile": profile}),
+        ),
+    )?);
+    let policy_event = match (policy_applied, policy_opt_out_reason) {
+        (true, _) => Some((
+            "project.policy.applied",
+            json!({"agent_id": agent_id, "project": project}),
+        )),
+        (false, Some(reason)) => Some((
+            "project.policy.opted_out",
+            json!({"agent_id": agent_id, "project": project, "reason": reason}),
+        )),
+        (false, None) => None,
+    };
+    if let Some((kind, data)) = policy_event {
+        events.push(insert_daemon_event_for_command(
             tx,
             command.id,
-            DaemonEventInput::new(
-                now,
-                "agent.created",
-                "agent",
-                Some(agent_num),
-                Some(0),
-                json!({"agent_id": agent_id, "project": project, "harness": harness, "profile": profile}),
-            ),
+            DaemonEventInput::new(now, kind, "project", Some(agent_num), Some(0), data),
         )?);
+    }
     let mut accepted_data = json!({"command_id": request.id, "verb": "launch"});
     if request.args["owner_override"] == true && principal == "owner" {
         accepted_data["admission_mode"] = json!("owner_override");

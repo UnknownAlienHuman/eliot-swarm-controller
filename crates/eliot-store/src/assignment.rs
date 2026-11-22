@@ -343,14 +343,12 @@ impl Store {
     }
 }
 
-pub(super) fn project_check_goal(
-    request: &SubmitCommand,
-) -> Result<Option<core::api::GoalDefinition>> {
+pub(super) fn launch_goal(request: &SubmitCommand) -> Result<Option<core::api::GoalDefinition>> {
     let Some(value) = request.args.get(core::PROJECT_CHECK_GOAL_ARG) else {
         return Ok(None);
     };
     let definition: core::api::GoalDefinition = serde_json::from_value(value.clone())
-        .map_err(|_| Error::new("invalid", "project check Goal is invalid"))?;
+        .map_err(|_| Error::new("invalid", "frozen launch Goal is invalid"))?;
     definition.validate()?;
     definition.require_auto_bound()?;
     Ok(Some(definition))
@@ -420,7 +418,9 @@ pub(super) fn record_admission_tx(
             "assignment brief was already admitted",
         ));
     }
-    Ok(launch.goal.or(project_check_goal(request)?).map(|goal| {
+    // New admissions provide the resolved Goal separately. Older retained
+    // admissions can still carry a complete Goal in the folder assignment.
+    Ok(launch_goal(request)?.or(launch.goal).map(|goal| {
         let cause = core::EventCause {
             command_id: request.id.clone(),
             rule: Some(format!("assignment-{}", launch.key)),

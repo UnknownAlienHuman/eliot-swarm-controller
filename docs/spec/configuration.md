@@ -872,13 +872,32 @@ profiles and implemented actions. Missing or empty allowlists deny all.
 project: `worktree` (the default for registered projects) prepares one standard
 worktree per top-level launch without any flag, while `shared` keeps sharing
 the registered checkout as before. Any other value is invalid.
-`format` and `check` are optional explicit argv arrays (1–32 nonempty
-arguments, at most 4 KiB each); the daemon never parses them through a shell.
-After a Git-confirmed `file.changed` hint or dirty `git.changed` snapshot
-settles, the daemon runs `format` and then `check` in the Agent's managed
-worktree. Set `check_at_turn_end = true` for a heavy check that runs through
-the idle Goal driver. With `check`, `max_rounds` defaults to 3 and accepts 1–16.
-Project registration readback uses the canonical Core [`ProjectRegistrationView`](../../crates/eliot-core/src/api/agent_views.rs);
+`format` remains an optional explicit argv array (1–32 nonempty arguments, at most
+4 KiB each); the daemon never parses it through a shell. The project's shared check
+and Goal defaults live in its canonical `[projects.ID.policy]` settings block:
+`policy.check.argv` is the explicit check argv, `policy.check.deadline_ms` is its
+bounded deadline, and `policy.check.at_turn_end` reserves that check for the idle
+Goal driver when true. The argv has the same 1–32 nonempty argument and 4 KiB per
+argument limits. After a Git-confirmed `file.changed` hint or dirty `git.changed`
+snapshot settles, the daemon runs `format` and then the policy check in the Agent's
+managed worktree.
+
+`policy.budget.max_rounds` supplies the Goal default (3 when omitted; accepted range
+1–16). `policy.budget.max_cost` is a `GoalCostLimit` pair `{ unit, amount_micros }`
+using the Agent's verbatim native session-cost unit; it is never converted. The
+policy's `scope` and `check_inputs` supply the corresponding Goal defaults. Launch
+Goal fields override each default independently; omitted fields inherit, while
+explicit nullable `null` and empty collections remain explicit values. A whole Goal
+object cannot be null. Only an Owner can override the check, `check_cwd` or
+`escalation`; Agent and project-rule launches may override safe Goal fields or opt
+out with a reason. A `no_policy` launch suppresses project defaults without changing
+the existing caller, project or launch authority.
+
+The settings API reads and saves this same canonical policy with the other project
+settings. Legacy flat `check`, `check_at_turn_end` and `max_rounds` values are accepted
+as migration input; settings readback exposes the nested policy shape. The desktop
+consumes the existing settings and project DTO data; a policy editor is separate design
+work. Project registration readback uses the canonical Core [`ProjectRegistrationView`](../../crates/eliot-core/src/api/agent_views.rs);
 project identity includes the canonical checkout and Git common directory. The registration ID names nothing a person reads: a project's name is the
 owner's `[desktop] display_names` entry, else the repository name of its `origin` remote
 (the readback's read-only `origin`, [api](api.md)), else the folder of the repository's
@@ -902,8 +921,8 @@ under its retained folder name; only a server link places it under a project. Th
 leaves historical Agent rows intact.
 
 The registration ID is the stable Project identity. Owner settings own its
-registration lifecycle, display name, registered repository, allowed profiles and
-actions, and future budget policy. The initial managed path uses one primary
+registration lifecycle, display name, registered repository, allowed profiles,
+actions and policy. The initial managed path uses one primary
 repository, identified by its verified local Git common directory. Origin is display
 metadata. Additional repositories and independent assignments sharing a repository
 require explicit policy. The [manager assignment](coordination.md#project-manager-assignment)

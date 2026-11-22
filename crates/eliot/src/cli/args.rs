@@ -486,6 +486,12 @@ pub(crate) struct LaunchArgs {
     /// completeness in the first input.
     #[arg(long = "source", value_name = "PATH")]
     pub(crate) sources: Vec<String>,
+    /// Skip the registered project's launch policy and record the reason.
+    #[arg(long, value_name = "REASON")]
+    pub(crate) no_policy: Option<String>,
+    /// Explicit Goal fields, merged over project policy defaults.
+    #[arg(long, value_name = "JSON_OBJECT")]
+    pub(crate) goal_json: Option<String>,
     /// Enqueue durable launch intent and return its receipt immediately.
     #[arg(long, conflicts_with_all = ["wait", "owner_override"])]
     pub(crate) queue: bool,
@@ -1779,6 +1785,12 @@ pub(crate) enum ProjectAssignmentCommand {
         /// workspace instead of preparing a fresh managed worktree.
         #[arg(long)]
         adopt_worktree: Option<String>,
+        /// Skip the registered project's launch policy and record the reason.
+        #[arg(long, value_name = "REASON")]
+        no_policy: Option<String>,
+        /// Explicit Goal fields, merged over project policy defaults.
+        #[arg(long, value_name = "JSON_OBJECT")]
+        goal_json: Option<String>,
     },
     /// Release an assignment using its current epoch.
     Release {

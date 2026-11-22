@@ -38,11 +38,53 @@ pub(crate) struct ProjectRegistrationConfig {
     pub interpreters: BTreeMap<String, core::api::ScriptInterpreter>,
     pub run_env: Vec<String>,
     pub format: Vec<String>,
-    pub check: Vec<String>,
-    pub check_at_turn_end: bool,
-    pub max_rounds: Option<i64>,
+    pub policy: Option<ProjectPolicyConfig>,
     pub command_guards: Vec<ProjectCommandGuard>,
     pub workspace: ProjectWorkspaceMode,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct ProjectPolicyConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub check: Option<ProjectPolicyCheck>,
+    pub budget: ProjectPolicyBudget,
+    pub scope: Vec<String>,
+    pub check_inputs: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProjectPolicyCheck {
+    pub argv: Vec<String>,
+    #[serde(default = "default_project_check_deadline_ms")]
+    pub deadline_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at_turn_end: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProjectPolicyBudget {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rounds: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cost: Option<core::api::GoalCostLimit>,
+}
+
+/// The settings boundary also accepts the former top-level #879 fields so it
+/// can migrate them into the canonical policy before saving the section.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+struct ProjectPolicySettingsInput {
+    policy: Option<ProjectPolicyConfig>,
+    check: Vec<String>,
+    check_at_turn_end: bool,
+    max_rounds: Option<i64>,
+}
+
+fn default_project_check_deadline_ms() -> i64 {
+    core::api::DEFAULT_GOAL_CHECK_TIMEOUT_MS
 }
 
 /// Default chat root for one data dir. The Owner's default data dir keeps
@@ -316,15 +358,17 @@ pub(super) struct ProjectEntry {
     /// Explicit argv run after a debounced file edit to format the Agent worktree.
     #[serde(default)]
     format: Vec<String>,
-    /// Explicit argv used for fast checks and the project default Goal.
+    /// Legacy #879 input. Settings read/save migrate this into `policy.check.argv`.
     #[serde(default)]
     check: Vec<String>,
-    /// Run a heavy check only through the idle Goal driver.
+    /// Legacy #879 input. Settings read/save migrate this into `policy.check`.
     #[serde(default)]
     check_at_turn_end: bool,
-    /// Bounds automatic Goal rounds.
+    /// Legacy #879 input. Settings read/save migrate this into `policy.budget`.
     #[serde(default)]
     max_rounds: Option<i64>,
+    #[serde(default)]
+    policy: Option<ProjectPolicyConfig>,
     #[serde(default)]
     command_guards: Vec<ProjectCommandGuard>,
     /// `workspace = "worktree" | "shared"`, default `worktree`.
@@ -435,32 +479,15 @@ pub(super) fn project_registrations_in(
                     )
             })?;
         let format = normalize_project_command_argv(&entry.format, source, offset, id, "format")?;
-        let check = normalize_project_command_argv(&entry.check, source, offset, id, "check")?;
-        let max_rounds = match (check.is_empty(), entry.max_rounds) {
-            (false, Some(rounds)) if (1..=MAX_PROJECT_CHECK_ROUNDS).contains(&rounds) => {
-                Some(rounds)
-            }
-            (false, None) => Some(DEFAULT_PROJECT_CHECK_ROUNDS),
-            (false, Some(_)) => {
-                return Err(config_error_at(
-                    source,
-                    offset,
-                    &format!("projects.{id}.max_rounds"),
-                    "must be between 1 and 16",
-                    "profile_error",
-                ));
-            }
-            (true, Some(_)) => {
-                return Err(config_error_at(
-                    source,
-                    offset,
-                    &format!("projects.{id}.max_rounds"),
-                    "requires a project check command",
-                    "profile_error",
-                ));
-            }
-            (true, None) => None,
-        };
+        let policy = normalize_project_policy(
+            id,
+            entry.policy.clone(),
+            &entry.check,
+            entry.check_at_turn_end,
+            entry.max_rounds,
+            source,
+            offset,
+        )?;
         let git = entry.git.clone();
         if let Some(git) = &git {
             validate_project_git_config(git, source, offset, id)?;
@@ -484,15 +511,214 @@ pub(super) fn project_registrations_in(
             interpreters: run_grant.interpreters,
             run_env: run_grant.run_env,
             format,
-            check,
-            check_at_turn_end: entry.check_at_turn_end,
-            max_rounds,
+            policy,
             command_guards: entry.command_guards.clone(),
             workspace: entry.workspace,
         });
     }
     projects.sort_by(|left, right| left.id.cmp(&right.id));
     Ok(projects)
+}
+
+/// Normalize the canonical policy and the legacy #879 project fields into
+/// one typed value. When both forms are present, canonical policy fields win.
+fn normalize_project_policy(
+    id: &str,
+    policy: Option<ProjectPolicyConfig>,
+    legacy_check: &[String],
+    legacy_at_turn_end: bool,
+    legacy_max_rounds: Option<i64>,
+    source: &str,
+    offset: usize,
+) -> core::Result<Option<ProjectPolicyConfig>> {
+    let has_legacy = !legacy_check.is_empty() || legacy_at_turn_end || legacy_max_rounds.is_some();
+    if policy.is_none() && !has_legacy {
+        return Ok(None);
+    }
+
+    let policy = policy.unwrap_or_default();
+    let legacy_check_used = policy.check.is_none() && !legacy_check.is_empty();
+    let mut check = match policy.check {
+        Some(mut check) => {
+            if check.at_turn_end.is_none() && legacy_at_turn_end {
+                check.at_turn_end = Some(true);
+            }
+            Some(check)
+        }
+        None if !legacy_check.is_empty() => Some(ProjectPolicyCheck {
+            argv: legacy_check.to_vec(),
+            deadline_ms: default_project_check_deadline_ms(),
+            at_turn_end: legacy_at_turn_end.then_some(true),
+        }),
+        None => None,
+    };
+
+    if let Some(configured) = &mut check {
+        let field = if legacy_check_used {
+            "check"
+        } else {
+            "policy.check.argv"
+        };
+        if configured.argv.is_empty() {
+            return Err(config_error_at(
+                source,
+                offset,
+                &format!("projects.{id}.{field}"),
+                "must contain 1 to 32 nonempty arguments",
+                "profile_error",
+            ));
+        }
+        configured.argv =
+            normalize_project_command_argv(&configured.argv, source, offset, id, field)?;
+        if !(core::api::MIN_GOAL_CHECK_TIMEOUT_MS..=core::api::MAX_GOAL_CHECK_TIMEOUT_MS)
+            .contains(&configured.deadline_ms)
+        {
+            return Err(config_error_at(
+                source,
+                offset,
+                &format!("projects.{id}.policy.check.deadline_ms"),
+                "must be between 1000 and 600000 milliseconds",
+                "profile_error",
+            ));
+        }
+    }
+
+    let legacy_rounds_used = policy.budget.max_rounds.is_none() && legacy_max_rounds.is_some();
+    let mut max_rounds = policy.budget.max_rounds.or(legacy_max_rounds);
+    if legacy_rounds_used && check.is_none() {
+        return Err(config_error_at(
+            source,
+            offset,
+            &format!("projects.{id}.max_rounds"),
+            "requires a project check command",
+            "profile_error",
+        ));
+    }
+    if check.is_some() && max_rounds.is_none() {
+        max_rounds = Some(DEFAULT_PROJECT_CHECK_ROUNDS);
+    }
+    if max_rounds.is_some_and(|rounds| !(1..=MAX_PROJECT_CHECK_ROUNDS).contains(&rounds)) {
+        let field = if legacy_rounds_used {
+            "max_rounds"
+        } else {
+            "policy.budget.max_rounds"
+        };
+        return Err(config_error_at(
+            source,
+            offset,
+            &format!("projects.{id}.{field}"),
+            "must be between 1 and 16",
+            "profile_error",
+        ));
+    }
+
+    if let Some(limit) = &policy.budget.max_cost {
+        limit.validate().map_err(|error| {
+            config_error_at(
+                source,
+                offset,
+                &format!("projects.{id}.policy.budget.max_cost"),
+                &error.message,
+                "profile_error",
+            )
+        })?;
+    }
+
+    for (name, globs) in [
+        ("scope", &policy.scope),
+        ("check_inputs", &policy.check_inputs),
+    ] {
+        if globs.len() > core::api::MAX_GOAL_SCOPE_GLOBS
+            || globs
+                .iter()
+                .any(|glob| core::api::normalize_claim_glob(glob).is_err())
+        {
+            return Err(config_error_at(
+                source,
+                offset,
+                &format!("projects.{id}.policy.{name}"),
+                "must contain at most 32 valid project-relative globs",
+                "profile_error",
+            ));
+        }
+    }
+
+    Ok(Some(ProjectPolicyConfig {
+        check,
+        budget: ProjectPolicyBudget {
+            max_rounds,
+            max_cost: policy.budget.max_cost,
+        },
+        scope: policy.scope,
+        check_inputs: policy.check_inputs,
+    }))
+}
+
+/// Convert a projects settings value to its one canonical policy shape.
+/// Invalid data remains readable for repair, but cannot be saved in legacy
+/// form or silently lose fields.
+pub(super) fn canonicalize_project_settings(
+    value: &mut serde_json::Value,
+    strict: bool,
+) -> core::Result<()> {
+    let Some(projects) = value.as_object_mut() else {
+        return Err(core::Error::new(
+            "invalid",
+            "projects settings must be an object",
+        ));
+    };
+
+    for (id, project_value) in projects {
+        let input = serde_json::from_value::<ProjectPolicySettingsInput>(project_value.clone());
+        let Some(project) = project_value.as_object_mut() else {
+            if strict {
+                return Err(core::Error::new(
+                    "profile_error",
+                    format!("projects.{id} must be a table"),
+                ));
+            }
+            continue;
+        };
+        let normalized = input
+            .map_err(|_| {
+                core::Error::new(
+                    "profile_error",
+                    format!("projects.{id} policy fields are invalid"),
+                )
+            })
+            .and_then(|input| {
+                normalize_project_policy(
+                    id,
+                    input.policy,
+                    &input.check,
+                    input.check_at_turn_end,
+                    input.max_rounds,
+                    "",
+                    0,
+                )
+            });
+        let normalized = match normalized {
+            Ok(normalized) => normalized,
+            Err(_) if !strict => continue,
+            Err(error) => return Err(error),
+        };
+
+        project.remove("check");
+        project.remove("check_at_turn_end");
+        project.remove("max_rounds");
+        match normalized {
+            Some(policy) => {
+                let policy = serde_json::to_value(policy).map_err(|_| {
+                    core::Error::new("internal", "project policy could not be encoded")
+                })?;
+                project.insert("policy".to_owned(), policy);
+            }
+            None => {
+                project.remove("policy");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn normalize_project_command_argv(

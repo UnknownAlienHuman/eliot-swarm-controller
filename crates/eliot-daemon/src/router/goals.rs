@@ -761,7 +761,11 @@ impl Router {
             .into_iter()
             .find(|project| {
                 project.id == agent.project
-                    && project.check == definition.check
+                    && project
+                        .policy
+                        .as_ref()
+                        .and_then(|policy| policy.check.as_ref())
+                        .is_some_and(|check| check.argv == definition.check)
                     && project.actions.iter().any(|action| action == "git.publish")
             })
             .map(|project| project.id)

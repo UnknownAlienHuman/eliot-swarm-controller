@@ -5,7 +5,7 @@
 //! Only a definite nonzero exit is delivered, bound to the exact generation
 //! and the context consumer available when the check finishes.
 
-use super::Router;
+use super::{Principal, Router};
 use crate::{
     common::now_ms,
     git_monitor::GitProbe,
@@ -19,6 +19,7 @@ use eliot_core::{
     api::{DEFAULT_GOAL_CHECK_TIMEOUT_MS, GoalDefinition},
 };
 use eliot_plugin::sync::LockExt;
+use serde_json::{Map, Value, json};
 use std::{
     collections::{HashMap, HashSet},
     path::Path,
@@ -77,7 +78,7 @@ struct CheckDisposition {
 
 struct ProjectWork {
     config: crate::config::ProjectRegistrationConfig,
-    check: Vec<String>,
+    check: Option<(Vec<String>, i64)>,
     workspace: String,
 }
 
@@ -105,84 +106,123 @@ pub(super) async fn wait_for_check_shutdown(shutdown: &mut watch::Receiver<bool>
     let _ = shutdown.wait_for(|stopped| *stopped).await;
 }
 
-/// Add the configured project check as a launch-time Goal for assigned and
-/// role-routed work. An assignment's explicit Goal wins and manual goal.set
-/// can replace this default through the ordinary Goal API.
-pub(super) async fn attach_default_goal(
+/// Resolve policy after project selection and before transactional launch admission.
+/// Keep the caller's fields intact for replay and retain the resolved Goal beside them.
+pub(super) async fn freeze_launch_goal(
     router: &Router,
     request: &mut SubmitCommand,
-    manager_assignment: bool,
+    principal: &Principal,
 ) -> Result<()> {
-    if request.verb != "launch"
-        || request
-            .args
-            .get(eliot_core::PROJECT_CHECK_GOAL_ARG)
-            .is_some()
-        || request
-            .args
-            .get("assignment")
-            .and_then(|assignment| assignment.get("goal"))
-            .is_some_and(|goal| !goal.is_null())
-    {
-        return Ok(());
-    }
-    let Some(project_id) = request
+    validate_launch_inputs(&request.args, matches!(principal, Principal::Owner))?;
+    let explicit = request
         .args
-        .get("registered_project")
-        .and_then(serde_json::Value::as_str)
-        .filter(|id| !id.is_empty())
-    else {
-        return Ok(());
-    };
-
-    let registration = {
-        let store = router.inner.store.lock().await;
-        store.get_project_registration("owner", project_id)?
-    };
-    let Some(registration) = registration else {
-        return Ok(());
-    };
-    let assigned_or_routed = manager_assignment
-        || request.args.get("assignment").is_some()
-        || request.args.get("profile_choice").is_some();
-    if !assigned_or_routed
-        && !registration
-            .actions
-            .iter()
-            .any(|action| action == "git.publish")
+        .get("goal")
+        .or_else(|| request.args.pointer("/assignment/goal"))
+        .and_then(Value::as_object);
+    let mut defaults = Map::new();
+    if request.args.get("no_policy").is_none()
+        && let Some(project_id) = request.args["registered_project"]
+            .as_str()
+            .filter(|id| !id.is_empty())
     {
+        let registration = router
+            .inner
+            .store
+            .lock()
+            .await
+            .get_project_registration("owner", project_id)?;
+        if let Some(registration) = registration {
+            let config = crate::config::load_project_registration_config(&router.inner.data_root)?
+                .into_iter()
+                .find(|project| project.id == project_id)
+                .ok_or_else(|| {
+                    Error::new("not_allowed", "project registration is no longer approved")
+                })?;
+            if let Some(policy) = config.policy
+                && (policy.check.is_some() || explicit.is_some())
+            {
+                crate::automation::verify_project_registration(
+                    &router.inner.data_root,
+                    &registration,
+                )
+                .await?;
+                if let Some(check) = policy.check {
+                    defaults.insert("check".to_owned(), json!(check.argv));
+                    defaults.insert("check_timeout_ms".to_owned(), json!(check.deadline_ms));
+                }
+                if let Some(max_rounds) = policy.budget.max_rounds {
+                    defaults.insert("max_rounds".to_owned(), json!(max_rounds));
+                }
+                if let Some(max_cost) = policy.budget.max_cost {
+                    defaults.insert("max_cost".to_owned(), json!(max_cost));
+                }
+                if !policy.scope.is_empty() {
+                    defaults.insert("scope".to_owned(), json!(policy.scope));
+                }
+                if !policy.check_inputs.is_empty() {
+                    defaults.insert("check_inputs".to_owned(), json!(policy.check_inputs));
+                }
+            }
+        }
+    }
+
+    if defaults.is_empty() && explicit.is_none() {
         return Ok(());
     }
-    crate::automation::verify_project_registration(&router.inner.data_root, &registration).await?;
-    let config = crate::config::load_project_registration_config(&router.inner.data_root)?
-        .into_iter()
-        .find(|project| project.id == project_id)
-        .ok_or_else(|| Error::new("not_allowed", "project registration is no longer approved"))?;
-    if config.check.is_empty() {
-        return Ok(());
+    let policy_applied = defaults
+        .keys()
+        .any(|field| explicit.is_none_or(|goal| !goal.contains_key(field)));
+    if let Some(explicit) = explicit {
+        defaults.extend(explicit.clone());
     }
-    let max_rounds = config
-        .max_rounds
-        .ok_or_else(|| Error::new("source_integrity", "project check has no round bound"))?;
-    let goal = GoalDefinition {
-        text: "Complete the assigned project work and satisfy the configured project check."
-            .to_owned(),
-        check: config.check,
-        check_cwd: None,
-        check_timeout_ms: DEFAULT_GOAL_CHECK_TIMEOUT_MS,
-        max_turns: None,
-        max_rounds: Some(max_rounds),
-        max_without_progress: None,
-        cadence_ms: None,
-        scope: Vec::new(),
-        check_inputs: Vec::new(),
-        max_cost: None,
-        escalation: None,
-    };
+    defaults
+        .entry("text")
+        .or_insert_with(|| json!("Complete the assigned project work and satisfy the Goal check."));
+    let goal: GoalDefinition = serde_json::from_value(Value::Object(defaults))
+        .map_err(|error| Error::new("invalid", format!("invalid launch Goal: {error}")))?;
     goal.validate()?;
     goal.require_auto_bound()?;
     request.args[eliot_core::PROJECT_CHECK_GOAL_ARG] = serde_json::to_value(goal)
-        .map_err(|_| Error::new("internal", "project check Goal could not be encoded"))?;
+        .map_err(|_| Error::new("internal", "launch Goal could not be encoded"))?;
+    if policy_applied {
+        request.args[eliot_core::PROJECT_POLICY_APPLIED_ARG] = Value::Bool(true);
+    }
+    Ok(())
+}
+
+pub(super) fn validate_launch_inputs(args: &Value, owner: bool) -> Result<()> {
+    if let Some(reason) = args.get("no_policy")
+        && !reason
+            .as_str()
+            .is_some_and(eliot_core::api::valid_project_policy_opt_out_reason)
+    {
+        return Err(Error::invalid_field(
+            "args.no_policy",
+            format!(
+                "nonblank reason of at most {} bytes without control characters",
+                eliot_core::api::PROJECT_POLICY_OPT_OUT_REASON_MAX_BYTES
+            ),
+        ));
+    }
+    if let Some(goal) = args.get("goal")
+        && (!goal.is_object() || args.pointer("/assignment/goal").is_some())
+    {
+        return Err(Error::invalid_field(
+            "args.goal",
+            "Goal object, supplied at only one location",
+        ));
+    }
+    if !owner
+        && let Some(goal) = args.get("goal").and_then(Value::as_object)
+        && ["check", "check_cwd", "escalation"]
+            .iter()
+            .any(|field| goal.contains_key(*field))
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "only the Owner can set launch Goal check, check_cwd or escalation",
+        ));
+    }
     Ok(())
 }
 
@@ -488,6 +528,7 @@ async fn check_after_edit(
         match run_argv(
             &work.config.format,
             &work.workspace,
+            DEFAULT_GOAL_CHECK_TIMEOUT_MS,
             Arc::clone(&policy),
             shutdown.clone(),
         )
@@ -527,8 +568,18 @@ async fn check_after_edit(
             }
         }
     }
-    if failure.is_none() && !work.check.is_empty() {
-        match run_argv(&work.check, &work.workspace, Arc::clone(&policy), shutdown).await {
+    if failure.is_none()
+        && let Some((argv, deadline_ms)) = &work.check
+    {
+        match run_argv(
+            argv,
+            &work.workspace,
+            *deadline_ms,
+            Arc::clone(&policy),
+            shutdown,
+        )
+        .await
+        {
             Ok(outcome @ (CheckOutcome::Passed | CheckOutcome::Failed { .. })) => {
                 // Remember the worktree left by this invocation, including
                 // any reports the checker wrote. Its own Git hints can then
@@ -594,7 +645,7 @@ async fn load_project_work(
     key: &WorkKey,
     expected_workspace: &str,
 ) -> Result<Option<ProjectWork>> {
-    let (agent, registration) = {
+    let (agent, registration, opted_out, launch_goal) = {
         let store = router.inner.store.lock().await;
         let Some(agent) = store.get_agent(&key.agent)? else {
             return Ok(None);
@@ -611,14 +662,20 @@ async fn load_project_work(
         let Some(registration) = store.get_project_registration("owner", &agent.project)? else {
             return Ok(None);
         };
-        (agent, registration)
+        let opted_out = agent.policy_opt_out_reason.is_some();
+        let launch_goal = store.launch_goal_definition(&agent.id, key.generation)?;
+        (agent, registration, opted_out, launch_goal)
     };
     let config = crate::config::load_project_registration_config(&router.inner.data_root)?
         .into_iter()
         .find(|project| project.id == registration.id)
         .ok_or_else(|| Error::new("not_allowed", "project registration is no longer approved"))?;
     crate::automation::verify_project_registration(&router.inner.data_root, &registration).await?;
-    let configured_argv = serde_json::json!([&config.format, &config.check]);
+    let project_check = config
+        .policy
+        .as_ref()
+        .and_then(|policy| policy.check.as_ref());
+    let configured_argv = json!([&config.format, project_check.map(|check| &check.argv)]);
     if router
         .secret_policy_snapshot()
         .contains_value(&configured_argv)
@@ -628,12 +685,20 @@ async fn load_project_work(
             "project check argv contains a known credential",
         ));
     }
-    let check = if config.check_at_turn_end {
-        Vec::new()
-    } else {
-        config.check.clone()
-    };
-    if config.format.is_empty() && check.is_empty() {
+    let check = project_check
+        .filter(|check| !opted_out && check.at_turn_end != Some(true))
+        .filter(|check| {
+            launch_goal
+                .as_ref()
+                .is_none_or(|goal| goal.check == check.argv && goal.check_cwd.is_none())
+        })
+        .map(|check| {
+            let deadline = launch_goal
+                .as_ref()
+                .map_or(check.deadline_ms, |goal| goal.check_timeout_ms);
+            (check.argv.clone(), deadline)
+        });
+    if config.format.is_empty() && check.is_none() {
         return Ok(None);
     }
     let Some(workspace) = agent.workspace.as_deref() else {
@@ -669,6 +734,7 @@ enum CheckOutcome {
 async fn run_argv(
     argv: &[String],
     workspace: &str,
+    deadline_ms: i64,
     policy: Arc<SecretPolicy>,
     cancellation: watch::Receiver<bool>,
 ) -> Result<CheckOutcome> {
@@ -680,7 +746,7 @@ async fn run_argv(
     let outcome = run_owned_process(
         command,
         Vec::new(),
-        Duration::from_millis(DEFAULT_GOAL_CHECK_TIMEOUT_MS as u64),
+        Duration::from_millis(deadline_ms as u64),
         policy.clone(),
         cancellation,
     )

@@ -67,13 +67,15 @@ pub use agent_views::{
     InstructionReadStatus, InstructionSourceStatus, MAX_DIAGNOSE_ATTENTION_STEPS,
     MAX_DIAGNOSE_MESSAGE_CHARS, MAX_DIAGNOSE_STEPS, MAX_DIAGNOSE_SUMMARY_CHARS,
     MAX_PATCH_DIGEST_OUTSIDE_CLAIMS, MAX_PATCH_DIGEST_PATH_BYTES, NativeNotice, NativeNoticeKind,
-    OwnedProcessKind, OwnedProcessSummary, PROCESS_CURSOR_MAX_BYTES, PatchDigestFile,
+    OwnedProcessKind, OwnedProcessSummary, PROCESS_CURSOR_MAX_BYTES,
+    PROJECT_POLICY_OPT_OUT_REASON_MAX_BYTES, PROJECT_POLICY_OPTOUTS_MAX, PatchDigestFile,
     ProcessPageCursor, ProjectCheckoutView, ProjectDiscoverResponse, ProjectGitHubCliView,
-    ProjectGitPublicationView, ProjectGitView, ProjectRegistrationView, RetainedUnknownSummary,
-    RetentionView, RunningTurnSummary, SourceOwner, SourceState, StatusBlocker,
-    UnsettledCommandSummary, WorkerTaskHealth, WorkerTaskStatus, WorkspaceCustodyView,
-    activity_state_name, agent_state_name, agent_status_line, diagnosis_reason, process_state_name,
-    repository_name_from_url, stats_coverage_name,
+    ProjectGitPublicationView, ProjectGitView, ProjectPolicyOptOutView, ProjectPolicyUsageView,
+    ProjectRegistrationView, RetainedUnknownSummary, RetentionView, RunningTurnSummary,
+    SourceOwner, SourceState, StatusBlocker, UnsettledCommandSummary, WorkerTaskHealth,
+    WorkerTaskStatus, WorkspaceCustodyView, activity_state_name, agent_state_name,
+    agent_status_line, diagnosis_reason, process_state_name, repository_name_from_url,
+    stats_coverage_name, valid_project_policy_opt_out_reason,
 };
 pub use config_views::{
     CONFIG_REVISION_HEX_LEN, MAX_LISTED_PROFILES, MAX_PROFILES_SOURCE_BYTES, ProfileListRequest,
@@ -113,8 +115,9 @@ pub use goals::{
     GoalGetRequest, GoalMarkerState, GoalMode, GoalPauseRequest, GoalResumeRequest, GoalRoundEvent,
     GoalRoundEventOutcome, GoalRoundMarker, GoalRoundOutcome, GoalRoundRequest, GoalRoundResponse,
     GoalScopeBase, GoalScopeStart, GoalSetRequest, GoalStatus, GoalView, MAX_GOAL_CADENCE_MS,
-    MAX_GOAL_CHECK_ARG_BYTES, MAX_GOAL_CHECK_ARGS, MAX_GOAL_LIMIT, MAX_GOAL_OBSERVATION_BYTES,
-    MAX_GOAL_SCOPE_BASE_PATHS, MIN_GOAL_CADENCE_MS,
+    MAX_GOAL_CHECK_ARG_BYTES, MAX_GOAL_CHECK_ARGS, MAX_GOAL_CHECK_TIMEOUT_MS, MAX_GOAL_LIMIT,
+    MAX_GOAL_OBSERVATION_BYTES, MAX_GOAL_SCOPE_BASE_PATHS, MAX_GOAL_SCOPE_GLOBS,
+    MIN_GOAL_CADENCE_MS, MIN_GOAL_CHECK_TIMEOUT_MS,
 };
 pub use handoff::{
     CommandCancelRequest, CommandCancelResponse, HandoffRequest, HandoffResponse,

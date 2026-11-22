@@ -663,11 +663,7 @@ fn agent_list_select_recent(
     } else if count {
         "COUNT(*)".to_owned()
     } else {
-        "agents.id, agents.generation, agents.name, agents.project, agents.harness, agents.profile, \
-                agents.profile_snapshot, agents.native_scope, agents.native_ref, agents.workspace, agents.effective, \
-                agents.pending, agents.state, agents.active_turn, agents.created_at, agents.updated_at, agents.origin, agents.observe_only, (agents.token IS NOT NULL AND agents.observe_only = 0), \
-                agents.parent, agents.root, agents.depth, agents.control, agents.profile_inherited, agents.profile_choice, agents.archived, agents.chat, agents.project_scope"
-            .to_owned()
+        AGENT_RECORD_COLUMNS.to_owned()
     };
     let mut predicates = Vec::new();
     let mut params: Vec<rusqlite::types::Value> = Vec::new();
@@ -824,11 +820,7 @@ fn agent_list_select(
     } else if count {
         "COUNT(*)".to_owned()
     } else {
-        "agents.id, agents.generation, agents.name, agents.project, agents.harness, agents.profile,
-                agents.profile_snapshot, agents.native_scope, agents.native_ref, agents.workspace, agents.effective,
-                agents.pending, agents.state, agents.active_turn, agents.created_at, agents.updated_at, agents.origin, agents.observe_only, (agents.token IS NOT NULL AND agents.observe_only = 0),
-                agents.parent, agents.root, agents.depth, agents.control, agents.profile_inherited, agents.profile_choice, agents.archived, agents.chat, agents.project_scope"
-            .to_owned()
+        AGENT_RECORD_COLUMNS.to_owned()
     };
     let mut predicates = Vec::new();
     let mut params: Vec<rusqlite::types::Value> = Vec::new();

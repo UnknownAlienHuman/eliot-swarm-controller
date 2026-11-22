@@ -38,8 +38,10 @@ impl Router {
                     launch.args = json!({"workspace": workspace, "profile": profile});
                     normalize_launch(&mut launch, principal)?;
                     launch.args["project"] = json!(source.project_scope());
+                    launch.args["registered_project"] = json!(source.project);
                     self.freeze_launch_profile(principal, &mut launch, false)
                         .await?;
+                    super::project_checks::freeze_launch_goal(self, &mut launch, principal).await?;
                     if policy.contains_value(&launch.args) {
                         return Err(Error::new(
                             "secret_in_payload",
@@ -198,7 +200,13 @@ impl Router {
                 })?)
             };
             launch.args["registered_project"] = json!(registration.id);
-            super::project_checks::attach_default_goal(self, &mut launch, true).await?;
+            if let Some(reason) = &request.no_policy {
+                launch.args["no_policy"] = json!(reason);
+            }
+            if let Some(goal) = &request.goal {
+                launch.args["goal"] = json!(goal);
+            }
+            super::project_checks::freeze_launch_goal(self, &mut launch, principal).await?;
             if contains_known_secret(&launch.args, &self.inner.secrets) {
                 return Err(Error::new(
                     "secret_in_payload",

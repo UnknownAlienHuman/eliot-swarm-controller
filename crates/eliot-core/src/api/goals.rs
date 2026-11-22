@@ -257,7 +257,7 @@ pub struct GoalCostLimit {
 }
 
 impl GoalCostLimit {
-    fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         if self.unit.is_empty()
             || self.unit.len() > MAX_GOAL_COST_UNIT_BYTES
             || self

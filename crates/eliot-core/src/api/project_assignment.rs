@@ -84,6 +84,12 @@ pub struct ProjectAssignmentLaunchRequest {
     /// Absent means a new opaque worktree; the daemon never adopts automatically.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adopt_worktree: Option<String>,
+    /// Explicit reason to omit project policy defaults for this launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_policy: Option<String>,
+    /// Explicit Goal fields override project policy field by field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 #[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]

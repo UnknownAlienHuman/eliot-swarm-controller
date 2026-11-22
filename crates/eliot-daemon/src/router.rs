@@ -2592,6 +2592,7 @@ impl Router {
             project_authority_preverified,
             submission_scope_preverified,
             false,
+            false,
         )
         .await
     }
@@ -2603,6 +2604,7 @@ impl Router {
         project_authority_preverified: bool,
         submission_scope_preverified: bool,
         arbitrated: bool,
+        defer_launch_goal: bool,
     ) -> Result<PreparedSubmission> {
         if request
             .args
@@ -2690,7 +2692,9 @@ impl Router {
                             arbitrated,
                         )
                         .await?;
-                    project_checks::attach_default_goal(self, &mut request, false).await?;
+                    if !defer_launch_goal {
+                        project_checks::freeze_launch_goal(self, &mut request, principal).await?;
+                    }
                     Ok(input)
                 }
                 .await;
@@ -3554,13 +3558,14 @@ impl Router {
         require_owner(principal)?;
         let request: ProjectGetRequest = eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
-        let registration = self
-            .inner
-            .store
-            .lock()
-            .await
-            .get_project_registration("owner", &request.id)?
-            .ok_or_else(|| Error::new("not_found", "project registration was not found"))?;
+        let registration = {
+            let store = self.inner.store.lock().await;
+            let mut registration = store
+                .get_project_registration("owner", &request.id)?
+                .ok_or_else(|| Error::new("not_found", "project registration was not found"))?;
+            registration.policy_usage = store.project_policy_usage(&registration.id, now_ms())?;
+            registration
+        };
         // Git reads run after the Store lock is released.
         let mut registrations = [registration];
         crate::workspace_git::WorkspaceGit::fill_project_readbacks(&mut registrations).await;
@@ -3574,12 +3579,15 @@ impl Router {
     async fn project_list(&self, params: &Value, principal: &Principal) -> Result<Value> {
         require_owner(principal)?;
         let _: ProjectListRequest = eliot_core::api::discovery::decode_params(params.clone())?;
-        let mut registrations = self
-            .inner
-            .store
-            .lock()
-            .await
-            .list_project_registrations("owner", None, PAGE_MAX)?;
+        let mut registrations = {
+            let store = self.inner.store.lock().await;
+            let mut registrations = store.list_project_registrations("owner", None, PAGE_MAX)?;
+            let now = now_ms();
+            for registration in &mut registrations {
+                registration.policy_usage = store.project_policy_usage(&registration.id, now)?;
+            }
+            registrations
+        };
         // Git reads run after the Store lock is released.
         crate::workspace_git::WorkspaceGit::fill_project_readbacks(&mut registrations).await;
         for registration in &mut registrations {
@@ -6697,14 +6705,15 @@ fn validate_rule_launch_action(
     if args.keys().any(|key| {
         !matches!(
             key.as_str(),
-            "profile" | "role" | "workspace" | "text" | "assignment"
+            "profile" | "role" | "workspace" | "text" | "assignment" | "goal" | "no_policy"
         )
     }) {
         return Err(Error::new(
             "invalid",
-            "rule launch accepts profile or role, workspace, optional text and assignment",
+            "rule launch accepts profile or role, workspace, text, assignment, goal and no_policy",
         ));
     }
+    project_checks::validate_launch_inputs(&request.args, project.is_none())?;
     let profile = args
         .get("profile")
         .map(|value| {
@@ -7395,11 +7404,12 @@ async fn generated_naming(
     Ok((project, task))
 }
 
-fn normalize_launch(request: &mut SubmitCommand, _principal: &Principal) -> Result<()> {
+fn normalize_launch(request: &mut SubmitCommand, principal: &Principal) -> Result<()> {
     if request.verb != "launch" {
         return Ok(());
     }
     reject_launch_derived_keys(&request.args)?;
+    project_checks::validate_launch_inputs(&request.args, matches!(principal, Principal::Owner))?;
     if let Some(role) = request.args.get("role") {
         let role = role
             .as_str()
@@ -8054,6 +8064,7 @@ fn reject_launch_derived_keys(args: &Value) -> Result<()> {
     for reserved in [
         "registered_project",
         eliot_core::PROJECT_CHECK_GOAL_ARG,
+        eliot_core::PROJECT_POLICY_APPLIED_ARG,
         "admission_mode",
         "auto_worktree",
         "project_assignment_launch",

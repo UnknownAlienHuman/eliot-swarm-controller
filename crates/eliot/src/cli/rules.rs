@@ -302,6 +302,20 @@ pub(crate) async fn run_project(
                     }
                 );
                 println!("Revision: {}", response.revision);
+                println!(
+                    "policy applied to {} of {} Agents in the last 24 h",
+                    response.policy_usage.applied, response.policy_usage.total
+                );
+                if !response.policy_usage.opt_outs.is_empty() {
+                    println!(
+                        "Policy opt-outs (showing {} of {})",
+                        response.policy_usage.opt_outs.len(),
+                        response.policy_usage.opted_out
+                    );
+                    for opt_out in &response.policy_usage.opt_outs {
+                        println!("  {}: {}", opt_out.agent, opt_out.reason);
+                    }
+                }
                 if !response.checkouts.is_empty() {
                     println!("Registered checkouts: {}", response.checkouts.len());
                     for checkout in &response.checkouts {

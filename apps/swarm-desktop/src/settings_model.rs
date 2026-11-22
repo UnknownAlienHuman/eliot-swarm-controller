@@ -3,8 +3,8 @@
 //! Each draft is the JSON value `settings.read` returned for one section
 //! (`routing`, `projects`, `automation`, `cloud_mcp`), changed in place and
 //! sent back whole by `settings.save`, which is a complete replacement of the
-//! named section. Fields the page does not show (a project's Git remotes or
-//! interpreters, the automation backlog limit and Run grant) ride along
+//! named section. Fields the page does not show (a project's policy, Git
+//! remotes or interpreters, the automation backlog limit and Run grant) ride along
 //! unchanged. Nothing here decides validity: the daemon validates every save,
 //! dry run first when asked. Wire shapes: [`eliot_core::api::config_views`].
 

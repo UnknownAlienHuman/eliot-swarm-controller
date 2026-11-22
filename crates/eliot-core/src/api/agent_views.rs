@@ -1320,6 +1320,73 @@ impl ProjectGitView {
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ProjectPolicyOptOutView {
+    pub agent: String,
+    /// The required launch opt-out rationale, bounded to 256 UTF-8 bytes.
+    #[schemars(length(max = 256))]
+    pub reason: String,
+    /// Unix timestamp in milliseconds from the Agent's creation event.
+    #[schemars(range(min = 0))]
+    pub created_at: i64,
+}
+
+impl ProjectPolicyOptOutView {
+    pub fn validate(&self) -> Result<()> {
+        text(&self.agent)?;
+        if self.created_at < 0 || !valid_project_policy_opt_out_reason(&self.reason) {
+            return Err(invalid_response());
+        }
+        Ok(())
+    }
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectPolicyUsageView {
+    /// Unique project Agents created in the last 24 hours with policy applied.
+    #[schemars(range(min = 0))]
+    pub applied: u64,
+    /// Unique project Agents created in the last 24 hours.
+    #[schemars(range(min = 0))]
+    pub total: u64,
+    /// All explicit opt-outs among the counted Agents.
+    #[serde(default)]
+    pub opted_out: u64,
+    /// Newest explicit opt-outs among those Agents, capped at 16 entries.
+    #[schemars(length(max = 16))]
+    pub opt_outs: Vec<ProjectPolicyOptOutView>,
+}
+
+impl ProjectPolicyUsageView {
+    pub fn validate(&self) -> Result<()> {
+        let mut agents = BTreeSet::new();
+        if self.applied.saturating_add(self.opted_out) > self.total
+            || self.opt_outs.len() as u64 > self.opted_out
+            || self.opt_outs.len() > PROJECT_POLICY_OPTOUTS_MAX
+        {
+            return Err(invalid_response());
+        }
+        for opt_out in &self.opt_outs {
+            opt_out.validate()?;
+            if !agents.insert(&opt_out.agent) {
+                return Err(invalid_response());
+            }
+        }
+        Ok(())
+    }
+}
+
+pub const PROJECT_POLICY_OPT_OUT_REASON_MAX_BYTES: usize = 256;
+pub const PROJECT_POLICY_OPTOUTS_MAX: usize = 16;
+
+pub fn valid_project_policy_opt_out_reason(reason: &str) -> bool {
+    !reason.trim().is_empty()
+        && reason.len() <= PROJECT_POLICY_OPT_OUT_REASON_MAX_BYTES
+        && !reason.chars().any(char::is_control)
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectRegistrationView {
     pub id: String,
     pub checkout: String,
@@ -1331,6 +1398,10 @@ pub struct ProjectRegistrationView {
     #[serde(default)]
     pub git: Option<ProjectGitView>,
     pub revision: i64,
+    /// Per-project launch policy usage from the trailing 24 hours. The opt-out
+    /// entries are the newest 16 unique Agents and retain their launch time.
+    #[serde(default)]
+    pub policy_usage: ProjectPolicyUsageView,
     /// The repository's name from its `origin` remote URL (the last path
     /// segment without `.git`), read live from Git by `project.list` and
     /// `project.get`. Read-only: never stored or settable, never the URL
@@ -1466,6 +1537,7 @@ impl ProjectRegistrationView {
                 "project registration revision must be nonnegative",
             ));
         }
+        self.policy_usage.validate()?;
         validate_project_allowset(&self.profiles, "profiles")?;
         validate_project_allowset(&self.actions, "actions")?;
         validate_project_run_env(&self.run_env)?;

@@ -488,10 +488,11 @@ struct GoalStatePersist {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     assignment_cause: Option<core::EventCause>,
     /// Starting point of a Goal with `scope` or `check_inputs`, recorded by
-    /// the Router at `set` and kept until the next `set`.
+    /// the Router at `set` or launch preflight and kept until the next `set`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     scope_base: Option<core::api::GoalScopeBase>,
-    /// Cost baseline of a Goal with `max_cost`, recorded at `set`.
+    /// Cost baseline of a Goal with `max_cost`, recorded at `set` or initialized
+    /// when launch admission binds it to a new native session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cost_base: Option<GoalCostBase>,
 }
@@ -751,9 +752,15 @@ pub(super) fn transfer_goal_tx(
         return Ok(None);
     };
     let destination = load_goal_row(tx, to_num, "eliot")?;
-    if destination
-        .as_ref()
-        .is_some_and(|row| row.state.status != GoalStatus::Cleared)
+    if let Some(row) = &destination
+        && row.state.status != GoalStatus::Cleared
+        && !(row.generation == to.generation
+            && row.revision == 1
+            && row.state.status == GoalStatus::Active
+            && row.state.project_default
+            && row.state.await_first_turn
+            && row.state.counters.rounds == 0
+            && count_turns(tx, to_num, to.generation)? == 0)
     {
         return Err(Error::new(
             "bad_state",
@@ -868,6 +875,60 @@ impl Store {
         load_goal_row(&self.connection, agent_num, mode)?
             .map(|row| self.goal_view(row))
             .transpose()
+    }
+
+    /// Read the Goal attached to an ordinary launch before native dispatch.
+    pub fn launch_goal_scope_target(&self, agent: &str, launch: &str) -> Result<Option<GoalView>> {
+        self.ensure_committed_reads()?;
+        let agent_num = parse_agent_id(agent)?;
+        let Some(row) = load_goal_row(&self.connection, agent_num, GoalMode::Eliot.as_str())?
+        else {
+            return Ok(None);
+        };
+        if row.generation != 1
+            || row
+                .state
+                .assignment_cause
+                .as_ref()
+                .is_none_or(|cause| cause.command_id != launch)
+            || row.state.scope_base.is_some()
+            || !row.definition.tracks_changes()
+        {
+            return Ok(None);
+        }
+        self.goal_view(row).map(Some)
+    }
+
+    /// The active generation's launch-installed definition, before any manual replacement.
+    pub fn launch_goal_definition(
+        &self,
+        agent: &str,
+        generation: i64,
+    ) -> Result<Option<GoalDefinition>> {
+        self.ensure_committed_reads()?;
+        let agent_num = parse_agent_id(agent)?;
+        Ok(
+            load_goal_row(&self.connection, agent_num, GoalMode::Eliot.as_str())?
+                .filter(|row| row.generation == generation && row.state.assignment_cause.is_some())
+                .map(|row| row.definition),
+        )
+    }
+
+    /// Commit the checkout starting point only while the same launch is undispatched.
+    pub fn set_launch_goal_scope(
+        &mut self,
+        launch: &str,
+        agent: &str,
+        workspace: &str,
+        revision: i64,
+        base: core::api::GoalScopeBase,
+        now: i64,
+    ) -> Result<()> {
+        self.ensure_writer_healthy()?;
+        let result =
+            self.set_launch_goal_scope_inner(launch, agent, workspace, revision, base, now);
+        self.fault_on_persistence_error(&result);
+        result
     }
 
     pub fn goal_pause(
@@ -1418,6 +1479,63 @@ impl Store {
         retain_goal_result(&tx, id, principal, "goal.set", &payload_digest, &view, now)?;
         commit_transaction(tx, &self.write_faulted)?;
         Ok(view)
+    }
+
+    fn set_launch_goal_scope_inner(
+        &mut self,
+        launch: &str,
+        agent: &str,
+        workspace: &str,
+        revision: i64,
+        base: core::api::GoalScopeBase,
+        now: i64,
+    ) -> Result<()> {
+        let agent_num = parse_agent_id(agent)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        let current = load_command(&tx, launch)?;
+        let current_agent = load_agent_by_num(&tx, agent_num)?;
+        if current.is_none_or(|command| {
+            command.verb != "launch"
+                || command.target.as_deref() != Some(agent)
+                || command.generation != Some(0)
+                || !matches!(command.state, CommandState::Accepted | CommandState::Queued)
+        }) || current_agent.is_none_or(|current| {
+            current.generation != 0 || current.workspace.as_deref() != Some(workspace)
+        }) {
+            return Err(Error::new(
+                "stale_generation",
+                "launch or workspace changed before the Goal starting point was committed",
+            ));
+        }
+        let Some(mut row) = load_goal_row(&tx, agent_num, GoalMode::Eliot.as_str())? else {
+            return commit_transaction(tx, &self.write_faulted);
+        };
+        if row.generation != 1
+            || row
+                .state
+                .assignment_cause
+                .as_ref()
+                .is_none_or(|cause| cause.command_id != launch)
+            || row.state.scope_base.is_some()
+            || !row.definition.tracks_changes()
+        {
+            return commit_transaction(tx, &self.write_faulted);
+        }
+        if row.revision != revision {
+            return Err(Error::new(
+                "stale_goal",
+                "launch Goal changed before its starting point was committed",
+            ));
+        }
+        row.state.scope_base = Some(base);
+        db!(tx.execute(
+            "UPDATE goals SET state = ?1, updated_at = ?2 WHERE agent = ?3 AND mode = 'eliot'",
+            params![encode_json(&row.state)?, now, agent_num],
+        ));
+        commit_transaction(tx, &self.write_faulted)
     }
 
     fn goal_pause_inner(
@@ -2658,8 +2776,8 @@ fn snapshot_cost(usage: &core::SessionUsage) -> Option<(f64, &str)> {
     Some((cost.amount?, cost.unit.as_deref()?))
 }
 
-/// Baseline at `set`. A budget needs the Agent's native session cost in its
-/// unit: the latest snapshot, or zero for an Agent that has run no turn.
+/// Baseline at `set` or launch preflight. A budget needs the Agent's native
+/// session cost in its unit: the latest snapshot, or zero before its first turn.
 fn goal_cost_base_tx(
     tx: &Transaction<'_>,
     agent_num: i64,
@@ -3319,18 +3437,21 @@ pub(super) fn install_assignment_goal_tx(
     definition.require_auto_bound()?;
     let state = GoalStatePersist {
         transferred_turns: 0,
-        await_first_turn: project_default,
+        await_first_turn: true,
         project_default,
         status: GoalStatus::Active,
         paused_reason: None,
         blocked_reason: None,
         counters: GoalCounters::default(),
-        cadence_anchor_ms: None,
+        cadence_anchor_ms: definition.cadence_ms.map(|_| now),
         last_committed_slot: None,
         last_continuation_command_id: None,
         assignment_cause: Some(cause),
         scope_base: None,
-        cost_base: None,
+        cost_base: definition
+            .max_cost
+            .as_ref()
+            .map(|_| GoalCostBase::default()),
     };
     db!(tx.execute(
         "INSERT INTO goals(agent, mode, generation, revision, definition,

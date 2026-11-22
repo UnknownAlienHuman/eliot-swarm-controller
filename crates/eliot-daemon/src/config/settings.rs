@@ -270,6 +270,9 @@ fn section_value(parsed: &toml::Table, name: &str) -> core::Result<JsonValue> {
     };
     let mut value = serde_json::to_value(value)
         .map_err(|_| core::Error::new("internal", "settings section could not be encoded"))?;
+    if name == "projects" {
+        super::projects::canonicalize_project_settings(&mut value, false)?;
+    }
     if name == "daemon" {
         add_attention_settings_defaults(&mut value, super::default_attention_suspicion_secs());
     }
@@ -1064,6 +1067,9 @@ fn section_source(
         return Ok(String::new());
     }
     let mut normalized = value.clone();
+    if section == SettingsSection::Projects {
+        super::projects::canonicalize_project_settings(&mut normalized, true)?;
+    }
     if section == SettingsSection::Desktop
         && let Some(object) = normalized.as_object_mut()
     {

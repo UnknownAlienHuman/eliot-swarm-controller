@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 
 const PROJECT_PRINCIPAL_PREFIX: &str = "project:";
+const PROJECT_POLICY_USAGE_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectRegistrationInput {
@@ -158,6 +159,67 @@ impl Store {
         let registrations = list_project_registrations_tx(&self.connection, after_id, limit)?;
         ensure_project_registration_bytes(&registrations)?;
         Ok(registrations)
+    }
+
+    /// Read launch adoption over the trailing day independently of journal retention.
+    pub fn project_policy_usage(
+        &self,
+        project: &str,
+        now: i64,
+    ) -> Result<core::api::ProjectPolicyUsageView> {
+        self.ensure_committed_reads()?;
+        let cutoff = now.saturating_sub(PROJECT_POLICY_USAGE_WINDOW_MS);
+        let (total, applied, opted_out): (i64, i64, i64) = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(policy_applied), 0),
+                        COALESCE(SUM(policy_opt_out_reason IS NOT NULL), 0)
+                 FROM agents
+                 WHERE project = ?1 AND origin = 'eliot' AND created_at BETWEEN ?2 AND ?3",
+                params![project, cutoff, now],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(sql_error)?;
+        let mut statement = self
+            .connection
+            .prepare_cached(
+                "SELECT id, policy_opt_out_reason, created_at FROM agents
+                 WHERE project = ?1 AND origin = 'eliot' AND created_at BETWEEN ?2 AND ?3
+                   AND policy_opt_out_reason IS NOT NULL
+                 ORDER BY created_at DESC, id DESC LIMIT ?4",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(
+                params![
+                    project,
+                    cutoff,
+                    now,
+                    core::api::PROJECT_POLICY_OPTOUTS_MAX as i64
+                ],
+                |row| {
+                    Ok(core::api::ProjectPolicyOptOutView {
+                        agent: format_agent_id(row.get(0)?),
+                        reason: row.get(1)?,
+                        created_at: row.get(2)?,
+                    })
+                },
+            )
+            .map_err(sql_error)?;
+        let count = |value| {
+            u64::try_from(value)
+                .map_err(|_| Error::new("source_integrity", "negative project policy count"))
+        };
+        let usage = core::api::ProjectPolicyUsageView {
+            applied: count(applied)?,
+            total: count(total)?,
+            opted_out: count(opted_out)?,
+            opt_outs: rows
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(sql_error)?,
+        };
+        usage.validate()?;
+        Ok(usage)
     }
 }
 
@@ -1096,6 +1158,7 @@ fn normalize_registration(input: &ProjectRegistrationInput) -> Result<ProjectReg
         interpreters: interpreters.clone(),
         run_env: run_env.clone(),
         revision: 1,
+        policy_usage: core::api::ProjectPolicyUsageView::default(),
         origin: None,
         checkouts: Vec::new(),
     };
@@ -1347,6 +1410,7 @@ fn project_registration_from_row(
         interpreters,
         run_env,
         revision,
+        policy_usage: core::api::ProjectPolicyUsageView::default(),
         origin: None,
         checkouts: Vec::new(),
     })
