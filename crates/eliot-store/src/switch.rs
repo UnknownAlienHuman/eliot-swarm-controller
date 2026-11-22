@@ -9,6 +9,7 @@ const METHOD: &str = "swarm.switch";
 const PROVIDER_FAILURE: &str = "provider_failure";
 const PROVIDER_AUTHORITY: &str = "provider_authority";
 const SESSION_GROWTH_AUTHORITY: &str = "session_growth_authority";
+const OWNER_AUTOMATION: &str = "owner_automation";
 
 #[derive(Clone, Copy)]
 pub struct ProviderSwitchFailure {
@@ -37,12 +38,14 @@ pub struct SwitchWork {
     pub plan: SwitchResponse,
     pub provider_failure: Option<ProviderSwitchFailure>,
     pub profile_authority: Option<[u8; 32]>,
+    pub owner_automation: bool,
 }
 
 struct RetainedSwitch {
     request: SwitchRequest,
     provider_failure: Option<ProviderSwitchFailure>,
     profile_authority: Option<[u8; 32]>,
+    owner_automation: bool,
 }
 
 fn decode_switch(mut args: Value) -> Result<RetainedSwitch> {
@@ -63,11 +66,18 @@ fn decode_switch(mut args: Value) -> Result<RetainedSwitch> {
         .map(serde_json::from_value)
         .transpose()
         .map_err(|_| malformed())?;
+    let owner_automation = args_map
+        .remove(OWNER_AUTOMATION)
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|_| malformed())?
+        .unwrap_or(false);
     let request = serde_json::from_value(args).map_err(|_| malformed())?;
     Ok(RetainedSwitch {
         request,
         provider_failure: failure.map(|kind| ProviderSwitchFailure { kind, authority }),
         profile_authority,
+        owner_automation,
     })
 }
 
@@ -81,9 +91,10 @@ pub(super) fn reserve_rule_switch_tx(
 ) -> Result<Change<SwitchResponse>> {
     owner(principal)?;
     request.validate()?;
-    let args = serde_json::to_value(request)
+    let mut args = serde_json::to_value(request)
         .map_err(|_| Error::new("internal", "cannot encode rule switch"))?;
     let digest = canonical::digest(&args)?;
+    args[OWNER_AUTOMATION] = json!(true);
     if policy.contains_value(&args) {
         return Err(Error::new(
             "secret_in_payload",
@@ -221,6 +232,14 @@ pub(super) fn reserve_provider_switch_tx(
         .map_err(|_| Error::new("internal", "cannot encode provider switch"))?;
     args[PROVIDER_FAILURE] = json!(restriction.kind);
     args[PROVIDER_AUTHORITY] = json!(core::provider_switch_authority(&agent.profile_snapshot)?);
+    if agent
+        .profile_choice
+        .as_ref()
+        .is_some_and(|choice| choice.owner_automation)
+        || command_cause_tx(tx, task)?.is_some_and(|cause| cause.rule.is_some())
+    {
+        args[OWNER_AUTOMATION] = json!(true);
+    }
     let digest = canonical::digest(&args)?;
     events.extend(reserve_switch_tx(tx, &request, args, &digest, now)?.events);
     events.push(insert_daemon_event(
@@ -392,7 +411,25 @@ impl Store {
                 request,
                 provider_failure,
                 profile_authority,
+                owner_automation,
             } = decode_switch(command.args)?;
+            let owner_automation = owner_automation
+                || profile_authority.is_some()
+                || command_cause_tx(&tx, id)?.is_some_and(|cause| cause.rule.is_some())
+                || (provider_failure.is_some()
+                    && command_cause_tx(&tx, &request.task_command)?
+                        .is_some_and(|cause| cause.rule.is_some()))
+                || tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM events
+                      WHERE agent=?1 AND generation=?2
+                        AND kind='x.user.agent.attention_step'
+                        AND json_extract(data,'$.step')='switch_for_session_growth'
+                        AND json_extract(data,'$.command_id')=?3)",
+                        params![parse_agent_id(&request.from)?, request.from_generation, id],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .map_err(sql_error)?;
             update_command_state(
                 &tx,
                 id,
@@ -417,6 +454,7 @@ impl Store {
                     plan: value,
                     provider_failure,
                     profile_authority,
+                    owner_automation,
                 }),
                 events,
             })

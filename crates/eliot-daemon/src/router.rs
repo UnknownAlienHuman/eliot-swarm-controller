@@ -511,6 +511,7 @@ impl Router {
         let context = SubmissionContext {
             remote: remote.as_ref(),
             owner_process: owner_process.as_ref(),
+            owner_automation: false,
         };
         let result = self
             .handle_authorized(method, params, principal, context)
@@ -2524,7 +2525,7 @@ impl Router {
 
     pub(crate) async fn prepare_owner_submission(
         &self,
-        request: SubmitCommand,
+        mut request: SubmitCommand,
     ) -> Result<PreparedSubmission> {
         if request.verb == "git.integrate" {
             return self
@@ -2538,7 +2539,20 @@ impl Router {
         }
         validate_rule_launch_action(&request, None)?;
         validate_rule_resume_action(&request, None)?;
-        let prepared = self.prepare_submission(request, &Principal::Owner).await?;
+        authorize_command(&Principal::Owner, &mut request)?;
+        let prepared = self
+            .prepare_submission_with_routing(
+                request,
+                &Principal::Owner,
+                false,
+                false,
+                routing::LaunchRouting {
+                    owner_automation: true,
+                    ..Default::default()
+                },
+                false,
+            )
+            .await?;
         validate_rule_launch_preparation(&prepared)?;
         validate_rule_resume_preparation(&prepared, None)?;
         Ok(prepared)
@@ -2983,7 +2997,7 @@ impl Router {
             principal,
             project_authority_preverified,
             submission_scope_preverified,
-            false,
+            routing::LaunchRouting::default(),
             false,
         )
         .await
@@ -2995,7 +3009,7 @@ impl Router {
         principal: &Principal,
         project_authority_preverified: bool,
         submission_scope_preverified: bool,
-        arbitrated: bool,
+        routing: routing::LaunchRouting,
         defer_launch_goal: bool,
     ) -> Result<PreparedSubmission> {
         if request
@@ -3081,7 +3095,7 @@ impl Router {
                             &mut request,
                             resolve_project,
                             parent_workspace_shared,
-                            arbitrated,
+                            routing,
                         )
                         .await?;
                     if !defer_launch_goal {
@@ -3318,10 +3332,10 @@ impl Router {
         request: &mut SubmitCommand,
         resolve_project: bool,
         parent_workspace_shared: bool,
-        arbitrated: bool,
+        routing: routing::LaunchRouting,
     ) -> Result<Option<WorkspacePreparationInput>> {
         if self
-            .freeze_launch_profile(principal, request, arbitrated)
+            .freeze_launch_profile(principal, request, routing)
             .await?
         {
             self.freeze_project_command_guards(request).await?;
@@ -3604,7 +3618,7 @@ impl Router {
         &self,
         principal: &Principal,
         request: &mut SubmitCommand,
-        arbitrated: bool,
+        routing: routing::LaunchRouting,
     ) -> Result<bool> {
         if self.hydrate_retained_launch(request).await? {
             return Ok(true);
@@ -3745,7 +3759,7 @@ impl Router {
 
         if request.args.get("profile").is_none() {
             let (name, harness, mut snapshot) = self
-                .route_launch_profile(principal, request, arbitrated)
+                .route_launch_profile(principal, request, routing)
                 .await?;
             request.args["profile"] = Value::String(name.clone());
             if harness == "claude" {
@@ -3905,6 +3919,14 @@ impl Router {
             let store = self.inner.store.lock().await;
             hierarchy::check_agent_launch_authority(&store, principal, request)?;
         }
+        self.check_explicit_launch_quota(
+            principal,
+            routing,
+            &profile_name,
+            &harness,
+            &request.args["profile_snapshot"],
+        )
+        .await?;
         Ok(false)
     }
 

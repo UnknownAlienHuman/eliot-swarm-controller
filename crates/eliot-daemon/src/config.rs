@@ -1307,6 +1307,10 @@ struct ProfileEntry {
     #[serde(default)]
     context_ceiling_tokens: Option<i64>,
     #[serde(default)]
+    quota_reserve_percent: Option<i64>,
+    #[serde(default)]
+    quota_unknown: Option<String>,
+    #[serde(default)]
     cmd: Option<String>,
     #[serde(default)]
     model: Option<String>,
@@ -1348,6 +1352,33 @@ struct ProfileEntry {
     scratch: Vec<String>,
     #[serde(default)]
     local_provider: Option<core::local_provider::LocalProvider>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum QuotaUnknownPolicy {
+    #[default]
+    Admit,
+    Hold,
+}
+
+/// Read the frozen percentage, defaulting older profile snapshots to zero.
+pub(crate) fn profile_quota_reserve_percent(snapshot: &Value) -> u8 {
+    snapshot
+        .get("quota_reserve_percent")
+        .and_then(Value::as_u64)
+        .and_then(|value| u8::try_from(value).ok())
+        .filter(|value| *value <= 100)
+        .unwrap_or_default()
+}
+
+/// Read the frozen unknown-quota policy, defaulting older snapshots to admit.
+pub(crate) fn profile_quota_unknown_policy(snapshot: &Value) -> QuotaUnknownPolicy {
+    match snapshot.get("quota_unknown") {
+        None => QuotaUnknownPolicy::Admit,
+        Some(Value::String(value)) if value == "admit" => QuotaUnknownPolicy::Admit,
+        Some(Value::String(value)) if value == "hold" => QuotaUnknownPolicy::Hold,
+        Some(_) => QuotaUnknownPolicy::Hold,
+    }
 }
 
 fn configured_route_credential_env_names(
@@ -1507,10 +1538,16 @@ fn resolve_profile_in(config: &FileConfig, source: &str, name: &str) -> core::Re
             format!("config.toml: profiles.{name}: profile not found"),
         )
     })?;
-    let mut snapshot = snapshot_from_entry(name, entry.get_ref(), entry.span().start, source)?;
+    let site = ProfileSite {
+        name,
+        source,
+        offset: entry.span().start,
+    };
+    let mut snapshot = snapshot_from_entry(name, entry.get_ref(), site.offset, source)?;
     if let Some(ceiling) = entry.get_ref().context_ceiling_tokens {
         snapshot["context_ceiling_tokens"] = json!(ceiling);
     }
+    freeze_profile_quota_policy(&mut snapshot, site, entry.get_ref())?;
     // Freeze the configured cloud MCP hostname (if any) beside the MCP
     // policy so harness plugins can apply the owner-identity HTTP arm
     // without reading owner config. Snapshots that predate the field read
@@ -1537,6 +1574,54 @@ fn resolve_profile_in(config: &FileConfig, source: &str, name: &str) -> core::Re
         source,
         snapshot,
     )
+}
+
+/// Freeze the daemon's routing quota policy with every resolved profile.
+fn freeze_profile_quota_policy(
+    snapshot: &mut Value,
+    site: ProfileSite<'_>,
+    entry: &ProfileEntry,
+) -> core::Result<()> {
+    let reserve_percent = entry.quota_reserve_percent.unwrap_or_default();
+    if !(0..=100).contains(&reserve_percent) {
+        return Err(site.error(
+            "quota_reserve_percent",
+            "must be an integer from 0 through 100",
+            "profile_error",
+        ));
+    }
+    let reserve_percent = u64::try_from(reserve_percent).map_err(|_| {
+        site.error(
+            "quota_reserve_percent",
+            "must be an integer from 0 through 100",
+            "profile_error",
+        )
+    })?;
+    let quota_unknown = validated_choice(
+        site,
+        "quota_unknown",
+        entry.quota_unknown.as_deref(),
+        &["admit", "hold"],
+        "must be admit or hold",
+        "profile_error",
+    )?
+    .unwrap_or("admit");
+    let snapshot = snapshot.as_object_mut().ok_or_else(|| {
+        core::Error::new("internal", "resolved profile snapshot must be an object")
+    })?;
+    if reserve_percent > 0 {
+        snapshot.insert(
+            "quota_reserve_percent".to_owned(),
+            Value::from(reserve_percent),
+        );
+    }
+    if quota_unknown != "admit" {
+        snapshot.insert(
+            "quota_unknown".to_owned(),
+            Value::String(quota_unknown.to_owned()),
+        );
+    }
+    Ok(())
 }
 
 /// Freeze the owner-configured Agent child allow-list for this profile.

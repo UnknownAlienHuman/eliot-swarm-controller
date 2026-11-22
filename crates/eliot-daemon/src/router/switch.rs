@@ -132,6 +132,7 @@ impl Router {
             plan,
             provider_failure,
             profile_authority,
+            owner_automation,
         }) = work
         else {
             return;
@@ -183,10 +184,21 @@ impl Router {
                     .to_owned(),
             };
             launch.args = request.launch.args(&workspace)?;
+            let mut owner_automation = owner_automation;
             let provider_route = if let Some(failure) = provider_failure {
                 let authority = failure.require_authority(&source.profile_snapshot)?;
+                owner_automation |= source
+                    .profile_choice
+                    .as_ref()
+                    .is_some_and(|choice| choice.owner_automation);
                 let (name, identity) = self
-                    .route_provider_switch(&mut launch, &source, failure.kind, authority)
+                    .route_provider_switch(
+                        &mut launch,
+                        &source,
+                        failure.kind,
+                        authority,
+                        owner_automation,
+                    )
                     .await?;
                 launch.args["profile"] = json!(name);
                 Some((launch.args["profile_choice"].take(), identity))
@@ -230,7 +242,10 @@ impl Router {
                     &Principal::Owner,
                     false,
                     false,
-                    false,
+                    routing::LaunchRouting {
+                        owner_automation,
+                        ..Default::default()
+                    },
                     true,
                 )
                 .await?;

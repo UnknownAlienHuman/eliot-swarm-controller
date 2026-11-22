@@ -2147,10 +2147,7 @@ async fn reconcile_due_timers_with_arbitration(
                     let retained = router.arbitration_timer_wait(&state).await?;
                     let retained_wait = retained.as_ref().map(|(_, wait)| wait);
                     let route = retained_wait.and_then(|wait| wait.route.clone());
-                    let wait_copy = retained_wait.map(|wait| eliot_store::TimerWait {
-                        reason: wait.reason.clone(),
-                        route: wait.route.clone(),
-                    });
+                    let wait_copy = retained_wait.cloned();
                     let project = match router.queued_launch_project(&action).await {
                         Ok(project) => project,
                         Err(error) => {
@@ -2228,7 +2225,8 @@ async fn reconcile_due_timers_with_arbitration(
             match head {
                 Head::Interactive(intent) => {
                     if intent.view.reason.as_ref().is_some_and(|reason| {
-                        reason.code == "capacity_unavailable"
+                        intent.route.is_some()
+                            && reason.code == "capacity_unavailable"
                             && blocked_scopes.contains(&reason.scope)
                     }) {
                         continue;
@@ -2259,7 +2257,8 @@ async fn reconcile_due_timers_with_arbitration(
                     } = *timer_head;
                     attempted_assignments.push(index);
                     if retained_wait.as_ref().is_some_and(|wait| {
-                        wait.reason.code == "capacity_unavailable"
+                        wait.route.is_some()
+                            && wait.reason.code == "capacity_unavailable"
                             && blocked_scopes.contains(&wait.reason.scope)
                     }) {
                         if let Some(timer) = rules[index].timer.as_mut() {
@@ -2270,6 +2269,9 @@ async fn reconcile_due_timers_with_arbitration(
                     let arb = eliot_store::ArbitratedTimer {
                         project,
                         route,
+                        owner_automation: retained_wait
+                            .as_ref()
+                            .is_none_or(|wait| wait.owner_automation),
                         wait: None,
                         blocked_scopes: blocked_scopes.clone(),
                     };
@@ -2420,8 +2422,10 @@ async fn reconcile_timer(
                                             .prepare_project_rule_submission(action, project)
                                             .await
                                     }
-                                    None if arbitration.is_some() => {
-                                        router.prepare_assignment_launch(action).await
+                                    None if let Some(arb) = &arbitration => {
+                                        router
+                                            .prepare_assignment_launch(action, arb.owner_automation)
+                                            .await
                                     }
                                     None => router.prepare_owner_submission(action).await,
                                 },
@@ -2454,9 +2458,10 @@ async fn reconcile_timer(
                         match crate::router::launch_queue::checked_route(
                             &prepared.request,
                             arb.route.as_deref(),
+                            arb.owner_automation,
                         ) {
                             Ok(route) => {
-                                arb.route = Some(route);
+                                arb.route = route;
                                 Ok(prepared)
                             }
                             Err(error) => Err(error),
@@ -2468,17 +2473,21 @@ async fn reconcile_timer(
                     && let Err(error) = &prepared
                     && assignment_unavailable.is_none()
                 {
-                    arb.wait = eliot_store::TimerWait::from_error(error, arb.route.clone())
-                        .map(|wait| wait.reason)
-                        .or_else(|| {
-                            (!is_deterministic_pre_admission_rejection(&error.code)
-                                && router.rule_firings_open())
-                            .then(|| eliot_core::api::LaunchWaitReason {
-                                code: error.code.clone(),
-                                scope: "assignment".into(),
-                                changed_by: "owner".into(),
-                            })
-                        });
+                    arb.wait = eliot_store::TimerWait::from_error(
+                        error,
+                        arb.route.clone(),
+                        arb.owner_automation,
+                    )
+                    .map(|wait| wait.reason)
+                    .or_else(|| {
+                        (!is_deterministic_pre_admission_rejection(&error.code)
+                            && router.rule_firings_open())
+                        .then(|| eliot_core::api::LaunchWaitReason {
+                            code: error.code.clone(),
+                            scope: "assignment".into(),
+                            changed_by: "owner".into(),
+                        })
+                    });
                 }
                 if let Some(code) = assignment_unavailable {
                     if !router.rule_firings_open() {

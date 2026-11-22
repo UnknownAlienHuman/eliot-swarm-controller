@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 89;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 91;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -2157,6 +2157,21 @@ impl Store {
                  CREATE INDEX git_integration_cleanup
                      ON git_integration_custody(common_dir) WHERE cleaned = 0;
                  INSERT INTO schema_migrations(version) VALUES (89);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 91 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE launch_intents ADD COLUMN owner_automation INTEGER NOT NULL
+                     DEFAULT 0 CHECK(owner_automation IN (0,1));
+                 ALTER TABLE assignment_waits ADD COLUMN owner_automation INTEGER NOT NULL
+                     DEFAULT 1 CHECK(owner_automation IN (0,1));
+                 INSERT INTO schema_migrations(version) VALUES(91);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;

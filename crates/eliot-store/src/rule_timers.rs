@@ -476,6 +476,7 @@ impl Store {
                 &crate::TimerWait {
                     reason,
                     route: arbitration.route.clone(),
+                    owner_automation: arbitration.owner_automation,
                 },
             )?;
             commit_transaction(tx, &self.write_faulted)?;
@@ -593,8 +594,11 @@ impl Store {
                     }
                     Err(error)
                         if let Some(arbitration) = &arbitration
-                            && let Some(wait) =
-                                crate::TimerWait::from_error(&error, arbitration.route.clone()) =>
+                            && let Some(wait) = crate::TimerWait::from_error(
+                                &error,
+                                arbitration.route.clone(),
+                                arbitration.owner_automation,
+                            ) =>
                     {
                         crate::launch_queue::write_timer_wait(
                             &tx,

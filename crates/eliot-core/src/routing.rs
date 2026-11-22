@@ -21,6 +21,9 @@ pub struct RoutingDecision {
     /// Frozen, ordered tail of an Owner's opted-in role launch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_failover: Option<Vec<String>>,
+    /// Preserve automation admission policy on a provider successor.
+    #[serde(default, skip_serializing_if = "crate::is_false")]
+    pub owner_automation: bool,
 }
 
 /// Why an ordered routing candidate was not selected.
@@ -31,6 +34,8 @@ pub enum RouteSkipReason {
     ProviderHold,
     ProviderFailure,
     QuotaExhausted,
+    QuotaReserve,
+    QuotaUnknown,
     CapacityFull,
     Unauthorized,
     InvalidProfile,
@@ -43,6 +48,8 @@ impl RouteSkipReason {
             Self::ProviderHold => "provider on hold",
             Self::ProviderFailure => "provider refused the previous attempt",
             Self::QuotaExhausted => "quota used up",
+            Self::QuotaReserve => "owner quota reserve",
+            Self::QuotaUnknown => "quota unknown and profile requires a reading",
             Self::CapacityFull => "at capacity",
             Self::Unauthorized => "not allowed here",
             Self::InvalidProfile => "profile does not resolve",

@@ -641,6 +641,12 @@ resume without new text, readback, request replies, interrupt and stop remain av
 Resume with text is a linked send and remains gated. Steer remains bound to its exact
 active turn and generation.
 
+The [Owner quota reserve](configuration.md#owner-quota-reserve-872) is a separate
+daemon admission policy for new automatic launches. It uses fresh passive quota
+readback and the existing routing and launch wait paths. Skipping a candidate on
+reserve or unknown quota creates no provider hold, consumes no probe claim and
+does not affect work already admitted.
+
 Rate-limit and quota holds permit at most one SEND probe claim per frozen provider
 scope in Store. An explicit `probe=true` SEND uses ordinary authorization and exact
 target/scope/generation fences. Daemon maintenance currently probes Codex profiles

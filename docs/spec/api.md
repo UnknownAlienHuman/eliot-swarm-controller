@@ -2285,6 +2285,19 @@ call it available. With no observation, or no installed MSP method, Muse
 returns `unsupported` and its reason. No quota query starts a turn, performs
 inference or polls Agents. CLI: `swarm quota --harness H [--profile P]`.
 
+The quota response includes the effective [Owner reserve](configuration.md#owner-quota-reserve-872)
+and `swarm quota` displays it with the recommended setting of 20%. For current
+account-wide windows with known bounds, the command reports retained Swarm
+usage for the selected profile route by Owner and automation, with coverage.
+The provider reports account-wide percentages. Per-caller usage uses native
+Swarm turn counters because the provider supplies no per-caller quota debit.
+The reserve readback reports unknown when the observed windows map to no model
+on the route, and exposes the profile's unknown-quota policy.
+
+An automatic launch refused by the reserve or unknown-reading policy returns
+`quota_reserve` or `quota_unknown`. Role-routed refusals include the typed
+candidate skips in `Error.routing`. A queued launch or arbitrated assignment
+can publish either code as its waiting reason before admission.
 
 `profile.list` (`ProfileListRequest`/`ProfileListResponse`, no params) returns the
 current `config.toml` revision, whether it parses, and per profile the name,

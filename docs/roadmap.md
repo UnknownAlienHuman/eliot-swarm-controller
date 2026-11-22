@@ -31,6 +31,12 @@ See AGENTS.md for the work loop.
         next eligible profile after a confirmed pre-work refusal. A private Windows
         daemon switched a Codex HTTP 429 to a successful turn in the same worktree
         and showed the decision in `swarm why`.
+      - [x] **Owner quota reserve (#872).** On a private Windows daemon, the
+        reserve refused an automatic Claude child and timer launch while the
+        Owner's Claude launch completed. A worker role recorded `quota_reserve`
+        and selected an OpenCode free profile that completed a native turn.
+        `swarm quota` showed retained Owner and automation usage in the active
+        Claude account windows.
 - [x] **S4 Assignment through automation.** Settings-managed existing rules/timers
       keep a configured number of Agents busy on a brief queue through ordinary
       routing-aware launch; retain exact command identity and unknown gates.

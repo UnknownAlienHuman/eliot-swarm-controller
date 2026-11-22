@@ -1408,6 +1408,33 @@ desktop shows it on the composer's Auto chip. Same-ID replay returns the frozen 
 Provider holds and capacity are rechecked transactionally at admission;
 a concurrent state change can refuse an otherwise prepared choice before dispatch.
 
+#### Owner quota reserve (#872)
+
+Set `quota_reserve_percent` on a named profile to an integer from 0 through 100.
+It defaults to 0. The recommended reserve is 20, which keeps the final 20
+percentage points of each applicable provider window for the Owner. A new
+automatic launch skips the route with `quota_reserve` when current usage of any
+applicable window is strictly greater than `100 - quota_reserve_percent`.
+`quota_unknown = "admit"` is the default. Set it to `"hold"` to skip with
+`quota_unknown` when no current applicable numerical reading is available,
+including when all observed windows are unmapped or the reader is unsupported.
+`swarm quota` shows the route's reserve readback and unknown policy.
+The current profile settings apply even when
+a child inherits its manager's previously frozen native route.
+
+The reserve applies to new Agent children, automated assignments, and rule and
+timer launches, including explicit profile choices. Owner-initiated launches and
+messages, in-flight turns, and Goal continuations of existing Agents are exempt.
+Provider holds and real provider limits retain their existing force.
+An automatic role with a configured quota policy tries eligible candidates with
+headroom. It prefers the lowest observed weekly usage, using the most-used
+applicable weekly window for a route. Candidates with a weekly reading precede
+those without one, and configured order breaks ties. Roles with both default
+settings throughout keep their existing ordering. Arbitration retains the
+automation class of waiting work. A waiting automatic role launch evaluates
+its configured candidates again on each attempt. A waiting explicit profile
+launch keeps its original route binding.
+
 `on_provider_failure` defaults to `stop`. With `next`, an Owner's role-routed
 launch in a project freezes the remaining candidate order. The daemon may continue
 the original launch input after a structured quota, rate-limit or access refusal
@@ -1421,6 +1448,7 @@ The daemon reuses the [switch and handoff](coordination.md#agent-switch-implemen
 transaction with fresh command IDs, the retained workspace and the next eligible
 candidate. Each switch consumes part of the frozen order. `swarm why` reports
 the refusal, skipped profiles and, when admitted, the successor and input command.
+An automated launch's provider successor applies the same quota admission policy.
 
 ### CLI editing
 

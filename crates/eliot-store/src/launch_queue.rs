@@ -25,6 +25,7 @@ pub struct PendingLaunch {
     pub request: SubmitCommand,
     pub created_at: i64,
     pub route: Option<String>,
+    pub owner_automation: bool,
     parent_generation: Option<i64>,
     assignment_epoch: Option<i64>,
     remote: Option<core::RemoteCallContext>,
@@ -34,17 +35,24 @@ pub struct PendingLaunch {
 pub struct ArbitratedTimer {
     pub project: String,
     pub route: Option<String>,
+    pub owner_automation: bool,
     pub wait: Option<LaunchWaitReason>,
     pub blocked_scopes: std::collections::HashSet<String>,
 }
 
+#[derive(Clone)]
 pub struct TimerWait {
     pub reason: LaunchWaitReason,
     pub route: Option<String>,
+    pub owner_automation: bool,
 }
 
 impl TimerWait {
-    pub fn from_error(error: &Error, route: Option<String>) -> Option<Self> {
+    pub fn from_error(
+        error: &Error,
+        route: Option<String>,
+        owner_automation: bool,
+    ) -> Option<Self> {
         let scope = match error.code.as_str() {
             "capacity_unavailable" => error
                 .message
@@ -59,6 +67,7 @@ impl TimerWait {
                 .strip_prefix("provider scope ")
                 .and_then(|text| text.split_once(" is held"))
                 .map_or("profile", |(scope, _)| scope),
+            "quota_reserve" | "quota_unknown" => "profile",
             "transfer_in_progress" => "transfer",
             "workspace_unavailable" => "workspace",
             _ => return None,
@@ -79,6 +88,7 @@ impl TimerWait {
                 .to_owned(),
             },
             route,
+            owner_automation,
         })
     }
 }
@@ -201,8 +211,8 @@ impl Store {
             };
             insert_receipt(&tx, &original.id, principal, METHOD, &digest, &view, now)?;
             tx.execute(
-                "INSERT INTO launch_intents(id,project,request,parent_generation,assignment_epoch,remote_context,owner_process)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                "INSERT INTO launch_intents(id,project,request,parent_generation,assignment_epoch,remote_context,owner_process,owner_automation)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                 params![
                     original.id,
                     project,
@@ -211,6 +221,7 @@ impl Store {
                     assignment_epoch,
                     context.remote.map(encode_json).transpose()?,
                     context.owner_process.map(encode_json).transpose()?,
+                    context.owner_automation,
                 ],
             )
             .map_err(sql_error)?;
@@ -243,7 +254,7 @@ impl Store {
     pub fn pending_launches(&self) -> Result<Vec<PendingLaunch>> {
         self.ensure_committed_reads()?;
         let mut statement = self.connection.prepare(
-            "SELECT w.result,w.principal,q.request,w.created_at,q.route,q.parent_generation,q.assignment_epoch,q.remote_context,q.owner_process
+            "SELECT w.result,w.principal,q.request,w.created_at,q.route,q.parent_generation,q.assignment_epoch,q.remote_context,q.owner_process,q.owner_automation
              FROM launch_intents q JOIN writes w USING (id)
              ORDER BY w.created_at,q.rowid",
         ).map_err(sql_error)?;
@@ -259,6 +270,7 @@ impl Store {
                     r.get(6)?,
                     r.get::<_, Option<String>>(7)?,
                     r.get::<_, Option<String>>(8)?,
+                    r.get(9)?,
                 ))
             })
             .map_err(sql_error)?;
@@ -273,6 +285,7 @@ impl Store {
                 assignment_epoch,
                 remote,
                 owner_process,
+                owner_automation,
             ) = row.map_err(sql_error)?;
             Ok(PendingLaunch {
                 view: decode(&view)?,
@@ -280,6 +293,7 @@ impl Store {
                 request: decode(&request)?,
                 created_at,
                 route,
+                owner_automation,
                 parent_generation,
                 assignment_epoch,
                 remote: remote.as_deref().map(decode).transpose()?,
@@ -401,24 +415,25 @@ impl Store {
 
     pub fn timer_wait(&self, state: &TimerStateView) -> Result<Option<(String, TimerWait)>> {
         self.ensure_committed_reads()?;
-        let row: Option<(String, String, Option<String>)> = self
+        let row: Option<(String, String, Option<String>, bool)> = self
             .connection
             .query_row(
                 &format!(
-                    "SELECT w.project,w.reason,w.route FROM {CURRENT_WAITS}
+                    "SELECT w.project,w.reason,w.route,w.owner_automation FROM {CURRENT_WAITS}
                       WHERE paused.rule IS NULL AND w.timer=?1 AND w.revision=?2 AND w.due=?3"
                 ),
                 params![state.id, state.schedule_revision, state.next_due_at],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()
             .map_err(sql_error)?;
-        row.map(|(project, reason, route)| {
+        row.map(|(project, reason, route, owner_automation)| {
             Ok((
                 project,
                 TimerWait {
                     reason: decode(&reason)?,
                     route,
+                    owner_automation,
                 },
             ))
         })
@@ -551,17 +566,19 @@ pub(super) fn write_timer_wait(
     wait: &TimerWait,
 ) -> Result<()> {
     tx.execute(
-        "INSERT INTO assignment_waits(timer,revision,due,project,reason,route)
-         VALUES (?1,?2,?3,?4,?5,?6)
+        "INSERT INTO assignment_waits(timer,revision,due,project,reason,route,owner_automation)
+         VALUES (?1,?2,?3,?4,?5,?6,?7)
          ON CONFLICT(timer) DO UPDATE SET revision=excluded.revision,due=excluded.due,
-             project=excluded.project,reason=excluded.reason,route=excluded.route",
+             project=excluded.project,reason=excluded.reason,route=excluded.route,
+             owner_automation=excluded.owner_automation",
         params![
             state.id,
             state.schedule_revision,
             state.next_due_at,
             project,
             encode_json(&wait.reason)?,
-            wait.route
+            wait.route,
+            wait.owner_automation
         ],
     )
     .map_err(sql_error)?;

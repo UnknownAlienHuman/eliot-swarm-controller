@@ -40,8 +40,12 @@ impl Router {
                     normalize_launch(&mut launch, principal)?;
                     launch.args["project"] = json!(source.project_scope());
                     launch.args["registered_project"] = json!(source.project);
-                    self.freeze_launch_profile(principal, &mut launch, false)
-                        .await?;
+                    self.freeze_launch_profile(
+                        principal,
+                        &mut launch,
+                        routing::LaunchRouting::default(),
+                    )
+                    .await?;
                     super::project_checks::freeze_launch_goal(self, &mut launch, principal).await?;
                     if policy.contains_value(&launch.args) {
                         return Err(Error::new(
@@ -177,7 +181,7 @@ impl Router {
                         "adopted checkout is outside this project repository",
                     ));
                 }
-                self.freeze_launch_profile(principal, &mut launch, false).await?;
+                self.freeze_launch_profile(principal, &mut launch, routing::LaunchRouting::default()).await?;
                 self.freeze_project_command_guards(&mut launch).await?;
                 None
             } else {
@@ -196,7 +200,7 @@ impl Router {
                 launch.args["auto_worktree"] =
                     json!({"project": logical, "task": "manager"});
                 let input = self
-                    .freeze_launch_admission(principal, &mut launch, false, false, false)
+                    .freeze_launch_admission(principal, &mut launch, false, false, routing::LaunchRouting::default())
                     .await?;
                 Some(input.ok_or_else(|| {
                     Error::new("internal", "manager worktree was not frozen")

@@ -575,6 +575,7 @@ impl Store {
         let SubmissionContext {
             remote,
             owner_process,
+            ..
         } = context;
         if remote.is_none() && owner_process.is_none() {
             return self.submit_inner_checked(principal, request, preparation, now);
@@ -4670,15 +4671,17 @@ pub struct OwnerProcess {
 pub struct SubmissionContext<'a> {
     pub remote: Option<&'a core::RemoteCallContext>,
     pub owner_process: Option<&'a OwnerProcess>,
+    /// Internal admission provenance for a deferred launch.
+    pub owner_automation: bool,
 }
 
 impl SubmissionContext<'_> {
     fn validate(self, principal: &str) -> Result<()> {
         validate_remote_command_context(principal, self.remote)?;
-        if self.owner_process.is_some() && principal != "owner" {
+        if (self.owner_process.is_some() || self.owner_automation) && principal != "owner" {
             return Err(Error::new(
                 "not_allowed",
-                "Owner process metadata requires an Owner submission",
+                "Owner provenance requires an Owner submission",
             ));
         }
         Ok(())
