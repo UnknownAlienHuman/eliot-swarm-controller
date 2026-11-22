@@ -896,6 +896,17 @@ before atomic child admission. The interpreter and `run_env` approvals are part 
 canonical project registration snapshot/revision and are revalidated at admission and
 dispatch.
 
+For an event-triggered Run, a captured `subject.workspace` selects the triggering
+Agent's event-time worktree as the process working directory. This working directory
+does not change the registered checkout's `.eliot/scripts/` entry root or its file and
+interpreter validation. A project Run uses that worktree only when Git confirms it
+shares the registered repository's common directory; a foreign repository is rejected
+before spawn. A relative `cwd` is resolved and contained beneath the selected worktree.
+An Owner-approved absolute `cwd` keeps its existing path policy. When the event has no
+workspace, the Run's configured `cwd` policy applies. Script stdin presents Windows
+verbatim workspace paths in display form; the persisted event and frozen command keep
+the original path identity.
+
 Load project rules only from the registered checkout's `.eliot/rules/*.toml`, never from
 an Agent worktree. Project rule files have principal `project:ID`. The owner registration
 approves the profile, action, interpreter and `run_env` sets; project files cannot define
@@ -1372,15 +1383,18 @@ secrets then reach the process. It is not default. Route/account selectors still
 explicit. Credential rotation may change authentication success but must not silently
 select another account/provider.
 
-Project script `run.env` is separate from profile `env` and `pass_env`: the child receives
-the minimal platform baseline, literal values for owner-approved `run_env` names and its
-Run identity. On Windows the baseline reads `SystemRoot` and `PATHEXT` from the
-daemon OS environment and fails before spawn if either is absent; it does not add
-`PATH`. It does not inherit arbitrary owner/Agent environment, profile secrets or route/account
-credentials and selectors. `run_env` cannot name Eliot/Agent/Run identity, credential,
-route/account, native-store selector, Git identity, `PATH` or other reserved environment names;
-names compare case-insensitively on Windows. Project values cannot override the
-role-specific Run variables.
+Goal checks and Run scripts use one explicit platform base environment, built after
+clearing the daemon environment. It includes `PATH`, temporary-directory variables and
+the platform home/profile variables; Windows also carries `SystemRoot`, `SystemDrive`,
+`WINDIR`, `PATHEXT` and `COMSPEC`, while Unix carries the user and locale variables.
+Windows still requires `SystemRoot` and `PATHEXT` before spawn. The base does not copy
+arbitrary daemon or Agent variables, profile secrets, or route/account credentials and
+selectors. Project script `run.env` is separate from profile `env` and `pass_env`: only
+Run scripts add literal values for owner-approved `run_env` names and their Run identity.
+Goal checks receive no action-specific environment. `run_env` cannot name
+Eliot/Agent/Run identity, credential, route/account, native-store selector, Git identity,
+`PATH` or other reserved environment names; names compare case-insensitively on Windows.
+Project values cannot override the role-specific Run variables.
 
 Mask known secret values in native output and reject them in caller durable text.
 Private routing tokens are handled separately from semantic profile data. Native

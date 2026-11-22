@@ -112,6 +112,33 @@ pub(crate) fn record(
     write_record(policy, code, ids, None, None, error)
 }
 
+pub(crate) fn record_repeated_rule_failure(
+    policy: &SecretPolicy,
+    principal: &str,
+    rule: &str,
+    code: &str,
+    message: &str,
+    count: u32,
+) {
+    let detail = Map::from_iter([
+        (
+            "principal".to_owned(),
+            json!(bounded_text(policy, principal, 256)),
+        ),
+        ("rule".to_owned(), json!(bounded_text(policy, rule, 256))),
+        (
+            "failure_code".to_owned(),
+            json!(bounded_text(policy, code, 64)),
+        ),
+        (
+            "message".to_owned(),
+            json!(bounded_text(policy, message, 512)),
+        ),
+        ("count".to_owned(), json!(count)),
+    ]);
+    write_record(policy, "repeated", &[], None, Some(detail), None);
+}
+
 /// Debug-only record: typed nonnegative numeric fields next to bounded
 /// string ids. Numbers are encoded as JSON numbers; callers pass no
 /// free-form text here, so secrets cannot enter through this path. Dropped

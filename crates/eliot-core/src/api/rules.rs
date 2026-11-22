@@ -1,8 +1,109 @@
 //! Typed Core inputs for rule limits and explicit retained-history catch-up.
 
-use crate::{Command, Error, Result};
+use crate::{Command, CommandState, Error, Result, StderrSnapshot};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+
+pub const MAX_RULE_REJECTION_MESSAGE_BYTES: usize = 512;
+pub const MAX_RULE_SHOW_STDERR_LINES: usize = 8;
+pub const MAX_RULE_SHOW_STDERR_BYTES: usize = 1_024;
+
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleShowView {
+    #[serde(flatten)]
+    pub state: super::reads::RuleStateView,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_outcome: Option<RuleLastOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_refusal: Option<RuleLastRefusal>,
+}
+
+impl RuleShowView {
+    pub fn validate(&self) -> Result<()> {
+        self.state.validate()?;
+        if self
+            .last_outcome
+            .as_ref()
+            .is_some_and(|outcome| outcome.validate().is_err())
+            || self
+                .last_refusal
+                .as_ref()
+                .is_some_and(|refusal| refusal.validate().is_err())
+        {
+            return Err(Error::new("invalid", "rule status view is invalid"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuleLastOutcome {
+    pub settled_at: i64,
+    pub state: CommandState,
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr: Option<StderrSnapshot>,
+}
+
+impl RuleLastOutcome {
+    pub fn validate(&self) -> Result<()> {
+        if self.settled_at < 0
+            || self
+                .stderr
+                .as_ref()
+                .is_some_and(|stderr| stderr.text.len() > MAX_RULE_SHOW_STDERR_BYTES)
+        {
+            return Err(Error::new("invalid", "rule last outcome is invalid"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuleLastRefusal {
+    /// Sequence of the event whose action was refused.
+    pub event_seq: i64,
+    /// Sequence of the retained rejection event.
+    pub recorded_event_seq: i64,
+    pub at: i64,
+    pub code: String,
+    /// Bounded message, falling back to code for older retained events.
+    pub reason: String,
+}
+
+impl RuleLastRefusal {
+    pub fn validate(&self) -> Result<()> {
+        if self.event_seq <= 0
+            || self.recorded_event_seq <= 0
+            || self.at < 0
+            || self.code.trim().is_empty()
+            || self.code.len() > 128
+            || self.reason.trim().is_empty()
+            || self.reason.len() > MAX_RULE_REJECTION_MESSAGE_BYTES
+        {
+            return Err(Error::new("invalid", "rule last refusal is invalid"));
+        }
+        Ok(())
+    }
+}
+
+impl super::reads::RuleGetRequest {
+    pub fn validate_show_response(&self, response: &RuleShowView) -> Result<()> {
+        if self.validate().is_err()
+            || response.state.id != self.id
+            || response.state.project != self.project
+            || response.validate().is_err()
+        {
+            return Err(Error::new(
+                "unknown",
+                "rule.show response does not match the requested rule",
+            ));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

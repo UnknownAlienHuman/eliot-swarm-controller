@@ -3,7 +3,8 @@ use super::args::{
     GoalArgs, GoalClearArgs, GoalCommand, GoalPauseArgs, GoalResumeArgs, GoalRoundArgs,
     GoalSetArgs, GoalShowArgs, ProjectArgs, ProjectCommand, ProjectShowArgs, ProviderArgs,
     ProviderClearHoldArgs, ProviderCommand, ProviderHoldsArgs, RuleArgs, RuleCatchUpArgs,
-    RuleCommand, RuleFileArgs, RuleShowArgs, TimerArgs, TimerCommand, TimerRunArgs, TimerShowArgs,
+    RuleCommand, RuleFileArgs, RuleShowArgs, TimerArgs, TimerCommand, TimerListArgs, TimerRunArgs,
+    TimerShowArgs,
 };
 use super::support::read_and_print;
 use super::support::{Failure, command_value, mutation_id, print_value, response_exit_code};
@@ -16,7 +17,7 @@ use eliot_core::api::{
     ProviderClearHoldResponse, ProviderCorrectiveEvidence, ProviderHoldsRequest,
     ProviderHoldsResponse, RuleCatchUpRequest, RuleDeleteRequest, RuleDeleteResponse,
     RuleGetRequest, RuleListRequest, RuleListResponse, RuleReadRequest, RuleReadResponse,
-    RuleSaveRequest, RuleSaveResponse, RuleStateView, TimerGetRequest, TimerRunRequest,
+    RuleSaveRequest, RuleSaveResponse, RuleShowView, TimerGetRequest, TimerRunRequest,
     TimerStateView,
 };
 use serde_json::Value;
@@ -199,7 +200,18 @@ pub(crate) async fn run_rule(
                 Some(project) => RuleGetRequest::new(id).in_project(project),
                 None => RuleGetRequest::new(id),
             };
-            read_and_print!(&data_dir, json_output, "rule.get", request, RuleStateView)
+            request.validate().map_err(Failure::for_read)?;
+            let response: RuleShowView =
+                eliot_daemon::client_call_typed(&data_dir, "rule.get", &request)
+                    .await
+                    .map_err(Failure::for_read)?;
+            request
+                .validate_show_response(&response)
+                .map_err(Failure::invalid_response)?;
+            let value = serde_json::to_value(response)
+                .map_err(|_| Failure::new(4, "rule.get response is invalid"))?;
+            print_value(&value, json_output);
+            Ok(0)
         }
         RuleCommand::Read(RuleFileArgs { project, path }) => {
             let request = RuleReadRequest { project, path };
@@ -304,6 +316,44 @@ pub(crate) async fn run_timer(
     id: Option<String>,
 ) -> Result<u8, Failure> {
     match command {
+        TimerCommand::List(TimerListArgs {
+            project,
+            after,
+            limit,
+        }) => {
+            let mut request = RuleListRequest {
+                project,
+                after,
+                limit,
+            };
+            request.validate().map_err(Failure::for_read)?;
+            // The RPC pages all rules. Fill a page of timer rows even if
+            // another rule sorts before the first timer.
+            request.limit = limit.max(RuleListRequest::default().limit);
+            let mut timers = Vec::new();
+            while timers.len() < limit {
+                let response: RuleListResponse =
+                    eliot_daemon::client_call_typed(&data_dir, "rule.list", &request)
+                        .await
+                        .map_err(Failure::for_read)?;
+                request
+                    .validate_response(&response)
+                    .map_err(Failure::invalid_response)?;
+                timers.extend(
+                    response
+                        .rules
+                        .into_iter()
+                        .filter(|entry| entry.timer.is_some())
+                        .take(limit - timers.len()),
+                );
+                let Some(next) = response.next else { break };
+                request.after = Some(next);
+            }
+            let next = timers.last().map(|entry| &entry.state.id);
+            let value = json!({"timers": timers, "next": next});
+            print_value(&value, json_output);
+            Ok(0)
+        }
         TimerCommand::Show(TimerShowArgs { id, project }) => {
             let request = match project {
                 Some(project) => TimerGetRequest::new(id).in_project(project),

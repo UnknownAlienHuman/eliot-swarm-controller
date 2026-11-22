@@ -589,13 +589,8 @@ impl Router {
         }
         validate_rule_launch_preparation(&prepared)?;
         validate_rule_resume_preparation(&prepared, project)?;
-        let PreparedSubmission { request, workspace } = prepared;
-        if workspace.is_some() {
-            return Err(Error::new(
-                "invalid",
-                "rule firing cannot contain workspace preparation",
-            ));
-        }
+        // Store admits the validated managed worktree from the frozen launch args.
+        let PreparedSubmission { request, .. } = prepared;
         if request.verb == "run" {
             if !request.id.is_empty()
                 || request.target.is_some()
@@ -703,6 +698,7 @@ impl Router {
         {
             self.schedule_rule_admission(child);
         }
+        self.note_rule_refusals(principal, &admission.events);
         self.signal_progress();
         Ok(Some(admission))
     }
@@ -730,14 +726,23 @@ impl Router {
                     {
                         Ok(frozen) => frozen,
                         Err(_) => {
-                            checked.push(RuleCatchUpAction::rejected(action.event_seq, "invalid"));
+                            checked.push(RuleCatchUpAction::rejected_with_message(
+                                action.event_seq,
+                                "invalid",
+                                "global Run arguments are not frozen",
+                            ));
                             continue;
                         }
                     };
                     match self.verify_global_run(&frozen).await {
                         Ok(_) => checked.push(action.clone()),
                         Err(error) if is_deterministic_pre_admission_rejection(&error.code) => {
-                            checked.push(RuleCatchUpAction::rejected(action.event_seq, error.code));
+                            let error = error.sanitized(&self.secret_policy_snapshot());
+                            checked.push(RuleCatchUpAction::rejected_with_message(
+                                action.event_seq,
+                                error.code,
+                                error.message.as_str(),
+                            ));
                         }
                         Err(error) => return Err(error),
                     }
@@ -776,6 +781,7 @@ impl Router {
             if let Some(child) = admission.children.first() {
                 self.schedule_rule_admission(child);
             }
+            self.note_rule_refusals(principal, &admission.events);
             self.signal_progress();
         }
         Ok(Some(admission))

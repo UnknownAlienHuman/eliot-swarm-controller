@@ -1,4 +1,4 @@
-//! One bounded diagnostic tail for an owned child pipe.
+//! A bounded diagnostic excerpt for an owned child pipe.
 //!
 //! Uses the existing Tokio child-pipe primitive from the donor map. Unlike the
 //! finite Git capture, reaching this tail's cap never stops pipe drainage.
@@ -17,20 +17,28 @@ use tokio::{
 };
 
 const TAIL_BYTES: usize = MAX_STDERR_BYTES;
+const PREFIX_BYTES: usize = 4 * 1024;
 const READ_BYTES: usize = 8192;
 
 #[derive(Default)]
-struct TailState {
+struct CaptureState {
     // Only bytes already emitted by the shared policy are retained here.
     bytes: VecDeque<u8>,
+    keep_prefix: bool,
     truncated: bool,
     eof: bool,
     read_error: bool,
     pending_bytes: usize,
 }
 
-impl TailState {
+impl CaptureState {
     fn append(&mut self, sanitized: &[u8]) {
+        if self.keep_prefix {
+            let available = PREFIX_BYTES.saturating_sub(self.bytes.len());
+            self.bytes.extend(sanitized.iter().take(available));
+            self.truncated |= sanitized.len() > available;
+            return;
+        }
         let excess = self
             .bytes
             .len()
@@ -62,15 +70,16 @@ impl TailState {
 /// Cloneable read-only access. Dropping a view never affects pipe drainage.
 #[derive(Clone)]
 pub struct StderrView {
-    state: Arc<Mutex<TailState>>,
+    state: Arc<Mutex<CaptureState>>,
 }
 
 impl StderrView {
     pub fn snapshot(&self) -> StderrSnapshot {
-        let (bytes, mut truncated, eof, read_error) = {
+        let (bytes, keep_prefix, mut truncated, eof, read_error) = {
             let state = self.state.lock_recover();
             (
                 state.bytes.iter().copied().collect::<Vec<_>>(),
+                state.keep_prefix,
                 state.truncated,
                 state.eof,
                 state.read_error,
@@ -79,13 +88,23 @@ impl StderrView {
         // Redaction happened on bytes before any lossy conversion. Lossy UTF-8
         // may expand invalid bytes, so enforce the rendered byte cap as well.
         let rendered = String::from_utf8_lossy(&bytes);
-        let mut start = rendered.len().saturating_sub(TAIL_BYTES);
-        while !rendered.is_char_boundary(start) {
-            start += 1;
-        }
-        truncated |= start != 0;
+        let text = if keep_prefix {
+            let mut end = rendered.len().min(PREFIX_BYTES);
+            while !rendered.is_char_boundary(end) {
+                end -= 1;
+            }
+            truncated |= end < rendered.len();
+            rendered[..end].to_owned()
+        } else {
+            let mut start = rendered.len().saturating_sub(TAIL_BYTES);
+            while !rendered.is_char_boundary(start) {
+                start += 1;
+            }
+            truncated |= start != 0;
+            rendered[start..].to_owned()
+        };
         StderrSnapshot {
-            text: rendered[start..].to_owned(),
+            text,
             truncated,
             eof,
             read_error,
@@ -148,7 +167,15 @@ pub fn spawn_stderr<R>(reader: R, policy: Arc<SecretPolicy>) -> StderrCapture
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
-    spawn_stderr_inner(reader, policy, None)
+    spawn_stderr_inner(reader, policy, None, false)
+}
+
+/// Retain the beginning of sanitized stderr while draining the entire pipe.
+pub fn spawn_stderr_prefix<R>(reader: R, policy: Arc<SecretPolicy>) -> StderrCapture
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    spawn_stderr_inner(reader, policy, None, true)
 }
 
 /// Plugin-owned telemetry channel. Filter before the diagnostic tail, including
@@ -162,7 +189,7 @@ pub fn spawn_plugin_stderr<R>(
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
-    spawn_stderr_inner(reader, policy, Some(Box::new(telemetry)))
+    spawn_stderr_inner(reader, policy, Some(Box::new(telemetry)), false)
 }
 
 type Telemetry = Box<dyn Fn(&str) + Send + Sync>;
@@ -171,12 +198,16 @@ fn spawn_stderr_inner<R>(
     reader: R,
     policy: Arc<SecretPolicy>,
     telemetry: Option<Telemetry>,
+    keep_prefix: bool,
 ) -> StderrCapture
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
     let view = StderrView {
-        state: Arc::new(Mutex::new(TailState::default())),
+        state: Arc::new(Mutex::new(CaptureState {
+            keep_prefix,
+            ..CaptureState::default()
+        })),
     };
     let state = Arc::clone(&view.state);
     let task = tokio::spawn(drain(reader, policy, state, telemetry));
@@ -189,7 +220,7 @@ where
 async fn drain<R: AsyncRead + Unpin>(
     mut reader: R,
     policy: Arc<SecretPolicy>,
-    state: Arc<Mutex<TailState>>,
+    state: Arc<Mutex<CaptureState>>,
     telemetry: Option<Telemetry>,
 ) {
     let mut input = [0_u8; READ_BYTES];
@@ -223,9 +254,9 @@ async fn drain<R: AsyncRead + Unpin>(
             return;
         }
         pending.drain(..consumed);
-        let mut tail = state.lock_recover();
-        tail.append(&sanitized);
-        tail.pending_bytes = pending.len();
+        let mut captured = state.lock_recover();
+        captured.append(&sanitized);
+        captured.pending_bytes = pending.len();
     }
 }
 

@@ -21,6 +21,7 @@ mod overview;
 mod patch_digest;
 mod project_assignment;
 mod provider_resilience;
+mod repeat_failures;
 mod resolution;
 mod routing;
 mod rules;
@@ -137,6 +138,7 @@ struct RouterInner {
     run_credentials: RunCredentialRegistry,
     unknown_commands: UnknownCommands,
     unknown_causes: Mutex<HashMap<String, String>>,
+    repeat_failures: Mutex<repeat_failures::RepeatFailures>,
     rule_definitions: Mutex<HashMap<(String, String), (i64, RuleDefinition)>>,
     rule_source_files: Mutex<HashMap<String, HashMap<String, String>>>,
     catalog_cache: Mutex<catalog::CatalogCache>,
@@ -391,6 +393,7 @@ impl Router {
                 run_credentials,
                 unknown_commands,
                 unknown_causes: Mutex::new(HashMap::new()),
+                repeat_failures: Mutex::default(),
                 rule_definitions: Mutex::new(HashMap::new()),
                 rule_source_files: Mutex::new(HashMap::new()),
                 catalog_cache: Mutex::new(catalog::CatalogCache::default()),
@@ -3210,21 +3213,30 @@ impl Router {
         let request: RuleGetRequest = eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         let rule_principal = rule_principal(request.project.as_deref());
-        let state = self
-            .inner
-            .store
-            .lock()
-            .await
-            .get_rule_state(&rule_principal, &request.id)?
-            .ok_or_else(|| Error::new("not_found", "rule was not found"))?;
+        let show = {
+            let store = self.inner.store.lock().await;
+            match store.get_rule_show(&rule_principal, &request.id)? {
+                Some(show) => show,
+                None if request.project.is_none() && store.rule_project_exists(&request.id)? => {
+                    return Err(Error::new(
+                        "not_found",
+                        "rule is defined in a project. Use --project PROJECT",
+                    ));
+                }
+                None => return Err(Error::new("not_found", "rule was not found")),
+            }
+        };
+        let state = &show.state;
         if state.validate().is_err() || state.id != request.id || state.project != request.project {
             return Err(Error::new(
                 "source_integrity",
                 "stored rule namespace differs from the request",
             ));
         }
-        serde_json::to_value(state)
-            .map_err(|_| Error::new("internal", "rule state could not be encoded"))
+        let mut result = serde_json::to_value(show)
+            .map_err(|_| Error::new("internal", "rule state could not be encoded"))?;
+        self.redact_native_value(&mut result);
+        Ok(result)
     }
 
     async fn timer_get(&self, params: &Value, principal: &Principal) -> Result<Value> {
@@ -3565,21 +3577,14 @@ impl Router {
         through: i64,
         outcome: eliot_store::RuleCursorOutcome,
     ) -> Result<RuleStateView> {
-        let report = matches!(
-            &outcome,
-            eliot_store::RuleCursorOutcome::Rejected { .. }
-                | eliot_store::RuleCursorOutcome::RejectedWithCapacity { .. }
-                | eliot_store::RuleCursorOutcome::Disabled
-        );
         let change = {
             let mut store = self.inner.store.lock().await;
             let change = store.advance_rule_cursor(principal, state, through, outcome, now_ms())?;
-            if report {
-                self.publish_locked(&change.events);
-            }
+            self.publish_locked(&change.events);
             change
         };
-        if report && !change.events.is_empty() {
+        if !change.events.is_empty() {
+            self.note_rule_refusals(principal, &change.events);
             self.signal_progress();
         }
         Ok(change.value)
@@ -5802,6 +5807,11 @@ impl Router {
             }
             (result, store.is_write_faulted())
         };
+        if let Ok(change) = &result
+            && !change.events.is_empty()
+        {
+            self.note_script_failure(&change.value);
+        }
         self.finish_settlement(id, result, write_faulted, &persistence_cause, true)
             .await
     }

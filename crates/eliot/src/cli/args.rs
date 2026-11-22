@@ -76,7 +76,7 @@ pub(crate) enum CliCommand {
     Project(ProjectArgs),
     /// Read or edit automation rules, or catch up one loaded rule.
     Rule(RuleArgs),
-    /// Read or manually run a startup-loaded timer.
+    /// List, show or manually run a startup-loaded timer.
     Timer(TimerArgs),
     /// Set, read or drive one Agent's Eliot-mode Goal.
     Goal(GoalArgs),
@@ -1470,10 +1470,23 @@ pub(crate) struct RuleCatchUpArgs {
 
 #[derive(Subcommand)]
 pub(crate) enum TimerCommand {
+    /// List loaded timers in the selected namespace.
+    List(TimerListArgs),
     /// Show the current timer schedule and durable UTC slot state.
     Show(TimerShowArgs),
     /// Run one timer action using a durable mutation ID.
     Run(TimerRunArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct TimerListArgs {
+    #[arg(long, value_name = "PROJECT")]
+    pub(crate) project: Option<String>,
+    /// Last rule id from the previous timer page.
+    #[arg(long, value_name = "RULE")]
+    pub(crate) after: Option<String>,
+    #[arg(long, default_value_t = eliot_core::api::RuleListRequest::default().limit)]
+    pub(crate) limit: usize,
 }
 
 #[derive(Args)]

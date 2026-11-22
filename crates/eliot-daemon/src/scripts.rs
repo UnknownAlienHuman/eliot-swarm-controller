@@ -43,6 +43,8 @@ pub(crate) async fn execute_dispatched(router: Router, command: Command) {
         auth::SavedRunPrincipal::ProjectRule { registration } => {
             if router.verify_run_registration(registration).await.is_err() {
                 Err("project_registration_changed".to_owned())
+            } else if !project_worktree_matches_registration(&frozen, registration).await {
+                Err("script_worktree_repository_mismatch".to_owned())
             } else {
                 let verification_policy = router.secret_policy_snapshot();
                 freeze::verify_project_run(&frozen, registration, verification_policy.as_ref())
@@ -65,7 +67,7 @@ pub(crate) async fn execute_dispatched(router: Router, command: Command) {
         .env("ELIOT_RUN_TOKEN", credential.token());
     let policy = router.script_secret_policy(credential.token());
 
-    let input = match ScriptInputContext::for_run_command(&frozen.context, run_id.clone()) {
+    let mut input = match ScriptInputContext::for_run_command(&frozen.context, run_id.clone()) {
         Ok(input) => input,
         Err(error) => {
             credential.revoke();
@@ -73,6 +75,7 @@ pub(crate) async fn execute_dispatched(router: Router, command: Command) {
             return;
         }
     };
+    display_sanitize_workspace_paths(&mut input);
     let stdin = match serde_json::to_vec(&input) {
         Ok(stdin) if stdin.len() <= MAX_FRAME_BYTES => stdin,
         _ => {
@@ -90,12 +93,13 @@ pub(crate) async fn execute_dispatched(router: Router, command: Command) {
         }
     };
 
-    let outcome = process::run_owned_process(
+    let outcome = process::run_owned_process_with_stderr(
         child,
         stdin,
         timeout,
         Arc::clone(&policy),
         router.run_cancellation_receiver(),
+        process::StderrExcerpt::Prefix,
     )
     .await;
     credential.revoke();
@@ -255,6 +259,51 @@ fn process_failure_code(reason: ProcessFailure) -> &'static str {
         ProcessFailure::Timeout => "script_timeout",
         ProcessFailure::Cancelled => "script_cancelled",
         ProcessFailure::OutputLimit => "script_output_too_large",
+    }
+}
+
+async fn project_worktree_matches_registration(
+    frozen: &FrozenScriptRun,
+    registration: &eliot_core::api::ProjectRegistrationView,
+) -> bool {
+    let Some(workspace) = freeze::event_workspace(&frozen.context) else {
+        return true;
+    };
+    let Ok(workspace_git) = crate::workspace_git::WorkspaceGit::new() else {
+        return false;
+    };
+    let Ok((_, common_dir)) = workspace_git.repository_identity(workspace).await else {
+        return false;
+    };
+    same_repository_path(&common_dir, &registration.repo_common_dir)
+}
+
+#[cfg(windows)]
+fn same_repository_path(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right)
+}
+
+#[cfg(not(windows))]
+fn same_repository_path(left: &str, right: &str) -> bool {
+    left == right
+}
+
+fn display_sanitize_workspace_paths(input: &mut ScriptInputContext) {
+    let ScriptInputContext::Event { event, subject, .. } = input else {
+        return;
+    };
+    if let Some(workspace) = event
+        .subject
+        .as_mut()
+        .and_then(|subject| subject.workspace.as_mut())
+    {
+        *workspace = eliot_core::display_path(workspace);
+    }
+    if let Some(workspace) = subject
+        .as_mut()
+        .and_then(|subject| subject.workspace.as_mut())
+    {
+        *workspace = eliot_core::display_path(workspace);
     }
 }
 

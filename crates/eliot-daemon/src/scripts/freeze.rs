@@ -142,7 +142,7 @@ fn freeze_run_in_scope(
     frozen.validate()?;
     project_run_timeout(&frozen)?;
     reject_known_secrets(&frozen, policy)?;
-    resolve_run_cwd(&scope, frozen.definition.cwd.as_deref())?;
+    resolve_script_cwd(&scope, &frozen)?;
     Ok(frozen)
 }
 
@@ -228,7 +228,18 @@ fn verify_run_in_scope(
         return Err(source_changed(message));
     }
 
-    let cwd = resolve_run_cwd(&scope, frozen.definition.cwd.as_deref())?;
+    let cwd = resolve_script_cwd(&scope, frozen)?;
+    #[cfg(windows)]
+    let cwd = {
+        let changed = || source_changed("display Run cwd differs from the admitted directory");
+        let rendered = eliot_core::display_path(cwd.to_str().ok_or_else(changed)?);
+        let path = PathBuf::from(rendered);
+        let verified = crate::setup::canonical_directory(&path).map_err(|_| changed())?;
+        if verified != cwd {
+            return Err(changed());
+        }
+        path
+    };
     project_run_timeout(frozen)?;
 
     let entry_argument =
@@ -236,15 +247,14 @@ fn verify_run_in_scope(
             CwdPolicy::Project => source_changed("registered script entry argument path changed"),
             CwdPolicy::Owner => source_changed("global script entry argument path changed"),
         })?;
-    let mut command = Command::new(&frozen.interpreter.executable.canonical_path);
+    let mut command =
+        super::process::local_process_command(&frozen.interpreter.executable.canonical_path)?;
     command
         .args(&frozen.interpreter.argv_prefix)
         .arg(entry_argument)
         .args(frozen.definition.cmd.iter().skip(2))
-        .current_dir(cwd)
-        .env_clear();
+        .current_dir(cwd);
 
-    add_minimal_platform_environment(&mut command)?;
     for (name, value) in &frozen.definition.env {
         command.env(name, value);
     }
@@ -402,6 +412,53 @@ fn resolve_run_cwd(scope: &RunScope<'_>, cwd: Option<&str>) -> Result<PathBuf> {
     }
 }
 
+fn resolve_script_cwd(scope: &RunScope<'_>, frozen: &FrozenScriptRun) -> Result<PathBuf> {
+    let Some(workspace) = event_workspace(&frozen.context) else {
+        return resolve_run_cwd(scope, frozen.definition.cwd.as_deref());
+    };
+    let workspace = crate::setup::canonical_directory(Path::new(workspace))
+        .map_err(|_| not_allowed("event-time Agent worktree is unavailable or unsafe"))?;
+    let Some(cwd) = frozen.definition.cwd.as_deref() else {
+        return Ok(workspace);
+    };
+    if matches!(scope.cwd_policy, CwdPolicy::Owner) && Path::new(cwd).is_absolute() {
+        return resolve_owner_cwd(scope.entry_root, Some(cwd));
+    }
+
+    let relative = Path::new(cwd);
+    if cwd.trim().is_empty()
+        || relative.is_absolute()
+        || relative.has_root()
+        || relative
+            .components()
+            .any(|component| matches!(component, Component::Prefix(_)))
+    {
+        return Err(not_allowed(
+            "event-time run cwd must be a nonempty relative path",
+        ));
+    }
+    let canonical = crate::setup::canonical_directory(&workspace.join(relative))
+        .map_err(|_| not_allowed("event-time run cwd is unavailable or unsafe"))?;
+    if !same_path(&workspace, &canonical) && !crate::setup::inside(&workspace, &canonical) {
+        return Err(not_allowed(
+            "event-time run cwd is outside the Agent worktree",
+        ));
+    }
+    Ok(canonical)
+}
+
+pub(crate) fn event_workspace(context: &FrozenScriptContext) -> Option<&str> {
+    context
+        .subject()
+        .and_then(|subject| subject.workspace.as_deref())
+        .or_else(|| {
+            context
+                .event()
+                .and_then(|event| event.subject.as_ref())
+                .and_then(|subject| subject.workspace.as_deref())
+        })
+}
+
 fn resolve_project_cwd(checkout: &Path, cwd: Option<&str>) -> Result<PathBuf> {
     let candidate = match cwd {
         Some(value) => {
@@ -475,23 +532,6 @@ fn capture_file(path: &Path, root: Option<&Path>) -> Result<FrozenSetupFile> {
     let mut remaining = u64::MAX;
     crate::setup::capture_file(path, root, &mut remaining)
         .map_err(|_| invalid("script file is not a bounded canonical regular file"))
-}
-
-fn add_minimal_platform_environment(command: &mut Command) -> Result<()> {
-    #[cfg(windows)]
-    {
-        let system_root = std::env::var_os("SystemRoot")
-            .ok_or_else(|| Error::new("unavailable", "Windows SystemRoot is unavailable"))?;
-        command.env("SystemRoot", system_root);
-        let pathext = std::env::var_os("PATHEXT")
-            .ok_or_else(|| Error::new("unavailable", "Windows PATHEXT is unavailable"))?;
-        command.env("PATHEXT", pathext);
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = command;
-    }
-    Ok(())
 }
 
 fn reject_known_secrets<T: serde::Serialize>(value: &T, policy: &SecretPolicy) -> Result<()> {
