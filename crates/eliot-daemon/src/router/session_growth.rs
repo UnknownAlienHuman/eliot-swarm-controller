@@ -13,15 +13,27 @@ impl Router {
         {
             return Ok(());
         }
-        let warning = self
-            .inner
-            .store
-            .lock()
-            .await
-            .latest_session_growth_incident(&agent.id, agent.generation)?;
-        let Some((seq, turn_id)) = warning else {
-            return Ok(());
+        let (warning, usage) = {
+            let store = self.inner.store.lock().await;
+            (
+                store.latest_session_growth_incident(&agent.id, agent.generation)?,
+                store.get_session_usage(&agent.id, agent.generation)?,
+            )
         };
+        let context_ceiling = agent
+            .profile_snapshot
+            .get("context_ceiling_tokens")
+            .and_then(Value::as_i64)
+            .filter(|ceiling| *ceiling > 0);
+        let ceiling_sample = context_ceiling
+            .zip(usage.as_ref())
+            .and_then(|(ceiling, usage)| {
+                let used = usage.context_used_tokens.filter(|used| *used >= 0)?;
+                (used > ceiling).then(|| (used, ceiling, (*usage).clone()))
+            });
+        if warning.is_none() && ceiling_sample.is_none() {
+            return Ok(());
+        }
         if !self.inner.attention.session_growth.enabled {
             return Ok(());
         }
@@ -35,34 +47,64 @@ impl Router {
             let action = serde_json::to_value(request)
                 .map_err(|_| Error::new("internal", "cannot encode session compaction"))?;
             ("compact_for_session_growth", Some(action), "")
-        } else if switch {
+        } else if ceiling_sample.is_some() || switch {
             let action = self.prepare_growth_switch(agent, &id).await?;
             ("switch_for_session_growth", action, "no_safe_handoff")
         } else {
             ("observe_session_growth", None, "switch_disabled")
         };
+        let incident_id = match (&ceiling_sample, &warning) {
+            (Some((used, ceiling, sample)), _) => format!(
+                "ceiling-{}-{}-{}-{}",
+                agent.generation,
+                sample.observed_at.unwrap_or_default(),
+                ceiling,
+                used
+            ),
+            (None, Some((seq, _))) => format!("growth-{seq}-{}-{}", agent.id, agent.generation),
+            (None, None) => return Ok(()),
+        };
         let reaction = AttentionStep {
-            incident_id: format!("growth-{seq}-{}-{}", agent.id, agent.generation),
+            incident_id,
             step: step.to_owned(),
             outcome: if action.is_some() { "unknown" } else { skipped }.to_owned(),
             command_id: action.as_ref().map(|_| id),
-            turn_id,
+            turn_id: warning.as_ref().and_then(|(_, turn_id)| turn_id.clone()),
         };
         {
             let thresholds = self.inner.observe.lock_recover().growth;
             let mut store = self.inner.store.lock().await;
             let current = store.get_agent(&agent.id)?;
-            if !current.is_some_and(|current| {
+            let agent_is_current = current.is_some_and(|current| {
                 current.generation == agent.generation
                     && current.state == AgentState::Idle
                     && current.active_turn.is_none()
-            }) || !store
-                .latest_session_growth_incident(&agent.id, agent.generation)?
-                .is_some_and(|(current_seq, _)| current_seq == seq)
-                || store
-                    .session_growth_view(&agent.harness, &agent.id, agent.generation, &thresholds)?
-                    .is_none()
-            {
+            });
+            let growth_is_current = if let Some((used, ceiling, sample)) = &ceiling_sample {
+                let current_usage = store.get_session_usage(&agent.id, agent.generation)?;
+                current_usage.as_ref() == Some(sample)
+                    && current_usage
+                        .as_ref()
+                        .and_then(|usage| usage.context_used_tokens)
+                        .is_some_and(|current_used| {
+                            current_used == *used && current_used > *ceiling
+                        })
+            } else if let Some((seq, _)) = &warning {
+                store
+                    .latest_session_growth_incident(&agent.id, agent.generation)?
+                    .is_some_and(|(current_seq, _)| current_seq == *seq)
+                    && store
+                        .session_growth_view(
+                            &agent.harness,
+                            &agent.id,
+                            agent.generation,
+                            &thresholds,
+                        )?
+                        .is_some()
+            } else {
+                false
+            };
+            if !agent_is_current || !growth_is_current {
                 return Ok(());
             }
             let Some(event) =

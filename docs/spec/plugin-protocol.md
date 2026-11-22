@@ -582,6 +582,9 @@ Cumulative usage replaces
 its prior scope value rather than being summed. OpenCode attributes its final assistant
 message's native token usage to the bound turn's terminal event at message scope; a
 repeated message id replaces, and the value is never presented as a turn or session total.
+When its latest assistant message has complete input, cache-read and cache-write
+counters, OpenCode also commits their checked per-call context sum as
+`context_used_tokens` without a window.
 `session.context.compacted` is a session fact. Codex emits it for a confirmed v2
 `item/completed` whose typed item is `contextCompaction`. The fact carries
 `native_turn_id` and includes `turn_id` when the compaction belongs to the exact active
