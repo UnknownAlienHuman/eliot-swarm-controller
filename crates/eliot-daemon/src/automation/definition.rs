@@ -79,6 +79,13 @@ struct TriggerDefinition {
 type MatchGroup = BTreeMap<String, CompiledMatch>;
 
 impl RuleDefinition {
+    pub(super) fn inserts_launch_result(&self) -> bool {
+        matches!(
+            self.actions.first(),
+            Some(ActionDefinition::LaunchResultInsertion(_))
+        )
+    }
+
     pub(super) fn guards_launch_worktree(&self) -> bool {
         matches!(
             self.actions.first(),
@@ -120,7 +127,7 @@ struct AssignmentActionDefinition {
 
 #[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct LaunchResultMail {
+pub(super) struct LaunchResultInsertion {
     pub(super) from_launch: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) to: Option<String>,
@@ -259,7 +266,7 @@ enum ActionDefinition {
     Mail {
         definition: MailDefinitionArgs,
     },
-    LaunchResultMail(LaunchResultMail),
+    LaunchResultInsertion(LaunchResultInsertion),
     Var {
         definition: VarDefinitionArgs,
     },
@@ -332,11 +339,6 @@ impl ActionDefinition {
         if action == "mail.send" || action == "msg.send" {
             let mut fields = object.clone();
             fields.remove("action");
-            if fields.contains_key("from_launch") {
-                let definition =
-                    eliot_core::api::discovery::decode_params_at(Value::Object(fields), root)?;
-                return Ok(Self::LaunchResultMail(definition));
-            }
             let definition =
                 eliot_core::api::discovery::decode_params_at(Value::Object(fields), root)?;
             return Ok(Self::Mail { definition });
@@ -351,6 +353,11 @@ impl ActionDefinition {
         if action == "inject" {
             let mut fields = object.clone();
             fields.remove("action");
+            if fields.contains_key("from_launch") {
+                let definition =
+                    eliot_core::api::discovery::decode_params_at(Value::Object(fields), root)?;
+                return Ok(Self::LaunchResultInsertion(definition));
+            }
             let definition: InjectActionDefinition =
                 eliot_core::api::discovery::decode_params_at(Value::Object(fields), root)?;
             return Ok(Self::Inject { definition });
@@ -504,15 +511,15 @@ impl Serialize for ActionDefinition {
                 fields.insert("action".to_owned(), Value::String("mail.send".to_owned()));
                 Value::Object(fields).serialize(serializer)
             }
-            Self::LaunchResultMail(definition) => {
+            Self::LaunchResultInsertion(definition) => {
                 #[derive(Serialize)]
                 struct Action<'a> {
                     action: &'static str,
                     #[serde(flatten)]
-                    definition: &'a LaunchResultMail,
+                    definition: &'a LaunchResultInsertion,
                 }
                 Action {
-                    action: "mail.send",
+                    action: "inject",
                     definition,
                 }
                 .serialize(serializer)
@@ -928,7 +935,7 @@ pub(super) enum RuleEvaluation {
     NoMatch,
     CauseDepth,
     Command(SubmitCommand),
-    LaunchResultMail(LaunchResultMail),
+    LaunchResultInsertion(LaunchResultInsertion),
 }
 
 /// Matches a committed event and projects its one ordinary command action.
@@ -991,8 +998,8 @@ pub(super) fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<RuleEvalu
         ActionDefinition::Mail { definition } => {
             return submit_mail_command(definition).map(RuleEvaluation::Command);
         }
-        ActionDefinition::LaunchResultMail(definition) => {
-            return Ok(RuleEvaluation::LaunchResultMail(definition.clone()));
+        ActionDefinition::LaunchResultInsertion(definition) => {
+            return Ok(RuleEvaluation::LaunchResultInsertion(definition.clone()));
         }
         ActionDefinition::Var { definition } => {
             return submit_var_command(definition).map(RuleEvaluation::Command);
@@ -1241,7 +1248,7 @@ fn submit_emit_command(definition: &EmitDefinitionArgs) -> Result<SubmitCommand,
     Ok(command)
 }
 
-pub(super) fn submit_mail_command(definition: &MailDefinitionArgs) -> Result<SubmitCommand, Error> {
+fn submit_mail_command(definition: &MailDefinitionArgs) -> Result<SubmitCommand, Error> {
     definition.validate().map_err(|error| {
         Error::new(
             error.code.clone(),
@@ -1646,10 +1653,11 @@ fn validate_rule(rule: &mut RuleDefinition) -> Result<(), Error> {
         if !is_default_catch_up(&rule.catch_up) {
             return Err(Error::new("invalid", "catch_up requires a timer trigger"));
         }
-        if matches!(action, ActionDefinition::LaunchResultMail(_)) && event != "turn.completed" {
+        if matches!(action, ActionDefinition::LaunchResultInsertion(_)) && event != "turn.completed"
+        {
             return Err(Error::invalid_field(
                 "on.event",
-                "turn.completed for mail.send from_launch",
+                "turn.completed for inject from_launch",
             ));
         }
         if matches!(action, ActionDefinition::Agent(agent) if agent.request_binding().is_some())
@@ -1831,7 +1839,7 @@ fn validate_event_action(action: &ActionDefinition) -> Result<(), Error> {
                 )
             });
         }
-        ActionDefinition::LaunchResultMail(definition) => {
+        ActionDefinition::LaunchResultInsertion(definition) => {
             if definition.from_launch.trim().is_empty() || definition.from_launch.contains("${") {
                 return Err(Error::invalid_field(
                     "from_launch",
@@ -2076,10 +2084,10 @@ fn timer_action(rule: &RuleDefinition) -> Result<SubmitCommand, Error> {
         ActionDefinition::Notify { definition } => return submit_notify_command(definition),
         ActionDefinition::Emit { definition } => return submit_emit_command(definition),
         ActionDefinition::Mail { definition } => return submit_mail_command(definition),
-        ActionDefinition::LaunchResultMail(_) => {
+        ActionDefinition::LaunchResultInsertion(_) => {
             return Err(Error::invalid_field(
                 "on",
-                "event trigger for mail.send from_launch",
+                "event trigger for inject from_launch",
             ));
         }
         ActionDefinition::Var { definition } => return submit_var_command(definition),

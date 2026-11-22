@@ -529,10 +529,10 @@ Backlog, explicit history catch-up, and rate-limit semantics are defined in
 This connected event-rule subset supports event actions `stop`, `send`, `launch`, `resume`,
 `interrupt`, `steer`, `approve`, `deny`, `answer`, `mail.send`, `var.set` and `inject`, plus
 project event-rule `run` during live
-evaluation and explicit history catch-up. Event `mail.send` and `var.set` are targetless
-coordination actions. Mail also supports the [linked launch result](#worktree-review-recipe)
-form. Event `inject` binds its Agent and turn exactly from the
-captured event (see below). Event-rule `resume` is available in live evaluation
+evaluation and explicit history catch-up. Event `mail.send` and `var.set` are literal
+targetless coordination actions. Event `inject` normally binds its Agent and turn
+from the captured event. The [linked launch result](#worktree-review-recipe) form
+resolves its manager from the originating launch. Event-rule `resume` is available in live evaluation
 and finite `rule.catch_up`; both use the captured event binding and ordinary command admission.
 The global event-rule `run` contract below uses owner-global approval and the shared frozen
 execution path. Other full L4.2 action requirements remain cumulative. SEND uses the
@@ -565,7 +565,7 @@ This is an automation increment, not a Task/Issue/acceptance engine.
 ### Worktree review recipe
 
 Install [review-after-turn.toml](../../config/recipes/review-after-turn.toml) in the
-registered checkout's rules directory and approve the launch, initial send and mail
+registered checkout's rules directory and approve the launch, initial send and inject
 actions. Use a distinct reviewer profile with native read-only permissions.
 An assigned project reserves launches for its current team. To review from a separate
 checkout in that case, install an Owner rule, constrain the author's project in the
@@ -580,14 +580,16 @@ and fingerprint before live admission and dispatch. This launch form requires li
 event processing. The binding is to the observed tree
 at those points. A reviewer reads the author's worktree, which can change during review.
 
-A second rule uses `mail.send` with `from_launch` set to the initiating rule ID.
-Swarm follows the linked initial SEND in that rule's namespace and queues the complete
-retained final text in a data fence, with the original author turn and fingerprint.
-The mail marks whether the fingerprint is still current at its delivery check. The
-optional `to` selects a local Agent explicitly. Otherwise Swarm uses the author's
-parent, or the assigned local project manager for a top-level author. The normal mail
-size and recipient bounds apply. The recipe asks the reviewer to fit its complete
-answer within those bounds. The manager interprets the review and decides what to do.
+A second rule uses `inject` with `from_launch` set to the initiating rule ID.
+Swarm follows the linked initial SEND in that rule's namespace. It submits the
+complete retained final text, the original author turn and fingerprint via
+`soonest`, using the [shared insertion frame](#inject-context-at-the-safe-point).
+The note records whether the fingerprint is still current at its delivery check.
+The optional `to` selects a local Agent explicitly. Otherwise Swarm uses the
+author's parent, or the assigned local project manager for a top-level author.
+Swarm rechecks the recipient and launch binding at admission. The normal insertion
+size, generation and context-point bounds apply. The manager interprets the review
+and decides what to do.
 
 The owner configures a global assignment under `[automation.assignments.<key>]`:
 

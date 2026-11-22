@@ -1,5 +1,5 @@
 # Install in the registered checkout's .eliot/rules/ directory to enable review.
-# Approve launch, send and mail.send in the project registration. Replace
+# Approve launch, send and inject in the project registration. Replace
 # author-profile, reviewer-profile and C:/src/app. Use a distinct reviewer
 # profile with read-only native permissions, such as Codex with
 # permissions = "read-only" and approval_policy = "never".
@@ -38,5 +38,5 @@ file and line references when available. Keep the complete review under 12 KiB.
 [[rule]]
 id = "deliver-review"
 on = { event = "turn.completed", match = { "event.cause.rule" = "review-after-turn", "data.outcome" = "success" } }
-do = [{ action = "mail.send", from_launch = "review-after-turn" }]
+do = [{ action = "inject", from_launch = "review-after-turn" }]
 # To select a particular manager, add to = "a1" with the real Agent ID above.

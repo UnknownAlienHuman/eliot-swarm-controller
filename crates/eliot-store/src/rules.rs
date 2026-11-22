@@ -867,16 +867,6 @@ impl Store {
             });
         }
 
-        let binding_error = if request.verb == "run" {
-            rule_run_action_binding_error(&tx, principal, &state.id, revision, event_seq, &request)?
-        } else {
-            rule_action_binding_error(&trigger, event_seq, &request)
-        };
-        if let Some(code) = binding_error {
-            request.id = key.child_id.clone();
-            let error = Error::new(code.clone(), code);
-            return reject_rule_event(tx, &self.write_faulted, &key, &error, now);
-        }
         let canonical_definition = if retiring {
             stored
                 .retiring_definition
@@ -885,6 +875,25 @@ impl Store {
         } else {
             &stored.canonical_definition
         };
+        let binding_error = if request.verb == "run" {
+            rule_run_action_binding_error(&tx, principal, &state.id, revision, event_seq, &request)?
+        } else if let Some(bound) = launch_result::rule_launch_insertion_binding(
+            &tx,
+            principal,
+            canonical_definition,
+            event_seq,
+            &request,
+        )? {
+            (!bound || !valid_inject_request(&request))
+                .then(|| "rule_action_binding_invalid".to_owned())
+        } else {
+            rule_action_binding_error(&trigger, event_seq, &request)
+        };
+        if let Some(code) = binding_error {
+            request.id = key.child_id.clone();
+            let error = Error::new(code.clone(), code);
+            return reject_rule_event(tx, &self.write_faulted, &key, &error, now);
+        }
         if should_suppress_own_event_send_or_run_tx(
             &tx,
             principal,

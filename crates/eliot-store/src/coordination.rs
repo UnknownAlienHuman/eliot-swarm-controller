@@ -1791,11 +1791,7 @@ impl Store {
                     "project rule principal is not authorized",
                 ));
             }
-            Some(
-                projects::project_registration_tx(tx, project)?.ok_or_else(|| {
-                    Error::new("not_allowed", "project mail requires a registered project")
-                })?,
-            )
+            Some(project)
         } else {
             return Err(Error::new(
                 "not_allowed",
@@ -1808,11 +1804,8 @@ impl Store {
             let agent = load_agent_by_num(tx, num)?.ok_or_else(|| {
                 Error::new("not_found", format!("Agent {recipient} was not found"))
             })?;
-            if let Some(project) = &project
-                && agent.project_scope() != project.id
-                && !(agent.project == project.id
-                    && core::display_path(agent.project_scope())
-                        == core::display_path(&project.checkout))
+            if let Some(project) = project
+                && agent.project_scope() != project
             {
                 return Err(Error::new(
                     "not_allowed",

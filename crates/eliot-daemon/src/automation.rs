@@ -1800,7 +1800,9 @@ async fn process_rule_cursor(
                         .await?;
                         continue;
                     }
-                    Ok(RuleEvaluation::LaunchResultMail(_)) => unreachable!("mail was resolved"),
+                    Ok(RuleEvaluation::LaunchResultInsertion(_)) => {
+                        unreachable!("insertion was resolved")
+                    }
                     Err(error) => {
                         flush_rule_no_match(router, rule, retiring, &mut no_match_through).await?;
                         advance_rule_cursor(
@@ -2688,14 +2690,17 @@ async fn evaluate_event_action(
         {
             Ok(RuleEvaluation::NoMatch)
         }
-        RuleEvaluation::LaunchResultMail(mail) => {
+        RuleEvaluation::LaunchResultInsertion(insertion) => {
             match router
-                .rule_launch_result_mail(principal, &mail.from_launch, mail.to.as_deref(), event)
+                .rule_launch_result_insertion(
+                    principal,
+                    &insertion.from_launch,
+                    insertion.to.as_deref(),
+                    event,
+                )
                 .await?
             {
-                Some(definition) => {
-                    definition::submit_mail_command(&definition).map(RuleEvaluation::Command)
-                }
+                Some(request) => Ok(RuleEvaluation::Command(request)),
                 None => Ok(RuleEvaluation::NoMatch),
             }
         }
@@ -2710,10 +2715,10 @@ pub(crate) async fn prepare_rule_catch_up_actions(
     events: &[Event],
     project: Option<&ProjectRegistrationView>,
 ) -> Result<Vec<eliot_store::RuleCatchUpAction>> {
-    if definition.guards_launch_worktree() {
+    if definition.guards_launch_worktree() || definition.inserts_launch_result() {
         return Err(Error::new(
             "unsupported",
-            "worktree-bound launches require live event processing",
+            "worktree-bound launches and result insertions require live event processing",
         ));
     }
     let principal = project.map_or_else(
@@ -2732,7 +2737,7 @@ pub(crate) async fn prepare_rule_catch_up_actions(
                 ));
                 continue;
             }
-            Ok(RuleEvaluation::LaunchResultMail(_)) => unreachable!("mail was resolved"),
+            Ok(RuleEvaluation::LaunchResultInsertion(_)) => unreachable!("insertion was resolved"),
             Err(error) if is_deterministic_pre_admission_rejection(&error.code) => {
                 actions.push(rule_catch_up_rejection(router, event.seq, &error));
                 continue;
