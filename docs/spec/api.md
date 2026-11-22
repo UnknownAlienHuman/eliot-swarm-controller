@@ -899,7 +899,8 @@ defaults to 100 and must be 1–1,000. Settings › Worktrees pages it to the en
 
 `rule.get` uses `RuleGetRequest`/`RuleShowView` and is Owner-only. It reads the selected
 rule's cursor and retirement boundary, latest action outcome and latest refusal when
-available. An optional `project` selects a registered project principal. Omission selects
+available. `suppressed_count` tracks live key suppressions and `rate_limited_firings`
+tracks rate suppressions. An optional `project` selects a registered project principal. Omission selects
 the global Owner scope. A global miss with a matching project rule includes a
 `--project` hint. The read does not reload configuration or advance either cursor.
 `rule.catch_up` accepts `RuleCatchUpRequest` and returns the retained Core `Command` parent
@@ -1654,7 +1655,14 @@ When the reply exceeds the encoded event budget, the retained suffix starts
 with `[... truncated ...]`. Status, exact command/turn binding and any
 structured provider restriction remain authoritative. `Turn.final_text = None`
 means the public final text is unavailable. Full native text remains private history.
-`Turn.usage = None` likewise means native token usage is unavailable. A present usage
+`turn.completed` can carry `data.worktree` when an enabled rule in the Owner or
+Agent's project namespace consumes it. The data includes the SHA-256
+`fingerprint`, the exact `base` commit, changed `files`, and changed `lines`
+(insertions plus deletions) for [worktree review rules](automation.md#worktree-review-recipe).
+Unavailable worktree observations do not supply a fingerprint or change totals.
+When a project check applies, the rules consume the separately bound passing fact
+for that worktree and author turn.
+`Turn.usage = None` means native token usage is unavailable. A present usage
 carries nullable token members with `scope`/`message_id` attribution when the harness
 reports it; null attribution means the native scope is unknown. Message scope is never
 a turn or session total, and a populated native total must not be assumed a per-turn or

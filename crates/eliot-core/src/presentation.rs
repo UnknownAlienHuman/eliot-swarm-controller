@@ -3,6 +3,7 @@
 //! and an unknown outcome reads "couldn't be confirmed", never success.
 
 use crate::Error;
+use crate::context::{ReviewWorktreeState, TrustedReviewLabels};
 
 pub fn reason_words(code: &str) -> String {
     let words = match code {
@@ -134,6 +135,23 @@ pub fn fence_untrusted_text(text: &str) -> String {
 
 /// Render an insertion using the verified submitting principal as its sender.
 pub fn swarm_note(text: &str, principal: &str) -> String {
+    swarm_note_with_labels(text, principal, None)
+}
+
+/// Render daemon-verified review labels before the single untrusted-body fence.
+pub fn swarm_note_with_trusted_review_labels(
+    text: &str,
+    principal: &str,
+    labels: &TrustedReviewLabels,
+) -> String {
+    swarm_note_with_labels(text, principal, Some(labels))
+}
+
+fn swarm_note_with_labels(
+    text: &str,
+    principal: &str,
+    labels: Option<&TrustedReviewLabels>,
+) -> String {
     let sender = match principal.split_once(':') {
         Some(("agent", identity)) => identity.split(':').next().unwrap_or("Swarm"),
         Some(("project", _)) => "project rule",
@@ -141,8 +159,20 @@ pub fn swarm_note(text: &str, principal: &str) -> String {
         _ if principal == "swarm_rule" => "Swarm rule",
         _ => "Swarm",
     };
+    let trusted_labels = labels.map_or_else(String::new, |labels| {
+        let worktree_state = match labels.worktree_state {
+            ReviewWorktreeState::CurrentAtDeliveryCheck => "still current at delivery check",
+            ReviewWorktreeState::ChangedOrUnconfirmedAtDeliveryCheck => {
+                "changed or could not be confirmed at delivery check"
+            }
+        };
+        format!(
+            "Worktree fingerprint: {:?}\nWorktree state: {worktree_state}\n",
+            labels.worktree_fingerprint
+        )
+    });
     format!(
-        "[Swarm note from {sender}] This adds to your task and does not replace it.\n{}",
+        "[Swarm note from {sender}] This adds to your task and does not replace it.\n{trusted_labels}{}",
         fence_untrusted_text(text)
     )
 }

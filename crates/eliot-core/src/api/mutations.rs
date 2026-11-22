@@ -20,6 +20,7 @@ impl CommandSubmitRequest {
             expected_turn_id: None,
             request_id: None,
             probe: false,
+            trusted_review_labels: None,
         }
     }
 

@@ -2535,6 +2535,7 @@ impl Store {
                             expected_turn_id: None,
                             request_id: None,
                             probe: false,
+                            trusted_review_labels: None,
                         };
                         escalation_admission = Some(admission::submit_tx(
                             &tx,
@@ -2559,6 +2560,7 @@ impl Store {
                     expected_turn_id: None,
                     request_id: None,
                     probe: false,
+                    trusted_review_labels: None,
                 };
                 if command_binding(&tx, &request.id)?.is_some() || write_exists(&tx, &request.id)? {
                     return Err(Error::new(

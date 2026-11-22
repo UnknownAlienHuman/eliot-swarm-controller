@@ -75,7 +75,7 @@ vendor-owned. Eliot is not another coding harness.
 
 ## Non-goals
 
-No Task/Issue/review/acceptance engine, multi-user security platform,
+No Task/Issue/acceptance engine, multi-user security platform,
 proof packets, readiness registers or operational document-hash ceremony. The former
 GUI non-goal is superseded: one optional Windows desktop companion (`swarm-desktop`,
 driven by the daemon) is approved; the daemon/CLI remains the headless authority and
@@ -86,6 +86,11 @@ permission to construct a generic receipt/provenance platform.
 The daemon can perform repository operations, including branch integration, when an
 authorized manager requests them or an applicable automation rule is configured.
 Repository integration has no default trigger.
+
+Projects can opt into a bounded review recipe using ordinary rules. A reviewer examines
+the identified worktree and Swarm delivers its assessment as quoted data to the manager.
+The manager interprets the assessment and decides what to do. External facts can enter
+rules as script events while task, issue and pull request state stays in the source system.
 
 One OS user is the local trust boundary for local control; the cloud endpoint is an
 authenticated owner MCP caller, distinct from a locally controlled native harness.

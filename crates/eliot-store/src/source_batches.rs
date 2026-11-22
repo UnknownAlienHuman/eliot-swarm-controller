@@ -1,6 +1,33 @@
 use super::native_events::{persist_effects, verified_native_event_cause_tx};
 use super::*;
 use std::borrow::Cow;
+/// Daemon-derived worktree facts attached only after the native source batch
+/// digest has been checked and the exact active turn is identified.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletionWorktreeCapture {
+    pub base: String,
+    pub fingerprint: String,
+    pub files: u64,
+    pub lines: u64,
+}
+
+impl CompletionWorktreeCapture {
+    fn validate(&self) -> Result<()> {
+        if !is_git_oid(&self.base)
+            || self.fingerprint.len() != 64
+            || !self
+                .fingerprint
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(Error::new(
+                "invalid",
+                "completion worktree capture is invalid",
+            ));
+        }
+        Ok(())
+    }
+}
 
 impl Store {
     pub fn latest_stream_gap(&self, agent: &str, generation: i64) -> Result<Option<Event>> {
@@ -462,7 +489,20 @@ impl Store {
     /// command/turn facts, source cursor, and last-batch acknowledgement.
     pub fn put_batch(&mut self, batch: SourceBatch, now: i64) -> Result<BatchCommit> {
         self.ensure_writer_healthy()?;
-        let result = self.put_batch_inner(batch, None, None, now);
+        let result = self.put_batch_inner(batch, None, None, None, None, now);
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    pub fn put_batch_with_completion_capture(
+        &mut self,
+        batch: SourceBatch,
+        worktree: Option<CompletionWorktreeCapture>,
+        project_check: Option<bool>,
+        now: i64,
+    ) -> Result<BatchCommit> {
+        self.ensure_writer_healthy()?;
+        let result = self.put_batch_inner(batch, None, None, worktree, project_check, now);
         self.fault_on_persistence_error(&result);
         result
     }
@@ -474,7 +514,7 @@ impl Store {
         now: i64,
     ) -> Result<BatchCommit> {
         self.ensure_writer_healthy()?;
-        let result = self.put_batch_inner(batch, Some(expected_subject), None, now);
+        let result = self.put_batch_inner(batch, Some(expected_subject), None, None, None, now);
         self.fault_on_persistence_error(&result);
         result
     }
@@ -487,19 +527,39 @@ impl Store {
         now: i64,
     ) -> Result<BatchCommit> {
         self.ensure_writer_healthy()?;
-        let result = self.put_batch_inner(batch, None, Some((producer, producer_generation)), now);
+        let result = self.put_batch_inner(
+            batch,
+            None,
+            Some((producer, producer_generation)),
+            None,
+            None,
+            now,
+        );
         self.fault_on_persistence_error(&result);
         result
     }
 
     fn put_batch_inner(
         &mut self,
-        batch: SourceBatch,
+        mut batch: SourceBatch,
         expected_subject: Option<(&str, &str)>,
         native_producer: Option<(&str, i64)>,
+        completion_worktree: Option<CompletionWorktreeCapture>,
+        project_check: Option<bool>,
         now: i64,
     ) -> Result<BatchCommit> {
         let observed = expected_subject.is_some() || native_producer.is_some();
+        if let Some(worktree) = completion_worktree.as_ref() {
+            worktree.validate()?;
+        }
+        if (completion_worktree.is_some() || project_check.is_some())
+            && (observed || batch.source != "stream")
+        {
+            return Err(Error::new(
+                "not_allowed",
+                "completion worktree capture requires the native stream source",
+            ));
+        }
         require_nonempty(&batch.batch_id, "batch_id")?;
         require_nonempty(&batch.source, "source")?;
         if batch.events.is_empty() {
@@ -516,6 +576,25 @@ impl Store {
                 "frame_too_large",
                 "native batch exceeds 900 KiB",
             ));
+        }
+        let event_payload_digests = batch
+            .events
+            .iter()
+            .map(|event| canonical::digest(&event.semantic_value()))
+            .collect::<Result<Vec<_>>>()?;
+        let batch_digest = batch
+            .semantic_digest()
+            .map_err(|error| Error::new("invalid", error.to_string()))?
+            .to_vec();
+        for event in batch
+            .events
+            .iter_mut()
+            .filter(|event| event.kind == "turn.completed")
+        {
+            if let Some(data) = event.data.as_object_mut() {
+                data.remove("worktree");
+                data.remove("project_check");
+            }
         }
         let agent_num = parse_agent_id(&batch.agent_id)?;
         let mut native_ids = HashSet::with_capacity(batch.events.len());
@@ -551,10 +630,6 @@ impl Store {
             }
             publication.push(published);
         }
-        let batch_digest = batch
-            .semantic_digest()
-            .map_err(|error| Error::new("invalid", error.to_string()))?
-            .to_vec();
 
         let tx = self
             .connection
@@ -706,7 +781,52 @@ impl Store {
         let mut provider_events = Vec::new();
         for (index, (source_event, published)) in batch.events.iter().zip(&publication).enumerate()
         {
-            let native_event = published.as_ref();
+            let mut enriched = None;
+            if !observed
+                && batch.source == "stream"
+                && source_event.kind == "turn.completed"
+                && projection.active_turn.as_deref()
+                    == source_event.data.get("turn_id").and_then(Value::as_str)
+                && (completion_worktree.is_some() || project_check.is_some())
+            {
+                let mut event = published.as_ref().clone();
+                if let Some(data) = event.data.as_object_mut() {
+                    if let Some(worktree) = completion_worktree.as_ref() {
+                        data.insert(
+                            "worktree".to_owned(),
+                            json!({
+                                "base": &worktree.base,
+                                "fingerprint": &worktree.fingerprint,
+                                "files": worktree.files,
+                                "lines": worktree.lines,
+                            }),
+                        );
+                    }
+                    if let Some(required) = project_check {
+                        data.insert(
+                            "project_check".to_owned(),
+                            json!(if required { "required" } else { "off" }),
+                        );
+                    }
+
+                    core::limits::bound_terminal_text(&mut event.data, MAX_EVENT_BYTES);
+                }
+                let mut data_bytes = encode_json(&event.data)?.len();
+                if data_bytes > MAX_EVENT_BYTES {
+                    if let Some(data) = event.data.as_object_mut() {
+                        data.remove("worktree");
+                    }
+                    core::limits::bound_terminal_text(&mut event.data, MAX_EVENT_BYTES);
+                    data_bytes = encode_json(&event.data)?.len();
+                }
+                if data_bytes > MAX_EVENT_BYTES
+                    && let Some(data) = event.data.as_object_mut()
+                {
+                    data.remove("project_check");
+                }
+                enriched = Some(event);
+            }
+            let native_event = enriched.as_ref().unwrap_or_else(|| published.as_ref());
             if !observed {
                 validate_resume_ready_subject_tx(
                     &tx,
@@ -744,7 +864,7 @@ impl Store {
             };
             let family = family_for_kind(&native_event.kind)?;
             // Deduplication still binds the exact redacted source payload.
-            let event_digest = canonical::digest(&source_event.semantic_value())?;
+            let event_digest = &event_payload_digests[index];
             let cause = if !observed {
                 verified_native_event_cause_tx(
                     &tx,
@@ -772,7 +892,7 @@ impl Store {
                     generation: batch.generation,
                     source: &batch.source,
                     cursor,
-                    payload_digest: &event_digest,
+                    payload_digest: event_digest,
                     subject: Some(EventSubject::from(&next)),
                     cause: cause.clone(),
                 },

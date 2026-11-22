@@ -8,6 +8,7 @@ mod autonomy;
 mod canonical;
 mod capacity;
 mod launch_queue;
+mod launch_result;
 mod online_backup;
 pub use launch_queue::{ArbitratedTimer, PendingLaunch, TimerWait};
 mod cleanup;
@@ -42,8 +43,8 @@ pub use resolution::{ConfigureReadback, TurnInactiveProof};
 pub use retention::{RetentionReport, RetentionSpaceStatus, StoreCompactionReport};
 pub use rules::{
     RuleCatchUpAction, RuleCatchUpActionOutcome, RuleCatchUpAdmission, RuleCursorOutcome,
-    RuleDefinitionInput, RuleEventAdmission, RuleProcessingState, TimerDefinitionInput,
-    TimerSlotAdmission, TimerSlotCommit,
+    RuleDefinitionInput, RuleEventAdmission, RuleEventInput, RuleProcessingState,
+    TimerDefinitionInput, TimerSlotAdmission, TimerSlotCommit,
 };
 pub use scripts::ScriptRunAdmission;
 pub use turn_recovery::{ActiveTurnRecovery, RecoveredTurn};
@@ -228,6 +229,7 @@ mod resolution;
 mod retention;
 mod schema;
 mod source_batches;
+pub use source_batches::CompletionWorktreeCapture;
 mod source_handoff;
 mod source_install;
 mod switch;

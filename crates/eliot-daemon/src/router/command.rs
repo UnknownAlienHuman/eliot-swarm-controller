@@ -13,7 +13,7 @@ use crate::common::now_ms;
 use crate::plugin_host::PendingCommand;
 use eliot_core::{
     Agent, AgentState, Command, CommandState, ContextItem, Error, Event, FailureOrigin,
-    FrozenScriptRun, InjectArgs, InjectPoint, Result, SecretPolicy,
+    FrozenScriptRun, InjectPoint, Result, SecretPolicy,
     api::{
         FrozenGitFetch, FrozenGitPublish, ProjectRegistrationView, configure_uses_native_session,
     },
@@ -198,7 +198,7 @@ impl Router {
             // concrete next_input send or authenticated safe-point callback
             // may claim them. An active_turn inject is a direct command: it
             // dispatches to the plugin's native turn/steer effect now.
-            let point = serde_json::from_value::<InjectArgs>(command.args.clone())
+            let point = eliot_core::decode_retained_inject_args(&command.args)
                 .map(|args| args.point)
                 .ok();
             if point != Some(InjectPoint::ActiveTurn) {
@@ -224,6 +224,10 @@ impl Router {
             return None;
         }
         let inputs = self.load_dispatch_binding(id, &command).await?;
+        if let Err(error) = self.check_rule_worktree_guard(&command).await {
+            self.reject_undispatched_error(id, &error).await;
+            return None;
+        }
         Some(PreparedCommand {
             command,
             git_fetch_registration,

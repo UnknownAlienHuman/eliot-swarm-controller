@@ -3,6 +3,17 @@ use super::*;
 const SCRIPT_ACTION_ID_DOMAIN: &str = "eliot.script.action.command.v1";
 
 fn valid_script_output_action_request(request: &SubmitCommand) -> bool {
+    if request.verb == "emit" {
+        return request.validate().is_ok()
+            && request.target.is_none()
+            && request.expected_generation.is_none()
+            && request.expected_turn_id.is_none()
+            && request.request_id.is_none()
+            && !request.probe
+            && request.args.is_object()
+            && serde_json::from_value::<core::api::EmitDefinitionArgs>(request.args.clone())
+                .is_ok_and(|definition| definition.validate().is_ok());
+    }
     matches!(request.verb.as_str(), "stop" | "send" | "interrupt")
         && rules::valid_rule_action_request(request, true)
 }
@@ -107,10 +118,11 @@ impl Store {
         let mut events = Vec::new();
         let mut child_ids = Vec::with_capacity(actions.len());
         for (index, mut action) in actions.into_iter().enumerate() {
+            action.validate()?;
             if !action.id.is_empty() || !valid_script_output_action_request(&action) {
                 return Err(Error::new(
                     "invalid",
-                    "script output must contain an id-free stop, send or interrupt command",
+                    "script output must contain an id-free stop, send, interrupt or emit command",
                 ));
             }
             let ordinal = i64::try_from(index)
@@ -157,6 +169,7 @@ impl Store {
                     "new script child could not be bound to its Run",
                 ));
             }
+            rules::record_script_output_rate_key_tx(&tx, origin, &child_id, now)?;
             let child_cause = core::EventCause {
                 command_id: child_id.clone(),
                 rule: Some(origin.rule.clone()),

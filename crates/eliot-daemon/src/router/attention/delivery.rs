@@ -48,6 +48,7 @@ pub(super) async fn persist_report_event(router: &Router, delivery: &FrozenRepor
     let request = EmitDefinitionArgs {
         topic: "agent.attention".to_owned(),
         data,
+        key: None,
     };
     let args = serde_json::to_value(request)
         .map_err(|_| Error::new("internal", "attention event args could not be encoded"))?;
@@ -111,6 +112,7 @@ pub(super) async fn persist_loss_delivery(
     let request = EmitDefinitionArgs {
         topic: "agent.attention".to_owned(),
         data,
+        key: None,
     };
     let args = serde_json::to_value(request)
         .map_err(|_| Error::new("internal", "attention event args could not be encoded"))?;
@@ -341,6 +343,7 @@ impl Router {
                 "generation": agent.generation,
                 "turn_id": reaction.turn_id,
             }),
+            key: None,
         };
         self.submit_attention_event(
             &json!({"id": emit_id, "verb": "attention.emit", "args": args}),

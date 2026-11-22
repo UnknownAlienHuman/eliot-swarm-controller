@@ -902,6 +902,16 @@ impl Router {
             continuation: None,
         };
         let result = self.commit_goal_round(&principal, &request, &commit).await;
+        if probe.project_default
+            && result
+                .as_ref()
+                .is_ok_and(|value| value["view"]["status"] == "completed")
+            && let GoalRoundKey::Idle(seq) = commit.round_key
+            && let Some(fingerprint) = commit.fingerprint_before.as_deref()
+        {
+            super::project_checks::publish_goal_worktree_pass(self, seq, fingerprint, &definition)
+                .await;
+        }
         claimed.complete(result)
     }
 

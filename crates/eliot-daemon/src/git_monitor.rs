@@ -936,6 +936,25 @@ impl GitProbe {
         Ok(())
     }
 
+    /// Take a fresh, stable Git snapshot and derive the shared event facts.
+    pub(crate) async fn capture_worktree(
+        &self,
+        workspace: &str,
+        base_oid: &str,
+        now: i64,
+    ) -> Result<WorktreeCapture> {
+        if !is_git_oid(base_oid) {
+            return Err(unavailable("workspace base is unavailable"));
+        }
+        let snapshot = self
+            .probe(workspace, None, Some(base_oid), &[], now)
+            .await?;
+        let capture = worktree_capture_from_snapshot(&snapshot)?;
+        if self.work_fingerprint(workspace).await? != capture.fingerprint {
+            return Err(unavailable("workspace changed during completion capture"));
+        }
+        Ok(capture)
+    }
     /// A Goal's no-progress fingerprint, read now: HEAD and the monitor's
     /// content `dirty_digest` over the dirty set. A read past the monitor's
     /// caps or of a workspace that is not an exact Git root fails.
@@ -2032,6 +2051,52 @@ pub(crate) fn work_fingerprint_from_snapshot(snapshot: &GitSnapshot) -> Result<S
         snapshot.head.as_deref(),
         dirty_digest,
     ))
+}
+
+/// Worktree identity and bounded diff size for one complete probe against its
+/// frozen base. Missing Git coverage is an error, never a zero-sized change.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WorktreeCapture {
+    pub base: String,
+    pub fingerprint: String,
+    pub files: u64,
+    pub lines: u64,
+}
+
+pub(crate) fn worktree_capture_from_snapshot(snapshot: &GitSnapshot) -> Result<WorktreeCapture> {
+    if !snapshot.complete
+        || !snapshot.base_complete
+        || snapshot
+            .base_oid
+            .as_deref()
+            .is_none_or(|base| !is_git_oid(base))
+    {
+        return Err(unavailable(
+            "workspace change size is not complete against its base",
+        ));
+    }
+    let work = snapshot
+        .work
+        .as_ref()
+        .filter(|work| work.available)
+        .ok_or_else(|| unavailable("workspace change size is unavailable"))?;
+    let (Some(files), Some(insertions), Some(deletions)) =
+        (work.files_changed, work.insertions, work.deletions)
+    else {
+        return Err(unavailable("workspace change size is incomplete"));
+    };
+    let lines = insertions
+        .checked_add(deletions)
+        .ok_or_else(|| unavailable("workspace change size exceeds its counter bound"))?;
+    Ok(WorktreeCapture {
+        base: snapshot
+            .base_oid
+            .clone()
+            .ok_or_else(|| unavailable("workspace base is unavailable"))?,
+        fingerprint: work_fingerprint_from_snapshot(snapshot)?,
+        files,
+        lines,
+    })
 }
 
 fn work_fingerprint_from_parts(head: Option<&str>, dirty_digest: &str) -> String {

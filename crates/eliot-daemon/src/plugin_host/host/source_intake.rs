@@ -6,7 +6,7 @@
 //! ownership stay with super; actor lifecycle lives in actor.
 
 use super::{
-    AgentKey, Bus, EventSource, PluginConnection, RPC_GRACE, StoreHandle, deadline,
+    AgentKey, Bus, EventSource, HostState, PluginConnection, RPC_GRACE, StoreHandle, deadline,
     fence_runtime_generation, late_batch_error, record_source_gap, record_store_batch_rejection,
     redact_native_error, redact_source_batch, redact_source_gap, safe_cause_code, signal_progress,
     source_state_binding,
@@ -15,6 +15,7 @@ use super::{native_children, observation, source_handoff};
 
 use crate::command_guard::{CommandGuardPolicy, CommandGuardRequest, REQUEST_FIELD};
 use crate::common::{now_ms, secure_eq};
+use crate::git_monitor::GitProbe;
 
 use eliot_core::{Error, PermissionRefusal, Result, SecretPolicy, SourceBatch, SourceGap};
 use eliot_plugin::protocol::{HookEvent, HookResponse};
@@ -25,7 +26,8 @@ use serde_json::{Value, json};
 use tokio::time::{Instant, timeout_at};
 use ulid::Ulid;
 
-struct GuardEvaluation<'a> {
+struct BatchIntake<'a> {
+    host: &'a std::sync::Weak<HostState>,
     policy: &'a CommandGuardPolicy,
     credentials: &'a [String],
 }
@@ -154,7 +156,8 @@ pub(super) async fn serve_plugin_requests(mut connection: PluginConnection, sour
                             &bus,
                             params,
                             binding,
-                            GuardEvaluation {
+                            BatchIntake {
+                                host: &state,
                                 credentials: &source_credentials,
                                 policy: &command_guard_policy,
                             },
@@ -386,18 +389,157 @@ pub(super) async fn serve_plugin_requests(mut connection: PluginConnection, sour
     }
 }
 
+async fn completion_capture(
+    state: &std::sync::Weak<HostState>,
+    store: &StoreHandle,
+    batch: &SourceBatch,
+    until: Instant,
+) -> (Option<eliot_store::CompletionWorktreeCapture>, Option<bool>) {
+    if batch.source != "stream"
+        || !batch
+            .events
+            .iter()
+            .any(|event| event.kind == "turn.completed")
+    {
+        return (None, None);
+    }
+    let Some(host) = state.upgrade() else {
+        return (None, None);
+    };
+    if host.completion_interests.lock_recover().is_empty() {
+        return (None, None);
+    }
+    // Both lookups and Git capture leave the native lifecycle commit its own budget.
+    let capture_until = until - RPC_GRACE;
+    let (agent, registered, fields) = {
+        let Ok(store) = timeout_at(capture_until, store.lock()).await else {
+            return (None, None);
+        };
+        let Some(agent) = store
+            .get_agent(&batch.agent_id)
+            .ok()
+            .flatten()
+            .filter(|agent| agent.generation == batch.generation)
+        else {
+            return (None, None);
+        };
+        let fields = completion_fields_for(&host, &agent);
+        if !fields.needed() {
+            return (None, None);
+        }
+        let registered = if agent.project.is_empty() {
+            Some(false)
+        } else {
+            store
+                .get_project_registration("owner", &agent.project)
+                .ok()
+                .map(|registration| registration.is_some())
+        };
+        (agent, registered, fields)
+    };
+    let Some(turn_id) = agent.active_turn.as_deref() else {
+        return (None, None);
+    };
+    if !batch.events.iter().any(|event| {
+        event.kind == "turn.completed"
+            && event.data.get("turn_id").and_then(Value::as_str) == Some(turn_id)
+    }) {
+        return (None, None);
+    }
+
+    let project_check = if agent.parent.is_some() || agent.policy_opt_out_reason.is_some() {
+        None
+    } else {
+        match registered {
+            Some(false) => Some(false),
+            Some(true) => crate::config::load_project_registration_config(&host.data_root)
+                .ok()
+                .and_then(|projects| {
+                    projects
+                        .into_iter()
+                        .find(|project| project.id == agent.project)
+                })
+                .map(|project| {
+                    project
+                        .policy
+                        .as_ref()
+                        .and_then(|policy| policy.check.as_ref())
+                        .is_some()
+                }),
+            None => None,
+        }
+    };
+    let capture = match (fields.worktree, project_check) {
+        (true, Some(true)) => match (
+            GitProbe::new(),
+            agent.workspace.as_deref(),
+            agent.base_oid.as_deref(),
+        ) {
+            (Ok(probe), Some(workspace), Some(base_oid)) => {
+                if crate::logging::is_debug() {
+                    crate::logging::record_debug(
+                        &SecretPolicy::new(host.secrets.lock_recover().iter()),
+                        "project.worktree.capture",
+                        &[("agent", &agent.id), ("turn_id", turn_id)],
+                        &[],
+                    );
+                }
+                match timeout_at(
+                    capture_until,
+                    probe.capture_worktree(workspace, base_oid, now_ms()),
+                )
+                .await
+                {
+                    Ok(Ok(capture)) => Some(capture),
+                    _ => None,
+                }
+            }
+            _ => None,
+        },
+        (true, Some(false)) => host.monitoring.completion_worktree_capture(&agent),
+        _ => None,
+    };
+    let capture = capture.map(|capture| eliot_store::CompletionWorktreeCapture {
+        base: capture.base,
+        fingerprint: capture.fingerprint,
+        files: capture.files,
+        lines: capture.lines,
+    });
+    (capture, project_check)
+}
+
+fn completion_fields_for(
+    host: &HostState,
+    agent: &eliot_core::Agent,
+) -> crate::automation::CompletionFields {
+    let interests = host.completion_interests.lock_recover();
+    let project = format!("project:{}", agent.project);
+    let mut fields = crate::automation::CompletionFields::default();
+    let Some(subject) = serde_json::to_value(eliot_core::EventSubject::from(agent)).ok() else {
+        return fields;
+    };
+    for principal in ["owner", project.as_str()] {
+        if let Some(rules) = interests.get(principal) {
+            for rule in rules.iter().filter(|rule| rule.matches_agent(&subject)) {
+                fields.worktree |= rule.fields.worktree;
+                fields.project_check |= rule.fields.project_check;
+            }
+        }
+    }
+    fields
+}
 async fn put_events(
     store: &StoreHandle,
     bus: &Bus,
     params: Value,
     binding: source_handoff::SourceBinding<'_>,
-    guard: GuardEvaluation<'_>,
+    intake: BatchIntake<'_>,
     until: Instant,
     rejected: &mut Option<SourceGap>,
 ) -> Result<Value> {
     let invalid_batch = || Error::new("invalid", "events.put params are malformed");
-    let credentials = guard.credentials;
-    let guard_policy = guard.policy;
+    let credentials = intake.credentials;
+    let guard_policy = intake.policy;
     let gap = batch_gap(&params).ok_or_else(invalid_batch)?;
     let is_child = gap.agent_id != binding.agent_id || gap.generation != binding.generation;
     let subject = binding.expected_subject()?;
@@ -422,6 +564,11 @@ async fn put_events(
             return Err(error);
         }
     };
+    let (completion_worktree, project_check) = if !is_child && subject.is_none() {
+        completion_capture(intake.host, store, &batch, until).await
+    } else {
+        (None, None)
+    };
     let batch_id = batch.batch_id.clone();
     let event_kinds = batch
         .events
@@ -438,7 +585,12 @@ async fn put_events(
             } else if let Some(subject) = subject {
                 store.put_observed_batch(batch, subject, now)
             } else {
-                store.put_batch(batch, now)
+                store.put_batch_with_completion_capture(
+                    batch,
+                    completion_worktree,
+                    project_check,
+                    now,
+                )
             };
             if let Ok(commit) = &result {
                 bus.publish(&commit.events);

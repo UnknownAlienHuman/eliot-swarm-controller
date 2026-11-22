@@ -272,12 +272,36 @@ impl Store {
         }
 
         let limit = rule_action_limit(&stored)?;
+        let definition_value: serde_json::Value =
+            serde_json::from_str(&stored.canonical_definition)
+                .map_err(|_| Error::new("source_integrity", "stored rule definition is invalid"))?;
+        if limit.per == core::api::RuleLimitScope::Key || definition_value.get("once_per").is_some()
+        {
+            return Err(Error::new(
+                "unsupported",
+                "once_per and key-scoped limits do not support historical catch-up",
+            ));
+        }
+        if limit.per == core::api::RuleLimitScope::Agent
+            && actions.iter().any(|action| {
+                matches!(
+                    &action.outcome,
+                    RuleCatchUpActionOutcome::Command(request) if request.verb == "launch"
+                )
+            })
+        {
+            return Err(Error::new(
+                "unsupported",
+                "Agent-scoped launch limits do not support historical catch-up",
+            ));
+        }
         let mut planned = Vec::new();
         let mut rejected = Vec::<(i64, Error)>::new();
         let mut suppressed = Vec::new();
         let mut skipped_markers = Vec::<SkippedRuleAction>::new();
         let mut seen = HashSet::with_capacity(actions.len());
         let mut scoped_added = HashMap::<String, i64>::new();
+        let mut scoped_last = HashMap::<String, i64>::new();
         let mut global_added = 0_i64;
         let mut previous_seq = request.after_seq;
 
@@ -404,16 +428,23 @@ impl Store {
                 return Err(error);
             }
             let target = action_request.target.as_deref();
-            let (scoped_count, global_count) =
-                rule_action_counts(&tx, principal, &request.rule, target, &limit, now)?;
+            let rate_agent = target.map(parse_agent_id).transpose()?;
+            let (scoped_count, stored_last, global_count) =
+                rule_action_counts(&tx, principal, &request.rule, rate_agent, &limit, None, now)?;
             let bucket = match limit.per {
                 core::api::RuleLimitScope::Rule => Some(String::new()),
                 core::api::RuleLimitScope::Agent => target.map(str::to_owned),
+                core::api::RuleLimitScope::Key => None,
             };
             let scoped_total = bucket.as_ref().map_or(0, |bucket| {
                 scoped_count.saturating_add(*scoped_added.get(bucket).unwrap_or(&0))
             });
+            let last_action_at = bucket
+                .as_ref()
+                .and_then(|bucket| scoped_last.get(bucket).copied())
+                .or(stored_last);
             if rule_limit_reached(scoped_total, limit.max)
+                || rule_min_interval_reached(last_action_at, &limit, now)
                 || global_count.saturating_add(global_added) >= GLOBAL_RULE_ACTION_LIMIT
             {
                 rejected.push((
@@ -504,7 +535,8 @@ impl Store {
                 cause,
             });
             if let Some(bucket) = bucket {
-                *scoped_added.entry(bucket).or_default() += 1;
+                *scoped_added.entry(bucket.clone()).or_default() += 1;
+                scoped_last.insert(bucket, now);
             }
             global_added += 1;
         }

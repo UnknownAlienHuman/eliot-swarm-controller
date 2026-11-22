@@ -16,8 +16,8 @@ use crate::platform::OwnedChild;
 use crate::platform::custody::{AgentCustodies, AgentSpawnError, LocalPeer};
 use actor::run_agent_inner;
 use eliot_core::{
-    Agent, Command, ContextItem, Error, InjectArgs, InjectPoint, Result, SecretPolicy, SourceBatch,
-    SourceGap, SourceGapAck, StderrSource,
+    Agent, Command, ContextItem, Error, InjectPoint, Result, SecretPolicy, SourceBatch, SourceGap,
+    SourceGapAck, StderrSource,
     api::{ArtifactKind, ArtifactView},
 };
 use eliot_plugin::{
@@ -362,6 +362,7 @@ struct HostState {
     store: StoreHandle,
     bus: Bus,
     monitoring: Monitoring,
+    completion_interests: Mutex<HashMap<String, Vec<crate::automation::CompletionRuleInterest>>>,
     agent_custodies: AgentCustodies,
     secrets: SecretSet,
     agent_credentials: AgentCredentials,
@@ -489,6 +490,7 @@ impl PluginHost {
                 store,
                 bus,
                 monitoring,
+                completion_interests: Mutex::default(),
                 agent_custodies: AgentCustodies::default(),
                 secrets,
                 agent_credentials,
@@ -506,6 +508,29 @@ impl PluginHost {
                 reader_slots: Arc::new(Semaphore::new(discovery::MAX_READERS)),
                 launch_reader_slots: Arc::new(Semaphore::new(discovery::MAX_LAUNCH_READERS)),
             }),
+        }
+    }
+
+    pub(crate) fn install_completion_interests(
+        &self,
+        principal: &str,
+        interests: Vec<crate::automation::CompletionRuleInterest>,
+    ) {
+        let mut stored = self.state.completion_interests.lock_recover();
+        if interests.is_empty() {
+            stored.remove(principal);
+        } else {
+            stored.insert(principal.to_owned(), interests);
+        }
+    }
+
+    pub(crate) fn remove_completion_interest(&self, principal: &str, id: &str) {
+        let mut stored = self.state.completion_interests.lock_recover();
+        if let Some(rules) = stored.get_mut(principal) {
+            rules.retain(|rule| rule.id != id);
+            if rules.is_empty() {
+                stored.remove(principal);
+            }
         }
     }
 
@@ -2479,11 +2504,12 @@ fn plugin_command_args(command: &Command) -> Result<Value> {
             })?;
         }
         "inject" => {
+            args.remove("_trusted_review_labels");
             // Direct active_turn inject: keep the original typed payload and the
             // captured turn. Any builder failure here is known before plugin
             // I/O, so it classifies native_not_dispatched (Rejected), never
             // a generic unsupported Unknown.
-            let typed: InjectArgs = serde_json::from_value(command.args.clone())
+            let typed = eliot_core::decode_retained_inject_args(&command.args)
                 .map_err(|_| Error::new("native_not_dispatched", "inject args are malformed"))?;
             if typed.point != InjectPoint::ActiveTurn {
                 return Err(Error::new(

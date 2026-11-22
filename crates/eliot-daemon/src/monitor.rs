@@ -5,7 +5,7 @@ use crate::{
     bus::Bus,
     common::now_ms,
     fs_invalidation::WorkspaceInvalidation,
-    git_monitor::{GitProbe, normalize_hint},
+    git_monitor::{GitProbe, WorktreeCapture, normalize_hint, worktree_capture_from_snapshot},
     platform::CustodyObserver,
     plugin_host::SecretSet,
 };
@@ -673,6 +673,29 @@ impl Monitoring {
                 .unwrap_or_default()
         };
         refresh_process_timestamps(processes, &cache);
+    }
+
+    /// Reuse existing bounded work capture for no-policy completion. The rule
+    /// launch boundary must fresh-probe and compare this candidate fingerprint.
+    pub(crate) fn completion_worktree_capture(&self, agent: &Agent) -> Option<WorktreeCapture> {
+        let workspace = agent.workspace.as_deref()?;
+        let target = self
+            .inner
+            .git_workspaces
+            .lock_recover()
+            .get(workspace)
+            .cloned()?;
+        let cache = target.cache.lock_recover().clone();
+        if cache.error.is_some() || self.inner.git_unavailable.lock_recover().is_some() {
+            return None;
+        }
+        let snapshot = cache.snapshot.as_ref()?;
+        if snapshot.workspace != workspace
+            || agent.base_oid.as_deref() != snapshot.base_oid.as_deref()
+        {
+            return None;
+        }
+        worktree_capture_from_snapshot(snapshot).ok()
     }
 
     pub(crate) async fn git_view(&self, agent: &Agent) -> Result<GitView> {

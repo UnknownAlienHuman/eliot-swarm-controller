@@ -20,6 +20,8 @@ mod inference;
 mod insertion_facts;
 mod instructions;
 pub(crate) mod launch_queue;
+mod launch_result;
+pub(crate) use launch_result::RULE_WORKTREE_GUARD_ARG;
 mod loss_recovery;
 mod organization;
 mod overview;
@@ -1206,6 +1208,7 @@ impl Router {
             expected_turn_id: None,
             request_id: None,
             probe: false,
+            trusted_review_labels: None,
         };
         let prepared = match self.prepare_submission(request, &Principal::Owner).await {
             Ok(prepared) => prepared,
@@ -4129,6 +4132,7 @@ impl Router {
         &self,
         principal: &str,
         definitions: &[(i64, RuleDefinition)],
+        completion_interests: Vec<crate::automation::CompletionRuleInterest>,
     ) {
         if principal == "owner" {
             let active = definitions
@@ -4148,6 +4152,15 @@ impl Router {
                 (*revision, definition.clone()),
             )
         }));
+        self.inner
+            .plugin_host
+            .install_completion_interests(principal, completion_interests);
+    }
+
+    pub(crate) fn remove_completion_interest(&self, principal: &str, id: &str) {
+        self.inner
+            .plugin_host
+            .remove_completion_interest(principal, id);
     }
 
     fn rule_definition(&self, principal: &str, id: &str) -> Option<(i64, RuleDefinition)> {
@@ -7062,7 +7075,7 @@ fn freeze_attach_profile(
 
 fn command_needs_worker(command: &Command) -> bool {
     command.verb != "inject"
-        || serde_json::from_value::<eliot_core::InjectArgs>(command.args.clone())
+        || eliot_core::decode_retained_inject_args(&command.args)
             .is_ok_and(|args| args.point == eliot_core::InjectPoint::ActiveTurn)
 }
 
@@ -8053,10 +8066,11 @@ fn user_event_kind_data(verb: &str, args: &Value) -> Result<(String, Value)> {
                 "params.args",
             )?;
             definition.validate()?;
-            Ok((
-                format!("x.user.{}", definition.topic),
-                json!({"data": definition.data}),
-            ))
+            let mut data = json!({"data": definition.data});
+            if let Some(key) = definition.key {
+                data["key"] = Value::String(key);
+            }
+            Ok((format!("x.user.{}", definition.topic), data))
         }
         _ => Err(Error::new("invalid", "not a local user-event verb")),
     }
@@ -8513,6 +8527,7 @@ fn reject_launch_derived_keys(args: &Value) -> Result<()> {
     }
     for reserved in [
         "registered_project",
+        RULE_WORKTREE_GUARD_ARG,
         eliot_core::PROJECT_CHECK_GOAL_ARG,
         eliot_core::PROJECT_POLICY_APPLIED_ARG,
         "admission_mode",

@@ -115,14 +115,19 @@ impl super::reads::RuleGetRequest {
 pub enum RuleLimitScope {
     Rule,
     Agent,
+    Key,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuleLimit {
     pub max: u64,
     pub per: RuleLimitScope,
     pub window_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_interval_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
 }
 
 impl RuleLimit {
@@ -135,6 +140,23 @@ impl RuleLimit {
                 "invalid",
                 "rule limit window_ms must be positive",
             ));
+        }
+        if self
+            .min_interval_ms
+            .is_some_and(|interval| interval <= 0 || interval > self.window_ms)
+        {
+            return Err(Error::new(
+                "invalid",
+                "rule limit min_interval_ms must be positive and no greater than window_ms",
+            ));
+        }
+        if (self.per != RuleLimitScope::Key && self.key.is_some())
+            || self
+                .key
+                .as_deref()
+                .is_some_and(|key| key.trim().is_empty() || key.len() > 4096)
+        {
+            return Err(Error::new("invalid", "rule limit key is invalid"));
         }
         Ok(())
     }

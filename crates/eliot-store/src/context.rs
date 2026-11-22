@@ -8,7 +8,8 @@ use facts::{edit_note_text, edit_path_key, new_note_paths};
 use super::*;
 use eliot_core::{
     ContextEditPath, ContextItem, ContextOutcome, InjectArgs, InjectPoint,
-    api::harness::MAX_HARNESS_MODEL_ID_BYTES, swarm_note, turn_started_data,
+    api::harness::MAX_HARNESS_MODEL_ID_BYTES, swarm_note, swarm_note_with_trusted_review_labels,
+    turn_started_data,
 };
 use serde::{Deserialize, Serialize};
 
@@ -446,7 +447,12 @@ fn render_injection(connection: &Connection, command: &Command, text: &str) -> R
     } else {
         &command.principal
     };
-    Ok(swarm_note(text, principal))
+    match decode_inject_args(&command.args)?.trusted_review_labels {
+        Some(labels) => Ok(swarm_note_with_trusted_review_labels(
+            text, principal, &labels,
+        )),
+        None => Ok(swarm_note(text, principal)),
+    }
 }
 
 pub(super) fn admit_tx(
@@ -558,7 +564,11 @@ pub(super) fn admit_tx(
         }
     };
 
-    let resolved = json!(args);
+    let mut resolved = json!(args);
+    if let Some(labels) = &request.trusted_review_labels {
+        resolved["_trusted_review_labels"] = serde_json::to_value(labels)
+            .map_err(|_| Error::new("internal", "trusted review labels could not be encoded"))?;
+    }
     let initial_outcome = (args.point == InjectPoint::NextInput).then(|| {
         let delivery = if request.expected_turn_id.is_some() {
             "moved"
@@ -2072,7 +2082,7 @@ fn inject_point_name(point: InjectPoint) -> &'static str {
     }
 }
 
-pub(super) fn decode_inject_args(value: &Value) -> Result<InjectArgs> {
-    serde_json::from_value(value.clone())
+pub(super) fn decode_inject_args(value: &Value) -> Result<eliot_core::RetainedInjectArgs> {
+    eliot_core::decode_retained_inject_args(value)
         .map_err(|_| Error::new("source_integrity", "persisted inject args are malformed"))
 }

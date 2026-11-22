@@ -18,6 +18,8 @@ pub use rule_timers::{TimerDefinitionInput, TimerSlotAdmission, TimerSlotCommit}
 const RULE_ACTION_WINDOW_MS: i64 = 60_000;
 const RULE_ACTION_LIMIT: i64 = 10;
 const GLOBAL_RULE_ACTION_LIMIT: i64 = 120;
+const RULE_ONCE_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+const RULE_ONCE_KEYS_PER_RULE_MAX: i64 = 10_000;
 const RULE_COMMAND_ID_DOMAIN: &str = "eliot-rule-command-v1";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,6 +71,27 @@ fn rule_limit_from_value(value: &serde_json::Value) -> Result<Option<core::api::
     Ok(Some(limit))
 }
 
+fn validate_rule_key_inputs(
+    definition: &str,
+    once_per_key: Option<&[u8; 32]>,
+    rate_key: Option<&[u8; 32]>,
+) -> Result<()> {
+    let value: Value = serde_json::from_str(definition)
+        .map_err(|_| Error::new("source_integrity", "stored rule definition is invalid"))?;
+    let expects_once_per = value.get("once_per").is_some();
+    let limit = rule_limit_from_value(&value)?;
+    let expects_rate_key = limit
+        .as_ref()
+        .is_some_and(|limit| limit.per == core::api::RuleLimitScope::Key);
+    if expects_once_per != once_per_key.is_some() || expects_rate_key != rate_key.is_some() {
+        return Err(Error::new(
+            "source_integrity",
+            "rendered rule keys do not match the stored definition",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuleCursorOutcome {
     /// A scanned event did not match. Cursor-only; this emits no event.
@@ -79,6 +102,8 @@ pub enum RuleCursorOutcome {
     Rejected { code: String, message: String },
     /// A matching event was skipped because its next verified cause depth is over the limit.
     SkippedCauseDepth,
+    /// A matching event did not provide a usable key.
+    Suppressed,
     /// A configured-capacity preparation refusal retains bounded Owner remedy
     /// text for automation readback; all other errors use `Rejected`.
     RejectedWithCapacity {
@@ -97,6 +122,12 @@ pub struct RuleEventAdmission {
     pub child: Option<Admission>,
     pub events: Vec<Event>,
     pub is_new: bool,
+}
+
+pub struct RuleEventInput {
+    pub seq: i64,
+    pub once_per_key: Option<[u8; 32]>,
+    pub rate_key: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,6 +172,8 @@ struct RuleFiringKey<'a> {
     principal: &'a str,
     state: &'a core::api::RuleStateView,
     trigger_cause: Option<core::EventCause>,
+    once_per_key: Option<[u8; 32]>,
+    rate_key: Option<[u8; 32]>,
     identity: RuleFiringIdentity,
     verb: &'static str,
     args: Value,
@@ -158,6 +191,8 @@ impl<'a> RuleFiringKey<'a> {
         revision: i64,
         event_seq: i64,
         trigger_cause: Option<core::EventCause>,
+        once_per_key: Option<[u8; 32]>,
+        rate_key: Option<[u8; 32]>,
     ) -> Result<Self> {
         let mut args = json!({
             "rule": state.id,
@@ -171,6 +206,8 @@ impl<'a> RuleFiringKey<'a> {
             principal,
             state,
             trigger_cause,
+            once_per_key,
+            rate_key,
             identity: RuleFiringIdentity::Event { event_seq },
             verb: "rule",
             args,
@@ -180,6 +217,10 @@ impl<'a> RuleFiringKey<'a> {
             parent_id: derived_rule_id("parent", principal, &state.id, revision, event_seq)?,
             child_id: derived_rule_id("action-0", principal, &state.id, revision, event_seq)?,
         })
+    }
+
+    fn set_rate_agent(&mut self, agent: i64) {
+        self.args["rate_agent"] = json!(agent);
     }
 
     fn command_event_data(&self, children: Vec<String>) -> Value {
@@ -236,7 +277,16 @@ impl<'a> RuleFiringKey<'a> {
     }
 
     fn matches_parent(&self, parent: &Command, principal: &str) -> bool {
-        if parent.principal != principal || parent.verb != self.verb || parent.args != self.args {
+        let mut parent_args = parent.args.clone();
+        if let Some(fields) = parent_args.as_object_mut() {
+            fields.remove("rate_agent");
+        }
+        let mut expected_args = self.args.clone();
+        if let Some(fields) = expected_args.as_object_mut() {
+            fields.remove("rate_agent");
+        }
+        if parent.principal != principal || parent.verb != self.verb || parent_args != expected_args
+        {
             return false;
         }
         match self.identity {
@@ -468,7 +518,7 @@ impl Store {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_error)?;
             validate_rule_principal_tx(&tx, principal)?;
-            let stored = load_rule_state(&tx, principal, &state.id)?
+            let mut stored = load_rule_state(&tx, principal, &state.id)?
                 .ok_or_else(|| Error::new("not_found", "rule state was not found"))?;
 
             let retiring = rule_cursor_is_retiring(&stored.view, through);
@@ -538,6 +588,20 @@ impl Store {
                             }),
                         )?);
                     }
+                }
+                RuleCursorOutcome::Suppressed => {
+                    events.extend(suppress_key_tx(
+                        &tx,
+                        principal,
+                        &mut stored.view,
+                        revision,
+                        through,
+                        now,
+                        &Error::new(
+                            "rule_key_unavailable",
+                            "event did not supply a usable rule key",
+                        ),
+                    )?);
                 }
                 RuleCursorOutcome::SkippedCauseDepth => {
                     let trigger = load_rule_trigger(&tx, through)?;
@@ -728,14 +792,14 @@ impl Store {
         &mut self,
         principal: &str,
         state: &core::api::RuleStateView,
-        event_seq: i64,
+        event: RuleEventInput,
         request: SubmitCommand,
         now: i64,
         secret_policy: &core::SecretPolicy,
     ) -> Result<RuleEventAdmission> {
         self.ensure_writer_healthy()?;
         let result =
-            self.admit_rule_action_inner(principal, state, event_seq, request, now, secret_policy);
+            self.admit_rule_action_inner(principal, state, event, request, now, secret_policy);
         self.fault_on_persistence_error(&result);
         result
     }
@@ -766,11 +830,16 @@ impl Store {
         &mut self,
         principal: &str,
         state: &core::api::RuleStateView,
-        event_seq: i64,
+        event: RuleEventInput,
         mut request: SubmitCommand,
         now: i64,
         secret_policy: &core::SecretPolicy,
     ) -> Result<RuleEventAdmission> {
+        let RuleEventInput {
+            seq: event_seq,
+            once_per_key,
+            rate_key,
+        } = event;
         require_nonempty(principal, "principal")?;
         require_nonempty(&state.id, "rule id")?;
         if event_seq <= 0 {
@@ -813,6 +882,8 @@ impl Store {
             revision,
             event_seq,
             trigger.cause.clone(),
+            once_per_key,
+            rate_key,
         )?;
 
         if cursor >= event_seq {
@@ -867,16 +938,6 @@ impl Store {
             });
         }
 
-        let binding_error = if request.verb == "run" {
-            rule_run_action_binding_error(&tx, principal, &state.id, revision, event_seq, &request)?
-        } else {
-            rule_action_binding_error(&trigger, event_seq, &request)
-        };
-        if let Some(code) = binding_error {
-            request.id = key.child_id.clone();
-            let error = Error::new(code.clone(), code);
-            return reject_rule_event(tx, &self.write_faulted, &key, &error, now);
-        }
         let canonical_definition = if retiring {
             stored
                 .retiring_definition
@@ -885,6 +946,30 @@ impl Store {
         } else {
             &stored.canonical_definition
         };
+        let binding_error = if request.verb == "run" {
+            rule_run_action_binding_error(&tx, principal, &state.id, revision, event_seq, &request)?
+        } else if let Some(bound) = launch_result::rule_launch_insertion_binding(
+            &tx,
+            principal,
+            canonical_definition,
+            event_seq,
+            &request,
+        )? {
+            (!bound || !valid_inject_request(&request))
+                .then(|| "rule_action_binding_invalid".to_owned())
+        } else {
+            rule_action_binding_error(&trigger, event_seq, &request)
+        };
+        if let Some(code) = binding_error {
+            request.id = key.child_id.clone();
+            let error = Error::new(code.clone(), code);
+            return reject_rule_event(tx, &self.write_faulted, &key, &error, now);
+        }
+        validate_rule_key_inputs(
+            canonical_definition,
+            key.once_per_key.as_ref(),
+            key.rate_key.as_ref(),
+        )?;
         if should_suppress_own_event_send_or_run_tx(
             &tx,
             principal,
@@ -926,6 +1011,13 @@ impl Store {
             }
             return Err(error);
         }
+        // A retained duplicate never consumes an admission or evicts another key.
+        if let Some(once_per_key) = key.once_per_key.as_ref()
+            && !once_per_key_available_tx(&tx, principal, &state.id, once_per_key, now)?
+        {
+            return suppress_rule_event_tx(tx, &self.write_faulted, &key, revision, now);
+        }
+
         request.id = key.child_id.clone();
 
         // Rate-limit a retiring event under its own captured revision, not the
@@ -933,15 +1025,32 @@ impl Store {
         // handoff in docs/spec/automation.md). `canonical_definition` above
         // already selected the retiring definition for this event.
         let limit = rule_action_limit_for_definition(canonical_definition)?;
-        let (scoped_count, global_count) = rule_action_counts(
+        let rate_agent = match limit.per {
+            core::api::RuleLimitScope::Agent if request.verb == "launch" => trigger.agent,
+            core::api::RuleLimitScope::Agent => {
+                request.target.as_deref().map(parse_agent_id).transpose()?
+            }
+            _ => None,
+        };
+        if request.verb == "launch"
+            && limit.per == core::api::RuleLimitScope::Agent
+            && let Some(rate_agent) = rate_agent
+        {
+            key.set_rate_agent(rate_agent);
+        }
+        let (scoped_count, last_action_at, global_count) = rule_action_counts(
             &tx,
             principal,
             &state.id,
-            request.target.as_deref(),
+            rate_agent,
             &limit,
+            key.rate_key.as_ref(),
             now,
         )?;
-        if rule_limit_reached(scoped_count, limit.max) || global_count >= GLOBAL_RULE_ACTION_LIMIT {
+        if rule_limit_reached(scoped_count, limit.max)
+            || rule_min_interval_reached(last_action_at, &limit, now)
+            || global_count >= GLOBAL_RULE_ACTION_LIMIT
+        {
             let error = Error::new("rate_limited", "rule action rate limit reached");
             return reject_rate_limited_rule_event(tx, &self.write_faulted, &key, &error, now);
         }
@@ -951,7 +1060,7 @@ impl Store {
             // script output validates against this saved policy plus current
             // authority, without requiring the definition revision to remain
             // retained.
-            key.run_rate_limit = Some(limit);
+            key.run_rate_limit = Some(limit.clone());
         }
 
         // submit_tx validates and admits the ordinary rule action. Its verb path
@@ -974,6 +1083,18 @@ impl Store {
             }
             Err(error) => return Err(error),
         };
+        if let Some(once_per_key) = key.once_per_key.as_ref() {
+            record_once_per_key_tx(&tx, key.principal, &state.id, once_per_key, now)?;
+        }
+        if limit.per == core::api::RuleLimitScope::Key {
+            let rate_key = key.rate_key.as_ref().ok_or_else(|| {
+                Error::new(
+                    "source_integrity",
+                    "key-scoped rule limit has no rendered key",
+                )
+            })?;
+            record_rule_key_usage_tx(&tx, &key.child_id, key.principal, &state.id, rate_key, now)?;
+        }
         let view = update_rule_cursor_tx(&tx, key.principal, &stored.view, event_seq, now)?;
         commit_transaction(tx, &self.write_faulted)?;
 
@@ -1520,6 +1641,7 @@ fn ensure_rule_state_tx(
         retiring_cursor: None,
         retire_through: None,
         enabled: input.enabled,
+        suppressed_count: 0,
         paused_reason: None,
     })
 }
@@ -1662,6 +1784,8 @@ fn rule_action_limit_for_definition(definition: &str) -> Result<core::api::RuleL
                 max: RULE_ACTION_LIMIT as u64,
                 per: core::api::RuleLimitScope::Rule,
                 window_ms: RULE_ACTION_WINDOW_MS,
+                min_interval_ms: None,
+                key: None,
             })
         })
 }
@@ -1671,6 +1795,7 @@ pub(super) struct ScriptRunOrigin {
     pub rule: String,
     pub cause: core::EventCause,
     limit: core::api::RuleLimit,
+    rate_key_digest: Option<[u8; 32]>,
 }
 
 pub(super) fn resolve_script_run_origin_tx(
@@ -1886,6 +2011,13 @@ fn resolve_event_script_run_origin_tx(
         // so successful output stays valid after the definition revision is
         // retired or replaced. Provenance and current authority were verified
         // above; the live definition pair is not consulted.
+        let rate_key_digest = script_run_parent_rate_key(parent.outcome.as_ref())?;
+        if limit.per == core::api::RuleLimitScope::Key && rate_key_digest.is_none() {
+            return Err(Error::new(
+                "source_integrity",
+                "key-scoped Run has no frozen rate key",
+            ));
+        }
         let cause = command_cause_tx(tx, &run.id)?
             .ok_or_else(|| Error::new("source_integrity", "script Run has no stored cause"))?;
         return Ok(ScriptRunOrigin {
@@ -1893,6 +2025,7 @@ fn resolve_event_script_run_origin_tx(
             rule: frozen_rule.id.clone(),
             cause,
             limit,
+            rate_key_digest,
         });
     }
     // Rows committed before the parent policy freeze fall back to the retained
@@ -1913,6 +2046,12 @@ fn resolve_event_script_run_origin_tx(
         ));
     };
     let limit = rule_action_limit_for_definition(definition)?;
+    if limit.per == core::api::RuleLimitScope::Key {
+        return Err(Error::new(
+            "source_integrity",
+            "key-scoped Run has no frozen rate policy",
+        ));
+    }
     let cause = command_cause_tx(tx, &run.id)?
         .ok_or_else(|| Error::new("source_integrity", "script Run has no stored cause"))?;
     Ok(ScriptRunOrigin {
@@ -1920,6 +2059,7 @@ fn resolve_event_script_run_origin_tx(
         rule: frozen_rule.id.clone(),
         cause,
         limit,
+        rate_key_digest: None,
     })
 }
 
@@ -1938,18 +2078,29 @@ fn script_run_parent_rate_limit(outcome: Option<&Value>) -> Result<Option<core::
     Ok(Some(limit))
 }
 
+fn script_run_parent_rate_key(outcome: Option<&Value>) -> Result<Option<[u8; 32]>> {
+    let Some(value) = outcome.and_then(|outcome| outcome.get("rate_key_digest")) else {
+        return Ok(None);
+    };
+    serde_json::from_value::<[u8; 32]>(value.clone())
+        .map(Some)
+        .map_err(|_| Error::new("source_integrity", "saved rule rate key is invalid"))
+}
+
 pub(super) fn validate_script_output_rate_tx(
     tx: &Transaction<'_>,
     origin: &ScriptRunOrigin,
     target_agent: Option<&str>,
     now: i64,
 ) -> Result<()> {
-    let (scoped_count, global_count) = rule_action_counts(
+    let rate_agent = target_agent.map(parse_agent_id).transpose()?;
+    let (scoped_count, _, global_count) = rule_action_counts(
         tx,
         &origin.principal,
         &origin.rule,
-        target_agent,
+        rate_agent,
         &origin.limit,
+        origin.rate_key_digest.as_ref(),
         now,
     )?;
     if rule_limit_reached(scoped_count, origin.limit.max)
@@ -1959,6 +2110,31 @@ pub(super) fn validate_script_output_rate_tx(
             "rate_limited",
             "script output exceeds the saved rule action rate limit",
         ));
+    }
+    Ok(())
+}
+
+pub(super) fn record_script_output_rate_key_tx(
+    tx: &Transaction<'_>,
+    origin: &ScriptRunOrigin,
+    action_id: &str,
+    now: i64,
+) -> Result<()> {
+    if origin.limit.per == core::api::RuleLimitScope::Key {
+        let key_digest = origin.rate_key_digest.as_ref().ok_or_else(|| {
+            Error::new(
+                "source_integrity",
+                "key-scoped Run has no rendered rate key",
+            )
+        })?;
+        record_rule_key_usage_tx(
+            tx,
+            action_id,
+            &origin.principal,
+            &origin.rule,
+            key_digest,
+            now,
+        )?;
     }
     Ok(())
 }
@@ -2273,7 +2449,8 @@ fn load_rule_state(
         .query_row(
             "SELECT revision, current_definition, definition_digest,
                     current_cursor, enabled, paused_reason, retiring_revision,
-                    retiring_definition, retiring_cursor, retire_through, source_present
+                    retiring_definition, retiring_cursor, retire_through, source_present,
+                    suppressed_count
              FROM rule_state WHERE principal = ?1 AND rule = ?2",
             params![principal, id],
             |row| {
@@ -2289,6 +2466,7 @@ fn load_rule_state(
                     row.get::<_, Option<i64>>(8)?,
                     row.get::<_, Option<i64>>(9)?,
                     row.get::<_, bool>(10)?,
+                    row.get::<_, i64>(11)?,
                 ))
             },
         )
@@ -2306,6 +2484,7 @@ fn load_rule_state(
         retiring_cursor,
         retire_through,
         source_present,
+        suppressed_count,
     )) = row
     else {
         return Ok(None);
@@ -2325,6 +2504,7 @@ fn load_rule_state(
         retiring_cursor,
         retire_through,
         enabled,
+        suppressed_count,
         paused_reason,
     };
     view.validate()
@@ -2374,6 +2554,45 @@ fn rule_cursor_is_retiring(state: &core::api::RuleStateView, through: i64) -> bo
         .is_some_and(|boundary| through <= boundary)
         && state.retiring_revision.is_some()
         && state.retiring_cursor.is_some()
+}
+
+fn suppress_key_tx(
+    tx: &Transaction<'_>,
+    principal: &str,
+    state: &mut core::api::RuleStateView,
+    revision: i64,
+    event_seq: i64,
+    now: i64,
+    error: &Error,
+) -> Result<Option<Event>> {
+    tx.execute(
+        "UPDATE rule_state
+         SET suppressed_count = CASE
+             WHEN suppressed_count < 9223372036854775807 THEN suppressed_count + 1
+             ELSE suppressed_count
+         END
+         WHERE principal = ?1 AND rule = ?2",
+        params![principal, &state.id],
+    )
+    .map_err(sql_error)?;
+    if tx.changes() != 1 {
+        return Err(Error::new("bad_state", "suppressed rule state disappeared"));
+    }
+    let first = state.suppressed_count == 0;
+    state.suppressed_count = state.suppressed_count.saturating_add(1);
+    if !first {
+        return Ok(None);
+    }
+    let trigger = load_rule_trigger(tx, event_seq)?;
+    let data = json!({
+        "rule": state.id,
+        "project": state.project,
+        "revision": revision,
+        "event_seq": event_seq,
+        "code": error.code,
+        "message": error.message,
+    });
+    insert_rule_event_with_cause(tx, now, "rule.rejected", data, trigger.cause).map(Some)
 }
 
 fn update_rule_cursor_tx(
@@ -2500,34 +2719,35 @@ fn derived_rule_id(
     Ok(Ulid::from_bytes(bytes).to_string())
 }
 
-fn load_rule_trigger(tx: &Transaction<'_>, event_seq: i64) -> Result<StoredRuleTrigger> {
-    tx.query_row(
-        "SELECT kind, agent, generation, cause,
+fn load_rule_trigger(connection: &Connection, event_seq: i64) -> Result<StoredRuleTrigger> {
+    connection
+        .query_row(
+            "SELECT kind, agent, generation, cause,
                 CASE WHEN json_type(data, '$.turn_id') = 'text'
                      THEN json_extract(data, '$.turn_id') END,
                 CASE WHEN json_type(data, '$.request_id') = 'text'
                      THEN json_extract(data, '$.request_id') END
          FROM events WHERE seq = ?1",
-        [event_seq],
-        |row| {
-            Ok(StoredRuleTrigger {
-                kind: row.get(0)?,
-                agent: row.get(1)?,
-                generation: row.get(2)?,
-                encoded_cause: row.get(3)?,
-                turn_id: row.get(4)?,
-                request_id: row.get(5)?,
-                cause: None,
-            })
-        },
-    )
-    .optional()
-    .map_err(sql_error)?
-    .ok_or_else(|| Error::new("not_found", "rule trigger event was not found"))
-    .map(|mut trigger| {
-        trigger.cause = decode_event_cause(trigger.encoded_cause.as_deref(), None);
-        trigger
-    })
+            [event_seq],
+            |row| {
+                Ok(StoredRuleTrigger {
+                    kind: row.get(0)?,
+                    agent: row.get(1)?,
+                    generation: row.get(2)?,
+                    encoded_cause: row.get(3)?,
+                    turn_id: row.get(4)?,
+                    request_id: row.get(5)?,
+                    cause: None,
+                })
+            },
+        )
+        .optional()
+        .map_err(sql_error)?
+        .ok_or_else(|| Error::new("not_found", "rule trigger event was not found"))
+        .map(|mut trigger| {
+            trigger.cause = decode_event_cause(trigger.encoded_cause.as_deref(), None);
+            trigger
+        })
 }
 
 struct StoredRuleTrigger {
@@ -2797,75 +3017,95 @@ fn rule_action_counts(
     tx: &Transaction<'_>,
     principal: &str,
     rule: &str,
-    target_agent: Option<&str>,
+    rate_agent: Option<i64>,
     limit: &core::api::RuleLimit,
+    rate_key: Option<&[u8; 32]>,
     now: i64,
-) -> Result<(i64, i64)> {
-    if limit.max == 0 || limit.window_ms <= 0 {
-        return Err(Error::new("invalid", "rule limit must be positive"));
-    }
+) -> Result<(i64, Option<i64>, i64)> {
+    limit.validate()?;
     let since = now.saturating_sub(limit.window_ms);
-    let scoped = match &limit.per {
+    let (scoped, last_action_at) = match limit.per {
         core::api::RuleLimitScope::Rule => tx
             .query_row(
-                "SELECT COUNT(*)
+                "SELECT COUNT(*), MAX(action.created_at)
                  FROM commands action
                  JOIN commands parent ON parent.id = action.parent_command
                  WHERE action.link_kind = 'rule_action' AND action.ordinal IS NOT NULL
                    AND action.created_at >= ?1 AND action.created_at <= ?2
-                    AND EXISTS (
-                        SELECT 1 FROM commands root
-                        WHERE root.principal = ?3
-                          AND root.verb IN ('rule','timer.run','rule.catch_up')
-                          AND json_extract(root.args, '$.rule') = ?4
-                          AND (
-                              root.id = parent.id
-                              OR (parent.verb = 'run'
-                                  AND parent.parent_command = root.id
-                                  AND parent.principal = root.principal
-                                  AND parent.link_kind = 'rule_action'
-                                  AND parent.ordinal IS NOT NULL)
-                          )
-                          AND action.principal = root.principal
-                    )",
+                   AND EXISTS (
+                       SELECT 1 FROM commands root
+                       WHERE root.principal = ?3
+                         AND root.verb IN ('rule','timer.run','rule.catch_up')
+                         AND json_extract(root.args, '$.rule') = ?4
+                         AND (
+                             root.id = parent.id
+                             OR (parent.verb = 'run'
+                                 AND parent.parent_command = root.id
+                                 AND parent.principal = root.principal
+                                 AND parent.link_kind = 'rule_action'
+                                 AND parent.ordinal IS NOT NULL)
+                         )
+                         AND action.principal = root.principal
+                   )",
                 params![since, now, principal, rule],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(sql_error)?,
-        core::api::RuleLimitScope::Agent => match target_agent {
-            // A targetless Run consumes rule/global capacity, but it has no
-            // Agent target and must not inherit one from its trigger event.
-            None => 0,
-            Some(target_agent) => {
-                let target_agent = parse_agent_id(target_agent)?;
-                tx.query_row(
-                    "SELECT COUNT(*)
+        core::api::RuleLimitScope::Agent => match rate_agent {
+            // Missing event Agents and targetless non-launch actions have no Agent bucket.
+            None => (0, None),
+            Some(rate_agent) => tx
+                .query_row(
+                    "SELECT COUNT(*), MAX(action.created_at)
                      FROM commands action
                      JOIN commands parent ON parent.id = action.parent_command
                      WHERE action.link_kind = 'rule_action' AND action.ordinal IS NOT NULL
                        AND action.created_at >= ?1 AND action.created_at <= ?2
-                        AND EXISTS (
-                            SELECT 1 FROM commands root
-                            WHERE root.principal = ?3
-                              AND root.verb IN ('rule','timer.run','rule.catch_up')
-                              AND json_extract(root.args, '$.rule') = ?4
-                              AND (
-                                  root.id = parent.id
-                                  OR (parent.verb = 'run'
-                                      AND parent.parent_command = root.id
-                                      AND parent.principal = root.principal
-                                      AND parent.link_kind = 'rule_action'
-                                      AND parent.ordinal IS NOT NULL)
-                              )
-                        )
-                        AND action.principal = ?3
-                        AND action.target = ?5",
-                    params![since, now, principal, rule, target_agent],
-                    |row| row.get(0),
+                       AND EXISTS (
+                           SELECT 1 FROM commands root
+                           WHERE root.principal = ?3
+                             AND root.verb IN ('rule','timer.run','rule.catch_up')
+                             AND json_extract(root.args, '$.rule') = ?4
+                             AND (
+                                 root.id = parent.id
+                                 OR (parent.verb = 'run'
+                                     AND parent.parent_command = root.id
+                                     AND parent.principal = root.principal
+                                     AND parent.link_kind = 'rule_action'
+                                     AND parent.ordinal IS NOT NULL)
+                             )
+                             AND action.principal = ?3
+                             AND (
+                                 (action.verb = 'launch' AND COALESCE(
+                                     json_extract(root.args, '$.rate_agent'),
+                                     (SELECT agent FROM events
+                                      WHERE seq = json_extract(root.args, '$.event_seq'))
+                                 ) = ?5)
+                                 OR (action.verb != 'launch' AND action.target = ?5)
+                             )
+                       )",
+                    params![since, now, principal, rule, rate_agent],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
-                .map_err(sql_error)?
-            }
+                .map_err(sql_error)?,
         },
+        core::api::RuleLimitScope::Key => {
+            let rate_key = rate_key.ok_or_else(|| {
+                Error::new(
+                    "source_integrity",
+                    "key-scoped rate policy has no rendered key",
+                )
+            })?;
+            tx.query_row(
+                "SELECT COUNT(*), MAX(used_at)
+                 FROM rule_key_usage
+                 WHERE principal = ?1 AND rule = ?2 AND key_digest = ?3
+                   AND used_at >= ?4 AND used_at <= ?5",
+                params![principal, rule, rate_key.as_slice(), since, now],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(sql_error)?
+        }
     };
     // The global guard spans owner and project principals and stays fixed at
     // 120 admitted action children per minute.
@@ -2878,7 +3118,17 @@ fn rule_action_counts(
             |row| row.get(0),
         )
         .map_err(sql_error)?;
-    Ok((scoped, global))
+    Ok((scoped, last_action_at, global))
+}
+
+fn rule_min_interval_reached(
+    last_action_at: Option<i64>,
+    limit: &core::api::RuleLimit,
+    now: i64,
+) -> bool {
+    limit.min_interval_ms.is_some_and(|interval| {
+        last_action_at.is_some_and(|last| last > now.saturating_sub(interval))
+    })
 }
 
 fn rule_limit_reached(count: i64, max: u64) -> bool {
@@ -3034,6 +3284,9 @@ fn insert_rule_parent_with_event_mode(
     {
         outcome["rate_limit"] = serde_json::to_value(rate_limit)
             .map_err(|_| Error::new("internal", "rule rate policy cannot be encoded"))?;
+        if let Some(rate_key) = key.rate_key {
+            outcome["rate_key_digest"] = json!(rate_key);
+        }
     }
     let digest = match &key.parent_digest {
         Some(digest) => digest.clone(),
@@ -3331,6 +3584,115 @@ pub(super) fn annotate_rule_command_event(
     cause: core::EventCause,
 ) -> Result<()> {
     annotate_admission_command_cause_tx(tx, command_id, events, cause)
+}
+
+fn once_per_key_available_tx(
+    tx: &Transaction<'_>,
+    principal: &str,
+    rule: &str,
+    key_digest: &[u8; 32],
+    now: i64,
+) -> Result<bool> {
+    tx.query_row(
+        "SELECT NOT EXISTS(
+             SELECT 1 FROM rule_once_keys
+             WHERE principal = ?1 AND rule = ?2 AND key_digest = ?3 AND expires_at > ?4
+         )",
+        params![principal, rule, key_digest.as_slice(), now],
+        |row| row.get(0),
+    )
+    .map_err(sql_error)
+}
+
+fn record_once_per_key_tx(
+    tx: &Transaction<'_>,
+    principal: &str,
+    rule: &str,
+    key_digest: &[u8; 32],
+    now: i64,
+) -> Result<()> {
+    tx.execute(
+        "DELETE FROM rule_once_keys WHERE principal = ?1 AND rule = ?2 AND expires_at <= ?3",
+        params![principal, rule, now],
+    )
+    .map_err(sql_error)?;
+    // Make room only after the new action is admitted in this transaction.
+    tx.execute(
+        "DELETE FROM rule_once_keys
+         WHERE principal = ?1 AND rule = ?2 AND key_digest IN (
+             SELECT key_digest FROM rule_once_keys
+             WHERE principal = ?1 AND rule = ?2
+             ORDER BY fired_at, key_digest
+             LIMIT MAX(0, (SELECT COUNT(*) FROM rule_once_keys
+                           WHERE principal = ?1 AND rule = ?2) - ?3 + 1)
+         )",
+        params![principal, rule, RULE_ONCE_KEYS_PER_RULE_MAX],
+    )
+    .map_err(sql_error)?;
+    tx.execute(
+        "INSERT INTO rule_once_keys(principal, rule, key_digest, fired_at, expires_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            principal,
+            rule,
+            key_digest.as_slice(),
+            now,
+            now.saturating_add(RULE_ONCE_RETENTION_MS),
+        ],
+    )
+    .map_err(sql_error)?;
+    Ok(())
+}
+
+pub(super) fn record_rule_key_usage_tx(
+    tx: &Transaction<'_>,
+    action_id: &str,
+    principal: &str,
+    rule: &str,
+    key_digest: &[u8; 32],
+    now: i64,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO rule_key_usage(action_id, principal, rule, key_digest, used_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![action_id, principal, rule, key_digest.as_slice(), now],
+    )
+    .map_err(sql_error)?;
+    Ok(())
+}
+
+fn suppress_rule_event_tx(
+    tx: Transaction<'_>,
+    write_faulted: &Cell<bool>,
+    key: &RuleFiringKey<'_>,
+    revision: i64,
+    now: i64,
+) -> Result<RuleEventAdmission> {
+    let RuleFiringIdentity::Event { event_seq } = key.identity else {
+        return Err(Error::new(
+            "internal",
+            "event suppression has a non-event key",
+        ));
+    };
+    let mut state = key.state.clone();
+    let event = suppress_key_tx(
+        &tx,
+        key.principal,
+        &mut state,
+        revision,
+        event_seq,
+        now,
+        &Error::new("once_per_duplicate", "rule already admitted this key"),
+    )?;
+    let view = update_rule_cursor_tx(&tx, key.principal, &state, event_seq, now)?;
+    commit_transaction(tx, write_faulted)?;
+    Ok(RuleEventAdmission {
+        state: view,
+        parent: None,
+        child: None,
+        events: event.into_iter().collect(),
+        is_new: true,
+    })
 }
 
 fn reject_rule_event(
@@ -3642,6 +4004,67 @@ fn ensure_admission_page(admissions: &[Admission]) -> Result<()> {
     Ok(())
 }
 
+fn validate_retained_rate_agent(
+    connection: &Connection,
+    stored: &StoredRuleState,
+    revision: i64,
+    event_seq: i64,
+    parent: &Command,
+) -> Result<()> {
+    let Some(value) = parent.args.get("rate_agent") else {
+        return Ok(());
+    };
+    let Some(rate_agent) = value.as_i64().filter(|agent| *agent > 0) else {
+        return Err(Error::new(
+            "source_integrity",
+            "stored rule rate Agent is invalid",
+        ));
+    };
+    let definition = if stored.view.revision == revision {
+        stored.canonical_definition.as_str()
+    } else if stored.view.retiring_revision == Some(revision) {
+        stored
+            .retiring_definition
+            .as_deref()
+            .ok_or_else(|| Error::new("source_integrity", "retiring rule definition is absent"))?
+    } else {
+        return Err(Error::new(
+            "source_integrity",
+            "rule revision is not retained",
+        ));
+    };
+    let limit = rule_action_limit_for_definition(definition)?;
+    let expected_agent = if limit.per == core::api::RuleLimitScope::Agent {
+        load_rule_trigger(connection, event_seq)?.agent
+    } else {
+        None
+    };
+    if parent.state == CommandState::Applied {
+        let child_id = derived_rule_id(
+            "action-0",
+            &parent.principal,
+            &stored.view.id,
+            revision,
+            event_seq,
+        )?;
+        let child = load_command(connection, &child_id)?
+            .ok_or_else(|| Error::new("source_integrity", "rate-scoped launch child is absent"))?;
+        if child.verb != "launch" {
+            return Err(Error::new(
+                "source_integrity",
+                "rate Agent annotation is attached to a non-launch action",
+            ));
+        }
+    }
+    if expected_agent != Some(rate_agent) {
+        return Err(Error::new(
+            "source_integrity",
+            "stored rule rate Agent does not match the event-time launch",
+        ));
+    }
+    Ok(())
+}
+
 fn load_retained_rule_event_action(
     connection: &Connection,
     principal: &str,
@@ -3649,7 +4072,15 @@ fn load_retained_rule_event_action(
     revision: i64,
     event_seq: i64,
 ) -> Result<Option<RuleEventAdmission>> {
-    let key = RuleFiringKey::event(principal, &stored.view, revision, event_seq, None)?;
+    let key = RuleFiringKey::event(
+        principal,
+        &stored.view,
+        revision,
+        event_seq,
+        None,
+        None,
+        None,
+    )?;
     let Some(parent) = load_command(connection, &key.parent_id)? else {
         return Ok(None);
     };
@@ -3659,6 +4090,7 @@ fn load_retained_rule_event_action(
             "derived rule parent id is bound to another action",
         ));
     }
+    validate_retained_rate_agent(connection, stored, revision, event_seq, &parent)?;
     if stored.view.current_cursor < event_seq
         && stored
             .view

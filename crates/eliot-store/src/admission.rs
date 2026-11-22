@@ -2035,6 +2035,12 @@ fn submit_tx_mode(
     policy: Option<&capacity::PolicyLoader>,
     restart_idle_resume: bool,
 ) -> Result<Admission> {
+    if request.trusted_review_labels.is_some() && !derived_rule {
+        return Err(Error::new(
+            "invalid",
+            "trusted review labels are reserved for linked rule results",
+        ));
+    }
     let (payload_digest, replay) = submit_head_tx(tx, principal, &request, now, derived_rule)?;
     if let Some(admission) = replay {
         return Ok(admission);

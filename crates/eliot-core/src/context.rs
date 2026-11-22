@@ -37,6 +37,57 @@ pub enum InjectPoint {
     ActiveTurn,
 }
 
+/// Daemon-verified worktree facts attached to an automatic review result.
+/// This is retained with the accepted context command and is not part of the
+/// `inject` wire arguments.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrustedReviewLabels {
+    pub worktree_fingerprint: String,
+    pub worktree_state: ReviewWorktreeState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewWorktreeState {
+    CurrentAtDeliveryCheck,
+    ChangedOrUnconfirmedAtDeliveryCheck,
+}
+
+/// Retained `inject` arguments may carry daemon-only review labels. Submitted
+/// requests still decode through `InjectArgs`, which rejects this field.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedInjectArgs {
+    pub text: String,
+    #[serde(alias = "at")]
+    pub point: InjectPoint,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<i64>,
+    #[serde(
+        default,
+        rename = "_trusted_review_labels",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub trusted_review_labels: Option<TrustedReviewLabels>,
+}
+
+pub fn decode_retained_inject_args(value: &Value) -> serde_json::Result<RetainedInjectArgs> {
+    let args: RetainedInjectArgs = serde_json::from_value(value.clone())?;
+    if let Some(labels) = &args.trusted_review_labels
+        && (labels.worktree_fingerprint.len() != 64
+            || !labels
+                .worktree_fingerprint
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit()))
+    {
+        return Err(serde::de::Error::custom(
+            "trusted worktree fingerprint must be SHA-256 hex",
+        ));
+    }
+    Ok(args)
+}
+
 /// Semantic arguments for the existing `inject` command.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

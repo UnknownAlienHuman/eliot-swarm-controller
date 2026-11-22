@@ -190,7 +190,9 @@ readback show the reason.
 
 The fast path uses the Agent's resolved launch Goal check, including any Owner argv,
 working-directory and deadline overrides. Setting `policy.check.at_turn_end = true`
-reserves the check for Goal rounds. A later manual `goal.set` replaces the Goal through
+directs checks to Goal rounds while the launch Goal is active. An enabled worktree review
+rule may request a check of a later author turn after that Goal completes. A later manual
+`goal.set` replaces the Goal through
 the ordinary revision. Every launch-installed Goal waits for the first turn to settle,
 so a check cannot finish the Goal before the Agent receives its work. A supplied
 cadence anchors at launch admission and still waits for that first turn.
@@ -271,6 +273,27 @@ commands continue. Explicit catch-up fails `history_gap`
 when its requested history has already been pruned. A lagging
 rule cannot pin expired storage indefinitely. Rate-limit windows longer than
 command retention count only retained history.
+
+An event rule's optional `once_per` renders a key from captured event fields. The
+Store hashes the canonical JSON array of rendered template parts and records the
+digest with an admitted action. Keys expire after 30 days. Each rule in each
+principal retains up to 10,000 keys. A new admission at capacity evicts the oldest
+keys in that rule's bucket. A suppression does not consume or evict a key.
+For example:
+
+```toml
+once_per = "${data.data.pull_number}@${data.data.head}"
+limit = { max = 2, per = "key", key = "${data.data.pull_number}", window = "24h", min_interval = "2h" }
+```
+
+`per = "key"` selects a rate bucket using `limit.key`, or the `once_per` key
+when `limit.key` is omitted. The optional `min_interval` spaces admissions in the
+same bucket and must fit within the configured window. An unavailable or invalid
+key skips the action. Keyed rules use live event traversal. The rule's
+`suppressed_count` records key suppressions. The first suppression for a rule
+also emits `rule.rejected` with its reason. Subsequent key suppressions only
+advance the cursor and counter. `rate_limited_firings` records rate suppressions.
+An event-triggered launch with `per = "agent"` uses the triggering Agent's bucket.
 
 During explicit history catch-up, project Run actions use the same freeze path as live firing,
 capturing each matching event and the validated current rule revision. Project authorization
@@ -404,8 +427,9 @@ and cannot decide or alter the in-flight callback. There is no `on.hook` trigger
 through the existing exact approval callbacks.
 
 Scalar `match` values compare exactly. String values prefixed `glob:` or `re:` use bounded
-glob or regex matching; `{ one_of = [...] }` accepts a list of scalar values, and
-`{ exists = true|false }` checks path presence. Conditions combine with AND. The
+glob or regex matching. `{ one_of = [...] }` accepts a list of scalar values,
+`{ exists = true|false }` checks path presence, and `{ at_most = N }` bounds a
+nonnegative integer. Conditions combine with AND. The
 [matching contract](#matching-and-rendering) also covers `any_of`, `not` and missing fields.
 For example:
 
@@ -513,8 +537,9 @@ This connected event-rule subset supports event actions `stop`, `send`, `launch`
 `interrupt`, `steer`, `approve`, `deny`, `answer`, `mail.send`, `var.set` and `inject`, plus
 project event-rule `run` during live
 evaluation and explicit history catch-up. Event `mail.send` and `var.set` are literal
-targetless coordination actions; event `inject` binds its Agent and turn exactly from the
-captured event (see below). Event-rule `resume` is available in live evaluation
+targetless coordination actions. Event `inject` normally binds its Agent and turn
+from the captured event. The [linked launch result](#worktree-review-recipe) form
+resolves its manager from the originating launch. Event-rule `resume` is available in live evaluation
 and finite `rule.catch_up`; both use the captured event binding and ordinary command admission.
 The global event-rule `run` contract below uses owner-global approval and the shared frozen
 execution path. Other full L4.2 action requirements remain cumulative. SEND uses the
@@ -530,13 +555,7 @@ first admission. Project/child authority is intersected before selection; retrie
 the original choice.
 
 Live Owner rules and history catch-up use the same managed-worktree preparation
-for targetless launch. The [review-after-turn recipe](../../config/recipes/review-after-turn.toml)
-launches a separate reviewer profile after a successful author turn. It passes the
-author's captured worktree for read-only review and directs the reviewer to send the
-verdict to a configured manager Agent using Swarm mail.
-Configure the reviewer with native read-only permissions, such as a Codex profile with
-`permissions = "read-only"` and `approval_policy = "never"`. The launch uses the named
-profile's native sandbox.
+for targetless launch.
 
 Queue assignment is configured in the unified settings file and runs through the existing
 timer and ordinary `launch` path. Each firing reads the next bounded `.md` brief by
@@ -549,6 +568,35 @@ the admitted filename in the same transaction as the durable launch command. The
 stays recorded after restart and command retention. An unknown launch keeps its original
 binding and outcome. The brief and any ready marker stay in the folder.
 This is an automation increment, not a Task/Issue/acceptance engine.
+
+### Worktree review recipe
+
+Install [review-after-turn.toml](../../config/recipes/review-after-turn.toml) in the
+registered checkout's rules directory and approve the launch, initial send and inject
+actions. Use a distinct reviewer profile with native read-only permissions.
+An assigned project reserves launches for its current team. To review from a separate
+checkout in that case, install an Owner rule, constrain the author's project in the
+trigger, and give the reviewer an unassigned checkout.
+
+The launch rule matches a passed project check for the author turn, selects the
+recorded change size, and admits at most one review per fingerprint, up to two per
+Agent per trailing day and at least two hours apart. A project without a configured
+check can use the recipe's alternate successful `turn.completed` trigger.
+`require_worktree = true` rechecks the exact captured Agent generation, workspace
+and fingerprint before live admission and dispatch. This launch form requires live
+event processing. The binding is to the observed tree
+at those points. A reviewer reads the author's worktree, which can change during review.
+
+A second rule uses `inject` with `from_launch` set to the initiating rule ID.
+Swarm follows the linked initial SEND in that rule's namespace. It submits the
+complete retained final text and the original author turn via `soonest`, using
+the [shared insertion frame](#inject-context-at-the-safe-point). The daemon's
+worktree fingerprint and delivery recheck state appear before the fenced review.
+The optional `to` selects a local Agent explicitly. Otherwise Swarm uses the
+author's parent, or the assigned local project manager for a top-level author.
+Swarm rechecks the recipient and launch binding at admission. The normal insertion
+size, generation and context-point bounds apply. The manager interprets the review
+and decides what to do.
 
 The owner configures a global assignment under `[automation.assignments.<key>]`:
 
@@ -860,6 +908,17 @@ A launch with text uses its linked initial SEND, which carries the launch rule's
 cause. `turn.unknown` records an uncertain terminal with `data.outcome = "unknown"`
 and the SEND ID when Store can prove that binding.
 
+Swarm captures worktree facts for an enabled owner or project rule that uses them
+and matches the author's configured subject. `data.worktree` carries the exact base
+commit, fingerprint, changed files and changed lines when the Git observation is
+complete. Lines count additions and deletions, including nonignored untracked text.
+Match `data.project_check = "off"` to use a successful completion in a project without
+a configured check. When a configured check applies, the completion carries
+`data.project_check = "required"`. Match the separate `project.worktree.check.passed`
+fact, which binds the same author turn and worktree after a confirmed passing check.
+A successful check whose observed fingerprint changed emits
+`project.worktree.check.refused` with `reason = "fingerprint_changed"`.
+
 To launch a fixer when a project check exits unsuccessfully, put the timer and follow-up
 definitions in the registered project's rule directory. In this example the project
 `app` approves `run`, `launch`, `send`, the `pwsh` interpreter and the `fixer` profile.
@@ -914,7 +973,8 @@ undocumented `agent.*` alias.
 Scalar values compare exactly. String values beginning `glob:` use glob matching and
 strings beginning `re:` use regex matching. `{ one_of = [...] }` accepts scalar choices;
 `{ exists = true|false }` tests whether a path is present. Conditions combine with AND.
-Missing paths do not match equality, choices or patterns. Use `exists = false` to check
+Use `{ at_most = N }` for a nonnegative integer at or below `N`.
+Missing paths do not match equality, choices, patterns or numeric bounds. Use `exists = false` to check
 for absence. A field can have `{ not = CONDITION }` with any one of these conditions.
 `not` complements the result, including when the source path is absent.
 
@@ -1382,10 +1442,23 @@ DTO; that type owns the closed flat record field catalog and converts to an ordi
 stdout action set. A `resume` stdout record is invalid under the closed Core DTO; it is never
 silently dropped.
 The effective send-text limit is Core `MAX_EVENT_BYTES` (64 KiB) from
-[Core limits](../../crates/eliot-core/src/limits.rs). Unknown, missing, `null`, nested,
-extra or wrong-type fields fail validation. Targets and generation/turn bindings are
+[Core limits](../../crates/eliot-core/src/limits.rs). The record is a closed object,
+and its typed fields must be present where required. Targets and generation/turn bindings are
 literal and must pass ordinary command validation. Records cannot supply command `id`, `principal`, `parent_command`, `ordinal`,
 `executable`, `cmd`, `cwd`, `timeout`, `env` or token fields.
+
+An `emit` record uses `topic` for the suffix of an `x.user.` event, `data` for the
+payload and an optional string `key`. For example:
+
+```json
+{"action":"emit","topic":"ci.red","data":{"branch":"main","head":"abc"},"key":"main@abc"}
+```
+
+Rules see event kind `x.user.ci.red`, the payload under `data.data`, and, when
+provided, the key under `data.key`. The key is nonblank and at most 128 UTF-8
+bytes. The encoded event data must fit within the normal event budget. Project
+scripts need both the `run` and `emit` action grants. A timer can schedule a polling
+script that emits these facts, and other rules can match them just like other events.
 
 After successful exit, validate each actually emitted record separately against its saved
 scope and the admission rate policy frozen in the committed rule parent: project Run uses

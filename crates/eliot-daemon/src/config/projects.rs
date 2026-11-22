@@ -478,6 +478,7 @@ pub(super) fn project_registrations_in(
                             | "git.integrate"
                             | "git.publish"
                             | "steer"
+                            | "inject"
                             | "interrupt"
                             | "approve"
                             | "deny"
