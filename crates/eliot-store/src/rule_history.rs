@@ -371,7 +371,7 @@ impl Store {
                     action_request,
                 )?
             } else {
-                rule_action_binding_error(&trigger, action_request)
+                rule_action_binding_error(&trigger, action.event_seq, action_request)
             };
             if let Some(code) = binding_error {
                 rejected.push((action.event_seq, Error::new(code.clone(), code)));

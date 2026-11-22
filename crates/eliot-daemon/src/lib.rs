@@ -20,6 +20,7 @@ pub mod operator;
 mod platform;
 mod plugin_host;
 mod proxy;
+pub(crate) mod publication;
 mod redaction;
 mod restart_capacity;
 mod router;

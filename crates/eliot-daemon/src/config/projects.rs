@@ -399,6 +399,7 @@ pub(super) fn project_registrations_in(
                             | "stop"
                             | "send"
                             | "git.fetch"
+                            | "git.publish"
                             | "steer"
                             | "interrupt"
                             | "approve"
@@ -503,6 +504,19 @@ fn validate_project_git_config(
                 "must be an absolute local path or direct HTTP, HTTPS, Git, or file URL without credentials or helper schemes; SSH is unsupported",
                 "profile_error",
             ));
+        }
+    }
+    if let Some(publication) = &git.publication {
+        for (remote, endpoint) in &publication.remotes {
+            if !is_direct_project_fetch_endpoint(endpoint) {
+                return Err(config_error_at(
+                    source,
+                    offset,
+                    &format!("projects.{project_id}.git.publication.remotes.{remote}"),
+                    "must be an absolute local path or direct HTTP, HTTPS, Git, or file URL without credentials or helper schemes; SSH is unsupported",
+                    "profile_error",
+                ));
+            }
         }
     }
     Ok(())

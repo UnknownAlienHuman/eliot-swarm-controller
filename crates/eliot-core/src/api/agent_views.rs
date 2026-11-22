@@ -1032,6 +1032,101 @@ pub enum GitCredentialHelper {
     Manager,
 }
 
+/// Owner-selected publication endpoints and optional GitHub CLI integration.
+/// Paths name the existing executable/config directory; credential contents
+/// are never read, copied, or serialized.
+#[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectGitPublicationView {
+    #[serde(default)]
+    pub remotes: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_cli: Option<ProjectGitHubCliView>,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectGitHubCliView {
+    pub program: String,
+    pub config_dir: String,
+    pub host: String,
+    pub repository: String,
+    pub base_ref: String,
+}
+
+impl ProjectGitHubCliView {
+    pub fn validate(&self) -> Result<()> {
+        for (field, value) in [
+            ("program", self.program.as_str()),
+            ("config_dir", self.config_dir.as_str()),
+        ] {
+            if value.trim() != value
+                || value.is_empty()
+                || value.len() > 4_096
+                || value.chars().any(char::is_control)
+                || !std::path::Path::new(value).is_absolute()
+            {
+                return Err(Error::new(
+                    "invalid",
+                    format!("GitHub CLI {field} must be an absolute path literal"),
+                ));
+            }
+        }
+        if self.host.is_empty()
+            || self.host.len() > 253
+            || !self
+                .host
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+            || self.host.starts_with('.')
+            || self.host.ends_with('.')
+        {
+            return Err(Error::new("invalid", "GitHub CLI host is invalid"));
+        }
+        let mut repository = self.repository.split('/');
+        let owner = repository.next().unwrap_or_default();
+        let name = repository.next().unwrap_or_default();
+        if owner.is_empty()
+            || name.is_empty()
+            || repository.next().is_some()
+            || [owner, name].iter().any(|part| {
+                part.starts_with('-')
+                    || part.len() > 100
+                    || !part.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+                    })
+            })
+        {
+            return Err(Error::new(
+                "invalid",
+                "GitHub CLI repository must be an owner/name literal",
+            ));
+        }
+        if self.base_ref.is_empty()
+            || self.base_ref.len() > 512
+            || self.base_ref.starts_with('-')
+            || self.base_ref.chars().any(char::is_whitespace)
+            || self
+                .base_ref
+                .chars()
+                .any(|character| matches!(character, '~' | '^' | ':' | '?' | '*' | '[' | '\\'))
+            || self.base_ref.contains("..")
+            || self.base_ref.contains("//")
+            || self.base_ref.contains("@{")
+            || self.base_ref.ends_with('/')
+            || self.base_ref.ends_with('.')
+            || self
+                .base_ref
+                .split('/')
+                .any(|part| part.is_empty() || part.starts_with('.') || part.ends_with(".lock"))
+            || self.base_ref.chars().any(char::is_control)
+        {
+            return Err(Error::new("invalid", "GitHub CLI base_ref is invalid"));
+        }
+        Ok(())
+    }
+}
+
 #[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectGitView {
@@ -1039,25 +1134,51 @@ pub struct ProjectGitView {
     pub fetch_remotes: BTreeMap<String, String>,
     #[serde(default)]
     pub credential_helper: Option<GitCredentialHelper>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication: Option<ProjectGitPublicationView>,
 }
 
 impl ProjectGitView {
     pub fn validate(&self) -> Result<()> {
-        if self.fetch_remotes.iter().any(|(remote, endpoint)| {
-            remote.is_empty()
-                || remote.len() > 128
-                || remote.starts_with('-')
-                || remote
+        let valid_remote = |remote: &str, endpoint: &str| {
+            !remote.is_empty()
+                && remote.len() <= 128
+                && !remote.starts_with('-')
+                && !remote
                     .chars()
                     .any(|character| character.is_whitespace() || character.is_control())
-                || endpoint.trim().is_empty()
-                || endpoint.len() > 4_096
-                || endpoint.chars().any(char::is_control)
-        }) {
+                && !endpoint.trim().is_empty()
+                && endpoint.len() <= 4_096
+                && !endpoint.chars().any(char::is_control)
+        };
+        if self
+            .fetch_remotes
+            .iter()
+            .any(|(remote, endpoint)| !valid_remote(remote, endpoint))
+        {
             return Err(Error::new(
                 "invalid",
                 "project Git fetch remotes must be bounded nonempty literals",
             ));
+        }
+        if let Some(publication) = &self.publication {
+            if publication.remotes.iter().any(|(remote, endpoint)| {
+                !valid_remote(remote, endpoint)
+                    || remote.starts_with('.')
+                    || remote.ends_with('.')
+                    || remote.contains("..")
+                    || !remote.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+                    })
+            }) {
+                return Err(Error::new(
+                    "invalid",
+                    "project Git publication remotes must be bounded nonempty literals",
+                ));
+            }
+            if let Some(github_cli) = &publication.github_cli {
+                github_cli.validate()?;
+            }
         }
         Ok(())
     }

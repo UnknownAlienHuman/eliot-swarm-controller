@@ -2,8 +2,9 @@ use eliot_core::{
     Error, Event, SubmitCommand,
     api::{
         CatchUp, CommandSubmitRequest, EmitDefinitionArgs, GitFetchDefinitionArgs,
-        MAX_RULE_FILE_BYTES, MailDefinitionArgs, NotifyDefinitionArgs, RuleLimit, RuleLimitScope,
-        RunDefinitionArgs, TimerSchedule, VarDefinitionArgs,
+        GitPublishDefinitionArgs, GitPublishTrigger, MAX_RULE_FILE_BYTES, MailDefinitionArgs,
+        NotifyDefinitionArgs, ProjectCheckPassed, RuleLimit, RuleLimitScope, RunDefinitionArgs,
+        TimerSchedule, VarDefinitionArgs,
     },
     canonical_json_sha256,
     limits::{MAX_EVENT_BYTES, MAX_TEXT_BYTES},
@@ -213,13 +214,30 @@ enum AgentActionDefinition {
 #[derive(Clone, Debug)]
 enum ActionDefinition {
     Agent(AgentActionDefinition),
-    Run { definition: RunDefinitionArgs },
-    GitFetch { definition: GitFetchDefinitionArgs },
-    Notify { definition: NotifyDefinitionArgs },
-    Emit { definition: EmitDefinitionArgs },
-    Mail { definition: MailDefinitionArgs },
-    Var { definition: VarDefinitionArgs },
-    Inject { definition: InjectActionDefinition },
+    Run {
+        definition: RunDefinitionArgs,
+    },
+    GitFetch {
+        definition: GitFetchDefinitionArgs,
+    },
+    GitPublish {
+        definition: GitPublishDefinitionArgs,
+    },
+    Notify {
+        definition: NotifyDefinitionArgs,
+    },
+    Emit {
+        definition: EmitDefinitionArgs,
+    },
+    Mail {
+        definition: MailDefinitionArgs,
+    },
+    Var {
+        definition: VarDefinitionArgs,
+    },
+    Inject {
+        definition: InjectActionDefinition,
+    },
 }
 
 impl<'de> Deserialize<'de> for ActionDefinition {
@@ -254,6 +272,13 @@ impl ActionDefinition {
             let definition =
                 eliot_core::api::discovery::decode_params_at(Value::Object(fields), root)?;
             return Ok(Self::GitFetch { definition });
+        }
+        if action == "git.publish" {
+            let mut fields = object.clone();
+            fields.remove("action");
+            let definition =
+                eliot_core::api::discovery::decode_params_at(Value::Object(fields), root)?;
+            return Ok(Self::GitPublish { definition });
         }
         if action == "notify" {
             let mut fields = object.clone();
@@ -356,6 +381,19 @@ impl Serialize for ActionDefinition {
                         }
                     };
                 fields.insert("action".to_owned(), Value::String("git.fetch".to_owned()));
+                Value::Object(fields).serialize(serializer)
+            }
+            Self::GitPublish { definition } => {
+                let mut fields =
+                    match serde_json::to_value(definition).map_err(serde::ser::Error::custom)? {
+                        Value::Object(fields) => fields,
+                        _ => {
+                            return Err(serde::ser::Error::custom(
+                                "git.publish definition must serialize as an object",
+                            ));
+                        }
+                    };
+                fields.insert("action".to_owned(), Value::String("git.publish".to_owned()));
                 Value::Object(fields).serialize(serializer)
             }
             Self::Run { definition } => {
@@ -864,6 +902,9 @@ pub(super) fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<RuleEvalu
         ActionDefinition::GitFetch { definition } => {
             return submit_git_fetch_command(definition).map(RuleEvaluation::Command);
         }
+        ActionDefinition::GitPublish { definition } => {
+            return submit_git_publish_command(definition, event).map(RuleEvaluation::Command);
+        }
         ActionDefinition::Notify { definition } => {
             return submit_notify_command(definition).map(RuleEvaluation::Command);
         }
@@ -1070,6 +1111,19 @@ fn validate_git_fetch_definition(definition: &GitFetchDefinitionArgs) -> Result<
     Ok(())
 }
 
+fn validate_git_publish_definition(definition: &GitPublishDefinitionArgs) -> Result<(), Error> {
+    definition.validate()?;
+    if let Some(timeout) = &definition.timeout {
+        super::schedule::parse_positive_duration_ms(timeout).map_err(|_| {
+            Error::new(
+                "invalid",
+                "git.publish timeout must be a positive whole-millisecond duration",
+            )
+        })?;
+    }
+    Ok(())
+}
+
 fn submit_notify_command(definition: &NotifyDefinitionArgs) -> Result<SubmitCommand, Error> {
     definition.validate()?;
     let args = serde_json::to_value(definition)
@@ -1234,6 +1288,52 @@ fn submit_git_fetch_command(definition: &GitFetchDefinitionArgs) -> Result<Submi
     Ok(command)
 }
 
+fn submit_git_publish_command(
+    definition: &GitPublishDefinitionArgs,
+    event: &Event,
+) -> Result<SubmitCommand, Error> {
+    validate_git_publish_definition(definition)?;
+    if event.kind != "project.check.passed" {
+        return Err(Error::new(
+            "not_allowed",
+            "git.publish requires a successful final project check",
+        ));
+    }
+    let check = serde_json::from_value::<ProjectCheckPassed>(event.data.clone())
+        .map_err(|_| Error::new("invalid", "project.check.passed data is invalid"))?;
+    check.validate()?;
+    let (Some(agent), Some(generation), Some(workspace)) = (
+        event.agent.as_deref(),
+        event.generation,
+        event
+            .subject
+            .as_ref()
+            .and_then(|subject| subject.workspace.as_deref()),
+    ) else {
+        return Err(Error::new(
+            "not_allowed",
+            "project.check.passed is missing its Agent workspace binding",
+        ));
+    };
+    let trigger = GitPublishTrigger {
+        repository: definition.repository.clone(),
+        remote: definition.remote.clone(),
+        create_pr: definition.create_pr,
+        timeout_ms: super::git_publish_timeout_ms(definition.timeout.as_deref())?,
+        source_event_seq: event.seq,
+        check,
+        agent: agent.to_owned(),
+        generation,
+        workspace: workspace.to_owned(),
+    };
+    trigger.validate()?;
+    let mut command = CommandSubmitRequest::new(String::new(), "git.publish");
+    command.args = serde_json::to_value(trigger)
+        .map_err(|_| Error::new("invalid", "git.publish trigger cannot be encoded"))?;
+    command.validate()?;
+    Ok(command)
+}
+
 fn submit_launch_command(
     profile: Option<&str>,
     workspace: &str,
@@ -1344,6 +1444,7 @@ fn reject_unimplemented_options(raw: &toml::Value) -> Result<(), Error> {
                                     | "resume"
                                     | "run"
                                     | "git.fetch"
+                                    | "git.publish"
                                     | "notify"
                                     | "emit"
                                     | "mail.send"
@@ -1398,6 +1499,13 @@ fn validate_rule(rule: &mut RuleDefinition) -> Result<(), Error> {
             return Err(Error::new(
                 "invalid",
                 "event trigger must be a nonempty literal event kind",
+            ));
+        }
+        if matches!(action, ActionDefinition::GitPublish { .. }) && event != "project.check.passed"
+        {
+            return Err(Error::new(
+                "invalid",
+                "git.publish requires the project.check.passed event trigger",
             ));
         }
         if !is_default_catch_up(&rule.catch_up) {
@@ -1561,6 +1669,9 @@ fn validate_event_action(action: &ActionDefinition) -> Result<(), Error> {
         ActionDefinition::Run { definition } => return definition.validate(),
         ActionDefinition::GitFetch { definition } => {
             return validate_git_fetch_definition(definition);
+        }
+        ActionDefinition::GitPublish { definition } => {
+            return validate_git_publish_definition(definition);
         }
         ActionDefinition::Notify { definition } => return definition.validate(),
         ActionDefinition::Emit { definition } => return definition.validate(),
@@ -1783,6 +1894,12 @@ fn timer_action(rule: &RuleDefinition) -> Result<SubmitCommand, Error> {
     let action = match action {
         ActionDefinition::Run { definition } => return submit_run_command(definition),
         ActionDefinition::GitFetch { definition } => return submit_git_fetch_command(definition),
+        ActionDefinition::GitPublish { .. } => {
+            return Err(Error::new(
+                "unsupported",
+                "git.publish requires a project.check.passed event",
+            ));
+        }
         ActionDefinition::Notify { definition } => return submit_notify_command(definition),
         ActionDefinition::Emit { definition } => return submit_emit_command(definition),
         ActionDefinition::Mail { definition } => return submit_mail_command(definition),
