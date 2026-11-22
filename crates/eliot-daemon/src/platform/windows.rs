@@ -1132,6 +1132,70 @@ fn verified_process(pid: u32, start_time: u64, extra_access: u32) -> Result<Quer
     }
     Ok(process)
 }
+
+/// Read-only query/synchronize handle pinning one exact verified process identity
+/// on Windows so its exit code remains readable if the parent harness closes its
+/// own child handle between sampling ticks.
+pub(crate) struct PinnedProcess {
+    handle: QueryHandle,
+}
+
+pub(crate) fn pin_process(identity: &ProcessIdentity) -> Option<PinnedProcess> {
+    if identity.pid == 0 || identity.start_time == 0 {
+        return None;
+    }
+    let handle = verified_process(identity.pid, identity.start_time, 0).ok()?;
+    Some(PinnedProcess { handle })
+}
+
+impl PinnedProcess {
+    pub(crate) fn poll_exit(&self) -> (ProcessState, Option<i32>) {
+        // SAFETY: `self.handle.0` is an owned live query/synchronize process handle.
+        match unsafe { WaitForSingleObject(self.handle.0, 0) } {
+            WAIT_TIMEOUT => (ProcessState::Running, None),
+            WAIT_OBJECT_0 => {
+                let mut exit_code = 0;
+                // SAFETY: process handle is signaled exited and `exit_code` is writable.
+                let code = if unsafe { GetExitCodeProcess(self.handle.0, &mut exit_code) } != 0 {
+                    Some(exit_code as i32)
+                } else {
+                    None
+                };
+                (ProcessState::Exited, code)
+            }
+            _ => (ProcessState::Unknown, None),
+        }
+    }
+}
+
+pub(crate) fn inspect_process_node(pid: u32) -> Option<super::ProcessNodeInfo> {
+    if pid == 0 {
+        return None;
+    }
+    // SAFETY: read-only query rights; the wrapper closes the handle.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return None;
+    }
+    let process = QueryHandle(process);
+    let parent_pid = process_parent_pid(process.0);
+    let image_path = process_image_path(process.0);
+    let command_line = process_command_line(process.0);
+    let mut argv = command_line
+        .as_deref()
+        .map(eliot_core::split_windows_command_line)
+        .unwrap_or_default();
+    if argv.len() > MAX_HEAVY_ARGV_TOKENS {
+        argv.truncate(MAX_HEAVY_ARGV_TOKENS);
+    }
+    Some(super::ProcessNodeInfo {
+        pid,
+        parent_pid,
+        image_path,
+        command_line,
+        argv,
+    })
+}
 /// ProcessCommandLineInformation class for NtQueryInformationProcess.
 const PROCESS_COMMAND_LINE_INFORMATION: u32 = 60;
 /// ProcessBasicInformation class for NtQueryInformationProcess (parent pid).

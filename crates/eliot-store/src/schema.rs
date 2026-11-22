@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 97;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 98;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -2304,6 +2304,54 @@ impl Store {
             tx.execute_batch(
                 "ALTER TABLE agents ADD COLUMN owner_rules_delivery TEXT;
                  INSERT INTO schema_migrations(version) VALUES (97);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 98 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE TABLE background_process_wakes (
+                     id TEXT PRIMARY KEY,
+                     agent INTEGER NOT NULL REFERENCES agents(id),
+                     generation INTEGER NOT NULL,
+                     turn_id TEXT NOT NULL,
+                     host_boot_id TEXT NOT NULL,
+                     pid INTEGER NOT NULL CHECK (pid > 0),
+                     start_time INTEGER NOT NULL CHECK (start_time > 0),
+                     command_line TEXT NOT NULL,
+                     command_truncated INTEGER NOT NULL DEFAULT 0 CHECK (command_truncated IN (0, 1)),
+                     state TEXT NOT NULL CHECK (state IN (
+                         'waiting', 'delivering', 'delivery_pending',
+                         'delivered', 'expired', 'stale', 'cancelled', 'failed', 'unknown'
+                     )),
+                     outcome_kind TEXT CHECK (outcome_kind IS NULL OR outcome_kind IN ('exited', 'expired')),
+                     exit_code INTEGER,
+                     output_tail TEXT,
+                     note_text TEXT,
+                     delivery_command_id TEXT NOT NULL UNIQUE,
+                     delivery_verb TEXT CHECK (delivery_verb IS NULL OR delivery_verb IN ('send', 'inject')),
+                     delivery_attempts INTEGER NOT NULL DEFAULT 0 CHECK (delivery_attempts >= 0),
+                     delivery_next_at INTEGER NOT NULL DEFAULT 0 CHECK (delivery_next_at >= 0),
+                     created_at INTEGER NOT NULL,
+                     expires_at INTEGER NOT NULL,
+                     settled_at INTEGER,
+                     CHECK (expires_at >= created_at),
+                     FOREIGN KEY (agent, generation, turn_id)
+                         REFERENCES turns(agent, generation, turn_id)
+                 );
+                 CREATE INDEX background_process_wakes_open
+                     ON background_process_wakes(state, created_at, id);
+                 CREATE UNIQUE INDEX background_process_wakes_one_open_per_generation
+                     ON background_process_wakes(agent, generation)
+                     WHERE state IN ('waiting', 'delivering', 'delivery_pending');
+                 CREATE INDEX background_process_wakes_autonomy_window
+                     ON background_process_wakes(settled_at, id)
+                     WHERE state IN ('delivered', 'expired', 'cancelled', 'failed', 'stale');
+                 INSERT INTO schema_migrations(version) VALUES (98);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;

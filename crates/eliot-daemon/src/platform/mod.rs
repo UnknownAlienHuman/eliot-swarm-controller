@@ -74,3 +74,37 @@ pub(crate) fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
         false
     }
 }
+
+/// Bounded live metadata for one inspected process node.
+#[derive(Clone, Debug)]
+pub(crate) struct ProcessNodeInfo {
+    pub(crate) pid: u32,
+    pub(crate) parent_pid: Option<u32>,
+    pub(crate) image_path: Option<String>,
+    pub(crate) command_line: Option<String>,
+    pub(crate) argv: Vec<String>,
+}
+
+/// Inspect one process's parent PID, image path, and bounded command line/argv
+/// for process-tree custody classification. Fails closed to `None` on exited/inaccessible PIDs.
+pub(crate) fn inspect_process_node(pid: u32) -> Option<ProcessNodeInfo> {
+    #[cfg(windows)]
+    {
+        windows::inspect_process_node(pid)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        unix::inspect_process_node(pid)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+#[cfg(windows)]
+pub(crate) use windows::{PinnedProcess, pin_process};
+
+#[cfg(not(windows))]
+pub(crate) use unix::{PinnedProcess, pin_process};

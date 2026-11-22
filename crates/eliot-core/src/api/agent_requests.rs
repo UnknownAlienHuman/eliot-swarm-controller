@@ -46,6 +46,10 @@ impl AgentGetRequest {
                 .as_ref()
                 .is_some_and(|facts| facts.validate().is_err())
             || reply
+                .pending_background_wake
+                .as_ref()
+                .is_some_and(|wake| wake.validate().is_err())
+            || reply
                 .session_usage
                 .as_ref()
                 .is_some_and(|usage| usage.validate().is_err())

@@ -240,6 +240,10 @@ mod turn_recovery;
 pub(crate) mod usage;
 mod wakes;
 pub use wakes::{AgentWakeRecord, AgentWakeRunReceipt, AgentWakeTurnReadiness};
+mod background_wakes;
+pub use background_wakes::{
+    BackgroundWakeArmInput, BackgroundWakeRecord, BackgroundWakeServerDeclarations,
+};
 mod workspace;
 
 fn decode_owner_rules_delivery(value: &str) -> Result<StoredOwnerRulesDelivery> {

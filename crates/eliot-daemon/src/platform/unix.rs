@@ -1245,3 +1245,38 @@ pub(crate) fn resolve_heavy_category(pid: u32) -> Option<CommandClass> {
         source: eliot_core::CATEGORY_SOURCE_CMDLINE,
     })
 }
+
+pub(crate) struct PinnedProcess;
+
+pub(crate) fn pin_process(_identity: &eliot_core::ProcessIdentity) -> Option<PinnedProcess> {
+    None
+}
+
+impl PinnedProcess {
+    pub(crate) fn poll_exit(&self) -> (eliot_core::ProcessState, Option<i32>) {
+        (eliot_core::ProcessState::Unknown, None)
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn inspect_process_node(pid: u32) -> Option<super::ProcessNodeInfo> {
+    if pid == 0 {
+        return None;
+    }
+    let parent_pid = proc_parent_pid(pid);
+    let argv = proc_argv(pid).unwrap_or_default();
+    let image_path = fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned());
+    if parent_pid.is_none() && argv.is_empty() && image_path.is_none() {
+        return None;
+    }
+    let command_line = (!argv.is_empty()).then(|| argv.join(" "));
+    Some(super::ProcessNodeInfo {
+        pid,
+        parent_pid,
+        image_path,
+        command_line,
+        argv,
+    })
+}

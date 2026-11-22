@@ -233,10 +233,11 @@ fn read_notes(
         delivered: by_kind.iter().map(|kind| kind.delivered).sum(),
         moved: by_kind.iter().map(|kind| kind.moved).sum(),
         cancelled: by_kind.iter().map(|kind| kind.cancelled).sum(),
+        expired: by_kind.iter().map(|kind| kind.expired).sum(),
         by_kind,
     };
     let mut row = AutonomyRow::partial(
-        "retained fact-note settlements and context moves",
+        "retained fact-note settlements, context moves, and automatic background-process wakes",
         "older outcomes without fact-note provenance are outside this source",
         counts,
     );

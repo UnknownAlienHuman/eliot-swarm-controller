@@ -932,6 +932,54 @@ pub struct AgentGetResponse {
         deserialize_with = "optional_object"
     )]
     pub owner_rules_delivery: Option<OwnerRulesDeliveryView>,
+    /// Automatic background-process wake armed when a turn ends while a process
+    /// started by the Agent is still running. Trailing field; absent when none is open.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "optional_object"
+    )]
+    pub pending_background_wake: Option<AgentBackgroundWakeView>,
+}
+
+/// Pending automatic background-process wake surfaced in `agent.get` (`swarm show`).
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentBackgroundWakeView {
+    pub id: String,
+    pub turn_id: String,
+    pub process: ProcessIdentity,
+    pub command_line: String,
+    #[serde(default)]
+    pub command_truncated: bool,
+    pub state: String,
+    pub armed_at: i64,
+    pub expires_at: i64,
+}
+
+impl AgentBackgroundWakeView {
+    pub fn validate(&self) -> Result<()> {
+        if self.id.trim().is_empty()
+            || self.id.len() > 64
+            || self.id.chars().any(char::is_control)
+            || self.turn_id.trim().is_empty()
+            || self.turn_id.chars().any(char::is_control)
+            || self.process.host_boot_id.trim().is_empty()
+            || self.process.pid == 0
+            || self.process.start_time == 0
+            || self.command_line.trim().is_empty()
+            || self.command_line.len() > crate::MAX_BACKGROUND_WAKE_COMMAND_BYTES + 64
+            || self.command_line.chars().any(char::is_control)
+            || !matches!(
+                self.state.as_str(),
+                "waiting" | "delivering" | "delivery_pending"
+            )
+            || self.armed_at < 0
+            || self.expires_at < self.armed_at
+        {
+            return Err(invalid_response());
+        }
+        Ok(())
+    }
 }
 
 /// Retained model/effort overlay readback for one Agent generation. The

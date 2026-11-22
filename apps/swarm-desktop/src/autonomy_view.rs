@@ -114,18 +114,20 @@ pub fn lines(
         }),
         line("Swarm fact notes", &read.notes, |counts| {
             let mut values = vec![format!(
-                "{} delivered · {} moved · {} cancelled",
+                "{} delivered · {} moved · {} cancelled · {} expired",
                 n(counts.delivered),
                 n(counts.moved),
-                n(counts.cancelled)
+                n(counts.cancelled),
+                n(counts.expired)
             )];
             values.extend(counts.by_kind.iter().map(|kind| {
                 format!(
-                    "{}: {} delivered · {} moved · {} cancelled · {} resolved",
+                    "{}: {} delivered · {} moved · {} cancelled · {} expired · {} resolved",
                     words(&kind.kind),
                     n(kind.delivered),
                     n(kind.moved),
                     n(kind.cancelled),
+                    n(kind.expired),
                     n(kind.resolved)
                 )
             }));

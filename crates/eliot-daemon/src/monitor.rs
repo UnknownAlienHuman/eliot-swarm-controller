@@ -120,6 +120,9 @@ struct ObserveTracker {
     warned_growth: HashSet<&'static str>,
     emitted_heavy: HashSet<String>,
     harness: Option<String>,
+    baseline_children: HashSet<ProcessIdentity>,
+    baseline_locked: bool,
+    ancestry: HashMap<u32, (u64, Option<u32>)>,
 }
 
 #[derive(Debug, Default)]
@@ -147,6 +150,14 @@ struct Target {
     cache: Mutex<Cache>,
     workspace: Option<WorkspaceProcessContext>,
     observe: Mutex<ObserveTracker>,
+    pinned_wake: Mutex<Option<(ProcessIdentity, crate::platform::PinnedProcess)>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BackgroundProcessCandidate {
+    pub(crate) identity: ProcessIdentity,
+    pub(crate) command_line: String,
+    pub(crate) command_truncated: bool,
 }
 
 #[derive(Clone, Default)]
@@ -335,6 +346,7 @@ impl Monitoring {
             cache: Mutex::new(Cache::default()),
             workspace: None,
             observe: Mutex::new(ObserveTracker::default()),
+            pinned_wake: Mutex::new(None),
         });
         {
             let mut targets = self.inner.targets.lock_recover();
@@ -408,6 +420,7 @@ impl Monitoring {
             cache: Mutex::new(Cache::default()),
             workspace: Some(context),
             observe: Mutex::new(ObserveTracker::default()),
+            pinned_wake: Mutex::new(None),
         });
         {
             let mut targets = self.inner.targets.lock_recover();
@@ -519,10 +532,267 @@ impl Monitoring {
     /// Sample an exiting root before its native stdout is drained. Only the OS
     /// observer determines process facts; failed probes never synthesize an exit.
     pub(crate) async fn sample_generation(&self, agent: &Agent) -> Result<()> {
+        self.release_background_wake_pin(&agent.id, agent.generation);
         match self.target(&agent.id, agent.generation) {
             Some(target) => self.sample_target(&target).await,
             None => Ok(()),
         }
+    }
+
+    pub(crate) fn lock_background_baseline(&self, agent: &str, generation: i64) {
+        if let Some(target) = self.target(agent, generation) {
+            target.observe.lock_recover().baseline_locked = true;
+        }
+    }
+
+    pub(crate) fn release_background_wake_pin(&self, agent: &str, generation: i64) {
+        if let Some(target) = self.target(agent, generation) {
+            *target.pinned_wake.lock_recover() = None;
+        }
+    }
+
+    /// Fresh-sample `agent`'s custody tree and pick the newest running
+    /// non-server descendant under its verified native harness session.
+    pub(crate) async fn inspect_running_background_processes(
+        &self,
+        agent: &Agent,
+        configured_mcp_programs: &[String],
+        declared_pids: &HashSet<u32>,
+        declared_commands: &[String],
+        tool_commands: &[String],
+        secrets: &eliot_core::SecretPolicy,
+    ) -> Result<Option<BackgroundProcessCandidate>> {
+        let Some(target) = self.target(&agent.id, agent.generation) else {
+            return Ok(None);
+        };
+        if let Err(error) = self.sample_target(&target).await {
+            crate::logging::record(
+                secrets,
+                "daemon.background_wake_sample_failed",
+                &[("agent", &agent.id)],
+                Some(&error),
+            );
+            return Ok(None);
+        }
+        let Some(snapshot) = target.cache.lock_recover().snapshot.clone() else {
+            return Ok(None);
+        };
+        if !snapshot.complete {
+            return Ok(None);
+        }
+
+        let mut harness_pids: HashMap<u32, u64> = HashMap::new();
+        let mut plugin_pids: HashMap<u32, u64> = HashMap::new();
+        let mut live_pids: Vec<u32> = Vec::new();
+        let mut sample_starts: HashMap<u32, u64> = HashMap::new();
+        for sample in &snapshot.samples {
+            if sample.record.state != ProcessState::Running {
+                continue;
+            }
+            sample_starts.insert(
+                sample.record.identity.pid,
+                sample.record.identity.start_time,
+            );
+            match sample.record.role.as_str() {
+                "harness" => {
+                    harness_pids.insert(
+                        sample.record.identity.pid,
+                        sample.record.identity.start_time,
+                    );
+                }
+                "plugin" => {
+                    plugin_pids.insert(
+                        sample.record.identity.pid,
+                        sample.record.identity.start_time,
+                    );
+                }
+                _ => {}
+            }
+            if live_pids.len() < 256 {
+                live_pids.push(sample.record.identity.pid);
+            }
+        }
+        if harness_pids.is_empty() {
+            let store = self.inner.store.lock().await;
+            for record in
+                store.list_processes(&owner(&agent.id, agent.generation), None, PAGE_LIMIT)?
+            {
+                if record.role == "harness" && record.state == ProcessState::Running {
+                    harness_pids.insert(record.identity.pid, record.identity.start_time);
+                    sample_starts.insert(record.identity.pid, record.identity.start_time);
+                }
+            }
+        }
+        if harness_pids.is_empty() || live_pids.is_empty() {
+            return Ok(None);
+        }
+
+        let nodes = tokio::task::spawn_blocking(move || {
+            let mut inspected = HashMap::with_capacity(live_pids.len());
+            for pid in live_pids {
+                if let Some(info) = crate::platform::inspect_process_node(pid) {
+                    inspected.insert(pid, info);
+                }
+            }
+            inspected
+        })
+        .await
+        .map_err(|_| Error::new("process_observation", "background process inspect failed"))?;
+
+        let (baseline_children, ancestry) = {
+            let mut tracker = target.observe.lock_recover();
+            for sample in &snapshot.samples {
+                if let Some(node) = nodes.get(&sample.record.identity.pid) {
+                    tracker.ancestry.insert(
+                        sample.record.identity.pid,
+                        (sample.record.identity.start_time, node.parent_pid),
+                    );
+                }
+            }
+            if tracker.ancestry.len() > 1_024 {
+                let current_pids: HashSet<u32> = snapshot
+                    .samples
+                    .iter()
+                    .map(|sample| sample.record.identity.pid)
+                    .collect();
+                tracker.ancestry.retain(|pid, _| current_pids.contains(pid));
+            }
+            (tracker.baseline_children.clone(), tracker.ancestry.clone())
+        };
+
+        let mut qualifying: Vec<(&ProcessSample, &crate::platform::ProcessNodeInfo, Vec<u32>)> =
+            Vec::new();
+        let mut server_ancestor_pids: HashSet<u32> = HashSet::new();
+
+        for sample in &snapshot.samples {
+            if sample.record.role != "child" || sample.record.state != ProcessState::Running {
+                continue;
+            }
+            if baseline_children.contains(&sample.record.identity) {
+                continue;
+            }
+            let Some(chain) = harness_descendant_chain(
+                sample.record.identity.pid,
+                sample.record.identity.start_time,
+                &nodes,
+                &ancestry,
+                &sample_starts,
+                &harness_pids,
+                &plugin_pids,
+            ) else {
+                continue;
+            };
+            let Some(node) = nodes.get(&sample.record.identity.pid) else {
+                continue;
+            };
+            if eliot_core::is_harness_owned_process(
+                node.image_path.as_deref(),
+                &node.argv,
+                node.command_line.as_deref(),
+                configured_mcp_programs,
+            ) {
+                continue;
+            }
+            let declared_server = declared_pids.contains(&sample.record.identity.pid)
+                || matches_declared_command(node, declared_commands);
+            if declared_server {
+                server_ancestor_pids.extend(chain);
+                continue;
+            }
+            qualifying.push((sample, node, chain));
+        }
+
+        qualifying
+            .retain(|(sample, _, _)| !server_ancestor_pids.contains(&sample.record.identity.pid));
+        let qualifying_pids: HashSet<u32> = qualifying
+            .iter()
+            .map(|(sample, _, _)| sample.record.identity.pid)
+            .collect();
+        qualifying.retain(|(_, _, chain)| !chain.iter().any(|pid| qualifying_pids.contains(pid)));
+
+        let Some((winner_sample, winner_node, _)) =
+            qualifying.into_iter().max_by_key(|(sample, _, _)| {
+                (
+                    sample.record.identity.start_time,
+                    sample.record.identity.pid,
+                )
+            })
+        else {
+            return Ok(None);
+        };
+
+        let pin_identity = winner_sample.record.identity.clone();
+        let pinned =
+            tokio::task::spawn_blocking(move || crate::platform::pin_process(&pin_identity))
+                .await
+                .ok()
+                .flatten();
+        if let Some(pinned) = pinned {
+            *target.pinned_wake.lock_recover() =
+                Some((winner_sample.record.identity.clone(), pinned));
+        }
+
+        let (command_line, command_truncated) =
+            bounded_command_line(winner_node, tool_commands, secrets);
+        Ok(Some(BackgroundProcessCandidate {
+            identity: winner_sample.record.identity.clone(),
+            command_line,
+            command_truncated,
+        }))
+    }
+
+    /// Observe live/exit status for one armed background-process wake, reading
+    /// any pinned kernel handle first so exact exit codes are retained even if
+    /// the parent harness already closed its child handle.
+    pub(crate) async fn check_background_wake_process(
+        &self,
+        agent: &Agent,
+        identity: &ProcessIdentity,
+        force_sample: bool,
+    ) -> Result<Option<ProcessRecord>> {
+        let target = self.target(&agent.id, agent.generation);
+        let pin_poll = target.as_ref().and_then(|target| {
+            let guard = target.pinned_wake.lock_recover();
+            guard
+                .as_ref()
+                .filter(|(pinned_id, _)| pinned_id == identity)
+                .map(|(_, pinned)| pinned.poll_exit())
+        });
+        if let Some((ProcessState::Exited, exit_code)) = pin_poll {
+            let record = ProcessRecord {
+                identity: identity.clone(),
+                owner: owner(&agent.id, agent.generation),
+                role: "child".to_owned(),
+                state: ProcessState::Exited,
+                exit_code,
+                updated_at: now_ms(),
+            };
+            {
+                let mut store = self.inner.store.lock().await;
+                let events = store.observe_processes(
+                    &agent.id,
+                    agent.generation,
+                    std::slice::from_ref(&record),
+                    record.updated_at,
+                )?;
+                self.inner.bus.publish(&events);
+            }
+            if let Some(target) = target {
+                let mut guard = target.pinned_wake.lock_recover();
+                if guard
+                    .as_ref()
+                    .is_some_and(|(pinned_id, _)| pinned_id == identity)
+                {
+                    *guard = None;
+                }
+            }
+            return Ok(Some(record));
+        }
+        if force_sample && let Some(target) = target {
+            let _ = self.sample_target(&target).await;
+        }
+        let store = self.inner.store.lock().await;
+        store.agent_wake_process(&agent.id, agent.generation, identity)
     }
 
     pub(crate) async fn view(&self, agent: &Agent) -> Result<ObservationView> {
@@ -1787,6 +2057,14 @@ impl Monitoring {
                 if sample.record.role != "child" {
                     continue;
                 }
+                if !tracker.baseline_locked
+                    && sample.record.state == ProcessState::Running
+                    && tracker.baseline_children.len() < 1_024
+                {
+                    tracker
+                        .baseline_children
+                        .insert(sample.record.identity.clone());
+                }
                 let key = episode_key(&sample.record.identity);
                 seen.insert(key.clone());
                 if let Some(open) = tracker.episodes.get_mut(&key) {
@@ -2279,4 +2557,118 @@ fn refresh_process_timestamps(processes: &mut [ProcessRecord], cache: &Cache) {
             process.updated_at = sample.updated_at;
         }
     }
+}
+
+fn harness_descendant_chain(
+    pid: u32,
+    start_time: u64,
+    nodes: &HashMap<u32, crate::platform::ProcessNodeInfo>,
+    ancestry: &HashMap<u32, (u64, Option<u32>)>,
+    sample_starts: &HashMap<u32, u64>,
+    harness_pids: &HashMap<u32, u64>,
+    plugin_pids: &HashMap<u32, u64>,
+) -> Option<Vec<u32>> {
+    let mut chain = Vec::new();
+    let mut seen = HashSet::from([pid]);
+    let mut current_pid = pid;
+    let mut current_start = start_time;
+    for _ in 0..16 {
+        let parent_pid = nodes
+            .get(&current_pid)
+            .and_then(|node| node.parent_pid)
+            .or_else(|| {
+                ancestry
+                    .get(&current_pid)
+                    .filter(|(st, _)| *st == current_start)
+                    .and_then(|(_, pp)| *pp)
+            })?;
+        if parent_pid == 0 || !seen.insert(parent_pid) {
+            return None;
+        }
+        let parent_start = sample_starts
+            .get(&parent_pid)
+            .copied()
+            .or_else(|| ancestry.get(&parent_pid).map(|(st, _)| *st));
+        if parent_start.is_some_and(|st| st > current_start) {
+            return None;
+        }
+        if plugin_pids
+            .get(&parent_pid)
+            .is_some_and(|st| *st <= current_start)
+        {
+            return None;
+        }
+        if harness_pids
+            .get(&parent_pid)
+            .is_some_and(|st| *st <= current_start)
+        {
+            return Some(chain);
+        }
+        chain.push(parent_pid);
+        current_pid = parent_pid;
+        if let Some(st) = parent_start {
+            current_start = st;
+        }
+    }
+    None
+}
+
+fn matches_declared_command(
+    node: &crate::platform::ProcessNodeInfo,
+    declared_commands: &[String],
+) -> bool {
+    if declared_commands.is_empty() {
+        return false;
+    }
+    let candidate = node
+        .command_line
+        .clone()
+        .unwrap_or_else(|| node.argv.join(" "));
+    let candidate_trimmed = candidate.trim();
+    if candidate_trimmed.is_empty() {
+        return false;
+    }
+    declared_commands.iter().any(|declared| {
+        let declared = declared.trim();
+        !declared.is_empty() && candidate_trimmed.contains(declared)
+    })
+}
+
+/// Display text for the woken process: the plugin-reported native tool command
+/// when the OS command line contains it verbatim, else the OS command line.
+fn bounded_command_line(
+    node: &crate::platform::ProcessNodeInfo,
+    tool_commands: &[String],
+    secrets: &eliot_core::SecretPolicy,
+) -> (String, bool) {
+    let raw = node
+        .command_line
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+        .or_else(|| (!node.argv.is_empty()).then(|| node.argv.join(" ")))
+        .or_else(|| {
+            node.image_path
+                .as_deref()
+                .map(|path| path.rsplit(['/', '\\']).next().unwrap_or(path).to_owned())
+        })
+        .unwrap_or_else(|| format!("pid {}", node.pid));
+    let raw = tool_commands
+        .iter()
+        .map(|command| command.trim())
+        .filter(|command| !command.is_empty() && raw.contains(command))
+        .max_by_key(|command| command.len())
+        .map_or(raw.clone(), str::to_owned);
+    let sanitized: String = raw
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    let redacted = secrets.redact_text(sanitized.trim());
+    let limit = eliot_core::MAX_BACKGROUND_WAKE_COMMAND_BYTES;
+    if redacted.len() <= limit {
+        return (redacted, false);
+    }
+    let end = redacted.floor_char_boundary(limit);
+    (redacted[..end].to_owned(), true)
 }

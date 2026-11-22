@@ -1066,6 +1066,10 @@ pub(crate) struct DaemonConfig {
     /// exposes a documented size source.
     #[serde(default = "default_session_file_bytes")]
     pub(crate) session_file_bytes: i64,
+    /// Maximum seconds Swarm waits after turn end for an Agent-started
+    /// background process to exit before delivering a still-running Swarm note.
+    #[serde(default = "default_background_wake_max_wait_secs")]
+    pub(crate) background_wake_max_wait_secs: i64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -1096,6 +1100,7 @@ impl Default for DaemonConfig {
             heavy_rss_bytes: default_heavy_rss_bytes(),
             session_growth_ratio_permille: default_session_growth_ratio_permille(),
             session_file_bytes: default_session_file_bytes(),
+            background_wake_max_wait_secs: default_background_wake_max_wait_secs(),
         }
     }
 }
@@ -1122,6 +1127,10 @@ fn default_session_growth_ratio_permille() -> i64 {
 
 fn default_session_file_bytes() -> i64 {
     core::DEFAULT_SESSION_FILE_BYTES as i64
+}
+
+fn default_background_wake_max_wait_secs() -> i64 {
+    core::DEFAULT_BACKGROUND_WAKE_MAX_WAIT_SECS
 }
 
 impl DaemonConfig {
@@ -1193,6 +1202,17 @@ impl DaemonConfig {
                 "config.toml: daemon.session_file_bytes must be a positive integer",
             ));
         }
+        if self.background_wake_max_wait_secs <= 0
+            || self.background_wake_max_wait_secs > core::MAX_BACKGROUND_WAKE_MAX_WAIT_SECS
+        {
+            return Err(core::Error::new(
+                "profile_error",
+                format!(
+                    "config.toml: daemon.background_wake_max_wait_secs must be between 1 and {}",
+                    core::MAX_BACKGROUND_WAKE_MAX_WAIT_SECS
+                ),
+            ));
+        }
         Ok(Self {
             chats_root: self.chats_root,
             on_restart: self.on_restart,
@@ -1207,6 +1227,7 @@ impl DaemonConfig {
             heavy_rss_bytes: self.heavy_rss_bytes,
             session_growth_ratio_permille: self.session_growth_ratio_permille,
             session_file_bytes: self.session_file_bytes,
+            background_wake_max_wait_secs: self.background_wake_max_wait_secs,
         })
     }
 

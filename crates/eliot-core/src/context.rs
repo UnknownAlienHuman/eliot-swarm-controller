@@ -114,6 +114,8 @@ pub struct ContextNoteCounters {
     pub moved: u64,
     pub cancelled: u64,
     pub resolved: u64,
+    #[serde(default)]
+    pub expired: u64,
 }
 
 /// One durable item claimed by a context consumer.

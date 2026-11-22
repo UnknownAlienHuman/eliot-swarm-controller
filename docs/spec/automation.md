@@ -893,6 +893,39 @@ For [#881 item 2](https://github.com/UnknownAlienHuman/eliot-swarm-controller/is
 the next-input move at turn end substitutes for a Claude Stop hook. Pending
 inserts can still be delivered by the before-tool and after-tool callbacks.
 
+### Automatic background-process wake
+
+For [#879](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/879) and [#883](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/883), Swarm wakes an Agent whose turn ended
+while a process it started is still running. When a `turn.completed` with outcome
+`success` or `failure` commits, the note worker freshly samples that generation's
+custody and picks the newest top-level [candidate](monitoring.md#background-process-wake-candidates).
+It retains one `waiting` row in `background_process_wakes`. Nothing arms when the
+turn ended with a stop or interrupt, or the Agent has an open or same-turn
+[self-wake](coordination.md#agent-self-wake-833-item-3). It also does not arm when an
+automatic wake is open for the generation or already ran for that turn. An Agent
+declares a long-lived server with `emit` topic `background.server` and data `pid`,
+`pids` or `command`. A matching process and its shell ancestors never arm.
+
+When that exact process identity exits, Swarm delivers one note in the
+[shared insertion frame](#inject-context-at-the-safe-point) at the soonest point.
+That is an `inject` into an active turn whose context points allow it, otherwise
+an ordinary `send` with the reserved delivery command id. The note gives the pid,
+the exit code (or `unknown`), the command, and a bounded output tail when a native
+`tool.completed` for that command captured one. The command is the plugin-reported
+native tool command when the OS command line contains it, else the redacted OS
+command line, at most 512 bytes. After `daemon.background_wake_max_wait_secs`
+(default 1,800, at most 86,400) the note says the process is still running. An
+unknown observation, a stop, a generation change or a terminal Agent retires the
+wake without delivery. Delivery follows the self-wake rules: bounded pre-admission
+retries, a delivery command id checked before any retry, and no replay of a
+retained unknown.
+
+`swarm show` prints the pending automatic wake (`pending_background_wake` in
+`agent.get`). The `swarm autonomy` Swarm fact notes row counts settled automatic
+wakes as kind `background_process_wake`: delivered, expired, and cancelled (stop,
+stale generation or failed delivery). Plugins add nothing; they keep translating
+native tool starts and exits ([#881](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/881)).
+
 ## Outcome chaining
 
 Run settlements use `command.applied`, `command.failed` and `command.unknown` with

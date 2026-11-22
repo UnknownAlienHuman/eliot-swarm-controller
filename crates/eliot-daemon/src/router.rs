@@ -1,6 +1,7 @@
 mod attention;
 mod attribution;
 mod auth;
+mod background_wake;
 mod catalog;
 mod child_run;
 mod cleanup;
@@ -166,6 +167,7 @@ struct RouterInner {
     bus: Bus,
     mail: crate::config::MailConfig,
     attention: crate::config::AttentionConfig,
+    background_wake_max_wait_ms: i64,
     owner_token: String,
     secrets: SecretSet,
     agent_credentials: AgentCredentials,
@@ -396,6 +398,7 @@ impl Router {
         bus: Bus,
         mail: crate::config::MailConfig,
         attention: crate::config::AttentionConfig,
+        background_wake_max_wait_ms: i64,
     ) -> Self {
         let secrets: SecretSet = Arc::new(Mutex::new(HashSet::from([owner_token.clone()])));
         let agent_credentials: AgentCredentials = Arc::new(Mutex::new(Default::default()));
@@ -438,6 +441,7 @@ impl Router {
                 bus,
                 mail,
                 attention,
+                background_wake_max_wait_ms,
                 owner_token,
                 secrets,
                 agent_credentials,
@@ -5065,11 +5069,13 @@ impl Router {
         // and `provenance` distinguishes a direct `configure` from a
         // `resume` generation's `inherited_from` row. Absent when no
         // overlay ever applied to this generation.
-        let config = {
+        let (config, pending_background_wake) = {
             let store = self.inner.store.lock().await;
+            let pending_background_wake =
+                store.pending_background_wake(&agent.id, agent.generation)?;
             let overlay = store.get_agent_config_current(&agent.id, agent.generation)?;
             let profile_inherited = agent.profile_inherited;
-            overlay.map(|overlay| AgentConfigView {
+            let config = overlay.map(|overlay| AgentConfigView {
                 revision: overlay.revision,
                 application: overlay.application.clone(),
                 provenance: overlay.provenance.clone(),
@@ -5089,7 +5095,8 @@ impl Router {
                     .get("effort")
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned),
-            })
+            });
+            (config, pending_background_wake)
         };
         let mut response = AgentGetResponse {
             agent,
@@ -5104,6 +5111,7 @@ impl Router {
             native_notice,
             instruction_delivery,
             owner_rules_delivery,
+            pending_background_wake,
         };
         display_agent_get_response(&mut response);
         serde_json::to_value(response)
