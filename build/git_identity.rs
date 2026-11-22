@@ -16,9 +16,18 @@ pub fn emit() {
         .unwrap_or_else(|| env::current_dir().unwrap_or_default());
     let workspace_root = find_workspace_root(&manifest_dir).unwrap_or(manifest_dir);
     let git_sha = read_git_sha(&workspace_root);
+    let git_dirty = git_sha
+        .as_ref()
+        .and_then(|_| read_git_dirty(&workspace_root));
     let package_version = env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "unknown".to_owned());
     let display_version = match git_sha.as_deref() {
-        Some(sha) => format!("{package_version}+g{}", &sha[..8]),
+        Some(sha) => {
+            let dirty_marker = match git_dirty {
+                Some(false) => "",
+                Some(true) | None => "-dirty",
+            };
+            format!("{package_version}+g{}{dirty_marker}", &sha[..8])
+        }
         None => format!("{package_version}+git-unknown"),
     };
 
@@ -52,6 +61,7 @@ fn read_git_sha(workspace_root: &Path) -> Option<String> {
     }
 
     watch_git_inputs(workspace_root);
+    watch_worktree_inputs(workspace_root);
 
     let output = git_output(workspace_root, &["rev-parse", "--verify", "HEAD"])?;
     let sha = output_text(&output)?;
@@ -67,6 +77,11 @@ fn watch_git_inputs(workspace_root: &Path) {
     };
     watch(&git_dir.join("HEAD"));
     watch(&git_dir.join("commondir"));
+    if let Some(path) = git_output(workspace_root, &["rev-parse", "--git-path", "index"])
+        .and_then(|output| output_text(&output))
+    {
+        watch(&absolute_from(workspace_root, Path::new(&path)));
+    }
 
     let common_dir = git_output(workspace_root, &["rev-parse", "--git-common-dir"])
         .and_then(|output| output_text(&output))
@@ -90,6 +105,32 @@ fn watch_git_inputs(workspace_root: &Path) {
     }
 }
 
+fn read_git_dirty(workspace_root: &Path) -> Option<bool> {
+    let output = git_output(
+        workspace_root,
+        &["status", "--porcelain=v1", "--untracked-files=no"],
+    )?;
+    Some(!output.stdout.is_empty())
+}
+
+fn watch_worktree_inputs(workspace_root: &Path) {
+    let Some(files) = git_output(workspace_root, &["ls-files", "-z"]) else {
+        return;
+    };
+    for relative in nul_paths(&files) {
+        watch(&workspace_root.join(relative));
+    }
+}
+
+fn nul_paths(output: &Output) -> Vec<PathBuf> {
+    output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .filter_map(|path| std::str::from_utf8(path).ok().map(PathBuf::from))
+        .collect()
+}
+
 fn watch_git_markers(workspace_root: &Path) {
     // Some managed worktrees keep their `.git` pointer outside the Cargo
     // workspace. Track existing ancestor markers too, without assuming a
@@ -106,6 +147,8 @@ fn watch_git_markers(workspace_root: &Path) {
 fn git_output(directory: &Path, arguments: &[&str]) -> Option<Output> {
     let output = Command::new("git")
         .args(arguments)
+        // Avoid Git's optional index refresh writes while calculating identity.
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .current_dir(directory)
         .output()
         .ok()?;

@@ -743,13 +743,21 @@ path/version, and one-command repair when a replacement is installed.
 `daemon.status` includes `build_identity`: the package version with a short Git
 revision suffix (or `git-unknown` when built without an available repository),
 the full compile-time `git_sha`, the parent directory of the running executable,
-and its exact SHA-256. The daemon computes the executable hash once at startup
-and reuses that snapshot in status and the `daemon.build_identity` startup log
-record. `git_sha`, `executable_directory`, and `executable_sha256` are null when
-their source cannot be read; an archive build does not inherit an enclosing
+and its exact SHA-256. The version metadata adds the literal `-dirty` suffix
+when Git reports a staged change or an unstaged tracked-path change or deletion;
+untracked-only changes, including Git-ignored private build outputs, are excluded.
+If Git status cannot be read despite a valid `HEAD`, the build conservatively adds
+`-dirty`. Cargo watches the worktree's actual index and each tracked path returned
+by `git ls-files -z`, so same-HEAD tracked edits and dirty-to-clean transitions
+refresh the marker without recursively watching the worktree root or `target/`.
+The daemon computes the executable hash once at startup and reuses that snapshot
+in status and the `daemon.build_identity` startup log record. `git_sha`,
+`executable_directory`, and `executable_sha256` are null when their source cannot
+be read; an archive build does not inherit an enclosing
 repository's commit. `swarm --version` and `daemon.json`'s `diagnostic_version`
-carry the same short revision suffix. Human `swarm status` prints the identity
-in one line; JSON status retains the typed `build_identity` object.
+carry the same short revision suffix and literal `-dirty` marker. Human `swarm
+status` prints the identity in one line; JSON status retains the typed
+`build_identity` object.
 
 `daemon.status` also reports bounded, redacted runtime status for the two
 daemon-owned automation tasks (`rule_worker` and `goal_driver`) via Core
