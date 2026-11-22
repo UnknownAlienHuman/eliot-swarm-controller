@@ -157,8 +157,10 @@ struct UiDetail {
     state: eliot_core::AgentState,
     /// Observe-only Agents reject native control verbs.
     observe_only: bool,
-    /// The project label (its checkout).
+    /// Retained project identity and optional distinct authorization scope.
     project: String,
+    project_scope: Option<String>,
+    parent: Option<String>,
     /// Actual task checkout, which can differ from its project on a worktree.
     workspace: Option<String>,
     project_instructions: Option<Vec<String>>,
@@ -671,6 +673,8 @@ fn detail_from(reply: &AgentGetResponse) -> UiDetail {
         state: reply.agent.state,
         observe_only: reply.agent.observe_only,
         project: reply.agent.project.clone(),
+        project_scope: reply.agent.project_scope.clone(),
+        parent: reply.agent.parent.clone(),
         workspace: reply.agent.workspace.clone(),
         project_instructions: crate::monitor_view::project_instruction_lines(reply),
         routing: reply.agent.profile_choice.clone(),

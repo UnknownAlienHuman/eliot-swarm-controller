@@ -28,30 +28,34 @@ impl DesktopApp {
             MENU_MOVE => {
                 // Bound to the generation the header shows.
                 let agent = self.find_agent(&binding.agent).cloned().or_else(|| {
-                    self.chat.detail.as_ref().map(|detail| UiAgent {
-                        id: binding.agent.clone(),
-                        generation: binding.generation,
-                        harness: detail.harness.clone(),
-                        state: detail.state,
-                        status_line: None,
-                        project_id: detail.project.clone(),
-                        project_scope: None,
-                        repo_common_dir: None,
-                        workspace: None,
-                        parent: None,
-                        updated_at: 0,
-                        title: self.agent_title(&binding.agent),
-                        native_child: detail.observe_only,
-                        tokens: None,
-                        chat: false,
-                        archived: false,
-                        pending: false,
-                        organization: None,
-                        tags: Vec::new(),
-                        organization_revision: None,
-                        model: detail.settings.effective_model.clone(),
-                        work: None,
-                    })
+                    self.chat
+                        .detail
+                        .as_ref()
+                        .filter(|detail| detail.generation == binding.generation)
+                        .map(|detail| UiAgent {
+                            id: binding.agent.clone(),
+                            generation: binding.generation,
+                            harness: detail.harness.clone(),
+                            state: detail.state,
+                            status_line: None,
+                            project_id: detail.project.clone(),
+                            project_scope: detail.project_scope.clone(),
+                            repo_common_dir: None,
+                            workspace: detail.workspace.clone(),
+                            parent: detail.parent.clone(),
+                            updated_at: 0,
+                            title: self.agent_title(&binding.agent),
+                            native_child: detail.observe_only,
+                            tokens: None,
+                            chat: false,
+                            archived: false,
+                            pending: false,
+                            organization: None,
+                            tags: Vec::new(),
+                            organization_revision: None,
+                            model: detail.settings.effective_model.clone(),
+                            work: None,
+                        })
                 });
                 if let Some(mut agent) = agent {
                     agent.generation = binding.generation;
