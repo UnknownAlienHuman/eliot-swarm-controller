@@ -423,7 +423,7 @@ impl GitProbe {
                     "--null",
                     "--name-only",
                     "--get-regexp",
-                    "^(filter\\..*|alias\\..*)$",
+                    "^(filter\\..*|alias\\..*|merge\\..*\\.driver)$",
                 ],
                 &[],
                 &[],
@@ -439,13 +439,16 @@ impl GitProbe {
         for key in nul_records(&output.stdout)? {
             if key.starts_with("alias.") {
                 overrides.insert(key.to_owned(), String::new());
+            } else if key.starts_with("merge.") && key.ends_with(".driver") {
+                // Repository attributes can name arbitrary configured merge
+                // drivers; blank their executable command before local merges.
+                overrides.insert(key.to_owned(), String::new());
             } else if let Some((prefix, _)) = key.rsplit_once('.')
                 && prefix.starts_with("filter.")
             {
                 filters.insert(prefix.to_owned());
             }
-        }
-        // Git 2.55 convert.c apply_filter explicitly requires a nonempty command
+        } // Git 2.55 convert.c apply_filter explicitly requires a nonempty command
         // before starting either a single-file or long-running filter. All three
         // command fields must be blank; process takes precedence over clean/smudge.
         for filter in filters {

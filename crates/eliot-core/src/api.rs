@@ -16,6 +16,7 @@ mod coordination;
 mod digests;
 pub mod discovery;
 mod git;
+mod git_integrate;
 mod goals;
 mod handoff;
 pub mod harness;
@@ -111,6 +112,13 @@ pub use git::{
     GitFetchDefinitionArgs, GitFetchOutcome, GitPublishDefinitionArgs, GitPublishOutcome,
     GitPublishTrigger, MAX_GIT_PUBLISH_SUBJECT_BYTES, ProjectCheckPassed, is_git_oid,
     validate_git_publish_subject,
+};
+pub use git_integrate::{
+    DEFAULT_GIT_INTEGRATE_TIMEOUT_MS, FrozenGitIntegrate, GitIntegrateBranchPin,
+    GitIntegrateCaller, GitIntegrateCheckClassification, GitIntegrateCheckFailure,
+    GitIntegrateDefinitionArgs, GitIntegrateOutcome, GitIntegrateRefUpdate, GitIntegrateStatus,
+    GitIntegrateTargetPin, MAX_GIT_INTEGRATE_BRANCHES, MAX_GIT_INTEGRATE_CHECK_TAIL_BYTES,
+    MAX_GIT_INTEGRATE_CONFLICT_PATHS,
 };
 pub use goals::{
     AssignmentGoal, CHECK_SPAWN_RETRYABLE, DEFAULT_GOAL_CHECK_TIMEOUT_MS, GoalClearRequest,

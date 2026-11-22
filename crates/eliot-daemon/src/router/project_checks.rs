@@ -842,7 +842,7 @@ async fn load_project_work(
     }))
 }
 
-enum CheckOutcome {
+pub(crate) enum CheckOutcome {
     Passed,
     Failed { exit_code: i32, output: String },
     Unknown(String),
@@ -855,11 +855,25 @@ async fn run_argv(
     policy: Arc<SecretPolicy>,
     cancellation: watch::Receiver<bool>,
 ) -> Result<CheckOutcome> {
+    run_argv_with_index(argv, workspace, deadline_ms, policy, cancellation, None).await
+}
+
+pub(crate) async fn run_argv_with_index(
+    argv: &[String],
+    workspace: &str,
+    deadline_ms: i64,
+    policy: Arc<SecretPolicy>,
+    cancellation: watch::Receiver<bool>,
+    index_file: Option<&Path>,
+) -> Result<CheckOutcome> {
     let (program, args) = argv
         .split_first()
         .ok_or_else(|| Error::new("source_integrity", "project command argv is empty"))?;
     let mut command = local_process_command(program)?;
     command.args(args).current_dir(workspace);
+    if let Some(index_file) = index_file {
+        command.env("GIT_INDEX_FILE", index_file);
+    }
     let outcome = run_owned_process(
         command,
         Vec::new(),
@@ -870,7 +884,6 @@ async fn run_argv(
     .await;
     classify_outcome(outcome, &policy)
 }
-
 fn classify_outcome(outcome: ProcessOutcome, policy: &SecretPolicy) -> Result<CheckOutcome> {
     Ok(match outcome {
         ProcessOutcome::NotSpawned(error) | ProcessOutcome::ProgramUnrunnable(error) => {

@@ -26,7 +26,7 @@ mod overview;
 mod patch_digest;
 mod project_assignment;
 mod project_broadcast;
-mod project_checks;
+pub(crate) mod project_checks;
 mod provider_resilience;
 mod repeat_failures;
 mod resolution;
@@ -1483,6 +1483,9 @@ impl Router {
     ) -> Result<Value> {
         let mut request: CommandSubmitRequest =
             eliot_core::api::discovery::decode_params(params.clone())?;
+        if request.verb == "git.integrate" {
+            return self.submit_git_integrate(request, principal, remote).await;
+        }
         if request.verb == "git.fetch" {
             return self.submit_git_fetch(request, principal, context).await;
         }
@@ -1715,6 +1718,293 @@ impl Router {
             .map_err(|_| Error::new("internal", "retained command result could not be encoded"))
     }
 
+    async fn submit_git_integrate(
+        &self,
+        mut request: CommandSubmitRequest,
+        principal: &Principal,
+        remote: Option<&eliot_core::RemoteCallContext>,
+    ) -> Result<Value> {
+        request.validate()?;
+        if request.verb != "git.integrate" {
+            return Err(Error::new(
+                "invalid",
+                "Git integration requires git.integrate",
+            ));
+        }
+        let definition = eliot_core::api::discovery::decode_params_at::<
+            eliot_core::api::GitIntegrateDefinitionArgs,
+        >(request.args.clone(), "params.args")?;
+        definition.validate()?;
+        let timeout_ms =
+            crate::automation::git_integrate_timeout_ms(definition.timeout.as_deref())?;
+        authorize_command(principal, &mut request)?;
+        self.authorize_submission_scope(&mut request, principal)
+            .await?;
+        if let Some(response) = self
+            .retained_git_integrate_submit(principal, &request, timeout_ms)
+            .await?
+        {
+            return Ok(response);
+        }
+        let prepared = match self
+            .prepare_git_integrate_submission(request.clone(), principal, None)
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                if let Some(response) = self
+                    .retained_git_integrate_submit(principal, &request, timeout_ms)
+                    .await?
+                {
+                    return Ok(response);
+                }
+                return Err(error);
+            }
+        };
+        let saved_principal = principal_name(principal);
+        let admission = {
+            let mut store = self.inner.store.lock().await;
+            self.admit_prepared_submission(&mut store, &saved_principal, prepared, remote)
+        };
+        let admission = match admission {
+            Ok(admission) => admission,
+            Err(error) => {
+                if let Some(response) = self
+                    .retained_git_integrate_submit(principal, &request, timeout_ms)
+                    .await?
+                {
+                    return Ok(response);
+                }
+                return Err(error);
+            }
+        };
+        if admission.command.state == CommandState::Unknown {
+            self.inner
+                .unknown_commands
+                .lock_recover()
+                .insert(admission.command.id.clone());
+        }
+        if admission.is_new {
+            self.schedule_command(admission.command.id.clone(), None);
+        }
+        self.signal_progress();
+        serde_json::to_value(submit_result(
+            &admission.command,
+            admission.linked_command.as_ref(),
+        ))
+        .map_err(|_| {
+            Error::new(
+                "internal",
+                "git.integrate admission result could not be encoded",
+            )
+        })
+    }
+
+    async fn retained_git_integrate_submit(
+        &self,
+        principal: &Principal,
+        request: &CommandSubmitRequest,
+        timeout_ms: i64,
+    ) -> Result<Option<Value>> {
+        let admission = self
+            .inner
+            .store
+            .lock()
+            .await
+            .replay_git_integrate_submission(&principal_name(principal), request, timeout_ms)?;
+        let Some(admission) = admission else {
+            return Ok(None);
+        };
+        self.note_unknown(&admission.events);
+        if admission.command.state == CommandState::Unknown {
+            self.inner
+                .unknown_commands
+                .lock_recover()
+                .insert(admission.command.id.clone());
+        }
+        self.signal_progress();
+        serde_json::to_value(submit_result(
+            &admission.command,
+            admission.linked_command.as_ref(),
+        ))
+        .map(Some)
+        .map_err(|_| {
+            Error::new(
+                "internal",
+                "retained git.integrate result could not be encoded",
+            )
+        })
+    }
+
+    async fn prepare_git_integrate_submission(
+        &self,
+        mut request: SubmitCommand,
+        principal: &Principal,
+        expected_registration: Option<&ProjectRegistrationView>,
+    ) -> Result<PreparedSubmission> {
+        if request.verb != "git.integrate"
+            || request.selector.is_some()
+            || request.target.is_some()
+            || request.expected_generation.is_some()
+            || request.expected_turn_id.is_some()
+            || request.request_id.is_some()
+            || request.probe
+        {
+            return Err(Error::new(
+                "invalid",
+                "git.integrate must be targetless and have no Agent command bindings",
+            ));
+        }
+        authorize_command(principal, &mut request)?;
+        if contains_known_secret(&request.args, &self.inner.secrets) {
+            return Err(Error::new(
+                "secret_in_payload",
+                "git.integrate request contains a known credential",
+            ));
+        }
+        let definition = eliot_core::api::discovery::decode_params_at::<
+            eliot_core::api::GitIntegrateDefinitionArgs,
+        >(request.args.clone(), "params.args")?;
+        definition.validate()?;
+        let timeout_ms =
+            crate::automation::git_integrate_timeout_ms(definition.timeout.as_deref())?;
+        let caller = match principal {
+            Principal::Owner => None,
+            Principal::ProjectRule {
+                registration: saved,
+            } => {
+                if definition.repository != saved.id
+                    || expected_registration.is_some_and(|expected| expected != saved.as_ref())
+                {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "project git.integrate repository differs from its saved principal",
+                    ));
+                }
+                let registration = self
+                    .inner
+                    .store
+                    .lock()
+                    .await
+                    .get_project_registration("owner", &saved.id)?
+                    .ok_or_else(|| Error::new("not_allowed", "project registration was removed"))?;
+                if registration != **saved {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "project git.integrate registration changed before preparation",
+                    ));
+                }
+                None
+            }
+            Principal::Agent { id, generation } => {
+                let (agent, registration) = {
+                    let store = self.inner.store.lock().await;
+                    let agent = store
+                        .get_agent(id)?
+                        .ok_or_else(|| Error::new("stale_generation", "manager Agent is absent"))?;
+                    let registration = store
+                        .get_project_registration("owner", &definition.repository)?
+                        .ok_or_else(|| {
+                            Error::new("not_allowed", "git.integrate repository is not registered")
+                        })?;
+                    (agent, registration)
+                };
+                if agent.generation != *generation
+                    || agent.is_terminal()
+                    || agent.observe_only
+                    || !matches!(
+                        agent.control,
+                        eliot_core::AgentControl::Tree | eliot_core::AgentControl::Project
+                    )
+                    || expected_registration.is_some_and(|expected| expected != &registration)
+                    || !registration
+                        .actions
+                        .iter()
+                        .any(|action| action == "git.integrate")
+                {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "git.integrate requires a current manager in its approved registered project",
+                    ));
+                }
+                let retained_workspace = agent.workspace.as_deref().ok_or_else(|| {
+                    Error::new("not_allowed", "manager has no retained workspace")
+                })?;
+                let (canonical, common_dir) = crate::workspace_git::WorkspaceGit::new()?
+                    .repository_identity(retained_workspace)
+                    .await?;
+                if canonical != retained_workspace || common_dir != registration.repo_common_dir {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "manager workspace is outside the registered Git repository",
+                    ));
+                }
+                if let Some(target) = &definition.fast_forward_to
+                    && agent.branch.as_deref() != Some(target.as_str())
+                {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "git.integrate fast-forward target must be the manager's own branch",
+                    ));
+                }
+                Some(eliot_core::api::GitIntegrateCaller {
+                    agent: id.clone(),
+                    generation: *generation,
+                    workspace: retained_workspace.to_owned(),
+                    project_scope: agent.project_scope().to_owned(),
+                    control: agent.control,
+                })
+            }
+            _ => {
+                return Err(Error::new(
+                    "not_allowed",
+                    "git.integrate requires Owner, project-rule, or manager authority",
+                ));
+            }
+        };
+        self.check_command_admission_mode(&request.verb)?;
+        let registration = match principal {
+            Principal::Owner => self
+                .inner
+                .store
+                .lock()
+                .await
+                .get_project_registration("owner", &definition.repository)?
+                .ok_or_else(|| {
+                    Error::new("not_found", "Git integration repository is not registered")
+                })?,
+            Principal::ProjectRule { registration } => registration.as_ref().clone(),
+            Principal::Agent { .. } => self
+                .inner
+                .store
+                .lock()
+                .await
+                .get_project_registration("owner", &definition.repository)?
+                .ok_or_else(|| Error::new("not_allowed", "git.integrate repository was removed"))?,
+            _ => unreachable!(),
+        };
+        if expected_registration.is_some_and(|expected| expected != &registration) {
+            return Err(Error::new(
+                "not_allowed",
+                "git.integrate registration differs from its saved project principal",
+            ));
+        }
+        registration.validate()?;
+        crate::automation::verify_project_registration(&self.inner.data_root, &registration)
+            .await?;
+        let frozen = crate::git_integration::freeze(
+            &self.inner.data_root,
+            &registration,
+            &definition,
+            caller,
+            timeout_ms,
+        )
+        .await?;
+        request.args = serde_json::to_value(frozen)
+            .map_err(|_| Error::new("internal", "frozen git.integrate intent cannot be encoded"))?;
+        self.prepare_submission_after_authorization(request, principal, true, false)
+            .await
+    }
     async fn submit_git_fetch(
         &self,
         request: CommandSubmitRequest,
@@ -2237,6 +2527,11 @@ impl Router {
         &self,
         request: SubmitCommand,
     ) -> Result<PreparedSubmission> {
+        if request.verb == "git.integrate" {
+            return self
+                .prepare_git_integrate_submission(request, &Principal::Owner, None)
+                .await;
+        }
         if request.verb == "git.fetch" {
             return self
                 .prepare_git_fetch_submission(request, &Principal::Owner, None)
@@ -2358,7 +2653,10 @@ impl Router {
         };
         let mut prepared = Vec::with_capacity(requests.len());
         for request in requests {
-            let prepared_request = if request.verb == "git.fetch" {
+            let prepared_request = if request.verb == "git.integrate" {
+                self.prepare_git_integrate_submission(request, &principal, Some(registration))
+                    .await?
+            } else if request.verb == "git.fetch" {
                 self.prepare_git_fetch_submission(request, &principal, Some(registration))
                     .await?
             } else if request.verb == "git.publish" {
@@ -2410,6 +2708,14 @@ impl Router {
         request: SubmitCommand,
         registration: &ProjectRegistrationView,
     ) -> Result<PreparedSubmission> {
+        if request.verb == "git.integrate" {
+            let principal = Principal::ProjectRule {
+                registration: Box::new(registration.clone()),
+            };
+            return self
+                .prepare_git_integrate_submission(request, &principal, Some(registration))
+                .await;
+        }
         if request.verb == "git.fetch" {
             let principal = Principal::ProjectRule {
                 registration: Box::new(registration.clone()),

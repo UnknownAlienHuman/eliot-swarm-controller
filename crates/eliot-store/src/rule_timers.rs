@@ -1578,6 +1578,7 @@ fn valid_timer_action_request(request: &SubmitCommand) -> bool {
     match request.verb.as_str() {
         "launch" => valid_targetless_rule_launch_request(request),
         "git.fetch" => valid_targetless_git_fetch_request(request),
+        "git.integrate" => valid_targetless_git_integrate_request(request),
         "notify" | "emit" => valid_targetless_user_event_request(request),
         "mail.send" | "var.set" => valid_targetless_coordination_request(request),
         _ => valid_rule_action_request(request, false),

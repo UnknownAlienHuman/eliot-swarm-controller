@@ -1322,6 +1322,19 @@ fn validate_project_rule_action_tx(
         let registration = super::projects::validate_git_fetch_intent_tx(tx, principal, &frozen)?;
         return Ok(Some(registration));
     }
+    if request.verb == "git.integrate" {
+        let Some(project_id) = rule_project_id(principal)? else {
+            return Ok(None);
+        };
+        let frozen = super::projects::decode_frozen_git_integrate(&request.args)?;
+        if frozen.repository != project_id {
+            return Err(Error::new(
+                "not_allowed",
+                "Project git.integrate repository must match its saved principal",
+            ));
+        }
+        return super::projects::validate_git_integrate_intent_tx(tx, principal, &frozen).map(Some);
+    }
     if request.verb == "git.publish" {
         let Some(project_id) = rule_project_id(principal)? else {
             return Err(Error::new(
@@ -2004,6 +2017,9 @@ fn valid_event_rule_action_request(request: &SubmitCommand) -> bool {
     if request.verb == "git.fetch" {
         return valid_targetless_git_fetch_request(request);
     }
+    if request.verb == "git.integrate" {
+        return valid_targetless_git_integrate_request(request);
+    }
     if request.verb == "git.publish" {
         return valid_targetless_git_publish_request(request);
     }
@@ -2133,6 +2149,17 @@ fn valid_targetless_git_fetch_request(request: &SubmitCommand) -> bool {
         && super::projects::decode_frozen_git_fetch(&request.args).is_ok()
 }
 
+fn valid_targetless_git_integrate_request(request: &SubmitCommand) -> bool {
+    request.validate().is_ok()
+        && request.selector.is_none()
+        && request.verb == "git.integrate"
+        && request.target.is_none()
+        && request.expected_generation.is_none()
+        && request.expected_turn_id.is_none()
+        && request.request_id.is_none()
+        && !request.probe
+        && super::projects::decode_frozen_git_integrate(&request.args).is_ok()
+}
 fn valid_targetless_git_publish_request(request: &SubmitCommand) -> bool {
     request.validate().is_ok()
         && request.verb == "git.publish"
@@ -2624,7 +2651,14 @@ fn rule_action_binding_error(
     }
     if matches!(
         request.verb.as_str(),
-        "launch" | "git.fetch" | "git.publish" | "notify" | "emit" | "mail.send" | "var.set"
+        "launch"
+            | "git.fetch"
+            | "git.integrate"
+            | "git.publish"
+            | "notify"
+            | "emit"
+            | "mail.send"
+            | "var.set"
     ) {
         return None;
     }

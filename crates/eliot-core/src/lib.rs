@@ -5,11 +5,12 @@ pub mod limits;
 pub mod requests;
 
 pub use api::{
-    DEFAULT_GIT_FETCH_TIMEOUT_MS, FrozenGitFetch, FrozenScriptContext, FrozenScriptInterpreter,
-    FrozenScriptRun, GitFetchDefinitionArgs, GitFetchOutcome, RunDefinitionArgs,
-    ScriptActionRecord, ScriptCommandContext, ScriptCustody, ScriptDirectExit, ScriptInputContext,
-    ScriptInterpreter, ScriptProcessResult, ScriptRuleContext, ScriptRunApplied,
-    ScriptTimerContext, ScriptTimerInvocation, bound_script_outcome_stderr,
+    DEFAULT_GIT_FETCH_TIMEOUT_MS, DEFAULT_GIT_INTEGRATE_TIMEOUT_MS, FrozenGitFetch,
+    FrozenGitIntegrate, FrozenScriptContext, FrozenScriptInterpreter, FrozenScriptRun,
+    GitFetchDefinitionArgs, GitFetchOutcome, GitIntegrateDefinitionArgs, GitIntegrateOutcome,
+    RunDefinitionArgs, ScriptActionRecord, ScriptCommandContext, ScriptCustody, ScriptDirectExit,
+    ScriptInputContext, ScriptInterpreter, ScriptProcessResult, ScriptRuleContext,
+    ScriptRunApplied, ScriptTimerContext, ScriptTimerInvocation, bound_script_outcome_stderr,
 };
 
 mod agent_start;

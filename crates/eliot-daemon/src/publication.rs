@@ -50,20 +50,24 @@ pub(crate) struct GitPublishExecutionContext<'a> {
     pub secret_policy: Arc<SecretPolicy>,
 }
 
-struct TemporaryGitIndex {
+pub(crate) struct TemporaryGitIndex {
     directory: PathBuf,
     index_file: PathBuf,
 }
 
 impl TemporaryGitIndex {
-    fn create(data_root: &Path) -> Result<Self> {
+    pub(crate) fn create(data_root: &Path) -> Result<Self> {
+        Self::create_with_prefix(data_root, "publish-index")
+    }
+
+    pub(crate) fn create_with_prefix(data_root: &Path, prefix: &str) -> Result<Self> {
         let data_root = fs::canonicalize(data_root).map_err(|_| {
             Error::new(
                 "unavailable",
                 "private Git publication data root cannot be resolved",
             )
         })?;
-        let directory = data_root.join(format!("publish-index-{}", ulid::Ulid::new()));
+        let directory = data_root.join(format!("{prefix}-{}", ulid::Ulid::new()));
         #[cfg(unix)]
         let create = {
             use std::os::unix::fs::DirBuilderExt;
@@ -83,7 +87,7 @@ impl TemporaryGitIndex {
         })
     }
 
-    fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.index_file
     }
 }
