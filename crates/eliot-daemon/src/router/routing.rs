@@ -365,7 +365,7 @@ impl Router {
             (rank_by_quota && decision.provider_failover.is_some()).then(Vec::new);
         let mut selected: Option<AvailableRoute> = None;
         let mut candidates = candidates.into_iter();
-        while let Some(name) = candidates.next() {
+        for name in candidates.by_ref() {
             let mut quota_status = RouteQuotaStatus::Unknown;
             let evaluated = self
                 .routing_candidate(
