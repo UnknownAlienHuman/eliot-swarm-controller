@@ -323,6 +323,9 @@ No second executor, workflow graph or acceptance engine.
 - [x] **L4.5 Rule editing and outcome branches.** Create, edit, enable, disable and
       delete rule files through the Owner API and CLI. A failed Run can launch a
       task, and its successful terminal turn can emit a notification.
+- [x] **L4.6 Worktree review and keyed rules (#874, #875).** A configured review
+      uses a passed project check and the author fingerprint, then inserts the
+      review for the manager. Script events drive rules with bounded keys and limits.
 
 **Result:** the first harness can work unattended under explicit limits. Hook support
 is added only for a native decision not expressible by the already-working stream.
