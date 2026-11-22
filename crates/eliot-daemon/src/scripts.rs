@@ -185,6 +185,15 @@ pub(crate) async fn execute_dispatched(router: Router, command: Command) {
             )
             .await;
         }
+        ProcessOutcome::NotSpawned(_) => {
+            settle_unknown(
+                &router,
+                &run_id,
+                process::ProcessUncertainty::Spawn.stable_code(),
+                unobserved_process_result(false),
+            )
+            .await;
+        }
         ProcessOutcome::Unknown { reason, quiescent } => {
             settle_unknown(
                 &router,

@@ -4,8 +4,8 @@
 use super::*;
 use eliot_core::api::{
     CommandSubmitResponse, GoalContinuationStage, GoalCounters, GoalDefinition, GoalMarkerState,
-    GoalMode, GoalRoundMarker, GoalRoundOutcome, GoalRoundRequest, GoalRoundResponse, GoalStatus,
-    GoalView, MAX_GOAL_OBSERVATION_BYTES,
+    GoalMode, GoalRoundEvent, GoalRoundEventOutcome, GoalRoundMarker, GoalRoundOutcome,
+    GoalRoundRequest, GoalRoundResponse, GoalStatus, GoalView, MAX_GOAL_OBSERVATION_BYTES,
 };
 use serde::{Deserialize, Serialize};
 
@@ -275,6 +275,40 @@ enum StoredGoalRoundOutcome {
     Running,
     Finished(Box<GoalRoundResponse>),
     Failed(Error),
+}
+
+fn insert_goal_round_event(
+    tx: &Transaction<'_>,
+    record: &GoalRoundRecord,
+    outcome: GoalRoundEventOutcome,
+    reason: Option<String>,
+    exit_code: Option<i32>,
+    cause: Option<core::EventCause>,
+    now: i64,
+) -> Result<Event> {
+    let data = serde_json::to_value(GoalRoundEvent {
+        id: record.request.id.clone(),
+        mode: record.request.mode,
+        revision: record.revision,
+        round_key: record.key.text(),
+        outcome,
+        reason,
+        exit_code,
+    })
+    .map_err(|_| Error::new("internal", "could not encode Goal round event"))?;
+    let event = DaemonEventInput::new(
+        now,
+        "goal.round",
+        "goal",
+        Some(parse_agent_id(&record.request.agent)?),
+        Some(record.generation),
+        data,
+    );
+    let event = match cause {
+        Some(cause) => event.with_cause(cause),
+        None => event,
+    };
+    insert_daemon_event_input(tx, event)
 }
 
 /// Retention uses the same serialized variant as the live reservation DTO.
@@ -1130,7 +1164,7 @@ impl Store {
         request: &GoalRoundRequest,
         error: &Error,
         now: i64,
-    ) -> Result<Error> {
+    ) -> Result<Change<Error>> {
         self.goal_finish_round_error(principal, request, error, now, true)
     }
 
@@ -1142,7 +1176,7 @@ impl Store {
         request: &GoalRoundRequest,
         error: &Error,
         now: i64,
-    ) -> Result<Error> {
+    ) -> Result<Change<Error>> {
         self.goal_finish_round_error(principal, request, error, now, false)
     }
 
@@ -1153,7 +1187,7 @@ impl Store {
         error: &Error,
         now: i64,
         release_marker: bool,
-    ) -> Result<Error> {
+    ) -> Result<Change<Error>> {
         self.ensure_writer_healthy()?;
         let result = (|| {
             let tx = self
@@ -1173,17 +1207,31 @@ impl Store {
                 // replacing an already retained original request error.
                 abandon_goal_marker_tx(&tx, &record, now)?;
             }
+            let mut events = Vec::new();
             let retained = if matches!(record.outcome, StoredGoalRoundOutcome::Running)
                 && record.holder == self.goal_holder
             {
-                retain_goal_round_error_tx(&tx, &mut record, error)?
+                let retained = retain_goal_round_error_tx(&tx, &mut record, error)?;
+                events.push(insert_goal_round_event(
+                    &tx,
+                    &record,
+                    GoalRoundEventOutcome::Unknown,
+                    Some(retained.code.clone()),
+                    None,
+                    None,
+                    now,
+                )?);
+                retained
             } else if let StoredGoalRoundOutcome::Failed(retained) = record.outcome {
                 retained
             } else {
                 error.clone()
             };
             commit_transaction(tx, &self.write_faulted)?;
-            Ok(retained)
+            Ok(Change {
+                value: retained,
+                events,
+            })
         })();
         self.fault_on_persistence_error(&result);
         result
@@ -2314,6 +2362,15 @@ impl Store {
             }),
         };
         request.validate_response(&response)?;
+        events.push(insert_goal_round_event(
+            &tx,
+            &record,
+            response.outcome.into(),
+            response.reason.clone(),
+            commit.check.as_ref().and_then(|check| check.exit_code),
+            state.assignment_cause.clone(),
+            now,
+        )?);
         record.outcome = StoredGoalRoundOutcome::Finished(Box::new(response.clone()));
         update_goal_round_tx(&tx, &record)?;
         commit_transaction(tx, &self.write_faulted)?;
@@ -2910,8 +2967,11 @@ fn round_key_names_idle_event(connection: &Connection, goal: &GoalRow, seq: i64)
                      WHEN json_extract(data, '$.outcome.reason') = 'consumer_input_unconfirmed'
                          THEN json_extract(data, '$.outcome.claim.consumer_id')
                  END IS NOT ?2
-             )",
-            params![seq, goal.state.last_continuation_command_id],
+             ) AND (kind <> 'goal.round' OR (
+                 json_extract(data, '$.outcome') IN ('blocked', 'completed')
+                 AND json_extract(data, '$.revision') + 1 < ?3
+             ))",
+            params![seq, goal.state.last_continuation_command_id, goal.revision],
             |row| {
                 Ok((
                     row.get::<_, Option<i64>>(0)?,

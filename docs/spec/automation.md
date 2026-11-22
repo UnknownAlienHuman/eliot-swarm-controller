@@ -1326,6 +1326,14 @@ and replaces the reservation with the full original response rendered from that
 same transaction connection. Stored round records use `MAX_FRAME_BYTES`, including
 their response; they are not subject to the smaller persisted-event budget.
 
+Settling a round publishes an ordinary `goal.round` event with the Agent and
+generation on the envelope and the round id, revision, key, outcome, optional
+reason and known direct exit code in [GoalRoundEvent](../../crates/eliot-core/src/api/goals.rs).
+The event and the retained result commit together. Event readers, watch and rules
+can observe the result. The idle driver does not schedule itself from these events.
+Setting a fresh definition on an idle Agent can reconcile from the retained terminal
+result of its previous Goal. Continued and unknown round events supply no idle key.
+
 The check is the frozen explicit argv from `goal set`, run through the shared
 owned-process custody outside the Store lock with a bounded timeout, a small
 round-context stdin and the daemon environment. Both check streams are
@@ -1348,8 +1356,17 @@ block, or one continuation. Success always completes, even on a spent budget.
 If the Goal's own continuation is rejected before native dispatch, that
 rejection and any resulting context rejections cannot supply a new idle key
 for the same Goal. A later eligible Agent event can still drive a round.
-An unknown check outcome (spawn/timeout/custody failure, or a check with no
-exit code such as a signal kill) commits no Goal progress or continuation, and
+An OS refusal before spawn or a failure to prepare the command blocks the Goal as
+`check_unrunnable`. A timed-out check with proven closure blocks as `check_timeout`.
+A check whose output exceeded the capture limit with proven closure blocks as
+`check_output_limit`. The Goal view retains a bounded, redacted observation with
+the command and the available cause. A blocked check consumes the round reservation
+and admits no continuation.
+If the caller drops after a block was decided, the finalizer commits that same
+bound decision through the Store and does not run the check again.
+
+An unknown check outcome (including unproven custody or a check with no exit code
+such as a signal kill) commits no Goal progress or continuation, and
 neither does a commit that finds the Agent left idle during the check: the marker goes `unknown`
 and that round key is never rerun — the next round needs a new key. After a
 crash the marker stays `unknown`. Abandonment burns its marker and retains the

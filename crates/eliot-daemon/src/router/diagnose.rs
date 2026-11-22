@@ -256,6 +256,48 @@ impl Router {
         let mut preceded_by = None;
         let mut commands = std::collections::HashSet::new();
         let mut unresolved = Vec::new();
+        if let Some(goal) = store.goal_get(agent, "eliot")?
+            && (goal.status != eliot_core::api::GoalStatus::Cleared || goal.round_marker.is_some())
+        {
+            let state = goal.status.as_str();
+            let reason = goal
+                .blocked_reason
+                .as_deref()
+                .or(goal.paused_reason.as_deref());
+            let mut message = format!("Goal {state}");
+            if let Some(reason) = reason {
+                message.push_str(&format!(" ({reason})"));
+            }
+            if matches!(
+                goal.blocked_reason.as_deref(),
+                Some("check_unrunnable" | "check_timeout" | "check_output_limit")
+            ) && let Some(observation) = goal.counters.last_observation.as_deref()
+            {
+                message.push_str(". ");
+                message.push_str(observation);
+            }
+            if let Some(marker) = &goal.round_marker {
+                message.push_str(&format!(
+                    ". Round {} is {}",
+                    marker.round_key,
+                    marker.state.as_str()
+                ));
+            }
+            if goal.generation != generation {
+                message.push_str(&format!(". Bound to generation {}", goal.generation));
+            }
+            steps.push(DiagnoseStep {
+                kind: "goal".to_owned(),
+                code: Some(state.to_owned()),
+                message: Some(bound_chars(&message, 1024)),
+                failure_where: None,
+                origin: None,
+                origin_evidence: None,
+                exit_code: None,
+                ntstatus: None,
+                at: (goal.updated_at >= 0).then_some(goal.updated_at),
+            });
+        }
         if row.is_terminal()
             && let Some(blocked) = store.restart_resume_blocked(agent, generation)?
             && let Some(message) = blocked.get("message").and_then(Value::as_str)
@@ -770,8 +812,10 @@ fn summary_for(target: &str, steps: &[DiagnoseStep], fallback_what: &str) -> Str
 }
 
 fn healthy_agent(steps: &[DiagnoseStep]) -> bool {
-    steps.len() == 1
-        && steps[0].kind == "agent"
+    steps.first().is_some_and(|step| step.kind == "agent")
+        && steps[1..]
+            .iter()
+            .all(|step| step.kind == "goal" && step.code.as_deref() != Some("blocked"))
         && matches!(
             steps[0].code.as_deref(),
             Some("idle" | "busy" | "waiting" | "stopped")

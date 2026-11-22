@@ -17,7 +17,8 @@ fn main() -> ExitCode {
         println!(
             "{}",
             serde_json::json!({
-                "version": concat!("swarm ", env!("CARGO_PKG_VERSION")),
+                "version": format!("swarm {}", env!("ELIOT_BUILD_VERSION")),
+                "git_sha": option_env!("ELIOT_BUILD_GIT_SHA").filter(|sha| !sha.is_empty()),
                 "store_schema": eliot_daemon::operator::STORE_SCHEMA_VERSION,
                 "backup_update": true,
             })

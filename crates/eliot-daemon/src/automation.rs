@@ -183,7 +183,12 @@ pub(crate) async fn initialize_global_rules(
     let (snapshot, from_file) = match reload::load(data_root) {
         Ok(snapshot) => (snapshot, true),
         Err(error) if !prior.is_empty() => {
-            report_rejected_source(policy, &error, &mut notices)?;
+            let log_ids = [
+                ("producer", "automation.rule_reload"),
+                ("method", "rules.reload"),
+                ("path", "rules/*.toml or config.toml"),
+            ];
+            report_rejected_source(policy, &error, &mut notices, &log_ids)?;
             (reload::from_processing(&prior)?, false)
         }
         Err(error) => return Err(error),
@@ -194,7 +199,12 @@ pub(crate) async fn initialize_global_rules(
         {
             Ok(rules) => (rules, from_file),
             Err(error) if !prior.is_empty() && rejected_reload(&error) => {
-                report_rejected_reload(policy, &snapshot.inputs, &error, &mut notices)?;
+                let log_ids = [
+                    ("producer", "automation.rule_reload"),
+                    ("method", "rules.reload"),
+                    ("path", "rules/*.toml"),
+                ];
+                report_rejected_reload(policy, &snapshot.inputs, &error, &mut notices, &log_ids)?;
                 let saved = reload::from_processing(&prior)?;
                 (
                     apply_global_rule_snapshot(
@@ -234,7 +244,17 @@ pub(crate) async fn initialize_project_rules(
     let (revision, registrations) = match registration_result {
         Ok(snapshot) => snapshot,
         Err(error) => {
-            logging::record(policy, "daemon.rule_reload_rejected", &[], Some(&error));
+            let log_ids = [
+                ("producer", "automation.project_registration"),
+                ("method", "project.registrations.load"),
+                ("path", "config.toml"),
+            ];
+            logging::record(
+                policy,
+                "daemon.rule_reload_rejected",
+                &log_ids,
+                Some(&error),
+            );
             return Ok(Vec::new());
         }
     };
@@ -260,11 +280,25 @@ pub(crate) async fn initialize_project_rules(
                 "Store returned an unconfigured project registration",
             ));
         };
+        let project_id = registration.id.clone();
         let initialized =
             initialize_project_namespace(router, data_root, policy, registration, view).await;
         match initialized {
             Ok(namespace) => namespaces.push(namespace),
-            Err(error) => logging::record(policy, "daemon.rule_reload_rejected", &[], Some(&error)),
+            Err(error) => {
+                let log_ids = [
+                    ("producer", "automation.project_rules"),
+                    ("method", "project.rules.load"),
+                    ("path", ".eliot/rules/*.toml"),
+                    ("project", project_id.as_str()),
+                ];
+                logging::record(
+                    policy,
+                    "daemon.rule_reload_rejected",
+                    &log_ids,
+                    Some(&error),
+                );
+            }
         }
     }
     Ok(namespaces)
@@ -292,7 +326,13 @@ async fn initialize_project_namespace(
     let loaded = match loaded_result {
         Ok(loaded) => loaded,
         Err(error) if !prior.is_empty() => {
-            report_rejected_source(policy, &error, &mut notices)?;
+            let log_ids = [
+                ("producer", "automation.project_rules"),
+                ("method", "project.rules.reload"),
+                ("path", ".eliot/rules/*.toml"),
+                ("project", registration.id.as_str()),
+            ];
+            report_rejected_source(policy, &error, &mut notices, &log_ids)?;
             let snapshot = reload::from_processing(&prior)?;
             let rules = apply_global_rule_snapshot(
                 router,
@@ -333,7 +373,13 @@ async fn initialize_project_namespace(
     let rules = match rules_result {
         Ok(rules) => rules,
         Err(error) if !prior.is_empty() && rejected_reload(&error) => {
-            report_rejected_reload(policy, &snapshot.inputs, &error, &mut notices)?;
+            let log_ids = [
+                ("producer", "automation.project_rules"),
+                ("method", "project.rules.reload"),
+                ("path", ".eliot/rules/*.toml"),
+                ("project", registration.id.as_str()),
+            ];
+            report_rejected_reload(policy, &snapshot.inputs, &error, &mut notices, &log_ids)?;
             let saved = reload::from_processing(&prior)?;
             apply_global_rule_snapshot(
                 router,
@@ -486,7 +532,12 @@ async fn refresh_project_namespaces(
     let (revision, registrations) = match projects::load_registrations(data_root).await {
         Ok(snapshot) => snapshot,
         Err(error) => {
-            report_rejected_source(policy, &error, owner_config_notices)?;
+            let log_ids = [
+                ("producer", "automation.project_registration"),
+                ("method", "project.registrations.reload"),
+                ("path", "config.toml"),
+            ];
+            report_rejected_source(policy, &error, owner_config_notices, &log_ids)?;
             for namespace in namespaces.iter_mut() {
                 namespace.registration_current = false;
             }
@@ -503,7 +554,12 @@ async fn refresh_project_namespaces(
     {
         Ok(views) => views,
         Err(error) => {
-            report_rejected_source(policy, &error, owner_config_notices)?;
+            let log_ids = [
+                ("producer", "automation.project_registration"),
+                ("method", "project.registrations.reload"),
+                ("path", "config.toml"),
+            ];
+            report_rejected_source(policy, &error, owner_config_notices, &log_ids)?;
             for namespace in namespaces.iter_mut() {
                 namespace.registration_current = false;
             }
@@ -534,11 +590,23 @@ async fn refresh_project_namespaces(
             .iter()
             .position(|namespace| namespace.registration.id == view.id)
         else {
+            let project_id = registration.id.clone();
             match initialize_project_namespace(router, data_root, policy, registration, view).await
             {
                 Ok(namespace) => namespaces.push(namespace),
                 Err(error) => {
-                    logging::record(policy, "daemon.rule_reload_rejected", &[], Some(&error));
+                    let log_ids = [
+                        ("producer", "automation.project_rules"),
+                        ("method", "project.rules.load"),
+                        ("path", ".eliot/rules/*.toml"),
+                        ("project", project_id.as_str()),
+                    ];
+                    logging::record(
+                        policy,
+                        "daemon.rule_reload_rejected",
+                        &log_ids,
+                        Some(&error),
+                    );
                 }
             }
             continue;
@@ -555,7 +623,13 @@ async fn refresh_project_namespaces(
         let loaded = match projects::load_project_rules(data_root, registration.clone()).await {
             Ok(loaded) => loaded,
             Err(error) => {
-                report_rejected_source(policy, &error, &mut namespace.notices)?;
+                let log_ids = [
+                    ("producer", "automation.project_rules"),
+                    ("method", "project.rules.reload"),
+                    ("path", ".eliot/rules/*.toml"),
+                    ("project", namespace.registration.id.as_str()),
+                ];
+                report_rejected_source(policy, &error, &mut namespace.notices, &log_ids)?;
                 continue;
             }
         };
@@ -566,7 +640,13 @@ async fn refresh_project_namespaces(
                 "source_integrity",
                 "project rule loader returned a different authority scope",
             );
-            report_rejected_source(policy, &error, &mut namespace.notices)?;
+            let log_ids = [
+                ("producer", "automation.project_rules"),
+                ("method", "project.rules.reload"),
+                ("path", ".eliot/rules/*.toml"),
+                ("project", namespace.registration.id.as_str()),
+            ];
+            report_rejected_source(policy, &error, &mut namespace.notices, &log_ids)?;
             continue;
         }
         let snapshot = loaded.snapshot;
@@ -667,9 +747,10 @@ fn report_rejected_reload(
     inputs: &[RuleDefinitionInput],
     error: &Error,
     notices: &mut ReloadNoticeContext,
+    ids: &[(&str, &str)],
 ) -> Result<()> {
     if claim_notice(reload_notice_key(inputs)?, &mut notices.rejected) {
-        logging::record(policy, "daemon.rule_reload_rejected", &[], Some(error));
+        logging::record(policy, "daemon.rule_reload_rejected", ids, Some(error));
     }
     Ok(())
 }
@@ -678,6 +759,7 @@ fn report_rejected_source(
     policy: &SecretPolicy,
     error: &Error,
     notices: &mut ReloadNoticeContext,
+    ids: &[(&str, &str)],
 ) -> Result<()> {
     let details = json!({"code": error.code, "message": error.message});
     let key = ReloadNoticeKey::Rejection(
@@ -685,7 +767,7 @@ fn report_rejected_source(
             .map_err(|_| Error::new("internal", "reload notice could not be canonicalized"))?,
     );
     if claim_notice(key, &mut notices.rejected) {
-        logging::record(policy, "daemon.rule_reload_rejected", &[], Some(error));
+        logging::record(policy, "daemon.rule_reload_rejected", ids, Some(error));
     }
     Ok(())
 }
@@ -796,7 +878,28 @@ async fn attempt_reload_snapshot(
             Ok(Some((updated, deferred)))
         }
         Err(error) if rejected_reload(&error) => {
-            report_rejected_reload(reporter.policy, &snapshot.inputs, &error, reporter.notices)?;
+            let mut log_ids = vec![
+                ("producer", "automation.rule_reload"),
+                ("method", "rules.reload"),
+                (
+                    "path",
+                    if project.is_some() {
+                        ".eliot/rules/*.toml"
+                    } else {
+                        "rules/*.toml"
+                    },
+                ),
+            ];
+            if let Some(project) = project {
+                log_ids.push(("project", project.id.as_str()));
+            }
+            report_rejected_reload(
+                reporter.policy,
+                &snapshot.inputs,
+                &error,
+                reporter.notices,
+                &log_ids,
+            )?;
             Ok(None)
         }
         Err(error) => Err(error),
@@ -1049,7 +1152,17 @@ async fn run_global_rules_inner(
     let mut watcher = match reload::RuleWatcher::watch(&data_root) {
         Ok(watcher) => Some(watcher),
         Err(error) => {
-            logging::record(&policy, "daemon.rule_watch_unavailable", &[], Some(&error));
+            let log_ids = [
+                ("producer", "automation.rule_watcher"),
+                ("method", "rules.watch"),
+                ("path", "rules/"),
+            ];
+            logging::record(
+                &policy,
+                "daemon.rule_watch_unavailable",
+                &log_ids,
+                Some(&error),
+            );
             None
         }
     };
@@ -1058,7 +1171,18 @@ async fn run_global_rules_inner(
         match reload::RuleWatcher::watch_project(Path::new(&namespace.registration.checkout)) {
             Ok(watcher) => project_watchers.push(watcher),
             Err(error) => {
-                logging::record(&policy, "daemon.rule_watch_unavailable", &[], Some(&error));
+                let log_ids = [
+                    ("producer", "automation.rule_watcher"),
+                    ("method", "project.rules.watch"),
+                    ("path", ".eliot/rules/"),
+                    ("project", namespace.registration.id.as_str()),
+                ];
+                logging::record(
+                    &policy,
+                    "daemon.rule_watch_unavailable",
+                    &log_ids,
+                    Some(&error),
+                );
             }
         }
     }
@@ -1086,7 +1210,12 @@ async fn run_global_rules_inner(
             .await?;
         }
         Err(error) => {
-            report_rejected_source(&policy, &error, &mut owner_config_notices)?;
+            let log_ids = [
+                ("producer", "automation.configuration"),
+                ("method", "automation.config.reload"),
+                ("path", "config.toml"),
+            ];
+            report_rejected_source(&policy, &error, &mut owner_config_notices, &log_ids)?;
             for namespace in &mut project_rules {
                 namespace.registration_current = false;
             }
@@ -1360,7 +1489,12 @@ async fn run_global_rules_inner(
                 cleanup_enabled = false;
                 cleanup_after = None;
                 last_cleanup_at = None;
-                report_rejected_source(&policy, &error, &mut owner_config_notices)?;
+                let log_ids = [
+                    ("producer", "automation.configuration"),
+                    ("method", "automation.config.reload"),
+                    ("path", "config.toml"),
+                ];
+                report_rejected_source(&policy, &error, &mut owner_config_notices, &log_ids)?;
             }
         }
         project_watchers.clear();
@@ -1377,7 +1511,12 @@ async fn run_global_rules_inner(
         let snapshot = match reload::load(&data_root) {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                report_rejected_source(&policy, &error, &mut notices)?;
+                let log_ids = [
+                    ("producer", "automation.rule_reload"),
+                    ("method", "rules.reload"),
+                    ("path", "rules/*.toml or config.toml"),
+                ];
+                report_rejected_source(&policy, &error, &mut notices, &log_ids)?;
                 continue;
             }
         };
@@ -1985,7 +2124,11 @@ async fn reconcile_due_timers_with_arbitration(
                                 crate::logging::record(
                                     &router.secret_policy_snapshot(),
                                     "assignment.project_wait",
-                                    &[("rule", &state.id)],
+                                    &[
+                                        ("producer", "automation.assignment"),
+                                        ("method", "assignment.project_wait"),
+                                        ("rule", state.id.as_str()),
+                                    ],
                                     Some(&error),
                                 );
                             }

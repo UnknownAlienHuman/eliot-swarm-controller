@@ -449,7 +449,11 @@ impl Router {
             "expected_generation": claim.generation,
             "args": args,
         });
-        if self.submit(&params, &Principal::Owner).await.is_err() {
+        if self
+            .submit(&params, &Principal::Owner, "daemon.mail_notice")
+            .await
+            .is_err()
+        {
             let mut store = self.inner.store.lock().await;
             let _ = store.notice_release(recipient, &notice_id);
         }

@@ -341,6 +341,12 @@ impl OwnedChild {
     /// Start the configured command under a Windows Job or a new Unix group.
     /// Configure Tokio's stdin/stdout/stderr as piped before passing the command.
     pub fn spawn(command: Command) -> Result<Self> {
+        Self::spawn_report(command).map_err(AgentSpawnError::into_error)
+    }
+
+    /// Preserve whether the OS refused to start the process or setup failed
+    /// after a child had already been created.
+    pub(crate) fn spawn_report(command: Command) -> std::result::Result<Self, AgentSpawnError> {
         Self::spawn_with_policy(command, false)
     }
 
@@ -440,15 +446,19 @@ impl OwnedChild {
         })
     }
 
-    fn spawn_with_policy(command: Command, leaf: bool) -> Result<Self> {
+    fn spawn_with_policy(
+        command: Command,
+        leaf: bool,
+    ) -> std::result::Result<Self, AgentSpawnError> {
         #[cfg(windows)]
         {
             let job = if leaf {
-                super::windows::Job::new_leaf()?
+                super::windows::Job::new_leaf()
             } else {
-                super::windows::Job::new_kill_on_close()?
-            };
-            Self::spawn_in_job(command, job).map_err(AgentSpawnError::into_error)
+                super::windows::Job::new_kill_on_close()
+            }
+            .map_err(AgentSpawnError::NotSpawned)?;
+            Self::spawn_in_job(command, job)
         }
 
         #[cfg(unix)]
@@ -456,9 +466,9 @@ impl OwnedChild {
             let _ = leaf;
             let mut command = command;
             command.process_group(0);
-            let child = command
-                .spawn()
-                .map_err(|error| io_error("spawn process-group child", error))?;
+            let child = command.spawn().map_err(|error| {
+                AgentSpawnError::NotSpawned(io_error("spawn process-group child", error))
+            })?;
             let identity = child
                 .id()
                 .and_then(|pid| super::unix::capture_process_group_identity(pid).ok());
@@ -473,10 +483,10 @@ impl OwnedChild {
         #[cfg(not(any(windows, unix)))]
         {
             let _ = (command, leaf);
-            Err(Error::new(
+            Err(AgentSpawnError::NotSpawned(Error::new(
                 "platform_unsupported",
                 "owned child custody is implemented for Windows and Unix",
-            ))
+            )))
         }
     }
 

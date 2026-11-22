@@ -24,7 +24,7 @@ pub(crate) struct PageArgs {
 #[derive(Parser)]
 #[command(
     name = "swarm",
-    version,
+    version = env!("ELIOT_BUILD_VERSION"),
     about = "Local controller for coding-agent sessions"
 )]
 pub(crate) struct Cli {

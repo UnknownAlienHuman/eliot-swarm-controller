@@ -195,6 +195,15 @@ pub(crate) async fn run_status(data_dir: PathBuf, json_output: bool) -> Result<u
     params
         .validate_response(&response)
         .map_err(Failure::invalid_response)?;
+    let build_line = response.build_identity.as_ref().map(|identity| {
+        format!(
+            "Build identity | version={} | executable_directory={} | git_sha={} | executable_sha256={}",
+            identity.version,
+            identity.executable_directory.as_deref().unwrap_or("unavailable"),
+            identity.git_sha.as_deref().unwrap_or("unavailable"),
+            identity.executable_sha256.as_deref().unwrap_or("unavailable"),
+        )
+    });
     let cleanup_line = response.automatic_cleanup.as_ref().map(|cleanup| {
         let policy = if let Some(code) = &cleanup.config_error {
             format!("unavailable ({code})")
@@ -232,6 +241,7 @@ pub(crate) async fn run_status(data_dir: PathBuf, json_output: bool) -> Result<u
     if let Some(object) = value.as_object_mut() {
         if !json_output {
             object.remove("automatic_cleanup");
+            object.remove("build_identity");
         }
         object.insert(
             "data_dir".to_owned(),
@@ -239,6 +249,9 @@ pub(crate) async fn run_status(data_dir: PathBuf, json_output: bool) -> Result<u
         );
     }
     print_value(&value, json_output);
+    if !json_output && let Some(line) = build_line {
+        println!("{line}");
+    }
     if !json_output && let Some(line) = cleanup_line {
         println!("{line}");
     }

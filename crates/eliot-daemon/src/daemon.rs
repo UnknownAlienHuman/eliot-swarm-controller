@@ -241,16 +241,60 @@ async fn run_with_update(path: PathBuf, attempt: Option<&str>) -> Result<()> {
     crate::skill::materialize(data_dir.path())?;
     let _log = logging::init(&data_dir, &daemon_lock)?;
     let policy = Arc::new(SecretPolicy::new([data_dir.owner_token()]));
+    let build_identity = crate::build_identity::current();
+    let unavailable = "unavailable";
+    logging::record(
+        &policy,
+        "daemon.build_identity",
+        &[
+            ("version", &build_identity.version),
+            (
+                "executable_directory",
+                build_identity
+                    .executable_directory
+                    .as_deref()
+                    .unwrap_or(unavailable),
+            ),
+            (
+                "git_sha",
+                build_identity.git_sha.as_deref().unwrap_or(unavailable),
+            ),
+            (
+                "executable_sha256",
+                build_identity
+                    .executable_sha256
+                    .as_deref()
+                    .unwrap_or(unavailable),
+            ),
+        ],
+        None,
+    );
     // This start ends the Owner's previous stop: a later exit without a
     // new `daemon.shutdown` is a failure the desktop may restart.
     if let Err(error) = data_dir.clear_owner_stop(&daemon_lock) {
-        logging::record(&policy, "daemon.owner_stop_clear_failed", &[], Some(&error));
+        logging::record(
+            &policy,
+            "daemon.owner_stop_clear_failed",
+            &[
+                ("producer", "daemon.startup"),
+                ("method", "daemon.owner_stop.clear"),
+            ],
+            Some(&error),
+        );
     }
     // `[daemon] log_level` sets process verbosity at startup; an invalid
     // value fails startup like invalid retention or mail config.
     let daemon_config = crate::config::load_daemon_config(data_dir.path()).map_err(|error| {
         let failure = startup_config_failure(error);
-        logging::record(&policy, "daemon.failed", &[], Some(&failure));
+        logging::record(
+            &policy,
+            "daemon.failed",
+            &[
+                ("producer", "daemon.startup"),
+                ("method", "daemon.config.load"),
+            ],
+            Some(&failure),
+        );
         failure
     })?;
     crate::logging::set_log_level(crate::logging::LogLevel::parse(&daemon_config.log_level)?);
@@ -258,7 +302,15 @@ async fn run_with_update(path: PathBuf, attempt: Option<&str>) -> Result<()> {
     if let Err(error) =
         crate::platform::data_dir::remove_abandoned_mcp_temps(&data_dir, &daemon_lock)
     {
-        logging::record(&policy, "daemon.mcp_temp_cleanup_failed", &[], Some(&error));
+        logging::record(
+            &policy,
+            "daemon.mcp_temp_cleanup_failed",
+            &[
+                ("producer", "daemon.startup"),
+                ("method", "daemon.mcp_temp.cleanup"),
+            ],
+            Some(&error),
+        );
     }
     let outcome = run_owned(
         &data_dir,
@@ -275,7 +327,7 @@ async fn run_with_update(path: PathBuf, attempt: Option<&str>) -> Result<()> {
         } else {
             "daemon.failed"
         },
-        &[],
+        &[("producer", "daemon.process"), ("method", "daemon.run")],
         outcome.as_ref().err(),
     );
     outcome
@@ -557,7 +609,11 @@ async fn spawn_workers(
             .transpose()?;
         // This durable endpoint change is the admission boundary. Boot
         // recovery workers, automation and RPC handling all follow it.
-        data_dir.publish_daemon(daemon_lock, listener.endpoint(), env!("CARGO_PKG_VERSION"))?
+        data_dir.publish_daemon(
+            daemon_lock,
+            listener.endpoint(),
+            env!("ELIOT_BUILD_VERSION"),
+        )?
     };
     logging::record(&policy, "daemon.ready", &[("boot_id", &info.boot_id)], None);
 
@@ -678,7 +734,10 @@ async fn spawn_workers(
             logging::record(
                 &capacity.policy,
                 "daemon.command_recovery_failed",
-                &[],
+                &[
+                    ("producer", "daemon.recovery"),
+                    ("method", "commands.recover"),
+                ],
                 Some(&error),
             );
         }
@@ -690,7 +749,10 @@ async fn spawn_workers(
             logging::record(
                 &capacity.policy,
                 "daemon.restart_agent_recovery_failed",
-                &[],
+                &[
+                    ("producer", "daemon.recovery"),
+                    ("method", "agents.restart_recover"),
+                ],
                 Some(&error),
             );
         }
@@ -947,7 +1009,19 @@ async fn supervise(mut supervision: DaemonSupervision) -> (Result<()>, DaemonSup
             }
             joined = workers.join_next(), if !workers.is_empty() => {
                 if matches!(joined, Some(Err(_))) {
-                    logging::record(&policy, "daemon.worker_supervisor_failed", &[], None);
+                    let error = Error::new(
+                        "worker_supervisor_failed",
+                        "daemon worker supervisor observed a panicked or cancelled task",
+                    );
+                    logging::record(
+                        &policy,
+                        "daemon.worker_supervisor_failed",
+                        &[
+                            ("producer", "daemon.worker_supervisor"),
+                            ("method", "worker.join"),
+                        ],
+                        Some(&error),
+                    );
                     break Err(Error::new(
                         "worker_supervisor_failed",
                         "daemon worker supervisor stopped unexpectedly",
@@ -956,7 +1030,19 @@ async fn supervise(mut supervision: DaemonSupervision) -> (Result<()>, DaemonSup
             }
             joined = monitor_tasks.join_next(), if !monitor_tasks.is_empty() => {
                 if matches!(joined, Some(Err(_))) {
-                    logging::record(&policy, "daemon.monitor_supervisor_failed", &[], None);
+                    let error = Error::new(
+                        "monitor_supervisor_failed",
+                        "monitor supervisor observed a panicked or cancelled task",
+                    );
+                    logging::record(
+                        &policy,
+                        "daemon.monitor_supervisor_failed",
+                        &[
+                            ("producer", "daemon.monitor_supervisor"),
+                            ("method", "monitor.join"),
+                        ],
+                        Some(&error),
+                    );
                     monitoring.mark_unavailable("monitor_supervisor_failed");
                     break Err(Error::new(
                         "monitor_supervisor_failed",
@@ -968,11 +1054,31 @@ async fn supervise(mut supervision: DaemonSupervision) -> (Result<()>, DaemonSup
                 match joined {
                     Some(Ok((_, Ok(())))) => {}
                     Some(Ok((_, Err(error)))) => {
-                        logging::record(&policy, "daemon.workspace_recovery_failed", &[], Some(&error));
+                        logging::record(
+                            &policy,
+                            "daemon.workspace_recovery_failed",
+                            &[
+                                ("producer", "daemon.workspace_recovery"),
+                                ("method", "workspace.recover"),
+                            ],
+                            Some(&error),
+                        );
                         router.note_workspace_recovery_failure(&error.code);
                     }
                     _ => {
-                        logging::record(&policy, "daemon.workspace_recovery_task_failed", &[], None);
+                        let error = Error::new(
+                            "workspace_recovery_task_failed",
+                            "workspace recovery task panicked or was cancelled",
+                        );
+                        logging::record(
+                            &policy,
+                            "daemon.workspace_recovery_task_failed",
+                            &[
+                                ("producer", "daemon.workspace_recovery"),
+                                ("method", "workspace.recover.join"),
+                            ],
+                            Some(&error),
+                        );
                         router.note_workspace_recovery_failure("workspace_recovery_task_failed");
                     }
                 }
@@ -980,20 +1086,64 @@ async fn supervise(mut supervision: DaemonSupervision) -> (Result<()>, DaemonSup
             joined = cloud_mcp_tasks.join_next(), if !cloud_mcp_tasks.is_empty() => {
                 match joined {
                     Some(Ok(Ok(()))) => {
-                        logging::record(&policy, "daemon.cloud_mcp_stopped_unexpectedly", &[], None);
+                        let error = Error::new(
+                            "cloud_mcp_stopped",
+                            "cloud MCP service exited unexpectedly",
+                        );
+                        logging::record(
+                            &policy,
+                            "daemon.cloud_mcp_stopped_unexpectedly",
+                            &[
+                                ("producer", "daemon.cloud_mcp"),
+                                ("method", "cloud_mcp.serve"),
+                            ],
+                            Some(&error),
+                        );
                     }
                     Some(Ok(Err(error))) => {
-                        logging::record(&policy, "daemon.cloud_mcp_failed", &[], Some(&error));
+                        logging::record(
+                            &policy,
+                            "daemon.cloud_mcp_failed",
+                            &[
+                                ("producer", "daemon.cloud_mcp"),
+                                ("method", "cloud_mcp.serve"),
+                            ],
+                            Some(&error),
+                        );
                     }
                     Some(Err(_)) => {
-                        logging::record(&policy, "daemon.cloud_mcp_task_failed", &[], None);
+                        let error = Error::new(
+                            "cloud_mcp_task_failed",
+                            "cloud MCP service task panicked or was cancelled",
+                        );
+                        logging::record(
+                            &policy,
+                            "daemon.cloud_mcp_task_failed",
+                            &[
+                                ("producer", "daemon.cloud_mcp"),
+                                ("method", "cloud_mcp.serve.join"),
+                            ],
+                            Some(&error),
+                        );
                     }
                     None => {}
                 }
             }
             joined = connections.join_next(), if !connections.is_empty() => {
                 if matches!(joined, Some(Err(_))) {
-                    logging::record(&policy, "daemon.connection_task_failed", &[], None);
+                    let error = Error::new(
+                        "connection_task_failed",
+                        "RPC connection task panicked or was cancelled",
+                    );
+                    logging::record(
+                        &policy,
+                        "daemon.connection_task_failed",
+                        &[
+                            ("producer", "daemon.ipc_connection"),
+                            ("method", "rpc.connection.join"),
+                        ],
+                        Some(&error),
+                    );
                 }
                 let _ = joined;
             }
@@ -1019,7 +1169,12 @@ fn note_accept_retry(policy: &SecretPolicy, attempt: u32, error: &Error) -> Inst
     logging::record(
         policy,
         "daemon.ipc_accept_retry",
-        &[("attempt", &attempt), ("retry_after_ms", &retry_after_ms)],
+        &[
+            ("producer", "daemon.ipc_listener"),
+            ("method", "ipc.accept"),
+            ("attempt", &attempt),
+            ("retry_after_ms", &retry_after_ms),
+        ],
         Some(error),
     );
     Instant::now() + delay
@@ -1032,7 +1187,11 @@ async fn report_accept_exhausted(
     error: &Error,
 ) -> Error {
     let attempt = failures.to_string();
-    let fields = [("attempt", attempt.as_str())];
+    let fields = [
+        ("producer", "daemon.ipc_listener"),
+        ("method", "ipc.accept"),
+        ("attempt", attempt.as_str()),
+    ];
     logging::record(policy, "daemon.ipc_accept_attention", &fields, Some(error));
     let message = format!(
         "The local IPC listener failed {failures} consecutive times. Swarm is exiting. Check the daemon log for the last accept error."
@@ -1041,7 +1200,11 @@ async fn report_accept_exhausted(
         logging::record(
             policy,
             "daemon.attention_delivery_failed",
-            &fields,
+            &[
+                ("producer", "daemon.attention"),
+                ("method", "attention.deliver"),
+                ("attempt", fields[2].1),
+            ],
             Some(&error),
         );
     }
@@ -1085,15 +1248,49 @@ async fn shutdown_supervision(
         match joined {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
-                logging::record(&policy, "daemon.cloud_mcp_failed", &[], Some(&error));
+                logging::record(
+                    &policy,
+                    "daemon.cloud_mcp_failed",
+                    &[
+                        ("producer", "daemon.cloud_mcp"),
+                        ("method", "cloud_mcp.serve"),
+                    ],
+                    Some(&error),
+                );
             }
-            Err(_) => logging::record(&policy, "daemon.cloud_mcp_task_failed", &[], None),
+            Err(_) => {
+                let error = Error::new(
+                    "cloud_mcp_task_failed",
+                    "cloud MCP service task panicked or was cancelled",
+                );
+                logging::record(
+                    &policy,
+                    "daemon.cloud_mcp_task_failed",
+                    &[
+                        ("producer", "daemon.cloud_mcp"),
+                        ("method", "cloud_mcp.serve.join"),
+                    ],
+                    Some(&error),
+                );
+            }
         }
     }
     worker_stop.send_replace(true);
     while let Some(joined) = workers.join_next().await {
         if joined.is_err() {
-            logging::record(&policy, "daemon.worker_supervisor_failed", &[], None);
+            let error = Error::new(
+                "worker_supervisor_failed",
+                "daemon worker supervisor observed a panicked or cancelled task",
+            );
+            logging::record(
+                &policy,
+                "daemon.worker_supervisor_failed",
+                &[
+                    ("producer", "daemon.worker_supervisor"),
+                    ("method", "worker.join"),
+                ],
+                Some(&error),
+            );
         }
     }
     if router.is_force_requested() {
@@ -1111,7 +1308,19 @@ async fn shutdown_supervision(
             Ok(()) => {}
             Err(_) => {
                 monitoring.mark_unavailable("monitor_supervisor_failed");
-                logging::record(&policy, "daemon.monitor_supervisor_failed", &[], None);
+                let error = Error::new(
+                    "monitor_supervisor_failed",
+                    "monitor supervisor observed a panicked or cancelled task",
+                );
+                logging::record(
+                    &policy,
+                    "daemon.monitor_supervisor_failed",
+                    &[
+                        ("producer", "daemon.monitor_supervisor"),
+                        ("method", "monitor.join"),
+                    ],
+                    Some(&error),
+                );
             }
         }
     }
@@ -1652,6 +1861,7 @@ async fn serve_connection_with_write_timeout(
     let incoming = timeout_at(Instant::now() + DEFAULT_CALL_TIMEOUT, framed.next()).await;
     let handle_started = Instant::now();
     let mut measured = false;
+    let mut rpc_context = None;
     let response = match incoming {
         Ok(Some(Ok(line))) if line.len().saturating_add(1) <= MAX_RPC_FRAME_BYTES => {
             match decode_request(&line) {
@@ -1662,7 +1872,9 @@ async fn serve_connection_with_write_timeout(
                             request.params.get("mode").and_then(Value::as_str),
                             Some("prepare_restart" | "cancel_restart")
                         );
-                    match router.handle_rpc(&request, peer).await {
+                    let (result, context) =
+                        router.handle_rpc_with_log_context(&request, peer).await;
+                    let response = match result {
                         Ok(result) => {
                             arm_shutdown = is_shutdown;
                             #[cfg(debug_assertions)]
@@ -1678,14 +1890,13 @@ async fn serve_connection_with_write_timeout(
                             }
                         }
                         Err(error) => {
-                            // The method names the calling convention behind a
-                            // rejection burst (for example a readiness wait
-                            // polling the wrong identity), so a flood stays
-                            // attributable without hiding the error itself.
                             logging::record(
                                 &policy,
                                 "rpc.error",
-                                &[("method", request.method.as_str())],
+                                &[
+                                    ("principal", context.principal.as_str()),
+                                    ("method", context.method.as_str()),
+                                ],
                                 Some(&error),
                             );
                             RpcResponse {
@@ -1695,7 +1906,9 @@ async fn serve_connection_with_write_timeout(
                                 error: Some(rpc_error(error, &policy)),
                             }
                         }
-                    }
+                    };
+                    rpc_context = Some(context);
+                    response
                 }
                 Err((id, error)) => RpcResponse {
                     jsonrpc: "2.0".to_owned(),
@@ -1764,7 +1977,20 @@ async fn serve_connection_with_write_timeout(
         }
     };
     if !wrote_response {
-        logging::record(&policy, "rpc.response_write_failed", &[], None);
+        let (principal, method) = rpc_context
+            .as_ref()
+            .map(|context| (context.principal.as_str(), context.method.as_str()))
+            .unwrap_or(("unauthenticated", "unavailable"));
+        let error = Error::new(
+            "rpc_response_write_failed",
+            "RPC response could not be delivered before the connection ended or its deadline elapsed",
+        );
+        logging::record(
+            &policy,
+            "rpc.response_write_failed",
+            &[("principal", principal), ("method", method)],
+            Some(&error),
+        );
     }
     router.response_finished(arm_shutdown);
     #[cfg(debug_assertions)]

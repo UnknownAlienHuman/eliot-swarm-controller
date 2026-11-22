@@ -974,6 +974,39 @@ pub enum GoalRoundOutcome {
     Continued,
 }
 
+/// Data of a retained `goal.round` event. The enclosing event binds the
+/// Agent and generation. Observations remain in the owner-only Goal view.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GoalRoundEvent {
+    pub id: String,
+    pub mode: GoalMode,
+    pub revision: i64,
+    pub round_key: String,
+    pub outcome: GoalRoundEventOutcome,
+    pub reason: Option<String>,
+    pub exit_code: Option<i32>,
+}
+
+#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalRoundEventOutcome {
+    Completed,
+    Blocked,
+    Continued,
+    Unknown,
+}
+
+impl From<GoalRoundOutcome> for GoalRoundEventOutcome {
+    fn from(outcome: GoalRoundOutcome) -> Self {
+        match outcome {
+            GoalRoundOutcome::Completed => Self::Completed,
+            GoalRoundOutcome::Blocked => Self::Blocked,
+            GoalRoundOutcome::Continued => Self::Continued,
+        }
+    }
+}
+
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GoalRoundResponse {

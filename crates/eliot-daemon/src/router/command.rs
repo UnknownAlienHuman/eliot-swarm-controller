@@ -1207,7 +1207,7 @@ impl Router {
         // keeps the full failure: code, bounded redacted message, stable
         // `where` and origin with evidence. Nothing here is a secret,
         // parameter, prompt or model output: the error was sanitized above.
-        let error = self.sanitized_failure(error, "router.dispatch.unknown");
+        let error = self.sanitized_failure(error, "router.dispatch.preflight");
         let outcome = self.command_error_outcome(&error, "reason");
         let (result, write_faulted) = {
             let mut store = self.inner.store.lock().await;
@@ -1251,16 +1251,10 @@ impl Router {
             }
             (result, store.is_write_faulted())
         };
-        if result
-            .as_ref()
-            .is_ok_and(|change| !change.events.is_empty())
+        if let Ok(change) = &result
+            && !change.events.is_empty()
         {
-            crate::logging::record(
-                &SecretPolicy::new(self.daemon_secrets()),
-                &error.code,
-                &[("command", id)],
-                Some(&error),
-            );
+            self.log_command_error(id, Some(&change.value), &error);
         }
         self.finish_settlement(id, result, write_faulted, "store_settlement_failed", false)
             .await;
@@ -1352,28 +1346,23 @@ impl Router {
     pub(super) async fn settle_plugin_error(&self, id: &str, error: &Error) {
         let current = {
             let store = self.inner.store.lock().await;
-            store.get_command(id)
+            store.get_command(id).ok().flatten()
         };
+        let error = self.sanitized_failure(error, "plugin.command");
+        self.log_command_error(id, current.as_ref(), &error);
         let (current_state, command_target, previous_outcome) = match current {
-            Ok(Some(command)) => (
+            Some(command) => (
                 Some(command.state),
                 command.target.zip(command.generation),
                 command.outcome,
             ),
-            _ => (None, None, None),
+            None => (None, None, None),
         };
         let late_batch_cause = command_target.as_ref().and_then(|(agent, generation)| {
             self.inner
                 .plugin_host
                 .take_late_batch_cause(agent, *generation)
         });
-        let error = self.sanitized_failure(error, "plugin.command.unknown");
-        crate::logging::record(
-            &SecretPolicy::new(self.daemon_secrets()),
-            &error.code,
-            &[("command", id)],
-            Some(&error),
-        );
         if current_state.is_some_and(|state| state.is_terminal())
             || current_state == Some(CommandState::Unknown) && error.diagnostics.is_empty()
         {
@@ -1436,9 +1425,11 @@ impl Router {
             self.reject_undispatched_error(id, error).await;
             return;
         }
-        if error.code == "unknown" {
+        let command = {
             let mut store = self.inner.store.lock().await;
-            if let Ok(Some(command)) = store.get_command(id)
+            let command = store.get_command(id).ok().flatten();
+            if error.code == "unknown"
+                && let Some(command) = &command
                 && is_start_verb(command.verb.as_str())
                 && matches!(command.state, CommandState::Accepted | CommandState::Queued)
                 && let Some(target_generation) = command
@@ -1462,15 +1453,28 @@ impl Router {
             {
                 self.publish_locked(&change.events);
             }
-        }
+            command
+        };
         let error = self.sanitized_failure(error, "store.dispatch.workspace_gate");
-        crate::logging::record(
-            &SecretPolicy::new(self.daemon_secrets()),
-            &error.code,
-            &[("command", id)],
-            Some(&error),
-        );
+        self.log_command_error(id, command.as_ref(), &error);
         self.signal_progress();
+    }
+
+    fn log_command_error(&self, id: &str, command: Option<&Command>, error: &Error) {
+        let mut ids = vec![("command", id)];
+        if let Some(command) = command {
+            ids.push(("principal", command.principal.as_str()));
+            ids.push(("method", command.verb.as_str()));
+            if let Some(agent) = command.target.as_deref() {
+                ids.push(("agent", agent));
+            }
+        }
+        crate::logging::record(
+            &self.secret_policy_snapshot(),
+            &error.code,
+            &ids,
+            Some(error),
+        );
     }
 }
 

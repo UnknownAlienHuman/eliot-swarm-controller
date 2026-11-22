@@ -72,6 +72,7 @@ impl Router {
             (status.markers.clone(), status.truncated)
         };
         serde_json::to_value(DaemonStatusResponse {
+            build_identity: Some(crate::build_identity::current().clone()),
             provider_probe_attention,
             state: if mode == "open" { "running" } else { mode }.to_owned(),
             admission: mode.to_owned(),

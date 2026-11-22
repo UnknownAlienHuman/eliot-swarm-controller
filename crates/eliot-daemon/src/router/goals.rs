@@ -72,6 +72,7 @@ struct ClaimedGoalRound {
     cancellation: watch::Sender<bool>,
     check: Option<Pin<Box<dyn Future<Output = ProcessOutcome> + Send>>>,
     quiescent: bool,
+    pending_block: Option<GoalRoundCommit>,
 }
 
 impl ClaimedGoalRound {
@@ -81,6 +82,38 @@ impl ClaimedGoalRound {
             Err(error) => self.error = error.clone(),
         }
         result
+    }
+
+    async fn commit_block(
+        &mut self,
+        probe: &eliot_store::GoalRoundProbe,
+        key: GoalRoundKey,
+        claim_seq: i64,
+        reason: &str,
+        observation: Option<String>,
+    ) -> Result<Value> {
+        let commit = self.pending_block.insert(GoalRoundCommit {
+            id: self.request.id.clone(),
+            principal: self.principal.clone(),
+            agent: self.request.agent.clone(),
+            mode: self.request.mode.as_str().to_owned(),
+            expected_generation: probe.view.generation,
+            expected_revision: probe.view.revision,
+            round_key: key,
+            claim_seq,
+            check: None,
+            blocked_reason: Some(reason.to_owned()),
+            observation,
+            fingerprint_before: None,
+            fingerprint_after: None,
+            continuation: None,
+        });
+        let result = self
+            .router
+            .commit_goal_round(&self.principal, &self.request, commit)
+            .await;
+        self.pending_block = None;
+        self.complete(result)
     }
 }
 
@@ -96,7 +129,15 @@ impl Drop for ClaimedGoalRound {
         let mut quiescent = self.quiescent;
         self.cancellation.send_replace(true);
         let check = self.check.take();
+        let pending_block = self.pending_block.take();
         self.runtime.spawn(async move {
+            if let Some(commit) = pending_block {
+                // This exact block was decided before awaiting the Store.
+                let _ = router
+                    .commit_goal_round(&principal, &request, &commit)
+                    .await;
+                return;
+            }
             if let Some(check) = check {
                 // Await this exact invocation, never reconstruct or replay it.
                 // run_owned_process retains and drains its existing supervisor.
@@ -373,15 +414,6 @@ impl Router {
             { store.goal_round_probe(&request.agent, request.mode.as_str(), key, now_ms())? };
         goal_round_gates(&probe, key)?;
         let definition = probe.view.definition.clone();
-        let mut command = local_process_command(&definition.check[0])?;
-        command.args(&definition.check[1..]);
-        if let Some(cwd) = definition
-            .check_cwd
-            .as_deref()
-            .or(probe.workspace.as_deref())
-        {
-            command.current_dir(cwd);
-        }
         let stdin = serde_json::to_vec(&json!({
             "agent": request.agent,
             "generation": probe.view.generation,
@@ -429,6 +461,7 @@ impl Router {
             cancellation: check_cancellation,
             check: None,
             quiescent: true,
+            pending_block: None,
         };
         let turns_used = probe
             .turn_count
@@ -446,18 +479,9 @@ impl Router {
             .is_some_and(|max| turns_used >= max)
             && !probe.spent_by_goal_continuation
         {
-            let result = self
-                .commit_goal_block(
-                    &principal,
-                    &request,
-                    &probe,
-                    key,
-                    claim_seq,
-                    "turn_limit",
-                    None,
-                )
+            return claimed
+                .commit_block(&probe, key, claim_seq, "turn_limit", None)
                 .await;
-            return claimed.complete(result);
         }
         // The change scope is read while the Agent is idle, before the
         // check runs. A confirmed change outside `scope` blocks the round:
@@ -481,18 +505,9 @@ impl Router {
             let outside = outside_scope(&definition, changed);
             if !outside.is_empty() {
                 let observation = finding("Changed outside the Goal's scope", &outside);
-                let result = self
-                    .commit_goal_block(
-                        &principal,
-                        &request,
-                        &probe,
-                        key,
-                        claim_seq,
-                        "scope_violation",
-                        Some(observation),
-                    )
+                return claimed
+                    .commit_block(&probe, key, claim_seq, "scope_violation", Some(observation))
                     .await;
-                return claimed.complete(result);
             }
         }
         // The no-progress fingerprint is read now, while the Agent is idle
@@ -500,27 +515,34 @@ impl Router {
         // read taken right after the previous failed check.
         let fingerprint_before = work_fingerprint(probe.workspace.as_deref()).await;
         let policy = self.secret_policy_snapshot();
-        let timeout = Duration::from_millis(definition.check_timeout_ms.max(0) as u64);
-        claimed.quiescent = false;
-        claimed.check = Some(run_check(
-            command,
-            stdin,
-            timeout,
-            Arc::clone(&policy),
-            check_cancelled,
-        ));
-        let outcome = {
-            let check = claimed
-                .check
-                .as_mut()
-                .expect("claimed check was just installed");
-            tokio::select! {
-                biased;
-                _ = async { let _ = cancellation.wait_for(|cancelled| *cancelled).await; } => {
-                    claimed.cancellation.send_replace(true);
-                    check.await
+        let outcome = match local_process_command(&definition.check[0]) {
+            Err(error) => ProcessOutcome::NotSpawned(error),
+            Ok(mut command) => {
+                command.args(&definition.check[1..]);
+                if let Some(cwd) = definition
+                    .check_cwd
+                    .as_deref()
+                    .or(probe.workspace.as_deref())
+                {
+                    command.current_dir(cwd);
                 }
-                outcome = check.as_mut() => outcome,
+                let timeout = Duration::from_millis(definition.check_timeout_ms.max(0) as u64);
+                claimed.quiescent = false;
+                let check = claimed.check.insert(run_check(
+                    command,
+                    stdin,
+                    timeout,
+                    Arc::clone(&policy),
+                    check_cancelled,
+                ));
+                tokio::select! {
+                    biased;
+                    _ = async { let _ = cancellation.wait_for(|cancelled| *cancelled).await; } => {
+                        claimed.cancellation.send_replace(true);
+                        check.await
+                    }
+                    outcome = check.as_mut() => outcome,
+                }
             }
         };
         // A completed future is never polled again. Carry its independent
@@ -529,6 +551,20 @@ impl Router {
         claimed.check = None;
         let check = match goal_check_result(outcome, &policy) {
             Ok(check) => check,
+            Err(error)
+                if claimed.quiescent
+                    && matches!(
+                        error.code.as_str(),
+                        "check_unrunnable" | "check_timeout" | "check_output_limit"
+                    ) =>
+            {
+                let message = format!("{}. Check argv: {:?}", error.message, definition.check);
+                let (observation, _) =
+                    truncate_bytes(&policy.redact_text(&message), MAX_GOAL_OBSERVATION_BYTES);
+                return claimed
+                    .commit_block(&probe, key, claim_seq, &error.code, Some(observation))
+                    .await;
+            }
             Err(error) => {
                 claimed.error = error.clone();
                 let retained = self
@@ -569,7 +605,7 @@ impl Router {
                     escalation_id,
                 }),
             };
-            let result = self.commit_goal_round(&principal, &request, commit).await;
+            let result = self.commit_goal_round(&principal, &request, &commit).await;
             return claimed.complete(result);
         }
         // A pass is measured again, so files the check wrote count too. It
@@ -636,38 +672,8 @@ impl Router {
             fingerprint_after: None,
             continuation: None,
         };
-        let result = self.commit_goal_round(&principal, &request, commit).await;
+        let result = self.commit_goal_round(&principal, &request, &commit).await;
         claimed.complete(result)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn commit_goal_block(
-        &self,
-        principal: &str,
-        request: &GoalRoundRequest,
-        probe: &eliot_store::GoalRoundProbe,
-        key: GoalRoundKey,
-        claim_seq: i64,
-        reason: &str,
-        observation: Option<String>,
-    ) -> Result<Value> {
-        let commit = GoalRoundCommit {
-            id: request.id.clone(),
-            principal: principal.to_owned(),
-            agent: request.agent.clone(),
-            mode: request.mode.as_str().to_owned(),
-            expected_generation: probe.view.generation,
-            expected_revision: probe.view.revision,
-            round_key: key,
-            claim_seq,
-            check: None,
-            blocked_reason: Some(reason.to_owned()),
-            observation,
-            fingerprint_before: None,
-            fingerprint_after: None,
-            continuation: None,
-        };
-        self.commit_goal_round(principal, request, commit).await
     }
 
     /// Retain the error; only proven custody closure may release the marker.
@@ -686,7 +692,10 @@ impl Router {
             store.goal_hold_round_error(principal, request, error, now_ms())
         };
         match retained {
-            Ok(retained) => retained,
+            Ok(retained) => {
+                self.publish_locked(&retained.events);
+                retained.value
+            }
             Err(error) => {
                 let policy = self.secret_policy_snapshot();
                 crate::logging::record(
@@ -704,15 +713,18 @@ impl Router {
         &self,
         principal: &str,
         request: &GoalRoundRequest,
-        commit: GoalRoundCommit,
+        commit: &GoalRoundCommit,
     ) -> Result<Value> {
         let result = {
             let mut store = self.inner.store.lock().await;
-            let result = match store.goal_commit_round(&commit, now_ms()) {
+            let result = match store.goal_commit_round(commit, now_ms()) {
                 Ok(result) => result,
                 Err(error) => {
                     match store.goal_abandon_round(principal, request, &error, now_ms()) {
-                        Ok(retained) => return Err(retained),
+                        Ok(retained) => {
+                            self.publish_locked(&retained.events);
+                            return Err(retained.value);
+                        }
                         Err(abandon) => {
                             let policy = self.secret_policy_snapshot();
                             crate::logging::record(
@@ -907,6 +919,7 @@ pub(crate) async fn run_goal_driver(
                 }
             }
             received = events.recv() => match received {
+                Ok(event) if event.kind == "goal.round" => {}
                 Ok(event) => {
                     spawn_auto_round(
                         &router,
@@ -1481,11 +1494,14 @@ fn goal_check_quiescent(outcome: &ProcessOutcome) -> bool {
     )
 }
 
-/// Interpret one owned check completion. Only a definite direct exit with
-/// proven custody is a check result; everything else is `unknown` and commits
-/// nothing.
+/// Interpret one owned check completion. A definite direct exit with proven
+/// custody is a check result. Known execution failures can block the Goal.
 fn goal_check_result(outcome: ProcessOutcome, policy: &SecretPolicy) -> Result<GoalCheckResult> {
     match outcome {
+        ProcessOutcome::NotSpawned(mut error) => {
+            *error.message = truncate_bytes(&policy.redact_text(&error.message), 1024).0;
+            Err(error.with_code("check_unrunnable"))
+        }
         ProcessOutcome::Completed(capture)
         | ProcessOutcome::Failed {
             reason: ProcessFailure::Exit,
@@ -1502,12 +1518,16 @@ fn goal_check_result(outcome: ProcessOutcome, policy: &SecretPolicy) -> Result<G
                 policy,
             )
         }
-        ProcessOutcome::Failed { reason, .. } => {
-            if reason == ProcessFailure::Cancelled {
-                return Err(Error::new("unavailable", "goal check was cancelled"));
-            }
-            Err(Error::new("unknown", failed_check_message(reason)))
-        }
+        ProcessOutcome::Failed { reason, .. } => Err(Error::new(
+            match reason {
+                ProcessFailure::InputLimit | ProcessFailure::InvalidTimeout => "check_unrunnable",
+                ProcessFailure::Timeout => "check_timeout",
+                ProcessFailure::OutputLimit => "check_output_limit",
+                ProcessFailure::Cancelled => "unavailable",
+                ProcessFailure::Exit => "unknown",
+            },
+            failed_check_message(reason),
+        )),
         ProcessOutcome::Unknown { reason, .. } => Err(Error::new(
             "unknown",
             format!("goal check outcome is unknown: {}", reason.stable_code()),
@@ -1517,7 +1537,7 @@ fn goal_check_result(outcome: ProcessOutcome, policy: &SecretPolicy) -> Result<G
 
 /// A completed capture is a result only with a definite exit code. A
 /// check killed by a signal (Unix exit code `None`) is an unknown outcome:
-/// it commits nothing, same as timeout/cancel. Both streams feed the
+/// it commits no Goal progress. Both streams feed the
 /// observation, so a reason the check writes only to stderr reaches the
 /// next continuation.
 fn goal_completed_check_result(
