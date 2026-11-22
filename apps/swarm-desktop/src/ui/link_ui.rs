@@ -362,8 +362,10 @@ impl DesktopApp {
             let checked = client::data_dir()
                 .and_then(|original| {
                     eliot_daemon::bootstrap::ensure_private_data_dir(
-                        original
-                            .with_file_name(format!("Eliot-private-{}", client::new_mutation_id())),
+                        eliot_daemon::bootstrap::fresh_data_dir(
+                            &original,
+                            &format!("Eliot-private-{}", client::new_mutation_id()),
+                        ),
                     )
                 })
                 .map_err(|error| {

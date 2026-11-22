@@ -13,6 +13,12 @@ use eliot_store::{ProjectRegistrationInput, Store};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
+/// Where a new private data directory named `name` goes for this process:
+/// beside `current`, unless Windows would redirect that location.
+pub fn fresh_data_dir(current: &Path, name: &str) -> PathBuf {
+    crate::platform::data_dir::fresh_data_dir(current, name)
+}
+
 /// Explicitly create or validate a user-selected private data directory.
 ///
 /// Passing a fresh path is the safe remedy for an unsafe default root. This

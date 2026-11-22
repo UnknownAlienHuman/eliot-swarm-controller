@@ -430,13 +430,12 @@ fn unsafe_data_dir_error(path: &Path, mut error: Error) -> Error {
     if repairable_data_dir_acl(&error) {
         return error;
     }
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty())
         .unwrap_or("Eliot");
-    let fresh_path = parent.join(format!("{name}-{}", ulid::Ulid::new()));
+    let fresh_path = fresh_data_dir(path, &format!("{name}-{}", ulid::Ulid::new()));
     // PowerShell single-quoted literals double embedded apostrophes.
     let command_path = fresh_path.to_string_lossy().replace('\'', "''");
     *error.message = format!(
@@ -944,6 +943,19 @@ pub(crate) fn refuse_package_redirected(path: &Path) -> Result<()> {
         let _ = path;
         Ok(())
     }
+}
+
+/// Where a new private data directory named `name` goes: beside `current`, or
+/// in the account profile when Windows would redirect that location for this
+/// process, so a remedy never names a directory the process must refuse.
+pub(crate) fn fresh_data_dir(current: &Path, name: &str) -> PathBuf {
+    #[cfg(windows)]
+    if refuse_package_redirected(current).is_err()
+        && let Ok(profile) = super::windows::account_profile()
+    {
+        return profile.join(name);
+    }
+    current.with_file_name(name)
 }
 
 /// Check the former AppData stand registry before trusting a record in it. A

@@ -1161,11 +1161,13 @@ pub(crate) fn record_stand_worktree(
         Ok(_) => {}
     }
     let root = stand_key_root(data_root)?;
-    let registry = stand_registry(false)?;
     let name = registry_name(&root);
-    let registration = read_stand_registration(&registry, &name, &root)?;
+    // A stand an earlier build registered keeps its records beside that
+    // registration until `stand down` moves them together.
+    let located = locate_stand_registration(&root)?;
+    let registration = located.record;
     verify_stand_marker(&root, &registration)?;
-    let dir = worktree_records_dir(&registry, &name);
+    let dir = worktree_records_dir(&located.registry, &name);
     if !dir.exists()
         && let Err(error) = create_stand_root(&dir)
         && !dir.exists()

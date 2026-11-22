@@ -28,12 +28,16 @@ symlink and reparse traversal is refused. Private files remain current-user-only
 Windows directory ACLs follow the narrow rule below.
 
 **Packaged-process rule (Windows).** Windows redirects AppData writes from a
-process inside an MSIX package to that package's private cache, and only
-processes in the package see the result. A daemon or CLI outside the package
-would use different files. A packaged process therefore refuses any data root
-under the account's `AppData` directory or its Local, LocalLow or Roaming known
-folders, including the default root, and refuses to write the selected-root
-pointer. Use `--data-dir` or `ELIOT_HOME` with a directory outside AppData.
+process inside an MSIX package to that package's private cache, and a shell such
+an app starts can be redirected with no package identity of its own. Only
+processes in that tree see the result; a daemon or CLI outside it would use
+different files. Swarm detects this from where a transient delete-on-close probe
+file lands. A redirected process refuses any data root under the account's
+`AppData` directory or its Local, LocalLow or Roaming known folders, including
+the default root, before any ACL diagnosis, and refuses to write the
+selected-root pointer. Its remedies never name an AppData location: use
+`--data-dir` or `ELIOT_HOME` with a directory outside AppData. The desktop's
+fresh-directory choice is created in the account profile.
 
 Linux is distributed as the [supported Docker image](../../docker/README.md).
 It runs as UID/GID 10001 with `ELIOT_HOME=/data`, an owned mode-0700 volume;
