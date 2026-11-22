@@ -1260,6 +1260,19 @@ impl PluginHost {
         result.map_err(|error| diagnose_error(error, &stderr, &credentials))
     }
 
+    /// The start command of the owned generation. A self-started native turn
+    /// has no send, so its exact-turn readback binds to this command.
+    pub(crate) fn session_start_command(&self, agent: &Agent) -> Option<String> {
+        let key = AgentKey {
+            id: agent.id.clone(),
+            generation: agent.generation,
+        };
+        let running = self.state.running.lock_recover();
+        running
+            .get(&key)
+            .map(|entry| entry.start_command_id.clone())
+    }
+
     /// Low-priority read-only status probe. A full runtime queue returns
     /// `busy` immediately so a diagnosis cannot delay a user control.
     pub(crate) async fn probe_snapshot(

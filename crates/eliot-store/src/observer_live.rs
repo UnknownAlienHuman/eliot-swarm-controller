@@ -121,6 +121,7 @@ pub(super) fn persist_turn_fact(
         resolution_source: None,
         effective_model: None,
         native_error_message: None,
+        native_trigger: None,
     });
     let mut terminal_usage = None;
     match event.kind.as_str() {
@@ -214,6 +215,7 @@ pub(super) fn persist_turn_fact(
                 config_revision: turn.config_revision,
                 preceded_by: turn.preceded_by.as_deref(),
                 effective_model: None,
+                native_trigger: None,
             },
         )?;
     } else {

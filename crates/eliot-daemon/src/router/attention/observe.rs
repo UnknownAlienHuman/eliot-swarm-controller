@@ -35,8 +35,17 @@ pub(super) fn child_capture_is_current(
 }
 
 pub(super) async fn probe_native_status(router: &Router, captured: &CapturedAgent) -> NativeStatus {
-    let turn = captured
-        .turn_command_id
+    // A self-started native turn has no send: it reads back through the
+    // session's start command.
+    let turn_command = captured.turn_command_id.clone().or_else(|| {
+        captured.agent.active_turn.as_ref().and_then(|_| {
+            router
+                .inner
+                .plugin_host
+                .session_start_command(&captured.agent)
+        })
+    });
+    let turn = turn_command
         .as_deref()
         .zip(captured.agent.active_turn.as_deref());
     let result = if captured.agent.active_turn.is_some() && turn.is_none() {

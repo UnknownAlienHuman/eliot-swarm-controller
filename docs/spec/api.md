@@ -1816,6 +1816,11 @@ track its result independently. Unassociated dispatched/unknown input blocks lat
 send/configure/Goal continuation; active/unknown turn blocks next turn; unknown transition
 blocks further takeover. Exact stop/interrupt/request replies/readback remain available.
 
+The one active-turn exception is a [self-started native turn](core.md#self-started-native-turns)
+with no bound send. A `send` to it dispatches at once and binds to that turn, so
+`send --wait` and `swarm result` report one turn with its final text. `Turn.native_trigger`
+names what started such a turn and is absent for a turn started by a `send`.
+
 Steer is bound to the captured generation and active turn and is checked against provider
 holds before acceptance. On harnesses that deliver `steer` through a direct native RPC,
 submitting to the plugin has a bounded response deadline; if that deadline expires, the

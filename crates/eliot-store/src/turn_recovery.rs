@@ -3,7 +3,9 @@ use super::*;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct ActiveTurnRecovery {
-    pub command_id: String,
+    /// The bound send; `None` for a self-started native turn with no send,
+    /// which reads back through the session's start command.
+    pub command_id: Option<String>,
     pub turn_id: String,
     source_event_seq: i64,
     muse_projection_gap: bool,
@@ -83,7 +85,9 @@ impl Store {
                 ("turn.unknown", json!({"reason": reason}))
             }
         };
-        data["command_id"] = json!(binding.command_id);
+        if let Some(command_id) = &binding.command_id {
+            data["command_id"] = json!(command_id);
+        }
         data["turn_id"] = json!(binding.turn_id);
         data["source_event_seq"] = json!(binding.source_event_seq);
         // Size the final reply after adding the exact recovery bindings.
@@ -167,12 +171,10 @@ pub(super) fn resolves_recovered_turn_tx(
     generation: i64,
     event: &NativeEvent,
 ) -> Result<bool> {
-    let (Some(turn_id), Some(command_id)) = (
-        event.data.get("turn_id").and_then(Value::as_str),
-        event.data.get("command_id").and_then(Value::as_str),
-    ) else {
+    let Some(turn_id) = event.data.get("turn_id").and_then(Value::as_str) else {
         return Ok(false);
     };
+    let command_id = event.data.get("command_id").and_then(Value::as_str);
     if event.kind != "turn.completed"
         || agent.observe_only
         || agent.generation != generation
@@ -186,7 +188,7 @@ pub(super) fn resolves_recovered_turn_tx(
     // source episode; an expired settlement event proves nothing.
     let recovered: Option<bool> = tx
         .query_row(
-            "SELECT source = 'daemon' AND json_extract(data, '$.command_id') = ?4
+            "SELECT source = 'daemon' AND json_extract(data, '$.command_id') IS ?4
                     AND json_type(data, '$.source_event_seq') = 'integer'
              FROM events INDEXED BY events_agent
              WHERE agent = ?1 AND generation = ?2 AND kind = 'turn.unknown'
@@ -245,9 +247,13 @@ fn active_turn_recovery(
     let agent_num = parse_agent_id(&agent.id)?;
     // A source can fail between send dispatch and the committed turn.started.
     // Bind the window to that same send, never to an unrelated historical gap.
-    let command: Option<(String, i64)> = connection
+    let command: Option<(Option<String>, i64)> = connection
         .query_row(
-            "SELECT json_extract(start.data, '$.command_id'), COALESCE((
+            "SELECT COALESCE(json_extract(start.data, '$.command_id'), (
+                 SELECT turn.start_command_id FROM turns turn
+                 WHERE turn.agent = start.agent AND turn.generation = start.generation
+                   AND turn.turn_id = json_extract(start.data, '$.turn_id')
+             )), COALESCE((
                  SELECT dispatch.seq FROM events dispatch
                  WHERE dispatch.agent = start.agent AND dispatch.generation = start.generation
                  AND dispatch.seq < start.seq AND dispatch.kind = 'command.dispatched'

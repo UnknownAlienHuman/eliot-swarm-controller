@@ -272,11 +272,20 @@ impl Router {
                 Some(agent)
                     if !agent.state.is_terminal() && agent.generation == request.generation =>
                 {
-                    store.turn_readback_command(
-                        &request.agent,
-                        request.generation,
-                        &request.turn_id,
-                    )?
+                    let native_turn = store
+                        .get_turn(&request.agent, request.generation, &request.turn_id)?
+                        .is_some_and(|turn| turn.native_trigger.is_some());
+                    store
+                        .turn_readback_command(
+                            &request.agent,
+                            request.generation,
+                            &request.turn_id,
+                        )?
+                        .or_else(|| {
+                            native_turn
+                                .then(|| self.inner.plugin_host.session_start_command(agent))
+                                .flatten()
+                        })
                 }
                 _ => None,
             };

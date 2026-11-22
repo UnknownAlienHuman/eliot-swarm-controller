@@ -2352,7 +2352,7 @@ impl Store {
             .prepare(
                 "SELECT agent, generation, turn_id, state, status, outcome, native_status,
                         final_text, started_at, completed_at, usage, config_revision, preceded_by,
-                        resolution_source, effective_model, native_error_message
+                        resolution_source, effective_model, native_error_message, native_trigger
                  FROM turns WHERE agent = ?1 AND generation = ?2
                  ORDER BY COALESCE(started_at, completed_at, 0) DESC, turn_id DESC
                  LIMIT ?3",
@@ -4068,6 +4068,7 @@ struct TurnRecord {
     resolution_source: Option<String>,
     effective_model: Option<String>,
     native_error_message: Option<String>,
+    native_trigger: Option<String>,
 }
 
 struct SourceStateRecord {
@@ -4270,6 +4271,7 @@ struct TurnInsert<'a> {
     config_revision: i64,
     preceded_by: Option<&'a str>,
     effective_model: Option<&'a str>,
+    native_trigger: Option<&'a str>,
 }
 
 /// One live custody owner: an Agent generation with at least one
@@ -5606,6 +5608,7 @@ fn turn_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TurnRecord>
         resolution_source: row.get(13)?,
         effective_model: row.get(14)?,
         native_error_message: row.get(15)?,
+        native_trigger: row.get(16)?,
     })
 }
 
@@ -5651,6 +5654,7 @@ fn turn_from_record(record: TurnRecord, harness: &str) -> Result<Turn> {
         resolution_source,
         effective_model: record.effective_model,
         native_error_message: record.native_error_message,
+        native_trigger: record.native_trigger,
     })
 }
 
@@ -5983,7 +5987,7 @@ fn load_turn(
         .query_row(
             "SELECT agent, generation, turn_id, state, status, outcome, native_status,
                     final_text, started_at, completed_at, usage, config_revision, preceded_by,
-                    resolution_source, effective_model, native_error_message
+                    resolution_source, effective_model, native_error_message, native_trigger
              FROM turns WHERE agent = ?1 AND generation = ?2 AND turn_id = ?3",
             params![agent, generation, turn_id],
             turn_record_from_row,
@@ -6021,8 +6025,8 @@ fn insert_turn(tx: &Transaction<'_>, turn: TurnInsert<'_>) -> Result<()> {
     db!(tx.execute(
         "INSERT INTO turns(agent, generation, turn_id, start_command_id, state, status, outcome, native_status,
                            final_text, started_at, completed_at, usage, config_revision,
-                           preceded_by, effective_model, insertion_seq)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                           preceded_by, effective_model, insertion_seq, native_trigger)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         params![
             turn.agent,
             turn.generation,
@@ -6040,6 +6044,7 @@ fn insert_turn(tx: &Transaction<'_>, turn: TurnInsert<'_>) -> Result<()> {
             turn.preceded_by,
             turn.effective_model,
             insertion_seq,
+            turn.native_trigger,
         ],
     ));
     Ok(())
@@ -6133,6 +6138,7 @@ pub fn family_for_kind(kind: &str) -> Result<&'static str> {
         "turn.started"
         | "turn.completed"
         | "turn.unknown"
+        | "turn.input_bound"
         | "turn.model_observed"
         | "turn.notice" => Ok("turn"),
         "message.completed" => Ok("message"),
@@ -6164,19 +6170,72 @@ fn send_gate_open(connection: &Connection, agent_num: i64, generation: i64) -> R
     send_outcome_gate_open(connection, agent_num, generation)
 }
 
+/// The SEND gate, plus the one busy case that accepts input: a running
+/// self-started native turn no send is bound to yet. The harness merges that
+/// input into the turn, so it never creates a second overlapping turn.
+fn send_input_gate_open(connection: &Connection, agent_num: i64, generation: i64) -> Result<bool> {
+    if send_gate_open(connection, agent_num, generation)? {
+        return Ok(true);
+    }
+    let Some(agent) = load_agent_by_num(connection, agent_num)? else {
+        return Err(Error::new("not_found", "send target Agent was not found"));
+    };
+    let Some(turn_id) = agent
+        .active_turn
+        .as_deref()
+        .filter(|_| agent.generation == generation && agent.state == AgentState::Busy)
+    else {
+        return Ok(false);
+    };
+    if !is_unbound_native_turn(connection, agent_num, generation, turn_id)? {
+        return Ok(false);
+    }
+    send_outcome_gate_open_except(connection, agent_num, generation, Some(turn_id))
+}
+
+/// A running turn the harness started by itself that has no bound send.
+fn is_unbound_native_turn(
+    connection: &Connection,
+    agent_num: i64,
+    generation: i64,
+    turn_id: &str,
+) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM turns
+                 WHERE agent = ?1 AND generation = ?2 AND turn_id = ?3 AND state = 'running'
+                   AND native_trigger IS NOT NULL AND start_command_id IS NULL
+             )",
+            params![agent_num, generation, turn_id],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)
+}
+
 /// The durable part of the SEND gate also applies after a generation stops.
 fn send_outcome_gate_open(
     connection: &Connection,
     agent_num: i64,
     generation: i64,
 ) -> Result<bool> {
+    send_outcome_gate_open_except(connection, agent_num, generation, None)
+}
+
+fn send_outcome_gate_open_except(
+    connection: &Connection,
+    agent_num: i64,
+    generation: i64,
+    open_native_turn: Option<&str>,
+) -> Result<bool> {
     let turn_block: bool = connection
         .query_row(
             "SELECT EXISTS(
                  SELECT 1 FROM turns
                  WHERE agent = ?1 AND generation = ?2 AND state IN ('running', 'unknown')
+                   AND turn_id IS NOT ?3
              )",
-            params![agent_num, generation],
+            params![agent_num, generation, open_native_turn],
             |row| row.get(0),
         )
         .map_err(sql_error)?;

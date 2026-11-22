@@ -58,18 +58,22 @@ the old generation and cannot affect replacement work. Native subagents normally
 environment; no independent Eliot token without actual isolated environment support.
 Sidechain assistant/user frames tagged with `parent_tool_use_id` and `agent_id`
 are discarded before active-turn/session validation, so they cannot be rebound
-to the foreground turn. A pending task notification followed by `system/init`
-marks subsequent assistant/user output as autonomous, even if a foreground
-input has started; suppression remains through the next terminal result because
-the `started` lifecycle can race with autonomous frames. The ambiguous output
-prefix and final text are omitted with a message/tool coverage gap rather than
-attributed to the foreground turn. A task-notification result without a current
-input UUID never settles that turn; with an exact UUID it may settle the
-consumed input, while the autonomous output remains omitted. A `tool_use` with
+to the foreground turn. A `tool_use` with
 `input.run_in_background = true` commits `native_background: true` on `tool.started`,
 because Claude wakes itself when that task ends. The `task_notification` naming that
 `tool_use_id` commits `tool.background_ended` with the turn that started the call.
 `tool.started` and `tool.completed` carry the frame `timestamp` as `native_at_ms`.
+
+Claude's self-started turns map to the
+[core contract](../spec/core.md#self-started-native-turns). Verified on installed
+2.1.330 (2026-11-22) with a background shell and a background subagent: the wake is
+`system/task_notification`, then a `system/init` with no `user_message_uuids`, then a
+`result` with `origin.kind = "task-notification"`. With no turn active, that init starts
+the turn, and its `uuid` is the turn id. Its trigger is `task-notification` when the
+notification named a tracked background call. An input written during the run gets
+lifecycle `queued`, then `started` after the running tool, and the single `result` lists
+its UUID. `queued` binds the send to the running turn. A task-notification `result` that
+omits the bound input leaves the turn open for the result that names it.
 
 ## Transport
 
@@ -194,7 +198,7 @@ The installed 2.1.325 interrupt capture on 2026-11-17 reports
 
 The daemon owns the SEND FIFO and normally waits for the previous turn. The
 plugin separately refuses a fresh SEND before writing when its session/source
-is unavailable, an exact turn is still active, or one prior input still awaits
+is unavailable, a turn with a bound send is still active, or one prior input still awaits
 association. These are authoritative `rejected` replies carrying the actual
 reason: a generic `busy` RPC error after daemon dispatch would be classified
 `unknown` despite no native input having been written. The event task repeats
@@ -332,9 +336,7 @@ a lost stream proves none of these, so the daemon monitor settles the turn
 Transcript JSONL is later observe/recovery data with file identity/offset where valid,
 not a parallel live producer. No proven replay cursor means gap + exact current
 readback, never full-history republishing. Child completion needs exact tool/task
-provenance, not parent idle. Background task-notification facts without an exact
-user-message UUID are omitted rather than attributed to the active or most recent
-user turn. Resumed cumulative cost is session scope, not a turn delta.
+provenance, not parent idle. Resumed cumulative cost is session scope, not a turn delta.
 
 ## Login
 

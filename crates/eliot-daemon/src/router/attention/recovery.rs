@@ -85,14 +85,22 @@ pub(super) async fn recover_active_turn(
             // A newer episode gets its own budget on the queued check/sweep.
             return Ok(false);
         }
+        let Some(command_id) = current
+            .command_id
+            .clone()
+            .or_else(|| router.inner.plugin_host.session_start_command(agent))
+        else {
+            binding = Some(current);
+            continue;
+        };
         let snapshot = router
             .inner
             .plugin_host
-            .probe_snapshot(agent, Some((&current.command_id, &current.turn_id)))
+            .probe_snapshot(agent, Some((&command_id, &current.turn_id)))
             .await;
         match snapshot {
             Ok(snapshot) => {
-                match readback(agent, &current.command_id, &current.turn_id, &snapshot) {
+                match readback(agent, &command_id, &current.turn_id, &snapshot) {
                     Readback::Running => return Ok(false),
                     Readback::Terminal(mut terminal) => {
                         router.secret_policy_snapshot().redact_values(&mut terminal);

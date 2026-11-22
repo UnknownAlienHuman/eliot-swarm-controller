@@ -61,7 +61,7 @@ impl Store {
         let sql = format!(
             "SELECT t.agent, t.generation, t.turn_id, t.state, t.status, t.outcome, t.native_status,
                     t.final_text, t.started_at, t.completed_at, t.usage, t.config_revision, t.preceded_by,
-                    t.resolution_source, t.effective_model, t.native_error_message, t.insertion_seq, g.reason
+                    t.resolution_source, t.effective_model, t.native_error_message, t.native_trigger, t.insertion_seq, g.reason
              FROM turns t
              LEFT JOIN agent_generation_reasons g ON g.agent = t.agent AND g.generation = t.generation
              WHERE t.agent = ?1 {filter}
@@ -79,8 +79,8 @@ impl Store {
                 |row| {
                     Ok((
                         turn_record_from_row(row)?,
-                        row.get::<_, i64>(16)?,
-                        row.get::<_, Option<String>>(17)?,
+                        row.get::<_, i64>(17)?,
+                        row.get::<_, Option<String>>(18)?,
                     ))
                 },
             )

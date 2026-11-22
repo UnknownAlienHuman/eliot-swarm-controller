@@ -6,7 +6,7 @@ use self::hooks::{
 };
 
 use eliot_core::{
-    ContextItem, ContextOutcome, Error, InjectPoint, Result, SecretPolicy,
+    ContextItem, ContextOutcome, Error, InjectPoint, Result, SecretPolicy, TurnUsage,
     limits::{MAX_COMMAND_ID_BYTES, MAX_TOOL_COMMAND_BYTES},
     requests::{ApprovalChoice, ApprovalDecision, ApprovalRequest},
 };
@@ -63,8 +63,13 @@ pub(crate) struct EventStatus {
     pub background_continuation: bool,
     pub ready: bool,
     pub session_id: Option<String>,
+    /// The send bound to the active turn. For a self-started native turn
+    /// with no send, this is the session's start command: its readback key.
     pub active_command_id: Option<String>,
     pub active_turn_id: Option<String>,
+    /// The active turn is self-started and no send has bound to it, so it
+    /// can take one input and its facts name no command.
+    pub native_unbound: bool,
     pub last_turn: Option<TurnFacts>,
     pub failure: Option<String>,
     pub batch_unknown: bool,
@@ -93,6 +98,7 @@ pub(crate) struct TurnFacts {
 }
 
 pub(crate) struct EventConfig {
+    pub start_command_id: String,
     pub credential: String,
     pub agent_id: String,
     pub generation: i64,
@@ -108,7 +114,9 @@ pub(crate) struct EventHandle {
 
 /// Outcome of one `ExpectTurn` wait, decided by the exact stream facts.
 pub(crate) enum TurnOutcome {
-    Associated,
+    /// Bound to this exact turn: its own, or the running native turn the
+    /// CLI merged the input into.
+    Associated(String),
     Rejected(String),
     Unknown(String),
 }
@@ -400,10 +408,19 @@ struct EventProcessor {
     /// At most one tool-coverage gap per turn; it does not invalidate the
     /// separately associated native terminal or future input.
     tool_coverage_gap_reported: bool,
-    /// A background completion can wake the native main loop without a SEND.
-    /// Its next unassociated init/output is never assigned to a queued input.
+    /// A tracked background task ended, so Claude wakes its main loop without
+    /// a SEND: the next init with no input UUID is that self-started turn.
     task_notification_pending: bool,
-    autonomous_output: bool,
+    start_command_id: String,
+    /// Input UUID the active turn must answer before it can end. A native
+    /// result that does not name it only ends the merged prefix.
+    active_input: Option<String>,
+    /// Input merged into the last finished turn, for its late lifecycle.
+    last_input: Option<String>,
+    /// A native result ended while the bound input was still queued.
+    native_prefix_ended: bool,
+    /// Main-loop usage of those earlier native results in this turn.
+    prefix_usage: Option<TurnUsage>,
     deny_uncertain: HashSet<String>,
     permission_admission_fenced: bool,
     message_seq: u64,
@@ -867,7 +884,11 @@ impl EventProcessor {
             background_tools: HashMap::new(),
             tool_coverage_gap_reported: false,
             task_notification_pending: false,
-            autonomous_output: false,
+            start_command_id: config.start_command_id,
+            active_input: None,
+            last_input: None,
+            native_prefix_ended: false,
+            prefix_usage: None,
             deny_uncertain: HashSet::new(),
             permission_admission_fenced: false,
             message_seq: 0,
@@ -984,7 +1005,9 @@ impl EventProcessor {
                 "Claude turn association requires a ready exact session and turn",
             ));
         }
-        if self.status.active_turn_id.is_some() || self.pending_turn.is_some() {
+        if (self.status.active_turn_id.is_some() && !self.status.native_unbound)
+            || self.pending_turn.is_some()
+        {
             return Err(Error::new(
                 "busy",
                 "Claude already has an associated active turn",
@@ -1086,7 +1109,7 @@ impl EventProcessor {
     fn should_buffer(&self, record: &Value) -> bool {
         let kind = record.get("type").and_then(Value::as_str);
         if kind == Some("assistant") || kind == Some("user") {
-            if self.autonomous_output || !is_main_thread(record) {
+            if !is_main_thread(record) {
                 return false;
             }
             return !self.status.ready
@@ -1136,9 +1159,7 @@ impl EventProcessor {
             .unwrap_or_default();
         // Sidechains can outlive the parent's turn. Filter before session,
         // association and tool-table checks, never against a later active turn.
-        if matches!(kind, "assistant" | "user")
-            && (self.autonomous_output || !is_main_thread(&record))
-        {
+        if matches!(kind, "assistant" | "user") && !is_main_thread(&record) {
             return Ok(());
         }
         match kind {
@@ -1177,8 +1198,8 @@ impl EventProcessor {
                     "Claude system record did not belong to the owned session",
                 ));
             }
-            self.observe_task_boundary(record);
             self.commit_background_task_end(record).await?;
+            self.observe_task_boundary(record).await?;
             self.retain_init_mcp_servers(record);
             return self.observe_compaction_boundary(record, session_id).await;
         }
@@ -1228,21 +1249,77 @@ impl EventProcessor {
             .await
     }
 
-    fn observe_task_boundary(&mut self, record: &Value) {
-        match record.get("subtype").and_then(Value::as_str) {
-            Some("task_notification") => self.task_notification_pending = true,
-            Some("init") if self.task_notification_pending => {
-                self.autonomous_output = true;
-                self.task_notification_pending = false;
-                // Until the terminal supplies provenance, even a lifecycle
-                // for a queued input cannot disambiguate this output prefix.
-                self.final_text = None;
-                self.empty_after_tool_hooks = 0;
+    /// An init naming no input UUID, with no turn active, is Claude starting
+    /// a turn by itself. A SEND's lifecycle always precedes its own init, so
+    /// an in-flight input only yields to a proven task notification.
+    async fn observe_task_boundary(&mut self, record: &Value) -> Result<()> {
+        if record.get("subtype").and_then(Value::as_str) == Some("init") {
+            let notified = std::mem::take(&mut self.task_notification_pending);
+            let names_input = record
+                .get("user_message_uuids")
+                .and_then(Value::as_array)
+                .is_some_and(|uuids| !uuids.is_empty());
+            if !names_input
+                && self.status.active_turn_id.is_none()
+                && self.status.ready
+                && !self.planned_stop
+                && (notified || self.pending_turn.is_none())
+            {
+                let trigger = if notified {
+                    "task-notification"
+                } else {
+                    "native"
+                };
+                self.start_native_turn(record, trigger).await?;
             }
-            _ => {}
         }
-        self.status.background_continuation =
-            self.task_notification_pending || self.autonomous_output;
+        self.status.background_continuation = self.task_notification_pending;
+        Ok(())
+    }
+
+    /// Commit a turn Claude started by itself. Its id is the native init
+    /// record's UUID; it has no command until a send merges into it.
+    async fn start_native_turn(&mut self, record: &Value, trigger: &str) -> Result<()> {
+        let Some(turn_id) = record
+            .get("uuid")
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty() && id.len() <= 128)
+            .map(str::to_owned)
+        else {
+            return self
+                .record_coverage_gap(
+                    "Claude self-started turn omitted its native id",
+                    &["message", "tool"],
+                )
+                .await;
+        };
+        self.status.active_command_id = Some(self.start_command_id.clone());
+        self.status.active_turn_id = Some(turn_id.clone());
+        self.status.native_unbound = true;
+        self.active_input = None;
+        self.latest_context_sample = None;
+        self.first_call_usage = FirstCallUsage::default();
+        self.native_failure = None;
+        self.final_text = None;
+        self.empty_after_tool_hooks = 0;
+        self.publish_now();
+        let session_id = self.status.session_id.as_deref().unwrap_or_default();
+        let native_id = format!("claude:{session_id}:{turn_id}:turn.started");
+        self.commit_event(
+            "turn.started",
+            native_id,
+            json!({"turn_id": turn_id, "native_trigger": trigger}),
+        )
+        .await
+    }
+
+    /// Facts of a self-started turn with no bound send name no command.
+    fn scope_turn_command(&self, data: &mut Value) {
+        if self.status.native_unbound
+            && let Some(fields) = data.as_object_mut()
+        {
+            fields.remove("command_id");
+        }
     }
 
     /// Retain the proven MCP surface from the owned session's
@@ -1303,11 +1380,23 @@ impl EventProcessor {
             }
             return Ok(());
         }
-        if self
-            .status
-            .last_turn
-            .as_ref()
-            .is_some_and(|last| last.turn_id == parsed.command_uuid)
+        if self.active_input.as_deref() == Some(parsed.command_uuid.as_str()) {
+            // A merged input Claude dropped: the running native turn still
+            // ends with its own result, unless that result already arrived.
+            if parsed.state == "cancelled" {
+                self.active_input = None;
+                if self.native_prefix_ended {
+                    return self.complete_cancelled_turn().await;
+                }
+            }
+            return Ok(());
+        }
+        if self.last_input.as_deref() == Some(parsed.command_uuid.as_str())
+            || self
+                .status
+                .last_turn
+                .as_ref()
+                .is_some_and(|last| last.turn_id == parsed.command_uuid)
         {
             return Ok(());
         }
@@ -1344,8 +1433,22 @@ impl EventProcessor {
                         "Claude event source acknowledgement is unresolved",
                     ));
                 }
+                if self.status.native_unbound
+                    && let Some(native_turn) = self.status.active_turn_id.clone()
+                {
+                    return self
+                        .bind_input_to_native_turn(
+                            command_id,
+                            turn_id,
+                            native_turn,
+                            context,
+                            outcome,
+                        )
+                        .await;
+                }
                 self.status.active_command_id = Some(command_id.clone());
                 self.status.active_turn_id = Some(turn_id.clone());
+                self.active_input = Some(turn_id.clone());
                 self.latest_context_sample = None;
                 self.first_call_usage = FirstCallUsage::default();
                 self.native_failure = None;
@@ -1365,7 +1468,7 @@ impl EventProcessor {
                     self.settle_turn_started_persistence(outcome, &error);
                     return Err(error);
                 }
-                settle(outcome, TurnOutcome::Associated);
+                settle(outcome, TurnOutcome::Associated(turn_id));
                 // Buffered assistant text drains in the caller's trailing
                 // flush, not here, keeping the commit path non-recursive.
                 Ok(())
@@ -1390,6 +1493,42 @@ impl EventProcessor {
                     .await
             }
         }
+    }
+
+    /// Claude queued this input into its running self-started turn, so the
+    /// send joins that turn. The turn stays open until a result names the
+    /// input; its command then carries the terminal and final text.
+    async fn bind_input_to_native_turn(
+        &mut self,
+        command_id: String,
+        input_id: String,
+        turn_id: String,
+        context: Vec<ContextItem>,
+        outcome: Option<oneshot::Sender<TurnOutcome>>,
+    ) -> Result<()> {
+        self.status.active_command_id = Some(command_id.clone());
+        self.status.native_unbound = false;
+        self.active_input = Some(input_id.clone());
+        self.publish_now();
+        let session_id = self.status.session_id.as_deref().unwrap_or_default();
+        let native_id = format!("claude:{session_id}:{input_id}:turn.input_bound");
+        let context_outcomes = next_input_outcomes(&context, &command_id);
+        let mut data = json!({
+            "command_id": command_id,
+            "turn_id": turn_id,
+            "input_id": input_id,
+        });
+        if !context_outcomes.is_empty() {
+            data["context_outcomes"] = json!(context_outcomes);
+        }
+        if let Err(error) = self.commit_event("turn.input_bound", native_id, data).await {
+            self.settle_turn_started_persistence(outcome, &error);
+            return Err(error);
+        }
+        if let Some(sender) = outcome {
+            let _ = sender.send(TurnOutcome::Associated(turn_id));
+        }
+        Ok(())
     }
 
     /// Settle a post-dispatch `turn.started` persistence failure. The input
@@ -1484,16 +1623,14 @@ impl EventProcessor {
                 self.message_seq = self.message_seq.saturating_add(1);
                 let session_id = self.status.session_id.as_deref().unwrap_or_default();
                 let native_id = format!("claude:{session_id}:{turn_id}:model:{}", self.message_seq);
-                self.commit_event(
-                    "turn.model_observed",
-                    native_id,
-                    json!({
-                        "command_id": self.status.active_command_id,
-                        "turn_id": turn_id,
-                        "model": model,
-                    }),
-                )
-                .await?;
+                let mut data = json!({
+                    "command_id": self.status.active_command_id,
+                    "turn_id": turn_id,
+                    "model": model,
+                });
+                self.scope_turn_command(&mut data);
+                self.commit_event("turn.model_observed", native_id, data)
+                    .await?;
             }
             return Ok(());
         }
@@ -1504,6 +1641,7 @@ impl EventProcessor {
             "turn_id": turn_id,
             "text": text.clone(),
         });
+        self.scope_turn_command(&mut data);
         if let Some(model) = observed_model {
             data["model"] = Value::String(model);
         }
@@ -1561,6 +1699,7 @@ impl EventProcessor {
                 "item_id": tool_use.id,
                 "tool": tool_use.name,
             });
+            self.scope_turn_command(&mut data);
             if let Some(at) = eliot_plugin::quota::rfc3339_ms(record.get("timestamp")) {
                 data["native_at_ms"] = json!(at);
             }
@@ -1650,6 +1789,7 @@ impl EventProcessor {
                 "tool": tool,
                 "status": tool_result_status(result.is_error),
             });
+            self.scope_turn_command(&mut data);
             if let Some(at) = eliot_plugin::quota::rfc3339_ms(record.get("timestamp")) {
                 data["native_at_ms"] = json!(at);
             }
@@ -1692,6 +1832,7 @@ impl EventProcessor {
         let Some(turn_id) = self.background_tools.remove(item_id) else {
             return Ok(());
         };
+        self.task_notification_pending = true;
         let session_id = self.status.session_id.as_deref().unwrap_or_default();
         let native_id = format!("claude:{session_id}:{turn_id}:tool.background_ended:{item_id}");
         let data = json!({ "turn_id": turn_id, "item_id": item_id });
@@ -2562,6 +2703,7 @@ impl EventProcessor {
         let guard_command =
             eliot_plugin::session::shell_permission_command(&body.tool_name, body.input.as_ref());
         let mut event_data = data;
+        self.scope_turn_command(&mut event_data);
         if let Some(command) = guard_command {
             event_data[eliot_core::COMMAND_GUARD_CONTEXT_FIELD] = json!({"commands": [command]});
         }
@@ -2904,8 +3046,6 @@ impl EventProcessor {
         if let Some(session_id) = parsed.session_id.as_deref() {
             self.check_session(session_id)?;
         }
-        let omitted_output = self.autonomous_output;
-        self.autonomous_output = false;
         self.task_notification_pending = false;
         self.status.background_continuation = false;
         if parsed
@@ -2913,37 +3053,31 @@ impl EventProcessor {
             .as_ref()
             .is_some_and(|origin| origin.kind == "task-notification")
         {
-            let answers_input = self.status.active_turn_id.as_deref().is_some_and(|turn| {
-                parsed.user_message_uuid.as_deref() == Some(turn)
-                    || parsed.user_message_uuids.iter().any(|uuid| uuid == turn)
+            let answers_input = self.active_input.as_deref().is_none_or(|input| {
+                parsed.user_message_uuid.as_deref() == Some(input)
+                    || parsed.user_message_uuids.iter().any(|uuid| uuid == input)
             });
-            // Background task wakeups are native autonomous work, not a SEND
-            // association or a terminal for whichever Eliot turn is current.
-            // Any pre-association message prefix belongs to this wakeup and
-            // must not drain into a later input's lifecycle.
+            // The native run ended before consuming the queued input. Claude
+            // answers that input next, inside this same Swarm turn.
             if !answers_input {
-                self.buffer.retain(|frame| {
-                    !matches!(
-                        frame.record.get("type").and_then(Value::as_str),
-                        Some("assistant" | "user")
-                    )
-                });
-                self.buffer_bytes = self.buffer.iter().map(|frame| frame.size).sum();
-            }
-            self.record_coverage_gap(
-                "Claude autonomous task-notification output was not attributed to an Eliot input",
-                &["message", "tool"],
-            )
-            .await?;
-            if !answers_input {
+                self.native_prefix_ended = true;
+                self.prefix_usage = TurnUsage::sum_native(
+                    "main_loop_turn",
+                    self.prefix_usage
+                        .take()
+                        .into_iter()
+                        .chain(result_usage(record)),
+                );
                 return Ok(());
             }
-        } else if omitted_output {
-            self.record_coverage_gap(
-                "Claude output after a task notification had ambiguous input provenance and was omitted",
-                &["message", "tool"],
-            )
-            .await?;
+            if self.status.active_turn_id.is_none() {
+                return self
+                    .record_coverage_gap(
+                        "Claude task-notification result had no observed native turn start",
+                        &["message", "tool"],
+                    )
+                    .await;
+            }
         }
         if parsed.terminal_reason.trim().is_empty() {
             return self
@@ -2993,6 +3127,7 @@ impl EventProcessor {
             "outcome": outcome,
             "native_status": terminal_reason.clone(),
         });
+        self.scope_turn_command(&mut data);
         // Optional native main-loop turn usage: absent/malformed usage never
         if outcome == "failure" {
             let error = self.native_failure.take();
@@ -3028,10 +3163,14 @@ impl EventProcessor {
         // blocks or gaps this terminal; it simply leaves `data.usage` unset.
         // Attaches before `attach_final_text` so the existing bounded
         // terminal-text accounting includes the usage bytes.
-        if let Some(usage) = self
-            .first_call_usage
-            .finish("main_loop_turn", result_usage(record))
-        {
+        let turn_usage = match self.prefix_usage.take() {
+            Some(prefix) => TurnUsage::sum_native(
+                "main_loop_turn",
+                std::iter::once(prefix).chain(result_usage(record)),
+            ),
+            None => result_usage(record),
+        };
+        if let Some(usage) = self.first_call_usage.finish("main_loop_turn", turn_usage) {
             data["usage"] = serde_json::to_value(&usage).unwrap_or(Value::Null);
         }
         // Proven MCP surface from the owned stream's `system`/`init`
@@ -3096,6 +3235,9 @@ impl EventProcessor {
         });
         self.status.active_turn_id = None;
         self.status.active_command_id = None;
+        self.status.native_unbound = false;
+        self.last_input = self.active_input.take();
+        self.native_prefix_ended = false;
         self.latest_context_sample = None;
         self.interrupted_turn = None;
         self.tool_use_turns.clear();
@@ -3274,6 +3416,10 @@ impl EventProcessor {
         self.status.ready = false;
         self.status.active_command_id = None;
         self.status.active_turn_id = None;
+        self.status.native_unbound = false;
+        self.active_input = None;
+        self.native_prefix_ended = false;
+        self.prefix_usage = None;
         self.interrupted_turn = None;
         Ok(())
     }

@@ -413,7 +413,7 @@ pub(super) fn admit_send_member(
             ));
         }
     }
-    let ready = send_gate_open(tx, agent_num, agent.generation)?
+    let ready = send_input_gate_open(tx, agent_num, agent.generation)?
         && earliest_pending_send(tx, agent_num, agent.generation)?.is_none();
     let state = if ready {
         CommandState::Accepted

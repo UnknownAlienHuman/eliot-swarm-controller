@@ -198,19 +198,17 @@ struct PendingTurn {
 }
 
 struct TurnWaiter {
-    turn_id: String,
     outcome: oneshot::Receiver<TurnOutcome>,
 }
 
 impl PendingTurn {
     fn finish(&mut self, outcome: TurnOutcome) -> Value {
-        let pending = self
-            .pending
+        self.pending
             .take()
             .expect("registered send owns its waiter");
         match outcome {
-            TurnOutcome::Associated => {
-                json!({"state": "applied", "turn_id": pending.turn_id})
+            TurnOutcome::Associated(turn_id) => {
+                json!({"state": "applied", "turn_id": turn_id})
             }
             TurnOutcome::Rejected(reason) => rejected_control(&reason),
             TurnOutcome::Unknown(reason) => {
@@ -1795,7 +1793,9 @@ fn check_send_ready(session: &AgentSession) -> Result<()> {
     if let Some(reason) = event_status.failure {
         return Err(Error::new("unknown", reason));
     }
-    if event_status.active_turn_id.is_some() {
+    // A self-started native turn with no send takes this input: Claude
+    // merges it and the event task binds it to that exact turn.
+    if event_status.active_turn_id.is_some() && !event_status.native_unbound {
         return Err(Error::new("busy", "Claude already has an active turn"));
     }
     if session.pending_turn.pending.is_some() {
@@ -1833,10 +1833,7 @@ async fn dispatch_send(
             return Ok(result);
         }
     };
-    session.pending_turn.pending = Some(TurnWaiter {
-        turn_id: turn_id.clone(),
-        outcome,
-    });
+    session.pending_turn.pending = Some(TurnWaiter { outcome });
     let input = OutboundUserInput {
         kind: "user",
         uuid: turn_id.clone(),
@@ -2024,6 +2021,7 @@ async fn launch_session(
         stream,
         peer.clone(),
         EventConfig {
+            start_command_id: params.command_id.clone(),
             credential: plan.credential.clone(),
             agent_id: params.agent_id.clone(),
             generation: params.generation,
