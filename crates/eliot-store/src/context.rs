@@ -8,6 +8,14 @@ use eliot_core::{
 use serde::{Deserialize, Serialize};
 
 const CONTEXT_ITEMS_ARG: &str = "context_items";
+
+/// Render one claimed inject at the native input boundary.
+pub fn fenced_inject_text(text: &str) -> String {
+    format!(
+        "Swarm context (quoted data):\n{}",
+        eliot_core::fence_untrusted_text(text)
+    )
+}
 const MAX_CONTEXT_QUERY_ROWS: usize = 32;
 const MAX_CONTEXT_QUERY_BYTES: usize = MAX_FRAME_BYTES;
 const PROJECT_CHECK_PRINCIPAL: &str = "project_check";
@@ -380,7 +388,7 @@ pub(super) fn claim_next_input_tx(
             }
             let item = ContextItem {
                 command_id: record.command.id.clone(),
-                text: args.text,
+                text: fenced_inject_text(&args.text),
                 expires_at_ms: args.expires_at_ms,
             };
             if item.text.len().saturating_add(2) > MAX_TEXT_BYTES {
@@ -609,7 +617,7 @@ impl Store {
             }
             let item = ContextItem {
                 command_id: record.command.id.clone(),
-                text: args.text,
+                text: fenced_inject_text(&args.text),
                 expires_at_ms: args.expires_at_ms,
             };
             let mut candidate = selected.clone();

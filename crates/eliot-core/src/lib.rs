@@ -75,7 +75,8 @@ pub use observe::{
     verified_harness,
 };
 pub use presentation::{
-    count_words, fence_untrusted_text, origin_words, reason_message, reason_words,
+    count_words, fence_untrusted_prefix, fence_untrusted_text, origin_words, reason_message,
+    reason_words,
 };
 pub use remote_call::{RemoteCallContext, RemoteIdentity};
 pub use routing::{

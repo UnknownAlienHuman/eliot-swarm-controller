@@ -207,7 +207,8 @@ The daemon prefers AGENTS.md as the primary file, then AGENTS.override.md,
 CLAUDE.md, .claude/CLAUDE.md, GEMINI.md and the local Claude instruction files.
 When the primary file's native reading isn't established, the daemon attaches it
 through the existing required-sources renderer to the launch's linked first input.
-That renderer labels SHA-256 as file identity and marks redacted text and truncation.
+The renderer puts file content in a [quoted data fence](coordination.md#quoted-data)
+and labels SHA-256, redaction and completeness outside the fence.
 Explicit user sources are read at admission from their requested workspace. The
 catalog reuses an explicit attachment with the same workspace-relative path and file
 digest as the prepared primary file. Otherwise automatic delivery reads the prepared

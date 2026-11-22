@@ -299,13 +299,7 @@ impl OriginAuth {
             keys.retry_after = Instant::now() + REFRESH_BACKOFF;
             self.key_refresh_in_progress.store(true, Ordering::Release);
         }
-        let set = match self.fetch_keys().await {
-            Ok(set) => set,
-            Err(error) => {
-                self.key_refresh_in_progress.store(false, Ordering::Release);
-                return Err(error);
-            }
-        };
+        let set = self.fetch_keys().await?;
         let mut keys = self.keys.lock().await;
         keys.set = set;
         keys.valid_until = Instant::now() + KEY_LIFETIME;

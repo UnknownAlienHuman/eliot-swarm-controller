@@ -8172,13 +8172,10 @@ fn validate_pass_env_references(
                     "profile pass_env entries must be environment variable names",
                 )
             })?;
-        if name
-            .get(..12)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("ELIOT_AGENT_"))
-        {
+        if crate::config::reserved_eliot_environment_name(name) {
             return Err(Error::new(
                 "invalid",
-                "profile pass_env cannot override Eliot Agent identity variables",
+                "profile pass_env cannot include reserved ELIOT_* names",
             ));
         }
     }

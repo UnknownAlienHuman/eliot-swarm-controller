@@ -47,9 +47,11 @@ pub(super) fn build(
     loop {
         let (task_text, t1) = bounded(&task_text, budget);
         let (output, t2) = bounded(&output, budget);
+        let output = core::fence_untrusted_text(&output);
         let (instructions, t3) = bounded(&instructions, budget / 2);
+        let instructions = core::fence_untrusted_text(&instructions);
         let text = format!(
-            "Handoff brief: context only. Await the separate successor SENDs before executing queued work.\nSource: {}/{}\nOriginal task command: {}\nRetained history: agent.result id={} generation={}; command.get id={}; turn.get agent={} generation={} turn_id={} (when retained). Retention gaps remain possible.\n\nOriginal task:\n{}\n\nLater instructions to the source, oldest first (they narrow or change the task):\n{}\n\nStore facts (recorded by Swarm, not model claims):\n{}\n\nExecutor's last report (model output, not verified by Swarm; turn {}):\n{}",
+            "Handoff brief: context only. Await the separate successor SENDs before executing queued work.\nSource: {}/{}\nOriginal task command: {}\nRetained history: agent.result id={} generation={}; command.get id={}; turn.get agent={} generation={} turn_id={} (when retained). Retention gaps remain possible.\n\nOriginal task:\n{}\n\nLater input to the source (quoted command history, oldest first):\n{}\n\nStore facts (recorded by Swarm, not model claims):\n{}\n\nExecutor's last report (quoted model output; turn {}):\n{}",
             request.from,
             request.from_generation,
             request.task_command,

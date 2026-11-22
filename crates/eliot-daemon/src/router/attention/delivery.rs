@@ -303,7 +303,9 @@ async fn route_notice(
         };
         let params = serde_json::to_value(request)
             .map_err(|_| Error::new("internal", "attention mail could not be encoded"))?;
-        router.mail_send(&params, &Principal::Owner).await?;
+        router
+            .mail_send_from(&params, eliot_core::api::SWARM_MAIL_SENDER)
+            .await?;
     } else {
         router
             .submit(

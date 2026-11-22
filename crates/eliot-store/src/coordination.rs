@@ -124,6 +124,13 @@ struct PreparedMailSend {
     payload_digest: Vec<u8>,
 }
 
+#[derive(Clone, Copy)]
+enum MailSendKind {
+    Ordinary,
+    Service,
+    Digest,
+}
+
 struct PreparedMailAck {
     mailbox: i64,
     payload_digest: Vec<u8>,
@@ -184,7 +191,13 @@ fn delivery_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MailDelivery> {
     })
 }
 
-const DELIVERY_COLUMNS: &str = "m.delivery_id, m.sender, m.sender_generation,
+const DELIVERY_COLUMNS: &str = "m.delivery_id,
+    CASE WHEN m.sender = 'owner' AND EXISTS (
+        SELECT 1 FROM completion_digests d
+        WHERE d.id = substr(m.delivery_id, 1, instr(m.delivery_id, '/') - 1)
+          AND d.delivered_mail_id = m.delivery_id
+    ) THEN 'swarm' ELSE m.sender END,
+    m.sender_generation,
     (SELECT 'a' || a.id FROM agents a WHERE a.id = m.recipient),
     m.recipient_generation, m.thread, m.reply_to_delivery, m.mode, m.text,
     m.admitted_at, m.presented_at, m.presentation_command, m.read_at";
@@ -252,7 +265,7 @@ impl Store {
         limits: MailLimits,
         now: i64,
     ) -> Result<MailSendResult> {
-        self.mail_send_filtered(principal, request, limits, now, false, None)
+        self.mail_send_filtered(principal, request, limits, now, MailSendKind::Ordinary)
     }
 
     /// Digest delivery path: the mail id is the digest registration id by
@@ -266,14 +279,7 @@ impl Store {
         limits: MailLimits,
         now: i64,
     ) -> Result<MailSendResult> {
-        self.mail_send_filtered(
-            principal,
-            request,
-            limits,
-            now,
-            true,
-            Some(SWARM_MAIL_SENDER),
-        )
+        self.mail_send_filtered(principal, request, limits, now, MailSendKind::Digest)
     }
 
     /// Queue daemon-produced mail with the Swarm service identity while
@@ -284,14 +290,7 @@ impl Store {
         limits: MailLimits,
         now: i64,
     ) -> Result<MailSendResult> {
-        self.mail_send_filtered(
-            "owner",
-            request,
-            limits,
-            now,
-            false,
-            Some(SWARM_MAIL_SENDER),
-        )
+        self.mail_send_filtered("owner", request, limits, now, MailSendKind::Service)
     }
 
     fn mail_send_filtered(
@@ -300,15 +299,15 @@ impl Store {
         request: &MailSendRequest,
         limits: MailLimits,
         now: i64,
-        allow_digest_id: bool,
-        sender_override: Option<&'static str>,
+        kind: MailSendKind,
     ) -> Result<MailSendResult> {
-        if sender_override.is_some() && principal != "owner" {
+        if !matches!(kind, MailSendKind::Ordinary) && principal != "owner" {
             return Err(Error::new(
                 "not_allowed",
                 "Swarm service mail requires Owner authorization",
             ));
         }
+        let allow_digest_id = matches!(kind, MailSendKind::Digest);
         self.ensure_committed_reads()?;
         let prepared = self.prepare_mail_send(principal, request)?;
         if command_binding(&self.connection, &request.id)?.is_some() {
@@ -351,15 +350,7 @@ impl Store {
             });
         }
         self.ensure_writer_healthy()?;
-        let result = self.mail_send_inner(
-            principal,
-            request,
-            &prepared,
-            limits,
-            now,
-            allow_digest_id,
-            sender_override,
-        );
+        let result = self.mail_send_inner(principal, request, &prepared, limits, now, kind);
         self.fault_on_persistence_error(&result);
         result
     }
@@ -1019,8 +1010,7 @@ impl Store {
         prepared: &PreparedMailSend,
         limits: MailLimits,
         now: i64,
-        allow_digest_id: bool,
-        sender_override: Option<&'static str>,
+        kind: MailSendKind,
     ) -> Result<MailSendResult> {
         limits.validate()?;
         if request.mode != MailMode::Queue {
@@ -1031,6 +1021,7 @@ impl Store {
         }
         let sender = &prepared.sender;
         let payload_digest = &prepared.payload_digest;
+        let allow_digest_id = matches!(kind, MailSendKind::Digest);
         // Public-write guards (command-namespace conflict, retained binding,
         // write-id age) stay here. The row effect below is shared with the
         // rule-child commit path, which never touches the public write-id
@@ -1197,11 +1188,7 @@ impl Store {
                 request.to == [parent]
                     && request.thread.as_deref() == Some(digest_thread(&request.id).as_str())
             });
-        let sender_override = if allow_digest_id && !digest_exempt {
-            None
-        } else {
-            sender_override
-        };
+        let service_sender = matches!(kind, MailSendKind::Service) || digest_exempt;
         if attention_write {
             validate_ulid(&request.id)?;
         } else if digest_exempt {
@@ -1225,13 +1212,12 @@ impl Store {
         };
         let (value, events) = Self::mail_effect_tx_with_sender(
             &tx,
-            sender,
+            (sender, service_sender),
             &definition,
             limits,
             &request.id,
             None,
             now,
-            sender_override,
         )?;
         request.validate_response(&value)?;
         if digest_exempt {
@@ -1522,25 +1508,23 @@ impl Store {
     ) -> Result<(MailSendResponse, Vec<super::Event>)> {
         Self::mail_effect_tx_with_sender(
             tx,
-            sender,
+            (sender, false),
             definition,
             limits,
             delivery_prefix,
             command_id,
             now,
-            None,
         )
     }
 
     fn mail_effect_tx_with_sender(
         tx: &Transaction<'_>,
-        sender: &Sender,
+        (sender, service_sender): (&Sender, bool),
         definition: &MailDefinitionArgs,
         limits: MailLimits,
         delivery_prefix: &str,
         command_id: Option<&str>,
         now: i64,
-        sender_override: Option<&str>,
     ) -> Result<(MailSendResponse, Vec<super::Event>)> {
         limits.validate()?;
         let to = &definition.to;
@@ -1589,12 +1573,10 @@ impl Store {
                 ));
             }
         }
-        let (sender_name, sender_generation) = match sender_override {
-            Some(name) => (name.to_owned(), None),
-            None => match sender {
-                Sender::Owner => ("owner".to_owned(), None),
-                Sender::Agent { id, generation, .. } => (id.clone(), Some(*generation)),
-            },
+        let (sender_name, sender_generation) = match sender {
+            Sender::Owner if service_sender => (SWARM_MAIL_SENDER.to_owned(), None),
+            Sender::Owner => ("owner".to_owned(), None),
+            Sender::Agent { id, generation, .. } => (id.clone(), Some(*generation)),
         };
         let mut deliveries = Vec::with_capacity(recipients.len());
         let mut events = Vec::with_capacity(recipients.len());
@@ -1994,13 +1976,11 @@ fn inline_mail_wake_tx(
         }
 
         let topic = topic.as_deref().unwrap_or("(no topic)");
-        let mail = if sender == SWARM_MAIL_SENDER {
+        let mail = if sender == SWARM_MAIL_SENDER && digest_id.is_some() {
+            format!("Mail from swarm (service) | topic {topic:?} | delivery {delivery_id}\n{text}")
+        } else if sender == SWARM_MAIL_SENDER || (sender == "owner" && digest_id.is_some()) {
             format!(
-                "Mail from Swarm (service, not the owner) | {topic} | delivery {delivery_id}\n{text}"
-            )
-        } else if sender == "owner" && digest_id.is_some() {
-            format!(
-                "Mail from Swarm (service, not the owner) | {topic} | delivery {delivery_id}\nLegacy digest body has no retained excerpt boundaries; quoted service data follows.\n{}",
+                "Mail from swarm (service) | topic {topic:?} | delivery {delivery_id}\nQuoted service data follows.\n{}",
                 fence_untrusted_text(&text)
             )
         } else if sender == "owner" {

@@ -365,9 +365,9 @@ pub fn native_no_write(code: &str) -> bool {
 
 /// Prepend FIFO-claimed context to the original send text for one native input
 /// operation. Items stay in claim order, joined by blank lines, then a blank
-/// line, then the exact original text; item texts are embedded verbatim and only
-/// separators are added. The original text and items are unmodified: retain the
-/// original for idempotency and digests, and send the returned string natively
+/// line, then the exact original text. The Store has already framed each item
+/// as quoted data. Retain the original input for idempotency and digests, and
+/// send the returned string natively
 /// in the same operation (no second send). The combined text is checked against
 /// `MAX_TEXT_BYTES` here; the caller checks the encoded native frame against
 /// `MAX_FRAME_BYTES` before I/O. Pure: no replay on late or unknown outcomes.

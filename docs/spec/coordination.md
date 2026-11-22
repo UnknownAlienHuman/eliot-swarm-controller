@@ -438,14 +438,16 @@ The notice is an ordinary owner `send` bound to the recipient's
 current generation. At claim, Store selects eligible unread mail addressed to
 that generation, in admission order. Each inline entry carries its sender,
 thread topic (or an explicit no-topic marker), exact delivery ID, and body.
-Peer mail carries the sender's Agent identity and a fenced untrusted body.
-The wake envelope grants the peer no Owner authority. Owner mail uses plain text.
+Peer mail carries the sender's Agent identity and a [quoted data fence](#quoted-data).
+Swarm-generated mail carries the service sender `swarm`. Completion messages
+quote the child excerpts and leave status lines and counters outside the
+fence. Other service notices quote their body. Owner mail uses plain text.
 An actionable attention report can be inlined on its one permitted wake.
 Older-generation mail and retained advisory copies remain in the inbox.
 If other wake-eligible unread rows
 remain, the text gives their count and points to `mail.inbox` and
 `mail.ack`. A completion-digest delivery remains eligible only when its
-owner-sent row matches the digest registration, the current recipient
+service message matches the digest registration, the current recipient
 requester (`agent:<recipient>:<generation>`), and that registration's digest
 thread. Other registered digest rows are not treated as ordinary mail.
 
@@ -554,6 +556,15 @@ the same mail body to the frozen parent recipient on the frozen
 digest pending. Delivered digests are pruned under
 the commands retention window (see [core](core.md#retention)), oldest delivery
 first; pending digests are never pruned.
+
+### Quoted data
+
+Swarm uses the shared Core fence for text from Agents, processes and files when
+it inserts that text into a model input. The delimiter uses at least three
+backticks and exceeds the longest run in the body. Add sender, file digest,
+completeness and counts outside the fence. The complete frame counts against
+the delivery budget. Shortened data retains a complete fence and an explicit
+completeness mark where the delivery reports truncation.
 
 ### Read and acknowledgement
 
@@ -1009,12 +1020,13 @@ handoff leaves children in place. Validation failure rolls back the transfer.
 
 The first successor input is one bounded handoff brief, admitted as ordinary `send`
 to B's exact generation. It contains the original task text from the named retained
-command; the later send/steer/inject texts A received after it, oldest first, each with
-its principal and verb, because those carry the limits and clarifications a summary
-loses (A's Goal continuations are excluded: they are Swarm-generated, not instructions); Store facts about A (workspace and its Git work, Goal status and last check
+command; a quoted history of the later send/steer/inject texts A received after
+it, oldest first, each with its command principal and verb. These capture limits
+and clarifications, and omit A's automatic Goal continuations. The brief also
+includes Store facts about A (workspace and its Git work, Goal status and last check
 exit, open or unknown commands of the handed-off generation), labelled as recorded by
 Swarm; A's latest retained final output (exact turn binding, or an explicit absence),
-labelled as model output Swarm did not verify; and pointers to A/generation/command/turn
+framed as quoted model output, and pointers to A/generation/command/turn
 retained history. Apply existing known-secret
 filtering/redaction and SEND/frame limits; label any truncated text and history gaps.
 Never copy credentials, raw native context or an inferred successful result. B keeps

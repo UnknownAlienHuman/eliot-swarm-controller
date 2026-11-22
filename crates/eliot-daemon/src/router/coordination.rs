@@ -92,6 +92,18 @@ fn wake_enabled(snapshot: &Value) -> bool {
 
 impl Router {
     pub(super) async fn mail_send(&self, params: &Value, principal: &Principal) -> Result<Value> {
+        let response = self
+            .mail_send_from(params, &principal_name(principal))
+            .await?;
+        serde_json::to_value(response)
+            .map_err(|_| Error::new("internal", "mail delivery could not be encoded"))
+    }
+
+    pub(super) async fn mail_send_from(
+        &self,
+        params: &Value,
+        sender: &str,
+    ) -> Result<MailSendResponse> {
         let request: MailSendRequest = decode_coordination_request(
             params,
             &self.inner.secrets,
@@ -100,11 +112,9 @@ impl Router {
         )?;
         let change = {
             let mut store = self.inner.store.lock().await;
-            self.mail_send_locked(&mut store, &principal_name(principal), &request, false)?
+            self.mail_send_locked(&mut store, sender, &request, false)?
         };
-        let response = self.mail_send_finish(&request, change).await?;
-        serde_json::to_value(response)
-            .map_err(|_| Error::new("internal", "mail delivery could not be encoded"))
+        self.mail_send_finish(&request, change).await
     }
 
     /// Admit one mail inside the caller's Store guard and publish its
@@ -123,6 +133,8 @@ impl Router {
         let limits = self.inner.mail.limits();
         let change = if allow_digest_id {
             store.mail_send_digest_delivery(name, request, limits, now_ms())?
+        } else if name == eliot_core::api::SWARM_MAIL_SENDER {
+            store.mail_send_as_swarm(request, limits, now_ms())?
         } else {
             store.mail_send(name, request, limits, now_ms())?
         };

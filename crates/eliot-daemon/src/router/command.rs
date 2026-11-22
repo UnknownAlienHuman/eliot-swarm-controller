@@ -962,10 +962,24 @@ impl Router {
         {
             return None;
         }
+        let mut command = command.clone();
+        if command.verb == "inject" {
+            let Some(text) = command.args.get("text").and_then(Value::as_str) else {
+                return Some(Err(Error::new("invalid", "inject requires text")));
+            };
+            let text = eliot_store::fenced_inject_text(text);
+            if text.len() > eliot_core::limits::MAX_TEXT_BYTES {
+                return Some(Err(Error::new(
+                    "frame_too_large",
+                    "fenced inject text exceeds 512 KiB",
+                )));
+            }
+            command.args["text"] = Value::String(text);
+        }
         let pending = self
             .inner
             .plugin_host
-            .enqueue_command(&agent, command.clone(), context);
+            .enqueue_command(&agent, command, context);
         Some(pending.map(|pending| (agent, pending)))
     }
 

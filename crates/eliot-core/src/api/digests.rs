@@ -9,13 +9,13 @@
 //! through the standard mail notice gate and never emits an attention
 //! incident.
 
-use crate::{Error, Result, parse_agent_id};
+use crate::{
+    Error, Result, fence_untrusted_prefix, parse_agent_id, presentation::fenced_untrusted_len,
+};
 use serde::{Deserialize, Serialize};
 
 use super::coordination::MAX_MAIL_TEXT_BYTES;
-use super::waits::{
-    MAX_SWARM_WAIT_TARGETS, WaitEntryResult, WaitTurnRef, all_wait_mode, truncate_bytes,
-};
+use super::waits::{MAX_SWARM_WAIT_TARGETS, WaitEntryResult, WaitTurnRef, all_wait_mode};
 
 /// Thread prefix for completion digests. Distinct from `attention-*` so a
 /// successful completion is never confused with an attention incident, and
@@ -320,7 +320,7 @@ pub fn digest_text(id: &str, to: &str, mode: &str, results: &[WaitEntryResult]) 
     let terminal = results.iter().filter(|entry| entry.is_terminal()).count();
     let succeeded = results.iter().filter(|entry| entry.succeeded()).count();
     let header = format!(
-        "Eliot completion digest {id} for {to} (mode {mode}): {terminal}/{} terminal, {succeeded} succeeded.",
+        "Eliot completion digest {id} for {to} (mode {mode}): {terminal}/{} terminal, {succeeded} succeeded.\nChild excerpts are quoted data.",
         results.len()
     );
     let footer = "Delivered once to the parent mailbox. No model turn was used. Successful completion is not an attention incident.";
@@ -343,7 +343,11 @@ pub fn digest_text(id: &str, to: &str, mode: &str, results: &[WaitEntryResult]) 
             digest_entry_line(entry, i, text.is_none() && entry.truncated).len()
         })
         .collect();
-    let demand: usize = texts.iter().flatten().map(|text| text.len() + 1).sum();
+    let framed_lengths: Vec<_> = texts
+        .iter()
+        .map(|text| text.as_deref().map(fenced_untrusted_len))
+        .collect();
+    let demand: usize = framed_lengths.iter().flatten().map(|len| len + 1).sum();
     let reserve = demand.min(DIGEST_EXCERPT_RESERVE_BYTES);
     let fixed = header.len() + 1 + footer.len();
     let all_lines: usize = line_lens.iter().map(|len| len + 1).sum();
@@ -408,12 +412,11 @@ pub fn digest_text(id: &str, to: &str, mode: &str, results: &[WaitEntryResult]) 
         (kept_count < results.len()).then(|| digest_cut_marker(results.len() - kept_count));
     let used = fixed + used_lines + marker.as_ref().map_or(0, |marker| marker.len() + 1);
     let available = MAX_MAIL_TEXT_BYTES.saturating_sub(used);
-    let text_lens: Vec<usize> = texts
+    let text_lens: Vec<usize> = framed_lengths
         .iter()
         .zip(&kept)
         .filter(|(_, keep)| **keep)
-        .filter_map(|(text, _)| text.as_deref())
-        .map(str::len)
+        .filter_map(|(length, _)| *length)
         .collect();
     let cap = if text_lens.is_empty() {
         usize::MAX
@@ -429,11 +432,12 @@ pub fn digest_text(id: &str, to: &str, mode: &str, results: &[WaitEntryResult]) 
         }
         match text.as_deref() {
             Some(text) => {
-                let (excerpt, cut) = truncate_bytes(text, cap);
+                let (excerpt, block) = fence_untrusted_prefix(text, cap);
+                let cut = excerpt.len() < text.len();
                 body.push_str(&digest_entry_line(entry, i, entry.truncated || cut));
                 if !excerpt.is_empty() {
                     body.push('\n');
-                    body.push_str(&excerpt);
+                    body.push_str(&block);
                 }
             }
             None => body.push_str(&digest_entry_line(entry, i, entry.truncated)),
