@@ -90,6 +90,9 @@ engine, second scheduler or critic loop.
       same OpenCode turn. The routing role installs the bounded project Goal.
 - [x] **File wake (#833).** OpenCode arms a file condition, ends its turn and
       receives one follow-up when the file appears in its worktree.
+- [x] **Project command guard and shell identity (#833).** OpenCode refuses
+      `git stash` with the configured text. Its shell omits the scoped identity
+      variables while its managed MCP tool authenticates as the Agent.
 - [x] **Check-bound commit and push (#833).** An opted-in project rule commits
       the checked tree with the first line of the Agent's final answer. A private
       bare remote read back the same commit.
@@ -284,9 +287,9 @@ No second executor, workflow graph or acceptance engine.
 - [x] **L4.2 Actions/scripts.** Agent commands first, then bounded explicit scripts.
       Frozen inputs, scoped principal, exit/output handling and unknown outcomes use
       normal commands. Add Git fetch/push wrappers only with their concrete recipe;
-      direct harness Git remains harness work, not intercepted by Eliot.
-      Agent actions, bounded Run scripts and `git.fetch` are connected; the remaining
-      wrappers stay unsupported as specified in [automation](spec/automation.md).
+      project guards apply when a harness sends a command permission request.
+      Agent actions, bounded Run scripts, `git.fetch` and check-bound `git.publish`
+      are connected through the recipes in [automation](spec/automation.md).
       Bounded `command.children` readback for retained expansions is connected
       through the same Router/CLI, and that target API is advertised.
 - [x] **L4.3 Goals/requests.** Eliot continuation/checks with turn and
