@@ -1649,11 +1649,11 @@ swarm usage <agent> and swarm usage --agent <agent> for the same Agent scope;
 project and root scopes retain their flags. `swarm usage` renders this response as a compact table;
 `--json` keeps printing the raw response.
 
-`by_role` groups the Agents in the authorized usage scope into managers
-and executors. An Agent is a manager when any retained Agent has it as
-parent, including archived children outside the requested usage scope. The
-scope includes only its authorized Agent generations and usage; the child
-existence check adds no child identity or usage to the response.
+`by_role` groups completed turns in the authorized usage scope using the
+same role attribution as `swarm autonomy`. A turn counts as manager
+usage when a retained child of that Agent existed by its completion.
+Archived children and children outside the requested scope can establish
+the role. Only authorized turn usage contributes to the totals.
 
 The role rows report normalized input (uncached input plus cached input once),
 output, and separate sample counts. `input_samples` and `output_samples` count
@@ -1662,7 +1662,8 @@ input includes cache writes once; cache writes are not added again as a
 separate counter.
 `average_context_tokens` averages observed `context_used_tokens` values from
 retained `session.usage` events for the authorized Agent generations. Each
-retained event is one context observation. `context_observations`,
+event is one context observation and uses the same role predicate at its
+journal timestamp. `context_observations`,
 `context_samples`, and `context_missing` report total observations,
 valid occupancy samples, and observations without valid occupancy; missing
 values are excluded from the mean, which is rounded down to a whole token.

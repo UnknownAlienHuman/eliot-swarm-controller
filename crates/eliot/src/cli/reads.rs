@@ -1427,9 +1427,8 @@ pub(crate) fn print_usage_table(response: &UsageSummaryResponse) {
         "    context average uses retained session.usage observations; missing values are excluded"
     );
     println!(
-        "    {:<10} {:>7} {:>12} {:>8} {:>12} {:>8} {:>12} {:>8} {:>8} {:>9}",
+        "    {:<10} {:>12} {:>8} {:>12} {:>8} {:>12} {:>8} {:>8} {:>9}",
         "ROLE",
-        "AGENTS",
         "INPUT",
         "INPUT_N",
         "OUTPUT",
@@ -1444,9 +1443,8 @@ pub(crate) fn print_usage_table(response: &UsageSummaryResponse) {
         ("executors", &response.by_role.executors),
     ] {
         println!(
-            "    {:<10} {:>7} {:>12} {:>8} {:>12} {:>8} {:>12} {:>8} {:>8} {:>9}",
+            "    {:<10} {:>12} {:>8} {:>12} {:>8} {:>12} {:>8} {:>8} {:>9}",
             name,
-            role.agents,
             counter_cell(role.input_tokens),
             role.input_samples,
             counter_cell(role.output_tokens),

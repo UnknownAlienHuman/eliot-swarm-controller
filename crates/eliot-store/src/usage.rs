@@ -15,14 +15,17 @@
 //! retained-event watermark names the retention floor instead of implying
 //! full totals.
 
+mod role;
+
+pub(crate) use role::{RoleUsage, manager_at_sql};
+
 use super::*;
 use super::{hierarchy, retention};
 use eliot_core::api::{
     FirstCallInput, MAX_FIRST_CALL_TURNS, PROFILE_FIRST_CALL_WINDOW, ProfileFirstCallInput,
     SessionCostTotal, SessionCumulativeTotals, SessionFacts, SessionTokenSubtotal,
-    TurnCounterMissing, TurnCounterTotals, TurnExpenditure, TurnScopeTotals, UsageRoleAccumulator,
-    UsageRoleAgent, UsageRoleObservation, UsageScopeView, UsageSummaryRequest,
-    UsageSummaryResponse,
+    TurnCounterMissing, TurnCounterTotals, TurnExpenditure, TurnScopeTotals, UsageScopeView,
+    UsageSummaryRequest, UsageSummaryResponse,
 };
 use rusqlite::params_from_iter;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -260,44 +263,6 @@ impl Store {
         Ok(pairs.into_iter().collect())
     }
 
-    /// Role membership checks all retained direct children, including
-    /// archived children and children outside the requested usage scope.
-    /// Only the scoped Agent id and child-existence bit leave this query.
-    fn usage_role_agents(&self, agents: &BTreeSet<i64>) -> Result<Vec<UsageRoleAgent>> {
-        if agents.is_empty() {
-            return Ok(Vec::new());
-        }
-        let placeholders = agents.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let sql = format!(
-            "SELECT a.id,
-                    EXISTS (
-                        SELECT 1 FROM agents child INDEXED BY agents_list_parent
-                        WHERE child.parent = a.id
-                    )
-             FROM agents a WHERE a.id IN ({placeholders})"
-        );
-        let mut statement = self.connection.prepare(&sql).map_err(sql_error)?;
-        let rows = statement
-            .query_map(params_from_iter(agents.iter()), |row| {
-                Ok(UsageRoleAgent {
-                    id: row.get(0)?,
-                    has_children: row.get(1)?,
-                })
-            })
-            .map_err(sql_error)?;
-        let mut scoped_agents = Vec::with_capacity(agents.len());
-        for row in rows {
-            scoped_agents.push(row.map_err(sql_error)?);
-        }
-        if scoped_agents.len() != agents.len() {
-            return Err(Error::new(
-                "internal",
-                "usage scope Agent disappeared during role aggregation",
-            ));
-        }
-        Ok(scoped_agents)
-    }
-
     /// Summarize retained usage for already-authorized (agent, generation)
     /// pairs. Runs under the caller's Store lock, so turn, event and session
     /// reads see one consistent view; every query rides an existing index.
@@ -319,9 +284,8 @@ impl Store {
             )
         };
         let wanted: std::collections::HashSet<(i64, i64)> = pairs.iter().copied().collect();
-        let role_agent_ids: BTreeSet<i64> = wanted.iter().map(|(agent, _)| *agent).collect();
-        let role_agents = self.usage_role_agents(&role_agent_ids)?;
-        let mut role_usage = UsageRoleAccumulator::new(role_agents);
+        let agent_ids: BTreeSet<i64> = wanted.iter().map(|(agent, _)| *agent).collect();
+        let mut role_usage = RoleUsage::default();
         let mut turns_counted = 0_usize;
         let mut turns_without_usage = 0_usize;
         let mut turns_unknown_excluded = 0_usize;
@@ -332,10 +296,8 @@ impl Store {
         let mut first_calls = BTreeMap::new();
         let mut first_calls_truncated = false;
         let mut observed_native_agents = 0i64;
-        if !wanted.is_empty() {
-            let nums: BTreeSet<i64> = wanted.iter().map(|(num, _)| *num).collect();
-            let nums: Vec<i64> = nums.into_iter().collect();
-            let placeholders = nums.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        if !agent_ids.is_empty() {
+            let placeholders = agent_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
             observed_native_agents = self
                 .connection
                 .query_row(
@@ -343,19 +305,21 @@ impl Store {
                         "SELECT COUNT(*) FROM agents
                           WHERE id IN ({placeholders}) AND origin = 'native' AND observe_only = 1"
                     ),
-                    params_from_iter(nums.iter()),
+                    params_from_iter(agent_ids.iter()),
                     |row| row.get(0),
                 )
                 .map_err(sql_error)?;
+            let completed = "COALESCE(t.completed_at, t.started_at, 0)";
+            let manager = manager_at_sql("t.agent", completed);
             let sql = format!(
                 "SELECT t.agent, t.generation, t.state, t.usage, a.harness, t.turn_id,
-                        COALESCE(t.completed_at, t.started_at, 0)
+                        {completed}, {manager}
                  FROM turns t JOIN agents a ON a.id = t.agent
                  WHERE t.agent IN ({placeholders})"
             );
             let mut statement = self.connection.prepare(&sql).map_err(sql_error)?;
             let rows = statement
-                .query_map(params_from_iter(nums.iter()), |row| {
+                .query_map(params_from_iter(agent_ids.iter()), |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
                         row.get::<_, i64>(1)?,
@@ -364,11 +328,12 @@ impl Store {
                         row.get::<_, String>(4)?,
                         row.get::<_, String>(5)?,
                         row.get::<_, i64>(6)?,
+                        row.get::<_, bool>(7)?,
                     ))
                 })
                 .map_err(sql_error)?;
             for row in rows {
-                let (agent, generation, state, usage, harness, turn_id, settled_at) =
+                let (agent, generation, state, usage, harness, turn_id, settled_at, manager) =
                     row.map_err(sql_error)?;
                 if !wanted.contains(&(agent, generation)) {
                     continue;
@@ -391,16 +356,7 @@ impl Store {
                     continue;
                 };
                 let usage = decode_turn_usage(&usage, &harness)?;
-                role_usage.observe(UsageRoleObservation {
-                    agent,
-                    input_tokens: core::reported_token_total(
-                        usage.input_tokens,
-                        usage.cache_read_tokens,
-                        None,
-                    ),
-                    output_tokens: usage.output_tokens,
-                    ..UsageRoleObservation::default()
-                });
+                role_usage.observe_turn(manager, &usage)?;
                 if let Some(input_tokens) = usage.first_call_input_tokens {
                     first_calls.insert((settled_at, agent, generation, turn_id), input_tokens);
                     if first_calls.len() > MAX_FIRST_CALL_TURNS {
@@ -431,7 +387,7 @@ impl Store {
                 turns_missing: counter_missing(accum.counted, &accum.supplied),
             })
             .collect();
-        self.accumulate_usage_context(&wanted, &role_agent_ids, &mut role_usage)?;
+        self.accumulate_usage_context(&wanted, &agent_ids, &mut role_usage)?;
         let sessions = self.summarize_sessions(&wanted)?;
         let (swarm_mcp, swarm_mcp_truncated) = self.swarm_mcp_turn_usage(pairs)?;
         let by_role = role_usage.finish();
@@ -551,14 +507,15 @@ impl Store {
         &self,
         wanted: &std::collections::HashSet<(i64, i64)>,
         agents: &BTreeSet<i64>,
-        role_usage: &mut UsageRoleAccumulator,
+        role_usage: &mut RoleUsage,
     ) -> Result<()> {
         if agents.is_empty() {
             return Ok(());
         }
         let placeholders = agents.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let manager = manager_at_sql("e.agent", "e.ts");
         let sql = format!(
-            "SELECT e.agent, e.generation, e.data
+            "SELECT e.agent, e.generation, e.data, {manager}
              FROM events e
              WHERE e.kind = 'session.usage' AND e.agent IN ({placeholders})
              ORDER BY e.seq"
@@ -570,11 +527,12 @@ impl Store {
                     row.get::<_, i64>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
                 ))
             })
             .map_err(sql_error)?;
         for row in rows {
-            let (agent, generation, data) = row.map_err(sql_error)?;
+            let (agent, generation, data, manager) = row.map_err(sql_error)?;
             if !wanted.contains(&(agent, generation)) {
                 continue;
             }
@@ -587,12 +545,7 @@ impl Store {
                 .map_err(|_| Error::new("internal", "retained session usage data is malformed"))?;
             usage.validate()?;
             usage.retain_valid_context();
-            role_usage.observe(UsageRoleObservation {
-                agent,
-                context_tokens: usage.context_used_tokens,
-                context_observed: true,
-                ..UsageRoleObservation::default()
-            });
+            role_usage.observe_context(manager, usage.context_used_tokens);
         }
         Ok(())
     }
