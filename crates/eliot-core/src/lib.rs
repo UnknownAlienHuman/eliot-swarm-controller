@@ -1680,7 +1680,10 @@ pub fn normalize_failure_where(where_: &str) -> String {
 }
 
 // Boxed so the owning `Error.message` field stays 16 bytes.
-#[allow(clippy::box_collection)]
+#[allow(
+    clippy::box_collection,
+    reason = "The boxed error representation keeps the owning error structure small."
+)]
 fn deserialize_failure_message<'de, D>(
     deserializer: D,
 ) -> std::result::Result<Box<String>, D::Error>
@@ -1718,7 +1721,10 @@ where
 // `Result<_, Error>` passes `clippy::result_large_err`; the extra
 // allocation only happens on the error path. See
 // `error_stays_small_enough_for_result_err`.
-#[allow(clippy::box_collection)]
+#[allow(
+    clippy::box_collection,
+    reason = "The boxed error representation keeps the owning error structure small."
+)]
 pub struct Error {
     pub code: String,
     #[serde(deserialize_with = "deserialize_failure_message")]

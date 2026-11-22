@@ -177,7 +177,7 @@ impl Router {
     }
 }
 
-fn append_block(text: &str, block: &str) -> String {
+pub(super) fn append_block(text: &str, block: &str) -> String {
     if text.trim().is_empty() {
         block.to_owned()
     } else {

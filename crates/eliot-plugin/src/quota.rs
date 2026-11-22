@@ -134,7 +134,10 @@ pub fn result(windows: Vec<Value>, source: &'static str) -> Result<Value> {
 }
 
 #[cfg(windows)]
-#[allow(unsafe_code)]
+#[allow(
+    unsafe_code,
+    reason = "Windows Credential Manager access requires this narrow FFI call."
+)]
 pub fn antigravity_credential() -> Result<Value> {
     use windows_sys::Win32::Security::Credentials::{
         CRED_TYPE_GENERIC, CREDENTIALW, CredFree, CredReadW,

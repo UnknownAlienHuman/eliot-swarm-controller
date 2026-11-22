@@ -7,7 +7,7 @@ use crate::{
     fs_invalidation::WorkspaceInvalidation,
     git_monitor::{GitProbe, WorktreeCapture, normalize_hint, worktree_capture_from_snapshot},
     platform::CustodyObserver,
-    plugin_host::SecretSet,
+    router::SecretSet,
 };
 use eliot_core::{
     Agent, Error, FileChangeHint, GitBaseline, GitHintPage, GitSnapshot, ProcessIdentity,

@@ -24,7 +24,10 @@ use std::{
     sync::{Arc, RwLock, atomic::AtomicBool},
 };
 
-#[allow(deprecated)] // SEP-2577: logging is deprecated but functional in rmcp 3.9.
+#[allow(
+    deprecated,
+    reason = "The required rmcp 3.9 logging surface remains functional under SEP-2577."
+)] // SEP-2577: logging is deprecated but functional in rmcp 3.9.
 use rmcp::model::LoggingLevel;
 
 use axum::{
@@ -102,7 +105,10 @@ pub async fn run_http(
         .with_allowed_origins(allowed_origins)
         .with_cancellation_token(cancel.clone());
     let factory_shutdown = cancel.clone();
-    #[allow(deprecated)] // SEP-2577: LoggingLevel default is deprecated but functional in rmcp 3.9.
+    #[allow(
+        deprecated,
+        reason = "The required rmcp 3.9 logging surface remains functional under SEP-2577."
+    )] // SEP-2577: LoggingLevel default is deprecated but functional in rmcp 3.9.
     let service = StreamableHttpService::new(
         move || {
             Ok(EliotMcpHandler {

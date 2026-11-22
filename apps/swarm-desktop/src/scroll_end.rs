@@ -16,7 +16,10 @@
 //! `IUIAutomationScrollPattern` 4 `SetScrollPercent`, 6
 //! `get_CurrentVerticalScrollPercent`). Call it off the UI thread: UI
 //! Automation reaches WinUI's peers on the UI thread, which keeps pumping.
-#![allow(unsafe_code)]
+#![allow(
+    unsafe_code,
+    reason = "The text control integration requires the Windows UI API."
+)]
 
 use std::ffi::c_void;
 

@@ -28,9 +28,13 @@ use std::{
     process::Stdio,
     time::Duration,
 };
+#[expect(
+    clippy::disallowed_types,
+    reason = "The Git action owner builds child commands for admitted fetch and publish effects."
+)]
+use tokio::process::Command;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
-    process::Command,
     sync::watch,
     time::{Instant, timeout_at},
 };
@@ -1005,7 +1009,7 @@ pub(crate) fn cleanup_after_settlement(data_root: &Path, view: &Path) {
     {
         return;
     }
-    let _ = fs::remove_dir_all(view);
+    let _ = crate::router::remove_dir_all(view);
 }
 
 /// The fetch only writes its private ref, so an unchanged tracking ref proves
@@ -2015,6 +2019,10 @@ async fn run_repository_command(
     run_owned_git(process, checkout, args, input, deadline, Some(cancellation)).await
 }
 
+#[expect(
+    clippy::disallowed_types,
+    reason = "This runner constructs the Git child for an admitted action."
+)]
 async fn run_owned_git(
     context: &GitProcessContext,
     cwd: &Path,
@@ -2050,6 +2058,10 @@ async fn run_owned_git(
             interrupted: true,
         });
     }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "This statement constructs a process owned by this module."
+    )]
     let mut command = Command::new(&toolchain.program);
     command
         .current_dir(cwd)

@@ -3,8 +3,9 @@
 use super::*;
 use eliot_core::SecretPolicy;
 use eliot_core::api::{
-    SettingsClientSource, SettingsHistoryStatus, SettingsReadIssue, SettingsReadResponse,
-    SettingsSaveRequest, SettingsSaveResponse, SettingsSection,
+    OWNER_RULES_WARNING_BYTES, SettingsClientSource, SettingsHistoryStatus, SettingsReadIssue,
+    SettingsReadResponse, SettingsReadWarning, SettingsSaveRequest, SettingsSaveResponse,
+    SettingsSection,
 };
 use eliot_store::Store;
 use serde_json::{Map as JsonMap, Value as JsonValue};
@@ -48,6 +49,7 @@ fn section_name(section: SettingsSection) -> &'static str {
         SettingsSection::Desktop => "desktop",
         SettingsSection::Accounts => "accounts",
         SettingsSection::Proxies => "proxies",
+        SettingsSection::OwnerRules => "owner_rules",
     }
 }
 
@@ -390,6 +392,7 @@ pub(crate) struct SettingsSnapshot {
     sections: Vec<SettingsSection>,
     values: BTreeMap<SettingsSection, JsonValue>,
     issues: Vec<SettingsReadIssue>,
+    warnings: Vec<SettingsReadWarning>,
 }
 
 impl SettingsSnapshot {
@@ -401,6 +404,7 @@ impl SettingsSnapshot {
             restart_required: restart_required(self.sections),
             sections: self.values,
             issues: self.issues,
+            warnings: self.warnings,
             history: store.list_settings_history(HISTORY_LIMIT)?,
         })
     }
@@ -631,11 +635,28 @@ pub(crate) fn read_snapshot(
             || (validation_dependencies(section) == [name]
                 && validate_candidate(&source_section).is_err());
     }
+    let warnings = values
+        .get(&SettingsSection::OwnerRules)
+        .and_then(|value| value.get("text"))
+        .and_then(JsonValue::as_str)
+        .map(|text| text.len())
+        .filter(|bytes| *bytes > OWNER_RULES_WARNING_BYTES)
+        .map(|bytes| {
+            vec![SettingsReadWarning {
+                section: SettingsSection::OwnerRules,
+                code: "owner_rules_over_budget".to_owned(),
+                message: format!(
+                    "owner rules use {bytes} UTF-8 bytes; the recommended shared budget is {OWNER_RULES_WARNING_BYTES} bytes"
+                ),
+            }]
+        })
+        .unwrap_or_default();
     Ok(SettingsSnapshot {
         revision,
         sections,
         values,
         issues,
+        warnings,
     })
 }
 
@@ -951,6 +972,62 @@ pub(crate) fn current_revision(data_root: &Path) -> core::Result<Option<String>>
         .map(profiles_edit::revision_of))
 }
 
+/// Read the current owner rules and the exact unified-settings revision they came from.
+pub(crate) fn owner_rules_snapshot(data_root: &Path) -> core::Result<Option<(String, String)>> {
+    let Some(source) = read_config_source(data_root)? else {
+        return Ok(None);
+    };
+    let revision = profiles_edit::revision_of(&source);
+    let config = super::parse_config(&source)?;
+    let text = config.owner_rules.text;
+    if text.trim().is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some((revision, text)))
+    }
+}
+
+pub(crate) fn validate_owner_rules_text(text: &str, policy: &SecretPolicy) -> core::Result<()> {
+    static CREDENTIAL_PATTERN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(concat!(
+                r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----",
+                r"|\b(?:sk-|gh[pousr]_|github_pat_|xox[baprs]-)[A-Za-z0-9_-]{16,}",
+                r"|\b(?:AKIA|ASIA)[A-Z0-9]{16}\b",
+                r#"|(?i:\b(?:authorization["']?\s*:\s*["']?bearer\s+|(?:[A-Z0-9]+_)*(?:api_key|access_key|token|password|secret)["']?\s*[:=]\s*["']?)[A-Za-z0-9_./+=-]{16,})"#,
+            ))
+            .expect("owner rules credential pattern is valid")
+    });
+    if policy.contains_text(text)
+        || policy.redact_text(text) != text
+        || text.contains(eliot_core::api::REDACTION_MARKER)
+        || CREDENTIAL_PATTERN.is_match(text)
+    {
+        return Err(core::Error::new(
+            "not_allowed",
+            "owner_rules.text contains secret-like content. Keep credentials out of owner rules.",
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve a retained digest from the sole settings source without retaining another copy.
+pub(crate) fn owner_rules_for_delivery(
+    data_root: &Path,
+    digest: &str,
+    policy: &SecretPolicy,
+) -> core::Result<String> {
+    if let Some((_, text)) = owner_rules_snapshot(data_root)?
+        && eliot_core::api::inference::sha256_hex(text.as_bytes()) == digest
+    {
+        validate_owner_rules_text(&text, policy)?;
+        return Ok(text);
+    }
+    Err(core::Error::new(
+        "owner_rules_unavailable",
+        "the retained owner rules digest no longer matches the settings source",
+    ))
+}
+
 /// Shared file publication and history path. Caller holds `SETTINGS_SAVE_LOCK`.
 pub(super) fn commit_candidate_locked(
     data_root: &Path,
@@ -1027,6 +1104,11 @@ fn replacements(
 ) -> core::Result<BTreeMap<String, String>> {
     let mut result = BTreeMap::new();
     for (section, value) in sections {
+        if *section == SettingsSection::OwnerRules
+            && let Some(text) = value.get("text").and_then(JsonValue::as_str)
+        {
+            validate_owner_rules_text(text, policy)?;
+        }
         if policy.contains_value(value) {
             return Err(core::Error::new(
                 "not_allowed",
@@ -1164,6 +1246,7 @@ fn validation_dependencies(section: SettingsSection) -> &'static [&'static str] 
         SettingsSection::Mail => &["mail"],
         SettingsSection::CloudMcp => &["cloud_mcp"],
         SettingsSection::Desktop => &["desktop"],
+        SettingsSection::OwnerRules => &["owner_rules"],
         SettingsSection::Proxies => &[
             "proxies",
             "profiles",
@@ -1198,6 +1281,9 @@ fn validate_candidate_for_sections(
 fn is_default_section(section: SettingsSection, value: &JsonValue) -> bool {
     match section {
         SettingsSection::Routing => value == &serde_json::json!({"default": []}),
+        SettingsSection::OwnerRules => {
+            value == &serde_json::json!({}) || value == &serde_json::json!({"text": ""})
+        }
         SettingsSection::Desktop => {
             value == &desktop_default()
                 || value == &serde_json::json!({"theme": "system", "window": null})

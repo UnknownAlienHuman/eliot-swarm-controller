@@ -648,7 +648,10 @@ fn require_filter_text(value: &str) -> Result<()> {
 /// archived exclusion into two indexed branches), the recent path keeps one
 /// predicate with the same custody set, so the first screen always carries
 /// the newest Agents.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The operation's distinct inputs remain explicit at its established call boundary."
+)]
 fn agent_list_select_recent(
     filter: &AgentListFilter,
     caller: Option<&Agent>,

@@ -65,7 +65,7 @@ impl Drop for VarWorkerGuard {
 
 pub(super) fn decode_coordination_request<T>(
     params: &Value,
-    secrets: &crate::plugin_host::SecretSet,
+    secrets: &crate::router::plugin_host::SecretSet,
     method: &str,
     validate: fn(&T) -> Result<()>,
 ) -> Result<T>

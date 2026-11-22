@@ -299,6 +299,10 @@ async fn check_health(path: &Path, pid: u32) -> Result<(), Failure> {
         if Instant::now() >= deadline {
             return Ok(());
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "The update command polls its authenticated restart status within a deadline"
+        )]
         sleep(Duration::from_millis(250)).await;
     }
 }
@@ -342,6 +346,10 @@ async fn reconcile_preparation(
             Preparation::Unconfirmed if Instant::now() < deadline => {}
             state => return state,
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "The update command polls its existing restart preparation until settlement"
+        )]
         sleep(Duration::from_millis(250)).await;
     }
 }
@@ -369,6 +377,10 @@ async fn quiesce(
             }
             Err(error) => return Err(error),
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "The update command waits for the replacement daemon's readiness"
+        )]
         sleep(Duration::from_millis(200)).await;
     }
 }
@@ -475,6 +487,14 @@ struct ReleaseInfo {
 }
 
 async fn release_info(binary: &Path) -> Result<ReleaseInfo, Failure> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "This statement constructs a process owned by this module."
+    )]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "This helper invokes the selected binary to read release metadata."
+    )]
     let mut command = tokio::process::Command::new(binary);
     command
         .arg("--operator-release-info")

@@ -41,8 +41,12 @@ use std::{
     },
     time::Duration,
 };
+#[expect(
+    clippy::disallowed_types,
+    reason = "The plugin host launches native adapter workers under owned process custody."
+)]
+use tokio::process::Command as ProcessCommand;
 use tokio::{
-    process::Command as ProcessCommand,
     sync::{Mutex as AsyncMutex, Semaphore, mpsc, oneshot, watch},
     time::{Instant, timeout_at},
 };
@@ -387,6 +391,7 @@ struct AgentActorConfig {
     key: AgentKey,
     agent: Agent,
     start_command: Command,
+    owner_rules: Option<String>,
     instance_dir: String,
     store_root: PathBuf,
     plugin_credential: String,
@@ -468,7 +473,10 @@ fn resume_source_generation(command: &Command) -> Result<i64> {
 }
 
 impl PluginHost {
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "The operation's distinct inputs remain explicit at its established call boundary."
+    )]
     pub(crate) fn new(
         options: PluginHostOptions,
         store: StoreHandle,
@@ -653,17 +661,33 @@ impl PluginHost {
 
         // Validate the committed credential and frozen environment before
         // creating anything on disk; both are pure reads of admitted state.
-        let agent_token = {
+        let (agent_token, owner_rules_receipt) = {
             let store = self.state.store.lock().await;
-            store
+            let token = store
                 .get_agent_token(&agent.id, agent.generation)?
                 .ok_or_else(|| {
                     Error::new(
                         "bad_state",
                         "Store did not commit the generation credential before plugin start",
                     )
-                })?
+                })?;
+            let receipt = if matches!(agent.harness.as_str(), "codex" | "claude" | "opencode") {
+                store.get_agent_owner_rules_delivery(&agent.id)?
+            } else {
+                None
+            };
+            (token, receipt)
         };
+        let owner_rules = owner_rules_receipt
+            .map(|receipt| {
+                let policy = SecretPolicy::new(self.state.secrets.lock_recover().iter());
+                crate::config::settings::owner_rules_for_delivery(
+                    &self.state.data_root,
+                    &receipt.digest,
+                    &policy,
+                )
+            })
+            .transpose()?;
         let (mut target_environment, mcp_environment) =
             build_target_environment(&self.state.data_root, &agent, &agent_token)?;
         let mcp_environment = if agent.is_automatic_provider_probe() || agent.harness == "muse" {
@@ -911,6 +935,7 @@ impl PluginHost {
             key: actor_key,
             agent: agent.clone(),
             start_command: command.clone(),
+            owner_rules,
             instance_dir: instance_dir.to_string_lossy().into_owned(),
             store_root: self.state.data_root.join("plugins"),
             plugin_credential: credential.clone(),
@@ -1669,10 +1694,18 @@ impl PluginHost {
         }
     }
 
+    #[expect(
+        clippy::disallowed_types,
+        reason = "This builds the configured process command for one harness plugin."
+    )]
     fn plugin_command(&self, harness: &str, workspace: &Path) -> Result<ProcessCommand> {
         let executable = std::env::current_exe().map_err(|error| {
             Error::new("platform_io", format!("locate Eliot executable: {error}"))
         })?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "This statement constructs a process owned by this module."
+        )]
         let mut command = ProcessCommand::new(executable);
         command
             .arg("--data-dir")
@@ -1834,6 +1867,10 @@ impl PluginHost {
                     Some(guard),
                 ));
             }
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "This bounded wait is owned by the surrounding operation."
+            )]
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }

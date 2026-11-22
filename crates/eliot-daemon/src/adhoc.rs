@@ -1599,12 +1599,24 @@ fn default_muse_launcher_dir() -> std::path::PathBuf {
     Path::new("C:/Tools/MuseCode").to_path_buf()
 }
 
+#[expect(
+    clippy::disallowed_types,
+    reason = "This probe launches Muse's native model-catalogue server for bounded readback."
+)]
 pub(crate) async fn probe_muse_catalogue_nonempty(cmd: &str) -> bool {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "This statement constructs a process owned by this module."
+    )]
     let mut command = tokio::process::Command::new(cmd);
     command.arg("serve");
     probe_muse_command(command, MUSE_PROBE_TIMEOUT).await
 }
 
+#[expect(
+    clippy::disallowed_types,
+    reason = "This helper owns the command used to inspect Muse's native catalogue."
+)]
 async fn probe_muse_command(
     mut command: tokio::process::Command,
     budget: std::time::Duration,
@@ -2172,6 +2184,10 @@ fn native_read(program: &str, args: &[&str], deadline: Instant) -> Option<Vec<u8
         .map(|capture| capture.stdout)
 }
 
+#[expect(
+    clippy::disallowed_types,
+    reason = "This discovery helper captures one native command through bounded custody."
+)]
 fn native_capture(
     program: &str,
     args: &[&str],
@@ -2195,11 +2211,15 @@ fn native_capture(
                     })?;
                 runtime.block_on(async {
                     let budget = discovery_remaining(deadline)?;
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "This statement constructs a process owned by this module."
+                    )]
                     let mut command = tokio::process::Command::new(program);
                     command
                         .args(args)
                         .env_clear()
-                        .envs(crate::plugin_host::minimal_plugin_environment());
+                        .envs(crate::router::minimal_plugin_environment());
                     let (_cancel, cancellation) = tokio::sync::watch::channel(false);
                     match run_owned_process(
                         command,

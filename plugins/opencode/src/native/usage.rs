@@ -40,7 +40,12 @@ use std::{ffi::OsStr, time::Duration};
 use eliot_core::{Error, Result};
 use eliot_plugin::native_cli::{BoundedReadLabels, run_bounded_utf8};
 use serde_json::{Value, json};
-use tokio::{process::Command, time::Instant};
+#[expect(
+    clippy::disallowed_types,
+    reason = "OpenCode usage readback launches its native query through the adapter owner."
+)]
+use tokio::process::Command;
+use tokio::time::Instant;
 
 /// Exact argv for the native usage-limits read: `api
 /// experimental.usage.limits --standalone`. Read-only (no session, no turn,
@@ -97,6 +102,14 @@ pub(crate) async fn run_usage_limits(
     environment: Option<&serde_json::Map<String, Value>>,
     deadline: Instant,
 ) -> Result<Option<UsageInfo>> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "This statement constructs a process owned by this module."
+    )]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "This command reads the selected OpenCode usage catalogue."
+    )]
     let mut command = Command::new(program);
     command.args(usage_limits_argv());
     if let Some(environment) = environment {

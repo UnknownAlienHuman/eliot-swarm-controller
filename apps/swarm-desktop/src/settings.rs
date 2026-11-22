@@ -489,7 +489,10 @@ fn config_has_desktop_section(source: &str) -> eliot_core::Result<bool> {
     Ok(value.get("desktop").is_some())
 }
 
-#[allow(unsafe_code)]
+#[allow(
+    unsafe_code,
+    reason = "The legacy Windows settings path requires this narrow native API call."
+)]
 fn legacy_path() -> Option<PathBuf> {
     #[cfg(windows)]
     {

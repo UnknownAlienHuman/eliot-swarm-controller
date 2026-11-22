@@ -28,6 +28,10 @@ impl IntegrationLease {
         }
     }
 
+    #[expect(
+        clippy::disallowed_types,
+        reason = "Integration custody receives a configured command from the owned process runner"
+    )]
     pub(crate) async fn spawn(
         &self,
         command: tokio::process::Command,
@@ -265,12 +269,12 @@ pub(crate) async fn reconcile(
         verify_registration_link(&scratch)?;
     }
     if directory_present(&scratch.root)? {
-        fs::remove_dir_all(&scratch.root).map_err(|_| {
+        crate::router::remove_dir_all(&scratch.root).map_err(|_| {
             unavailable("integration checkout or private index removal is incomplete")
         })?;
     }
     if registered {
-        fs::remove_dir_all(&scratch.registration)
+        crate::router::remove_dir_all(&scratch.registration)
             .map_err(|_| unavailable("integration worktree registration removal is incomplete"))?;
     }
     if worktree_registered(&git, Path::new(&checkout), &scratch.worktree).await? {

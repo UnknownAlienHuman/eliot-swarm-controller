@@ -220,7 +220,13 @@ fn settings_issue_visible(page: Page, section: Option<Section>) -> bool {
         Some(Section::Automation) => page == Page::Automations,
         Some(Section::CloudMcp) => page == Page::CloudMcp,
         Some(Section::Desktop) => matches!(page, Page::General | Page::Access),
-        Some(Section::Daemon | Section::Mail | Section::Accounts | Section::Proxies) => false,
+        Some(
+            Section::Daemon
+            | Section::Mail
+            | Section::Accounts
+            | Section::Proxies
+            | Section::OwnerRules,
+        ) => false,
         None => page.has_config(),
     }
 }

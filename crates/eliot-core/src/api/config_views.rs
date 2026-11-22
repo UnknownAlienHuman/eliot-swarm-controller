@@ -128,6 +128,10 @@ pub struct ProfileListResponse {
     pub profiles: Vec<ProfileSummary>,
 }
 
+pub const MAX_OWNER_RULES_BYTES: usize = 64 * 1024;
+pub const OWNER_RULES_WARNING_BYTES: usize = 8 * 1024;
+pub const PROJECT_RULES_WARNING_BYTES: u64 = 4 * 1024;
+
 /// A complete, allowlisted section of the unified settings document.
 #[derive(
     schemars::JsonSchema,
@@ -154,10 +158,11 @@ pub enum SettingsSection {
     Desktop,
     Accounts,
     Proxies,
+    OwnerRules,
 }
 
 impl SettingsSection {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Profiles,
         Self::Routing,
         Self::Projects,
@@ -168,6 +173,7 @@ impl SettingsSection {
         Self::Desktop,
         Self::Accounts,
         Self::Proxies,
+        Self::OwnerRules,
     ];
 }
 
@@ -232,6 +238,7 @@ impl SettingsReadRequest {
         validate_revision(&reply.revision)?;
         if reply.history.len() > 100
             || reply.issues.len() > 16
+            || reply.warnings.len() > 16
             || reply.sections.values().any(|value| !value.is_object())
             || reply
                 .restart_required
@@ -254,6 +261,14 @@ impl SettingsReadRequest {
             .sections
             .keys()
             .any(|section| !requested.contains(section))
+            || reply.warnings.iter().any(|warning| {
+                !requested.contains(&warning.section)
+                    || warning.code.is_empty()
+                    || warning.code.len() > 128
+                    || warning.message.is_empty()
+                    || warning.message.len() > 4096
+                    || warning.message.contains('\0')
+            })
             || reply.issues.iter().any(|issue| {
                 issue
                     .section
@@ -337,8 +352,19 @@ pub struct SettingsReadResponse {
     pub sections: std::collections::BTreeMap<SettingsSection, serde_json::Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub issues: Vec<SettingsReadIssue>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<SettingsReadWarning>,
     pub restart_required: Vec<SettingsSection>,
     pub history: Vec<SettingsHistoryEntry>,
+}
+
+/// Non-blocking settings guidance. Messages contain metadata only, never setting text.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SettingsReadWarning {
+    pub section: SettingsSection,
+    pub code: String,
+    pub message: String,
 }
 
 /// Request for `settings.save`. Each supplied section is a complete replacement.

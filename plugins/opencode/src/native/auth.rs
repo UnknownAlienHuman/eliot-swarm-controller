@@ -43,9 +43,13 @@ use eliot_core::{Error, Result};
 use eliot_plugin::native_cli::{BoundedReadError, BoundedReadLabels, run_bounded};
 use eliot_plugin::native_lifecycle::kill_and_reap;
 use serde::Deserialize;
+#[expect(
+    clippy::disallowed_types,
+    reason = "OpenCode auth transfer builds native CLI children with exact profile bindings."
+)]
+use tokio::process::Command;
 use tokio::{
     io::AsyncWriteExt,
-    process::Command,
     time::{Instant, timeout_at},
 };
 
@@ -287,7 +291,15 @@ fn gate(entries: &[ListEntry], selector: &str) -> Gate {
 /// owner config, plugins, and MCP servers never load during the transfer.
 /// The data home stays canonical, so the child resolves exactly the owner's
 /// credential store.
+#[expect(
+    clippy::disallowed_types,
+    reason = "This builder preserves the canonical OpenCode credential-store binding."
+)]
 fn canonical_command(transfer: &AuthTransfer<'_>) -> Command {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "This statement constructs a process owned by this module."
+    )]
     let mut command = Command::new(transfer.program);
     command
         .current_dir(transfer.workspace)
@@ -310,7 +322,15 @@ fn canonical_env(transfer: &AuthTransfer<'_>) -> Vec<(OsString, OsString)> {
 
 /// Base command for isolated-store children: inherit, plus the target
 /// environment, plus the exact isolated roots the server will receive.
+#[expect(
+    clippy::disallowed_types,
+    reason = "This builder directs an OpenCode auth child to its isolated credential store."
+)]
 fn isolated_command(transfer: &AuthTransfer<'_>) -> Command {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "This statement constructs a process owned by this module."
+    )]
     let mut command = Command::new(transfer.program);
     command
         .current_dir(transfer.workspace)
@@ -323,6 +343,10 @@ fn isolated_command(transfer: &AuthTransfer<'_>) -> Command {
 
 /// Run one list child and parse its metadata, bounded. Stderr is discarded
 /// like every other helper's; failures are static strings only.
+#[expect(
+    clippy::disallowed_types,
+    reason = "This helper consumes the bounded OpenCode auth-list child command."
+)]
 async fn run_list(command: Command, deadline: Instant) -> Result<Vec<ListEntry>> {
     let buffer = run_bounded(
         command,
@@ -534,6 +558,14 @@ pub(crate) async fn quota_credential_for(
         .ok_or_else(|| {
             eliot_plugin::quota::environment("OpenCode native executable is unavailable")
         })?;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "This statement constructs a process owned by this module."
+    )]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "This command reads the OpenCode executable selected by the profile."
+    )]
     let mut command = Command::new(cmd);
     if let Some(environment) = environment.and_then(serde_json::Value::as_object) {
         for (key, value) in environment {

@@ -787,6 +787,54 @@ pub struct InstructionFileView {
     pub delivery_redacted: bool,
 }
 
+/// Metadata-only evidence for shared owner rules, whose text is held in settings.
+#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnerRulesDeliveryMethod {
+    CodexDeveloperInstructions,
+    ClaudeAppendSystemPromptFile,
+    OpenCodeAgentsFile,
+    FirstInput,
+}
+
+#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnerRulesDeliveryStatus {
+    Pending,
+    Offered,
+    Delivered,
+    Unknown,
+    NotDelivered,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnerRulesDeliveryView {
+    /// Revision of the settings document from which this frozen text was read.
+    pub revision: String,
+    pub digest: String,
+    pub method: OwnerRulesDeliveryMethod,
+    pub status: OwnerRulesDeliveryStatus,
+    pub delivered: bool,
+}
+
+impl OwnerRulesDeliveryView {
+    pub fn validate(&self) -> Result<()> {
+        let sha256 =
+            |value: &str| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+        if !sha256(&self.revision)
+            || !sha256(&self.digest)
+            || self.delivered != (self.status == OwnerRulesDeliveryStatus::Delivered)
+        {
+            return Err(Error::new(
+                "invalid",
+                "owner rules delivery view is malformed",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl InstructionDeliveryView {
     pub fn validate(&self) -> Result<()> {
         if !INSTRUCTION_FILE_PATHS.contains(&self.primary_path.as_str())
@@ -877,6 +925,13 @@ pub struct AgentGetResponse {
         deserialize_with = "optional_object"
     )]
     pub instruction_delivery: Option<InstructionDeliveryView>,
+    /// Metadata-only owner rules evidence; absent on legacy Agents.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "optional_object"
+    )]
+    pub owner_rules_delivery: Option<OwnerRulesDeliveryView>,
 }
 
 /// Retained model/effort overlay readback for one Agent generation. The

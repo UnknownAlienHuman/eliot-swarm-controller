@@ -15,6 +15,10 @@ use std::{
     process::Stdio,
     time::{Duration, Instant},
 };
+#[expect(
+    clippy::disallowed_types,
+    reason = "Script freezing returns a verified child command to the process owner."
+)]
 use tokio::process::Command;
 
 #[derive(Clone, Copy)]
@@ -147,6 +151,10 @@ fn freeze_run_in_scope(
 }
 
 /// Verify the current owner grant and frozen file receipts, then build an explicit child command.
+#[expect(
+    clippy::disallowed_types,
+    reason = "This verifier builds the command from a frozen project script grant."
+)]
 pub(crate) fn verify_project_run(
     frozen: &FrozenScriptRun,
     registration: &ProjectRegistrationView,
@@ -163,6 +171,10 @@ pub(crate) fn verify_project_run(
 }
 
 /// Verify the current owner grant and frozen file receipts for one global run.
+#[expect(
+    clippy::disallowed_types,
+    reason = "This verifier builds the command from a frozen owner script grant."
+)]
 pub(crate) fn verify_global_run(
     frozen: &FrozenScriptRun,
     grant: &crate::config::RunGrantConfig,
@@ -174,6 +186,10 @@ pub(crate) fn verify_global_run(
     verify_run_in_scope(frozen, RunScope::owner(grant, &scripts_root), policy)
 }
 
+#[expect(
+    clippy::disallowed_types,
+    reason = "This helper builds the command after validating frozen script paths and scope."
+)]
 fn verify_run_in_scope(
     frozen: &FrozenScriptRun,
     scope: RunScope<'_>,

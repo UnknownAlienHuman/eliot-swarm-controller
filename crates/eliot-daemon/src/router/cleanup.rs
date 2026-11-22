@@ -19,6 +19,14 @@ const CLEANUP_BACKFILL_LIMIT: usize = 1_024;
 const CLEANUP_BACKFILL_BUDGET: Duration = Duration::from_secs(8);
 const CLEANUP_PLAN_MAX_PREFLIGHT: Duration = Duration::from_secs(15);
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "Recursive directory removal is centralized in daemon cleanup."
+)]
+pub(crate) fn remove_dir_all(path: &Path) -> std::io::Result<()> {
+    std::fs::remove_dir_all(path)
+}
+
 #[derive(Default)]
 pub(super) struct AutomaticCleanupState {
     kept_reasons: HashMap<String, String>,

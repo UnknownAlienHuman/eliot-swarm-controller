@@ -3,7 +3,10 @@ use super::*;
 impl DesktopApp {
     /// Submit one draft action on a worker. `fallback` marks the send that
     /// follows a steer refused because the turn just ended.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "The operation's distinct inputs remain explicit at its established call boundary."
+    )]
     pub(super) fn spawn_draft(
         &self,
         action: DraftAction,

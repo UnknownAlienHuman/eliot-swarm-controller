@@ -939,7 +939,10 @@ impl PluginHost {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "The operation's distinct inputs remain explicit at its established call boundary."
+    )]
     async fn read_subject_page(
         &self,
         profile: Value,

@@ -26,6 +26,7 @@ mod loss_recovery;
 mod organization;
 mod overview;
 pub(crate) mod owner_inbox;
+mod owner_rules_doctor;
 mod patch_digest;
 mod project_assignment;
 mod project_broadcast;
@@ -44,6 +45,12 @@ mod task_card;
 mod tool_incident;
 mod wake;
 
+#[path = "plugin_host/mod.rs"]
+pub(in crate::router) mod plugin_host;
+
+pub(crate) use cleanup::remove_dir_all;
+pub(crate) use plugin_host::{SecretSet, build_process_environment, minimal_plugin_environment};
+
 pub(crate) use attention::run_attention;
 use auth::{authorize_command, authorize_rpc_method};
 pub(crate) use context_notes::run_context_notes;
@@ -55,13 +62,13 @@ pub(crate) use project_checks::run_project_checks;
 pub(crate) use tool_incident::run_tool_failure_attention;
 pub(crate) use wake::run_agent_wakes;
 
+use self::plugin_host::{AgentCredentials, PluginHost, PluginHostOptions, UnknownCommands};
 use crate::{
     automation::RuleDefinition,
     bus::Bus,
     common::{now_ms, valid_environment_name},
     config::OnRestart,
     monitor::{Monitoring, ObserveThresholds},
-    plugin_host::{AgentCredentials, PluginHost, PluginHostOptions, SecretSet, UnknownCommands},
     scripts::auth::{RunCredentialGuard, RunCredentialRegistry, SavedRunPrincipal},
     workspaces::WorkspaceManager,
 };
@@ -4760,6 +4767,15 @@ impl Router {
         }
         let (profile_first_calls, profile_first_calls_truncated) = store.profile_first_calls()?;
         drop(store);
+        let data_root = self.inner.data_root.clone();
+        let (owner_rules_drift, owner_rules_check_unavailable) = match tokio::task::spawn_blocking(
+            move || owner_rules_doctor::check(&data_root),
+        )
+        .await
+        {
+            Ok(Ok(files)) => (files, false),
+            _ => (Vec::new(), true),
+        };
         let response = HarnessDoctorResponse {
             harnesses,
             claude_profile_command_issues,
@@ -4767,6 +4783,8 @@ impl Router {
             profile_first_calls_truncated,
             goal_check_deadlines: self.goal_check_deadlines().await?,
             attention_thresholds: Some(self.attention_thresholds().await?),
+            owner_rules_drift,
+            owner_rules_check_unavailable,
         };
         request
             .validate_response(&response)
@@ -4965,6 +4983,7 @@ impl Router {
             provider_hold,
             native_notice,
             instruction_delivery,
+            owner_rules_delivery,
         ) = {
             let store = self.inner.store.lock().await;
             hierarchy::authorize_agent_read(&store, principal, id, None)?;
@@ -4973,6 +4992,7 @@ impl Router {
                 .ok_or_else(|| Error::new("not_found", format!("Agent {id} was not found")))?;
             let (provider_hold, native_notice) = store.agent_status_projection(&agent)?;
             let instruction_delivery = store.get_agent_instruction_delivery(id)?;
+            let owner_rules_delivery = store.get_agent_owner_rules_delivery(id)?;
             let mut source_states = store.list_source_states(id, agent.generation)?;
             if let Some(workspace) = store.get_workspace(id)?
                 && workspace.target_generation != agent.generation
@@ -4988,6 +5008,7 @@ impl Router {
                 provider_hold,
                 native_notice,
                 instruction_delivery,
+                owner_rules_delivery,
             )
         };
         let live_presence = if agent.observe_only {
@@ -5066,6 +5087,7 @@ impl Router {
             provider_hold,
             native_notice,
             instruction_delivery,
+            owner_rules_delivery,
         };
         display_agent_get_response(&mut response);
         serde_json::to_value(response)
@@ -6556,6 +6578,10 @@ impl Router {
                     self.inner.mode.store(MODE_QUIESCE, Ordering::SeqCst);
                     let router = self.clone();
                     tokio::spawn(async move {
+                        #[expect(
+                            clippy::disallowed_methods,
+                            reason = "This bounded wait is owned by the surrounding operation."
+                        )]
                         tokio::time::sleep(RESTART_LEASE).await;
                         let _store = router.inner.store.lock().await;
                         let mut lease = router.inner.restart_lease.lock_recover();
@@ -6627,6 +6653,10 @@ impl Router {
         crate::automation::verify_project_registration(&self.inner.data_root, registration).await
     }
 
+    #[expect(
+        clippy::disallowed_types,
+        reason = "This Router method verifies and returns the frozen owner script command."
+    )]
     pub(crate) async fn verify_global_run(
         &self,
         frozen: &FrozenScriptRun,
@@ -6844,7 +6874,7 @@ impl Router {
             store.get_agent_token(agent, generation)
         };
         if matches!(token, Ok(None)) {
-            crate::plugin_host::forget_revoked_agent_token(
+            plugin_host::forget_revoked_agent_token(
                 &self.inner.agent_credentials,
                 &self.inner.secrets,
                 &(agent.to_owned(), generation),

@@ -1165,6 +1165,10 @@ pub(crate) async fn run_global_rules(
     result
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "The rule worker owns this bounded arbitration wait."
+)]
 async fn run_global_rules_inner(
     router: Router,
     start: RuleWorkerStart,

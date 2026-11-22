@@ -1,5 +1,6 @@
 //! Narrow Memory authority and call-owned artifact lifecycle. Vendor protocol is
 //! in the Claude plugin; this module owns Store-before-effect and publication.
+
 use super::{MODE_OPEN, Principal, Router, contains_known_secret_including_keys, require_owner};
 use crate::{
     common::{now_ms, secure_eq},
@@ -20,6 +21,10 @@ use std::{
     sync::atomic::Ordering,
     time::Duration,
 };
+#[expect(
+    clippy::disallowed_types,
+    reason = "The Memory inference path owns the Claude child after durable admission."
+)]
 use tokio::process::Command;
 
 #[derive(Serialize, Deserialize)]
@@ -475,6 +480,10 @@ impl Router {
         self.signal_progress();
     }
 
+    #[expect(
+        clippy::disallowed_types,
+        reason = "This effect runner starts the admitted Claude inference command."
+    )]
     async fn run_inference_inner(
         &self,
         client: &str,
@@ -512,6 +521,10 @@ impl Router {
         }
         let cwd = self.inner.data_root.join("inference-work");
         ensure_private_root(&cwd)?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "This statement constructs a process owned by this module."
+        )]
         let mut command = Command::new(route.claude_executable);
         command
             .args(eliot_plugin_claude::inference::arguments())

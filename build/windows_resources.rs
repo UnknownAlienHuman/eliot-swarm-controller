@@ -1,6 +1,10 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[expect(
+    clippy::disallowed_types,
+    reason = "Windows resource embedding imports the command type for the SDK resource compiler"
+)]
 use std::process::Command;
 
 pub fn embed(binary: &str, description: &str) {
@@ -72,6 +76,14 @@ END
         binary = rc_string(binary),
     );
     fs::write(out_dir.join("eliot-swarm.rc"), script).expect("Write the Windows resource script");
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "Compile the binary's Windows resources in Cargo's output directory"
+    )]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "This statement runs the Windows SDK resource compiler"
+    )]
     let status = Command::new(&rc)
         .current_dir(&out_dir)
         .args(["/nologo", "/fo", "eliot-swarm.res", "eliot-swarm.rc"])

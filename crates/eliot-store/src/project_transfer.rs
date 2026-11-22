@@ -483,7 +483,10 @@ fn replacement_occupies_workspace(conn: &Connection, id: Option<&str>) -> Result
     Ok(Some(launch))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The operation's distinct inputs remain explicit at its established call boundary."
+)]
 fn stage_launch(
     tx: &Transaction<'_>,
     limits: HierarchyLimits,
@@ -640,7 +643,10 @@ fn stage_launch(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The operation's distinct inputs remain explicit at its established call boundary."
+)]
 fn commit_transfer(
     tx: &Transaction<'_>,
     from: &Agent,

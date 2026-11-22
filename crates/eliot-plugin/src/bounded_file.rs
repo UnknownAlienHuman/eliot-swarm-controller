@@ -35,7 +35,10 @@ pub(crate) fn read_regular_file(
     }
     let file = options.open(path)?;
     #[cfg(windows)]
-    #[allow(unsafe_code)]
+    #[allow(
+        unsafe_code,
+        reason = "Windows file-type verification requires this isolated FFI call."
+    )]
     {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_DISK, GetFileType};

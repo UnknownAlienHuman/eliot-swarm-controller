@@ -55,6 +55,10 @@ pub(super) async fn recover_active_turn(
     let mut binding = None;
     for delay in RETRY_DELAYS {
         if !delay.is_zero() {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "This bounded wait is owned by the surrounding operation."
+            )]
             tokio::time::sleep(delay).await;
         }
         let current = {

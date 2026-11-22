@@ -29,7 +29,10 @@
 //! window that WinUI already made its thread's active window becomes the
 //! foreground window with no `HCBT_ACTIVATE`, no XAML focus change and no
 //! `EVENT_SYSTEM_FOREGROUND` reaching this thread (observed live).
-#![allow(unsafe_code)]
+#![allow(
+    unsafe_code,
+    reason = "Window placement requires Windows geometry and monitor APIs."
+)]
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};

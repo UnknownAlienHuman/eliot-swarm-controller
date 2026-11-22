@@ -5,7 +5,10 @@
 //! CoTaskMem-owned filesystem path. Reactor 0.100.0 exposes no picker. No
 //! new dependency. The modal is owned by this desktop, so cancelling
 //! changes nothing.
-#![allow(unsafe_code)]
+#![allow(
+    unsafe_code,
+    reason = "Native file selection uses the Windows Shell dialog API."
+)]
 
 use std::ffi::c_void;
 

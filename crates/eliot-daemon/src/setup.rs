@@ -12,6 +12,10 @@ use std::{
     path::{Component, Path, PathBuf},
     process::Stdio,
 };
+#[expect(
+    clippy::disallowed_types,
+    reason = "Setup verification returns its configured child command to the process owner."
+)]
 use tokio::process::Command;
 
 const MAX_STEPS: usize = 16;
@@ -117,6 +121,10 @@ pub(crate) fn freeze(profile: &Value, repo_root: &Path) -> Result<Vec<WorkspaceS
 }
 
 /// Construct a command only after checking the same admitted references and contents.
+#[expect(
+    clippy::disallowed_types,
+    reason = "This verifier builds the command for an explicitly approved setup entry."
+)]
 pub(crate) fn verify_command(
     entry: &WorkspaceSetup,
     workspace: &Path,
@@ -145,6 +153,10 @@ pub(crate) fn verify_command(
         });
     }
     check_environment(environment)?;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "This statement constructs a process owned by this module."
+    )]
     let mut command = Command::new(&entry.program.canonical_path);
     command
         .args(args)
@@ -169,7 +181,7 @@ pub(crate) fn build_environment(
             "setup requires an exact Agent and positive target generation",
         ));
     }
-    let mut environment = crate::plugin_host::build_process_environment(profile)?;
+    let mut environment = crate::router::build_process_environment(profile)?;
     environment.insert("ELIOT_AGENT_ID".to_owned(), Value::String(agent.to_owned()));
     environment.insert(
         "ELIOT_AGENT_GENERATION".to_owned(),

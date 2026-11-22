@@ -135,6 +135,10 @@ pub(crate) async fn reconcile(
 /// page read is logged and retried on the next tick; it never ends the loop.
 pub(crate) async fn recheck(context: Reconcile) {
     loop {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "This bounded wait is owned by the surrounding operation."
+        )]
         tokio::time::sleep(RECHECK).await;
         match reconcile_pass(&context, false).await {
             Ok(report) => {

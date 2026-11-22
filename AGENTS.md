@@ -55,6 +55,17 @@ runtime or tooling. Select the next unchecked increment in the roadmap.
 - Keep secrets out of persisted semantic data, fixtures and logs. Use explicit argv
   and scoped process ownership; Windows is a first-class platform.
 
+## Static architecture boundaries
+
+The workspace Clippy lints enforce these boundaries during the required `cargo clippy ... -- -D warnings` command:
+
+- Each process constructor has a statement-level `#[expect(clippy::disallowed_methods, reason = "...")]`, or the smallest existing function when construction is a returned expression. Do not scope this expectation over a module.
+- Each listed process type has a site-specific `#[expect(clippy::disallowed_types, reason = "...")]` on its exact mention or the smallest owning function. Do not scope this expectation over a module.
+- Vendor plugins must use `eliot_plugin::retry` for retry delays and must not call `tokio::time::sleep` directly.
+- Recursive directory removal goes through the CLI or daemon cleanup module.
+- The daemon plugin host is visible only inside `router` and its descendants; automation reaches native effects through Router.
+- Every `#[allow]` attribute carries a non-empty `reason`.
+
 ## Donor use
 
 [donors.md](docs/reference/donors.md) names source, target and extraction boundary.

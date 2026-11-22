@@ -1629,7 +1629,10 @@ pub(super) fn transition_lost_tx(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The operation's distinct inputs remain explicit at its established call boundary."
+)]
 fn mark_lost_turn_unknown_tx(
     tx: &Transaction<'_>,
     agent: &Agent,

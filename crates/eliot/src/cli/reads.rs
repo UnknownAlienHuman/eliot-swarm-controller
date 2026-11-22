@@ -167,14 +167,56 @@ pub(crate) async fn run_show(
             if let Some(instructions) = &response.instruction_delivery {
                 print_project_instructions(instructions);
             }
+            if let Some(owner_rules) = &response.owner_rules_delivery {
+                print_owner_rules_delivery(owner_rules);
+            }
         });
         Ok(0)
     }
 }
 
+fn print_owner_rules_delivery(delivery: &eliot_core::api::OwnerRulesDeliveryView) {
+    use eliot_core::api::{OwnerRulesDeliveryMethod as Method, OwnerRulesDeliveryStatus as Status};
+    let method = match delivery.method {
+        Method::CodexDeveloperInstructions => "codex developer_instructions",
+        Method::ClaudeAppendSystemPromptFile => "claude append-system-prompt-file",
+        Method::OpenCodeAgentsFile => "OpenCode isolated AGENTS.md",
+        Method::FirstInput => "first-input fallback",
+    };
+    let status = match delivery.status {
+        Status::Pending => "pending",
+        Status::Offered => "offered",
+        Status::Delivered => "delivered",
+        Status::Unknown => "unknown",
+        Status::NotDelivered => "not delivered",
+    };
+    println!(
+        "Owner rules: revision {}, SHA-256 {}, method {}, status {}, delivered {}",
+        delivery.revision,
+        delivery.digest,
+        method,
+        status,
+        if delivery.delivered { "yes" } else { "no" }
+    );
+}
+
 fn print_project_instructions(instructions: &eliot_core::api::InstructionDeliveryView) {
-    use eliot_core::api::{InstructionFileStatus, InstructionReadStatus, InstructionSourceStatus};
+    use eliot_core::api::{
+        InstructionFileStatus, InstructionReadStatus, InstructionSourceStatus,
+        PROJECT_RULES_WARNING_BYTES,
+    };
     println!("Project instructions");
+    let project_bytes = instructions
+        .files
+        .iter()
+        .filter(|file| file.status == InstructionFileStatus::Present)
+        .filter_map(|file| file.size_bytes)
+        .fold(0_u64, u64::saturating_add);
+    if project_bytes > PROJECT_RULES_WARNING_BYTES {
+        println!(
+            "  Warning: project instruction files use {project_bytes} UTF-8 bytes; the recommended budget is {PROJECT_RULES_WARNING_BYTES} bytes"
+        );
+    }
     let mut files = instructions
         .files
         .iter()
@@ -474,6 +516,22 @@ pub(crate) fn print_doctor_table(response: &HarnessDoctorResponse) {
             }
         } else {
             println!("  no installed Claude replacement was discovered");
+        }
+    }
+    if response.owner_rules_check_unavailable {
+        println!("Owner rules comparison unavailable");
+    }
+    if !response.owner_rules_drift.is_empty() {
+        use eliot_core::api::OwnerRulesGlobalFileStatus::{Different, Match, Missing, Unreadable};
+        println!("Global instruction files compared with Swarm owner rules");
+        for file in &response.owner_rules_drift {
+            let status = match file.status {
+                Match => "matches",
+                Different => "differs",
+                Missing => "missing",
+                Unreadable => "unreadable",
+            };
+            println!("  {} {} ({status})", file.harness, file.path);
         }
     }
     println!("First-call input by profile (tokens)");
@@ -912,6 +970,10 @@ fn with_watch_resume_cursor(mut failure: Failure, after: i64) -> Failure {
 /// Bounded retry around one watch RPC. Transient transport failures back off
 /// and re-issue from the same cursor; only Ctrl-C, typed domain errors, or
 /// an exhausted retry budget end the poll.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "The watch poll owns its bounded retry wait."
+)]
 async fn watch_poll<T, Fut>(
     mut attempt: impl FnMut() -> Fut,
     resume_after: Option<i64>,

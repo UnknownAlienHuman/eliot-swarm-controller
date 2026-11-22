@@ -17,6 +17,7 @@ pub enum RetryOperation {
     SessionBinding,
     OutstandingOffer,
     HookPoll,
+    ReadinessPoll,
 }
 
 pub enum StartupAfterFailure {
@@ -42,7 +43,9 @@ impl Retry {
         match self.operation {
             RetryOperation::NativeStartup => self.retries >= 1,
             RetryOperation::SessionBinding => self.retries >= 2,
-            RetryOperation::OutstandingOffer | RetryOperation::HookPoll => false,
+            RetryOperation::OutstandingOffer
+            | RetryOperation::HookPoll
+            | RetryOperation::ReadinessPoll => false,
         }
     }
 
@@ -83,7 +86,7 @@ impl Retry {
             RetryOperation::OutstandingOffer => {
                 Duration::from_millis(250 * (1 << self.retries.min(3)))
             }
-            RetryOperation::HookPoll => Duration::from_millis(250),
+            RetryOperation::HookPoll | RetryOperation::ReadinessPoll => Duration::from_millis(250),
         };
         let wake = Instant::now() + delay;
         if deadline.is_some_and(|end| wake >= end) {

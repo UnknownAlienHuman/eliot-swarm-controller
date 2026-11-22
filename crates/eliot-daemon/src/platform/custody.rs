@@ -4,7 +4,12 @@ use std::process::ExitStatus;
 use std::sync::{Arc, Mutex, Weak};
 #[cfg(any(windows, target_os = "linux"))]
 use std::time::Duration;
-use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+#[expect(
+    clippy::disallowed_types,
+    reason = "The custody module accepts Tokio commands and owns their platform process families."
+)]
+use tokio::process::Command;
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 use tokio::sync::Notify;
 
 /// How strongly the operating system contains this child family.
@@ -305,6 +310,10 @@ impl OwnedChild {
             if now >= deadline {
                 return Ok(false);
             }
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "This bounded wait is owned by the surrounding operation."
+            )]
             tokio::time::sleep((deadline - now).min(Duration::from_millis(10))).await;
         }
     }
@@ -317,6 +326,10 @@ impl OwnedChild {
             if self.try_wait_exit_unreaped()? {
                 return Ok(());
             }
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "This bounded wait is owned by the surrounding operation."
+            )]
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
@@ -352,24 +365,40 @@ impl OwnedChild {
             if now >= deadline {
                 return Ok(false);
             }
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "This bounded wait is owned by the surrounding operation."
+            )]
             tokio::time::sleep((deadline - now).min(Duration::from_millis(50))).await;
         }
     }
 
     /// Start the configured command under a Windows Job or a new Unix group.
     /// Configure Tokio's stdin/stdout/stderr as piped before passing the command.
+    #[expect(
+        clippy::disallowed_types,
+        reason = "This entry point moves a configured child command into platform custody."
+    )]
     pub fn spawn(command: Command) -> Result<Self> {
         Self::spawn_report(command).map_err(AgentSpawnError::into_error)
     }
 
     /// Preserve whether the OS refused to start the process or setup failed
     /// after a child had already been created.
+    #[expect(
+        clippy::disallowed_types,
+        reason = "This entry point preserves spawn versus post-creation custody outcomes."
+    )]
     pub(crate) fn spawn_report(command: Command) -> std::result::Result<Self, AgentSpawnError> {
         Self::spawn_with_policy(command, false)
     }
 
     /// Start a read-only Git leaf with child-process creation fenced before exec.
     /// The caller must select the actual executable, not a launcher requiring children.
+    #[expect(
+        clippy::disallowed_types,
+        reason = "This entry point applies leaf restrictions before admitting a Git child."
+    )]
     pub fn spawn_leaf(command: Command) -> Result<Self> {
         #[cfg(windows)]
         {
@@ -408,6 +437,10 @@ impl OwnedChild {
     /// Start one Agent generation's plugin in custody that a later daemon can
     /// check after replacement: a Job named from the Store custody namespace on
     /// Windows, or a Unix group whose recorded leader identifies it.
+    #[expect(
+        clippy::disallowed_types,
+        reason = "This entry point binds the plugin child to the Agent generation's custody."
+    )]
     pub fn spawn_agent(
         command: Command,
         namespace: &str,
@@ -431,6 +464,10 @@ impl OwnedChild {
     }
 
     #[cfg(windows)]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "This Windows helper starts a child inside the selected Job object."
+    )]
     fn spawn_in_job(
         command: Command,
         job: super::windows::Job,
@@ -439,6 +476,10 @@ impl OwnedChild {
     }
 
     #[cfg(windows)]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "This Windows entry point records identity for a named integration child Job."
+    )]
     pub(crate) fn spawn_integration(
         command: Command,
         scratch_id: &str,
@@ -463,6 +504,10 @@ impl OwnedChild {
     }
 
     #[cfg(windows)]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "This Windows helper assigns the suspended child before resuming it."
+    )]
     fn spawn_in_job_checked(
         mut command: Command,
         job: super::windows::Job,
@@ -497,6 +542,10 @@ impl OwnedChild {
         })
     }
 
+    #[expect(
+        clippy::disallowed_types,
+        reason = "This platform helper selects the custody policy for the configured child."
+    )]
     fn spawn_with_policy(
         command: Command,
         leaf: bool,

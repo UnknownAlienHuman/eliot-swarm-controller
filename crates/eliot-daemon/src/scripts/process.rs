@@ -3,9 +3,14 @@ use crate::platform::{CustodyGuarantee, CustodyObserver, OwnedChild, custody::Ag
 use eliot_core::{Error, SecretPolicy, StderrSnapshot, limits::MAX_FRAME_BYTES};
 use eliot_plugin::{StderrCapture, spawn_stderr, spawn_stderr_prefix};
 use std::{ffi::OsStr, io, process::ExitStatus, process::Stdio, sync::Arc, time::Duration};
+#[expect(
+    clippy::disallowed_types,
+    reason = "Script process supervision transfers native commands through owned custody."
+)]
+use tokio::process::Command;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
-    process::{ChildStdin, ChildStdout, Command},
+    process::{ChildStdin, ChildStdout},
     sync::watch,
     task::JoinHandle,
     time::{Instant, sleep_until, timeout_at},
@@ -43,7 +48,15 @@ const LOCAL_BASE_ENVIRONMENT: &[&str] = &[];
 ///
 /// These checks and scripts need installed developer tools from PATH, while
 /// ambient credentials and unrelated daemon variables must stay out.
+#[expect(
+    clippy::disallowed_types,
+    reason = "This builder creates commands for daemon scripts and Goal checks."
+)]
 pub(crate) fn local_process_command(program: impl AsRef<OsStr>) -> eliot_core::Result<Command> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "This statement constructs a process owned by this module."
+    )]
     let mut command = Command::new(program);
     command.env_clear();
 
@@ -146,6 +159,10 @@ struct InterruptedProcess<'a> {
 
 /// Run one already-resolved command. Output is exposed only after the direct
 /// exit, all required pipe drainage and owned-custody quiescence are known.
+#[expect(
+    clippy::disallowed_types,
+    reason = "This runner accepts the script command and settles its owned process family."
+)]
 pub(crate) async fn run_owned_process(
     command: Command,
     stdin: Vec<u8>,
@@ -170,6 +187,10 @@ pub(crate) enum StderrExcerpt {
     Prefix,
 }
 
+#[expect(
+    clippy::disallowed_types,
+    reason = "This runner captures the selected stderr view for an owned script process."
+)]
 pub(crate) async fn run_owned_process_with_stderr(
     command: Command,
     stdin: Vec<u8>,
@@ -181,6 +202,10 @@ pub(crate) async fn run_owned_process_with_stderr(
     run_supervised_process(command, stdin, timeout, policy, cancellation, stderr, None).await
 }
 
+#[expect(
+    clippy::disallowed_types,
+    reason = "This runner binds an integration child to its durable Git lease."
+)]
 pub(crate) async fn run_integration_process(
     command: Command,
     timeout: Duration,
@@ -200,6 +225,10 @@ pub(crate) async fn run_integration_process(
     .await
 }
 
+#[expect(
+    clippy::disallowed_types,
+    reason = "This supervisor owns the process command until drainage and custody settle."
+)]
 async fn run_supervised_process(
     command: Command,
     stdin: Vec<u8>,
@@ -291,6 +320,10 @@ async fn wait_root_exit(child: &mut OwnedChild) -> eliot_core::Result<RootExitWa
     }
 }
 
+#[expect(
+    clippy::disallowed_types,
+    reason = "This inner runner spawns the resolved command under owned custody."
+)]
 async fn run_owned_process_inner(
     mut command: Command,
     stdin: Vec<u8>,

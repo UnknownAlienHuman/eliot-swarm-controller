@@ -378,6 +378,15 @@ struct FileConfig {
     routing: RoutingConfig,
     #[serde(default)]
     desktop: DesktopSettings,
+    #[serde(default)]
+    owner_rules: OwnerRulesConfig,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct OwnerRulesConfig {
+    #[serde(default)]
+    text: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -1793,6 +1802,14 @@ fn read_config(data_root: &Path) -> core::Result<Option<(FileConfig, String)>> {
 /// located errors.
 fn parse_config(source: &str) -> core::Result<FileConfig> {
     let config = parse_config_document(source)?;
+    if config.owner_rules.text.len() > eliot_core::api::MAX_OWNER_RULES_BYTES
+        || config.owner_rules.text.contains('\0')
+    {
+        return Err(core::Error::new(
+            "profile_error",
+            "config.toml: owner_rules.text exceeds 64 KiB or contains NUL",
+        ));
+    }
     config.desktop.validate()?;
     let mut role_candidates = Vec::with_capacity(config.routing.roles.len() + 1);
     role_candidates.push(("default", &config.routing.default));

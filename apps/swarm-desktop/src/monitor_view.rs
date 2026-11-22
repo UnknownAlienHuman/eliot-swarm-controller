@@ -335,7 +335,10 @@ fn cpu_latest_label(cpu: Option<f64>) -> String {
 /// one star column each on a track as wide as the card, then the scale and
 /// what the number means. Unknown points stay a faint stub so gaps show;
 /// known values are at least 2 DIPs tall.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The operation's distinct inputs remain explicit at its established call boundary."
+)]
 fn chart_card(
     title: &str,
     latest: String,

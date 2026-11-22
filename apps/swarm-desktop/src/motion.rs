@@ -29,7 +29,10 @@
 //! with System.Reflection.Metadata and checked against Reactor's generated
 //! bindings where Reactor declares the same interface; each vtable below
 //! asserts its slot offsets.
-#![allow(unsafe_code)]
+#![allow(
+    unsafe_code,
+    reason = "Windows pointer motion requires the native input API."
+)]
 
 use std::cell::RefCell;
 use std::collections::VecDeque;

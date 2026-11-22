@@ -90,6 +90,10 @@ pub(super) async fn wait_for_exit(daemon: &DaemonInfo, wait: Duration) -> Result
                 format!("daemon PID {} did not exit", daemon.pid),
             ));
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "The local operator polls exact daemon process exit within its deadline"
+        )]
         sleep(PROBE_INTERVAL).await;
     }
     Ok(())
@@ -116,6 +120,10 @@ async fn wait_for_custody_to_settle(data_dir: &Path, daemon: &DaemonInfo) -> Res
                 ),
             ));
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "The local operator waits briefly for stopped process custody to settle"
+        )]
         sleep(PROBE_INTERVAL).await;
     }
 }
@@ -255,6 +263,14 @@ async fn start_owned_inner(
     #[cfg(unix)]
     let (pid, mut child) = {
         use std::process::Stdio;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "This statement constructs a process owned by this module."
+        )]
+        #[expect(
+            clippy::disallowed_types,
+            reason = "This launches the Unix operator helper under its scoped process owner."
+        )]
         let mut command = tokio::process::Command::new(binary);
         command
             .args(args)
@@ -365,6 +381,10 @@ async fn wait_for_ready(
                 ),
             ));
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "The local operator waits for the requested daemon to become ready"
+        )]
         sleep(PROBE_INTERVAL).await;
     }
 }

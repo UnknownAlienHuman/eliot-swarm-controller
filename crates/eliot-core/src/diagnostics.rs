@@ -127,7 +127,10 @@ pub fn bound_stderr_diagnostics(values: &mut Vec<StderrDiagnostic>, max_encoded_
 }
 
 // Boxed so the owning `Error.diagnostics` field stays 8 bytes.
-#[allow(clippy::box_collection)]
+#[allow(
+    clippy::box_collection,
+    reason = "The boxed error representation keeps the owning error structure small."
+)]
 pub(crate) fn deserialize_diagnostics<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Box<Vec<StderrDiagnostic>>, D::Error> {

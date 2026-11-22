@@ -17,7 +17,12 @@ use std::{
 use eliot_core::api::{HarnessModelEntry, harness::native_model_display_name};
 use eliot_core::{Error, Result};
 use eliot_plugin::native_cli::{BoundedReadLabels, run_bounded_utf8, valid_model_id};
-use tokio::{process::Command, time::Instant};
+#[expect(
+    clippy::disallowed_types,
+    reason = "Antigravity model discovery uses an owned native CLI command."
+)]
+use tokio::process::Command;
+use tokio::time::Instant;
 
 /// Exact argv for the catalogue child: `models`, nothing else.
 pub(crate) fn models_argv() -> [&'static str; 1] {
@@ -43,6 +48,14 @@ pub(crate) async fn run_models(
     environment: &[(OsString, OsString)],
     deadline: Instant,
 ) -> Result<Vec<HarnessModelEntry>> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "This statement constructs a process owned by this module."
+    )]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "This command queries Antigravity's native model catalogue."
+    )]
     let mut command = Command::new(program);
     command
         .args(models_argv())

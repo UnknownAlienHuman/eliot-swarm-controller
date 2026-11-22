@@ -4,7 +4,10 @@ use eliot_core::{Error, Result};
 use std::path::Path;
 
 #[cfg(windows)]
-#[allow(unsafe_code)]
+#[allow(
+    unsafe_code,
+    reason = "Windows worktree admission requires this narrowly scoped handle API."
+)]
 mod windows {
     use super::*;
     use serde::{Deserialize, Serialize};

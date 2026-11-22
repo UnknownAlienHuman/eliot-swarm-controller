@@ -275,7 +275,7 @@ impl Router {
                     "native model catalogue executable was not discovered",
                 )
             })?;
-            let route = crate::plugin_host::metadata_route(&profile)?;
+            let route = crate::router::plugin_host::metadata_route(&profile)?;
             if harness == "claude" && route.identity.is_none() {
                 return Err(Error::new(
                     "unavailable",
@@ -462,7 +462,7 @@ impl Router {
         let (scope, credential) = catalog::describe_snapshot(&label, &harness, snapshot.as_ref());
         let mut profile = snapshot
             .ok_or_else(|| Error::new("profile_error", "quota requires a native profile"))?;
-        let route = crate::plugin_host::metadata_route(&profile)?;
+        let route = crate::router::plugin_host::metadata_route(&profile)?;
         // Universal policy, decided before any reader spawns and before any
         // cache access: an external provider route never reports CLI/keyring
         // quota for another route. The refusal flows through the same shaped
@@ -959,7 +959,10 @@ impl Router {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "The operation's distinct inputs remain explicit at its established call boundary."
+    )]
     fn catalog_page(
         request: &eliot_core::api::ModelsCatalogRequest,
         harnesses: &[eliot_core::api::HarnessEntry],

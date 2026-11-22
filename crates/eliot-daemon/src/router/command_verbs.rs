@@ -114,6 +114,10 @@ impl Router {
                     Err(error)
                         if error.code == "busy" && tokio::time::Instant::now() < deadline =>
                     {
+                        #[expect(
+                            clippy::disallowed_methods,
+                            reason = "Daemon integration cleanup polls exact process custody with a bounded delay"
+                        )]
                         tokio::time::sleep(Duration::from_millis(25)).await;
                     }
                     Err(error) => {
@@ -661,10 +665,10 @@ impl Router {
                     }
                 }
             }
-            Err(crate::plugin_host::StartError::NotSpawned(error)) => {
+            Err(crate::router::plugin_host::StartError::NotSpawned(error)) => {
                 self.settle_unspawned_start(id, &error).await;
             }
-            Err(crate::plugin_host::StartError::Uncertain(error)) => {
+            Err(crate::router::plugin_host::StartError::Uncertain(error)) => {
                 self.settle_plugin_error(id, &error).await;
             }
         }

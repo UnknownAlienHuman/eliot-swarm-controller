@@ -425,6 +425,18 @@ impl HarnessDoctorRequest {
         crate::api::harness::validate_claude_profile_command_issues(
             &reply.claude_profile_command_issues,
         )?;
+        let mut files = std::collections::HashSet::new();
+        if reply.owner_rules_drift.len() > MAX_DOCTOR_HARNESSES
+            || (reply.owner_rules_check_unavailable && !reply.owner_rules_drift.is_empty())
+            || reply.owner_rules_drift.iter().any(|file| {
+                !super::is_supported_harness(&file.harness)
+                    || file.path.trim().is_empty()
+                    || file.path.chars().any(char::is_control)
+                    || !files.insert((file.harness.as_str(), file.path.as_str()))
+            })
+        {
+            return Err(Error::new("invalid", "doctor owner rules check is invalid"));
+        }
         let mut profiles = std::collections::HashSet::new();
         let mut sampled_turns = 0_usize;
         for sample in &reply.profile_first_calls {
@@ -469,6 +481,28 @@ pub struct HarnessDoctorResponse {
     pub goal_check_deadlines: Vec<super::goals::GoalCheckDeadlineStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention_thresholds: Option<super::monitor_views::AttentionThresholdsResponse>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owner_rules_drift: Vec<OwnerRulesGlobalFile>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub owner_rules_check_unavailable: bool,
+}
+
+/// Metadata-only comparison of a harness's global instruction file with the
+/// current Swarm owner rules.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerRulesGlobalFile {
+    pub harness: String,
+    pub path: String,
+    pub status: OwnerRulesGlobalFileStatus,
+}
+
+#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnerRulesGlobalFileStatus {
+    Match,
+    Different,
+    Missing,
+    Unreadable,
 }
 
 /// Bounded per-Agent work summary covering Git progress versus frozen `base_oid`

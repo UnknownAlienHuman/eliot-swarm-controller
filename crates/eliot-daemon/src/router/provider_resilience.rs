@@ -396,6 +396,10 @@ impl Router {
             match inspected {
                 Ok(_) => break,
                 Err(error) if error.code == "busy" && tokio::time::Instant::now() < deadline => {
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "This bounded wait is owned by the surrounding operation."
+                    )]
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 Err(error) => return Err(error),

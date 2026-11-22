@@ -1,12 +1,13 @@
 //! Managed-worktree orchestration. Store owns intent; setup owns verification;
 //! workspace_git owns Git identity/readback. Only this module runs their mutators.
+
 use crate::{
     bus::Bus,
     common::now_ms,
     git_monitor::{canonical_root, reject_links},
     monitor::{Monitoring, WorkspaceProcessContext},
     platform::{CustodyObserver, OwnedChild, worktree_guard::WorktreeWriteGuard},
-    plugin_host::SecretSet,
+    router::SecretSet,
     setup,
     workspace_git::{
         WorkspaceGit,
@@ -34,9 +35,13 @@ use std::{
     },
     time::Duration,
 };
+#[expect(
+    clippy::disallowed_types,
+    reason = "Workspace orchestration passes prepared Git commands to its custody owner."
+)]
+use tokio::process::Command;
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
-    process::Command,
     sync::{Mutex as AsyncMutex, OwnedMutexGuard, watch},
     time::{Instant, sleep_until, timeout_at},
 };
@@ -205,7 +210,10 @@ impl WorkspaceManager {
     /// Freeze a standard managed worktree. The Store finalizes the directory
     /// and any generated branch using the admitted Agent ID. `base_repo` can
     /// point to another checkout of the same repository to resolve the base.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Managed worktree preparation binds repository identity, ancestry, and naming"
+    )]
     pub(crate) async fn freeze_launch(
         &self,
         repo: &str,
@@ -677,6 +685,10 @@ impl WorkspaceManager {
         Ok(outcome)
     }
 
+    #[expect(
+        clippy::disallowed_types,
+        reason = "This rollback runner receives the prepared command for a failed worktree create."
+    )]
     async fn run_creation_rollback(
         &self,
         slot: &Arc<Slot>,
@@ -875,7 +887,10 @@ impl WorkspaceManager {
         outcome
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "The operation's distinct inputs remain explicit at its established call boundary."
+    )]
     async fn remove_guarded(
         &self,
         command: &CoreCommand,
@@ -1735,6 +1750,10 @@ impl WorkspaceManager {
 
     // Caller holds the same per-target gate used by cancel, and has checked/committed
     // the exact Store marker. The gate is released only after handle registration.
+    #[expect(
+        clippy::disallowed_types,
+        reason = "This runner executes the admitted worktree command through process custody."
+    )]
     async fn run_owned(
         &self,
         slot: &Arc<Slot>,

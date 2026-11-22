@@ -262,6 +262,49 @@ does not return project-instruction readback, so its status remains unknown.
 agent.get returns the retained object as optional instruction_delivery; swarm show
 prints the same typed readback. Missing fields from older Store rows remain absent.
 
+## Shared owner rules
+
+`[owner_rules].text` in the unified settings file is the single shared owner-rule
+source. `settings.read` exposes the unified settings-file revision beside that text.
+A launch freezes the revision and SHA-256 of the text before native dispatch.
+Queued launches use the rules available when they start. A resume reuses the
+retained digest, and a legacy Agent can capture the current setting when explicitly
+reopened. Delivery resolves that digest from settings. If the text changes before
+delivery or native reopen, the operation reports that the retained rules are
+unavailable. Settings saves reject values detected by the secret policy, redaction
+markers, and common credential forms such as bearer tokens and private keys. The
+same validation applies to text read for delivery.
+
+The Agent's Store record contains delivery metadata. `agent.get` and
+`swarm show` expose revision, digest, delivery method, status and delivered flag.
+The owner rules text stays out of the Agent and profile readbacks. The unified
+settings read warns above 8 KiB of UTF-8 owner rules. The human-readable Agent view
+warns when readable project instruction files total more than 4 KiB of UTF-8 data.
+The first-input fallback enforces the existing 64 KiB persisted-text budget.
+
+Codex receives the frozen text through native thread developer instructions.
+Claude uses `--append-system-prompt-file` with an owned instance file. OpenCode v2
+loads the instance's isolated `AGENTS.md`. Muse and Antigravity receive a fenced
+owner rules block in the first input after any quoted project-source data.
+
+A launch records `pending` independently of the linked input. If the required
+receipt cannot be bound, the daemon records `not_delivered` when the launch still
+owns the Agent row and refuses the launch. The first eligible send records
+`offered` before native dispatch, whether that send is linked or submitted later.
+The committed native association of the exact rules-bearing send records
+`delivered=true`. A rejected input records `not_delivered`. An uncertain delivery
+retains `unknown` after an Owner assertion of success. An Owner resolution to
+`failed` allows a later independent send to bind the rules. Same-ID retries reuse
+the prepared input. Child, rule and switch launches use the same capture path.
+
+`swarm doctor` compares known global instruction files with the current source after
+removing a leading UTF-8 BOM, converting CRLF to LF, and ignoring trailing LF
+characters. It reports the harness, path and match status. Symlinks, reparse points,
+non-regular files, read failures and files beyond its fixed read bound report
+`unreadable`. The bound derives from the 64 KiB owner-rules byte cap and leaves room for
+CRLF expansion, an optional BOM and trailing newlines, so line-ending normalization
+does not truncate equivalent text. The comparison makes zero configuration writes.
+
 ## Ad-hoc Owner launch (no stored profile)
 
 `swarm launch --harness <codex|claude|muse|opencode|antigravity>
@@ -1268,7 +1311,7 @@ resolved-configuration distinction.
 `<data_dir>/config.toml` is the single settings source. `settings.read` and
 `settings.save` expose typed, explicitly named sections: profiles, routing, projects,
 daemon (including limits and retention), automation, mail, cloud_mcp, desktop,
-accounts and proxies.
+accounts, proxies and owner_rules.
 Rules/scripts remain files owned by their existing APIs; settings references and
 automation policy do not create a second executor. Desktop preferences use
 `[desktop]`: `theme` (`system`, `light`, `dark`, `amoled`, `purple`, `neon`,

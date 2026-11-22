@@ -28,11 +28,21 @@ use std::{
 
 use eliot_core::local_provider::LocalProvider;
 use eliot_core::{Error, FailureOrigin, Result, SecretPolicy};
-use eliot_plugin::{StderrCapture, session::paths_equal, skill, spawn_stderr};
+use eliot_plugin::{
+    StderrCapture,
+    retry::{Retry, RetryFact, RetryOperation},
+    session::paths_equal,
+    skill, spawn_stderr,
+};
+#[expect(
+    clippy::disallowed_types,
+    reason = "OpenCode server sessions are launched and supervised by this native adapter."
+)]
+use tokio::process::Command;
 use tokio::{
     net::TcpListener,
-    process::{Child, Command},
-    time::{Instant, sleep, timeout_at},
+    process::Child,
+    time::{Instant, timeout_at},
 };
 
 use super::apply_environment;
@@ -41,8 +51,6 @@ use crate::native::{
     client::{OpenCodeHttp, server_native_directory},
     transfer_selected_integration,
 };
-
-const READINESS_POLL: Duration = Duration::from_millis(250);
 
 /// Embedded vendor-native context-hook producer shim. Written verbatim into
 /// the isolated per-Agent config root's auto-discovered `opencode/plugins/`
@@ -264,6 +272,7 @@ pub struct ServerLaunch {
     pub model: Option<String>,
     pub auth: Option<AuthSetup>,
     pub local_provider: Option<LocalProvider>,
+    pub owner_rules: Option<String>,
     pub frozen_pass_env: Option<serde_json::Value>,
     /// Active Swarm executable for the Agent-scoped MCP server command.
     /// Absolute; start admission resolves it from the running executable.
@@ -366,6 +375,16 @@ impl OwnedServer {
             )
         })?;
         let config_path = config_dir.join("opencode.jsonc");
+        if let Some(rules) = &launch.owner_rules {
+            // OpenCode v2 loads AGENTS.md from its effective global config
+            // directory. XDG_CONFIG_HOME below binds it to this instance.
+            std::fs::write(config_dir.join("AGENTS.md"), rules).map_err(|_| {
+                Error::new(
+                    "native_spawn",
+                    "OpenCode could not write the private owner rules file",
+                )
+            })?;
+        }
         if launch.local_provider.is_some() && launch.model.is_none() {
             return Err(Error::new(
                 "profile_error",
@@ -571,6 +590,14 @@ impl OwnedServer {
         let capture = SecretPolicy::new(capture);
         let http = OpenCodeHttp::new(port, password.clone(), &native_directory)?;
 
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "This statement constructs a process owned by this module."
+        )]
+        #[expect(
+            clippy::disallowed_types,
+            reason = "This launches the selected OpenCode MCP server session."
+        )]
         let mut command = Command::new(&launch.program);
         apply_environment(
             &mut command,
@@ -656,6 +683,7 @@ impl OwnedServer {
     /// per-Agent config file. An early child exit fails fast with the
     /// retained stderr tail attached.
     async fn await_ready(&mut self, deadline: Instant) -> Result<()> {
+        let mut retry = Retry::new(RetryOperation::ReadinessPoll);
         loop {
             if let Some(status) = self.child.try_wait().map_err(|error| {
                 Error::new(
@@ -691,13 +719,12 @@ impl OwnedServer {
                 Ok(_) => {}
                 Err(_) => {}
             }
-            if Instant::now() + READINESS_POLL >= deadline {
+            if !retry.wait(RetryFact::Idempotent, Some(deadline)).await {
                 return Err(Error::new(
                     "native_spawn",
                     "OpenCode serve did not become ready before its deadline",
                 ));
             }
-            sleep(READINESS_POLL).await;
         }
     }
 
@@ -769,6 +796,14 @@ impl OwnedServer {
         capture.push(password.clone());
         let capture = SecretPolicy::new(capture);
         let http = OpenCodeHttp::new(port, password.clone(), &native_directory)?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "This statement constructs a process owned by this module."
+        )]
+        #[expect(
+            clippy::disallowed_types,
+            reason = "This launches OpenCode's retained native server session."
+        )]
         let mut command = Command::new(&launch.program);
         apply_environment(&mut command, &launch.environment, false);
         command

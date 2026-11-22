@@ -1283,6 +1283,7 @@ impl CodexPlugin {
                 cwd: Some(plan.workspace.to_string_lossy().into_owned()),
                 sandbox: Some(plan.sandbox_mode),
                 approval_policy: Some(json!(plan.approval_policy.clone())),
+                developer_instructions: params.owner_rules.clone(),
                 config: thread_config,
             };
             (
@@ -1301,6 +1302,7 @@ impl CodexPlugin {
                 model_provider: Some(plan.route.provider().to_owned()),
                 sandbox: Some(plan.sandbox_mode),
                 approval_policy: Some(json!(plan.approval_policy.clone())),
+                developer_instructions: params.owner_rules.clone(),
                 config: thread_config,
                 service_tier: None,
                 ephemeral: None,

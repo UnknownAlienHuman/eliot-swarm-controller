@@ -1151,7 +1151,10 @@ fn action(choice: &str, method: &str, args: Value) -> OwnerAction {
         args,
     }
 }
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The decision item's identity, timestamps, and actions are explicit at each call site"
+)]
 fn item(
     kind: OwnerInboxKind,
     subject: String,
