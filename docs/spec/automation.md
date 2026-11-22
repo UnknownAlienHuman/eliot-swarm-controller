@@ -273,9 +273,10 @@ rule cannot pin expired storage indefinitely. Rate-limit windows longer than
 command retention count only retained history.
 
 An event rule's optional `once_per` renders a key from captured event fields. The
-Store records the digest of the rendered value with an admitted action. The same
-rule in that namespace can fire for that value again after the bounded key
-retention expires. A suppression does not consume a new key. For example:
+Store records the digest of the rendered value with an admitted action. Keys expire
+after 30 days. Store holds up to 10,000 keys per rule and 100,000 across rules, and
+skips new keys when capacity is full. A suppression does not consume a new key.
+For example:
 
 ```toml
 once_per = "${data.data.pull_number}@${data.data.head}"
@@ -285,8 +286,10 @@ limit = { max = 2, per = "key", key = "${data.data.pull_number}", window = "24h"
 `per = "key"` selects a rate bucket using `limit.key`, or the `once_per` key
 when `limit.key` is omitted. The optional `min_interval` spaces admissions in the
 same bucket and must fit within the configured window. An unavailable or invalid
-key skips the action. Keyed rules use live event traversal. Suppressed duplicates
-and rate-limited live events increment the rule's `suppressed_count`.
+key skips the action. Keyed rules use live event traversal. The rule's
+`suppressed_count` records key suppressions, and `rate_limited_firings` records
+rate suppressions. Both advance the event cursor without a per-event rejection.
+An event-triggered launch with `per = "agent"` uses the triggering Agent's bucket.
 
 During explicit history catch-up, project Run actions use the same freeze path as live firing,
 capturing each matching event and the validated current rule revision. Project authorization
@@ -905,8 +908,9 @@ Worktree-aware rules can match `data.worktree` when a complete Git observation
 supplies the exact base commit, fingerprint, changed files and changed lines. Lines
 count additions and deletions, including line counts for nonignored untracked text.
 Match `data.project_check = "off"` to use a successful completion in a project without
-a configured check. For a configured check, match `project.worktree.check.passed` and
-its worktree and author-turn binding.
+a configured check. When a configured check applies, the completion carries
+`data.project_check = "required"`. Match the separate `project.worktree.check.passed`
+fact, which binds the same author turn and worktree after a confirmed passing check.
 
 To launch a fixer when a project check exits unsuccessfully, put the timer and follow-up
 definitions in the registered project's rule directory. In this example the project

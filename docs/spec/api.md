@@ -899,8 +899,8 @@ defaults to 100 and must be 1–1,000. Settings › Worktrees pages it to the en
 
 `rule.get` uses `RuleGetRequest`/`RuleShowView` and is Owner-only. It reads the selected
 rule's cursor and retirement boundary, latest action outcome and latest refusal when
-available. `suppressed_count` tracks live events skipped by deduplication or rate
-limits. An optional `project` selects a registered project principal. Omission selects
+available. `suppressed_count` tracks live key suppressions and `rate_limited_firings`
+tracks rate suppressions. An optional `project` selects a registered project principal. Omission selects
 the global Owner scope. A global miss with a matching project rule includes a
 `--project` hint. The read does not reload configuration or advance either cursor.
 `rule.catch_up` accepts `RuleCatchUpRequest` and returns the retained Core `Command` parent
