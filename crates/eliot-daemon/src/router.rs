@@ -27,6 +27,7 @@ mod routing;
 mod rules;
 mod sources;
 mod status;
+mod swarm_usage;
 mod switch;
 
 pub(crate) use attention::run_attention;
@@ -440,18 +441,53 @@ impl Router {
     async fn handle(
         &self,
         method: &str,
-        wire_params: Value,
+        mut wire_params: Value,
         peer: Option<crate::platform::custody::LocalPeer>,
     ) -> Result<Value> {
         let remote = wire_params
             .get("_auth")
             .and_then(|a| a.get("remote_call"))
             .cloned();
+        let mcp_call_id = wire_params
+            .get_mut("_auth")
+            .and_then(Value::as_object_mut)
+            .and_then(|auth| auth.remove("swarm_mcp_call_id"));
         let (principal, params) = self.authenticate(wire_params, peer).await?;
         let remote: Option<eliot_core::RemoteCallContext> = remote
             .map(serde_json::from_value)
             .transpose()
             .map_err(|_| Error::new("not_allowed", "invalid remote context"))?;
+        let mcp_trace = if let Some(call_id) = mcp_call_id.as_ref() {
+            let call_id = call_id
+                .as_str()
+                .filter(|id| ulid::Ulid::from_string(id).is_ok())
+                .ok_or_else(|| Error::new("invalid", "Swarm MCP call id is invalid"))?;
+            self.begin_swarm_mcp_tool_call(&principal, remote.as_ref(), call_id, method)
+                .await
+        } else {
+            None
+        };
+        let result = self
+            .handle_authorized(method, params, principal, remote.as_ref())
+            .await;
+        if let Some(trace) = mcp_trace {
+            self.finish_swarm_mcp_tool_call(&trace, result.is_err())
+                .await;
+        }
+        let result = result?;
+        Ok(match remote {
+            Some(remote) => json!({"result": result, "remote_call": remote}),
+            None => result,
+        })
+    }
+
+    async fn handle_authorized(
+        &self,
+        method: &str,
+        params: Value,
+        principal: Principal,
+        remote: Option<&eliot_core::RemoteCallContext>,
+    ) -> Result<Value> {
         authorize_rpc_method(&principal, method)?;
         let _write = if method != "daemon.shutdown" && discovery::is_mutation(method) {
             let guard = self.inner.restart_writes.read().await;
@@ -524,9 +560,7 @@ impl Router {
             "cleanup.plan" => self.cleanup_plan(&params, &principal).await,
             "cleanup.apply" => self.cleanup_apply(&params, &principal).await,
             "command.submit" => {
-                let result = self
-                    .submit_bound(&params, &principal, remote.as_ref())
-                    .await;
+                let result = self.submit_bound(&params, &principal, remote).await;
                 // Capacity preflight can refuse before a command exists.
                 // Retain diagnostic metadata under the caller's exact ID in
                 // the existing bounded log; this grants no replay authority.
@@ -544,10 +578,7 @@ impl Router {
                 }
                 result
             }
-            "launch.enqueue" => {
-                self.enqueue_launch(&params, &principal, remote.as_ref())
-                    .await
-            }
+            "launch.enqueue" => self.enqueue_launch(&params, &principal, remote).await,
             "launch.intent.get" => self.read_launch_intent(&params, &principal).await,
             "launch.queue" => self.read_launch_queue(&params, &principal).await,
             "project.budget.set" => self.set_manager_budget(&params, &principal).await,
@@ -694,11 +725,7 @@ impl Router {
                 &fields,
             );
         }
-        let result = result?;
-        Ok(match remote {
-            Some(remote) => json!({"result": result, "remote_call": remote}),
-            None => result,
-        })
+        result
     }
 
     pub(crate) async fn handle_rpc(

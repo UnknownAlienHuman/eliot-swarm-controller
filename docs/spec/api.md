@@ -1529,7 +1529,14 @@ echoes the scope, reports the included Agent/generation counts with explicit
 `turns_counted`/`turns_without_usage`/per-counter `turns_missing` (no
 cross-scope totals) plus the excluded unknown/running turns the sums skip,
 and carries session subtotals with their supply gaps
-and per-unit costs. `swarm usage` renders this response as a compact table;
+and per-unit costs.
+The swarm_mcp member lists the exact Agent generation and turn with its Swarm
+MCP call and refusal counts. Calls count when tool.started commits; refusals
+count only when the matching tool.completed records an RPC error. Remote HTTP
+calls have no local turn and are omitted. The list covers the most recent
+1,000 turns; swarm_mcp_truncated marks older rows omitted. The CLI accepts
+swarm usage <agent> and swarm usage --agent <agent> for the same Agent scope;
+project and root scopes retain their flags. `swarm usage` renders this response as a compact table;
 `--json` keeps printing the raw response.
 
 Required IDs must be strings whose trimmed value is nonempty and are preserved without

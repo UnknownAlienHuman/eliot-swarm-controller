@@ -67,9 +67,15 @@ pub async fn client_call_measured(
     validate_client_call(method, &params)?;
     let identity = caller_identity_for_target(path)?;
     let mut timings = CallTimings::default();
-    let value =
-        client_call_with_identity_measured(path, method, params, identity, Some(&mut timings))
-            .await?;
+    let value = client_call_with_identity_measured(
+        path,
+        method,
+        params,
+        identity,
+        Some(&mut timings),
+        None,
+    )
+    .await?;
     Ok((value, timings))
 }
 const MAX_CLIENTS: usize = 128;
@@ -1129,6 +1135,22 @@ pub async fn client_call_with_agent_identity(
     client_call_with_identity(path, method, params, identity).await
 }
 
+/// Make one Agent-authenticated daemon RPC from the shared Swarm MCP tool boundary.
+/// The call id is private provenance metadata; RPC params remain unchanged.
+pub async fn client_call_with_agent_mcp_tool(
+    path: &Path,
+    method: &str,
+    params: Value,
+    call_id: &str,
+) -> Result<Value> {
+    validate_client_call(method, &params)?;
+    if Ulid::from_string(call_id).is_err() {
+        return Err(Error::new("invalid", "Swarm MCP call id is invalid"));
+    }
+    let identity = required_agent_identity_for(path)?;
+    client_call_with_identity_measured(path, method, params, identity, None, Some(call_id)).await
+}
+
 fn required_agent_identity_for(target: &Path) -> Result<ClientIdentity> {
     match caller_identity_for_target(target)? {
         identity @ ClientIdentity::Agent { .. } => Ok(identity),
@@ -1145,7 +1167,7 @@ async fn client_call_with_identity(
     params: Value,
     identity: ClientIdentity,
 ) -> Result<Value> {
-    client_call_with_identity_measured(path, method, params, identity, None).await
+    client_call_with_identity_measured(path, method, params, identity, None, None).await
 }
 
 async fn client_call_with_identity_measured(
@@ -1154,6 +1176,7 @@ async fn client_call_with_identity_measured(
     params: Value,
     identity: ClientIdentity,
     timings: Option<&mut CallTimings>,
+    swarm_mcp_call_id: Option<&str>,
 ) -> Result<Value> {
     let data_dir = DataDir::open_existing(path).map_err(|error| with_connect_hint(path, error))?;
     let info = data_dir
@@ -1162,7 +1185,7 @@ async fn client_call_with_identity_measured(
         .ok_or_else(|| {
             with_connect_hint(path, Error::new("unavailable", "daemon is not running"))
         })?;
-    let auth = match identity {
+    let mut auth = match identity {
         ClientIdentity::Owner => {
             let token = data_dir.read_owner_token()?;
             json!({
@@ -1189,6 +1212,9 @@ async fn client_call_with_identity_measured(
             "credential": token,
         }),
     };
+    if let Some(call_id) = swarm_mcp_call_id {
+        auth["swarm_mcp_call_id"] = json!(call_id);
+    }
     let credential = auth["credential"].as_str().unwrap_or("");
     let policy = SecretPolicy::new([credential]);
     raw_client_call_measured(&info.endpoint, method, params, auth, &policy, timings)
@@ -1263,6 +1289,46 @@ pub async fn client_call_with_remote_context(
         .map_err(|error| with_connect_hint(path, error))?;
     let policy = SecretPolicy::new([token.as_str()]);
     let auth = json!({"kind":"owner", "credential": token, "remote_call": remote});
+    let result = raw_client_call(&info.endpoint, method, params, auth, &policy)
+        .await
+        .map_err(|error| with_connect_hint(path, error))?;
+    let echoed: eliot_core::RemoteCallContext =
+        serde_json::from_value(result["remote_call"].clone())
+            .map_err(|_| Error::new("unknown", "daemon omitted verified remote call binding"))?;
+    if &echoed != remote || result.get("result").is_none() {
+        return Err(Error::new("unknown", "daemon remote call binding differs"));
+    }
+    Ok(result)
+}
+
+/// HTTP bridge variant for one authenticated Swarm MCP tools/call request.
+/// The signed remote request id is forwarded as private method-attribution context.
+pub async fn client_call_with_remote_mcp_tool(
+    path: &Path,
+    method: &str,
+    params: Value,
+    remote: &eliot_core::RemoteCallContext,
+) -> Result<Value> {
+    remote.validate()?;
+    if method.trim().is_empty() || !params.is_object() || remote.mcp_request_id.is_none() {
+        return Err(Error::new("invalid", "invalid remote Swarm MCP tool call"));
+    }
+    if Ulid::from_string(&remote.call_id).is_err() {
+        return Err(Error::new("invalid", "Swarm MCP call id is invalid"));
+    }
+    let data_dir = DataDir::open_existing(path).map_err(|error| with_connect_hint(path, error))?;
+    let info = data_dir
+        .read_daemon_info()
+        .map_err(|error| with_connect_hint(path, error))?
+        .ok_or_else(|| {
+            with_connect_hint(path, Error::new("unavailable", "daemon is not running"))
+        })?;
+    let token = data_dir
+        .read_owner_token()
+        .map_err(|error| with_connect_hint(path, error))?;
+    let policy = SecretPolicy::new([token.as_str()]);
+    let mut auth = json!({"kind":"owner", "credential": token, "remote_call": remote});
+    auth["swarm_mcp_call_id"] = json!(remote.call_id);
     let result = raw_client_call(&info.endpoint, method, params, auth, &policy)
         .await
         .map_err(|error| with_connect_hint(path, error))?;

@@ -259,7 +259,7 @@ impl ServerHandler for EliotMcpHandler {
             }
             let result = match remote.as_ref() {
                 Some(remote) => {
-                    eliot_daemon::client_call_with_remote_context(
+                    eliot_daemon::client_call_with_remote_mcp_tool(
                         Path::new(&data_dir),
                         &parsed.method,
                         params,
@@ -268,10 +268,12 @@ impl ServerHandler for EliotMcpHandler {
                     .await
                 }
                 None if require_agent => {
-                    eliot_daemon::client_call_with_agent_identity(
+                    let call_id = ulid::Ulid::new().to_string();
+                    eliot_daemon::client_call_with_agent_mcp_tool(
                         Path::new(&data_dir),
                         &parsed.method,
                         params,
+                        &call_id,
                     )
                     .await
                 }

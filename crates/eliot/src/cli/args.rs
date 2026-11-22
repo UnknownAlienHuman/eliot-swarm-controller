@@ -700,8 +700,16 @@ pub(crate) struct HeavyArgs {
 #[derive(Args)]
 pub(crate) struct UsageArgs {
     #[arg(
+        value_name = "AGENT",
+        conflicts_with = "agent",
+        conflicts_with = "project",
+        conflicts_with = "root"
+    )]
+    pub(crate) agent_positional: Option<String>,
+    #[arg(
         long,
         value_name = "AGENT",
+        conflicts_with = "agent_positional",
         conflicts_with = "project",
         conflicts_with = "root"
     )]

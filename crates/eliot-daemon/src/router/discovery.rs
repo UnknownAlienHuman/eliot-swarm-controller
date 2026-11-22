@@ -417,6 +417,9 @@ pub(super) fn owner_only_read(name: &str) -> bool {
 }
 
 fn visible(method: &Method, principal: &Principal) -> bool {
+    if method.name == "child.run" && !matches!(principal, Principal::Agent { .. }) {
+        return false;
+    }
     // Discovery lists callable methods, so it shares the RPC gate's own
     // principal/method classification: Memory-only entries such as
     // `client.identity` and `inference.*` (except `inference.client.*`) are

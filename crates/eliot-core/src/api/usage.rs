@@ -243,6 +243,10 @@ pub struct UsageSummaryResponse {
     pub pruned_through: i64,
     pub turns: TurnExpenditure,
     pub sessions: SessionFacts,
+    #[serde(default)]
+    pub swarm_mcp: Vec<super::SwarmMcpTurnUsage>,
+    #[serde(default)]
+    pub swarm_mcp_truncated: bool,
 }
 
 impl UsageSummaryResponse {
@@ -308,6 +312,22 @@ impl UsageSummaryResponse {
                 || !(cost.total_amount.is_finite() && cost.total_amount >= 0.0)
                 || cost.snapshots == 0
                 || !units.insert(cost.unit.as_str())
+            {
+                return Err(invalid_response());
+            }
+        }
+        let mut swarm_turns = std::collections::BTreeSet::new();
+        for usage in &self.swarm_mcp {
+            if crate::parse_agent_id(&usage.agent).is_err()
+                || usage.generation < 0
+                || usage.turn_id.trim().is_empty()
+                || usage.calls == 0
+                || usage.refusals > usage.calls
+                || !swarm_turns.insert((
+                    usage.agent.as_str(),
+                    usage.generation,
+                    usage.turn_id.as_str(),
+                ))
             {
                 return Err(invalid_response());
             }

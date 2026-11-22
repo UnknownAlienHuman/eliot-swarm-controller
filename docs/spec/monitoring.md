@@ -941,6 +941,16 @@ marker; turn-backed usage carries `"turn"`. The fallback is fleet
 visibility, never turn expenditure: per-turn accounting stays on
 `usage.summary`, whose `turns_without_usage` and per-counter coverage name
 exactly what the native stream did not supply.
+The authenticated Swarm MCP tool boundary records semantic tool.started and
+tool.completed events with the exact RPC method, call ID, origin, and exact
+active Agent turn. The event data contains no RPC parameters, result text, or
+error detail. A completed event uses status "refused" when the daemon RPC
+returns an error; calls count from their start event. Only these daemon-origin
+Swarm MCP events feed per-turn usage, so generic native harness MCP tool events
+are never guessed or counted again. This covers Agent-authenticated stdio calls
+across the harness adapters. Remote StreamableHTTP calls carry authenticated
+remote Owner context but no local Agent generation or turn; their events remain
+unbound and are excluded from per-turn usage.
 
 `daemon.status` also exposes retention and drain honesty in one place. The
 retention view reports the `eliot.db` main and WAL sizes, the configured

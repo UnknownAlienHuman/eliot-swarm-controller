@@ -94,5 +94,7 @@ The HTTP verifier binds the verified subject to the SDK session and carries nons
 connection/call provenance through the existing authenticated Router path, as owned
 by [the API](api.md#mcp-streamablehttp-server). It does not derive identity from
 `clientInfo` or process metadata. The process module owns custody, not an OAuth or
-principal registry. End-to-end qualification of the corrected origin and caller
+principal registry. Authenticated remote tools/call requests retain exact RPC method attribution
+at the shared daemon boundary, with no local Agent, generation, or turn binding;
+see the monitoring usage contract. End-to-end qualification of the corrected origin and caller
 binding remains required by L6.7.

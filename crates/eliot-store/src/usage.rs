@@ -323,6 +323,7 @@ impl Store {
             })
             .collect();
         let sessions = self.summarize_sessions(&wanted)?;
+        let (swarm_mcp, swarm_mcp_truncated) = self.swarm_mcp_turn_usage(pairs)?;
         Ok(UsageSummaryResponse {
             scope,
             agents_included,
@@ -340,6 +341,8 @@ impl Store {
                 by_scope,
             },
             sessions,
+            swarm_mcp,
+            swarm_mcp_truncated,
         })
     }
 }

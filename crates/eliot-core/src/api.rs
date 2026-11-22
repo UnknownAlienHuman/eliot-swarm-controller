@@ -40,6 +40,7 @@ mod rules;
 mod script_edit;
 mod scripts;
 mod string_list;
+mod swarm_usage;
 mod switch;
 mod timers;
 mod usage;
@@ -189,6 +190,10 @@ pub use scripts::{
     ScriptActionRecord, ScriptCommandContext, ScriptCustody, ScriptDirectExit, ScriptInputContext,
     ScriptInterpreter, ScriptProcessResult, ScriptRuleContext, ScriptRunApplied,
     ScriptTimerContext, ScriptTimerInvocation, bound_script_outcome_stderr,
+};
+pub use swarm_usage::{
+    MAX_SWARM_MCP_TURNS, SWARM_MCP_EVENT_ORIGIN, SWARM_MCP_EVENT_TOOL, SwarmMcpToolEventData,
+    SwarmMcpToolStatus, SwarmMcpTurnUsage,
 };
 pub use switch::{
     SWITCH_BLANK_SCOPE_ARG, SWITCH_PROJECT_REVISION_ARG, SwitchAgent, SwitchLaunch, SwitchRequest,
