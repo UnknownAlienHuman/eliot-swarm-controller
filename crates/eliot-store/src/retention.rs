@@ -853,7 +853,9 @@ fn subtree_members_tx(connection: &Connection, root: &str) -> Result<(Vec<Subtre
                       AND t.turn_id = c.turn_id AND t.state IN ('running', 'unknown')
                 ),
                 (EXISTS(SELECT 1 FROM workspaces w WHERE w.start_command_id = c.id)
-                  OR EXISTS(SELECT 1 FROM project_transfers p WHERE p.launch_command = c.id)),
+                  OR EXISTS(SELECT 1 FROM project_transfers p WHERE p.launch_command = c.id)
+                  OR EXISTS(SELECT 1 FROM git_integration_custody j
+                            WHERE j.command_id = c.id AND j.cleaned = 0)),
                 EXISTS(SELECT 1 FROM provider_holds h WHERE h.probe_command = c.id),
                 EXISTS(
                     SELECT 1 FROM goals g

@@ -225,6 +225,8 @@ pub struct GitIntegrateOutcome {
     pub conflict_paths: Vec<String>,
     #[serde(default)]
     pub conflict_paths_truncated: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cleanup_pending: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check_failure: Option<GitIntegrateCheckFailure>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

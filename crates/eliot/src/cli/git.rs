@@ -83,6 +83,9 @@ pub(crate) async fn run(
 }
 
 fn print_integration(result: &GitIntegrateOutcome, command_id: &str, state: CommandState) {
+    if result.cleanup_pending {
+        println!("Integration scratch cleanup is pending");
+    }
     match result.status {
         GitIntegrateStatus::Merged => {
             println!(

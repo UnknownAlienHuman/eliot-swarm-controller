@@ -4,11 +4,13 @@
 //! admission. This module uses fixed Git argv, a private index, scoped process
 //! custody and the registered project policy check. It never pushes.
 
+mod custody;
 use crate::{
     git_monitor::{GitProbe, git_path_argument},
-    publication::TemporaryGitIndex,
     workspace_git::WorkspaceGit,
 };
+pub(crate) use custody::{IntegrationLease, reconcile};
+use custody::{Scratch, boot_id};
 use eliot_core::{
     CommandState, Error, Result, SecretPolicy,
     api::{
@@ -20,12 +22,7 @@ use eliot_core::{
     },
 };
 use serde_json::{Value, json};
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
+use std::{fs, path::Path, sync::Arc, time::Duration};
 use tokio::{sync::watch, time::Instant};
 
 const REF_READ_BUDGET: Duration = Duration::from_secs(10);
@@ -139,6 +136,7 @@ fn outcome(frozen: &FrozenGitIntegrate, status: GitIntegrateStatus) -> GitIntegr
         integration_oid: None,
         conflict_paths: Vec::new(),
         conflict_paths_truncated: false,
+        cleanup_pending: false,
         check_failure: None,
         fast_forward: None,
         failure_code: None,
@@ -164,55 +162,6 @@ fn execution(
     GitIntegrateExecution {
         state,
         outcome: value,
-    }
-}
-
-struct TemporaryWorktree {
-    root: PathBuf,
-    path: PathBuf,
-}
-
-impl TemporaryWorktree {
-    fn create(data_root: &Path) -> Result<Self> {
-        let data_root = fs::canonicalize(data_root)
-            .map_err(|_| unavailable("private Git integration data root cannot be resolved"))?;
-        let root = data_root.join(format!("git-integrate-{}", ulid::Ulid::new()));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            fs::DirBuilder::new()
-                .mode(0o700)
-                .create(&root)
-                .map_err(|_| unavailable("private Git integration directory cannot be created"))?;
-        }
-        #[cfg(not(unix))]
-        fs::create_dir(&root)
-            .map_err(|_| unavailable("private Git integration directory cannot be created"))?;
-        let canonical = fs::canonicalize(&root)
-            .map_err(|_| unavailable("private Git integration directory cannot be resolved"))?;
-        if canonical.parent() != Some(data_root.as_path())
-            || fs::symlink_metadata(&canonical)
-                .map(|metadata| crate::platform::is_reparse_point(&metadata))
-                .unwrap_or(true)
-        {
-            let _ = fs::remove_dir(&root);
-            return Err(unavailable("private Git integration directory is unsafe"));
-        }
-        Ok(Self {
-            path: canonical.join("worktree"),
-            root: canonical,
-        })
-    }
-
-    fn cleanup_root(&self) -> Result<()> {
-        let metadata = fs::symlink_metadata(&self.root)
-            .map_err(|_| unavailable("private Git integration directory disappeared"))?;
-        if !metadata.is_dir() || crate::platform::is_reparse_point(&metadata) {
-            return Err(unavailable("private Git integration directory changed"));
-        }
-        fs::remove_dir(&self.root)
-            .map_err(|_| unavailable("private Git integration artifacts remain"))?;
-        Ok(())
     }
 }
 
@@ -374,19 +323,19 @@ async fn run_git_effect(
     root: &Path,
     args: &[&str],
     index: &Path,
-    deadline: Instant,
-    policy: Arc<SecretPolicy>,
-    cancellation: watch::Receiver<bool>,
+    run: GitRun<'_>,
 ) -> Result<crate::scripts::process::ProcessOutcome> {
-    git.workspace_effect_command_with_index(
-        root,
-        args,
-        index,
-        remaining(deadline)?,
-        policy,
-        cancellation,
+    let command = git
+        .prepare_workspace_effect_with_index(root, args, index, run.deadline)
+        .await?;
+    Ok(crate::scripts::process::run_integration_process(
+        command,
+        remaining(run.deadline)?,
+        Arc::clone(run.policy),
+        run.cancellation.clone(),
+        run.lease.clone(),
     )
-    .await
+    .await)
 }
 
 async fn current_head(
@@ -513,9 +462,7 @@ async fn merge_branch(
     root: &Path,
     index: &Path,
     pin: &GitIntegrateBranchPin,
-    deadline: Instant,
-    policy: Arc<SecretPolicy>,
-    cancellation: watch::Receiver<bool>,
+    run: GitRun<'_>,
 ) -> MergeResult {
     let message = format!("Integrate {}", pin.branch);
     let args = [
@@ -532,17 +479,16 @@ async fn merge_branch(
         message.as_str(),
         pin.oid.as_str(),
     ];
-    let result = match run_git_effect(git, root, &args, index, deadline, policy, cancellation).await
-    {
+    let result = match run_git_effect(git, root, &args, index, run).await {
         Ok(result) => result,
         Err(_) => return MergeResult::Failed("git_integrate_merge_not_started"),
     };
     match process_exit(&result) {
-        Some(0) => match current_head(git, root, index, deadline).await {
+        Some(0) => match current_head(git, root, index, run.deadline).await {
             Ok(head) => MergeResult::Merged(head),
             Err(_) => MergeResult::Unknown("git_integrate_merge_readback_unknown"),
         },
-        Some(_) => match conflict_paths(git, root, index, deadline).await {
+        Some(_) => match conflict_paths(git, root, index, run.deadline).await {
             Ok((paths, truncated)) if !paths.is_empty() || truncated => {
                 MergeResult::Conflict(paths, truncated)
             }
@@ -561,43 +507,23 @@ async fn reset_to_base(
     root: &Path,
     index: &Path,
     base_oid: &str,
-    deadline: Instant,
-    policy: Arc<SecretPolicy>,
-    cancellation: watch::Receiver<bool>,
+    run: GitRun<'_>,
 ) -> Result<()> {
     let clean_args = ["clean", "-fdx"];
-    let clean = run_git_effect(
-        git,
-        root,
-        &clean_args,
-        index,
-        deadline,
-        Arc::clone(&policy),
-        cancellation.clone(),
-    )
-    .await?;
+    let clean = run_git_effect(git, root, &clean_args, index, run).await?;
     if process_exit(&clean) != Some(0) {
         return Err(unavailable(
             "temporary integration worktree could not be cleaned",
         ));
     }
     let reset_args = ["reset", "--hard", base_oid];
-    let reset = run_git_effect(
-        git,
-        root,
-        &reset_args,
-        index,
-        deadline,
-        policy,
-        cancellation,
-    )
-    .await?;
+    let reset = run_git_effect(git, root, &reset_args, index, run).await?;
     if process_exit(&reset) != Some(0) {
         return Err(unavailable(
             "temporary integration worktree could not return to base",
         ));
     }
-    verify_private_tree(git, root, index, base_oid, deadline).await
+    verify_private_tree(git, root, index, base_oid, run.deadline).await
 }
 
 async fn run_policy_check(
@@ -605,11 +531,10 @@ async fn run_policy_check(
     configured_timeout_ms: i64,
     root: &Path,
     index: &Path,
-    deadline: Instant,
-    policy: Arc<SecretPolicy>,
-    cancellation: watch::Receiver<bool>,
+    run: GitRun<'_>,
 ) -> Result<crate::router::project_checks::CheckOutcome> {
-    let remaining_ms = deadline
+    let remaining_ms = run
+        .deadline
         .saturating_duration_since(Instant::now())
         .as_millis()
         .min(i64::MAX as u128) as i64;
@@ -622,9 +547,9 @@ async fn run_policy_check(
         argv,
         path_text(root)?,
         configured_timeout_ms.min(remaining_ms),
-        policy,
-        cancellation,
-        Some(index),
+        Arc::clone(run.policy),
+        run.cancellation.clone(),
+        Some((index, run.lease.clone())),
     )
     .await
 }
@@ -639,6 +564,7 @@ struct GitRun<'a> {
     deadline: Instant,
     policy: &'a Arc<SecretPolicy>,
     cancellation: &'a watch::Receiver<bool>,
+    lease: &'a IntegrationLease,
 }
 
 async fn verify_private_worktree(
@@ -667,11 +593,7 @@ async fn isolate_failed_branches(
     check_timeout_ms: i64,
     run: GitRun<'_>,
 ) -> std::result::Result<IsolationResult, &'static str> {
-    let GitRun {
-        deadline,
-        policy,
-        cancellation,
-    } = run;
+    let deadline = run.deadline;
     let mut result = IsolationResult {
         failed: Vec::new(),
         unknown: Vec::new(),
@@ -688,43 +610,15 @@ async fn isolate_failed_branches(
         verify_private_worktree(git, root, &frozen.common_dir, deadline)
             .await
             .map_err(|_| "git_integrate_isolation_worktree_changed")?;
-        reset_to_base(
-            git,
-            root,
-            index,
-            &frozen.base_oid,
-            deadline,
-            Arc::clone(policy),
-            cancellation.clone(),
-        )
-        .await
-        .map_err(|_| "git_integrate_isolation_reset_unknown")?;
-        match merge_branch(
-            git,
-            root,
-            index,
-            pin,
-            deadline,
-            Arc::clone(policy),
-            cancellation.clone(),
-        )
-        .await
-        {
+        reset_to_base(git, root, index, &frozen.base_oid, run)
+            .await
+            .map_err(|_| "git_integrate_isolation_reset_unknown")?;
+        match merge_branch(git, root, index, pin, run).await {
             MergeResult::Merged(oid) => {
                 verify_private_tree(git, root, index, &oid, deadline)
                     .await
                     .map_err(|_| "git_integrate_isolation_tree_unknown")?;
-                match run_policy_check(
-                    check_argv,
-                    check_timeout_ms,
-                    root,
-                    index,
-                    deadline,
-                    Arc::clone(policy),
-                    cancellation.clone(),
-                )
-                .await
-                {
+                match run_policy_check(check_argv, check_timeout_ms, root, index, run).await {
                     Ok(crate::router::project_checks::CheckOutcome::Passed) => {}
                     Ok(crate::router::project_checks::CheckOutcome::Failed { .. }) => {
                         result.failed.push(pin.branch.clone());
@@ -735,51 +629,14 @@ async fn isolate_failed_branches(
                     Err(_) => result.unknown.push(pin.branch.clone()),
                 }
             }
-            MergeResult::Conflict(_, _) | MergeResult::Failed(_) => {
+            MergeResult::Conflict(_, _) => {
                 result.failed.push(pin.branch.clone());
             }
+            MergeResult::Failed(_) => result.unknown.push(pin.branch.clone()),
             MergeResult::Unknown(_) => return Err("git_integrate_isolation_merge_unknown"),
         }
     }
     Ok(result)
-}
-
-async fn cleanup_temporary_worktree(
-    git: &GitProbe,
-    repository_root: &Path,
-    temporary: &TemporaryWorktree,
-    index: &Path,
-    deadline: Instant,
-    policy: Arc<SecretPolicy>,
-    cancellation: watch::Receiver<bool>,
-) -> Result<()> {
-    let registered = worktree_registered(git, repository_root, &temporary.path).await?;
-    let exists = fs::symlink_metadata(&temporary.path).is_ok();
-    if registered || exists {
-        let path = git_path_argument(&temporary.path)?;
-        let args = ["worktree", "remove", "--force", path.as_str()];
-        let outcome = run_git_effect(
-            git,
-            repository_root,
-            &args,
-            index,
-            deadline,
-            Arc::clone(&policy),
-            cancellation,
-        )
-        .await?;
-        if process_exit(&outcome) != Some(0) {
-            return Err(unavailable("temporary Git worktree removal is unconfirmed"));
-        }
-        if worktree_registered(git, repository_root, &temporary.path).await?
-            || fs::symlink_metadata(&temporary.path).is_ok()
-        {
-            return Err(unavailable(
-                "temporary Git worktree still exists after removal",
-            ));
-        }
-    }
-    temporary.cleanup_root()
 }
 
 async fn current_branch_oid(
@@ -836,145 +693,140 @@ async fn update_fast_forward(
     integration_oid: &str,
     run: GitRun<'_>,
 ) -> std::result::Result<GitIntegrateRefUpdate, TargetUpdateFailure> {
-    let GitRun {
-        deadline,
-        policy,
-        cancellation,
-    } = run;
-    let Some(target) = &frozen.fast_forward else {
-        return Err(TargetUpdateFailure {
-            code: "git_integrate_target_missing",
-            unknown: false,
-        });
-    };
-    match ref_is_checked_out(git, root, &target.branch).await {
-        Ok(false) => {}
-        Ok(true) => {
-            return Err(TargetUpdateFailure {
-                code: "git_integrate_target_checked_out",
-                unknown: false,
-            });
-        }
-        Err(_) => {
-            return Err(TargetUpdateFailure {
-                code: "git_integrate_target_checkout_unknown",
-                unknown: true,
-            });
-        }
-    }
-    match branch_is_ancestor(git, root, &target.expected_oid, integration_oid, deadline).await {
+    let failure = |code, unknown| TargetUpdateFailure { code, unknown };
+    let target = frozen
+        .fast_forward
+        .as_ref()
+        .ok_or_else(|| failure("git_integrate_target_missing", false))?;
+    match branch_is_ancestor(
+        git,
+        root,
+        &target.expected_oid,
+        integration_oid,
+        run.deadline,
+    )
+    .await
+    {
         Ok(true) => {}
-        Ok(false) => {
-            return Err(TargetUpdateFailure {
-                code: "git_integrate_target_not_fast_forwardable",
-                unknown: false,
-            });
-        }
-        Err(_) => {
-            return Err(TargetUpdateFailure {
-                code: "git_integrate_target_ancestry_unknown",
-                unknown: true,
-            });
-        }
+        Ok(false) => return Err(failure("git_integrate_target_not_fast_forwardable", false)),
+        Err(_) => return Err(failure("git_integrate_target_ancestry_unknown", false)),
     }
-    match current_branch_oid(git, root, &target.branch, deadline).await {
+    match current_branch_oid(git, root, &target.branch, run.deadline).await {
         Ok(oid) if oid == target.expected_oid => {}
-        Ok(_) => {
-            return Err(TargetUpdateFailure {
-                code: "git_integrate_target_moved",
-                unknown: false,
-            });
-        }
-        Err(_) => {
-            return Err(TargetUpdateFailure {
-                code: "git_integrate_target_readback_unknown",
-                unknown: true,
-            });
-        }
+        Ok(_) => return Err(failure("git_integrate_target_moved", false)),
+        Err(_) => return Err(failure("git_integrate_target_readback_unknown", false)),
     }
     match ref_is_checked_out(git, root, &target.branch).await {
         Ok(false) => {}
-        Ok(true) => {
-            return Err(TargetUpdateFailure {
-                code: "git_integrate_target_checked_out",
-                unknown: false,
-            });
-        }
-        Err(_) => {
-            return Err(TargetUpdateFailure {
-                code: "git_integrate_target_checkout_unknown",
-                unknown: true,
-            });
-        }
+        Ok(true) => return Err(failure("git_integrate_target_checked_out", false)),
+        Err(_) => return Err(failure("git_integrate_target_checkout_unknown", false)),
     }
+
+    run.lease
+        .ref_pending(true)
+        .await
+        .map_err(|_| failure("git_integrate_target_update_not_started", false))?;
     let reference = format!("refs/heads/{}", target.branch);
     let args = [
         "update-ref",
         "--no-deref",
-        reference.as_str(),
+        &reference,
         integration_oid,
-        target.expected_oid.as_str(),
+        &target.expected_oid,
     ];
-    let effect = match run_git_effect(
-        git,
-        root,
-        &args,
-        index,
-        deadline,
-        Arc::clone(policy),
-        cancellation.clone(),
-    )
-    .await
-    {
-        Ok(effect) => effect,
-        Err(_) => {
-            return Err(TargetUpdateFailure {
-                code: "git_integrate_target_update_not_started",
-                unknown: false,
-            });
+    let result = match run_git_effect(git, root, &args, index, run).await {
+        Err(_) => Err(failure("git_integrate_target_update_not_started", false)),
+        Ok(effect) if !process_cannot_have_effect(&effect) && !process_quiescent(&effect) => {
+            Err(failure("git_integrate_target_update_unknown", true))
         }
-    };
-    let exit = process_exit(&effect);
-    if exit.is_none() && !process_cannot_have_effect(&effect) && !process_quiescent(&effect) {
-        return Err(TargetUpdateFailure {
-            code: "git_integrate_target_update_unknown",
-            unknown: true,
-        });
-    }
-    let current = current_branch_oid(git, root, &target.branch, deadline).await;
-    match current {
-        Ok(oid) if oid == integration_oid => {
-            match ref_is_checked_out(git, root, &target.branch).await {
-                Ok(false) => Ok(GitIntegrateRefUpdate {
+        Ok(effect) => {
+            let deadline = Instant::now() + REF_READ_BUDGET;
+            let checked_out = ref_is_checked_out(git, root, &target.branch).await;
+            let current = current_branch_oid(git, root, &target.branch, deadline).await;
+            let installed = current.as_ref().is_ok_and(|oid| oid == integration_oid);
+            let update_succeeded = process_exit(&effect) == Some(0);
+            match (checked_out, current) {
+                (Ok(true), _) if installed || update_succeeded => {
+                    // Compensate only our own ref value. A concurrent writer's
+                    // value must survive this compare-and-swap.
+                    let rollback = [
+                        "update-ref",
+                        "--no-deref",
+                        &reference,
+                        &target.expected_oid,
+                        integration_oid,
+                    ];
+                    let (_cancel_guard, cancellation) = watch::channel(false);
+                    let rollback_run = GitRun {
+                        deadline: Instant::now() + REF_READ_BUDGET,
+                        cancellation: &cancellation,
+                        ..run
+                    };
+                    let compensated =
+                        run_git_effect(git, root, &rollback, index, rollback_run).await;
+                    let observed = current_branch_oid(
+                        git,
+                        root,
+                        &target.branch,
+                        Instant::now() + REF_READ_BUDGET,
+                    )
+                    .await;
+                    let code = match (compensated.as_ref().ok(), observed) {
+                        (Some(effect), Ok(oid))
+                            if process_exit(effect) == Some(0) && oid == target.expected_oid =>
+                        {
+                            "git_integrate_checkout_race_rolled_back"
+                        }
+                        (Some(effect), Ok(oid))
+                            if process_cannot_have_effect(effect)
+                                && oid != integration_oid
+                                && oid != target.expected_oid =>
+                        {
+                            "git_integrate_checkout_race_ref_changed"
+                        }
+                        _ => "git_integrate_checkout_race_rollback_unconfirmed",
+                    };
+                    Err(failure(code, true))
+                }
+                (Ok(false), Ok(oid)) if installed => Ok(GitIntegrateRefUpdate {
                     branch: target.branch.clone(),
                     oid,
                 }),
-                Ok(true) => Err(TargetUpdateFailure {
-                    code: "git_integrate_target_checkout_race_unknown",
-                    unknown: true,
-                }),
-                Err(_) => Err(TargetUpdateFailure {
-                    code: "git_integrate_target_checkout_unknown",
-                    unknown: true,
-                }),
+                (_, Ok(oid)) if oid == target.expected_oid && !update_succeeded => {
+                    Err(failure("git_integrate_target_update_failed", false))
+                }
+                (Err(_), _) => Err(failure("git_integrate_target_checkout_unknown", true)),
+                (_, Ok(_)) => Err(failure(
+                    "git_integrate_target_update_readback_mismatch",
+                    true,
+                )),
+                (_, Err(_)) => Err(failure(
+                    "git_integrate_target_update_readback_unknown",
+                    true,
+                )),
             }
         }
-        Ok(oid) if oid == target.expected_oid && exit != Some(0) => Err(TargetUpdateFailure {
-            code: "git_integrate_target_update_failed",
-            unknown: false,
-        }),
-        Ok(_) => Err(TargetUpdateFailure {
-            code: "git_integrate_target_update_readback_mismatch",
-            unknown: true,
-        }),
-        Err(_) => Err(TargetUpdateFailure {
-            code: "git_integrate_target_update_readback_unknown",
-            unknown: true,
-        }),
+    };
+    if (result.is_ok()
+        || result.as_ref().is_err_and(|error| {
+            !error.unknown
+                || matches!(
+                    error.code,
+                    "git_integrate_checkout_race_rolled_back"
+                        | "git_integrate_checkout_race_ref_changed"
+                )
+        }))
+        && run.lease.ref_pending(false).await.is_err()
+    {
+        return result.and_then(|_| Err(failure("git_integrate_ref_custody_unconfirmed", true)));
     }
+    result
 }
+
 pub(crate) async fn execute(
     data_root: &Path,
+    store: &Arc<tokio::sync::Mutex<eliot_store::Store>>,
+    command_id: &str,
     frozen: &FrozenGitIntegrate,
     registration: &ProjectRegistrationView,
     cancellation: watch::Receiver<bool>,
@@ -1105,209 +957,169 @@ pub(crate) async fn execute(
         return execution(frozen, CommandState::Rejected, result, None);
     }
 
-    let deadline = Instant::now()
-        .checked_add(Duration::from_millis(frozen.timeout_ms as u64))
-        .unwrap_or_else(Instant::now);
+    let record = (|| -> Result<eliot_store::IntegrationCustody> {
+        let canonical = fs::canonicalize(data_root)
+            .map_err(|_| unavailable("integration data root is unavailable"))?;
+        Ok(eliot_store::IntegrationCustody {
+            command_id: command_id.to_owned(),
+            scratch_id: ulid::Ulid::new().to_string(),
+            data_root: path_text(&canonical)?.to_owned(),
+            checkout: frozen.canonical_checkout.clone(),
+            common_dir: frozen.common_dir.clone(),
+            boot_id: boot_id()?,
+            armed: false,
+            process: None,
+        })
+    })();
+    let Ok(record) = record else {
+        return execution(
+            frozen,
+            CommandState::Rejected,
+            result,
+            Some("git_integrate_custody_unavailable"),
+        );
+    };
+    if store
+        .lock()
+        .await
+        .reserve_integration_custody(&record)
+        .is_err()
+    {
+        return execution(
+            frozen,
+            CommandState::Rejected,
+            result,
+            Some("git_integrate_custody_unavailable"),
+        );
+    }
+    let lease = IntegrationLease::for_record(store, &record);
     let run = GitRun {
-        deadline,
+        deadline: Instant::now() + Duration::from_millis(frozen.timeout_ms as u64),
         policy: &secret_policy,
         cancellation: &cancellation,
+        lease: &lease,
     };
-    let temporary = match TemporaryWorktree::create(data_root) {
-        Ok(temporary) => temporary,
-        Err(_) => {
-            result.failure_code = Some("git_integrate_private_worktree_unavailable".to_owned());
-            return execution(frozen, CommandState::Rejected, result, None);
+    let mut settled = match Scratch::allocate(data_root, &record) {
+        Ok(scratch) => {
+            execute_in_scratch(
+                &git,
+                frozen,
+                (&check.argv, check.deadline_ms),
+                &scratch,
+                run,
+            )
+            .await
         }
+        Err(_) => execution(
+            frozen,
+            CommandState::Failed,
+            result,
+            Some("git_integrate_scratch_unavailable"),
+        ),
     };
-    let index = match TemporaryGitIndex::create_with_prefix(data_root, "git-integrate-index") {
-        Ok(index) => index,
-        Err(_) => {
-            let _ = temporary.cleanup_root();
-            result.failure_code = Some("git_integrate_private_index_unavailable".to_owned());
-            return execution(frozen, CommandState::Rejected, result, None);
-        }
+    let retained = store.lock().await.integration_custody(command_id);
+    let cleaned = match retained {
+        Ok(Some(record)) => reconcile(store, data_root, &record).await,
+        Ok(None) => Ok(()),
+        Err(error) => Err(error),
     };
-    let repo_root = Path::new(&frozen.canonical_checkout);
-    let temporary_root = temporary.path.as_path();
-    let temporary_path = match git_path_argument(temporary_root) {
+    if let Err(error) = cleaned {
+        crate::logging::record(
+            &secret_policy,
+            "git.integrate.cleanup_pending",
+            &[("command", command_id)],
+            Some(&error),
+        );
+        settled.state = CommandState::Unknown;
+        settled.outcome["cleanup_pending"] = json!(true);
+    }
+    settled
+}
+
+async fn execute_in_scratch(
+    git: &GitProbe,
+    frozen: &FrozenGitIntegrate,
+    check: (&[String], i64),
+    scratch: &Scratch,
+    run: GitRun<'_>,
+) -> GitIntegrateExecution {
+    use crate::router::project_checks::CheckOutcome;
+    let mut result = outcome(frozen, GitIntegrateStatus::Unknown);
+    let repo = Path::new(&frozen.canonical_checkout);
+    let root = &scratch.worktree;
+    let index = &scratch.index;
+    let temporary_path = match git_path_argument(root) {
         Ok(path) => path,
         Err(_) => {
-            let _ = temporary.cleanup_root();
-            result.failure_code = Some("git_integrate_private_worktree_path_invalid".to_owned());
-            return execution(frozen, CommandState::Rejected, result, None);
+            return execution(
+                frozen,
+                CommandState::Failed,
+                result,
+                Some("git_integrate_private_worktree_path_invalid"),
+            );
         }
     };
-    let add_args = [
+    let add = [
+        "-c",
+        "worktree.useRelativePaths=false",
         "worktree",
         "add",
         "--detach",
         "--no-checkout",
-        temporary_path.as_str(),
-        frozen.base_oid.as_str(),
+        "--",
+        &temporary_path,
+        &frozen.base_oid,
     ];
-    let added = match run_git_effect(
-        &git,
-        repo_root,
-        &add_args,
-        index.path(),
-        deadline,
-        Arc::clone(&secret_policy),
-        cancellation.clone(),
-    )
-    .await
-    {
-        Ok(effect) => effect,
-        Err(_) => {
-            let _ = temporary.cleanup_root();
-            result.failure_code = Some("git_integrate_worktree_add_not_started".to_owned());
-            return execution(frozen, CommandState::Failed, result, None);
+    match run_git_effect(git, repo, &add, index, run).await {
+        Ok(effect) if process_exit(&effect) == Some(0) => {}
+        Ok(effect) if !process_quiescent(&effect) && !process_cannot_have_effect(&effect) => {
+            return execution(
+                frozen,
+                CommandState::Unknown,
+                result,
+                Some("git_integrate_worktree_add_unknown"),
+            );
         }
-    };
-    let add_exit = process_exit(&added);
-    if add_exit != Some(0) {
-        if process_cannot_have_effect(&added) {
-            if cleanup_temporary_worktree(
-                &git,
-                repo_root,
-                &temporary,
-                index.path(),
-                deadline,
-                Arc::clone(&secret_policy),
-                cancellation.clone(),
-            )
-            .await
-            .is_err()
-            {
-                std::mem::forget(index);
-                result.failure_code = Some("git_integrate_worktree_add_cleanup_unknown".to_owned());
-                return execution(frozen, CommandState::Unknown, result, None);
-            }
-            result.failure_code = Some("git_integrate_worktree_add_failed".to_owned());
-            return execution(frozen, CommandState::Failed, result, None);
+        _ => {
+            return execution(
+                frozen,
+                CommandState::Failed,
+                result,
+                Some("git_integrate_worktree_add_failed"),
+            );
         }
-        std::mem::forget(index);
-        result.failure_code = Some("git_integrate_worktree_add_unknown".to_owned());
-        return execution(frozen, CommandState::Unknown, result, None);
     }
 
-    if verify_private_worktree(&git, temporary_root, &frozen.common_dir, deadline)
+    if verify_private_worktree(git, root, &frozen.common_dir, run.deadline)
         .await
         .is_err()
     {
-        std::mem::forget(index);
-        result.failure_code = Some("git_integrate_private_worktree_unverified".to_owned());
-        return execution(frozen, CommandState::Unknown, result, None);
+        return execution(
+            frozen,
+            CommandState::Unknown,
+            result,
+            Some("git_integrate_private_worktree_unverified"),
+        );
     }
-    let reset_args = ["reset", "--hard", frozen.base_oid.as_str()];
-    let reset = match run_git_effect(
-        &git,
-        temporary_root,
-        &reset_args,
-        index.path(),
-        deadline,
-        Arc::clone(&secret_policy),
-        cancellation.clone(),
-    )
-    .await
-    {
-        Ok(effect) => effect,
-        Err(_) => {
-            result.failure_code = Some("git_integrate_base_checkout_not_started".to_owned());
-            if cleanup_temporary_worktree(
-                &git,
-                repo_root,
-                &temporary,
-                index.path(),
-                deadline,
-                Arc::clone(&secret_policy),
-                cancellation.clone(),
-            )
-            .await
-            .is_err()
-            {
-                std::mem::forget(index);
-                result.failure_code = Some("git_integrate_base_cleanup_unknown".to_owned());
-                return execution(frozen, CommandState::Unknown, result, None);
-            }
-            return execution(frozen, CommandState::Failed, result, None);
-        }
-    };
-    let reset_exit = process_exit(&reset);
-    let base_tree = if reset_exit == Some(0) {
-        verify_private_tree(
-            &git,
-            temporary_root,
-            index.path(),
-            &frozen.base_oid,
-            deadline,
-        )
-        .await
-        .is_ok()
-    } else {
-        false
-    };
-    if !base_tree {
-        if reset_exit.is_none() && !process_cannot_have_effect(&reset) {
-            std::mem::forget(index);
-            result.failure_code = Some("git_integrate_base_checkout_unknown".to_owned());
-            return execution(frozen, CommandState::Unknown, result, None);
-        }
-        if cleanup_temporary_worktree(
-            &git,
-            repo_root,
-            &temporary,
-            index.path(),
-            deadline,
-            Arc::clone(&secret_policy),
-            cancellation.clone(),
-        )
+    if reset_to_base(git, root, index, &frozen.base_oid, run)
         .await
         .is_err()
-        {
-            std::mem::forget(index);
-            result.failure_code = Some("git_integrate_base_cleanup_unknown".to_owned());
-            return execution(frozen, CommandState::Unknown, result, None);
-        }
-        result.failure_code = Some("git_integrate_base_checkout_failed".to_owned());
-        return execution(frozen, CommandState::Failed, result, None);
+    {
+        return execution(
+            frozen,
+            CommandState::Unknown,
+            result,
+            Some("git_integrate_base_checkout_unconfirmed"),
+        );
     }
-
     let mut integration_oid = frozen.base_oid.clone();
     for pin in &frozen.branches {
-        match merge_branch(
-            &git,
-            temporary_root,
-            index.path(),
-            pin,
-            deadline,
-            Arc::clone(&secret_policy),
-            cancellation.clone(),
-        )
-        .await
-        {
+        match merge_branch(git, root, index, pin, run).await {
             MergeResult::Merged(oid) => integration_oid = oid,
             MergeResult::Conflict(paths, truncated) => {
                 result.status = GitIntegrateStatus::Conflict;
                 result.conflict_paths = paths;
                 result.conflict_paths_truncated = truncated;
-                if cleanup_temporary_worktree(
-                    &git,
-                    repo_root,
-                    &temporary,
-                    index.path(),
-                    deadline,
-                    Arc::clone(&secret_policy),
-                    cancellation.clone(),
-                )
-                .await
-                .is_err()
-                {
-                    std::mem::forget(index);
-                    result.status = GitIntegrateStatus::Unknown;
-                    result.failure_code = Some("git_integrate_conflict_cleanup_unknown".to_owned());
-                    return execution(frozen, CommandState::Unknown, result, None);
-                }
                 return execution(
                     frozen,
                     CommandState::Failed,
@@ -1316,89 +1128,49 @@ pub(crate) async fn execute(
                 );
             }
             MergeResult::Failed(code) => {
-                if cleanup_temporary_worktree(
-                    &git,
-                    repo_root,
-                    &temporary,
-                    index.path(),
-                    deadline,
-                    Arc::clone(&secret_policy),
-                    cancellation.clone(),
-                )
-                .await
-                .is_err()
-                {
-                    std::mem::forget(index);
-                    result.failure_code = Some("git_integrate_merge_cleanup_unknown".to_owned());
-                    return execution(frozen, CommandState::Unknown, result, None);
-                }
-                result.failure_code = Some(code.to_owned());
-                return execution(frozen, CommandState::Failed, result, None);
+                return execution(frozen, CommandState::Failed, result, Some(code));
             }
             MergeResult::Unknown(code) => {
-                std::mem::forget(index);
-                result.failure_code = Some(code.to_owned());
-                return execution(frozen, CommandState::Unknown, result, None);
+                return execution(frozen, CommandState::Unknown, result, Some(code));
             }
         }
     }
-    if verify_private_tree(
-        &git,
-        temporary_root,
-        index.path(),
-        &integration_oid,
-        deadline,
-    )
-    .await
-    .is_err()
+    if verify_private_tree(git, root, index, &integration_oid, run.deadline)
+        .await
+        .is_err()
     {
-        std::mem::forget(index);
-        result.failure_code = Some("git_integrate_combined_tree_unknown".to_owned());
-        return execution(frozen, CommandState::Unknown, result, None);
+        return execution(
+            frozen,
+            CommandState::Unknown,
+            result,
+            Some("git_integrate_combined_tree_unknown"),
+        );
     }
-    match run_policy_check(
-        &check.argv,
-        check.deadline_ms,
-        temporary_root,
-        index.path(),
-        deadline,
-        Arc::clone(&secret_policy),
-        cancellation.clone(),
-    )
-    .await
-    {
-        Ok(crate::router::project_checks::CheckOutcome::Passed) => {}
-        Ok(crate::router::project_checks::CheckOutcome::Failed { exit_code, output }) => {
-            let isolation = isolate_failed_branches(
-                &git,
-                temporary_root,
-                index.path(),
-                frozen,
-                &check.argv,
-                check.deadline_ms,
-                run,
+    match run_policy_check(check.0, check.1, root, index, run).await {
+        Ok(CheckOutcome::Passed) => {}
+        Ok(CheckOutcome::Failed { exit_code, output }) => {
+            let (state, code, isolation) = match isolate_failed_branches(
+                git, root, index, frozen, check.0, check.1, run,
             )
-            .await;
-            let isolation = match isolation {
-                Ok(isolation) => isolation,
-                Err(code) => {
-                    std::mem::forget(index);
-                    result.status = GitIntegrateStatus::CheckFailed;
-                    result.integration_oid = Some(integration_oid.clone());
-                    result.check_failure = Some(GitIntegrateCheckFailure {
-                        exit_code,
-                        tail: diagnostic_tail(&output),
-                        classification: GitIntegrateCheckClassification::IsolationUnknown,
-                        failed_branches: Vec::new(),
-                        unknown_branches: frozen
+            .await
+            {
+                Ok(isolation) => (
+                    CommandState::Failed,
+                    "git_integrate_check_failed",
+                    isolation,
+                ),
+                Err(code) => (
+                    CommandState::Unknown,
+                    code,
+                    IsolationResult {
+                        failed: Vec::new(),
+                        unknown: frozen
                             .branches
                             .iter()
                             .map(|pin| pin.branch.clone())
                             .collect(),
-                    });
-                    result.failure_code = Some(code.to_owned());
-                    return execution(frozen, CommandState::Unknown, result, None);
-                }
+                    },
+                ),
             };
             let classification = if !isolation.unknown.is_empty() {
                 GitIntegrateCheckClassification::IsolationUnknown
@@ -1408,7 +1180,7 @@ pub(crate) async fn execute(
                 GitIntegrateCheckClassification::CombinationOnly
             };
             result.status = GitIntegrateStatus::CheckFailed;
-            result.integration_oid = Some(integration_oid.clone());
+            result.integration_oid = Some(integration_oid);
             result.check_failure = Some(GitIntegrateCheckFailure {
                 exit_code,
                 tail: diagnostic_tail(&output),
@@ -1416,88 +1188,45 @@ pub(crate) async fn execute(
                 failed_branches: isolation.failed,
                 unknown_branches: isolation.unknown,
             });
-            if cleanup_temporary_worktree(
-                &git,
-                repo_root,
-                &temporary,
-                index.path(),
-                deadline,
-                Arc::clone(&secret_policy),
-                cancellation.clone(),
-            )
-            .await
-            .is_err()
-            {
-                std::mem::forget(index);
-                result.status = GitIntegrateStatus::Unknown;
-                result.failure_code = Some("git_integrate_check_cleanup_unknown".to_owned());
-                return execution(frozen, CommandState::Unknown, result, None);
-            }
+            return execution(frozen, state, result, Some(code));
+        }
+        Ok(CheckOutcome::Unknown(_)) | Err(_) => {
             return execution(
                 frozen,
-                CommandState::Failed,
+                CommandState::Unknown,
                 result,
-                Some("git_integrate_check_failed"),
+                Some("git_integrate_check_unknown"),
             );
-        }
-        Ok(crate::router::project_checks::CheckOutcome::Unknown(_)) | Err(_) => {
-            std::mem::forget(index);
-            result.failure_code = Some("git_integrate_check_unknown".to_owned());
-            return execution(frozen, CommandState::Unknown, result, None);
         }
     }
 
-    let checked_tree_intact =
-        verify_private_worktree(&git, temporary_root, &frozen.common_dir, deadline)
+    if verify_private_worktree(git, root, &frozen.common_dir, run.deadline)
+        .await
+        .is_err()
+        || verify_private_tree(git, root, index, &integration_oid, run.deadline)
             .await
-            .is_ok()
-            && verify_private_tree(
-                &git,
-                temporary_root,
-                index.path(),
-                &integration_oid,
-                deadline,
-            )
-            .await
-            .is_ok();
-    if cleanup_temporary_worktree(
-        &git,
-        repo_root,
-        &temporary,
-        index.path(),
-        deadline,
-        Arc::clone(&secret_policy),
-        cancellation.clone(),
-    )
-    .await
-    .is_err()
+            .is_err()
     {
-        std::mem::forget(index);
-        result.status = GitIntegrateStatus::Unknown;
-        result.failure_code = Some("git_integrate_cleanup_unknown".to_owned());
-        return execution(frozen, CommandState::Unknown, result, None);
-    }
-    if !checked_tree_intact {
-        result.failure_code = Some("git_integrate_checked_tree_changed".to_owned());
-        return execution(frozen, CommandState::Failed, result, None);
+        return execution(
+            frozen,
+            CommandState::Failed,
+            result,
+            Some("git_integrate_checked_tree_changed"),
+        );
     }
     result.status = GitIntegrateStatus::Merged;
     result.integration_oid = Some(integration_oid.clone());
-
     if frozen.fast_forward.is_some() {
-        match update_fast_forward(&git, repo_root, index.path(), frozen, &integration_oid, run)
-            .await
-        {
+        match update_fast_forward(git, repo, index, frozen, &integration_oid, run).await {
             Ok(update) => result.fast_forward = Some(update),
             Err(failure) => {
-                result.failure_code = Some(failure.code.to_owned());
                 let state = if failure.unknown {
                     result.status = GitIntegrateStatus::Unknown;
                     CommandState::Unknown
                 } else {
                     CommandState::Failed
                 };
-                return execution(frozen, state, result, None);
+                return execution(frozen, state, result, Some(failure.code));
             }
         }
     }

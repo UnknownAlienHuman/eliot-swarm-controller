@@ -150,6 +150,7 @@ struct RouterInner {
     data_root: PathBuf,
     store: StoreHandle,
     autonomy_reader: Arc<tokio::sync::Semaphore>,
+    integration_cleanup: AsyncMutex<()>,
     bus: Bus,
     mail: crate::config::MailConfig,
     attention: crate::config::AttentionConfig,
@@ -415,6 +416,7 @@ impl Router {
                 data_root,
                 store,
                 autonomy_reader: Arc::new(tokio::sync::Semaphore::new(1)),
+                integration_cleanup: AsyncMutex::new(()),
                 bus,
                 mail,
                 attention,
@@ -1992,6 +1994,8 @@ impl Router {
         }
         registration.validate()?;
         crate::automation::verify_project_registration(&self.inner.data_root, &registration)
+            .await?;
+        self.reconcile_git_integrations(Some(&registration.repo_common_dir))
             .await?;
         let frozen =
             crate::git_integration::freeze(&registration, &definition, caller, timeout_ms).await?;

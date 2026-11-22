@@ -1129,12 +1129,9 @@ impl GitProbe {
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or_else(|| Error::new("invalid", "Git effect timeout is out of range"))?;
-        let overrides = self.safe_overrides(root, deadline).await?;
-        if Instant::now() >= deadline {
-            return Err(unavailable("Git effect preparation deadline elapsed"));
-        }
-        let command =
-            self.build_command_with_index(root, args, &overrides, None, Some(index_file))?;
+        let command = self
+            .prepare_workspace_effect_with_index(root, args, index_file, deadline)
+            .await?;
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(unavailable("Git effect preparation deadline elapsed"));
@@ -1147,6 +1144,20 @@ impl GitProbe {
             cancellation,
         )
         .await)
+    }
+
+    pub(crate) async fn prepare_workspace_effect_with_index(
+        &self,
+        root: &Path,
+        args: &[&str],
+        index_file: &Path,
+        deadline: Instant,
+    ) -> Result<Command> {
+        let overrides = self.safe_overrides(root, deadline).await?;
+        if Instant::now() >= deadline {
+            return Err(unavailable("Git effect preparation deadline elapsed"));
+        }
+        self.build_command_with_index(root, args, &overrides, None, Some(index_file))
     }
 
     /// Read from the captured Git repository binding, even if the checkout's

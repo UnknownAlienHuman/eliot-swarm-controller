@@ -1,3 +1,4 @@
+use crate::git_integration::IntegrationLease;
 use crate::platform::{CustodyGuarantee, CustodyObserver, OwnedChild, custody::AgentSpawnError};
 use eliot_core::{Error, SecretPolicy, StderrSnapshot, limits::MAX_FRAME_BYTES};
 use eliot_plugin::{StderrCapture, spawn_stderr, spawn_stderr_prefix};
@@ -177,6 +178,37 @@ pub(crate) async fn run_owned_process_with_stderr(
     cancellation: watch::Receiver<bool>,
     stderr: StderrExcerpt,
 ) -> ProcessOutcome {
+    run_supervised_process(command, stdin, timeout, policy, cancellation, stderr, None).await
+}
+
+pub(crate) async fn run_integration_process(
+    command: Command,
+    timeout: Duration,
+    policy: Arc<SecretPolicy>,
+    cancellation: watch::Receiver<bool>,
+    lease: IntegrationLease,
+) -> ProcessOutcome {
+    run_supervised_process(
+        command,
+        Vec::new(),
+        timeout,
+        policy,
+        cancellation,
+        StderrExcerpt::Tail,
+        Some(lease),
+    )
+    .await
+}
+
+async fn run_supervised_process(
+    command: Command,
+    stdin: Vec<u8>,
+    timeout: Duration,
+    policy: Arc<SecretPolicy>,
+    cancellation: watch::Receiver<bool>,
+    stderr: StderrExcerpt,
+    lease: Option<IntegrationLease>,
+) -> ProcessOutcome {
     if stdin.len() > MAX_FRAME_BYTES {
         return ProcessOutcome::Failed {
             reason: ProcessFailure::InputLimit,
@@ -198,13 +230,14 @@ pub(crate) async fn run_owned_process_with_stderr(
 
     // Keep process ownership alive if the caller drops this future. The
     // cancellation receiver and timeout remain the supervisor's stop paths.
-    match tokio::spawn(run_owned_process_inner(
+    let outcome = match tokio::spawn(run_owned_process_inner(
         command,
         stdin,
         timeout,
         policy,
         cancellation,
         stderr,
+        lease.clone(),
     ))
     .await
     {
@@ -213,7 +246,30 @@ pub(crate) async fn run_owned_process_with_stderr(
             reason: ProcessUncertainty::Supervisor,
             quiescent: false,
         },
+    };
+    if let Some(lease) = lease
+        && matches!(
+            &outcome,
+            ProcessOutcome::NotSpawned(_)
+                | ProcessOutcome::ProgramUnrunnable(_)
+                | ProcessOutcome::Completed(_)
+                | ProcessOutcome::Failed {
+                    reason: ProcessFailure::Exit,
+                    capture: Some(_)
+                }
+                | ProcessOutcome::Unknown {
+                    quiescent: true,
+                    ..
+                }
+        )
+        && lease.process_closed().await.is_err()
+    {
+        return ProcessOutcome::Unknown {
+            reason: ProcessUncertainty::Supervisor,
+            quiescent: false,
+        };
     }
+    outcome
 }
 
 enum RootExitWait {
@@ -242,6 +298,7 @@ async fn run_owned_process_inner(
     policy: Arc<SecretPolicy>,
     mut cancellation: watch::Receiver<bool>,
     stderr: StderrExcerpt,
+    lease: Option<IntegrationLease>,
 ) -> ProcessOutcome {
     let Some(deadline) = Instant::now().checked_add(timeout) else {
         return ProcessOutcome::Failed {
@@ -254,7 +311,12 @@ async fn run_owned_process_inner(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let mut child = match OwnedChild::spawn_report(command) {
+    let spawn = if let Some(lease) = &lease {
+        lease.spawn(command).await
+    } else {
+        OwnedChild::spawn_report(command)
+    };
+    let mut child = match spawn {
         Ok(child) => child,
         Err(AgentSpawnError::NotSpawned(error)) => return ProcessOutcome::NotSpawned(error),
         Err(AgentSpawnError::ProgramUnrunnable(error)) => {
@@ -272,6 +334,17 @@ async fn run_owned_process_inner(
     let observer = child.observer().ok();
     #[cfg(not(unix))]
     let observer: Option<CustodyObserver> = None;
+    #[cfg(target_os = "linux")]
+    if let Some(lease) = &lease
+        && let Some(identity) = child.integration_root_identity()
+        && lease.record_process(&identity).await.is_err()
+    {
+        let quiescent = terminate_and_wait(&mut child, observer.as_ref()).await;
+        return ProcessOutcome::Unknown {
+            reason: ProcessUncertainty::Supervisor,
+            quiescent,
+        };
+    }
 
     let (stdin_pipe, stdout_pipe, stderr_pipe) =
         (child.take_stdin(), child.take_stdout(), child.take_stderr());

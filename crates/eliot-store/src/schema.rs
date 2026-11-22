@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 88;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 89;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -2134,6 +2134,30 @@ impl Store {
                  CREATE INDEX context_noted_paths_turn ON context_noted_paths(agent,generation,turn_id,note_id);
                  INSERT INTO schema_migrations(version) VALUES(88);",
             ).map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 89 {
+            let tx = self.connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE TABLE git_integration_custody (
+                     command_id TEXT PRIMARY KEY REFERENCES commands(id) ON DELETE CASCADE,
+                     scratch_id TEXT NOT NULL UNIQUE,
+                     data_root TEXT NOT NULL,
+                     checkout TEXT NOT NULL,
+                     common_dir TEXT NOT NULL,
+                     boot_id TEXT NOT NULL,
+                     armed INTEGER NOT NULL DEFAULT 0,
+                     process_identity TEXT,
+                     ref_pending INTEGER NOT NULL DEFAULT 0,
+                     cleaned INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE INDEX git_integration_cleanup
+                     ON git_integration_custody(common_dir) WHERE cleaned = 0;
+                 INSERT INTO schema_migrations(version) VALUES (89);",
+            )
+            .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
         Ok(())

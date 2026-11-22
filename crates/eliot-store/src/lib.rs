@@ -12,7 +12,9 @@ mod online_backup;
 pub use launch_queue::{ArbitratedTimer, PendingLaunch, TimerWait};
 mod cleanup;
 pub use cleanup::{CleanupInventoryPage, cleanup_worktree_command_id};
+mod git_integration_custody;
 mod projects;
+pub use git_integration_custody::IntegrationCustody;
 mod provider_holds;
 mod result_page;
 mod rules;
@@ -4256,6 +4258,9 @@ fn repo_git_write_blocked_tx(
     let git_action_pending = tx
         .query_row(
             "SELECT EXISTS(
+                 SELECT 1 FROM git_integration_custody
+                 WHERE common_dir = ?2 AND cleaned = 0 AND command_id <> ?1
+             ) OR EXISTS(
              SELECT 1
              FROM commands prior
              WHERE prior.verb IN ('git.fetch','git.publish','git.integrate')
@@ -4263,6 +4268,9 @@ fn repo_git_write_blocked_tx(
                AND prior.state IN ('accepted','queued','dispatched','unknown')
                AND json_extract(prior.args, '$.common_dir') = ?2
                AND (prior.state IN ('dispatched','unknown') OR prior.rowid < ?3)
+               AND NOT (prior.verb = 'git.integrate' AND prior.state = 'unknown'
+                        AND EXISTS (SELECT 1 FROM git_integration_custody c
+                                    WHERE c.command_id = prior.id AND c.cleaned = 1 AND c.ref_pending = 0))
          )",
             params![command_id, common_dir, current_rowid],
             |row| row.get(0),

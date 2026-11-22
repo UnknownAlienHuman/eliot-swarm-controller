@@ -68,6 +68,8 @@ impl Router {
         };
         let mut execution = crate::git_integration::execute(
             &self.inner.data_root,
+            &self.inner.store,
+            id,
             &frozen,
             &registration,
             self.run_cancellation_receiver(),
@@ -78,6 +80,55 @@ impl Router {
         self.settle(id, execution.state, Some(execution.outcome))
             .await;
         self.signal_progress();
+    }
+
+    pub(crate) async fn reconcile_git_integrations(&self, common_dir: Option<&str>) -> Result<()> {
+        let _guard = self.inner.integration_cleanup.lock().await;
+        let records = self
+            .inner
+            .store
+            .lock()
+            .await
+            .recoverable_integration_custody(common_dir)?;
+        let policy = self.secret_policy_snapshot();
+        for record in records {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                match crate::git_integration::reconcile(
+                    &self.inner.store,
+                    &self.inner.data_root,
+                    &record,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        self.signal_progress();
+                        crate::logging::record(
+                            &policy,
+                            "git.integrate.cleanup_recovered",
+                            &[("command", &record.command_id)],
+                            None,
+                        );
+                        break;
+                    }
+                    Err(error)
+                        if error.code == "busy" && tokio::time::Instant::now() < deadline =>
+                    {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                    Err(error) => {
+                        crate::logging::record(
+                            &policy,
+                            "git.integrate.cleanup_pending",
+                            &[("command", &record.command_id)],
+                            Some(&error),
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Execute a dispatched `git.fetch` against its registration and settle
