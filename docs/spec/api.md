@@ -1373,15 +1373,15 @@ explicit path remains pinned.
 `sources` (launch and `send`, CLI `--source PATH`, at most 16 distinct paths) names
 files the Agent must read. Before admission the daemon reads each one from the launch
 workspace, or for `send` from the target Agent's workspace, and replaces `sources` with a
-delivered block appended to `text`. Each file gets one section with its path, a content
-SHA-256 prefix, its size and its completeness (`complete`, or the first N of M bytes,
-with the rest left in the file). The texts share what the 64 KiB persisted input text
+delivered block appended to `text`. Each section carries the path, original file
+SHA-256 prefix and byte size, and the completeness of the delivered text.
+The texts share what the 64 KiB persisted input text
 leaves after the prompt, smallest first, so a short file is never cut to make room.
-Known secrets are redacted.
+Known secrets are redacted. A redacted attachment is labeled as such, including when
+its redacted text fits in full.
 A file that is missing, outside the workspace, not regular, binary (including NUL bytes) or larger than 8 MiB
 gets a `not delivered (reason)` line instead of being skipped. Delivery proves the text
-reached the input, not that it was understood. A same-ID retry re-reads the files: an
-unchanged file replays, and a changed file is `id_conflict`.
+reached the input. A same-ID retry of an admitted request reuses its retained text.
 
 A parentless Owner launch names a stored `profile`, requests the configured default
 by omitting profile/harness, or names an ad-hoc
@@ -1574,8 +1574,8 @@ project and root scopes retain their flags. `swarm usage` renders this response 
 `--json` keeps printing the raw response.
 
 `first_calls` reports known first-call input for exact retained Agent generations
-and turns within that same usage scope. The list is bounded in Agent, generation
-and turn ID order. `first_calls_truncated` marks measured turns left out.
+and turns within that same usage scope, newest completion first.
+`first_calls_truncated` marks older measured turns left out.
 `swarm doctor` reports the average first-call input and sample count by profile,
 harness and frozen MCP policy. It samples terminal turns from a bounded window of
 the newest retained turn rows and uses profile facts for exact current generations.

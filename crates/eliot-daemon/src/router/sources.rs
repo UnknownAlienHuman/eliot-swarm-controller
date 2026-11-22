@@ -10,6 +10,7 @@ use eliot_core::{
     api::{InstructionFileStatus, InstructionSourceStatus, inference::sha256_hex, truncate_bytes},
     limits::MAX_EVENT_BYTES,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -20,17 +21,21 @@ const MAX_SOURCE_PATH_BYTES: usize = 1024;
 /// beyond its path (digest, sizes and the completeness phrase).
 const BLOCK_HEADER_BYTES: usize = 256;
 const SECTION_HEADER_BYTES: usize = 160;
-const BLOCK_HEADER: &str = "Required sources (delivered by Swarm with path, content digest and completeness; read them here instead of reopening the files):";
+const BLOCK_HEADER: &str = "Required sources (delivered by Swarm with path, file identity and completeness; read them here instead of reopening the files):";
+const LEGACY_BLOCK_HEADER: &str = "Required sources (delivered by Swarm with path, content digest and completeness; read them here instead of reopening the files):";
 /// Larger files are refused rather than read just to be cut.
 const MAX_SOURCE_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct SourceDelivery {
+    /// Canonical path within the workspace, for matching a later capture.
     pub path: String,
     pub size_bytes: Option<u64>,
     pub sha256: Option<String>,
     pub file_status: InstructionFileStatus,
     pub status: InstructionSourceStatus,
+    #[serde(default)]
+    pub redacted: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -212,9 +217,11 @@ fn delivered_block(
 ) -> DeliveredBlock {
     enum Read {
         Text {
+            path: String,
             content: String,
             size: u64,
             digest: String,
+            redacted: bool,
         },
         Skipped {
             reason: String,
@@ -233,17 +240,27 @@ fn delivered_block(
                 },
                 digest: None,
             },
-            Ok(bytes) => {
+            Ok((bytes, source_path)) => {
                 let digest = sha256_hex(&bytes);
                 let size = bytes.len() as u64;
                 match std::str::from_utf8(&bytes) {
-                    Ok(text) if !text.contains('\0') => Read::Text {
-                        content: policy.redact_text(text),
-                        size,
-                        digest,
-                    },
+                    Ok(text) if !text.contains('\0') => {
+                        let content = policy.redact_text(text);
+                        let redacted = content != text;
+                        Read::Text {
+                            path: source_path,
+                            content,
+                            size,
+                            digest,
+                            redacted,
+                        }
+                    }
                     _ => Read::Skipped {
-                        reason: format!("binary content, sha256 {}, {} bytes", &digest[..16], size),
+                        reason: format!(
+                            "binary content, file sha256 {}, {} bytes",
+                            &digest[..16],
+                            size
+                        ),
                         size: Some(size),
                         digest: Some(digest),
                     },
@@ -302,29 +319,35 @@ fn delivered_block(
                         _ => InstructionFileStatus::Unreadable,
                     },
                     status: InstructionSourceStatus::Unavailable,
+                    redacted: false,
                 });
             }
             Read::Text {
+                path: source_path,
                 content,
                 size,
                 digest,
+                redacted,
             } => {
                 let (kept, cut) = truncate_bytes(content, share);
-                let completeness = if cut {
-                    format!(
+                let completeness = match (cut, redacted) {
+                    (true, true) => {
+                        format!("first {} of {} redacted bytes", kept.len(), content.len())
+                    }
+                    (true, false) => format!(
                         "first {} of {} bytes; read the rest from the file",
                         kept.len(),
                         content.len()
-                    )
-                } else {
-                    "complete".to_owned()
+                    ),
+                    (false, true) => "complete redacted text".to_owned(),
+                    (false, false) => "complete".to_owned(),
                 };
                 out.push_str(&format!(
-                    "\n\n=== {path} (sha256 {}, {size} bytes, {completeness}) ===\n{kept}",
+                    "\n\n=== {path} (file sha256 {}, {size} bytes, {completeness}) ===\n{kept}",
                     &digest[..16]
                 ));
                 sources.push(SourceDelivery {
-                    path: path.clone(),
+                    path: source_path.clone(),
                     size_bytes: Some(*size),
                     sha256: Some(digest.clone()),
                     file_status: InstructionFileStatus::Present,
@@ -333,6 +356,7 @@ fn delivered_block(
                     } else {
                         InstructionSourceStatus::Complete
                     },
+                    redacted: *redacted,
                 });
             }
         }
@@ -341,10 +365,10 @@ fn delivered_block(
 }
 
 /// Read one named file inside `root`. The reason is a short fixed phrase.
-pub(super) fn read_source(
+pub(super) fn resolve_source(
     root: &Path,
     path: &str,
-) -> std::result::Result<Vec<u8>, SourceReadError> {
+) -> std::result::Result<PathBuf, SourceReadError> {
     let candidate = Path::new(path);
     let joined = if candidate.is_absolute() {
         candidate.to_path_buf()
@@ -361,6 +385,14 @@ pub(super) fn read_source(
     if !canonical.starts_with(root) {
         return Err(SourceReadError::OutsideWorkspace);
     }
+    Ok(canonical)
+}
+
+pub(super) fn read_source(
+    root: &Path,
+    path: &str,
+) -> std::result::Result<(Vec<u8>, String), SourceReadError> {
+    let canonical = resolve_source(root, path)?;
     let metadata = std::fs::metadata(&canonical).map_err(|_| SourceReadError::Unreadable)?;
     if !metadata.is_file() {
         return Err(SourceReadError::NotRegular);
@@ -368,18 +400,26 @@ pub(super) fn read_source(
     if metadata.len() > MAX_SOURCE_FILE_BYTES {
         return Err(SourceReadError::TooLarge(metadata.len()));
     }
-    std::fs::read(&canonical).map_err(|_| SourceReadError::Unreadable)
+    let relative = canonical
+        .strip_prefix(root)
+        .map_err(|_| SourceReadError::OutsideWorkspace)?
+        .to_string_lossy()
+        .into_owned();
+    let bytes = std::fs::read(&canonical).map_err(|_| SourceReadError::Unreadable)?;
+    Ok((bytes, relative))
 }
 
 /// Whether `stored` is `text` with a delivered sources block appended, so a
 /// same-ID retry of that request replays the admitted text instead of
 /// re-reading files that may have changed since.
 pub(super) fn is_delivery_of(stored: &str, text: &str) -> bool {
+    let has_header =
+        |block: &str| block.starts_with(BLOCK_HEADER) || block.starts_with(LEGACY_BLOCK_HEADER);
     if text.trim().is_empty() {
-        return stored.starts_with(BLOCK_HEADER);
+        return has_header(stored);
     }
     stored
         .strip_prefix(text)
         .and_then(|rest| rest.strip_prefix("\n\n"))
-        .is_some_and(|rest| rest.starts_with(BLOCK_HEADER))
+        .is_some_and(has_header)
 }

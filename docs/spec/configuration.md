@@ -206,15 +206,17 @@ The daemon prefers AGENTS.md as the primary file, then AGENTS.override.md,
 CLAUDE.md, .claude/CLAUDE.md, GEMINI.md and the local Claude instruction files.
 When the primary file's native reading isn't established, the daemon attaches it
 through the existing required-sources renderer to the launch's linked first input.
-That renderer keeps its path, SHA-256 prefix and completeness wording, secret redaction,
-frame budget and retained command input. Explicit user sources continue to be read at
-admission from their requested workspace; the automatic primary file is read from
-the prepared execution checkout. If the workspace, file, input, or source budget prevents
+That renderer labels SHA-256 as file identity and marks redacted text and truncation.
+Explicit user sources are read at admission from their requested workspace. The
+catalog reuses an explicit attachment with the same workspace-relative path and file
+digest as the prepared primary file. Otherwise automatic delivery reads the prepared
+execution checkout. If the workspace, file, input, or source budget prevents
 a delivery, the typed facts report that outcome. Launches without a first input
 record the catalog without starting a separate model turn.
 
-Native-read status is evidence-labeled: documented means the vendor documents the
-file convention; conditional means documented behavior depends on settings, precedence
+Native-read status is evidence-labeled. Documented means the vendor documents the
+file convention. Partial means the file exceeds the documented or profile-selected
+native byte limit. Conditional means documented behavior depends on settings, precedence
 or exclusions that this launch did not prove; not_native means the active Eliot
 adapter configuration does not enable that reader; unknown means no supported
 conclusion. These are not claims that a model consumed the file. In particular,
@@ -222,12 +224,15 @@ Claude Code 2.1.277 and later document AGENTS.md reading when no applicable
 CLAUDE.md, .claude/CLAUDE.md, or CLAUDE.local.md takes precedence, subject to
 project-instruction settings, plugins, telemetry/version and excludes. The frozen
 Claude cmd_version is exposed where available, but this inventory does not claim
-per-launch native consumption. The managed Claude adapter leaves ordinary instruction
-settings to the vendor; its empty --setting-sources is limited to the separate print
-inference path. Muse's current launch args omit --trust-workspace, so its root
-AGENTS.md status is not_native. Ordinary Codex and OpenCode AGENTS.md reading is
-vendor-documented; the Codex provider-probe profile explicitly sets
-project_doc_max_bytes to zero. OpenCode reads CLAUDE.md as a fallback. Antigravity
+per-launch native consumption. The managed Claude adapter leaves project memory
+enabled, so `CLAUDE.md`, `.claude/CLAUDE.md` and `CLAUDE.local.md` use documented
+native delivery. Only the separate print inference path passes empty
+`--setting-sources`. Muse's current launch args omit `--trust-workspace`, so its
+root AGENTS.md status is not_native. Codex CLI 0.167.1 defaults to 32 KiB for
+project instruction content. A Codex profile may set `project_doc_max_bytes`
+to pass a native override. The provider-probe route uses zero. The inventory
+compares each Codex instruction file with that limit and delivers an oversized
+primary through sources. OpenCode reads CLAUDE.md as a fallback. Antigravity
 does not return project-instruction readback, so its status remains unknown.
 
 agent.get returns the retained object as optional instruction_delivery; swarm show

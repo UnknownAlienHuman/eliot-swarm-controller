@@ -3,7 +3,9 @@
 use super::sources::{self, SourceReadError};
 use eliot_core::api::{
     INSTRUCTION_FILE_PATHS, InstructionDeliveryView, InstructionFileStatus, InstructionFileView,
-    InstructionReadStatus, InstructionSourceStatus, inference::sha256_hex,
+    InstructionReadStatus, InstructionSourceStatus,
+    inference::sha256_hex,
+    native_profile::{CODEX_DEFAULT_PROJECT_DOC_MAX_BYTES, codex_project_doc_override},
 };
 use serde_json::Value;
 use std::path::Path;
@@ -13,6 +15,7 @@ const MAX_CATALOG_BYTES: u64 = 8 * 1024 * 1024;
 pub(super) struct Capture {
     pub facts: InstructionDeliveryView,
     pub should_deliver_primary: bool,
+    source_path: Option<String>,
 }
 
 pub(super) fn capture(workspace: Option<&str>, harness: &str, profile: &Value) -> Capture {
@@ -22,19 +25,12 @@ pub(super) fn capture(workspace: Option<&str>, harness: &str, profile: &Value) -
     let files = INSTRUCTION_FILE_PATHS
         .iter()
         .map(|path| {
-            let (native_read_status, native_read_version) = native_read(harness, path, profile);
             let mut file = match root.as_deref() {
                 Some(root) => catalog_file(root, path, &mut remaining),
-                None => InstructionFileView {
-                    path: (*path).to_owned(),
-                    status: InstructionFileStatus::WorkspaceUnavailable,
-                    size_bytes: None,
-                    sha256: None,
-                    native_read_status,
-                    native_read_version: native_read_version.clone(),
-                    delivery_status: InstructionSourceStatus::NotNeeded,
-                },
+                None => empty_file(path, InstructionFileStatus::WorkspaceUnavailable),
             };
+            let (native_read_status, native_read_version) =
+                native_read(harness, path, profile, file.size_bytes);
             file.native_read_status = native_read_status;
             file.native_read_version = native_read_version;
             file
@@ -60,6 +56,10 @@ pub(super) fn capture(workspace: Option<&str>, harness: &str, profile: &Value) -
         })
     })
     .unwrap_or("AGENTS.md");
+    let source_path = root.as_deref().and_then(|root| {
+        let path = sources::resolve_source(root, primary).ok()?;
+        Some(path.strip_prefix(root).ok()?.to_string_lossy().into_owned())
+    });
     let mut facts = InstructionDeliveryView {
         source_workspace,
         primary_path: primary.to_owned(),
@@ -87,6 +87,7 @@ pub(super) fn capture(workspace: Option<&str>, harness: &str, profile: &Value) -
     Capture {
         facts,
         should_deliver_primary,
+        source_path,
     }
 }
 
@@ -120,6 +121,7 @@ fn catalog_file(root: &Path, path: &str, remaining: &mut u64) -> InstructionFile
             native_read_status: InstructionReadStatus::Unknown,
             native_read_version: None,
             delivery_status: InstructionSourceStatus::NotNeeded,
+            delivery_redacted: false,
         };
     }
     if size > MAX_CATALOG_BYTES || size > *remaining {
@@ -131,10 +133,11 @@ fn catalog_file(root: &Path, path: &str, remaining: &mut u64) -> InstructionFile
             native_read_status: InstructionReadStatus::Unknown,
             native_read_version: None,
             delivery_status: InstructionSourceStatus::NotNeeded,
+            delivery_redacted: false,
         };
     }
     let bytes = match sources::read_source(root, path) {
-        Ok(bytes) => bytes,
+        Ok((bytes, _)) => bytes,
         Err(error) => {
             let status = match error {
                 SourceReadError::NotFound => InstructionFileStatus::Missing,
@@ -151,6 +154,7 @@ fn catalog_file(root: &Path, path: &str, remaining: &mut u64) -> InstructionFile
                 native_read_status: InstructionReadStatus::Unknown,
                 native_read_version: None,
                 delivery_status: InstructionSourceStatus::NotNeeded,
+                delivery_redacted: false,
             };
         }
     };
@@ -164,6 +168,7 @@ fn catalog_file(root: &Path, path: &str, remaining: &mut u64) -> InstructionFile
             native_read_status: InstructionReadStatus::Unknown,
             native_read_version: None,
             delivery_status: InstructionSourceStatus::NotNeeded,
+            delivery_redacted: false,
         };
     }
     *remaining = (*remaining).saturating_sub(actual_size);
@@ -181,6 +186,7 @@ fn catalog_file(root: &Path, path: &str, remaining: &mut u64) -> InstructionFile
         native_read_status: InstructionReadStatus::Unknown,
         native_read_version: None,
         delivery_status: InstructionSourceStatus::NotNeeded,
+        delivery_redacted: false,
     }
 }
 
@@ -193,6 +199,7 @@ fn empty_file(path: &str, status: InstructionFileStatus) -> InstructionFileView 
         native_read_status: InstructionReadStatus::Unknown,
         native_read_version: None,
         delivery_status: InstructionSourceStatus::NotNeeded,
+        delivery_redacted: false,
     }
 }
 
@@ -200,6 +207,7 @@ fn native_read(
     harness: &str,
     path: &str,
     profile: &Value,
+    size_bytes: Option<u64>,
 ) -> (InstructionReadStatus, Option<String>) {
     let version = profile
         .get("cmd_version")
@@ -211,15 +219,20 @@ fn native_read(
             Some(false) => InstructionReadStatus::NotNative,
             None => InstructionReadStatus::Unknown,
         },
-        (
-            "claude",
-            "CLAUDE.md" | "CLAUDE.local.md" | ".claude/CLAUDE.md" | ".claude/CLAUDE.local.md",
-        ) => InstructionReadStatus::Conditional,
+        ("claude", "CLAUDE.md" | "CLAUDE.local.md" | ".claude/CLAUDE.md") => {
+            InstructionReadStatus::Documented
+        }
         ("codex", "AGENTS.md" | "AGENTS.override.md") => {
-            if profile.get("_provider_probe") == Some(&Value::Bool(true)) {
-                InstructionReadStatus::NotNative
-            } else {
-                InstructionReadStatus::Documented
+            let limit = profile
+                .as_object()
+                .and_then(codex_project_doc_override)
+                .unwrap_or(CODEX_DEFAULT_PROJECT_DOC_MAX_BYTES);
+            match limit {
+                0 => InstructionReadStatus::NotNative,
+                limit if size_bytes.is_some_and(|size| size > limit) => {
+                    InstructionReadStatus::Partial
+                }
+                _ => InstructionReadStatus::Documented,
             }
         }
         ("muse", "AGENTS.md" | "AGENTS.override.md") => InstructionReadStatus::NotNative,
@@ -261,12 +274,47 @@ pub(super) fn apply_delivery(capture: &mut Capture, delivery: super::sources::So
         .facts
         .files
         .iter_mut()
-        .find(|file| file.path == delivery.path)
+        .find(|file| file.path == capture.facts.primary_path)
     {
         file.status = delivery.file_status;
         file.size_bytes = delivery.size_bytes;
         file.sha256 = delivery.sha256;
         file.delivery_status = delivery.status;
+        file.delivery_redacted = delivery.redacted;
+    }
+}
+
+pub(super) fn reuse_explicit_delivery(capture: &mut Capture, retained: &Value) {
+    let Some(path) = capture.source_path.as_deref() else {
+        return;
+    };
+    let Some(digest) = capture
+        .facts
+        .files
+        .iter()
+        .find(|file| file.path == capture.facts.primary_path)
+        .and_then(|file| file.sha256.as_deref())
+    else {
+        return;
+    };
+    let Some(deliveries) = retained.as_array() else {
+        return;
+    };
+    let delivery = deliveries
+        .iter()
+        .filter_map(|value| serde_json::from_value::<sources::SourceDelivery>(value.clone()).ok())
+        .find(|delivery| {
+            (delivery.path == path || cfg!(windows) && delivery.path.eq_ignore_ascii_case(path))
+                && delivery.sha256.as_deref() == Some(digest)
+                && delivery.file_status == InstructionFileStatus::Present
+                && matches!(
+                    delivery.status,
+                    InstructionSourceStatus::Complete | InstructionSourceStatus::Truncated
+                )
+        });
+    if let Some(delivery) = delivery {
+        apply_delivery(capture, delivery);
+        capture.should_deliver_primary = false;
     }
 }
 

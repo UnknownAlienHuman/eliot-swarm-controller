@@ -842,7 +842,7 @@ impl EventProcessor {
         self.final_text = None;
         self.turn_has_work_or_uncertain_effects = false;
         self.turn_usage = None;
-        self.first_call_usage = FirstCallUsage::default();
+        self.first_call_usage.associate_turn(&turn_id);
         self.usage_window
             .associate_turn(&turn_id, model.as_deref().or(self.thread_model.as_deref()));
         let thread_id = self.status.thread_id.as_deref().unwrap_or_default();
@@ -1783,13 +1783,17 @@ impl EventProcessor {
             })?;
         validate_thread_and_turn(&self.status, &notification.thread_id, &notification.turn_id)?;
         let last = &notification.token_usage.last;
-        let response = self.status.active_turn_id.as_deref() == Some(notification.turn_id.as_str())
-            && last.has_response_counters();
-        self.first_call_usage.observe(
+        let response = last.has_response_counters();
+        self.first_call_usage.observe_for_turn(
+            self.status.active_turn_id.as_deref(),
+            &notification.turn_id,
             response,
             call_input_tokens("codex", last.input_tokens, None, None),
         );
-        if response && let Some(total) = notification.token_usage.total.clone() {
+        if response
+            && self.status.active_turn_id.as_deref() == Some(notification.turn_id.as_str())
+            && let Some(total) = notification.token_usage.total.clone()
+        {
             match self.turn_usage.as_mut() {
                 Some((turn_id, _, latest)) if turn_id == &notification.turn_id => {
                     *latest = total;

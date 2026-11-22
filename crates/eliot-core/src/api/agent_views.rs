@@ -755,6 +755,7 @@ pub enum InstructionFileStatus {
 #[serde(rename_all = "snake_case")]
 pub enum InstructionReadStatus {
     Documented,
+    Partial,
     Conditional,
     NotNative,
     Unknown,
@@ -782,6 +783,8 @@ pub struct InstructionFileView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_read_version: Option<String>,
     pub delivery_status: InstructionSourceStatus,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub delivery_redacted: bool,
 }
 
 impl InstructionDeliveryView {

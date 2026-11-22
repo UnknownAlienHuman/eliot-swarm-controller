@@ -7,6 +7,8 @@ use eliot_core::TurnUsage;
 #[derive(Default)]
 pub struct FirstCallUsage {
     input_tokens: Option<Option<i64>>,
+    early: Vec<(String, Option<i64>)>,
+    early_overflowed: bool,
 }
 
 impl FirstCallUsage {
@@ -14,6 +16,43 @@ impl FirstCallUsage {
         if response {
             self.input_tokens.get_or_insert(input_tokens);
         }
+    }
+
+    /// An event stream can run ahead of the IPC reply that binds a turn.
+    /// Retain early counters by exact ID without delaying session usage.
+    pub fn observe_for_turn(
+        &mut self,
+        active_turn: Option<&str>,
+        turn_id: &str,
+        response: bool,
+        input_tokens: Option<i64>,
+    ) {
+        if !response {
+            return;
+        }
+        match active_turn {
+            Some(active) if active == turn_id => self.observe(true, input_tokens),
+            Some(_) => {}
+            None => {
+                if self.early.iter().any(|(known, _)| known == turn_id) {
+                    return;
+                }
+                if self.early.len() == 8 || turn_id.len() > 512 {
+                    self.early_overflowed = true;
+                } else {
+                    self.early.push((turn_id.to_owned(), input_tokens));
+                }
+            }
+        }
+    }
+
+    pub fn associate_turn(&mut self, turn_id: &str) {
+        self.input_tokens = self
+            .early
+            .drain(..)
+            .find_map(|(known, input)| (known == turn_id).then_some(input))
+            .or_else(|| self.early_overflowed.then_some(None));
+        self.early_overflowed = false;
     }
 
     pub fn finish(&mut self, scope: &str, usage: Option<TurnUsage>) -> Option<TurnUsage> {
@@ -34,10 +73,11 @@ pub fn call_input_tokens(
         return Some(input);
     }
     let cached = cache_read.filter(|tokens| *tokens >= 0)?;
+    let written = cache_write.filter(|tokens| *tokens >= 0)?;
     let counters = TurnUsage {
         input_tokens: Some(input),
         cache_read_tokens: Some(cached),
-        cache_write_tokens: cache_write.filter(|tokens| *tokens >= 0),
+        cache_write_tokens: Some(written),
         ..TurnUsage::default()
     };
     counters

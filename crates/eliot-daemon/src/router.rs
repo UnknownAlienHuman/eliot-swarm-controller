@@ -2730,7 +2730,10 @@ impl Router {
         // Required sources are read and delivered before the secret check, so
         // their redacted text is checked like any other input text.
         if matches!(request.verb.as_str(), "launch" | "send") {
-            self.deliver_sources(&mut request).await?;
+            let delivered = self.deliver_sources(&mut request).await?;
+            if request.verb == "launch" && !delivered.is_empty() {
+                request.args["instruction_sources"] = json!(delivered);
+            }
         }
         // Emit data and variable values are arbitrary JSON: their object keys
         // can smuggle a known credential past the values-only check. Block
@@ -8056,6 +8059,7 @@ fn reject_launch_derived_keys(args: &Value) -> Result<()> {
         "project_assignment_launch",
         "project_transfer_launch",
         "profile_choice",
+        "instruction_sources",
         "source_plan",
         "target_environment",
         "workspace_preparation",

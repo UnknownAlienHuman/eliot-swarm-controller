@@ -49,6 +49,7 @@ pub fn project_instruction_lines(reply: &AgentGetResponse) -> Option<Vec<String>
         }
         let status = match file.native_read_status {
             InstructionReadStatus::Documented => "Documented native instructions",
+            InstructionReadStatus::Partial => "Exceeds the native instruction byte limit",
             InstructionReadStatus::Conditional => "Native reading depends on harness settings",
             InstructionReadStatus::NotNative => "Outside the harness's native instruction lookup",
             InstructionReadStatus::Unknown => "Native reading unverified",
@@ -59,6 +60,12 @@ pub fn project_instruction_lines(reply: &AgentGetResponse) -> Option<Vec<String>
         }
         let sources = match file.delivery_status {
             InstructionSourceStatus::NotNeeded => None,
+            InstructionSourceStatus::Complete if file.delivery_redacted => {
+                Some("Swarm attached the complete redacted text to the input")
+            }
+            InstructionSourceStatus::Truncated if file.delivery_redacted => {
+                Some("Swarm attached part of the redacted text to the input")
+            }
             InstructionSourceStatus::Complete => {
                 Some("Swarm attached the complete file to the input")
             }
@@ -73,7 +80,7 @@ pub fn project_instruction_lines(reply: &AgentGetResponse) -> Option<Vec<String>
             let _ = write!(line, "\n{sources}");
         }
         if let Some(sha256) = &file.sha256 {
-            let _ = write!(line, "\nSHA-256 {sha256}");
+            let _ = write!(line, "\nFile SHA-256 {sha256}");
         }
         lines.push(line);
     }

@@ -1096,6 +1096,7 @@ impl CodexPlugin {
                 &plugin_disables,
                 plan.native_subagents.as_deref(),
                 plan.provider_probe,
+                eliot_core::api::native_profile::codex_project_doc_override(&plan.profile),
             )?,
             cwd: plan.workspace.clone(),
             environment: plan.environment.clone(),

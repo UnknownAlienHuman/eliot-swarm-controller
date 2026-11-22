@@ -285,7 +285,7 @@ impl Store {
         let mut overall_supplied = [0_usize; TURN_COUNTERS];
         let mut overall_sums = [0_i128; TURN_COUNTERS];
         let mut scopes: BTreeMap<String, ScopeAccum> = BTreeMap::new();
-        let mut first_calls = Vec::new();
+        let mut first_calls = BTreeMap::new();
         let mut first_calls_truncated = false;
         let mut observed_native_agents = 0i64;
         if !wanted.is_empty() {
@@ -304,10 +304,10 @@ impl Store {
                 )
                 .map_err(sql_error)?;
             let sql = format!(
-                "SELECT t.agent, t.generation, t.state, t.usage, a.harness, t.turn_id
+                "SELECT t.agent, t.generation, t.state, t.usage, a.harness, t.turn_id,
+                        COALESCE(t.completed_at, t.started_at, 0)
                  FROM turns t JOIN agents a ON a.id = t.agent
-                 WHERE t.agent IN ({placeholders})
-                 ORDER BY t.agent, t.generation, t.turn_id"
+                 WHERE t.agent IN ({placeholders})"
             );
             let mut statement = self.connection.prepare(&sql).map_err(sql_error)?;
             let rows = statement
@@ -319,11 +319,13 @@ impl Store {
                         row.get::<_, Option<String>>(3)?,
                         row.get::<_, String>(4)?,
                         row.get::<_, String>(5)?,
+                        row.get::<_, i64>(6)?,
                     ))
                 })
                 .map_err(sql_error)?;
             for row in rows {
-                let (agent, generation, state, usage, harness, turn_id) = row.map_err(sql_error)?;
+                let (agent, generation, state, usage, harness, turn_id, settled_at) =
+                    row.map_err(sql_error)?;
                 if !wanted.contains(&(agent, generation)) {
                     continue;
                 }
@@ -346,14 +348,9 @@ impl Store {
                 };
                 let usage = decode_turn_usage(&usage, &harness)?;
                 if let Some(input_tokens) = usage.first_call_input_tokens {
-                    if first_calls.len() < MAX_FIRST_CALL_TURNS {
-                        first_calls.push(FirstCallInput {
-                            agent: format_agent_id(agent),
-                            generation,
-                            turn_id,
-                            input_tokens,
-                        });
-                    } else {
+                    first_calls.insert((settled_at, agent, generation, turn_id), input_tokens);
+                    if first_calls.len() > MAX_FIRST_CALL_TURNS {
+                        first_calls.pop_first();
                         first_calls_truncated = true;
                     }
                 }
@@ -400,7 +397,18 @@ impl Store {
                 by_scope,
             },
             sessions,
-            first_calls,
+            first_calls: first_calls
+                .into_iter()
+                .rev()
+                .map(
+                    |((_, agent, generation, turn_id), input_tokens)| FirstCallInput {
+                        agent: format_agent_id(agent),
+                        generation,
+                        turn_id,
+                        input_tokens,
+                    },
+                )
+                .collect(),
             first_calls_truncated,
             swarm_mcp,
             swarm_mcp_truncated,

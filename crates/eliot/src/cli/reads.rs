@@ -189,16 +189,23 @@ fn print_project_instructions(instructions: &eliot_core::api::InstructionDeliver
             print!(" · {bytes} bytes");
         }
         if let Some(digest) = &file.sha256 {
-            print!(" · SHA-256 {digest}");
+            print!(" · file SHA-256 {digest}");
         }
         let native = match file.native_read_status {
             InstructionReadStatus::Documented => "native reading documented",
+            InstructionReadStatus::Partial => "exceeds the native instruction byte limit",
             InstructionReadStatus::Conditional => "native reading depends on settings",
             InstructionReadStatus::NotNative => "outside native instruction lookup",
             InstructionReadStatus::Unknown => "native reading unverified",
         };
         print!(" · {native}");
         match file.delivery_status {
+            InstructionSourceStatus::Complete if file.delivery_redacted => {
+                print!(" · Swarm attached the complete redacted text");
+            }
+            InstructionSourceStatus::Truncated if file.delivery_redacted => {
+                print!(" · Swarm attached part of the redacted text");
+            }
             InstructionSourceStatus::Complete => print!(" · Swarm attached the complete file"),
             InstructionSourceStatus::Truncated => print!(" · Swarm attached part of the file"),
             InstructionSourceStatus::Unavailable => print!(" · source attachment unavailable"),
@@ -1436,7 +1443,7 @@ pub(crate) fn print_usage_table(response: &UsageSummaryResponse) {
     }
     if response.first_calls_truncated {
         println!(
-            "    Limited to {} measured turns in Agent, generation and turn ID order",
+            "    Limited to the newest {} measured turns",
             eliot_core::api::MAX_FIRST_CALL_TURNS
         );
     }

@@ -612,6 +612,10 @@ impl Router {
             }
         };
 
+        super::instructions::reuse_explicit_delivery(
+            &mut capture,
+            &command.args["instruction_sources"],
+        );
         let mut expected_text = None;
         let mut delivered_text = None;
         if capture.should_deliver_primary {

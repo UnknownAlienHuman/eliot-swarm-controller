@@ -898,9 +898,11 @@ without native turn counters or a first-call measurement keeps null usage.
 
 `first_call_input_tokens` counts the first model response's input, including
 cache hits and cache creation once on the normalized basis. Codex uses the first
-response-bearing token update bound to the turn. Claude uses the first native
-main-thread assistant response. OpenCode uses the earliest assistant message
-in the exact user-to-idle slice. A missing first-call counter stays unavailable.
+response-bearing token update bound to the turn. The shared runtime keeps a bounded
+set of early samples by native turn ID until the exact input is bound. Claude uses
+the first native main-thread assistant response. OpenCode uses the earliest assistant
+message in the exact user-to-idle slice. Missing counters, including OpenCode's
+cache-write input, leave the first-call value unavailable.
 Session snapshots and whole-turn usage supply their own counters.
 
 `session_usage` retains only the latest serialized `SessionUsage` snapshot
