@@ -587,6 +587,7 @@ pub(super) fn handoff_tx(
         )
         .map_err(sql_error)?;
     }
+    super::result_page::record_handoff_origin_tx(tx, parse_agent_id(&to.id)?, to.generation)?;
     refresh_parent_tx(tx, &brief_command, now)?;
     let parent = load_command(tx, &request.id)?
         .ok_or_else(|| Error::new("internal", "handoff parent disappeared"))?;

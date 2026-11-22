@@ -1711,7 +1711,12 @@ pub(super) fn submit_restart_resume_tx(
     limits: core::api::HierarchyLimits,
     policy: Option<&capacity::PolicyLoader>,
 ) -> Result<Admission> {
-    submit_tx_mode(tx, "owner", request, None, now, false, limits, policy, true)
+    let command_id = request.id.clone();
+    let admission = submit_tx_mode(tx, "owner", request, None, now, false, limits, policy, true)?;
+    if admission.is_new {
+        super::result_page::record_restart_resume_intent_tx(tx, &command_id)?;
+    }
+    Ok(admission)
 }
 
 #[allow(clippy::too_many_arguments)]

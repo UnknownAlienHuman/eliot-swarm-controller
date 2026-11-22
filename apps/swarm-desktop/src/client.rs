@@ -275,20 +275,50 @@ pub async fn input_failure(
     Ok(Some(failure))
 }
 
-/// Newest `limit` retained turns of the current generation of the Agent.
-/// `agent.result` has no cursor: older pages are a larger limit.
+#[derive(Clone, Debug)]
+pub struct TranscriptResults {
+    pub generation: i64,
+    pub turns: Vec<eliot_core::Turn>,
+    pub has_older: bool,
+}
+
+/// Read a bounded window of the Agent's retained turns across generations.
 pub async fn agent_results(
     data_dir: &Path,
     agent: &str,
     limit: usize,
-) -> Result<AgentResultResponse> {
+) -> Result<TranscriptResults> {
     let mut params = AgentResultRequest::new(agent);
     params.limit = limit;
+    let first = agent_result_page(data_dir, &params).await?;
+    let mut turns = first.turns;
+    let mut next = first.next;
+    while turns.len() < limit {
+        let Some(before) = next.take() else { break };
+        params.before = Some(before);
+        params.limit = limit - turns.len();
+        let page = agent_result_page(data_dir, &params).await?;
+        if page.generation != first.generation || (page.turns.is_empty() && page.next.is_some()) {
+            return Err(Error::new("unknown", "result window changed while paging"));
+        }
+        turns.extend(page.turns);
+        next = page.next;
+    }
+    Ok(TranscriptResults {
+        generation: first.generation,
+        turns,
+        has_older: next.is_some(),
+    })
+}
+
+async fn agent_result_page(
+    data_dir: &Path,
+    params: &AgentResultRequest,
+) -> Result<AgentResultResponse> {
     params.validate()?;
-    let reply: AgentResultResponse =
-        eliot_daemon::client_call_typed(data_dir, "agent.result", &params).await?;
-    params.validate_response(&reply)?;
-    Ok(reply)
+    let page = eliot_daemon::client_call_typed(data_dir, "agent.result", params).await?;
+    params.validate_response(&page)?;
+    Ok(page)
 }
 
 /// Filter for one conversation: its Agent and the kinds the view consumes,

@@ -7,16 +7,15 @@
 //! text a command was admitted with. `agent.history` is the observed-subject
 //! surface and is not used for Eliot-managed Agents.
 //!
-//! Identity is stable: one virtualized item per turn (`turn:<id>`), keyed
+//! Identity is stable: one virtualized item per generation and turn, keyed
 //! parts inside it (`in:<command>`, message native id, `tools:<first item>`,
 //! `final:<turn>`), and a content revision per part. Reactor resets a whole
 //! virtual collection when its key list changes, so activity inside a turn
 //! never changes the item keys; only a new or evicted turn does.
 //!
-//! Coverage is explicit and never inferred: how many turns the result read
-//! returned against its limit, whether the Agent's creation event is still
-//! retained (its events are read from there), the retention floor, evictions
-//! and inputs whose text could not be read.
+//! Coverage records whether older turns can be read, whether the Agent's
+//! creation event is retained, the retention floor, evictions and inputs
+//! whose text could not be read.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -24,8 +23,6 @@ use eliot_core::{Event, Turn, TurnOutcome, TurnState};
 
 /// Turns added per "Load older" step.
 pub const TURN_PAGE: usize = 20;
-/// `agent.result` upper bound.
-pub const MAX_RESULT_LIMIT: usize = 1_000;
 /// Resident turns; older ones are evicted and reported.
 pub const MAX_RESIDENT_TURNS: usize = 200;
 /// Resident text bytes across all turns.
@@ -163,9 +160,24 @@ enum Activity {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct TurnKey {
+    generation: i64,
+    id: String,
+}
+
+impl TurnKey {
+    fn new(generation: i64, id: &str) -> Self {
+        Self {
+            generation,
+            id: id.to_owned(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct TurnEntry {
-    turn_id: String,
+    key: TurnKey,
     started_ms: Option<i64>,
     first_seq: Option<i64>,
     status: TurnStatus,
@@ -189,9 +201,9 @@ struct TurnEntry {
 }
 
 impl TurnEntry {
-    fn new(turn_id: &str) -> Self {
+    fn new(key: TurnKey) -> Self {
         Self {
-            turn_id: turn_id.to_owned(),
+            key,
             started_ms: None,
             first_seq: None,
             status: TurnStatus::Running,
@@ -210,10 +222,12 @@ impl TurnEntry {
         }
     }
 
-    fn order(&self) -> (i64, i64) {
+    fn order(&self) -> (i64, i64, i64, &str) {
         (
+            self.key.generation,
             self.started_ms.unwrap_or(i64::MAX),
             self.first_seq.unwrap_or(i64::MAX),
+            &self.key.id,
         )
     }
 
@@ -436,11 +450,11 @@ pub enum InputText {
 /// Explicit coverage of what the resident conversation contains.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Coverage {
-    /// Generation whose turns `agent.result` returned.
+    /// Current Agent generation at the result read.
     pub generation: i64,
-    /// `agent.result` limit used and rows it returned.
+    /// `agent.result` limit used and whether it has an older page.
     pub result_limit: usize,
-    pub result_returned: usize,
+    pub has_older: bool,
     /// Committed cursor: events are applied through this sequence.
     pub cursor: i64,
     /// Retention floor from `events.bounds`.
@@ -454,9 +468,9 @@ pub struct Coverage {
 }
 
 impl Coverage {
-    /// True when the result read returned every retained turn of the generation.
+    /// True when the result read returned every retained turn.
     pub fn turns_complete(&self) -> bool {
-        self.result_returned < self.result_limit
+        !self.has_older
     }
 
     /// The Agent's events are read from the retention floor; without its
@@ -467,7 +481,7 @@ impl Coverage {
 
     /// "Load older" pages turns only: the events already start at creation.
     pub fn can_load_older(&self) -> bool {
-        !self.turns_complete() && self.result_limit < MAX_RESULT_LIMIT
+        !self.turns_complete() && self.result_limit < MAX_RESIDENT_TURNS
     }
 
     /// Human-readable coverage lines; every limit is named, none is hidden.
@@ -476,11 +490,10 @@ impl Coverage {
     /// turns, a reread in progress. Empty when everything is here.
     pub fn notes(&self, inputs_missing: usize) -> Vec<String> {
         let mut notes = Vec::new();
-        if !self.turns_complete() {
+        if self.can_load_older() {
             notes.push("Older turns exist; Load older messages shows them.".to_owned());
-        }
-        if self.generation > 1 {
-            notes.push("Earlier runs are not shown.".to_owned());
+        } else if !self.turns_complete() {
+            notes.push("Older turns exist beyond the loaded window.".to_owned());
         }
         if self.activity_pruned() {
             notes.push("Older activity was removed by retention.".to_owned());
@@ -608,7 +621,7 @@ pub struct TurnItem {
 #[derive(Clone, Debug, Default)]
 pub struct Conversation {
     agent: String,
-    turns: HashMap<String, TurnEntry>,
+    turns: HashMap<TurnKey, TurnEntry>,
     inputs: HashMap<String, InputText>,
     /// Exact pending text of unlinked local inputs, for Retry: the bounded
     /// `inputs` copy is the display preview only (#643). One entry per
@@ -624,9 +637,9 @@ pub struct Conversation {
     applied_seq: i64,
     coverage: Coverage,
     /// Turns evicted by the resident bounds; late events never resurrect them.
-    evicted: HashSet<String>,
+    evicted: HashSet<TurnKey>,
     /// Eviction order of `evicted`, so the no-resurrection index stays bounded.
-    evicted_order: VecDeque<String>,
+    evicted_order: VecDeque<TurnKey>,
 }
 
 fn data_str<'a>(event: &'a Event, field: &str) -> Option<&'a str> {
@@ -735,13 +748,13 @@ impl Conversation {
                 self.coverage.reached_creation = true;
                 continue;
             }
-            if let Some(generation) = event.generation
-                && self.coverage.generation > 0
-                && generation != self.coverage.generation
-            {
-                // Older generations are outside this view; a newer one means
-                // the Agent resumed and the snapshot must be reread.
-                invalidation.generation_changed |= generation > self.coverage.generation;
+            let Some(generation) = event.generation else {
+                // The Agent read can refresh, but this event cannot bind a turn.
+                invalidation.detail = true;
+                continue;
+            };
+            if generation > self.coverage.generation {
+                invalidation.generation_changed = true;
                 continue;
             }
             match event.kind.as_str() {
@@ -750,14 +763,15 @@ impl Conversation {
                 // included (k113: a lost Agent offers Resume, not Delete).
                 "request.opened" | "request.closed" | "request.resolved" | "agent.failed"
                 | "agent.lost" | "agent.stopped" | "session.ready" | "session.ended" => {
-                    invalidation.detail = true
+                    invalidation.detail |= generation == self.coverage.generation;
                 }
                 _ => {}
             }
             let Some(turn_id) = data_str(event, "turn_id") else {
                 continue;
             };
-            if self.evicted.contains(turn_id) {
+            let key = TurnKey::new(generation, turn_id);
+            if self.evicted.contains(&key) {
                 continue;
             }
             // Only a start creates a turn: late activity for a discarded
@@ -765,13 +779,13 @@ impl Conversation {
             // completion whose start is below the retention floor does
             // not fabricate a newest turn (its record still arrives
             // through `agent.result`).
-            if !self.turns.contains_key(turn_id) && event.kind != "turn.started" {
+            if !self.turns.contains_key(&key) && event.kind != "turn.started" {
                 continue;
             }
             let turn = self
                 .turns
-                .entry(turn_id.to_owned())
-                .or_insert_with(|| TurnEntry::new(turn_id));
+                .entry(key.clone())
+                .or_insert_with(|| TurnEntry::new(key));
             turn.first_seq.get_or_insert(event.seq);
             turn.started_ms.get_or_insert(event.ts);
             match event.kind.as_str() {
@@ -782,14 +796,14 @@ impl Conversation {
                             invalidation.inputs.push(command.to_owned());
                         }
                     }
-                    invalidation.detail = true;
+                    invalidation.detail |= generation == self.coverage.generation;
                 }
                 "turn.completed" | "turn.resolved" => {
                     if !turn.read_back {
                         turn.status = TurnStatus::Completed(None);
                     }
                     invalidation.turns = true;
-                    invalidation.detail = true;
+                    invalidation.detail |= generation == self.coverage.generation;
                 }
                 "command.accepted" if data_str(event, "verb") == Some("steer") => {
                     if let Some(command) = data_str(event, "command_id") {
@@ -809,7 +823,7 @@ impl Conversation {
                 "turn.unknown" => {
                     turn.status = TurnStatus::Unknown;
                     invalidation.turns = true;
-                    invalidation.detail = true;
+                    invalidation.detail |= generation == self.coverage.generation;
                 }
                 "message.completed" => {
                     let text = data_str(event, "text").unwrap_or_default();
@@ -864,29 +878,17 @@ impl Conversation {
         invalidation
     }
 
-    /// Apply authoritative turn reads (one `agent.result` page): state,
-    /// outcome and public final text. The page also refreshes the turn
-    /// coverage, so an Agent snapshotted at creation does not keep claiming
-    /// zero turns of generation 0 after its first turns complete.
+    /// Apply authoritative state, outcome and public final text.
     pub fn apply_turns(&mut self, turns: &[Turn]) {
-        if let Some(first) = turns.first()
-            && first.agent == self.agent
-        {
-            if self.coverage.generation == 0 {
-                self.coverage.generation = first.generation;
-            }
-            if first.generation == self.coverage.generation {
-                self.coverage.result_returned = turns.len();
-            }
-        }
         for read in turns {
-            if read.agent != self.agent || self.evicted.contains(&read.turn_id) {
+            let key = TurnKey::new(read.generation, &read.turn_id);
+            if read.agent != self.agent || self.evicted.contains(&key) {
                 continue;
             }
             let turn = self
                 .turns
-                .entry(read.turn_id.clone())
-                .or_insert_with(|| TurnEntry::new(&read.turn_id));
+                .entry(key.clone())
+                .or_insert_with(|| TurnEntry::new(key));
             if let Some(started) = read.started_at.or(read.completed_at) {
                 turn.started_ms = Some(started);
             }
@@ -908,6 +910,12 @@ impl Conversation {
             turn.read_back = true;
         }
         self.enforce_bounds();
+    }
+
+    pub fn update_turn_coverage(&mut self, generation: i64, has_older: bool) {
+        if generation == self.coverage.generation {
+            self.coverage.has_older = has_older;
+        }
     }
 
     /// Record input texts read from retained commands.
@@ -1049,9 +1057,9 @@ impl Conversation {
     /// Remember an evicted turn so late events never resurrect it. The
     /// index is bounded: the exact count lives in `coverage.evicted_turns`,
     /// and a snapshot rebuild starts a fresh window from retained history.
-    fn remember_evicted(&mut self, turn_id: String) {
-        if self.evicted.insert(turn_id.clone()) {
-            self.evicted_order.push_back(turn_id);
+    fn remember_evicted(&mut self, key: TurnKey) {
+        if self.evicted.insert(key.clone()) {
+            self.evicted_order.push_back(key);
             while self.evicted_order.len() > MAX_EVICTED_IDS {
                 let Some(old) = self.evicted_order.pop_front() else {
                     break;
@@ -1084,8 +1092,8 @@ impl Conversation {
             let Some(oldest) = self
                 .turns
                 .values()
-                .min_by_key(|turn| (turn.order(), turn.turn_id.clone()))
-                .map(|turn| turn.turn_id.clone())
+                .min_by(|a, b| a.order().cmp(&b.order()))
+                .map(|turn| turn.key.clone())
             else {
                 return;
             };
@@ -1098,7 +1106,7 @@ impl Conversation {
     /// Ordered virtualized items with stable keys and content revisions.
     pub fn items(&self) -> Vec<TurnItem> {
         let mut turns: Vec<&TurnEntry> = self.turns.values().collect();
-        turns.sort_by(|a, b| a.order().cmp(&b.order()).then(a.turn_id.cmp(&b.turn_id)));
+        turns.sort_by(|a, b| a.order().cmp(&b.order()));
         let mut items: Vec<TurnItem> = turns.iter().map(|turn| self.turn_item(turn)).collect();
         for command in &self.local {
             let text = match self.inputs.get(command) {
@@ -1150,6 +1158,7 @@ impl Conversation {
     }
 
     fn turn_item(&self, turn: &TurnEntry) -> TurnItem {
+        let key = format!("turn:{}:{}", turn.key.generation, turn.key.id);
         let mut parts = Vec::new();
         match turn.command_id.as_deref() {
             Some(command) => {
@@ -1170,7 +1179,7 @@ impl Conversation {
                 ));
             }
             None => parts.push(Part::new(
-                format!("in:turn:{}", turn.turn_id),
+                format!("in:turn:{}", turn.key.id),
                 PartKind::Notice,
                 "Input".to_owned(),
                 "The message that started this turn is not in the loaded history.".to_owned(),
@@ -1353,7 +1362,7 @@ impl Conversation {
 
         if turn.messages_dropped > 0 {
             parts.push(Part::new(
-                format!("dropped:{}", turn.turn_id),
+                format!("dropped:{}", turn.key.id),
                 PartKind::Notice,
                 "Progress".to_owned(),
                 format!(
@@ -1367,7 +1376,7 @@ impl Conversation {
                 Vec::new(),
             ));
         }
-        let final_key = format!("final:{}", turn.turn_id);
+        let final_key = format!("final:{}", turn.key.id);
         let label = match &turn.status {
             TurnStatus::Completed(Some(TurnOutcome::Success)) | TurnStatus::Completed(None) => {
                 "Assistant".to_owned()
@@ -1431,18 +1440,21 @@ impl Conversation {
                 _ => (reason, detail),
             };
             parts.push(Part::new(
-                format!("failed:{}", turn.turn_id),
+                format!("failed:{}", turn.key.id),
                 PartKind::TurnFailed,
                 final_part.label,
                 text,
                 detail,
             ));
         }
-        let revision = parts.iter().fold(text_hash(&turn.turn_id), |hash, part| {
+        let revision = parts.iter().fold(text_hash(&turn.key.id), |hash, part| {
             mix(hash, part.revision)
         });
+        for part in &mut parts {
+            part.key = format!("{key}/{}", part.key);
+        }
         TurnItem {
-            key: format!("turn:{}", turn.turn_id),
+            key,
             revision,
             parts,
         }

@@ -1532,32 +1532,58 @@ and per-unit costs. `swarm usage` renders this response as a compact table;
 
 Required IDs must be strings whose trimmed value is nonempty and are preserved without
 trimming or normalization. Command references use the [Core command ID validator](../../crates/eliot-core/src/command.rs).
-`turn.get` requires a nonnegative integer
-generation. For `agent.result`, omitted `generation` selects the current generation;
-omitted `turn_id` requests turns for that generation; omitted `limit` defaults to 100.
-Any supplied generation must be a nonnegative integer, and any supplied `turn_id` must
-be a nonempty string. The limit must be 1–1,000 even when `turn_id` selects one exact
-turn. Optional request members that are absent are omitted during serialization; do not
-send `null`. Explicit `null`, wrong types, invalid values and unknown request fields are
-`invalid`. Unknown RPC methods and command verbs retain their existing `unsupported`
-behavior.
+`turn.get` requires a nonnegative integer generation. An `agent.result` self-read
+uses the generation bound to the Agent's credential, including when `generation`
+is omitted. For other authorized callers, omitting `generation` selects all retained
+generations. An exact `turn_id` lookup defaults to the current Agent generation
+for those callers. An authorized explicit generation selects only that generation.
+Omitted `limit` defaults to 100 and must be
+1–1,000, including for an exact `turn_id` lookup. Any supplied generation must be a
+nonnegative integer, and any supplied `turn_id` must be a nonempty string. Optional
+request members that are absent are omitted during serialization; do not send `null`.
+Explicit `null`, wrong types, invalid values and unknown request fields are
+`invalid`. Unknown RPC methods and command verbs retain their existing
+`unsupported` behavior.
 
-The existing principal checks, generation rules and unknown-state masking apply. An
-explicit generation retains the existing principal-scoped historical read behavior.
-`agent_metadata` is the current Agent object and may have a different generation from
-the result when an explicit historical generation was requested.
+An unfiltered `agent.result` page orders generations newest first. Within each
+generation it sorts by the immutable turn insertion sequence, newest first. To
+continue, pass the returned `next` as `before` with the same Agent and generation
+filter. The byte budget includes turns, generation markers, Agent metadata, and
+the continuation cursor. An exact `turn_id` lookup returns just that row and
+cannot take `before`.
+`next` is null when no older row remains.
 
-Before printing a read response or using it to advance a wait, the client validates its
-binding: `command.get` must return the requested command ID; `turn.get` must match the
-requested Agent, generation and turn ID; and `agent.result` must match the requested
-Agent, its requested generation (or the current metadata generation when omitted), and
-the requested exact turn when present (exactly one matching turn). Every result turn
-must match the response Agent and generation, and the response must respect the requested
-limit. A mismatch yields only the fixed `unknown` error
-`read response does not match the requested binding`, with no response data or
-diagnostics exposed. A `command.children` response must hold at most `limit`
+The response includes `generation_boundaries` in descending generation order.
+Each marker carries the generation number and its recorded origin, including
+`restart_resume`, `owner_resume`, `switch` or `handoff`. A missing historical
+origin is `unknown`. The first page can include the current generation before its
+first turn. Markers can recur when two pages include turns from the same generation.
+[Result DTOs](../../crates/eliot-core/src/api/reads.rs)
+
+The existing principal checks and unknown-state masking apply. `agent_metadata`
+is the current Agent object. On a self-read, the response's `generation` is the
+credential's generation. On other reads it echoes an explicit filter, or reports
+the current Agent generation when the filter is omitted. Each turn carries its
+own generation.
+
+Clients validate the binding before displaying a read or using it to advance a
+wait. `command.get` must return the requested command ID. `turn.get` must match
+the requested Agent, generation, and turn ID. `agent.result` must match the
+requested Agent and the applicable response generation described above. An
+exact-turn lookup must return one row that matches the requested turn ID and the
+response generation. Each result turn belongs to the requested Agent and any
+applicable generation filter. On a cross-generation page a turn's generation
+can be older than the response generation. The response respects the requested
+limit, and the markers cover the generations in the page. A mismatch yields only the fixed
+`unknown` error `read response does not match the requested binding`, with no response
+data or diagnostics exposed. A `command.children` response must hold at most `limit`
 well-formed commands with `next` equal to the last child id, or null when the
 page is empty; a mismatch is the same fixed `unknown` error.
+
+The desktop transcript uses the default `agent.result` read and continues older
+pages with `before`. MCP `agent.result` uses the same contract. Each result row
+keeps its own `final_text`, including the latest turn. MCP `swarm.wait` binds to
+frozen command or turn references and returns bounded `final_text` for each exact turn.
 
 `swarm cmd show`, `swarm cmd children` and `swarm result` exit 0 after a valid read
 even if a returned command or turn is `unknown`; that state is not a successful task
@@ -2638,7 +2664,7 @@ swarm interrupt|abort A [--generation N] [--turn ID]
 swarm stop A [--force] [--tree | --generation N]
 swarm resume A [PROMPT] [--wait] [--timeout-seconds N]
 swarm wait --all|--any --timeout-seconds N ID...
-swarm result A [--generation N] [--turns N]
+swarm result A [--generation N] [--before CURSOR_JSON | --turn-id TURN] [--limit N]
 swarm turn show|resolve ...
 swarm approve|deny A [--request R] [--choice ID] [--feedback TEXT] | answer ... [--request R]
 swarm configure A [--model MODEL] [--effort EFFORT] [--generation N]

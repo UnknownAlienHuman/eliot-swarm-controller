@@ -157,7 +157,7 @@ const METHODS: &[Method] = &[
     method!("models.catalog", ModelsCatalogRequest, ModelsCatalogResponse, true, false, "Search one unified model catalogue across every installed harness (read-only).", {"query":"luna"}),
     method!("agent.history", AgentHistoryRequest, ObservationPage, true, false, "Read a bounded native history view advertised by agent.get.", {"id":"a1","source":"native","view":"turns","limit":20}),
     method!("agent.list", AgentListRequest, AgentListResponse, false, false, "List scoped compact Agent summaries with filters and counts.", {"limit":20,"state":"busy"}),
-    method!("agent.result", AgentResultRequest, AgentResultResponse, false, false, "Read retained turns/results for one Agent.", {"id":"a1","limit":20}),
+    method!("agent.result", AgentResultRequest, AgentResultResponse, false, false, "Page through one Agent's retained turns and their generation origins.", {"id":"a1","limit":20}),
     method!("agent.processes", AgentProcessesRequest, AgentProcessesResponse, false, false, "Read bounded process observations for one Agent.", {"id":"a1"}),
     method!("agent.stats", AgentStatsRequest, AgentStatsResponse, false, false, "Read sampled Agent statistics with freshness metadata.", {"id":"a1"}),
     method!(

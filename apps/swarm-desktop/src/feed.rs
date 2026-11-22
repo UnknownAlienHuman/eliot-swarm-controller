@@ -50,7 +50,7 @@ impl Depth {
     pub fn older(self) -> Self {
         Self {
             result_limit: (self.result_limit + crate::chat::TURN_PAGE)
-                .min(crate::chat::MAX_RESULT_LIMIT),
+                .min(crate::chat::MAX_RESIDENT_TURNS),
         }
     }
 }
@@ -69,7 +69,7 @@ pub struct Snapshot {
 /// A coalesced authoritative reread after events invalidated state.
 #[derive(Clone, Debug)]
 pub struct Reread {
-    pub turns: Option<Vec<Turn>>,
+    pub results: Option<client::TranscriptResults>,
     pub detail: Option<AgentGetResponse>,
     pub inputs: Vec<(String, InputText)>,
     pub docs: Vec<(u64, Doc)>,
@@ -98,33 +98,39 @@ fn parse_docs(texts: Vec<String>) -> Vec<(u64, Doc)> {
         .collect()
 }
 
+// The snapshot delivers generationless events for Agent invalidation. Only
+// events bound to a generation and turn can contribute to input loading.
+fn event_turn_key(event: &Event) -> Option<(i64, &str)> {
+    Some((event.generation?, event.data.get("turn_id")?.as_str()?))
+}
+
 /// Commands of the turns the resident bounds will keep: the newest
 /// [`crate::chat::MAX_RESIDENT_TURNS`] turn ids by first event (the order
 /// the bounds evict by), so a snapshot fetches only resident input texts
 /// instead of one RPC per `turn.started` in the whole scanned window, and
 /// evicted prompts never load the budget (#642).
 fn resident_commands(events: &[Event]) -> Vec<String> {
-    let mut first: HashMap<&str, (i64, i64)> = HashMap::new();
+    let mut first = HashMap::new();
     for event in events {
-        if let Some(turn_id) = event.data.get("turn_id").and_then(|value| value.as_str()) {
-            first.entry(turn_id).or_insert((event.ts, event.seq));
-        }
+        let Some(key) = event_turn_key(event) else {
+            continue;
+        };
+        first.entry(key).or_insert((key.0, event.ts, event.seq));
     }
-    let mut resident: Vec<&str> = first.keys().copied().collect();
+    let mut resident: Vec<_> = first.keys().copied().collect();
     resident.sort_by(|a, b| first[b].cmp(&first[a]));
     resident.truncate(crate::chat::MAX_RESIDENT_TURNS);
-    let keep: HashSet<&str> = resident.into_iter().collect();
+    let keep: HashSet<_> = resident.into_iter().collect();
     let mut commands: Vec<String> = events
         .iter()
-        .filter(|event| {
-            event.kind == "turn.started"
-                && event
-                    .data
-                    .get("turn_id")
-                    .and_then(|value| value.as_str())
-                    .is_some_and(|turn_id| keep.contains(turn_id))
+        .filter(|event| event.kind == "turn.started")
+        .filter_map(|event| {
+            let key = event_turn_key(event)?;
+            if keep.contains(&key) {
+                return event.data.get("command_id")?.as_str().map(str::to_owned);
+            }
+            None
         })
-        .filter_map(|event| event.data.get("command_id")?.as_str().map(str::to_owned))
         .collect();
     commands.sort();
     commands.dedup();
@@ -157,7 +163,7 @@ pub fn snapshot(data_dir: &Path, agent: &str, depth: Depth) -> Fallible<Snapshot
             coverage: Coverage {
                 generation: results.generation,
                 result_limit: depth.result_limit,
-                result_returned: results.turns.len(),
+                has_older: results.has_older,
                 cursor: scan.next,
                 pruned_through: bounds.pruned_through,
                 ..Coverage::default()
@@ -186,22 +192,20 @@ pub fn reread(
         } else {
             None
         };
-        let turns = if turns {
-            Some(
-                client::agent_results(data_dir, agent, result_limit)
-                    .await?
-                    .turns,
-            )
+        let results = if turns {
+            Some(client::agent_results(data_dir, agent, result_limit).await?)
         } else {
             None
         };
         let inputs = client::input_texts(data_dir, inputs).await;
         let docs = parse_docs(Conversation::markdown_texts(
-            turns.as_deref().unwrap_or_default(),
+            results
+                .as_ref()
+                .map_or(&[], |result| result.turns.as_slice()),
             &[],
         ));
         Ok(Reread {
-            turns,
+            results,
             detail,
             inputs,
             docs,
