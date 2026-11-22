@@ -318,6 +318,144 @@ impl Router {
         id: &str,
         command: &Command,
     ) -> std::result::Result<Option<ProjectRegistrationView>, ()> {
+        if command.verb == "git.integrate" {
+            let frozen = match serde_json::from_value::<eliot_core::api::FrozenGitIntegrate>(
+                command.args.clone(),
+            ) {
+                Ok(frozen) if frozen.validate().is_ok() => frozen,
+                _ => {
+                    self.reject_undispatched_error(
+                        id,
+                        &Error::new(
+                            "invalid",
+                            "git.integrate args are not a valid frozen intent",
+                        )
+                        .with_where("router.dispatch.git_integrate_gate"),
+                    )
+                    .await;
+                    return Err(());
+                }
+            };
+            let principal_matches = match (command.principal.as_str(), frozen.caller.as_ref()) {
+                ("owner", None) => true,
+                (principal, None)
+                    if principal.strip_prefix("project:") == Some(frozen.repository.as_str()) =>
+                {
+                    true
+                }
+                (principal, Some(caller)) => {
+                    principal == format!("agent:{}:{}", caller.agent, caller.generation)
+                }
+                _ => false,
+            };
+            if !principal_matches {
+                self.reject_undispatched_error(
+                    id,
+                    &Error::new(
+                        "not_allowed",
+                        "git.integrate principal differs from frozen authority",
+                    )
+                    .with_where("router.dispatch.git_integrate_gate"),
+                )
+                .await;
+                return Err(());
+            }
+            let registration = {
+                let store = self.inner.store.lock().await;
+                store.get_project_registration("owner", &frozen.repository)
+            };
+            let registration = match registration {
+                Ok(Some(registration))
+                    if registration.revision == frozen.registration_revision
+                        && registration.id == frozen.repository
+                        && registration.checkout == frozen.canonical_checkout
+                        && registration.repo_common_dir == frozen.common_dir =>
+                {
+                    registration
+                }
+                Ok(_) => {
+                    self.reject_undispatched_error(
+                        id,
+                        &Error::new("not_allowed", "git.integrate project registration is stale")
+                            .with_where("router.dispatch.git_integrate_gate"),
+                    )
+                    .await;
+                    return Err(());
+                }
+                Err(error) => {
+                    self.reject_undispatched_error(id, &error).await;
+                    return Err(());
+                }
+            };
+            if let Some(caller) = &frozen.caller {
+                let agent = {
+                    let store = self.inner.store.lock().await;
+                    store.get_agent(&caller.agent)
+                };
+                let agent = match agent {
+                    Ok(Some(agent)) => agent,
+                    Ok(None) => {
+                        self.reject_undispatched_error(
+                            id,
+                            &Error::new("stale_generation", "git.integrate manager disappeared")
+                                .with_where("router.dispatch.git_integrate_gate"),
+                        )
+                        .await;
+                        return Err(());
+                    }
+                    Err(error) => {
+                        self.reject_undispatched_error(id, &error).await;
+                        return Err(());
+                    }
+                };
+                if agent.generation != caller.generation
+                    || agent.is_terminal()
+                    || agent.observe_only
+                    || agent.control != caller.control
+                    || agent.project_scope() != caller.project_scope
+                    || agent.workspace.as_deref() != Some(caller.workspace.as_str())
+                    || !registration
+                        .actions
+                        .iter()
+                        .any(|action| action == "git.integrate")
+                    || frozen.fast_forward.as_ref().is_some_and(|target| {
+                        agent.branch.as_deref() != Some(target.branch.as_str())
+                    })
+                {
+                    self.reject_undispatched_error(
+                        id,
+                        &Error::new("not_allowed", "git.integrate manager authority changed")
+                            .with_where("router.dispatch.git_integrate_gate"),
+                    )
+                    .await;
+                    return Err(());
+                }
+                let identity = match crate::workspace_git::WorkspaceGit::new() {
+                    Ok(git) => git.repository_identity(&caller.workspace).await,
+                    Err(error) => Err(error),
+                };
+                let identity = match identity {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        self.reject_undispatched_error(id, &error).await;
+                        return Err(());
+                    }
+                };
+                if identity.0 != caller.workspace || identity.1 != frozen.common_dir {
+                    self.reject_undispatched_error(
+                        id,
+                        &Error::new(
+                            "not_allowed",
+                            "git.integrate manager workspace no longer matches its registered repository",
+                        )
+                        .with_where("router.dispatch.git_integrate_gate"),
+                    )
+                    .await;
+                    return Err(());
+                }
+            }
+            return Ok(Some(registration));
+        }
         if command.verb == "git.publish" {
             let frozen = match serde_json::from_value::<FrozenGitPublish>(command.args.clone()) {
                 Ok(frozen) if frozen.validate().is_ok() => frozen,
@@ -450,7 +588,10 @@ impl Router {
         let Some(project_id) = command.principal.strip_prefix("project:") else {
             return true;
         };
-        let registration = if matches!(command.verb.as_str(), "git.fetch" | "git.publish") {
+        let registration = if matches!(
+            command.verb.as_str(),
+            "git.fetch" | "git.publish" | "git.integrate"
+        ) {
             match git_fetch_registration {
                 Some(registration) => Ok(Some(registration.clone())),
                 None => Err(Error::new(
@@ -843,6 +984,14 @@ impl Router {
                             "force shutdown prevents Git fetch dispatch",
                         ))
                     }
+                    None if command.verb == "git.integrate"
+                        && self.inner.mode.load(Ordering::SeqCst) == MODE_FORCE =>
+                    {
+                        Err(Error::new(
+                            "bad_state",
+                            "force shutdown prevents Git integration dispatch",
+                        ))
+                    }
                     None if command.verb == "git.publish"
                         && self.inner.mode.load(Ordering::SeqCst) == MODE_FORCE =>
                     {
@@ -1104,6 +1253,11 @@ impl Router {
         }
         if dispatched.verb == "run" {
             self.execute_run_command(dispatched).await;
+            return;
+        }
+        if dispatched.verb == "git.integrate" {
+            self.execute_git_integrate_command(&id, dispatched, git_fetch_registration)
+                .await;
             return;
         }
         if dispatched.verb == "git.fetch" {

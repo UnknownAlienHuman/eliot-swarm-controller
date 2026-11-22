@@ -888,6 +888,32 @@ fn check_settle_verb_guards(
     outcome: &Option<Value>,
     id: &str,
 ) -> Result<()> {
+    if record.command.verb == "git.integrate"
+        && matches!(
+            state,
+            CommandState::Applied | CommandState::Failed | CommandState::Unknown
+        )
+    {
+        let frozen = projects::decode_frozen_git_integrate(&record.command.args)?;
+        let value = outcome.as_ref().ok_or_else(|| {
+            Error::new(
+                "invalid",
+                "git.integrate settlement requires its typed result",
+            )
+        })?;
+        let result = serde_json::from_value::<core::api::GitIntegrateOutcome>(value.clone())
+            .map_err(|_| Error::new("invalid", "git.integrate result is malformed"))?;
+        result.validate_for(&frozen)?;
+        if state == CommandState::Applied
+            && (result.status != core::api::GitIntegrateStatus::Merged
+                || result.integration_oid.is_none())
+        {
+            return Err(Error::new(
+                "invalid",
+                "applied git.integrate requires a merged integration OID",
+            ));
+        }
+    }
     if record.command.verb == "git.fetch" && state == CommandState::Applied {
         let frozen = projects::decode_frozen_git_fetch(&record.command.args)?;
         let value = outcome.as_ref().ok_or_else(|| {

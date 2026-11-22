@@ -356,6 +356,112 @@ pub(super) fn decode_frozen_git_fetch(args: &Value) -> Result<core::api::FrozenG
     Ok(frozen)
 }
 
+pub(super) fn decode_frozen_git_integrate(args: &Value) -> Result<core::api::FrozenGitIntegrate> {
+    let frozen = serde_json::from_value::<core::api::FrozenGitIntegrate>(args.clone())
+        .map_err(|_| Error::new("invalid", "git.integrate args must be a frozen intent"))?;
+    frozen.validate()?;
+    Ok(frozen)
+}
+
+pub(super) fn validate_git_integrate_intent_tx(
+    tx: &Transaction<'_>,
+    principal: &str,
+    frozen: &core::api::FrozenGitIntegrate,
+) -> Result<core::api::ProjectRegistrationView> {
+    frozen.validate()?;
+    let project_id = project_id_from_principal(principal)?;
+    if project_id
+        .as_deref()
+        .is_some_and(|project_id| project_id != frozen.repository)
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "Project git.integrate repository must match its saved principal",
+        ));
+    }
+    let registration = load_project_registration(tx, &frozen.repository)?
+        .ok_or_else(|| Error::new("not_allowed", "git.integrate repository is not registered"))?;
+    registration.validate()?;
+    if registration.id != frozen.repository
+        || registration.revision != frozen.registration_revision
+        || registration.checkout != frozen.canonical_checkout
+        || registration.repo_common_dir != frozen.common_dir
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "git.integrate frozen registration binding is stale",
+        ));
+    }
+
+    let caller = if principal.starts_with("agent:") {
+        match super::hierarchy::parse_caller(tx, principal)? {
+            super::hierarchy::Caller::Agent {
+                num,
+                id,
+                control,
+                project,
+            } => Some((num, id, control, project)),
+            super::hierarchy::Caller::Owner => None,
+        }
+    } else {
+        None
+    };
+    match (
+        principal,
+        project_id.as_deref(),
+        frozen.caller.as_ref(),
+        caller,
+    ) {
+        ("owner", None, None, None) => {}
+        (_, Some(project_id), None, None) if project_id == frozen.repository => {
+            require_project_registration_action(&registration, "git.integrate")?;
+        }
+        (_, None, Some(frozen_caller), Some((num, id, control, project_scope))) => {
+            frozen_caller.validate()?;
+            if frozen_caller.agent != id
+                || frozen_caller.generation <= 0
+                || frozen_caller.control != control
+                || frozen_caller.project_scope != project_scope
+            {
+                return Err(Error::new(
+                    "not_allowed",
+                    "git.integrate manager generation or scope differs from its frozen binding",
+                ));
+            }
+            require_project_registration_action(&registration, "git.integrate")?;
+            let manager = super::load_agent_by_num(tx, num)?.ok_or_else(|| {
+                Error::new("stale_generation", "git.integrate manager disappeared")
+            })?;
+            if manager.id != id
+                || manager.generation != frozen_caller.generation
+                || manager.control != control
+                || manager.project_scope() != frozen_caller.project_scope
+                || manager.workspace.as_deref() != Some(frozen_caller.workspace.as_str())
+                || manager.observe_only
+            {
+                return Err(Error::new(
+                    "stale_generation",
+                    "git.integrate manager workspace, generation, or scope changed",
+                ));
+            }
+            if let Some(target) = &frozen.fast_forward
+                && manager.branch.as_deref() != Some(target.branch.as_str())
+            {
+                return Err(Error::new(
+                    "not_allowed",
+                    "git.integrate fast-forward target must be the manager's own branch",
+                ));
+            }
+        }
+        _ => {
+            return Err(Error::new(
+                "not_allowed",
+                "git.integrate requires Owner, approved project-rule, or current manager authority",
+            ));
+        }
+    }
+    Ok(registration)
+}
 pub(super) fn decode_frozen_git_publish(args: &Value) -> Result<core::api::FrozenGitPublish> {
     let frozen = serde_json::from_value::<core::api::FrozenGitPublish>(args.clone())
         .map_err(|_| Error::new("invalid", "git.publish args must be a frozen intent"))?;
@@ -567,6 +673,15 @@ pub(super) fn capture_project_command_binding_tx(
     tx: &Transaction<'_>,
     command: &CommandInsert<'_>,
 ) -> Result<Option<String>> {
+    if command.verb == "git.integrate" {
+        let frozen = decode_frozen_git_integrate(command.args)?;
+        let registration = validate_git_integrate_intent_tx(tx, command.principal, &frozen)?;
+        if project_id_from_principal(command.principal)?.is_some() {
+            return encode_json(&targetless_project_command_binding(registration.revision))
+                .map(Some);
+        }
+        return Ok(None);
+    }
     let Some(project_id) = project_id_from_principal(command.principal)? else {
         return Ok(None);
     };
@@ -690,6 +805,18 @@ pub(super) fn validate_project_command_dispatch_tx(
             return Err(Error::new(
                 "not_allowed",
                 "project resume Agent, workspace or repository binding changed",
+            ));
+        }
+        return Ok(());
+    }
+    if command.target.is_none() && command.command.verb == "git.integrate" {
+        let frozen = decode_frozen_git_integrate(&command.command.args)?;
+        validate_git_integrate_intent_tx(tx, &command.command.principal, &frozen)?;
+        require_project_registration_action(&registration, "git.integrate")?;
+        if binding != targetless_project_command_binding(registration.revision) {
+            return Err(Error::new(
+                "not_allowed",
+                "Project git.integrate binding does not match its saved registration",
             ));
         }
         return Ok(());
@@ -1249,6 +1376,7 @@ fn is_supported_project_action(action: &str) -> bool {
             | "deny"
             | "answer"
             | "git.fetch"
+            | "git.integrate"
             | "git.publish"
             | "notify"
             | "emit"

@@ -77,7 +77,13 @@ pub(super) fn dispatch_tx(
         return dispatch_targetless_tx(tx, id, command, now, events, "targetless action");
     }
     let verb = command.command.verb.as_str();
-    if matches!(verb, "git.fetch" | "git.publish") {
+    if matches!(verb, "git.fetch" | "git.publish" | "git.integrate") {
+        if command.command.selector.is_some() {
+            return Err(Error::new(
+                "source_integrity",
+                "stored Git command has a selector",
+            ));
+        }
         if command.target.is_some()
             || command.command.generation.is_some()
             || command.command.expected_generation.is_some()
@@ -91,14 +97,26 @@ pub(super) fn dispatch_tx(
                 "stored Git command has an Agent binding",
             ));
         }
-        let common_dir = if verb == "git.fetch" {
-            let frozen = projects::decode_frozen_git_fetch(&command.command.args)?;
-            projects::validate_git_fetch_intent_tx(tx, &command.command.principal, &frozen)?;
-            frozen.common_dir
-        } else {
-            let frozen = projects::decode_frozen_git_publish(&command.command.args)?;
-            projects::validate_git_publish_intent_tx(tx, &command.command.principal, &frozen)?;
-            frozen.common_dir
+        let common_dir = match verb {
+            "git.fetch" => {
+                let frozen = projects::decode_frozen_git_fetch(&command.command.args)?;
+                projects::validate_git_fetch_intent_tx(tx, &command.command.principal, &frozen)?;
+                frozen.common_dir
+            }
+            "git.publish" => {
+                let frozen = projects::decode_frozen_git_publish(&command.command.args)?;
+                projects::validate_git_publish_intent_tx(tx, &command.command.principal, &frozen)?;
+                frozen.common_dir
+            }
+            _ => {
+                let frozen = projects::decode_frozen_git_integrate(&command.command.args)?;
+                projects::validate_git_integrate_intent_tx(
+                    tx,
+                    &command.command.principal,
+                    &frozen,
+                )?;
+                frozen.common_dir
+            }
         };
         projects::validate_project_command_dispatch_tx(tx, command)?;
         match rules::gate_rule_action_dispatch_tx(tx, id, now, events)? {

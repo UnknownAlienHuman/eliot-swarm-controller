@@ -198,7 +198,7 @@ fn is_in_subtree_of(connection: &Connection, member_num: i64, ancestor_num: i64)
 /// The one frozen-scope walk: itself, its subtree for tree control, or its
 /// project label for project control. Shared by Store admission
 /// (`caller_may_command`) and Router reads (`Store::agent_in_scope`).
-fn scope_allows(
+pub(super) fn scope_allows(
     connection: &Connection,
     caller_id: &str,
     caller_num: i64,

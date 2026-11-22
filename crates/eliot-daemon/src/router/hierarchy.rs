@@ -46,6 +46,21 @@ pub(super) fn bind_agent_submit(
         }
         return Ok(());
     }
+    if request.verb == "git.integrate" {
+        if request.target.is_some()
+            || request.selector.is_some()
+            || request.expected_generation.is_some()
+            || request.expected_turn_id.is_some()
+            || request.request_id.is_some()
+            || request.probe
+        {
+            return Err(Error::new(
+                "invalid",
+                "git.integrate is targetless and has no Agent command bindings",
+            ));
+        }
+        return Ok(());
+    }
     if !matches!(
         request.verb.as_str(),
         "send" | "stop" | "steer" | "inject" | "interrupt" | "approve" | "deny" | "answer"

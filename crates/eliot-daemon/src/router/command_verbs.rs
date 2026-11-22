@@ -34,6 +34,53 @@ impl Router {
         self.signal_progress();
     }
 
+    /// Execute one frozen local branch integration and settle its short typed result.
+    pub(super) async fn execute_git_integrate_command(
+        &self,
+        id: &str,
+        dispatched: Command,
+        registration: Option<ProjectRegistrationView>,
+    ) {
+        let Some(registration) = registration else {
+            self.settle(
+                id,
+                CommandState::Rejected,
+                Some(json!({"code":"git_integrate_registration_missing"})),
+            )
+            .await;
+            self.signal_progress();
+            return;
+        };
+        let frozen = match serde_json::from_value::<eliot_core::api::FrozenGitIntegrate>(
+            dispatched.args.clone(),
+        ) {
+            Ok(frozen) if frozen.validate().is_ok() => frozen,
+            _ => {
+                self.settle(
+                    id,
+                    CommandState::Rejected,
+                    Some(json!({"code":"git_integrate_frozen_intent_invalid"})),
+                )
+                .await;
+                self.signal_progress();
+                return;
+            }
+        };
+        let mut execution = crate::git_integration::execute(
+            &self.inner.data_root,
+            id,
+            &frozen,
+            &registration,
+            self.run_cancellation_receiver(),
+            self.secret_policy_snapshot(),
+        )
+        .await;
+        self.redact_native_value(&mut execution.outcome);
+        self.settle(id, execution.state, Some(execution.outcome))
+            .await;
+        self.signal_progress();
+    }
+
     /// Execute a dispatched `git.fetch` against its registration and settle
     /// the recorded outcome, cleaning up only after a durable match.
     pub(super) async fn execute_git_fetch_command(

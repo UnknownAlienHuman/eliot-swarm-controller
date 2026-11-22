@@ -13,6 +13,7 @@ pub mod crash;
 pub(crate) mod daemon;
 mod fs_invalidation;
 mod git_actions;
+mod git_integration;
 mod git_monitor;
 pub(crate) mod logging;
 mod maintenance;

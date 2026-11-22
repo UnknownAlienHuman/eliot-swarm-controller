@@ -714,6 +714,65 @@ impl Store {
         Ok(None)
     }
 
+    /// Resolve an idempotent git.integrate retry from caller-selected names
+    /// before reading current branch tips.
+    pub fn replay_git_integrate_submission(
+        &self,
+        principal: &str,
+        request: &SubmitCommand,
+        timeout_ms: i64,
+    ) -> Result<Option<Admission>> {
+        require_nonempty(principal, "principal")?;
+        self.ensure_committed_reads()?;
+        request.validate()?;
+        validate_ulid(&request.id)?;
+        if request.verb != "git.integrate"
+            || request.selector.is_some()
+            || request.target.is_some()
+            || request.expected_generation.is_some()
+            || request.expected_turn_id.is_some()
+            || request.request_id.is_some()
+            || request.probe
+        {
+            return Err(Error::new(
+                "invalid",
+                "Git integration replay lookup requires the exact targetless command shape",
+            ));
+        }
+        let definition =
+            serde_json::from_value::<core::api::GitIntegrateDefinitionArgs>(request.args.clone())
+                .map_err(|_| Error::new("invalid", "git.integrate definition args are malformed"))?;
+        let semantic_args = definition.binding_args(timeout_ms)?;
+        if encode_json(request)?.len() > MAX_FRAME_BYTES {
+            return Err(Error::new(
+                "frame_too_large",
+                "command request exceeds 1 MiB",
+            ));
+        }
+        let semantic_payload = admission::command_semantic_payload(request, semantic_args)?;
+        let payload_digest = canonical::digest(&semantic_payload)?;
+        if let Some(admission) = admission::replay_command_binding(
+            &self.connection,
+            principal,
+            request,
+            &payload_digest,
+        )? {
+            if admission.command.verb != "git.integrate" || admission.command.target.is_some() {
+                return Err(Error::new(
+                    "source_integrity",
+                    "retained Git integration binding has another command shape",
+                ));
+            }
+            return Ok(Some(admission));
+        }
+        if write_exists(&self.connection, &request.id)? {
+            return Err(Error::new(
+                "id_conflict",
+                "command id is already bound to another write",
+            ));
+        }
+        Ok(None)
+    }
     fn submit_inner(
         &mut self,
         principal: &str,
@@ -4199,7 +4258,7 @@ fn repo_git_write_blocked_tx(
             "SELECT EXISTS(
              SELECT 1
              FROM commands prior
-             WHERE prior.verb IN ('git.fetch','git.publish')
+             WHERE prior.verb IN ('git.fetch','git.publish','git.integrate')
                AND prior.id <> ?1
                AND prior.state IN ('accepted','queued','dispatched','unknown')
                AND json_extract(prior.args, '$.common_dir') = ?2

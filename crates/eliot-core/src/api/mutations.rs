@@ -46,7 +46,7 @@ impl CommandSubmitRequest {
                 "provider probes are supported only for send",
             ));
         }
-        if self.verb == "git.fetch"
+        if matches!(self.verb.as_str(), "git.fetch" | "git.integrate")
             && (self.target.is_some()
                 || self.expected_generation.is_some()
                 || self.expected_turn_id.is_some()
@@ -55,8 +55,11 @@ impl CommandSubmitRequest {
         {
             return Err(Error::new(
                 "invalid",
-                "git.fetch is targetless and has no Agent bindings",
+                "Git fetch/integrate are targetless and have no Agent bindings",
             ));
+        }
+        if self.verb == "git.integrate" && self.selector.is_some() {
+            return Err(Error::new("invalid", "git.integrate cannot use a selector"));
         }
         if is_user_event_verb(self.verb.as_str())
             && (self.target.is_some()
