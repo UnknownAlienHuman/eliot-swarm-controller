@@ -23,10 +23,7 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
     time::Duration,
 };
 use tokio::{process::Command, sync::watch, time::Instant};
@@ -53,48 +50,36 @@ pub(crate) struct GitPublishExecutionContext<'a> {
     pub secret_policy: Arc<SecretPolicy>,
 }
 
-static TEMP_GIT_INDEX_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
 struct TemporaryGitIndex {
     directory: PathBuf,
     index_file: PathBuf,
 }
 
 impl TemporaryGitIndex {
-    fn create() -> Result<Self> {
-        let temp_root = fs::canonicalize(std::env::temp_dir()).map_err(|_| {
+    fn create(data_root: &Path) -> Result<Self> {
+        let data_root = fs::canonicalize(data_root).map_err(|_| {
             Error::new(
                 "unavailable",
-                "private Git publication temp directory cannot be resolved",
+                "private Git publication data root cannot be resolved",
             )
         })?;
-        for _ in 0..32 {
-            let sequence = TEMP_GIT_INDEX_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let directory = temp_root.join(format!(
-                "eliot-git-publish-{}-{sequence}",
-                std::process::id()
-            ));
-            let mut builder = fs::DirBuilder::new();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                builder.mode(0o700);
-            }
-            match builder.create(&directory) {
-                Ok(()) => {
-                    return Ok(Self {
-                        index_file: directory.join("index"),
-                        directory,
-                    });
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(_) => break,
-            }
+        let directory = data_root.join(format!("publish-index-{}", ulid::Ulid::new()));
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
         }
-        Err(Error::new(
-            "unavailable",
-            "private Git publication index cannot be created",
-        ))
+        builder.create(&directory).map_err(|_| {
+            Error::new(
+                "unavailable",
+                "private Git publication index cannot be created",
+            )
+        })?;
+        Ok(Self {
+            index_file: directory.join("index"),
+            directory,
+        })
     }
 
     fn path(&self) -> &Path {
@@ -104,7 +89,9 @@ impl TemporaryGitIndex {
 
 impl Drop for TemporaryGitIndex {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.directory);
+        let _ = fs::remove_file(self.index_file.with_extension("lock"));
+        let _ = fs::remove_file(&self.index_file);
+        let _ = fs::remove_dir(&self.directory);
     }
 }
 
@@ -391,7 +378,7 @@ pub(crate) async fn execute(context: GitPublishExecutionContext<'_>) -> GitPubli
     let private_index = if existing_commit {
         None
     } else {
-        match TemporaryGitIndex::create() {
+        match TemporaryGitIndex::create(data_root) {
             Ok(index) => Some(index),
             Err(_) => {
                 return execution(
@@ -429,7 +416,7 @@ pub(crate) async fn execute(context: GitPublishExecutionContext<'_>) -> GitPubli
         };
         match effect_exit(&initialized) {
             Some(0) if effect_quiescent(&initialized) => {}
-            Some(_) if effect_is_definite_exit(&initialized) => {
+            _ if effect_failed_definitely(&initialized) => {
                 return execution(
                     CommandState::Failed,
                     "git_publish_stage_failed",
@@ -478,7 +465,7 @@ pub(crate) async fn execute(context: GitPublishExecutionContext<'_>) -> GitPubli
     if let Some(staged) = &staged {
         match effect_exit(staged) {
             Some(0) if effect_quiescent(staged) => {}
-            Some(_) if effect_is_definite_exit(staged) => {
+            _ if effect_failed_definitely(staged) => {
                 return execution(
                     CommandState::Failed,
                     "git_publish_stage_failed",
@@ -536,7 +523,7 @@ pub(crate) async fn execute(context: GitPublishExecutionContext<'_>) -> GitPubli
                 );
             }
             Some(1) if effect_quiescent(staged_diff) => {}
-            Some(_) if effect_is_definite_exit(staged_diff) => {
+            _ if effect_failed_definitely(staged_diff) => {
                 return execution(
                     CommandState::Failed,
                     "git_publish_index_read_failed",
@@ -682,7 +669,7 @@ pub(crate) async fn execute(context: GitPublishExecutionContext<'_>) -> GitPubli
         _ => None,
     };
     let Some(commit_object) = commit_object.filter(|oid| is_git_oid(oid)) else {
-        let state = if effect_is_definite_exit(&committed) {
+        let state = if effect_failed_definitely(&committed) {
             CommandState::Failed
         } else {
             CommandState::Unknown
@@ -732,7 +719,7 @@ pub(crate) async fn execute(context: GitPublishExecutionContext<'_>) -> GitPubli
     };
     let commit_oid = match verify_commit_readback(&git, root, frozen, index_file, timeout).await {
         Ok(Some(oid)) if oid == commit_object => oid,
-        Ok(None) if effect_is_definite_exit(&updated) => {
+        Ok(None) if effect_failed_definitely(&updated) => {
             return execution(
                 CommandState::Failed,
                 "git_publish_commit_failed",
@@ -1304,7 +1291,12 @@ async fn checked_commit_tree(
     }
     let snapshot = capture_workspace_snapshot(&frozen.workspace).await?;
     let diff = git
-        .workspace_command(root, &["diff", "--quiet", &tree, "--"], deadline)
+        .workspace_command_with_index(
+            root,
+            &["diff", "--quiet", &tree, "--"],
+            index_file,
+            deadline,
+        )
         .await?;
     if diff.code != 0
         || snapshot.head.as_deref() != Some(frozen.head_oid.as_str())
@@ -1361,7 +1353,12 @@ async fn verify_commit_readback(
     let parent = read_git_line(git, root, &["rev-parse", "--verify", "HEAD^"], deadline).await?;
     let subject = read_git_line(git, root, &["log", "-1", "--format=%s"], deadline).await?;
     let worktree_diff = git
-        .workspace_command(root, &["diff", "--quiet", head.as_str(), "--"], deadline)
+        .workspace_command_with_index(
+            root,
+            &["diff", "--quiet", head.as_str(), "--"],
+            index_file,
+            deadline,
+        )
         .await?;
     let untracked = git
         .workspace_command_with_index(
@@ -1398,19 +1395,20 @@ async fn verify_committed_workspace(
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or_else(|| Error::new("invalid", "git.publish timeout is out of range"))?;
-    let worktree_diff = git
-        .workspace_command(root, &["diff", "--quiet", commit_oid, "--"], deadline)
-        .await?;
+    let diff_args = ["diff", "--quiet", commit_oid, "--"];
     let untracked_args = ["ls-files", "--others", "--exclude-standard", "-z"];
-    let untracked = match index_file {
-        Some(index_file) => {
+    let (worktree_diff, untracked) = match index_file {
+        Some(index_file) => (
+            git.workspace_command_with_index(root, &diff_args, index_file, deadline)
+                .await?,
             git.workspace_command_with_index(root, &untracked_args, index_file, deadline)
-                .await?
-        }
-        None => {
+                .await?,
+        ),
+        None => (
+            git.workspace_command(root, &diff_args, deadline).await?,
             git.workspace_command(root, &untracked_args, deadline)
-                .await?
-        }
+                .await?,
+        ),
     };
     if actual_branch != branch
         || actual_head != commit_oid
@@ -1473,13 +1471,18 @@ fn effect_exit(outcome: &ProcessOutcome) -> Option<i32> {
             capture: Some(capture),
             ..
         } => capture.status.code(),
-        ProcessOutcome::Failed { capture: None, .. } | ProcessOutcome::Unknown { .. } => None,
+        ProcessOutcome::Failed { capture: None, .. }
+        | ProcessOutcome::NotSpawned(_)
+        | ProcessOutcome::ProgramUnrunnable(_)
+        | ProcessOutcome::Unknown { .. } => None,
     }
 }
 
 fn effect_quiescent(outcome: &ProcessOutcome) -> bool {
     match outcome {
-        ProcessOutcome::Completed(_) => true,
+        ProcessOutcome::Completed(_)
+        | ProcessOutcome::NotSpawned(_)
+        | ProcessOutcome::ProgramUnrunnable(_) => true,
         ProcessOutcome::Failed {
             capture: Some(_), ..
         } => true,
@@ -1488,13 +1491,15 @@ fn effect_quiescent(outcome: &ProcessOutcome) -> bool {
     }
 }
 
-fn effect_is_definite_exit(outcome: &ProcessOutcome) -> bool {
+fn effect_failed_definitely(outcome: &ProcessOutcome) -> bool {
     matches!(
         outcome,
-        ProcessOutcome::Failed {
-            reason: ProcessFailure::Exit,
-            capture: Some(_),
-        }
+        ProcessOutcome::NotSpawned(_)
+            | ProcessOutcome::ProgramUnrunnable(_)
+            | ProcessOutcome::Failed {
+                reason: ProcessFailure::Exit,
+                capture: Some(_),
+            }
     )
 }
 

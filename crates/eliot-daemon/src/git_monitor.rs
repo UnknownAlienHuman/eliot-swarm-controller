@@ -1105,16 +1105,13 @@ impl GitProbe {
         deadline: Instant,
     ) -> Result<Captured> {
         let overrides = self.safe_overrides(root, deadline).await?;
-        self.run_scoped_with_index(
-            root,
-            args,
-            &overrides,
-            &[],
-            deadline,
-            None,
-            Some(index_file),
-        )
-        .await
+        let command =
+            self.build_command_with_index(root, args, &overrides, None, Some(index_file))?;
+        let (code, stdout) = Self::capture_git(command, &[], deadline, |stdout| {
+            bounded_read(stdout, OUTPUT_BYTES)
+        })
+        .await?;
+        Ok(Captured { code, stdout })
     }
 
     /// Run one explicitly dispatched local Git mutation under the same
@@ -1448,21 +1445,7 @@ impl GitProbe {
         deadline: Instant,
         binding: Option<GitBinding<'_>>,
     ) -> Result<Captured> {
-        self.run_scoped_with_index(root, args, overrides, input, deadline, binding, None)
-            .await
-    }
-
-    async fn run_scoped_with_index(
-        &self,
-        root: &Path,
-        args: &[&str],
-        overrides: &[(String, String)],
-        input: &[u8],
-        deadline: Instant,
-        binding: Option<GitBinding<'_>>,
-        index_file: Option<&Path>,
-    ) -> Result<Captured> {
-        let command = self.build_command_with_index(root, args, overrides, binding, index_file)?;
+        let command = self.build_command(root, args, overrides, binding)?;
         let (code, stdout) = Self::capture_git(command, input, deadline, |stdout| {
             bounded_read(stdout, OUTPUT_BYTES)
         })
