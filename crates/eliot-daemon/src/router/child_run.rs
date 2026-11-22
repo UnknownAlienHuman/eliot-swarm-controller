@@ -11,6 +11,7 @@ use eliot_core::{
     },
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 const CHILD_RUN_CHANGED_FILES_MAX: usize = 64;
 const CHILD_RUN_CHANGED_FILES_READ: usize = CHILD_RUN_CHANGED_FILES_MAX + 1;
@@ -407,10 +408,12 @@ fn status_from_wait(entry: &WaitEntryResult) -> Result<ChildRunStatus> {
 fn child_run_digest_id(id: &str) -> Result<String> {
     let value = ulid::Ulid::from_string(id).map_err(|_| Error::invalid_mutation_id())?;
     let original = value.to_bytes();
-    let hash = eliot_core::canonical::digest(&json!({"child.run.digest": value.to_string()}))?;
+    let mut hash = Sha256::new();
+    hash.update(b"child.run.digest");
+    hash.update(original);
     // Keep the launch's admission timestamp and derive a separate, stable digest id.
     let mut bytes = original;
-    bytes[6..].copy_from_slice(&hash[..10]);
+    bytes[6..].copy_from_slice(&hash.finalize()[..10]);
     if bytes == original {
         bytes[15] ^= 1;
     }
