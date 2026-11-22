@@ -117,7 +117,7 @@ impl Router {
             linked.as_ref(),
             principal,
             request.effective_wait_ms(),
-            false,
+            request.wait_ms == Some(0),
         )
         .await
     }

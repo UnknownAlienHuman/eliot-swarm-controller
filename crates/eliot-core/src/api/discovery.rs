@@ -255,6 +255,7 @@ pub fn decode_params_at<T: DeserializeOwned + JsonSchema>(params: Value, root: &
         node = resolve(&schema, node);
         if unknown_field {
             path.push_str(".<unknown-field>");
+            return Error::invalid_field_schema(path, unknown_field_expectation(node));
         }
         let mut expectation = serde_json::Map::new();
         for key in [
@@ -277,9 +278,6 @@ pub fn decode_params_at<T: DeserializeOwned + JsonSchema>(params: Value, root: &
                 expectation.insert(key.to_owned(), value.clone());
             }
         }
-        if unknown_field {
-            expectation.insert("additionalProperties".to_owned(), Value::Bool(false));
-        }
         if expectation.is_empty() {
             expectation.insert(
                 "description".to_owned(),
@@ -288,6 +286,34 @@ pub fn decode_params_at<T: DeserializeOwned + JsonSchema>(params: Value, root: &
         }
         Error::invalid_field_schema(path, Value::Object(expectation))
     })
+}
+
+fn unknown_field_expectation(node: &Value) -> Value {
+    let mut expectation = json!({"type": "object", "additionalProperties": false});
+    if let Some(properties) = node.get("properties").and_then(Value::as_object) {
+        let required = node
+            .get("required")
+            .and_then(Value::as_array)
+            .map_or(&[][..], Vec::as_slice);
+        let allowed_fields = bounded_field_names(properties.keys().map(String::as_str));
+        let required_fields = bounded_field_names(required.iter().filter_map(Value::as_str));
+        if allowed_fields.len() < properties.len() || required_fields.len() < required.len() {
+            expectation["fields_truncated"] = Value::Bool(true);
+        }
+        expectation["allowed_fields"] = json!(allowed_fields);
+        expectation["required"] = json!(required_fields);
+    }
+    expectation
+}
+
+fn bounded_field_names<'a>(names: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
+    // Leave room for both lists and the surrounding fragment within the 512-byte limit.
+    names
+        .scan(192_usize, |remaining, name| {
+            *remaining = remaining.checked_sub(json!(name).to_string().len() + 1)?;
+            Some(name)
+        })
+        .collect()
 }
 
 fn resolve<'a>(root: &'a Value, mut node: &'a Value) -> &'a Value {

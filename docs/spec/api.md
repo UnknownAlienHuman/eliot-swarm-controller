@@ -657,9 +657,9 @@ Rust Unicode whitespace trimming). Router-local descriptors supply only
 the summary, example, mutation rules, scope/capability limits and CLI aliases. CLI aliases
 are not RPC names. Every registered Router method has a descriptor. Help is capped at
 256 KiB; it never includes credentials or another principal's identity. Examples naming
-existing resources require actual retained IDs/profile/source/view; new writes require
-a fresh caller-retained mutation ULID rather than reusing the illustrative example ID,
-or omit `id` on MCP so the server mints one.
+existing resources require actual retained IDs, profiles, sources or views. Direct
+callers replace the illustrative mutation ID with a fresh ULID for a new write.
+Compact MCP examples omit `id` when the bridge can mint it.
 
 `api.identity` returns the authenticated principal kind, Agent id/generation when present,
 and its allowed scope patterns. An Agent's variable scope defaults to its frozen
@@ -680,8 +680,9 @@ schema. DTO-owned validation retains its existing error code (including `unsuppo
 Nested action DTO failures retain `params.args.<field>` for command submission and
 `rule[<index>].do[<index>].<field>` when loading authored rule files. Rejected values,
 unknown user-supplied keys/variants and whole payloads are never echoed. Unknown keys
-are reported as `<unknown-field>` with `additionalProperties: false`; use `api.help`
-to inspect DTO fields. The existing MCP error-diagnostic forwarding is a separate
+are reported as `<unknown-field>` with `additionalProperties: false` and bounded
+`allowed_fields` and `required` lists for the owning DTO. `fields_truncated` marks
+an incomplete list. Use `api.help` to inspect the full DTO. MCP error forwarding is a separate
 transport concern.
 
 The method inventory includes later-layer methods. Later methods identified

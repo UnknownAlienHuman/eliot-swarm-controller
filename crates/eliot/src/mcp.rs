@@ -62,7 +62,7 @@ use tokio_util::sync::CancellationToken;
 
 const TOOL_NAME: &str = "swarm";
 const TOOL_DESCRIPTION: &str = "Call a Swarm method with inherited authentication. Use api.methods or api.help when you need a name or example. Omit a mutation id to mint one. Keep it for exact retries.";
-const REQUIRE_AGENT_INSTRUCTIONS: &str = "Use the swarm MCP tool and the eliot-swarm skill when your task needs coordination. Call known methods directly. Use api.identity if you need your identity or scope.";
+const REQUIRE_AGENT_INSTRUCTIONS: &str = "Use the swarm MCP tool and the eliot-swarm skill when your task needs coordination. Call known methods directly. Use api.identity if you need your identity or scope. Retain mutation IDs for exact retries. Never mint a new one after an uncertain outcome. Never put credentials or tokens in tool arguments.";
 
 const INVALID_ARGS_MESSAGE: &str = "tool arguments must be an object with method and params";
 
@@ -322,6 +322,21 @@ fn success_output(method: &str, value: &Value, minted_id: Option<&str>, http: bo
     } else {
         json!({"method": method, "result": value})
     };
+    if method == "api.help" {
+        let help = &mut output["result"];
+        // The daemon example is valid for direct RPC. Only this bridge can mint its id.
+        if help.get("request_schema").is_none()
+            && help["method"].as_str().is_some_and(|method| {
+                !method.starts_with("inference.") && eliot_daemon::is_mutation_id_method(method)
+            })
+            && let Some(params) = help
+                .get_mut("example")
+                .and_then(|example| example.get_mut("params"))
+                .and_then(Value::as_object_mut)
+        {
+            params.remove("id");
+        }
+    }
     if let Some(id) = minted_id
         && let Some(map) = output.as_object_mut()
     {

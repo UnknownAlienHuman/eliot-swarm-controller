@@ -205,7 +205,7 @@ const METHODS: &[Method] = &[
     ),
     method!("events.read", EventsReadRequest, EventsReadResponse, false, false, "Read a bounded event page; history gaps remain explicit.", {"after":0,"limit":20}),
     method!("events.subscribe", EventsSubscribeRequest, EventsSubscribeResponse, false, false, "Long-poll a bounded event page, at most 30 seconds.", {"after":0,"limit":20,"wait_ms":1000}),
-    method!("child.run", ChildRunRequest, ChildRunResponse, false, true, "Launch one child with its first input and return the exact result; wait_ms:0 registers a durable completion wake.", {"text":"Review the requested source and summarize the result.","wait_ms":0}),
+    method!("child.run", ChildRunRequest, ChildRunResponse, false, true, "Launch one child with its first input and return the exact result; wait_ms:0 registers a durable completion wake.", {"id":EXAMPLE_ID,"text":"Review the requested source and summarize the result.","wait_ms":0}),
     method!("swarm.wait", SwarmWaitRequest, SwarmWaitResponse, false, false, "Wait up to 30 s for frozen child commands/turns (all/any); completed turns return final_text.", {"commands":[EXAMPLE_ID],"turns":[],"mode":"all","wait_ms":30000}),
     method!("swarm.digest", SwarmDigestRequest, SwarmDigestResponse, false, true, "Register a durable completion digest with the standard mail wake.", {"id":EXAMPLE_ID,"to":"a1","mode":"all","commands":[EXAMPLE_ID],"turns":[]}),
     method!("swarm.reparent", ReparentRequest, ReparentResponse, true, true, "Move one Agent subtree or all children to a controlled manager; Owner only.", {"id":EXAMPLE_ID,"agent":"a2","expected_generation":1,"parent":"a3","parent_generation":1}),
@@ -634,13 +634,6 @@ impl Router {
         {
             example["agent"] = json!("a1");
         }
-        if !full
-            && is_mutation_id_method(method.name)
-            && !method.name.starts_with("inference.")
-            && let Some(fields) = example.as_object_mut()
-        {
-            fields.remove("id");
-        }
         let scopes = if full {
             method_scopes(method.name, principal, &identity)
         } else {
@@ -672,7 +665,7 @@ impl Router {
             mutation_id: if full || method.name.starts_with("inference.") {
                 mutation_id_help(method).to_owned()
             } else if is_mutation_id_method(method.name) {
-                "MCP can mint id. Reuse it for exact retries.".to_owned()
+                "Direct callers supply a fresh ULID in id. MCP can mint one. Reuse the same id for exact retries.".to_owned()
             } else {
                 String::new()
             },
