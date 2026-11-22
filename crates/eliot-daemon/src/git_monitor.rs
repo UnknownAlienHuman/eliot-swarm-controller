@@ -958,7 +958,6 @@ impl GitProbe {
     /// A Goal's no-progress fingerprint, read now: HEAD and the monitor's
     /// content `dirty_digest` over the dirty set. A read past the monitor's
     /// caps or of a workspace that is not an exact Git root fails.
-
     pub(crate) async fn work_fingerprint(&self, workspace: &str) -> Result<String> {
         let root = canonical_root(workspace)?;
         let deadline = Instant::now() + PROBE_TIME;
