@@ -165,7 +165,7 @@ pub(crate) enum CliCommand {
     Turn(TurnArgs),
     /// Explain why and where a command, Agent or turn failed (owner only).
     Why(WhyArgs),
-    /// Read committed events after a sequence number.
+    /// Read committed events from the retained history, or after --since SEQ.
     Events(EventsArgs),
     /// Wait for a frozen set of child commands/turns with all/any semantics.
     Wait(WaitArgs),
@@ -831,6 +831,7 @@ pub(crate) struct WhyArgs {
 
 #[derive(Args)]
 pub(crate) struct EventsArgs {
+    /// Exclusive sequence cursor. Omit to begin at the retained history floor.
     #[arg(long, value_name = "SEQ")]
     pub(crate) since: Option<i64>,
     #[command(flatten)]

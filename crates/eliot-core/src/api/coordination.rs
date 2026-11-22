@@ -1297,6 +1297,7 @@ impl ClaimReleaseRequest {
         }
         if response.glob != normalize_claim_glob(&self.glob).map_err(|_| unproven())?
             || response.generation < 0
+            || response.released > 1
         {
             return Err(unproven());
         }
@@ -1318,6 +1319,14 @@ pub struct ClaimReleaseResponse {
     pub agent: String,
     pub generation: i64,
     pub glob: String,
+    #[serde(default = "previous_claim_release_count")]
+    #[schemars(range(max = 1))]
+    pub released: usize,
+}
+
+// Successful receipts retained before the count was added always removed one claim.
+fn previous_claim_release_count() -> usize {
+    1
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

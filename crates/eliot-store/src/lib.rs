@@ -1997,7 +1997,9 @@ impl Store {
         if after < retained {
             return Err(Error::new(
                 "history_gap",
-                "requested event history is no longer fully retained",
+                format!(
+                    "requested event history is no longer fully retained. Earliest resume cursor is {retained}."
+                ),
             ));
         }
         Ok(())

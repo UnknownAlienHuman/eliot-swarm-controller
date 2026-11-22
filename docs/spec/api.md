@@ -2241,6 +2241,10 @@ transport timeout never ends the stream: the client re-issues `events.subscribe`
 its last cursor with bounded backoff. Only a typed rejection ends it; on `history_gap`
 the client resolves the retained resume cursor from fresh bounds and reports it.
 
+CLI `events` starts from `pruned_through` when `--since` is omitted. An explicit
+`--since SEQ` remains exact. A cursor below the history floor returns `history_gap`
+with the earliest resume cursor at the time of the rejection.
+
 Before printing events or advancing a cursor, validate each response page against the
 effective request cursor: `0 <= after <= next <= high_water`. Event `seq` values must be
 strictly increasing, greater than `after`, and no greater than `next`. A malformed page
@@ -2391,9 +2395,9 @@ cannot claim for a terminal Agent (`bad_state`). One generation holds at
 most 100 live claims; beyond that the write is rejected with
 `claim_limit`. Re-setting the same glob refreshes its note and TTL. Both
 writes bind their ULID idempotently to principal, method and semantic
-payload; set and release each emit `claim.changed`. `claim.release`
-removes one live claim; absent, expired and prior-generation claims read
-`not_found`.
+payload. `claim.set` emits `claim.changed`. `claim.release` removes one
+live claim, emits `claim.changed`, and reports `released: 1`. It reports
+`released: 0` for an absent, expired or prior-generation claim.
 
 A claim is live only while its generation still matches the holder's
 current generation, the holder is not terminal, and the TTL has not

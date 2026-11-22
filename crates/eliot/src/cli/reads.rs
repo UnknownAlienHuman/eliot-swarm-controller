@@ -603,8 +603,24 @@ pub(crate) async fn run_events(
     json_output: bool,
 ) -> Result<u8, Failure> {
     validate_limit(limit)?;
+    let after = match since {
+        Some(after) => after,
+        None => {
+            let bounds: EventsBoundsResponse = eliot_daemon::client_call_typed(
+                &data_dir,
+                "events.bounds",
+                &EventsBoundsRequest {
+                    filter: EventsFilter::default(),
+                },
+            )
+            .await
+            .map_err(Failure::for_read)?;
+            bounds.validate().map_err(Failure::for_read)?;
+            bounds.pruned_through
+        }
+    };
     let params = EventsReadRequest {
-        after: since.unwrap_or(0),
+        after,
         limit,
         filter: EventsFilter::default(),
     };
