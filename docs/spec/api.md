@@ -1818,8 +1818,8 @@ submitting to the plugin has a bounded response deadline; if that deadline expir
 command settles as `unknown` with a timeout reason and releases the pending call slot
 without repeating the steer or treating timeout as turn completion.
 
-Claude delivers `steer` at a `turn_safe_point` hook. Its admission also requires `args.text`
-alone, a live runtime with that hook support, a healthy native stream and no in-flight
+A session whose plugin declares `steer_delivery: "turn_safe_point"` (Claude) takes `steer`
+at a hook. Its admission also requires `args.text` alone, a live runtime with that hook support, a healthy native stream and no in-flight
 stop, and the `#888` Swarm-note frame must fit the 1 MiB hook response. Store rechecks the
 dispatch gates, including rule-action order, and claims pending Claude steers in FIFO order
 on the soonest `PreToolUse` or `PostToolUse` callback (`hook.event`) for that exact turn

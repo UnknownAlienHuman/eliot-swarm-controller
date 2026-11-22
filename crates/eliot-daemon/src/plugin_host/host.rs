@@ -1454,6 +1454,9 @@ impl PluginHost {
     }
 
     pub(crate) fn check_steer_target(&self, agent: &Agent) -> Result<()> {
+        if !agent.steers_at_turn_safe_point() {
+            return Ok(());
+        }
         let key = AgentKey {
             id: agent.id.clone(),
             generation: agent.generation,

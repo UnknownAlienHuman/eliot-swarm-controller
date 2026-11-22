@@ -16,7 +16,7 @@ use eliot_plugin::{
         ensure_dedicated_reader, initialize_fields_valid, native_no_write, not_initialized,
         optional_profile_text, parse_resume_subject, register_native_process, rejected_control,
         request_reply_ids, unknown_control, unknown_snapshot, validate_binding, validate_identity,
-        validate_source_plan, with_claimed_context, with_context_points,
+        validate_source_plan, with_claimed_context, with_context_points, with_safe_point_steer,
     },
     skill,
 };
@@ -2337,7 +2337,7 @@ fn start_effective_settings(
 ) -> Value {
     // Initialize has no effective effort field. The environment can override
     // --effort, and a model or maxEffortLevel setting can cap the result.
-    with_context_points(
+    with_safe_point_steer(with_context_points(
         json!({
             "model": null,
             "effort": null,
@@ -2350,7 +2350,7 @@ fn start_effective_settings(
             "mcp_servers_verified": false,
         }),
         &[InjectPoint::NextInput, InjectPoint::TurnSafePoint],
-    )
+    ))
 }
 
 /// The shared start/input/stop commands plus the Claude-only interrupt,

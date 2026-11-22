@@ -3,8 +3,20 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-pub fn harness_uses_turn_safe_point_steer(harness: &str) -> bool {
-    harness == "claude"
+/// `session.ready` effective field naming where a session takes `steer`.
+/// Absent means a direct native steer; `turn_safe_point` means Store holds the
+/// steer for the next tool hook of its exact turn.
+pub const STEER_DELIVERY_FIELD: &str = "steer_delivery";
+
+impl crate::Agent {
+    /// Whether this session's plugin declared safe-point steer delivery.
+    pub fn steers_at_turn_safe_point(&self) -> bool {
+        self.effective
+            .as_ref()
+            .and_then(|effective| effective.get(STEER_DELIVERY_FIELD))
+            .and_then(|value| InjectPoint::deserialize(value).ok())
+            == Some(InjectPoint::TurnSafePoint)
+    }
 }
 
 /// Persisted file edit evidence never includes an absolute path.

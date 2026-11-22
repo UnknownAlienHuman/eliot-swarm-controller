@@ -1904,7 +1904,7 @@ pub(super) fn admit_control_tx(
         provider_holds::require_unheld_tx(tx, &agent)?;
         // A safe-point steer waits durably for a hook, so a turn that cannot
         // take it is refused here. Direct-RPC steers settle from their plugin.
-        if eliot_core::harness_uses_turn_safe_point_steer(&agent.harness) {
+        if agent.steers_at_turn_safe_point() {
             if request.args.as_object().is_none_or(|args| args.len() != 1) {
                 return Err(Error::new("invalid", "steer accepts only args.text"));
             }

@@ -890,14 +890,6 @@ fn dispatch_control_tx(
     }
     // Control-verb support is owned by the PluginHost manifest
     // check; only generation, state, turn and request are rechecked.
-    if command.command.verb == "steer"
-        && eliot_core::harness_uses_turn_safe_point_steer(&agent.harness)
-    {
-        return Err(Error::new(
-            "bad_state",
-            "Claude steer commands are claimed by turn safe-point hooks, not dispatched directly",
-        ));
-    }
     if !matches!(agent.state, AgentState::Busy | AgentState::Waiting) {
         return Err(Error::new(
             "bad_state",
@@ -1113,6 +1105,14 @@ impl Store {
             return Ok(Change { value, events });
         }
         let (agent_num, agent, command_generation) = dispatch_target_tx(&tx, &command)?;
+        // A safe-point steer has no direct native effect: it stays pending for
+        // the hook claim of its exact turn, which applies the rule-action gate.
+        if command.command.verb == "steer" && agent.steers_at_turn_safe_point() {
+            let value = load_command(&tx, id)?
+                .ok_or_else(|| Error::new("source_integrity", "pending steer disappeared"))?;
+            commit_transaction(tx, &self.write_faulted)?;
+            return Ok(Change { value, events });
+        }
         if let Some(value) = dispatch_rule_hold_tx(&tx, id, now, &mut events)? {
             commit_transaction(tx, &self.write_faulted)?;
             return Ok(Change { value, events });

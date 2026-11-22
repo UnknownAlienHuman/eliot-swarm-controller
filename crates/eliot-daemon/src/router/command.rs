@@ -205,13 +205,6 @@ impl Router {
                 return None;
             }
         }
-        if command.verb == "steer"
-            && let Some(target) = command.target.as_deref()
-            && let Ok(Some(agent)) = self.inner.store.lock().await.get_agent(target)
-            && eliot_core::harness_uses_turn_safe_point_steer(&agent.harness)
-        {
-            return None;
-        }
         if !self.check_script_dispatch_gate(id, &command).await {
             return None;
         }

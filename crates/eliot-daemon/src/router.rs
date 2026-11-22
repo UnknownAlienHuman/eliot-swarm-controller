@@ -3305,10 +3305,9 @@ impl Router {
             };
             agent
         };
-        if eliot_core::harness_uses_turn_safe_point_steer(&agent.harness)
-            && request
-                .expected_generation
-                .is_none_or(|expected| expected == agent.generation)
+        if request
+            .expected_generation
+            .is_none_or(|expected| expected == agent.generation)
             && matches!(agent.state, AgentState::Busy | AgentState::Waiting)
             && agent.active_turn.as_deref().is_some_and(|turn| {
                 request

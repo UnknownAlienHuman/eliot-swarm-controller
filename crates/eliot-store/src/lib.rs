@@ -6822,8 +6822,8 @@ fn terminalize_generation_commands(
         update_command_state(tx, &id, CommandState::Unknown, Some(&outcome), None, now)?;
     }
     let mut context_events = Vec::new();
-    let safe_point_steers = load_agent_by_num(tx, agent)?
-        .is_some_and(|agent| eliot_core::harness_uses_turn_safe_point_steer(&agent.harness));
+    let safe_point_steers =
+        load_agent_by_num(tx, agent)?.is_some_and(|agent| agent.steers_at_turn_safe_point());
     for id in pending_command_ids(tx, agent, generation)? {
         if handoff::held_successor_tx(tx, &id)? {
             continue;

@@ -151,10 +151,13 @@ under the writer deadline. The host then waits up to the plugin RPC response dea
 while continuing to process `interrupt`, `stop`, `agent.snapshot`, and lifecycle messages.
 A timeout releases the correlation slot and settles the command as `unknown` with the
 elapsed deadline as its reason. An unresolved transport or generation teardown also settles
-as `unknown`. The host never replays the steer. On Claude, `steer` does not use
-`agent.command`; Store claims pending exact-turn steers alongside `turn_safe_point`
-injects through the authenticated `hook.event` callback and settles them from the
-committed hook receipt.
+as `unknown`. The host never replays the steer.
+
+A plugin with no native steer declares `steer_delivery: "turn_safe_point"` in its
+`session.ready` effective settings (Claude does); absent means a direct native steer.
+Such a session's `steer` does not use `agent.command`: the dispatch transaction leaves it
+pending, and Store claims it alongside `turn_safe_point` injects through the authenticated
+`hook.event` callback and settles it from the committed hook receipt.
 
 An optional shared Core `RouteBinding` travels inside the frozen profile snapshot; it
 does not add a service RPC or a new harness. The controlled Codex process must apply the

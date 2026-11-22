@@ -479,12 +479,12 @@ pub(super) fn has_unhealthy_native_stream_tx(
     .map_err(sql_error)
 }
 
-/// Room a safe-point steer harness needs around the context in its native
+/// Room a safe-point steer session needs around the context in its native
 /// hook response.
 const HOOK_NATIVE_ENVELOPE_BYTES: usize = 1024;
 
-fn hook_frame_limit(harness: &str) -> usize {
-    if eliot_core::harness_uses_turn_safe_point_steer(harness) {
+fn hook_frame_limit(agent: &Agent) -> usize {
+    if agent.steers_at_turn_safe_point() {
         MAX_FRAME_BYTES - HOOK_NATIVE_ENVELOPE_BYTES
     } else {
         MAX_FRAME_BYTES
@@ -529,7 +529,7 @@ pub(super) fn validate_turn_safe_point_steer_admission(
     if !hook_response_fits(
         &max_reply_id,
         std::slice::from_ref(&item),
-        hook_frame_limit(&agent.harness),
+        hook_frame_limit(agent),
     )? {
         return Err(Error::new(
             "frame_too_large",
@@ -1034,11 +1034,11 @@ impl Store {
             InjectPoint::TurnSafePoint,
             Some(turn_id),
         )?;
-        if eliot_core::harness_uses_turn_safe_point_steer(&agent.harness) {
+        if agent.steers_at_turn_safe_point() {
             pending_candidates.extend(pending_turn_steers(&tx, agent_num, generation, turn_id)?);
             pending_candidates.sort_by_key(|(created_at, rowid, _)| (*created_at, *rowid));
         }
-        let frame_limit = hook_frame_limit(&agent.harness);
+        let frame_limit = hook_frame_limit(&agent);
         for (_, _, record) in pending_candidates {
             if record.command.turn_id.as_deref() != Some(turn_id) {
                 continue;
@@ -1490,9 +1490,7 @@ pub(super) fn settle_ended_turn_context_tx(
     let mut events = Vec::new();
     let agent = load_agent_by_num(tx, agent_num)?;
     let can_move = agent.as_ref().is_some_and(next_input_available);
-    let safe_point_steers = agent
-        .as_ref()
-        .is_some_and(|agent| eliot_core::harness_uses_turn_safe_point_steer(&agent.harness));
+    let safe_point_steers = agent.as_ref().is_some_and(Agent::steers_at_turn_safe_point);
     for command_id in pending_turn_context_command_ids(tx, agent_num, generation, turn_id)? {
         let record = load_command_record(tx, &command_id)?
             .ok_or_else(|| Error::new("source_integrity", "turn context disappeared"))?;
