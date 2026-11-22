@@ -34,7 +34,7 @@ struct FailureKey {
     message: String,
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(PartialEq, Eq, Hash)]
 struct StormKey {
     principal: String,
     method: &'static str,
@@ -56,24 +56,20 @@ struct CounterWindow {
 #[derive(Default)]
 struct StormDiagnostics {
     connection_ids: HashSet<String>,
-    connection_count: u64,
     connections_overflow: bool,
     source: Option<String>,
 }
 
 impl StormDiagnostics {
     fn observe_connection(&mut self, connection_id: &str) {
-        let connection_id = eliot_core::bound_chars(connection_id, 256);
-        if self.connection_ids.contains(&connection_id) {
+        if self.connections_overflow || self.connection_ids.contains(connection_id) {
             return;
         }
         if self.connection_ids.len() == MAX_STORM_CONNECTION_IDS {
-            self.connection_count = MAX_STORM_CONNECTION_IDS as u64 + 1;
             self.connections_overflow = true;
-            return;
+        } else {
+            self.connection_ids.insert(connection_id.to_owned());
         }
-        self.connection_ids.insert(connection_id);
-        self.connection_count = self.connection_ids.len() as u64;
     }
 
     fn observe_rule(&mut self, rule_id: &str) {
@@ -110,8 +106,11 @@ impl RepeatFailures {
             message: normalized_message(message),
         });
         let now = Instant::now();
-        match self.increment(key, now, 1, 0) {
-            Some((count, _)) if count == u64::from(REPEAT_THRESHOLD) => RepeatOutcome::Threshold,
+        match self
+            .increment(key, now, 1, 0)
+            .map(|(window, _)| window.count)
+        {
+            Some(count) if count == u64::from(REPEAT_THRESHOLD) => RepeatOutcome::Threshold,
             None if self
                 .overflow_logged_at
                 .is_none_or(|logged| now.duration_since(logged) >= REPEAT_WINDOW) =>
@@ -129,7 +128,7 @@ impl RepeatFailures {
         now: Instant,
         count: u64,
         refused: u64,
-    ) -> Option<(u64, Option<(WindowKey, CounterWindow)>)> {
+    ) -> Option<(&mut CounterWindow, Option<(WindowKey, CounterWindow)>)> {
         if self.windows.len() >= MAX_TRACKED_WINDOWS && !self.windows.contains_key(&key) {
             // Storm windows must survive until their final counts are logged.
             self.windows
@@ -159,7 +158,7 @@ impl RepeatFailures {
         });
         window.count = window.count.saturating_add(count);
         window.refused = window.refused.saturating_add(refused);
-        Some((window.count, closed))
+        Some((window, closed))
     }
 }
 
@@ -222,23 +221,22 @@ impl Router {
         connection_id: Option<&str>,
         rule_id: Option<&str>,
     ) {
-        let sample = {
+        let closed = {
             let mut counter = self.inner.repeat_failures.lock_recover();
-            let key = WindowKey::Storm(source.clone());
-            let sample = counter.increment(key.clone(), Instant::now(), count, refused);
-            if sample.is_some()
-                && let Some(window) = counter.windows.get_mut(&key)
-            {
-                if let Some(connection_id) = connection_id {
-                    window.storm.observe_connection(connection_id);
-                }
-                if let Some(rule_id) = rule_id {
-                    window.storm.observe_rule(rule_id);
-                }
+            let Some((window, closed)) =
+                counter.increment(WindowKey::Storm(source), Instant::now(), count, refused)
+            else {
+                return;
+            };
+            if let Some(connection_id) = connection_id {
+                window.storm.observe_connection(connection_id);
             }
-            sample
+            if let Some(rule_id) = rule_id {
+                window.storm.observe_rule(rule_id);
+            }
+            closed
         };
-        if let Some((_, Some((WindowKey::Storm(source), window)))) = sample {
+        if let Some((WindowKey::Storm(source), window)) = closed {
             self.log_command_storm(source, window);
         }
     }
@@ -279,7 +277,8 @@ impl Router {
                 window.refused,
                 STORM_WINDOW_MS,
                 crate::logging::CommandStormMetadata {
-                    connection_count: window.storm.connection_count,
+                    connection_count: window.storm.connection_ids.len() as u64
+                        + u64::from(window.storm.connections_overflow),
                     connections_overflow: window.storm.connections_overflow,
                 },
             );
