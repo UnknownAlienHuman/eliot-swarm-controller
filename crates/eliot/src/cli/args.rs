@@ -270,6 +270,9 @@ pub(crate) enum ArtifactCommand {
         kind: String,
         #[arg(long)]
         purpose: String,
+        /// Optional time-to-live duration (e.g. 30m, 24h, 7d).
+        #[arg(long, value_name = "DURATION")]
+        ttl: Option<String>,
     },
 }
 
@@ -1183,6 +1186,10 @@ pub(crate) struct ClaimArgs {
 
 #[derive(Args)]
 pub(crate) struct PluginArgs {
+    /// Read the owning daemon's per-spawn crash-report nonce as the first
+    /// stdin line before any RPC.
+    #[arg(long, hide = true)]
+    pub(crate) crash_nonce_stdin: bool,
     #[command(subcommand)]
     pub(crate) command: PluginCommand,
 }
@@ -1235,12 +1242,19 @@ pub(crate) enum StandAction {
         /// Swarm executable to run. Defaults to the current binary.
         #[arg(long)]
         binary: Option<PathBuf>,
+        /// Stand time-to-live duration (default 24h, max 30d).
+        #[arg(long, value_name = "DURATION")]
+        ttl: Option<String>,
     },
     /// Drain the private daemon and delete this stand's files.
     Down {
         /// Stand directory printed by stand up.
         path: PathBuf,
     },
+    /// List registered stands with expiry and liveness status.
+    List,
+    /// Tear down expired registered stands.
+    Prune,
 }
 
 #[derive(Args)]

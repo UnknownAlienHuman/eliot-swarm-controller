@@ -42,6 +42,10 @@ struct AutomaticCleanupProgress {
 const SWARM_PLUGIN_INSTANCE_PURPOSE: &str = "Swarm plugin instance directory";
 const SWARM_ARTIFACT_ROOT_PURPOSE: &str = "Swarm artifact root";
 
+fn is_stand_artifact(artifact: &ArtifactView) -> bool {
+    artifact.kind == ArtifactKind::DataDir && artifact.purpose == SWARM_STAND_ARTIFACT_PURPOSE
+}
+
 fn validate_cleanup_path(path: &Path) -> Result<()> {
     if !path.is_absolute()
         || path.components().any(|p| match p {
@@ -459,6 +463,7 @@ impl Router {
                 purpose: "Swarm chat directory".to_owned(),
                 identity: directory.identity()?,
                 created_at: now_ms(),
+                expires_at: None,
                 state: "registered".to_owned(),
                 git: None,
             })
@@ -500,6 +505,7 @@ impl Router {
             purpose: "Swarm artifact root".to_owned(),
             identity: directory.identity()?,
             created_at: now_ms(),
+            expires_at: None,
             state: "ownership_root".to_owned(),
             git: None,
         };
@@ -575,6 +581,7 @@ impl Router {
                 purpose: "Swarm managed worktree".to_owned(),
                 identity: directory_identity(Path::new(&workspace.worktree_path))?,
                 created_at: agent.created_at,
+                expires_at: None,
                 state: "registered".to_owned(),
                 git: Some(git.clone()),
             });
@@ -598,6 +605,7 @@ impl Router {
                     purpose: "Swarm managed branch".to_owned(),
                     identity: String::from_utf8_lossy(&oid.stdout).trim().to_owned(),
                     created_at: agent.created_at,
+                    expires_at: None,
                     state: "registered".to_owned(),
                     git: Some(git),
                 });
@@ -635,6 +643,7 @@ impl Router {
                         purpose: "frozen profile scratch".to_owned(),
                         identity,
                         created_at: agent.created_at,
+                        expires_at: None,
                         state: "registered".to_owned(),
                         git: None,
                     });
@@ -679,6 +688,7 @@ impl Router {
                     purpose: "frozen CARGO_TARGET_DIR".to_owned(),
                     identity,
                     created_at: agent.created_at,
+                    expires_at: None,
                     state: "registered".to_owned(),
                     git: None,
                 });
@@ -1101,6 +1111,19 @@ impl Router {
             let ended_at = store.terminal_agent_end_time(&agent)?;
             (agent, ended_at)
         };
+        // An explicit expiry only extends retention; it never shortens it.
+        if let Some(expires_at) = artifact.expires_at
+            && now < expires_at
+        {
+            return Ok(Some(
+                if is_stand_artifact(artifact) {
+                    "stand_not_expired"
+                } else {
+                    "not_expired"
+                }
+                .to_owned(),
+            ));
+        }
         let cutoff = now.saturating_sub(retention_ms);
         if artifact.created_at >= cutoff || ended_at >= cutoff {
             return Ok(Some("retention_age".to_owned()));
@@ -1506,11 +1529,16 @@ impl Router {
                 {
                     break;
                 }
-                match self.cleanup_preflight(&candidate.artifact).await {
+                match self
+                    .cleanup_preflight_with_fetches(&candidate.artifact, Some(&mut fetches))
+                    .await
+                {
                     Ok(bytes) => {
                         candidate.verdict = "safe".to_owned();
                         candidate.reason = if ownership_root {
                             "terminal_owned_artifact_root"
+                        } else if is_stand_artifact(&candidate.artifact) {
+                            "expired_stand"
                         } else {
                             "terminal_owned_artifact"
                         }
@@ -1819,6 +1847,14 @@ impl Router {
     }
 
     async fn cleanup_preflight(&self, artifact: &ArtifactView) -> Result<u64> {
+        self.cleanup_preflight_with_fetches(artifact, None).await
+    }
+
+    async fn cleanup_preflight_with_fetches(
+        &self,
+        artifact: &ArtifactView,
+        fetches: Option<&mut CleanupFetches>,
+    ) -> Result<u64> {
         if artifact.kind == ArtifactKind::NativeSession {
             // The archive itself runs at apply through the harness native
             // API; the plan verdict already gated harness and quiescence.
@@ -1831,6 +1867,18 @@ impl Router {
                 .ok_or_else(|| Error::new("invalid", "branch Git binding absent"))?;
             self.cleanup_branch_classification(artifact, git).await?;
             return Ok(0);
+        }
+        if let Some(expires_at) = artifact.expires_at
+            && now_ms() < expires_at
+        {
+            return Err(Error::new(
+                if is_stand_artifact(artifact) {
+                    "stand_not_expired"
+                } else {
+                    "not_expired"
+                },
+                "artifact has not expired",
+            ));
         }
         if artifact.kind == ArtifactKind::DataDir {
             Self::cleanup_check_daemon_lock(Path::new(&artifact.path))?;
@@ -1846,6 +1894,15 @@ impl Router {
             .checked_cleanup_artifact_path(&agent, artifact, false)
             .await?;
         self.cleanup_check_git(&agent, &path).await?;
+        if is_stand_artifact(artifact) {
+            return crate::stand_cleanup::plan_stand_artifact(
+                &self.inner.data_root,
+                &path,
+                &artifact.identity,
+                fetches,
+            )
+            .await;
+        }
         #[cfg(windows)]
         {
             let tree = CleanupTree::open(&path)?;
@@ -2128,6 +2185,18 @@ impl Router {
                 .cleanup_remove_worktree(principal, artifact, &request.id, automatic)
                 .await;
         }
+        if let Some(expires_at) = artifact.expires_at
+            && now_ms() < expires_at
+        {
+            return Err(Error::new(
+                if is_stand_artifact(artifact) {
+                    "stand_not_expired"
+                } else {
+                    "not_expired"
+                },
+                "artifact has not expired",
+            ));
+        }
         let agent = self
             .inner
             .store
@@ -2139,6 +2208,36 @@ impl Router {
             .checked_cleanup_artifact_path(&agent, artifact, true)
             .await?;
         self.cleanup_check_git(&agent, &path).await?;
+        if is_stand_artifact(artifact) {
+            Self::cleanup_check_daemon_lock(Path::new(&artifact.path))?;
+            {
+                let store = self.inner.store.lock().await;
+                if automatic
+                    && store
+                        .get_agent(&artifact.agent)?
+                        .is_some_and(|agent| agent.archived)
+                {
+                    return Err(Error::new(
+                        "archived",
+                        "Archived Agent artifacts are protected",
+                    ));
+                }
+                if !store.cleanup_authorized(principal, artifact)?
+                    || !store.cleanup_agent_quiescent(artifact)?
+                {
+                    return Err(Error::new(
+                        "agent_not_quiescent",
+                        "cleanup authority or generation changed",
+                    ));
+                }
+            }
+            return crate::stand_cleanup::apply_stand_artifact(
+                &self.inner.data_root,
+                &path,
+                &artifact.identity,
+            )
+            .await;
+        }
         #[cfg(windows)]
         {
             let tree = CleanupTree::open(&path)?;
@@ -2422,7 +2521,10 @@ impl Router {
     /// Only called after fresh current-tip containment. Recheck attachment
     /// and the pinned tip before deleting. Git's ancestry gate does not
     /// recognize squash merges, so use `-D` after these checks.
-    async fn delete_local_branch(git: &CleanupGitBinding, expected_tip: &str) -> Result<()> {
+    pub(crate) async fn delete_local_branch(
+        git: &CleanupGitBinding,
+        expected_tip: &str,
+    ) -> Result<()> {
         if !crate::git_actions::valid_cleanup_branch(&git.branch) {
             return Err(Error::new(
                 "invalid_branch",
@@ -2739,6 +2841,7 @@ fn native_session_artifact(agent: &Agent) -> Option<ArtifactView> {
         purpose: agent.harness.clone(),
         identity: scope.clone(),
         created_at: agent.created_at,
+        expires_at: None,
         state: "registered".to_owned(),
         git: None,
     })

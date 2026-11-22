@@ -32,7 +32,7 @@ use std::{
 
 const LOG_BYTES: u64 = 1024 * 1024;
 const RECORD_BYTES: usize = 32 * 1024;
-pub(crate) const CAPACITY_REFUSAL_CODE: &str = "command.refused";
+pub(crate) const ADMISSION_REFUSAL_CODE: &str = "command.refused";
 static LOG: Mutex<Option<LogFile>> = Mutex::new(None);
 static LEVEL: AtomicU8 = AtomicU8::new(LogLevel::Standard as u8);
 
@@ -472,12 +472,12 @@ fn is_failure_record(code: &str) -> bool {
         || event.ends_with("_unexpectedly")
 }
 
-/// Exact-ID capacity preflight evidence when no command was admitted. These
-/// optional rotated records are diagnostics only, never command/replay state.
-pub(crate) fn capacity_refusal(
+/// Exact-ID admission preflight evidence (capacity, a missing profile
+/// executable) when no command was admitted. These optional rotated records
+/// are diagnostics only, never command/replay state.
+pub(crate) fn admission_refusal(
     data_root: &std::path::Path,
     id: &str,
-    policy: &SecretPolicy,
 ) -> Option<eliot_core::api::DiagnoseStep> {
     if ulid::Ulid::from_string(id).is_err() {
         return None;
@@ -501,24 +501,28 @@ pub(crate) fn capacity_refusal(
             let Ok(value) = serde_json::from_slice::<Value>(line) else {
                 continue;
             };
-            if value["code"] != CAPACITY_REFUSAL_CODE
-                || value["ids"]["command"] != id
-                || value["error_code"] != "capacity_unavailable"
-                || value["origin"] != "swarm"
-            {
+            if value["code"] != ADMISSION_REFUSAL_CODE || value["ids"]["command"] != id {
                 continue;
             }
+            let Some(refusal) = value["error_code"].as_str().and_then(|code| {
+                eliot_core::AdmissionRefusal::of_parts(
+                    code,
+                    value["where"].as_str(),
+                    value["origin"]
+                        .as_str()
+                        .and_then(eliot_core::FailureOrigin::parse),
+                )
+            }) else {
+                continue;
+            };
+            let (code, where_, origin, evidence) = refusal.parts();
             return Some(eliot_core::api::DiagnoseStep {
                 kind: "admission".to_owned(),
-                code: Some("capacity_unavailable".to_owned()),
-                message: Some("capacity refused before command admission".to_owned()),
-                failure_where: value["where"]
-                    .as_str()
-                    .map(|text| bounded_text(policy, text, 128)),
-                origin: Some("swarm".to_owned()),
-                origin_evidence: value["origin_evidence"]
-                    .as_str()
-                    .map(|text| bounded_text(policy, text, 512)),
+                code: Some(code.to_owned()),
+                message: Some("refused before command admission".to_owned()),
+                failure_where: Some(where_.to_owned()),
+                origin: Some(origin.as_str().to_owned()),
+                origin_evidence: Some(evidence.to_owned()),
                 exit_code: None,
                 ntstatus: None,
                 at: value["ts"].as_i64().filter(|at| *at >= 0),

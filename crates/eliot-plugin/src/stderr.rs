@@ -83,9 +83,16 @@ impl CaptureState {
 #[derive(Clone)]
 pub struct StderrView {
     state: Arc<Mutex<CaptureState>>,
+    crash_line_prefix: Option<Arc<str>>,
 }
 
 impl StderrView {
+    /// The spawn-bound line prefix that authenticates a crash report on this
+    /// exact owned pipe, when the owner bound one at spawn.
+    pub fn crash_line_prefix(&self) -> Option<&str> {
+        self.crash_line_prefix.as_deref()
+    }
+
     pub fn snapshot(&self) -> StderrSnapshot {
         let (bytes, keep_prefix, mut truncated, eof, read_error) = {
             let state = self.state.lock_recover();
@@ -179,7 +186,7 @@ pub fn spawn_stderr<R>(reader: R, policy: Arc<SecretPolicy>) -> StderrCapture
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
-    spawn_stderr_inner(reader, policy, None, false)
+    spawn_stderr_inner(reader, policy, None, false, None)
 }
 
 /// Retain the beginning of sanitized stderr while draining the entire pipe.
@@ -187,21 +194,30 @@ pub fn spawn_stderr_prefix<R>(reader: R, policy: Arc<SecretPolicy>) -> StderrCap
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
-    spawn_stderr_inner(reader, policy, None, true)
+    spawn_stderr_inner(reader, policy, None, true, None)
 }
 
 /// Plugin-owned telemetry channel. Filter before the diagnostic tail, including
 /// malformed and oversized telemetry lines. Native harness stderr uses the
-/// ordinary capture and cannot impersonate plugin telemetry.
+/// ordinary capture and cannot impersonate plugin telemetry. Crash reports on
+/// this pipe count only when they carry `crash_line_prefix`, the per-spawn
+/// nonce and owned PID chosen by the process owner.
 pub fn spawn_plugin_stderr<R>(
     reader: R,
     policy: Arc<SecretPolicy>,
     telemetry: impl Fn(&str) + Send + Sync + 'static,
+    crash_line_prefix: String,
 ) -> StderrCapture
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
-    spawn_stderr_inner(reader, policy, Some(Box::new(telemetry)), false)
+    spawn_stderr_inner(
+        reader,
+        policy,
+        Some(Box::new(telemetry)),
+        false,
+        Some(crash_line_prefix.into()),
+    )
 }
 
 type Telemetry = Box<dyn Fn(&str) + Send + Sync>;
@@ -211,6 +227,7 @@ fn spawn_stderr_inner<R>(
     policy: Arc<SecretPolicy>,
     telemetry: Option<Telemetry>,
     keep_prefix: bool,
+    crash_line_prefix: Option<Arc<str>>,
 ) -> StderrCapture
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -220,6 +237,7 @@ where
             keep_prefix,
             ..CaptureState::default()
         })),
+        crash_line_prefix,
     };
     let state = Arc::clone(&view.state);
     let task = tokio::spawn(drain(reader, policy, state, telemetry));

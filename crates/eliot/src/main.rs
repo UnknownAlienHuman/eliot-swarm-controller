@@ -28,7 +28,14 @@ fn main() -> ExitCode {
     let is_plugin = matches!(&cli.command, Some(CliCommand::Plugin(_)));
     // One hook for both binaries: the daemon and every plugin share this
     // executable, so the code is mode-aware. A WMI-started daemon has no
-    // console, so the marker file under ELIOT_CRASH_DIR is the durable path.
+    // console, so its marker file is the durable path. A plugin reports only
+    // on its owned stderr pipe, bound by the nonce its daemon writes as the
+    // first stdin line (never argv or environment).
+    if let Some(CliCommand::Plugin(args)) = &cli.command
+        && args.crash_nonce_stdin
+    {
+        eliot_daemon::crash::read_plugin_crash_nonce();
+    }
     if !matches!(&cli.command, Some(CliCommand::Stand(_))) {
         eliot_daemon::crash::install_panic_hook(is_plugin);
     }
@@ -68,6 +75,7 @@ async fn run(cli: Cli) -> ExitCode {
 }
 
 async fn run_inner(cli: Cli) -> ExitCode {
+    let is_plugin = matches!(&cli.command, Some(CliCommand::Plugin(_)));
     let data_dir = if matches!(&cli.command, Some(CliCommand::Stand(_))) {
         if cli.data_dir.is_some() || cli.id.is_some() {
             return report_failure(Failure::new(2, "stand uses its own path and mutation IDs"));
@@ -79,7 +87,10 @@ async fn run_inner(cli: Cli) -> ExitCode {
             Err(failure) => return report_failure(failure),
         };
         // Read lazily by the panic hook for the daemon this process serves.
-        eliot_daemon::crash::set_crash_dir(&eliot_daemon::crash::crash_dir(&path));
+        // Plugins never write data-directory crash files.
+        if !is_plugin {
+            eliot_daemon::crash::set_crash_dir(&eliot_daemon::crash::crash_dir(&path));
+        }
         path
     };
 
@@ -104,7 +115,7 @@ async fn run_inner(cli: Cli) -> ExitCode {
     };
 
     let result = match command {
-        CliCommand::Plugin(PluginArgs { command }) => run_plugin_command(command).await,
+        CliCommand::Plugin(PluginArgs { command, .. }) => run_plugin_command(command).await,
         command => {
             if !matches!(
                 command,

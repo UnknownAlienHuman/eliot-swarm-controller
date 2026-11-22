@@ -6,10 +6,141 @@ use std::path::{Path, PathBuf};
 
 pub use crate::daemon::run_for_update;
 pub use crate::platform::data_dir::{DaemonInfo, DaemonLock, OperatorLock};
+pub use crate::stand_cleanup::{
+    PinnedStandRoot, STAND_MARKER, StandBranchOutcome, StandEntry, StandExternalCleanupReport,
+    StandMarker, StandRegistration, StandWorktreeOutcome, bind_stand_owner_token,
+    check_directory_chain, check_nested_roots, cleanup_stand_external_git,
+    ensure_registry_is_external, list_stand_registrations, parse_stand_ttl_ms,
+    read_stand_registration, registry_name, remove_offline_stand_root, remove_stand_registration,
+    stand_base, stand_key_root, stand_now_ms, stand_registry, verify_stand_marker,
+    verify_stand_owner_binding, write_stand_registration,
+};
 pub use crate::update_backup::{
     discard_update_backup, lock_update_publication, restore_update_backup, update_backup_path,
 };
 pub const STORE_SCHEMA_VERSION: i64 = eliot_store::Store::SCHEMA_VERSION;
+
+/// Returns the issuing parent daemon data directory when running inside a
+/// managed Agent session with complete inherited credentials.
+pub fn inherited_agent_parent_data_dir() -> Option<PathBuf> {
+    let has_agent_creds = [
+        "ELIOT_AGENT_ID",
+        "ELIOT_AGENT_GENERATION",
+        "ELIOT_AGENT_TOKEN",
+    ]
+    .into_iter()
+    .all(|name| std::env::var_os(name).is_some_and(|val| !val.is_empty()));
+    if !has_agent_creds {
+        return None;
+    }
+    let resolved = if let Some(dir) = std::env::var_os(crate::daemon::AGENT_DATA_DIR_ENV)
+        .filter(|val| !val.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    {
+        dir
+    } else {
+        crate::platform::data_dir::resolve_data_dir(None).ok()?
+    };
+    if let Some(scope) = std::env::var_os(crate::daemon::AGENT_DATA_SCOPE_ENV)
+        && scope != std::ffi::OsStr::new(&crate::daemon::identity_data_scope(&resolved))
+    {
+        return None;
+    }
+    if let Some(issuing) = std::env::var_os(crate::daemon::AGENT_DATA_DIR_ENV)
+        && !crate::daemon::identity_data_dirs_equal(&resolved, Path::new(&issuing))
+    {
+        return None;
+    }
+    Some(resolved)
+}
+
+/// Checks whether `candidate` matches `expected` data directory identity.
+pub fn data_dirs_match(left: &Path, right: &Path) -> bool {
+    crate::daemon::identity_data_dirs_equal(left, right)
+}
+
+fn same_root(target: &Path, candidate: &Path) -> bool {
+    let canonical = std::fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
+    data_dirs_match(target, candidate)
+        || data_dirs_match(&canonical, candidate)
+        || std::fs::canonicalize(candidate)
+            .is_ok_and(|canon_candidate| data_dirs_match(&canonical, &canon_candidate))
+}
+
+/// Returns whether `target` is a daemon root this process could resolve as
+/// its own (`--data-dir`-less resolution, `ELIOT_HOME`, the durable selection
+/// and the default, from the environment and the account profile alike).
+/// The issuing parent comes only from the stand registration
+/// ([`refuse_issuing_root`]); live daemons need a full stand binding
+/// ([`verify_stand_target`]).
+pub fn target_is_protected_from_stand_owner_auth(target: &Path) -> bool {
+    crate::platform::data_dir::protected_daemon_roots()
+        .iter()
+        .any(|dir| same_root(target, dir))
+}
+
+/// Refuse a target that is the daemon `stand up` recorded as the stand's
+/// issuing parent. The persisted root is used, never inherited environment.
+pub fn refuse_issuing_root(
+    target: &Path,
+    registration: &crate::stand_cleanup::StandRegistration,
+) -> Result<()> {
+    if registration
+        .parent_data_dir
+        .as_deref()
+        .is_some_and(|parent| same_root(target, parent))
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "a stand operation cannot target the stand's issuing daemon",
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse any target that is not a stand bound by `stand up`: a protected
+/// daemon root, the recorded issuing daemon, or a root that is not the
+/// handle-identified directory `stand up` created with its marker and owner
+/// token. A root with a live (or undeterminable) daemon never qualifies
+/// without that full binding. Returns the owner token. During an interrupted
+/// removal (`removing_pid` recorded, no live daemon, no owner token left)
+/// only the root protections apply and no token is returned.
+pub fn verify_stand_target(
+    root: &Path,
+    registration: &crate::stand_cleanup::StandRegistration,
+) -> Result<Option<String>> {
+    if target_is_protected_from_stand_owner_auth(root) {
+        return Err(Error::new(
+            "not_allowed",
+            "a stand operation cannot target a daemon root this process resolves as its own",
+        ));
+    }
+    refuse_issuing_root(root, registration)?;
+    let live = match daemon_info(root) {
+        Ok(None) => false,
+        Ok(Some(info)) => daemon_alive(&info).unwrap_or(true),
+        Err(_) => true,
+    };
+    if !live
+        && registration.removing_pid.is_some()
+        && std::fs::symlink_metadata(root.join("owner.token"))
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Ok(None);
+    }
+    match crate::stand_cleanup::verify_stand_owner_binding(root, registration) {
+        Ok(token) => Ok(Some(token)),
+        Err(error) if live => Err(Error::new(
+            "not_allowed",
+            format!(
+                "target runs a live daemon that is not a stand created by this registry: {}",
+                error.message
+            ),
+        )),
+        Err(error) => Err(error),
+    }
+}
 
 pub fn daemon_info(path: &Path) -> Result<Option<DaemonInfo>> {
     DataDir::open_existing(path)?.read_daemon_info()
@@ -80,6 +211,10 @@ pub fn validate_stand_directory(path: &Path) -> Result<()> {
 pub fn write_stand_record(path: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     DataDir::open_existing(path)?;
     crate::platform::data_dir::replace_file_atomically(path, name, bytes, true)
+}
+
+pub fn write_stand_config(root: &Path, bytes: &[u8]) -> Result<()> {
+    crate::platform::data_dir::replace_private_file(root, "config.toml", bytes)
 }
 
 pub fn daemon_alive(info: &DaemonInfo) -> Result<bool> {

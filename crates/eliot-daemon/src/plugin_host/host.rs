@@ -808,6 +808,10 @@ impl PluginHost {
             return Err(error);
         }
         let spawn_started = Instant::now();
+        // Per-spawn crash nonce, written as the plugin's first stdin line
+        // (never argv or environment): only reports carrying it and the owned
+        // PID count as plugin crashes.
+        let crash_nonce = format!("{}{}", Ulid::new(), Ulid::new());
         let spawned = self.spawn_plugin(&agent, &instance_dir).await;
         let mut child = match spawned {
             Ok(child) => {
@@ -874,31 +878,49 @@ impl PluginHost {
             return Err(error);
         };
 
+        // The plugin reads this line before anything else. A write failure
+        // means the plugin already exited; the owned exit path settles it.
+        let mut stdin = stdin;
+        {
+            use tokio::io::AsyncWriteExt;
+            let _ = stdin.write_all(format!("{crash_nonce}\n").as_bytes()).await;
+            let _ = stdin.flush().await;
+        }
         let telemetry_policy = Arc::new(SecretPolicy::new(source_credentials.iter()));
         let debug_policy = Arc::clone(&telemetry_policy);
         let debug_agent = agent.id.clone();
         let debug_generation = agent.generation as u64;
-        let stderr_capture = spawn_plugin_stderr(stderr, telemetry_policy, move |line| {
-            if crate::logging::is_debug()
-                && let Some(record) = eliot_plugin::parse_debug_line(line)
-            {
-                let mut ids: Vec<_> = record
-                    .ids
-                    .iter()
-                    .map(|(k, v)| (k.as_str(), v.as_str()))
-                    .collect();
-                ids.retain(|(key, _)| *key != "agent_id" && *key != "generation");
-                ids.push(("agent_id", debug_agent.as_str()));
-                let mut fields: Vec<_> = record
-                    .fields
-                    .iter()
-                    .map(|(k, v)| (k.as_str(), *v))
-                    .collect();
-                fields.retain(|(key, _)| *key != "generation");
-                fields.push(("generation", debug_generation));
-                crate::logging::record_debug(&debug_policy, &record.code, &ids, &fields);
-            }
-        });
+        let crash_line_prefix = format!(
+            "{} {crash_nonce} {} ",
+            crate::crash::PLUGIN_CRASH_LINE,
+            child.pid().unwrap_or_default()
+        );
+        let stderr_capture = spawn_plugin_stderr(
+            stderr,
+            telemetry_policy,
+            move |line| {
+                if crate::logging::is_debug()
+                    && let Some(record) = eliot_plugin::parse_debug_line(line)
+                {
+                    let mut ids: Vec<_> = record
+                        .ids
+                        .iter()
+                        .map(|(k, v)| (k.as_str(), v.as_str()))
+                        .collect();
+                    ids.retain(|(key, _)| *key != "agent_id" && *key != "generation");
+                    ids.push(("agent_id", debug_agent.as_str()));
+                    let mut fields: Vec<_> = record
+                        .fields
+                        .iter()
+                        .map(|(k, v)| (k.as_str(), *v))
+                        .collect();
+                    fields.retain(|(key, _)| *key != "generation");
+                    fields.push(("generation", debug_generation));
+                    crate::logging::record_debug(&debug_policy, &record.code, &ids, &fields);
+                }
+            },
+            crash_line_prefix,
+        );
         let stderr_view = stderr_capture.view();
 
         let connection = PluginConnection::new(stdout, stdin);
@@ -1551,6 +1573,7 @@ impl PluginHost {
             purpose: "Swarm plugin instance directory".to_owned(),
             identity: identity.clone(),
             created_at: now_ms(),
+            expires_at: None,
             state: "registered".to_owned(),
             git: None,
         };
@@ -1742,7 +1765,7 @@ impl PluginHost {
                 ))
             })?;
         let command = self
-            .plugin_command(&agent.harness, Path::new(workspace))
+            .plugin_command(&agent.harness, Path::new(workspace), true)
             .map_err(AgentSpawnError::NotSpawned)?;
         self.state.agent_custodies.spawn(&agent.id, || {
             OwnedChild::spawn_agent(command, &namespace, &agent.id, agent.generation)
@@ -1762,7 +1785,7 @@ impl PluginHost {
         workspace: &Path,
         observation: Option<&Agent>,
     ) -> Result<OwnedChild> {
-        let command = self.plugin_command(harness, workspace)?;
+        let command = self.plugin_command(harness, workspace, false)?;
         if let Some(agent) = observation {
             self.state
                 .agent_custodies
@@ -1779,7 +1802,12 @@ impl PluginHost {
         clippy::disallowed_types,
         reason = "This builds the configured process command for one harness plugin."
     )]
-    fn plugin_command(&self, harness: &str, workspace: &Path) -> Result<ProcessCommand> {
+    fn plugin_command(
+        &self,
+        harness: &str,
+        workspace: &Path,
+        crash_nonce_stdin: bool,
+    ) -> Result<ProcessCommand> {
         let executable = std::env::current_exe().map_err(|error| {
             Error::new("platform_io", format!("locate Eliot executable: {error}"))
         })?;
@@ -1791,7 +1819,11 @@ impl PluginHost {
         command
             .arg("--data-dir")
             .arg(&self.state.data_root)
-            .arg("plugin")
+            .arg("plugin");
+        if crash_nonce_stdin {
+            command.arg("--crash-nonce-stdin");
+        }
+        command
             .arg(harness)
             .current_dir(workspace)
             .env_clear()
@@ -2140,7 +2172,7 @@ async fn cleanup_startup(
     proven_no_dispatch: bool,
     origin: Option<eliot_core::FailureOrigin>,
 ) {
-    let exited = terminate_child(child, &actor.monitoring, &actor.agent).await;
+    let (exited, exit) = terminate_child_with_exit(child, &actor.monitoring, &actor.agent).await;
     // `settle_owned_source_exit` returns Ok only after positive custody exit,
     // completed reader drain, and the committed exit gap (see
     // `settle_drained_source_exit`). This failed-start path never enters the
@@ -2160,21 +2192,31 @@ async fn cleanup_startup(
     if settled.is_ok() && !proven_no_dispatch {
         // The stderr reader is independent of the source reader. Join it
         // before inspecting the final bytes of a plugin that panicked.
-        let stderr = stderr_capture
+        let capture = stderr_capture
             .take()
-            .expect("startup owns the stderr capture until cleanup")
-            .finish(Instant::now() + STOP_GRACE)
-            .await;
-        let origin_evidence = plugin_crash_marker(&stderr.text).map(|marker| marker.summary());
+            .expect("startup owns the stderr capture until cleanup");
+        let crash_line_prefix = capture.view().crash_line_prefix().map(str::to_owned);
+        let stderr = capture.finish(Instant::now() + STOP_GRACE).await;
+        let marker = plugin_crash_marker(&stderr.text, crash_line_prefix.as_deref());
+        let (origin, origin_evidence) = match marker {
+            Some(marker) => {
+                record_plugin_crash(&actor.state, &marker);
+                (
+                    Some(eliot_core::FailureOrigin::Swarm),
+                    Some(marker.summary()),
+                )
+            }
+            None => (origin, None),
+        };
         mark_lost_state_with_exit(
             &actor.state,
             &actor.key,
             "plugin_startup_exit",
             AgentLossEvidence {
+                exit,
                 stderr_tail: Some(stderr.text),
                 origin,
                 origin_evidence,
-                ..Default::default()
             },
         )
         .await;
@@ -2529,8 +2571,12 @@ fn diagnose_error(error: Error, stderr: &StderrView, credentials: &[String]) -> 
     // never enter this path. Marker evidence never replaces the effect code.
     let snapshot = stderr.snapshot();
     let mut error = error;
-    if let Some(marker) = plugin_crash_marker(&snapshot.text) {
+    if let Some(marker) = plugin_crash_marker(&snapshot.text, stderr.crash_line_prefix()) {
         let summary = marker.summary();
+        error.origin = Some(eliot_core::FailureOrigin::Swarm);
+        if error.failure_where.is_none() {
+            error.failure_where = Some(eliot_core::PLUGIN_EXIT_WHERE.into());
+        }
         error.origin_evidence = Some(
             match error.origin_evidence.as_deref() {
                 Some(evidence) => format!("{evidence}; {summary}"),
@@ -3537,7 +3583,9 @@ async fn wait_child(
     monitoring: &Monitoring,
     agent: &Agent,
 ) -> bool {
-    wait_child_family(child, duration, duration, monitoring, agent).await
+    wait_child_family_with_exit(child, duration, duration, monitoring, agent)
+        .await
+        .0
 }
 
 /// Wait `leader` for the plugin process, then `family` for its Job to
@@ -3549,6 +3597,18 @@ async fn wait_child_family(
     monitoring: &Monitoring,
     agent: &Agent,
 ) -> bool {
+    wait_child_family_with_exit(child, leader, family, monitoring, agent)
+        .await
+        .0
+}
+
+async fn wait_child_family_with_exit(
+    child: &mut OwnedChild,
+    leader: Duration,
+    family: Duration,
+    monitoring: &Monitoring,
+    agent: &Agent,
+) -> (bool, Option<eliot_core::ProcessExit>) {
     #[cfg(target_os = "linux")]
     {
         linux_wait_child_family(child, leader, family, monitoring, agent).await
@@ -3573,25 +3633,28 @@ async fn linux_wait_child_family(
     family: Duration,
     monitoring: &Monitoring,
     agent: &Agent,
-) -> bool {
+) -> (bool, Option<eliot_core::ProcessExit>) {
     if !matches!(
         timeout_at(Instant::now() + leader, child.wait_exit_unreaped()).await,
         Ok(Ok(()))
     ) {
-        return false;
+        return (false, None);
     }
     let _ = monitoring.sample_generation(agent).await;
     if !linux_drain_owned_group(child, family).await {
-        return false;
+        return (false, None);
     }
     let _ = monitoring.sample_generation(agent).await;
     // Reap only after the group is proven empty except the leader: the
     // numeric PGID cannot be reused between the final observation and this
     // reap because the exited leader is still unreaped.
-    matches!(
-        timeout_at(Instant::now() + family, child.wait()).await,
-        Ok(Ok(_))
-    )
+    match timeout_at(Instant::now() + family, child.wait()).await {
+        Ok(Ok(status)) => (
+            true,
+            Some(eliot_core::ProcessExit::from_code(status.code())),
+        ),
+        _ => (false, None),
+    }
 }
 
 /// Linux owned-group drain after the leader exit was observed without
@@ -3628,13 +3691,11 @@ async fn legacy_wait_child_family(
     family: Duration,
     monitoring: &Monitoring,
     agent: &Agent,
-) -> bool {
-    if !matches!(
-        timeout_at(Instant::now() + leader, child.wait()).await,
-        Ok(Ok(_))
-    ) {
-        return false;
-    }
+) -> (bool, Option<eliot_core::ProcessExit>) {
+    let Ok(Ok(status)) = timeout_at(Instant::now() + leader, child.wait()).await else {
+        return (false, None);
+    };
+    let exit = eliot_core::ProcessExit::from_code(status.code());
     let _ = monitoring.sample_generation(agent).await;
     #[cfg(windows)]
     {
@@ -3642,15 +3703,15 @@ async fn legacy_wait_child_family(
             // Consume the OS observer's verified-empty certificate before the
             // owning Job is dropped; exited database rows alone are not proof.
             let _ = monitoring.sample_generation(agent).await;
-            true
+            (true, Some(exit))
         } else {
-            false
+            (false, Some(exit))
         }
     }
     #[cfg(not(windows))]
     {
         let _ = family;
-        true
+        (true, Some(exit))
     }
 }
 
@@ -3670,6 +3731,25 @@ async fn terminate_child(mut child: OwnedChild, monitoring: &Monitoring, agent: 
         child.terminate().is_ok() && wait_child(&mut child, STOP_GRACE, monitoring, agent).await;
     drop(child);
     exited
+}
+
+async fn terminate_child_with_exit(
+    mut child: OwnedChild,
+    monitoring: &Monitoring,
+    agent: &Agent,
+) -> (bool, Option<eliot_core::ProcessExit>) {
+    #[cfg(not(target_os = "linux"))]
+    let early_exit = child.try_root_exit_if_finished();
+    #[cfg(target_os = "linux")]
+    let early_exit = None;
+    let terminated = child.terminate().is_ok();
+    let (exited, waited_exit) = if terminated {
+        wait_child_family_with_exit(&mut child, STOP_GRACE, STOP_GRACE, monitoring, agent).await
+    } else {
+        (false, None)
+    };
+    drop(child);
+    (exited, early_exit.or(waited_exit))
 }
 
 /// Private shutdown, input close, then graceful wait with one
@@ -3878,14 +3958,27 @@ async fn mark_lost_state(state: &Weak<HostState>, key: &AgentKey, reason: &'stat
 }
 
 /// The one owned plugin crash marker in this stderr snapshot, if any. Only
-/// the exact owned process pipe is ever read here; a disk marker belonging to
-/// another process or generation cannot enter this path.
-fn plugin_crash_marker(stderr: &str) -> Option<eliot_core::api::CrashMarker> {
+/// the exact owned process pipe is read, and only a line carrying that
+/// spawn's prefix (argv nonce and owned PID) counts, so forwarded native
+/// output, other processes and disk files cannot override a failure origin.
+fn plugin_crash_marker(
+    stderr: &str,
+    crash_line_prefix: Option<&str>,
+) -> Option<eliot_core::api::CrashMarker> {
+    let prefix = crash_line_prefix?;
     stderr
         .lines()
-        .filter_map(|line| line.strip_prefix("eliot_crash "))
+        .filter_map(|line| line.strip_prefix(prefix))
         .filter_map(|json| serde_json::from_str::<eliot_core::api::CrashMarker>(json).ok())
         .find(|marker| marker.code == "plugin.panicked" && marker.validate().is_ok())
+}
+
+/// Record one verified plugin crash in this daemon's own crash directory so
+/// `daemon.status` reports it; plugins never write data-directory files.
+fn record_plugin_crash(state: &Weak<HostState>, marker: &eliot_core::api::CrashMarker) {
+    if let Some(state) = state.upgrade() {
+        crate::crash::write_marker(&crate::crash::crash_dir(&state.data_root), marker);
+    }
 }
 
 /// Mark an agent generation lost with its process exit evidence: the

@@ -944,6 +944,36 @@ impl WorkspaceGit {
                 "workspace remove requires its removing marker",
             ));
         }
+        self.prepare_remove_checked(preparation, verified_tip, deadline)
+            .await
+    }
+
+    /// Non-force worktree removal command for an offline private stand whose
+    /// daemon lock is held exclusively by cleanup.
+    #[expect(
+        clippy::disallowed_types,
+        reason = "This prepares the authorized non-force worktree removal command for stand cleanup."
+    )]
+    pub(crate) async fn prepare_stand_worktree_remove(
+        &self,
+        preparation: &WorkspacePreparation,
+        verified_tip: &str,
+        deadline: Instant,
+    ) -> Result<Command> {
+        self.prepare_remove_checked(preparation, verified_tip, deadline)
+            .await
+    }
+
+    #[expect(
+        clippy::disallowed_types,
+        reason = "This prepares the authorized non-force worktree removal command."
+    )]
+    async fn prepare_remove_checked(
+        &self,
+        preparation: &WorkspacePreparation,
+        verified_tip: &str,
+        deadline: Instant,
+    ) -> Result<Command> {
         let subject = self.subject(preparation, deadline).await?;
         if subject.head != verified_tip {
             return Err(problem(

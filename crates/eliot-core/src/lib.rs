@@ -1624,6 +1624,76 @@ impl FailureOrigin {
     }
 }
 
+/// An admission preflight refusal: a typed failure before any command exists.
+/// [`Self::error`] builds the typed error at any layer; only the router's
+/// preflight call site marks it with [`Self::at_preflight`], and only marked
+/// errors produce the `command.refused` record `diagnose` can explain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdmissionRefusal {
+    /// A configured local capacity bound is reserved.
+    Capacity,
+    /// An explicit profile executable path does not exist.
+    ProfileCommand,
+}
+
+impl AdmissionRefusal {
+    const ALL: [Self; 2] = [Self::Capacity, Self::ProfileCommand];
+
+    /// `(code, where, origin, evidence)`; schema-owned vocabulary only.
+    pub fn parts(self) -> (&'static str, &'static str, FailureOrigin, &'static str) {
+        match self {
+            Self::Capacity => (
+                "capacity_unavailable",
+                "store.admission.capacity",
+                FailureOrigin::Swarm,
+                "configured local capacity bound is reserved",
+            ),
+            Self::ProfileCommand => (
+                "profile_error",
+                "router.admission.profile_cmd",
+                FailureOrigin::Environment,
+                "configured profile executable is missing",
+            ),
+        }
+    }
+
+    /// The typed refusal error, unmarked.
+    pub fn error(self, message: impl Into<String>) -> Error {
+        let (code, where_, origin, evidence) = self.parts();
+        Error::new(code, message)
+            .with_where(where_)
+            .with_origin(origin, evidence)
+    }
+
+    /// Mark a typed refusal at the router's admission preflight call site,
+    /// which calls this only after proving no command was admitted for the
+    /// request. Any other error passes through unmarked.
+    pub fn at_preflight(mut error: Error) -> Error {
+        error.admission = Self::of_parts(&error.code, error.failure_where.as_deref(), error.origin);
+        error
+    }
+
+    /// Parse a retained `command.refused` record written for a marked refusal.
+    pub fn of_parts(
+        code: &str,
+        where_: Option<&str>,
+        origin: Option<FailureOrigin>,
+    ) -> Option<Self> {
+        Self::ALL.into_iter().find(|refusal| {
+            let (expected_code, expected_where, expected_origin, _) = refusal.parts();
+            code == expected_code
+                && where_ == Some(expected_where)
+                && origin == Some(expected_origin)
+        })
+    }
+
+    /// The refusal marked by [`Self::at_preflight`] in this process, if any.
+    /// Matching by value never counts: only the private preflight marker does.
+    pub fn of(error: &Error) -> Option<Self> {
+        error.admission
+    }
+}
+
 /// The loss reason of a daemon restart: Swarm fences every live generation.
 pub const DAEMON_RESTART_REASON: &str = "daemon_restart";
 
@@ -1784,6 +1854,12 @@ pub struct Error {
         skip_serializing_if = "Option::is_none"
     )]
     pub ntstatus: Option<Box<str>>,
+    /// Private, in-process only: set solely by [`AdmissionRefusal::error`] at
+    /// the preflight call site. Never serialized, deserialized or settable by
+    /// value, so a later error with the same code/where/origin never counts.
+    #[serde(skip)]
+    #[schemars(skip)]
+    admission: Option<AdmissionRefusal>,
 }
 
 /// Parameter diagnostics contain schema-owned names/expectations, never values.
@@ -1880,6 +1956,7 @@ impl Error {
             failure_where: None,
             origin: None,
             origin_evidence: None,
+            admission: None,
         }
     }
 

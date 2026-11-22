@@ -1302,6 +1302,74 @@ impl Store {
         enforce_page_bytes(&mut workspaces)?;
         Ok(workspaces)
     }
+}
+
+/// Stand-owned managed workspace record read offline from a private stand's Store.
+pub struct StandWorkspaceRecord {
+    pub preparation: WorkspacePreparation,
+    pub scratch: Vec<String>,
+}
+
+impl Store {
+    /// Read all managed workspace records and their frozen scratch lists from
+    /// an offline stand SQLite database without opening the Store writer.
+    pub fn list_stand_workspaces_readonly(db_path: &Path) -> Result<Vec<StandWorkspaceRecord>> {
+        if !db_path.exists() {
+            return Ok(Vec::new());
+        }
+        let connection = Connection::open_with_flags(
+            db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(sql_error)?;
+        connection
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(sql_error)?;
+        let table_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workspaces')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
+        if !table_exists {
+            return Ok(Vec::new());
+        }
+        let mut statement = connection
+            .prepare(&format!(
+                "SELECT {WORKSPACE_COLUMNS},
+                        (SELECT a.profile_snapshot FROM agents a WHERE a.id = workspaces.agent)
+                 FROM workspaces ORDER BY agent LIMIT 257"
+            ))
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                let preparation = workspace_from_row(row)?;
+                let snapshot_text: Option<String> = row.get(15)?;
+                Ok((preparation, snapshot_text))
+            })
+            .map_err(sql_error)?;
+        let mut records = Vec::new();
+        for item in rows {
+            let (preparation, snapshot_text) = item.map_err(sql_error)?;
+            if records.len() >= 256 {
+                return Err(Error::new(
+                    "unavailable",
+                    "stand workspace count exceeds cleanup bound",
+                ));
+            }
+            let scratch = snapshot_text
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                .and_then(|value| value.get("scratch").cloned())
+                .and_then(|value| serde_json::from_value::<Vec<String>>(value).ok())
+                .unwrap_or_default();
+            records.push(StandWorkspaceRecord {
+                preparation,
+                scratch,
+            });
+        }
+        Ok(records)
+    }
 
     /// Retain original filesystem permissions before changing them, using the
     /// same removal row and command identity. Clear after exact ACL restoration.

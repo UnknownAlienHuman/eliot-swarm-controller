@@ -710,9 +710,16 @@ Redact complete messages and evidence before imposing their persistence/wire bou
 Constructors retain complete text until the owning policy is available. No minimum
 secret or truncated-prefix length is a confidentiality boundary. A failed-start
 conversion preserves the typed origin, location and evidence; proof of no effect
-does not imply a Swarm origin. A plugin panic is diagnostic evidence from the exact
-owned process pipe bound to its Agent/generation. Its summary augments the
-recorded evidence while preserving the original command error.
+does not imply a Swarm origin. A plugin panic is diagnostic evidence only from the
+exact owned process pipe of that spawn: the daemon writes a per-spawn nonce as the
+plugin's first stdin line (never argv or environment), and only a stderr line
+`eliot_crash <nonce> <owned PID> <marker>` counts. Plugins write no data-directory
+crash files and receive no data-directory path in their environment; the daemon
+records each verified marker in its own crash directory, which its entry point
+sets explicitly, for `daemon.status`. Its
+summary augments the recorded evidence while preserving the original command error,
+and when matched on a plugin exit or startup failure classifies `origin: swarm`
+(using `where: plugin.exit` when no transport location applies).
 
 Native mappings are versioned at their owning adapters: Codex 0.167.1
 `CodexErrorInfo` upstream variants/statuses; Claude stream-json structured
@@ -739,9 +746,15 @@ Agent diagnosis joins the exact generation's launch/resume even when no turn
 exists, and the failed turn's input and `preceded_by` commands. Native terminal
 diagnostics come from that exact retained turn event; missing retained links are
 left missing, never inferred by timestamps.
-Capacity preflight can refuse before command admission. `diagnose` can explain
-that exact request ID from a `command.refused` operational record while it
-remains in the bounded rotated log. This admission step carries structured
+Admission preflight can refuse before command admission with a typed location
+and origin: a reserved capacity bound (`swarm` at `store.admission.capacity`) or
+a missing explicit profile executable (`environment` at
+`router.admission.profile_cmd`). Only the router's `command.submit` preflight
+call site sets the private in-process refusal marker, and only after the Store
+proves no command was admitted under that request ID; a later-stage error with
+the same code, location and origin is never recorded. `diagnose` can explain that exact request ID
+from a `command.refused` operational record while it remains in the bounded
+rotated log. This admission step carries structured
 code/location/origin/evidence, no free-text error message. It is optional
 diagnostic evidence and creates neither command state nor replay authority;
 rotation or log loss leaves the unadmitted ID `not_found`.

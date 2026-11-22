@@ -460,7 +460,7 @@ qualification is incomplete; do not describe it as feature complete.
         - the host crate stays outside this repository, as a patch on Zed `761786a4`.
       - **Resume when Zed releases a headless agent mode with ACP.** Start from #720 and the frozen branches, against the installed release. Until then, no Zed work.
 
-- [ ] **Failure diagnostics that say why and where (#384).** Typed `where`/`origin`
+- [x] **Failure diagnostics that say why and where (#384).** Typed `where`/`origin`
       on every settled failure, sanitized daemon log with standard/debug modes,
       crash markers surfaced in `daemon.status`, startup output and `swarm why`,
       owner-scoped `diagnose` plus `swarm why <command|Agent|agent:turn>` with a
@@ -481,7 +481,7 @@ the connected product. Keep results in the PR/CI, not a permanent audit/readines
       expose check outcomes (#802).
 - [x] Daemon logs attribute errors and count command storms. `swarm status` and
       the startup log identify the executable directory, commit and hash (#806).
-- [ ] Automatic stand artifact registration and expiry, and cleanup of stand-created
+- [x] Automatic stand artifact registration and expiry, and cleanup of stand-created
       worktrees and branches in external repositories (#837).
 - [x] **Physical retention.** Wire retention settings to bounded Store cleanup invoked
       by daemon maintenance. Implement event-prefix pruning and atomic command/child

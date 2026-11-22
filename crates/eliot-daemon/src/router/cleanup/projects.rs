@@ -54,6 +54,7 @@ impl Router {
                     purpose: "Project registration".to_owned(),
                     identity: revision.clone(),
                     created_at: 0,
+                    expires_at: None,
                     state: "registered".to_owned(),
                     git: None,
                 },

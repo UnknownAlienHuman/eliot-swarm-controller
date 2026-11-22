@@ -4,8 +4,9 @@
 
 The shared wire DTOs are in
 [`api/cleanup.rs`](../../crates/eliot-core/src/api/cleanup.rs).
-`artifact.register {id,path,kind,purpose}` admits an existing directory owned by
-the authenticated Agent generation. It captures the opened filesystem identity,
+`artifact.register {id,path,kind,purpose,expires_at?}` admits an existing directory owned by
+the authenticated Agent generation. Optional `expires_at` sets an explicit Unix-millisecond
+expiry bounded by `MAX_ARTIFACT_TTL_MS` (30 days); CLI exposes `--ttl DURATION`. It captures the opened filesystem identity,
 project and generation-bound ancestor chain. Before native startup Swarm creates
 `<first-configured-artifact-root>/<agent>-<generation>/`, or
 `<data-dir>/artifacts/<agent>-<generation>/` when none is configured. Creation is
@@ -75,11 +76,24 @@ once per repository and upstream remote and reuses that result across its
 candidates. The fetch updates remote-tracking state and leaves branches and
 worktree files in place. A present
 `daemon.lock` with a live owner keeps a data directory. Only a provably dead
-owner releases it.
+owner releases it. Artifacts carrying `expires_at` stay `keep(not_expired)` or
+`keep(stand_not_expired)` until `expires_at`. Stand plan and apply refuse the
+parent's own data root and apply the same protected-root, issuing-root,
+handle-identity, marker and owner-binding checks as `stand down` before any
+removal. Expiry only extends retention: an
+expired artifact still keeps `retention_age` until the ordinary retention window
+has passed. Expired registered private stands
+(`purpose: SWARM_STAND_ARTIFACT_PURPOSE`) then verify external registry binding,
+clean shutdown (`daemon.stopped`), and clean `#885` preflight on external-repo
+worktrees/branches before surfacing `safe(expired_stand)`.
 
 `cleanup.apply {id,plan_id,artifacts?}` consumes only the plan's safe candidates, rechecks
-authority, generation, Git cleanliness, opened identities and busy/link refusal,
-then records each outcome as `removed`, `skipped` with reason, or `unknown`. An
+authority, generation, expiry, Git cleanliness, opened identities and busy/link refusal,
+then records each outcome as `removed`, `skipped` with reason, or `unknown`. For an
+expired stand candidate, apply performs `#885` two-pass external worktree and detached
+branch cleanup under `WorktreeWriteGuard` + `OwnedChild`, keeps the stand if any
+external item is kept/unknown, and deletes the offline stand root and external registry
+entry only when external cleanup is complete. An
 optional `artifacts` list (at most 64 unique ids, each a safe candidate of that
 plan) attempts only those; the plan's other safe candidates settle
 `skipped(not_selected)` without an attempt fence, so a later plan offers them again.
