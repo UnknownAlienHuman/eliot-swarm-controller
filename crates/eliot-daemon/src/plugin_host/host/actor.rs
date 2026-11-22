@@ -8,15 +8,16 @@
 
 use super::super::connection::{MAX_PENDING_CALLS, PLUGIN_TRANSPORT_WHERE};
 use super::{
-    AgentActorConfig, MAX_PENDING_SNAPSHOT_READS, PendingFailure, PendingSnapshotFuture,
-    PendingSteerFuture, PluginClient, PluginCommandCompletion, PluginSnapshotCompletion, RPC_GRACE,
-    RuntimeMessage, STOP_GRACE, agent_command_params, cleanup_actor, cleanup_startup,
-    complete_plugin_command, custody_label, deadline, fence_command_routing,
-    fence_runtime_generation, initialize_agent, is_failed_start_result, mark_lost_state,
-    mark_lost_state_with_exit, prepare_queued_stop_call, record_plugin_error, redact_native_error,
-    resolve_resume_config, resolve_send_config, retire_failed_start, settle_drained_source_exit,
-    settle_owned_source_exit, shutdown_and_wait_child, snapshot_future, start_deadline,
-    validate_applied, validate_start_result, wait_child, wait_for_stop_exit_proof, wait_stop_child,
+    AgentActorConfig, COMPACT_RPC_DEADLINE, MAX_PENDING_SNAPSHOT_READS, PendingFailure,
+    PendingSnapshotFuture, PendingSteerFuture, PluginClient, PluginCommandCompletion,
+    PluginSnapshotCompletion, RPC_GRACE, RuntimeMessage, STOP_GRACE, agent_command_params,
+    cleanup_actor, cleanup_startup, complete_plugin_command, custody_label, deadline,
+    fence_command_routing, fence_runtime_generation, initialize_agent, is_failed_start_result,
+    mark_lost_state, mark_lost_state_with_exit, prepare_queued_stop_call, record_plugin_error,
+    redact_native_error, resolve_resume_config, resolve_send_config, retire_failed_start,
+    settle_drained_source_exit, settle_owned_source_exit, shutdown_and_wait_child, snapshot_future,
+    start_deadline, validate_applied, validate_start_result, wait_child, wait_for_stop_exit_proof,
+    wait_stop_child,
 };
 use crate::monitor::Monitoring;
 use crate::platform::OwnedChild;
@@ -670,7 +671,8 @@ async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
                                 }
                             }
                             Ok(params) => {
-                                let result = client.call("agent.command", params, deadline()).await;
+                                let command_deadline = if command.verb == "compact" { Instant::now() + COMPACT_RPC_DEADLINE } else { deadline() };
+                                let result = client.call("agent.command", params, command_deadline).await;
                                 complete_plugin_command(
                                     PluginCommandCompletion {
                                         command,

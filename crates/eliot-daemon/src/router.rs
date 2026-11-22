@@ -17,18 +17,22 @@ mod handoff;
 mod hierarchy;
 mod inference;
 pub(crate) mod launch_queue;
+mod loss_recovery;
 mod organization;
 mod overview;
 mod patch_digest;
 mod project_assignment;
 mod provider_resilience;
+mod repeat_failures;
 mod resolution;
 mod routing;
 mod rules;
+mod session_growth;
 mod sources;
 mod status;
 mod swarm_usage;
 mod switch;
+mod tool_incident;
 
 pub(crate) use attention::run_attention;
 use auth::{authorize_command, authorize_rpc_method};
@@ -36,6 +40,7 @@ pub(crate) use coordination::run_mail_reoffer;
 pub(crate) use digests::run_completion_digest;
 use eliot_core::{is_attachment_verb, is_start_verb, is_user_event_verb};
 pub(crate) use goals::{real_goal_check, run_goal_driver};
+pub(crate) use tool_incident::run_tool_failure_attention;
 
 use crate::{
     automation::RuleDefinition,
@@ -56,15 +61,16 @@ use eliot_core::{
         AgentConfigView, AgentDiscoverRequest, AgentEditsRequest, AgentEditsResponse,
         AgentGetRequest, AgentGetResponse, AgentGitRequest, AgentGitResponse, AgentHistoryRequest,
         AgentListRequest, AgentListResponse, AgentListRow, AgentProcessesRequest,
-        AgentProcessesResponse, AgentResultRequest, AgentResultResponse, AgentStatsRequest,
-        AgentStatsResponse, AgentSummary, CommandChildrenRequest, CommandChildrenResponse,
-        CommandGetRequest, CommandSubmitRequest, CommandSubmitResponse, CrashMarker,
-        DaemonShutdownRequest, DaemonShutdownResponse, DaemonStatusRequest, DiscoverPage,
-        DoctorHarnessEntry, EmitDefinitionArgs, EventsBoundsRequest, EventsFilter,
-        EventsReadRequest, EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse,
+        AgentProcessesResponse, AgentResultRequest, AgentStatsRequest, AgentStatsResponse,
+        AgentSummary, CommandChildrenRequest, CommandChildrenResponse, CommandGetRequest,
+        CommandSubmitRequest, CommandSubmitResponse, CrashMarker, DaemonShutdownRequest,
+        DaemonShutdownResponse, DaemonStatusRequest, DiscoverPage, DoctorHarnessEntry,
+        EmitDefinitionArgs, EventsBoundsRequest, EventsFilter, EventsReadRequest,
+        EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse,
         GitFetchDefinitionArgs, GitView, HarnessDoctorRequest, HarnessDoctorResponse,
         HeavyAgentTotals, HeavyEpisodeView, HeavySummaryView, MAX_OBSERVATION_PAGE_BYTES,
         MAX_SWARM_WAIT_MS, MAX_SWARM_WAIT_TARGETS, MAX_WAIT_FINAL_TEXT_BYTES, MAX_WAIT_FRAME_BYTES,
+        MaintenancePurgeLegacyAttentionRequest, MaintenancePurgeLegacyAttentionResponse,
         MaintenanceRunRequest, MaintenanceRunResponse, NotifyDefinitionArgs, ObservationPage,
         ObservationQuery, ObservationView, ObserveHeavyRequest, ObserveHeavyResponse,
         ProcessPageCursor, ProjectDiscoverRequest, ProjectRegistrationView,
@@ -133,12 +139,14 @@ struct RouterInner {
     store: StoreHandle,
     bus: Bus,
     mail: crate::config::MailConfig,
+    attention: crate::config::AttentionConfig,
     owner_token: String,
     secrets: SecretSet,
     agent_credentials: AgentCredentials,
     run_credentials: RunCredentialRegistry,
     unknown_commands: UnknownCommands,
     unknown_causes: Mutex<HashMap<String, String>>,
+    repeat_failures: Mutex<repeat_failures::RepeatFailures>,
     rule_definitions: Mutex<HashMap<(String, String), (i64, RuleDefinition)>>,
     rule_source_files: Mutex<HashMap<String, HashMap<String, String>>>,
     catalog_cache: Mutex<catalog::CatalogCache>,
@@ -345,14 +353,14 @@ struct UnknownMarks {
 }
 
 impl Router {
-    /// Build a Router with owner `[mail]` limits loaded once by the caller
-    /// (daemon startup), instead of re-reading the config file per send.
-    pub(crate) fn new_with_mail_config(
+    /// Build the Router with the Owner settings captured at daemon startup.
+    pub(crate) fn new(
         data_root: std::path::PathBuf,
         owner_token: String,
         store: StoreHandle,
         bus: Bus,
         mail: crate::config::MailConfig,
+        attention: crate::config::AttentionConfig,
     ) -> Self {
         let secrets: SecretSet = Arc::new(Mutex::new(HashSet::from([owner_token.clone()])));
         let agent_credentials: AgentCredentials = Arc::new(Mutex::new(Default::default()));
@@ -387,12 +395,14 @@ impl Router {
                 store,
                 bus,
                 mail,
+                attention,
                 owner_token,
                 secrets,
                 agent_credentials,
                 run_credentials,
                 unknown_commands,
                 unknown_causes: Mutex::new(HashMap::new()),
+                repeat_failures: Mutex::default(),
                 rule_definitions: Mutex::new(HashMap::new()),
                 rule_source_files: Mutex::new(HashMap::new()),
                 catalog_cache: Mutex::new(catalog::CatalogCache::default()),
@@ -556,6 +566,10 @@ impl Router {
                 }))
             }
             "maintenance.run" => self.maintenance_run(&params, &principal).await,
+            "maintenance.purge_legacy_attention_advisories" => {
+                self.maintenance_purge_legacy_attention_advisories(&params, &principal)
+                    .await
+            }
             "artifact.register" => self.artifact_register(&params, &principal).await,
             "cleanup.plan" => self.cleanup_plan(&params, &principal).await,
             "cleanup.apply" => self.cleanup_apply(&params, &principal).await,
@@ -762,6 +776,10 @@ impl Router {
         });
     }
 
+    pub(crate) fn attention_config(&self) -> crate::config::AttentionConfig {
+        self.inner.attention
+    }
+
     pub(crate) fn monitoring(&self) -> Monitoring {
         self.inner.monitoring.clone()
     }
@@ -943,7 +961,7 @@ impl Router {
     /// are derived durably by Store, so this can run after the initial custody
     /// pass and again after a later recheck without replaying old input.
     pub(crate) async fn recover_restart_idle_agents(&self, on_restart: OnRestart) -> Result<usize> {
-        if on_restart == OnRestart::Hold {
+        if on_restart == OnRestart::Hold || !self.inner.attention.agent_lost.enabled {
             return Ok(0);
         }
         let mut after: Option<String> = None;
@@ -1589,10 +1607,13 @@ impl Router {
             ));
         }
         let (kind, _) = user_event_kind_data(&request.verb, &request.args)?;
-        if kind == ATTENTION_USER_EVENT_KIND {
+        if matches!(
+            kind.as_str(),
+            ATTENTION_USER_EVENT_KIND | eliot_core::ATTENTION_STEP_KIND
+        ) {
             return Err(Error::new(
                 "invalid",
-                "agent.attention is reserved for the internal attention producer",
+                "monitoring topics are reserved for the internal attention producer",
             ));
         }
         Ok(())
@@ -3252,21 +3273,30 @@ impl Router {
         let request: RuleGetRequest = eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         let rule_principal = rule_principal(request.project.as_deref());
-        let state = self
-            .inner
-            .store
-            .lock()
-            .await
-            .get_rule_state(&rule_principal, &request.id)?
-            .ok_or_else(|| Error::new("not_found", "rule was not found"))?;
+        let show = {
+            let store = self.inner.store.lock().await;
+            match store.get_rule_show(&rule_principal, &request.id)? {
+                Some(show) => show,
+                None if request.project.is_none() && store.rule_project_exists(&request.id)? => {
+                    return Err(Error::new(
+                        "not_found",
+                        "rule is defined in a project. Use --project PROJECT",
+                    ));
+                }
+                None => return Err(Error::new("not_found", "rule was not found")),
+            }
+        };
+        let state = &show.state;
         if state.validate().is_err() || state.id != request.id || state.project != request.project {
             return Err(Error::new(
                 "source_integrity",
                 "stored rule namespace differs from the request",
             ));
         }
-        serde_json::to_value(state)
-            .map_err(|_| Error::new("internal", "rule state could not be encoded"))
+        let mut result = serde_json::to_value(show)
+            .map_err(|_| Error::new("internal", "rule state could not be encoded"))?;
+        self.redact_native_value(&mut result);
+        Ok(result)
     }
 
     async fn timer_get(&self, params: &Value, principal: &Principal) -> Result<Value> {
@@ -3607,21 +3637,14 @@ impl Router {
         through: i64,
         outcome: eliot_store::RuleCursorOutcome,
     ) -> Result<RuleStateView> {
-        let report = matches!(
-            &outcome,
-            eliot_store::RuleCursorOutcome::Rejected { .. }
-                | eliot_store::RuleCursorOutcome::RejectedWithCapacity { .. }
-                | eliot_store::RuleCursorOutcome::Disabled
-        );
         let change = {
             let mut store = self.inner.store.lock().await;
             let change = store.advance_rule_cursor(principal, state, through, outcome, now_ms())?;
-            if report {
-                self.publish_locked(&change.events);
-            }
+            self.publish_locked(&change.events);
             change
         };
-        if report && !change.events.is_empty() {
+        if !change.events.is_empty() {
+            self.note_rule_refusals(principal, &change.events);
             self.signal_progress();
         }
         Ok(change.value)
@@ -3695,7 +3718,7 @@ impl Router {
             args.remove("inline_digest");
             args.insert(
                 "text".to_owned(),
-                Value::String("[redacted: inline completion digest]".to_owned()),
+                Value::String("[redacted: inline mail]".to_owned()),
             );
             args.insert("redacted".to_owned(), Value::Bool(true));
         }
@@ -4652,35 +4675,38 @@ impl Router {
             eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         let id = request.id.as_str();
-        let (agent_metadata, generation, mut turns) = {
+        let mut response = {
             let store = self.inner.store.lock().await;
             hierarchy::authorize_agent_read(&store, principal, id, request.generation)?;
             let agent = store
                 .get_agent(id)?
                 .ok_or_else(|| Error::new("not_found", format!("Agent {id} was not found")))?;
-            let generation = request.generation.unwrap_or(agent.generation);
-            let mut turns = if let Some(turn_id) = request.turn_id.as_deref() {
-                vec![store.get_turn(id, generation, turn_id)?.ok_or_else(|| {
-                    Error::new("not_found", format!("turn {turn_id} was not found"))
-                })?]
-            } else {
-                store.list_turns(id, generation, request.limit)?
+            let self_generation = match principal {
+                Principal::Agent {
+                    id: caller_id,
+                    generation,
+                } if caller_id == id => Some(*generation),
+                _ => None,
             };
-            // Historical configuration from each turn's exact retained
-            // revision, never the current overlay.
-            for turn in &mut turns {
-                store.fill_turn_readback(&agent, turn)?;
+            let generation_filter = request.generation.or(self_generation);
+            let generation = generation_filter.unwrap_or(agent.generation);
+            if let Some(before) = &request.before
+                && (before.generation > generation
+                    || generation_filter.is_some_and(|filter| before.generation != filter))
+            {
+                return Err(Error::new(
+                    "invalid",
+                    "result cursor generation is outside the requested generation scope",
+                ));
             }
-            (agent, generation, turns)
+            store.agent_result_page(&agent, generation_filter, &request)?
         };
-        self.mask_unknown_turns(id, generation, &mut turns).await?;
-        serde_json::to_value(AgentResultResponse {
-            agent: request.id,
-            generation,
-            turns,
-            agent_metadata: request.metadata.then_some(agent_metadata),
-        })
-        .map_err(|_| Error::new("internal", "agent.result response could not be encoded"))
+        self.mask_unknown_turns(id, &mut response.turns).await?;
+        request
+            .validate_response(&response)
+            .map_err(|_| Error::new("internal", "agent.result response is invalid"))?;
+        serde_json::to_value(response)
+            .map_err(|_| Error::new("internal", "agent.result response could not be encoded"))
     }
 
     async fn turn_get(&self, params: &Value, principal: &Principal) -> Result<Value> {
@@ -4703,7 +4729,7 @@ impl Router {
             store.fill_turn_readback(&agent_row, &mut turn)?;
             turn
         };
-        self.mask_unknown_turns(agent, generation, std::slice::from_mut(&mut turn))
+        self.mask_unknown_turns(agent, std::slice::from_mut(&mut turn))
             .await?;
         serde_json::to_value(turn)
             .map_err(|error| Error::new("internal", format!("encode turn: {error}")))
@@ -5433,6 +5459,36 @@ impl Router {
             .map_err(|_| Error::new("internal", "maintenance.run result could not be encoded"))
     }
 
+    /// Preview or explicitly purge owner-sent legacy advisory-attention mail.
+    async fn maintenance_purge_legacy_attention_advisories(
+        &self,
+        params: &Value,
+        principal: &Principal,
+    ) -> Result<Value> {
+        require_owner(principal)?;
+        let request: MaintenancePurgeLegacyAttentionRequest =
+            eliot_core::api::discovery::decode_params(params.clone())?;
+        request.validate()?;
+        let (matching_count, deleted_count) = self
+            .inner
+            .store
+            .lock()
+            .await
+            .purge_legacy_attention_advisories(request.expected_message_count)?;
+        let response = MaintenancePurgeLegacyAttentionResponse {
+            matching_count,
+            deleted_count,
+            applied: request.expected_message_count.is_some(),
+        };
+        request.validate_response(&response)?;
+        serde_json::to_value(response).map_err(|_| {
+            Error::new(
+                "internal",
+                "legacy attention advisory purge result could not be encoded",
+            )
+        })
+    }
+
     pub(super) fn set_previous_crash(&self, crash: Option<CrashMarker>) {
         *self.inner.previous_crash.lock_recover() = crash;
     }
@@ -5844,6 +5900,11 @@ impl Router {
             }
             (result, store.is_write_faulted())
         };
+        if let Ok(change) = &result
+            && !change.events.is_empty()
+        {
+            self.note_script_failure(&change.value);
+        }
         self.finish_settlement(id, result, write_faulted, &persistence_cause, true)
             .await
     }
@@ -6009,24 +6070,22 @@ impl Router {
         self.inner.unknown_causes.lock_recover().get(id).cloned()
     }
 
-    async fn mask_unknown_turns(
-        &self,
-        agent: &str,
-        generation: i64,
-        turns: &mut [Turn],
-    ) -> Result<()> {
+    async fn mask_unknown_turns(&self, agent: &str, turns: &mut [Turn]) -> Result<()> {
         self.clear_terminal_unknown_cache().await;
         if turns.is_empty() {
             return Ok(());
         }
         let memory_unknown = self.unknown_ids();
-        let turn_ids: Vec<String> = turns.iter().map(|turn| turn.turn_id.clone()).collect();
+        let turn_keys = turns
+            .iter()
+            .map(|turn| (turn.generation, turn.turn_id.clone()))
+            .collect::<Vec<_>>();
         let unknown_turns = {
             let store = self.inner.store.lock().await;
-            store.turns_with_unknown_commands(agent, generation, &turn_ids, &memory_unknown)?
+            store.turns_with_unknown_commands_for_page(agent, &turn_keys, &memory_unknown)?
         };
         for turn in turns {
-            if unknown_turns.contains(&turn.turn_id) {
+            if unknown_turns.contains(&(turn.generation, turn.turn_id.clone())) {
                 turn.state = TurnState::Unknown;
                 turn.status = None;
             }
@@ -6152,6 +6211,20 @@ fn command_needs_worker(command: &Command) -> bool {
     command.verb != "inject"
         || serde_json::from_value::<eliot_core::InjectArgs>(command.args.clone())
             .is_ok_and(|args| args.point == eliot_core::InjectPoint::ActiveTurn)
+}
+
+fn attention_inject_point(agent: &Agent) -> Option<eliot_core::InjectPoint> {
+    let points = agent
+        .effective
+        .as_ref()?
+        .get("context_points")?
+        .as_array()?;
+    [
+        ("turn_safe_point", eliot_core::InjectPoint::TurnSafePoint),
+        ("active_turn", eliot_core::InjectPoint::ActiveTurn),
+    ]
+    .into_iter()
+    .find_map(|(name, point)| points.iter().any(|value| value == name).then_some(point))
 }
 
 fn rule_admission_dispatch_plan(

@@ -15,7 +15,9 @@ pub enum RuleCatchUpActionOutcome {
     Command(SubmitCommand),
     Rejected {
         code: String,
+        message: String,
     },
+    SkippedCauseDepth,
     RejectedWithCapacity {
         code: String,
         message: String,
@@ -32,9 +34,35 @@ impl RuleCatchUpAction {
     }
 
     pub fn rejected(event_seq: i64, code: impl Into<String>) -> Self {
+        let code = code.into();
         Self {
             event_seq,
-            outcome: RuleCatchUpActionOutcome::Rejected { code: code.into() },
+            outcome: RuleCatchUpActionOutcome::Rejected {
+                message: code.clone(),
+                code,
+            },
+        }
+    }
+
+    pub fn rejected_with_message(
+        event_seq: i64,
+        code: impl Into<String>,
+        message: impl AsRef<str>,
+    ) -> Self {
+        let code = code.into();
+        Self {
+            event_seq,
+            outcome: RuleCatchUpActionOutcome::Rejected {
+                message: super::bounded_rule_rejection_message(message.as_ref(), &code),
+                code,
+            },
+        }
+    }
+
+    pub fn skipped_cause_depth(event_seq: i64) -> Self {
+        Self {
+            event_seq,
+            outcome: RuleCatchUpActionOutcome::SkippedCauseDepth,
         }
     }
 
@@ -43,7 +71,7 @@ impl RuleCatchUpAction {
             event_seq,
             outcome: RuleCatchUpActionOutcome::RejectedWithCapacity {
                 code: error.code.clone(),
-                message: error.message.to_string(),
+                message: super::bounded_rule_rejection_message(error.message.as_ref(), &error.code),
                 failure_where: error
                     .failure_where
                     .as_deref()
@@ -68,6 +96,13 @@ struct PlannedAction {
     admission: Admission,
     events: Vec<Event>,
     cause: core::EventCause,
+}
+
+struct SkippedRuleAction {
+    event_seq: i64,
+    reason: &'static str,
+    cause_depth: u8,
+    self_cause: bool,
 }
 
 struct CatchUpParentInput<'a> {
@@ -240,6 +275,7 @@ impl Store {
         let mut planned = Vec::new();
         let mut rejected = Vec::<(i64, Error)>::new();
         let mut suppressed = Vec::new();
+        let mut skipped_markers = Vec::<SkippedRuleAction>::new();
         let mut seen = HashSet::with_capacity(actions.len());
         let mut scoped_added = HashMap::<String, i64>::new();
         let mut global_added = 0_i64;
@@ -267,11 +303,30 @@ impl Store {
             let depth = next_rule_cause_depth(trigger.cause.as_ref());
             if depth > 5 {
                 suppressed.push(action.event_seq);
+                if !trigger.kind.starts_with("rule.") {
+                    skipped_markers.push(SkippedRuleAction {
+                        event_seq: action.event_seq,
+                        reason: "cause_depth",
+                        cause_depth: depth,
+                        self_cause: rule_event_originates_from_rule_tx(
+                            &tx,
+                            principal,
+                            &request.rule,
+                            trigger.cause.as_ref(),
+                        )?,
+                    });
+                }
                 continue;
             }
             let action_request = match &action.outcome {
                 RuleCatchUpActionOutcome::Command(request) => request,
-                RuleCatchUpActionOutcome::Rejected { code } => {
+                RuleCatchUpActionOutcome::SkippedCauseDepth => {
+                    return Err(Error::new(
+                        "invalid",
+                        "catch-up action is not over the cause-depth limit",
+                    ));
+                }
+                RuleCatchUpActionOutcome::Rejected { code, message } => {
                     validate_rule_rejection_code(code)?;
                     if !core::is_deterministic_pre_admission_rejection(code) {
                         return Err(Error::new(
@@ -279,7 +334,10 @@ impl Store {
                             "rule catch-up rejection code is not deterministic",
                         ));
                     }
-                    rejected.push((action.event_seq, Error::new(code.clone(), code.clone())));
+                    rejected.push((
+                        action.event_seq,
+                        Error::new(code.clone(), bounded_rule_rejection_message(message, code)),
+                    ));
                     continue;
                 }
                 RuleCatchUpActionOutcome::RejectedWithCapacity {
@@ -297,7 +355,8 @@ impl Store {
                     }
                     rejected.push((
                         action.event_seq,
-                        Error::new(code.clone(), message.clone()).with_where(failure_where.clone()),
+                        Error::new(code.clone(), bounded_rule_rejection_message(message, code))
+                            .with_where(failure_where.clone()),
                     ));
                     continue;
                 }
@@ -327,6 +386,14 @@ impl Store {
                 trigger.cause.as_ref(),
             )? {
                 suppressed.push(action.event_seq);
+                if !trigger.kind.starts_with("rule.") {
+                    skipped_markers.push(SkippedRuleAction {
+                        event_seq: action.event_seq,
+                        reason: "self_cause",
+                        cause_depth: depth,
+                        self_cause: true,
+                    });
+                }
                 continue;
             }
             if let Err(error) = validate_project_rule_action_tx(&tx, principal, action_request) {
@@ -499,7 +566,7 @@ impl Store {
             children.push(admission);
         }
         events.push(parent_event);
-        let mut markers = Vec::with_capacity(fired.len() + rejected.len());
+        let mut markers = Vec::with_capacity(fired.len() + rejected.len() + skipped_markers.len());
         for (event_seq, child_id, cause) in fired {
             markers.push((
                 event_seq,
@@ -525,12 +592,29 @@ impl Store {
                 "event_seq": event_seq,
                 "parent_command": parent.id,
                 "code": error.code,
+                "message": bounded_rule_rejection_message(&error.message, &error.code),
             });
             if is_capacity {
-                data["message"] = json!(error.message);
                 data["where"] = json!("store.admission.capacity");
             }
             markers.push((event_seq, "rule.rejected", data, parent_cause.clone()));
+        }
+        for skipped in skipped_markers {
+            markers.push((
+                skipped.event_seq,
+                "rule.skipped",
+                json!({
+                    "rule": request.rule,
+                    "project": request.project,
+                    "revision": state.revision,
+                    "event_seq": skipped.event_seq,
+                    "parent_command": parent.id,
+                    "reason": skipped.reason,
+                    "self_cause": skipped.self_cause,
+                    "cause_depth": skipped.cause_depth,
+                }),
+                parent_cause.clone(),
+            ));
         }
         markers.sort_by_key(|(event_seq, _, _, _)| *event_seq);
         for (_, kind, data, cause) in markers {

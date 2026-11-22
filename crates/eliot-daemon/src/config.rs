@@ -886,6 +886,129 @@ fn default_max_unread_messages_per_agent() -> i64 {
     core::api::DEFAULT_MAX_UNREAD_MESSAGES_PER_AGENT
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TimedAttentionConfig {
+    #[serde(default = "default_attention_enabled")]
+    pub(crate) enabled: bool,
+    #[serde(default)]
+    pub(crate) threshold_secs: Option<i64>,
+}
+
+impl Default for TimedAttentionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            threshold_secs: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NoProgressAttentionConfig {
+    #[serde(default = "default_attention_enabled")]
+    pub(crate) enabled: bool,
+    #[serde(default)]
+    pub(crate) threshold_secs: Option<i64>,
+    /// Automatic interruption after a no-progress notice is opt-in.
+    #[serde(default)]
+    pub(crate) interrupt: bool,
+}
+
+impl Default for NoProgressAttentionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            threshold_secs: None,
+            interrupt: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SwitchAttentionConfig {
+    #[serde(default = "default_attention_enabled")]
+    pub(crate) enabled: bool,
+}
+
+impl Default for SwitchAttentionConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SessionGrowthAttentionConfig {
+    #[serde(default = "default_attention_enabled")]
+    pub(crate) enabled: bool,
+    /// Automatic switching after session-growth attention is opt-in.
+    #[serde(default)]
+    pub(crate) switch: bool,
+}
+
+impl Default for SessionGrowthAttentionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            switch: false,
+        }
+    }
+}
+
+fn default_attention_enabled() -> bool {
+    true
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AttentionConfig {
+    #[serde(default)]
+    pub(crate) no_progress: NoProgressAttentionConfig,
+    #[serde(default)]
+    pub(crate) no_code_progress: TimedAttentionConfig,
+    #[serde(default)]
+    pub(crate) children_unattended: TimedAttentionConfig,
+    #[serde(default)]
+    pub(crate) source_unhealthy: SwitchAttentionConfig,
+    #[serde(default)]
+    pub(crate) agent_lost: SwitchAttentionConfig,
+    #[serde(default)]
+    pub(crate) provider_refusal: SwitchAttentionConfig,
+    #[serde(default)]
+    pub(crate) session_growth: SessionGrowthAttentionConfig,
+    #[serde(default)]
+    pub(crate) repeated_command_failure: SwitchAttentionConfig,
+}
+
+impl AttentionConfig {
+    fn validate_with_legacy_threshold(mut self, legacy_secs: i64) -> core::Result<Self> {
+        for (name, config) in [
+            ("no_progress", &mut self.no_progress.threshold_secs),
+            (
+                "no_code_progress",
+                &mut self.no_code_progress.threshold_secs,
+            ),
+            (
+                "children_unattended",
+                &mut self.children_unattended.threshold_secs,
+            ),
+        ] {
+            let threshold = config.get_or_insert(legacy_secs);
+            if *threshold <= 0 || *threshold > i64::MAX / 1_000 {
+                return Err(core::Error::new(
+                    "profile_error",
+                    format!(
+                        "config.toml: daemon.attention.{name}.threshold_secs must be a positive integer whose millisecond value fits in i64",
+                    ),
+                ));
+            }
+        }
+        Ok(self)
+    }
+}
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DaemonConfig {
@@ -910,10 +1033,13 @@ pub(crate) struct DaemonConfig {
     /// unset value keeps its coordination-contract default.
     #[serde(default)]
     pub(crate) limits: core::api::HierarchyLimits,
-    /// Healthy-source no-progress window before an attention diagnosis. See
-    /// docs/spec/monitoring.md; this is advisory and never infers agent death.
+    /// Legacy fallback for per-kind attention thresholds. Retained for older
+    /// config files; new settings belong under daemon.attention.<kind>.
+    /// The value remains advisory and never infers agent death.
     #[serde(default = "default_attention_suspicion_secs")]
     pub(crate) attention_suspicion_secs: i64,
+    #[serde(default)]
+    pub(crate) attention: AttentionConfig,
     /// Heavy-episode thresholds for one `activity.heavy` event: a child
     /// process tree whose wall time, consumed CPU or peak RSS crosses any one
     /// threshold. See docs/spec/monitoring.md; defaults tune from real data.
@@ -955,6 +1081,7 @@ impl Default for DaemonConfig {
             log_level: default_log_level(),
             limits: core::api::HierarchyLimits::default(),
             attention_suspicion_secs: default_attention_suspicion_secs(),
+            attention: AttentionConfig::default(),
             heavy_wall_secs: default_heavy_wall_secs(),
             heavy_cpu_secs: default_heavy_cpu_secs(),
             heavy_rss_bytes: default_heavy_rss_bytes(),
@@ -1020,6 +1147,9 @@ impl DaemonConfig {
                 "config.toml: daemon.attention_suspicion_secs must be a positive integer whose millisecond value fits in i64",
             ));
         }
+        let attention = self
+            .attention
+            .validate_with_legacy_threshold(self.attention_suspicion_secs)?;
         // Parse here so an invalid level is a config error, not a silent
         // fallback. The live value is applied at startup and on every
         // `settings.save` through `crate::logging`.
@@ -1061,6 +1191,7 @@ impl DaemonConfig {
             retention: self.retention.validate()?,
             limits: self.limits,
             attention_suspicion_secs: self.attention_suspicion_secs,
+            attention,
             log_level: self.log_level,
             heavy_wall_secs: self.heavy_wall_secs,
             heavy_cpu_secs: self.heavy_cpu_secs,

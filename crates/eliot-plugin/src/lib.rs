@@ -27,4 +27,7 @@ pub use protocol::{
     ObserverDetachParams, ObserverSnapshotParams, PluginManifest, RpcError, RpcRequest,
     RpcResponse,
 };
-pub use stderr::{StderrCapture, StderrSnapshot, StderrView, spawn_plugin_stderr, spawn_stderr};
+pub use stderr::{
+    StderrCapture, StderrSnapshot, StderrView, spawn_plugin_stderr, spawn_stderr,
+    spawn_stderr_prefix,
+};

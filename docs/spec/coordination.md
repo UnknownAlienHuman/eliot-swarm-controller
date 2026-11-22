@@ -408,39 +408,52 @@ conversation. Native turn success is separate from message delivery/read state.
 commands and report their actual application point. Presented is not read or understood.
 
 With `wake_on_mail=true` (read from the recipient's frozen profile snapshot,
-default true), a routed recipient may receive one generic coalesced notice
-per minute, with at most one open notice command. The wake text is one
-neutral line for every harness: `N unread: mail.inbox, then mail.ack`
-(`N overlapping work claims: who` for claim notices). An unread reply whose
+default true), a routed recipient may receive one coalesced notice per minute,
+with at most one open notice command. The count-only fallback is
+`N unread: mail.inbox, then mail.ack`. An unread reply whose
 `reply_to_delivery` names mail the recipient itself sent, admitted after the
 last presentation, skips the one-minute cooldown once, so an answer to an
 Agent's own question wakes it at once; the open-notice, busy, pending-input
 and unknown gates still apply.
-The notice is an ordinary owner `send` bound to the recipient's current
-generation and carrying only the unread count at claim time; ordinary mail
-notices never contain the body or mark it read. An unread completion digest
-registered by the recipient Agent itself at its current generation
-(`agent:<recipient>:<generation>`) is the explicit exception (the registrant
-is already the recipient and holds command/read scope over the digest): when
-it fits within the wake budget (`MAX_EVENT_BYTES`, 64 KiB), the wake `send`
-shows the digest body directly to the recipient's own turn (appending
-`N unread: mail.inbox, then mail.ack` when uninlined unread mail remains) and
-binds `presentation_command` so `turn.started` of that wake stamps both
-`presented_at` and `read_at` on the inlined digest delivery, while ordinary
-command readback (`command.get`/`command.children`) redacts `args.text` so no
-other principal can read excerpt text through the wake command. If it does not
-fit, or the registrant differs (for
-example Owner or an earlier generation), the wake falls back to the generic
-count notice and leaves `read_at` unset until `mail.ack`. Unknown notice is not blindly retried;
+The notice is an ordinary owner `send` bound to the recipient's
+current generation. At claim, Store selects eligible unread mail addressed to
+that generation, in admission order. Each inline entry carries its sender,
+thread topic (or an explicit no-topic marker), exact delivery ID, and body.
+Peer mail carries the sender's Agent identity and a fenced untrusted body.
+The wake envelope grants the peer no Owner authority. Owner mail uses plain text.
+An actionable attention report can be inlined on its one permitted wake.
+Older-generation mail and retained advisory copies remain in the inbox.
+If other wake-eligible unread rows
+remain, the text gives their count and points to `mail.inbox` and
+`mail.ack`. A completion-digest delivery remains eligible only when its
+owner-sent row matches the digest registration, the current recipient
+requester (`agent:<recipient>:<generation>`), and that registration's digest
+thread. Other registered digest rows are not treated as ordinary mail.
+
+Store binds every inline delivery to the exact notice command in the same
+claim transaction. The exact wake's first committed model output or
+successful terminal stamps `presented_at` and `read_at` on those rows in the
+same transaction. A definite terminal without either releases the
+presentation binding so unread deliveries can be included in the next eligible
+wake. Unknown outcomes keep their binding. If no
+current-generation delivery qualifies, or the serialized
+`send` request including the complete rendered content and any unread
+remainder line exceeds `MAX_EVENT_BYTES`, the notice falls back to the
+count-only text and binds no rows; overflow never partially presents a batch.
+A prior presentation binding is reusable only when its command is missing or
+settled as `rejected`, `failed`, or `cancelled`, and the delivery remains
+unpresented. Active and `unknown` commands are never rebound. Command readback
+redacts inline notice text, and the Router strips its internal notice metadata
+before plugin dispatch. Unknown
+notice is not blindly retried;
 provider hold, pending request, current unknown gate and drain suppress new wake.
 A busy, waiting or input-pending mail recipient suppresses a new mail wake:
 a current-generation `send` already accepted, queued, dispatched or unknown
 but not yet `turn.started` still reads idle in that gap, so the wake is
 deferred (skipped, not queued) rather than dispatched after the inbox was
-already read and acked. Claim-conflict notices keep their prior busy policy
-and still queue; only mail notices defer, ordinary user sends still queue
-FIFO. The claimed `send` carries an explicit structured `notice_kind`
-(`mail` or `claim` only); a send naming the open notice with a missing,
+already read and acked. Ordinary user sends queue FIFO.
+The claimed `send` carries explicit `notice_kind: "mail"` metadata.
+A send naming the open notice with a missing,
 wrongly typed or other value is invalid, with no inferred default, while
 normal sends never inspect it. Mail revalidates the busy, pending and
 unknown gates at admission via its open-notice identity; the Store never
@@ -453,14 +466,15 @@ claim. Store dispatch settlement of a notice `send` as `rejected`, `failed`,
 or `cancelled` stamps the shared cooldown and clears that exact open claim in
 the same transaction. Restart recovery clears only commandless open claims.
 Command retention clears the open reference of the exact completed notice it
-deletes. A successful notice starts the cooldown at actual presentation
+deletes. Native acceptance starts the wake-attempt cooldown
 (`turn.started` stamps `last_notice_at`).
 A daemon driver re-pages due recipients every 2 seconds: current `idle`,
 non-observer agents holding unread mail past the normal cooldown are
 re-offered through the same atomic claim, so an agent that idles with no
 new event still wakes once due. Normal queued mail and older-generation
-unread rows can therefore surface as a fresh current-generation generic
-count notice; the notice never replays message or job bodies.
+unread rows can therefore surface as a fresh current-generation count notice.
+Only current-generation ordinary mail bodies are inlined; older-generation
+bodies remain in the inbox and are represented by the remainder count.
 A recipient with no live plugin owner for a dispatched generation stays
 queue-only.
 
@@ -468,13 +482,20 @@ Without independent recipient identity, route only a generic notice to a live ro
 parent/manager, otherwise stay queue-only. Parent notifications follow the same policy.
 No routine acknowledgements/status chatter or broadcasts are generated by default.
 
-Automatic Agent-attention reports queue a mail pointer for the affected Agent
-through ordinary `mail.send` with the existing wake policy. Its parent manager, when
-present, receives a normal queued mail through the existing wake policy; without a
-parent, the owner receives the ordinary local notify event and bus report. These notices
-include a short bounded diagnosis from the structured report and point to the
-`x.user.agent.attention` event for details. They contain no native transcript and never
-replay the Agent's prompt or job.
+Automatic Agent-attention reports route a bounded mail pointer to the manager who can
+act: the parent manager receives an ordinary queued mail through the existing wake
+policy, with `children_unattended` routed to that manager itself. When no eligible
+manager exists, the owner receives the ordinary local notify event and bus report. No
+advisory self-copy is generated. Notices carry a short bounded diagnosis and point to
+the `x.user.agent.attention` event for details; they contain no native transcript or
+replay of the Agent's prompt or job.
+
+The 206 owner-sent advisory-attention messages retained by older versions can be
+previewed and purged by the owner-only `maintenance.purge_legacy_attention_advisories`
+operation. The default call reports an exact count across read and unread rows;
+applying requires that count and rechecks it atomically before deletion. The operation
+matches only `attention-*-advisory` threads sent by the owner, preserving regular mail
+and non-advisory attention escalations. See the [maintenance API](api.md) contract.
 
 A completion digest (`swarm.digest`, see [api](api.md#waiting)) reuses the same
 ordinary queued mail and wake policy for a different purpose: exactly one coalesced

@@ -377,6 +377,13 @@ pub(super) fn persist_effects(
             params![agent_num, generation, turn_id],
         ));
     }
+    if matches!(
+        native_event.kind.as_str(),
+        "turn.model_observed" | "tool.started" | "tool.completed"
+    ) && let Some(turn_id) = native_event.data["turn_id"].as_str()
+    {
+        settle_inline_mail(scope, turn_id, true)?;
+    }
     Ok((command_events, provider_events))
 }
 
@@ -514,19 +521,11 @@ fn persist_turn_associated(
         params![turn_id, encode_json(&outcome)?, now, command_id],
     ));
     handoff::refresh_parent_tx(tx, command_id, now)?;
-    // Presentation stamps the notice cooldown at native acceptance, so a long
-    // queue cannot spend it while waiting. Ordinary sends match no notice row.
+    // Native acceptance starts the wake-attempt cooldown. It does not
+    // establish that the model received the inline mail.
     db!(tx.execute(
         "UPDATE mail_notices SET last_notice_at = ?1
          WHERE recipient = ?2 AND open_notice_command = ?3",
-        params![now, agent_num, command_id],
-    ));
-    // Self-registered completion digests shown directly in that wake `send`
-    // are marked presented and read on the wake turn's `turn.started`.
-    db!(tx.execute(
-        "UPDATE messages SET presented_at = COALESCE(presented_at, ?1),
-                             read_at = COALESCE(read_at, ?1)
-         WHERE recipient = ?2 AND presentation_command = ?3",
         params![now, agent_num, command_id],
     ));
     let mut command_events = vec![PendingCommandEvent {
@@ -873,6 +872,64 @@ fn persist_message_completed(
             "message.completed does not target the exact running turn",
         ));
     }
+    if scope.native_event.data["model_output"].as_bool() != Some(false) {
+        settle_inline_mail(scope, turn_id, true)?;
+    }
+    Ok(())
+}
+
+/// Settle the exact wake's inline rows in the same transaction as proof of
+/// model output or a definite terminal. Unknown outcomes retain the binding.
+fn settle_inline_mail(scope: EffectScope<'_, '_>, turn_id: &str, delivered: bool) -> Result<()> {
+    let EffectScope {
+        tx,
+        agent_num,
+        generation,
+        now,
+        ..
+    } = scope;
+    let command: Option<String> = tx
+        .query_row(
+            "SELECT c.id FROM mail_notices n
+             JOIN commands c ON c.id = n.open_notice_command
+             WHERE n.recipient = ?1 AND c.target = n.recipient AND c.generation = ?2
+               AND c.turn_id = ?3 AND c.verb = 'send' AND c.state = 'applied'
+               AND EXISTS (
+                   SELECT 1 FROM messages m WHERE m.recipient = n.recipient
+                     AND m.recipient_generation = c.generation
+                     AND m.presentation_command = c.id AND m.presented_at IS NULL
+               )",
+            params![agent_num, generation, turn_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    let Some(command) = command else {
+        return Ok(());
+    };
+    if delivered {
+        db!(tx.execute(
+            "INSERT OR IGNORE INTO attention_wakes(recipient, thread, woken_at)
+             SELECT DISTINCT recipient, thread, ?1 FROM messages
+             WHERE recipient = ?2 AND recipient_generation = ?3
+               AND presentation_command = ?4 AND presented_at IS NULL
+               AND thread LIKE 'attention-%' AND thread NOT LIKE 'attention-%-advisory'",
+            params![now, agent_num, generation, command],
+        ));
+        db!(tx.execute(
+            "UPDATE messages SET presented_at = ?1, read_at = COALESCE(read_at, ?1)
+             WHERE recipient = ?2 AND recipient_generation = ?3
+               AND presentation_command = ?4 AND presented_at IS NULL",
+            params![now, agent_num, generation, command],
+        ));
+    } else {
+        db!(tx.execute(
+            "UPDATE messages SET presentation_command = NULL
+             WHERE recipient = ?1 AND recipient_generation = ?2
+               AND presentation_command = ?3 AND presented_at IS NULL",
+            params![agent_num, generation, command],
+        ));
+    }
     Ok(())
 }
 
@@ -993,6 +1050,12 @@ fn persist_turn_terminal(
             "source_integrity",
             format!("terminal event references missing turn {turn_id}"),
         ));
+    }
+    if state == TurnState::Completed {
+        let delivered = outcome == Some("success")
+            || (final_text.is_some_and(|text| !text.trim().is_empty())
+                && native_event.data["model_output"].as_bool() != Some(false));
+        settle_inline_mail(scope, turn_id, delivered)?;
     }
     db!(tx.execute(
         "UPDATE pending_requests SET state = 'stale'

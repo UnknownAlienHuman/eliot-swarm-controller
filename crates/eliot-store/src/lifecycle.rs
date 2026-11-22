@@ -402,11 +402,24 @@ impl Store {
                     "attention subject Agent is no longer present",
                 ));
             };
-            if current.generation != generation {
+            if current.generation != generation
+                || (current.state == AgentState::Lost
+                    && report["reason"] == "source_unhealthy"
+                    && report["phase"] == "incident")
+            {
                 return Err(Error::new(
                     "stale_generation",
                     "attention evidence targets a stale generation",
                 ));
+            }
+            let turn_id = report
+                .get("turn_id")
+                .and_then(Value::as_str)
+                .filter(|turn| !turn.trim().is_empty())
+                .map(str::to_owned);
+            let mut data = data;
+            if let Some(turn_id) = turn_id {
+                data["turn_id"] = json!(turn_id);
             }
             let mut events = Vec::new();
             events.push(insert_daemon_event_for_command(
@@ -1497,8 +1510,14 @@ pub(super) fn transition_lost_tx(
     // for this reason. A failed start on a missing external credential keeps
     // its `environment` origin instead of being retyped as Agent software.
     let mut data = json!({"agent_id": agent.id, "reason": reason});
-    if reason == core::DAEMON_RESTART_REASON {
+    if matches!(
+        reason,
+        core::DAEMON_RESTART_REASON | core::PLUGIN_ROOT_EXITED_REASON
+    ) {
         data["previous_state"] = json!(agent.state);
+    }
+    if let Some(turn_id) = &agent.active_turn {
+        data["turn_id"] = json!(turn_id);
     }
     if let Some((origin, location)) = failure {
         data["origin"] = json!(origin.as_str());

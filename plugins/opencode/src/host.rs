@@ -16,7 +16,7 @@ use crate::{
     },
 };
 use eliot_core::local_provider::LocalProvider;
-use eliot_core::{ContextItem, Error, FailureOrigin, InjectPoint, McpPolicy, Result};
+use eliot_core::{ContextItem, Error, FailureOrigin, InjectPoint, McpPolicy, Result, SecretPolicy};
 use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
     MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
@@ -374,6 +374,7 @@ struct AgentSession {
     resources_proved_closed: bool,
     stop_end_ack_proved: bool,
     local_provider: Option<LocalProvider>,
+    secret_policy: SecretPolicy,
 }
 
 /// A start request that passed admission: decoded params plus the validated
@@ -1325,6 +1326,7 @@ impl OpenCodePlugin {
             resources_proved_closed: false,
             stop_end_ack_proved: false,
             local_provider: parsed.local_provider.clone(),
+            secret_policy: SecretPolicy::new(&parsed.secrets),
         };
 
         Ok(session)
@@ -2876,6 +2878,7 @@ impl OpenCodePlugin {
         match params.verb.as_str() {
             "send" => self.send_command(params).await,
             "configure" => self.configure_command(params).await,
+            "compact" => self.compact_command(params).await,
             "steer" => self.steer_command(params).await,
             "interrupt" => self.interrupt_command(params).await,
             "approve" | "deny" | "answer" => self.reply_command(params).await,
@@ -2884,6 +2887,81 @@ impl OpenCodePlugin {
                 "OpenCode plugin command verb is not implemented",
             )),
         }
+    }
+
+    async fn compact_command(&mut self, params: AgentCommandParams) -> Result<Value> {
+        if params.turn_id.is_some() {
+            return Err(Error::new(
+                "native_not_dispatched",
+                "OpenCode compaction requires an idle session",
+            ));
+        }
+        let session = ready_session(&mut self.session, &params)?;
+        let session_id = session
+            .session_id
+            .as_deref()
+            .ok_or_else(|| Error::new("native_not_dispatched", "OpenCode session is not bound"))?;
+        let terminal = session.events.begin_compaction().await?;
+        let deadline = Instant::now() + RPC_TIMEOUT;
+        let receipt = match session.http.compact(session_id, deadline).await {
+            Ok(receipt) => receipt,
+            Err(HttpOutcome::Rejected { reason, .. } | HttpOutcome::NotDispatched { reason }) => {
+                session.events.refuse_compaction().await?;
+                return Ok(json!({"state": "rejected", "reason": reason}));
+            }
+            Err(HttpOutcome::Unknown { .. }) => {
+                session.phase = SessionPhase::Unknown;
+                return Err(Error::new(
+                    "unknown",
+                    "OpenCode compaction admission is unconfirmed",
+                ));
+            }
+        };
+        if receipt.session_id != session_id
+            || receipt.id.trim().is_empty()
+            || receipt.kind != "compaction"
+            || receipt.delivery != "queue"
+        {
+            session.phase = SessionPhase::Unknown;
+            return Err(Error::new(
+                "unknown",
+                "OpenCode compaction receipt differs from the request",
+            ));
+        }
+        let applied = match timeout_at(deadline, terminal).await {
+            Ok(Ok((input, applied))) if input == receipt.id => applied,
+            _ => {
+                // Native message history carries a terminal fact under the
+                // inbox id even when the stream leaves the command uncertain.
+                if !session.events.current_status().await.is_ok_and(|status| {
+                    !status.compaction_in_flight && !status.source_unknown && !status.batch_unknown
+                }) {
+                    session.phase = SessionPhase::Unknown;
+                }
+                let Some(outcome) = session
+                    .http
+                    .compaction_outcome(
+                        session_id,
+                        &receipt.id,
+                        Instant::now() + std::time::Duration::from_secs(5),
+                    )
+                    .await
+                    .unwrap_or(None)
+                else {
+                    session.phase = SessionPhase::Unknown;
+                    return Err(Error::new(
+                        "unknown",
+                        "OpenCode compaction completion is unconfirmed",
+                    ));
+                };
+                outcome
+            }
+        };
+        Ok(json!({
+            "state": if applied { "applied" } else { "failed" },
+            "command_id": params.command_id,
+            "compaction": {"completed": applied, "receipt_id": receipt.id},
+        }))
     }
 
     /// Read-only live model catalogue for the owned session: the exact
@@ -3676,14 +3754,21 @@ impl OpenCodePlugin {
                 "terminal": false,
             }),
             Some(events::TurnReadback::Terminal(terminal)) => {
-                json!({
+                let mut turn = json!({
                     "command_id": params.command_id,
                     "turn_id": request.turn_id,
                     "status": terminal.outcome,
                     "terminal": true,
-                    "final_text": terminal.final_text,
+                    "final_text": null,
                     "native_error": terminal.idle_error.map(|error| error.message),
-                })
+                });
+                if let Some(text) = terminal.final_text {
+                    eliot_plugin::session::attach_final_text(
+                        &mut turn,
+                        &session.secret_policy.redact_text(&text),
+                    );
+                }
+                turn
             }
             None => match Self::snapshot_turn_facts(
                 &event_status,
@@ -4913,6 +4998,7 @@ fn opencode_manifest() -> PluginManifest {
             "resume",
             "send",
             "configure",
+            "compact",
             "models",
             "steer",
             "interrupt",

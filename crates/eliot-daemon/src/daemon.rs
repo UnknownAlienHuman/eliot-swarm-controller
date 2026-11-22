@@ -305,7 +305,7 @@ struct DaemonRuntime {
     daemon_config: crate::config::DaemonConfig,
     automation_config: crate::config::AutomationConfig,
     cloud_mcp_config: Option<crate::cloud_mcp::CloudMcpConfig>,
-    attention_suspicion_window: Duration,
+    attention_config: crate::config::AttentionConfig,
     capacity: restart_capacity::Reconcile,
     capacity_retained: usize,
     global_rules: Vec<automation::ActiveRule>,
@@ -415,16 +415,19 @@ async fn initialize_runtime(
         crate::config::settings::reconcile_at_startup(data_dir.path(), &mut store)?;
     }
     let bus = Bus::new(1_024);
+    let daemon_config =
+        crate::config::load_daemon_config(data_dir.path()).map_err(startup_config_failure)?;
     // Invalid `[mail]` fails startup like invalid retention; the Router keeps
     // the loaded limits for the run instead of re-reading the file per send.
     let mail_config =
         crate::config::load_mail_config(data_dir.path()).map_err(startup_config_failure)?;
-    let router = Router::new_with_mail_config(
+    let router = Router::new(
         data_dir.path().to_path_buf(),
         data_dir.owner_token().to_owned(),
         std::sync::Arc::clone(&store),
         bus.clone(),
         mail_config,
+        daemon_config.attention,
     );
 
     crate::bootstrap::ensure_hot_start(data_dir.path(), &store, &policy).await?;
@@ -489,8 +492,7 @@ async fn initialize_runtime(
         crate::config::load_automation_config(data_dir.path()).map_err(startup_config_failure)?;
     let cloud_mcp_config =
         crate::config::load_cloud_mcp_config(data_dir.path()).map_err(startup_config_failure)?;
-    let attention_suspicion_window =
-        Duration::from_secs(daemon_config.attention_suspicion_secs as u64);
+    let attention_config = router.attention_config();
     // Install [daemon] observe thresholds once: monitor sweeps and Router
     // readbacks share them; the daemon never re-reads the file per sweep.
     router.set_observe_thresholds(crate::monitor::ObserveThresholds {
@@ -518,7 +520,7 @@ async fn initialize_runtime(
         daemon_config,
         automation_config,
         cloud_mcp_config,
-        attention_suspicion_window,
+        attention_config,
         global_rules,
         initial_deferred_notice,
         project_rule_namespaces,
@@ -542,7 +544,7 @@ async fn spawn_workers(
         daemon_config,
         automation_config,
         cloud_mcp_config,
-        attention_suspicion_window,
+        attention_config,
         global_rules,
         initial_deferred_notice,
         project_rule_namespaces,
@@ -601,13 +603,9 @@ async fn spawn_workers(
         let router = attention_router.clone();
         let reporter = attention_reporter.clone();
         async move {
-            let result = crate::router::run_attention(
-                router,
-                attention_suspicion_window,
-                shutdown.clone(),
-                reporter,
-            )
-            .await;
+            let result =
+                crate::router::run_attention(router, attention_config, shutdown.clone(), reporter)
+                    .await;
             crate::daemon::workers::from_result(result, &shutdown)
         }
     };
@@ -616,6 +614,23 @@ async fn spawn_workers(
         worker_reporter.clone(),
         worker_stop.subscribe(),
         attention_factory,
+    ));
+    let tool_router = router.clone();
+    let tool_reporter = worker_reporter.clone();
+    let tool_failure_factory = move |shutdown: watch::Receiver<bool>| {
+        let router = tool_router.clone();
+        let reporter = tool_reporter.clone();
+        async move {
+            let result =
+                crate::router::run_tool_failure_attention(router, shutdown.clone(), reporter).await;
+            crate::daemon::workers::from_result(result, &shutdown)
+        }
+    };
+    workers.spawn(crate::daemon::workers::supervise(
+        "tool_failure_attention",
+        worker_reporter.clone(),
+        worker_stop.subscribe(),
+        tool_failure_factory,
     ));
     let mail_router = router.clone();
     let mail_reporter = worker_reporter.clone();

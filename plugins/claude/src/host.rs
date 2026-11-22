@@ -1956,7 +1956,7 @@ fn live_session_snapshot(
     };
     let result_known = last_turn
         .as_ref()
-        .is_some_and(|turn| turn.final_text.is_some() && turn.final_text_unavailable.is_none());
+        .is_some_and(|turn| turn.final_text.is_some());
     let process_exited = session.native.transport.process_exit_observed();
     let mut active_turn = event_status.active_turn_id.clone();
     let mut last_turn = serde_json::to_value(last_turn)

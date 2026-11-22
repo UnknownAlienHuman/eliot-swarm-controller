@@ -76,7 +76,9 @@ pub enum RuleCursorOutcome {
     /// A contiguous disabled range was deliberately skipped.
     Disabled,
     /// A deterministic definition/action rejection was recorded.
-    Rejected { code: String },
+    Rejected { code: String, message: String },
+    /// A matching event was skipped because its next verified cause depth is over the limit.
+    SkippedCauseDepth,
     /// A configured-capacity preparation refusal retains bounded Owner remedy
     /// text for automation readback; all other errors use `Rejected`.
     RejectedWithCapacity {
@@ -201,8 +203,14 @@ impl<'a> RuleFiringKey<'a> {
         let object = data.as_object_mut().expect("firing args are an object");
         object.insert("parent_command".to_owned(), json!(self.parent_id));
         object.insert("code".to_owned(), json!(rejection.code));
-        if let Some((message, where_)) = capacity_metadata(rejection) {
-            object.insert("message".to_owned(), json!(message));
+        object.insert(
+            "message".to_owned(),
+            json!(bounded_rule_rejection_message(
+                &rejection.message,
+                &rejection.code
+            )),
+        );
+        if let Some((_, where_)) = capacity_metadata(rejection) {
             object.insert("where".to_owned(), json!(where_));
         }
         data
@@ -266,6 +274,49 @@ impl Store {
         validate_rule_principal_read(&self.connection, principal)?;
         require_nonempty(id, "rule id")?;
         Ok(load_rule_state(&self.connection, principal, id)?.map(|state| state.view))
+    }
+
+    pub fn rule_project_exists(&self, id: &str) -> Result<bool> {
+        require_nonempty(id, "rule id")?;
+        self.connection
+            .query_row(
+                "SELECT EXISTS (
+                    SELECT 1 FROM project_registrations p
+                    JOIN rule_state r ON r.principal = 'project:' || p.id
+                    WHERE r.rule = ?1
+                )",
+                [id],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)
+    }
+
+    /// Read the cursor state and its newest retained action/refusal facts in one
+    /// SQLite snapshot. Status is deliberately separate from the cursor CAS view.
+    pub fn get_rule_show(
+        &self,
+        principal: &str,
+        id: &str,
+    ) -> Result<Option<core::api::RuleShowView>> {
+        require_nonempty(id, "rule id")?;
+        let tx = self.connection.unchecked_transaction().map_err(sql_error)?;
+        validate_rule_principal_read(&tx, principal)?;
+        let Some(stored) = load_rule_state(&tx, principal, id)? else {
+            tx.commit().map_err(sql_error)?;
+            return Ok(None);
+        };
+        let last_outcome = load_last_rule_action_outcome(&tx, principal, id)?;
+        let last_refusal =
+            load_last_rule_refusal(&tx, principal, id, stored.view.project.as_deref())?;
+        let view = core::api::RuleShowView {
+            state: stored.view,
+            last_outcome,
+            last_refusal,
+        };
+        view.validate()
+            .map_err(|_| Error::new("source_integrity", "stored rule status is invalid"))?;
+        tx.commit().map_err(sql_error)?;
+        Ok(Some(view))
     }
 
     /// Reconcile a startup or watcher snapshot. A single captured event high-water
@@ -486,14 +537,43 @@ impl Store {
                         )?);
                     }
                 }
-                RuleCursorOutcome::Rejected { code } => {
+                RuleCursorOutcome::SkippedCauseDepth => {
+                    let trigger = load_rule_trigger(&tx, through)?;
+                    let cause_depth = next_rule_cause_depth(trigger.cause.as_ref());
+                    if cause_depth <= 5 {
+                        return Err(Error::new(
+                            "invalid",
+                            "rule event is not over the cause-depth limit",
+                        ));
+                    }
+                    if !trigger.kind.starts_with("rule.") {
+                        let self_cause = rule_event_originates_from_rule_tx(
+                            &tx,
+                            principal,
+                            &state.id,
+                            trigger.cause.as_ref(),
+                        )?;
+                        events.push(insert_rule_skipped_event(
+                            &tx,
+                            now,
+                            &stored.view,
+                            revision,
+                            RuleSkip {
+                                event_seq: through,
+                                cause_depth,
+                                self_cause,
+                            },
+                            trigger.cause,
+                        )?);
+                    }
+                }
+                RuleCursorOutcome::Rejected { code, message } => {
                     events.extend(rule_rejection_event(
                         &tx,
-                        &state.id,
+                        &stored.view,
                         revision,
                         cursor + 1..=through,
-                        &code,
-                        None,
+                        &Error::new(code, message),
                         now,
                     )?);
                 }
@@ -511,11 +591,10 @@ impl Store {
                     }
                     events.extend(rule_rejection_event(
                         &tx,
-                        &state.id,
+                        &stored.view,
                         revision,
                         cursor + 1..=through,
-                        &code,
-                        Some((&message, &failure_where)),
+                        &Error::new(code, message).with_where(failure_where),
                         now,
                     )?);
                 }
@@ -650,9 +729,11 @@ impl Store {
         event_seq: i64,
         request: SubmitCommand,
         now: i64,
+        secret_policy: &core::SecretPolicy,
     ) -> Result<RuleEventAdmission> {
         self.ensure_writer_healthy()?;
-        let result = self.admit_rule_action_inner(principal, state, event_seq, request, now);
+        let result =
+            self.admit_rule_action_inner(principal, state, event_seq, request, now, secret_policy);
         self.fault_on_persistence_error(&result);
         result
     }
@@ -686,6 +767,7 @@ impl Store {
         event_seq: i64,
         mut request: SubmitCommand,
         now: i64,
+        secret_policy: &core::SecretPolicy,
     ) -> Result<RuleEventAdmission> {
         require_nonempty(principal, "principal")?;
         require_nonempty(&state.id, "rule id")?;
@@ -750,13 +832,35 @@ impl Store {
 
         let depth = next_rule_cause_depth(trigger.cause.as_ref());
         if depth > 5 {
+            let self_cause = rule_event_originates_from_rule_tx(
+                &tx,
+                principal,
+                &state.id,
+                trigger.cause.as_ref(),
+            )?;
+            let events = if trigger.kind.starts_with("rule.") {
+                Vec::new()
+            } else {
+                vec![insert_rule_skipped_event(
+                    &tx,
+                    now,
+                    &stored.view,
+                    revision,
+                    RuleSkip {
+                        event_seq,
+                        cause_depth: depth,
+                        self_cause,
+                    },
+                    trigger.cause.clone(),
+                )?]
+            };
             let view = update_rule_cursor_tx(&tx, principal, &stored.view, event_seq, now)?;
             commit_transaction(tx, &self.write_faulted)?;
             return Ok(RuleEventAdmission {
                 state: view,
                 parent: None,
                 child: None,
-                events: Vec::new(),
+                events,
                 is_new: true,
             });
         }
@@ -787,13 +891,29 @@ impl Store {
             &request,
             trigger.cause.as_ref(),
         )? {
+            let events = if trigger.kind.starts_with("rule.") {
+                Vec::new()
+            } else {
+                vec![insert_rule_skipped_event(
+                    &tx,
+                    now,
+                    &stored.view,
+                    revision,
+                    RuleSkip {
+                        event_seq,
+                        cause_depth: depth,
+                        self_cause: true,
+                    },
+                    trigger.cause.clone(),
+                )?]
+            };
             let view = update_rule_cursor_tx(&tx, principal, &stored.view, event_seq, now)?;
             commit_transaction(tx, &self.write_faulted)?;
             return Ok(RuleEventAdmission {
                 state: view,
                 parent: None,
                 child: None,
-                events: Vec::new(),
+                events,
                 is_new: true,
             });
         }
@@ -837,14 +957,21 @@ impl Store {
         // the surrounding transaction rolls every write back on persistence failure.
         let limits = self.hierarchy_limits;
         let policy = self.capacity_policy.as_deref();
-        let (parent, child_admission, events) =
-            match admit_rule_action_tx(&tx, &key, request, now, limits, policy) {
-                Ok(admission) => admission,
-                Err(error) if core::is_deterministic_pre_admission_rejection(&error.code) => {
-                    return reject_rule_event(tx, &self.write_faulted, &key, &error, now);
-                }
-                Err(error) => return Err(error),
-            };
+        let (parent, child_admission, events) = match admit_rule_action_tx(
+            &tx,
+            &key,
+            request,
+            now,
+            limits,
+            policy,
+            Some(secret_policy),
+        ) {
+            Ok(admission) => admission,
+            Err(error) if core::is_deterministic_pre_admission_rejection(&error.code) => {
+                return reject_rule_event(tx, &self.write_faulted, &key, &error, now);
+            }
+            Err(error) => return Err(error),
+        };
         let view = update_rule_cursor_tx(&tx, key.principal, &stored.view, event_seq, now)?;
         commit_transaction(tx, &self.write_faulted)?;
 
@@ -919,6 +1046,120 @@ impl Store {
         trim_recovery_admission_page(&mut admissions)?;
         Ok(admissions)
     }
+}
+
+fn load_last_rule_action_outcome(
+    tx: &Transaction<'_>,
+    principal: &str,
+    rule: &str,
+) -> Result<Option<core::api::RuleLastOutcome>> {
+    let retained: Option<(String, i64, Option<String>)> = tx
+        .query_row(
+            "SELECT action.state, action.updated_at, action.outcome
+             FROM commands action
+             JOIN commands parent ON parent.id = action.parent_command
+             WHERE action.principal = ?1 AND parent.principal = ?1
+               AND action.link_kind = 'rule_action' AND action.ordinal IS NOT NULL
+               AND action.state IN ('applied', 'rejected', 'failed', 'cancelled', 'unknown')
+               AND parent.verb IN ('rule', 'timer.run', 'rule.catch_up')
+               AND json_extract(parent.args, '$.rule') = ?2
+             ORDER BY action.updated_at DESC, action.id DESC LIMIT 1",
+            params![principal, rule],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    let Some((state, settled_at, encoded_outcome)) = retained else {
+        return Ok(None);
+    };
+    let state = serde_json::from_value::<CommandState>(json!(state))
+        .map_err(|_| Error::new("source_integrity", "stored rule action state is invalid"))?;
+    let outcome = encoded_outcome.as_deref().map(decode_json).transpose()?;
+    let process = outcome.as_ref().and_then(|value| value.get("process"));
+    let exit_code = process
+        .and_then(|process| process.get("direct_exit"))
+        .and_then(|direct_exit| direct_exit.get("exit_code"))
+        .and_then(Value::as_i64)
+        .and_then(|code| i32::try_from(code).ok());
+    let stderr = process
+        .and_then(|process| process.get("stderr"))
+        .cloned()
+        .and_then(|value| serde_json::from_value::<core::StderrSnapshot>(value).ok())
+        .map(|mut snapshot| {
+            let original = std::mem::take(&mut snapshot.text);
+            let excerpt = original
+                .lines()
+                .take(core::api::MAX_RULE_SHOW_STDERR_LINES)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let bounded = core::bound_chars(&excerpt, core::api::MAX_RULE_SHOW_STDERR_BYTES);
+            snapshot.truncated |= bounded.len() != original.len();
+            snapshot.text = bounded;
+            snapshot
+        });
+    Ok(Some(core::api::RuleLastOutcome {
+        settled_at,
+        state,
+        exit_code,
+        stderr,
+    }))
+}
+
+fn load_last_rule_refusal(
+    tx: &Transaction<'_>,
+    principal: &str,
+    rule: &str,
+    project: Option<&str>,
+) -> Result<Option<core::api::RuleLastRefusal>> {
+    let retained: Option<(i64, i64, String)> = tx
+        .query_row(
+            "SELECT event.seq, event.ts, event.data FROM events event
+             WHERE event.kind = 'rule.rejected'
+               AND json_extract(event.data, '$.rule') = ?1
+               AND COALESCE(json_extract(event.data, '$.event_seq'),
+                            json_extract(event.data, '$.through_seq')) > 0
+               AND (
+                   (json_type(event.data, '$.project') IS NOT NULL
+                    AND json_extract(event.data, '$.project') IS ?2)
+                   OR (json_type(event.data, '$.project') IS NULL AND EXISTS (
+                       SELECT 1 FROM commands parent
+                       WHERE parent.id = json_extract(event.data, '$.parent_command')
+                         AND parent.principal = ?3
+                         AND parent.verb IN ('rule', 'rule.catch_up')
+                         AND json_extract(parent.args, '$.rule') = ?1
+                   ))
+               )
+             ORDER BY event.seq DESC LIMIT 1",
+            params![rule, project, principal],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    let Some((recorded_event_seq, at, encoded_data)) = retained else {
+        return Ok(None);
+    };
+    let data = decode_json(&encoded_data)?;
+    let code = data
+        .get("code")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::new("source_integrity", "retained rule refusal has no code"))?;
+    let event_seq = data
+        .get("event_seq")
+        .and_then(Value::as_i64)
+        .or_else(|| data.get("through_seq").and_then(Value::as_i64))
+        .ok_or_else(|| Error::new("source_integrity", "retained rule refusal has no event"))?;
+    let reason = data
+        .get("message")
+        .and_then(Value::as_str)
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or(code);
+    Ok(Some(core::api::RuleLastRefusal {
+        event_seq,
+        recorded_event_seq,
+        at,
+        code: code.to_owned(),
+        reason: core::bound_chars(reason, core::api::MAX_RULE_REJECTION_MESSAGE_BYTES),
+    }))
 }
 
 fn validate_principal_rule(principal: &str, rule: &str) -> Result<()> {
@@ -1011,6 +1252,14 @@ fn validate_project_rule_action_tx(
     principal: &str,
     request: &SubmitCommand,
 ) -> Result<Option<core::api::ProjectRegistrationView>> {
+    if (request.probe || matches!(request.verb.as_str(), "compact" | "switch"))
+        && principal != "owner"
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "provider probes, compact and switch rule actions require the Owner principal",
+        ));
+    }
     if request.verb == "launch" {
         return super::projects::validate_project_rule_launch_action_tx(
             tx,
@@ -1734,6 +1983,15 @@ fn valid_event_rule_action_request(request: &SubmitCommand) -> bool {
     if request.verb == "inject" {
         return valid_inject_request(request);
     }
+    if request.verb == "compact" {
+        return valid_compact_rule_action_request(request);
+    }
+    if request.verb == "switch" {
+        return valid_switch_rule_action_request(request);
+    }
+    if request.probe {
+        return valid_probe_send_rule_action_request(request);
+    }
     let reply = is_request_reply_verb(request.verb.as_str());
     if request.verb != "steer" && !reply {
         return valid_rule_action_request(request, true);
@@ -1793,7 +2051,7 @@ fn valid_inject_request(request: &SubmitCommand) -> bool {
             .expected_turn_id
             .as_deref()
             .is_some_and(|turn_id| !turn_id.is_empty()),
-        eliot_core::InjectPoint::ActiveTurn => false,
+        eliot_core::InjectPoint::ActiveTurn => request.expected_turn_id.is_some(),
     }
 }
 
@@ -2209,6 +2467,95 @@ struct StoredRuleTrigger {
     cause: Option<core::EventCause>,
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuleSwitchActionArgs {
+    #[serde(default)]
+    commands: Vec<String>,
+    launch: core::api::SwitchLaunch,
+}
+
+fn parse_rule_switch_args(args: &Value) -> Result<RuleSwitchActionArgs> {
+    let parsed: RuleSwitchActionArgs = serde_json::from_value(args.clone())
+        .map_err(|_| Error::new("invalid", "switch action args are malformed"))?;
+    if parsed.commands.len() > core::api::MAX_HANDOFF_SENDS {
+        return Err(Error::new(
+            "fanout_limit",
+            "switch action exceeds the handoff command limit",
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    if parsed
+        .commands
+        .iter()
+        .any(|id| core::validate_command_id(id).is_err() || !seen.insert(id))
+    {
+        return Err(Error::new(
+            "invalid",
+            "switch action commands must be distinct valid command IDs",
+        ));
+    }
+    parsed.launch.validate()?;
+    Ok(parsed)
+}
+
+fn valid_compact_rule_action_request(request: &SubmitCommand) -> bool {
+    request.validate().is_ok()
+        && request.verb == "compact"
+        && request
+            .target
+            .as_deref()
+            .is_some_and(|target| core::parse_agent_id(target).is_ok())
+        && request
+            .expected_generation
+            .is_some_and(|generation| generation > 0)
+        && request.expected_turn_id.is_none()
+        && request.request_id.is_none()
+        && request.selector.is_none()
+        && !request.probe
+        && request.args.as_object().is_some_and(|args| args.is_empty())
+}
+
+fn valid_probe_send_rule_action_request(request: &SubmitCommand) -> bool {
+    request.validate().is_ok()
+        && request.verb == "send"
+        && request
+            .target
+            .as_deref()
+            .is_some_and(|target| core::parse_agent_id(target).is_ok())
+        && request
+            .expected_generation
+            .is_some_and(|generation| generation > 0)
+        && request.expected_turn_id.is_none()
+        && request.request_id.is_none()
+        && request.selector.is_none()
+        && request.probe
+        && request
+            .args
+            .as_object()
+            .is_some_and(|args| args.len() == 1 && args.get("text").is_some_and(Value::is_string))
+}
+
+fn valid_switch_rule_action_request(request: &SubmitCommand) -> bool {
+    request.validate().is_ok()
+        && request.verb == "switch"
+        && request
+            .target
+            .as_deref()
+            .is_some_and(|target| core::parse_agent_id(target).is_ok())
+        && request
+            .expected_generation
+            .is_some_and(|generation| generation > 0)
+        && request
+            .expected_turn_id
+            .as_deref()
+            .is_some_and(|turn_id| !turn_id.is_empty())
+        && request.request_id.is_none()
+        && request.selector.is_none()
+        && !request.probe
+        && parse_rule_switch_args(&request.args).is_ok()
+}
+
 fn rule_action_binding_error(event: &StoredRuleTrigger, request: &SubmitCommand) -> Option<String> {
     if !valid_event_rule_action_request(request) {
         return Some("rule_action_binding_invalid".to_owned());
@@ -2223,8 +2570,8 @@ fn rule_action_binding_error(event: &StoredRuleTrigger, request: &SubmitCommand)
         || request.expected_generation != event.generation
         || ((matches!(
             request.verb.as_str(),
-            "interrupt" | "steer" | "approve" | "deny" | "answer"
-        ) || (request.verb == "inject" && request.args["point"] == "turn_safe_point"))
+            "interrupt" | "steer" | "approve" | "deny" | "answer" | "switch"
+        ) || (request.verb == "inject" && request.args["point"] != "next_input"))
             && request.expected_turn_id.as_deref() != event.turn_id.as_deref())
         || (is_request_reply_verb(request.verb.as_str())
             && (event.kind != "request.opened"
@@ -2262,6 +2609,15 @@ fn should_suppress_own_event_send_or_run_tx(
     {
         return Ok(false);
     }
+    rule_event_originates_from_rule_tx(tx, principal, rule, trigger_cause)
+}
+
+fn rule_event_originates_from_rule_tx(
+    tx: &Transaction<'_>,
+    principal: &str,
+    rule: &str,
+    trigger_cause: Option<&core::EventCause>,
+) -> Result<bool> {
     let Some(cause) = trigger_cause else {
         return Ok(false);
     };
@@ -2446,32 +2802,72 @@ fn capacity_metadata(error: &Error) -> Option<(&str, &str)> {
     .then_some((error.message.as_str(), "store.admission.capacity"))
 }
 
+fn bounded_rule_rejection_message(message: &str, code: &str) -> String {
+    let message = if message.trim().is_empty() {
+        code
+    } else {
+        message
+    };
+    core::bound_chars(message, core::api::MAX_RULE_REJECTION_MESSAGE_BYTES)
+}
+
 fn rule_rejection_event(
     tx: &Transaction<'_>,
-    rule: &str,
+    state: &core::api::RuleStateView,
     revision: i64,
     range: std::ops::RangeInclusive<i64>,
-    code: &str,
-    capacity: Option<(&str, &str)>,
+    error: &Error,
     now: i64,
 ) -> Result<Option<Event>> {
-    validate_rule_rejection_code(code)?;
+    validate_rule_rejection_code(&error.code)?;
     let trigger = load_rule_trigger(tx, *range.end())?;
     if trigger.kind.starts_with("rule.") || next_rule_cause_depth(trigger.cause.as_ref()) > 5 {
         return Ok(None);
     }
     let mut data = json!({
-        "rule": rule,
+        "rule": state.id,
+        "project": state.project,
         "revision": revision,
         "from_seq": range.start(),
         "through_seq": range.end(),
-        "code": code,
+        "code": error.code,
+        "message": bounded_rule_rejection_message(&error.message, &error.code),
     });
-    if let Some((message, failure_where)) = capacity {
-        data["message"] = json!(message);
+    if let Some((_, failure_where)) = capacity_metadata(error) {
         data["where"] = json!(failure_where);
     }
     insert_rule_event_with_cause(tx, now, "rule.rejected", data, trigger.cause).map(Some)
+}
+
+struct RuleSkip {
+    event_seq: i64,
+    cause_depth: u8,
+    self_cause: bool,
+}
+
+fn insert_rule_skipped_event(
+    tx: &Transaction<'_>,
+    now: i64,
+    state: &core::api::RuleStateView,
+    revision: i64,
+    skipped: RuleSkip,
+    cause: Option<core::EventCause>,
+) -> Result<Event> {
+    let reason = if skipped.cause_depth > 5 {
+        "cause_depth"
+    } else {
+        "self_cause"
+    };
+    let data = json!({
+        "rule": state.id,
+        "project": state.project,
+        "revision": revision,
+        "event_seq": skipped.event_seq,
+        "reason": reason,
+        "self_cause": skipped.self_cause,
+        "cause_depth": skipped.cause_depth,
+    });
+    insert_rule_event_with_cause(tx, now, "rule.skipped", data, cause)
 }
 
 fn insert_rule_parent(
@@ -2496,11 +2892,11 @@ fn insert_rule_parent(
         Some(code) => json!({"children": child_ids, "code": code}),
         None => json!({"children": child_ids}),
     };
-    if let RuleParentOutcome::Rejected { error } = &outcome_kind
-        && let Some((message, where_)) = capacity_metadata(error)
-    {
-        outcome["message"] = json!(message);
-        outcome["where"] = json!(where_);
+    if let RuleParentOutcome::Rejected { error } = &outcome_kind {
+        outcome["message"] = json!(bounded_rule_rejection_message(&error.message, &error.code,));
+        if let Some((_, where_)) = capacity_metadata(error) {
+            outcome["where"] = json!(where_);
+        }
     }
     if rejection_code.is_none()
         && let Some(script_context) = &key.script_context
@@ -2579,26 +2975,111 @@ fn admit_rule_action_tx(
     now: i64,
     limits: core::api::HierarchyLimits,
     policy: Option<&capacity::PolicyLoader>,
+    secret_policy: Option<&core::SecretPolicy>,
 ) -> Result<(Command, Admission, Vec<Event>)> {
+    if (request.probe || matches!(request.verb.as_str(), "compact" | "switch"))
+        && key.principal != "owner"
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "provider probes, compact and switch rule actions require the Owner principal",
+        ));
+    }
     let parent_cause = key.command_cause(&key.parent_id)?;
     let child_cause = key.command_cause(&key.child_id)?;
     request.id = key.child_id.clone();
-    let preparation = rule_launch_preparation(&request)?;
-    // Ordinary admission may have inserted an Agent/cursor before a later
-    // transactional capacity gate refuses it. A rejected firing must retain
-    // none of those partial writes when its rejection is committed.
+    // Reserve a Switch through its existing Owner-only durable workflow. The
+    // exact event turn resolves to its committed original SEND in this
+    // transaction; no prompt is reconstructed or replayed here.
     tx.execute_batch("SAVEPOINT rule_child_admission")
         .map_err(sql_error)?;
-    let mut child_admission = match admission::submit_tx(
-        tx,
-        key.principal,
-        request,
-        preparation,
-        now,
-        true,
-        limits,
-        policy,
-    ) {
+    let child_admission_result = if request.verb == "switch" {
+        (|| {
+            let secret_policy = secret_policy.ok_or_else(|| {
+                Error::new(
+                    "not_allowed",
+                    "rule switch requires the Owner secret policy",
+                )
+            })?;
+            let RuleFiringIdentity::Event { .. } = key.identity else {
+                return Err(Error::new(
+                    "unsupported",
+                    "switch actions require an event rule",
+                ));
+            };
+            let from = request
+                .target
+                .as_deref()
+                .ok_or_else(|| Error::new("invalid", "switch action target is missing"))?;
+            let from_generation = request
+                .expected_generation
+                .ok_or_else(|| Error::new("invalid", "switch action generation is missing"))?;
+            let turn_id = request
+                .expected_turn_id
+                .as_deref()
+                .ok_or_else(|| Error::new("invalid", "switch action turn binding is missing"))?;
+            let agent_num = core::parse_agent_id(from)?;
+            let task_command: Option<String> = tx
+                .query_row(
+                    "SELECT json_extract(data, '$.command_id') FROM events
+                     WHERE agent = ?1 AND generation = ?2 AND kind = 'turn.started'
+                       AND json_extract(data, '$.turn_id') = ?3
+                     ORDER BY seq DESC LIMIT 1",
+                    params![agent_num, from_generation, turn_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(sql_error)?;
+            let task_command = task_command.ok_or_else(|| {
+                Error::new(
+                    "not_found",
+                    "switch event turn has no retained original command",
+                )
+            })?;
+            let action = parse_rule_switch_args(&request.args)?;
+            let switch_request = core::api::SwitchRequest {
+                id: request.id.clone(),
+                from: from.to_owned(),
+                from_generation,
+                task_command,
+                commands: action.commands,
+                launch: action.launch,
+            };
+            let change = super::switch::reserve_rule_switch_tx(
+                tx,
+                key.principal,
+                &switch_request,
+                limits,
+                secret_policy,
+                now,
+            )?;
+            let command = load_command(tx, &request.id)?.ok_or_else(|| {
+                Error::new(
+                    "source_integrity",
+                    "reserved rule switch command disappeared",
+                )
+            })?;
+            Ok(Admission {
+                command,
+                linked_command: None,
+                events: change.events,
+                is_new: true,
+            })
+        })()
+    } else {
+        let preparation = rule_launch_preparation(&request)?;
+        admission::submit_tx(
+            tx,
+            key.principal,
+            request,
+            preparation,
+            now,
+            true,
+            limits,
+            policy,
+        )
+    };
+    let mut child_admission = match child_admission_result {
         Ok(admission) => {
             tx.execute_batch("RELEASE rule_child_admission")
                 .map_err(sql_error)?;

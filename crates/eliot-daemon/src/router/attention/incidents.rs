@@ -3,7 +3,7 @@
 use super::{
     ActiveIncident, AgentKey, AttentionReport, AttentionState, CapturedAgent, FrozenReport,
     IncidentKey, IncidentKind, NativeStatus, ReportContext, ReportPhase, Router,
-    delivery::{persist_and_notify, persist_loss_delivery},
+    delivery::{attention_thread, persist_and_notify, persist_loss_delivery},
     observe::{build_report, child_capture_is_current, process_observation, source_is_unhealthy},
 };
 use crate::common::now_ms;
@@ -149,10 +149,7 @@ fn record_obsolete_delivery(key: &IncidentKey, phase: &str, error: &Error) {
 }
 
 /// Whether the retained loss incident needs no further work: its incident
-/// event is already committed and every expected notice is already
-/// delivered. Expected notices are the advisory subject copy, plus the
-/// supervisor escalation for a parented subject or the owner notice
-/// otherwise. A post-restart re-report that finds this state is a no-op.
+/// event and its manager or Owner notice already committed.
 pub(super) async fn loss_report_already_complete(
     router: &Router,
     incident_id: &str,
@@ -162,30 +159,15 @@ pub(super) async fn loss_report_already_complete(
     if !store.attention_incident_exists(incident_id)? {
         return Ok(false);
     }
-    let escalation_thread = Some(format!(
-        "attention-{}",
-        &incident_id[..20.min(incident_id.len())]
-    ));
-    let advisory_thread = escalation_thread
-        .as_deref()
-        .map(|thread| format!("{thread}-advisory"));
-    let Some(advisory_thread) = advisory_thread else {
-        return Ok(false);
-    };
-    if !store.attention_thread_mailed_to(&advisory_thread, &agent.id)? {
-        return Ok(false);
+    if !router.attention_config().agent_lost.enabled {
+        return Ok(true);
     }
-    if let Some(parent) = agent.parent.as_deref().filter(|parent| *parent != agent.id) {
-        let Some(escalation_thread) = escalation_thread.as_deref() else {
-            return Ok(false);
-        };
-        if !store.attention_thread_mailed_to(escalation_thread, parent)? {
-            return Ok(false);
-        }
-    } else if !store.attention_owner_notice_exists(incident_id)? {
-        return Ok(false);
+    if let Some(parent) = agent.parent.as_deref()
+        && store.attention_thread_mailed_to(&attention_thread(incident_id), parent)?
+    {
+        return Ok(true);
     }
-    Ok(true)
+    store.attention_owner_notice_exists(incident_id)
 }
 
 /// Deliver the frozen loss incident, then drop it from the active set.
@@ -198,6 +180,12 @@ pub(super) async fn persist_loss_report(
     state: &Arc<Mutex<AttentionState>>,
     key: &IncidentKey,
 ) -> Result<()> {
+    let resume_enabled = state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .config
+        .agent_lost
+        .enabled;
     let Some((incident_id, delivery)) = ({
         let state = state.lock().unwrap_or_else(|error| error.into_inner());
         state.active.get(key).map(|incident| {
@@ -210,7 +198,7 @@ pub(super) async fn persist_loss_report(
         return Ok(());
     };
     if let Some(delivery) = delivery {
-        if let Err(error) = persist_loss_delivery(router, &delivery).await {
+        if let Err(error) = persist_loss_delivery(router, &delivery, resume_enabled).await {
             if matches!(error.code.as_str(), "stale_generation" | "not_found") {
                 let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
                 if state
@@ -481,7 +469,6 @@ pub(super) fn freeze_report(report: AttentionReport) -> FrozenReport {
     FrozenReport {
         report,
         emit_command_id: ulid::Ulid::new().to_string(),
-        affected_mail_id: ulid::Ulid::new().to_string(),
         supervisor_mail_id: ulid::Ulid::new().to_string(),
         owner_notify_id: ulid::Ulid::new().to_string(),
     }
@@ -499,12 +486,6 @@ pub(super) fn freeze_loss_report(report: AttentionReport, loss_event_ts_ms: i64)
     };
     FrozenReport {
         emit_command_id: attention_ulid(&report.incident_id, phase, "emit", loss_event_ts_ms),
-        affected_mail_id: attention_ulid(
-            &report.incident_id,
-            phase,
-            "affected-mail",
-            loss_event_ts_ms,
-        ),
         supervisor_mail_id: attention_ulid(
             &report.incident_id,
             phase,
@@ -521,7 +502,7 @@ pub(super) fn freeze_loss_report(report: AttentionReport, loss_event_ts_ms: i64)
     }
 }
 
-fn attention_ulid(incident_id: &str, phase: &str, purpose: &str, ts_ms: i64) -> String {
+pub(super) fn attention_ulid(incident_id: &str, phase: &str, purpose: &str, ts_ms: i64) -> String {
     let mut digest = Sha256::new();
     for part in ["attention-mutation-id", incident_id, phase, purpose] {
         digest.update((part.len() as u64).to_le_bytes());
@@ -554,7 +535,8 @@ pub(super) async fn deliver_active_incident(
         // Stale evidence (Agent gone or generation moved between capture
         // and commit) is classified, not retried: drop the frozen delivery
         // so an unchanged superseded incident cannot produce further wakes.
-        if let Err(error) = persist_and_notify(router, &delivery).await {
+        let result = persist_and_notify(router, &delivery).await;
+        if let Err(error) = result {
             if matches!(error.code.as_str(), "stale_generation" | "not_found") {
                 let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
                 if state
@@ -588,9 +570,12 @@ pub(super) async fn deliver_active_incident(
 
 pub(super) fn desired_incident(
     captured: &CapturedAgent,
-    suspicion_window: Duration,
+    config: &crate::config::AttentionConfig,
 ) -> Option<(IncidentKey, String)> {
-    if let Some(activity) = child_attention_activity(captured, suspicion_window) {
+    let children_window = super::attention_duration(config.children_unattended.threshold_secs);
+    if config.children_unattended.enabled
+        && let Some(activity) = child_attention_activity(captured, children_window)
+    {
         return Some((
             IncidentKey {
                 agent: captured.agent.id.clone(),
@@ -601,7 +586,8 @@ pub(super) fn desired_incident(
             activity.to_owned(),
         ));
     }
-    if captured.agent.state != AgentState::Stopped
+    if config.source_unhealthy.enabled
+        && captured.agent.state != AgentState::Stopped
         && source_is_unhealthy(captured.agent.state, &captured.source_states)
     {
         return Some((
@@ -614,11 +600,11 @@ pub(super) fn desired_incident(
             activity_context(captured),
         ));
     }
-    let threshold_ms = i64::try_from(suspicion_window.as_millis()).ok()?;
-    // Working without writing code: activity continues (a silent turn is
-    // `no_progress` below) while neither a write nor a commit landed for
-    // the window since the turn started (`docs/spec/monitoring.md`).
-    if !is_read_only_or_audit_profile(&captured.agent)
+
+    let no_code_window = super::attention_duration(config.no_code_progress.threshold_secs);
+    let no_code_threshold_ms = i64::try_from(no_code_window.as_millis()).ok()?;
+    if config.no_code_progress.enabled
+        && !is_read_only_or_audit_profile(&captured.agent)
         && captured.agent.workspace.is_some()
         && captured.agent.state == AgentState::Busy
         && captured.source_healthy == Some(true)
@@ -626,11 +612,11 @@ pub(super) fn desired_incident(
         && captured.agent.pending.is_empty()
         && captured
             .progress_age_ms
-            .is_some_and(|age| age < threshold_ms)
+            .is_some_and(|age| age < no_code_threshold_ms)
         && code_progress_basis(captured).is_some_and(|at| {
             now_ms()
                 .checked_sub(at)
-                .is_some_and(|age| age >= threshold_ms)
+                .is_some_and(|age| age >= no_code_threshold_ms)
         })
     {
         let activity = "no_code_progress".to_owned();
@@ -644,7 +630,12 @@ pub(super) fn desired_incident(
             activity,
         ));
     }
-    let threshold_ms = i64::try_from(suspicion_window.as_millis()).ok()?;
+
+    if !config.no_progress.enabled {
+        return None;
+    }
+    let no_progress_window = super::attention_duration(config.no_progress.threshold_secs);
+    let threshold_ms = i64::try_from(no_progress_window.as_millis()).ok()?;
     if captured.agent.state != AgentState::Busy
         || captured.agent.active_turn.is_none()
         || captured.source_healthy != Some(true)
@@ -663,10 +654,9 @@ pub(super) fn desired_incident(
             kind: IncidentKind::NoProgress,
             turn_id: Some(turn_id),
         },
-        activity_classification(captured, suspicion_window),
+        activity_classification(captured, no_progress_window),
     ))
 }
-
 /// When the active turn last made code progress: the later of the
 /// worktree's last write or commit and the turn's start. `None` unless the
 /// current Git observation is usable: an unavailable probe (for example a
@@ -759,6 +749,24 @@ pub(super) fn activity_context(captured: &CapturedAgent) -> String {
 }
 
 pub(super) fn incident_id(captured: &CapturedAgent, kind: IncidentKind, activity: &str) -> String {
+    if matches!(kind, IncidentKind::NoProgress | IncidentKind::CodeProgress) {
+        let turn_id = captured.agent.active_turn.as_deref().unwrap_or_default();
+        let baseline = match kind {
+            IncidentKind::NoProgress => captured.progress_basis_at,
+            IncidentKind::CodeProgress => code_progress_basis(captured),
+            _ => None,
+        }
+        .map(|at| at.to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
+        return digest_id(&[
+            "attention-time-incident",
+            kind.as_str(),
+            captured.agent.id.as_str(),
+            &captured.agent.generation.to_string(),
+            turn_id,
+            &baseline,
+        ]);
+    }
     let identity = incident_identity(captured, kind, activity);
     digest_id(&[&identity, &ulid::Ulid::new().to_string()])
 }

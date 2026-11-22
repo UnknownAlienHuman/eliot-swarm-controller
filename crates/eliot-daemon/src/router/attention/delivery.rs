@@ -3,7 +3,7 @@
 use super::super::Principal;
 use super::{AttentionReport, FrozenReport, ReportPhase, Router};
 use eliot_core::api::{EmitDefinitionArgs, MailMode, MailSendRequest};
-use eliot_core::{CommandState, Error, Result};
+use eliot_core::{Agent, AgentState, AttentionStep, CommandState, Error, Result};
 use serde_json::{Value, json};
 use std::time::Duration;
 use tokio::time::timeout;
@@ -26,8 +26,22 @@ impl Router {
     }
 }
 
-pub(super) async fn persist_and_notify(router: &Router, delivery: &FrozenReport) -> Result<()> {
+pub(super) async fn persist_report_event(router: &Router, delivery: &FrozenReport) -> Result<()> {
     let report = &delivery.report;
+    let phase = match report.phase {
+        ReportPhase::Incident => "incident",
+        ReportPhase::Recovery => "recovery",
+    };
+    if router
+        .inner
+        .store
+        .lock()
+        .await
+        .attention_report_event(&report.incident_id, phase)?
+        .is_some()
+    {
+        return Ok(());
+    }
     let data = serde_json::to_value(report)
         .map_err(|_| Error::new("internal", "attention report could not be encoded"))?;
     let request = EmitDefinitionArgs {
@@ -41,25 +55,55 @@ pub(super) async fn persist_and_notify(router: &Router, delivery: &FrozenReport)
         store.get_command(&delivery.emit_command_id)?.is_some()
     };
     if !already_admitted {
-        // Only the internal attention verb reaches the bound commit; a public
-        // emit naming the reserved topic is rejected at admission.
         router
             .submit_attention_event(
                 &json!({"id": delivery.emit_command_id.clone(), "verb": "attention.emit", "args": args}),
             )
             .await?;
     }
-    wait_for_applied(router, &delivery.emit_command_id).await?;
-    send_notice(router, delivery).await?;
-    Ok(())
+    match wait_for_applied(router, &delivery.emit_command_id).await {
+        Ok(()) => Ok(()),
+        Err(_)
+            if router
+                .inner
+                .store
+                .lock()
+                .await
+                .attention_report_event(&report.incident_id, phase)?
+                .is_some() =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
+pub(super) async fn persist_and_notify(router: &Router, delivery: &FrozenReport) -> Result<()> {
+    persist_report_event(router, delivery).await?;
+    if matches!(
+        delivery.report.reason.as_str(),
+        "no_progress" | "no_code_progress"
+    ) {
+        return Ok(());
+    }
+    send_notice(
+        router,
+        &delivery.report,
+        &delivery.supervisor_mail_id,
+        &delivery.owner_notify_id,
+    )
+    .await
+}
 /// Persist one frozen loss-evidence delivery. The deterministic mutation ids
 /// replay the retained emit when this loss was already reported (a retained
 /// command binding skips submission entirely), and per-thread presence skips
 /// mail that is already delivered, so a crash between the emit commit and
 /// notice delivery — or a restart re-report — cannot duplicate the incident.
-pub(super) async fn persist_loss_delivery(router: &Router, delivery: &FrozenReport) -> Result<()> {
+pub(super) async fn persist_loss_delivery(
+    router: &Router,
+    delivery: &FrozenReport,
+    resume_enabled: bool,
+) -> Result<()> {
     let report = &delivery.report;
     let data = serde_json::to_value(report)
         .map_err(|_| Error::new("internal", "attention report could not be encoded"))?;
@@ -87,6 +131,28 @@ pub(super) async fn persist_loss_delivery(router: &Router, delivery: &FrozenRepo
         return Err(error);
     }
     wait_for_applied(router, &delivery.emit_command_id).await?;
+    if !resume_enabled {
+        return Ok(());
+    }
+    if let Some(event_seq) = report.trigger_event_seq {
+        router
+            .resume_after_process_loss(
+                &report.agent_id,
+                report.generation,
+                event_seq,
+                &report.incident_id,
+            )
+            .await?;
+        let command_id = {
+            let store = router.inner.store.lock().await;
+            store
+                .attention_step_event(&report.incident_id, "resume_after_process_loss")?
+                .and_then(|event| event.data["command_id"].as_str().map(str::to_owned))
+        };
+        if let Some(command_id) = command_id {
+            let _ = wait_for_applied(router, &command_id).await;
+        }
+    }
     send_loss_notice(router, delivery).await?;
     Ok(())
 }
@@ -167,339 +233,210 @@ async fn wait_for_applied(router: &Router, command_id: &str) -> Result<()> {
     .map_err(|_| Error::new("unknown", "attention event settlement deadline elapsed"))?
 }
 
-/// Shared notice text and threads for one frozen report: the inbox text, the
-/// escalation thread (which wakes an eligible idle recipient at most once
-/// per thread), and the subject copy thread (advisory and never waking,
-/// except for a `children_unattended` report addressed to the manager
-/// itself, whose subject copy is the actionable escalation).
-fn attention_notice_parts(report: &AttentionReport) -> (String, Option<String>, Option<String>) {
-    let phase_label = match report.phase {
-        ReportPhase::Incident => "report",
-        ReportPhase::Recovery => "recovery",
-    };
-    let diagnosis = diagnosis_summary(report);
-    let text = format!(
-        "Eliot attention {phase_label} for Agent {} generation {}. Incident {}. {diagnosis} See the structured x.user.agent.attention event for details.",
-        report.agent_id, report.generation, report.incident_id,
-    );
-    let escalation_thread = Some(format!(
-        "attention-{}",
-        &report.incident_id[..20.min(report.incident_id.len())]
-    ));
-    let affected_thread = if report.reason == "children_unattended" {
-        escalation_thread.clone()
-    } else {
-        escalation_thread
-            .as_deref()
-            .map(|thread| format!("{thread}-advisory"))
-    };
-    (text, escalation_thread, affected_thread)
+pub(super) fn attention_thread(incident_id: &str) -> String {
+    let prefix: String = incident_id.chars().take(20).collect();
+    format!("attention-{prefix}")
 }
 
-async fn send_notice(router: &Router, delivery: &FrozenReport) -> Result<()> {
-    let report = &delivery.report;
-    // The subject's own copy is advisory: durable in its inbox for voluntary
-    // reads and acknowledgement, but never wakes it (the Store excludes the
-    // `-advisory` thread from mail wake claims and reoffer pages). A
-    // `children_unattended` report is addressed to the manager itself, so its
-    // subject copy is the actionable escalation and keeps the waking thread.
-    // At most one incident and one recovery notice are ever sent per
-    // incident, and the Store spends each escalation thread's wake only once,
-    // so an unchanged unread set cannot produce further wakes.
-    let (text, escalation_thread, affected_thread) = attention_notice_parts(report);
-    let affected = MailSendRequest {
-        id: delivery.affected_mail_id.clone(),
-        to: vec![report.agent_id.clone()],
-        mode: MailMode::Queue,
-        text: text.clone(),
-        thread: affected_thread,
-        reply_to_delivery: None,
+async fn notice_recipient(router: &Router, candidate: Option<&str>) -> Result<Option<String>> {
+    let Some(candidate) = candidate else {
+        return Ok(None);
     };
-    let mut delivery_errors = Vec::with_capacity(2);
-    match serde_json::to_value(affected) {
-        Ok(affected) => {
-            if let Err(error) = router.mail_send(&affected, &Principal::Owner).await {
-                delivery_errors.push(format!("affected_mail:{}", error.code));
-            }
-        }
-        Err(_) => delivery_errors.push("affected_mail:encode".to_owned()),
-    }
+    let store = router.inner.store.lock().await;
+    Ok(store
+        .get_agent(candidate)?
+        .filter(|agent| {
+            !agent.observe_only
+                && matches!(
+                    agent.state,
+                    AgentState::Idle | AgentState::Busy | AgentState::Waiting
+                )
+        })
+        .map(|agent| agent.id))
+}
 
-    if let Some(parent) = report
-        .parent_agent
-        .as_ref()
-        .filter(|parent| *parent != &report.agent_id && report.reason != "children_unattended")
-    {
-        let supervisor = MailSendRequest {
-            id: delivery.supervisor_mail_id.clone(),
-            to: vec![parent.clone()],
+pub(super) async fn send_notice(
+    router: &Router,
+    report: &AttentionReport,
+    mail_id: &str,
+    owner_id: &str,
+) -> Result<()> {
+    let candidate = if report.reason == "children_unattended" {
+        Some(report.agent_id.as_str())
+    } else {
+        report.parent_agent.as_deref()
+    };
+    let title = match report.phase {
+        ReportPhase::Incident => "Agent attention",
+        ReportPhase::Recovery => "Agent attention recovered",
+    };
+    route_notice(
+        router,
+        candidate,
+        mail_id,
+        owner_id,
+        &report.incident_id,
+        title,
+        attention_summary(report),
+    )
+    .await
+}
+
+async fn route_notice(
+    router: &Router,
+    candidate: Option<&str>,
+    mail_id: &str,
+    owner_id: &str,
+    incident_id: &str,
+    title: &str,
+    text: String,
+) -> Result<()> {
+    if let Some(recipient) = notice_recipient(router, candidate).await? {
+        let request = MailSendRequest {
+            id: mail_id.to_owned(),
+            to: vec![recipient],
             mode: MailMode::Queue,
             text,
-            thread: escalation_thread,
+            thread: Some(attention_thread(incident_id)),
             reply_to_delivery: None,
         };
-        match serde_json::to_value(supervisor) {
-            Ok(supervisor) => {
-                if let Err(error) = router.mail_send(&supervisor, &Principal::Owner).await {
-                    delivery_errors.push(format!("supervisor_mail:{}", error.code));
-                }
-            }
-            Err(_) => delivery_errors.push("supervisor_mail:encode".to_owned()),
-        }
+        let params = serde_json::to_value(request)
+            .map_err(|_| Error::new("internal", "attention mail could not be encoded"))?;
+        router.mail_send(&params, &Principal::Owner).await?;
     } else {
-        let title = match report.phase {
-            ReportPhase::Incident => "Agent attention",
-            ReportPhase::Recovery => "Agent attention recovered",
-        };
-        let diagnosis = diagnosis_summary(report);
-        let message = format!(
-            "Agent {} generation {}: {} (incident {}). {diagnosis} See the structured x.user.agent.attention event for details.",
-            report.agent_id, report.generation, report.reason, report.incident_id
-        );
-        if let Err(error) = router
+        router
             .submit(
-                &json!({
-                    "id": delivery.owner_notify_id.clone(),
-                    "verb": "notify",
-                    "args": {"title": title, "message": message}
-                }),
+                &json!({"id": owner_id, "verb": "notify", "args": {
+                    "title": title, "message": format!("{text} ({incident_id})")
+                }}),
                 &Principal::Owner,
             )
-            .await
-        {
-            delivery_errors.push(format!("owner_notify:{}", error.code));
-        }
-        if report.reason == "children_unattended"
-            && let Err(error) = wait_for_applied(router, &delivery.owner_notify_id).await
-        {
-            delivery_errors.push(format!("owner_notify_settlement:{}", error.code));
-        }
+            .await?;
+        wait_for_applied(router, owner_id).await?;
     }
-    if delivery_errors.is_empty() {
-        Ok(())
-    } else {
-        Err(Error::new(
-            "unknown",
-            format!(
-                "attention notice delivery incomplete: {}",
-                delivery_errors.join(", ")
-            ),
-        ))
-    }
+    Ok(())
 }
 
-/// Send the notices for one frozen loss-evidence delivery, resending only
-/// what is missing. Mail is skipped when its thread already reached the
-/// recipient (a retained `id_conflict` binding means the notice was already
-/// delivered, possibly acked and pruned since), and the owner notice is
-/// skipped when its command or a notice naming this incident already exists.
-/// A loss incident is never about a `children_unattended` cohort, so the
-/// subject copy is always the advisory thread here.
-async fn send_loss_notice(router: &Router, delivery: &FrozenReport) -> Result<()> {
-    let report = &delivery.report;
-    let (text, escalation_thread, affected_thread) = attention_notice_parts(report);
-    let mut delivery_errors = Vec::with_capacity(2);
-    send_loss_mail(
-        router,
-        &delivery.affected_mail_id,
-        &report.agent_id,
-        affected_thread,
-        text.clone(),
-        &mut delivery_errors,
-        "affected_mail",
-    )
-    .await;
-    if let Some(parent) = report
-        .parent_agent
-        .as_ref()
-        .filter(|parent| *parent != &report.agent_id)
-    {
-        send_loss_mail(
-            router,
-            &delivery.supervisor_mail_id,
-            parent,
-            escalation_thread,
-            text,
-            &mut delivery_errors,
-            "supervisor_mail",
-        )
-        .await;
-    } else {
-        let owner_done = {
-            let store = router.inner.store.lock().await;
-            store.get_command(&delivery.owner_notify_id)?.is_some()
-                || store.attention_owner_notice_exists(&report.incident_id)?
+impl Router {
+    pub(in crate::router) async fn report_session_growth(
+        &self,
+        agent: &Agent,
+        reaction: &AttentionStep,
+    ) -> Result<()> {
+        // Bind the report before routing. The manager's attention thread
+        // needs this committed subject to make its one eligible wake.
+        let emit_id = ulid::Ulid::new().to_string();
+        let args = EmitDefinitionArgs {
+            topic: "agent.attention".to_owned(),
+            data: json!({
+                "schema": 1,
+                "incident_id": reaction.incident_id,
+                "phase": "incident",
+                "reason": "session_growth",
+                "agent_id": agent.id,
+                "generation": agent.generation,
+                "turn_id": reaction.turn_id,
+            }),
         };
-        if !owner_done {
-            let title = match report.phase {
-                ReportPhase::Incident => "Agent attention",
-                ReportPhase::Recovery => "Agent attention recovered",
-            };
-            let diagnosis = diagnosis_summary(report);
-            let message = format!(
-                "Agent {} generation {}: {} (incident {}). {diagnosis} See the structured x.user.agent.attention event for details.",
-                report.agent_id, report.generation, report.reason, report.incident_id
-            );
-            let submit_owner = |id: &str| {
-                let id = id.to_owned();
-                let title = title.to_owned();
-                let message = message.clone();
-                async move {
-                    router
-                        .submit(
-                            &json!({
-                                "id": id,
-                                "verb": "notify",
-                                "args": {"title": title, "message": message}
-                            }),
-                            &Principal::Owner,
-                        )
-                        .await
-                }
-            };
-            if let Err(error) = submit_owner(&delivery.owner_notify_id).await {
-                // The retained evidence can predate the retry window: without
-                // a binding this id cannot be admitted, so fall back to a
-                // fresh owner-notice id once. The incident id stays
-                // deterministic, so the next restart still reconciles by
-                // incident record instead of duplicating.
-                if error.code == "id_expired" && {
-                    let store = router.inner.store.lock().await;
-                    store.get_command(&delivery.owner_notify_id)?.is_none()
-                } {
-                    if let Err(error) = submit_owner(&ulid::Ulid::new().to_string()).await {
-                        delivery_errors.push(format!("owner_notify:{}", error.code));
-                    }
-                } else {
-                    delivery_errors.push(format!("owner_notify:{}", error.code));
-                }
-            }
-        }
-    }
-    if delivery_errors.is_empty() {
-        Ok(())
-    } else {
-        Err(Error::new(
-            "unknown",
-            format!(
-                "attention notice delivery incomplete: {}",
-                delivery_errors.join(", ")
-            ),
-        ))
+        self.submit_attention_event(
+            &json!({"id": emit_id, "verb": "attention.emit", "args": args}),
+        )
+        .await?;
+        wait_for_applied(self, &emit_id).await?;
+        let id = ulid::Ulid::new().to_string();
+        let text = format!(
+            "{} has session growth. Can you check it with swarm show {}?",
+            agent.id, agent.id
+        );
+        route_notice(
+            self,
+            agent.parent.as_deref(),
+            &id,
+            &id,
+            &reaction.incident_id,
+            "Agent attention",
+            text,
+        )
+        .await
     }
 }
 
-/// Send one loss notice unless its thread already reached the recipient. A
-/// retained `id_conflict` binding means the notice was already delivered
-/// (possibly acked and pruned since): re-check presence and skip instead of
-/// duplicating it.
-#[allow(clippy::too_many_arguments)]
-async fn send_loss_mail(
-    router: &Router,
-    mail_id: &str,
-    recipient: &str,
-    thread: Option<String>,
-    text: String,
-    delivery_errors: &mut Vec<String>,
-    label: &str,
-) {
-    let Some(thread) = thread else {
-        return;
-    };
-    let already_mailed = {
-        let store = router.inner.store.lock().await;
-        store.attention_thread_mailed_to(&thread, recipient)
-    };
-    let already_mailed = match already_mailed {
-        Ok(mailed) => mailed,
-        Err(error) => {
-            delivery_errors.push(format!("{label}:{}", error.code));
-            return;
-        }
-    };
-    if already_mailed {
-        return;
-    }
-    let request = MailSendRequest {
-        id: mail_id.to_owned(),
-        to: vec![recipient.to_owned()],
-        mode: MailMode::Queue,
-        text,
-        thread: Some(thread),
-        reply_to_delivery: None,
-    };
-    let encoded = match serde_json::to_value(request) {
-        Ok(encoded) => encoded,
-        Err(_) => {
-            delivery_errors.push(format!("{label}:encode"));
-            return;
-        }
-    };
-    if let Err(error) = router.mail_send(&encoded, &Principal::Owner).await {
-        if error.code == "id_conflict" {
-            let still_missing = {
-                let store = router.inner.store.lock().await;
-                store.attention_thread_mailed_to(
-                    encoded
-                        .get("thread")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default(),
-                    recipient,
-                )
-            };
-            if still_missing.is_ok_and(|missing| !missing) {
-                return;
-            }
-        }
-        delivery_errors.push(format!("{label}:{}", error.code));
-    }
+/// A retained loss has a single manager or Owner notice, even on retries.
+async fn loss_notice_exists(router: &Router, delivery: &FrozenReport) -> Result<bool> {
+    let report = &delivery.report;
+    let store = router.inner.store.lock().await;
+    Ok(store.get_command(&delivery.owner_notify_id)?.is_some()
+        || store.attention_owner_notice_exists(&report.incident_id)?
+        || report.parent_agent.as_deref().map_or(Ok(false), |parent| {
+            store.attention_thread_mailed_to(&attention_thread(&report.incident_id), parent)
+        })?)
 }
 
-fn diagnosis_summary(report: &AttentionReport) -> String {
-    let source_health = match report.source_health {
-        Some(true) => "healthy",
-        Some(false) => "unhealthy",
-        None => "unknown",
-    };
-    let progress_age = report
-        .progress_age_ms
-        .map(|age| age.to_string())
-        .unwrap_or_else(|| "unknown".to_owned());
-    let native_state = report.native_status.state.as_deref().unwrap_or("unknown");
-    let native_error = report.native_status.error_code.as_deref().unwrap_or("none");
-    let process_age = report
-        .process_observation
-        .sample_age_ms
-        .map(|age| age.to_string())
-        .unwrap_or_else(|| "unknown".to_owned());
-    let process_complete = report
-        .process_observation
-        .complete
-        .map(|complete| complete.to_string())
-        .unwrap_or_else(|| "unknown".to_owned());
-    let process_exited = report
-        .native_status
-        .process_exited
-        .map(|exited| exited.to_string())
-        .unwrap_or_else(|| "unknown".to_owned());
-    format!(
-        "Diagnosis: reason={}, activity={}, children_unfinished={}, children_lost={}, children_stalled={}, source_health={}, progress_age_ms={}, native_probe_requested={}, native_state={}, native_error={}, native_basis={}, native_freshness={}, native_binding_matches={}, process_coverage={}, process_sample_age_ms={}, process_complete={}, process_exited={}",
-        report.reason,
-        report.activity,
-        report.children.unfinished,
-        report.children.lost,
-        report.children.stalled,
-        source_health,
-        progress_age,
-        report.native_status.probe_requested,
-        native_state,
-        native_error,
-        report.native_status.basis,
-        report.native_status.freshness,
-        report.native_status.binding_matches,
-        report.process_observation.coverage,
-        process_age,
-        process_complete,
-        process_exited,
+async fn send_loss_notice(router: &Router, delivery: &FrozenReport) -> Result<()> {
+    if loss_notice_exists(router, delivery).await? {
+        return Ok(());
+    }
+    let report = &delivery.report;
+    match send_notice(
+        router,
+        report,
+        &delivery.supervisor_mail_id,
+        &delivery.owner_notify_id,
     )
+    .await
+    {
+        Err(error)
+            if error.code == "id_conflict" && loss_notice_exists(router, delivery).await? =>
+        {
+            Ok(())
+        }
+        Err(error)
+            if error.code == "id_expired" && !loss_notice_exists(router, delivery).await? =>
+        {
+            // The old id was refused without dispatch after the retry window.
+            let id = ulid::Ulid::new().to_string();
+            send_notice(router, report, &id, &id).await
+        }
+        result => result,
+    }
+}
+
+fn attention_summary(report: &AttentionReport) -> String {
+    let agent = &report.agent_id;
+    let fact = if report.phase == ReportPhase::Recovery {
+        match (report.agent_state.as_str(), report.reason.as_str()) {
+            ("stopped", _) => format!("{agent} stopped and its alert cleared."),
+            (_, "no_code_progress") => format!("{agent}'s code-progress alert cleared."),
+            (_, "no_progress") => format!("{agent}'s model-progress alert cleared."),
+            _ => format!("{agent}'s observation source recovered."),
+        }
+    } else {
+        let age = match report.reason.as_str() {
+            "no_code_progress" => report
+                .code_progress_at
+                .and_then(|at| report.observed_at.checked_sub(at)),
+            _ => report.progress_age_ms,
+        };
+        let elapsed = age
+            .filter(|age| *age >= 0)
+            .map(|age| format!(" for {} s", age / 1000))
+            .unwrap_or_default();
+        match report.reason.as_str() {
+            "no_code_progress" => format!("{agent} has made no code changes{elapsed}."),
+            "no_progress" => format!("{agent} has shown no model progress{elapsed}."),
+            "children_unattended" => {
+                format!(
+                    "{agent} has {} unfinished children needing attention.",
+                    report.children.unfinished
+                )
+            }
+            _ if report.agent_state == "lost" => format!("{agent} lost its native session."),
+            _ => format!("{agent} has an unhealthy observation source."),
+        }
+    };
+    if report.reason == "children_unattended" {
+        format!("{fact} Can you check those child turns?")
+    } else {
+        format!("{fact} Can you check it with swarm show {agent}?")
+    }
 }

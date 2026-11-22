@@ -246,9 +246,14 @@ sections, and [OpenCodex](harnesses/opencodex.md) only for the proxy task.
       reconciliation. Commit ownership/cursor boundaries before publication; keep
       private history private and never replay an uncertain external effect.
 - [x] **L3.3d Observe what matters.** `activity.heavy` episodes with basename-only
-      categories, `session.growth` warnings with no auto-compact, and `harness.drift`
+      categories, `session.growth` warnings, and `harness.drift`
       against pinned verified contracts surface in `swarm top` (`OBS`), `swarm stats`,
       `swarm heavy`, `swarm doctor` and the desktop Details Observe section.
+- [x] **L3.3e Monitoring reactions (#835, #833).** On OpenCode 2.2.7, a stalled
+      turn queued one question, received one interrupt and produced one Owner
+      notice. A killed idle Agent resumed its retained session once. Three
+      matching tool failures produced one fact and an Owner rule steered the
+      exact turn. The retained reaction steps appear in `swarm why`.
 
 - [x] **L3.4 Proxy/capacity.** First attach to an already-running OpenCodex endpoint.
       Add managed service launch only when actually needed. Add account/proxy caps and

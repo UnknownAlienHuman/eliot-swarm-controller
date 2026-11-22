@@ -124,6 +124,17 @@ pub struct InboxUser {
     pub session_id: String,
 }
 
+/// Installed `POST /api/session/{id}/compact` receipt.
+#[derive(Debug, Deserialize)]
+pub struct InboxCompaction {
+    pub id: String,
+    #[serde(rename = "sessionID")]
+    pub session_id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub delivery: String,
+}
+
 // ---------------------------------------------------------------------------
 // Interrupt, permissions, forms, inbox, agents (PR2 readback and replies)
 // ---------------------------------------------------------------------------
@@ -297,17 +308,24 @@ pub struct PageCursor {
     pub next: Option<String>,
 }
 
-/// Message subset used by PR1. Only `user`, `assistant` and `idle` messages
-/// are interpreted; every other type deserializes as `Other` and is skipped
-/// by final-text extraction (never treated as terminal or as text).
+/// Message subset for turn and compaction readback. Compaction is interpreted
+/// only through its exact receipt. Other types are skipped.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum Message {
     User(UserMessage),
     Assistant(AssistantMessage),
     Idle(IdleMessage),
+    Compaction(CompactionMessage),
     #[serde(other)]
     Other,
+}
+
+/// A manual compaction result retained under its exact inbox receipt id.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct CompactionMessage {
+    pub id: String,
+    pub status: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -374,6 +392,7 @@ where
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum AssistantContent {
     Text(TextPart),
+    Tool,
     #[serde(other)]
     Other,
 }

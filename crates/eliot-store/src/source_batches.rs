@@ -1,5 +1,6 @@
 use super::native_events::{persist_effects, verified_native_event_cause_tx};
 use super::*;
+use std::borrow::Cow;
 
 impl Store {
     pub fn latest_stream_gap(&self, agent: &str, generation: i64) -> Result<Option<Event>> {
@@ -518,6 +519,7 @@ impl Store {
         }
         let agent_num = parse_agent_id(&batch.agent_id)?;
         let mut native_ids = HashSet::with_capacity(batch.events.len());
+        let mut publication = Vec::with_capacity(batch.events.len());
         for event in &batch.events {
             require_nonempty(&event.kind, "event kind")?;
             require_nonempty(&event.native_id, "native_id")?;
@@ -530,12 +532,24 @@ impl Store {
                     ),
                 ));
             }
+            let mut published = Cow::Borrowed(event);
             if encode_json(&event.data)?.len() > MAX_EVENT_BYTES {
-                return Err(Error::new(
-                    "frame_too_large",
-                    format!("event {} data exceeds 64 KiB", event.native_id),
-                ));
+                if event.kind == "turn.completed" && event.data["final_text"].is_string() {
+                    core::limits::bound_terminal_text(
+                        &mut published.to_mut().data,
+                        MAX_EVENT_BYTES,
+                    );
+                }
+                if matches!(published, Cow::Borrowed(_))
+                    || encode_json(&published.data)?.len() > MAX_EVENT_BYTES
+                {
+                    return Err(Error::new(
+                        "frame_too_large",
+                        format!("event {} data exceeds 64 KiB", event.native_id),
+                    ));
+                }
             }
+            publication.push(published);
         }
         let batch_digest = batch
             .semantic_digest()
@@ -689,7 +703,9 @@ impl Store {
         let mut committed_events = Vec::with_capacity(batch.events.len());
         let mut command_events = Vec::new();
         let mut provider_events = Vec::new();
-        for (index, native_event) in batch.events.iter().enumerate() {
+        for (index, (source_event, published)) in batch.events.iter().zip(&publication).enumerate()
+        {
+            let native_event = published.as_ref();
             if !observed {
                 validate_resume_ready_subject_tx(
                     &tx,
@@ -726,7 +742,8 @@ impl Store {
                 core::apply(&projection, native_event, now)?
             };
             let family = family_for_kind(&native_event.kind)?;
-            let event_digest = canonical::digest(&native_event.semantic_value())?;
+            // Deduplication still binds the exact redacted source payload.
+            let event_digest = canonical::digest(&source_event.semantic_value())?;
             let cause = if !observed {
                 verified_native_event_cause_tx(
                     &tx,
@@ -902,4 +919,141 @@ fn commit_source_batch(tx: Transaction<'_>, write_faulted: &Cell<bool>) -> Resul
         "unknown",
         "native batch commit could not be settled",
     ))
+}
+
+impl Store {
+    /// Read the exact bounded command and failure text for one committed native
+    /// completion, plus the number of matching failures in this Agent,
+    /// generation and turn (capped at the reaction threshold).
+    ///
+    /// The command and output must both be complete redacted values. Older
+    /// adapter rows without explicit truncation flags and any truncated
+    /// payload are deliberately ineligible, so prefixes can never masquerade
+    /// as equal full failures.
+    pub fn repeated_command_failure_evidence(
+        &self,
+        agent: &str,
+        generation: i64,
+        turn_id: &str,
+        event_seq: i64,
+    ) -> Result<Option<(String, String, u8)>> {
+        if generation < 1 || turn_id.trim().is_empty() || turn_id.len() > 256 || event_seq < 1 {
+            return Err(Error::new(
+                "invalid",
+                "invalid repeated-command failure binding",
+            ));
+        }
+        let agent_num = parse_agent_id(agent)?;
+        let current: Option<(String, String, String)> = self
+            .connection
+            .query_row(
+                "SELECT s.source, json_extract(s.data, '$.command'),
+                        json_extract(c.data, '$.native_error.message')
+                 FROM events AS c
+                 JOIN events AS s
+                   ON s.agent = c.agent AND s.generation = c.generation
+                  AND s.source = c.source AND s.kind = 'tool.started'
+                  AND s.native_id IS NOT NULL
+                  AND s.seq < c.seq
+                  AND json_extract(s.data, '$.turn_id') = ?4
+                  AND json_extract(s.data, '$.item_id') =
+                      json_extract(c.data, '$.item_id')
+                 WHERE c.seq = ?1 AND c.agent = ?2 AND c.generation = ?3
+                   AND c.native_id IS NOT NULL
+                   AND c.kind = 'tool.completed'
+                   AND json_extract(c.data, '$.turn_id') = ?4
+                   AND json_extract(c.data, '$.status') = 'error'
+                   AND json_type(c.data, '$.native_error.message') = 'text'
+                   AND json_extract(c.data, '$.native_error.truncated') = 0
+                   AND json_type(s.data, '$.command') = 'text'
+                   AND json_extract(s.data, '$.command_truncated') = 0
+                 LIMIT 1",
+                params![event_seq, agent_num, generation, turn_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        let Some((source, command, output)) = current else {
+            return Ok(None);
+        };
+        if command.is_empty()
+            || output.is_empty()
+            || command.len() > 1024
+            || output.len() > 4 * 1024
+        {
+            return Ok(None);
+        }
+        let count: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM (
+                    SELECT DISTINCT c.seq
+                    FROM events AS c
+                    JOIN events AS s
+                      ON s.agent = c.agent AND s.generation = c.generation
+                     AND s.source = c.source AND s.kind = 'tool.started'
+                     AND s.native_id IS NOT NULL
+                     AND s.seq < c.seq
+                     AND json_extract(s.data, '$.turn_id') = ?4
+                     AND json_extract(s.data, '$.item_id') =
+                         json_extract(c.data, '$.item_id')
+                    WHERE c.agent = ?1 AND c.generation = ?2 AND c.source = ?3
+                      AND c.kind = 'tool.completed' AND c.native_id IS NOT NULL AND c.seq <= ?7
+                      AND json_extract(c.data, '$.turn_id') = ?4
+                      AND json_extract(c.data, '$.status') = 'error'
+                      AND json_extract(c.data, '$.native_error.message') = ?6
+                      AND json_extract(c.data, '$.native_error.truncated') = 0
+                      AND json_extract(s.data, '$.command') = ?5
+                      AND json_extract(s.data, '$.command_truncated') = 0
+                    ORDER BY c.seq DESC
+                    LIMIT 3
+                 )",
+                params![
+                    agent_num, generation, source, turn_id, command, output, event_seq
+                ],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
+        let count = u8::try_from(count)
+            .map_err(|_| Error::new("internal", "failure count exceeded its bound"))?;
+        Ok(Some((command, output, count)))
+    }
+}
+
+impl Store {
+    /// Read a bounded recent tail of committed native tool completions.
+    /// Results are returned in event order and contain only native terminal
+    /// rows, so recovery never treats a daemon or user event as tool evidence.
+    pub fn recent_native_tool_completions(
+        &self,
+        after: i64,
+        through: i64,
+        limit: usize,
+    ) -> Result<Vec<Event>> {
+        validate_limit(limit)?;
+        if after < 0 || through < after {
+            return Err(Error::new("invalid", "invalid tool event sequence bounds"));
+        }
+        self.require_retained(after)?;
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT seq, ts, kind, agent, generation, source, native_id, data, subject, cause
+                 FROM events INDEXED BY events_kind
+                 WHERE kind = 'tool.completed' AND native_id IS NOT NULL
+                   AND seq > ?1 AND seq <= ?2
+                 ORDER BY seq DESC LIMIT ?3",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(params![after, through, limit as i64], event_record_from_row)
+            .map_err(sql_error)?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(event_from_record(row.map_err(sql_error)?)?);
+        }
+        events.reverse();
+        enforce_page_bytes(&mut events)?;
+        Ok(events)
+    }
 }

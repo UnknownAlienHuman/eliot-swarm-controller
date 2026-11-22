@@ -152,6 +152,55 @@ impl TurnGetRequest {
     }
 }
 
+/// Keyset cursor for the descending generation and insertion order.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResultCursor {
+    #[schemars(range(min = 0), with = "i64")]
+    pub generation: i64,
+    /// Immutable sequence assigned when Store first records the turn.
+    #[schemars(range(min = 1))]
+    pub insertion_seq: i64,
+    #[serde(deserialize_with = "required_id")]
+    #[schemars(description = "Nonblank exact turn ID; preserved without normalization.")]
+    pub turn_id: String,
+}
+
+impl ResultCursor {
+    pub fn validate(&self) -> Result<()> {
+        validate_generation(self.generation)?;
+        if self.insertion_seq <= 0 {
+            return Err(Error::new(
+                "invalid",
+                "result cursor insertion sequence must be positive",
+            ));
+        }
+        validate_id(&self.turn_id)
+    }
+}
+
+#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GenerationReason {
+    Launch,
+    RestartResume,
+    OwnerResume,
+    AgentResume,
+    Switch,
+    Handoff,
+    Attach,
+    Detach,
+    Unknown,
+}
+
+#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GenerationBoundary {
+    #[schemars(range(min = 0), with = "i64")]
+    pub generation: i64,
+    pub reason: GenerationReason,
+}
+
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentResultRequest {
@@ -185,6 +234,13 @@ pub struct AgentResultRequest {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     #[schemars(description = "Include agent_metadata; defaults to false.")]
     pub metadata: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_result_cursor"
+    )]
+    #[schemars(description = "Exclusive cursor from the prior agent.result page.")]
+    pub before: Option<ResultCursor>,
 }
 
 impl AgentResultRequest {
@@ -195,6 +251,7 @@ impl AgentResultRequest {
             turn_id: None,
             limit: super::DEFAULT_LIMIT,
             metadata: false,
+            before: None,
         }
     }
 
@@ -208,6 +265,24 @@ impl AgentResultRequest {
         }
         if !(1..=super::MAX_LIMIT).contains(&self.limit) {
             return Err(Error::new("invalid", "limit must be between 1 and 1000"));
+        }
+        if let Some(before) = &self.before {
+            before.validate()?;
+            if self.turn_id.is_some() {
+                return Err(Error::new(
+                    "invalid",
+                    "before cannot be combined with an exact turn_id",
+                ));
+            }
+            if self
+                .generation
+                .is_some_and(|generation| generation != before.generation)
+            {
+                return Err(Error::new(
+                    "invalid",
+                    "result cursor generation must match the requested generation",
+                ));
+            }
         }
         Ok(())
     }
@@ -272,11 +347,22 @@ pub struct CommandChildrenResponse {
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentResultResponse {
     pub agent: String,
+    /// The credential's generation for a self-read, the requested generation
+    /// for an explicit filter, or the Agent's current generation otherwise.
     pub generation: i64,
+    /// The current generation, also available without the full Agent DTO.
+    pub current_generation: i64,
     #[serde(deserialize_with = "object_turns")]
     pub turns: Vec<Turn>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_metadata: Option<Agent>,
+    #[schemars(description = "Cursor for the next older page, or null when complete.")]
+    #[serde(deserialize_with = "nullable")]
+    pub next: Option<ResultCursor>,
+    #[schemars(
+        description = "Origins for returned generations, including the current generation on its first page."
+    )]
+    pub generation_boundaries: Vec<GenerationBoundary>,
 }
 
 fn required_command_id<'de, D: serde::Deserializer<'de>>(
@@ -349,6 +435,12 @@ fn present_id<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<Option<String>, D::Error> {
     required_id(deserializer).map(Some)
+}
+
+fn present_result_cursor<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<ResultCursor>, D::Error> {
+    ResultCursor::deserialize(deserializer).map(Some)
 }
 
 fn object_turns<'de, D: serde::Deserializer<'de>>(

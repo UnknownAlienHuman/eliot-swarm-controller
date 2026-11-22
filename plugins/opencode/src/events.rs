@@ -23,8 +23,8 @@ use eliot_plugin::{
     native_stdio::StreamState,
     protocol::{HookEvent, HookResponse},
     session::{
-        EVENT_DEADLINE, MessageCommit, StreamSource, attach_final_text, attach_native_error,
-        event_id, is_blank_native_text, next_input_outcomes, redact_request_details_for_commit,
+        EVENT_DEADLINE, StreamSource, attach_final_text, attach_native_error, event_id,
+        is_blank_native_text, next_input_outcomes, redact_request_details_for_commit,
         with_claimed_context,
     },
 };
@@ -61,6 +61,48 @@ const MAX_PENDING_REQUESTS: usize = 128;
 const MAX_RESOLVED_REQUESTS: usize = 128;
 const MAX_STEER_WATCHES: usize = 128;
 const MAX_TOOL_PARTS: usize = 128;
+const MAX_TOOL_FAILURE_CONTENT_BLOCKS: usize = 32;
+const MAX_TOOL_FAILURE_OUTPUT_BYTES: usize = 4 * 1024;
+
+fn native_tool_failure_output(data: &Value) -> (Option<String>, bool) {
+    let mut truncated = data
+        .get("metadata")
+        .and_then(|metadata| metadata.get("truncated"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let Some(blocks) = data.get("content").and_then(Value::as_array) else {
+        return (None, true);
+    };
+    if blocks.len() > MAX_TOOL_FAILURE_CONTENT_BLOCKS {
+        truncated = true;
+    }
+    let mut output = String::new();
+    for block in blocks.iter().take(MAX_TOOL_FAILURE_CONTENT_BLOCKS) {
+        if block.get("type").and_then(Value::as_str) != Some("text") {
+            truncated = true;
+            continue;
+        }
+        let Some(text) = block.get("text").and_then(Value::as_str) else {
+            truncated = true;
+            continue;
+        };
+        let remaining = MAX_TOOL_FAILURE_OUTPUT_BYTES.saturating_sub(output.len());
+        if text.len() > remaining {
+            let mut taken = 0usize;
+            for character in text.chars() {
+                if taken.saturating_add(character.len_utf8()) > remaining {
+                    break;
+                }
+                output.push(character);
+                taken += character.len_utf8();
+            }
+            truncated = true;
+            break;
+        }
+        output.push_str(text);
+    }
+    ((!output.is_empty()).then_some(output), truncated)
+}
 const REPLY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Per-part tool tracking for the exact active turn: the native name
@@ -89,6 +131,7 @@ pub(crate) struct EventStatus {
     pub failure: Option<String>,
     pub batch_unknown: bool,
     pub source_unknown: bool,
+    pub compaction_in_flight: bool,
     pub stopped: bool,
 }
 
@@ -169,6 +212,13 @@ enum Control {
         inbox_id: String,
         reply: oneshot::Sender<InboxRecord>,
     },
+    BeginCompact {
+        terminal: oneshot::Sender<(String, bool)>,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    RefuseCompact {
+        reply: oneshot::Sender<Result<()>>,
+    },
     BeginStop {
         reply: oneshot::Sender<Result<()>>,
     },
@@ -232,6 +282,12 @@ struct PendingInbox {
     command_id: String,
     context: Vec<ContextItem>,
     inbox_id: String,
+}
+
+struct CompactWatch {
+    input: Option<String>,
+    result: Option<bool>,
+    terminal: oneshot::Sender<(String, bool)>,
 }
 
 /// Verdict for one steered input watched against its exact turn.
@@ -300,6 +356,8 @@ struct EventProcessor {
     writes_blocked: bool,
     gap_reported: bool,
     pending: Option<PendingInbox>,
+    compaction: Option<CompactWatch>,
+    last_compaction_terminal: Option<String>,
     /// Inbox id of the currently open turn: the prompt response id, which
     /// is the user message id the terminal readback bounds against.
     active_model: Option<ModelRef>,
@@ -381,6 +439,17 @@ pub(crate) fn spawn(
 }
 
 impl EventHandle {
+    pub async fn begin_compaction(&self) -> Result<oneshot::Receiver<(String, bool)>> {
+        let (terminal, result) = oneshot::channel();
+        self.send(|reply| Control::BeginCompact { terminal, reply })
+            .await?;
+        Ok(result)
+    }
+
+    pub async fn refuse_compaction(&self) -> Result<()> {
+        self.send(|reply| Control::RefuseCompact { reply }).await
+    }
+
     pub async fn ready(
         &self,
         native_scope: String,
@@ -685,6 +754,8 @@ impl EventProcessor {
             writes_blocked: false,
             gap_reported: false,
             pending: None,
+            compaction: None,
+            last_compaction_terminal: None,
             active_model: None,
             tool_parts: HashMap::new(),
             tool_parts_overflowed: false,
@@ -790,6 +861,39 @@ impl EventProcessor {
                     delivered: self.seen_delivered.contains(&inbox_id),
                     cancelled: self.seen_cancelled.contains(&inbox_id),
                 });
+                true
+            }
+            Control::BeginCompact { terminal, reply } => {
+                let result = if self.status.active_turn_id.is_some()
+                    || self.pending.is_some()
+                    || self.stashed_started.is_some()
+                    || self.compaction.is_some()
+                    || !self.status.ready
+                    || !self.status.connected
+                    || self.status.source_unknown
+                    || self.status.batch_unknown
+                    || self.writes_blocked
+                {
+                    Err(Error::new(
+                        "native_not_dispatched",
+                        "OpenCode compaction requires a proven idle session",
+                    ))
+                } else {
+                    self.status.compaction_in_flight = true;
+                    self.compaction = Some(CompactWatch {
+                        input: None,
+                        result: None,
+                        terminal,
+                    });
+                    Ok(())
+                };
+                let _ = reply.send(result);
+                true
+            }
+            Control::RefuseCompact { reply } => {
+                self.compaction = None;
+                self.status.compaction_in_flight = false;
+                let _ = reply.send(Ok(()));
                 true
             }
             Control::BeginStop { reply } => {
@@ -1614,6 +1718,12 @@ impl EventProcessor {
             "session.inbox.delivered" => self.observe_inbox(&envelope.data, true).await,
             "session.inbox.cancelled" => self.observe_inbox_cancelled(&envelope.data).await,
             "session.execution.started" => self.observe_execution_started(&envelope).await,
+            "session.compaction.started"
+            | "session.compaction.ended"
+            | "session.compaction.failed" => {
+                self.observe_compaction(&envelope);
+                Ok(())
+            }
             "session.retry.scheduled" if next_retry => {
                 self.observe_retry_scheduled(&envelope).await
             }
@@ -1645,6 +1755,26 @@ impl EventProcessor {
             // fold into the terminal readback or stay unconnected; they are
             // never gaps.
             _ => Ok(()),
+        }
+    }
+
+    fn observe_compaction(&mut self, envelope: &SseEnvelope) {
+        if self.status.session_id.as_deref() != envelope.data["sessionID"].as_str()
+            || envelope.data["reason"] != "manual"
+            || self.stashed_started.is_none()
+        {
+            return;
+        }
+        let Some(watch) = self.compaction.as_mut() else {
+            return;
+        };
+        match envelope.event_type.as_str() {
+            "session.compaction.started" if watch.input.is_none() => {
+                watch.input = envelope.data["inputID"].as_str().map(str::to_owned);
+            }
+            "session.compaction.ended" if watch.input.is_some() => watch.result = Some(true),
+            "session.compaction.failed" if watch.input.is_some() => watch.result = Some(false),
+            _ => {}
         }
     }
 
@@ -1940,13 +2070,13 @@ impl EventProcessor {
             .get("input")
             .and_then(|input| input.get("command"))
             .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|command| !command.is_empty())
+            .filter(|command| !command.trim().is_empty())
         {
-            data["command"] = Value::String(
-                SecretPolicy::new(self.secrets.iter().cloned())
-                    .redact_bounded(command, MAX_TOOL_COMMAND_BYTES),
-            );
+            let policy = SecretPolicy::new(self.secrets.iter().cloned());
+            let redacted = policy.redact_text(command);
+            data["command_truncated"] = json!(redacted.len() > MAX_TOOL_COMMAND_BYTES);
+            data["command"] =
+                Value::String(policy.redact_bounded(&redacted, MAX_TOOL_COMMAND_BYTES));
         }
         if serde_json::to_vec(&data).map_or(true, |bytes| bytes.len() > MAX_EVENT_BYTES) {
             return self
@@ -1968,19 +2098,16 @@ impl EventProcessor {
         Ok(())
     }
 
-    /// `session.tool.success` / `session.tool.failed`: the installed
-    /// durable tool terminals. Commit `tool.completed` with the frame's
-    /// own verdict (`completed` or `error`) and, on failure with an
-    /// error body, the bounded redacted `Session.StructuredError` message
-    /// (the installed schema requires `error`, but its absence still
-    /// commits `status: error` without a message). The result
-    /// `content`/`metadata` payload is never persisted. A terminal with
-    /// no remembered start (its `input.started`/`called` were lost) is one
-    /// tool-family coverage gap, never a guessed tool row; the first
-    /// terminal per part wins and a replay never re-commits.
+    /// Translate the installed native terminal verdict: session.tool.failed
+    /// is an error, and session.tool.success is an error only when the
+    /// structured completed metadata carries a nonzero integer exit code.
+    /// Persist only bounded redacted textual output on failures. Native
+    /// truncation stays explicit, so incomplete output cannot match an exact
+    /// repeated failure. A terminal without an observed start is a coverage
+    /// gap, never a guessed tool row; a replay never re-commits.
     async fn complete_tool(&mut self, envelope: &SseEnvelope) -> Result<()> {
-        let failed = envelope.event_type == "session.tool.failed";
-        let (terminal, native_error) = if failed {
+        let failed_event = envelope.event_type == "session.tool.failed";
+        let (terminal, failed, native_error, output_truncated) = if failed_event {
             let failure: ToolFailedData =
                 serde_json::from_value(envelope.data.clone()).map_err(|_| {
                     Error::new(
@@ -1993,7 +2120,9 @@ impl EventProcessor {
                     session_id: failure.session_id,
                     id: failure.id,
                 },
-                failure.error,
+                true,
+                failure.error.map(|error| error.message),
+                false,
             )
         } else {
             let terminal: ToolEventData =
@@ -2003,7 +2132,21 @@ impl EventProcessor {
                         "OpenCode tool success omitted its exact identity",
                     )
                 })?;
-            (terminal, None)
+            let metadata = envelope.data.get("metadata");
+            let failed = metadata
+                .and_then(|metadata| metadata.get("status"))
+                .and_then(Value::as_str)
+                == Some("completed")
+                && metadata
+                    .and_then(|metadata| metadata.get("exit"))
+                    .and_then(Value::as_i64)
+                    .is_some_and(|exit| exit != 0);
+            let (output, truncated) = if failed {
+                native_tool_failure_output(&envelope.data)
+            } else {
+                (None, false)
+            };
+            (terminal, failed, output, truncated)
         };
         if self.status.session_id.as_deref() != Some(terminal.session_id.as_str())
             || terminal.id.trim().is_empty()
@@ -2038,11 +2181,10 @@ impl EventProcessor {
             "tool": tool,
             "status": if failed { "error" } else { "completed" },
         });
-        attach_native_error(
-            &mut data,
-            native_error.as_ref().map(|error| error.message.as_str()),
-            &secrets,
-        );
+        attach_native_error(&mut data, native_error.as_deref(), &secrets);
+        if output_truncated && let Some(native_error) = data.get_mut("native_error") {
+            native_error["truncated"] = json!(true);
+        }
         if serde_json::to_vec(&data).map_or(true, |bytes| bytes.len() > MAX_EVENT_BYTES) {
             return self
                 .record_gap("OpenCode tool completion exceeded the persisted-event bound")
@@ -2151,6 +2293,19 @@ impl EventProcessor {
                 )
             })?;
         if self.status.session_id.as_deref() != Some(terminal.session_id.as_str()) {
+            return Ok(());
+        }
+        if self.last_compaction_terminal.as_ref() == Some(&envelope.id) {
+            return Ok(());
+        }
+        if let Some(watch) = self.compaction.take() {
+            self.status.compaction_in_flight = false;
+            self.stashed_started = None;
+            self.last_compaction_terminal = Some(envelope.id.clone());
+            if let (Some(input), Some(result)) = (watch.input, watch.result) {
+                let applied = result && envelope.event_type == "session.execution.succeeded";
+                let _ = watch.terminal.send((input, applied));
+            }
             return Ok(());
         }
         let Some((command_id, turn_id)) = self.resolve_terminal_turn().await? else {
@@ -2262,10 +2417,9 @@ impl EventProcessor {
                 "opencode",
                 "OpenCode",
             )?;
-            let commit = self.stream_source().commit_message(native_id, data).await?;
-            if commit == MessageCommit::Gapped {
-                return Err(Error::new("unknown", "OpenCode reply exceeded its bound"));
-            }
+            // A message-event gap does not erase exact terminal text
+            // obtained from readback; terminal_turn_data bounds final_text.
+            let _message_commit = self.stream_source().commit_message(native_id, data).await?;
         }
         let mut data =
             terminal_turn_data(command_id, turn_id, status, terminal, readback, &secrets);
@@ -2874,18 +3028,8 @@ fn terminal_turn_data(
         "turn_id": turn_id,
         "status": status,
     });
-    if let Some(readback) = readback {
-        if let Some(text) = readback.final_text.as_deref() {
-            attach_final_text(
-                &mut data,
-                &secrets.redact_text(text),
-                status == "failed",
-                secrets,
-            );
-        }
-        if let Some(usage) = readback.usage.as_ref() {
-            data["usage"] = serde_json::to_value(usage).unwrap_or(Value::Null);
-        }
+    if let Some(usage) = readback.and_then(|readback| readback.usage.as_ref()) {
+        data["usage"] = serde_json::to_value(usage).unwrap_or(Value::Null);
     }
     let native_error = terminal
         .error
@@ -2912,6 +3056,9 @@ fn terminal_turn_data(
             secrets,
         );
     }
+    if let Some(text) = readback.and_then(|readback| readback.final_text.as_deref()) {
+        attach_final_text(&mut data, &secrets.redact_text(text));
+    }
     data
 }
 
@@ -2936,7 +3083,7 @@ pub(crate) async fn read_turn_messages(
     let mut seen_cursors = HashSet::new();
     let mut user_position: Option<usize> = None;
     let mut idle: Option<(String, String, Option<StructuredError>, usize)> = None;
-    let mut texts: Vec<(usize, usize, i64, String)> = Vec::new();
+    let mut assistant_messages: Vec<(usize, Vec<String>)> = Vec::new();
     let mut usages: HashMap<String, (usize, i64, Option<AssistantTokens>)> = HashMap::new();
     let mut position: usize = 0;
     for _ in 0..MAX_MESSAGE_PAGES {
@@ -2953,18 +3100,19 @@ pub(crate) async fn read_turn_messages(
                     break;
                 }
                 Message::Assistant(assistant) => {
-                    for (part_index, part) in assistant.content.iter().enumerate() {
-                        if let AssistantContent::Text(text) = part
-                            && let Some(body) = text.text.as_deref()
-                        {
-                            texts.push((
-                                position,
-                                part_index,
-                                assistant.time.created,
-                                body.to_owned(),
-                            ));
+                    let mut message_text = Vec::new();
+                    for part in &assistant.content {
+                        match part {
+                            AssistantContent::Text(text) => {
+                                if let Some(body) = text.text.as_deref() {
+                                    message_text.push(body.to_owned());
+                                }
+                            }
+                            AssistantContent::Tool => message_text.clear(),
+                            AssistantContent::Other => {}
                         }
                     }
+                    assistant_messages.push((position, message_text));
                     // A repeated message id replaces its usage; repeated
                     // observations are never summed.
                     usages.insert(
@@ -3011,11 +3159,9 @@ pub(crate) async fn read_turn_messages(
     let Some((idle_id, outcome, idle_error, idle_position)) = idle else {
         return Ok(TurnReadback::Running);
     };
-    // Assistant text strictly between our input and the selected idle in
-    // newest-first page order: positions after the idle, before our user.
-    // Both text and usage share this exact slice, so assistants newer
-    // than the selected idle never leak into either.
-    let final_text = project_terminal_text(texts, idle_position, user_position);
+    // The newest assistant message strictly between our input and selected
+    // idle supplies final_text; earlier messages remain separate events.
+    let final_text = project_terminal_text(assistant_messages, idle_position, user_position);
     Ok(TurnReadback::Terminal(Box::new(TerminalReadback {
         idle_id,
         outcome: match outcome.as_str() {
@@ -3048,35 +3194,19 @@ pub(crate) struct TerminalReadback {
     usage: Option<TurnUsage>,
 }
 
-/// Project the terminal assistant text for one turn from collected parts:
-/// `(newest-first message position, intra-message content index, created,
-/// body)`. Positions are newest-first page order strictly between the
-/// selected idle and our input; the projection returns chronological text
-/// by reversing that page order while preserving each message's native
-/// `content` array order. Page position alone decides message order:
-/// `created` never outranks it, because timestamps can disagree with the
-/// native sequence across pages. The part index orders parts within one
-/// message (parts of one message share `created`, which previously made
-/// the text body the tiebreaker and reordered the response
-/// alphabetically).
+/// Project only the newest assistant message in the exact user-to-idle
+/// slice. Content parts before its final tool call are excluded, and a
+/// newer textless assistant message prevents fallback to an earlier reply.
 fn project_terminal_text(
-    texts: Vec<(usize, usize, i64, String)>,
+    messages: Vec<(usize, Vec<String>)>,
     idle_position: usize,
     user_position: usize,
 ) -> Option<String> {
-    let mut selected: Vec<(usize, usize, String)> = texts
+    let (_, parts) = messages
         .into_iter()
-        .filter(|(position, _, _, _)| *position > idle_position && *position < user_position)
-        .map(|(position, part, _, body)| (position, part, body))
-        .collect();
-    selected.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
-    let mut final_text = String::new();
-    for (_, _, body) in selected {
-        if !final_text.is_empty() {
-            final_text.push('\n');
-        }
-        final_text.push_str(&body);
-    }
+        .filter(|(position, _)| *position > idle_position && *position < user_position)
+        .min_by_key(|(position, _)| *position)?;
+    let final_text = parts.join("\n");
     if final_text.is_empty() {
         None
     } else {

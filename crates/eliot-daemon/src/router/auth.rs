@@ -409,10 +409,12 @@ pub(super) fn authorize_command(principal: &Principal, request: &mut SubmitComma
     // Model and effort authority never delegates: only the Owner may
     // reconfigure a retained Agent. Project rules already fall out above;
     // this also fences every Agent principal before scoped submit rules.
-    if request.verb == "configure" && !matches!(principal, Principal::Owner) {
+    if matches!(request.verb.as_str(), "configure" | "compact")
+        && !matches!(principal, Principal::Owner)
+    {
         return Err(Error::new(
             "not_allowed",
-            "configure requires the Owner principal",
+            format!("{} requires the Owner principal", request.verb),
         ));
     }
     let Principal::Agent { id, generation } = principal else {

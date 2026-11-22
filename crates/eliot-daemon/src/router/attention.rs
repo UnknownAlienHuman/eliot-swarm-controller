@@ -5,6 +5,7 @@ mod delivery;
 mod incidents;
 mod observe;
 mod recovery;
+mod steps;
 mod sweep;
 
 use super::{Router, StoreHandle};
@@ -21,7 +22,7 @@ use observe::{
     build_report, capture_agent, child_capture_is_current, probe_native_status,
     process_observation, revalidate_probe,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
@@ -57,7 +58,7 @@ impl IncidentKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ReportPhase {
     Incident,
@@ -101,6 +102,7 @@ struct AttentionState {
     reconcile_all: bool,
     active_reconcile_cursor: usize,
     reserved_incidents: usize,
+    config: crate::config::AttentionConfig,
 }
 
 #[derive(Clone)]
@@ -120,7 +122,6 @@ struct ActiveIncident {
 struct FrozenReport {
     report: AttentionReport,
     emit_command_id: String,
-    affected_mail_id: String,
     supervisor_mail_id: String,
     owner_notify_id: String,
 }
@@ -158,7 +159,7 @@ struct CapturedAgent {
     turn_started_at: Option<i64>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct AttentionReport {
     schema: u32,
     incident_id: String,
@@ -198,7 +199,7 @@ struct AttentionReport {
     messages: Option<u64>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct ProcessObservation {
     basis: String,
     available: bool,
@@ -213,7 +214,7 @@ struct ProcessObservation {
     error_code: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct ProcessFact {
     role: String,
     pid: u32,
@@ -224,7 +225,7 @@ struct ProcessFact {
     age_ms: Option<i64>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct SourceFact {
     source: String,
     families: Vec<String>,
@@ -235,7 +236,7 @@ struct SourceFact {
     gap_seq: Option<i64>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct NativeStatus {
     probe_requested: bool,
     freshness: String,
@@ -256,16 +257,24 @@ enum Trigger {
     AgentLost { event_seq: i64 },
 }
 
+fn attention_duration(threshold_secs: Option<i64>) -> Duration {
+    Duration::from_secs(threshold_secs.unwrap_or(15 * 60) as u64)
+}
+
 pub(crate) async fn run_attention(
     router: Router,
-    suspicion_window: Duration,
+    attention_config: crate::config::AttentionConfig,
     mut shutdown: watch::Receiver<bool>,
     reporter: crate::daemon::workers::WorkerReporter,
 ) -> Result<()> {
     let mut events = router.inner.bus.subscribe();
     let mut ticks = interval(SWEEP_INTERVAL);
     ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let state = Arc::new(Mutex::new(AttentionState::default()));
+    let suspicion_window = attention_duration(attention_config.no_progress.threshold_secs);
+    let state = Arc::new(Mutex::new(AttentionState {
+        config: attention_config,
+        ..AttentionState::default()
+    }));
     let sweep_running = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut tasks: JoinSet<()> = JoinSet::new();
 
@@ -382,6 +391,8 @@ fn attention_transition_event(kind: &str) -> bool {
                 | "tool.started"
                 | "tool.completed"
                 | "session.ended"
+                | "session.growth"
+                | "capacity.released"
         )
 }
 
@@ -393,17 +404,34 @@ async fn inspect_agent(
     suspicion_window: Duration,
     trigger: Trigger,
 ) -> Result<()> {
+    let config = state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .config;
+    let no_progress_window = suspicion_window;
+    let no_code_progress_window = attention_duration(config.no_code_progress.threshold_secs);
+    let children_window = attention_duration(config.children_unattended.threshold_secs);
     let trigger_event_seq = match trigger {
         Trigger::SourceEvent { event_seq, .. } => Some(event_seq),
         Trigger::Sweep | Trigger::AgentLost { .. } => None,
     };
 
-    let Some(captured) = capture_agent(router, agent_id, generation, suspicion_window).await?
-    else {
+    let Some(captured) = capture_agent(router, agent_id, generation, children_window).await? else {
         return Ok(());
     };
     if captured.agent.observe_only {
         return Ok(());
+    }
+    if captured.agent.state == AgentState::Idle
+        && config.session_growth.enabled
+        && let Err(error) = router.react_to_session_growth(&captured.agent).await
+    {
+        crate::logging::record(
+            &router.secret_policy_snapshot(),
+            "daemon.attention_session_growth_failed",
+            &[("agent", agent_id)],
+            Some(&error),
+        );
     }
     if matches!(
         trigger,
@@ -412,7 +440,7 @@ async fn inspect_agent(
                 recovery_due: true,
                 ..
             }
-    ) && recovery::recover_active_turn(router, &captured, suspicion_window).await?
+    ) && recovery::recover_active_turn(router, &captured, no_progress_window).await?
     {
         return Ok(());
     }
@@ -424,7 +452,7 @@ async fn inspect_agent(
     // synthesized. A lost manager with unfinished children still takes the
     // generic child-cohort path below, matching the `AgentLost` trigger.
     if captured.agent.state == AgentState::Lost
-        && child_attention_activity(&captured, suspicion_window).is_none()
+        && child_attention_activity(&captured, children_window).is_none()
     {
         let event_seq = match trigger {
             Trigger::AgentLost { event_seq } => Some(event_seq),
@@ -442,17 +470,26 @@ async fn inspect_agent(
             agent_id,
             generation,
             event_seq,
-            suspicion_window,
+            children_window,
         )
         .await;
     }
-    let desired = desired_incident(&captured, suspicion_window);
-    report_cleared_incidents(router, &state, &captured, suspicion_window).await?;
+    let desired = desired_incident(&captured, &config);
+    report_cleared_incidents(router, &state, &captured, no_progress_window).await?;
 
     let Some((key, _activity)) = desired else {
         return Ok(());
     };
+    if key.kind == IncidentKind::SourceUnhealthy && owned_exit_source(&captured) {
+        return Ok(());
+    }
     if deliver_active_incident(router, &state, &key).await? {
+        if matches!(
+            key.kind,
+            IncidentKind::NoProgress | IncidentKind::CodeProgress
+        ) {
+            steps::advance_time_ladder(router, &state, &key, &captured, config).await?;
+        }
         return Ok(());
     }
     let Some(mut reservation) = reserve_incident(&state, &key) else {
@@ -464,14 +501,21 @@ async fn inspect_agent(
     } else {
         probe_native_status(router, &captured).await
     };
-    let Some(after_probe) = revalidate_probe(router, &captured, key.kind, suspicion_window).await?
+    let Some(after_probe) = revalidate_probe(router, &captured, key.kind, children_window).await?
     else {
         return Ok(());
     };
-    let Some((still_key, still_activity)) = desired_incident(&after_probe, suspicion_window) else {
+    // A source probe may race the transition to Lost. The retained loss
+    // trigger owns that report, including when the source check began earlier.
+    if after_probe.agent.state == AgentState::Lost && key.kind != IncidentKind::ChildrenUnattended {
+        return Ok(());
+    }
+    let Some((still_key, still_activity)) = desired_incident(&after_probe, &config) else {
         return Ok(());
     };
-    if still_key != key {
+    if still_key != key
+        || (key.kind == IncidentKind::SourceUnhealthy && owned_exit_source(&after_probe))
+    {
         return Ok(());
     }
     let report = build_report(
@@ -482,11 +526,12 @@ async fn inspect_agent(
             incident_id: incident_id(&after_probe, key.kind, still_activity.as_str()),
             activity: still_activity,
             observed_at: now_ms(),
-            suspicion_window: matches!(
-                key.kind,
-                IncidentKind::NoProgress | IncidentKind::ChildrenUnattended
-            )
-            .then_some(suspicion_window),
+            suspicion_window: match key.kind {
+                IncidentKind::NoProgress => Some(no_progress_window),
+                IncidentKind::CodeProgress => Some(no_code_progress_window),
+                IncidentKind::ChildrenUnattended => Some(children_window),
+                IncidentKind::SourceUnhealthy => None,
+            },
             trigger_event_seq,
             native_status,
             process_observation,
@@ -519,7 +564,22 @@ async fn inspect_agent(
     );
     drop(child_guard);
     let _ = deliver_active_incident(router, &state, &key).await?;
+    if matches!(
+        key.kind,
+        IncidentKind::NoProgress | IncidentKind::CodeProgress
+    ) {
+        steps::advance_time_ladder(router, &state, &key, &after_probe, config).await?;
+    }
     Ok(())
+}
+
+fn owned_exit_source(captured: &CapturedAgent) -> bool {
+    captured.source_states.iter().any(|source| {
+        source
+            .gap_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("host-root-exit:"))
+    })
 }
 
 async fn inspect_lost_agent(
@@ -528,10 +588,9 @@ async fn inspect_lost_agent(
     agent_id: &str,
     generation: i64,
     event_seq: i64,
-    suspicion_window: Duration,
+    children_window: Duration,
 ) -> Result<()> {
-    let Some(captured) = capture_agent(router, agent_id, generation, suspicion_window).await?
-    else {
+    let Some(captured) = capture_agent(router, agent_id, generation, children_window).await? else {
         return Ok(());
     };
     if captured.agent.observe_only || captured.agent.state == AgentState::Stopped {
@@ -552,6 +611,9 @@ async fn inspect_lost_agent(
         return Ok(());
     };
     if loss_report_already_complete(router, &incident_id, &captured.agent).await? {
+        router
+            .resume_after_process_loss(agent_id, generation, event_seq, &incident_id)
+            .await?;
         return Ok(());
     }
     let key = IncidentKey {
@@ -602,13 +664,17 @@ async fn inspect_lost_agent(
         router,
         &captured,
         IncidentKind::SourceUnhealthy,
-        suspicion_window,
+        children_window,
     )
     .await?
     else {
         return Ok(());
     };
-    let report = build_report(
+    let loss_turn_id = {
+        let store = router.inner.store.lock().await;
+        store.attention_loss_turn_id(agent_id, generation, event_seq)?
+    };
+    let mut report = build_report(
         &after_probe,
         IncidentKind::SourceUnhealthy,
         ReportContext {
@@ -622,6 +688,10 @@ async fn inspect_lost_agent(
             process_observation,
         },
     );
+    if let Some(turn_id) = loss_turn_id {
+        report.turn_id = Some(turn_id);
+    }
+    report.reason = "agent_lost".to_owned();
     let frozen = freeze_loss_report(report, loss_ts);
     let incident_id = frozen.report.incident_id.clone();
     let baseline_progress_at = frozen.report.progress_basis_at;

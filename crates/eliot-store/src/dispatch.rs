@@ -109,6 +109,26 @@ fn dispatch_launch_tx(
             "launch target changed before its generation token was committed",
         ));
     }
+    let switch_launch: bool = tx
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM commands
+                 WHERE id = ?1 AND link_kind = 'switch' AND ordinal = 0
+             )",
+            [id],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    super::result_page::record_generation_reason_tx(
+        tx,
+        agent_num,
+        1,
+        if switch_launch {
+            eliot_core::api::GenerationReason::Switch
+        } else {
+            eliot_core::api::GenerationReason::Launch
+        },
+    )?;
     if agent.chat {
         db!(tx.execute("UPDATE artifacts SET generation=1,body=json_set(body,'$.generation',1) WHERE agent=?1 AND generation=0 AND json_extract(body,'$.purpose')='Swarm chat directory'",[agent_num]));
     }
@@ -258,6 +278,16 @@ fn dispatch_resume_tx(
             "resume target changed before its new generation was committed",
         ));
     }
+    let reason = if super::result_page::is_restart_resume_intent_tx(tx, id)? {
+        eliot_core::api::GenerationReason::RestartResume
+    } else if command.command.principal == "owner" {
+        eliot_core::api::GenerationReason::OwnerResume
+    } else if command.command.principal.starts_with("agent:") {
+        eliot_core::api::GenerationReason::AgentResume
+    } else {
+        eliot_core::api::GenerationReason::Unknown
+    };
+    super::result_page::record_generation_reason_tx(tx, agent_num, next_generation, reason)?;
     // A new generation explicitly inherits the previous generation's latest
     // overlay as its own revision 1 with `inherited_from` provenance, so a
     // `resume` never silently reverts to the frozen snapshot and the new
@@ -847,6 +877,9 @@ fn dispatch_control_tx(
             "control command no longer targets the exact active turn",
         ));
     }
+    if command.command.verb == "interrupt" {
+        attention_lookup::guard_attention_interrupt(tx, agent_num, agent.generation, turn_id, id)?;
+    }
     if is_request_reply_verb(command.command.verb.as_str()) {
         let request_id = command.command.request_id.as_deref().ok_or_else(|| {
             Error::new(
@@ -1119,6 +1152,26 @@ impl Store {
                 now,
                 &mut events,
             )?,
+            "compact" => {
+                if command_generation != agent.generation {
+                    return Err(Error::new(
+                        "stale_generation",
+                        "compact Agent generation changed",
+                    ));
+                }
+                admission::require_idle_compaction(&tx, &agent, agent_num, id)?;
+                update_command_state(&tx, id, CommandState::Dispatched, None, None, now)?;
+                events.push(insert_daemon_command_event(
+                    &tx,
+                    now,
+                    "command.dispatched",
+                    Some(agent_num),
+                    Some(agent.generation),
+                    id,
+                    json!({"command_id": id, "verb": "compact"}),
+                )?);
+                None
+            }
             "inject" => {
                 dispatch_inject_tx(
                     &tx,

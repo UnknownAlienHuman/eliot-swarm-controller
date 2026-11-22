@@ -463,6 +463,7 @@ command id frozen at claim. Stored Goal responses/round records use Core
 | `api.methods/help/identity` | bounded authenticated method discovery, compact DTO fields/examples, and credential-free caller scope |
 | `daemon.status/shutdown` | owner-only current state/admission and exact drain/force |
 | `maintenance.run` | owner-only immediate bounded retention pass reporting pruned counts |
+| `maintenance.purge_legacy_attention_advisories` | owner-only dry-run count and exact-count purge of owner-sent legacy advisory-attention mail |
 | `agent.list/get/result` | scoped, paginated Agent state and exact results |
 | `agent.processes/stats` | scoped process records and ephemeral OS samples |
 | `agent.git/edits` | current Git snapshot and paginated native-attributed edits |
@@ -504,7 +505,7 @@ command id frozen at claim. Stored Goal responses/round records use Core
 | `agent.history` | owner-only bounded history of an exact observed subject |
 | `mail.send/inbox/read/ack`, `var.set/get` | addressed queued mail with separate acknowledgement, shared variables with CAS |
 | `swarm.reparent` | Owner-only atomic subtree or all-children manager change; generation-bound, no native effect |
-| `who`, `claim.set/list/release` | current-worker file areas plus advisory claims with coalesced conflict notices |
+| `who`, `claim.set/list/release` | current-worker file areas plus advisory claims with deferred conflict details |
 
 Canonical public wire types are re-exported by
 [`eliot_core::api`](../../crates/eliot-core/src/api.rs). These DTOs and their validators
@@ -768,6 +769,18 @@ settings reload fails the call instead of pruning under stale windows. The
 manual pass adds no new retention semantics; the contract stays in
 [core](core.md#retention).
 
+`maintenance.purge_legacy_attention_advisories` is owner-only. An empty request
+is a read-only dry-run that returns the exact number of owner-sent messages whose
+thread matches `attention-*-advisory`, including both read and unread rows. To
+apply the purge, the owner supplies that number as `expected_message_count`; the
+Store rechecks the count and deletes the matching rows in one immediate
+transaction. A changed count returns a conflict without deleting anything, so
+the owner must run the dry-run again. The CLI command
+`swarm maintenance purge-legacy-attention-advisories` previews by default;
+`--apply --expected-count <COUNT>` explicitly applies the preview. The filter
+preserves regular mail, non-advisory attention escalations, and messages not
+sent by the owner. This operation does not change normal mail retention.
+
 `project.list` and `project.get` are owner-only readbacks of the owner-registered
 canonical checkout, repository common directory, explicit profile/action allowlists and
 optional Git fetch approval. They do not create or modify registrations. Their project
@@ -802,10 +815,11 @@ time. Like `agent.list`, the response carries the required `total` ignoring the
 cursor, explicit `truncated`, and `next` at the last row of a nonempty page; `limit`
 defaults to 100 and must be 1–1,000. Settings › Worktrees pages it to the end.
 
-`rule.get` uses `RuleGetRequest`/`RuleStateView`, is owner-only, and reads the selected
-global or project rule's current cursor and any retiring definition's cursor/boundary. An
-optional `project` selects that registered project principal; omission selects global
-Owner scope. It does not reload configuration or advance either cursor.
+`rule.get` uses `RuleGetRequest`/`RuleShowView` and is Owner-only. It reads the selected
+rule's cursor and retirement boundary, latest action outcome and latest refusal when
+available. An optional `project` selects a registered project principal. Omission selects
+the global Owner scope. A global miss with a matching project rule includes a
+`--project` hint. The read does not reload configuration or advance either cursor.
 `rule.catch_up` accepts `RuleCatchUpRequest` and returns the retained Core `Command` parent
 for a finite committed-event range. Its ULID binds the principal and original semantic
 request; the retained command records the revision and captured range selected on first
@@ -1506,12 +1520,11 @@ Codes without specific words display their readable code name without implying a
 failure. Accepted, queued and dispatched commands describe progress; process steps
 retain whether the Agent was lost or failed and explain their recorded reason.
 
-For every failed terminal turn, with or without a structured provider restriction, status
-and exact command/turn binding remain authoritative when final text exceeds the event
-budget. The event omits oversized final text rather than exposing a truncated string as
-complete, and includes
-`final_text_unavailable:"event_budget"` when representable. `Turn.final_text = None`
-means the public final text is unavailable; full native text remains private history.
+The terminal event and `Turn.final_text` carry the final assistant message.
+When the reply exceeds the encoded event budget, the retained suffix starts
+with `[... truncated ...]`. Status, exact command/turn binding and any
+structured provider restriction remain authoritative. `Turn.final_text = None`
+means the public final text is unavailable. Full native text remains private history.
 `Turn.usage = None` likewise means native token usage is unavailable. A present usage
 carries nullable token members with `scope`/`message_id` attribution when the harness
 reports it; null attribution means the native scope is unknown. Message scope is never
@@ -1541,36 +1554,60 @@ project and root scopes retain their flags. `swarm usage` renders this response 
 
 Required IDs must be strings whose trimmed value is nonempty and are preserved without
 trimming or normalization. Command references use the [Core command ID validator](../../crates/eliot-core/src/command.rs).
-`turn.get` requires a nonnegative integer
-generation. For `agent.result`, omitted `generation` selects the current generation;
-omitted `turn_id` requests turns for that generation; omitted `limit` defaults to 100.
-Any supplied generation must be a nonnegative integer, and any supplied `turn_id` must
-be a nonempty string. The limit must be 1–1,000 even when `turn_id` selects one exact
-turn. Optional request members that are absent are omitted during serialization; do not
-send `null`. Explicit `null`, wrong types, invalid values and unknown request fields are
-`invalid`. Unknown RPC methods and command verbs retain their existing `unsupported`
-behavior.
+`turn.get` requires a nonnegative integer generation. An `agent.result` self-read
+uses the generation bound to the Agent's credential, including when `generation`
+is omitted. For other authorized callers, omitting `generation` selects all retained
+generations. An exact `turn_id` lookup defaults to the current Agent generation
+for those callers. An authorized explicit generation selects only that generation.
+Omitted `limit` defaults to 100 and must be
+1–1,000, including for an exact `turn_id` lookup. Any supplied generation must be a
+nonnegative integer, and any supplied `turn_id` must be a nonempty string. Optional
+request members that are absent are omitted during serialization; do not send `null`.
+Explicit `null`, wrong types, invalid values and unknown request fields are
+`invalid`. Unknown RPC methods and command verbs retain their existing
+`unsupported` behavior.
 
-The existing principal checks, generation rules and unknown-state masking apply. An
-explicit generation retains the existing principal-scoped historical read behavior.
-`agent_metadata` is omitted unless `metadata: true` is requested. When present it is
-the current Agent object and may have a different generation from the result when an
-explicit historical generation was requested. `swarm result` includes it only with
-`--metadata`; callers that only need turns omit it.
+An unfiltered `agent.result` page orders generations newest first. Within each
+generation it sorts by the immutable turn insertion sequence, newest first. To
+continue, pass the returned `next` as `before` with the same Agent and generation
+filter. The byte budget includes turns, generation markers, Agent metadata, and
+the continuation cursor. An exact `turn_id` lookup returns just that row and
+cannot take `before`.
+`next` is null when no older row remains.
 
-Before printing a read response or using it to advance a wait, the client validates its
-binding: `command.get` must return the requested command ID; `turn.get` must match the
-requested Agent, generation and turn ID; and `agent.result` must match the requested
-Agent, its explicitly requested generation when present, and the requested exact turn
-when present (exactly one matching turn). With no requested generation, the response's
-selected generation is authoritative. Optional metadata, when present, must match the
-Agent and have a nonnegative generation; it must match the selected generation when no
-historical generation was requested. Every result turn must match the response Agent and
-generation, and the response must respect the requested limit. A mismatch yields only the fixed `unknown` error
-`read response does not match the requested binding`, with no response data or
-diagnostics exposed. A `command.children` response must hold at most `limit`
+The response includes `generation_boundaries` in descending generation order.
+Each marker carries the generation number and its recorded origin, including
+`restart_resume`, `owner_resume`, `switch` or `handoff`. A missing historical
+origin is `unknown`. The first page can include the current generation before its
+first turn. Markers can recur when two pages include turns from the same generation.
+[Result DTOs](../../crates/eliot-core/src/api/reads.rs)
+
+The existing principal checks and unknown-state masking apply. `current_generation`
+identifies the current Agent generation. Request `metadata: true` or use
+`swarm result --metadata` to include the full current `agent_metadata` object.
+On a self-read, the response's `generation` is the
+credential's generation. On other reads it echoes an explicit filter, or reports
+the current Agent generation when the filter is omitted. Each turn carries its
+own generation.
+
+Clients validate the binding before displaying a read or using it to advance a
+wait. `command.get` must return the requested command ID. `turn.get` must match
+the requested Agent, generation, and turn ID. `agent.result` must match the
+requested Agent and the applicable response generation described above. An
+exact-turn lookup must return one row that matches the requested turn ID and the
+response generation. Each result turn belongs to the requested Agent and any
+applicable generation filter. On a cross-generation page a turn's generation
+can be older than the response generation. The response respects the requested
+limit, and the markers cover the generations in the page. A mismatch yields only the fixed
+`unknown` error `read response does not match the requested binding`, with no response
+data or diagnostics exposed. A `command.children` response must hold at most `limit`
 well-formed commands with `next` equal to the last child id, or null when the
 page is empty; a mismatch is the same fixed `unknown` error.
+
+The desktop transcript uses the default `agent.result` read and continues older
+pages with `before`. MCP `agent.result` uses the same contract. Each result row
+keeps its own `final_text`, including the latest turn. MCP `swarm.wait` binds to
+frozen command or turn references and returns bounded `final_text` for each exact turn.
 
 `swarm cmd show`, `swarm cmd children` and `swarm result` exit 0 after a valid read
 even if a returned command or turn is `unknown`; that state is not a successful task
@@ -1929,17 +1966,10 @@ pending registrations with a progressing keyset cursor that seeks after the last
 examined `(created_at, id)` and wraps once it passes the sweep high-water
 observed at sweep start, so pending or undeliverable registrations at the front
 never starve later eligible ones even while new registrations keep arriving;
-new arrivals join the next sweep. The digest reuses the
-ordinary mail wake (one generic coalesced notice per minute, at most one open notice
-command), except that when the registrant and recipient are the same Agent at its
-current generation and the digest body fits within `MAX_EVENT_BYTES` (64 KiB),
-the wake `send` carries that body directly (with `N unread: mail.inbox, then mail.ack`
-appended if other unread mail remains) and `turn.started` of that wake marks the
-digest delivery read (ordinary command readback via `command.get`/`command.children`
-redacts the wake `args.text` so only the recipient's own turn sees the excerpt
-text); otherwise (for example Owner-registered digests, other
-generations, or overflow) the generic count notice and `mail.inbox`/`mail.ack`
-apply. The digest emits no `x.user.agent.attention` event; a successful completion stays
+new arrivals join the next sweep. A digest registered by its recipient in the
+current generation is eligible for inline presentation under the ordinary mail
+wake budget. Other digest deliveries remain available through the mailbox.
+The digest emits no `x.user.agent.attention` event; a successful completion stays
 distinct from an attention incident and no model call is needed to poll. The CLI is
 `swarm digest --all|--any --to PARENT ID...` with the same `ID` shape as
 `swarm wait`; it exits 0 when the digest is accepted (pending or delivered).
@@ -2126,6 +2156,9 @@ secret policy (keys included) are withheld, and `next` names the last returned
 id. Like `agent.list`, every nonempty page sets `next` to its last id and the
 caller continues until an empty page; a page shortened by the byte budget never
 hides later rules. It changes nothing.
+
+`swarm timer list` uses the same namespace read and returns timer entries only. Its
+`--limit` counts timers and its `next` cursor is the last returned timer id.
 
 `rule.read`, `rule.save` and `rule.delete` select the global namespace by default or a
 registered namespace by `project`. `path` is a top-level TOML filename in that
@@ -2385,16 +2418,19 @@ as JSON before admission. The file path is not part of command metadata;
 only the resulting value is stored.
 
 A routed recipient with `wake_on_mail` (profile snapshot, default true) may
-receive one generic coalesced wake per minute with at most one open notice
-command per recipient across mail and claims. The wake text is one neutral
-line for every harness: `N unread: mail.inbox, then mail.ack`. An unread reply
+receive one coalesced wake per minute with at most one open notice
+command per recipient. An unread reply
 whose `reply_to_delivery` names mail the recipient itself sent, admitted after
 the last presentation, skips the one-minute cooldown once; the open-notice,
 busy, pending-input and unknown gates still apply.
-Ordinary mail notices never contain
-the body; only a self-registered completion digest at the recipient's current
-generation shows its body directly when it fits (`MAX_EVENT_BYTES`) and marks
-read on `turn.started`. Every notice is sent through the ordinary owner `send` path bound to the
+Eligible mail for the current generation is presented with sender, thread,
+delivery ID and body within the encoded wake budget. Peer bodies are fenced
+untrusted data. The exact wake's first committed model output or successful
+terminal marks the inline rows read in the same transaction. A definite
+no-output failure leaves them unread for the next eligible wake.
+Command readback redacts wake text that contains mail. Uninlined deliveries
+remain unread and the wake reports their count. Every notice uses the ordinary
+owner `send` path bound to the
 recipient's current generation, and is skipped — never retried — while a
 notice command is open or unknown, a provider hold, pending request or
 unknown command/turn stands, the daemon is draining, or no live plugin
@@ -2425,19 +2461,13 @@ by construction; expiry filters on read and is purged in a bounded batch
 by the next claim write. A conflict — two globs that may overlap after
 normalization (segments are compatible when equal or either side carries
 a wildcard, with `**` realigning across directories), in the same project
-— is reported in-band in the `claim.set` response and routes at most one
-coalesced generic notice per holder: `1 overlapping work claim: who` /
-`N overlapping work claims: who`, the same text for every harness. Detection is
-conservative: a false positive only adds an
-advisory notice. The in-band list holds at most 100 conflicts;
-`truncated` signals the scan or report cap engaged. The notice shares the
-mail-wake gate (one per minute, at most one open notice command per
-recipient across mail and claims, same unknown/hold/request suppression,
-ordinary owner `send` bound to the holder's current generation); there is
-no `wake_on_mail` flag for claims, and a replayed `claim.set` (no new
-event) never re-notifies. A conflict is never a lock, a reassignment, or
-a second ownership database. `claim.list` pages live claims, optionally
-filtered by project and Agent; an Agent caller reads only its own project.
+— is reported in-band in the `claim.set` response. Each holder can receive
+bounded details naming the Agents and globs through a generation-bound
+`next_input` context item. The item waits for an independently scheduled
+input. A replayed claim creates no new context item. Detection is
+conservative. The in-band list holds up to 100 conflicts and `truncated`
+signals the scan or report cap. Claims are advisory. `claim.list` pages
+live claims by project and Agent. An Agent caller reads only its own project.
 
 `who` composes existing L3 projections per current worker: the roster
 holds every non-terminal Agent in scope (at most 100, oldest first, with
@@ -2657,7 +2687,7 @@ swarm interrupt|abort A [--generation N] [--turn ID]
 swarm stop A [--force] [--tree | --generation N]
 swarm resume A [PROMPT] [--wait] [--timeout-seconds N]
 swarm wait --all|--any --timeout-seconds N ID...
-swarm result A [--generation N] [--turns N] [--metadata]
+swarm result A [--generation N] [--before CURSOR_JSON | --turn-id TURN] [--limit N] [--metadata]
 swarm turn show|resolve ...
 swarm approve|deny A [--request R] [--choice ID] [--feedback TEXT] | answer ... [--request R]
 swarm configure A [--model MODEL] [--effort EFFORT] [--generation N]
@@ -2670,11 +2700,13 @@ swarm var set KEY [VALUE | --value-file PATH] [--as-json] [...] | var get ... | 
 swarm project list | show ID
 swarm rule list [--project PROJECT] [--after ID] [--limit N]
 swarm rule show ID [--project PROJECT]
+swarm rule list [--project PROJECT] [--after ID] [--limit N]
 swarm rule read NAME.toml [--project PROJECT]
 swarm rule save NAME.toml --file FILE [--expected-revision SHA256] [--project PROJECT]
 swarm rule delete NAME.toml --expected-revision SHA256 [--project PROJECT]
 swarm rule catch-up ID --after SEQ [--through SEQ] [--project PROJECT]
 swarm timer show ID [--project PROJECT] | run ID [--project PROJECT]
+swarm timer list [--project PROJECT] [--after ID] [--limit N]
 swarm goal set A --text TEXT --check CMD [ARGS...] [--mode eliot|native] [--check-cwd PATH] [--check-timeout-ms MS] [--max-turns N] [--max-rounds N] [--max-without-progress N] [--cadence-ms MS] [--scope GLOB]... [--check-input GLOB]... [--max-cost AMOUNT --cost-unit UNIT] [--escalate-model M] [--escalate-effort E] [--escalate-reason TEXT]
 swarm goal show|pause|clear|resume A [--mode eliot|native] [--reason R]
 swarm goal round A (--idle-seq SEQ | --slot N) [--mode eliot|native]

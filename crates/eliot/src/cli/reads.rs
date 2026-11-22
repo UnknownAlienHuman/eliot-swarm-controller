@@ -542,6 +542,7 @@ pub(crate) async fn run_result(
         agent,
         generation: GenerationArgs { generation },
         turn_id,
+        before,
         page: PageArgs { limit },
         metadata,
     }: ResultArgs,
@@ -549,10 +550,16 @@ pub(crate) async fn run_result(
     json_output: bool,
 ) -> Result<u8, Failure> {
     validate_limit(limit)?;
+    let before = before
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|_| Failure::new(2, "--before must be a JSON result cursor"))?;
     let params = AgentResultRequest {
         id: agent,
         generation,
         turn_id,
+        before,
         limit,
         metadata,
     };
@@ -1456,6 +1463,15 @@ fn print_why_diagnosis(response: &DiagnoseResponse) {
     }
     if let Some(preceded_by) = response.preceded_by.as_deref() {
         println!("  preceded by: {preceded_by}");
+    }
+    for entry in &response.attention_steps {
+        let reaction = &entry.reaction;
+        println!(
+            "  [monitoring, generation {}] {} ({})",
+            entry.generation,
+            reaction.step.replace('_', " "),
+            reaction.outcome.replace('_', " "),
+        );
     }
     if let Some(crash) = response.previous_crash.as_ref() {
         println!("  previous crash: {}", crash.summary());

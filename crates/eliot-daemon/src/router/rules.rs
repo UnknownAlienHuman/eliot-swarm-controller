@@ -461,12 +461,19 @@ impl Router {
             request: action,
             workspace,
         } = prepared;
+        if (action.probe || action.verb == "compact") && principal != "owner" {
+            return Err(Error::new(
+                "not_allowed",
+                "provider probes and compact timer actions require the Owner principal",
+            ));
+        }
         if !matches!(
             action.verb.as_str(),
             "stop"
                 | "send"
                 | "launch"
                 | "resume"
+                | "compact"
                 | "run"
                 | "git.fetch"
                 | "notify"
@@ -589,11 +596,14 @@ impl Router {
         }
         validate_rule_launch_preparation(&prepared)?;
         validate_rule_resume_preparation(&prepared, project)?;
-        let PreparedSubmission { request, workspace } = prepared;
-        if workspace.is_some() {
+        // Store admits the validated managed worktree from the frozen launch args.
+        let PreparedSubmission { request, .. } = prepared;
+        if (request.probe || matches!(request.verb.as_str(), "compact" | "switch"))
+            && principal != "owner"
+        {
             return Err(Error::new(
-                "invalid",
-                "rule firing cannot contain workspace preparation",
+                "not_allowed",
+                "provider probes, compact and switch rule actions require the Owner principal",
             ));
         }
         if request.verb == "run" {
@@ -655,6 +665,8 @@ impl Router {
                     | "mail.send"
                     | "var.set"
                     | "inject"
+                    | "compact"
+                    | "switch"
             )
         {
             return Err(Error::new(
@@ -662,6 +674,7 @@ impl Router {
                 "rule firing must contain a prepared stop, send, launch, resume, steer, interrupt, reply, Run, inject, mail.send, var.set, or local event action",
             ));
         }
+        let secret_policy = self.secret_policy_snapshot();
         let admission = {
             let mut store = self.inner.store.lock().await;
             let retained_resume = if matches!(request.verb.as_str(), "resume" | "git.fetch") {
@@ -693,7 +706,14 @@ impl Router {
                         ));
                     }
                 }
-                store.admit_rule_action(principal, state, event_seq, request, now_ms())?
+                store.admit_rule_action(
+                    principal,
+                    state,
+                    event_seq,
+                    request,
+                    now_ms(),
+                    &secret_policy,
+                )?
             };
             self.publish_locked(&admission.events);
             admission
@@ -703,6 +723,7 @@ impl Router {
         {
             self.schedule_rule_admission(child);
         }
+        self.note_rule_refusals(principal, &admission.events);
         self.signal_progress();
         Ok(Some(admission))
     }
@@ -730,14 +751,23 @@ impl Router {
                     {
                         Ok(frozen) => frozen,
                         Err(_) => {
-                            checked.push(RuleCatchUpAction::rejected(action.event_seq, "invalid"));
+                            checked.push(RuleCatchUpAction::rejected_with_message(
+                                action.event_seq,
+                                "invalid",
+                                "global Run arguments are not frozen",
+                            ));
                             continue;
                         }
                     };
                     match self.verify_global_run(&frozen).await {
                         Ok(_) => checked.push(action.clone()),
                         Err(error) if is_deterministic_pre_admission_rejection(&error.code) => {
-                            checked.push(RuleCatchUpAction::rejected(action.event_seq, error.code));
+                            let error = error.sanitized(&self.secret_policy_snapshot());
+                            checked.push(RuleCatchUpAction::rejected_with_message(
+                                action.event_seq,
+                                error.code,
+                                error.message.as_str(),
+                            ));
                         }
                         Err(error) => return Err(error),
                     }
@@ -776,6 +806,7 @@ impl Router {
             if let Some(child) = admission.children.first() {
                 self.schedule_rule_admission(child);
             }
+            self.note_rule_refusals(principal, &admission.events);
             self.signal_progress();
         }
         Ok(Some(admission))

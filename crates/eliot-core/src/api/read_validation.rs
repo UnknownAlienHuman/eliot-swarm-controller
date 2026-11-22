@@ -1,6 +1,8 @@
 //! Pure binding checks for implemented read callers.
 //! These checks do not settle commands, repair replies, or interpret their state.
 
+use std::collections::HashSet;
+
 use super::{
     AgentResultRequest, AgentResultResponse, CommandChildrenRequest, CommandChildrenResponse,
     CommandGetRequest, RuleGetRequest, RuleStateView, TurnGetRequest,
@@ -83,23 +85,31 @@ impl TurnGetRequest {
 
 impl AgentResultRequest {
     pub fn validate_response(&self, response: &AgentResultResponse) -> Result<()> {
-        let metadata_matches = response.agent_metadata.as_ref().is_none_or(|metadata| {
-            metadata.id == self.id
-                && metadata.generation >= 0
-                && (self.generation.is_some() || metadata.generation == response.generation)
+        let expected_generation = self.generation.unwrap_or(response.current_generation);
+        let mut turn_keys = HashSet::new();
+        let upper_generation = self.before.as_ref().map_or(response.generation, |before| {
+            turn_keys.insert((before.generation, before.turn_id.as_str()));
+            before.generation
         });
         if self.validate().is_err()
             || response.agent != self.id
+            || self.metadata != response.agent_metadata.is_some()
+            || response.agent_metadata.as_ref().is_some_and(|agent| {
+                agent.id != self.id || agent.generation != response.current_generation
+            })
             || response.generation < 0
-            || self
-                .generation
-                .is_some_and(|generation| generation != response.generation)
-            || (self.metadata && response.agent_metadata.is_none())
-            || !metadata_matches
+            || response.current_generation < 0
+            || response.generation != expected_generation
+            || upper_generation > response.generation
             || response.turns.len() > self.limit
             || response.turns.iter().any(|turn| {
                 turn.agent != response.agent
-                    || turn.generation != response.generation
+                    || turn.generation < 0
+                    || turn.generation > upper_generation
+                    || !turn_keys.insert((turn.generation, turn.turn_id.as_str()))
+                    || self
+                        .generation
+                        .is_some_and(|generation| turn.generation != generation)
                     || turn.config_revision < 0
                     || turn.config.as_ref().is_some_and(|config| {
                         config.validate().is_err() || config.revision != turn.config_revision
@@ -108,9 +118,48 @@ impl AgentResultRequest {
         {
             return Err(binding_mismatch());
         }
+        if response
+            .turns
+            .windows(2)
+            .any(|pair| pair[0].generation < pair[1].generation)
+        {
+            return Err(binding_mismatch());
+        }
+        let mut generations = response
+            .turns
+            .iter()
+            .map(|turn| turn.generation)
+            .collect::<Vec<_>>();
+        if self.before.is_none()
+            && self.turn_id.is_none()
+            && response.generation > 0
+            && response.generation == response.current_generation
+        {
+            generations.insert(0, response.generation);
+        }
+        generations.dedup();
+        if !response
+            .generation_boundaries
+            .iter()
+            .map(|boundary| boundary.generation)
+            .eq(generations)
+            || response.next.as_ref().is_some_and(|next| {
+                self.turn_id.is_some()
+                    || next.validate().is_err()
+                    || response.turns.last().is_none_or(|turn| {
+                        turn.generation != next.generation || turn.turn_id != next.turn_id
+                    })
+                    || self.before.as_ref().is_some_and(|before| {
+                        (next.generation, next.insertion_seq)
+                            >= (before.generation, before.insertion_seq)
+                    })
+            })
+        {
+            return Err(binding_mismatch());
+        }
         if let Some(turn_id) = &self.turn_id {
             match response.turns.as_slice() {
-                [turn] if turn.turn_id == *turn_id => {}
+                [turn] if turn.turn_id == *turn_id && turn.generation == expected_generation => {}
                 _ => return Err(binding_mismatch()),
             }
         }

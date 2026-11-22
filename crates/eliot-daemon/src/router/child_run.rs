@@ -406,9 +406,15 @@ fn status_from_wait(entry: &WaitEntryResult) -> Result<ChildRunStatus> {
 
 fn child_run_digest_id(id: &str) -> Result<String> {
     let value = ulid::Ulid::from_string(id).map_err(|_| Error::invalid_mutation_id())?;
-    // The sibling ULID preserves the operation timestamp while reserving a
-    // separate id for the digest table. Repeated calls derive the same id.
-    Ok(ulid::Ulid(value.0 ^ 1).to_string())
+    let original = value.to_bytes();
+    let hash = eliot_core::canonical::digest(&json!({"child.run.digest": value.to_string()}))?;
+    // Keep the launch's admission timestamp and derive a separate, stable digest id.
+    let mut bytes = original;
+    bytes[6..].copy_from_slice(&hash[..10]);
+    if bytes == original {
+        bytes[15] ^= 1;
+    }
+    Ok(ulid::Ulid::from_bytes(bytes).to_string())
 }
 
 fn encode_child_run(response: ChildRunResponse) -> Result<Value> {

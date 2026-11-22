@@ -58,17 +58,18 @@ pub use agent_views::{
     AGENT_LIST_STATES, AGENT_NOTICE_MESSAGE_CHARS, AGENT_PREVIEW_CHARS, AgentConfigView,
     AgentEditsResponse, AgentGetResponse, AgentGitResponse, AgentListResponse, AgentListRow,
     AgentNativeNotice, AgentPatchDigestResponse, AgentProcessesResponse, AgentProviderHold,
-    AgentStateTotal, AgentStatsResponse, AgentSummary, AutomaticCleanupPolicy,
-    AutomaticCleanupSweep, AutomaticCleanupView, CloudMcpCustody, CloudMcpHealth, CloudMcpStatus,
-    CrashMarker, DaemonPanicTestResponse, DaemonStatusResponse, DiagnoseResponse, DiagnoseStep,
-    DrainReport, GitCredentialHelper, MAX_DIAGNOSE_MESSAGE_CHARS, MAX_DIAGNOSE_STEPS,
-    MAX_DIAGNOSE_SUMMARY_CHARS, NativeNotice, NativeNoticeKind, OwnedProcessKind,
-    OwnedProcessSummary, PROCESS_CURSOR_MAX_BYTES, PatchDigestFile, ProcessPageCursor,
-    ProjectCheckoutView, ProjectDiscoverResponse, ProjectGitView, ProjectRegistrationView,
-    RetainedUnknownSummary, RetentionView, RunningTurnSummary, SourceOwner, SourceState,
-    StatusBlocker, UnsettledCommandSummary, WorkerTaskHealth, WorkerTaskStatus,
-    WorkspaceCustodyView, activity_state_name, agent_state_name, agent_status_line,
-    diagnosis_reason, process_state_name, repository_name_from_url, stats_coverage_name,
+    AgentStateTotal, AgentStatsResponse, AgentSummary, AttentionStepReadback,
+    AutomaticCleanupPolicy, AutomaticCleanupSweep, AutomaticCleanupView, CloudMcpCustody,
+    CloudMcpHealth, CloudMcpStatus, CrashMarker, DaemonPanicTestResponse, DaemonStatusResponse,
+    DiagnoseResponse, DiagnoseStep, DrainReport, GitCredentialHelper, MAX_DIAGNOSE_ATTENTION_STEPS,
+    MAX_DIAGNOSE_MESSAGE_CHARS, MAX_DIAGNOSE_STEPS, MAX_DIAGNOSE_SUMMARY_CHARS, NativeNotice,
+    NativeNoticeKind, OwnedProcessKind, OwnedProcessSummary, PROCESS_CURSOR_MAX_BYTES,
+    PatchDigestFile, ProcessPageCursor, ProjectCheckoutView, ProjectDiscoverResponse,
+    ProjectGitView, ProjectRegistrationView, RetainedUnknownSummary, RetentionView,
+    RunningTurnSummary, SourceOwner, SourceState, StatusBlocker, UnsettledCommandSummary,
+    WorkerTaskHealth, WorkerTaskStatus, WorkspaceCustodyView, activity_state_name,
+    agent_state_name, agent_status_line, diagnosis_reason, process_state_name,
+    repository_name_from_url, stats_coverage_name,
 };
 pub use config_views::{
     CONFIG_REVISION_HEX_LEN, MAX_LISTED_PROFILES, MAX_PROFILES_SOURCE_BYTES, ProfileListRequest,
@@ -127,7 +128,10 @@ pub use hierarchy::{
     DEFAULT_MAX_TREE_AGENTS, HierarchyLimits, ReparentRequest, ReparentResponse, ReparentedAgent,
     parse_tree_selector, selector_child_id,
 };
-pub use maintenance::{MaintenanceRunRequest, MaintenanceRunResponse};
+pub use maintenance::{
+    MaintenancePurgeLegacyAttentionRequest, MaintenancePurgeLegacyAttentionResponse,
+    MaintenanceRunRequest, MaintenanceRunResponse,
+};
 pub use monitor_views::{
     FilesystemInvalidationState, FilesystemInvalidationView, GitObservation, GitView,
     LivenessBasis, LivenessView, MonitoringSourceState, ObservationData, ObservationView,
@@ -168,7 +172,8 @@ pub use provider::{
 };
 pub use reads::{
     AgentResultRequest, AgentResultResponse, CommandChildrenRequest, CommandChildrenResponse,
-    CommandGetRequest, RuleGetRequest, RuleStateView, TurnGetRequest,
+    CommandGetRequest, GenerationBoundary, GenerationReason, ResultCursor, RuleGetRequest,
+    RuleStateView, TurnGetRequest,
 };
 pub use resolutions::{
     CommandResolution, CommandResolveRequest, CommandResolveResponse, SettleStoppedRequest,
@@ -179,7 +184,10 @@ pub use rule_edit::{
     MAX_RULE_FILE_BYTES, MAX_RULE_PATH_BYTES, RULE_REVISION_HEX_LEN, RuleDeleteRequest,
     RuleDeleteResponse, RuleReadRequest, RuleReadResponse, RuleSaveRequest, RuleSaveResponse,
 };
-pub use rules::{RuleCatchUpRequest, RuleLimit, RuleLimitScope};
+pub use rules::{
+    MAX_RULE_REJECTION_MESSAGE_BYTES, MAX_RULE_SHOW_STDERR_BYTES, MAX_RULE_SHOW_STDERR_LINES,
+    RuleCatchUpRequest, RuleLastOutcome, RuleLastRefusal, RuleLimit, RuleLimitScope, RuleShowView,
+};
 pub use script_edit::{
     MAX_SCRIPT_EDIT_BYTES, MAX_SCRIPT_ENTRIES, MAX_SCRIPT_PAGE_BYTES, MAX_SCRIPT_PATH_BYTES,
     ScriptEntryView, ScriptListRequest, ScriptListResponse, ScriptReadRequest, ScriptReadResponse,

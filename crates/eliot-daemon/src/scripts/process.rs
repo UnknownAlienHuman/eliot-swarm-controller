@@ -1,7 +1,7 @@
 use crate::platform::{CustodyGuarantee, CustodyObserver, OwnedChild};
-use eliot_core::{SecretPolicy, StderrSnapshot, limits::MAX_FRAME_BYTES};
-use eliot_plugin::{StderrCapture, spawn_stderr};
-use std::{io, process::ExitStatus, process::Stdio, sync::Arc, time::Duration};
+use eliot_core::{Error, SecretPolicy, StderrSnapshot, limits::MAX_FRAME_BYTES};
+use eliot_plugin::{StderrCapture, spawn_stderr, spawn_stderr_prefix};
+use std::{ffi::OsStr, io, process::ExitStatus, process::Stdio, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::{ChildStdin, ChildStdout, Command},
@@ -11,6 +11,58 @@ use tokio::{
 };
 
 const CLEANUP_GRACE: Duration = Duration::from_secs(5);
+
+#[cfg(windows)]
+const LOCAL_BASE_ENVIRONMENT: &[&str] = &[
+    "PATH",
+    "PATHEXT",
+    "SystemRoot",
+    "SystemDrive",
+    "WINDIR",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "HOME",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "COMSPEC",
+];
+
+#[cfg(unix)]
+const LOCAL_BASE_ENVIRONMENT: &[&str] = &[
+    "PATH", "HOME", "TMPDIR", "TMP", "TEMP", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE",
+];
+
+#[cfg(not(any(windows, unix)))]
+const LOCAL_BASE_ENVIRONMENT: &[&str] = &[];
+
+/// Build a local child command with the shared, explicit platform environment.
+///
+/// These checks and scripts need installed developer tools from PATH, while
+/// ambient credentials and unrelated daemon variables must stay out.
+pub(crate) fn local_process_command(program: impl AsRef<OsStr>) -> eliot_core::Result<Command> {
+    let mut command = Command::new(program);
+    command.env_clear();
+
+    #[cfg(windows)]
+    for (name, message) in [
+        ("SystemRoot", "Windows SystemRoot is unavailable"),
+        ("PATHEXT", "Windows PATHEXT is unavailable"),
+    ] {
+        if std::env::var_os(name).is_none() {
+            return Err(Error::new("unavailable", message));
+        }
+    }
+
+    for &name in LOCAL_BASE_ENVIRONMENT {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    Ok(command)
+}
 
 #[derive(Debug)]
 pub(crate) struct ProcessCapture {
@@ -98,6 +150,31 @@ pub(crate) async fn run_owned_process(
     policy: Arc<SecretPolicy>,
     cancellation: watch::Receiver<bool>,
 ) -> ProcessOutcome {
+    run_owned_process_with_stderr(
+        command,
+        stdin,
+        timeout,
+        policy,
+        cancellation,
+        StderrExcerpt::Tail,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum StderrExcerpt {
+    Tail,
+    Prefix,
+}
+
+pub(crate) async fn run_owned_process_with_stderr(
+    command: Command,
+    stdin: Vec<u8>,
+    timeout: Duration,
+    policy: Arc<SecretPolicy>,
+    cancellation: watch::Receiver<bool>,
+    stderr: StderrExcerpt,
+) -> ProcessOutcome {
     if stdin.len() > MAX_FRAME_BYTES {
         return ProcessOutcome::Failed {
             reason: ProcessFailure::InputLimit,
@@ -125,6 +202,7 @@ pub(crate) async fn run_owned_process(
         timeout,
         policy,
         cancellation,
+        stderr,
     ))
     .await
     {
@@ -161,6 +239,7 @@ async fn run_owned_process_inner(
     timeout: Duration,
     policy: Arc<SecretPolicy>,
     mut cancellation: watch::Receiver<bool>,
+    stderr: StderrExcerpt,
 ) -> ProcessOutcome {
     let Some(deadline) = Instant::now().checked_add(timeout) else {
         return ProcessOutcome::Failed {
@@ -205,7 +284,10 @@ async fn run_owned_process_inner(
         stdin_result: None,
         stdout_task: tokio::spawn(capture_stdout(stdout_pipe)),
         stdout_result: None,
-        stderr_task: spawn_stderr(stderr_pipe, policy),
+        stderr_task: match stderr {
+            StderrExcerpt::Tail => spawn_stderr(stderr_pipe, policy),
+            StderrExcerpt::Prefix => spawn_stderr_prefix(stderr_pipe, policy),
+        },
     };
     #[cfg(target_os = "linux")]
     let status = None;

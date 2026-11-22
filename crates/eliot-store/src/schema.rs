@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 77;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 79;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -1849,6 +1849,98 @@ impl Store {
                      WHERE agent = OLD.id AND generation = OLD.generation;
                  END;
                  INSERT INTO schema_migrations(version) VALUES (77);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 78 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE turns ADD COLUMN insertion_seq INTEGER NOT NULL DEFAULT 0;
+                 UPDATE turns SET insertion_seq = rowid;
+                 CREATE TABLE turn_insertion_sequence (
+                     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                     last_seq INTEGER NOT NULL CHECK(last_seq >= 0)
+                 );
+                 INSERT INTO turn_insertion_sequence
+                     SELECT 1, COALESCE(MAX(insertion_seq), 0) FROM turns;
+                 CREATE INDEX turns_agent_result_order
+                     ON turns(agent, generation DESC, insertion_seq DESC);
+                 CREATE TABLE agent_generation_reasons (
+                     agent INTEGER NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                     generation INTEGER NOT NULL CHECK(generation >= 0),
+                     reason TEXT NOT NULL CHECK(reason IN (
+                         'launch', 'restart_resume', 'owner_resume', 'agent_resume',
+                         'switch', 'handoff', 'attach', 'detach', 'unknown'
+                     )),
+                     PRIMARY KEY(agent, generation)
+                 );
+                 CREATE TABLE restart_resume_intents (
+                     command_id TEXT PRIMARY KEY REFERENCES commands(id) ON DELETE CASCADE
+                 );
+                 INSERT INTO agent_generation_reasons(agent, generation, reason)
+                 SELECT t.agent, t.generation,
+                     CASE
+                         WHEN t.generation = 1 AND EXISTS (
+                             SELECT 1 FROM commands c
+                             WHERE c.target = t.agent AND c.generation = t.generation
+                               AND c.verb = 'launch' AND c.link_kind = 'switch' AND c.ordinal = 0
+                         ) THEN 'switch'
+                         WHEN t.generation = 1 AND EXISTS (
+                             SELECT 1 FROM commands c
+                             WHERE c.target = t.agent AND c.generation = t.generation
+                               AND c.verb = 'launch'
+                         ) THEN 'launch'
+                         ELSE 'unknown'
+                     END
+                 FROM (SELECT DISTINCT agent, generation FROM turns) t;
+                 INSERT INTO schema_migrations(version) VALUES (78);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 79 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE INDEX events_monitoring_agent
+                 ON events(agent, kind, seq)
+                 WHERE kind IN ('session.growth', 'x.user.agent.attention_step');
+                 CREATE INDEX events_attention_report
+                 ON events(json_extract(data, '$.data.incident_id'), json_extract(data, '$.data.phase'), seq)
+                 WHERE kind = 'x.user.agent.attention';
+                 CREATE INDEX events_attention_step
+                 ON events(json_extract(data, '$.incident_id'), json_extract(data, '$.step'), seq)
+                 WHERE kind = 'x.user.agent.attention_step';
+                 CREATE INDEX events_tool_turn
+                 ON events(agent, generation, kind, json_extract(data, '$.turn_id'), seq)
+                 WHERE kind = 'tool.started' OR kind = 'tool.completed';
+                 CREATE TABLE turn_attention_steps (
+                     agent INTEGER NOT NULL,
+                     generation INTEGER NOT NULL,
+                     turn_id TEXT NOT NULL,
+                     incident_kind TEXT NOT NULL,
+                     step TEXT NOT NULL,
+                     event_seq INTEGER NOT NULL,
+                     claimed_at INTEGER NOT NULL,
+                     command_id TEXT,
+                     after_question_seq INTEGER,
+                     PRIMARY KEY(agent, generation, turn_id, incident_kind, step),
+                     FOREIGN KEY(agent, generation, turn_id)
+                         REFERENCES turns(agent, generation, turn_id) ON DELETE CASCADE
+                 );
+                 CREATE UNIQUE INDEX turn_attention_step_command
+                     ON turn_attention_steps(command_id) WHERE command_id IS NOT NULL;
+                 CREATE UNIQUE INDEX turn_attention_one_question
+                     ON turn_attention_steps(agent, generation, turn_id) WHERE step = 'question';
+                 ALTER TABLE provider_holds ADD COLUMN attention_notified INTEGER NOT NULL DEFAULT 0
+                     CHECK(attention_notified IN (0,1));
+                 INSERT INTO schema_migrations(version) VALUES (79);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;

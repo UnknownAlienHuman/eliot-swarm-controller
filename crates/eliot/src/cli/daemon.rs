@@ -1,10 +1,15 @@
 //! Daemon lifecycle and serving commands: daemon, status, mcp.
-use super::args::{DaemonAction, DaemonArgs, MaintenanceArgs, MaintenanceCommand, McpArgs};
+use super::args::{
+    DaemonAction, DaemonArgs, MaintenanceArgs, MaintenanceCommand, McpArgs,
+    PurgeLegacyAttentionAdvisoriesArgs,
+};
 use super::support::{Failure, mutation_id, print_value, read_and_print, response_exit_code};
 use crate::mcp;
 use eliot_core::api::{
     AutomaticCleanupPolicy, DaemonShutdownRequest, DaemonShutdownResponse, DaemonStatusRequest,
-    DaemonStatusResponse, MaintenanceRunRequest, MaintenanceRunResponse, ShutdownMode,
+    DaemonStatusResponse, MaintenancePurgeLegacyAttentionRequest,
+    MaintenancePurgeLegacyAttentionResponse, MaintenanceRunRequest, MaintenanceRunResponse,
+    ShutdownMode,
 };
 use serde_json::Value;
 use serde_json::json;
@@ -158,6 +163,23 @@ pub(crate) async fn run_maintenance(
                 "maintenance.run",
                 MaintenanceRunRequest::default(),
                 MaintenanceRunResponse
+            )
+        }
+        MaintenanceCommand::PurgeLegacyAttentionAdvisories(
+            PurgeLegacyAttentionAdvisoriesArgs {
+                apply,
+                expected_count,
+            },
+        ) => {
+            let request = MaintenancePurgeLegacyAttentionRequest {
+                expected_message_count: if apply { expected_count } else { None },
+            };
+            read_and_print!(
+                &data_dir,
+                json_output,
+                "maintenance.purge_legacy_attention_advisories",
+                request,
+                MaintenancePurgeLegacyAttentionResponse
             )
         }
     }

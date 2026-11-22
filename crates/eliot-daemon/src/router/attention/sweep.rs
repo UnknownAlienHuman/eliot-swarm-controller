@@ -639,7 +639,12 @@ async fn retry_pending_deliveries(router: &Router, state: Arc<Mutex<AttentionSta
             // presence skips mail that is already delivered); the generic
             // path would treat a retained duplicate mail binding as failure.
             let delivered = if is_loss && !recovery {
-                persist_loss_delivery(&router, &delivery).await
+                persist_loss_delivery(
+                    &router,
+                    &delivery,
+                    router.attention_config().agent_lost.enabled,
+                )
+                .await
             } else {
                 persist_and_notify(&router, &delivery).await
             };

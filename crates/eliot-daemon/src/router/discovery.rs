@@ -136,6 +136,15 @@ const METHODS: &[Method] = &[
         "Run the bounded retention pass now and report pruned counts.",
         {}
     ),
+    method!(
+        "maintenance.purge_legacy_attention_advisories",
+        MaintenancePurgeLegacyAttentionRequest,
+        MaintenancePurgeLegacyAttentionResponse,
+        true,
+        true,
+        "Preview the exact count of owner-sent legacy advisory-attention mail, or purge it after an exact-count confirmation.",
+        {}
+    ),
     method!("command.submit", CommandSubmitRequest, CommandSubmitResponse, false, true, "Submit a command with launch/send/wait child verbs.", {"id":EXAMPLE_ID,"verb":"send","target":"a1","args":{"text":"Report current progress."}}),
     method!("command.get", CommandGetRequest, Command, false, false, "Read a retained command in your authorized scope.", {"id":EXAMPLE_ID}),
     method!("command.children", CommandChildrenRequest, CommandChildrenResponse, false, false, "Page the retained children of one command.", {"id":EXAMPLE_ID,"limit":20}),
@@ -157,7 +166,7 @@ const METHODS: &[Method] = &[
     method!("models.catalog", ModelsCatalogRequest, ModelsCatalogResponse, true, false, "Search one unified model catalogue across every installed harness (read-only).", {"query":"luna"}),
     method!("agent.history", AgentHistoryRequest, ObservationPage, true, false, "Read a bounded native history view advertised by agent.get.", {"id":"a1","source":"native","view":"turns","limit":20}),
     method!("agent.list", AgentListRequest, AgentListResponse, false, false, "List scoped compact Agent summaries with filters and counts.", {"limit":20,"state":"busy"}),
-    method!("agent.result", AgentResultRequest, AgentResultResponse, false, false, "Read retained turns/results for one Agent.", {"id":"a1","limit":20}),
+    method!("agent.result", AgentResultRequest, AgentResultResponse, false, false, "Page through one Agent's retained turns and their generation origins.", {"id":"a1","limit":20}),
     method!("agent.processes", AgentProcessesRequest, AgentProcessesResponse, false, false, "Read bounded process observations for one Agent.", {"id":"a1"}),
     method!("agent.stats", AgentStatsRequest, AgentStatsResponse, false, false, "Read sampled Agent statistics with freshness metadata.", {"id":"a1"}),
     method!(
@@ -277,7 +286,7 @@ const METHODS: &[Method] = &[
     method!("script.read", ScriptReadRequest, ScriptReadResponse, true, false, "Read one existing script entry through a verified handle.", {"project":null,"path":"check.ps1"}),
     method!("script.save", ScriptSaveRequest, ScriptSaveResponse, true, true, "Validate (dry_run) or replace one existing script entry guarded by its revision; never executes.", {"project":null,"path":"check.ps1","expected_revision":"0000000000000000000000000000000000000000000000000000000000000000","content":"Write-Output ok\n","dry_run":true}),
     method!("rule.list", RuleListRequest, RuleListResponse, true, false, "Page one rule namespace's stored states and timer states.", {"limit":20}),
-    method!("rule.get", RuleGetRequest, RuleStateView, true, false, "Read one rule's current and retiring cursors.", {"id":"rule-1"}),
+    method!("rule.get", RuleGetRequest, RuleShowView, true, false, "Read one rule's cursors, latest action outcome and latest refusal.", {"id":"rule-1"}),
     method!("rule.read", RuleReadRequest, RuleReadResponse, true, false, "Read one approved rule source file and its byte revision.", {"path":"notify.toml"}),
     method!("rule.save", RuleSaveRequest, RuleSaveResponse, true, true, "Create or replace a rule source file against its expected revision.", {"path":"notify.toml","expected_revision":null,"content":"[[rule]]\nid = 'notify-finished'\non = { event = 'turn.completed' }\ndo = [{ action = 'notify', message = 'Task done' }]\n"}),
     method!("rule.delete", RuleDeleteRequest, RuleDeleteResponse, true, true, "Remove one rule source file against its expected revision.", {"path":"notify.toml","expected_revision":"0000000000000000000000000000000000000000000000000000000000000000"}),

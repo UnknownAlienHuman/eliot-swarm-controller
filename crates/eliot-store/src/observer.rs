@@ -528,6 +528,16 @@ pub(super) fn dispatch(
         ));
         next
     };
+    super::result_page::record_generation_reason_tx(
+        tx,
+        id,
+        generation,
+        if command.command.verb == "attach" {
+            eliot_core::api::GenerationReason::Attach
+        } else {
+            eliot_core::api::GenerationReason::Detach
+        },
+    )?;
     update_command_state(
         tx,
         &command.command.id,

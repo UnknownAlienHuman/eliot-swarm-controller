@@ -349,15 +349,13 @@ impl Router {
                 && definition.validate().is_ok()
             {
                 for recipient in &definition.to {
-                    self.offer_notice(recipient, eliot_store::NoticePending::Mail)
-                        .await;
+                    self.offer_notice(recipient).await;
                 }
             }
             return;
         }
         for recipient in &recipients {
-            self.offer_notice(recipient, eliot_store::NoticePending::Mail)
-                .await;
+            self.offer_notice(recipient).await;
         }
     }
 

@@ -76,7 +76,7 @@ pub(crate) enum CliCommand {
     Project(ProjectArgs),
     /// Read or edit automation rules, or catch up one loaded rule.
     Rule(RuleArgs),
-    /// Read or manually run a startup-loaded timer.
+    /// List, show or manually run a startup-loaded timer.
     Timer(TimerArgs),
     /// Set, read or drive one Agent's Eliot-mode Goal.
     Goal(GoalArgs),
@@ -758,6 +758,9 @@ pub(crate) struct ResultArgs {
     pub(crate) generation: GenerationArgs,
     #[arg(long, value_name = "TURN")]
     pub(crate) turn_id: Option<String>,
+    /// Read older turns starting before the previous response's `next` cursor.
+    #[arg(long, value_name = "CURSOR_JSON", conflicts_with = "turn_id")]
+    pub(crate) before: Option<String>,
     #[command(flatten)]
     pub(crate) page: PageArgs,
     /// Include current Agent metadata; by default result output contains turns only.
@@ -1161,6 +1164,23 @@ pub(crate) struct MaintenanceArgs {
 pub(crate) enum MaintenanceCommand {
     /// Run one bounded retention pass now and report pruned counts.
     Run,
+    /// Preview owner-sent legacy attention advisory mail; apply only with the exact preview count.
+    PurgeLegacyAttentionAdvisories(PurgeLegacyAttentionAdvisoriesArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct PurgeLegacyAttentionAdvisoriesArgs {
+    /// Apply the purge after confirming the exact count from a prior dry-run.
+    #[arg(long, requires = "expected_count")]
+    pub(crate) apply: bool,
+    /// Exact total returned by the prior dry-run.
+    #[arg(
+        long,
+        value_name = "COUNT",
+        value_parser = clap::value_parser!(i64).range(0..),
+        requires = "apply"
+    )]
+    pub(crate) expected_count: Option<i64>,
 }
 
 #[derive(Args)]
@@ -1482,10 +1502,23 @@ pub(crate) struct RuleCatchUpArgs {
 
 #[derive(Subcommand)]
 pub(crate) enum TimerCommand {
+    /// List loaded timers in the selected namespace.
+    List(TimerListArgs),
     /// Show the current timer schedule and durable UTC slot state.
     Show(TimerShowArgs),
     /// Run one timer action using a durable mutation ID.
     Run(TimerRunArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct TimerListArgs {
+    #[arg(long, value_name = "PROJECT")]
+    pub(crate) project: Option<String>,
+    /// Last rule id from the previous timer page.
+    #[arg(long, value_name = "RULE")]
+    pub(crate) after: Option<String>,
+    #[arg(long, default_value_t = eliot_core::api::RuleListRequest::default().limit)]
+    pub(crate) limit: usize,
 }
 
 #[derive(Args)]
