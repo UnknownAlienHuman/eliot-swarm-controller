@@ -2,12 +2,13 @@
 use super::args::{
     ClaimArgs, ClaimCommand, ClaimListArgs, ClaimReleaseArgs, ClaimSetArgs, CmdArgs,
     CmdChildrenArgs, CmdCommand, CmdResolveArgs, CmdSettleStoppedArgs, CmdShowArgs, InboxArgs,
-    MsgAckArgs, MsgArgs, MsgCommand, MsgSendArgs, MsgShowArgs, PageArgs, TurnArgs, TurnCommand,
-    TurnResolveArgs, VarArgs, VarCommand, VarGetArgs, VarSetArgs, WhoArgs,
+    MsgAckArgs, MsgArgs, MsgCommand, MsgSendArgs, MsgShowArgs, OptionalAgent, PageArgs, TurnArgs,
+    TurnCommand, TurnResolveArgs, VarArgs, VarCommand, VarGetArgs, VarSetArgs, WhoArgs,
 };
+use super::reads::resolve_agent_target;
 use super::support::{
-    Failure, command_value, mutation_id, print_value, sleep_before_deadline, validate_limit,
-    wait_deadline,
+    Failure, command_value, mutation_id, print_value, print_value_or_human, sleep_before_deadline,
+    validate_limit, wait_deadline,
 };
 use eliot_core::Command as CoreCommand;
 use eliot_core::api::discovery::{IdentityRequest, IdentityResponse};
@@ -56,9 +57,40 @@ pub(crate) async fn run_cmd(
             {
                 return Err(Failure::new(4, "stop settlement response binding differs"));
             }
-            let value = serde_json::to_value(response)
+            let value = serde_json::to_value(&response)
                 .map_err(|_| Failure::new(4, "stop settlement response is invalid"))?;
-            print_value(&value, json_output);
+            print_value_or_human(&value, json_output, || {
+                println!(
+                    "Stop settlement {}: {} proven stop(s), {} still awaiting proof.",
+                    if response.applied {
+                        "applied"
+                    } else {
+                        "preview"
+                    },
+                    response.stops.len(),
+                    response.awaiting_proof.len()
+                );
+                println!("Review digest: {}", response.review);
+                for stop in &response.stops {
+                    println!(
+                        "  Agent {} generation {} · command {} · mark stopped: {}{}",
+                        stop.agent,
+                        stop.generation,
+                        stop.command_id,
+                        stop.mark_stopped,
+                        stop.interrupted_turn
+                            .as_deref()
+                            .map(|turn| format!(" · interrupted turn {turn}"))
+                            .unwrap_or_default()
+                    );
+                }
+                for command in &response.awaiting_proof {
+                    println!("  Awaiting process or reader proof: {command}");
+                }
+                if let Some(next) = response.next.as_deref() {
+                    println!("Continue with --after {next}");
+                }
+            });
             Ok(0)
         }
         CmdCommand::Cancel(CmdShowArgs { command_id }) => {
@@ -93,8 +125,31 @@ pub(crate) async fn run_cmd(
             params
                 .validate_response(&response)
                 .map_err(Failure::invalid_response)?;
-            let result = command_value(response)?;
-            print_value(&result, json_output);
+            let result = command_value(response.clone())?;
+            print_value_or_human(&result, json_output, || {
+                println!(
+                    "Command {} · {} · {}",
+                    response.id,
+                    response.verb,
+                    format!("{:?}", response.state).to_lowercase()
+                );
+                println!("Method: {}", response.method);
+                if let Some(target) = response.target.as_deref() {
+                    println!("Target: {target}");
+                }
+                if let Some(generation) = response.generation {
+                    println!("Generation: {generation}");
+                }
+                if let Some(turn) = response.turn_id.as_deref() {
+                    println!("Turn: {turn}");
+                }
+                if let Some(request) = response.request_id.as_deref() {
+                    println!("Request: {request}");
+                }
+                if let Some(outcome) = &response.outcome {
+                    println!("Outcome: {outcome}");
+                }
+            });
             Ok(0)
         }
         CmdCommand::Children(CmdChildrenArgs {
@@ -123,11 +178,26 @@ pub(crate) async fn run_cmd(
         }
         CmdCommand::Resolve(CmdResolveArgs {
             command_id,
-            resolution,
+            status,
+            legacy_as,
             reason,
         }) => {
-            let resolution = CommandResolution::parse(&resolution)
-                .map_err(|_| Failure::new(2, "--as must be applied or failed"))?;
+            let resolution = match (status.as_deref(), legacy_as.as_deref()) {
+                (Some(_), Some(_)) => {
+                    return Err(Failure::new(2, "--status and --as cannot be used together"));
+                }
+                (Some("completed"), None) | (None, Some("applied")) => CommandResolution::Applied,
+                (Some("failed"), None) | (None, Some("failed")) => CommandResolution::Failed,
+                (None, None) => {
+                    return Err(Failure::new(2, "--status or legacy --as is required"));
+                }
+                _ => {
+                    return Err(Failure::new(
+                        2,
+                        "--status must be completed or failed; --as must be applied or failed",
+                    ));
+                }
+            };
             let request = CommandResolveRequest {
                 id: mutation_id(id)?,
                 command_id,
@@ -228,9 +298,16 @@ pub(crate) async fn run_msg(
             print_value(&value, json_output);
             Ok(0)
         }
-        MsgCommand::Show(MsgShowArgs { delivery, agent }) => {
+        MsgCommand::Show(MsgShowArgs {
+            delivery,
+            agent:
+                OptionalAgent {
+                    agent: agent_positional,
+                    legacy_agent,
+                },
+        }) => {
             let request = MailReadRequest {
-                agent,
+                agent: resolve_agent_target(agent_positional, legacy_agent)?,
                 delivery_id: delivery,
             };
             request.validate().map_err(Failure::for_read)?;
@@ -246,7 +323,15 @@ pub(crate) async fn run_msg(
             print_value(&value, json_output);
             Ok(0)
         }
-        MsgCommand::Ack(MsgAckArgs { delivery, agent }) => {
+        MsgCommand::Ack(MsgAckArgs {
+            delivery,
+            agent:
+                OptionalAgent {
+                    agent: agent_positional,
+                    legacy_agent,
+                },
+        }) => {
+            let agent = resolve_agent_target(agent_positional, legacy_agent)?;
             let request = MailAckRequest {
                 id: mutation_id(id)?,
                 agent,
@@ -598,10 +683,15 @@ pub(crate) async fn run_claim_command(
     match command {
         ClaimCommand::Set(ClaimSetArgs {
             glob,
-            agent,
+            agent:
+                OptionalAgent {
+                    agent: agent_positional,
+                    legacy_agent,
+                },
             note,
             ttl_secs,
         }) => {
+            let agent = resolve_agent_target(agent_positional, legacy_agent)?;
             let request = ClaimSetRequest {
                 id: mutation_id(id)?,
                 agent,
@@ -622,7 +712,15 @@ pub(crate) async fn run_claim_command(
             print_value(&value, json_output);
             Ok(0)
         }
-        ClaimCommand::List(ClaimListArgs { project, agent }) => {
+        ClaimCommand::List(ClaimListArgs {
+            project,
+            agent:
+                OptionalAgent {
+                    agent: agent_positional,
+                    legacy_agent,
+                },
+        }) => {
+            let agent = resolve_agent_target(agent_positional, legacy_agent)?;
             let request = ClaimListRequest { project, agent };
             request.validate().map_err(Failure::for_read)?;
             let response: ClaimListResponse =
@@ -637,7 +735,15 @@ pub(crate) async fn run_claim_command(
             print_value(&value, json_output);
             Ok(0)
         }
-        ClaimCommand::Release(ClaimReleaseArgs { glob, agent }) => {
+        ClaimCommand::Release(ClaimReleaseArgs {
+            glob,
+            agent:
+                OptionalAgent {
+                    agent: agent_positional,
+                    legacy_agent,
+                },
+        }) => {
+            let agent = resolve_agent_target(agent_positional, legacy_agent)?;
             let request = ClaimReleaseRequest {
                 id: mutation_id(id)?,
                 agent,

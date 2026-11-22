@@ -48,7 +48,10 @@ impl TimerWait {
             "capacity_unavailable" => error
                 .message
                 .strip_prefix("configured capacity bound ")
-                .and_then(|text| text.rsplit_once(" max_live="))
+                .and_then(|text| {
+                    text.rsplit_once(" max_live=")
+                        .or_else(|| text.rsplit_once(" max_busy="))
+                })
                 .map_or("reservation", |(scope, _)| scope),
             "provider_held" => error
                 .message

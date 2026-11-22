@@ -22,7 +22,7 @@ status.
 `show AGENT` includes the same observation view. Missing or stale counters are null,
 and process activity never counts as model progress.
 
-`discover --profile PROFILE [--scope SCOPE] [--cursor CURSOR] [--archived] [--limit N]` reads a
+`discover --profile PROFILE [--scope SCOPE] [--after CURSOR] [--archived] [--limit N]` reads a
 bounded native session metadata page through the selected profile. It creates no
 Agent and sends no prompt; `--archived` explicitly selects archived Codex subjects. Codex enumeration is state-DB-only; previews and transcripts
 are excluded, and reader-local `notLoaded` remains unknown. Pass `next_cursor` unchanged
@@ -84,6 +84,8 @@ not a task engine (see [queue assignment](docs/spec/automation.md#targetless-lau
 From the repository root, build the binary and replace the workspace, data-directory, and
 Agent placeholders with your values:
 
+A fresh data directory creates the `codex` profile used by the first launch below.
+
 ```powershell
 cargo build --locked -p eliot
 $swarm = '.\target\debug\swarm.exe'
@@ -91,12 +93,12 @@ $workspace = 'PATH_TO_EXISTING_WORKSPACE'
 $dataDir = 'PATH_TO_PRIVATE_ELIOT_DATA_DIR'
 & $swarm --data-dir $dataDir daemon
 & $swarm --data-dir $dataDir status
-& $swarm --data-dir $dataDir launch --profile codex-luna --workspace $workspace 'hello-one' --wait
+& $swarm --data-dir $dataDir launch --profile codex --workspace $workspace 'hello-one' --wait
 & $swarm --data-dir $dataDir ls
 $agent = 'AGENT_ID_FROM_OUTPUT'
 & $swarm --data-dir $dataDir send $agent 'hello-two' --wait
 & $swarm --data-dir $dataDir watch $agent     # Ctrl+C stops watching
-& $swarm --data-dir $dataDir events --since 0
+& $swarm --data-dir $dataDir events --after 0
 & $swarm --data-dir $dataDir result $agent
 & $swarm --data-dir $dataDir stop $agent
 & $swarm --data-dir $dataDir daemon stop --drain  # or --force
@@ -179,7 +181,7 @@ Use an unused branch name. Setup file-argument syntax and scratch policy are doc
 in [configuration](docs/spec/configuration.md#owner-workspace-setup).
 
 Other read commands include `show AGENT` and `cmd show ID`. `watch [AGENT]` streams
-committed events; `events --since SEQ` reads a page of event history.
+committed events; `events --after SEQ` reads a page of event history.
 
 ## Data and credentials
 

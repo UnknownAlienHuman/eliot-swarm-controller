@@ -67,9 +67,9 @@ pub struct TimerStateView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_due_at: Option<i64>,
     pub enabled: bool,
-    /// The code that skipped or rejected the last scheduled slot (for an
-    /// assignment, `not_found` means no new brief); absent once a slot admits
-    /// its action. A manual run changes neither this nor `last_key`.
+    /// Latest scheduled check result. Assignment readbacks also expose a
+    /// current arbitration wait here while its scheduled slot remains due.
+    /// A manual run changes neither this nor `last_key`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_outcome: Option<String>,
 }
@@ -175,6 +175,8 @@ pub struct TimerRunRequest {
     )]
     #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
     pub project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include: Option<String>,
 }
 
 impl TimerRunRequest {
@@ -183,6 +185,7 @@ impl TimerRunRequest {
             id: id.into(),
             rule: rule.into(),
             project: None,
+            include: None,
         }
     }
 
@@ -196,6 +199,18 @@ impl TimerRunRequest {
         validate_nonempty(&self.rule, "timer id")?;
         if let Some(project) = &self.project {
             validate_nonempty(project, "project id")?;
+        }
+        if let Some(name) = &self.include
+            && (self.project.is_some()
+                || name.len() > 255
+                || !name.to_ascii_lowercase().ends_with(".md")
+                || name.contains(['/', '\\'])
+                || name.chars().any(char::is_control))
+        {
+            return Err(Error::new(
+                "invalid",
+                "include requires one brief filename on an Owner timer",
+            ));
         }
         Ok(())
     }
@@ -211,6 +226,7 @@ impl TimerRunRequest {
                 .and_then(serde_json::Value::as_str)
                 != Some(self.rule.as_str())
             || !project_matches_args(&response.args, self.project.as_deref())
+            || response.args.get("include").and_then(Value::as_str) != self.include.as_deref()
         {
             return Err(Error::new(
                 "unknown",

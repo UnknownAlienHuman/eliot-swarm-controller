@@ -1044,7 +1044,7 @@ events.
 The daemon releases the Store writer between retention batches. New Stores use
 incremental auto-vacuum to return free pages in bounded steps. Existing Stores with
 auto-vacuum disabled reuse freed pages during live retention. An explicit [startup
-conversion](configuration.md#later-configuration-example) rebuilds an older file before
+conversion](configuration.md#daemon-and-automation-settings) rebuilds an older file before
 serving and allows future incremental reclamation.
 
 ## Explicit Agent tree presentation and removal

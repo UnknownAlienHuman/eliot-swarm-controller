@@ -1,24 +1,32 @@
-//! Folder assignment cursor and slots on ordinary launch commands and variables.
+//! Folder assignment admissions and slots on ordinary launch commands.
 use super::*;
 use serde::Deserialize;
 use std::collections::HashSet;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AssignmentStatus {
-    pub cursor: Option<String>,
-    pub busy: usize,
-}
+const UNKNOWN_ASSIGNMENT_HOLD_MS: i64 = 60_000;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AssignmentLaunch {
     key: String,
     brief: String,
-    previous: Option<String>,
+    #[serde(default)]
+    include: Option<String>,
     max_busy: u64,
     /// The brief's frozen Goal for Goal-owned work.
     #[serde(default)]
     goal: Option<core::api::GoalDefinition>,
+}
+
+fn assignment_legacy_floor(connection: &Connection, key: &str) -> Result<Option<String>> {
+    connection
+        .query_row(
+            "SELECT cursor FROM assignment_legacy_floors WHERE assignment_key=?1",
+            [key],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_error)
 }
 
 fn validate_key(key: &str) -> Result<()> {
@@ -33,46 +41,101 @@ fn validate_key(key: &str) -> Result<()> {
     Ok(())
 }
 
-fn status(connection: &Connection, key: &str, max_busy: u64) -> Result<AssignmentStatus> {
+fn require_slot(connection: &Connection, key: &str, max_busy: u64, now_ms: i64) -> Result<()> {
     validate_key(key)?;
     if max_busy == 0 || max_busy > 1_000 {
         return Err(Error::new("invalid", "invalid assignment capacity bound"));
     }
-    let value: Option<String> = connection
-        .query_row(
-            "SELECT value FROM vars WHERE scope='global' AND key=?1",
-            [format!("assignment.{key}")],
-            |row| row.get(0),
+    // Consider only the indexed unresolved launches. The expensive custody
+    // check applies only when every remaining reservation is an aged unknown
+    // turn on the exact lost generation.
+    let mut slots = connection
+        .prepare_cached(
+            "SELECT l.target, l.generation, (
+                l.state IN ('accepted','queued','dispatched','unknown')
+                OR NOT EXISTS (
+                    SELECT 1 FROM agents a WHERE a.id=l.target
+                      AND (a.generation>l.generation
+                           OR (a.generation=l.generation AND a.state='lost'))
+                )
+                OR EXISTS (
+                    SELECT 1 FROM commands s
+                    LEFT JOIN turns t ON t.agent=s.target AND t.generation=s.generation
+                                     AND t.turn_id=s.turn_id
+                    WHERE s.parent_command=l.id AND s.link_kind='send'
+                      AND (
+                        s.state IN ('accepted','queued','dispatched','unknown')
+                        OR (s.state='applied' AND (
+                            s.turn_id IS NULL
+                            OR t.state IN ('starting','running')
+                            OR (t.state='unknown' AND (
+                                t.completed_at IS NULL OR t.completed_at>?2
+                                OR s.target IS NOT l.target OR s.generation IS NOT l.generation
+                            ))
+                        ))
+                      )
+                )
+             )
+             FROM commands l INDEXED BY commands_assignment_busy
+             WHERE l.verb='launch' AND l.assignment_busy=1
+               AND json_extract(l.args,'$.assignment.key')=?1",
         )
-        .optional()
         .map_err(sql_error)?;
-    let cursor = value
-        .map(|value| -> Result<String> {
-            decode_json(&value)?
-                .get("cursor")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .ok_or_else(|| Error::new("source_integrity", "assignment cursor is malformed"))
+    let cutoff = now_ms.saturating_sub(UNKNOWN_ASSIGNMENT_HOLD_MS);
+    let candidates = slots
+        .query_map(params![key, cutoff], |row| {
+            Ok((
+                row.get::<_, Option<i64>>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, bool>(2)?,
+            ))
         })
-        .transpose()?;
-    // The partial index contains only durable unresolved membership. LIMIT
-    // bounds each admission/status recount by the configured capacity.
-    let busy: i64 = connection
+        .map_err(sql_error)?;
+    let mut busy = 0;
+    for candidate in candidates {
+        let (agent, generation, still_reserved) = candidate.map_err(sql_error)?;
+        if !still_reserved
+            && let (Some(agent), Some(generation)) = (agent, generation)
+            && assignment_generation_drained(connection, agent, generation)?
+        {
+            continue;
+        }
+        busy += 1;
+        if busy >= max_busy {
+            return Err(Error::new(
+                "capacity_unavailable",
+                format!("configured capacity bound assignment:{key} max_busy={max_busy}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn assignment_generation_drained(
+    connection: &Connection,
+    agent: i64,
+    generation: i64,
+) -> Result<bool> {
+    if capacity::has_owned_exit_and_reader_drain_tx(connection, agent, generation)? {
+        return Ok(true);
+    }
+    // Exited PID rows can be pruned after release. Keep the release effective
+    // once the durable owned-exit and closed OS-source facts prove it.
+    let owner = format!("agent:{}#{generation}", format_agent_id(agent));
+    connection
         .query_row(
-            "SELECT COUNT(*) FROM (
-             SELECT id FROM commands INDEXED BY commands_assignment_busy
-             WHERE verb='launch' AND assignment_busy=1
-               AND json_extract(args,'$.assignment.key')=?1
-             LIMIT ?2)",
-            params![key, max_busy as i64],
+            "SELECT EXISTS (
+            SELECT 1 FROM agents a
+            JOIN owned_exits e ON e.agent=a.id AND e.generation=?2
+            JOIN source_state os ON os.agent=a.id AND os.generation=e.generation
+                                AND os.source='os' AND os.state='closed'
+            WHERE a.id=?1 AND a.capacity_generation IS NOT ?2
+              AND NOT EXISTS (SELECT 1 FROM processes p WHERE p.owner=?3 AND p.state!='exited')
+         )",
+            params![agent, generation, owner],
             |row| row.get(0),
         )
-        .map_err(sql_error)?;
-    Ok(AssignmentStatus {
-        cursor,
-        busy: usize::try_from(busy)
-            .map_err(|_| Error::new("source_integrity", "invalid assignment slot count"))?,
-    })
+        .map_err(sql_error)
 }
 
 impl Store {
@@ -110,9 +173,42 @@ impl Store {
         Ok(Some(key))
     }
 
-    pub fn assignment_status(&self, key: &str, max_busy: u64) -> Result<AssignmentStatus> {
+    pub fn require_assignment_slot(&self, key: &str, max_busy: u64, now_ms: i64) -> Result<()> {
         self.ensure_committed_reads()?;
-        status(&self.connection, key, max_busy)
+        require_slot(&self.connection, key, max_busy, now_ms)
+    }
+
+    pub fn unadmitted_briefs(
+        &self,
+        key: &str,
+        briefs: Vec<String>,
+        include: Option<&str>,
+    ) -> Result<(Vec<String>, bool)> {
+        self.ensure_committed_reads()?;
+        validate_key(key)?;
+        let legacy_floor = assignment_legacy_floor(&self.connection, key)?;
+        let mut present = self
+            .connection
+            .prepare_cached(
+                "SELECT 1 FROM assignment_admissions WHERE assignment_key=?1 AND brief=?2",
+            )
+            .map_err(sql_error)?;
+        let mut unadmitted = Vec::new();
+        let mut floor_blocked = false;
+        for name in briefs {
+            if present.exists(params![key, name]).map_err(sql_error)? {
+                continue;
+            }
+            if legacy_floor
+                .as_deref()
+                .is_some_and(|floor| name.as_str() <= floor && include != Some(name.as_str()))
+            {
+                floor_blocked = true;
+                continue;
+            }
+            unadmitted.push(name);
+        }
+        Ok((unadmitted, floor_blocked))
     }
 
     /// Verifies that an event's retained Store cause descends from an Owner
@@ -247,15 +343,14 @@ impl Store {
     }
 }
 
-/// Called inside ordinary launch admission. Its cursor update rolls back with
-/// any later hold/capacity/command failure, and is visible only after commit.
-/// Commit the assignment cursor with the launch admission. Returns the
+/// Record the name inside ordinary launch admission. The insert rolls back with
+/// any later admission failure and is visible only after commit. Returns the
 /// brief's frozen Goal and its launch cause for Goal-owned work.
-pub(super) fn commit_cursor_tx(
+pub(super) fn record_admission_tx(
     tx: &Transaction<'_>,
     principal: &str,
     request: &SubmitCommand,
-    now: i64,
+    now_ms: i64,
 ) -> Result<Option<(core::api::GoalDefinition, core::EventCause)>> {
     let Some(value) = request.args.get("assignment") else {
         return Ok(None);
@@ -276,9 +371,9 @@ pub(super) fn commit_cursor_tx(
         || launch.brief.contains(['/', '\\'])
         || launch.brief.chars().any(char::is_control)
         || launch
-            .previous
-            .as_ref()
-            .is_some_and(|old| old >= &launch.brief)
+            .include
+            .as_deref()
+            .is_some_and(|include| include != launch.brief.as_str())
         || request
             .args
             .get("text")
@@ -290,31 +385,28 @@ pub(super) fn commit_cursor_tx(
             "invalid assignment brief or concurrency",
         ));
     }
-    let current = status(tx, &launch.key, launch.max_busy)?;
-    if current.cursor != launch.previous {
+    if assignment_legacy_floor(tx, &launch.key)?.is_some_and(|floor| launch.brief <= floor)
+        && launch.include.as_deref() != Some(launch.brief.as_str())
+    {
+        return Err(Error::new(
+            "brief_requires_include",
+            "an older brief requires explicit Owner inclusion",
+        ));
+    }
+    require_slot(tx, &launch.key, launch.max_busy, now_ms)?;
+    let inserted = tx
+        .execute(
+            "INSERT INTO assignment_admissions (assignment_key, brief) VALUES (?1,?2)
+             ON CONFLICT (assignment_key, brief) DO NOTHING",
+            params![launch.key, launch.brief],
+        )
+        .map_err(sql_error)?;
+    if inserted == 0 {
         return Err(Error::new(
             "conflict",
-            "assignment cursor changed before admission",
+            "assignment brief was already admitted",
         ));
     }
-    if current.busy as u64 >= launch.max_busy {
-        return Err(Error::new(
-            "capacity_unavailable",
-            "assignment slots are occupied",
-        ));
-    }
-    tx.execute(
-        "INSERT INTO vars(scope,key,value,version,set_by,note,set_at)
-         VALUES ('global',?1,?2,1,'owner','automation assignment cursor',?3)
-         ON CONFLICT(scope,key) DO UPDATE SET value=excluded.value,
-           version=vars.version+1,set_by=excluded.set_by,note=excluded.note,set_at=excluded.set_at",
-        params![
-            format!("assignment.{}", launch.key),
-            encode_json(&json!({"cursor":launch.brief,"command_id":request.id}))?,
-            now
-        ],
-    )
-    .map_err(sql_error)?;
     Ok(launch.goal.map(|goal| {
         let cause = core::EventCause {
             command_id: request.id.clone(),

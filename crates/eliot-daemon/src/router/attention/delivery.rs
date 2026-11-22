@@ -347,7 +347,7 @@ impl Router {
         wait_for_applied(self, &emit_id).await?;
         let id = ulid::Ulid::new().to_string();
         let text = format!(
-            "{} has session growth. Can you check it with swarm show {}?",
+            "{} has session growth. Can you check it with `swarm show {} --json`?",
             agent.id, agent.id
         );
         route_notice(
@@ -439,6 +439,6 @@ fn attention_summary(report: &AttentionReport) -> String {
     if report.reason == "children_unattended" {
         format!("{fact} Can you check those child turns?")
     } else {
-        format!("{fact} Can you check it with swarm show {agent}?")
+        format!("{fact} Can you check it with `swarm show {agent} --json`?")
     }
 }

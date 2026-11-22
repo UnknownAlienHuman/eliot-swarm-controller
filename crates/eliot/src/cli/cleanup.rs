@@ -16,9 +16,9 @@ pub(crate) async fn run_cleanup(
             scope,
             project,
             older_than,
-            continuation,
+            after,
         } => {
-            let continuation = continuation
+            let continuation = after
                 .as_deref()
                 .map(|token| PlanContinuation::decode(token).and_then(|page| page.encode()))
                 .transpose()

@@ -7,7 +7,9 @@ use super::args::{
     TimerShowArgs,
 };
 use super::support::read_and_print;
-use super::support::{Failure, command_value, mutation_id, print_value, response_exit_code};
+use super::support::{
+    Failure, command_value, mutation_id, print_value, print_value_or_human, response_exit_code,
+};
 use eliot_core::Command as CoreCommand;
 use eliot_core::api::{
     DEFAULT_GOAL_CHECK_TIMEOUT_MS, GoalClearRequest, GoalCostLimit, GoalDefinition, GoalEscalation,
@@ -16,13 +18,128 @@ use eliot_core::api::{
     ProjectOverviewResponse, ProjectRegistrationView, ProviderClearHoldRequest,
     ProviderClearHoldResponse, ProviderCorrectiveEvidence, ProviderHoldsRequest,
     ProviderHoldsResponse, RuleCatchUpRequest, RuleDeleteRequest, RuleDeleteResponse,
-    RuleGetRequest, RuleListRequest, RuleListResponse, RuleReadRequest, RuleReadResponse,
-    RuleSaveRequest, RuleSaveResponse, RuleShowView, TimerGetRequest, TimerRunRequest,
-    TimerStateView,
+    RuleGetRequest, RuleListEntry, RuleListRequest, RuleListResponse, RuleReadRequest,
+    RuleReadResponse, RuleSaveRequest, RuleSaveResponse, RuleShowView, TimerGetRequest,
+    TimerRunRequest, TimerSchedule, TimerStateView,
 };
 use serde_json::Value;
 use serde_json::json;
 use std::{fs::File, io::Read, path::PathBuf};
+
+fn print_rule_list(response: &RuleListResponse) {
+    if response.rules.is_empty() {
+        println!("No rules in this page.");
+    } else {
+        println!("Rules ({}):", response.rules.len());
+        for entry in &response.rules {
+            let state = &entry.state;
+            let status = if !state.enabled {
+                "disabled"
+            } else if state.paused_reason.is_some() {
+                "paused"
+            } else {
+                "enabled"
+            };
+            let project = state.project.as_deref().unwrap_or("global");
+            println!(
+                "  {} · {} · project {} · revision {} · cursor {}",
+                state.id, status, project, state.revision, state.current_cursor
+            );
+            if let Some(reason) = state.paused_reason.as_deref() {
+                println!("    paused: {reason}");
+            }
+            if !entry.source_present {
+                println!("    source: missing from the current configuration");
+            } else if let Some(path) = entry.source_file.as_deref() {
+                println!("    source: {path}");
+            }
+        }
+    }
+    if let Some(next) = response.next.as_deref() {
+        println!("Continue with --after {next}");
+    }
+}
+
+fn print_timer_list(entries: &[RuleListEntry]) {
+    if entries.is_empty() {
+        println!("No timers in this page.");
+        return;
+    }
+    println!("Timers ({}):", entries.len());
+    for entry in entries {
+        if let Some(timer) = entry.timer.as_ref() {
+            print_timer_summary(timer);
+        }
+    }
+    if let Some(next) = entries.last().map(|entry| entry.state.id.as_str()) {
+        println!("Page cursor (use with --after): {next}");
+    }
+}
+
+fn print_timer_summary(timer: &TimerStateView) {
+    let status = if timer.enabled { "enabled" } else { "disabled" };
+    let scope = timer.project.as_deref().unwrap_or("global");
+    let due = timer
+        .next_due_at
+        .map(|at| format!("{at} ms since Unix epoch"))
+        .unwrap_or_else(|| "not scheduled".to_owned());
+    println!(
+        "  {} · {} · scope {} · {} · next due {}",
+        timer.id,
+        status,
+        scope,
+        timer_schedule_text(&timer.schedule),
+        due
+    );
+    if let Some(outcome) = timer.last_outcome.as_deref() {
+        let description = match outcome {
+            "brief_settling" => "Briefs are still settling",
+            "brief_requires_include" => "Older briefs require explicit Owner inclusion",
+            "not_found" => "No new brief",
+            "capacity_unavailable" => "Waiting for capacity",
+            other => other,
+        };
+        println!("    Last scheduled outcome: {description}");
+    }
+}
+
+fn timer_schedule_text(schedule: &TimerSchedule) -> String {
+    match schedule {
+        TimerSchedule::Interval { period_ms, .. } => format!("every {period_ms} ms"),
+        TimerSchedule::Cron { expression, tz } => format!("cron {expression} ({tz})"),
+        TimerSchedule::Once { at } => format!("once at {at} ms UTC"),
+    }
+}
+
+fn print_goal_summary(goal: &GoalView) {
+    println!(
+        "Goal for {} · {} · generation {} · {}",
+        goal.agent,
+        goal.mode.as_str(),
+        goal.generation,
+        goal.status.as_str()
+    );
+    println!("{}", goal.definition.text);
+    println!("Check: {}", goal.definition.check.join(" "));
+    let turns = goal
+        .definition
+        .max_turns
+        .map(|max| format!("{}/{}", goal.counters.turns_used, max))
+        .unwrap_or_else(|| goal.counters.turns_used.to_string());
+    let rounds = goal
+        .definition
+        .max_rounds
+        .map(|max| format!("{}/{}", goal.counters.rounds, max))
+        .unwrap_or_else(|| goal.counters.rounds.to_string());
+    println!("Progress: {turns} turns · {rounds} rounds");
+    if let Some(reason) = goal.blocked_reason.as_deref() {
+        println!("Blocked: {reason}");
+    }
+    if let Some(reason) = goal.paused_reason.as_deref() {
+        println!("Paused: {reason}");
+    }
+    println!("Cost: {}", goal.cost_status);
+}
 
 pub(crate) async fn run_provider(
     ProviderArgs { command }: ProviderArgs,
@@ -162,9 +279,41 @@ pub(crate) async fn run_project(
             if response.id != id || response.validate().is_err() {
                 return Err(Failure::new(4, "project.get response is invalid"));
             }
-            let value = serde_json::to_value(response)
+            let value = serde_json::to_value(&response)
                 .map_err(|_| Failure::new(4, "project.get response is invalid"))?;
-            print_value(&value, json_output);
+            print_value_or_human(&value, json_output, || {
+                let repository = response.origin.as_deref().unwrap_or("unknown repository");
+                println!("Project {} ({repository})", response.id);
+                println!("Checkout: {}", response.checkout);
+                println!(
+                    "Profiles: {}",
+                    if response.profiles.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        response.profiles.join(", ")
+                    }
+                );
+                println!(
+                    "Actions: {}",
+                    if response.actions.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        response.actions.join(", ")
+                    }
+                );
+                println!("Revision: {}", response.revision);
+                if !response.checkouts.is_empty() {
+                    println!("Registered checkouts: {}", response.checkouts.len());
+                    for checkout in &response.checkouts {
+                        let branch = checkout.branch.as_deref().unwrap_or("detached");
+                        println!(
+                            "  {}{} ({branch})",
+                            checkout.path,
+                            if checkout.main { " (main)" } else { "" }
+                        );
+                    }
+                }
+            });
             Ok(0)
         }
     }
@@ -187,13 +336,18 @@ pub(crate) async fn run_rule(
                 after,
                 limit,
             };
-            read_and_print!(
-                &data_dir,
-                json_output,
-                "rule.list",
-                request,
-                RuleListResponse
-            )
+            request.validate().map_err(Failure::for_read)?;
+            let response: RuleListResponse =
+                eliot_daemon::client_call_typed(&data_dir, "rule.list", &request)
+                    .await
+                    .map_err(Failure::for_read)?;
+            request
+                .validate_response(&response)
+                .map_err(Failure::invalid_response)?;
+            let value = serde_json::to_value(&response)
+                .map_err(|_| Failure::new(4, "rule.list response is invalid"))?;
+            print_value_or_human(&value, json_output, || print_rule_list(&response));
+            Ok(0)
         }
         RuleCommand::Show(RuleShowArgs { id, project }) => {
             let request = match project {
@@ -350,8 +504,8 @@ pub(crate) async fn run_timer(
                 request.after = Some(next);
             }
             let next = timers.last().map(|entry| &entry.state.id);
-            let value = json!({"timers": timers, "next": next});
-            print_value(&value, json_output);
+            let value = json!({"timers": &timers, "next": next});
+            print_value_or_human(&value, json_output, || print_timer_list(&timers));
             Ok(0)
         }
         TimerCommand::Show(TimerShowArgs { id, project }) => {
@@ -359,10 +513,26 @@ pub(crate) async fn run_timer(
                 Some(project) => TimerGetRequest::new(id).in_project(project),
                 None => TimerGetRequest::new(id),
             };
-            read_and_print!(&data_dir, json_output, "timer.get", request, TimerStateView)
+            request.validate().map_err(Failure::for_read)?;
+            let timer: TimerStateView =
+                eliot_daemon::client_call_typed(&data_dir, "timer.get", &request)
+                    .await
+                    .map_err(Failure::for_read)?;
+            request
+                .validate_response(&timer)
+                .map_err(Failure::invalid_response)?;
+            let value = serde_json::to_value(&timer)
+                .map_err(|_| Failure::new(4, "timer.get response is invalid"))?;
+            print_value_or_human(&value, json_output, || print_timer_summary(&timer));
+            Ok(0)
         }
-        TimerCommand::Run(TimerRunArgs { rule, project }) => {
-            let request = TimerRunRequest::new(mutation_id(id)?, rule);
+        TimerCommand::Run(TimerRunArgs {
+            rule,
+            project,
+            include,
+        }) => {
+            let mut request = TimerRunRequest::new(mutation_id(id)?, rule);
+            request.include = include;
             let request = match project {
                 Some(project) => request.in_project(project),
                 None => request,
@@ -489,7 +659,18 @@ pub(crate) async fn run_goal(
                 agent,
                 mode: goal_mode(&mode)?,
             };
-            read_and_print!(&data_dir, json_output, "goal.get", request, GoalView)
+            request.validate().map_err(Failure::for_read)?;
+            let response: GoalView =
+                eliot_daemon::client_call_typed(&data_dir, "goal.get", &request)
+                    .await
+                    .map_err(Failure::for_read)?;
+            request
+                .validate_response(&response)
+                .map_err(Failure::invalid_response)?;
+            let value = serde_json::to_value(&response)
+                .map_err(|_| Failure::new(4, "goal.get response is invalid"))?;
+            print_value_or_human(&value, json_output, || print_goal_summary(&response));
+            Ok(0)
         }
         GoalCommand::Pause(GoalPauseArgs {
             agent,

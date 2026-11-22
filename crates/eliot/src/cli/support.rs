@@ -35,10 +35,12 @@ impl Failure {
     }
 
     pub(crate) fn from_core(error: CoreError, mutation: bool) -> Self {
-        let exit_code = if !mutation {
-            1
-        } else {
+        let exit_code = if mutation {
             Self::mutation_exit_code(&error.code)
+        } else if error.code == "invalid" {
+            2
+        } else {
+            1
         };
         let code = error.code.clone();
         let mut failure = Self::new(exit_code, error.to_string());
@@ -52,12 +54,15 @@ impl Failure {
     }
 
     /// Exit code for an RPC error on a path where a write may have occurred.
-    /// Exit 3 is reserved for confirmed pre-admission rejections through the
+    /// Invalid input exits 2. Exit 3 covers other pre-admission rejections through the
     /// one Core predicate (shared with the daemon, which marks post-write
     /// validation and framing failures `unknown` at their source);
     /// provider/domain failures exit 1; anything else is an uncertain
     /// effect (exit 4).
     pub(crate) fn mutation_exit_code(code: &str) -> u8 {
+        if code == "invalid" {
+            return 2;
+        }
         if code == "failed" {
             return 1;
         }
@@ -430,5 +435,13 @@ pub(crate) fn print_value(value: &Value, json_output: bool) {
         println!("{rendered}");
     } else {
         println!("{value}");
+    }
+}
+
+pub(crate) fn print_value_or_human(value: &Value, json_output: bool, human: impl FnOnce()) {
+    if json_output {
+        println!("{value}");
+    } else {
+        human();
     }
 }

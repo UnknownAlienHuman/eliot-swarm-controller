@@ -2,6 +2,9 @@
 
 Call the inherited `swarm` MCP tool as `{"method":"...","params":{...}}`. Use canonical method names. `api.methods` and `api.help` are optional lookups when a method or field is unclear. If MCP is unavailable, use the approved `swarm` executable and its help; never pass credentials.
 
+Use `swarm show AGENT --json` and `swarm result AGENT --json` for machine
+readback. Add `--metadata` to result when you need the current Agent metadata.
+
 ## Delegation
 
 `child.run` inherits the caller's workspace and profile. Supply `text`; optionally name task source paths and an allow-listed profile. The initial request is `{text, sources?, profile?, wait_ms?}`. A returned id resumes the same child with `{id, wait_ms}`.

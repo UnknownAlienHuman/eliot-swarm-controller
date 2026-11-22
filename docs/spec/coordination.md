@@ -134,7 +134,7 @@ tree settle as `skipped(native_session_kept)`. This also applies to a
 
 Continue a cleanup review with the opaque `continuation` string from the previous
 response and the same scope, project and age cutoff. The CLI passes it as
-`--continuation <token>` and MCP passes the string as `params.continuation`.
+`--after <token>` and MCP passes the string as `params.continuation`.
 The daemon also accepts legacy JSON continuations. A progress page can contain
 zero candidates with a continuation while the daemon scans the retained inventory.
 The backfill cursor advances only across completed probe batches. A failed probe
@@ -159,9 +159,13 @@ candidate. CLI callers pass one `--artifact <id>` per safe registration selected
 `cleanup apply <plan-id>`. The desktop's Project
 registrations group starts unchecked.
 
-The current limits are 64 candidates, 4,096 retained artifacts, 1,024 retained
-plans, 10,000 filesystem entries, depth 64 and five seconds per tree scan.
-Exceeding a bound refuses the tree before deletion. A full plan ledger self-heals
+The current limits are 64 candidates, 4,096 retained artifacts and 1,024 retained
+plans. On Windows, the [`CleanupTree` artifact-directory scan](../../crates/eliot-daemon/src/platform/script_file.rs#L391)
+is bounded to 10,000 filesystem entries, depth 64 and five seconds per scan.
+Managed-worktree removal uses a separate [write-fence inventory](../../crates/eliot-daemon/src/platform/worktree_guard.rs#L34),
+bounded to 20,000 entries and depth 64 with a ten-second deadline for each
+prepare and activation pass. Exceeding an applicable bound refuses its operation
+before filesystem deletion. A full plan ledger self-heals
 on retain first: it reclaims fully settled consumed plans (no `unknown` item
 outcome), consumed plans whose receipt was pruned while their own settlement
 is terminal and known (none of their item artifacts is still `unknown`), and
@@ -188,7 +192,7 @@ has no Owner per-Agent scope, so there is no per-task cleanup entry.
 The daemon's automatic sweep pages through recorded owned artifacts of finished
 Agent generations and uses the same guarded cleanup path.
 Manual previews can backfill older ownership records. The [Owner settings]
-(configuration.md#later-configuration-example) control the age and enablement. Both
+(configuration.md#daemon-and-automation-settings) control the age and enablement. Both
 the artifact and its exact finished generation must be older than the configured
 window. Archived Agents and their artifacts stay protected from automatic cleanup.
 An omitted `automation.auto_cleanup` runs plan-only pages, retaining no plans for

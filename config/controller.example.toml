@@ -100,6 +100,8 @@ worker = ["codex-luna"]
 audit = ["codex-luna"]
 
 # Optional settings-managed backlog assignment. The key is the assignment id.
+# An empty .ready/<brief> file publishes a closed brief immediately.
+# Briefs without a marker become ready after their size and mtime stabilize.
 # [automation.assignments.review-queue]
 # folder = "C:/work/briefs"
 # workspace = "C:/work/eliot"

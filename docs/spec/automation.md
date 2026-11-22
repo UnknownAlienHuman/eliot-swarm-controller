@@ -489,10 +489,10 @@ filename and emits one routing-aware launch. In a `worktree`-mode project that l
 gets the standard managed worktree an interactive top-level launch would get, frozen by
 the daemon and prepared by Store in the launch admission; a rule cannot name a worktree
 or base itself. `max_busy` counts unresolved launches,
-linked initial sends and live Agents; an unknown command holds its slot. Store advances
-the filename cursor only in the transaction that admits the durable launch command.
-An unknown launch is never rerouted or replayed. No brief is moved or marked started in
-the filesystem, so a crash or restart leaves the durable cursor and command as authority.
+linked initial sends and live Agents; an unknown command holds its slot. Store records
+the admitted filename in the same transaction as the durable launch command. The name
+stays recorded after restart and command retention. An unknown launch keeps its original
+binding and outcome. The brief and any ready marker stay in the folder.
 This is an automation increment, not a Task/Issue/acceptance engine.
 
 The owner configures a global assignment under `[automation.assignments.<key>]`:
@@ -507,21 +507,36 @@ interval = "30s"
 enabled = true
 ```
 
-`key` is a stable identity; changing it starts a separate cursor. On each interval the
-daemon selects the lexicographically first regular `.md` file whose filename is after the
-retained cursor. New queue entries must sort after the cursor. The folder scan is bounded
-to 500 entries per firing; overflow fails closed rather than skipping an unseen earlier
-brief. Each brief is
+`key` identifies one queue. A regular `.md` brief becomes ready when its size
+and modification time match across scans at least three seconds apart. To
+publish immediately, close the brief and create an empty regular file with the
+same name in `.ready`, such as `.ready/0010-review.md`. The marker must be at
+least as recent as the brief. The daemon checks the opened file's size and
+modification time across the read in both cases. On each interval it selects
+the lexicographically first eligible ready name. The Store admits each exact
+filename at most once per key.
+
+An upgrade seeds admitted names from retained launch commands and freezes the
+legacy cursor as a floor. A name at or below that floor requires the Owner to
+select it explicitly with `swarm timer run assignment-KEY --include NAME`.
+Explicit inclusion uses the same readiness and deduplication checks. Names
+above the floor can arrive in any order. New queues have no legacy floor.
+
+Each firing scans up to 500 entries in the briefs folder, excluding `.ready`.
+Overflow fails the slot before selection. Each brief is
 limited to the ordinary 64 KiB launch-text bound. Unsafe, oversized or invalid UTF-8
 briefs fail the slot visibly. An unreadable or missing briefs folder fails only that
-assignment's slot with its code. A slot with no next brief advances to the next interval.
-Every scheduled timer slot that is skipped or rejected (no next brief is `not_found`, a
-routing miss is `routing_unavailable`) commits that code as the timer's `last_outcome`
+assignment's slot with its code. A scheduled check that starts no work advances to the next
+interval when the folder has no new brief (`not_found`), eligible briefs are settling
+(`brief_settling`), or only older names await explicit inclusion (`brief_requires_include`).
+Each skipped or rejected slot commits its code as the timer's `last_outcome`
 with the slot, and an admitted slot clears it, so timer reads show why the last check
 started nothing. A scheduled skip emits `rule.skipped` when its reason changes or
 the slot carries a capacity diagnostic. Repeated skips with the same bare reason
 still advance the timer cursor. A manual run changes neither `last_outcome` nor `last_key`.
-A capacity, provider, workspace or transfer wait keeps the due slot and its brief cursor.
+A capacity, provider, workspace or transfer wait keeps the due slot. Timer and
+rule-list readback report the current wait code in `last_outcome` while the
+slot remains due.
 Settings generate a global interval timer
 rule and an ordinary completion rule. Before admitting cleanup, Store verifies that
 the captured Agent/generation was launched by this assignment's own launch for the
@@ -557,11 +572,11 @@ enablement; pages do not each send a notice.
 `enabled = false` (default true) pauses the assignment at timer admission before
 `settings.save` acknowledges it. An unrelated rules-file parse error can retain the
 previous rule snapshot, and the saved pause still fences fresh scheduled and manual
-admissions. Effective timer reads report the pause. The folder cursor and schedule
+admissions. Effective timer reads report the pause. The admitted names and schedule
 position are retained. The completion rule stays enabled, so Agents already running
 still retire.
-Manual timer runs use the same admission and cursor checks. Multiple firings race
-through the same retained cursor and are serialized by Store's cursor compare-and-swap.
+Manual timer runs use the same readiness and admission checks. Store serializes
+simultaneous firings using the unique assignment key and filename.
 The ordinary command ID remains the timer child ID, preserving exact same-ID replay.
 
 The existing Owner timer worker arbitrates due assignments and explicit interactive
@@ -569,8 +584,8 @@ launch intents. It uses the oldest eligible due timer or enqueued intent within 
 project. A timer with an open action keeps its due slot and yields to other work in
 its project until the action settles. Ties between
 assignment timers use their rule IDs. An interactive intent wins an exact timestamp
-tie with a timer. Briefs within an assignment remain in filename order. The cursor
-advances in the same Store transaction as successful admission. A head waiting on
+tie with a timer. Ready, unadmitted briefs within an assignment are considered in
+filename order. A head waiting on
 capacity, a provider, a workspace or transfer keeps its position within its project
 and other projects still get a chance.
 
@@ -580,13 +595,14 @@ attempts the selected model, account and route bindings must still match. The
 manager's Owner-granted priority orders fresh heads from highest to lowest. Within
 each priority tier, projects rotate after the last successful admission. At 30 seconds
 of waiting, heads take precedence in a single project rotation, so repeated priority
-changes cannot keep overtaking them. The selected brief filename, previous cursor, assignment
+changes cannot keep overtaking them. The selected brief filename, assignment
 key and capacity bound accompany the normal launch command for Store validation. Store
 maintains unresolved assignment membership transactionally with command and turn changes.
 It counts indexed unresolved membership, including unresolved launches,
 linked initial sends, and starting, running or unknown native turns. Counting stops
-at `max_busy` and excludes completed history. A terminal turn releases the slot;
-process liveness by itself does not establish completion. Store checks the cursor,
+at `max_busy` and excludes completed history. An unknown turn on a lost generation
+can release its assignment slot after 60 seconds from the persisted unknown transition
+once custody has closed. Its outcome remains unknown. Store checks admission history,
 all applicable capacity bounds and provider holds in the normal launch transaction.
 A full scope keeps the due slot available for the next arbitration pass. Capacity waits
 re-arbitrate on committed `capacity.released` (not on `stop` acceptance), and a
@@ -1339,7 +1355,12 @@ successor revision. Continued and unknown round events supply no idle key.
 
 The check is the frozen explicit argv from `goal set`, run through the shared
 owned-process custody outside the Store lock with a bounded timeout, a small
-round-context stdin and the daemon environment. Both check streams are
+round-context stdin and the daemon environment. The timeout accepts 1s through
+10m and defaults to 60s. Its deadline starts immediately before spawning the
+check child, after round preparation. Timeout cleanup and custody settlement use
+their own limits. See the [Goal API bounds](../../crates/eliot-core/src/api/goals.rs#L19-L22).
+
+Both check streams are
 secret-redacted into one bounded observation: labelled `[stdout]` and `[stderr]`
 sections, each label stating that stream's own completeness (stderr is the
 capture's bounded tail), and each section keeping its beginning and end around an
@@ -1493,10 +1514,10 @@ seq as an idle key through the same `goal round` path — same probe, gates,
 check custody and conditional commit — under a fresh owner mutation id. It
 skips cadenced Goals (slot-keyed), paused or terminal Goals, drifted
 generations, and anything while automation is draining; it waits while an
-active native Goal drives. Each automatic round runs in its own task, at most
-one per Goal and four Goals at once, so a slow check never stalls another
-Goal's round; a newer event for a Goal with a round in flight is driven as
-a follow-up when that round resolves. Bus events dropped past the cap or to
+active native Goal drives. The driver starts each automatic round in its own task
+and runs up to four across Goals. Automatic and explicit rounds share the same
+per-Goal single-flight marker. The driver follows up on a newer event for a Goal
+when its in-flight round resolves. Bus events dropped past the cap or to
 bus lag are logged, as are queued waits and stale rounds. Other races
 against explicit rounds resolve through the
 single-flight marker and the burn and stay silent. Shutdown cancels every

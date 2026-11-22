@@ -33,7 +33,7 @@ pub(crate) async fn run_discover(
         profile,
         harness,
         scope,
-        cursor,
+        after,
         archived,
         page: PageArgs { limit },
     }: DiscoverArgs,
@@ -45,7 +45,7 @@ pub(crate) async fn run_discover(
         profile,
         harness,
         native_scope: scope,
-        cursor,
+        cursor: after,
         archived,
         limit,
     };
@@ -1198,7 +1198,7 @@ pub(crate) async fn swarm_wait(
             "--timeout-seconds must be between 1 and 30",
         ));
     }
-    if ids.is_empty() || ids.len() > MAX_SWARM_WAIT_TARGETS {
+    if ids.len() > MAX_SWARM_WAIT_TARGETS {
         return Err(Failure::new(2, "swarm wait requires 1..=256 captured ids"));
     }
     let mode = if all { "all" } else { "any" };
@@ -1390,8 +1390,8 @@ pub(crate) fn parse_wait_turn_ref(id: &str) -> Result<WaitTurnRef, Failure> {
 
 /// Exit code for a settled `swarm wait`. Timeout (or an uncompleted snapshot)
 /// exits 5; otherwise 0 only when every entry succeeded (`all`) or at least
-/// one succeeded (`any`). Interrupted entries exit 7, unknown/not_found/
-/// not_visible entries exit 4, and plain failures exit 1.
+/// one succeeded (`any`). Interrupted entries exit 7, unknown outcomes exit
+/// 4, and failures or unavailable entries exit 1.
 pub(crate) fn swarm_wait_exit_code(response: &SwarmWaitResponse) -> u8 {
     if response.timed_out || !response.completed {
         return 5;
@@ -1415,12 +1415,11 @@ pub(crate) fn swarm_wait_exit_code(response: &SwarmWaitResponse) -> u8 {
     {
         return INTERRUPTED_EXIT_CODE;
     }
-    if response.results.iter().any(|entry| {
-        matches!(
-            entry.status.as_str(),
-            "unknown" | "not_found" | "not_visible"
-        )
-    }) {
+    if response
+        .results
+        .iter()
+        .any(|entry| entry.status == "unknown")
+    {
         return 4;
     }
     1
