@@ -7,6 +7,93 @@ use crate::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 
+pub const MAX_ATTENTION_THRESHOLD_PAIRS: usize = 256;
+pub const MAX_ATTENTION_HISTORY: usize = 20;
+pub const MIN_ATTENTION_HISTORY: usize = 3;
+pub const MIN_ATTENTION_THRESHOLD_SECS: i64 = 900;
+
+/// A configured/fallback baseline and a history-derived quiet-gap threshold
+/// for one frozen profile/project pair.
+#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttentionThreshold {
+    #[schemars(range(min = 900))]
+    pub threshold_secs: i64,
+    #[schemars(range(min = 1))]
+    pub configured_secs: i64,
+    #[schemars(range(min = 900))]
+    pub baseline_secs: i64,
+    #[serde(default, deserialize_with = "nullable")]
+    #[schemars(range(min = 0))]
+    pub normal_p90_secs: Option<i64>,
+    #[schemars(range(max = 20))]
+    pub history_count: usize,
+    pub fallback: bool,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttentionThresholdPair {
+    pub profile: String,
+    pub project: String,
+    pub no_progress: AttentionThreshold,
+    pub no_code_progress: AttentionThreshold,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttentionThresholdsResponse {
+    #[serde(deserialize_with = "attention_threshold_pairs")]
+    #[schemars(length(max = 256))]
+    pub pairs: Vec<AttentionThresholdPair>,
+    pub truncated: bool,
+}
+
+impl AttentionThresholdsResponse {
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.pairs.len() > MAX_ATTENTION_THRESHOLD_PAIRS
+            || self.pairs.iter().any(|pair| {
+                pair.profile.is_empty()
+                    || pair.project.is_empty()
+                    || !valid_attention_threshold(pair.no_progress)
+                    || !valid_attention_threshold(pair.no_code_progress)
+            })
+        {
+            return Err(crate::Error::new(
+                "unknown",
+                "attention threshold view is invalid",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn valid_attention_threshold(value: AttentionThreshold) -> bool {
+    value.threshold_secs >= MIN_ATTENTION_THRESHOLD_SECS
+        && value.configured_secs > 0
+        && value.baseline_secs >= MIN_ATTENTION_THRESHOLD_SECS
+        && value.baseline_secs == value.configured_secs.max(MIN_ATTENTION_THRESHOLD_SECS)
+        && value.history_count <= MAX_ATTENTION_HISTORY
+        && (value.fallback == (value.history_count < MIN_ATTENTION_HISTORY))
+        && (value.normal_p90_secs.is_some() == !value.fallback)
+        && value
+            .normal_p90_secs
+            .is_none_or(|normal| normal >= 0 && value.threshold_secs >= normal)
+        && value.threshold_secs >= value.baseline_secs
+}
+
+fn attention_threshold_pairs<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Vec<AttentionThresholdPair>, D::Error> {
+    let pairs = Vec::<AttentionThresholdPair>::deserialize(deserializer)?;
+    if pairs.len() > MAX_ATTENTION_THRESHOLD_PAIRS {
+        return Err(serde::de::Error::custom(
+            "attention threshold pairs exceed their limit",
+        ));
+    }
+    Ok(pairs)
+}
+
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(untagged, deny_unknown_fields)]
 pub enum ObservationView {

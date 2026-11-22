@@ -2,6 +2,22 @@ use crate::{Store, event_from_record, event_record_from_row, sql_error};
 use eliot_core::{Event, Result, parse_agent_id};
 use rusqlite::{Connection, OptionalExtension, params};
 
+const MAX_ATTENTION_HISTORY_TURNS: usize = eliot_core::api::MAX_ATTENTION_HISTORY;
+const MAX_ATTENTION_ACTIVITY_EVENTS_PER_TURN: usize = 1_024;
+const MAX_ATTENTION_PROFILE_PAIRS: usize = eliot_core::api::MAX_ATTENTION_THRESHOLD_PAIRS;
+
+#[derive(Clone, Debug)]
+struct SuccessfulAttentionTurn {
+    agent: i64,
+    generation: i64,
+    turn_id: String,
+    started_at: i64,
+    completed_at: i64,
+    started_seq: i64,
+    completed_seq: i64,
+    workspace: Option<String>,
+}
+
 /// Only direct Owner input to this exact turn can veto an automatic interrupt.
 /// The accepted event orders input against the question even within one millisecond.
 pub(super) fn owner_input_after_question(
@@ -191,4 +207,390 @@ impl Store {
             .optional()
             .map_err(sql_error)
     }
+
+    /// Current, non-archived profile/project pairs for the bounded attention
+    /// status view, with the existing worktree/read-only guard for Git history.
+    /// Returns at most `limit + 1` entries so the caller can report truncation.
+    pub fn attention_profile_pairs(&self, limit: usize) -> Result<Vec<(String, String, bool)>> {
+        let limit = limit.clamp(1, MAX_ATTENTION_PROFILE_PAIRS);
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT DISTINCT profile, project FROM agents
+                 WHERE archived = 0 AND generation > 0 AND project <> ''
+                 ORDER BY project, profile LIMIT ?1",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(params![limit as i64 + 1], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(sql_error)?;
+        let pairs = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sql_error)?;
+        let pairs = pairs
+            .into_iter()
+            .map(|(profile, project)| {
+                let code_eligible = self.attention_pair_code_eligible(&profile, &project)?;
+                Ok((profile, project, code_eligible))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(pairs)
+    }
+
+    pub fn attention_pair_code_eligible(&self, profile: &str, project: &str) -> Result<bool> {
+        profile_code_eligible(&self.connection, profile, project)
+    }
+
+    /// Read at most twenty recent successful turns for one exact frozen
+    /// profile/project pair and return one maximum native and Git quiet
+    /// gap per usable turn. Each gap stays within one Agent generation and
+    /// turn; missing lifecycle, source-gap, clock-regressed, and overlarge
+    /// histories are excluded.
+    pub fn attention_quiet_gaps(
+        &self,
+        profile: &str,
+        project: &str,
+        include_git: bool,
+    ) -> Result<(Vec<i64>, Vec<i64>)> {
+        let turns = successful_attention_turns(&self.connection, profile, project)?;
+        let mut native_gaps = Vec::with_capacity(turns.len());
+        let mut git_gaps = Vec::with_capacity(turns.len());
+        for turn in turns {
+            if let Some(gap) = attention_quiet_gap(&self.connection, &turn, false)? {
+                native_gaps.push(gap);
+            }
+            if include_git && let Some(gap) = attention_quiet_gap(&self.connection, &turn, true)? {
+                git_gaps.push(gap);
+            }
+        }
+        Ok((native_gaps, git_gaps))
+    }
+}
+
+fn profile_code_eligible(connection: &Connection, profile: &str, project: &str) -> Result<bool> {
+    let tokens = profile
+        .split(['-', '_', ' '])
+        .filter(|part| !part.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    let named_read_only = tokens
+        .iter()
+        .any(|token| matches!(token.as_str(), "audit" | "readonly"))
+        || tokens
+            .windows(2)
+            .any(|pair| pair[0] == "read" && pair[1] == "only");
+    if named_read_only {
+        return Ok(false);
+    }
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM agents AS a
+                 WHERE a.archived = 0 AND a.generation > 0
+                   AND a.profile = ?1 AND a.project = ?2 AND a.workspace IS NOT NULL
+                   AND json_extract(a.profile_snapshot, '$.permissions') IS NOT 'read-only'
+                   AND json_extract(a.profile_snapshot, '$.permission_mode') IS NOT 'plan'
+                   AND json_extract(a.profile_snapshot, '$.mode') IS NOT 'plan'
+                   AND json_extract(a.profile_snapshot, '$.collaboration_mode') IS NOT 'plan'
+                   AND json_extract(a.effective, '$.permissions') IS NOT 'read-only'
+                   AND json_extract(a.effective, '$.permission_mode') IS NOT 'plan'
+                   AND json_extract(a.effective, '$.mode') IS NOT 'plan'
+                   AND json_extract(a.effective, '$.collaboration_mode') IS NOT 'plan'
+                   AND lower(COALESCE(json_extract(a.profile_choice, '$.role'), '')) <> 'audit'
+             )",
+            params![profile, project],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)
+}
+
+fn successful_attention_turns(
+    connection: &Connection,
+    profile: &str,
+    project: &str,
+) -> Result<Vec<SuccessfulAttentionTurn>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT t.agent, t.generation, t.turn_id, t.started_at, t.completed_at,
+                    started.seq, completed.seq,
+                    json_extract(started.subject, '$.workspace')
+             FROM agents AS a INDEXED BY agents_list_project
+             CROSS JOIN turns AS t ON t.agent = a.id
+             CROSS JOIN events AS started INDEXED BY attention_turn_endpoints
+               ON started.agent = t.agent AND started.generation = t.generation
+              AND started.kind = 'turn.started'
+              AND json_extract(started.data, '$.turn_id') = t.turn_id
+             CROSS JOIN events AS completed INDEXED BY attention_turn_endpoints
+               ON completed.agent = t.agent AND completed.generation = t.generation
+              AND completed.kind = 'turn.completed'
+              AND json_extract(completed.data, '$.turn_id') = t.turn_id
+             WHERE a.project = ?2 AND t.state = 'completed' AND t.outcome = 'success'
+               AND t.started_at > 0 AND t.completed_at >= t.started_at
+               AND started.seq < completed.seq
+               AND json_extract(started.subject, '$.profile') = ?1
+               AND json_extract(completed.subject, '$.profile') = ?1
+               AND json_extract(started.subject, '$.project') = json_extract(completed.subject, '$.project')
+               AND (json_extract(started.subject, '$.project') = ?2
+                    OR json_extract(started.subject, '$.project') = (
+                        SELECT checkout FROM project_registrations WHERE id = ?2
+                    ))
+               AND NOT EXISTS (
+                   SELECT 1 FROM events AS incident INDEXED BY attention_history_events
+                   WHERE incident.agent = t.agent AND incident.generation = t.generation
+                     AND incident.kind = 'x.user.agent.attention'
+                     AND json_extract(incident.data, '$.data.phase') = 'incident'
+                     AND json_extract(incident.data, '$.data.turn_id') = t.turn_id
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM turn_attention_steps AS step
+                   WHERE step.agent = t.agent AND step.generation = t.generation
+                     AND step.turn_id = t.turn_id
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM events AS dispatched INDEXED BY attention_history_events
+                   JOIN commands AS c ON c.id = json_extract(dispatched.data, '$.command_id')
+                   WHERE dispatched.agent = t.agent AND dispatched.generation = t.generation
+                     AND dispatched.kind = 'command.dispatched' AND dispatched.seq > started.seq
+                     AND dispatched.seq < completed.seq
+                     AND c.target = t.agent AND c.generation = t.generation
+                     AND COALESCE(c.expected_turn_id, c.turn_id) = t.turn_id
+                     AND c.verb IN ('send', 'steer', 'inject', 'interrupt', 'approve', 'deny', 'answer')
+                     AND c.state NOT IN ('rejected', 'cancelled')
+               )
+             ORDER BY t.completed_at DESC, t.agent DESC, t.turn_id DESC LIMIT ?3",
+        )
+        .map_err(sql_error)?;
+    let rows = statement
+        .query_map(
+            params![profile, project, MAX_ATTENTION_HISTORY_TURNS as i64],
+            |row| {
+                Ok(SuccessfulAttentionTurn {
+                    agent: row.get(0)?,
+                    generation: row.get(1)?,
+                    turn_id: row.get(2)?,
+                    started_at: row.get(3)?,
+                    completed_at: row.get(4)?,
+                    started_seq: row.get(5)?,
+                    completed_seq: row.get(6)?,
+                    workspace: row.get(7)?,
+                })
+            },
+        )
+        .map_err(sql_error)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(sql_error)
+}
+
+fn attention_quiet_gap(
+    connection: &Connection,
+    turn: &SuccessfulAttentionTurn,
+    git: bool,
+) -> Result<Option<i64>> {
+    if git && !git_history_covered(connection, turn)? {
+        return Ok(None);
+    }
+    if history_clock_gapped(connection, turn, git)? {
+        return Ok(None);
+    }
+    let source_gap: bool = if git {
+        connection
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM events INDEXED BY attention_history_events
+                     WHERE agent = ?1 AND generation = ?2 AND kind = 'source.gap'
+                       AND json_extract(data, '$.source') = 'git'
+                       AND (ts BETWEEN ?3 AND ?4 OR (seq > ?5 AND seq < ?6))
+                 )",
+                params![
+                    turn.agent,
+                    turn.generation,
+                    turn.started_at,
+                    turn.completed_at,
+                    turn.started_seq,
+                    turn.completed_seq,
+                ],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?
+    } else {
+        connection
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM events AS gap INDEXED BY attention_history_events
+                     WHERE gap.agent = ?1 AND gap.generation = ?2 AND gap.kind = 'source.gap'
+                       AND (gap.ts BETWEEN ?3 AND ?4 OR (gap.seq > ?5 AND gap.seq < ?6))
+                       AND EXISTS (
+                           SELECT 1 FROM json_each(gap.data, '$.families') AS family
+                           WHERE family.value IN ('turn', 'message', 'tool', 'request')
+                       )
+                 )",
+                params![
+                    turn.agent,
+                    turn.generation,
+                    turn.started_at,
+                    turn.completed_at,
+                    turn.started_seq,
+                    turn.completed_seq,
+                ],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?
+    };
+    if source_gap {
+        return Ok(None);
+    }
+
+    let sql = if git {
+        "SELECT event.seq, event.ts, event.source FROM events AS event
+         WHERE event.agent = ?1 AND event.generation = ?2 AND event.source = 'git'
+           AND event.seq > ?3 AND event.seq < ?4
+           AND event.ts BETWEEN ?5 AND ?6
+           AND (
+               (event.kind = 'git.committed' AND NOT EXISTS (
+                   SELECT 1 FROM turns AS other
+                   WHERE other.agent = event.agent AND other.generation = event.generation
+                     AND other.turn_id <> ?7 AND other.started_at IS NOT NULL
+                     AND other.completed_at IS NOT NULL
+                     AND event.ts BETWEEN other.started_at AND other.completed_at
+               ))
+               OR (event.kind = 'file.changed' AND EXISTS (
+                   SELECT 1 FROM events AS cause
+                   WHERE cause.seq = json_extract(event.data, '$.cause_seq')
+                     AND cause.agent = event.agent AND cause.generation = event.generation
+                     AND json_extract(cause.data, '$.turn_id') = ?7
+                     AND cause.seq > ?3 AND cause.seq < ?4
+               ))
+           )
+         ORDER BY event.seq LIMIT ?8"
+    } else {
+        "SELECT event.seq, event.ts, event.source FROM events AS event
+         WHERE event.agent = ?1 AND event.generation = ?2 AND event.native_id IS NOT NULL
+           AND event.seq > ?3 AND event.seq < ?4
+           AND event.ts BETWEEN ?5 AND ?6
+           AND event.source NOT IN ('daemon', 'os', 'git', 'workspace_process')
+           AND event.kind IN ('turn.started', 'turn.completed', 'message.completed',
+                              'tool.started', 'tool.completed', 'request.opened',
+                              'request.resolved', 'request.closed')
+           AND json_extract(event.data, '$.turn_id') = ?7
+         ORDER BY event.seq LIMIT ?8"
+    };
+    let mut statement = connection.prepare(sql).map_err(sql_error)?;
+    let rows = statement
+        .query_map(
+            params![
+                turn.agent,
+                turn.generation,
+                turn.started_seq,
+                turn.completed_seq,
+                turn.started_at,
+                turn.completed_at,
+                turn.turn_id,
+                MAX_ATTENTION_ACTIVITY_EVENTS_PER_TURN as i64 + 1,
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .map_err(sql_error)?;
+    let events = rows
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(sql_error)?;
+    if events.len() > MAX_ATTENTION_ACTIVITY_EVENTS_PER_TURN {
+        return Ok(None);
+    }
+
+    let mut last_by_source = std::collections::HashMap::<String, i64>::new();
+    let mut points = Vec::with_capacity(events.len() + 2);
+    points.push(turn.started_at);
+    for (_, at, source) in events {
+        if !(turn.started_at..=turn.completed_at).contains(&at)
+            || last_by_source.get(&source).is_some_and(|last| at < *last)
+        {
+            return Ok(None);
+        }
+        last_by_source.insert(source, at);
+        points.push(at);
+    }
+    points.push(turn.completed_at);
+    points.sort_unstable();
+    Ok(points.windows(2).map(|pair| pair[1] - pair[0]).max())
+}
+
+fn git_history_covered(connection: &Connection, turn: &SuccessfulAttentionTurn) -> Result<bool> {
+    let Some(workspace) = turn.workspace.as_deref() else {
+        return Ok(false);
+    };
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM source_state AS source
+                 JOIN git_work_state AS work ON work.workspace = ?3
+                 WHERE source.agent = ?1 AND source.generation = ?2 AND source.source = 'git'
+                   AND source.state = 'open' AND source.health IN ('ok', 'slow')
+                   AND source.last_store_seq IS NOT NULL
+                   AND (work.work_available = 1 OR
+                        (work.work_error = 'no_base_oid' AND work.dirty_digest IS NOT NULL))
+             )",
+            params![turn.agent, turn.generation, workspace],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)
+}
+
+fn history_clock_gapped(
+    connection: &Connection,
+    turn: &SuccessfulAttentionTurn,
+    git: bool,
+) -> Result<bool> {
+    let sql = if git {
+        "SELECT EXISTS(
+             SELECT 1 FROM events AS event
+             WHERE event.agent = ?1 AND event.generation = ?2 AND event.source = 'git'
+               AND event.seq > ?3 AND event.seq < ?4
+               AND event.ts NOT BETWEEN ?5 AND ?6
+               AND (
+                   event.kind = 'git.committed'
+                   OR (event.kind = 'file.changed' AND EXISTS (
+                       SELECT 1 FROM events AS cause
+                       WHERE cause.seq = json_extract(event.data, '$.cause_seq')
+                         AND cause.agent = event.agent AND cause.generation = event.generation
+                         AND cause.seq > ?3 AND cause.seq < ?4
+                         AND json_extract(cause.data, '$.turn_id') = ?7
+                   ))
+               )
+         )"
+    } else {
+        "SELECT EXISTS(
+             SELECT 1 FROM events AS event
+             WHERE event.agent = ?1 AND event.generation = ?2 AND event.native_id IS NOT NULL
+               AND event.seq > ?3 AND event.seq < ?4
+               AND event.ts NOT BETWEEN ?5 AND ?6
+               AND event.source NOT IN ('daemon', 'os', 'git', 'workspace_process')
+               AND event.kind IN ('turn.started', 'turn.completed', 'message.completed',
+                                  'tool.started', 'tool.completed', 'request.opened',
+                                  'request.resolved', 'request.closed')
+               AND json_extract(event.data, '$.turn_id') = ?7
+         )"
+    };
+    connection
+        .query_row(
+            sql,
+            params![
+                turn.agent,
+                turn.generation,
+                turn.started_seq,
+                turn.completed_seq,
+                turn.started_at,
+                turn.completed_at,
+                turn.turn_id,
+            ],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)
 }

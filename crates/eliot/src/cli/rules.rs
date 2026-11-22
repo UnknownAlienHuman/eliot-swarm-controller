@@ -12,15 +12,14 @@ use super::support::{
 };
 use eliot_core::Command as CoreCommand;
 use eliot_core::api::{
-    DEFAULT_GOAL_CHECK_TIMEOUT_MS, GoalClearRequest, GoalCostLimit, GoalDefinition, GoalEscalation,
-    GoalGetRequest, GoalMode, GoalPauseRequest, GoalResumeRequest, GoalRoundRequest,
-    GoalRoundResponse, GoalSetRequest, GoalView, MAX_RULE_FILE_BYTES, ProjectOverviewRequest,
-    ProjectOverviewResponse, ProjectRegistrationView, ProviderClearHoldRequest,
-    ProviderClearHoldResponse, ProviderCorrectiveEvidence, ProviderHoldsRequest,
-    ProviderHoldsResponse, RuleCatchUpRequest, RuleDeleteRequest, RuleDeleteResponse,
-    RuleGetRequest, RuleListEntry, RuleListRequest, RuleListResponse, RuleReadRequest,
-    RuleReadResponse, RuleSaveRequest, RuleSaveResponse, RuleShowView, TimerGetRequest,
-    TimerRunRequest, TimerSchedule, TimerStateView,
+    GoalClearRequest, GoalCostLimit, GoalDefinition, GoalEscalation, GoalGetRequest, GoalMode,
+    GoalPauseRequest, GoalResumeRequest, GoalRoundRequest, GoalRoundResponse, GoalSetRequest,
+    GoalView, MAX_RULE_FILE_BYTES, ProjectOverviewRequest, ProjectOverviewResponse,
+    ProjectRegistrationView, ProviderClearHoldRequest, ProviderClearHoldResponse,
+    ProviderCorrectiveEvidence, ProviderHoldsRequest, ProviderHoldsResponse, RuleCatchUpRequest,
+    RuleDeleteRequest, RuleDeleteResponse, RuleGetRequest, RuleListEntry, RuleListRequest,
+    RuleListResponse, RuleReadRequest, RuleReadResponse, RuleSaveRequest, RuleSaveResponse,
+    RuleShowView, TimerGetRequest, TimerRunRequest, TimerSchedule, TimerStateView,
 };
 use serde_json::Value;
 use serde_json::json;
@@ -615,6 +614,7 @@ pub(crate) async fn run_goal(
                 check,
                 check_cwd,
                 check_timeout_ms,
+                check_timeout_retry_safe,
                 max_turns,
                 max_rounds,
                 max_without_progress,
@@ -647,7 +647,8 @@ pub(crate) async fn run_goal(
                     text,
                     check,
                     check_cwd,
-                    check_timeout_ms: check_timeout_ms.unwrap_or(DEFAULT_GOAL_CHECK_TIMEOUT_MS),
+                    check_timeout_ms,
+                    check_timeout_retry_safe,
                     max_turns,
                     max_rounds,
                     max_without_progress,

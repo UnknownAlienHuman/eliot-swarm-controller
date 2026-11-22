@@ -739,8 +739,12 @@ threshold; when a per-kind threshold is omitted, the legacy
 
 Time windows must be positive integers whose millisecond value fits in `i64`.
 An older `daemon.attention_suspicion_secs` supplies the default for omitted
-per-kind windows. Source-health failures are observed promptly. The `no_progress`
-window also bounds recovery for an unhealthy source ([plugin protocol](plugin-protocol.md)).
+per-kind windows. The configured `no_progress` and `no_code_progress`
+windows, with a 900-second minimum, provide the fallback for a profile and
+project with too few successful turns. See [automatic attention](monitoring.md#automatic-attention)
+for when Swarm derives a larger window from the Store. Source-health failures
+are observed promptly. The configured `no_progress` window also bounds
+recovery for an unhealthy source ([plugin protocol](plugin-protocol.md)).
 
 `agent_lost`, `source_unhealthy`, `provider_refusal`, `session_growth`, and
 `repeated_command_failure` each have an `enabled` setting under
@@ -903,12 +907,19 @@ the registered checkout as before. Any other value is invalid.
 `format` remains an optional explicit argv array (1–32 nonempty arguments, at most
 4 KiB each); the daemon never parses it through a shell. The project's shared check
 and Goal defaults live in its canonical `[projects.ID.policy]` settings block:
-`policy.check.argv` is the explicit check argv, `policy.check.deadline_ms` is its
-bounded deadline, and `policy.check.at_turn_end` reserves that check for the idle
-Goal driver when true. The argv has the same 1–32 nonempty argument and 4 KiB per
-argument limits. After a Git-confirmed `file.changed` hint or dirty `git.changed`
-snapshot settles, the daemon runs `format` and then the Agent's resolved launch Goal
-check, with the Goal's argv, deadline and working directory.
+`policy.check.argv` is the explicit check argv. `policy.check.deadline_ms`
+sets the optional bounded deadline. Omission uses the
+[Goal check default](automation.md#goal-loop) for Goal rounds.
+`policy.check.at_turn_end` reserves that check for the idle Goal driver when
+true. The argv has the same 1–32 nonempty argument and 4 KiB per argument
+limits. After a Git-confirmed `file.changed` hint or dirty `git.changed`
+snapshot settles, the daemon runs `format` and then the Agent's resolved
+launch Goal check with the Goal's argv and working directory. The fast check
+uses 60 seconds when no deadline is set.
+
+The Owner can enable `policy.check.check_timeout_retry_safe` for a pure
+check that is safe to repeat. It authorizes the [Goal timeout retry](automation.md#goal-loop)
+for the approved command.
 
 `policy.budget.max_rounds` supplies the Goal default (3 when omitted; accepted range
 1–16). `policy.budget.max_cost` is a `GoalCostLimit` pair `{ unit, amount_micros }`
@@ -917,7 +928,8 @@ policy's `scope` and `check_inputs` supply the corresponding Goal defaults. A po
 that sets a budget, scope, or check inputs requires a check. The Owner can override
 each Goal field independently, including clearing nullable limits or scope lists.
 Agent and project-rule launches that inherit policy can lower budgets and the check
-deadline, add protected check inputs, and narrow scope. A path must match both the
+deadline, add protected check inputs, and narrow scope. When the policy omits
+its deadline, an Agent or project rule can set at most 60 seconds. A path must match both the
 project scope and an explicit launch scope. Null limits, empty scope or check-input
 lists, and a cadence that replaces idle checks require an explicit opt-out.
 Executable check overrides and escalation require Owner authority.

@@ -4751,6 +4751,8 @@ impl Router {
             claude_profile_command_issues,
             profile_first_calls,
             profile_first_calls_truncated,
+            goal_check_deadlines: self.goal_check_deadlines().await?,
+            attention_thresholds: Some(self.attention_thresholds().await?),
         };
         request
             .validate_response(&response)

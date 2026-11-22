@@ -23,17 +23,18 @@ use crate::{
 use eliot_core::{
     AgentState, Error, Event, Result, SecretPolicy, StderrSnapshot,
     api::{
-        CHECK_SPAWN_RETRYABLE, GoalClearRequest, GoalContinuationStage, GoalDefinition,
-        GoalGetRequest, GoalMode, GoalPauseRequest, GoalResumeRequest, GoalRoundRequest,
-        GoalSetRequest, GoalStatus, MAX_GOAL_OBSERVATION_BYTES, inference::sha256_hex,
-        truncate_bytes,
+        CHECK_SPAWN_RETRYABLE, GoalCheckDeadlineStatus, GoalClearRequest, GoalContinuationStage,
+        GoalDefinition, GoalGetRequest, GoalMode, GoalPauseRequest, GoalResumeRequest,
+        GoalRoundRequest, GoalSetRequest, GoalStatus, MAX_GOAL_CHECK_DEADLINE_STATUS,
+        MAX_GOAL_CHECK_TIMEOUT_MS, MAX_GOAL_OBSERVATION_BYTES, derive_goal_check_deadline_ms,
+        goal_check_digest, inference::sha256_hex, truncate_bytes,
     },
     limits::MAX_FRAME_BYTES,
 };
 use eliot_plugin::sync::LockExt;
 use eliot_store::{
-    GoalCheckResult, GoalContinuation, GoalRoundClaim, GoalRoundCommit, GoalRoundDecision,
-    GoalRoundKey,
+    GoalCheckDeadlineTarget, GoalCheckHistoryEntry, GoalCheckResult, GoalContinuation,
+    GoalRoundClaim, GoalRoundCommit, GoalRoundDecision, GoalRoundKey,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -42,7 +43,7 @@ use std::{
     future::Future,
     pin::Pin,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     process::Command as TokioCommand,
@@ -73,9 +74,20 @@ struct ClaimedGoalRound {
     armed: bool,
     cancellation: watch::Sender<bool>,
     check: Option<Pin<Box<dyn Future<Output = ProcessOutcome> + Send>>>,
+    check_timeout_ms: Option<i64>,
+    retry_timeout_ms: Option<i64>,
     quiescent: bool,
     pending_decision: Option<GoalRoundCommit>,
     workspace_permit: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+struct GoalCheckDeadlineCandidate {
+    project_id: String,
+    agent: Option<String>,
+    check_digest: String,
+    check_program: String,
+    explicit_timeout_ms: Option<i64>,
+    timeout_retry_safe: bool,
 }
 
 impl ClaimedGoalRound {
@@ -105,6 +117,9 @@ impl ClaimedGoalRound {
             round_key: key,
             claim_seq,
             check: None,
+            check_history: None,
+            check_timeout_ms: self.check_timeout_ms,
+            retry_timeout_ms: self.retry_timeout_ms,
             decision: Some(decision),
             observation,
             fingerprint_before: None,
@@ -131,6 +146,8 @@ impl Drop for ClaimedGoalRound {
         let request = self.request.clone();
         let mut error = self.error.clone();
         let mut quiescent = self.quiescent;
+        let check_timeout_ms = self.check_timeout_ms;
+        let retry_timeout_ms = self.retry_timeout_ms;
         self.cancellation.send_replace(true);
         let check = self.check.take();
         let pending_decision = self.pending_decision.take();
@@ -167,7 +184,14 @@ impl Drop for ClaimedGoalRound {
             // A persistence failure faults the Store; restart resolves any
             // remaining reservation under the old holder to unknown.
             let _ = router
-                .settle_goal_round_error(&principal, &request, &error, quiescent)
+                .settle_goal_round_error(
+                    &principal,
+                    &request,
+                    &error,
+                    quiescent,
+                    check_timeout_ms,
+                    retry_timeout_ms,
+                )
                 .await;
         });
     }
@@ -310,6 +334,95 @@ impl Router {
             .map_err(|_| Error::new("internal", "goal state could not be encoded"))
     }
 
+    /// Read bounded effective Goal-check deadlines for current registered projects.
+    pub(super) async fn goal_check_deadlines(&self) -> Result<Vec<GoalCheckDeadlineStatus>> {
+        let (registrations, goals) = {
+            let store = self.inner.store.lock().await;
+            (
+                store.list_project_registrations("owner", None, MAX_GOAL_CHECK_DEADLINE_STATUS)?,
+                store.goal_check_deadline_targets(MAX_GOAL_CHECK_DEADLINE_STATUS)?,
+            )
+        };
+        let registered: std::collections::HashSet<_> = registrations
+            .into_iter()
+            .map(|project| project.id)
+            .collect();
+        let projects = crate::config::load_project_registration_config(&self.inner.data_root)?;
+        let mut candidates = Vec::new();
+        for project in projects {
+            if !registered.contains(&project.id) {
+                continue;
+            }
+            if let Some(check) = project
+                .policy
+                .as_ref()
+                .and_then(|policy| policy.check.as_ref())
+            {
+                candidates.push(GoalCheckDeadlineCandidate {
+                    project_id: project.id.clone(),
+                    agent: None,
+                    check_digest: goal_check_digest(&check.argv, None)?,
+                    check_program: check.argv.first().cloned().unwrap_or_default(),
+                    explicit_timeout_ms: check.deadline_ms,
+                    timeout_retry_safe: check.check_timeout_retry_safe
+                        && !shell_command_or_script(&check.argv),
+                });
+            }
+        }
+        for GoalCheckDeadlineTarget {
+            project_id,
+            agent,
+            definition,
+        } in goals
+        {
+            if !registered.contains(&project_id) {
+                continue;
+            }
+            candidates.push(GoalCheckDeadlineCandidate {
+                project_id,
+                agent: Some(agent),
+                check_digest: goal_check_digest(
+                    &definition.check,
+                    definition.check_cwd.as_deref(),
+                )?,
+                check_program: definition.check.first().cloned().unwrap_or_default(),
+                explicit_timeout_ms: definition.check_timeout_ms,
+                timeout_retry_safe: definition.check_timeout_retry_safe
+                    && !shell_command_or_script(&definition.check),
+            });
+        }
+        candidates.sort_by(|left, right| {
+            left.project_id
+                .cmp(&right.project_id)
+                .then_with(|| left.agent.cmp(&right.agent))
+                .then_with(|| left.check_digest.cmp(&right.check_digest))
+        });
+        candidates.truncate(MAX_GOAL_CHECK_DEADLINE_STATUS);
+
+        let secrets = self.secret_policy_snapshot();
+        let store = self.inner.store.lock().await;
+        let mut statuses = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let history =
+                store.goal_check_history(&candidate.project_id, &candidate.check_digest)?;
+            let (deadline_ms, source) =
+                derive_goal_check_deadline_ms(candidate.explicit_timeout_ms, &history);
+            let redacted_program = secrets.redact_text(&candidate.check_program);
+            let (check_program, _) = truncate_bytes(&redacted_program, 256);
+            statuses.push(GoalCheckDeadlineStatus {
+                project_id: candidate.project_id,
+                agent: candidate.agent,
+                check_program,
+                check_id: candidate.check_digest,
+                deadline_ms,
+                history_size: history.len() as u64,
+                source,
+                timeout_retry_safe: candidate.timeout_retry_safe,
+            });
+        }
+        Ok(statuses)
+    }
+
     pub(super) async fn goal_pause(&self, params: &Value, principal: &Principal) -> Result<Value> {
         let request: GoalPauseRequest = decode_goal_request(
             params,
@@ -428,6 +541,14 @@ impl Router {
             { store.goal_round_probe(&request.agent, request.mode.as_str(), key, now_ms())? };
         goal_round_gates(&probe, key)?;
         let definition = probe.view.definition.clone();
+        let check_digest = goal_check_digest(&definition.check, definition.check_cwd.as_deref())?;
+        let history = if probe.project_id.is_empty() {
+            Vec::new()
+        } else {
+            store.goal_check_history(&probe.project_id, &check_digest)?
+        };
+        let (check_timeout_ms, deadline_source) =
+            derive_goal_check_deadline_ms(definition.check_timeout_ms, &history);
         let stdin = serde_json::to_vec(&json!({
             "agent": request.agent,
             "generation": probe.view.generation,
@@ -488,6 +609,8 @@ impl Router {
             armed: true,
             cancellation: check_cancellation,
             check: None,
+            check_timeout_ms: None,
+            retry_timeout_ms: None,
             quiescent: true,
             pending_decision: None,
             workspace_permit,
@@ -556,40 +679,67 @@ impl Router {
         // read taken right after the previous failed check.
         let fingerprint_before = work_fingerprint(probe.workspace.as_deref()).await;
         let policy = self.secret_policy_snapshot();
-        let outcome = match local_process_command(&definition.check[0]) {
-            Err(error) => ProcessOutcome::NotSpawned(error),
-            Ok(mut command) => {
-                command.args(&definition.check[1..]);
-                if let Some(cwd) = definition
-                    .check_cwd
-                    .as_deref()
-                    .or(probe.workspace.as_deref())
-                {
-                    command.current_dir(cwd);
-                }
-                let timeout = Duration::from_millis(definition.check_timeout_ms.max(0) as u64);
-                claimed.quiescent = false;
-                let check = claimed.check.insert(run_check(
-                    command,
-                    stdin,
-                    timeout,
-                    Arc::clone(&policy),
-                    check_cancelled,
-                ));
-                tokio::select! {
-                    biased;
-                    _ = async { let _ = cancellation.wait_for(|cancelled| *cancelled).await; } => {
-                        claimed.cancellation.send_replace(true);
-                        check.await
+        let retry_safe = deadline_source == eliot_core::api::GoalCheckDeadlineSource::History
+            && definition.check_timeout_retry_safe
+            && !shell_command_or_script(&definition.check);
+        let mut timeout_retry_attempted = false;
+        let mut attempt_timeout_ms = check_timeout_ms;
+        let mut check_duration_ms = 0_i64;
+        let outcome = loop {
+            let outcome = match local_process_command(&definition.check[0]) {
+                Err(error) => ProcessOutcome::NotSpawned(error),
+                Ok(mut command) => {
+                    command.args(&definition.check[1..]);
+                    if let Some(cwd) = definition
+                        .check_cwd
+                        .as_deref()
+                        .or(probe.workspace.as_deref())
+                    {
+                        command.current_dir(cwd);
                     }
-                    outcome = check.as_mut() => outcome,
+                    let timeout = Duration::from_millis(attempt_timeout_ms as u64);
+                    if timeout_retry_attempted {
+                        claimed.retry_timeout_ms = Some(attempt_timeout_ms);
+                    } else {
+                        claimed.check_timeout_ms = Some(attempt_timeout_ms);
+                    }
+                    claimed.quiescent = false;
+                    let started = Instant::now();
+                    let check = claimed.check.insert(run_check(
+                        command,
+                        stdin.clone(),
+                        timeout,
+                        Arc::clone(&policy),
+                        check_cancelled.clone(),
+                    ));
+                    let outcome = tokio::select! {
+                        biased;
+                        _ = async { let _ = cancellation.wait_for(|cancelled| *cancelled).await; } => {
+                            claimed.cancellation.send_replace(true);
+                            check.await
+                        }
+                        outcome = check.as_mut() => outcome,
+                    };
+                    check_duration_ms = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
+                    outcome
                 }
+            };
+            // Each attempt settles through the same owned-process supervisor.
+            // The timeout retry stays inside this claimed Goal round.
+            claimed.quiescent = goal_check_quiescent(&outcome);
+            claimed.check = None;
+            if !timeout_retry_attempted
+                && retry_safe
+                && claimed.quiescent
+                && !*cancellation.borrow()
+                && goal_timeout_retry_closed(&outcome)
+            {
+                timeout_retry_attempted = true;
+                attempt_timeout_ms = MAX_GOAL_CHECK_TIMEOUT_MS;
+                continue;
             }
+            break outcome;
         };
-        // A completed future is never polled again. Carry its independent
-        // custody fact through error retention and cancellation of that await.
-        claimed.quiescent = goal_check_quiescent(&outcome);
-        claimed.check = None;
         let check = match goal_check_result(outcome, &policy) {
             Ok(check) => check,
             Err(error)
@@ -617,7 +767,14 @@ impl Router {
             Err(error) => {
                 claimed.error = error.clone();
                 let retained = self
-                    .settle_goal_round_error(&principal, &request, &error, claimed.quiescent)
+                    .settle_goal_round_error(
+                        &principal,
+                        &request,
+                        &error,
+                        claimed.quiescent,
+                        claimed.check_timeout_ms,
+                        claimed.retry_timeout_ms,
+                    )
                     .await;
                 return claimed.complete(Err(retained));
             }
@@ -643,6 +800,9 @@ impl Router {
                 round_key: key,
                 claim_seq,
                 check: Some(check),
+                check_history: None,
+                check_timeout_ms: claimed.check_timeout_ms,
+                retry_timeout_ms: claimed.retry_timeout_ms,
                 decision: None,
                 observation: None,
                 fingerprint_before,
@@ -716,6 +876,11 @@ impl Router {
         } else {
             None
         };
+        let check_history = (!probe.project_id.is_empty()).then(|| GoalCheckHistoryEntry {
+            project_id: probe.project_id.clone(),
+            check_digest: check_digest.clone(),
+            duration_ms: check_duration_ms,
+        });
         let commit = GoalRoundCommit {
             id: request.id.clone(),
             principal: principal.clone(),
@@ -726,6 +891,9 @@ impl Router {
             round_key: key,
             claim_seq,
             check: Some(check),
+            check_history,
+            check_timeout_ms: claimed.check_timeout_ms,
+            retry_timeout_ms: claimed.retry_timeout_ms,
             decision,
             observation: None,
             fingerprint_before,
@@ -787,12 +955,28 @@ impl Router {
         request: &GoalRoundRequest,
         error: &Error,
         quiescent: bool,
+        check_timeout_ms: Option<i64>,
+        retry_timeout_ms: Option<i64>,
     ) -> Error {
         let mut store = self.inner.store.lock().await;
         let retained = if quiescent {
-            store.goal_abandon_round(principal, request, error, now_ms())
+            store.goal_abandon_round(
+                principal,
+                request,
+                error,
+                check_timeout_ms,
+                retry_timeout_ms,
+                now_ms(),
+            )
         } else {
-            store.goal_hold_round_error(principal, request, error, now_ms())
+            store.goal_hold_round_error(
+                principal,
+                request,
+                error,
+                check_timeout_ms,
+                retry_timeout_ms,
+                now_ms(),
+            )
         };
         match retained {
             Ok(retained) => {
@@ -823,7 +1007,14 @@ impl Router {
             let result = match store.goal_commit_round(commit, now_ms()) {
                 Ok(result) => result,
                 Err(error) => {
-                    match store.goal_abandon_round(principal, request, &error, now_ms()) {
+                    match store.goal_abandon_round(
+                        principal,
+                        request,
+                        &error,
+                        commit.check_timeout_ms,
+                        commit.retry_timeout_ms,
+                        now_ms(),
+                    ) {
                         Ok(retained) => {
                             self.publish_locked(&retained.events);
                             return Err(retained.value);
@@ -1595,6 +1786,56 @@ fn goal_check_quiescent(outcome: &ProcessOutcome) -> bool {
             ..
         }
     )
+}
+
+/// A timeout can authorize one retry only after the owned runner returned a
+/// capture with its custody proof. Unknown outcomes never pass this check.
+fn goal_timeout_retry_closed(outcome: &ProcessOutcome) -> bool {
+    matches!(
+        outcome,
+        ProcessOutcome::Failed {
+            reason: ProcessFailure::Timeout,
+            capture: Some(capture),
+        } if custody_proven_for_capture(capture)
+    )
+}
+
+/// Safe retry is an Owner assertion on a direct command. Shells and shell
+/// scripts remain excluded because their effects cannot be inferred from argv.
+fn shell_command_or_script(argv: &[String]) -> bool {
+    fn shell_program(value: &str) -> bool {
+        let base = value.rsplit(['/', '\\']).next().unwrap_or(value);
+        let base = base.to_ascii_lowercase();
+        matches!(
+            base.as_str(),
+            "sh" | "sh.exe"
+                | "bash"
+                | "bash.exe"
+                | "dash"
+                | "dash.exe"
+                | "zsh"
+                | "zsh.exe"
+                | "ksh"
+                | "ksh.exe"
+                | "cmd"
+                | "cmd.exe"
+                | "powershell"
+                | "powershell.exe"
+                | "pwsh"
+                | "pwsh.exe"
+        ) || [
+            ".sh", ".bash", ".dash", ".zsh", ".ksh", ".cmd", ".bat", ".ps1", ".psm1",
+        ]
+        .iter()
+        .any(|extension| base.ends_with(extension))
+    }
+
+    argv.is_empty()
+        || argv.iter().any(|argument| {
+            argument
+                .split_whitespace()
+                .any(|word| shell_program(word.trim_matches(['\'', '"'])))
+        })
 }
 
 /// Interpret one owned check completion. A definite direct exit with proven

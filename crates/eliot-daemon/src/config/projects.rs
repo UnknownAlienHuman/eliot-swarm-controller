@@ -57,10 +57,20 @@ pub(crate) struct ProjectPolicyConfig {
 #[serde(deny_unknown_fields)]
 pub(crate) struct ProjectPolicyCheck {
     pub argv: Vec<String>,
-    #[serde(default = "default_project_check_deadline_ms")]
-    pub deadline_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "project_policy_false")]
+    pub check_timeout_retry_safe: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub at_turn_end: Option<bool>,
+}
+
+impl ProjectPolicyCheck {
+    /// Project checks outside a Goal round use the fixed default.
+    pub(crate) fn fixed_deadline_ms(&self) -> i64 {
+        self.deadline_ms
+            .unwrap_or(core::api::DEFAULT_GOAL_CHECK_TIMEOUT_MS)
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
@@ -83,8 +93,8 @@ struct ProjectPolicySettingsInput {
     max_rounds: Option<i64>,
 }
 
-fn default_project_check_deadline_ms() -> i64 {
-    core::api::DEFAULT_GOAL_CHECK_TIMEOUT_MS
+fn project_policy_false(value: &bool) -> bool {
+    !value
 }
 
 /// Default chat root for one data dir. The Owner's default data dir keeps
@@ -548,7 +558,8 @@ fn normalize_project_policy(
         }
         None if !legacy_check.is_empty() => Some(ProjectPolicyCheck {
             argv: legacy_check.to_vec(),
-            deadline_ms: default_project_check_deadline_ms(),
+            deadline_ms: None,
+            check_timeout_retry_safe: false,
             at_turn_end: legacy_at_turn_end.then_some(true),
         }),
         None => None,
@@ -571,9 +582,10 @@ fn normalize_project_policy(
         }
         configured.argv =
             normalize_project_command_argv(&configured.argv, source, offset, id, field)?;
-        if !(core::api::MIN_GOAL_CHECK_TIMEOUT_MS..=core::api::MAX_GOAL_CHECK_TIMEOUT_MS)
-            .contains(&configured.deadline_ms)
-        {
+        if configured.deadline_ms.is_some_and(|deadline_ms| {
+            !(core::api::MIN_GOAL_CHECK_TIMEOUT_MS..=core::api::MAX_GOAL_CHECK_TIMEOUT_MS)
+                .contains(&deadline_ms)
+        }) {
             return Err(config_error_at(
                 source,
                 offset,

@@ -21,6 +21,13 @@ pub const MAX_GOAL_CHECK_ARGS: usize = 32;
 pub const MIN_GOAL_CHECK_TIMEOUT_MS: i64 = 1_000;
 pub const MAX_GOAL_CHECK_TIMEOUT_MS: i64 = 600_000;
 pub const DEFAULT_GOAL_CHECK_TIMEOUT_MS: i64 = 60_000;
+/// Number of recent successful runs retained for one project/check identity.
+pub const GOAL_CHECK_HISTORY_LIMIT: usize = 20;
+/// A deadline is history-derived only after this many successful runs.
+pub const GOAL_CHECK_HISTORY_MIN_SAMPLES: usize = 3;
+/// Upper bound for the internal status view of known Goal checks.
+pub const MAX_GOAL_CHECK_DEADLINE_STATUS: usize = 256;
+const GOAL_CHECK_DEADLINE_MULTIPLIER: i128 = 5;
 /// Upper bound for every Goal turn/round/progress limit.
 pub const MAX_GOAL_LIMIT: i64 = 1_000_000;
 /// Cadence bounds in milliseconds. Below a minute a cadence would spin
@@ -36,6 +43,76 @@ pub const MAX_GOAL_SCOPE_GLOBS: usize = 32;
 /// Most paths already changed when a scoped Goal is set; a larger starting
 /// change set is refused rather than recorded incompletely.
 pub const MAX_GOAL_SCOPE_BASE_PATHS: usize = 512;
+
+#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalCheckDeadlineSource {
+    Explicit,
+    History,
+    Fallback,
+}
+
+/// Read-only deadline and bounded history summary for one current project or Goal check.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GoalCheckDeadlineStatus {
+    pub project_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Redacted executable label; check identity is the full SHA-256 digest.
+    pub check_program: String,
+    pub check_id: String,
+    pub deadline_ms: i64,
+    pub history_size: u64,
+    pub source: GoalCheckDeadlineSource,
+    pub timeout_retry_safe: bool,
+}
+
+/// Use an explicit deadline when present; otherwise derive five times the
+/// median of the newest 20 successful runs, with a 60-second short-history
+/// fallback and a 60-to-600-second derived range. `history_ms` is newest first.
+pub fn derive_goal_check_deadline_ms(
+    explicit_timeout_ms: Option<i64>,
+    history_ms: &[i64],
+) -> (i64, GoalCheckDeadlineSource) {
+    if let Some(timeout_ms) = explicit_timeout_ms {
+        return (timeout_ms, GoalCheckDeadlineSource::Explicit);
+    }
+
+    let sample = &history_ms[..history_ms.len().min(GOAL_CHECK_HISTORY_LIMIT)];
+    if sample.len() < GOAL_CHECK_HISTORY_MIN_SAMPLES {
+        return (
+            DEFAULT_GOAL_CHECK_TIMEOUT_MS,
+            GoalCheckDeadlineSource::Fallback,
+        );
+    }
+
+    let mut sorted = sample.to_vec();
+    sorted.sort_unstable();
+    let middle = sorted.len() / 2;
+    let median_ms = if sorted.len().is_multiple_of(2) {
+        (i128::from(sorted[middle - 1]) + i128::from(sorted[middle])) / 2
+    } else {
+        i128::from(sorted[middle])
+    };
+    let deadline_ms = (median_ms * GOAL_CHECK_DEADLINE_MULTIPLIER).clamp(
+        i128::from(DEFAULT_GOAL_CHECK_TIMEOUT_MS),
+        i128::from(MAX_GOAL_CHECK_TIMEOUT_MS),
+    ) as i64;
+    (deadline_ms, GoalCheckDeadlineSource::History)
+}
+
+/// Stable identity for a check's argv and optional working-directory override.
+/// The normal Agent worktree is implicit, so linked worktrees share history.
+pub fn goal_check_digest(check: &[String], cwd: Option<&str>) -> Result<String> {
+    let encoded = serde_json::to_vec(&(check, cwd))
+        .map_err(|_| Error::new("internal", "goal check argv could not be encoded"))?;
+    Ok(crate::api::inference::sha256_hex(&encoded))
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
+}
 
 #[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -103,6 +180,8 @@ pub struct AssignmentGoal {
     pub check: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check_timeout_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub check_timeout_retry_safe: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_turns: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -120,9 +199,8 @@ impl AssignmentGoal {
             ),
             check: self.check.clone(),
             check_cwd: None,
-            check_timeout_ms: self
-                .check_timeout_ms
-                .unwrap_or(DEFAULT_GOAL_CHECK_TIMEOUT_MS),
+            check_timeout_ms: self.check_timeout_ms,
+            check_timeout_retry_safe: self.check_timeout_retry_safe,
             max_turns: self.max_turns,
             max_rounds: self.max_rounds,
             max_without_progress: self.max_without_progress,
@@ -152,8 +230,11 @@ pub struct GoalDefinition {
     pub check: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check_cwd: Option<String>,
-    #[serde(default = "default_check_timeout")]
-    pub check_timeout_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_timeout_ms: Option<i64>,
+    /// Owner assertion that this check is safe to rerun after a closed timeout.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub check_timeout_retry_safe: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_turns: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -284,10 +365,6 @@ impl GoalCostLimit {
     }
 }
 
-fn default_check_timeout() -> i64 {
-    DEFAULT_GOAL_CHECK_TIMEOUT_MS
-}
-
 impl GoalDefinition {
     pub fn validate(&self) -> Result<()> {
         if self.text.trim().is_empty() || self.text.len() > MAX_GOAL_TEXT_BYTES {
@@ -318,8 +395,9 @@ impl GoalDefinition {
                 "goal check cwd must be nonempty and at most 4 KiB",
             ));
         }
-        if !(MIN_GOAL_CHECK_TIMEOUT_MS..=MAX_GOAL_CHECK_TIMEOUT_MS).contains(&self.check_timeout_ms)
-        {
+        if self.check_timeout_ms.is_some_and(|timeout_ms| {
+            !(MIN_GOAL_CHECK_TIMEOUT_MS..=MAX_GOAL_CHECK_TIMEOUT_MS).contains(&timeout_ms)
+        }) {
             return Err(Error::new(
                 "invalid",
                 "goal check timeout must be between 1s and 10m",
@@ -1005,6 +1083,10 @@ pub struct GoalRoundEvent {
     pub outcome: GoalRoundEventOutcome,
     pub reason: Option<String>,
     pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_timeout_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_timeout_ms: Option<i64>,
 }
 
 #[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 92;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 94;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -2208,6 +2208,32 @@ impl Store {
                  CREATE INDEX owner_inbox_unknown_turns ON turns(agent,generation,turn_id)
                      WHERE state='unknown';
                  INSERT INTO schema_migrations(version) VALUES (92);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 94 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE TABLE goal_check_history (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     project_id TEXT NOT NULL,
+                     check_digest TEXT NOT NULL CHECK(length(check_digest) = 64),
+                     duration_ms INTEGER NOT NULL CHECK(duration_ms >= 0)
+                 );
+                 CREATE INDEX goal_check_history_identity
+                     ON goal_check_history(project_id, check_digest, id DESC);
+                 CREATE INDEX attention_turn_endpoints
+                     ON events(agent, generation, kind, json_extract(data, '$.turn_id'), seq)
+                     WHERE kind = 'turn.started' OR kind = 'turn.completed';
+                 CREATE INDEX attention_history_events
+                     ON events(agent, generation, kind, seq)
+                     WHERE kind = 'source.gap' OR kind = 'x.user.agent.attention'
+                        OR kind = 'command.dispatched';
+                 INSERT INTO schema_migrations(version) VALUES (94);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;

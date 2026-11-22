@@ -18,6 +18,7 @@ pub(super) async fn advance_time_ladder(
     key: &IncidentKey,
     captured: &CapturedAgent,
     config: AttentionConfig,
+    no_progress_window: Duration,
 ) -> Result<()> {
     let Some(incident) = ({
         let state = state.lock().unwrap_or_else(|error| error.into_inner());
@@ -112,9 +113,7 @@ pub(super) async fn advance_time_ladder(
     if notice_after_question {
         return send_turn_notice(router, key, &report).await;
     }
-    let window_ms =
-        i64::try_from(super::attention_duration(config.no_progress.threshold_secs).as_millis())
-            .unwrap_or(i64::MAX);
+    let window_ms = i64::try_from(no_progress_window.as_millis()).unwrap_or(i64::MAX);
     // A later stall in this turn starts its own observation window, but
     // retains the first question and any subsequent Owner intervention.
     if !no_progress_is_still_same_episode(captured, &incident)

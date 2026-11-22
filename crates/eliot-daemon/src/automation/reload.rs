@@ -126,6 +126,9 @@ fn goal_toml(goal: &eliot_core::api::AssignmentGoal) -> String {
             fields.push(format!("{name} = {value}"));
         }
     }
+    if goal.check_timeout_retry_safe {
+        fields.push("check_timeout_retry_safe = true".to_owned());
+    }
     format!(", goal = {{ {} }}", fields.join(", "))
 }
 

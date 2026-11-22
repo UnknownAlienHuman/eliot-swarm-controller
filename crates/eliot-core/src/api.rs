@@ -123,14 +123,17 @@ pub use git_integrate::{
     MAX_GIT_INTEGRATE_CONFLICT_PATHS,
 };
 pub use goals::{
-    AssignmentGoal, CHECK_SPAWN_RETRYABLE, DEFAULT_GOAL_CHECK_TIMEOUT_MS, GoalClearRequest,
-    GoalContinuationStage, GoalCostLimit, GoalCounters, GoalDefinition, GoalEscalation,
-    GoalGetRequest, GoalMarkerState, GoalMode, GoalPauseRequest, GoalResumeRequest, GoalRoundEvent,
-    GoalRoundEventOutcome, GoalRoundMarker, GoalRoundOutcome, GoalRoundRequest, GoalRoundResponse,
-    GoalScopeBase, GoalScopeStart, GoalSetRequest, GoalStatus, GoalView, MAX_GOAL_CADENCE_MS,
-    MAX_GOAL_CHECK_ARG_BYTES, MAX_GOAL_CHECK_ARGS, MAX_GOAL_CHECK_TIMEOUT_MS, MAX_GOAL_LIMIT,
+    AssignmentGoal, CHECK_SPAWN_RETRYABLE, DEFAULT_GOAL_CHECK_TIMEOUT_MS, GOAL_CHECK_HISTORY_LIMIT,
+    GOAL_CHECK_HISTORY_MIN_SAMPLES, GoalCheckDeadlineSource, GoalCheckDeadlineStatus,
+    GoalClearRequest, GoalContinuationStage, GoalCostLimit, GoalCounters, GoalDefinition,
+    GoalEscalation, GoalGetRequest, GoalMarkerState, GoalMode, GoalPauseRequest, GoalResumeRequest,
+    GoalRoundEvent, GoalRoundEventOutcome, GoalRoundMarker, GoalRoundOutcome, GoalRoundRequest,
+    GoalRoundResponse, GoalScopeBase, GoalScopeStart, GoalSetRequest, GoalStatus, GoalView,
+    MAX_GOAL_CADENCE_MS, MAX_GOAL_CHECK_ARG_BYTES, MAX_GOAL_CHECK_ARGS,
+    MAX_GOAL_CHECK_DEADLINE_STATUS, MAX_GOAL_CHECK_TIMEOUT_MS, MAX_GOAL_LIMIT,
     MAX_GOAL_OBSERVATION_BYTES, MAX_GOAL_SCOPE_BASE_PATHS, MAX_GOAL_SCOPE_GLOBS,
-    MIN_GOAL_CADENCE_MS, MIN_GOAL_CHECK_TIMEOUT_MS,
+    MIN_GOAL_CADENCE_MS, MIN_GOAL_CHECK_TIMEOUT_MS, derive_goal_check_deadline_ms,
+    goal_check_digest,
 };
 pub use handoff::{
     CommandCancelRequest, CommandCancelResponse, HandoffRequest, HandoffResponse,
@@ -156,9 +159,11 @@ pub use maintenance::{
     MaintenanceRunRequest, MaintenanceRunResponse,
 };
 pub use monitor_views::{
+    AttentionThreshold, AttentionThresholdPair, AttentionThresholdsResponse,
     FilesystemInvalidationState, FilesystemInvalidationView, GitObservation, GitView,
-    LivenessBasis, LivenessView, MonitoringSourceState, ObservationData, ObservationView,
-    ProcessStatsView, StatsCoverage, WorkspaceObservation, WorkspaceView,
+    LivenessBasis, LivenessView, MAX_ATTENTION_HISTORY, MAX_ATTENTION_THRESHOLD_PAIRS,
+    MIN_ATTENTION_HISTORY, MIN_ATTENTION_THRESHOLD_SECS, MonitoringSourceState, ObservationData,
+    ObservationView, ProcessStatsView, StatsCoverage, WorkspaceObservation, WorkspaceView,
 };
 pub use mutations::{
     CommandSubmitRequest, CommandSubmitResponse, DaemonShutdownRequest, DaemonShutdownResponse,
