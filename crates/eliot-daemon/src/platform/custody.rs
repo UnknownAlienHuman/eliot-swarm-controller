@@ -125,7 +125,10 @@ impl AgentCustodies {
         Ok(child)
     }
 
-    pub(crate) async fn authorize_owner(&self, peer: Option<LocalPeer>) -> Result<()> {
+    pub(crate) async fn authorize_owner(
+        &self,
+        peer: Option<LocalPeer>,
+    ) -> Result<Option<LocalPeer>> {
         let agents = loop {
             let registered = self.started.notified();
             let snapshot = {
@@ -147,7 +150,7 @@ impl AgentCustodies {
 
         #[cfg(windows)]
         if agents.is_empty() {
-            return Ok(());
+            return Ok(peer);
         }
         let peer = peer.ok_or_else(owner_peer_unknown)?;
 
@@ -175,7 +178,9 @@ impl AgentCustodies {
             if unknown || process.verify().is_err() {
                 return Err(owner_peer_unknown());
             }
-            Ok(())
+            #[cfg(target_os = "linux")]
+            let process = process.into_peer();
+            Ok(Some(process))
         }
         #[cfg(not(any(windows, target_os = "linux")))]
         {

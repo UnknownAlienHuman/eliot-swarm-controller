@@ -21,7 +21,7 @@ impl Router {
         &self,
         wire_params: Value,
         peer: Option<LocalPeer>,
-    ) -> Result<(Principal, Value)> {
+    ) -> Result<(Principal, Value, Option<LocalPeer>)> {
         let mut envelope = wire_params.as_object().cloned().ok_or_else(|| {
             Error::new(
                 "invalid",
@@ -65,7 +65,8 @@ impl Router {
                 "daemon credentials are incomplete",
             ));
         }
-        match kind {
+        let mut owner_peer = None;
+        let authenticated = match kind {
             "memory_inference" => {
                 let client_id = auth
                     .get("client_id")
@@ -110,7 +111,7 @@ impl Router {
             }
             "owner" => {
                 if secure_eq(credential, &self.inner.owner_token) {
-                    self.inner.plugin_host.authorize_local_owner(peer).await?;
+                    owner_peer = self.inner.plugin_host.authorize_local_owner(peer).await?;
                     if let Some(remote) = auth.get("remote_call") {
                         let remote: eliot_core::RemoteCallContext =
                             serde_json::from_value(remote.clone())
@@ -218,7 +219,8 @@ impl Router {
                 ))
             }
             _ => Err(Error::new("not_allowed", "daemon principal is unsupported")),
-        }
+        };
+        authenticated.map(|(principal, payload)| (principal, payload, owner_peer))
     }
 }
 

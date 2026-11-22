@@ -824,6 +824,36 @@ fn stop_fences_resume_tx(tx: &Transaction<'_>, agent: i64, generation: i64) -> R
 }
 
 impl Store {
+    /// Record an authenticated Owner submission before its handler runs.
+    pub fn record_owner_submission(
+        &mut self,
+        method: &str,
+        mutation_id: Option<&str>,
+        process: &OwnerProcess,
+        now: i64,
+    ) -> Result<Event> {
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let event = insert_daemon_event(
+                &tx,
+                now,
+                "owner.submitted",
+                "owner",
+                None,
+                None,
+                json!({"method": method, "mutation_id": mutation_id, "owner_process": process}),
+            )?;
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(event)
+        })();
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
     /// Persist an idempotent non-command write. L1 uses this for daemon shutdown;
     /// command admission remains in the commands table.
     pub fn record_write(
@@ -4599,12 +4629,18 @@ fn annotate_owner_events(
         if !event.kind.starts_with("command.") {
             continue;
         }
-        event.data["owner_process"] = process.clone();
+        let mut data = event.data.clone();
+        data["owner_process"] = process.clone();
+        let encoded = encode_json(&data)?;
+        if encoded.len() > MAX_EVENT_BYTES {
+            continue;
+        }
         tx.execute(
             "UPDATE events SET data = ?1 WHERE seq = ?2",
-            params![encode_json(&event.data)?, event.seq],
+            params![encoded, event.seq],
         )
         .map_err(sql_error)?;
+        event.data = data;
     }
     Ok(())
 }

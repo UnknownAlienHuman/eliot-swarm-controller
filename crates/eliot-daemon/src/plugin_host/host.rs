@@ -651,13 +651,23 @@ impl PluginHost {
         } else {
             None
         };
-        if let Some(root) = self
+        let artifact_root = self
             .state
             .store
             .lock()
             .await
-            .agent_artifact_root(&agent.id, agent.generation)?
-        {
+            .agent_artifact_root(&agent.id, agent.generation)?;
+        if let Some(root) = artifact_root {
+            if !agent.is_automatic_provider_probe()
+                && target_environment
+                    .get(crate::daemon::AGENT_DATA_SCOPE_ENV)
+                    .is_some()
+            {
+                crate::platform::data_dir::write_agent_root_locator(
+                    Path::new(&root.path),
+                    &self.state.data_root,
+                )?;
+            }
             target_environment
                 .as_object_mut()
                 .ok_or_else(|| Error::new("invalid", "target environment is not an object"))?
@@ -1604,7 +1614,10 @@ impl PluginHost {
         })
     }
 
-    pub(crate) async fn authorize_local_owner(&self, peer: Option<LocalPeer>) -> Result<()> {
+    pub(crate) async fn authorize_local_owner(
+        &self,
+        peer: Option<LocalPeer>,
+    ) -> Result<Option<LocalPeer>> {
         self.state.agent_custodies.authorize_owner(peer).await
     }
 

@@ -472,16 +472,6 @@ impl Router {
         peer: Option<crate::platform::custody::LocalPeer>,
         log_principal: &mut String,
     ) -> Result<Value> {
-        let owner_process = (matches!(
-            method,
-            "command.submit"
-                | "launch.enqueue"
-                | "project.assignment.launch"
-                | "project.transfer"
-                | "swarm.handoff"
-                | "swarm.switch"
-        ) && wire_params["_auth"]["kind"] == "owner")
-            .then(|| self.owner_process(peer.as_ref()));
         let remote = wire_params
             .get("_auth")
             .and_then(|a| a.get("remote_call"))
@@ -490,8 +480,11 @@ impl Router {
             .get_mut("_auth")
             .and_then(Value::as_object_mut)
             .and_then(|auth| auth.remove("swarm_mcp_call_id"));
-        let (principal, params) = self.authenticate(wire_params, peer).await?;
+        let (principal, params, owner_peer) = self.authenticate(wire_params, peer).await?;
         *log_principal = diagnostic_principal(&principal);
+        let owner_process = (matches!(principal, Principal::Owner)
+            && discovery::is_mutation(method))
+        .then(|| self.owner_process(owner_peer.as_ref()));
         let remote: Option<eliot_core::RemoteCallContext> = remote
             .map(serde_json::from_value)
             .transpose()
@@ -528,8 +521,16 @@ impl Router {
         #[cfg(any(windows, target_os = "linux"))]
         let (pid, image_path) = (
             peer.map(|peer| peer.process_id()),
-            peer.and_then(|peer| peer.image_path())
-                .map(|path| self.secret_policy_snapshot().redact_text(&path)),
+            peer.and_then(|peer| peer.image_path()).map(|path| {
+                const MAX_IMAGE_PATH_BYTES: usize = 4096;
+                const TRUNCATED: &str = " [truncated]";
+                let mut path = self.secret_policy_snapshot().redact_text(&path);
+                if path.len() > MAX_IMAGE_PATH_BYTES {
+                    path.truncate(path.floor_char_boundary(MAX_IMAGE_PATH_BYTES - TRUNCATED.len()));
+                    path.push_str(TRUNCATED);
+                }
+                path
+            }),
         );
         #[cfg(not(any(windows, target_os = "linux")))]
         let (pid, image_path) = {
@@ -559,6 +560,22 @@ impl Router {
         } else {
             None
         };
+        if let Some(process) = context.owner_process {
+            let mutation_id = params
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| ulid::Ulid::from_string(id).is_ok());
+            let mut store = self.inner.store.lock().await;
+            match store.record_owner_submission(method, mutation_id, process, now_ms()) {
+                Ok(event) => self.publish_locked(&[event]),
+                Err(error) => crate::logging::record(
+                    &self.secret_policy_snapshot(),
+                    "owner.submission_record_failed",
+                    &[("method", method)],
+                    Some(&error),
+                ),
+            }
+        }
         // Debug mode times every RPC at this single choke point. Standard
         // mode pays one Instant read and a branch; no parameters, prompts or
         // results ever enter the record.

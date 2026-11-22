@@ -407,6 +407,10 @@ impl LocalPeer {
 
 #[cfg(target_os = "linux")]
 impl InspectedLocalPeer {
+    pub(crate) fn into_peer(self) -> LocalPeer {
+        self.peer
+    }
+
     pub(crate) fn verify(&self) -> Result<()> {
         for (index, (pid, expected)) in self.lineage.iter().enumerate() {
             let current = if index == 0 {

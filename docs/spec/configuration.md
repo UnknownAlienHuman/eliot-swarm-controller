@@ -1488,7 +1488,9 @@ the default) with the issuing directory after lexical normalization and case-ins
 on Windows. The CLI refuses cross-root and unbound Agent credentials before connecting.
 When `pass_agent_identity_to_shell` is enabled, the shell receives the Agent ID,
 generation and token with a fingerprint of the issuing directory in
-`ELIOT_AGENT_DATA_SCOPE`. The CLI compares that fingerprint with the chosen root.
+`ELIOT_AGENT_DATA_SCOPE`. A bare Agent CLI resolves the issuing directory from
+its generation's private artifact root and checks the fingerprint before connecting.
+An explicit directory must match the same binding.
 Codex receives the Agent identity at its app-server boundary to configure the named
 MCP transport, with its issuing directory supplied in the MCP environment.
 It prepends the active controller executable's parent directory to `PATH`, preserving the

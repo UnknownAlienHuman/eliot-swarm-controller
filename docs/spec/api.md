@@ -398,12 +398,14 @@ do not create an audit event, and other RPC results carry call context without
 claiming command-cause attribution. JWTs, OAuth tokens, cookies and owner credentials
 never enter that context or semantic data.
 
-An Owner command's admission event carries `data.owner_process` with the PID
-and executable path observed on the daemon's local connection. For cloud MCP,
-this identifies the local bridge process, while `remote_call` identifies the
-cloud caller. Fields are null when the OS cannot supply them. Queued launches
-retain the original sender, and an idempotent retry leaves the original event
-intact. This metadata is diagnostic.
+Each authenticated Owner mutation records an `owner.submitted` event with
+its method, mutation ID when available, and the PID and executable path
+reported by the OS in `data.owner_process`. The image path is bounded to
+4096 UTF-8 bytes and marked if shortened. Fields are null when unavailable.
+For cloud MCP the process is the local bridge, and `remote_call` identifies
+the cloud caller. Commands and queued launches retain the original submission
+metadata on admission. A retry has its own submission event and preserves
+earlier admission events.
 
 Session handling is native rmcp negotiation with no override: pre-2026 clients get
 stateful in-memory SDK sessions (`LocalSessionManager`); clients negotiating
