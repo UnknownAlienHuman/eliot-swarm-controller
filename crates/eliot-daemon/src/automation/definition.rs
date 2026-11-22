@@ -124,6 +124,27 @@ struct SendActionDefinition {
     target: Value,
     expected_generation: Value,
     text: Value,
+    #[serde(default, skip_serializing_if = "is_false")]
+    probe: bool,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompactActionDefinition {
+    target: Value,
+    expected_generation: Value,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SwitchActionDefinition {
+    target: Value,
+    expected_generation: Value,
+    expected_turn_id: Value,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = eliot_core::api::MAX_HANDOFF_SENDS), extend("uniqueItems" = true))]
+    commands: Vec<String>,
+    launch: Box<eliot_core::api::SwitchLaunch>,
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
@@ -185,6 +206,8 @@ enum AgentActionDefinition {
     Answer(AnswerActionDefinition),
     Resume(ResumeActionDefinition),
     Launch(LaunchActionDefinition),
+    Compact(CompactActionDefinition),
+    Switch(SwitchActionDefinition),
 }
 
 #[derive(Clone, Debug)]
@@ -296,6 +319,12 @@ impl ActionDefinition {
                 eliot_core::api::discovery::decode_params_at(fields, root)?,
             ),
             "launch" => AgentActionDefinition::Launch(
+                eliot_core::api::discovery::decode_params_at(fields, root)?,
+            ),
+            "compact" => AgentActionDefinition::Compact(
+                eliot_core::api::discovery::decode_params_at(fields, root)?,
+            ),
+            "switch" => AgentActionDefinition::Switch(
                 eliot_core::api::discovery::decode_params_at(fields, root)?,
             ),
             _ => {
@@ -459,7 +488,9 @@ impl AgentActionDefinition {
             | Self::Approve(ChoiceActionDefinition { target, .. })
             | Self::Deny(ChoiceActionDefinition { target, .. })
             | Self::Answer(AnswerActionDefinition { target, .. })
-            | Self::Resume(ResumeActionDefinition { target, .. }) => Some(target),
+            | Self::Resume(ResumeActionDefinition { target, .. })
+            | Self::Compact(CompactActionDefinition { target, .. })
+            | Self::Switch(SwitchActionDefinition { target, .. }) => Some(target),
             Self::Launch(_) => None,
         }
     }
@@ -495,6 +526,14 @@ impl AgentActionDefinition {
                 ..
             })
             | Self::Resume(ResumeActionDefinition {
+                expected_generation,
+                ..
+            })
+            | Self::Compact(CompactActionDefinition {
+                expected_generation,
+                ..
+            })
+            | Self::Switch(SwitchActionDefinition {
                 expected_generation,
                 ..
             }) => Some(expected_generation),
@@ -537,6 +576,9 @@ impl AgentActionDefinition {
             Self::Answer(AnswerActionDefinition {
                 expected_turn_id, ..
             }) => Some((expected_turn_id, "answer")),
+            Self::Switch(SwitchActionDefinition {
+                expected_turn_id, ..
+            }) => Some((expected_turn_id, "switch")),
             _ => None,
         }
     }
@@ -586,7 +628,13 @@ impl AgentActionDefinition {
             Self::Answer(_) => "answer",
             Self::Resume(_) => "resume",
             Self::Launch(_) => "launch",
+            Self::Compact(_) => "compact",
+            Self::Switch(_) => "switch",
         }
+    }
+
+    fn probe(&self) -> bool {
+        matches!(self, Self::Send(SendActionDefinition { probe: true, .. }))
     }
 }
 
@@ -897,18 +945,22 @@ pub(super) fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<RuleEvalu
         ));
     }
     let verb = action.verb();
-    let args = action
-        .text()
-        .map(|(text, max_bytes, limit_label)| {
-            render_text(text, &roots, max_bytes, verb, limit_label)
-        })
-        .transpose()?
-        .map(|text| json!({"text": text}))
-        .or_else(|| action.answers().map(|answers| json!({"answers": answers})))
-        .map(Ok)
-        .or_else(|| approval_reply_args(action, &roots, verb).transpose())
-        .transpose()?
-        .unwrap_or_else(|| json!({}));
+    let args = if let AgentActionDefinition::Switch(switch) = action {
+        json!({"commands": &switch.commands, "launch": &switch.launch})
+    } else {
+        action
+            .text()
+            .map(|(text, max_bytes, limit_label)| {
+                render_text(text, &roots, max_bytes, verb, limit_label)
+            })
+            .transpose()?
+            .map(|text| json!({"text": text}))
+            .or_else(|| action.answers().map(|answers| json!({"answers": answers})))
+            .map(Ok)
+            .or_else(|| approval_reply_args(action, &roots, verb).transpose())
+            .transpose()?
+            .unwrap_or_else(|| json!({}))
+    };
     let expected_turn_id = action
         .turn_binding()
         .map(|(source, verb)| {
@@ -922,14 +974,16 @@ pub(super) fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<RuleEvalu
         })
         .transpose()?;
 
-    Ok(RuleEvaluation::Command(submit_command(
+    let mut command = submit_command(
         action.verb(),
         target,
         generation,
         args,
         expected_turn_id,
         request_id,
-    )))
+    );
+    command.probe = action.probe();
+    Ok(RuleEvaluation::Command(command))
 }
 
 fn approval_reply_args(
@@ -1074,11 +1128,14 @@ fn validate_inject_action(definition: &InjectActionDefinition) -> Result<(), Err
     validate_template(target, true)?;
     if definition.at.trim().is_empty()
         || has_templates(&parse_template(&definition.at)?)
-        || !matches!(definition.at.as_str(), "turn_safe_point" | "next_input")
+        || !matches!(
+            definition.at.as_str(),
+            "turn_safe_point" | "active_turn" | "next_input"
+        )
     {
         return Err(Error::new(
             "invalid",
-            "inject at must be turn_safe_point or next_input without templates",
+            "inject at must be turn_safe_point, active_turn or next_input without templates",
         ));
     }
     validate_text_template(
@@ -1098,10 +1155,13 @@ fn submit_inject_event_command(
     subject: Option<&Value>,
     data: &Value,
 ) -> Result<SubmitCommand, Error> {
-    if !matches!(definition.at.as_str(), "turn_safe_point" | "next_input") {
+    if !matches!(
+        definition.at.as_str(),
+        "turn_safe_point" | "active_turn" | "next_input"
+    ) {
         return Err(Error::new(
             "invalid",
-            "inject at must be turn_safe_point or next_input",
+            "inject at must be turn_safe_point, active_turn or next_input",
         ));
     }
     if has_templates(&parse_template(&definition.at)?) {
@@ -1142,17 +1202,14 @@ fn submit_inject_event_command(
     if text.trim().is_empty() {
         return Err(Error::new("invalid", "inject text cannot be empty"));
     }
-    let expected_turn_id = if definition.at == "turn_safe_point" {
+    let expected_turn_id = if definition.at != "next_input" {
         let turn_id = event
             .data
             .get("turn_id")
             .and_then(Value::as_str)
             .filter(|turn_id| !turn_id.trim().is_empty())
             .ok_or_else(|| {
-                Error::new(
-                    "invalid",
-                    "turn_safe_point inject requires event.data.turn_id",
-                )
+                Error::new("invalid", "turn-bound inject requires event.data.turn_id")
             })?;
         Some(turn_id.to_owned())
     } else {
@@ -1293,6 +1350,8 @@ fn reject_unimplemented_options(raw: &toml::Value) -> Result<(), Error> {
                                     | "msg.send"
                                     | "var.set"
                                     | "inject"
+                                    | "compact"
+                                    | "switch"
                             )
                         })
                 })
@@ -1543,6 +1602,26 @@ fn validate_event_action(action: &ActionDefinition) -> Result<(), Error> {
             true,
         );
     }
+    if let AgentActionDefinition::Switch(switch) = action {
+        switch.launch.validate()?;
+        if switch.commands.len() > eliot_core::api::MAX_HANDOFF_SENDS {
+            return Err(Error::new(
+                "invalid",
+                "switch commands exceed the handoff limit",
+            ));
+        }
+        let mut seen = HashSet::new();
+        if switch
+            .commands
+            .iter()
+            .any(|id| eliot_core::validate_command_id(id).is_err() || !seen.insert(id))
+        {
+            return Err(Error::new(
+                "invalid",
+                "switch commands must be distinct valid command IDs",
+            ));
+        }
+    }
     let target = action
         .target()
         .and_then(Value::as_str)
@@ -1725,6 +1804,7 @@ fn timer_action(rule: &RuleDefinition) -> Result<SubmitCommand, Error> {
             target,
             expected_generation,
             text,
+            ..
         }) => {
             let (_, max_bytes, limit_label) = action.text().expect("Send action has text");
             validate_text_template(text, false, max_bytes, action.verb(), limit_label)?;
@@ -1733,6 +1813,16 @@ fn timer_action(rule: &RuleDefinition) -> Result<SubmitCommand, Error> {
                 expected_generation,
                 json!({"text": text.as_str().expect("validated send text")}),
             )
+        }
+        AgentActionDefinition::Compact(CompactActionDefinition {
+            target,
+            expected_generation,
+        }) => (target, expected_generation, json!({})),
+        AgentActionDefinition::Switch(_) => {
+            return Err(Error::new(
+                "unsupported",
+                "switch actions require an event trigger",
+            ));
         }
         AgentActionDefinition::Interrupt(_) => {
             return Err(Error::new(
@@ -1834,14 +1924,16 @@ fn timer_action(rule: &RuleDefinition) -> Result<SubmitCommand, Error> {
                 },
             )
         })?;
-    Ok(submit_command(
+    let mut command = submit_command(
         action.verb(),
         target.to_owned(),
         expected_generation,
         args,
         None,
         None,
-    ))
+    );
+    command.probe = action.probe();
+    Ok(command)
 }
 
 fn submit_command(

@@ -461,12 +461,19 @@ impl Router {
             request: action,
             workspace,
         } = prepared;
+        if (action.probe || action.verb == "compact") && principal != "owner" {
+            return Err(Error::new(
+                "not_allowed",
+                "provider probes and compact timer actions require the Owner principal",
+            ));
+        }
         if !matches!(
             action.verb.as_str(),
             "stop"
                 | "send"
                 | "launch"
                 | "resume"
+                | "compact"
                 | "run"
                 | "git.fetch"
                 | "notify"
@@ -591,6 +598,14 @@ impl Router {
         validate_rule_resume_preparation(&prepared, project)?;
         // Store admits the validated managed worktree from the frozen launch args.
         let PreparedSubmission { request, .. } = prepared;
+        if (request.probe || matches!(request.verb.as_str(), "compact" | "switch"))
+            && principal != "owner"
+        {
+            return Err(Error::new(
+                "not_allowed",
+                "provider probes, compact and switch rule actions require the Owner principal",
+            ));
+        }
         if request.verb == "run" {
             if !request.id.is_empty()
                 || request.target.is_some()
@@ -650,6 +665,8 @@ impl Router {
                     | "mail.send"
                     | "var.set"
                     | "inject"
+                    | "compact"
+                    | "switch"
             )
         {
             return Err(Error::new(
@@ -657,6 +674,7 @@ impl Router {
                 "rule firing must contain a prepared stop, send, launch, resume, steer, interrupt, reply, Run, inject, mail.send, var.set, or local event action",
             ));
         }
+        let secret_policy = self.secret_policy_snapshot();
         let admission = {
             let mut store = self.inner.store.lock().await;
             let retained_resume = if matches!(request.verb.as_str(), "resume" | "git.fetch") {
@@ -688,7 +706,14 @@ impl Router {
                         ));
                     }
                 }
-                store.admit_rule_action(principal, state, event_seq, request, now_ms())?
+                store.admit_rule_action(
+                    principal,
+                    state,
+                    event_seq,
+                    request,
+                    now_ms(),
+                    &secret_policy,
+                )?
             };
             self.publish_locked(&admission.events);
             admission
