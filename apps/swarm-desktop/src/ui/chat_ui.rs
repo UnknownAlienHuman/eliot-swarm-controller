@@ -660,7 +660,7 @@ impl DesktopApp {
                 // Typing goes on in the composer; focus would leave the
                 // search box and close its list.
                 if !self.chat.opened_from_search {
-                    take_focus(&self.chat.composer_ref);
+                    self.take_focus(FocusTarget::Composer);
                 }
             }
             ChatMsg::ToolsToggled(key, expanded) => {

@@ -23,10 +23,16 @@
 //! (`start /min`, a Minimized shortcut, `swarm daemon update`) moves
 //! keyboard focus only once the window is the foreground window, because
 //! focusing a control activates a window that is not active
-//! ([`may_take_focus`]).
+//! ([`may_take_focus`]). Focus held back meanwhile is applied once the
+//! window is the foreground window ([`held_focus_ready`], polled by the
+//! shortcut watcher while focus is held). No event says so reliably: a
+//! window that WinUI already made its thread's active window becomes the
+//! foreground window with no `HCBT_ACTIVATE`, no XAML focus change and no
+//! `EVENT_SYSTEM_FOREGROUND` reaching this thread (observed live).
 #![allow(unsafe_code)]
 
 use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
@@ -73,6 +79,11 @@ thread_local! {
     /// The start asked for an activated window (see [`started_to_activate`]).
     static ACTIVATE: Cell<bool> = const { Cell::new(true) };
 }
+
+/// The window's handle for other threads (0: none yet).
+static WINDOW_ID: AtomicIsize = AtomicIsize::new(0);
+/// Keyboard focus is held until the window is the foreground window.
+static FOCUS_HELD: AtomicBool = AtomicBool::new(false);
 
 /// The thread's CBT hook; removed by [`Hook::finish`].
 pub struct Hook(HHOOK);
@@ -121,6 +132,7 @@ unsafe extern "system" fn cbt(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRES
         let create = unsafe { &mut *(*(lparam as *mut CBT_CREATEWNDW)).lpcs };
         if create.style & WS_CHILD as i32 == 0 {
             WINDOW.set(window);
+            WINDOW_ID.store(window as isize, Ordering::Relaxed);
             if let Some(wanted) = WANTED.get() {
                 // A window created at an explicit place keeps its created
                 // size (Reactor's ResizeClient does not change it: observed
@@ -170,6 +182,23 @@ pub fn may_take_focus() -> bool {
     let window = WINDOW.get();
     // SAFETY: a plain query.
     ACTIVATE.get() || (!window.is_null() && unsafe { GetForegroundWindow() } == window)
+}
+
+/// Hold keyboard focus until the window is the foreground window, or stop.
+pub fn hold_focus(held: bool) {
+    FOCUS_HELD.store(held, Ordering::Relaxed);
+}
+
+/// Keyboard focus is held ([`hold_focus`]).
+pub fn focus_held() -> bool {
+    FOCUS_HELD.load(Ordering::Relaxed)
+}
+
+/// Focus is held and the window is now the foreground window (any thread).
+pub fn held_focus_ready() -> bool {
+    let window = WINDOW_ID.load(Ordering::Relaxed);
+    // SAFETY: a plain query.
+    focus_held() && window != 0 && unsafe { GetForegroundWindow() } as isize == window
 }
 
 /// Whether the window is maximized now (on the UI thread).

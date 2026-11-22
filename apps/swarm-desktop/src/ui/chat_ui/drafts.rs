@@ -104,7 +104,7 @@ impl DesktopApp {
         context: &ComponentContext<Self>,
     ) {
         // Keyboard focus goes back to the composer (no-op while it is unbound).
-        take_focus(&self.chat.composer_ref);
+        self.take_focus(FocusTarget::Composer);
         self.settle_mutation(settles(&outcome));
         match outcome {
             Ok(outcome) => {

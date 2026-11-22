@@ -124,6 +124,12 @@ pub(super) enum ShellMsg {
     FocusSearch(u8),
     /// Wait, then send [`ShellMsg::FocusSearch`] with these tries.
     FocusSearchLater(u8),
+    /// Focus what a quiet start held back, now that the window is the
+    /// foreground window (tries left; WinUI refuses focus right after an
+    /// activation).
+    FocusHeld(FocusTarget, u8),
+    /// Wait, then send [`ShellMsg::FocusHeld`] with these tries.
+    FocusHeldLater(FocusTarget, u8),
     /// The shortcut watcher stopped (window closing): nothing to do.
     ShortcutsEnded,
     RefreshRequested,
@@ -180,10 +186,11 @@ const PRIME_RETRY_MS: u64 = 16;
 const SIDEBAR_PADDING: f64 = tokens::spacing::SM;
 /// The hidden sidebar: a rail of icon buttons, one control wide.
 const RAIL_WIDTH: f64 = tokens::height::CONTROL + 2.0 * SIDEBAR_PADDING;
-/// Focus attempts for Ctrl+K, and the wait between them: right after a
-/// cold start WinUI refuses focus until the window's content is ready.
-const SEARCH_FOCUS_TRIES: u8 = 20;
-const SEARCH_FOCUS_RETRY_MS: u64 = 100;
+/// Focus attempts for Ctrl+K and for focus held back until the window is
+/// the foreground window, and the wait between them: right after a cold
+/// start or an activation WinUI refuses focus until the content is ready.
+const FOCUS_TRIES: u8 = 20;
+const FOCUS_RETRY_MS: u64 = 100;
 /// A suggestion WinUI reports as chosen this soon after ↑/↓ was reached
 /// with the arrows: it is only highlighted.
 const ARROW_CHOICE_MS: u64 = 500;
@@ -838,7 +845,7 @@ impl DesktopApp {
             ShellMsg::SearchToggled(open) => {
                 if open {
                     self.nav.search.open = true;
-                    self.focus_search(SEARCH_FOCUS_TRIES, context);
+                    self.focus_search(FOCUS_TRIES, context);
                 } else {
                     self.nav.search = Search::default();
                     self.clear_found();
@@ -893,6 +900,16 @@ impl DesktopApp {
             }
             ShellMsg::Shortcut(shortcut) => {
                 match shortcut {
+                    // Before the dialog arm: the hold ends either way (a
+                    // closing dialog puts focus back itself).
+                    Shortcut::Foreground => {
+                        crate::window_place::hold_focus(false);
+                        if let Some(target) = self.focus_held.take()
+                            && self.dialog_kind() == 0
+                        {
+                            self.focus_held_now(target, FOCUS_TRIES, context);
+                        }
+                    }
                     Shortcut::Popover(key) if self.dialog_kind() != 0 => {
                         self.dialog_key(key, context)
                     }
@@ -902,7 +919,7 @@ impl DesktopApp {
                     Shortcut::Forward => self.step(true, context),
                     Shortcut::Search => {
                         self.nav.search.open = true;
-                        self.focus_search(SEARCH_FOCUS_TRIES, context)
+                        self.focus_search(FOCUS_TRIES, context)
                     }
                     Shortcut::Settings => self.open_settings(None, context),
                     Shortcut::ModelPicker => {
@@ -958,7 +975,13 @@ impl DesktopApp {
                 self.watch_shortcuts(context);
             }
             ShellMsg::FocusSearch(tries) => self.focus_search(tries, context),
-            ShellMsg::FocusSearchLater(tries) => self.focus_search_later(tries, context),
+            ShellMsg::FocusSearchLater(tries) => {
+                self.focus_later(ShellMsg::FocusSearch(tries), context)
+            }
+            ShellMsg::FocusHeld(target, tries) => self.focus_held_now(target, tries, context),
+            ShellMsg::FocusHeldLater(target, tries) => {
+                self.focus_later(ShellMsg::FocusHeld(target, tries), context)
+            }
             ShellMsg::ShortcutsEnded => {}
             ShellMsg::AlertDismissed => {
                 // Dismissing the queue notice releases its draft only once
@@ -1190,7 +1213,7 @@ impl DesktopApp {
             self.reprime_fields(context);
         }
         // Keyboard focus goes back to the composer (no-op while it is unbound).
-        take_focus(&self.chat.composer_ref);
+        self.take_focus(FocusTarget::Composer);
         self.chat.epoch += 1;
         self.chat.inputs_checking = false;
         if let Some(task) = self.chat.live_task.take() {
@@ -1449,15 +1472,37 @@ impl DesktopApp {
             }
         });
         if !accepted && left > 0 {
-            self.focus_search_later(left, context);
+            self.focus_later(ShellMsg::FocusSearch(left), context);
         }
     }
 
-    fn focus_search_later(&self, tries: u8, context: &ComponentContext<Self>) {
+    /// Focus the control a quiet start held back (`take_focus`); a refused
+    /// or unbound focus is tried again, `tries` times in all.
+    fn focus_held_now(&self, target: FocusTarget, tries: u8, context: &ComponentContext<Self>) {
+        let Some(left) = tries.checked_sub(1) else {
+            return;
+        };
+        let later = context.sender();
+        let retry = move |result: Result<bool, _>| {
+            if !matches!(result, Ok(true)) && left > 0 {
+                let _ = later.send(Message::Shell(ShellMsg::FocusHeldLater(target, left)));
+            }
+        };
+        let accepted = match target {
+            FocusTarget::Composer => self.chat.composer_ref.request_focus_result(retry),
+            FocusTarget::Search => self.nav.search_ref.request_focus_result(retry),
+        };
+        if !accepted && left > 0 {
+            self.focus_later(ShellMsg::FocusHeld(target, left), context);
+        }
+    }
+
+    /// Send a focus retry after [`FOCUS_RETRY_MS`].
+    fn focus_later(&self, retry: ShellMsg, context: &ComponentContext<Self>) {
         let _task = context.spawn_background(move |cancel| {
             let cancelled = || cancel.is_cancelled();
-            let _ = feed::backoff(SEARCH_FOCUS_RETRY_MS, &cancelled);
-            Message::Shell(ShellMsg::FocusSearch(tries))
+            let _ = feed::backoff(FOCUS_RETRY_MS, &cancelled);
+            Message::Shell(retry)
         });
     }
 
@@ -1471,8 +1516,18 @@ impl DesktopApp {
                 return Message::Shell(ShellMsg::ShortcutsEnded);
             };
             loop {
-                match chords.recv_timeout(std::time::Duration::from_millis(SHORTCUT_POLL_MS)) {
+                // While keyboard focus is held, look for the window becoming
+                // the foreground window at the focus retry pace.
+                let wait = if crate::window_place::focus_held() {
+                    FOCUS_RETRY_MS
+                } else {
+                    SHORTCUT_POLL_MS
+                };
+                match chords.recv_timeout(std::time::Duration::from_millis(wait)) {
                     Ok(chord) => return Message::Shell(ShellMsg::Shortcut(chord)),
+                    Err(RecvTimeoutError::Timeout) if crate::window_place::held_focus_ready() => {
+                        return Message::Shell(ShellMsg::Shortcut(Shortcut::Foreground));
+                    }
                     Err(RecvTimeoutError::Timeout) if !cancel.is_cancelled() => {}
                     // Window closing or hook gone: nothing more to deliver.
                     Err(_) => return Message::Shell(ShellMsg::ShortcutsEnded),
