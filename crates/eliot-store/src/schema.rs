@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 94;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 95;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -2234,6 +2234,31 @@ impl Store {
                      WHERE kind = 'source.gap' OR kind = 'x.user.agent.attention'
                         OR kind = 'command.dispatched';
                  INSERT INTO schema_migrations(version) VALUES (94);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 95 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            // Grandfather reservations already duplicated by older daemons.
+            // Preserve every custody record. Admission still checks all rows.
+            tx.execute_batch(
+                "ALTER TABLE workspaces ADD COLUMN branch_reservation INTEGER NOT NULL
+                     DEFAULT 1 CHECK(branch_reservation IN (0,1));
+                 UPDATE workspaces SET branch_reservation = 0 WHERE agent IN (
+                     SELECT agent FROM (
+                         SELECT agent, ROW_NUMBER() OVER (
+                             PARTITION BY repo_common_dir, requested_branch ORDER BY agent
+                         ) AS reservation_rank FROM workspaces WHERE phase <> 'removed'
+                     ) WHERE reservation_rank > 1
+                 );
+                 CREATE UNIQUE INDEX workspaces_live_branch_reservation
+                     ON workspaces(repo_common_dir, requested_branch)
+                     WHERE phase <> 'removed' AND branch_reservation = 1;
+                 INSERT INTO schema_migrations(version) VALUES (95);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;

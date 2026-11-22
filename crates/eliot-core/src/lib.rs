@@ -93,7 +93,7 @@ pub use routing::{
 };
 pub use secrets::SecretPolicy;
 pub use source_handoff::{SourceHandoff, SourceHandoffAck, SourceHandoffGap};
-pub use verbatim::{display_path, verbatim_path};
+pub use verbatim::{display_path, verbatim_path, workspace_path_key};
 
 use crate::api::AgentConfigView;
 use serde::{Deserialize, Serialize};

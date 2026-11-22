@@ -336,6 +336,11 @@ fn branch(value: &str, field: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validate a local branch name that can be passed to branch integration.
+pub fn validate_integration_branch(value: &str) -> Result<()> {
+    branch(value, "branch")
+}
+
 fn absolute_path(value: &str, field: &str) -> Result<()> {
     literal(value, field, 4_096)?;
     if !Path::new(value).is_absolute() {

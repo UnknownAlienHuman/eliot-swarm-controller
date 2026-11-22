@@ -50,6 +50,12 @@ impl Router {
         if let Some(sources) = request.sources.as_ref() {
             args["sources"] = json!(sources);
         }
+        if let Some(worktree) = request.worktree.as_deref() {
+            args["worktree"] = json!(worktree);
+        }
+        if let Some(base) = request.base.as_deref() {
+            args["base"] = json!(base);
+        }
 
         // The caller's mutation id is the ordinary launch id. Existing command
         // admission therefore owns idempotency and retains the linked first
@@ -179,6 +185,8 @@ impl Router {
                 status: status_from_command(launch.state),
                 agent: None,
                 generation: None,
+                branch: None,
+                branch_error: None,
                 turn_id: None,
                 final_text: None,
                 truncated: false,
@@ -238,6 +246,12 @@ impl Router {
             entry.final_text.clone()
         };
         let truncated = !hidden && entry.truncated;
+        let branch = if hidden { None } else { entry.branch.clone() };
+        let branch_error = if hidden {
+            None
+        } else {
+            entry.branch_error.clone()
+        };
 
         let facts = if hidden {
             ChildRunFacts::unobserved()
@@ -259,6 +273,8 @@ impl Router {
             status,
             agent,
             generation,
+            branch,
+            branch_error,
             turn_id,
             final_text,
             truncated,

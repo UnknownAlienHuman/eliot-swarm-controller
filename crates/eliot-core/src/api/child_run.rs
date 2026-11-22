@@ -44,6 +44,12 @@ pub struct ChildRunRequest {
     pub sources: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// New managed branch. An empty name lets Swarm generate the branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
+    /// Commit or ref reachable from the parent checkout's current branch tip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(
         range(min = 0, max = 25000),
@@ -75,7 +81,11 @@ impl ChildRunRequest {
                     ));
                 }
             }
-            None if self.sources.is_some() || self.profile.is_some() => {
+            None if self.sources.is_some()
+                || self.profile.is_some()
+                || self.worktree.is_some()
+                || self.base.is_some() =>
+            {
                 return Err(Error::invalid_field(
                     "params.text",
                     "required for an initial call; continuation accepts only id and wait_ms",
@@ -286,6 +296,12 @@ pub struct ChildRunResponse {
     pub agent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generation: Option<i64>,
+    /// Retained managed worktree branch for this child generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// Error code if this child's retained branch could not be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -303,6 +319,8 @@ impl ChildRunResponse {
         if !valid_child_run_id(&self.id)
             || self.generation.is_some_and(|generation| generation < 0)
             || self.agent.is_some() != self.generation.is_some()
+            || (self.branch.is_some() && self.agent.is_none())
+            || (self.branch_error.is_some() && (self.agent.is_none() || self.branch.is_some()))
             || ((self.final_text.is_some() || self.truncated) && self.turn_id.is_none())
             || self
                 .final_text

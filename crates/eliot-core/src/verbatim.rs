@@ -21,6 +21,24 @@ pub fn display_path(path: &str) -> String {
 
 use std::path::{Path, PathBuf};
 
+/// Comparison key for an already-resolved workspace path. Keep the original
+/// spelling for filesystem access and retained Git identity.
+pub fn workspace_path_key(path: &str) -> std::borrow::Cow<'_, str> {
+    #[cfg(windows)]
+    {
+        let path = path.replace('\\', "/").to_lowercase();
+        let path = match path.strip_prefix("//?/unc/") {
+            Some(rest) => format!("//{rest}"),
+            None => path.strip_prefix("//?/").unwrap_or(&path).to_owned(),
+        };
+        std::borrow::Cow::Owned(path)
+    }
+    #[cfg(not(windows))]
+    {
+        std::borrow::Cow::Borrowed(path)
+    }
+}
+
 /// Verbatim-prefixed form of `path` for raw Win32 file opens.
 ///
 /// Local disk-absolute paths gain the `\\?\` prefix after `absolute`

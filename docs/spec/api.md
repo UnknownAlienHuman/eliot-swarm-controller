@@ -554,7 +554,7 @@ The request and readback use [ProjectTransferRequest and ProjectTransferResult](
 A managed manager launch always runs in a project worktree. Without an explicit
 `adopt_worktree` the daemon prepares a fresh opaque worktree on a unique
 branch from the frozen base OID and runs the existing preparation and setup chain
-before native dispatch; workers inherit that worktree through the parent link.
+before native dispatch. Workers inherit that worktree through the parent link by default.
 `adopt_worktree` names an existing checkout of the same repository explicitly;
 adoption verifies Git identity and live workspace overlap, and freezes the profile
 without running its setup. Cleanup and worktree removal keep bound or borrowed
@@ -1522,29 +1522,33 @@ is created, including when the launch has no prompt. The child inherits the pare
 authorization namespace and tree root, and the configured fanout limits are checked
 at admission. The parent must be controlled. An Agent-principal child
 never supplies `profile_snapshot`: the daemon freezes it, so a supplied snapshot
-rejects. With no configured default route, it may omit `profile`, or it may
-specify the parent's same profile name, with no
-`worktree`, and reuses the parent's frozen profile snapshot
-verbatim, without resolving a mutable named profile. It may instead name a profile
-from the parent snapshot's captured `child_profiles` allow-list; the daemon resolves
+rejects. With no configured default route, it may omit `profile` or specify the
+parent's same profile name to reuse the parent's frozen profile snapshot verbatim.
+It may instead name a profile from the parent snapshot's captured `child_profiles`
+allow-list. The daemon resolves
 that configured profile now and freezes its snapshot for the child. A `role`
 instead selects ordered candidates intersected with the parent's frozen allow-list
 (including its inherited profile). An unlisted name is rejected before any native effect. An omitted
 `workspace` defaults to the parent's workspace, including for CLI child launches.
-The child keeps the parent's recorded project ID. An explicit different workspace
-rejects, so a child never escapes the parent's workspace. Same-harness children
-inherit native authority and captured credential bindings verbatim. An approved
+The child keeps the parent's recorded project ID and policy. An explicit `workspace`
+must match the parent's. `worktree` optionally requests a managed checkout in the
+same Git repository. The daemon freezes `base` at the parent's branch tip or at an
+explicit ref that resolves to an ancestor of that tip. An omitted `base` uses the
+parent's `HEAD`. A child request with `base` requires `worktree`. An explicit child
+branch must meet the local name rules of `git.integrate` and be unused for a new
+launch. Admission reserves the name within the repository before any Git write.
+A bare `--worktree` generates a branch.
+Same-harness children inherit native authority and captured credential bindings
+verbatim. An approved
 same-harness profile can set its model, effort, and daemon context ceiling.
 An allow-listed different harness is an explicit Owner grant of that
 profile's own native policy and bindings; parent credential/native-store bindings
 are never copied across harnesses. Capacity scopes keep every non-profile scope
 of the parent with the same bounds alongside the child's own scopes; conflicting
-bounds reject. Inherited workspace launches use the prepared environment without
-running setup. Then the authority check below
-applies: control is narrowed or equal, the workspace is shared, and no worktree is
-minted. An Owner child launch may instead supply `profile`, a different workspace,
-and `worktree`, and remains unrestricted by that check
-(see [coordination](coordination.md#claims-and-hierarchy)).
+bounds reject. Control is narrowed or equal. Shared-workspace launches use the
+prepared environment. New child worktrees use the ordinary managed preparation and
+cleanup path. Owner child launches can specify a different workspace.
+See [coordination](coordination.md#claims-and-hierarchy).
 
 Removal uses the same command admission and readback path:
 
@@ -2058,7 +2062,9 @@ terminal outcome of its exact captured command or turn. Per-entry `status` is on
 scope. A direct or command-bound turn can also carry its
 [resolution provenance](#input-turn-and-unknown-gates). Every entry that
 resolved to a turn also carries that turn's identity (`agent`, `generation`,
-`turn_id`); a completed turn additionally carries its retained `final_text`,
+`turn_id`). A visible child launch, input, or turn can also carry its retained
+managed worktree `branch`. A branch read failure returns `branch_error` on that
+entry with its command or turn status. A completed turn carries its retained `final_text`,
 cut to 16 KiB per entry within one 64 KiB response budget, with `truncated`
 marking a cut or a text withheld by the budget (`agent.result` reads the whole
 text). `mailbox: true` (Agent callers only; the owner has no mailbox) also ends

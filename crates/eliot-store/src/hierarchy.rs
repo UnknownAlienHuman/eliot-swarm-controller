@@ -289,6 +289,7 @@ pub(super) struct ParentLink {
     pub(super) workspace: Option<String>,
     pub(super) profile_snapshot: Value,
     pub(super) control: AgentControl,
+    pub(super) launched_by_agent: bool,
 }
 
 /// Resolve `args.parent` for a launch: the parent must exist and be
@@ -337,6 +338,7 @@ pub(super) fn resolve_launch_parent(
         workspace: parent_agent.workspace.clone(),
         profile_snapshot: parent_agent.profile_snapshot.clone(),
         control: parent_agent.control,
+        launched_by_agent: matches!(caller, Caller::Agent { .. }),
     }))
 }
 
@@ -431,7 +433,10 @@ pub(super) fn admission_allows_carried_parent_binding(
         || !args
             .get("workspace")
             .and_then(Value::as_str)
-            .is_some_and(|workspace| parent.workspace.as_deref() == Some(workspace))
+            .is_some_and(|workspace| {
+                parent.workspace.as_deref().map(core::workspace_path_key)
+                    == Some(core::workspace_path_key(workspace))
+            })
     {
         return Ok(false);
     }

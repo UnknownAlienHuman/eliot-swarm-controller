@@ -202,68 +202,17 @@ impl WorkspaceManager {
         }
     }
 
-    /// Freeze an explicitly requested branch into the standard directory
-    /// (`<data_dir>/worktrees/<project>/<agent>-<task-slug>`). The branch
-    /// always wins; the directory is still finalized with the admitted Agent
-    /// ID by the Store, exactly like a generated worktree. When `base_repo` is
-    /// set (for example a retained linked worktree), the base commit is resolved
-    /// from `base_repo` while the worktree itself is frozen against `repo`.
+    /// Freeze a standard managed worktree. The Store finalizes the directory
+    /// and any generated branch using the admitted Agent ID. `base_repo` can
+    /// point to another checkout of the same repository to resolve the base.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn freeze_launch(
-        &self,
-        repo: &str,
-        branch: &str,
-        base_ref: Option<&str>,
-        base_repo: Option<&str>,
-        project_slug: &str,
-        task_slug: &str,
-        profile: &Value,
-    ) -> Result<WorkspacePreparationInput> {
-        self.freeze_launch_with_naming(
-            repo,
-            Some(branch),
-            base_ref,
-            base_repo,
-            project_slug,
-            task_slug,
-            profile,
-        )
-        .await
-    }
-
-    /// Freeze a generated standard worktree (`<project>/<agent>-<task-slug>`
-    /// at `<data_dir>/worktrees/<project>/<agent>-<task-slug>`). The daemon
-    /// freezes the base OID, setup and a unique readable placeholder; the
-    /// Store finalizes the exact branch and path with the admitted Agent ID.
-    /// Uniqueness never derives from caller command-id syntax.
-    pub(crate) async fn freeze_launch_generated(
-        &self,
-        repo: &str,
-        project_slug: &str,
-        task_slug: &str,
-        base_ref: Option<&str>,
-        base_repo: Option<&str>,
-        profile: &Value,
-    ) -> Result<WorkspacePreparationInput> {
-        self.freeze_launch_with_naming(
-            repo,
-            None,
-            base_ref,
-            base_repo,
-            project_slug,
-            task_slug,
-            profile,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn freeze_launch_with_naming(
         &self,
         repo: &str,
         explicit_branch: Option<&str>,
         base_ref: Option<&str>,
         base_repo: Option<&str>,
+        require_parent_ancestry: bool,
         project_slug: &str,
         task_slug: &str,
         profile: &Value,
@@ -285,7 +234,14 @@ impl WorkspaceManager {
             .to_str()
             .ok_or_else(|| problem("invalid", "managed workspace path is not UTF-8"))?;
         let frozen = WorkspaceGit::new()?
-            .freeze(repo, &branch, base_ref, base_repo, target)
+            .freeze(
+                repo,
+                &branch,
+                base_ref,
+                base_repo,
+                target,
+                require_parent_ancestry,
+            )
             .await?;
         let frozen_setup = setup::freeze(profile, Path::new(&frozen.repo_path))?;
         let input = WorkspacePreparationInput {

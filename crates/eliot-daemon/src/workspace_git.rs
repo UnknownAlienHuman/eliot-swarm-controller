@@ -2,10 +2,10 @@
 //! mutations, under its durable cancellation/spawn gate and ordinary custody.
 
 use crate::git_monitor::{GitBinding, GitProbe, canonical_root, git_path_argument, reject_links};
-use eliot_core::api::is_git_oid;
+use eliot_core::api::{is_git_oid, validate_integration_branch};
 use eliot_core::{
     Error, Result, WorkspaceCreationOutcome, WorkspacePhase, WorkspacePreparation,
-    WorkspaceRemovalOutcome,
+    WorkspaceRemovalOutcome, workspace_path_key,
 };
 use std::{
     collections::BTreeSet,
@@ -45,6 +45,22 @@ struct Repository {
     root: PathBuf,
     git_dir: PathBuf,
     common_dir: PathBuf,
+}
+
+impl Repository {
+    fn same_identity(&self, other: &Self) -> bool {
+        git_path_matches(&self.root, &other.root)
+            && git_path_matches(&self.git_dir, &other.git_dir)
+            && git_path_matches(&self.common_dir, &other.common_dir)
+    }
+}
+
+fn git_path_matches(left: &Path, right: &Path) -> bool {
+    left == right
+        || left
+            .to_str()
+            .zip(right.to_str())
+            .is_some_and(|(left, right)| workspace_path_key(left) == workspace_path_key(right))
 }
 
 struct WorktreeEntry {
@@ -152,13 +168,19 @@ impl WorkspaceGit {
         base_ref: Option<&str>,
         base_repo_path: Option<&str>,
         target: &str,
+        require_parent_ancestry: bool,
     ) -> Result<FrozenWorkspaceGit> {
         let deadline = Instant::now() + READ_TIME;
-        let source = self.repository(repo_path, deadline).await?;
+        let source_is_parent_workspace = require_parent_ancestry && base_repo_path.is_none();
+        let source = self
+            .workspace_repository(repo_path, !source_is_parent_workspace, deadline)
+            .await?;
         let base_source = match base_repo_path {
             Some(path) => {
-                let base = self.repository(path, deadline).await?;
-                if base.common_dir != source.common_dir {
+                let base = self
+                    .workspace_repository(path, !require_parent_ancestry, deadline)
+                    .await?;
+                if !git_path_matches(&base.common_dir, &source.common_dir) {
                     return Err(problem(
                         "source_integrity",
                         "workspace base repository differs from project checkout",
@@ -168,6 +190,9 @@ impl WorkspaceGit {
             }
             None => None,
         };
+        if require_parent_ancestry {
+            validate_integration_branch(branch)?;
+        }
         self.validate_branch(&source.root, branch, deadline).await?;
         self.require_branch_namespace_free(&source.root, branch, deadline)
             .await?;
@@ -191,44 +216,27 @@ impl WorkspaceGit {
                 "workspace path or branch is already registered",
             ));
         }
-        let reference = base_ref.unwrap_or("HEAD");
-        if reference.is_empty() || reference.contains('\0') {
-            return Err(problem(
-                "invalid",
-                "workspace base reference is empty or malformed",
-            ));
-        }
-        let commit = format!("{reference}^{{commit}}");
         let base_root = base_source.as_ref().map_or(&source.root, |repo| &repo.root);
-        let base_oid = self
-            .read_line(
-                base_root,
-                &["rev-parse", "--verify", "--end-of-options", &commit],
-                deadline,
-            )
+        let base_oid = if require_parent_ancestry {
+            self.child_base_oid(base_root, base_ref, deadline).await?
+        } else {
+            self.worktree_commit(base_root, base_ref.unwrap_or("HEAD"), deadline)
+                .await?
+        };
+        let verified = self
+            .workspace_repository(repo_path, !source_is_parent_workspace, deadline)
             .await?;
-        if !is_git_oid(&base_oid) {
-            return Err(problem(
-                "source_integrity",
-                "resolved workspace base is not a full commit id",
-            ));
-        }
-        let verified = self.repository(repo_path, deadline).await?;
-        if source.root != verified.root
-            || source.git_dir != verified.git_dir
-            || source.common_dir != verified.common_dir
-        {
+        if !source.same_identity(&verified) {
             return Err(problem(
                 "source_integrity",
                 "source repository identity changed during freeze",
             ));
         }
         if let (Some(base), Some(base_path)) = (base_source.as_ref(), base_repo_path) {
-            let verified_base = self.repository(base_path, deadline).await?;
-            if base.root != verified_base.root
-                || base.git_dir != verified_base.git_dir
-                || base.common_dir != verified_base.common_dir
-            {
+            let verified_base = self
+                .workspace_repository(base_path, !require_parent_ancestry, deadline)
+                .await?;
+            if !base.same_identity(&verified_base) {
                 return Err(problem(
                     "source_integrity",
                     "base workspace identity changed during freeze",
@@ -242,6 +250,93 @@ impl WorkspaceGit {
             base_oid,
             worktree_path: path_text(&destination)?,
         })
+    }
+
+    async fn worktree_commit(
+        &self,
+        root: &Path,
+        reference: &str,
+        deadline: Instant,
+    ) -> Result<String> {
+        if reference.is_empty() || reference.contains('\0') {
+            return Err(problem(
+                "invalid",
+                "workspace base reference is empty or malformed",
+            ));
+        }
+        let commit = format!("{reference}^{{commit}}");
+        let base_oid = self
+            .read_line(
+                root,
+                &["rev-parse", "--verify", "--end-of-options", &commit],
+                deadline,
+            )
+            .await?;
+        if !is_git_oid(&base_oid) {
+            return Err(problem(
+                "source_integrity",
+                "resolved workspace base is not a full commit id",
+            ));
+        }
+        Ok(base_oid)
+    }
+
+    async fn child_base_oid(
+        &self,
+        root: &Path,
+        base_ref: Option<&str>,
+        deadline: Instant,
+    ) -> Result<String> {
+        let head = self
+            .git
+            .workspace_command(root, &["symbolic-ref", "--quiet", "HEAD"], deadline)
+            .await?;
+        if head.code == 1 {
+            return Err(problem(
+                "not_allowed",
+                "parent workspace has a detached HEAD",
+            ));
+        }
+        if head.code != 0 {
+            return Err(problem(
+                "unavailable",
+                "parent workspace branch cannot be read",
+            ));
+        }
+        let branch = line(&head.stdout)?;
+        if !branch.starts_with("refs/heads/") {
+            return Err(problem(
+                "not_allowed",
+                "parent workspace HEAD must name a local branch",
+            ));
+        }
+        let tip = self.worktree_commit(root, &branch, deadline).await?;
+        let Some(reference) = base_ref else {
+            return Ok(tip);
+        };
+        let base = self.worktree_commit(root, reference, deadline).await?;
+        if base == tip {
+            return Ok(base);
+        }
+        let ancestry = self
+            .git
+            .workspace_command(
+                root,
+                &["merge-base", "--is-ancestor", &base, &tip],
+                deadline,
+            )
+            .await?;
+        match ancestry.code {
+            0 => Ok(base),
+            1 => Err(problem(
+                "not_allowed",
+                "child worktree base is outside the parent's current branch history",
+            )),
+            _ => Err(problem(
+                "unavailable",
+                "child worktree base ancestry could not be verified",
+            )),
+        }
     }
 
     /// A requested branch must not collide with the branch namespace: an
@@ -921,7 +1016,10 @@ impl WorkspaceGit {
             ));
         }
         let source = self.repository(&preparation.repo_path, deadline).await?;
-        if source.common_dir != canonical_root(&preparation.repo_common_dir)? {
+        if !git_path_matches(
+            &source.common_dir,
+            &canonical_root(&preparation.repo_common_dir)?,
+        ) {
             return Err(problem(
                 "source_integrity",
                 "source repository common directory differs from the frozen identity",
@@ -931,14 +1029,23 @@ impl WorkspaceGit {
     }
 
     async fn repository(&self, path: &str, deadline: Instant) -> Result<Repository> {
-        let root = canonical_root(path)?;
+        self.workspace_repository(path, true, deadline).await
+    }
+
+    async fn workspace_repository(
+        &self,
+        path: &str,
+        require_root: bool,
+        deadline: Instant,
+    ) -> Result<Repository> {
+        let workspace = canonical_root(path)?;
         // One rev-parse reports toplevel, git dir and common dir together. Each
         // read costs two Git spawns (safe-overrides preflight plus the read),
         // so three separate reads serialize six spawns on every repository
         // identity check, including each project registration at daemon startup.
         let bytes = self
             .read(
-                &root,
+                &workspace,
                 &[
                     "rev-parse",
                     "--path-format=absolute",
@@ -950,7 +1057,14 @@ impl WorkspaceGit {
             )
             .await?;
         let (actual_root, git_dir, common_dir) = identity_lines(&bytes)?;
-        if canonical_root(&actual_root)? != root {
+        let root = canonical_root(&actual_root)?;
+        let root_text = path_text(&root)?;
+        let workspace_text = path_text(&workspace)?;
+        let root_key = workspace_path_key(&root_text);
+        let workspace_key = workspace_path_key(&workspace_text);
+        if (require_root && workspace_key != root_key)
+            || !Path::new(workspace_key.as_ref()).starts_with(Path::new(root_key.as_ref()))
+        {
             return Err(problem(
                 "source_integrity",
                 "workspace path is not the exact repository root",

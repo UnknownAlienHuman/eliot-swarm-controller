@@ -268,9 +268,8 @@ fn cross_harness_capacity_scopes(child: &Value, parent: &Agent) -> Result<Value>
 /// are stamped after the check from the inherited project. An allow-listed
 /// cross-harness profile is an explicit Owner grant of its own native policy
 /// and bindings, retaining the parent's shared capacity scopes. Control is
-/// equal or narrower, the workspace is shared, and no worktree is minted:
-/// the spec grants children nothing beyond project/root inheritance. Runs
-/// after the profile freeze, before workspace preparation mints anything.
+/// equal or narrower. The parent's workspace is the execution directory or
+/// the source of a daemon-managed child worktree. This check precedes Git freeze.
 pub(super) fn check_agent_launch_authority(
     store: &Store,
     principal: &Principal,
@@ -354,19 +353,19 @@ pub(super) fn check_agent_launch_authority(
             &parent.profile,
         )?;
     }
-    if parent.workspace.as_deref() != request.args.get("workspace").and_then(Value::as_str) {
-        return Err(Error::new(
-            "not_allowed",
-            "Agent children share their parent's workspace",
-        ));
-    }
-    if request.args.get("worktree").is_some()
-        || request.args.get("base").is_some()
-        || request.args.get("auto_worktree").is_some()
+    if parent
+        .workspace
+        .as_deref()
+        .map(eliot_core::workspace_path_key)
+        != request
+            .args
+            .get("workspace")
+            .and_then(Value::as_str)
+            .map(eliot_core::workspace_path_key)
     {
         return Err(Error::new(
             "not_allowed",
-            "Agent children cannot mint a new worktree",
+            "Agent child launches must use their parent's workspace as the source",
         ));
     }
     Ok(())
