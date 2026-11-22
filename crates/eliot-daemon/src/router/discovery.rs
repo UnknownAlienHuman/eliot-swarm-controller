@@ -472,7 +472,8 @@ fn visible(method: &Method, principal: &Principal) -> bool {
         // conservative even when used internally; do not broaden their gate.
         Principal::Run { .. }
         | Principal::ProjectRule { .. }
-        | Principal::MemoryInference { .. } => false,
+        | Principal::MemoryInference { .. }
+        | Principal::Swarm(_) => false,
     }
 }
 

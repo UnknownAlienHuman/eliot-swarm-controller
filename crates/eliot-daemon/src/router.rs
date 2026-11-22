@@ -247,6 +247,7 @@ struct RunWorkerHandle {
 #[derive(Clone)]
 enum Principal {
     Owner,
+    Swarm(&'static str),
     MemoryInference {
         client_id: String,
         token_version: i64,
@@ -4727,7 +4728,8 @@ impl Router {
             }
             Principal::Run { .. }
             | Principal::ProjectRule { .. }
-            | Principal::MemoryInference { .. } => {
+            | Principal::MemoryInference { .. }
+            | Principal::Swarm(_) => {
                 return Err(Error::new(
                     "not_allowed",
                     "heavy work needs the owner or an Agent principal",
@@ -5458,7 +5460,8 @@ impl Router {
                 }
                 Principal::Run { .. }
                 | Principal::ProjectRule { .. }
-                | Principal::MemoryInference { .. } => {
+                | Principal::MemoryInference { .. }
+                | Principal::Swarm(_) => {
                     return Err(Error::new(
                         "not_allowed",
                         "usage summary needs the owner or an Agent principal",
@@ -5511,7 +5514,7 @@ impl Router {
         let agent_caller = match principal {
             Principal::Owner => None,
             Principal::Agent { id, .. } => Some(id.clone()),
-            Principal::Run { .. } | Principal::MemoryInference { .. } => {
+            Principal::Run { .. } | Principal::MemoryInference { .. } | Principal::Swarm(_) => {
                 return Err(Error::new(
                     "not_allowed",
                     "Run credentials cannot list Agents",
@@ -5858,7 +5861,7 @@ impl Router {
         request.validate()?;
         match principal {
             Principal::Owner | Principal::Agent { .. } => {}
-            Principal::Run { .. } | Principal::MemoryInference { .. } => {
+            Principal::Run { .. } | Principal::MemoryInference { .. } | Principal::Swarm(_) => {
                 return Err(Error::new(
                     "not_allowed",
                     "Run credentials may call only command.get",
@@ -8775,6 +8778,7 @@ fn require_owner(principal: &Principal) -> Result<()> {
 fn diagnostic_principal(principal: &Principal) -> String {
     match principal {
         Principal::Owner => "owner".to_owned(),
+        Principal::Swarm(name) => (*name).to_owned(),
         Principal::MemoryInference { client_id, .. } => format!("memory_inference:{client_id}"),
         Principal::Agent { id, generation } => format!("{id}#{generation}"),
         Principal::ProjectRule { registration } => format!("project:{}", registration.id),
@@ -8784,6 +8788,7 @@ fn diagnostic_principal(principal: &Principal) -> String {
 fn principal_name(principal: &Principal) -> String {
     match principal {
         Principal::Owner => "owner".to_owned(),
+        Principal::Swarm(name) => (*name).to_owned(),
         Principal::MemoryInference { client_id, .. } => format!("memory_inference:{client_id}"),
         Principal::Agent { id, generation } => format!("agent:{id}:{generation}"),
         Principal::ProjectRule { registration } => format!("project:{}", registration.id),

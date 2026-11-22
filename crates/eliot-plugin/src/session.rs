@@ -441,6 +441,20 @@ pub fn with_safe_point_steer(mut effective: Value) -> Value {
     effective
 }
 
+/// Project plugin-reported harness helper argv prefixes into a `session.ready`
+/// effective object so shared daemon custody skips harness-owned helpers.
+pub fn with_harness_helpers(mut effective: Value, helpers: &[Vec<String>]) -> Value {
+    if !helpers.is_empty()
+        && let Some(object) = effective.as_object_mut()
+    {
+        object.insert(
+            eliot_core::HARNESS_HELPER_COMMANDS_FIELD.to_owned(),
+            serde_json::to_value(helpers).unwrap_or(Value::Null),
+        );
+    }
+    effective
+}
+
 /// `bad_state` for a request that arrived before `initialize`.
 pub fn not_initialized(harness: &str) -> Error {
     Error::new(

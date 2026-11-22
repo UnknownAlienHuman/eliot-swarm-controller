@@ -49,26 +49,36 @@ impl Router {
         };
 
         let configured_mcp = eliot_core::extract_configured_mcp_programs(&agent.profile_snapshot);
+        let harness_helpers = eliot_core::extract_harness_helper_commands(agent.effective.as_ref());
         let secrets = self.secret_policy_snapshot();
         let Some(candidate) = self
             .inner
             .monitoring
-            .inspect_running_background_processes(&agent, &configured_mcp, &context, &secrets)
+            .inspect_running_background_processes(
+                &agent,
+                &configured_mcp,
+                &harness_helpers,
+                &context,
+                &secrets,
+            )
             .await?
         else {
             return Ok(());
         };
 
-        let output_tail = match &candidate.tool_item {
-            Some((tool_turn, item_id)) => self
-                .inner
-                .store
-                .lock()
-                .await
-                .background_wake_tool_output_tail(&agent.id, agent.generation, tool_turn, item_id)?
-                .map(|text| bounded_redacted_tail(&text, &secrets)),
-            None => None,
-        };
+        let (tool_turn, tool_item_id) = candidate.tool_item;
+        let output_tail = self
+            .inner
+            .store
+            .lock()
+            .await
+            .background_wake_tool_output_tail(
+                &agent.id,
+                agent.generation,
+                &tool_turn,
+                &tool_item_id,
+            )?
+            .map(|text| bounded_redacted_tail(&text, &secrets));
         // Held locally and installed only after the wake commits, so every
         // refusal or error drops (closes) the handle.
         let pinned = self
@@ -84,6 +94,7 @@ impl Router {
                 agent: agent.id.clone(),
                 generation: agent.generation,
                 turn_id: turn_id.to_owned(),
+                tool_item_id,
                 process: candidate.identity,
                 command_line: candidate.command_line,
                 command_truncated: candidate.command_truncated,
@@ -419,7 +430,11 @@ impl Router {
             "args": { "text": framed },
         });
         let submitted = self
-            .submit(&params, &Principal::Owner, "command.submit")
+            .submit(
+                &params,
+                &Principal::Swarm(eliot_core::BACKGROUND_WAKE_PRINCIPAL),
+                "daemon.background_wake",
+            )
             .await;
         let command = self.inner.store.lock().await.get_command(command_id)?;
         if let Some(command) = command {
@@ -527,6 +542,7 @@ impl Router {
 
 fn matches_background_wake_command(command: &Command, wake: &BackgroundWakeRecord) -> bool {
     command.id == wake.delivery_command_id
+        && command.principal == eliot_core::BACKGROUND_WAKE_PRINCIPAL
         && command.target.as_deref() == Some(wake.agent.as_str())
         && command.expected_generation == Some(wake.generation)
         && matches!(command.verb.as_str(), "send" | "inject")

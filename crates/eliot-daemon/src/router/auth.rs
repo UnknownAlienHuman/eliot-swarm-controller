@@ -244,6 +244,12 @@ pub(super) fn authorize_rpc_method(principal: &Principal, method: &str) -> Resul
             "inference requires a Memory principal",
         ));
     }
+    if matches!(principal, Principal::Swarm(_)) {
+        return Err(Error::new(
+            "not_allowed",
+            "Swarm service principals cannot invoke RPC methods",
+        ));
+    }
     if matches!(principal, Principal::Run { .. }) && method != "command.get" {
         return Err(Error::new(
             "not_allowed",
@@ -417,6 +423,22 @@ pub(super) fn authorize_command(principal: &Principal, request: &mut SubmitComma
             "Run credentials cannot submit commands",
         ));
     }
+    if matches!(principal, Principal::Swarm(_)) {
+        if request.verb != "send"
+            || request.target.is_none()
+            || request.expected_generation.is_none()
+            || request.expected_turn_id.is_some()
+            || request.selector.is_some()
+            || request.request_id.is_some()
+            || request.probe
+        {
+            return Err(Error::new(
+                "not_allowed",
+                "Swarm service principal may submit only generation-bound send commands",
+            ));
+        }
+        return Ok(());
+    }
     // Model and effort authority never delegates: only the Owner may
     // reconfigure a retained Agent. Project rules already fall out above;
     // this also fences every Agent principal before scoped submit rules.
@@ -439,6 +461,12 @@ pub(super) fn authorize_command_read_self(principal: &Principal, command: &Comma
         return Err(Error::new(
             "not_allowed",
             "project rule authority cannot read commands",
+        ));
+    }
+    if matches!(principal, Principal::Swarm(_)) {
+        return Err(Error::new(
+            "not_allowed",
+            "Swarm service principal cannot read commands",
         ));
     }
     if let Principal::Run { run_command_id, .. } = principal
@@ -478,6 +506,12 @@ pub(super) fn authorize_agent_read_self(
         return Err(Error::new(
             "not_allowed",
             "project rule authority cannot read Agents",
+        ));
+    }
+    if matches!(principal, Principal::Swarm(_)) {
+        return Err(Error::new(
+            "not_allowed",
+            "Swarm service principal cannot read Agents",
         ));
     }
     if let Principal::Agent {

@@ -165,6 +165,12 @@ impl Router {
                     "project rule authority cannot register a digest",
                 ));
             }
+            Principal::Swarm(_) => {
+                return Err(Error::new(
+                    "not_allowed",
+                    "internal Swarm principals cannot register a digest",
+                ));
+            }
         }
         if let Principal::Agent { id, .. } = principal
             && request.to != *id

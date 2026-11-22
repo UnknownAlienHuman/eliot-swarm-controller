@@ -20,7 +20,6 @@ const BACKGROUND_WAKE_RETENTION_MS: i64 = 31 * 24 * 60 * 60 * 1_000;
 const MAX_PRE_ADMISSION_ATTEMPTS: u32 = 5;
 const MAX_DECLARATION_SCAN_ROWS: i64 = 128;
 const MAX_DECLARED_COMMAND_BYTES: i64 = 4_096;
-const MAX_TURN_EVENT_SCAN_ROWS: i64 = 4_096;
 const MAX_TOOL_COMMAND_BYTES: i64 = 8_192;
 const MAX_TOOL_COMMANDS: i64 = 64;
 const MAX_TAIL_SCAN_CHARS: i64 = 4_096;
@@ -30,6 +29,7 @@ pub struct BackgroundWakeArmInput {
     pub agent: String,
     pub generation: i64,
     pub turn_id: String,
+    pub tool_item_id: String,
     pub process: ProcessIdentity,
     pub command_line: String,
     pub command_truncated: bool,
@@ -68,18 +68,30 @@ pub struct BackgroundWakeToolCommand {
     pub command: String,
 }
 
+/// One committed native `tool.started` item of the completing turn for
+/// harnesses whose `tool.started` omits `data.command` (Antigravity, Muse).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BackgroundWakeToolItem {
+    pub turn_id: String,
+    pub item_id: String,
+    pub started_at: i64,
+}
+
 /// Everything the Router needs to pick a candidate, read in one short
 /// Store call. Only bounded fields are selected; no event payload is decoded.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BackgroundWakeArmContext {
-    /// Earliest process start (Unix ms): the generation's first turn start.
+    /// Earliest process start (Unix ms): this completing turn's start.
     pub window_start: i64,
-    /// Latest process start (Unix ms): this turn's completion.
+    /// Latest process start (Unix ms): this completing turn's completion.
     pub window_end: i64,
     pub declared_pids: HashSet<u32>,
     pub declared_commands: Vec<String>,
-    /// Recent native `tool.started` facts of this generation, newest first.
+    /// Committed native `tool.started` commands of this completing turn, newest first.
     pub tool_commands: Vec<BackgroundWakeToolCommand>,
+    /// Committed native `tool.started` items of this completing turn when the
+    /// harness does not attach `data.command` to `tool.started`, newest first.
+    pub tool_items: Vec<BackgroundWakeToolItem>,
     /// Identities that already had an automatic wake in this generation.
     pub woken: HashSet<ProcessIdentity>,
 }
@@ -94,14 +106,15 @@ impl Store {
         turn_id: &str,
     ) -> Result<Option<BackgroundWakeArmContext>> {
         let agent_num = parse_agent_id(agent)?;
-        if !background_wake_arm_eligible_tx(&self.connection, agent_num, generation, turn_id)? {
+        let Some(requires_tool_command) =
+            background_wake_arm_eligible_tx(&self.connection, agent_num, generation, turn_id)?
+        else {
             return Ok(None);
-        }
+        };
         let window: Option<(Option<i64>, Option<i64>)> = self
             .connection
             .query_row(
-                "SELECT (SELECT MIN(started_at) FROM turns WHERE agent = ?1 AND generation = ?2),
-                        completed_at
+                "SELECT started_at, completed_at
                  FROM turns WHERE agent = ?1 AND generation = ?2 AND turn_id = ?3",
                 params![agent_num, generation, turn_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
@@ -159,19 +172,22 @@ impl Store {
             }
         }
 
-        // The process may have started in an earlier turn of this generation
-        // (a queued input began the next turn first). Those tool facts are among
-        // the Agent's newest events: scan a bounded window backwards.
+        // Collect native `tool.started` commands belonging strictly to this
+        // completing turn; on harnesses whose `tool.started` omits `command`
+        // (Antigravity, Muse), also collect the completing turn's committed
+        // `tool.started` items. A process with no tool item in this turn never arms.
         let mut tools = self
             .connection
             .prepare(
                 "SELECT json_extract(data, '$.turn_id'), json_extract(data, '$.item_id'),
                         json_extract(data, '$.command')
-                 FROM (SELECT seq, kind, generation, data FROM events INDEXED BY events_agent
-                       WHERE agent = ?1 ORDER BY seq DESC LIMIT ?3)
-                 WHERE kind = 'tool.started' AND generation = ?2
-                   AND json_type(data, '$.turn_id') = 'text'
+                 FROM events INDEXED BY events_tool_turn
+                 WHERE agent = ?1 AND generation = ?2
+                   AND kind = 'tool.started'
+                   AND json_extract(data, '$.turn_id') = ?3
+                   AND source = 'stream'
                    AND json_type(data, '$.item_id') = 'text'
+                   AND length(trim(json_extract(data, '$.item_id'))) > 0
                    AND json_type(data, '$.command') = 'text'
                    AND length(trim(json_extract(data, '$.command'))) BETWEEN 1 AND ?4
                  ORDER BY seq DESC LIMIT ?5",
@@ -182,7 +198,7 @@ impl Store {
                 params![
                     agent_num,
                     generation,
-                    MAX_TURN_EVENT_SCAN_ROWS,
+                    turn_id,
                     MAX_TOOL_COMMAND_BYTES,
                     MAX_TOOL_COMMANDS,
                 ],
@@ -202,6 +218,47 @@ impl Store {
                 item_id,
                 command: command.trim().to_owned(),
             });
+        }
+        if !requires_tool_command {
+            let mut items = self
+                .connection
+                .prepare(
+                    "SELECT json_extract(data, '$.turn_id'), json_extract(data, '$.item_id'), ts
+                     FROM events INDEXED BY events_tool_turn
+                     WHERE agent = ?1 AND generation = ?2
+                       AND kind = 'tool.started'
+                       AND json_extract(data, '$.turn_id') = ?3
+                       AND source = 'stream'
+                       AND json_type(data, '$.item_id') = 'text'
+                       AND length(trim(json_extract(data, '$.item_id'))) > 0
+                     ORDER BY seq DESC LIMIT ?4",
+                )
+                .map_err(sql_error)?;
+            let rows = items
+                .query_map(
+                    params![agent_num, generation, turn_id, MAX_TOOL_COMMANDS],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    },
+                )
+                .map_err(sql_error)?;
+            for row in rows {
+                let (turn_id, item_id, started_at) = row.map_err(sql_error)?;
+                context.tool_items.push(BackgroundWakeToolItem {
+                    turn_id,
+                    item_id,
+                    started_at,
+                });
+            }
+        }
+        if (requires_tool_command && context.tool_commands.is_empty())
+            || (context.tool_commands.is_empty() && context.tool_items.is_empty())
+        {
+            return Ok(None);
         }
 
         let mut woken = self
@@ -255,20 +312,14 @@ impl Store {
                             json_extract(data, '$.stderr_tail'),
                             json_extract(data, '$.stdout_tail'),
                             json_extract(data, '$.native_error.message')), -?5)
-                 FROM (SELECT kind, generation, data FROM events INDEXED BY events_agent
-                       WHERE agent = ?1 ORDER BY seq DESC LIMIT ?6)
-                 WHERE kind = 'tool.completed' AND generation = ?2
+                 FROM events INDEXED BY events_tool_turn
+                 WHERE agent = ?1 AND generation = ?2
+                   AND kind = 'tool.completed'
                    AND json_extract(data, '$.turn_id') = ?3
+                   AND source = 'stream'
                    AND json_extract(data, '$.item_id') = ?4
                  LIMIT 1",
-                params![
-                    agent_num,
-                    generation,
-                    turn_id,
-                    item_id,
-                    MAX_TAIL_SCAN_CHARS,
-                    MAX_TURN_EVENT_SCAN_ROWS,
-                ],
+                params![agent_num, generation, turn_id, item_id, MAX_TAIL_SCAN_CHARS,],
                 |row| row.get(0),
             )
             .optional()
@@ -288,6 +339,7 @@ impl Store {
     ) -> Result<Option<BackgroundWakeRecord>> {
         if input.generation <= 0
             || input.turn_id.trim().is_empty()
+            || input.tool_item_id.trim().is_empty()
             || input.process.host_boot_id.trim().is_empty()
             || input.process.pid == 0
             || input.process.start_time == 0
@@ -317,7 +369,19 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
-        if !background_wake_arm_eligible_tx(&tx, agent_num, input.generation, &input.turn_id)? {
+        let Some(requires_tool_command) =
+            background_wake_arm_eligible_tx(&tx, agent_num, input.generation, &input.turn_id)?
+        else {
+            return Ok(None);
+        };
+        if !has_turn_tool_tx(
+            &tx,
+            agent_num,
+            input.generation,
+            &input.turn_id,
+            Some(&input.tool_item_id),
+            requires_tool_command,
+        )? {
             return Ok(None);
         }
         let owner = format!("agent:{}#{}", input.agent, input.generation);
@@ -772,17 +836,72 @@ impl Store {
     }
 }
 
+fn has_turn_tool_tx(
+    connection: &rusqlite::Connection,
+    agent_num: i64,
+    generation: i64,
+    turn_id: &str,
+    item_id: Option<&str>,
+    requires_tool_command: bool,
+) -> Result<bool> {
+    if requires_tool_command {
+        connection
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM events INDEXED BY events_tool_turn
+                     WHERE agent = ?1 AND generation = ?2
+                       AND kind = 'tool.started'
+                       AND json_extract(data, '$.turn_id') = ?3
+                       AND source = 'stream'
+                       AND json_type(data, '$.item_id') = 'text'
+                       AND length(trim(json_extract(data, '$.item_id'))) > 0
+                       AND (?4 IS NULL OR json_extract(data, '$.item_id') = ?4)
+                       AND json_type(data, '$.command') = 'text'
+                       AND length(trim(json_extract(data, '$.command'))) BETWEEN 1 AND ?5
+                 )",
+                params![
+                    agent_num,
+                    generation,
+                    turn_id,
+                    item_id,
+                    MAX_TOOL_COMMAND_BYTES
+                ],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)
+    } else {
+        connection
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM events INDEXED BY events_tool_turn
+                     WHERE agent = ?1 AND generation = ?2
+                       AND kind = 'tool.started'
+                       AND json_extract(data, '$.turn_id') = ?3
+                       AND source = 'stream'
+                       AND json_type(data, '$.item_id') = 'text'
+                       AND length(trim(json_extract(data, '$.item_id'))) > 0
+                       AND (?4 IS NULL OR json_extract(data, '$.item_id') = ?4)
+                 )",
+                params![agent_num, generation, turn_id, item_id],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)
+    }
+}
+
+/// Returns `Some(requires_tool_command)` when the completing turn is eligible
+/// for automatic background-process wake arming, else `None`.
 fn background_wake_arm_eligible_tx(
     connection: &rusqlite::Connection,
     agent_num: i64,
     generation: i64,
     turn_id: &str,
-) -> Result<bool> {
+) -> Result<Option<bool>> {
     if generation <= 0 || turn_id.trim().is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
     let Some(agent) = load_agent_by_num(connection, agent_num)? else {
-        return Ok(false);
+        return Ok(None);
     };
     if agent.generation != generation
         || agent.is_terminal()
@@ -792,10 +911,10 @@ fn background_wake_arm_eligible_tx(
             .as_deref()
             .is_some_and(|active| active != turn_id)
     {
-        return Ok(false);
+        return Ok(None);
     }
     let Some(turn) = load_turn(connection, agent_num, generation, turn_id)? else {
-        return Ok(false);
+        return Ok(None);
     };
     let newer_turn: bool = connection
         .query_row(
@@ -809,7 +928,7 @@ fn background_wake_arm_eligible_tx(
         )
         .map_err(sql_error)?;
     if newer_turn {
-        return Ok(false);
+        return Ok(None);
     }
     if turn.state != TurnState::Completed
         || !matches!(
@@ -817,10 +936,10 @@ fn background_wake_arm_eligible_tx(
             Some(TurnOutcome::Success | TurnOutcome::Failure)
         )
     {
-        return Ok(false);
+        return Ok(None);
     }
     if agent_has_active_stop_tx(connection, agent_num, generation)? {
-        return Ok(false);
+        return Ok(None);
     }
     let interrupted: bool = connection
         .query_row(
@@ -836,7 +955,7 @@ fn background_wake_arm_eligible_tx(
         )
         .map_err(sql_error)?;
     if interrupted {
-        return Ok(false);
+        return Ok(None);
     }
     let manual_wake_open: bool = connection
         .query_row(
@@ -851,7 +970,7 @@ fn background_wake_arm_eligible_tx(
         )
         .map_err(sql_error)?;
     if manual_wake_open {
-        return Ok(false);
+        return Ok(None);
     }
     let auto_wake_open: bool = connection
         .query_row(
@@ -864,7 +983,23 @@ fn background_wake_arm_eligible_tx(
             |row| row.get(0),
         )
         .map_err(sql_error)?;
-    Ok(!auto_wake_open)
+    if auto_wake_open {
+        return Ok(None);
+    }
+    // Requiring at least one committed native `tool.started` item belonging to
+    // this completing turn enforces both tool attribution (#903 item 1) and the
+    // wake loop guard (#903 item 3: any turn started by a wake that ran no
+    // native tool arms no new wake).
+    let requires_tool_command = eliot_core::harness_emits_tool_commands(&agent.harness);
+    let has_native_tool = has_turn_tool_tx(
+        connection,
+        agent_num,
+        generation,
+        turn_id,
+        None,
+        requires_tool_command,
+    )?;
+    Ok(has_native_tool.then_some(requires_tool_command))
 }
 
 fn agent_has_active_stop_tx(
