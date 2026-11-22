@@ -348,7 +348,9 @@ impl Router {
             "expected_generation": wake.generation,
             "args": { "text": format!("Wake condition met: {fact}") },
         });
-        let submitted = self.submit(&params, &Principal::Owner).await;
+        let submitted = self
+            .submit(&params, &Principal::Owner, "command.submit")
+            .await;
         let command = self.inner.store.lock().await.get_command(command_id)?;
         if let Some(command) = command {
             self.record_wake_delivery_state(wake, command_id, command.state, now)
