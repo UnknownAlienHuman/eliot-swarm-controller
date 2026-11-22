@@ -53,15 +53,29 @@ tracked, untracked and ignored changes keep the worktree. Native stores are neve
 deleted as files. A Codex or OpenCode session of a terminal Swarm-created Agent
 is `safe` with reason `native_archive_pending`; attached or observed sessions
 and every other harness stay `keep(no_native_archive)`.
-The plan snapshot anchors the freshly classified branch tip (the backfill also refreshes the stored row), and apply re-verifies that exact tip. A branch is `safe` only after a fresh upstream fetch proves the tip is
-contained in the upstream default branch with no unpushed commits (a remote
-branch already deleted upstream counts as merged only together with that
-containment); otherwise it stays `keep` with `unmerged`, `ahead`, or a fetch
-readiness reason. Default-branch discovery must freshly advertise the remote
-HEAD symref; a cached remote HEAD never substitutes for a failed discovery
-(`keep(no_default_branch)`). The plan fetch updates remote-tracking state but never
-deletes branches. A present `daemon.lock` with a live owner keeps a data
-directory; only a provably dead owner releases it.
+Worktree and branch cleanup, automatic cleanup, and direct `worktree.remove`
+share the fresh-upstream containment check. Ancestry proves containment for
+either removal. Worktree removal retains the branch, so it can also use a
+historical default-branch commit containing the entire branch delta from the
+unique merge base. It compares exact repository paths, Git modes and object IDs
+at up to 64 commits on the default branch's first-parent history within six
+seconds and the caller's deadline. This can prove a squash merge after later
+edits or a revert. Branch deletion requires the same paths, modes and objects
+at the current upstream default tip. Missing matches keep the branch with
+`content_not_at_tip`. The plan reason records ancestry or the exact content
+witness commit.
+
+Plans anchor the freshly classified tip and apply re-verifies that tip with a
+new fetch. An `ahead` tracking branch stays kept. A deleted remote branch still
+requires containment. Missing evidence stays `keep` with `unmerged`, a scan
+limit or deadline, or a Git readiness reason. The remote must freshly
+advertise its HEAD symref and object ID, which must agree with the fetched
+default branch (`keep(no_default_branch)` otherwise). Each plan page fetches
+once per repository and upstream remote and reuses that result across its
+candidates. The fetch updates remote-tracking state and leaves branches and
+worktree files in place. A present
+`daemon.lock` with a live owner keeps a data directory. Only a provably dead
+owner releases it.
 
 `cleanup.apply {id,plan_id,artifacts?}` consumes only the plan's safe candidates, rechecks
 authority, generation, Git cleanliness, opened identities and busy/link refusal,
@@ -90,8 +104,9 @@ protected even there.
 Unix reports unsupported rather than using pathname unlink. Worktree directory
 and its exact private Git administration directory are removed; its local branch
 is retained when the worktree is removed through worktree cleanup. A planned
-branch is deleted locally with the safe `-d` form after a second fresh-fetch
-verification at apply time, and only after its worktree is gone; refuse reasons
+branch is deleted locally with `git branch -D` after fresh current-tip
+verification, a pinned-tip recheck, and confirmation that no worktree uses it.
+Refuse reasons
 are `branch_checked_out`, `branch_delete_refused` and `identity_changed`, and
 a branch that vanished concurrently is `unknown`. Remote branch deletion is a
 separate explicit Owner-only flag (`delete_remote`) on `cleanup.apply` and

@@ -89,6 +89,9 @@ pub struct CleanupGitBinding {
     pub worktree: String,
     pub admin: String,
     pub admin_identity: String,
+    /// Exact branch tip classified for a safe worktree plan item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planned_tip: Option<String>,
 }
 
 #[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

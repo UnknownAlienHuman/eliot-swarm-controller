@@ -8,7 +8,10 @@ use crate::{
     platform::{CustodyObserver, OwnedChild, worktree_guard::WorktreeWriteGuard},
     plugin_host::SecretSet,
     setup,
-    workspace_git::WorkspaceGit,
+    workspace_git::{
+        WorkspaceGit,
+        containment::{BranchClassification, CleanupFetches},
+    },
 };
 use eliot_core::api::{CommandResolveRequest, CommandResolveResponse};
 use eliot_core::is_start_verb;
@@ -46,6 +49,12 @@ const GIT_TIME: Duration = Duration::from_secs(60);
 const PAGE_SIZE: usize = 100;
 
 type StoreHandle = Arc<AsyncMutex<eliot_store::Store>>;
+
+pub(crate) struct RemovalPreflight {
+    pub(crate) branch: BranchClassification,
+    scratch: Vec<String>,
+    files: Vec<PathBuf>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Key {
@@ -752,9 +761,21 @@ impl WorkspaceManager {
         git: &WorkspaceGit,
         preparation: &WorkspacePreparation,
         profile: &Value,
-    ) -> Result<(Vec<String>, Vec<PathBuf>)> {
+        expected_tip: Option<&str>,
+        fetches: Option<&mut CleanupFetches>,
+        deadline: Instant,
+    ) -> Result<RemovalPreflight> {
         let scratch = frozen_scratch(profile)?;
-        let candidates = git.removal_candidates(preparation, &scratch).await?;
+        let (branch, candidates) = git
+            .removal_candidates(
+                &self.inner.data_root,
+                preparation,
+                &scratch,
+                expected_tip,
+                fetches,
+                deadline,
+            )
+            .await?;
         let mut files = Vec::with_capacity(candidates.len());
         let mut seen = HashSet::new();
         for candidate in candidates {
@@ -764,7 +785,11 @@ impl WorkspaceManager {
             }
             files.push(file);
         }
-        Ok((scratch, files))
+        Ok(RemovalPreflight {
+            branch,
+            scratch,
+            files,
+        })
     }
 
     async fn remove_workspace(
@@ -903,19 +928,36 @@ impl WorkspaceManager {
         profile: &Value,
         deadline: Instant,
     ) -> WorkspaceRemovalOutcome {
-        let (scratch, files) =
-            match timeout_at(deadline, self.removal_candidates(git, preparation, profile)).await {
-                Ok(Ok(candidates)) => candidates,
-                Ok(Err(error)) => return removal_preflight_error(&error),
-                Err(_) => return removal_unknown("workspace_scratch_deadline"),
-            };
+        let expected_tip = command.args.get("expected_tip").and_then(Value::as_str);
+        let preflight = match timeout_at(
+            deadline,
+            self.removal_candidates(git, preparation, profile, expected_tip, None, deadline),
+        )
+        .await
+        {
+            Ok(Ok(candidates)) => candidates,
+            Ok(Err(error)) => return removal_preflight_error(&error),
+            Err(_) => return removal_unknown("workspace_scratch_deadline"),
+        };
         if let Err(outcome) = self
-            .remove_scratch_files(command, preparation, slot, &scratch, files, deadline)
+            .remove_scratch_files(
+                command,
+                preparation,
+                slot,
+                &preflight.scratch,
+                preflight.files,
+                deadline,
+            )
             .await
         {
             return outcome;
         }
-        let mutator = match timeout_at(deadline, git.prepare_remove(preparation)).await {
+        let mutator = match timeout_at(
+            deadline,
+            git.prepare_remove(preparation, &preflight.branch.tip, deadline),
+        )
+        .await
+        {
             Ok(Ok(command)) => command,
             Ok(Err(error)) => return removal_preflight_error(&error),
             Err(_) => return removal_unknown("workspace_remove_deadline"),
@@ -1922,7 +1964,7 @@ fn workspace_git_effect_quiescent(slot: &Slot) -> bool {
 }
 
 async fn drain_bounded<R: AsyncRead + Unpin>(mut stream: R) -> Result<()> {
-    let mut buffer = [0_u8; 4096];
+    let mut buffer = vec![0_u8; 4096];
     let mut total = 0_usize;
     loop {
         let count = stream

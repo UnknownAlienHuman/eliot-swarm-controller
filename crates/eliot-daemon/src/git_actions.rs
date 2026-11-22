@@ -2281,7 +2281,8 @@ async fn run_owned_git(
 
 async fn capture_bounded<R: AsyncRead + Unpin>(mut reader: R, cap: usize) -> Result<Vec<u8>> {
     let mut output = Vec::with_capacity(cap.min(64 * 1024));
-    let mut buffer = [0_u8; 8192];
+    // The transport polls two capture futures inside each cleanup preflight.
+    let mut buffer = vec![0_u8; 8192];
     loop {
         let read = reader
             .read(&mut buffer)
@@ -2549,7 +2550,7 @@ pub(crate) async fn run_cleanup_transport(
     let native = native_endpoint_argument(endpoint)?;
     let git = GitProbe::new()?;
     let checkout = canonical_root(checkout)?;
-    let read_deadline = Instant::now() + GIT_READ_TIME;
+    let read_deadline = deadline.min(Instant::now() + GIT_READ_TIME);
     let git_dir = canonical_root(
         &read_git_line(
             &git,

@@ -1322,12 +1322,18 @@ fn admit_worktree_remove_tx(
     let agent_num = parse_agent_id(target)?;
     let agent = load_agent_by_num(tx, agent_num)?
         .ok_or_else(|| Error::new("not_found", "workspace owner was not found"))?;
+    let args = request
+        .args
+        .as_object()
+        .ok_or_else(|| Error::new("invalid", "worktree.remove arguments must be an object"))?;
+    let expected_tip = args.get("expected_tip");
     if request.request_id.is_some()
         || request.expected_turn_id.is_some()
         || request
             .expected_generation
             .is_some_and(|expected| expected != agent.generation)
-        || request.args.as_object().is_none_or(|args| !args.is_empty())
+        || args.keys().any(|key| key != "expected_tip")
+        || expected_tip.is_some_and(|tip| !tip.as_str().is_some_and(eliot_core::api::is_git_oid))
     {
         return Err(Error::new(
             "invalid",
@@ -1337,7 +1343,10 @@ fn admit_worktree_remove_tx(
     let workspace = workspace::load_workspace(tx, agent_num)?
         .ok_or_else(|| Error::new("not_found", "Agent has no managed worktree"))?;
     workspace::require_workspace_removable(tx, &agent, &workspace, now)?;
-    let args = json!({"target_generation": workspace.target_generation});
+    let mut args = json!({"target_generation": workspace.target_generation});
+    if let Some(tip) = expected_tip {
+        args["expected_tip"] = tip.clone();
+    }
     events.push(admit_command(
         tx,
         &CommandInsert {

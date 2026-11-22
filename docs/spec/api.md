@@ -1472,12 +1472,15 @@ Removal uses the same command admission and readback path:
 
 ```text
 command.submit {id, target:AGENT, verb:"worktree.remove",
-  args:{}, expected_generation?:N}
+  args:{expected_tip?:OID}, expected_generation?:N}
 ```
 
 The Router/Store enforce owner authority, the captured generation and terminal-only,
-clean removal under the admitted scratch policy. The daemon selects the retained
-managed worktree, preserves its branch and never removes a caller-supplied path. The
+clean removal under the admitted scratch policy. When supplied, `expected_tip`
+must match the managed worktree's HEAD. The freshly classified branch tip must
+also equal that HEAD. Cleanup apply supplies the tip retained in its plan.
+The daemon selects the retained managed worktree,
+preserves its branch and never removes a caller-supplied path. The
 CLI offers no force/path argument and uses its normal ULID binding and exit codes.
 It reads the exact command to settlement with a bounded 30-second wait; timeout does
 not cancel or retry removal. Same-ID retries return the retained outcome even after

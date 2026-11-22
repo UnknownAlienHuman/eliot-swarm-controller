@@ -3,6 +3,9 @@ use super::*;
 #[cfg(windows)]
 use crate::platform::script_file::CleanupTree;
 use crate::platform::script_file::directory_identity;
+use crate::workspace_git::containment::{
+    BranchClassification, CleanupFetches, ContainmentScope, branch_rev_parse, classify_branch,
+};
 use eliot_core::FailureOrigin;
 use eliot_core::api::*;
 use std::path::{Component, Path};
@@ -551,6 +554,7 @@ impl Router {
                 worktree: workspace.worktree_path.clone(),
                 admin: admin.to_string_lossy().into_owned(),
                 admin_identity: directory_identity(&admin)?,
+                planned_tip: None,
             };
             known.push(ArtifactView {
                 id: ulid::Ulid::new().to_string(),
@@ -1026,6 +1030,7 @@ impl Router {
     async fn automatic_cleanup_worktree_keep_reason(
         &self,
         agent: &Agent,
+        fetches: Option<&mut CleanupFetches>,
     ) -> Result<Option<String>> {
         let artifact = {
             let store = self.inner.store.lock().await;
@@ -1057,8 +1062,8 @@ impl Router {
         if let Err(error) = self.current_managed_worktree_path(&artifact.path) {
             return Ok(Some(error.code));
         }
-        match self.worktree_cleanup_preflight(&artifact).await {
-            Ok(()) => Ok(None),
+        match self.worktree_cleanup_preflight(&artifact, fetches).await {
+            Ok(_) => Ok(None),
             Err(error) => Ok(Some(error.code)),
         }
     }
@@ -1069,6 +1074,7 @@ impl Router {
         retention_ms: i64,
         now: i64,
         allow_fenced_root: bool,
+        fetches: Option<&mut CleanupFetches>,
     ) -> Result<Option<String>> {
         let (agent, ended_at) = {
             let store = self.inner.store.lock().await;
@@ -1114,7 +1120,10 @@ impl Router {
             return Ok(Some("manual_only".to_owned()));
         }
         if artifact.kind != ArtifactKind::Worktree {
-            match self.automatic_cleanup_worktree_keep_reason(&agent).await {
+            match self
+                .automatic_cleanup_worktree_keep_reason(&agent, fetches)
+                .await
+            {
                 Ok(Some(reason)) => return Ok(Some(reason)),
                 Err(error) => return Ok(Some(error.code)),
                 Ok(None) => {}
@@ -1350,6 +1359,7 @@ impl Router {
         )?;
         let artifacts_total = artifacts.len();
         let mut middle = Vec::new();
+        let mut fetches = CleanupFetches::default();
         for artifact in artifacts {
             let mut candidate = CleanupCandidate {
                 artifact,
@@ -1379,6 +1389,7 @@ impl Router {
                         retention_ms,
                         now_ms(),
                         false,
+                        Some(&mut fetches),
                     )
                     .await
                 {
@@ -1411,7 +1422,8 @@ impl Router {
                 {
                     break;
                 }
-                self.classify_worktree(&mut candidate).await;
+                self.classify_worktree(&mut candidate, Some(&mut fetches))
+                    .await;
             } else if candidate.artifact.kind == ArtifactKind::Branch {
                 let Some(git) = candidate.artifact.git.as_ref() else {
                     candidate.reason = "source_integrity".to_owned();
@@ -1438,6 +1450,7 @@ impl Router {
                     .cleanup_branch_classification_with_deadline(
                         &candidate.artifact,
                         git,
+                        Some(&mut fetches),
                         Instant::now() + CLEANUP_PLAN_MAX_PREFLIGHT,
                     )
                     .await
@@ -1445,7 +1458,7 @@ impl Router {
                     Ok(classification) => {
                         candidate.artifact.identity = classification.tip.clone();
                         candidate.verdict = "safe".to_owned();
-                        candidate.reason = classification.reason.to_owned();
+                        candidate.reason = classification.reason;
                         candidate.bytes = Some(0);
                     }
                     Err(error) => candidate.reason = error.code,
@@ -1625,21 +1638,35 @@ impl Router {
         Ok(after)
     }
 
-    async fn classify_worktree(&self, candidate: &mut CleanupCandidate) {
+    async fn classify_worktree(
+        &self,
+        candidate: &mut CleanupCandidate,
+        fetches: Option<&mut CleanupFetches>,
+    ) {
         if candidate.artifact.state != "registered" {
             candidate.reason = candidate.artifact.state.clone();
             return;
         }
-        match self.worktree_cleanup_preflight(&candidate.artifact).await {
-            Ok(()) => {
+        match self
+            .worktree_cleanup_preflight(&candidate.artifact, fetches)
+            .await
+        {
+            Ok(classification) => {
+                if let Some(git) = candidate.artifact.git.as_mut() {
+                    git.planned_tip = Some(classification.tip);
+                }
                 candidate.verdict = "safe".to_owned();
-                candidate.reason = "merged_quiet_worktree".to_owned();
+                candidate.reason = classification.reason;
             }
             Err(error) => candidate.reason = error.code,
         }
     }
 
-    async fn worktree_cleanup_preflight(&self, artifact: &ArtifactView) -> Result<()> {
+    async fn worktree_cleanup_preflight(
+        &self,
+        artifact: &ArtifactView,
+        fetches: Option<&mut CleanupFetches>,
+    ) -> Result<BranchClassification> {
         if !cfg!(windows) {
             return Err(Error::new(
                 "unsupported",
@@ -1662,11 +1689,19 @@ impl Router {
         };
         check_worktree_artifact(artifact, &preparation)?;
         let git = crate::workspace_git::WorkspaceGit::new()?;
-        self.inner
+        let preflight = self
+            .inner
             .workspaces
-            .removal_candidates(&git, &preparation, &profile)
+            .removal_candidates(
+                &git,
+                &preparation,
+                &profile,
+                None,
+                fetches,
+                Instant::now() + CLEANUP_PLAN_MAX_PREFLIGHT,
+            )
             .await?;
-        Ok(())
+        Ok(preflight.branch)
     }
 
     pub(crate) async fn auto_cleanup_worktrees(&self, after: &mut Option<String>) {
@@ -1767,7 +1802,7 @@ impl Router {
         }
         let age = crate::automation::parse_positive_duration_ms(&config.auto_cleanup_after)?;
         if let Some(reason) = self
-            .automatic_cleanup_keep_reason(artifact, age, now_ms(), true)
+            .automatic_cleanup_keep_reason(artifact, age, now_ms(), true, None)
             .await?
         {
             return Err(Error::new(reason, "automatic cleanup eligibility changed"));
@@ -2263,6 +2298,13 @@ impl Router {
             let mut request = SubmitCommand::new(id, "worktree.remove");
             request.target = Some(artifact.agent.clone());
             request.expected_generation = Some(artifact.generation);
+            if let Some(tip) = artifact
+                .git
+                .as_ref()
+                .and_then(|git| git.planned_tip.as_ref())
+            {
+                request.args = json!({"expected_tip": tip});
+            }
             let admission = self.admit_prepared_submission(
                 &mut store,
                 principal,
@@ -2328,6 +2370,7 @@ impl Router {
         self.cleanup_branch_classification_with_deadline(
             artifact,
             git,
+            None,
             Instant::now() + Duration::from_secs(60),
         )
         .await
@@ -2337,6 +2380,7 @@ impl Router {
         &self,
         artifact: &ArtifactView,
         git: &CleanupGitBinding,
+        fetches: Option<&mut CleanupFetches>,
         deadline: Instant,
     ) -> Result<BranchClassification> {
         let workspace = self
@@ -2355,362 +2399,21 @@ impl Router {
                 "the retained worktree still uses this branch",
             ));
         }
-        Self::classify_branch(&self.inner.data_root, git, deadline).await
-    }
-
-    /// Fetch the branch upstream and classify the local branch. `safe` means
-    /// the fresh fetch succeeded, the tip is contained in the upstream
-    /// default branch and no commits are unpushed; anything else is a keep
-    /// reason or an explicit refusal. The fetch updates remote-tracking
-    /// state but never deletes a branch; deletion happens only at apply.
-    async fn classify_branch(
-        data_root: &Path,
-        git: &CleanupGitBinding,
-        deadline: Instant,
-    ) -> Result<BranchClassification> {
-        use crate::git_actions::{CleanupTransportOp, run_cleanup_transport};
-        if !crate::git_actions::valid_cleanup_branch(&git.branch) {
-            return Err(Error::new(
-                "invalid_branch",
-                "branch name is not admissible",
-            ));
-        }
-        let repo = Path::new(&git.common);
-        let probe = crate::git_monitor::GitProbe::new()?;
-        let branch_ref = format!("refs/heads/{}", git.branch);
-        let remote = Self::branch_upstream_remote(&probe, repo, &branch_ref, deadline).await?;
-        let url = Self::branch_remote_url(&probe, repo, &remote, deadline).await?;
-        // A fresh fetch through the same isolated transport as the approved
-        // fetch action: private view, isolated HOME and config, no
-        // credentials, only file/HTTPS/HTTP/git. It updates remote-tracking
-        // refs but never deletes a branch; deletion happens only at apply.
-        // No classification is trusted without this fetch completing.
-        let fetch = run_cleanup_transport(
-            data_root,
+        classify_branch(
+            &self.inner.data_root,
             &git.repo,
-            &remote,
-            &url,
-            None,
-            CleanupTransportOp::FetchPrune,
+            Path::new(&git.common),
+            &git.branch,
+            ContainmentScope::BranchDeletion,
+            fetches,
             deadline,
         )
         .await
-        .map_err(|error| match error.code.as_str() {
-            "unsupported" => Error::new(
-                "remote_transport_unsupported",
-                "upstream transport is not file, HTTPS, HTTP or git",
-            ),
-            "invalid_remote" | "invalid" => {
-                Error::new("invalid_remote", "upstream remote is not admissible")
-            }
-            _ => Error::new(
-                "fetch_failed",
-                format!("branch upstream fetch failed: {}", error.message),
-            ),
-        })?;
-        if fetch.interrupted || !fetch.quiescent || fetch.exit_code != Some(0) {
-            return Err(Error::new(
-                "fetch_failed",
-                "branch upstream fetch did not complete",
-            ));
-        }
-        let default_name =
-            Self::branch_default_name(data_root, git, &remote, &url, deadline).await?;
-        let default_ref = format!("refs/remotes/{remote}/{default_name}");
-        let default_tip =
-            Self::branch_rev_parse(&probe, repo, &default_ref, "no_default_branch", deadline)
-                .await?;
-        let tip =
-            Self::branch_rev_parse(&probe, repo, &branch_ref, "branch_absent", deadline).await?;
-        let ancestor = probe
-            .workspace_command(
-                repo,
-                &["merge-base", "--is-ancestor", &tip, &default_tip],
-                deadline,
-            )
-            .await
-            .map_err(|_| Error::new("merge_check_failed", "branch merge check is unavailable"))?;
-        let merged = match ancestor.code {
-            0 => true,
-            1 => false,
-            _ => {
-                return Err(Error::new(
-                    "merge_check_failed",
-                    "branch merge check did not complete",
-                ));
-            }
-        };
-        let upstream =
-            Self::branch_upstream_tip(&probe, repo, &branch_ref, &remote, &git.branch, deadline)
-                .await?;
-        let unpushed = match upstream.as_deref() {
-            Some(upstream) => {
-                let count = probe
-                    .workspace_command(
-                        repo,
-                        &["rev-list", "--count", &format!("{upstream}..{tip}")],
-                        deadline,
-                    )
-                    .await
-                    .map_err(|_| {
-                        Error::new("branch_read_failed", "branch ahead check is unavailable")
-                    })?;
-                if count.code != 0 {
-                    return Err(Error::new(
-                        "branch_read_failed",
-                        "branch ahead check did not complete",
-                    ));
-                }
-                String::from_utf8_lossy(&count.stdout)
-                    .trim()
-                    .parse::<u64>()
-                    .map_err(|_| {
-                        Error::new("branch_read_failed", "branch ahead count is not a number")
-                    })?
-                    > 0
-            }
-            None => !merged,
-        };
-        let remote_heads = run_cleanup_transport(
-            data_root,
-            &git.repo,
-            &remote,
-            &url,
-            Some(&git.branch),
-            CleanupTransportOp::ListHeads,
-            deadline,
-        )
-        .await
-        .map_err(|_| Error::new("remote_check_failed", "branch remote check is unavailable"))?;
-        if remote_heads.interrupted || !remote_heads.quiescent || remote_heads.exit_code != Some(0)
-        {
-            return Err(Error::new(
-                "remote_check_failed",
-                "branch remote check did not complete",
-            ));
-        }
-        let deleted_remotely = remote_heads.stdout.is_empty();
-        if merged && !unpushed {
-            Ok(BranchClassification {
-                reason: if deleted_remotely {
-                    "merged_remote_deleted"
-                } else {
-                    "merged"
-                },
-                remote,
-                url,
-                tip,
-            })
-        } else if !merged {
-            Err(Error::new(
-                "unmerged",
-                "branch tip is not contained in the upstream default branch",
-            ))
-        } else {
-            Err(Error::new(
-                "ahead",
-                "branch carries commits its upstream tracking ref lacks",
-            ))
-        }
     }
 
-    async fn branch_upstream_remote(
-        probe: &crate::git_monitor::GitProbe,
-        repo: &Path,
-        branch_ref: &str,
-        deadline: Instant,
-    ) -> Result<String> {
-        let remote = probe
-            .workspace_command(
-                repo,
-                &[
-                    "for-each-ref",
-                    "--format=%(upstream:remotename)",
-                    branch_ref,
-                ],
-                deadline,
-            )
-            .await
-            .map_err(|_| Error::new("branch_read_failed", "branch upstream is unreadable"))?;
-        if remote.code != 0 {
-            return Err(Error::new(
-                "branch_read_failed",
-                "branch upstream is unreadable",
-            ));
-        }
-        let name = String::from_utf8(remote.stdout)
-            .map_err(|_| Error::new("branch_read_failed", "branch upstream is not Unicode"))?;
-        let name = name.trim();
-        if !name.is_empty() {
-            return Ok(name.to_owned());
-        }
-        let origin = probe
-            .workspace_command(repo, &["remote", "get-url", "origin"], deadline)
-            .await
-            .map_err(|_| Error::new("no_upstream_remote", "branch has no upstream remote"))?;
-        if origin.code != 0 {
-            return Err(Error::new(
-                "no_upstream_remote",
-                "branch has no upstream remote",
-            ));
-        }
-        Ok("origin".to_owned())
-    }
-
-    /// Read the exact remote URL from local repository config. The URL is
-    /// validated as an endpoint by the isolated transport before any network
-    /// use; only file/HTTPS/HTTP/git transports are admitted.
-    async fn branch_remote_url(
-        probe: &crate::git_monitor::GitProbe,
-        repo: &Path,
-        remote: &str,
-        deadline: Instant,
-    ) -> Result<String> {
-        let key = format!("remote.{remote}.url");
-        let configured = probe
-            .workspace_command(repo, &["config", "--get", &key], deadline)
-            .await
-            .map_err(|_| Error::new("no_upstream_remote", "branch remote URL is unreadable"))?;
-        if configured.code != 0 {
-            return Err(Error::new(
-                "no_upstream_remote",
-                "branch has no configured upstream remote",
-            ));
-        }
-        let url = String::from_utf8(configured.stdout)
-            .map_err(|_| Error::new("no_upstream_remote", "branch remote URL is not Unicode"))?;
-        let url = url.trim().to_owned();
-        if url.is_empty() || url.len() > 4096 || url.chars().any(char::is_control) {
-            return Err(Error::new(
-                "no_upstream_remote",
-                "branch remote URL is not admissible",
-            ));
-        }
-        Ok(url)
-    }
-
-    async fn branch_default_name(
-        data_root: &Path,
-        git: &CleanupGitBinding,
-        remote: &str,
-        url: &str,
-        deadline: Instant,
-    ) -> Result<String> {
-        use crate::git_actions::{CleanupTransportOp, run_cleanup_transport};
-        // The upstream HEAD symref is read fresh from the remote through the
-        // isolated transport; a stale local remote-HEAD pointer alone never
-        // decides the default branch.
-        if let Ok(symref) = run_cleanup_transport(
-            data_root,
-            &git.repo,
-            remote,
-            url,
-            None,
-            CleanupTransportOp::ListSymrefHead,
-            deadline,
-        )
-        .await
-            && symref.exit_code == Some(0)
-            && symref.quiescent
-            && !symref.interrupted
-        {
-            let output = String::from_utf8_lossy(&symref.stdout);
-            for line in output.lines() {
-                if let Some(rest) = line.strip_prefix("ref: ")
-                    && rest.split_whitespace().nth(1) == Some("HEAD")
-                    && let Some(name) = rest
-                        .split_whitespace()
-                        .next()
-                        .and_then(|reference| reference.strip_prefix("refs/heads/"))
-                    && crate::git_actions::valid_cleanup_branch(name)
-                {
-                    return Ok(name.to_owned());
-                }
-            }
-        }
-        Err(Error::new(
-            "no_default_branch",
-            "upstream default branch is unreadable",
-        ))
-    }
-
-    async fn branch_rev_parse(
-        probe: &crate::git_monitor::GitProbe,
-        repo: &Path,
-        reference: &str,
-        missing_code: &'static str,
-        deadline: Instant,
-    ) -> Result<String> {
-        let parsed = probe
-            .workspace_command(repo, &["rev-parse", "--verify", reference], deadline)
-            .await
-            .map_err(|_| Error::new("branch_read_failed", "branch tip is unreadable"))?;
-        if parsed.code != 0 {
-            return Err(Error::new(missing_code, "branch reference is absent"));
-        }
-        let oid = String::from_utf8(parsed.stdout)
-            .map_err(|_| Error::new("branch_read_failed", "branch tip is not Unicode"))?;
-        let oid = oid.trim().to_owned();
-        if !eliot_core::api::is_git_oid(&oid) {
-            return Err(Error::new(
-                "branch_read_failed",
-                "branch tip is not an object id",
-            ));
-        }
-        Ok(oid)
-    }
-
-    async fn branch_upstream_tip(
-        probe: &crate::git_monitor::GitProbe,
-        repo: &Path,
-        branch_ref: &str,
-        remote: &str,
-        branch: &str,
-        deadline: Instant,
-    ) -> Result<Option<String>> {
-        let upstream = probe
-            .workspace_command(
-                repo,
-                &["for-each-ref", "--format=%(upstream)", branch_ref],
-                deadline,
-            )
-            .await
-            .map_err(|_| Error::new("branch_read_failed", "branch upstream is unreadable"))?;
-        if upstream.code != 0 {
-            return Err(Error::new(
-                "branch_read_failed",
-                "branch upstream is unreadable",
-            ));
-        }
-        let name = String::from_utf8_lossy(&upstream.stdout);
-        let name = name.trim();
-        if !name.is_empty() {
-            // A configured upstream can name a tracking ref the fresh prune
-            // just removed (remote branch deleted). Only a resolvable
-            // tracking ref counts; a stale one is the same as none.
-            let parsed = probe
-                .workspace_command(repo, &["rev-parse", "--verify", name], deadline)
-                .await
-                .map_err(|_| Error::new("branch_read_failed", "branch upstream is unreadable"))?;
-            if parsed.code == 0 {
-                return Ok(Some(name.to_owned()));
-            }
-            return Ok(None);
-        }
-        let same_name = format!("refs/remotes/{remote}/{branch}");
-        let parsed = probe
-            .workspace_command(repo, &["rev-parse", "--verify", &same_name], deadline)
-            .await
-            .map_err(|_| Error::new("branch_read_failed", "branch tracking ref is unreadable"))?;
-        if parsed.code != 0 {
-            return Ok(None);
-        }
-        Ok(Some(same_name))
-    }
-
-    /// Re-verify at apply time, then delete the local branch with the safe
-    /// `-d` form only. A refused deletion keeps the branch and reports why;
-    /// a branch that vanished concurrently is `unknown`, never replayed.
+    /// Only called after fresh current-tip containment. Recheck attachment
+    /// and the pinned tip before deleting. Git's ancestry gate does not
+    /// recognize squash merges, so use `-D` after these checks.
     async fn delete_local_branch(git: &CleanupGitBinding, expected_tip: &str) -> Result<()> {
         if !crate::git_actions::valid_cleanup_branch(&git.branch) {
             return Err(Error::new(
@@ -2721,20 +2424,6 @@ impl Router {
         let repo = Path::new(&git.common);
         let probe = crate::git_monitor::GitProbe::new()?;
         let deadline = Instant::now() + Duration::from_secs(30);
-        let tip = Self::branch_rev_parse(
-            &probe,
-            repo,
-            &format!("refs/heads/{}", git.branch),
-            "branch_absent",
-            deadline,
-        )
-        .await?;
-        if tip != expected_tip {
-            return Err(Error::new(
-                "identity_changed",
-                "branch tip moved since the plan was retained",
-            ));
-        }
         let worktrees = probe
             .workspace_command(repo, &["worktree", "list", "--porcelain"], deadline)
             .await
@@ -2755,10 +2444,22 @@ impl Router {
                 "branch is checked out in a live worktree",
             ));
         }
-        // A refused `-d` writes diagnostics, which the process fence turns
-        // into an error: either way the branch is re-read before concluding.
+        let tip = branch_rev_parse(
+            &probe,
+            repo,
+            &format!("refs/heads/{}", git.branch),
+            "branch_absent",
+            deadline,
+        )
+        .await?;
+        if tip != expected_tip {
+            return Err(Error::new(
+                "identity_changed",
+                "branch tip moved since the plan was retained",
+            ));
+        }
         let deleted = match probe
-            .workspace_command(repo, &["branch", "-d", &git.branch], deadline)
+            .workspace_command(repo, &["branch", "-D", "--", &git.branch], deadline)
             .await
         {
             Ok(deleted) => deleted.code,
@@ -2768,13 +2469,13 @@ impl Router {
             return Ok(());
         }
         let branch_ref = format!("refs/heads/{}", git.branch);
-        let again = Self::branch_rev_parse(&probe, repo, &branch_ref, "branch_absent", deadline)
+        let again = branch_rev_parse(&probe, repo, &branch_ref, "branch_absent", deadline)
             .await
             .map_err(|_| Error::new("unknown", "branch deletion outcome is uncertain"))?;
         if !again.is_empty() {
             return Err(Error::new(
                 "branch_delete_refused",
-                "branch is not fully merged and was kept",
+                "Git refused branch deletion and the branch still exists",
             ));
         }
         Err(Error::new(
@@ -2933,15 +2634,6 @@ fn merge_cleanup_page(
     (items, safe_shown, kept_shown)
 }
 
-/// Fresh-fetch branch classification for one plan item.
-#[derive(Debug)]
-struct BranchClassification {
-    reason: &'static str,
-    remote: String,
-    url: String,
-    tip: String,
-}
-
 /// Split the recorded `native:{scope}:{reference}` path into its reference.
 /// The scope is cross-checked against the retained native identity so a
 /// substituted path can never archive a different thread.
@@ -3096,7 +2788,7 @@ impl Router {
             reason: "retirement_preflight".to_owned(),
         };
         if candidate.artifact.kind == ArtifactKind::Worktree {
-            self.classify_worktree(&mut candidate).await;
+            self.classify_worktree(&mut candidate, None).await;
             return candidate;
         }
         let gate = self

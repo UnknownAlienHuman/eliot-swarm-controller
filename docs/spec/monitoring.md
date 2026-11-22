@@ -399,9 +399,10 @@ the same eligibility checks as direct removal. The Store checks the terminal own
 overlapping borrowers, current assignment binding and settled preparation in the
 transaction that sets `removing`. Admission to the checkout or its descendants
 stops at that phase until settlement. Removal requires at least 60 seconds since
-the last owner or borrower ended. The worktree tip must be an ancestor of the
-exact base OID frozen at preparation, and Git must report a clean index and worktree
-apart from regular untracked or ignored files in frozen scratch paths.
+the last owner or borrower ended. Git must confirm fresh upstream
+[containment](coordination.md#registered-artifacts-and-cleanup-k69) for the
+worktree tip and a clean index and worktree apart from regular untracked or
+ignored files in frozen scratch paths.
 The cached path inventory includes Git links. Cleanup accepts empty or absent
 submodule directories and retains populated submodule checkouts.
 
