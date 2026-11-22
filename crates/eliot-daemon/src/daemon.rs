@@ -704,6 +704,22 @@ async fn spawn_workers(
         worker_stop.subscribe(),
         mail_factory,
     ));
+    let wake_router = router.clone();
+    let wake_reporter = worker_reporter.clone();
+    let wake_factory = move |shutdown: watch::Receiver<bool>| {
+        let router = wake_router.clone();
+        let reporter = wake_reporter.clone();
+        async move {
+            let result = crate::router::run_agent_wakes(router, shutdown.clone(), reporter).await;
+            crate::daemon::workers::from_result(result, &shutdown)
+        }
+    };
+    workers.spawn(crate::daemon::workers::supervise(
+        "agent_wake",
+        worker_reporter.clone(),
+        worker_stop.subscribe(),
+        wake_factory,
+    ));
     let digest_router = router.clone();
     let digest_reporter = worker_reporter.clone();
     let digest_factory = move |shutdown: watch::Receiver<bool>| {

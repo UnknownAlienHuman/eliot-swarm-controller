@@ -33,6 +33,7 @@ mod status;
 mod swarm_usage;
 mod switch;
 mod tool_incident;
+mod wake;
 
 pub(crate) use attention::run_attention;
 use auth::{authorize_command, authorize_rpc_method};
@@ -41,6 +42,7 @@ pub(crate) use digests::run_completion_digest;
 use eliot_core::{is_attachment_verb, is_start_verb, is_user_event_verb};
 pub(crate) use goals::{real_goal_check, run_goal_driver};
 pub(crate) use tool_incident::run_tool_failure_attention;
+pub(crate) use wake::run_agent_wakes;
 
 use crate::{
     automation::RuleDefinition,
@@ -653,6 +655,7 @@ impl Router {
             "events.read" => self.events_read(&params, &principal).await,
             "events.subscribe" => self.events_subscribe(&params, &principal).await,
             "child.run" => self.child_run(&params, &principal).await,
+            "agent.wake" => self.agent_wake(&params, &principal).await,
             "swarm.wait" => self.swarm_wait(&params, &principal).await,
             "swarm.digest" => self.swarm_digest(&params, &principal).await,
             "swarm.reparent" => self.swarm_reparent(&params, &principal).await,
