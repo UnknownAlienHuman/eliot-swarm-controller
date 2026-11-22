@@ -568,12 +568,21 @@ async fn initialize_runtime(
         &policy,
     ))
     .await?;
-    let project_rule_namespaces = Box::pin(automation::initialize_project_rules(
-        &router,
-        data_dir.path(),
-        &policy,
-    ))
-    .await?;
+    // A configured namespace adds nested Git and Store futures during
+    // restart. Construct them on a runtime worker's stack.
+    let project_router = router.clone();
+    let project_root = data_dir.path().to_owned();
+    let project_policy = Arc::clone(&policy);
+    let project_rule_namespaces = tokio::spawn(async move {
+        Box::pin(automation::initialize_project_rules(
+            &project_router,
+            &project_root,
+            &project_policy,
+        ))
+        .await
+    })
+    .await
+    .map_err(|_| Error::new("internal", "project rule startup task did not finish"))??;
     logging::record(&policy, "daemon.rules_loaded", &[], None);
     Ok(DaemonRuntime {
         store,

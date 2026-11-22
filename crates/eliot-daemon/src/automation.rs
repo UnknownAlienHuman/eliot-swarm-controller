@@ -301,8 +301,14 @@ pub(crate) async fn initialize_project_rules(
             ));
         };
         let project_id = registration.id.clone();
-        let initialized =
-            initialize_project_namespace(router, data_root, policy, registration, view).await;
+        let initialized = Box::pin(initialize_project_namespace(
+            router,
+            data_root,
+            policy,
+            registration,
+            view,
+        ))
+        .await;
         match initialized {
             Ok(namespace) => namespaces.push(namespace),
             Err(error) => {
