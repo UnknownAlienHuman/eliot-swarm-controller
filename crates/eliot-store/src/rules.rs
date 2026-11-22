@@ -518,7 +518,7 @@ impl Store {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_error)?;
             validate_rule_principal_tx(&tx, principal)?;
-            let stored = load_rule_state(&tx, principal, &state.id)?
+            let mut stored = load_rule_state(&tx, principal, &state.id)?
                 .ok_or_else(|| Error::new("not_found", "rule state was not found"))?;
 
             let retiring = rule_cursor_is_retiring(&stored.view, through);
@@ -593,7 +593,7 @@ impl Store {
                     events.extend(suppress_key_tx(
                         &tx,
                         principal,
-                        &stored.view,
+                        &mut stored.view,
                         revision,
                         through,
                         now,
@@ -2559,7 +2559,7 @@ fn rule_cursor_is_retiring(state: &core::api::RuleStateView, through: i64) -> bo
 fn suppress_key_tx(
     tx: &Transaction<'_>,
     principal: &str,
-    state: &core::api::RuleStateView,
+    state: &mut core::api::RuleStateView,
     revision: i64,
     event_seq: i64,
     now: i64,
@@ -2578,7 +2578,9 @@ fn suppress_key_tx(
     if tx.changes() != 1 {
         return Err(Error::new("bad_state", "suppressed rule state disappeared"));
     }
-    if state.suppressed_count != 0 {
+    let first = state.suppressed_count == 0;
+    state.suppressed_count = state.suppressed_count.saturating_add(1);
+    if !first {
         return Ok(None);
     }
     let trigger = load_rule_trigger(tx, event_seq)?;
@@ -3672,16 +3674,17 @@ fn suppress_rule_event_tx(
             "event suppression has a non-event key",
         ));
     };
+    let mut state = key.state.clone();
     let event = suppress_key_tx(
         &tx,
         key.principal,
-        key.state,
+        &mut state,
         revision,
         event_seq,
         now,
         &Error::new("once_per_duplicate", "rule already admitted this key"),
     )?;
-    let view = update_rule_cursor_tx(&tx, key.principal, key.state, event_seq, now)?;
+    let view = update_rule_cursor_tx(&tx, key.principal, &state, event_seq, now)?;
     commit_transaction(tx, write_faulted)?;
     Ok(RuleEventAdmission {
         state: view,
