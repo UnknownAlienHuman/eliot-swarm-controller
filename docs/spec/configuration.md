@@ -43,16 +43,18 @@ and LocalLow to the same-named folder of the package's `LocalCache`, and the
 - **Not redirected:** every package cache was inspected and none holds the probe.
   Nothing is refused.
 - **Indeterminate:** the probe could not be created, or a cache could not be
-  inspected and none held the probe. Opening an existing root and read-only calls
-  proceed, so one unreadable package cannot disconnect the desktop or CLI. Creating
-  a new data root or stand directory under those folders and writing the
-  selected-root pointer are refused with the probe error. The cost is that those
-  creations stay blocked until the cause is fixed, and that a redirected process
-  whose probe fails can still open what it sees as an existing root.
+  inspected and none held the probe. Opening a root whose owner token exists and
+  read-only calls proceed, so one unreadable package cannot disconnect the desktop
+  or CLI. Creating a new data root, an existing root's missing owner token or a
+  stand directory under those folders and writing the selected-root pointer are
+  refused with the probe error. The cost is that those creations stay blocked
+  until the cause is fixed, and that a redirected process whose probe fails can
+  still open what it sees as an existing root.
 
-If the account's known folders cannot be read, no path can be classified: existing
-roots still open, and any new data root, stand directory or pointer write is
-refused with the lookup error, wherever it is.
+If the account's known folders cannot be read, no path can be classified: a root
+whose owner token exists still opens, and any new data root, owner token, stand
+directory or pointer write is refused with the lookup error, wherever it is. The
+lookup is retried on the next call.
 
 Remedies for a redirected caller never name an AppData location: use `--data-dir`
 or `ELIOT_HOME` with a directory outside AppData. The desktop's fresh-directory

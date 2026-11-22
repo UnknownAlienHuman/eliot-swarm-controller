@@ -2168,14 +2168,15 @@ impl AppDataFolder {
     }
 }
 
-/// The account's AppData folders, most specific first, or the lookup error,
-/// read once per process.
-fn appdata_folders() -> std::result::Result<&'static [AppDataFolder], &'static str> {
-    static FOLDERS: OnceLock<std::result::Result<Vec<AppDataFolder>, String>> = OnceLock::new();
-    match FOLDERS.get_or_init(|| load_appdata_folders().map_err(|error| *error.message)) {
-        Ok(folders) => Ok(folders),
-        Err(error) => Err(error),
+/// The account's AppData folders, most specific first. Only a successful
+/// lookup is kept, so a transient failure clears on the next call.
+fn appdata_folders() -> Result<&'static [AppDataFolder]> {
+    static FOLDERS: OnceLock<Vec<AppDataFolder>> = OnceLock::new();
+    if let Some(folders) = FOLDERS.get() {
+        return Ok(folders);
     }
+    let folders = load_appdata_folders()?;
+    Ok(FOLDERS.get_or_init(|| folders))
 }
 
 /// Windows also redirects a directory created directly under AppData, and
@@ -2247,8 +2248,9 @@ fn check_redirection(path: &Path, creates_shared_state: bool) -> Result<()> {
             return Err(Error::new(
                 "not_allowed",
                 format!(
-                    "{} cannot be created because the account's AppData folders, needed to check Windows redirection, cannot be read: {lookup}",
-                    path.display()
+                    "{} cannot be created because the account's AppData folders, needed to check Windows redirection, cannot be read: {}",
+                    path.display(),
+                    lookup.message
                 ),
             ));
         }

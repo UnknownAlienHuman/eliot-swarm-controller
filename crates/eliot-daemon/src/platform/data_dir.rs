@@ -198,13 +198,18 @@ impl DataDir {
     /// Open or initialize a private data root and its persistent owner token.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = absolute_path(path.as_ref())?;
-        // A root that does not exist yet is new state other processes will read.
-        if fs::symlink_metadata(&path)
-            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-        {
+        refuse_package_redirected(&path)?;
+        // A new root or a missing owner token is new state other processes
+        // will read. A root whose token exists only needs the check above.
+        let is_missing = |target: &Path| {
+            fs::symlink_metadata(target)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        };
+        let token = path.join(OWNER_TOKEN_FILE);
+        if is_missing(&path) {
             refuse_unverified_write(&path)?;
-        } else {
-            refuse_package_redirected(&path)?;
+        } else if is_missing(&token) {
+            refuse_unverified_write(&token)?;
         }
         ensure_private_root(&path).map_err(|error| {
             if error.code == "unsafe_data_dir" {
