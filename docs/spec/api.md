@@ -1390,15 +1390,16 @@ implemented bounded server wait over a frozen child command/turn set. Single-tar
 server-side wait semantics further below are retained for a future API layer, not part
 of the current request shape.
 
-Repository integration takes a base branch and an ordered list of local branches in a
-registered project. The daemon merges the committed inputs in its own workspace and
-runs the project's configured check there. The retained command outcome reports the
-checked merge, conflict paths, or a bounded check failure. If the combined check
-fails, the daemon checks each input against the same base and reports the branches
-that fail individually. The requester can explicitly name a permitted local branch
-to fast-forward after a passing check. Integration leaves the manager's working
-tree and index intact and has no remote effect. The same operation is available to
-[authorized automation rules](automation.md#git-actions).
+Submit the targetless `git.integrate` verb through `command.submit`. Its
+[`GitIntegrateDefinitionArgs`](../../crates/eliot-core/src/api/git_integrate.rs)
+names a registered repository, a base branch, and the ordered local branches to combine.
+The daemon merges the pinned commits in its own workspace and runs the project's
+configured check there. Read the checked merge, conflict paths, or a bounded check failure
+through `command.get`. If the combined check fails, the daemon checks each input against
+the same base and reports branches that fail individually. An explicit request can
+fast-forward a permitted local branch that no worktree has checked out. Integration leaves
+the manager's working tree and index intact and has no remote effect. The same operation
+is available to [authorized automation rules](automation.md#git-actions).
 
 Generation-changing dispatch follows [core](core.md#generation-fence): advance and
 revoke before native I/O, no rollback, no replay after unknown. Terminal settlement
@@ -2834,6 +2835,7 @@ swarm heavy [A] [--generation N] [--window-secs N]
 swarm models [A] [--harness H] [--profile P] [--workspace DIR] [--query Q] [--after CURSOR] [--limit N]
 swarm processes A [--scope agent|workspace] [--generation N] [--after CURSOR] [--limit N]
 swarm stats A [--generation N]
+swarm git integrate --project P --base BRANCH [--fast-forward-to BRANCH] [--timeout DURATION] [--wait --timeout-seconds N] BRANCH...
 swarm git-status A [--generation N]
 swarm patch-digest A [--generation N]
 swarm edits A [--generation N] [--after PATH] [--limit N]
