@@ -79,6 +79,18 @@ struct TriggerDefinition {
 type MatchGroup = BTreeMap<String, CompiledMatch>;
 
 impl RuleDefinition {
+    pub(crate) fn matches_project_review(&self, terminal: &Event) -> bool {
+        if !self.enabled
+            || !self.guards_launch_worktree()
+            || self.trigger.event.as_deref() != Some("project.worktree.check.passed")
+        {
+            return false;
+        }
+        let mut passed = terminal.clone();
+        passed.kind = "project.worktree.check.passed".to_owned();
+        matches!(evaluate(self, &passed), Ok(RuleEvaluation::Command(_)))
+    }
+
     pub(super) fn inserts_launch_result(&self) -> bool {
         matches!(
             self.actions.first(),

@@ -48,6 +48,7 @@ struct PendingEdit {
     seq: i64,
     deadline: Instant,
     workspace: String,
+    review: Option<Event>,
 }
 
 #[derive(Default)]
@@ -55,6 +56,7 @@ struct CheckState {
     checked_seq: i64,
     fingerprint: Option<String>,
     uncertain: bool,
+    passed: Option<ProjectCheckPass>,
 }
 
 struct WorkCompletion {
@@ -62,6 +64,7 @@ struct WorkCompletion {
     event_seq: i64,
     uncertain: bool,
     fingerprint: Option<String>,
+    passed: Option<ProjectCheckPass>,
 }
 
 struct CheckDriver {
@@ -74,6 +77,7 @@ struct CheckDriver {
 struct CheckDisposition {
     uncertain: bool,
     fingerprint: Option<String>,
+    passed: Option<ProjectCheckPass>,
 }
 
 struct ProjectWork {
@@ -82,10 +86,17 @@ struct ProjectWork {
     workspace: String,
 }
 
+#[derive(Clone, PartialEq, Eq)]
 struct ProjectWorkCheck {
     argv: Vec<String>,
     cwd: Option<String>,
     deadline_ms: i64,
+}
+
+#[derive(Clone)]
+struct ProjectCheckPass {
+    check: ProjectWorkCheck,
+    fingerprint: String,
 }
 
 impl Router {
@@ -419,7 +430,7 @@ pub(crate) async fn run_project_checks(
                 }
             }
             received = events.recv() => match received {
-                Ok(event) => schedule_edit(&router, event, &mut driver),
+                Ok(event) => schedule_edit(&router, event, &mut driver).await,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                     log_worker(&router, "daemon.project_check_lagged", None, &skipped.to_string());
                 }
@@ -438,6 +449,7 @@ pub(crate) async fn run_project_checks(
                     state.checked_seq = state.checked_seq.max(completion.event_seq);
                     state.uncertain = completion.uncertain;
                     state.fingerprint = completion.fingerprint;
+                    state.passed = completion.passed;
                     if completion.uncertain {
                         driver.pending.remove(&completion.key);
                     }
@@ -457,7 +469,7 @@ pub(crate) async fn run_project_checks(
     }
 }
 
-fn schedule_edit(router: &Router, event: Event, driver: &mut CheckDriver) {
+async fn schedule_edit(router: &Router, event: Event, driver: &mut CheckDriver) {
     if let (Some(agent), Some(generation), Some(subject)) =
         (&event.agent, event.generation, &event.subject)
         && (subject.state.is_terminal() || event.kind == "session.ready")
@@ -470,7 +482,10 @@ fn schedule_edit(router: &Router, event: Event, driver: &mut CheckDriver) {
         driver.check_states.retain(|key, _| retained(key));
         driver.pending.retain(|key, _| retained(key));
     }
-    if event.source != "git" || !matches!(event.kind.as_str(), "file.changed" | "git.changed") {
+    let review = wants_checked_review(router, &event).await;
+    if !review
+        && (event.source != "git" || !matches!(event.kind.as_str(), "file.changed" | "git.changed"))
+    {
         return;
     }
     let git_only = event.kind == "git.changed";
@@ -488,11 +503,15 @@ fn schedule_edit(router: &Router, event: Event, driver: &mut CheckDriver) {
     {
         return;
     }
-    let Some(workspace) = event
-        .data
-        .get("workspace")
-        .and_then(serde_json::Value::as_str)
-    else {
+    let workspace = if review {
+        event
+            .subject
+            .as_ref()
+            .and_then(|subject| subject.workspace.as_deref())
+    } else {
+        event.data["workspace"].as_str()
+    };
+    let Some(workspace) = workspace.map(str::to_owned) else {
         return;
     };
     if event
@@ -503,7 +522,7 @@ fn schedule_edit(router: &Router, event: Event, driver: &mut CheckDriver) {
     {
         return;
     }
-    let (Some(agent), Some(generation)) = (event.agent, event.generation) else {
+    let (Some(agent), Some(generation)) = (event.agent.clone(), event.generation) else {
         return;
     };
     let key = WorkKey { agent, generation };
@@ -524,19 +543,46 @@ fn schedule_edit(router: &Router, event: Event, driver: &mut CheckDriver) {
         return;
     }
     let deadline = Instant::now() + EDIT_DEBOUNCE;
-    driver
-        .pending
-        .entry(key)
-        .and_modify(|existing| {
-            existing.seq = existing.seq.max(event.seq);
-            existing.deadline = deadline;
-            existing.workspace = workspace.to_owned();
+    let pending = driver.pending.entry(key).or_insert_with(|| PendingEdit {
+        seq: event.seq,
+        deadline,
+        workspace: workspace.clone(),
+        review: None,
+    });
+    pending.seq = pending.seq.max(event.seq);
+    pending.deadline = deadline;
+    pending.workspace = workspace;
+    if review {
+        pending.review = Some(event);
+    }
+}
+
+async fn wants_checked_review(router: &Router, event: &Event) -> bool {
+    if event.kind != "turn.completed"
+        || event.data["outcome"] != "success"
+        || event.data["project_check"] != "required"
+        || !event.data["worktree"].is_object()
+    {
+        return false;
+    }
+    let Some(agent) = event.agent.as_deref() else {
+        return false;
+    };
+    let Ok(Some(agent)) = router.inner.store.lock().await.get_agent(agent) else {
+        return false;
+    };
+    if event.generation != Some(agent.generation) || agent.policy_opt_out_reason.is_some() {
+        return false;
+    }
+    let project = format!("project:{}", agent.project);
+    router
+        .inner
+        .rule_definitions
+        .lock_recover()
+        .iter()
+        .any(|((owner, _), (_, rule))| {
+            (owner == "owner" || owner == &project) && rule.matches_project_review(event)
         })
-        .or_insert(PendingEdit {
-            seq: event.seq,
-            deadline,
-            workspace: workspace.to_owned(),
-        });
 }
 
 fn is_live_generation(store: &eliot_store::Store, key: &WorkKey) -> bool {
@@ -587,6 +633,10 @@ fn start_due_checks(router: &Router, shutdown: &watch::Receiver<bool>, driver: &
             .check_states
             .get(&key)
             .and_then(|state| state.fingerprint.clone());
+        let prior_pass = driver
+            .check_states
+            .get(&key)
+            .and_then(|state| state.passed.clone());
         let task_router = router.clone();
         let task_shutdown = shutdown.clone();
         let task_key = key.clone();
@@ -595,9 +645,9 @@ fn start_due_checks(router: &Router, shutdown: &watch::Receiver<bool>, driver: &
             let disposition = check_after_edit(
                 &task_router,
                 &task_key,
-                edit.seq,
-                &edit.workspace,
+                &edit,
                 prior_fingerprint.as_deref(),
+                prior_pass,
                 task_shutdown,
             )
             .await;
@@ -606,6 +656,7 @@ fn start_due_checks(router: &Router, shutdown: &watch::Receiver<bool>, driver: &
                 event_seq: edit.seq,
                 uncertain: disposition.uncertain,
                 fingerprint: disposition.fingerprint,
+                passed: disposition.passed,
             }
         });
     }
@@ -614,25 +665,29 @@ fn start_due_checks(router: &Router, shutdown: &watch::Receiver<bool>, driver: &
 async fn check_after_edit(
     router: &Router,
     key: &WorkKey,
-    event_seq: i64,
-    expected_workspace: &str,
+    edit: &PendingEdit,
     prior_fingerprint: Option<&str>,
+    prior_pass: Option<ProjectCheckPass>,
     mut shutdown: watch::Receiver<bool>,
 ) -> CheckDisposition {
+    let event_seq = edit.seq;
+    let expected_workspace = &edit.workspace;
     let lock = router.workspace_check_lock(expected_workspace);
     let _permit = tokio::select! {
         biased;
         _ = wait_for_check_shutdown(&mut shutdown) => {
-            return CheckDisposition { uncertain: false, fingerprint: None };
+            return CheckDisposition { uncertain: false, fingerprint: None, passed: None };
         }
         permit = lock.lock_owned() => permit,
     };
-    let work = match load_project_work(router, key, expected_workspace).await {
+    let work = match load_project_work(router, key, expected_workspace, edit.review.is_some()).await
+    {
         Ok(Some(work)) => work,
         Ok(None) => {
             return CheckDisposition {
                 uncertain: false,
                 fingerprint: None,
+                passed: None,
             };
         }
         Err(error) => {
@@ -646,6 +701,7 @@ async fn check_after_edit(
             return CheckDisposition {
                 uncertain: false,
                 fingerprint: None,
+                passed: None,
             };
         }
     };
@@ -662,13 +718,24 @@ async fn check_after_edit(
             return CheckDisposition {
                 uncertain: false,
                 fingerprint: None,
+                passed: None,
             };
         }
     };
-    if prior_fingerprint == Some(before.as_str()) {
+    let review = edit
+        .review
+        .as_ref()
+        .filter(|event| event.data["worktree"]["fingerprint"] == before && work.check.is_some());
+    let prior_pass = prior_pass
+        .filter(|pass| pass.fingerprint == before && work.check.as_ref() == Some(&pass.check));
+    if prior_pass.is_some() || (review.is_none() && prior_fingerprint == Some(before.as_str())) {
+        if let Some(event) = review {
+            record_worktree_check_pass(router, key, event, &work.config.id).await;
+        }
         return CheckDisposition {
             uncertain: false,
             fingerprint: Some(before),
+            passed: prior_pass,
         };
     }
 
@@ -676,6 +743,7 @@ async fn check_after_edit(
     let mut failure = None;
     let mut checked_fingerprint = None;
     let mut fast_check_exit = None;
+    let mut passed = None;
     if !work.config.format.is_empty() {
         match run_argv(
             &work.config.format,
@@ -703,6 +771,7 @@ async fn check_after_edit(
                 return CheckDisposition {
                     uncertain: true,
                     fingerprint: None,
+                    passed: None,
                 };
             }
             Err(error) => {
@@ -716,6 +785,7 @@ async fn check_after_edit(
                 return CheckDisposition {
                     uncertain: false,
                     fingerprint: None,
+                    passed: None,
                 };
             }
         }
@@ -723,6 +793,9 @@ async fn check_after_edit(
     if failure.is_none()
         && let Some(check) = &work.check
     {
+        let before_check = checked_fingerprint
+            .clone()
+            .or_else(|| work.config.format.is_empty().then(|| before.clone()));
         match run_argv(
             &check.argv,
             check.cwd.as_deref().unwrap_or(&work.workspace),
@@ -742,6 +815,14 @@ async fn check_after_edit(
                     failure = Some(format_failure("fast check", exit_code, &output, &policy));
                 } else {
                     fast_check_exit = Some(0);
+                    if let Some(fingerprint) = before_check
+                        && checked_fingerprint.as_ref() == Some(&fingerprint)
+                    {
+                        passed = Some(ProjectCheckPass {
+                            check: check.clone(),
+                            fingerprint,
+                        });
+                    }
                 }
             }
             Ok(CheckOutcome::Unknown(reason)) => {
@@ -749,6 +830,7 @@ async fn check_after_edit(
                 return CheckDisposition {
                     uncertain: true,
                     fingerprint: None,
+                    passed: None,
                 };
             }
             Err(error) => {
@@ -762,6 +844,7 @@ async fn check_after_edit(
                 return CheckDisposition {
                     uncertain: false,
                     fingerprint: checked_fingerprint,
+                    passed: None,
                 };
             }
         }
@@ -776,6 +859,13 @@ async fn check_after_edit(
             &error,
         );
     }
+    if let Some(event) = review
+        && passed
+            .as_ref()
+            .is_some_and(|pass| event.data["worktree"]["fingerprint"] == pass.fingerprint)
+    {
+        record_worktree_check_pass(router, key, event, &work.config.id).await;
+    }
 
     let uncertain = checked_fingerprint.is_none();
     if uncertain {
@@ -789,6 +879,7 @@ async fn check_after_edit(
     CheckDisposition {
         uncertain,
         fingerprint: checked_fingerprint,
+        passed,
     }
 }
 
@@ -796,10 +887,25 @@ async fn work_fingerprint(workspace: &str) -> Result<String> {
     GitProbe::new()?.work_fingerprint(workspace).await
 }
 
+async fn record_worktree_check_pass(router: &Router, key: &WorkKey, event: &Event, project: &str) {
+    let mut store = router.inner.store.lock().await;
+    match store.record_project_worktree_check_pass(event, project, now_ms()) {
+        Ok(change) => router.publish_locked(&change.events),
+        Err(error) => log_error(
+            router,
+            "daemon.project_worktree_check_receipt_failed",
+            key,
+            event.seq,
+            &error,
+        ),
+    }
+}
+
 async fn load_project_work(
     router: &Router,
     key: &WorkKey,
     expected_workspace: &str,
+    review: bool,
 ) -> Result<Option<ProjectWork>> {
     let (agent, registration, opted_out, launch_goal) = {
         let store = router.inner.store.lock().await;
@@ -832,7 +938,7 @@ async fn load_project_work(
         .as_ref()
         .and_then(|policy| policy.check.as_ref());
     let check = project_check
-        .filter(|check| !opted_out && check.at_turn_end != Some(true))
+        .filter(|check| !opted_out && (review || check.at_turn_end != Some(true)))
         .map(|check| match launch_goal {
             Some(goal) => ProjectWorkCheck {
                 argv: goal.check,

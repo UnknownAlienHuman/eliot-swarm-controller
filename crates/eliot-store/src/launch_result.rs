@@ -2,6 +2,81 @@ use super::*;
 use eliot_core::api::ProjectManagerIdentity;
 
 impl Store {
+    pub fn record_project_worktree_check_pass(
+        &mut self,
+        event: &Event,
+        project: &str,
+        now: i64,
+    ) -> Result<Change<()>> {
+        self.ensure_writer_healthy()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        let empty = Change {
+            value: (),
+            events: Vec::new(),
+        };
+        let retained = scripts::load_event_tx(&tx, event.seq)?;
+        let (Some(agent), Some(generation), Some(turn)) = (
+            retained.agent.as_deref(),
+            retained.generation,
+            retained.data["turn_id"].as_str(),
+        ) else {
+            return Ok(empty);
+        };
+        let agent = parse_agent_id(agent)?;
+        let Some(current) = load_agent_by_num(&tx, agent)? else {
+            return Ok(empty);
+        };
+        let worktree = &retained.data["worktree"];
+        if retained != *event
+            || retained.kind != "turn.completed"
+            || retained.data["outcome"] != "success"
+            || retained.data["project_check"] != "required"
+            || current.generation != generation
+            || current.project != project
+            || current.is_terminal()
+            || current.policy_opt_out_reason.is_some()
+            || current.base_oid.as_deref() != worktree["base"].as_str()
+            || retained
+                .subject
+                .as_ref()
+                .and_then(|subject| subject.workspace.as_deref())
+                != current.workspace.as_deref()
+        {
+            return Ok(empty);
+        }
+        let exists: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM events
+              WHERE agent = ?1 AND generation = ?2 AND seq > ?3
+                AND kind = 'project.worktree.check.passed'
+                AND json_extract(data, '$.completion_seq') = ?3)",
+                params![agent, generation, retained.seq],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
+        if exists {
+            return Ok(empty);
+        }
+        let mut passed = DaemonEventInput::new(
+            now,
+            "project.worktree.check.passed",
+            "project_check",
+            Some(agent),
+            Some(generation),
+            json!({"project": project, "turn_id": turn, "worktree": worktree, "completion_seq": retained.seq}),
+        );
+        passed.cause = retained.cause;
+        let passed = insert_daemon_event_input(&tx, passed)?;
+        commit_transaction(tx, &self.write_faulted)?;
+        Ok(Change {
+            value: (),
+            events: vec![passed],
+        })
+    }
+
     pub fn rule_action_trigger(&self, action: &str) -> Result<Option<Event>> {
         self.connection
             .query_row(
