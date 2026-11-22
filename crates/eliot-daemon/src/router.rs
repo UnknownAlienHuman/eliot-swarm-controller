@@ -511,6 +511,7 @@ impl Router {
         let context = SubmissionContext {
             remote: remote.as_ref(),
             owner_process: owner_process.as_ref(),
+            owner_automation: false,
         };
         let result = self
             .handle_authorized(method, params, principal, context)
@@ -3008,7 +3009,7 @@ impl Router {
         principal: &Principal,
         project_authority_preverified: bool,
         submission_scope_preverified: bool,
-        routing: routing::LaunchRouting<'_>,
+        routing: routing::LaunchRouting,
         defer_launch_goal: bool,
     ) -> Result<PreparedSubmission> {
         if request
@@ -3331,7 +3332,7 @@ impl Router {
         request: &mut SubmitCommand,
         resolve_project: bool,
         parent_workspace_shared: bool,
-        routing: routing::LaunchRouting<'_>,
+        routing: routing::LaunchRouting,
     ) -> Result<Option<WorkspacePreparationInput>> {
         if self
             .freeze_launch_profile(principal, request, routing)
@@ -3617,7 +3618,7 @@ impl Router {
         &self,
         principal: &Principal,
         request: &mut SubmitCommand,
-        routing: routing::LaunchRouting<'_>,
+        routing: routing::LaunchRouting,
     ) -> Result<bool> {
         if self.hydrate_retained_launch(request).await? {
             return Ok(true);

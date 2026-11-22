@@ -175,11 +175,11 @@ impl Router {
     pub(crate) async fn prepare_assignment_launch(
         &self,
         request: SubmitCommand,
-        route: Option<&str>,
+        owner_automation: bool,
     ) -> Result<PreparedSubmission> {
         validate_rule_launch_action(&request, None)?;
         let prepared = self
-            .prepare_arbitrated_launch(request, &Principal::Owner, true, route)
+            .prepare_arbitrated_launch(request, &Principal::Owner, owner_automation)
             .await?;
         validate_rule_launch_preparation(&prepared)?;
         Ok(prepared)
@@ -190,7 +190,6 @@ impl Router {
         request: SubmitCommand,
         principal: &Principal,
         owner_automation: bool,
-        route: Option<&str>,
     ) -> Result<PreparedSubmission> {
         if request
             .args
@@ -203,8 +202,6 @@ impl Router {
                 "queued launch workspace is unavailable",
             ));
         }
-        let bound_profile =
-            route.and_then(|route| route.rsplit_once(':').map(|(profile, _)| profile));
         self.prepare_submission_with_routing(
             request,
             principal,
@@ -213,7 +210,6 @@ impl Router {
             routing::LaunchRouting {
                 arbitrated: true,
                 owner_automation,
-                bound_profile,
             },
             false,
         )
@@ -242,13 +238,13 @@ impl Router {
             }
         };
         let mut route = intent.route.clone();
+        let automatic = intent.owner_automation || matches!(principal, Principal::Agent { .. });
         let outcome = async {
             let prepared = self
                 .prepare_arbitrated_launch(
                     intent.request.clone(),
                     &principal,
-                    false,
-                    route.as_deref(),
+                    intent.owner_automation,
                 )
                 .await?;
             let project = if prepared.request.args.get("parent").is_some() {
@@ -266,7 +262,7 @@ impl Router {
                     "queued launch project identity changed",
                 ));
             }
-            route = Some(checked_route(&prepared.request, route.as_deref())?);
+            route = checked_route(&prepared.request, route.as_deref(), automatic)?;
             let mut store = self.inner.store.lock().await;
             self.check_command_admission_mode("launch")?;
             let admission = store.admit_launch_intent(
@@ -293,7 +289,10 @@ impl Router {
             Err(error) if error.code == "unavailable" && !self.rule_firings_open() => {
                 Ok(LaunchArbitrationAttempt::Other)
             }
-            Err(error) if let Some(wait) = TimerWait::from_error(&error, route.clone()) => {
+            Err(error)
+                if let Some(wait) =
+                    TimerWait::from_error(&error, route.clone(), intent.owner_automation) =>
+            {
                 let capacity_scope =
                     (wait.reason.code == "capacity_unavailable").then(|| wait.reason.scope.clone());
                 if intent.view.reason.as_ref() != Some(&wait.reason) || intent.route != route {
@@ -355,7 +354,14 @@ pub(crate) enum LaunchArbitrationAttempt {
     Other,
 }
 
-pub(crate) fn checked_route(request: &SubmitCommand, previous: Option<&str>) -> Result<String> {
+pub(crate) fn checked_route(
+    request: &SubmitCommand,
+    previous: Option<&str>,
+    automatic: bool,
+) -> Result<Option<String>> {
+    if automatic && request.args.get("profile_choice").is_some() {
+        return Ok(None);
+    }
     let mut snapshot = request.args["profile_snapshot"].clone();
     if let Some(snapshot) = snapshot.as_object_mut() {
         snapshot.remove("quota_reserve_percent");
@@ -401,7 +407,7 @@ pub(crate) fn checked_route(request: &SubmitCommand, previous: Option<&str>) -> 
             "queued launch route changed; submit a new intent",
         ));
     }
-    Ok(route)
+    Ok(Some(route))
 }
 
 fn encode(value: impl serde::Serialize) -> Result<Value> {

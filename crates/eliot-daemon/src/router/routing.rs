@@ -6,13 +6,12 @@ use crate::config::{
 use eliot_core::{RouteQuotaStatus, RouteSkip, RouteSkipReason, RoutingDecision};
 
 #[derive(Clone, Copy, Default)]
-pub(super) struct LaunchRouting<'a> {
+pub(super) struct LaunchRouting {
     pub(super) arbitrated: bool,
     pub(super) owner_automation: bool,
-    pub(super) bound_profile: Option<&'a str>,
 }
 
-impl LaunchRouting<'_> {
+impl LaunchRouting {
     fn automatic(self, principal: &Principal) -> bool {
         self.owner_automation
             || matches!(
@@ -40,8 +39,12 @@ impl QuotaPolicy {
         self.reserve > 0 || self.hold_unknown
     }
 
-    fn refusal(self, headroom: Option<&catalog::QuotaHeadroom>) -> Option<RouteSkipReason> {
-        match headroom.and_then(|headroom| headroom.max_used) {
+    fn refusal(self, quota: &CandidateQuota) -> Option<RouteSkipReason> {
+        match quota
+            .headroom
+            .as_ref()
+            .and_then(|headroom| headroom.max_used)
+        {
             Some(used) if self.reserve > 0 && used > f64::from(100 - self.reserve) => {
                 Some(RouteSkipReason::QuotaReserve)
             }
@@ -51,8 +54,9 @@ impl QuotaPolicy {
     }
 }
 
-struct CandidateQuota {
-    status: RouteQuotaStatus,
+pub(super) struct CandidateQuota {
+    pub(super) status: RouteQuotaStatus,
+    pub(super) unmapped: bool,
     exhausted: bool,
     headroom: Option<catalog::QuotaHeadroom>,
 }
@@ -82,7 +86,6 @@ struct RoutePreflight {
     provider_refusal: Option<Error>,
     quota_policies: HashMap<String, QuotaPolicy>,
     quota_deadline: Option<std::time::Instant>,
-    bound_candidate: bool,
 }
 
 impl RoutePreflight {
@@ -98,7 +101,7 @@ impl RoutePreflight {
     }
 
     fn check_candidate_holds(&self) -> bool {
-        !self.arbitrated || self.quota_deadline.is_some() && !self.bound_candidate
+        !self.arbitrated || self.quota_deadline.is_some()
     }
 }
 
@@ -140,7 +143,7 @@ impl Router {
         &self,
         principal: &Principal,
         request: &mut SubmitCommand,
-        mode: LaunchRouting<'_>,
+        mode: LaunchRouting,
     ) -> Result<(String, String, Value)> {
         let role = request
             .args
@@ -169,7 +172,7 @@ impl Router {
         let candidates = routing.candidates(&role).unwrap_or_default().to_vec();
         // An unconfigured child default preserves the established inherited
         // profile path. An explicitly configured role is always intersected.
-        let mut candidates = if candidates.is_empty()
+        let candidates = if candidates.is_empty()
             && role == "default"
             && let Some(parent) = parent.as_ref()
         {
@@ -200,12 +203,6 @@ impl Router {
         };
         if mode.automatic(principal) {
             self.prepare_quota_policies(&mut preflight, &candidates, parent.as_ref());
-            if preflight.quota_deadline.is_some()
-                && let Some(bound) = mode.bound_profile
-            {
-                candidates.retain(|candidate| candidate == bound);
-                preflight.bound_candidate = true;
-            }
         }
         self.choose_route(
             principal,
@@ -251,7 +248,7 @@ impl Router {
     pub(super) async fn check_explicit_launch_quota(
         &self,
         principal: &Principal,
-        mode: LaunchRouting<'_>,
+        mode: LaunchRouting,
         profile: &str,
         harness: &str,
         snapshot: &Value,
@@ -267,7 +264,7 @@ impl Router {
         let quota = self
             .read_candidate_quota(profile, harness, snapshot, deadline)
             .await;
-        let refusal = policy.refusal(quota.headroom.as_ref());
+        let refusal = policy.refusal(&quota);
         if quota.exhausted && refusal != Some(RouteSkipReason::QuotaReserve) {
             return Err(Error::new(
                 "provider_held",
@@ -550,6 +547,7 @@ impl Router {
         let quota = if preflight.arbitrated && preflight.quota_deadline.is_none() {
             CandidateQuota {
                 status: RouteQuotaStatus::Unknown,
+                unmapped: false,
                 exhausted: false,
                 headroom: None,
             }
@@ -564,7 +562,7 @@ impl Router {
         if let Some(reason) = preflight
             .quota_policies
             .get(name)
-            .and_then(|policy| policy.refusal(quota.headroom.as_ref()))
+            .and_then(|policy| policy.refusal(&quota))
         {
             return Ok(Err(reason));
         }
@@ -597,9 +595,6 @@ impl Router {
         snapshot: &Value,
         deadline: std::time::Instant,
     ) -> CandidateQuota {
-        let model = snapshot["model"]
-            .as_str()
-            .or_else(|| snapshot["daemon_model"].as_str());
         let evidence = self
             .quota_for_snapshot(
                 harness.to_owned(),
@@ -609,7 +604,7 @@ impl Router {
             )
             .await
             .ok();
-        route_quota(evidence.as_ref(), model, now_ms())
+        route_quota(evidence.as_ref(), snapshot, now_ms())
     }
 }
 
@@ -657,14 +652,23 @@ fn native_installed(harness: &str, snapshot: &Value) -> bool {
     })
 }
 
-fn route_quota(
+pub(super) fn route_quota(
     quota: Option<&catalog::ScopedQuota>,
-    model: Option<&str>,
+    snapshot: &Value,
     now: i64,
 ) -> CandidateQuota {
-    if let Some(projection) = quota.and_then(|quota| catalog::projected_quota(quota, model, now))
-        && projection.mapping != catalog::QuotaMapping::Unmapped
-    {
+    let model = snapshot["model"]
+        .as_str()
+        .or_else(|| snapshot["daemon_model"].as_str());
+    if let Some(projection) = quota.and_then(|quota| catalog::projected_quota(quota, model, now)) {
+        if projection.mapping == catalog::QuotaMapping::Unmapped {
+            return CandidateQuota {
+                status: RouteQuotaStatus::Unknown,
+                unmapped: true,
+                exhausted: false,
+                headroom: None,
+            };
+        }
         return CandidateQuota {
             status: if projection.exhausted || projection.headroom.max_used.is_some() {
                 RouteQuotaStatus::Supported
@@ -672,6 +676,7 @@ fn route_quota(
                 RouteQuotaStatus::Unknown
             },
             exhausted: projection.exhausted,
+            unmapped: false,
             headroom: Some(projection.headroom),
         };
     }
@@ -682,6 +687,7 @@ fn route_quota(
     };
     CandidateQuota {
         status,
+        unmapped: false,
         exhausted: false,
         headroom: None,
     }

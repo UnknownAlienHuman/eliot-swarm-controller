@@ -612,10 +612,20 @@ pub struct HarnessQuotaResponse {
     /// Effective configured reserve. Missing fields from older peers mean zero.
     #[serde(default)]
     pub effective_reserve_percent: u8,
+    /// How the current route's quota evidence applies to the reserve.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserve_readback: Option<QuotaReserveReadback>,
     /// Retained native turn usage grouped by provider quota window. This is
     /// observed token usage, not a split of the provider-reported percentage.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub observed_usage: Vec<QuotaWindowUsage>,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuotaReserveReadback {
+    pub status: crate::RouteQuotaStatus,
+    pub unmapped: bool,
+    pub hold_unknown: bool,
 }
 
 /// Bounds normalized from one provider-reported account quota window.

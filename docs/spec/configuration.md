@@ -1417,7 +1417,9 @@ automatic launch skips the route with `quota_reserve` when current usage of any
 applicable window is strictly greater than `100 - quota_reserve_percent`.
 `quota_unknown = "admit"` is the default. Set it to `"hold"` to skip with
 `quota_unknown` when no current applicable numerical reading is available,
-including unsupported readers. The current profile settings apply even when
+including when all observed windows are unmapped or the reader is unsupported.
+`swarm quota` shows the route's reserve readback and unknown policy.
+The current profile settings apply even when
 a child inherits its manager's previously frozen native route.
 
 The reserve applies to new Agent children, automated assignments, and rule and
@@ -1428,8 +1430,10 @@ An automatic role with a configured quota policy tries eligible candidates with
 headroom. It prefers the lowest observed weekly usage, using the most-used
 applicable weekly window for a route. Candidates with a weekly reading precede
 those without one, and configured order breaks ties. Roles with both default
-settings throughout keep their existing ordering. Arbitration keeps a previously
-bound waiting route on its recorded profile.
+settings throughout keep their existing ordering. Arbitration retains the
+automation class of waiting work. A waiting automatic role launch evaluates
+its configured candidates again on each attempt. A waiting explicit profile
+launch keeps its original route binding.
 
 `on_provider_failure` defaults to `stop`. With `next`, an Owner's role-routed
 launch in a project freezes the remaining candidate order. The daemon may continue

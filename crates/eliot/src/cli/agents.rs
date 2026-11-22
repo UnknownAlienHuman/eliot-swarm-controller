@@ -178,6 +178,22 @@ pub(crate) async fn run_quota(
         "Quota reserve {}% (recommended {}%)",
         response.effective_reserve_percent, RECOMMENDED_QUOTA_RESERVE_PERCENT
     );
+    if let Some(readback) = &response.reserve_readback {
+        let reading = match readback.status {
+            eliot_core::RouteQuotaStatus::Supported => "known",
+            eliot_core::RouteQuotaStatus::Unknown if readback.unmapped => {
+                "unknown (unmapped windows)"
+            }
+            eliot_core::RouteQuotaStatus::Unknown => "unknown",
+            eliot_core::RouteQuotaStatus::Unsupported => "unknown (unsupported reader)",
+        };
+        let policy = if readback.hold_unknown {
+            "hold"
+        } else {
+            "admit"
+        };
+        println!("Quota reserve reading {reading}, unknown policy {policy}");
+    }
     println!(
         "Provider reading at {} ms (TTL {} ms, credential {})",
         response.fetched_at_ms, response.ttl_ms, response.credential

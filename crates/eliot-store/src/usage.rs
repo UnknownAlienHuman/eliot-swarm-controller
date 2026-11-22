@@ -185,12 +185,17 @@ fn quota_turn_origin(connection: &Connection, command_id: &str) -> Result<QuotaO
         i64,
     ) = connection
         .query_row(
-            "WITH RECURSIVE command_chain(id, parent_command, verb, principal, cause, depth) AS (
-                 SELECT id, parent_command, verb, principal, cause, 0
+            "WITH RECURSIVE command_chain(id, parent_command, verb, principal, cause, automated_switch, depth) AS (
+                 SELECT id, parent_command, verb, principal, cause,
+                        verb='switch' AND (json_extract(args,'$.owner_automation')=1
+                            OR json_extract(args,'$.session_growth_authority') IS NOT NULL), 0
                    FROM commands WHERE id = ?1
                  UNION ALL
                  SELECT parent.id, parent.parent_command, parent.verb,
-                        parent.principal, parent.cause, command_chain.depth + 1
+                        parent.principal, parent.cause,
+                        parent.verb='switch' AND (json_extract(parent.args,'$.owner_automation')=1
+                            OR json_extract(parent.args,'$.session_growth_authority') IS NOT NULL),
+                        command_chain.depth + 1
                    FROM commands parent
                    JOIN command_chain ON parent.id = command_chain.parent_command
                   WHERE command_chain.depth < 64
@@ -198,6 +203,7 @@ fn quota_turn_origin(connection: &Connection, command_id: &str) -> Result<QuotaO
              SELECT MAX(CASE WHEN depth = 0 THEN principal END),
                     COALESCE(MAX(CASE WHEN verb IN ('rule','timer.run','rule.catch_up')
                                       OR json_extract(cause, '$.rule') IS NOT NULL
+                                      OR automated_switch=1
                                       THEN 1 ELSE 0 END), 0),
                     COALESCE(MAX(CASE WHEN principal LIKE 'agent:%'
                                       THEN 1 ELSE 0 END), 0),

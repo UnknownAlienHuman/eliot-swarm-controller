@@ -2291,6 +2291,8 @@ account-wide windows with known bounds, the command reports retained Swarm
 usage for the selected profile route by Owner and automation, with coverage.
 The provider reports account-wide percentages. Per-caller usage uses native
 Swarm turn counters because the provider supplies no per-caller quota debit.
+The reserve readback reports unknown when the observed windows map to no model
+on the route, and exposes the profile's unknown-quota policy.
 
 An automatic launch refused by the reserve or unknown-reading policy returns
 `quota_reserve` or `quota_unknown`. Role-routed refusals include the typed

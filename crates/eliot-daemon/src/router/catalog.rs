@@ -374,11 +374,21 @@ impl Router {
         let evidence = self
             .quota_for_snapshot(harness, snapshot.clone(), label.clone(), deadline)
             .await?;
+        let now = now_ms();
+        let reserve_readback = snapshot.as_ref().map(|snapshot| {
+            let quota = super::routing::route_quota(Some(&evidence), snapshot, now);
+            eliot_core::api::harness::QuotaReserveReadback {
+                status: quota.status,
+                unmapped: quota.unmapped,
+                hold_unknown: crate::config::profile_quota_unknown_policy(snapshot)
+                    == crate::config::QuotaUnknownPolicy::Hold,
+            }
+        });
         let mut response = evidence.response;
+        response.reserve_readback = reserve_readback;
         if let Some(snapshot) = snapshot {
             response.effective_reserve_percent =
                 crate::config::profile_quota_reserve_percent(&snapshot);
-            let now = now_ms();
             if evidence.route_verified && quota_fresh(response.fetched_at_ms, response.ttl_ms, now)
             {
                 let windows = quota_usage_windows(&response, now);
@@ -471,6 +481,7 @@ impl Router {
                 note: None,
                 details: None,
                 effective_reserve_percent: 0,
+                reserve_readback: None,
                 observed_usage: Vec::new(),
             };
             catalog::quota_read_error(&mut response, eliot_plugin::quota::environment(note));
@@ -521,6 +532,7 @@ impl Router {
                     details: Some(json!({"windows": observation.windows, "state": "ready",
                         "origin": "provider", "source": "Muse MSP usage/changed"})),
                     effective_reserve_percent: 0,
+                    reserve_readback: None,
                     observed_usage: Vec::new(),
                 },
             });
@@ -552,6 +564,7 @@ impl Router {
             note: None,
             details: None,
             effective_reserve_percent: 0,
+            reserve_readback: None,
             observed_usage: Vec::new(),
         };
         match raw {
