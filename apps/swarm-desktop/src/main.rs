@@ -7,6 +7,12 @@
 //! WinUI 3 controls come from the `windows-reactor` dependency, used only on
 //! Windows; other platforms build a stub that explains the requirement so the
 //! default workspace build and Ubuntu CI stay green.
+//!
+//! On Windows it is a GUI-subsystem binary: a console-subsystem start makes
+//! Windows open a console window beside the app, which took the foreground
+//! even when the desktop was started minimized. A start from a terminal
+//! still prints to that terminal (`attach_parent_console`).
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 #[cfg(windows)]
 mod accessibility;
@@ -96,9 +102,21 @@ pub(crate) struct DesktopArgs {
     workspace: Option<std::path::PathBuf>,
 }
 
+/// Write `--help`, `--version` and start-up errors to the terminal the
+/// desktop was started from, if any (Microsoft Learn: `AttachConsole`);
+/// without a parent console there is none.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn attach_parent_console() {
+    use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+    // SAFETY: a plain Win32 call; failure leaves the process without a console.
+    unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+}
+
 #[cfg(windows)]
 fn main() {
     use clap::Parser;
+    attach_parent_console();
     let args = DesktopArgs::parse();
     let workspace = args
         .workspace

@@ -60,6 +60,8 @@ windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     # The per-user settings folder (SHGetKnownFolderPath) and CoTaskMemFree.
     "Win32_System_Com",
+    # The terminal a GUI-subsystem start came from (AttachConsole).
+    "Win32_System_Console",
     "Win32_System_DataExchange",
     # The Windows App SDK window id of the desktop's window
     # (Windowing_GetWindowIdFromWindow, as Microsoft.UI.Interop.h loads it)

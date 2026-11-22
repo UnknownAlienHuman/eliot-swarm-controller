@@ -516,6 +516,11 @@ fn part_view(
         PartKind::Notice => crate::m3::secondary(format!("{} · {}", part.label, part.plain))
             .text_wrapping(TextWrapping::Wrap)
             .into(),
+        // Where a new generation starts: one quiet line, read out by name.
+        PartKind::Generation => label(&part.label)
+            .text_wrapping(TextWrapping::Wrap)
+            .automation_name(part.label.clone())
+            .into(),
     }
 }
 

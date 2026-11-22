@@ -220,6 +220,16 @@ type MutationResult<T> = Result<T, eliot_core::Error>;
 /// One rule namespace read: its rules and whether more remain.
 type RulePage = (Vec<RuleListEntry>, bool);
 
+/// Programmatic keyboard focus (a no-op while the control is unbound).
+/// Focusing a control activates a window that is not active, so a desktop
+/// started without activation moves focus only once it is the foreground
+/// window (`window_place::may_take_focus`).
+fn take_focus<T: windows_reactor::FocusControl>(target: &ElementRef<T>) {
+    if crate::window_place::may_take_focus() {
+        let _ = target.request_focus();
+    }
+}
+
 /// Messages are plain owned data so background workers can return them.
 #[derive(Clone, Debug)]
 enum Message {

@@ -1190,7 +1190,7 @@ impl DesktopApp {
             self.reprime_fields(context);
         }
         // Keyboard focus goes back to the composer (no-op while it is unbound).
-        let _ = self.chat.composer_ref.request_focus();
+        take_focus(&self.chat.composer_ref);
         self.chat.epoch += 1;
         self.chat.inputs_checking = false;
         if let Some(task) = self.chat.live_task.take() {

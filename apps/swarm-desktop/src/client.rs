@@ -22,12 +22,12 @@ use eliot_core::api::{
     CommandChildrenResponse, CommandGetRequest, CommandResolution, CommandResolveRequest,
     CommandResolveResponse, CommandSubmitRequest, CommandSubmitResponse, DiagnoseRequest,
     DiagnoseResponse, EventsBoundsRequest, EventsBoundsResponse, EventsFilter, EventsReadRequest,
-    EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse, HandoffRequest,
-    HandoffResponse, HarnessModelsRequest, HarnessModelsResponse, LaunchIntentGetRequest,
-    LaunchIntentView, LaunchQueueListRequest, LaunchQueueRequest, LaunchQueueView,
-    ORGANIZATION_CHANGED_KIND, OrgGroupView, OrgRowChange, OrganizationChangedEvent,
-    ReparentRequest, ReparentResponse, SwitchRequest, SwitchResponse, UsageSummaryRequest,
-    UsageSummaryResponse,
+    EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse, GenerationBoundary,
+    HandoffRequest, HandoffResponse, HarnessModelsRequest, HarnessModelsResponse,
+    LaunchIntentGetRequest, LaunchIntentView, LaunchQueueListRequest, LaunchQueueRequest,
+    LaunchQueueView, ORGANIZATION_CHANGED_KIND, OrgGroupView, OrgRowChange,
+    OrganizationChangedEvent, ReparentRequest, ReparentResponse, SwitchRequest, SwitchResponse,
+    UsageSummaryRequest, UsageSummaryResponse,
 };
 use eliot_core::{Command, Error, Result};
 use futures_util::StreamExt;
@@ -280,6 +280,9 @@ pub struct TranscriptResults {
     pub generation: i64,
     pub turns: Vec<eliot_core::Turn>,
     pub has_older: bool,
+    /// Where each generation in the window came from (`generation_boundaries`
+    /// of every page read).
+    pub boundaries: Vec<GenerationBoundary>,
 }
 
 /// Read a bounded window of the Agent's retained turns across generations.
@@ -293,6 +296,7 @@ pub async fn agent_results(
     let first = agent_result_page(data_dir, &params).await?;
     let mut turns = first.turns;
     let mut next = first.next;
+    let mut boundaries = first.generation_boundaries;
     while turns.len() < limit {
         let Some(before) = next.take() else { break };
         params.before = Some(before);
@@ -302,12 +306,14 @@ pub async fn agent_results(
             return Err(Error::new("unknown", "result window changed while paging"));
         }
         turns.extend(page.turns);
+        boundaries.extend(page.generation_boundaries);
         next = page.next;
     }
     Ok(TranscriptResults {
         generation: first.generation,
         turns,
         has_older: next.is_some(),
+        boundaries,
     })
 }
 

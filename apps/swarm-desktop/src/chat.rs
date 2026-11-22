@@ -11,14 +11,18 @@
 //! parts inside it (`in:<command>`, message native id, `tools:<first item>`,
 //! `final:<turn>`), and a content revision per part. Reactor resets a whole
 //! virtual collection when its key list changes, so activity inside a turn
-//! never changes the item keys; only a new or evicted turn does.
+//! never changes the item keys; only a new or evicted turn does. A
+//! generation that did not start with the Agent's launch gets one quiet
+//! marker item (`gen:<n>`) before its first turn, from the result read's
+//! `generation_boundaries`.
 //!
 //! Coverage records whether older turns can be read, whether the Agent's
 //! creation event is retained, the retention floor, evictions and inputs
 //! whose text could not be read.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
+use eliot_core::api::{GenerationBoundary, GenerationReason};
 use eliot_core::{Event, Turn, TurnOutcome, TurnState};
 
 /// Turns added per "Load older" step.
@@ -566,6 +570,8 @@ pub enum PartKind {
     /// A submitted input whose outcome Swarm cannot prove: the summary and
     /// origin, never Retry (an uncertain effect is not replayed).
     Unconfirmed,
+    /// Where a new generation of the Agent starts, and why.
+    Generation,
 }
 
 /// Why a local input did not start: the `swarm why` summary line and its
@@ -636,6 +642,8 @@ pub struct Conversation {
     local_failures: HashMap<String, InputFailure>,
     applied_seq: i64,
     coverage: Coverage,
+    /// How each generation in the result window started.
+    boundaries: BTreeMap<i64, GenerationReason>,
     /// Turns evicted by the resident bounds; late events never resurrect them.
     evicted: HashSet<TurnKey>,
     /// Eviction order of `evicted`, so the no-resurrection index stays bounded.
@@ -912,6 +920,13 @@ impl Conversation {
         self.enforce_bounds();
     }
 
+    /// Record how the generations of a result read started.
+    pub fn apply_boundaries(&mut self, boundaries: &[GenerationBoundary]) {
+        for boundary in boundaries {
+            self.boundaries.insert(boundary.generation, boundary.reason);
+        }
+    }
+
     pub fn update_turn_coverage(&mut self, generation: i64, has_older: bool) {
         if generation == self.coverage.generation {
             self.coverage.has_older = has_older;
@@ -1107,7 +1122,31 @@ impl Conversation {
     pub fn items(&self) -> Vec<TurnItem> {
         let mut turns: Vec<&TurnEntry> = self.turns.values().collect();
         turns.sort_by(|a, b| a.order().cmp(&b.order()));
-        let mut items: Vec<TurnItem> = turns.iter().map(|turn| self.turn_item(turn)).collect();
+        // The oldest resident generation may have started in a page that is
+        // not loaded or was evicted: its start is not known, so no marker.
+        let partial = (!self.coverage.turns_complete() || self.coverage.evicted_turns > 0)
+            .then(|| turns.first().map(|turn| turn.key.generation))
+            .flatten();
+        let mut markers = self
+            .boundaries
+            .iter()
+            .filter(|(generation, _)| Some(**generation) != partial)
+            .filter_map(|(generation, reason)| {
+                generation_line(*generation, *reason).map(|line| (*generation, line))
+            })
+            .peekable();
+        let mut items = Vec::with_capacity(turns.len() + self.local.len());
+        for turn in turns {
+            // A generation's marker goes before its first turn; one with no
+            // turn yet stays after the earlier generations' messages.
+            while let Some((generation, line)) =
+                markers.next_if(|(generation, _)| *generation <= turn.key.generation)
+            {
+                items.push(generation_item(generation, line));
+            }
+            items.push(self.turn_item(turn));
+        }
+        items.extend(markers.map(|(generation, line)| generation_item(generation, line)));
         for command in &self.local {
             let text = match self.inputs.get(command) {
                 Some(InputText::Loaded(text)) => text.clone(),
@@ -1487,6 +1526,39 @@ impl Conversation {
                     format!("{}\n{}", part.text, part.detail.join("\n"))
                 }
             })
+    }
+}
+
+/// The quiet line where a generation starts. The Agent's launch needs none,
+/// nor does a first generation whose origin was not recorded.
+fn generation_line(generation: i64, reason: GenerationReason) -> Option<&'static str> {
+    Some(match reason {
+        GenerationReason::Launch => return None,
+        GenerationReason::Unknown if generation <= 1 => return None,
+        GenerationReason::Unknown => "Continued in a new session",
+        GenerationReason::RestartResume => "Continued after a daemon restart",
+        GenerationReason::OwnerResume => "Resumed by you",
+        GenerationReason::AgentResume => "Resumed by an Agent",
+        GenerationReason::Switch => "Moved to a new session",
+        GenerationReason::Handoff => "Continued from a handoff",
+        GenerationReason::Attach => "Attached to its native session",
+        GenerationReason::Detach => "Detached from its native session",
+    })
+}
+
+/// A generation marker as its own virtualized item.
+fn generation_item(generation: i64, line: &str) -> TurnItem {
+    let part = Part::new(
+        format!("gen:{generation}/line"),
+        PartKind::Generation,
+        line.to_owned(),
+        line.to_owned(),
+        Vec::new(),
+    );
+    TurnItem {
+        key: format!("gen:{generation}"),
+        revision: part.revision,
+        parts: vec![part],
     }
 }
 

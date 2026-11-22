@@ -697,7 +697,10 @@ of the explicitly selected release scope.
       ring. A steered message reads as "Steer" over its text in the user's
       bubble shape, filled with the selected role at half strength. Copy under a
       message shows only while the message is under the pointer or the action
-      has keyboard focus. A new task's composer is D9. Settings replaces the
+      has keyboard focus. A desktop started minimized or without activation
+      moves keyboard focus to the composer only once its window is the
+      foreground window, and it opens no console window (a GUI-subsystem
+      binary). A new task's composer is D9. Settings replaces the
       sidebar with its own navigation and shows one centred page of at most 720
       DIPs (D9). One tactile Material 3 component system with Codex's
       logic (owner reviews 2026-11-15, 2026-11-16 and 2026-11-19), every
