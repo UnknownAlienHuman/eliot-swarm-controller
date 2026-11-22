@@ -85,6 +85,14 @@ engine, second scheduler or critic loop.
       scope until `--resume`; `agent.patch_digest` (files, packages, new
       dependencies, public interface, checker/lint changes, new suppressions)
       focuses the independent review.
+- [x] **Project formatting and checks (#833, #811).** Swarm applies the project
+      formatter in the managed worktree and delivers a failed fast check in the
+      same OpenCode turn. The routing role installs the bounded project Goal.
+- [x] **File wake (#833).** OpenCode arms a file condition, ends its turn and
+      receives one follow-up when the file appears in its worktree.
+- [x] **Check-bound commit and push (#833).** An opted-in project rule commits
+      the checked tree with the first line of the Agent's final answer. A private
+      bare remote read back the same commit.
 
 ## Repairs to implemented paths
 
