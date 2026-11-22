@@ -145,12 +145,16 @@ pub struct StandBranchOutcome {
 pub struct StandExternalCleanupReport {
     pub worktrees: Vec<StandWorktreeOutcome>,
     pub branches: Vec<StandBranchOutcome>,
+    /// Unusable creation records not already reported on a worktree or branch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unusable_records: Vec<String>,
 }
 
 impl StandExternalCleanupReport {
     pub fn has_retained_or_unknown(&self) -> bool {
         self.worktrees.iter().any(|item| item.outcome != "removed")
             || self.branches.iter().any(|item| item.outcome != "removed")
+            || !self.unusable_records.is_empty()
     }
 
     pub fn has_unknown(&self) -> bool {
@@ -193,6 +197,9 @@ impl StandExternalCleanupReport {
                     .unwrap_or("stand external branch could not be safely removed");
                 return (code, detail);
             }
+        }
+        if let Some(message) = self.unusable_records.first() {
+            return ("not_allowed", message);
         }
         (
             "stand_external_retained",
@@ -873,6 +880,44 @@ fn check_worktree_record(
     }
 }
 
+/// Every creation record that exists but cannot be used, including one no
+/// Store worktree refers to, because teardown would otherwise delete it
+/// unseen. Interrupted-write temporaries (dot-prefixed) are not records.
+fn unusable_worktree_records(registry: &Path, registry_file: &str) -> Result<Vec<String>> {
+    let dir = worktree_records_dir(registry, registry_file);
+    let list_failed = |error: std::io::Error| {
+        Error::new(
+            "platform_io",
+            format!("list stand worktree records at {}: {error}", dir.display()),
+        )
+    };
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(list_failed(error)),
+    };
+    let mut unusable = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(list_failed)?;
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        if name.starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        let detail = match read_record::<StandWorktreeRecord>(&path) {
+            Ok(record) if record.file_name() == name => continue,
+            Ok(_) => "binding check failed: record does not match this file name".to_owned(),
+            // Removed while the sidecar was being listed.
+            Err(RecordFailure::Missing) => continue,
+            Err(RecordFailure::Unusable(detail)) => detail,
+        };
+        unusable.push(*unusable_record("stand worktree record", &path, &detail).message);
+    }
+    unusable.sort();
+    Ok(unusable)
+}
+
 /// Remove the external registration and its worktree records after the
 /// stand root is gone.
 pub fn remove_stand_registration(registry: &Path, registry_file: &str) -> Result<()> {
@@ -1367,6 +1412,12 @@ pub(crate) async fn plan_external_git(
             "prior stand worktree removal requires stand recovery",
         ));
     }
+    if let Some(message) = unusable_worktree_records(registry, registry_file)?
+        .into_iter()
+        .next()
+    {
+        return Err(Error::new("not_allowed", message));
+    }
     let workspaces = load_external_workspaces(stand_root)?;
     if workspaces.is_empty() {
         return Ok(());
@@ -1451,9 +1502,11 @@ pub async fn cleanup_stand_external_git(
         registration.pending_write_guard = None;
         write_stand_registration(registry, registry_file, registration)?;
     }
+    let unusable = unusable_worktree_records(registry, registry_file)?;
     let workspaces = load_external_workspaces(stand_root)?;
     let mut report = StandExternalCleanupReport::default();
     if workspaces.is_empty() {
+        report.unusable_records = unusable;
         return Ok(report);
     }
     let git = WorkspaceGit::new()?;
@@ -1776,6 +1829,19 @@ pub async fn cleanup_stand_external_git(
         }
     }
 
+    report.unusable_records = unusable
+        .into_iter()
+        .filter(|message| {
+            !report
+                .worktrees
+                .iter()
+                .any(|item| item.detail.as_ref() == Some(message))
+                && !report
+                    .branches
+                    .iter()
+                    .any(|item| item.detail.as_ref() == Some(message))
+        })
+        .collect();
     Ok(report)
 }
 

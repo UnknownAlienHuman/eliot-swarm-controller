@@ -279,6 +279,7 @@ struct DownOutcome {
     daemon_pid: u32,
     external_worktrees: Vec<eliot_daemon::operator::StandWorktreeOutcome>,
     external_branches: Vec<eliot_daemon::operator::StandBranchOutcome>,
+    unusable_records: Vec<String>,
 }
 
 pub(crate) async fn down(path: PathBuf, json_output: bool) -> Result<u8, Failure> {
@@ -291,6 +292,7 @@ pub(crate) async fn down(path: PathBuf, json_output: bool) -> Result<u8, Failure
         "daemon_pid": outcome.daemon_pid,
         "external_worktrees": outcome.external_worktrees,
         "external_branches": outcome.external_branches,
+        "unusable_records": outcome.unusable_records,
     });
     if json_output {
         print_value(&payload, true);
@@ -302,12 +304,15 @@ pub(crate) async fn down(path: PathBuf, json_output: bool) -> Result<u8, Failure
         print_external_summary(&outcome.external_worktrees, &outcome.external_branches);
     } else {
         eprintln!(
-            "Retained {} (daemon PID {} stopped) because one or more external Git resources were kept or unknown:",
+            "Retained {} (daemon PID {} stopped) because one or more external Git resources or creation records were kept or unknown:",
             outcome.data_dir, outcome.daemon_pid
         );
         print_external_summary(&outcome.external_worktrees, &outcome.external_branches);
+        for message in &outcome.unusable_records {
+            println!("  {message}");
+        }
         eprintln!(
-            "Clean or merge kept items, then retry: swarm stand down \"{}\"",
+            "Clean, merge or repair kept items, then retry: swarm stand down \"{}\"",
             outcome.data_dir
         );
     }
@@ -344,6 +349,7 @@ async fn down_inner(path: &Path) -> Result<DownOutcome, Failure> {
                 daemon_pid: record.removing_pid.unwrap_or_default(),
                 external_worktrees: Vec::new(),
                 external_branches: Vec::new(),
+                unusable_records: Vec::new(),
             });
         }
         Err(error) => return Err(io_failure("inspect stand root", error)),
@@ -388,6 +394,7 @@ async fn down_inner(path: &Path) -> Result<DownOutcome, Failure> {
             daemon_pid: pid,
             external_worktrees: report.worktrees,
             external_branches: report.branches,
+            unusable_records: report.unusable_records,
         });
     }
     record.removing_pid = Some(pid);
@@ -400,6 +407,7 @@ async fn down_inner(path: &Path) -> Result<DownOutcome, Failure> {
         daemon_pid: pid,
         external_worktrees: report.worktrees,
         external_branches: report.branches,
+        unusable_records: report.unusable_records,
     })
 }
 
@@ -513,6 +521,7 @@ pub(crate) async fn prune(json_output: bool) -> Result<u8, Failure> {
                     "daemon_pid": outcome.daemon_pid,
                     "external_worktrees": outcome.external_worktrees,
                     "external_branches": outcome.external_branches,
+                    "unusable_records": outcome.unusable_records,
                 }));
             }
             Err(error) => {
@@ -557,6 +566,14 @@ pub(crate) async fn prune(json_output: bool) -> Result<u8, Failure> {
                 {
                     println!("  {detail}");
                 }
+            }
+            for message in item["unusable_records"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+            {
+                println!("  {message}");
             }
         }
         print_unusable(&unusable);
