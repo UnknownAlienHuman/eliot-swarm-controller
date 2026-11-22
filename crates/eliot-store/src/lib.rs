@@ -339,6 +339,11 @@ pub enum StoreOpenPhase {
     Migrated,
 }
 
+enum ReceiptWrite<'a> {
+    Ordinary(&'a str),
+    SealedRestart,
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         Self::open_with_observer(path, |_| {})
@@ -749,7 +754,37 @@ impl Store {
         now: i64,
     ) -> Result<WriteAdmission> {
         self.ensure_writer_healthy()?;
-        let outcome = self.record_write_inner(id, principal, method, semantic_payload, result, now);
+        let outcome = self.record_write_inner(
+            id,
+            principal,
+            ReceiptWrite::Ordinary(method),
+            semantic_payload,
+            result,
+            now,
+        );
+        self.fault_on_persistence_error(&outcome);
+        outcome
+    }
+
+    /// Publish the restart receipt only if the same transaction can seal the
+    /// connection before COMMIT. The caller holds the daemon writer boundary.
+    pub fn record_restart_and_seal(
+        &mut self,
+        id: &str,
+        principal: &str,
+        semantic_payload: &Value,
+        result: &Value,
+        now: i64,
+    ) -> Result<WriteAdmission> {
+        self.ensure_writer_healthy()?;
+        let outcome = self.record_write_inner(
+            id,
+            principal,
+            ReceiptWrite::SealedRestart,
+            semantic_payload,
+            result,
+            now,
+        );
         self.fault_on_persistence_error(&outcome);
         outcome
     }
@@ -758,11 +793,15 @@ impl Store {
         &mut self,
         id: &str,
         principal: &str,
-        method: &str,
+        intent: ReceiptWrite<'_>,
         semantic_payload: &Value,
         result: &Value,
         now: i64,
     ) -> Result<WriteAdmission> {
+        let (method, seal) = match intent {
+            ReceiptWrite::Ordinary(method) => (method, false),
+            ReceiptWrite::SealedRestart => ("daemon.shutdown", true),
+        };
         require_nonempty(principal, "principal")?;
         require_nonempty(method, "method")?;
         validate_ulid(id)?;
@@ -799,6 +838,14 @@ impl Store {
                     "write id is already bound to another principal, method, or payload",
                 ));
             }
+            // A receipt alone (including one written by an older release)
+            // cannot authorize sealing or restarting this daemon epoch.
+            if seal {
+                return Err(Error::new(
+                    "id_conflict",
+                    "restart receipt is already recorded",
+                ));
+            }
             let result = decode_json(&old_result)?;
             commit_transaction(tx, &self.write_faulted)?;
             return Ok(WriteAdmission {
@@ -812,7 +859,25 @@ impl Store {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![id, principal, method, digest, result_json, now],
         ));
-        commit_transaction(tx, &self.write_faulted)?;
+        let committed = if seal {
+            tx.pragma_update(None, "query_only", true)
+                .map_err(sql_error)
+                .and_then(|()| commit_transaction(tx, &self.write_faulted))
+        } else {
+            commit_transaction(tx, &self.write_faulted)
+        };
+        if seal
+            && committed.is_err()
+            && !self.write_faulted.get()
+            && let Err(error) = self.connection.pragma_update(None, "query_only", false)
+        {
+            self.write_faulted.set(true);
+            return Err(Error::new(
+                "internal",
+                format!("could not reopen Store writes after restart refusal: {error}"),
+            ));
+        }
+        committed?;
         Ok(WriteAdmission {
             result: result.clone(),
             is_new: true,
@@ -1185,13 +1250,6 @@ impl Store {
             )
             .map_err(sql_error)?;
         Ok(active || self.count_unsettled_commands_excluding_retained()? != 0)
-    }
-
-    /// Freeze the old writer before handing a backup to the replacement.
-    pub fn seal_for_restart(&self) -> Result<()> {
-        self.connection
-            .pragma_update(None, "query_only", true)
-            .map_err(sql_error)
     }
 
     /// Total unsettled commands ignoring the drain list bound and the page

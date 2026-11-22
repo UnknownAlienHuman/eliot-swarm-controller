@@ -11,10 +11,7 @@ use std::time::{Duration, Instant};
 
 impl Store {
     pub fn online_backup_bytes(&self) -> Result<u64> {
-        let page_count: i64 = self
-            .connection
-            .pragma_query_value(None, "page_count", |row| row.get(0))
-            .map_err(sql_error)?;
+        let page_count = page_count(&self.connection).map_err(sql_error)?;
         let page_size: i64 = self
             .connection
             .pragma_query_value(None, "page_size", |row| row.get(0))
@@ -64,10 +61,62 @@ impl Store {
             }
         }
         target.close().map_err(|(_, error)| sql_error(error))?;
+        // The copied database header can carry the source's WAL mode. Reset
+        // it through a fresh writable connection before read-only verification,
+        // so the resulting backup has no SQLite sidecars.
+        let standalone =
+            Connection::open_with_flags(destination, OpenFlags::SQLITE_OPEN_READ_WRITE)
+                .map_err(sql_error)?;
+        let journal: String = standalone
+            .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
+            .map_err(sql_error)?;
+        if journal != "delete" {
+            return Err(Error::new(
+                "backup_integrity",
+                "Store backup could not leave WAL mode",
+            ));
+        }
+        standalone.close().map_err(|(_, error)| sql_error(error))?;
         OpenOptions::new()
             .write(true)
             .open(destination)
             .and_then(|file| file.sync_all())
-            .map_err(|error| Error::new("platform_io", format!("sync Store backup: {error}")))
+            .map_err(|error| Error::new("platform_io", format!("sync Store backup: {error}")))?;
+        verify_backup(
+            destination,
+            page_count(&self.connection).map_err(sql_error)?,
+        )
     }
+}
+
+fn page_count(connection: &Connection) -> rusqlite::Result<i64> {
+    connection.pragma_query_value(None, "page_count", |row| row.get(0))
+}
+
+fn verify_backup(path: &Path, source_pages: i64) -> Result<()> {
+    let failure = |error: rusqlite::Error| {
+        Error::new(
+            "backup_integrity",
+            format!("could not verify the Store backup: {error}"),
+        )
+    };
+    let backup =
+        Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(failure)?;
+    let check: String = backup
+        .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
+        .map_err(failure)?;
+    if check != "ok" {
+        return Err(Error::new(
+            "backup_integrity",
+            "Store backup failed SQLite quick_check",
+        ));
+    }
+    let pages = page_count(&backup).map_err(failure)?;
+    if pages != source_pages {
+        return Err(Error::new(
+            "backup_integrity",
+            format!("Store backup has {pages} pages; source has {source_pages}"),
+        ));
+    }
+    Ok(())
 }

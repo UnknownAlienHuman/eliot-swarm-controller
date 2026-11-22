@@ -2520,7 +2520,9 @@ fence. The writer accepts `restart` under that fence only after admitted
 turns and workers finish. If the wait expires, `cancel_restart` reopens the
 same daemon. The fence also expires if its client disappears. Before
 committing the restart, the writer checks free space, creates an online
-SQLite backup next to `eliot.db`, and seals further writes to the old Store.
+SQLite backup next to `eliot.db`, and verifies SQLite integrity and the
+source page count. The restart receipt commits only after the old Store
+connection has been sealed. Confirmed cancellation discards its backup.
 
 After commit, the old daemon retires its owned idle processes and leaves
 the existing Store recovery facts for the next boot. Startup and rollback
@@ -2531,7 +2533,8 @@ still be settling when that state is read.
 
 The replacement publishes its endpoint before admitting RPC or background
 work. A failure before publication restores the backup under the exclusive
-daemon lock and restarts the previous executable. Once publication is
+daemon lock and restarts the previous executable. Restore retains the
+original SQLite sidecars until database replacement succeeds. Once publication is
 recorded, failure retains the backup and leaves the Store in place because
 replacement writes may exist. Healthy open admission throughout a short
 health check removes the temporary backup. On Windows the restart preserves the running daemon's

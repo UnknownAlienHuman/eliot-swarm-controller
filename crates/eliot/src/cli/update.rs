@@ -76,16 +76,29 @@ pub(crate) async fn run(
         match reconcile_preparation(&data_dir, &old, &cancel).await {
             result @ (Preparation::Open | Preparation::Unconfirmed) => {
                 let recovered = matches!(result, Preparation::Open);
+                let backup_path = backup.retained();
+                let backup_cleanup_error = if recovered && backup_path.is_some() {
+                    discard_update_backup(&startup_path, backup.id).err()
+                } else {
+                    None
+                };
                 print_value(
                     &json!({
                         "state": if recovered { "update_cancelled" } else { "update_cancel_unconfirmed" },
                         "pid": old.pid, "error": error.message,
                         "admission": if recovered { Some("open") } else { None },
                         "agents_before": before,
+                        "backup": backup_path,
+                        "backup_retained": backup.retained().is_some(),
+                        "backup_cleanup_error": backup_cleanup_error.as_ref().map(ToString::to_string),
                     }),
                     json_output,
                 );
-                return Ok(if recovered { error.exit_code } else { 4 });
+                return Ok(if recovered && backup_cleanup_error.is_none() {
+                    error.exit_code
+                } else {
+                    4
+                });
             }
             Preparation::Exited => {
                 return Ok(rollback(
@@ -221,13 +234,11 @@ async fn reconcile_status(path: &Path, old: &DaemonInfo) -> Preparation {
         Ok(true) if check_same_daemon(path, old).is_ok() => {}
         _ => return Preparation::Unconfirmed,
     }
-    match status(path)
-        .await
-        .as_ref()
-        .map(|status| status.admission.as_str())
-    {
-        Ok("open") => Preparation::Open,
-        Ok("restarting") => Preparation::Restarting,
+    match status(path).await {
+        Ok(status) if status.admission == "open" && !status.store_write_faulted => {
+            Preparation::Open
+        }
+        Ok(status) if status.admission == "restarting" => Preparation::Restarting,
         _ => Preparation::Unconfirmed,
     }
 }

@@ -7,6 +7,7 @@ use eliot_core::{Error, Result};
 use eliot_store::Store;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 pub fn update_backup_path(root: &Path, id: &str) -> Result<PathBuf> {
     let ulid: ulid::Ulid = id
@@ -19,6 +20,7 @@ pub fn update_backup_path(root: &Path, id: &str) -> Result<PathBuf> {
 }
 
 pub(crate) fn create(root: &Path, id: &str, store: &Store) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(120);
     let path = update_backup_path(root, id)?;
     let needed = store.online_backup_bytes()?;
     let available = available_space(root)?;
@@ -29,11 +31,22 @@ pub(crate) fn create(root: &Path, id: &str, store: &Store) -> Result<()> {
         ));
     }
     drop(create_new_private_file(&path).map_err(|error| io_error("create Store backup", error))?);
-    if let Err(error) = store
-        .online_backup(&path)
-        .and_then(|()| sync_directory(root))
-    {
-        let _ = fs::remove_file(&path);
+    if let Err(error) = store.online_backup(&path).and_then(|()| {
+        sync_directory(root)?;
+        if Instant::now() >= deadline {
+            return Err(Error::new(
+                "backup_timeout",
+                "Store backup and verification exceeded the restart budget",
+            ));
+        }
+        Ok(())
+    }) {
+        if let Err(cleanup) = discard_update_backup(root, id) {
+            return Err(Error::new(
+                error.code,
+                format!("{}; Store backup cleanup failed: {cleanup}", error.message),
+            ));
+        }
         return Err(error);
     }
     Ok(())
@@ -94,15 +107,80 @@ pub fn restore_update_backup(
     validate_private_file(&backup)?;
     let live = root.join("eliot.db");
     existing_store_file(&live)?;
-    for name in ["eliot.db-wal", "eliot.db-shm", "eliot.db-journal"] {
-        let path = root.join(name);
-        if existing_store_file(&path)? {
-            fs::remove_file(path)
-                .map_err(|error| io_error("remove replacement Store sidecar", error))?;
+    let mut parked = Vec::new();
+    let replacement = (|| {
+        for (name, kind) in [
+            ("eliot.db-wal", "wal"),
+            ("eliot.db-shm", "shm"),
+            ("eliot.db-journal", "journal"),
+        ] {
+            let path = root.join(name);
+            let aside = backup.with_extension(format!("tmp.aside-{kind}"));
+            require_absent(&aside)?;
+            if existing_store_file(&path)? {
+                fs::rename(&path, &aside)
+                    .map_err(|error| io_error("park replacement Store sidecar", error))?;
+                parked.push((path, aside));
+            }
+        }
+        sync_directory(root)?;
+        replace_file(&backup, &live).map_err(|error| {
+            Error::new(error.code, format!("replace live Store: {}", error.message))
+        })
+    })();
+    if let Err(error) = replacement {
+        return Err(restore_sidecars(root, parked, error));
+    }
+    // After replacement, these sidecars belong to the displaced database.
+    // Keep them until the new directory entry is durable.
+    sync_directory(root)?;
+    for (_, aside) in parked {
+        fs::remove_file(&aside).map_err(|error| {
+            io_error(
+                &format!("remove parked Store sidecar {}", aside.display()),
+                error,
+            )
+        })?;
+    }
+    sync_directory(root)
+}
+
+fn require_absent(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(Error::new(
+            "sidecar_exists",
+            format!("Store sidecar path already exists: {}", path.display()),
+        )),
+        Err(error) => Err(io_error("inspect Store sidecar path", error)),
+    }
+}
+
+fn restore_sidecars(root: &Path, parked: Vec<(PathBuf, PathBuf)>, error: Error) -> Error {
+    let mut failures = Vec::new();
+    for (path, aside) in parked.into_iter().rev() {
+        let restored = require_absent(&path).and_then(|()| {
+            fs::rename(&aside, &path).map_err(|error| io_error("restore Store sidecar", error))
+        });
+        if let Err(failure) = restored {
+            failures.push(format!("{} retained: {failure}", aside.display()));
         }
     }
-    replace_file(&backup, &live)?;
-    sync_directory(root)
+    if let Err(failure) = sync_directory(root) {
+        failures.push(failure.to_string());
+    }
+    if failures.is_empty() {
+        error
+    } else {
+        Error::new(
+            error.code,
+            format!(
+                "{}; could not fully restore sidecars: {}",
+                error.message,
+                failures.join("; ")
+            ),
+        )
+    }
 }
 
 fn existing_store_file(path: &Path) -> Result<bool> {
@@ -133,15 +211,23 @@ fn existing_store_file(path: &Path) -> Result<bool> {
 
 pub fn discard_update_backup(root: &Path, id: &str) -> Result<()> {
     let path = update_backup_path(root, id)?;
-    match fs::symlink_metadata(&path) {
-        Ok(_) => {
-            validate_private_file(&path)?;
-            fs::remove_file(path).map_err(|error| io_error("remove Store backup", error))?;
-            sync_directory(root)
+    let mut removed = false;
+    for suffix in ["-wal", "-shm", "-journal", ""] {
+        let mut file = path.as_os_str().to_os_string();
+        file.push(suffix);
+        let file = PathBuf::from(file);
+        if existing_store_file(&file)? {
+            if suffix.is_empty() {
+                validate_private_file(&file)?;
+            }
+            fs::remove_file(file).map_err(|error| io_error("remove Store backup file", error))?;
+            removed = true;
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(io_error("inspect Store backup", error)),
     }
+    if removed {
+        sync_directory(root)?;
+    }
+    Ok(())
 }
 
 fn io_error(context: &str, error: std::io::Error) -> Error {

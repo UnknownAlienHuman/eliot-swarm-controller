@@ -5464,27 +5464,35 @@ impl Router {
         if request.backup {
             crate::update_backup::create(&self.inner.data_root, &request.id, &store)?;
         }
-        let admission = store.record_write(
-            &request.id,
-            &principal_name(principal),
-            "daemon.shutdown",
-            &json!({"mode": action, "restart_id": request.restart_id, "backup": request.backup}),
-            &result,
-            now_ms(),
-        ).and_then(|admission| {
-            if request.backup && admission.is_new {
-                store.seal_for_restart()?;
-            }
-            Ok(admission)
-        });
+        let owner = principal_name(principal);
+        let payload =
+            json!({"mode": action, "restart_id": request.restart_id, "backup": request.backup});
+        let admission = if request.backup {
+            store.record_restart_and_seal(&request.id, &owner, &payload, &result, now_ms())
+        } else {
+            store.record_write(
+                &request.id,
+                &owner,
+                "daemon.shutdown",
+                &payload,
+                &result,
+                now_ms(),
+            )
+        };
         let admission = match admission {
             Ok(admission) => admission,
             Err(error) => {
-                if request.backup {
-                    crate::update_backup::discard_update_backup(
+                if request.backup
+                    && !store.is_write_faulted()
+                    && let Err(cleanup) = crate::update_backup::discard_update_backup(
                         &self.inner.data_root,
                         &request.id,
-                    )?;
+                    )
+                {
+                    return Err(Error::new(
+                        error.code,
+                        format!("{}; Store backup cleanup failed: {cleanup}", error.message),
+                    ));
                 }
                 return Err(error);
             }
