@@ -746,16 +746,13 @@ Store transaction as its Applied settlement; stale evidence (unknown Agent or
 generation drift) is rejected and never mailed. The wire shape stays compatible:
 kind `x.user.agent.attention` with the report at `event.data.data`. A valid
 explicit `on.event` rule can target the incident through that binding without
-weakening stale-generation checks. Child-cohort reports go only to the manager's
-existing queued mail path (which wakes an eligible idle recipient), plus the Owner
-notice even when the manager itself has a parent. Source/no-progress reports mail
-an advisory copy to the affected subject on a non-waking thread (durable in its
-inbox for voluntary reads and acknowledgement, never a wake) and an actionable
-escalation to the nearest controlled ancestor (the parent mail path, which wakes)
-plus the Owner notice; a subject with no parent gets the Owner notice instead.
-A stopped manager receives queued mail but is not automatically resumed. No child
-is addressed, controlled or stopped; no native snapshot or model call is needed
-for this decision. CPU and Git are not progress. At most one incident and one
+weakening stale-generation checks. Child-cohort reports go to the live manager
+responsible for that cohort. Other reports go to the subject's live manager.
+The Owner receives the notice when no such manager can act. The subject's
+diagnostic facts stay in the structured event. Mail and Owner notices carry
+the main fact and an actionable question. A no-code-progress notice uses
+the elapsed time since the recorded code progress basis.
+At most one incident and one
 recovery notice are ever sent per incident, so an unchanged unread set cannot
 generate further wakes. Binding an advisory attention event never starts a Goal
 or reoffers mail; automatic idle/Goal/mail nudges ignore the attention kind.

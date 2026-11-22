@@ -121,7 +121,10 @@ pub use hierarchy::{
     DEFAULT_MAX_TREE_AGENTS, HierarchyLimits, ReparentRequest, ReparentResponse, ReparentedAgent,
     parse_tree_selector, selector_child_id,
 };
-pub use maintenance::{MaintenanceRunRequest, MaintenanceRunResponse};
+pub use maintenance::{
+    MaintenancePurgeLegacyAttentionRequest, MaintenancePurgeLegacyAttentionResponse,
+    MaintenanceRunRequest, MaintenanceRunResponse,
+};
 pub use monitor_views::{
     FilesystemInvalidationState, FilesystemInvalidationView, GitObservation, GitView,
     LivenessBasis, LivenessView, MonitoringSourceState, ObservationData, ObservationView,

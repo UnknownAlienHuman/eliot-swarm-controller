@@ -389,7 +389,13 @@ impl Router {
         if let Ok(change) = result
             && let Some(handoff) = change.value.handoff
         {
-            self.notify_claim_conflicts(&handoff.claim_conflicts).await;
+            self.notify_claim_conflicts(
+                &handoff.to,
+                &handoff.claims,
+                &handoff.claim_conflicts,
+                None,
+            )
+            .await;
         }
     }
 }

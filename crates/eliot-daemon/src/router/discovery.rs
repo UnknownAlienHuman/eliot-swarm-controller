@@ -136,6 +136,15 @@ const METHODS: &[Method] = &[
         "Run the bounded retention pass now and report pruned counts.",
         {}
     ),
+    method!(
+        "maintenance.purge_legacy_attention_advisories",
+        MaintenancePurgeLegacyAttentionRequest,
+        MaintenancePurgeLegacyAttentionResponse,
+        true,
+        true,
+        "Preview the exact count of owner-sent legacy advisory-attention mail, or purge it after an exact-count confirmation.",
+        {}
+    ),
     method!("command.submit", CommandSubmitRequest, CommandSubmitResponse, false, true, "Submit a command with launch/send/wait child verbs.", {"id":EXAMPLE_ID,"verb":"send","target":"a1","args":{"text":"Report current progress."}}),
     method!("command.get", CommandGetRequest, Command, false, false, "Read a retained command in your authorized scope.", {"id":EXAMPLE_ID}),
     method!("command.children", CommandChildrenRequest, CommandChildrenResponse, false, false, "Page the retained children of one command.", {"id":EXAMPLE_ID,"limit":20}),

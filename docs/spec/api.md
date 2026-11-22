@@ -465,6 +465,7 @@ command id frozen at claim. Stored Goal responses/round records use Core
 | `api.methods/help/identity` | bounded authenticated method discovery, DTO schemas/examples, and credential-free caller scope |
 | `daemon.status/shutdown` | owner-only current state/admission and exact drain/force |
 | `maintenance.run` | owner-only immediate bounded retention pass reporting pruned counts |
+| `maintenance.purge_legacy_attention_advisories` | owner-only dry-run count and exact-count purge of owner-sent legacy advisory-attention mail |
 | `agent.list/get/result` | scoped, paginated Agent state and exact results |
 | `agent.processes/stats` | scoped process records and ephemeral OS samples |
 | `agent.git/edits` | current Git snapshot and paginated native-attributed edits |
@@ -506,7 +507,7 @@ command id frozen at claim. Stored Goal responses/round records use Core
 | `agent.history` | owner-only bounded history of an exact observed subject |
 | `mail.send/inbox/read/ack`, `var.set/get` | addressed queued mail with separate acknowledgement, shared variables with CAS |
 | `swarm.reparent` | Owner-only atomic subtree or all-children manager change; generation-bound, no native effect |
-| `who`, `claim.set/list/release` | current-worker file areas plus advisory claims with coalesced conflict notices |
+| `who`, `claim.set/list/release` | current-worker file areas plus advisory claims with deferred conflict details |
 
 Canonical public wire types are re-exported by
 [`eliot_core::api`](../../crates/eliot-core/src/api.rs). These DTOs and their validators
@@ -764,6 +765,18 @@ pruned counts and the retained-event watermark `pruned_through`. A rejected
 settings reload fails the call instead of pruning under stale windows. The
 manual pass adds no new retention semantics; the contract stays in
 [core](core.md#retention).
+
+`maintenance.purge_legacy_attention_advisories` is owner-only. An empty request
+is a read-only dry-run that returns the exact number of owner-sent messages whose
+thread matches `attention-*-advisory`, including both read and unread rows. To
+apply the purge, the owner supplies that number as `expected_message_count`; the
+Store rechecks the count and deletes the matching rows in one immediate
+transaction. A changed count returns a conflict without deleting anything, so
+the owner must run the dry-run again. The CLI command
+`swarm maintenance purge-legacy-attention-advisories` previews by default;
+`--apply --expected-count <COUNT>` explicitly applies the preview. The filter
+preserves regular mail, non-advisory attention escalations, and messages not
+sent by the owner. This operation does not change normal mail retention.
 
 `project.list` and `project.get` are owner-only readbacks of the owner-registered
 canonical checkout, repository common directory, explicit profile/action allowlists and
@@ -1504,12 +1517,11 @@ Codes without specific words display their readable code name without implying a
 failure. Accepted, queued and dispatched commands describe progress; process steps
 retain whether the Agent was lost or failed and explain their recorded reason.
 
-For every failed terminal turn, with or without a structured provider restriction, status
-and exact command/turn binding remain authoritative when final text exceeds the event
-budget. The event omits oversized final text rather than exposing a truncated string as
-complete, and includes
-`final_text_unavailable:"event_budget"` when representable. `Turn.final_text = None`
-means the public final text is unavailable; full native text remains private history.
+The terminal event and `Turn.final_text` carry the final assistant message.
+When the reply exceeds the encoded event budget, the retained suffix starts
+with `[... truncated ...]`. Status, exact command/turn binding and any
+structured provider restriction remain authoritative. `Turn.final_text = None`
+means the public final text is unavailable. Full native text remains private history.
 `Turn.usage = None` likewise means native token usage is unavailable. A present usage
 carries nullable token members with `scope`/`message_id` attribution when the harness
 reports it; null attribution means the native scope is unknown. Message scope is never
@@ -1941,17 +1953,10 @@ pending registrations with a progressing keyset cursor that seeks after the last
 examined `(created_at, id)` and wraps once it passes the sweep high-water
 observed at sweep start, so pending or undeliverable registrations at the front
 never starve later eligible ones even while new registrations keep arriving;
-new arrivals join the next sweep. The digest reuses the
-ordinary mail wake (one generic coalesced notice per minute, at most one open notice
-command), except that when the registrant and recipient are the same Agent at its
-current generation and the digest body fits within `MAX_EVENT_BYTES` (64 KiB),
-the wake `send` carries that body directly (with `N unread: mail.inbox, then mail.ack`
-appended if other unread mail remains) and `turn.started` of that wake marks the
-digest delivery read (ordinary command readback via `command.get`/`command.children`
-redacts the wake `args.text` so only the recipient's own turn sees the excerpt
-text); otherwise (for example Owner-registered digests, other
-generations, or overflow) the generic count notice and `mail.inbox`/`mail.ack`
-apply. The digest emits no `x.user.agent.attention` event; a successful completion stays
+new arrivals join the next sweep. A digest registered by its recipient in the
+current generation is eligible for inline presentation under the ordinary mail
+wake budget. Other digest deliveries remain available through the mailbox.
+The digest emits no `x.user.agent.attention` event; a successful completion stays
 distinct from an attention incident and no model call is needed to poll. The CLI is
 `swarm digest --all|--any --to PARENT ID...` with the same `ID` shape as
 `swarm wait`; it exits 0 when the digest is accepted (pending or delivered).
@@ -2392,16 +2397,19 @@ as JSON before admission. The file path is not part of command metadata;
 only the resulting value is stored.
 
 A routed recipient with `wake_on_mail` (profile snapshot, default true) may
-receive one generic coalesced wake per minute with at most one open notice
-command per recipient across mail and claims. The wake text is one neutral
-line for every harness: `N unread: mail.inbox, then mail.ack`. An unread reply
+receive one coalesced wake per minute with at most one open notice
+command per recipient. An unread reply
 whose `reply_to_delivery` names mail the recipient itself sent, admitted after
 the last presentation, skips the one-minute cooldown once; the open-notice,
 busy, pending-input and unknown gates still apply.
-Ordinary mail notices never contain
-the body; only a self-registered completion digest at the recipient's current
-generation shows its body directly when it fits (`MAX_EVENT_BYTES`) and marks
-read on `turn.started`. Every notice is sent through the ordinary owner `send` path bound to the
+Eligible mail for the current generation is presented with sender, thread,
+delivery ID and body within the encoded wake budget. Peer bodies are fenced
+untrusted data. The exact wake's first committed model output or successful
+terminal marks the inline rows read in the same transaction. A definite
+no-output failure leaves them unread for the next eligible wake.
+Command readback redacts wake text that contains mail. Uninlined deliveries
+remain unread and the wake reports their count. Every notice uses the ordinary
+owner `send` path bound to the
 recipient's current generation, and is skipped — never retried — while a
 notice command is open or unknown, a provider hold, pending request or
 unknown command/turn stands, the daemon is draining, or no live plugin
@@ -2432,19 +2440,13 @@ by construction; expiry filters on read and is purged in a bounded batch
 by the next claim write. A conflict — two globs that may overlap after
 normalization (segments are compatible when equal or either side carries
 a wildcard, with `**` realigning across directories), in the same project
-— is reported in-band in the `claim.set` response and routes at most one
-coalesced generic notice per holder: `1 overlapping work claim: who` /
-`N overlapping work claims: who`, the same text for every harness. Detection is
-conservative: a false positive only adds an
-advisory notice. The in-band list holds at most 100 conflicts;
-`truncated` signals the scan or report cap engaged. The notice shares the
-mail-wake gate (one per minute, at most one open notice command per
-recipient across mail and claims, same unknown/hold/request suppression,
-ordinary owner `send` bound to the holder's current generation); there is
-no `wake_on_mail` flag for claims, and a replayed `claim.set` (no new
-event) never re-notifies. A conflict is never a lock, a reassignment, or
-a second ownership database. `claim.list` pages live claims, optionally
-filtered by project and Agent; an Agent caller reads only its own project.
+— is reported in-band in the `claim.set` response. Each holder can receive
+bounded details naming the Agents and globs through a generation-bound
+`next_input` context item. The item waits for an independently scheduled
+input. A replayed claim creates no new context item. Detection is
+conservative. The in-band list holds up to 100 conflicts and `truncated`
+signals the scan or report cap. Claims are advisory. `claim.list` pages
+live claims by project and Agent. An Agent caller reads only its own project.
 
 `who` composes existing L3 projections per current worker: the roster
 holds every non-terminal Agent in scope (at most 100, oldest first, with

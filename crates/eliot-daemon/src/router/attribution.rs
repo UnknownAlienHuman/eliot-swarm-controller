@@ -2,9 +2,8 @@
 //!
 //! Claims live in the Store; the Router only authenticates the caller,
 //! rejects known credentials in payloads, publishes committed events, and
-//! routes at most one coalesced generic conflict notice per holder through
-//! the ordinary `send` path. A notice carries only the overlap count, never
-//! paths; every suppression gate simply skips it. `who` composes existing
+//! queues bounded conflict details for each holder's next input.
+//! Claims do not start a turn. `who` composes existing
 //! L3 projections per current worker — current-generation edits still
 //! dirty, dirty files of a singly owned worktree, committed paths against
 //! the frozen base the workspace records, live claims, and optional bounded
@@ -18,12 +17,13 @@ use crate::common::now_ms;
 use eliot_core::{
     Agent, Error, GitPathStatus, Result,
     api::{
-        ClaimListRequest, ClaimListResponse, ClaimReleaseRequest, ClaimSetRequest, ClaimView,
-        GitView, MAX_WHO_PATHS, WhoRequest, WhoResponse, WhoSharedWorkspace, WhoWorker,
+        ClaimConflict, ClaimListRequest, ClaimListResponse, ClaimReleaseRequest, ClaimSetRequest,
+        ClaimView, GitView, MAX_WHO_PATHS, WhoRequest, WhoResponse, WhoSharedWorkspace, WhoWorker,
+        claim_globs_overlap_normalized,
     },
 };
-use eliot_store::{NoticePending, WhoWorkerRow};
-use serde_json::Value;
+use eliot_store::WhoWorkerRow;
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 fn truncate_paths(mut paths: Vec<String>) -> Vec<String> {
@@ -71,7 +71,13 @@ impl Router {
         // fresh admission notifies holders; a replay carries no events and
         // must not re-notify.
         if !change.events.is_empty() {
-            self.notify_claim_conflicts(&change.value.conflicts).await;
+            self.notify_claim_conflicts(
+                &change.value.agent,
+                std::slice::from_ref(&change.value.glob),
+                &change.value.conflicts,
+                Some(change.value.expires_at),
+            )
+            .await;
         }
         serde_json::to_value(change.value)
             .map_err(|_| Error::new("internal", "claim could not be encoded"))
@@ -238,15 +244,44 @@ impl Router {
 
     pub(super) async fn notify_claim_conflicts(
         &self,
-        conflicts: &[eliot_core::api::ClaimConflict],
+        claimant: &str,
+        claimed_globs: &[String],
+        conflicts: &[ClaimConflict],
+        expires_at_ms: Option<i64>,
     ) {
-        let mut holders: BTreeMap<&str, i64> = BTreeMap::new();
+        const MAX_DETAILS_BYTES: usize = 8 * 1024;
+        let mut holders: BTreeMap<(&str, i64), String> = BTreeMap::new();
         for conflict in conflicts {
-            *holders.entry(conflict.agent.as_str()).or_insert(0) += 1;
+            for glob in claimed_globs
+                .iter()
+                .filter(|glob| claim_globs_overlap_normalized(glob, &conflict.glob))
+            {
+                let text = holders
+                    .entry((conflict.agent.as_str(), conflict.generation))
+                    .or_insert_with(|| "Advisory work claim overlap at admission:".to_owned());
+                let line = format!(
+                    "\nAgent {claimant} holds {glob:?}, overlapping Agent {}'s {:?}.",
+                    conflict.agent, conflict.glob,
+                );
+                if text.len() + line.len() > MAX_DETAILS_BYTES {
+                    break;
+                }
+                text.push_str(&line);
+            }
         }
-        for (holder, overlapping) in holders {
-            self.offer_notice(holder, NoticePending::Claim { overlapping })
-                .await;
+        for ((holder, generation), text) in holders {
+            let notice = json!({
+                "id": ulid::Ulid::new().to_string(),
+                "verb": "inject",
+                "target": holder,
+                "expected_generation": generation,
+                "args": {
+                    "point": "next_input",
+                    "text": text,
+                    "expires_at_ms": expires_at_ms,
+                },
+            });
+            let _ = self.submit(&notice, &Principal::Owner).await;
         }
     }
 }

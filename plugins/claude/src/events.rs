@@ -14,10 +14,9 @@ use eliot_plugin::{
     native_stdio::StreamState,
     protocol::{HookEvent, HookResponse},
     session::{
-        EVENT_DEADLINE, MessageCommit, StreamSource, approval_reply_args, attach_final_text,
-        attach_final_text_unavailable, is_blank_native_text, native_no_write, next_input_outcomes,
-        rejected_control, request_event_id, request_reply_applied, unknown_control,
-        with_claimed_context,
+        EVENT_DEADLINE, StreamSource, approval_reply_args, attach_final_text, is_blank_native_text,
+        native_no_write, next_input_outcomes, rejected_control, request_event_id,
+        request_reply_applied, unknown_control, with_claimed_context,
     },
 };
 use serde::Serialize;
@@ -80,8 +79,6 @@ pub(crate) struct TurnFacts {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub native_status: Option<String>,
     pub final_text: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub final_text_unavailable: Option<String>,
     pub terminal: bool,
     /// The terminal is published before its own `turn.completed` write
     /// resolves (a send racing the terminal must see the finished turn);
@@ -355,7 +352,6 @@ struct EventProcessor {
     /// must not erase it if the immediate record was blocked).
     pending_fault_gap: Option<String>,
     final_text: Option<String>,
-    final_text_unavailable: bool,
     native_failure: Option<Error>,
     /// Proven MCP surface from the owned stream's `system`/`init` record
     /// (names plus statuses). Retained on observation and attached to the
@@ -909,7 +905,6 @@ impl EventProcessor {
             gap_reported: false,
             pending_fault_gap: None,
             final_text: None,
-            final_text_unavailable: false,
             native_failure: None,
             init_mcp_servers: None,
             init_context_window: None,
@@ -1449,7 +1444,6 @@ impl EventProcessor {
                 self.status.active_turn_id = Some(turn_id.clone());
                 self.native_failure = None;
                 self.final_text = None;
-                self.final_text_unavailable = false;
                 self.publish_now();
                 let session_id = self.status.session_id.as_deref().unwrap_or_default();
                 let native_id = format!("claude:{session_id}:{turn_id}:turn.started");
@@ -1551,19 +1545,24 @@ impl EventProcessor {
                 )
                 .await;
         };
-        if is_main_thread_assistant(record) {
+        let main_thread = is_main_thread_assistant(record);
+        let model = assistant_model(record);
+        let model_output = main_thread
+            && record.get("error").is_none_or(Value::is_null)
+            && model.as_deref() != Some("<synthetic>");
+        let has_tool_uses = main_thread && assistant_tool_use_count(record) > 0;
+        if main_thread {
             self.native_failure = record
                 .get("error")
                 .and_then(Value::as_str)
                 .and_then(claude_api_failure);
+            if has_tool_uses {
+                self.final_text = None;
+            }
             self.bind_tool_uses(record, &turn_id);
             self.observe_tool_uses(record).await?;
         }
-        let observed_model = if record.get("error").is_none_or(Value::is_null) {
-            assistant_model(record).filter(|model| model != "<synthetic>")
-        } else {
-            None
-        };
+        let observed_model = model.filter(|_| model_output);
         let text = assistant_text(record);
         if is_blank_native_text(&text) {
             if let Some(model) = observed_model {
@@ -1593,19 +1592,20 @@ impl EventProcessor {
         if let Some(model) = observed_model {
             data["model"] = Value::String(model);
         }
+        if !model_output {
+            data["model_output"] = Value::Bool(false);
+        }
         self.message_seq = self.message_seq.saturating_add(1);
         let session_id = self.status.session_id.as_deref().unwrap_or_default();
         let native_id = format!("claude:{session_id}:{turn_id}:message:{}", self.message_seq);
-        // The reply text is the native fact, not the write: accumulate it
-        // (bounded) before the commit, so a definitely rejected message
-        // never leaves a later terminal presenting only the remaining text.
-        self.accumulate_final_text(&text);
-        if self.stream_source().commit_message(native_id, data).await? == MessageCommit::Gapped {
-            // Only this message is lost: the turn keeps running and its
-            // terminal text can no longer be the full reply.
-            self.final_text = None;
-            self.final_text_unavailable = true;
+        // Keep every assistant message in the event stream, but expose only
+        // the last visible message after the turn's final tool call.
+        if model_output && !has_tool_uses {
+            self.final_text = Some(text.clone());
         }
+        // A message-event gap does not erase text already observed for the
+        // terminal payload; the shared final-text boundary bounds that field.
+        self.stream_source().commit_message(native_id, data).await?;
         Ok(())
     }
 
@@ -1759,34 +1759,6 @@ impl EventProcessor {
         self.record_coverage_gap(reason, &["tool"]).await?;
         self.tool_coverage_gap_reported = true;
         Ok(())
-    }
-
-    fn accumulate_final_text(&mut self, text: &str) {
-        if self.final_text_unavailable {
-            return;
-        }
-        let bytes = self
-            .final_text
-            .as_ref()
-            .map_or(0, String::len)
-            .saturating_add(text.len());
-        if bytes > MAX_EVENT_BYTES {
-            self.final_text = None;
-            self.final_text_unavailable = true;
-            return;
-        }
-        let accumulated = self.final_text.get_or_insert_default();
-        accumulated.push_str(text);
-        let mut data = json!({
-            "command_id": self.status.active_command_id.as_deref().unwrap_or_default(),
-            "turn_id": self.status.active_turn_id.as_deref().unwrap_or_default(),
-        });
-        let secrets = SecretPolicy::new(self.secrets.iter().cloned());
-        attach_final_text(&mut data, accumulated, true, &secrets);
-        if data.get("final_text").is_none() {
-            self.final_text = None;
-            self.final_text_unavailable = true;
-        }
     }
 
     /// Keep a bounded, generation-local association from Claude invocation
@@ -3138,15 +3110,10 @@ impl EventProcessor {
             }
         }
         let final_text = self.final_text.take();
-        if self.final_text_unavailable {
-            attach_final_text_unavailable(&mut data, &secrets);
-        } else if let Some(text) = final_text {
-            // Use omit-on-overflow accounting for every native terminal. The
-            // helper's flag does not change the observed terminal status.
-            attach_final_text(&mut data, &secrets.redact_text(&text), true, &secrets);
-            if data.get("final_text").is_none() {
-                self.final_text_unavailable = true;
-            }
+        if let Some(text) = final_text {
+            // Attach the one final native message; the shared boundary
+            // accounts for its event payload size.
+            attach_final_text(&mut data, &secrets.redact_text(&text));
         }
         let session_id = self.status.session_id.as_deref().unwrap_or_default();
         let native_id = format!("claude:{session_id}:{turn_id}:turn.completed");
@@ -3164,10 +3131,6 @@ impl EventProcessor {
             native_status: Some(terminal_reason),
             final_text: data
                 .get("final_text")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            final_text_unavailable: data
-                .get("final_text_unavailable")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
             terminal: true,
@@ -3338,23 +3301,12 @@ impl EventProcessor {
             self.status.active_command_id.clone(),
             self.status.active_turn_id.clone(),
         ) {
-            let mut text_status = json!({});
-            if self.final_text_unavailable {
-                attach_final_text_unavailable(
-                    &mut text_status,
-                    &SecretPolicy::new(self.secrets.iter().cloned()),
-                );
-            }
             self.status.last_turn = Some(TurnFacts {
                 command_id,
                 turn_id,
                 status: None,
                 native_status: None,
                 final_text: None,
-                final_text_unavailable: text_status
-                    .get("final_text_unavailable")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
                 terminal: false,
                 write_pending: false,
             });

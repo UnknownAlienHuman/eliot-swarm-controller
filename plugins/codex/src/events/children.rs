@@ -1132,10 +1132,10 @@ impl EventProcessor {
             "status": status_text,
         });
         let policy = SecretPolicy::new(self.secrets.iter().cloned());
-        if let Some(text) = state.final_text.take() {
-            attach_final_text(&mut data, &text, &notification.turn.status, &policy);
-        }
         attach_native_error(&mut data, notification.turn.error.as_ref(), &policy);
+        if let Some(text) = state.final_text.take() {
+            attach_final_text(&mut data, &text);
+        }
         let native_id = event_id(
             child_thread,
             &notification.turn.id,

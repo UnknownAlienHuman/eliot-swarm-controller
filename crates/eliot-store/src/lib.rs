@@ -24,7 +24,7 @@ pub use capacity::{OwnedExitProof, RecordedProcess, RestartResumeCandidate, Reta
 pub use command_children::{CommandChildrenPage, history_expired};
 pub use config_overlay::AgentConfig;
 pub use context::ContextDispatch;
-pub use coordination::{MailSendOutcome, MailSendResult, NoticeClaim, NoticeKind, NoticePending};
+pub use coordination::{MailSendOutcome, MailSendResult, NoticeClaim};
 pub use digests::{DigestRegisterOutcome, DigestRow, DigestTurn};
 pub use fleet::{AgentListFilter, AgentListPage};
 pub use git::CodeProgressState;

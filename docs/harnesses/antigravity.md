@@ -139,14 +139,13 @@ is held until that actual in-band terminal reply, an error, a stream
 fault, stop, or drop — stream silence is not staleness and no
 model-turn timer expires admitted work. `end_turn`/`max_tokens`/`max_turn_requests` complete the
 turn, `cancelled` settles an interrupt, `refusal` fails it, and any other
-stop reason is a native protocol gap. Assistant text is accumulated from
-`agent_message_chunk` updates carrying text blocks only (other content
-blocks contribute no text), bounded at 256 KiB, then
-`final_text_unavailable:"event_budget"`. A reply within that budget but over the
-persisted-event bound records one `message` coverage gap instead of
-`message.completed` and the same marker; the turn still completes with its
-`stopReason`. Thought and user chunks are
-bookkeeping. A normal completion with no assistant text at all keeps its
+stop reason is a native protocol gap. Text chunks within an assistant message
+are joined in ACP order. A tool invocation closes the preceding message and
+clears the final reply candidate. Bounded earlier messages are retained as
+`message.completed` events. An oversized message opens a `message` coverage
+gap. An oversized final reply still retains a marked suffix in the terminal
+event with its native `stopReason`. Thought and user chunks are bookkeeping.
+A normal completion with no assistant final reply keeps its
 native `stopReason` but carries
 `final_text_unavailable:"empty_native_response"` (see Facts and recovery),
 so silence is never presented as a normal answer. Send uses one 25 s

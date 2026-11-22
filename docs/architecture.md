@@ -108,8 +108,8 @@ remains for local control.
 Stalled or unhealthy agents are detected and diagnosed from read-only native, process,
 turn and event facts. Native process statistics alone do not prove model progress, and
 silence is not completion. An unhealthy or no-progress result triggers read-only
-diagnosis and actual delivery through the existing router/bus mail/notify path to the
-supervisor/agent. It never authorizes automatic resend of a job or a false Done result.
+diagnosis and delivery through the existing router/bus mail/notify path to the
+responsible manager or Owner. It never authorizes automatic resend of a job or a false Done result.
 
 ## State and effects
 

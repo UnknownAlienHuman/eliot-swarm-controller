@@ -196,7 +196,9 @@ adapter commits no `session.usage` fact; `session_usage` stays null.
 Controlled exact-session SSE owns supplied lifecycle. Message/session reads repair
 current state, not a second live event stream. On disconnect: mark stale, reconnect,
 discard stale resync work, read permissions/forms/inbox/current execution, recover current
-output by exact message/part ids (terminal text reverses the native newest-first page order with each message's content array order preserved; timestamps never reorder it), record the uncovered gap, then follow live events.
+output by exact message/part ids, record the uncovered gap, then follow live events.
+Terminal text comes from the final assistant message in the bound execution.
+Native page position selects the message and its content array orders the parts.
 
 A local reconnect counter may order concurrent snapshots; it is not another persisted
 Agent epoch. No guaranteed exclusive native history cursor means no historical replay.

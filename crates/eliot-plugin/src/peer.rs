@@ -6,6 +6,7 @@ use crate::protocol::{
 use crate::sync::LockExt;
 use eliot_core::{
     BatchAck, Error, MAX_STDERR_DIAGNOSTIC_BYTES, Result, SourceBatch, bound_stderr_diagnostics,
+    limits::bound_terminal_text,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
@@ -336,14 +337,17 @@ impl CommitSink {
     }
 
     /// Commit one complete event batch and validate its acknowledgement.
-    pub async fn commit(&mut self, batch: SourceBatch, deadline: Instant) -> Result<BatchAck> {
+    pub async fn commit(&mut self, mut batch: SourceBatch, deadline: Instant) -> Result<BatchAck> {
         if self.credential.len() > crate::protocol::MAX_CREDENTIAL_BYTES {
             return Err(Error::new(
                 "invalid",
                 "event credential exceeds its size limit",
             ));
         }
-        for event in &batch.events {
+        for event in &mut batch.events {
+            if event.kind == "turn.completed" && event.data["final_text"].is_string() {
+                bound_terminal_text(&mut event.data, MAX_EVENT_BYTES);
+            }
             let encoded_data = serde_json::to_vec(&event.data)
                 .map_err(|_| Error::new("internal", "event data could not be encoded"))?;
             if encoded_data.len() > MAX_EVENT_BYTES {
