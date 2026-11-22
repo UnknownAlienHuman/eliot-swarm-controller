@@ -288,6 +288,14 @@ pub struct LocatedRegistration {
     pub former: bool,
 }
 
+/// A stand's registry after any former-location record was handled.
+#[derive(Clone, Debug)]
+pub struct SettledRegistration {
+    pub registry: PathBuf,
+    /// What happened at the former location and its path, when reportable.
+    pub former: Option<(String, String)>,
+}
+
 pub fn parse_stand_ttl_ms(value: &str) -> Result<i64> {
     let ms = crate::automation::parse_positive_duration_ms(value).map_err(|_| {
         Error::new(
@@ -496,6 +504,10 @@ pub fn list_stand_registrations(registry: &Path) -> Result<StandRegistryScan> {
         })?;
         let file_name = item.file_name();
         let Some(name) = file_name.to_str() else {
+            scan.unusable.push(UnusableStandRegistration {
+                registry_path: item.path().display().to_string(),
+                detail: "file name is not valid UTF-8".to_owned(),
+            });
             continue;
         };
         if !name.ends_with(".json") || name.starts_with('.') {
@@ -526,6 +538,9 @@ pub fn list_stand_registrations(registry: &Path) -> Result<StandRegistryScan> {
     Ok(scan)
 }
 
+/// How output names the former registry when its path cannot be resolved.
+const FORMER_REGISTRY_LABEL: &str = r"%LOCALAPPDATA%\EliotStands\.registry";
+
 /// The AppData registry used before the stand home moved out of MSIX
 /// redirection. `Ok(None)` on platforms that never had it.
 fn former_registry() -> Result<Option<PathBuf>> {
@@ -548,7 +563,7 @@ pub fn add_former_registrations(scan: &mut StandRegistryScan) {
         Ok(None) => return,
         Err(error) => {
             scan.unusable.push(UnusableStandRegistration {
-                registry_path: r"%LOCALAPPDATA%\EliotStands\.registry".to_owned(),
+                registry_path: FORMER_REGISTRY_LABEL.to_owned(),
                 detail: format!("former stand registry cannot be located: {}", error.message),
             });
             return;
@@ -578,6 +593,10 @@ pub fn add_former_registrations(scan: &mut StandRegistryScan) {
         };
         let file_name = entry.file_name();
         let Some(name) = file_name.to_str() else {
+            scan.unusable.push(UnusableStandRegistration {
+                registry_path: entry.path().display().to_string(),
+                detail: "former registry location: file name is not valid UTF-8".to_owned(),
+            });
             continue;
         };
         if !name.ends_with(".json") || name.starts_with('.') {
@@ -673,24 +692,38 @@ pub fn locate_stand_registration(root: &Path) -> Result<LocatedRegistration> {
 /// Move a former-location registration and its worktree records into the
 /// current registry. Call it only after the stand's daemon exit is proven and
 /// under its offline lock, so the old daemon cannot add a record. Safe to
-/// repeat after a crash. Returns the current registry and the former file
-/// when this call retired one.
+/// repeat after a crash. A problem at the former location never blocks a
+/// stand already in the current registry; it is returned for the output.
 pub fn settle_former_registration(
     root: &Path,
     located: &LocatedRegistration,
     record: &StandRegistration,
-) -> Result<(PathBuf, Option<PathBuf>)> {
+) -> Result<SettledRegistration> {
     let name = registry_name(root);
+    let keep = |former: Option<(String, String)>| {
+        Ok(SettledRegistration {
+            registry: located.registry.clone(),
+            former,
+        })
+    };
     let former = match former_registry() {
         Ok(Some(former)) => former,
-        Ok(None) => return Ok((located.registry.clone(), None)),
+        Ok(None) => return keep(None),
         Err(error) if located.former => return Err(error),
-        Err(_) => return Ok((located.registry.clone(), None)),
+        Err(error) => {
+            return keep(Some((
+                format!("could not be checked: {}", error.message),
+                FORMER_REGISTRY_LABEL.to_owned(),
+            )));
+        }
     };
     let former_file = former.join(&name);
-    let same_stand = read_record::<StandRegistration>(&former_file).is_ok_and(|found| {
-        found.marker.token == record.marker.token && registry_name(&found.marker.root) == name
-    });
+    let found = read_record::<StandRegistration>(&former_file);
+    let same_stand = matches!(
+        &found,
+        Ok(found) if found.marker.token == record.marker.token
+            && registry_name(&found.marker.root) == name
+    );
     if !same_stand {
         if located.former {
             return Err(Error::new(
@@ -701,7 +734,14 @@ pub fn settle_former_registration(
                 ),
             ));
         }
-        return Ok((located.registry.clone(), None));
+        let note = match found {
+            Err(RecordFailure::Missing) => None,
+            Err(RecordFailure::Unusable(detail)) => {
+                Some(format!("unusable, left in place: {detail}"))
+            }
+            Ok(_) => Some("belongs to a different creation, left in place".to_owned()),
+        };
+        return keep(note.map(|action| (action, former_file.display().to_string())));
     }
     let former_records = read_former_worktree_records(&worktree_records_dir(&former, &name))?;
     let registry = stand_registry(true)?;
@@ -742,7 +782,13 @@ pub fn settle_former_registration(
         write_stand_registration(&registry, &name, record)?;
     }
     remove_stand_registration(&former, &name)?;
-    Ok((registry, Some(former_file)))
+    Ok(SettledRegistration {
+        registry,
+        former: Some((
+            "migrated to the current registry".to_owned(),
+            former_file.display().to_string(),
+        )),
+    })
 }
 
 /// Every former worktree record, or a refusal naming the first unusable one,

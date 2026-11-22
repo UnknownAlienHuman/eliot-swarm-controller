@@ -282,17 +282,17 @@ struct DownOutcome {
     external_branches: Vec<eliot_daemon::operator::StandBranchOutcome>,
     unusable_records: Vec<String>,
     /// What happened to a former-location registration, and its path.
-    former_registration: Option<(&'static str, String)>,
+    former_registration: Option<(String, String)>,
 }
 
-fn former_value(former: Option<&(&'static str, String)>) -> Value {
+fn former_value(former: Option<&(String, String)>) -> Value {
     former.map_or(
         Value::Null,
         |(action, path)| json!({ "action": action, "path": path }),
     )
 }
 
-fn print_former(former: Option<&(&'static str, String)>) {
+fn print_former(former: Option<&(String, String)>) {
     if let Some((action, path)) = former {
         println!("  former-location registration {path}: {action}");
     }
@@ -370,7 +370,7 @@ async fn down_inner(path: &Path) -> Result<DownOutcome, Failure> {
                 unusable_records: Vec::new(),
                 former_registration: located.former.then(|| {
                     (
-                        "removed",
+                        "removed".to_owned(),
                         located.registry.join(&reg_name).display().to_string(),
                     )
                 }),
@@ -405,14 +405,10 @@ async fn down_inner(path: &Path) -> Result<DownOutcome, Failure> {
     }
     // The old daemon has exited and the offline lock is held: it can no
     // longer add a record, so a former-location registration moves now.
-    let (registry, moved_from) =
+    let settled =
         settle_former_registration(&root, &located, &record).map_err(Failure::for_read)?;
-    let former_registration = moved_from.map(|path| {
-        (
-            "migrated to the current registry",
-            path.display().to_string(),
-        )
-    });
+    let registry = settled.registry;
+    let former_registration = settled.former;
     let report: StandExternalCleanupReport = Box::pin(cleanup_stand_external_git(
         &root,
         &root,
