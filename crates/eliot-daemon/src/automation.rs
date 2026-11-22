@@ -4,8 +4,8 @@ mod projects;
 mod reload;
 pub(crate) mod rule_edit;
 mod schedule;
-pub(crate) use definition::RuleDefinition;
 use definition::RuleEvaluation;
+pub(crate) use definition::{CompletionFields, CompletionRuleInterest, RuleDefinition};
 pub(crate) use schedule::parse_positive_duration_ms;
 
 use crate::{common::now_ms, logging, router::Router};
@@ -597,6 +597,7 @@ async fn refresh_project_namespaces(
         let current = current_ids.contains(&namespace.registration.id);
         if !current {
             router.install_rule_source_files(&namespace.principal, &HashMap::new());
+            router.install_rule_definitions(&namespace.principal, &[], Vec::new());
         }
         current
     });
@@ -850,7 +851,14 @@ async fn apply_global_rule_snapshot(
         .iter()
         .map(|rule| (rule.state.revision, rule.definition.clone()))
         .collect::<Vec<_>>();
-    router.install_rule_definitions(principal, &cached);
+    let completion_interests = active
+        .iter()
+        .filter(|rule| {
+            rule.source_present && rule.state.enabled && rule.state.paused_reason.is_none()
+        })
+        .filter_map(|rule| rule.definition.completion_interest())
+        .collect();
+    router.install_rule_definitions(principal, &cached, completion_interests);
     Ok(active)
 }
 

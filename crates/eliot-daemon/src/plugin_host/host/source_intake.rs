@@ -406,31 +406,36 @@ async fn completion_capture(
     let Some(host) = state.upgrade() else {
         return (None, None);
     };
+    if host.completion_interests.lock_recover().is_empty() {
+        return (None, None);
+    }
     // Both lookups and Git capture leave the native lifecycle commit its own budget.
     let capture_until = until - RPC_GRACE;
-    let (agent, registered) = {
+    let (agent, registered, fields) = {
         let Ok(store) = timeout_at(capture_until, store.lock()).await else {
             return (None, None);
         };
-        let agent = store
+        let Some(agent) = store
             .get_agent(&batch.agent_id)
             .ok()
             .flatten()
-            .filter(|agent| agent.generation == batch.generation);
-        let registered = agent.as_ref().and_then(|agent| {
-            if agent.project.is_empty() {
-                Some(false)
-            } else {
-                store
-                    .get_project_registration("owner", &agent.project)
-                    .ok()
-                    .map(|registration| registration.is_some())
-            }
-        });
-        (agent, registered)
-    };
-    let Some(agent) = agent else {
-        return (None, None);
+            .filter(|agent| agent.generation == batch.generation)
+        else {
+            return (None, None);
+        };
+        let fields = completion_fields_for(&host, &agent);
+        if !fields.needed() {
+            return (None, None);
+        }
+        let registered = if agent.project.is_empty() {
+            Some(false)
+        } else {
+            store
+                .get_project_registration("owner", &agent.project)
+                .ok()
+                .map(|registration| registration.is_some())
+        };
+        (agent, registered, fields)
     };
     let Some(turn_id) = agent.active_turn.as_deref() else {
         return (None, None);
@@ -464,13 +469,21 @@ async fn completion_capture(
             None => None,
         }
     };
-    let capture = match project_check {
-        Some(true) => match (
+    let capture = match (fields.worktree, project_check) {
+        (true, Some(true)) => match (
             GitProbe::new(),
             agent.workspace.as_deref(),
             agent.base_oid.as_deref(),
         ) {
             (Ok(probe), Some(workspace), Some(base_oid)) => {
+                if crate::logging::is_debug() {
+                    crate::logging::record_debug(
+                        &SecretPolicy::new(host.secrets.lock_recover().iter()),
+                        "project.worktree.capture",
+                        &[("agent", &agent.id), ("turn_id", turn_id)],
+                        &[],
+                    );
+                }
                 match timeout_at(
                     capture_until,
                     probe.capture_worktree(workspace, base_oid, now_ms()),
@@ -483,8 +496,8 @@ async fn completion_capture(
             }
             _ => None,
         },
-        Some(false) => host.monitoring.completion_worktree_capture(&agent),
-        None => None,
+        (true, Some(false)) => host.monitoring.completion_worktree_capture(&agent),
+        _ => None,
     };
     let capture = capture.map(|capture| eliot_store::CompletionWorktreeCapture {
         base: capture.base,
@@ -493,6 +506,27 @@ async fn completion_capture(
         lines: capture.lines,
     });
     (capture, project_check)
+}
+
+fn completion_fields_for(
+    host: &HostState,
+    agent: &eliot_core::Agent,
+) -> crate::automation::CompletionFields {
+    let interests = host.completion_interests.lock_recover();
+    let project = format!("project:{}", agent.project);
+    let mut fields = crate::automation::CompletionFields::default();
+    let Some(subject) = serde_json::to_value(eliot_core::EventSubject::from(agent)).ok() else {
+        return fields;
+    };
+    for principal in ["owner", project.as_str()] {
+        if let Some(rules) = interests.get(principal) {
+            for rule in rules.iter().filter(|rule| rule.matches_agent(&subject)) {
+                fields.worktree |= rule.fields.worktree;
+                fields.project_check |= rule.fields.project_check;
+            }
+        }
+    }
+    fields
 }
 async fn put_events(
     store: &StoreHandle,

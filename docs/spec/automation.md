@@ -275,9 +275,10 @@ rule cannot pin expired storage indefinitely. Rate-limit windows longer than
 command retention count only retained history.
 
 An event rule's optional `once_per` renders a key from captured event fields. The
-Store records the digest of the rendered value with an admitted action. Keys expire
-after 30 days. Store holds up to 10,000 keys per rule and 100,000 across rules, and
-skips new keys when capacity is full. A suppression does not consume a new key.
+Store hashes the canonical JSON array of rendered template parts and records the
+digest with an admitted action. Keys expire after 30 days. Each rule in each
+principal retains up to 10,000 keys. A new admission at capacity evicts the oldest
+keys in that rule's bucket. A suppression does not consume or evict a key.
 For example:
 
 ```toml
@@ -906,13 +907,16 @@ A launch with text uses its linked initial SEND, which carries the launch rule's
 cause. `turn.unknown` records an uncertain terminal with `data.outcome = "unknown"`
 and the SEND ID when Store can prove that binding.
 
-Worktree-aware rules can match `data.worktree` when a complete Git observation
-supplies the exact base commit, fingerprint, changed files and changed lines. Lines
-count additions and deletions, including line counts for nonignored untracked text.
+Swarm captures worktree facts for an enabled owner or project rule that uses them
+and matches the author's configured subject. `data.worktree` carries the exact base
+commit, fingerprint, changed files and changed lines when the Git observation is
+complete. Lines count additions and deletions, including nonignored untracked text.
 Match `data.project_check = "off"` to use a successful completion in a project without
 a configured check. When a configured check applies, the completion carries
 `data.project_check = "required"`. Match the separate `project.worktree.check.passed`
 fact, which binds the same author turn and worktree after a confirmed passing check.
+A successful check whose observed fingerprint changed emits
+`project.worktree.check.refused` with `reason = "fingerprint_changed"`.
 
 To launch a fixer when a project check exits unsuccessfully, put the timer and follow-up
 definitions in the registered project's rule directory. In this example the project

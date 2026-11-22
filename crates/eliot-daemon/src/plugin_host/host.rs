@@ -362,6 +362,7 @@ struct HostState {
     store: StoreHandle,
     bus: Bus,
     monitoring: Monitoring,
+    completion_interests: Mutex<HashMap<String, Vec<crate::automation::CompletionRuleInterest>>>,
     agent_custodies: AgentCustodies,
     secrets: SecretSet,
     agent_credentials: AgentCredentials,
@@ -489,6 +490,7 @@ impl PluginHost {
                 store,
                 bus,
                 monitoring,
+                completion_interests: Mutex::default(),
                 agent_custodies: AgentCustodies::default(),
                 secrets,
                 agent_credentials,
@@ -506,6 +508,19 @@ impl PluginHost {
                 reader_slots: Arc::new(Semaphore::new(discovery::MAX_READERS)),
                 launch_reader_slots: Arc::new(Semaphore::new(discovery::MAX_LAUNCH_READERS)),
             }),
+        }
+    }
+
+    pub(crate) fn install_completion_interests(
+        &self,
+        principal: &str,
+        interests: Vec<crate::automation::CompletionRuleInterest>,
+    ) {
+        let mut stored = self.state.completion_interests.lock_recover();
+        if interests.is_empty() {
+            stored.remove(principal);
+        } else {
+            stored.insert(principal.to_owned(), interests);
         }
     }
 

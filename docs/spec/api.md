@@ -1655,7 +1655,8 @@ When the reply exceeds the encoded event budget, the retained suffix starts
 with `[... truncated ...]`. Status, exact command/turn binding and any
 structured provider restriction remain authoritative. `Turn.final_text = None`
 means the public final text is unavailable. Full native text remains private history.
-`turn.completed` can also carry a captured `data.worktree` with the SHA-256
+`turn.completed` can carry `data.worktree` when an enabled rule in the Owner or
+Agent's project namespace consumes it. The data includes the SHA-256
 `fingerprint`, the exact `base` commit, changed `files`, and changed `lines`
 (insertions plus deletions) for [worktree review rules](automation.md#worktree-review-recipe).
 Unavailable worktree observations do not supply a fingerprint or change totals.

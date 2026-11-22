@@ -2991,26 +2991,16 @@ fn rule_action_counts(
     rate_key: Option<&[u8; 32]>,
     now: i64,
 ) -> Result<(i64, Option<i64>, i64)> {
-    if limit.max == 0 || limit.window_ms <= 0 {
-        return Err(Error::new("invalid", "rule limit must be positive"));
-    }
+    limit.validate()?;
     let since = now.saturating_sub(limit.window_ms);
-    let last_since = now.saturating_sub(
-        limit
-            .min_interval_ms
-            .unwrap_or_default()
-            .max(limit.window_ms),
-    );
     let (scoped, last_action_at) = match limit.per {
         core::api::RuleLimitScope::Rule => tx
             .query_row(
-                "SELECT COUNT(CASE WHEN action.created_at >= ?1 THEN 1 END),
-                        MAX(CASE WHEN action.created_at >= ?5
-                                 THEN action.created_at END)
+                "SELECT COUNT(*), MAX(action.created_at)
                  FROM commands action
                  JOIN commands parent ON parent.id = action.parent_command
                  WHERE action.link_kind = 'rule_action' AND action.ordinal IS NOT NULL
-                   AND action.created_at >= ?5 AND action.created_at <= ?2
+                   AND action.created_at >= ?1 AND action.created_at <= ?2
                    AND EXISTS (
                        SELECT 1 FROM commands root
                        WHERE root.principal = ?3
@@ -3026,7 +3016,7 @@ fn rule_action_counts(
                          )
                          AND action.principal = root.principal
                    )",
-                params![since, now, principal, rule, last_since],
+                params![since, now, principal, rule],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(sql_error)?,
@@ -3035,13 +3025,11 @@ fn rule_action_counts(
             None => (0, None),
             Some(rate_agent) => tx
                 .query_row(
-                    "SELECT COUNT(CASE WHEN action.created_at >= ?1 THEN 1 END),
-                            MAX(CASE WHEN action.created_at >= ?6
-                                     THEN action.created_at END)
+                    "SELECT COUNT(*), MAX(action.created_at)
                      FROM commands action
                      JOIN commands parent ON parent.id = action.parent_command
                      WHERE action.link_kind = 'rule_action' AND action.ordinal IS NOT NULL
-                       AND action.created_at >= ?6 AND action.created_at <= ?2
+                       AND action.created_at >= ?1 AND action.created_at <= ?2
                        AND EXISTS (
                            SELECT 1 FROM commands root
                            WHERE root.principal = ?3
@@ -3065,7 +3053,7 @@ fn rule_action_counts(
                                  OR (action.verb != 'launch' AND action.target = ?5)
                              )
                        )",
-                    params![since, now, principal, rule, rate_agent, last_since],
+                    params![since, now, principal, rule, rate_agent],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .map_err(sql_error)?,
@@ -3078,12 +3066,11 @@ fn rule_action_counts(
                 )
             })?;
             tx.query_row(
-                "SELECT COUNT(CASE WHEN used_at >= ?4 THEN 1 END),
-                        MAX(CASE WHEN used_at >= ?6 THEN used_at END)
+                "SELECT COUNT(*), MAX(used_at)
                  FROM rule_key_usage
                  WHERE principal = ?1 AND rule = ?2 AND key_digest = ?3
-                   AND used_at >= ?6 AND used_at <= ?5",
-                params![principal, rule, rate_key.as_slice(), since, now, last_since],
+                   AND used_at >= ?4 AND used_at <= ?5",
+                params![principal, rule, rate_key.as_slice(), since, now],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(sql_error)?

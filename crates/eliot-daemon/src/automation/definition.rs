@@ -81,16 +81,133 @@ struct TriggerDefinition {
 
 type MatchGroup = BTreeMap<String, CompiledMatch>;
 
+#[derive(Clone, Copy, Default)]
+pub(crate) struct CompletionFields {
+    pub(crate) worktree: bool,
+    pub(crate) project_check: bool,
+}
+
+impl CompletionFields {
+    pub(crate) fn needed(self) -> bool {
+        self.worktree || self.project_check
+    }
+}
+
+pub(crate) struct CompletionRuleInterest {
+    pub(crate) fields: CompletionFields,
+    matches: MatchGroup,
+    alternatives: Vec<MatchGroup>,
+}
+
+impl CompletionRuleInterest {
+    pub(crate) fn matches_agent(&self, subject: &Value) -> bool {
+        let group_matches = |group: &MatchGroup| {
+            group.iter().all(|(path, matcher)| {
+                let field = path
+                    .trim_start_matches("event.")
+                    .trim_start_matches("subject.");
+                matcher.matches(subject.get(field))
+            })
+        };
+        group_matches(&self.matches)
+            && (self.alternatives.is_empty() || self.alternatives.iter().any(group_matches))
+    }
+}
+
+fn completion_fields(definition: &Value, fields: &mut CompletionFields) {
+    let mut add_path = |path: &str| {
+        let path = path.strip_prefix("event.").unwrap_or(path);
+        fields.worktree |= path == "data.worktree" || path.starts_with("data.worktree.");
+        fields.project_check |= path == "data.project_check";
+    };
+    match definition {
+        Value::String(text) => {
+            for path in text
+                .split("${")
+                .skip(1)
+                .filter_map(|part| part.split_once('}').map(|(path, _)| path))
+            {
+                add_path(path.trim());
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                completion_fields(item, fields);
+            }
+        }
+        Value::Object(items) => {
+            for path in items.keys() {
+                add_path(path);
+            }
+            for item in items.values() {
+                completion_fields(item, fields);
+            }
+        }
+        _ => {}
+    }
+}
+
 impl RuleDefinition {
-    pub(crate) fn matches_project_review(&self, terminal: &Event) -> bool {
-        if !self.enabled
-            || !self.guards_launch_worktree()
-            || self.trigger.event.as_deref() != Some("project.worktree.check.passed")
-        {
+    pub(crate) fn completion_interest(&self) -> Option<CompletionRuleInterest> {
+        if !self.enabled {
+            return None;
+        }
+        let mut fields = CompletionFields::default();
+        match self.trigger.event.as_deref() {
+            Some("project.worktree.check.passed") => fields.worktree = true,
+            Some("turn.completed") => {
+                fields.worktree = self.guards_launch_worktree();
+                completion_fields(&serde_json::to_value(self).ok()?, &mut fields);
+            }
+            _ => return None,
+        }
+        if !fields.needed() {
+            return None;
+        }
+        // Other predicates may depend on the completion itself or facts the
+        // capture has yet to produce. The rule engine evaluates them later.
+        let stable_subject = |group: &MatchGroup| {
+            group
+                .iter()
+                .filter(|(name, _)| {
+                    let name = name.strip_prefix("event.").unwrap_or(name);
+                    matches!(
+                        name,
+                        "subject.profile"
+                            | "subject.harness"
+                            | "subject.project"
+                            | "subject.workspace"
+                    )
+                })
+                .map(|(key, matcher)| (key.clone(), matcher.clone()))
+                .collect()
+        };
+        Some(CompletionRuleInterest {
+            fields,
+            matches: stable_subject(&self.trigger.compiled_matches),
+            alternatives: self
+                .trigger
+                .compiled_any_of
+                .iter()
+                .map(stable_subject)
+                .collect(),
+        })
+    }
+
+    pub(crate) fn matches_project_review(&self, terminal: &Event, project: &str) -> bool {
+        if !self.enabled || self.trigger.event.as_deref() != Some("project.worktree.check.passed") {
             return false;
         }
         let mut passed = terminal.clone();
         passed.kind = "project.worktree.check.passed".to_owned();
+        passed.source = "daemon".to_owned();
+        passed.native_id = None;
+        passed.data = json!({
+            "project": project,
+            "turn_id": terminal.data["turn_id"],
+            "worktree": terminal.data["worktree"],
+            "completion_seq": terminal.seq,
+        });
         matches!(evaluate(self, &passed), Ok(RuleEvaluation::Command { .. }))
     }
 
@@ -1838,23 +1955,28 @@ fn validate_rule_key_template(source: &str, field: &str) -> Result<(), Error> {
 
 fn render_rule_key(source: &str, roots: &TemplateRoots<'_>) -> Option<[u8; 32]> {
     let parts = parse_template(source).ok()?;
-    let mut rendered = String::new();
+    let mut rendered = Vec::with_capacity(parts.len());
+    let mut bytes = 0;
+    let mut nonblank = false;
     for part in parts {
-        match part {
-            TemplatePart::Literal(text) => rendered.push_str(text),
+        let value = match part {
+            TemplatePart::Literal(text) => Cow::Borrowed(text),
             TemplatePart::Placeholder(path) => {
                 let value = lookup(path, roots.event, roots.subject, roots.data)?;
-                rendered.push_str(scalar_text(value).ok()?.as_ref());
+                scalar_text(value).ok()?
             }
-        }
-        if rendered.len() > MAX_RULE_KEY_BYTES {
+        };
+        bytes += value.len();
+        if bytes > MAX_RULE_KEY_BYTES {
             return None;
         }
+        nonblank |= !value.trim().is_empty();
+        rendered.push(value);
     }
-    if rendered.trim().is_empty() {
+    if !nonblank {
         return None;
     }
-    canonical_json_sha256(&json!({"rule_key": rendered})).ok()
+    canonical_json_sha256(&json!(rendered)).ok()
 }
 
 fn render_rule_event_keys(

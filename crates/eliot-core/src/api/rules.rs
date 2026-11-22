@@ -141,10 +141,13 @@ impl RuleLimit {
                 "rule limit window_ms must be positive",
             ));
         }
-        if self.min_interval_ms.is_some_and(|interval| interval <= 0) {
+        if self
+            .min_interval_ms
+            .is_some_and(|interval| interval <= 0 || interval > self.window_ms)
+        {
             return Err(Error::new(
                 "invalid",
-                "rule limit min_interval_ms must be positive",
+                "rule limit min_interval_ms must be positive and no greater than window_ms",
             ));
         }
         if (self.per != RuleLimitScope::Key && self.key.is_some())

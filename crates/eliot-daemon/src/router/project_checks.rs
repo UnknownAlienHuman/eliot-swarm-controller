@@ -581,7 +581,8 @@ async fn wants_checked_review(router: &Router, event: &Event) -> bool {
         .lock_recover()
         .iter()
         .any(|((owner, _), (_, rule))| {
-            (owner == "owner" || owner == &project) && rule.matches_project_review(event)
+            (owner == "owner" || owner == &project)
+                && rule.matches_project_review(event, &agent.project)
         })
 }
 
@@ -730,7 +731,7 @@ async fn check_after_edit(
         .filter(|pass| pass.fingerprint == before && work.check.as_ref() == Some(&pass.check));
     if prior_pass.is_some() || (review.is_none() && prior_fingerprint == Some(before.as_str())) {
         if let Some(event) = review {
-            record_worktree_check_pass(router, key, event, &work.config.id).await;
+            record_worktree_check_outcome(router, key, event, &work.config.id, None).await;
         }
         return CheckDisposition {
             uncertain: false,
@@ -744,6 +745,7 @@ async fn check_after_edit(
     let mut checked_fingerprint = None;
     let mut fast_check_exit = None;
     let mut passed = None;
+    let mut check_changed_worktree = false;
     if !work.config.format.is_empty() {
         match run_argv(
             &work.config.format,
@@ -815,13 +817,16 @@ async fn check_after_edit(
                     failure = Some(format_failure("fast check", exit_code, &output, &policy));
                 } else {
                     fast_check_exit = Some(0);
-                    if let Some(fingerprint) = before_check
-                        && checked_fingerprint.as_ref() == Some(&fingerprint)
+                    if let (Some(fingerprint), Some(observed)) =
+                        (before_check, checked_fingerprint.as_ref())
                     {
-                        passed = Some(ProjectCheckPass {
-                            check: check.clone(),
-                            fingerprint,
-                        });
+                        check_changed_worktree = &fingerprint != observed;
+                        if !check_changed_worktree {
+                            passed = Some(ProjectCheckPass {
+                                check: check.clone(),
+                                fingerprint,
+                            });
+                        }
                     }
                 }
             }
@@ -860,11 +865,15 @@ async fn check_after_edit(
         );
     }
     if let Some(event) = review
-        && passed
-            .as_ref()
-            .is_some_and(|pass| event.data["worktree"]["fingerprint"] == pass.fingerprint)
+        && fast_check_exit == Some(0)
+        && let Some(observed) = checked_fingerprint.as_deref()
     {
-        record_worktree_check_pass(router, key, event, &work.config.id).await;
+        if check_changed_worktree || event.data["worktree"]["fingerprint"] != observed {
+            record_worktree_check_outcome(router, key, event, &work.config.id, Some(observed))
+                .await;
+        } else if passed.is_some() {
+            record_worktree_check_outcome(router, key, event, &work.config.id, None).await;
+        }
     }
 
     let uncertain = checked_fingerprint.is_none();
@@ -887,9 +896,16 @@ async fn work_fingerprint(workspace: &str) -> Result<String> {
     GitProbe::new()?.work_fingerprint(workspace).await
 }
 
-async fn record_worktree_check_pass(router: &Router, key: &WorkKey, event: &Event, project: &str) {
+async fn record_worktree_check_outcome(
+    router: &Router,
+    key: &WorkKey,
+    event: &Event,
+    project: &str,
+    changed_fingerprint: Option<&str>,
+) {
     let mut store = router.inner.store.lock().await;
-    match store.record_project_worktree_check_pass(event, project, now_ms()) {
+    match store.record_project_worktree_check_outcome(event, project, changed_fingerprint, now_ms())
+    {
         Ok(change) => router.publish_locked(&change.events),
         Err(error) => log_error(
             router,
@@ -949,16 +965,13 @@ pub(super) async fn publish_goal_worktree_pass(
                             .is_none_or(|cwd| cwd == workspace)
                 })
     });
-    if matches_policy
-        && work_fingerprint(workspace)
-            .await
-            .is_ok_and(|current| current == fingerprint)
-    {
+    if matches_policy && let Ok(observed) = work_fingerprint(workspace).await {
         let key = WorkKey {
             agent: agent.id,
             generation,
         };
-        record_worktree_check_pass(router, &key, event, &agent.project).await;
+        let changed = (observed != fingerprint).then_some(observed.as_str());
+        record_worktree_check_outcome(router, &key, event, &agent.project, changed).await;
     }
 }
 
@@ -1006,7 +1019,7 @@ async fn load_project_work(
             goal.generation == key.generation
                 && goal.status == GoalStatus::Completed
                 && goal.round_marker.is_none()
-        }) && !store.has_project_worktree_check_pass(event)?
+        }) && !store.has_project_worktree_check_outcome(event)?
     } else {
         false
     };

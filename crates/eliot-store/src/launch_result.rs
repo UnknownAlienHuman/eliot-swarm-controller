@@ -2,11 +2,11 @@ use super::*;
 use eliot_core::api::ProjectManagerIdentity;
 
 impl Store {
-    pub fn has_project_worktree_check_pass(&self, event: &Event) -> Result<bool> {
+    pub fn has_project_worktree_check_outcome(&self, event: &Event) -> Result<bool> {
         let (Some(agent), Some(generation)) = (event.agent.as_deref(), event.generation) else {
             return Ok(false);
         };
-        worktree_check_pass_exists(
+        worktree_check_outcome_exists(
             &self.connection,
             parse_agent_id(agent)?,
             generation,
@@ -14,10 +14,11 @@ impl Store {
         )
     }
 
-    pub fn record_project_worktree_check_pass(
+    pub fn record_project_worktree_check_outcome(
         &mut self,
         event: &Event,
         project: &str,
+        changed_fingerprint: Option<&str>,
         now: i64,
     ) -> Result<Change<()>> {
         self.ensure_writer_healthy()?;
@@ -59,23 +60,31 @@ impl Store {
         {
             return Ok(empty);
         }
-        if worktree_check_pass_exists(&tx, agent, generation, retained.seq)? {
+        if worktree_check_outcome_exists(&tx, agent, generation, retained.seq)? {
             return Ok(empty);
         }
-        let mut passed = DaemonEventInput::new(
+        let mut data = json!({"project": project, "turn_id": turn, "worktree": worktree, "completion_seq": retained.seq});
+        let kind = if let Some(fingerprint) = changed_fingerprint {
+            data["reason"] = json!("fingerprint_changed");
+            data["observed_fingerprint"] = json!(fingerprint);
+            "project.worktree.check.refused"
+        } else {
+            "project.worktree.check.passed"
+        };
+        let mut outcome = DaemonEventInput::new(
             now,
-            "project.worktree.check.passed",
+            kind,
             "project_check",
             Some(agent),
             Some(generation),
-            json!({"project": project, "turn_id": turn, "worktree": worktree, "completion_seq": retained.seq}),
+            data,
         );
-        passed.cause = retained.cause;
-        let passed = insert_daemon_event_input(&tx, passed)?;
+        outcome.cause = retained.cause;
+        let outcome = insert_daemon_event_input(&tx, outcome)?;
         commit_transaction(tx, &self.write_faulted)?;
         Ok(Change {
             value: (),
-            events: vec![passed],
+            events: vec![outcome],
         })
     }
 
@@ -135,7 +144,7 @@ pub(super) fn rule_launch_insertion_binding(
     })))
 }
 
-fn worktree_check_pass_exists(
+fn worktree_check_outcome_exists(
     connection: &Connection,
     agent: i64,
     generation: i64,
@@ -145,7 +154,7 @@ fn worktree_check_pass_exists(
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM events
           WHERE agent = ?1 AND generation = ?2 AND seq > ?3
-            AND kind = 'project.worktree.check.passed'
+            AND kind IN ('project.worktree.check.passed', 'project.worktree.check.refused')
             AND json_extract(data, '$.completion_seq') = ?3)",
             params![agent, generation, completion_seq],
             |row| row.get(0),

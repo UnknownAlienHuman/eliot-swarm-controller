@@ -4131,6 +4131,7 @@ impl Router {
         &self,
         principal: &str,
         definitions: &[(i64, RuleDefinition)],
+        completion_interests: Vec<crate::automation::CompletionRuleInterest>,
     ) {
         if principal == "owner" {
             let active = definitions
@@ -4150,6 +4151,9 @@ impl Router {
                 (*revision, definition.clone()),
             )
         }));
+        self.inner
+            .plugin_host
+            .install_completion_interests(principal, completion_interests);
     }
 
     fn rule_definition(&self, principal: &str, id: &str) -> Option<(i64, RuleDefinition)> {
