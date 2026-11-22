@@ -871,7 +871,7 @@ impl DesktopApp {
             crate::shortcuts::set_popover(HookPopover::None);
             if self.launch.preset.take().is_none() {
                 // Keyboard focus goes back to the composer (no-op while unbound).
-                let _ = self.chat.composer_ref.request_focus();
+                self.take_focus(FocusTarget::Composer);
             }
         }
     }
@@ -1264,7 +1264,7 @@ impl DesktopApp {
         context: &ComponentContext<Self>,
     ) {
         // Keyboard focus goes back to the composer (no-op while it is unbound).
-        let _ = self.chat.composer_ref.request_focus();
+        self.take_focus(FocusTarget::Composer);
         self.settle_mutation(
             outcome
                 .as_ref()

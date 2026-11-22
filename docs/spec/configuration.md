@@ -95,6 +95,7 @@ workspace through the same machine-author settings writer.
   owner.token
   eliot.db, eliot.db-wal, eliot.db-shm
   daemon.lock, daemon.json, logs/daemon.log
+  desktop.log              the desktop's start-up errors and panics (bounded, restarts past 256 KiB)
   owner-stop             present from an Owner `daemon.shutdown` until the next start
   skills/                daemon-materialized `eliot-swarm` Agent skill (private, rewritten at startup)
   plugins/                 only instantiated plugins

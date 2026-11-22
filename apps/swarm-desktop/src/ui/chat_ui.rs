@@ -495,6 +495,7 @@ impl DesktopApp {
                         if let Some(convo) = self.chat.convo.as_mut() {
                             let missing =
                                 convo.reset(snapshot.coverage, &snapshot.turns, &snapshot.events);
+                            convo.apply_boundaries(&snapshot.boundaries);
                             generation_changed = missing.generation_changed;
                             convo.apply_inputs(snapshot.inputs);
                             convo.set_stale(None);
@@ -611,6 +612,7 @@ impl DesktopApp {
                             if let Some(results) = reread.results.as_ref() {
                                 convo.update_turn_coverage(results.generation, results.has_older);
                                 convo.apply_turns(&results.turns);
+                                convo.apply_boundaries(&results.boundaries);
                             }
                             convo.apply_inputs(reread.inputs);
                         }
@@ -658,7 +660,7 @@ impl DesktopApp {
                 // Typing goes on in the composer; focus would leave the
                 // search box and close its list.
                 if !self.chat.opened_from_search {
-                    let _ = self.chat.composer_ref.request_focus();
+                    self.take_focus(FocusTarget::Composer);
                 }
             }
             ChatMsg::ToolsToggled(key, expanded) => {

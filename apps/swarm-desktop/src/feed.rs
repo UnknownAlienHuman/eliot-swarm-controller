@@ -14,7 +14,7 @@ use std::future::Future;
 use std::path::Path;
 use std::time::Duration;
 
-use eliot_core::api::AgentGetResponse;
+use eliot_core::api::{AgentGetResponse, GenerationBoundary};
 use eliot_core::{Event, Turn};
 
 use crate::chat::{Conversation, Coverage, InputText, text_hash};
@@ -60,6 +60,7 @@ impl Depth {
 pub struct Snapshot {
     pub coverage: Coverage,
     pub turns: Vec<Turn>,
+    pub boundaries: Vec<GenerationBoundary>,
     pub events: Vec<Event>,
     pub inputs: Vec<(String, InputText)>,
     pub detail: AgentGetResponse,
@@ -169,6 +170,7 @@ pub fn snapshot(data_dir: &Path, agent: &str, depth: Depth) -> Fallible<Snapshot
                 ..Coverage::default()
             },
             turns: results.turns,
+            boundaries: results.boundaries,
             events,
             inputs,
             detail,

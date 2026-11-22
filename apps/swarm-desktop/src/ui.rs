@@ -220,6 +220,13 @@ type MutationResult<T> = Result<T, eliot_core::Error>;
 /// One rule namespace read: its rules and whether more remain.
 type RulePage = (Vec<RuleListEntry>, bool);
 
+/// A control the desktop moves keyboard focus to on its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FocusTarget {
+    Composer,
+    Search,
+}
+
 /// Messages are plain owned data so background workers can return them.
 #[derive(Clone, Debug)]
 enum Message {
@@ -309,6 +316,9 @@ struct DesktopApp {
     prefs_rev: u64,
     /// The startup conversation was considered (once per window).
     startup_done: bool,
+    /// Keyboard focus held back until the window is the foreground window
+    /// (see `take_focus`).
+    focus_held: Option<FocusTarget>,
     /// The window's client width in DIPs, once observed.
     window_width: Option<f64>,
     /// The window's client height in DIPs (menu placement clamps to it).
@@ -757,6 +767,27 @@ fn settle_run(data_dir: &Path, parent: Command, cancelled: &dyn Fn() -> bool) ->
     }
 }
 
+impl DesktopApp {
+    /// Programmatic keyboard focus (a no-op while the control is unbound).
+    /// Focusing a control activates a window that is not active, so a
+    /// desktop started without activation holds the request until its
+    /// window is the foreground window (`window_place::may_take_focus`,
+    /// `ShellMsg::FocusHeld`); the latest request wins.
+    fn take_focus(&mut self, target: FocusTarget) {
+        let hold = !crate::window_place::may_take_focus();
+        crate::window_place::hold_focus(hold);
+        if hold {
+            self.focus_held = Some(target);
+            return;
+        }
+        self.focus_held = None;
+        let _ = match target {
+            FocusTarget::Composer => self.chat.composer_ref.request_focus(),
+            FocusTarget::Search => self.nav.search_ref.request_focus(),
+        };
+    }
+}
+
 fn submit_note(reply: &CommandSubmitResponse) -> String {
     format!("{:?}", reply.state).to_lowercase()
 }
@@ -779,6 +810,7 @@ impl Component for DesktopApp {
             prefs_saving: false,
             prefs_rev: 0,
             startup_done: false,
+            focus_held: None,
             window_width: None,
             window_height: None,
             window_size: input.window.map(|window| (window.width, window.height)),
@@ -953,7 +985,7 @@ pub fn run(workspace: Option<PathBuf>) -> Result<(), String> {
     let closed = match placement {
         Ok(hook) => hook.finish(),
         Err(error) => {
-            eprintln!("swarm-desktop: {error}");
+            crate::startup::note(&error);
             None
         }
     };
@@ -975,7 +1007,7 @@ pub fn run(workspace: Option<PathBuf>) -> Result<(), String> {
         if let Err(error) =
             client::block_on(crate::settings::save_window_on_close(&data_dir, placement))
         {
-            eprintln!("swarm-desktop: window placement not saved: {error}");
+            crate::startup::note(&format!("window placement not saved: {error}"));
         }
     }
     result

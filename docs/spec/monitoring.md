@@ -950,7 +950,10 @@ historical origin is reported as `unknown`.
 
 The desktop consumes the default cross-generation result and joins each turn to its
 retained events using the exact generation and turn ID. The API supplies the markers
-for the desktop renderer.
+for the desktop renderer. It draws one quiet line, also its UIA name, where a
+generation that did not start with the launch begins, for example "Continued after a
+daemon restart" or "Resumed by you". A generation whose start lies in an unloaded
+page shows no line.
 
 ## Views
 

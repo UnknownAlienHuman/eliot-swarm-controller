@@ -17,23 +17,39 @@
 //!   maximized.
 //! - `HCBT_DESTROYWND`: its placement (`GetWindowPlacement`) is read once
 //!   for the one `[desktop]` write after the window closes.
+//!
+//! The start's show command (`STARTUPINFO`) also says whether the desktop
+//! may take the foreground: a start minimized, hidden or without activation
+//! (`start /min`, a Minimized shortcut, `swarm daemon update`) moves
+//! keyboard focus only once the window is the foreground window, because
+//! focusing a control activates a window that is not active
+//! ([`may_take_focus`]). Focus held back meanwhile is applied once the
+//! window is the foreground window ([`held_focus_ready`], polled by the
+//! shortcut watcher while focus is held). No event says so reliably: a
+//! window that WinUI already made its thread's active window becomes the
+//! foreground window with no `HCBT_ACTIVATE`, no XAML focus change and no
+//! `EVENT_SYSTEM_FOREGROUND` reaching this thread (observed live).
 #![allow(unsafe_code)]
 
 use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect,
 };
-use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+use windows_sys::Win32::System::Threading::{
+    GetCurrentThreadId, GetStartupInfoW, STARTF_USESHOWWINDOW, STARTUPINFOW,
+};
 use windows_sys::Win32::UI::HiDpi::{
     AdjustWindowRectExForDpi, GetDpiForMonitor, MDT_EFFECTIVE_DPI,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CBT_CREATEWNDW, CallNextHookEx, GetClassNameW, GetWindowPlacement, HCBT_ACTIVATE,
-    HCBT_CREATEWND, HCBT_DESTROYWND, HHOOK, IsIconic, IsZoomed, SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED,
-    SetWindowPlacement, SetWindowsHookExW, UnhookWindowsHookEx, WH_CBT, WINDOWPLACEMENT,
-    WPF_RESTORETOMAXIMIZED, WS_CHILD,
+    CBT_CREATEWNDW, CallNextHookEx, GetClassNameW, GetForegroundWindow, GetWindowPlacement,
+    HCBT_ACTIVATE, HCBT_CREATEWND, HCBT_DESTROYWND, HHOOK, IsIconic, IsZoomed, SW_HIDE,
+    SW_MINIMIZE, SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED, SW_SHOWMINNOACTIVE, SW_SHOWNA,
+    SW_SHOWNOACTIVATE, SetWindowPlacement, SetWindowsHookExW, UnhookWindowsHookEx, WH_CBT,
+    WINDOWPLACEMENT, WPF_RESTORETOMAXIMIZED, WS_CHILD,
 };
 
 /// Where the window was when it closed.
@@ -60,7 +76,14 @@ thread_local! {
     static CLOSED: Cell<Option<Closed>> = const { Cell::new(None) };
     /// The window opens maximized at its first activation.
     static MAXIMIZE: Cell<bool> = const { Cell::new(false) };
+    /// The start asked for an activated window (see [`started_to_activate`]).
+    static ACTIVATE: Cell<bool> = const { Cell::new(true) };
 }
+
+/// The window's handle for other threads (0: none yet).
+static WINDOW_ID: AtomicIsize = AtomicIsize::new(0);
+/// Keyboard focus is held until the window is the foreground window.
+static FOCUS_HELD: AtomicBool = AtomicBool::new(false);
 
 /// The thread's CBT hook; removed by [`Hook::finish`].
 pub struct Hook(HHOOK);
@@ -73,6 +96,7 @@ pub fn install(saved: Option<crate::settings::WindowPlacement>) -> Result<Hook, 
         size: (saved.width, saved.height),
         maximized: saved.maximized,
     }));
+    ACTIVATE.set(started_to_activate());
     // SAFETY: `cbt` has the HOOKPROC signature; a null module with the
     // current thread's id installs a thread-local hook.
     let hook = unsafe {
@@ -108,6 +132,7 @@ unsafe extern "system" fn cbt(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRES
         let create = unsafe { &mut *(*(lparam as *mut CBT_CREATEWNDW)).lpcs };
         if create.style & WS_CHILD as i32 == 0 {
             WINDOW.set(window);
+            WINDOW_ID.store(window as isize, Ordering::Relaxed);
             if let Some(wanted) = WANTED.get() {
                 // A window created at an explicit place keeps its created
                 // size (Reactor's ResizeClient does not change it: observed
@@ -127,6 +152,53 @@ unsafe extern "system" fn cbt(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRES
     }
     // SAFETY: passes the event on unchanged.
     unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
+}
+
+/// Whether the starter asked for an activated window (Microsoft Learn:
+/// `STARTUPINFOW`, `ShowWindow`): a show command that is minimized, hidden
+/// or without activation did not.
+fn started_to_activate() -> bool {
+    let mut startup = STARTUPINFOW {
+        cb: size_of::<STARTUPINFOW>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: cb is set; the structure is written in place.
+    unsafe { GetStartupInfoW(&mut startup) };
+    startup.dwFlags & STARTF_USESHOWWINDOW == 0
+        || !matches!(
+            i32::from(startup.wShowWindow),
+            SW_HIDE
+                | SW_SHOWMINIMIZED
+                | SW_SHOWNOACTIVATE
+                | SW_MINIMIZE
+                | SW_SHOWMINNOACTIVE
+                | SW_SHOWNA
+        )
+}
+
+/// Programmatic keyboard focus may go to a control now: the start asked for
+/// an activated window, or the window is the foreground window already.
+pub fn may_take_focus() -> bool {
+    let window = WINDOW.get();
+    // SAFETY: a plain query.
+    ACTIVATE.get() || (!window.is_null() && unsafe { GetForegroundWindow() } == window)
+}
+
+/// Hold keyboard focus until the window is the foreground window, or stop.
+pub fn hold_focus(held: bool) {
+    FOCUS_HELD.store(held, Ordering::Relaxed);
+}
+
+/// Keyboard focus is held ([`hold_focus`]).
+pub fn focus_held() -> bool {
+    FOCUS_HELD.load(Ordering::Relaxed)
+}
+
+/// Focus is held and the window is now the foreground window (any thread).
+pub fn held_focus_ready() -> bool {
+    let window = WINDOW_ID.load(Ordering::Relaxed);
+    // SAFETY: a plain query.
+    focus_held() && window != 0 && unsafe { GetForegroundWindow() } as isize == window
 }
 
 /// Whether the window is maximized now (on the UI thread).

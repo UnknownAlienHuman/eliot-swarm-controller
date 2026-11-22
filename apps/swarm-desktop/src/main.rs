@@ -7,6 +7,15 @@
 //! WinUI 3 controls come from the `windows-reactor` dependency, used only on
 //! Windows; other platforms build a stub that explains the requirement so the
 //! default workspace build and Ubuntu CI stay green.
+//!
+//! On Windows every build, debug included, is a GUI-subsystem binary: a
+//! console-subsystem start makes Windows open a console window beside the
+//! app, which took the foreground even when the desktop was started
+//! minimized, and debug and release then behave alike in QA. A start from a
+//! terminal still prints to it; without a terminal, start-up errors and
+//! panics go to the data directory's `desktop.log` and a fatal start-up
+//! error to a message box (`startup`).
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 #[cfg(windows)]
 mod accessibility;
@@ -32,6 +41,8 @@ mod reparent;
 mod scroll_end;
 #[cfg(windows)]
 mod shortcuts;
+#[cfg(windows)]
+mod startup;
 #[cfg(windows)]
 mod ui;
 #[cfg(windows)]
@@ -99,7 +110,14 @@ pub(crate) struct DesktopArgs {
 #[cfg(windows)]
 fn main() {
     use clap::Parser;
-    let args = DesktopArgs::parse();
+    startup::attach_parent_console();
+    startup::install_panic_hook();
+    let args = match DesktopArgs::try_parse() {
+        Ok(args) => args,
+        // --help and --version print and exit 0.
+        Err(error) if !error.use_stderr() => error.exit(),
+        Err(error) => startup::fatal(error.to_string().trim_end()),
+    };
     let workspace = args
         .workspace
         .map(|workspace| {
@@ -119,8 +137,7 @@ fn main() {
         .map_err(|error| error.to_string())
         .and_then(ui::run);
     if let Err(error) = result {
-        eprintln!("swarm-desktop: {error}");
-        std::process::exit(1);
+        startup::fatal(&error);
     }
 }
 

@@ -91,6 +91,9 @@ pub enum Shortcut {
     /// Shift+F10 or the context-menu key on the focused sidebar row
     /// (`crate::motion::focused_row_anchor` says where).
     RowMenu,
+    /// The window became the foreground window while keyboard focus was
+    /// held (`crate::window_place::held_focus_ready`).
+    Foreground,
 }
 
 /// Which popover is open: none, the model picker (all popover keys), a

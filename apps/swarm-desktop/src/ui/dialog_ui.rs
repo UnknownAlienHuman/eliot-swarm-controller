@@ -87,9 +87,9 @@ impl DesktopApp {
             if kind == 0 {
                 crate::shortcuts::set_popover(Popover::None);
                 if self.main == Main::Conversation {
-                    let _ = self.chat.composer_ref.request_focus();
+                    self.take_focus(FocusTarget::Composer);
                 } else {
-                    let _ = self.nav.search_ref.request_focus();
+                    self.take_focus(FocusTarget::Search);
                 }
             } else {
                 self.close_menu();
