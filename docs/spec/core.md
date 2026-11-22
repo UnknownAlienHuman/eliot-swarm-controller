@@ -889,9 +889,10 @@ names that part of output when supplied. `cache_write_tokens` describes the
 portion written to cache. `total_tokens` is uncached input + cached input +
 output when all three are proven. Reported subtotals carry explicit coverage.
 When a harness includes cache hits in its input total or reports cache
-creation separately, the corresponding cache counter is required to
-establish uncached input. A missing split leaves uncached input unavailable
-and counts toward missing-input coverage, including on historical rows.
+creation separately, the corresponding cache counter establishes the input
+adjustment. With a missing split, the observed input count stays available
+and the cache counter and complete total stay unavailable. This also applies
+to retained history.
 Context occupancy and cumulative cost belong to session facts. A terminal
 without native turn counters keeps null usage.
 
@@ -902,8 +903,8 @@ milliseconds defaulted at the owning boundary). A strictly newer snapshot
 replaces the retained one; an older or equal-timestamp snapshot or a
 byte-identical duplicate is ignored, so replays and out-of-order deliveries
 can never inflate or regress the readback. `context_used_tokens`/`context_window_tokens` carry occupancy
-and capacity for the same model. An adapter can reuse an observed window
-when it can bind the reading to the same model or native turn. Occupancy is
+and capacity for the same model. Shared usage logic reuses an observed window
+when the adapter binds the reading to the same model or native turn. Occupancy is
 available for a positive window with a value between zero and that window.
 `cumulative_tokens` projects input/output/cache counters on the same
 accounting basis as turns, and `cumulative_cost` carries the

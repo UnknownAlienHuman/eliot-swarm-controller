@@ -9,6 +9,7 @@
 
 use eliot_core::{
     MAX_MCP_SERVER_NAME_LEN, SessionCost, SessionTokenTotals, SessionUsage, TurnUsage,
+    usage_counter,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -253,34 +254,16 @@ pub(crate) struct ResultOrigin {
 /// wholly malformed `usage` yields no usage at all so completion proceeds.
 pub(crate) fn result_usage(record: &Value) -> Option<TurnUsage> {
     let usage = record.get("usage")?.as_object()?;
-    let counter = |key: &str| {
-        usage
-            .get(key)
-            .and_then(Value::as_i64)
-            .filter(|value| *value >= 0)
-    };
-    let input_tokens = counter("input_tokens");
-    let output_tokens = counter("output_tokens");
-    let cache_read_tokens = counter("cache_read_input_tokens");
-    let cache_write_tokens = counter("cache_creation_input_tokens");
-    if input_tokens.is_none()
-        && output_tokens.is_none()
-        && cache_read_tokens.is_none()
-        && cache_write_tokens.is_none()
-    {
-        return None;
-    }
-    Some(TurnUsage {
-        scope: Some("main_loop_turn".to_owned()),
-        message_id: None,
-        input_tokens,
-        output_tokens,
-        reasoning_tokens: None,
-        thinking_tokens: None,
-        cache_read_tokens,
-        cache_write_tokens,
-        total_tokens: None,
-    })
+    TurnUsage::from_native(
+        "main_loop_turn",
+        TurnUsage {
+            input_tokens: usage_counter(usage.get("input_tokens")),
+            output_tokens: usage_counter(usage.get("output_tokens")),
+            cache_read_tokens: usage_counter(usage.get("cache_read_input_tokens")),
+            cache_write_tokens: usage_counter(usage.get("cache_creation_input_tokens")),
+            ..TurnUsage::default()
+        },
+    )
 }
 
 /// Extract cumulative session token counters from a terminal `result`
@@ -304,22 +287,10 @@ pub(crate) fn result_session_tokens(record: &Value) -> Option<SessionTokenTotals
             continue;
         };
         let counters = [
-            entry
-                .get("inputTokens")
-                .and_then(Value::as_i64)
-                .filter(|value| *value >= 0),
-            entry
-                .get("outputTokens")
-                .and_then(Value::as_i64)
-                .filter(|value| *value >= 0),
-            entry
-                .get("cacheReadInputTokens")
-                .and_then(Value::as_i64)
-                .filter(|value| *value >= 0),
-            entry
-                .get("cacheCreationInputTokens")
-                .and_then(Value::as_i64)
-                .filter(|value| *value >= 0),
+            usage_counter(entry.get("inputTokens")),
+            usage_counter(entry.get("outputTokens")),
+            usage_counter(entry.get("cacheReadInputTokens")),
+            usage_counter(entry.get("cacheCreationInputTokens")),
         ];
         for (index, counter) in counters.into_iter().enumerate() {
             if let Some(value) = counter {

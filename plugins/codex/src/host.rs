@@ -607,14 +607,10 @@ impl CodexPlugin {
     /// reader plugin instance pages `model/list` with no thread, no input
     /// and no inference; the default entry is the native `isDefault`.
     async fn model_list(&self, raw: &Value) -> Result<Value> {
-        ensure_dedicated_reader(
-            self.session.is_some() || self.failed_start.is_some() || self.observer.is_some(),
-            "Codex",
-            "model.list",
-        )?;
-        let profile: Value = decode(raw, "Codex model.list params are invalid")?;
-        let snapshot = profile.get("profile").unwrap_or(&profile);
-        ensure_reader_harness(snapshot, "codex", "Codex", "model.list")?;
+        let occupied =
+            self.session.is_some() || self.failed_start.is_some() || self.observer.is_some();
+        let snapshot =
+            eliot_plugin::session::model_catalogue_profile(raw, occupied, "codex", "Codex", false)?;
         let (launch, secrets, metadata_secrets) = self.reader_launch(snapshot, &json!({}))?;
         let entries = crate::discovery::list_models(
             launch,
@@ -2773,66 +2769,72 @@ impl CodexPlugin {
     }
 
     async fn shutdown(&mut self) -> Result<Value> {
-        if let Some(observer) = self.observer.as_mut() {
-            observer
-                .shutdown(Instant::now() + crate::discovery::READ_TIMEOUT)
-                .await?;
-        }
-        self.observer = None;
-        if let Some(session) = self.session.as_mut() {
-            if session.phase != SessionPhase::Stopped {
-                terminate_session(session, true).await?;
-            }
-            session.events.close().await;
-        }
-        Ok(json!({"state": "shutdown"}))
+        self.shutdown_all(false).await
     }
 
     async fn shutdown_owned(&mut self) {
+        let _ = self.shutdown_all(true).await;
+    }
+
+    async fn shutdown_all(&mut self, best_effort: bool) -> Result<Value> {
         if let Some(observer) = self.observer.as_mut() {
-            let _ = observer
+            let result = observer
                 .shutdown(Instant::now() + crate::discovery::READ_TIMEOUT)
                 .await;
+            if !best_effort {
+                result?;
+            }
         }
         self.observer = None;
-        if let Some(session) = self.session.as_mut() {
-            if session.phase != SessionPhase::Stopped {
-                let _ = terminate_session(session, true).await;
-            }
-            session.events.close().await;
-        }
+        eliot_plugin::session::shutdown_session(
+            self.session.as_mut(),
+            best_effort,
+            async |session: &mut AgentSession| {
+                if session.phase == SessionPhase::Stopped {
+                    Ok(())
+                } else {
+                    terminate_session(session, true).await
+                }
+            },
+            async |session: &mut AgentSession| {
+                session.events.close().await;
+            },
+        )
+        .await
     }
 }
 
 async fn terminate_session(session: &mut AgentSession, force: bool) -> Result<()> {
-    let begin = session.events.begin_stop().await;
-    let deadline = Instant::now() + RPC_TIMEOUT;
-    let process_exit = if force {
-        // Startup/plugin-shutdown cleanup retains its separate forceful path.
-        session.native.terminate(true, deadline).await
-    } else {
-        // Agent stop must never escalate to a child kill; daemon Job custody
-        // owns force termination after this graceful close is unresolved.
-        session
-            .native
-            .transport
-            .close_gracefully(deadline, true)
-            .await
+    let events = &session.events;
+    let native = &mut session.native;
+    let begin = events.begin_stop();
+    let native_result = async move {
+        let process_deadline = Instant::now() + RPC_TIMEOUT;
+        let process_exit = if force {
+            // Startup/plugin-shutdown cleanup retains its separate forceful path.
+            native.terminate(true, process_deadline).await
+        } else {
+            // Agent stop must never escalate to a child kill; daemon Job custody
+            // owns force termination after this graceful close is unresolved.
+            native
+                .transport
+                .close_gracefully(process_deadline, true)
+                .await
+        };
+        let drained = native
+            .await_output_drained(Instant::now() + RPC_TIMEOUT)
+            .await;
+        (process_exit, drained)
     };
-    let drained = session
-        .native
-        .await_output_drained(Instant::now() + RPC_TIMEOUT)
-        .await;
-    let ended = session.events.end_stop().await;
-    if begin.is_err() || process_exit.is_err() || drained.is_err() || ended.is_err() {
-        session.phase = SessionPhase::Unknown;
-        return Err(Error::new(
-            "unknown",
-            "Codex process/output drain or session.ended outcome is unknown",
-        ));
-    }
-    session.phase = SessionPhase::Stopped;
-    Ok(())
+    let end = events.end_stop();
+    let result =
+        eliot_plugin::session::stop_owned_session("Codex", None, begin, native_result, end).await;
+    session.phase = if result.is_ok() {
+        SessionPhase::Stopped
+    } else {
+        SessionPhase::Unknown
+    };
+    result
 }
 
 async fn discard_unstarted(session: &mut AgentSession) {
@@ -2891,43 +2893,47 @@ fn select_launch_model(
     requested_model: Option<&str>,
     daemon_model: Option<&str>,
 ) -> Result<NativeModelEntry> {
-    if let Some(requested) = requested_model {
-        return entries
-            .iter()
-            .find(|model| model.id == requested && model.model == requested)
-            .cloned()
-            .ok_or_else(|| {
-                eliot_plugin::start_classification::harness_unavailable_model(
-                    "codex",
-                    "model_list",
-                    "The exact requested Codex model is unavailable in this account catalogue",
-                )
-            });
-    }
-    if let Some(frozen) = daemon_model.filter(|frozen| !frozen.trim().is_empty()) {
-        return entries
-            .iter()
-            .find(|model| model.id == frozen)
-            .cloned()
-            .ok_or_else(|| {
-                eliot_plugin::start_classification::harness_unavailable_model(
-                    "codex",
-                    "model_list",
-                    "Codex model/list no longer contains the daemon-frozen default model; use an explicit model",
-                )
-            });
-    }
-    entries
-        .iter()
-        .find(|model| model.is_default)
-        .cloned()
-        .ok_or_else(|| {
-            eliot_plugin::start_classification::harness_unavailable_model(
-                "codex",
-                "model_list",
-                "Codex model/list reported no default model; use an explicit model",
-            )
-        })
+    use eliot_plugin::session::{LaunchModelMissing, LaunchModelRequest};
+
+    let request = match requested_model {
+        Some(requested) => LaunchModelRequest::Explicit(requested),
+        None => match daemon_model.filter(|frozen| !frozen.trim().is_empty()) {
+            Some(frozen) => LaunchModelRequest::Frozen(frozen),
+            None => LaunchModelRequest::CatalogueDefault,
+        },
+    };
+    let missing = |reason: LaunchModelMissing| match reason {
+        LaunchModelMissing::Explicit => {
+            "The exact requested Codex model is unavailable in this account catalogue"
+        }
+        LaunchModelMissing::Frozen => {
+            "Codex model/list no longer contains the daemon-frozen default model; use an explicit model"
+        }
+        LaunchModelMissing::Default => {
+            "Codex model/list reported no default model; use an explicit model"
+        }
+    };
+    let selected = eliot_plugin::session::choose_launch_model(
+        entries,
+        request,
+        |model| model.id.as_str(),
+        |model, requested| model.model == requested,
+        |model| model.is_default,
+    )
+    .map_err(|reason| {
+        eliot_plugin::start_classification::harness_unavailable_model(
+            "codex",
+            "model_list",
+            missing(reason),
+        )
+    })?;
+    selected.cloned().ok_or_else(|| {
+        eliot_plugin::start_classification::harness_unavailable_model(
+            "codex",
+            "model_list",
+            missing(LaunchModelMissing::Default),
+        )
+    })
 }
 
 /// Bounded launch catalogue: per-page `RPC_TIMEOUT` capped by an overall

@@ -712,15 +712,7 @@ pub(crate) fn session_usage_from_token_usage(
     previous: Option<&SessionUsage>,
 ) -> Option<SessionUsage> {
     let counter = |value: Option<i64>| value.filter(|value| *value >= 0);
-    let mut merged = previous.cloned().unwrap_or(SessionUsage {
-        context_used_tokens: None,
-        context_window_tokens: None,
-        cumulative_tokens: None,
-        cumulative_cost: None,
-        session_file_bytes: None,
-        source: None,
-        observed_at: None,
-    });
+    let mut merged = previous.cloned().unwrap_or_default();
     let mut changed = false;
     if let Some(cumulative) = &notification.cumulative {
         let totals = SessionTokenTotals {
@@ -772,15 +764,7 @@ pub(crate) fn session_usage_from_context_usage(
     let counter = |value: Option<i64>| value.filter(|value| *value >= 0);
     let used = counter(notification.used_tokens);
     let window = counter(notification.window_tokens);
-    let mut merged = previous.cloned().unwrap_or(SessionUsage {
-        context_used_tokens: None,
-        context_window_tokens: None,
-        cumulative_tokens: None,
-        cumulative_cost: None,
-        session_file_bytes: None,
-        source: None,
-        observed_at: None,
-    });
+    let mut merged = previous.cloned().unwrap_or_default();
     if merged.context_used_tokens == used && merged.context_window_tokens == window {
         return None;
     }
@@ -800,31 +784,17 @@ pub(crate) fn session_usage_from_context_usage(
 /// `session/tokenUsage` session facts, not in the terminal.
 pub(crate) fn turn_usage(notification: &NativeTurnCompletedNotification) -> Option<TurnUsage> {
     let usage = notification.usage.as_ref()?;
-    let counter = |value: Option<i64>| value.filter(|value| *value >= 0);
-    let input_tokens = counter(usage.input_tokens);
-    let output_tokens = counter(usage.output_tokens);
-    let reasoning_tokens = counter(usage.reasoning_tokens);
-    let cache_read_tokens = counter(usage.cache_read_tokens);
-    let cache_write_tokens = counter(usage.cache_write_tokens);
-    if input_tokens.is_none()
-        && output_tokens.is_none()
-        && reasoning_tokens.is_none()
-        && cache_read_tokens.is_none()
-        && cache_write_tokens.is_none()
-    {
-        return None;
-    }
-    Some(TurnUsage {
-        scope: Some("turn".to_owned()),
-        message_id: None,
-        input_tokens,
-        output_tokens,
-        reasoning_tokens,
-        thinking_tokens: None,
-        cache_read_tokens,
-        cache_write_tokens,
-        total_tokens: None,
-    })
+    TurnUsage::from_native(
+        "turn",
+        TurnUsage {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            reasoning_tokens: usage.reasoning_tokens,
+            cache_read_tokens: usage.cache_read_tokens,
+            cache_write_tokens: usage.cache_write_tokens,
+            ..TurnUsage::default()
+        },
+    )
 }
 
 /// One transcript item at one revision. Only the common identity fields, the

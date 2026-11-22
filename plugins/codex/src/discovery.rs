@@ -5,10 +5,7 @@ use crate::{
     host::{contextual_error, native_scope},
     native::{
         NativeClient, NativeFrame, NativeLaunch, NativeProcess,
-        startup_retry::{
-            StartupFailureEvidence, exhausted_start_failure, native_start_failed, next_retry_count,
-            randomized_retry_delay,
-        },
+        startup_retry::{StartupFailureEvidence, native_start_failed},
         store_policy::ensure_store_pin_supported,
         types::{
             NativeClientInfo, NativeDiscoveryConfigReadResponse, NativeDiscoverySourceKind,
@@ -27,7 +24,10 @@ use eliot_core::{
     },
     canonical_json_sha256,
 };
-use eliot_plugin::{DiscoverParams, MAX_EVENT_BYTES};
+use eliot_plugin::{
+    DiscoverParams, MAX_EVENT_BYTES,
+    retry::{Retry, RetryOperation, StartupAfterFailure},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -42,7 +42,7 @@ use std::{
 };
 use tokio::{
     task::JoinHandle,
-    time::{Instant, sleep_until, timeout_at},
+    time::{Instant, timeout_at},
 };
 
 pub(crate) const READ_TIMEOUT: Duration = Duration::from_secs(25);
@@ -1274,7 +1274,7 @@ async fn start_initialized_reader(
     diagnostic_secrets: &[String],
     deadline: Instant,
 ) -> Result<(NativeProcess, JoinHandle<()>, NativeInitializeResponse)> {
-    let mut retries_used = 0;
+    let mut retry = Retry::new(RetryOperation::NativeStartup);
     loop {
         if Instant::now() >= deadline {
             // This refusal is before spawn; no native process or session exists.
@@ -1310,15 +1310,21 @@ async fn start_initialized_reader(
                     native_frame_seen: native_frame_seen.load(Ordering::Acquire),
                     stderr: &stderr,
                 };
-                if let Some(next_retry_count) = next_retry_count(retries_used, evidence) {
-                    retries_used = next_retry_count;
-                    sleep_until((Instant::now() + randomized_retry_delay()).min(deadline)).await;
-                    continue;
+                let no_effect = evidence.initialize_request_failed
+                    && !evidence.initialize_response_received
+                    && evidence.proves_no_thread_or_session_effect(true);
+                match retry
+                    .after_start_failure(evidence.retryable(), no_effect, deadline)
+                    .await
+                {
+                    StartupAfterFailure::Retry => continue,
+                    StartupAfterFailure::Failed => {
+                        return Err(client.diagnostic_error(native_start_failed()));
+                    }
+                    StartupAfterFailure::Unresolved => {
+                        return Err(client.diagnostic_error(initialize_error));
+                    }
                 }
-                if let Some(error) = exhausted_start_failure(retries_used, evidence, true) {
-                    return Err(client.diagnostic_error(error));
-                }
-                return Err(client.diagnostic_error(initialize_error));
             }
         };
 

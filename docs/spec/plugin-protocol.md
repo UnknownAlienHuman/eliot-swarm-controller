@@ -1,8 +1,10 @@
 # Plugin protocol
 
 A plugin translates one native harness, normalizes its facts and supplies native
-readback. It never writes SQLite or repeats an uncertain native effect. Host and plugin
-share wire types, not vendor SDK types or the daemon's implementation.
+readback. Shared Rust owns retry timing, event-control deadlines, common lifecycle
+decisions and diagnostic redaction. The daemon owns durable command settlement and
+SQLite writes. The host and plugin share wire types and use vendor types only inside
+the adapter.
 
 ## First harness subset
 
@@ -70,6 +72,28 @@ oversize input before native I/O.
 Continuously drain cancel-safe readers; never cancel a partially read line. Credentials
 are excluded from logs, recordings and plugin state.
 
+The [shared event actor](../../crates/eliot-plugin/src/event_actor.rs) uses one
+deadline for submitting a control and waiting for its reply. It uses the
+caller's deadline when supplied and 25 seconds otherwise, inside the host's
+command reply window. An elapsed or lost reply reports `unknown`.
+Admission-sensitive callers can distinguish an
+unavailable queue or a task that stopped before it took the control. A timeout never
+authorizes replay. A queued control may still finish behind an in-progress native fact.
+Internal hook offers and completion notifications wait for queue space while
+their event consumer remains open. This keeps settlement deliverable during
+backpressure and allows forwarding to continue when the consumer catches up.
+
+The [shared retry policy](../../crates/eliot-plugin/src/retry.rs) schedules another
+attempt only from a proven pre-effect failure or an idempotent operation. Safe startup
+retries once with a 25–100 ms delay. A session hook bind makes at most three attempts,
+100 ms apart. Both stay within the caller's deadline. Repeated observations of the
+same outstanding hook offer pace from 250 ms up to 2 s. The first offer forwards
+immediately. A failed hook read waits 250 ms before the next read.
+
+Read-only native CLI helpers bound stdout and process exit under the caller's deadline.
+Claude auth status can consume its JSON result on either exit status. The same shared
+reader reaps the owned helper on a deadline or read failure.
+
 ## Manifest
 
 An initial plugin may declare:
@@ -115,6 +139,11 @@ reply or `session.ended` terminal does not block applied once both proofs hold;
 the result records `native_session_end_observed=false`. If either proof is
 missing, the stop remains unknown with the missing proof named. The daemon never
 reissues an uncertain native call.
+
+The [shared session runtime](../../crates/eliot-plugin/src/session.rs) sequences
+plugin-side cleanup and drain. Adapters supply their native close and readback
+steps. Antigravity waits for notification of its exact turn's settlement after
+dispatching cancellation. Only an observed cancellation terminal confirms it.
 
 Steer uses an ordered, bounded write followed by a correlated response wait: the host
 writes its `agent.command` frame in dispatch order under the writer deadline. The host
@@ -456,6 +485,12 @@ families and reserved `daemon`, `os`, `git` and `workspace_process` sources retu
 of `cursor` or `gap` is non-null. A cursor must equal the predecessor's committed
 exclusive cursor; a gap carries its stable id/reason and optional from/to boundary.
 There is no `handoff_id`.
+
+The [shared native-child runtime](../../crates/eliot-plugin/src/native_child.rs)
+validates registration acknowledgements and tracks observed turn transitions. The
+adapter supplies native identity and terminal evidence. An unresolved registration
+keeps its original id. Source loss leaves incomplete activity unknown and preserves
+committed terminal facts.
 
 `gap_id` identifies one uncovered interval. Same id and canonical fields return its
 stored result; the same id with different fields is an integrity error. After that

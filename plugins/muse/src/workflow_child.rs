@@ -22,16 +22,14 @@
 //! / `message` history composites are unsupported — no fact is ever
 //! synthesized from them.
 
-use std::time::Duration;
-
-use eliot_core::{ChildRegistration, ChildRegistrationAck, Error, Result};
+use eliot_core::{ChildRegistration, Error, Result};
 use eliot_plugin::{
     CommitSink, PeerClient,
-    protocol::{ChildParams, MAX_COMMAND_ID_BYTES},
+    native_child::{ChildAction, ChildBinding, ChildFact, ChildLifecycle},
+    protocol::MAX_COMMAND_ID_BYTES,
     session::StreamSource,
 };
 use serde_json::{Value, json};
-use tokio::time::Instant;
 
 use crate::events::{native_terminal, turn_status};
 use crate::native::types::NativeTurnTerminal;
@@ -48,10 +46,6 @@ pub(crate) const MAX_WORKFLOW_CHILDREN: usize = 256;
 /// under it. Must match the Store's `muse` grant (shared boundary); a drift
 /// fails closed at ACK validation.
 pub(crate) const WORKFLOW_CHILD_FAMILIES: [&str; 1] = ["turn"];
-
-/// Bounded registration attempt: a lost ACK retains the identical
-/// registration for the next revision; only deterministic rejections end it.
-const CHILD_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Whether this notification frame is a workflow-item revision carrying child
 /// lifecycle facts.
@@ -247,90 +241,6 @@ pub(crate) fn complete_event_data(key: &WorkflowChildKey, status: &str, native: 
     })
 }
 
-/// The single-parent binding the producer needs before publishing child facts.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ChildBinding {
-    pub registration: ChildRegistration,
-    pub agent_id: String,
-    pub agent_generation: i64,
-    pub native_ref: String,
-}
-
-/// Register one workflow child through the host. Success commits nothing by
-/// itself; the caller publishes child facts only after this ACK validates.
-///
-/// The host authenticates the producer from the private connection. No child
-/// credential is sent and no child control verb is exposed.
-pub(crate) async fn register_child(
-    host: &PeerClient,
-    credential: &str,
-    registration: ChildRegistration,
-) -> Result<ChildRegistrationAck> {
-    registration.validate()?;
-    let params = serde_json::to_value(ChildParams {
-        credential: credential.to_owned(),
-        registration: registration.clone(),
-    })
-    .map_err(|_| Error::new("internal", "Muse child params could not be encoded"))?;
-    let value = host
-        .call("child", params, Instant::now() + CHILD_DEADLINE)
-        .await?;
-    let ack: ChildRegistrationAck = serde_json::from_value(value)
-        .map_err(|_| Error::new("source_integrity", "child ACK was not well formed"))?;
-    registration.validate_ack(&ack, "muse", &WORKFLOW_CHILD_FAMILIES)?;
-    Ok(ack)
-}
-
-/// Whether an RPC error proves the registration was never admitted. Only
-/// deterministic rejections end tracking; anything else retains the identical
-/// registration for the next revision.
-pub(crate) fn is_admission_rejection(error: &Error) -> bool {
-    matches!(
-        error.code.as_str(),
-        "invalid" | "unsupported" | "stale_generation" | "not_allowed" | "id_conflict"
-    )
-}
-
-/// Build the child binding from a validated ACK.
-pub(crate) fn binding_from_ack(
-    registration: ChildRegistration,
-    ack: &ChildRegistrationAck,
-) -> ChildBinding {
-    ChildBinding {
-        registration,
-        agent_id: ack.agent.id.clone(),
-        agent_generation: ack.agent.generation,
-        native_ref: ack.agent.native_ref.clone().unwrap_or_default(),
-    }
-}
-
-/// Pure plan for one child revision against its tracked state. The caller
-/// executes registration/commits; NOTHING here touches the network or Store,
-/// so the actual-wire revision walk is unit-testable without a host.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PlannedAction {
-    /// No fact: dedup, scheduled-while-registered, uninterpretable status, or
-    /// an unknown child covered by its gap.
-    Ignore,
-    /// No binding yet: register (or retry the retained registration), then
-    /// re-plan the same revision.
-    Register,
-    /// Commit the ONE `turn.started`.
-    Start,
-    /// Commit the ONE `turn.completed`, starting first when the live states
-    /// were never observed. `status` is the normalized turn status;
-    /// `native` is the raw wire terminal preserved as `native_status`.
-    Complete {
-        status: &'static str,
-        native: &'static str,
-    },
-    /// Record a child-scoped gap; optionally stop expecting more revisions.
-    ChildGap {
-        reason: &'static str,
-        mark_unknown: bool,
-    },
-}
-
 /// Per-K tracked state: the turn-only observation progress for one identity.
 /// K itself lives in the caller map key (the parent-session, run, child,
 /// and attempt parts are consumed there to build native_ref,
@@ -350,10 +260,8 @@ pub(crate) struct WorkflowChildState {
     pub source_range: Option<Value>,
     pub binding: Option<ChildBinding>,
     pub pending_registration: Option<ChildRegistration>,
-    pub started: bool,
-    pub completed_status: Option<String>,
+    pub lifecycle: ChildLifecycle,
     pub completed_revision: Option<i64>,
-    pub unknown: bool,
     pub writes_blocked: bool,
     pub gap_reported: bool,
     pub gap_number: u64,
@@ -370,10 +278,8 @@ impl WorkflowChildState {
             source_range: None,
             binding: None,
             pending_registration: None,
-            started: false,
-            completed_status: None,
+            lifecycle: ChildLifecycle::default(),
             completed_revision: None,
-            unknown: false,
             writes_blocked: false,
             gap_reported: false,
             gap_number: 0,
@@ -396,53 +302,19 @@ impl WorkflowChildState {
         }
     }
 
-    pub(crate) fn plan(&self, status: &str, terminal: Option<&str>) -> PlannedAction {
-        if self.unknown {
-            return PlannedAction::Ignore;
-        }
-        if let Some(done) = self.completed_status.as_deref() {
-            // A repeated terminal revision dedups; only a MAPPED DIFFERENT
-            // terminal contradicts the kept completion. Unmapped noise after
-            // completion is ignored, never regressed.
-            if let Some(term) = terminal {
-                let mapped = turn_status(&NativeTurnTerminal::parse_workflow_terminal(term));
-                if matches!(mapped, Some(text) if text != done) {
-                    return PlannedAction::ChildGap {
-                        reason: "Muse workflow child terminal changed after completion",
-                        mark_unknown: false,
-                    };
-                }
-            }
-            return PlannedAction::Ignore;
-        }
-        if self.binding.is_none() {
-            return PlannedAction::Register;
-        }
-        if let Some(term) = terminal {
-            let parsed = NativeTurnTerminal::parse_workflow_terminal(term);
+    pub(crate) fn plan(&self, status: &str, terminal: Option<&str>) -> ChildAction {
+        let fact = if let Some(terminal) = terminal {
+            let parsed = NativeTurnTerminal::parse_workflow_terminal(terminal);
             match (turn_status(&parsed), native_terminal(&parsed)) {
-                (Some(status_text), Some(native_text)) => {
-                    return PlannedAction::Complete {
-                        status: status_text,
-                        native: native_text,
-                    };
-                }
-                _ => {
-                    return PlannedAction::ChildGap {
-                        reason: "Muse workflow child terminal is unknown",
-                        mark_unknown: true,
-                    };
-                }
+                (Some(status), Some(native)) => ChildFact::Completed { status, native },
+                _ => ChildFact::UnrecognizedTerminal,
             }
-        }
-        if status == "scheduled" || !is_live_child_status(status) {
-            return PlannedAction::Ignore;
-        }
-        if self.started {
-            PlannedAction::Ignore
+        } else if status == "scheduled" || !is_live_child_status(status) {
+            ChildFact::Declared
         } else {
-            PlannedAction::Start
-        }
+            ChildFact::Started
+        };
+        self.lifecycle.plan(self.binding.is_some(), fact)
     }
 
     pub(crate) async fn commit_event(

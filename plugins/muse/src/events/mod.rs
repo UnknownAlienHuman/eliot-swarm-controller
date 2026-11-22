@@ -7,6 +7,8 @@ use eliot_core::{
 };
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
+    event_actor::EventActor,
+    native_child::{ChildAction, binding_from_ack, is_admission_rejection, register_child},
     protocol::MAX_COMMAND_ID_BYTES,
     session::{
         EVENT_DEADLINE, MessageCommit, StreamSource, attach_final_text, attach_native_error,
@@ -25,9 +27,9 @@ use tokio::{
 };
 
 use self::workflow_child::{
-    MAX_WORKFLOW_CHILDREN, PlannedAction, WorkflowChildKey, WorkflowChildState, binding_from_ack,
-    child_event_id, complete_event_data, is_admission_rejection, is_workflow_item_frame,
-    muse_child_key, register_child, should_bypass_parent_buffer, start_event_data,
+    MAX_WORKFLOW_CHILDREN, WORKFLOW_CHILD_FAMILIES, WorkflowChildKey, WorkflowChildState,
+    child_event_id, complete_event_data, is_workflow_item_frame, muse_child_key,
+    should_bypass_parent_buffer, start_event_data,
 };
 use crate::native::{
     NativeClient, NativeFrame, StreamState, native_error_code,
@@ -271,8 +273,7 @@ pub(crate) struct EventConfig {
 }
 
 pub(crate) struct EventHandle {
-    control: mpsc::Sender<Control>,
-    status: watch::Receiver<EventStatus>,
+    actor: EventActor<Control, EventStatus>,
 }
 
 enum Control {
@@ -579,10 +580,14 @@ pub(crate) fn spawn(
     config: EventConfig,
 ) -> EventHandle {
     let processor = EventProcessor::new(native, host, config);
-    let (control, control_rx) = mpsc::channel(CONTROL_QUEUE);
-    let (status_tx, status) = watch::channel(EventStatus::default());
-    tokio::spawn(run(frames, stream, processor, control_rx, status_tx));
-    EventHandle { control, status }
+    let actor = EventActor::spawn(
+        CONTROL_QUEUE,
+        EventStatus::default(),
+        move |control_rx, status_tx| async move {
+            run(frames, stream, processor, control_rx, status_tx).await;
+        },
+    );
+    EventHandle { actor }
 }
 
 impl EventHandle {
@@ -672,25 +677,16 @@ impl EventHandle {
         verb: String,
         args: Value,
     ) -> Result<Value> {
-        let (reply, response) = oneshot::channel();
-        timeout_at(
-            Instant::now() + EVENT_DEADLINE,
-            self.control.send(Control::ReplyRequest {
+        self.actor
+            .call(|reply| Control::ReplyRequest {
                 command_id,
                 request_id,
                 turn_id,
                 verb,
                 args,
                 reply,
-            }),
-        )
-        .await
-        .map_err(|_| Error::new("unknown", "Muse event-control queue deadline elapsed"))?
-        .map_err(|_| Error::new("unknown", "Muse event processor stopped"))?;
-        timeout_at(Instant::now() + EVENT_DEADLINE, response)
-            .await
-            .map_err(|_| Error::new("unknown", "Muse event-control outcome is unknown"))?
-            .map_err(|_| Error::new("unknown", "Muse event-control response was lost"))?
+            })
+            .await?
     }
 
     /// Authoritative exact-turn gate for steer/interrupt: the check runs
@@ -698,21 +694,12 @@ impl EventHandle {
     /// control that arrives after the terminal batch always sees the
     /// finished turn even though the watch snapshot still lags it.
     pub async fn check_turn(&self, turn_id: &str) -> Result<bool> {
-        let (reply, response) = oneshot::channel();
-        timeout_at(
-            Instant::now() + EVENT_DEADLINE,
-            self.control.send(Control::CheckTurn {
+        self.actor
+            .call(|reply| Control::CheckTurn {
                 turn_id: turn_id.to_owned(),
                 reply,
-            }),
-        )
-        .await
-        .map_err(|_| Error::new("unknown", "Muse event-control queue deadline elapsed"))?
-        .map_err(|_| Error::new("unknown", "Muse event processor stopped"))?;
-        timeout_at(Instant::now() + EVENT_DEADLINE, response)
+            })
             .await
-            .map_err(|_| Error::new("unknown", "Muse event-control outcome is unknown"))?
-            .map_err(|_| Error::new("unknown", "Muse event-control response was lost"))
     }
 
     pub async fn adopt_pulled(
@@ -741,52 +728,35 @@ impl EventHandle {
     }
 
     pub async fn close(&self) {
-        let (reply, response) = oneshot::channel();
-        if self.control.send(Control::Close { reply }).await.is_ok() {
-            let _ = timeout_at(Instant::now() + EVENT_DEADLINE, response).await;
-        }
+        let _ = self.actor.call(|reply| Control::Close { reply }).await;
     }
 
     pub async fn drain_native(&self) -> Result<()> {
-        eliot_plugin::native_lifecycle::wait_for_native_tail(&self.status, |s| s.native_drained)
-            .await
+        eliot_plugin::native_lifecycle::wait_for_native_tail(self.actor.watch(), |s| {
+            s.native_drained
+        })
+        .await
     }
 
     /// Retain one confirmed native endpoint exit for the readback. Only the
     /// first death wins; terminality is never manufactured here. Best effort:
     /// a closing queue drops the record instead of failing the shutdown.
     pub async fn record_native_exit(&self, text: String) {
-        let (reply, response) = oneshot::channel();
-        if self
-            .control
-            .send(Control::RecordNativeExit { text, reply })
-            .await
-            .is_ok()
-        {
-            let _ = timeout_at(Instant::now() + EVENT_DEADLINE, response).await;
-        }
+        let _ = self
+            .actor
+            .call(|reply| Control::RecordNativeExit { text, reply })
+            .await;
     }
 
     pub fn status(&self) -> EventStatus {
-        self.status.borrow().clone()
+        self.actor.watch().borrow().clone()
     }
 
     async fn send<T>(
         &self,
         build: impl FnOnce(oneshot::Sender<Result<T>>) -> Control,
     ) -> Result<T> {
-        let (reply, response) = oneshot::channel();
-        timeout_at(
-            Instant::now() + EVENT_DEADLINE,
-            self.control.send(build(reply)),
-        )
-        .await
-        .map_err(|_| Error::new("unknown", "Muse event-control queue deadline elapsed"))?
-        .map_err(|_| Error::new("unknown", "Muse event processor stopped"))?;
-        timeout_at(Instant::now() + EVENT_DEADLINE, response)
-            .await
-            .map_err(|_| Error::new("unknown", "Muse event-control outcome is unknown"))?
-            .map_err(|_| Error::new("unknown", "Muse event-control response was lost"))?
+        self.actor.call(build).await?
     }
 
     async fn send_at<T>(
@@ -794,18 +764,7 @@ impl EventHandle {
         build: impl FnOnce(oneshot::Sender<Result<T>>) -> Control,
         deadline: Instant,
     ) -> Result<T> {
-        // One shared budget for both waits: the queue wait never borrows
-        // past the caller's deadline, and the outcome wait reuses whatever
-        // is left instead of minting a second full deadline.
-        let (reply, response) = oneshot::channel();
-        timeout_at(deadline, self.control.send(build(reply)))
-            .await
-            .map_err(|_| Error::new("unknown", "Muse event-control queue deadline elapsed"))?
-            .map_err(|_| Error::new("unknown", "Muse event processor stopped"))?;
-        timeout_at(deadline, response)
-            .await
-            .map_err(|_| Error::new("unknown", "Muse event-control outcome is unknown"))?
-            .map_err(|_| Error::new("unknown", "Muse event-control response was lost"))?
+        self.actor.call_by(deadline, build).await?
     }
 }
 
@@ -3611,34 +3570,53 @@ impl EventProcessor {
                 .workflow_children
                 .get(&key)
                 .map(|state| state.plan(&child.status, child.terminal.as_deref()))
-                .unwrap_or(PlannedAction::Ignore);
+                .unwrap_or(ChildAction::Ignore);
             match planned {
-                PlannedAction::Ignore => return Ok(()),
-                PlannedAction::ChildGap {
-                    reason,
-                    mark_unknown,
-                } => {
+                ChildAction::Ignore => return Ok(()),
+                ChildAction::ConflictingTerminal => {
                     let host = self.host.clone();
                     let credential = self.credential.clone();
                     let sink = &mut self.sink;
                     if let Some(state) = self.workflow_children.get_mut(&key) {
-                        let _ = state.record_gap(sink, &host, &credential, reason).await;
-                        if mark_unknown {
-                            state.unknown = true;
-                        }
+                        let _ = state
+                            .record_gap(
+                                sink,
+                                &host,
+                                &credential,
+                                "Muse workflow child terminal changed after completion",
+                            )
+                            .await;
                     }
                     return Ok(());
                 }
-                PlannedAction::Register => {
+                ChildAction::UnknownTerminal => {
+                    let host = self.host.clone();
+                    let credential = self.credential.clone();
+                    let sink = &mut self.sink;
+                    if let Some(state) = self.workflow_children.get_mut(&key)
+                        && state.lifecycle.observation_lost()
+                    {
+                        let _ = state
+                            .record_gap(
+                                sink,
+                                &host,
+                                &credential,
+                                "Muse workflow child terminal is unknown",
+                            )
+                            .await;
+                    }
+                    return Ok(());
+                }
+                ChildAction::Register => {
                     if !self.register_workflow_child(&key).await {
                         return Ok(());
                     }
                 }
-                PlannedAction::Start => {
+                ChildAction::Start => {
                     self.start_workflow_child_turn(&key).await;
                     return Ok(());
                 }
-                PlannedAction::Complete { status, native } => {
+                ChildAction::Complete { status, native } => {
                     self.complete_workflow_child_turn(
                         &key,
                         status,
@@ -3677,7 +3655,15 @@ impl EventProcessor {
                     return;
                 }
             };
-        let ack = match register_child(&self.host, &self.credential, registration.clone()).await {
+        let ack = match register_child(
+            &self.host,
+            &self.credential,
+            registration.clone(),
+            "muse",
+            &WORKFLOW_CHILD_FAMILIES,
+        )
+        .await
+        {
             Ok(ack) => ack,
             Err(error) if is_admission_rejection(&error) => {
                 let _ = self
@@ -3732,7 +3718,7 @@ impl EventProcessor {
                 Ok(registration) => registration,
                 Err(_) => {
                     if let Some(state) = self.workflow_children.get_mut(key) {
-                        state.unknown = true;
+                        state.lifecycle.observation_lost();
                     }
                     let _ = self
                         .record_gap("Muse workflow child registration could not be built")
@@ -3744,7 +3730,15 @@ impl EventProcessor {
         if let Some(state) = self.workflow_children.get_mut(key) {
             state.pending_registration = Some(registration.clone());
         }
-        match register_child(&self.host, &self.credential, registration.clone()).await {
+        match register_child(
+            &self.host,
+            &self.credential,
+            registration.clone(),
+            "muse",
+            &WORKFLOW_CHILD_FAMILIES,
+        )
+        .await
+        {
             Ok(ack) => {
                 let binding = binding_from_ack(registration, &ack);
                 if let Some(state) = self.workflow_children.get_mut(key) {
@@ -3756,19 +3750,19 @@ impl EventProcessor {
             Err(error) if is_admission_rejection(&error) => {
                 if let Some(state) = self.workflow_children.get_mut(key) {
                     state.pending_registration = None;
-                    state.unknown = true;
+                    state.lifecycle.observation_lost();
                 }
                 let _ = self
                     .record_gap("Muse workflow child registration was rejected")
                     .await;
                 false
             }
+            // Retain the exact registration ID and payload. A later revision
+            // retries that same id, never a new external registration.
             Err(_) => false,
         }
     }
 
-    /// Commit the ONE `turn.started` for a registered child. A failed commit
-    /// already recorded its child gap; the key unknowns and stops.
     async fn start_workflow_child_turn(&mut self, key: &WorkflowChildKey) {
         let native_id = match child_event_id(key, "turn.started") {
             Ok(native_id) => native_id,
@@ -3776,7 +3770,9 @@ impl EventProcessor {
                 let host = self.host.clone();
                 let credential = self.credential.clone();
                 let sink = &mut self.sink;
-                if let Some(state) = self.workflow_children.get_mut(key) {
+                if let Some(state) = self.workflow_children.get_mut(key)
+                    && state.lifecycle.observation_lost()
+                {
                     let _ = state
                         .record_gap(
                             sink,
@@ -3785,7 +3781,6 @@ impl EventProcessor {
                             "Muse workflow child turn identity exceeded its bound",
                         )
                         .await;
-                    state.unknown = true;
                 }
                 return;
             }
@@ -3803,17 +3798,13 @@ impl EventProcessor {
         };
         if let Some(state) = self.workflow_children.get_mut(key) {
             if committed {
-                state.started = true;
+                state.lifecycle.started(&key.turn_id());
             } else {
-                state.unknown = true;
+                state.lifecycle.observation_lost();
             }
         }
     }
 
-    /// Commit the ONE `turn.completed`, starting first when the live states
-    /// were never observed: an explicit terminal proves the turn ran.
-    /// `status` is the normalized turn status; `native` is the raw wire
-    /// terminal preserved as `native_status`.
     async fn complete_workflow_child_turn(
         &mut self,
         key: &WorkflowChildKey,
@@ -3824,13 +3815,13 @@ impl EventProcessor {
         if self
             .workflow_children
             .get(key)
-            .is_some_and(|state| !state.started)
+            .is_some_and(|state| state.lifecycle.active_turn.is_none())
         {
             self.start_workflow_child_turn(key).await;
             if self
                 .workflow_children
                 .get(key)
-                .is_some_and(|state| !state.started)
+                .is_some_and(|state| state.lifecycle.active_turn.is_none())
             {
                 return;
             }
@@ -3841,7 +3832,9 @@ impl EventProcessor {
                 let host = self.host.clone();
                 let credential = self.credential.clone();
                 let sink = &mut self.sink;
-                if let Some(state) = self.workflow_children.get_mut(key) {
+                if let Some(state) = self.workflow_children.get_mut(key)
+                    && state.lifecycle.observation_lost()
+                {
                     let _ = state
                         .record_gap(
                             sink,
@@ -3850,7 +3843,6 @@ impl EventProcessor {
                             "Muse workflow child turn identity exceeded its bound",
                         )
                         .await;
-                    state.unknown = true;
                 }
                 return;
             }
@@ -3868,22 +3860,19 @@ impl EventProcessor {
         };
         if let Some(state) = self.workflow_children.get_mut(key) {
             if committed {
-                state.completed_status = Some(status.to_owned());
+                state.lifecycle.completed(Some(status));
                 state.completed_revision = Some(revision);
             } else {
-                state.unknown = true;
+                state.lifecycle.observation_lost();
             }
         }
     }
 
-    /// Stream end settles child tracking: completed children keep their
-    /// terminal, open children go unknown — their terminal can never be
-    /// observed now. A pending registration is a parent gap.
     async fn settle_workflow_children(&mut self) {
         let open: Vec<WorkflowChildKey> = self
             .workflow_children
             .iter()
-            .filter(|entry| entry.1.completed_status.is_none() && !entry.1.unknown)
+            .filter(|entry| entry.1.lifecycle.terminal.is_none() && !entry.1.lifecycle.unknown)
             .map(|entry| entry.0.clone())
             .collect();
         if open.is_empty() {
@@ -3896,12 +3885,14 @@ impl EventProcessor {
                     state.pending_registration = None;
                     pending_lost = true;
                 }
-                state.unknown = true;
+                state.lifecycle.observation_lost();
             }
         }
         for key in &open {
             let running = self.workflow_children.get(key).is_some_and(|state| {
-                state.started && state.completed_status.is_none() && state.binding.is_some()
+                state.lifecycle.active_turn.is_some()
+                    && state.lifecycle.terminal.is_none()
+                    && state.binding.is_some()
             });
             if !running {
                 continue;

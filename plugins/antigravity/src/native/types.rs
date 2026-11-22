@@ -155,38 +155,18 @@ pub(crate) struct PromptResult {
 /// prompt call's model usage, not just the final message.
 pub(crate) fn prompt_turn_usage(result: &PromptResult) -> Option<TurnUsage> {
     let usage = result.usage.as_ref()?.as_object()?;
-    let counter = |key: &str| {
-        usage
-            .get(key)
-            .and_then(Value::as_i64)
-            .filter(|value| *value >= 0)
-    };
-    let input_tokens = counter("inputTokens");
-    let output_tokens = counter("outputTokens");
-    let cache_read_tokens = counter("cachedReadTokens");
-    let cache_write_tokens = counter("cachedWriteTokens");
-    let thinking_tokens = counter("thoughtTokens");
-    let total_tokens = counter("totalTokens");
-    if input_tokens.is_none()
-        && output_tokens.is_none()
-        && cache_read_tokens.is_none()
-        && cache_write_tokens.is_none()
-        && thinking_tokens.is_none()
-        && total_tokens.is_none()
-    {
-        return None;
-    }
-    Some(TurnUsage {
-        scope: Some("turn".to_owned()),
-        message_id: None,
-        input_tokens,
-        output_tokens,
-        reasoning_tokens: None,
-        thinking_tokens,
-        cache_read_tokens,
-        cache_write_tokens,
-        total_tokens,
-    })
+    TurnUsage::from_native(
+        "turn",
+        TurnUsage {
+            input_tokens: eliot_core::usage_counter(usage.get("inputTokens")),
+            output_tokens: eliot_core::usage_counter(usage.get("outputTokens")),
+            cache_read_tokens: eliot_core::usage_counter(usage.get("cachedReadTokens")),
+            cache_write_tokens: eliot_core::usage_counter(usage.get("cachedWriteTokens")),
+            thinking_tokens: eliot_core::usage_counter(usage.get("thoughtTokens")),
+            total_tokens: eliot_core::usage_counter(usage.get("totalTokens")),
+            ..TurnUsage::default()
+        },
+    )
 }
 
 /// One option the native offers for a `session/request_permission` ask.
@@ -366,12 +346,6 @@ pub(crate) enum AcpUpdate {
     Unknown(String),
 }
 
-/// One nonnegative `usage_update` token counter. Negative values and
-/// non-integers stay unknown (null), never zero.
-fn usage_counter(value: Option<&Value>) -> Option<i64> {
-    value.and_then(Value::as_i64).filter(|value| *value >= 0)
-}
-
 /// One finite nonnegative `usage_update` cost amount, from a bare number or
 /// a cost object's amount/value/total member. Anything else stays unknown.
 fn usage_cost_amount(cost: Option<&Value>) -> Option<f64> {
@@ -471,8 +445,8 @@ pub(crate) fn classify_update(params: &Value) -> Option<(String, AcpUpdate)> {
                     .to_owned(),
             },
             "usage_update" => AcpUpdate::SessionUsage {
-                used: usage_counter(update.get("used")),
-                size: usage_counter(update.get("size")),
+                used: eliot_core::usage_counter(update.get("used")),
+                size: eliot_core::usage_counter(update.get("size")),
                 cost_amount: usage_cost_amount(update.get("cost")),
                 cost_unit: usage_cost_unit(update.get("cost")),
             },
@@ -509,15 +483,7 @@ pub(crate) fn session_usage_from_update(
     cost_unit: Option<String>,
     previous: Option<&SessionUsage>,
 ) -> Option<SessionUsage> {
-    let mut merged = previous.cloned().unwrap_or(SessionUsage {
-        context_used_tokens: None,
-        context_window_tokens: None,
-        cumulative_tokens: None,
-        cumulative_cost: None,
-        session_file_bytes: None,
-        source: None,
-        observed_at: None,
-    });
+    let mut merged = previous.cloned().unwrap_or_default();
     let mut changed = false;
     if used.is_some_and(|used| merged.context_used_tokens != Some(used)) {
         merged.context_used_tokens = used;

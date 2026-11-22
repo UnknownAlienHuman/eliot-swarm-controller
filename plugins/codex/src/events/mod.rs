@@ -6,14 +6,15 @@ use crate::native_child::{
     ChildBinding, binding_from_ack, build_registration, is_admission_rejection, register_child,
 };
 use eliot_core::{
-    ChildRegistration, ContextItem, Error, ProviderRestriction, Result, SecretPolicy,
-    SessionTokenTotals, SessionUsage, TurnUsage,
+    ChildRegistration, ContextItem, ContextWindowTracker, Error, ProviderRestriction, Result,
+    SecretPolicy, SessionTokenTotals, SessionUsage, TurnUsage,
     api::{NativeNotice, NativeNoticeKind},
     limits::{MAX_TOOL_COMMAND_BYTES, MAX_TOOL_ERROR_TAIL_BYTES},
     turn_started_data,
 };
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
+    event_actor::EventActor,
     protocol::MAX_COMMAND_ID_BYTES,
     session::{
         EVENT_DEADLINE, MessageCommit, StreamSource, attach_final_text,
@@ -86,12 +87,6 @@ pub(crate) struct TurnFacts {
     pub terminal: bool,
 }
 
-struct ContextWindow {
-    turn_id: String,
-    model: Option<String>,
-    tokens: i64,
-}
-
 pub(crate) struct EventConfig {
     pub credential: String,
     pub agent_id: String,
@@ -101,8 +96,7 @@ pub(crate) struct EventConfig {
 }
 
 pub(crate) struct EventHandle {
-    control: mpsc::Sender<Control>,
-    status: watch::Receiver<EventStatus>,
+    actor: EventActor<Control, EventStatus>,
 }
 
 enum Control {
@@ -228,8 +222,7 @@ struct EventProcessor {
     /// never summed.
     turn_usage: Option<(String, NativeTokenUsageDelta, NativeTokenUsageDelta)>,
     thread_model: Option<String>,
-    usage_turn_model: Option<(String, String)>,
-    usage_window: Option<ContextWindow>,
+    usage_window: ContextWindowTracker,
     /// Latest merged session-scoped snapshot from
     /// `thread/tokenUsage/updated`: the cumulative per-thread `total` and
     /// `modelContextWindow` capacity. Never turn expenditure; committed as
@@ -271,10 +264,14 @@ pub(crate) fn spawn(
     config: EventConfig,
 ) -> EventHandle {
     let processor = EventProcessor::new(native, host, config);
-    let (control, control_rx) = mpsc::channel(CONTROL_QUEUE);
-    let (status_tx, status) = watch::channel(EventStatus::default());
-    tokio::spawn(run(frames, stream, processor, control_rx, status_tx));
-    EventHandle { control, status }
+    let actor = EventActor::spawn(
+        CONTROL_QUEUE,
+        EventStatus::default(),
+        move |control_rx, status_tx| async move {
+            run(frames, stream, processor, control_rx, status_tx).await;
+        },
+    );
+    EventHandle { actor }
 }
 
 impl EventHandle {
@@ -340,7 +337,7 @@ impl EventHandle {
         command_id: &str,
         deadline: Instant,
     ) -> Result<CompactionProgress> {
-        let mut status = self.status.clone();
+        let mut status = self.actor.watch().clone();
         loop {
             let snapshot = status.borrow().clone();
             if let Some(progress) = snapshot.compaction
@@ -383,56 +380,35 @@ impl EventHandle {
         verb: String,
         args: Value,
     ) -> Result<Value> {
-        let (reply, response) = oneshot::channel();
-        timeout_at(
-            Instant::now() + EVENT_DEADLINE,
-            self.control.send(Control::ReplyRequest {
+        self.actor
+            .call_with_dispatch(|reply| Control::ReplyRequest {
                 command_id,
                 request_id,
                 turn_id,
                 verb,
                 args,
                 reply,
-            }),
-        )
-        .await
-        .map_err(|_| Error::new("busy", "Codex event-control queue is full"))?
-        .map_err(|_| Error::new("native_not_dispatched", "Codex event processor stopped"))?;
-        timeout_at(Instant::now() + EVENT_DEADLINE, response)
-            .await
-            .map_err(|_| Error::new("unknown", "Codex request-reply outcome is unknown"))?
-            .map_err(|_| Error::new("unknown", "Codex request-reply response was lost"))?
+            })
+            .await?
     }
 
     pub async fn close(&self) {
-        let (reply, response) = oneshot::channel();
-        if self.control.send(Control::Close { reply }).await.is_ok() {
-            let _ = timeout_at(Instant::now() + EVENT_DEADLINE, response).await;
-        }
+        let _ = self.actor.call(|reply| Control::Close { reply }).await;
     }
 
     pub async fn drain_native(&self) -> Result<()> {
-        eliot_plugin::native_lifecycle::wait_for_native_tail(&self.status, |s| s.native_drained)
-            .await
+        eliot_plugin::native_lifecycle::wait_for_native_tail(self.actor.watch(), |s| {
+            s.native_drained
+        })
+        .await
     }
 
     pub fn status(&self) -> EventStatus {
-        self.status.borrow().clone()
+        self.actor.watch().borrow().clone()
     }
 
     async fn send(&self, build: impl FnOnce(oneshot::Sender<Result<()>>) -> Control) -> Result<()> {
-        let (reply, response) = oneshot::channel();
-        timeout_at(
-            Instant::now() + EVENT_DEADLINE,
-            self.control.send(build(reply)),
-        )
-        .await
-        .map_err(|_| Error::new("unknown", "Codex event-control queue deadline elapsed"))?
-        .map_err(|_| Error::new("unknown", "Codex event processor stopped"))?;
-        timeout_at(Instant::now() + EVENT_DEADLINE, response)
-            .await
-            .map_err(|_| Error::new("unknown", "Codex event-control outcome is unknown"))?
-            .map_err(|_| Error::new("unknown", "Codex event-control response was lost"))?
+        self.actor.call(build).await?
     }
 }
 
@@ -466,8 +442,7 @@ impl EventProcessor {
             turn_has_work_or_uncertain_effects: false,
             turn_usage: None,
             thread_model: None,
-            usage_turn_model: None,
-            usage_window: None,
+            usage_window: ContextWindowTracker::default(),
             session_usage: None,
             session_usage_committed: None,
             session_usage_seq: 0,
@@ -864,13 +839,8 @@ impl EventProcessor {
         self.final_text = None;
         self.turn_has_work_or_uncertain_effects = false;
         self.turn_usage = None;
-        let associated_model = model.as_ref().or(self.thread_model.as_ref()).cloned();
-        if let Some(window) = &mut self.usage_window
-            && window.turn_id == turn_id
-        {
-            window.model.clone_from(&associated_model);
-        }
-        self.usage_turn_model = associated_model.map(|model| (turn_id.clone(), model));
+        self.usage_window
+            .associate_turn(&turn_id, model.as_deref().or(self.thread_model.as_deref()));
         let thread_id = self.status.thread_id.as_deref().unwrap_or_default();
         let native_id = event_id(thread_id, &turn_id, &turn_id, "turn.started")?;
         // Report the model/effort the native turn request actually carried,
@@ -1817,32 +1787,12 @@ impl EventProcessor {
                 }
             }
         }
-        let model = self
-            .usage_turn_model
-            .as_ref()
-            .filter(|(turn, _)| turn == &notification.turn_id)
-            .map(|(_, model)| model.as_str());
-        let cached_window = self
-            .usage_window
-            .as_ref()
-            .filter(|window| {
-                window.turn_id == notification.turn_id
-                    || (model.is_some() && model == window.model.as_deref())
-            })
-            .map(|window| window.tokens);
-        let merged = session_usage_from_token_usage(
+        let Some(merged) = session_usage_from_token_usage(
             &notification.token_usage,
             self.session_usage.as_ref(),
-            cached_window,
-        );
-        if let Some(tokens) = notification.token_usage.model_context_window {
-            self.usage_window = (tokens > 0).then(|| ContextWindow {
-                turn_id: notification.turn_id.clone(),
-                model: model.map(str::to_owned),
-                tokens,
-            });
-        }
-        let Some(merged) = merged else {
+            &mut self.usage_window,
+            &notification.turn_id,
+        ) else {
             return Ok(());
         };
         self.session_usage = Some(merged.clone());
@@ -2306,33 +2256,18 @@ fn turn_expenditure(
 /// null (never zero), and a delta with no usable counter yields no usage at
 /// all. `modelContextWindow` capacity never enters this mapping.
 fn turn_usage_from_delta(delta: &NativeTokenUsageDelta) -> Option<TurnUsage> {
-    let counter = |value: Option<i64>| value.filter(|value| *value >= 0);
-    let input_tokens = counter(delta.input_tokens);
-    let output_tokens = counter(delta.output_tokens);
-    let reasoning_tokens = counter(delta.reasoning_output_tokens);
-    let cache_read_tokens = counter(delta.cached_input_tokens);
-    let cache_write_tokens = counter(delta.cache_write_input_tokens);
-    let total_tokens = counter(delta.total_tokens);
-    if input_tokens.is_none()
-        && output_tokens.is_none()
-        && reasoning_tokens.is_none()
-        && cache_read_tokens.is_none()
-        && cache_write_tokens.is_none()
-        && total_tokens.is_none()
-    {
-        return None;
-    }
-    Some(TurnUsage {
-        scope: Some("turn".to_owned()),
-        message_id: None,
-        input_tokens,
-        output_tokens,
-        reasoning_tokens,
-        thinking_tokens: None,
-        cache_read_tokens,
-        cache_write_tokens,
-        total_tokens,
-    })
+    TurnUsage::from_native(
+        "turn",
+        TurnUsage {
+            input_tokens: delta.input_tokens,
+            output_tokens: delta.output_tokens,
+            reasoning_tokens: delta.reasoning_output_tokens,
+            cache_read_tokens: delta.cached_input_tokens,
+            cache_write_tokens: delta.cache_write_input_tokens,
+            total_tokens: delta.total_tokens,
+            ..TurnUsage::default()
+        },
+    )
 }
 
 /// Merge one `thread/tokenUsage/updated` body into the retained session
@@ -2342,18 +2277,11 @@ fn turn_usage_from_delta(delta: &NativeTokenUsageDelta) -> Option<TurnUsage> {
 fn session_usage_from_token_usage(
     token_usage: &NativeThreadTokenUsage,
     previous: Option<&SessionUsage>,
-    cached_window: Option<i64>,
+    context: &mut ContextWindowTracker,
+    turn_id: &str,
 ) -> Option<SessionUsage> {
     let counter = |value: Option<i64>| value.filter(|value| *value >= 0);
-    let mut merged = previous.cloned().unwrap_or(SessionUsage {
-        context_used_tokens: None,
-        context_window_tokens: None,
-        cumulative_tokens: None,
-        cumulative_cost: None,
-        session_file_bytes: None,
-        source: None,
-        observed_at: None,
-    });
+    let mut merged = previous.cloned().unwrap_or_default();
     let mut changed = false;
     let last = &token_usage.last;
     let has_response = last.has_response_counters();
@@ -2374,19 +2302,13 @@ fn session_usage_from_token_usage(
             changed = true;
         }
     }
-    let previous_context = (merged.context_used_tokens, merged.context_window_tokens);
-    if has_response {
-        merged.context_used_tokens = last.total_tokens;
-        merged.context_window_tokens = token_usage.model_context_window.or(cached_window);
-    } else if let Some(window) = token_usage.model_context_window
-        && (cached_window.is_none() || merged.context_window_tokens != Some(window))
-    {
-        // A capacity-only update cannot pair a new window with old occupancy.
-        merged.context_used_tokens = None;
-        merged.context_window_tokens = Some(window);
-    }
-    merged.retain_valid_context();
-    changed |= previous_context != (merged.context_used_tokens, merged.context_window_tokens);
+    changed |= context.observe(
+        &mut merged,
+        turn_id,
+        has_response,
+        last.total_tokens,
+        token_usage.model_context_window,
+    );
     if !changed {
         return None;
     }

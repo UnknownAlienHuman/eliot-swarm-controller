@@ -21,7 +21,7 @@ use std::{
     sync::{Arc, Mutex as StdMutex},
 };
 
-use eliot_core::{Error, Result, SecretPolicy, StderrSnapshot, StderrSource};
+use eliot_core::{Error, Result, SecretPolicy, StderrSnapshot};
 use eliot_plugin::{
     StderrView,
     native_transport::{
@@ -409,9 +409,8 @@ impl AgyClient {
         self.stderr.snapshot()
     }
 
-    pub fn diagnostic_error(&self, mut error: Error) -> Error {
-        error.message = self.policy.redact_text(&error.message).into();
-        error.with_stderr(StderrSource::Harness, self.stderr_snapshot())
+    pub fn diagnostic_error(&self, error: Error) -> Error {
+        eliot_plugin::harness_diagnostic(error, &self.policy, Some(self.stderr_snapshot()))
     }
 
     async fn call_inner(&self, method: &str, params: Value, deadline: Instant) -> Result<Value> {

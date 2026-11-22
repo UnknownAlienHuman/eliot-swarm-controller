@@ -16,7 +16,7 @@ use tokio::{
     time::{Instant, timeout_at},
 };
 
-use eliot_core::{Error, Result, SecretPolicy, StderrSnapshot, StderrSource};
+use eliot_core::{Error, Result, SecretPolicy, StderrSnapshot};
 use eliot_plugin::{
     StderrView,
     native_transport::{
@@ -249,8 +249,7 @@ impl ClaudeClient {
                     "native control refusal without structured upstream evidence",
                 );
         }
-        error = error.sanitized(&self.policy);
-        error.with_stderr(StderrSource::Harness, self.stderr_snapshot())
+        eliot_plugin::harness_diagnostic(error, &self.policy, Some(self.stderr_snapshot()))
     }
 
     async fn control_inner(
