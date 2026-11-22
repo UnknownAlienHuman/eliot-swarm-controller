@@ -100,6 +100,9 @@ fn is_false(value: &bool) -> bool {
     !value
 }
 
+/// Daemon-derived launch argument carrying the default project-check Goal.
+pub const PROJECT_CHECK_GOAL_ARG: &str = "_project_check_goal";
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FrozenSetupFile {
     pub canonical_path: String,

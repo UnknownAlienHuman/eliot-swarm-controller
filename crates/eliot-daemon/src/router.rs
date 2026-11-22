@@ -22,6 +22,7 @@ mod organization;
 mod overview;
 mod patch_digest;
 mod project_assignment;
+mod project_checks;
 mod provider_resilience;
 mod repeat_failures;
 mod resolution;
@@ -40,6 +41,7 @@ pub(crate) use coordination::run_mail_reoffer;
 pub(crate) use digests::run_completion_digest;
 use eliot_core::{is_attachment_verb, is_start_verb, is_user_event_verb};
 pub(crate) use goals::{real_goal_check, run_goal_driver};
+pub(crate) use project_checks::run_project_checks;
 pub(crate) use tool_incident::run_tool_failure_attention;
 
 use crate::{
@@ -2396,14 +2398,17 @@ impl Router {
                         hierarchy::inherit_launch_project_scope(&store, &mut request)?
                     };
                     let resolve_project = !chat && request.args.get("parent").is_none();
-                    self.freeze_launch_admission(
-                        principal,
-                        &mut request,
-                        resolve_project,
-                        parent_workspace_shared,
-                        arbitrated,
-                    )
-                    .await
+                    let input = self
+                        .freeze_launch_admission(
+                            principal,
+                            &mut request,
+                            resolve_project,
+                            parent_workspace_shared,
+                            arbitrated,
+                        )
+                        .await?;
+                    project_checks::attach_default_goal(self, &mut request).await?;
+                    Ok(input)
                 }
                 .await;
                 workspace = match frozen {
@@ -7681,6 +7686,7 @@ fn reject_launch_derived_keys(args: &Value) -> Result<()> {
     }
     for reserved in [
         "registered_project",
+        eliot_core::PROJECT_CHECK_GOAL_ARG,
         "admission_mode",
         "auto_worktree",
         "project_assignment_launch",
