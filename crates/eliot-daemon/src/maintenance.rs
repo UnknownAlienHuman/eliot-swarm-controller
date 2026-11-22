@@ -33,7 +33,13 @@ pub(crate) async fn run(
     router.recover_ended_provider_probes(&shutdown).await?;
     reporter.running("maintenance");
     tokio::try_join!(
-        run_retention(store, data_root, Arc::clone(&policy), initial, shutdown.clone()),
+        run_retention(
+            store,
+            data_root,
+            Arc::clone(&policy),
+            initial,
+            shutdown.clone()
+        ),
         run_provider_maintenance(router, policy, shutdown),
     )?;
     Ok(())
