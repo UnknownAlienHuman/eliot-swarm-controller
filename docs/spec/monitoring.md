@@ -525,6 +525,12 @@ that generation. Source closure or a generation replacement clears its entries.
 A partial persisted view neither replays nor gates a commit. A repeat poll compares equal
 and writes nothing.
 
+The cached `agent.git` view includes `line_counts` only when the workspace work probe
+has complete status and a usable base. It reports files changed, insertions and deletions
+against that workspace base; a missing or partial work probe leaves the field null.
+These are workspace measurements, not per-Agent authorship facts when more than one
+non-terminal Agent admits the checkout.
+
 Executable Git filters are disabled, and applicable filter
 attributes make raw status partial; bounded attribution-path coverage can also make a
 snapshot partial. An empty partial dirty set does not prove the workspace clean.

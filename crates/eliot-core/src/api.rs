@@ -64,14 +64,15 @@ pub use agent_views::{
     CloudMcpHealth, CloudMcpStatus, CrashMarker, DaemonBuildIdentity, DaemonPanicTestResponse,
     DaemonStatusResponse, DiagnoseResponse, DiagnoseStep, DrainReport, GitCredentialHelper,
     MAX_DIAGNOSE_ATTENTION_STEPS, MAX_DIAGNOSE_MESSAGE_CHARS, MAX_DIAGNOSE_STEPS,
-    MAX_DIAGNOSE_SUMMARY_CHARS, NativeNotice, NativeNoticeKind, OwnedProcessKind,
-    OwnedProcessSummary, PROCESS_CURSOR_MAX_BYTES, PatchDigestFile, ProcessPageCursor,
-    ProjectCheckoutView, ProjectDiscoverResponse, ProjectGitHubCliView, ProjectGitPublicationView,
-    ProjectGitView, ProjectRegistrationView, RetainedUnknownSummary, RetentionView,
-    RunningTurnSummary, SourceOwner, SourceState, StatusBlocker, UnsettledCommandSummary,
-    WorkerTaskHealth, WorkerTaskStatus, WorkspaceCustodyView, activity_state_name,
-    agent_state_name, agent_status_line, diagnosis_reason, process_state_name,
-    repository_name_from_url, stats_coverage_name,
+    MAX_DIAGNOSE_SUMMARY_CHARS, MAX_PATCH_DIGEST_OUTSIDE_CLAIMS, MAX_PATCH_DIGEST_PATH_BYTES,
+    NativeNotice, NativeNoticeKind, OwnedProcessKind, OwnedProcessSummary,
+    PROCESS_CURSOR_MAX_BYTES, PatchDigestFile, ProcessPageCursor, ProjectCheckoutView,
+    ProjectDiscoverResponse, ProjectGitHubCliView, ProjectGitPublicationView, ProjectGitView,
+    ProjectRegistrationView, RetainedUnknownSummary, RetentionView, RunningTurnSummary,
+    SourceOwner, SourceState, StatusBlocker, UnsettledCommandSummary, WorkerTaskHealth,
+    WorkerTaskStatus, WorkspaceCustodyView, activity_state_name, agent_state_name,
+    agent_status_line, diagnosis_reason, process_state_name, repository_name_from_url,
+    stats_coverage_name,
 };
 pub use config_views::{
     CONFIG_REVISION_HEX_LEN, MAX_LISTED_PROFILES, MAX_PROFILES_SOURCE_BYTES, ProfileListRequest,
@@ -220,8 +221,9 @@ pub use usage::{
     UsageSummaryRequest, UsageSummaryResponse,
 };
 pub use waits::{
-    MAX_SWARM_WAIT_MS, MAX_SWARM_WAIT_TARGETS, MAX_WAIT_FINAL_TEXT_BYTES, MAX_WAIT_FRAME_BYTES,
-    SwarmWaitRequest, SwarmWaitResponse, WaitEntryResult, WaitTurnRef, truncate_bytes,
+    MAX_SWARM_WAIT_MS, MAX_SWARM_WAIT_TARGETS, MAX_WAIT_FACTS_FRAME_BYTES,
+    MAX_WAIT_FINAL_TEXT_BYTES, MAX_WAIT_FRAME_BYTES, SwarmWaitRequest, SwarmWaitResponse,
+    WaitEntryResult, WaitTurnRef, truncate_bytes,
 };
 pub use wakes::{
     AgentWakeCondition, AgentWakeRequest, AgentWakeResponse, DEFAULT_AGENT_WAKE_TIMEOUT_SECS,

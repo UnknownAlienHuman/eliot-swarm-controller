@@ -5287,9 +5287,11 @@ impl Router {
                 || Self::wait_mode_completed(mode, &snapshot.results)
                 || !poll.wake(|event| snapshot.watches(event)).await?
             {
+                let mut results = snapshot.results;
+                self.attach_wait_facts(&mut results, principal).await;
                 return Self::encode_wait(
                     &request,
-                    snapshot.results,
+                    results,
                     !snapshot.mail_arrived,
                     snapshot.mail_arrived,
                 );

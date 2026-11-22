@@ -14,9 +14,10 @@ use eliot_core::{
     ProcessRecord, ProcessSample, ProcessSnapshot, ProcessState, Result, SourceGap,
     WorkspacePreparation,
     api::{
-        FilesystemInvalidationState, FilesystemInvalidationView, GitObservation, GitView,
-        LivenessBasis, LivenessView, MonitoringSourceState, ObservationData, ObservationView,
-        ProcessStatsView, SourceState, StatsCoverage, WorkspaceObservation, WorkspaceView,
+        ChildRunLineCounts, FilesystemInvalidationState, FilesystemInvalidationView,
+        GitObservation, GitView, LivenessBasis, LivenessView, MonitoringSourceState,
+        ObservationData, ObservationView, ProcessStatsView, SourceState, StatsCoverage,
+        WorkspaceObservation, WorkspaceView,
     },
 };
 use eliot_plugin::sync::LockExt;
@@ -730,6 +731,17 @@ impl Monitoring {
             base_oid: snapshot.and_then(|snapshot| snapshot.base_oid.clone()),
             committed_paths: snapshot.map(|snapshot| snapshot.committed_paths.clone()),
             base_complete: snapshot.map(|snapshot| snapshot.base_complete),
+            line_counts: snapshot.and_then(|snapshot| {
+                let work = snapshot.work.as_ref()?;
+                if !work.available {
+                    return None;
+                }
+                Some(ChildRunLineCounts {
+                    files_changed: work.files_changed?,
+                    insertions: work.insertions?,
+                    deletions: work.deletions?,
+                })
+            }),
             baseline,
             edits_truncated: edits.len() == PAGE_LIMIT,
             edits,

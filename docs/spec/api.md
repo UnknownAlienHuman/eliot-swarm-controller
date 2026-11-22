@@ -466,8 +466,8 @@ command id frozen at claim. Stored Goal responses/round records use Core
 | `maintenance.purge_legacy_attention_advisories` | owner-only dry-run count and exact-count purge of owner-sent legacy advisory-attention mail |
 | `agent.list/get/result` | scoped, paginated Agent state and exact results |
 | `agent.processes/stats` | scoped process records and ephemeral OS samples |
-| `agent.git/edits` | current Git snapshot and paginated native-attributed edits |
-| `agent.patch_digest` | review digest of the Agent's patch against its worktree base (else HEAD): changed files and packages, new dependencies, public-interface lines, checker/lint configuration changes and added suppressions, each list bounded; an attention filter, not a quality score |
+| `agent.git/edits` | current Git snapshot with complete work line counts when available, and paginated native-attributed edits |
+| `agent.patch_digest` | review digest of the Agent's patch against its worktree base (else HEAD): changed files and packages, new dependencies, public-interface lines, checker/lint configuration changes, suppressions and paths outside active claim globs, each list bounded; an attention filter, not a quality score |
 | `workspace.list` | owner-only page of the managed worktrees Swarm created |
 | `command.submit/get` | implemented immutable admission and command readback |
 | `turn.get` | implemented running/completed/unknown turn read |
@@ -1951,6 +1951,22 @@ follow the read section: 0 only when every entry succeeded (`--all`) or at least
 succeeded (`--any`), 5 on timeout, 7 when an entry was interrupted, 4 for
 `unknown`/`not_found`/`not_visible`, 1 for plain failure.
 
+Each visible settled child Agent result (`succeeded`, `failed` or `interrupted`) also carries
+the shared bounded `ChildRunFacts` DTO: generation-attributed edit paths and their
+timestamps, workspace line counts, recent commit ids, the exact-generation last Goal
+check exit code/time, and whether any workspace change is outside the Agent's active
+claims. The CLI carries these fields through the same `WaitEntryResult`. Facts are
+collected only for child waits and after the final wait snapshot, once per Agent
+generation, so long polls do not repeat Git reads. Shared workspace Git paths, line
+counts and commits remain unobserved; they are attached only when that workspace has
+exactly one non-terminal Agent binding and it is the target generation. On shared
+workspaces, only generation-attributed edit hints and the Goal check are reported;
+an edit hint outside an active claim may set `outside_claims` to `true`, while no
+mismatch does not prove `false`. No active claims leaves `outside_claims` unobserved.
+Missing/stale targets and partial Git, history or claim evidence also remain
+`unobserved`. Claims remain advisory. The combined facts in one wait response are
+bounded to 3 MiB.
+
 `swarm.digest` is the durable completion digest over the same frozen child set.
 The request carries `id` (caller ULID, stable effect identity), `to` (one parent
 Agent mailbox), `mode` (default `all`), and `commands`/`turns` (1..=256 entries,
@@ -1988,7 +2004,9 @@ entries render in request order and the rest are cut with an explicit
 spends the bound before any answer;
 `SwarmDigestResponse.results`
 uses `WaitEntryResult` with `not_visible` entries completely masked and
-out-of-recipient-scope entries reduced to status-only. Same id plus same
+out-of-recipient-scope entries reduced to status-only. Visible settled entries
+carry no observed work facts; fact collection is limited to `swarm.wait` and `child.run`.
+The completion mail carries its bounded status and answer excerpt. Same id plus same
 payload replays the retained registration and mail without a second delivery; same
 id plus a different payload or principal rejects `id_conflict`. Reconnect or restart
 replays the same mail id, so the digest is never duplicated. The driver sweeps
@@ -2498,6 +2516,18 @@ input. A replayed claim creates no new context item. Detection is
 conservative. The in-band list holds up to 100 conflicts and `truncated`
 signals the scan or report cap. Claims are advisory. `claim.list` pages
 live claims by project and Agent. An Agent caller reads only its own project.
+
+`agent.patch_digest.outside_claims` lists changed paths matching none of the target
+Agent generation's active claim globs at the digest read. With no active claims the
+list is empty and `outside_claims_complete` is false because there is no declared
+scope to compare. The field is advisory and does not reject or limit work.
+`outside_claims_complete` is also false when Git path coverage, the claim listing or
+the bounded outside-path list is incomplete; known outside paths may still be present
+when only Git path coverage is partial. For a shared workspace, the list uses only
+the target generation's attributed edit paths and remains incomplete; it does not
+claim all workspace changes belong to that Agent. Claims are live state, so the
+digest does not reconstruct which claim was active when an edit occurred. A requested
+stale generation still returns `stale_generation`.
 
 `who` composes existing L3 projections per current worker: the roster
 holds every non-terminal Agent in scope (at most 100, oldest first, with

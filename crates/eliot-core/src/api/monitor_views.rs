@@ -1,5 +1,5 @@
 //! Cached monitoring projections. Null counters and coverage remain unknown facts.
-use super::SourceState;
+use super::{ChildRunLineCounts, SourceState};
 use crate::{
     AgentEdit, AgentState, GitBaseline, GitCommit, GitPathStatus, ProcessRecord, ProcessSample,
     WorkspacePhase,
@@ -193,6 +193,9 @@ pub struct GitObservation {
     pub committed_paths: Option<Vec<String>>,
     #[serde(deserialize_with = "nullable")]
     pub base_complete: Option<bool>,
+    /// Complete workspace patch line counts when the Git work probe succeeded.
+    #[serde(default, deserialize_with = "nullable_object")]
+    pub line_counts: Option<ChildRunLineCounts>,
     #[serde(deserialize_with = "nullable_object")]
     pub baseline: Option<GitBaseline>,
     pub edits_truncated: bool,

@@ -958,9 +958,18 @@ pub struct AgentPatchDigestResponse {
     pub checker_changes: Vec<String>,
     /// Added error or lint suppressions.
     pub suppressions: Vec<String>,
+    /// Changed paths that match none of the Agent generation's active claim globs.
+    #[serde(default)]
+    pub outside_claims: Vec<String>,
+    /// False when Git paths, claim coverage, workspace attribution or the list were incomplete.
+    #[serde(default)]
+    pub outside_claims_complete: bool,
     /// True when a list was cut at its bound.
     pub truncated: bool,
 }
+
+pub const MAX_PATCH_DIGEST_OUTSIDE_CLAIMS: usize = 100;
+pub const MAX_PATCH_DIGEST_PATH_BYTES: usize = 4096;
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

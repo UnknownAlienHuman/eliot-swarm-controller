@@ -729,6 +729,16 @@ impl AgentPatchDigestRequest {
     pub fn validate_response(&self, reply: &AgentPatchDigestResponse) -> Result<()> {
         if self.validate().is_err()
             || !binding(&self.id, self.generation, &reply.agent, reply.generation)
+            || reply.outside_claims.len() > super::MAX_PATCH_DIGEST_OUTSIDE_CLAIMS
+            || reply.outside_claims.iter().any(|path| {
+                path.trim().is_empty()
+                    || path.len() > super::MAX_PATCH_DIGEST_PATH_BYTES
+                    || path.contains('\0')
+            })
+            || reply
+                .outside_claims
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
         {
             return Err(invalid_response());
         }

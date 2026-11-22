@@ -200,6 +200,21 @@ impl SwarmDigestResponse {
         for entry in &self.results {
             entry.validate()?;
         }
+        let facts_frame = serde_json::to_vec(
+            &self
+                .results
+                .iter()
+                .map(|entry| &entry.facts)
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|_| Error::new("invalid", "digest facts could not be encoded"))?
+        .len();
+        if facts_frame > super::MAX_WAIT_FACTS_FRAME_BYTES {
+            return Err(Error::new(
+                "invalid",
+                "digest response exceeds its child facts frame budget",
+            ));
+        }
         Ok(())
     }
 }
