@@ -148,6 +148,8 @@ pub(crate) enum CliCommand {
     Stats(StatsArgs),
     /// Read bounded usage totals with explicit coverage for one Agent, project or tree.
     Usage(UsageArgs),
+    /// Run local Git operations through the daemon.
+    Git(GitArgs),
     /// Read the current Git snapshot for an Agent's workspace.
     GitStatus(GitStatusArgs),
     /// Digest an Agent's patch for review: files, packages, new
@@ -749,6 +751,43 @@ pub(crate) struct UsageArgs {
     /// Subtree-root Agent ID; covers the root and its descendants.
     #[arg(long, value_name = "AGENT")]
     pub(crate) root: Option<String>,
+}
+
+#[derive(Args)]
+pub(crate) struct GitArgs {
+    #[command(subcommand)]
+    pub(crate) command: GitCommand,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum GitCommand {
+    /// Merge local branches in a private checkout and run the project check.
+    Integrate(GitIntegrateArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct GitIntegrateArgs {
+    /// Owner-registered project.
+    #[arg(long, value_name = "PROJECT")]
+    pub(crate) project: String,
+    /// Local base branch.
+    #[arg(long, value_name = "BRANCH")]
+    pub(crate) base: String,
+    /// Optional local branch to fast-forward after a passing check.
+    #[arg(long, value_name = "BRANCH")]
+    pub(crate) fast_forward_to: Option<String>,
+    /// Deadline for the daemon operation.
+    #[arg(long, value_name = "DURATION")]
+    pub(crate) timeout: Option<String>,
+    /// Wait for the retained integration result.
+    #[arg(long)]
+    pub(crate) wait: bool,
+    /// How long to wait for the result without cancelling the command.
+    #[arg(long, default_value_t = DEFAULT_WAIT_SECONDS)]
+    pub(crate) timeout_seconds: u64,
+    /// Local branches to merge in the listed order.
+    #[arg(required = true, value_name = "BRANCH")]
+    pub(crate) branches: Vec<String>,
 }
 
 #[derive(Args)]
