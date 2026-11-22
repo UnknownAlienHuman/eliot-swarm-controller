@@ -44,8 +44,8 @@ async fn stand_owner_call_typed<P: Serialize + ?Sized, R: DeserializeOwned>(
     let absolute = std::path::absolute(data_dir)
         .map_err(|error| CoreError::new("unavailable", format!("resolve stand root: {error}")))?;
     eliot_daemon::operator::check_directory_chain(&absolute)?;
-    let canonical = std::fs::canonicalize(&absolute)
-        .map_err(|error| CoreError::new("unavailable", format!("resolve stand root: {error}")))?;
+    // Never resolve the root component itself: a link there must not redirect.
+    let canonical = eliot_daemon::operator::stand_key_root(&absolute)?;
     eliot_daemon::operator::check_directory_chain(&canonical)?;
     if eliot_daemon::operator::target_is_protected_from_stand_owner_auth(&absolute) {
         return Err(CoreError::new(

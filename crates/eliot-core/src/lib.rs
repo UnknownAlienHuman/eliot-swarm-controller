@@ -1658,12 +1658,14 @@ impl AdmissionRefusal {
 
     pub fn error(self, message: impl Into<String>) -> Error {
         let (code, where_, origin, evidence) = self.parts();
-        Error::new(code, message)
+        let mut error = Error::new(code, message)
             .with_where(where_)
-            .with_origin(origin, evidence)
+            .with_origin(origin, evidence);
+        error.admission = Some(self);
+        error
     }
 
-    /// The refusal exactly produced by [`Self::error`], if any.
+    /// Parse a retained `command.refused` record written for a marked refusal.
     pub fn of_parts(
         code: &str,
         where_: Option<&str>,
@@ -1677,8 +1679,10 @@ impl AdmissionRefusal {
         })
     }
 
+    /// The refusal [`Self::error`] produced in this process, if any. Matching
+    /// by value never counts: only the private preflight marker does.
     pub fn of(error: &Error) -> Option<Self> {
-        Self::of_parts(&error.code, error.failure_where.as_deref(), error.origin)
+        error.admission
     }
 }
 
@@ -1842,6 +1846,12 @@ pub struct Error {
         skip_serializing_if = "Option::is_none"
     )]
     pub ntstatus: Option<Box<str>>,
+    /// Private, in-process only: set solely by [`AdmissionRefusal::error`] at
+    /// the preflight call site. Never serialized, deserialized or settable by
+    /// value, so a later error with the same code/where/origin never counts.
+    #[serde(skip)]
+    #[schemars(skip)]
+    admission: Option<AdmissionRefusal>,
 }
 
 /// Parameter diagnostics contain schema-owned names/expectations, never values.
@@ -1938,6 +1948,7 @@ impl Error {
             failure_where: None,
             origin: None,
             origin_evidence: None,
+            admission: None,
         }
     }
 

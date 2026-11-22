@@ -1186,9 +1186,10 @@ pub(crate) struct ClaimArgs {
 
 #[derive(Args)]
 pub(crate) struct PluginArgs {
-    /// Per-spawn crash-report nonce chosen by the owning daemon.
+    /// Read the owning daemon's per-spawn crash-report nonce as the first
+    /// stdin line before any RPC.
     #[arg(long, hide = true)]
-    pub(crate) crash_nonce: Option<String>,
+    pub(crate) crash_nonce_stdin: bool,
     #[command(subcommand)]
     pub(crate) command: PluginCommand,
 }

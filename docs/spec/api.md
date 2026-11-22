@@ -2876,8 +2876,13 @@ AppData Known Folder on Windows, or `.local/state/eliot-stands` under the
 account's password-database home on Unix. The private registry always lives in
 `.registry` under that fixed stand home; no environment variable selects it.
 It binds the random creation token to the canonical stand path outside the
-stand itself, and while starting the daemon it created `stand up` records the
-SHA-256 of the owner token that daemon minted. While a stand daemon prepares a
+stand itself and records the handle identity (volume serial and file index) of
+the directory `stand up` created and the issuing daemon root when created
+inside an Agent session. While starting the daemon it created, `stand up`
+records the SHA-256 of the owner token that daemon minted; that bind first
+refuses protected roots and reads the token relative to the root held by
+handle (ancestors pinned, no reparse point) after matching its identity and
+marker. While a stand daemon prepares a
 managed worktree, before any Git effect, it records the repository common
 directory, branch, creation OID and worktree path in a sidecar of its
 registration; a stand whose registration cannot be verified refuses the
@@ -2888,10 +2893,12 @@ state, and `stand prune` tears down expired registered stands.
 binding before any action. It refuses every daemon root the caller could resolve
 as its own: the root resolved without `--data-dir`, `ELIOT_HOME`, the durable
 selected root and the default, read from the environment and from the account's
-fixed profile location, plus the inherited issuing daemon. The target's
-`owner.token` must hash to the value `stand up` recorded, so a copied or forged
-marker cannot qualify without the target's own secret, and a running non-stand
-daemon never qualifies. It then stops owned processes, records exit proof
+fixed profile location, plus the issuing daemon persisted in the registration
+(never inherited environment). Through the root held by handle, its identity
+must equal the recorded creation identity, its marker must match and its
+`owner.token` must hash to the value `stand up` recorded, so a copied, forged
+or junction-swapped root cannot qualify without the target's own secret. A
+root with a live daemon is refused unless it carries that full binding. It then stops owned processes, records exit proof
 before removal, and deletes the marker last. Its local stand owner-credential
 helper applies the same checks and permits only stand lifecycle and readback
 RPCs (`daemon.status`, `agent.list`, `agent.get`, `swarm.wait`, `command.get`,

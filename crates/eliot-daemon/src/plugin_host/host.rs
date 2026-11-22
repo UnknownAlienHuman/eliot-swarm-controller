@@ -808,10 +808,11 @@ impl PluginHost {
             return Err(error);
         }
         let spawn_started = Instant::now();
-        // Per-spawn crash nonce on argv (never in the inherited environment):
-        // only reports carrying it and the owned PID count as plugin crashes.
+        // Per-spawn crash nonce, written as the plugin's first stdin line
+        // (never argv or environment): only reports carrying it and the owned
+        // PID count as plugin crashes.
         let crash_nonce = format!("{}{}", Ulid::new(), Ulid::new());
-        let spawned = self.spawn_plugin(&agent, &instance_dir, &crash_nonce).await;
+        let spawned = self.spawn_plugin(&agent, &instance_dir).await;
         let mut child = match spawned {
             Ok(child) => {
                 *may_have_spawned = true;
@@ -877,6 +878,14 @@ impl PluginHost {
             return Err(error);
         };
 
+        // The plugin reads this line before anything else. A write failure
+        // means the plugin already exited; the owned exit path settles it.
+        let mut stdin = stdin;
+        {
+            use tokio::io::AsyncWriteExt;
+            let _ = stdin.write_all(format!("{crash_nonce}\n").as_bytes()).await;
+            let _ = stdin.flush().await;
+        }
         let telemetry_policy = Arc::new(SecretPolicy::new(source_credentials.iter()));
         let debug_policy = Arc::clone(&telemetry_policy);
         let debug_agent = agent.id.clone();
@@ -1738,7 +1747,6 @@ impl PluginHost {
         &self,
         agent: &Agent,
         _instance_dir: &Path,
-        crash_nonce: &str,
     ) -> std::result::Result<OwnedChild, AgentSpawnError> {
         let workspace = agent.workspace.as_deref().ok_or_else(|| {
             AgentSpawnError::NotSpawned(Error::new("invalid", "Agent launch requires a workspace"))
@@ -1757,7 +1765,7 @@ impl PluginHost {
                 ))
             })?;
         let command = self
-            .plugin_command(&agent.harness, Path::new(workspace), Some(crash_nonce))
+            .plugin_command(&agent.harness, Path::new(workspace), true)
             .map_err(AgentSpawnError::NotSpawned)?;
         self.state.agent_custodies.spawn(&agent.id, || {
             OwnedChild::spawn_agent(command, &namespace, &agent.id, agent.generation)
@@ -1777,7 +1785,7 @@ impl PluginHost {
         workspace: &Path,
         observation: Option<&Agent>,
     ) -> Result<OwnedChild> {
-        let command = self.plugin_command(harness, workspace, None)?;
+        let command = self.plugin_command(harness, workspace, false)?;
         if let Some(agent) = observation {
             self.state
                 .agent_custodies
@@ -1798,7 +1806,7 @@ impl PluginHost {
         &self,
         harness: &str,
         workspace: &Path,
-        crash_nonce: Option<&str>,
+        crash_nonce_stdin: bool,
     ) -> Result<ProcessCommand> {
         let executable = std::env::current_exe().map_err(|error| {
             Error::new("platform_io", format!("locate Eliot executable: {error}"))
@@ -1812,8 +1820,8 @@ impl PluginHost {
             .arg("--data-dir")
             .arg(&self.state.data_root)
             .arg("plugin");
-        if let Some(nonce) = crash_nonce {
-            command.arg("--crash-nonce").arg(nonce);
+        if crash_nonce_stdin {
+            command.arg("--crash-nonce-stdin");
         }
         command
             .arg(harness)

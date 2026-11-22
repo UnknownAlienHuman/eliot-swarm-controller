@@ -11,8 +11,9 @@ pub use crate::stand_cleanup::{
     StandRegistration, StandWorktreeOutcome, bind_stand_owner_token, check_directory_chain,
     check_nested_roots, cleanup_stand_external_git, ensure_registry_is_external,
     list_stand_registrations, parse_stand_ttl_ms, read_stand_registration, registry_name,
-    remove_offline_stand_root, remove_stand_registration, stand_base, stand_now_ms, stand_registry,
-    verify_stand_marker, verify_stand_owner_binding, write_stand_registration,
+    remove_offline_stand_root, remove_stand_registration, stand_base, stand_key_root, stand_now_ms,
+    stand_registry, stand_root_identity, verify_stand_marker, verify_stand_owner_binding,
+    write_stand_registration,
 };
 pub use crate::update_backup::{
     discard_update_backup, lock_update_publication, restore_update_backup, update_backup_path,
@@ -59,65 +60,86 @@ pub fn data_dirs_match(left: &Path, right: &Path) -> bool {
     crate::daemon::identity_data_dirs_equal(left, right)
 }
 
-/// Returns whether `target` must never receive stand-owner treatment: any
-/// daemon root this process could resolve as its own (`--data-dir`-less
-/// resolution, `ELIOT_HOME`, the durable selection and the default, from the
-/// environment and the account profile alike) or the inherited Agent issuing
-/// daemon. Stand roots additionally need the owner binding `stand up` recorded.
-pub fn target_is_protected_from_stand_owner_auth(target: &Path) -> bool {
+fn same_root(target: &Path, candidate: &Path) -> bool {
     let canonical = std::fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
-    let matches_dir = |candidate: &Path| {
-        data_dirs_match(target, candidate)
-            || data_dirs_match(&canonical, candidate)
-            || std::fs::canonicalize(candidate)
-                .is_ok_and(|canon_candidate| data_dirs_match(&canonical, &canon_candidate))
-    };
-    if inherited_agent_parent_data_dir().is_some_and(|parent| matches_dir(&parent)) {
-        return true;
-    }
-    if std::env::var_os(crate::daemon::AGENT_DATA_DIR_ENV)
-        .filter(|value| !value.is_empty())
-        .is_some_and(|dir| matches_dir(Path::new(&dir)))
-    {
-        return true;
-    }
-    if let Some(scope) =
-        std::env::var_os(crate::daemon::AGENT_DATA_SCOPE_ENV).filter(|value| !value.is_empty())
-        && (scope == std::ffi::OsStr::new(&crate::daemon::identity_data_scope(target))
-            || scope == std::ffi::OsStr::new(&crate::daemon::identity_data_scope(&canonical)))
-    {
-        return true;
-    }
+    data_dirs_match(target, candidate)
+        || data_dirs_match(&canonical, candidate)
+        || std::fs::canonicalize(candidate)
+            .is_ok_and(|canon_candidate| data_dirs_match(&canonical, &canon_candidate))
+}
+
+/// Returns whether `target` is a daemon root this process could resolve as
+/// its own (`--data-dir`-less resolution, `ELIOT_HOME`, the durable selection
+/// and the default, from the environment and the account profile alike).
+/// The issuing parent comes only from the stand registration
+/// ([`refuse_issuing_root`]); live daemons need a full stand binding
+/// ([`verify_stand_target`]).
+pub fn target_is_protected_from_stand_owner_auth(target: &Path) -> bool {
     crate::platform::data_dir::protected_daemon_roots()
         .iter()
-        .any(|dir| matches_dir(dir))
+        .any(|dir| same_root(target, dir))
+}
+
+/// Refuse a target that is the daemon `stand up` recorded as the stand's
+/// issuing parent. The persisted root is used, never inherited environment.
+pub fn refuse_issuing_root(
+    target: &Path,
+    registration: &crate::stand_cleanup::StandRegistration,
+) -> Result<()> {
+    if registration
+        .parent_data_dir
+        .as_deref()
+        .is_some_and(|parent| same_root(target, parent))
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "a stand operation cannot target the stand's issuing daemon",
+        ));
+    }
+    Ok(())
 }
 
 /// Refuse any target that is not a stand bound by `stand up`: a protected
-/// daemon root, or a root whose owner token is not the one its own daemon
-/// minted at stand creation. Returns that token. During an interrupted
-/// removal (`removing_pid` recorded and no owner token left) only the root
-/// protection applies and no token is returned.
+/// daemon root, the recorded issuing daemon, or a root that is not the
+/// handle-identified directory `stand up` created with its marker and owner
+/// token. A root with a live (or undeterminable) daemon never qualifies
+/// without that full binding. Returns the owner token. During an interrupted
+/// removal (`removing_pid` recorded, no live daemon, no owner token left)
+/// only the root protections apply and no token is returned.
 pub fn verify_stand_target(
     root: &Path,
     registration: &crate::stand_cleanup::StandRegistration,
 ) -> Result<Option<String>> {
-    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    if target_is_protected_from_stand_owner_auth(root)
-        || target_is_protected_from_stand_owner_auth(&canonical)
-    {
+    if target_is_protected_from_stand_owner_auth(root) {
         return Err(Error::new(
             "not_allowed",
             "a stand operation cannot target a daemon root this process resolves as its own",
         ));
     }
-    if registration.removing_pid.is_some()
+    refuse_issuing_root(root, registration)?;
+    let live = match daemon_info(root) {
+        Ok(None) => false,
+        Ok(Some(info)) => daemon_alive(&info).unwrap_or(true),
+        Err(_) => true,
+    };
+    if !live
+        && registration.removing_pid.is_some()
         && std::fs::symlink_metadata(root.join("owner.token"))
             .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
     {
         return Ok(None);
     }
-    crate::stand_cleanup::verify_stand_owner_binding(root, registration).map(Some)
+    match crate::stand_cleanup::verify_stand_owner_binding(root, registration) {
+        Ok(token) => Ok(Some(token)),
+        Err(error) if live => Err(Error::new(
+            "not_allowed",
+            format!(
+                "target runs a live daemon that is not a stand created by this registry: {}",
+                error.message
+            ),
+        )),
+        Err(error) => Err(error),
+    }
 }
 
 pub fn daemon_info(path: &Path) -> Result<Option<DaemonInfo>> {

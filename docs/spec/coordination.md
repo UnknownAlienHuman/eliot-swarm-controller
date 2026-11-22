@@ -77,7 +77,10 @@ candidates. The fetch updates remote-tracking state and leaves branches and
 worktree files in place. A present
 `daemon.lock` with a live owner keeps a data directory. Only a provably dead
 owner releases it. Artifacts carrying `expires_at` stay `keep(not_expired)` or
-`keep(stand_not_expired)` until `expires_at`. Expiry only extends retention: an
+`keep(stand_not_expired)` until `expires_at`. Stand plan and apply refuse the
+parent's own data root and apply the same protected-root, issuing-root,
+handle-identity, marker and owner-binding checks as `stand down` before any
+removal. Expiry only extends retention: an
 expired artifact still keeps `retention_age` until the ordinary retention window
 has passed. Expired registered private stands
 (`purpose: SWARM_STAND_ARTIFACT_PURPOSE`) then verify external registry binding,

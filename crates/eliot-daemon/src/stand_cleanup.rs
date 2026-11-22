@@ -101,6 +101,10 @@ pub struct StandRegistration {
     /// SHA-256 of the owner token the stand's own daemon minted at creation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_token_sha256: Option<String>,
+    /// Handle identity (volume serial and file index) of the directory
+    /// `stand up` created as this stand's root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_identity: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_write_guard: Option<StandWriteGuardJournal>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -522,39 +526,160 @@ fn owner_token_digest(token: &str) -> String {
     eliot_core::api::inference::sha256_hex(token.as_bytes())
 }
 
-/// Bind the registration to the owner token the stand's own daemon minted at
-/// creation. Only `stand up` calls this while starting the daemon it just
-/// created; `Ok(false)` means the daemon has not minted the token yet.
-pub fn bind_stand_owner_token(root: &Path) -> Result<bool> {
-    let root = fs::canonicalize(root)
+/// The registry spelling of a stand root: the canonical parent joined with the
+/// root's own name. The root component itself is never resolved, so a link
+/// planted at the root cannot redirect the lookup.
+pub fn stand_key_root(path: &Path) -> Result<PathBuf> {
+    let path = std::path::absolute(path)
         .map_err(|error| Error::new("unavailable", format!("resolve stand root: {error}")))?;
-    let registry = stand_registry(false)?;
-    let name = registry_name(&root);
-    let mut registration = read_stand_registration(&registry, &name, &root)?;
-    verify_stand_marker(&root, &registration)?;
-    let Ok(token) = crate::platform::data_dir::DataDir::open_existing(&root)
-        .and_then(|dir| dir.read_owner_token())
-    else {
-        return Ok(false);
-    };
-    let digest = owner_token_digest(&token);
-    match registration.owner_token_sha256.as_deref() {
-        Some(bound) if bound == digest => Ok(true),
-        Some(_) => Err(Error::new(
-            "identity_changed",
-            "stand owner token differs from its creation binding",
-        )),
-        None => {
-            registration.owner_token_sha256 = Some(digest);
-            write_stand_registration(&registry, &name, &registration)?;
-            Ok(true)
+    let name = path
+        .file_name()
+        .ok_or_else(|| Error::new("invalid", "stand path has no directory name"))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::new("invalid", "stand path has no parent directory"))?
+        .canonicalize()
+        .map_err(|error| Error::new("unavailable", format!("resolve stand parent: {error}")))?;
+    Ok(parent.join(name))
+}
+
+/// A stand root opened by handle. Every ancestor stays held without delete
+/// sharing, so no component can be renamed or swapped for a junction while
+/// held, no component may be a reparse point, and files are read relative to
+/// the held root.
+struct PinnedStandRoot {
+    root: PathBuf,
+    dir: crate::platform::script_file::Directory,
+    identity: String,
+}
+
+impl PinnedStandRoot {
+    fn open(root: &Path) -> Result<Self> {
+        let dir = crate::platform::script_file::Directory::open(root).map_err(|_| {
+            Error::new(
+                "not_allowed",
+                "stand root must be a plain directory chain without links or reparse points",
+            )
+        })?;
+        let identity = dir.identity()?;
+        Ok(Self {
+            root: root.to_owned(),
+            dir,
+            identity,
+        })
+    }
+
+    /// Read `name` relative to the held root; `None` when it does not exist.
+    fn read(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        if fs::symlink_metadata(self.root.join(name))
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            return Ok(None);
         }
+        let mut file = self.dir.file(name).map_err(|_| {
+            Error::new(
+                "not_allowed",
+                "stand file must be a plain single-link file inside the held root",
+            )
+        })?;
+        crate::platform::script_file::read(&mut file).map(Some)
     }
 }
 
-/// Require the target's owner token to be the one its daemon minted at stand
-/// creation, so a copied or forged marker cannot qualify without the
-/// target's own secret. Returns that token.
+/// Handle identity of a freshly created stand root, recorded by `stand up`.
+pub fn stand_root_identity(root: &Path) -> Result<String> {
+    Ok(PinnedStandRoot::open(root)?.identity)
+}
+
+/// Open the stand root by handle and prove it is the exact directory `stand
+/// up` created and marked for `registration`; then read its owner token from
+/// that same held directory. Returns the held root and the token, if minted.
+fn pinned_stand_token(
+    root: &Path,
+    registration: &StandRegistration,
+) -> Result<(PinnedStandRoot, Option<String>)> {
+    let pinned = PinnedStandRoot::open(root)?;
+    let expected = registration.root_identity.as_deref().ok_or_else(|| {
+        Error::new(
+            "not_allowed",
+            "stand registration carries no creation identity from stand up",
+        )
+    })?;
+    if pinned.identity != expected {
+        return Err(Error::new(
+            "identity_changed",
+            "stand root is not the directory stand up created",
+        ));
+    }
+    let marker = pinned
+        .read(STAND_MARKER)?
+        .and_then(|bytes| serde_json::from_slice::<StandMarker>(&bytes).ok())
+        .filter(|marker| {
+            marker.format == registration.marker.format
+                && marker.root == registration.marker.root
+                && marker.token == registration.marker.token
+        });
+    if marker.is_none() {
+        return Err(Error::new(
+            "identity_changed",
+            "stand ownership marker does not match the external registration",
+        ));
+    }
+    let token = pinned
+        .read("owner.token")?
+        .map(|bytes| {
+            String::from_utf8(bytes)
+                .map(|token| token.trim().to_owned())
+                .map_err(|_| Error::new("not_allowed", "stand owner token is not UTF-8"))
+        })
+        .transpose()?;
+    Ok((pinned, token))
+}
+
+/// Bind the registration to the owner token the stand's own daemon minted at
+/// creation. Only `stand up` calls this while starting the daemon it just
+/// created; `Ok(false)` means the daemon has not minted the token yet. The
+/// protection check runs first, and the token is read from the same held
+/// root whose identity and marker were verified.
+pub fn bind_stand_owner_token(root: &Path) -> Result<bool> {
+    if crate::operator::target_is_protected_from_stand_owner_auth(root) {
+        return Err(Error::new(
+            "not_allowed",
+            "a stand operation cannot target a daemon root this process resolves as its own",
+        ));
+    }
+    let root = stand_key_root(root)?;
+    let registry = stand_registry(false)?;
+    let name = registry_name(&root);
+    let mut registration = read_stand_registration(&registry, &name, &root)?;
+    crate::operator::refuse_issuing_root(&root, &registration)?;
+    let (pinned, token) = pinned_stand_token(&root, &registration)?;
+    let Some(token) = token else {
+        return Ok(false);
+    };
+    let digest = owner_token_digest(&token);
+    let bound = match registration.owner_token_sha256.as_deref() {
+        Some(bound) if bound == digest => true,
+        Some(_) => {
+            return Err(Error::new(
+                "identity_changed",
+                "stand owner token differs from its creation binding",
+            ));
+        }
+        None => {
+            registration.owner_token_sha256 = Some(digest);
+            write_stand_registration(&registry, &name, &registration)?;
+            true
+        }
+    };
+    drop(pinned);
+    Ok(bound)
+}
+
+/// Require the held root to be the directory `stand up` created, its marker
+/// to match, and its owner token to be the one its daemon minted at stand
+/// creation, so a copied or forged marker cannot qualify without the target's
+/// own secret. Returns that token.
 pub fn verify_stand_owner_binding(root: &Path, registration: &StandRegistration) -> Result<String> {
     let bound = registration.owner_token_sha256.as_deref().ok_or_else(|| {
         Error::new(
@@ -562,7 +687,8 @@ pub fn verify_stand_owner_binding(root: &Path, registration: &StandRegistration)
             "stand registration carries no owner binding from stand up",
         )
     })?;
-    let token = crate::platform::data_dir::DataDir::open_existing(root)?.read_owner_token()?;
+    let (_pinned, token) = pinned_stand_token(root, registration)?;
+    let token = token.ok_or_else(|| Error::new("not_allowed", "stand has no owner token"))?;
     if owner_token_digest(&token) != bound {
         return Err(Error::new(
             "not_allowed",
@@ -596,8 +722,7 @@ pub(crate) fn record_stand_worktree(
         }
         Ok(_) => {}
     }
-    let root = fs::canonicalize(data_root)
-        .map_err(|error| Error::new("unavailable", format!("resolve stand root: {error}")))?;
+    let root = stand_key_root(data_root)?;
     let registry = stand_registry(false)?;
     let name = registry_name(&root);
     let registration = read_stand_registration(&registry, &name, &root)?;
@@ -1713,6 +1838,8 @@ pub(crate) async fn plan_stand_artifact(
     let reg_name = registry_name(stand_root);
     let registration = read_stand_registration(&registry, &reg_name, stand_root)?;
     verify_stand_marker(stand_root, &registration)?;
+    refuse_parent_root(daemon_data_root, stand_root)?;
+    crate::operator::verify_stand_target(stand_root, &registration)?;
     let _ = verify_stand_stopped(stand_root, &registration)?;
     let records = load_worktree_records(&registry, &reg_name);
     Box::pin(plan_external_git(
@@ -1745,6 +1872,8 @@ pub(crate) async fn apply_stand_artifact(
     let _transition = lock_transition(stand_root)?;
     let mut registration = read_stand_registration(&registry, &reg_name, stand_root)?;
     verify_stand_marker(stand_root, &registration)?;
+    refuse_parent_root(daemon_data_root, stand_root)?;
+    crate::operator::verify_stand_target(stand_root, &registration)?;
     let pid = verify_stand_stopped(stand_root, &registration)?.unwrap_or_default();
     let offline = lock_offline(stand_root)?;
     check_directory_chain(stand_root)?;
@@ -1756,6 +1885,7 @@ pub(crate) async fn apply_stand_artifact(
     }
     registration = read_stand_registration(&registry, &reg_name, stand_root)?;
     verify_stand_marker(stand_root, &registration)?;
+    crate::operator::verify_stand_target(stand_root, &registration)?;
     check_nested_roots(stand_root)?;
     if let Some(info) = daemon_info(stand_root)?
         && ((registration.removing_pid.is_none() && info.pid != pid) || daemon_alive(&info)?)
@@ -1783,6 +1913,22 @@ pub(crate) async fn apply_stand_artifact(
     remove_offline_stand_root(stand_root, offline)?;
     remove_stand_registration(&registry, &reg_name)?;
     Ok(bytes)
+}
+
+/// Parent cleanup never treats its own data root as a stand.
+fn refuse_parent_root(daemon_data_root: &Path, stand_root: &Path) -> Result<()> {
+    if crate::operator::data_dirs_match(daemon_data_root, stand_root)
+        || fs::canonicalize(daemon_data_root)
+            .ok()
+            .zip(fs::canonicalize(stand_root).ok())
+            .is_some_and(|(left, right)| crate::operator::data_dirs_match(&left, &right))
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "parent cleanup cannot treat its own data root as a stand",
+        ));
+    }
+    Ok(())
 }
 
 pub fn stand_now_ms() -> i64 {

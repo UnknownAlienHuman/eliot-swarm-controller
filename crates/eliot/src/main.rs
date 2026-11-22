@@ -29,11 +29,12 @@ fn main() -> ExitCode {
     // One hook for both binaries: the daemon and every plugin share this
     // executable, so the code is mode-aware. A WMI-started daemon has no
     // console, so its marker file is the durable path. A plugin reports only
-    // on its owned stderr pipe, bound by the nonce its daemon put on argv.
+    // on its owned stderr pipe, bound by the nonce its daemon writes as the
+    // first stdin line (never argv or environment).
     if let Some(CliCommand::Plugin(args)) = &cli.command
-        && let Some(nonce) = args.crash_nonce.as_deref()
+        && args.crash_nonce_stdin
     {
-        eliot_daemon::crash::set_plugin_crash_nonce(nonce);
+        eliot_daemon::crash::read_plugin_crash_nonce();
     }
     if !matches!(&cli.command, Some(CliCommand::Stand(_))) {
         eliot_daemon::crash::install_panic_hook(is_plugin);

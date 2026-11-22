@@ -12,8 +12,8 @@ use eliot_daemon::operator::{
     daemon_alive, daemon_info, data_dirs_match, ensure_registry_is_external,
     inherited_agent_parent_data_dir, list_stand_registrations, lock_offline, lock_transition,
     parse_stand_ttl_ms, read_stand_registration, registry_name, remove_offline_stand_root,
-    remove_stand_registration, stand_base, stand_now_ms, stand_registry, verify_stand_marker,
-    verify_stand_target, write_stand_registration,
+    remove_stand_registration, stand_base, stand_now_ms, stand_registry, stand_root_identity,
+    verify_stand_marker, verify_stand_target, write_stand_registration,
 };
 use serde_json::{Value, json};
 use std::fs::{self, File};
@@ -111,6 +111,9 @@ pub(crate) async fn up(
     let root = root
         .canonicalize()
         .map_err(|error| io_failure("resolve created stand", error))?;
+    // Handle identity of the directory just created; every later owner
+    // operation requires this exact directory.
+    let root_identity = stand_root_identity(&root).map_err(Failure::for_read)?;
     let workspace = root.join("repo");
     if let Err(failure) = prepare(&root, &workspace, profile).await {
         super::cleanup::remove_dir_all(&root).map_err(|error| {
@@ -140,8 +143,11 @@ pub(crate) async fn up(
         },
         removing_pid: None,
         artifact_id: None,
-        parent_data_dir: None,
+        // The issuing daemon is persisted at creation; later checks never
+        // read it from inherited environment.
+        parent_data_dir: agent_parent.clone(),
         owner_token_sha256: None,
+        root_identity: Some(root_identity),
         pending_write_guard: None,
         settled_external_worktrees: Vec::new(),
         settled_external_branches: Vec::new(),
@@ -178,7 +184,6 @@ pub(crate) async fn up(
         match registered {
             Ok(view) => {
                 registration.artifact_id = Some(view.id);
-                registration.parent_data_dir = Some(parent_dir.clone());
                 write_stand_registration(&registry, &reg_name, &registration)
                     .map_err(Failure::for_read)?;
             }

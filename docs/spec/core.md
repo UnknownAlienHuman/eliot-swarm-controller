@@ -711,11 +711,12 @@ Constructors retain complete text until the owning policy is available. No minim
 secret or truncated-prefix length is a confidentiality boundary. A failed-start
 conversion preserves the typed origin, location and evidence; proof of no effect
 does not imply a Swarm origin. A plugin panic is diagnostic evidence only from the
-exact owned process pipe of that spawn: the daemon passes a per-spawn nonce on the
-plugin's argv (never in its inherited environment), and only a stderr line
+exact owned process pipe of that spawn: the daemon writes a per-spawn nonce as the
+plugin's first stdin line (never argv or environment), and only a stderr line
 `eliot_crash <nonce> <owned PID> <marker>` counts. Plugins write no data-directory
 crash files and receive no data-directory path in their environment; the daemon
-records each verified marker in its own crash directory for `daemon.status`. Its
+records each verified marker in its own crash directory, which its entry point
+sets explicitly, for `daemon.status`. Its
 summary augments the recorded evidence while preserving the original command error,
 and when matched on a plugin exit or startup failure classifies `origin: swarm`
 (using `where: plugin.exit` when no transport location applies).
@@ -748,7 +749,9 @@ left missing, never inferred by timestamps.
 Admission preflight can refuse before command admission with a typed location
 and origin: a reserved capacity bound (`swarm` at `store.admission.capacity`) or
 a missing explicit profile executable (`environment` at
-`router.admission.profile_cmd`). `diagnose` can explain that exact request ID
+`router.admission.profile_cmd`). Only an error built by that preflight
+constructor carries the private in-process refusal marker; a later error with
+the same code, location and origin is never recorded. `diagnose` can explain that exact request ID
 from a `command.refused` operational record while it remains in the bounded
 rotated log. This admission step carries structured
 code/location/origin/evidence, no free-text error message. It is optional

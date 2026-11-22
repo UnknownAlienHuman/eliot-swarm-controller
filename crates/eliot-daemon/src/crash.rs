@@ -9,8 +9,10 @@
 //! and echoes one `eliot_crash` JSON line to stderr (a WMI-started daemon has
 //! no console, so the file is the durable path). A plugin writes no file: it
 //! reports on its owned stderr pipe as `eliot_crash <nonce> <pid> <json>`,
-//! with the per-spawn nonce the daemon passed on argv, and the observing
-//! daemon records only reports bound to that spawn. The hook never touches the
+//! with the per-spawn nonce the daemon wrote as the first stdin line, and the
+//! observing daemon records only reports bound to that spawn. The daemon's
+//! crash directory is set explicitly by its entry point; no environment
+//! variable selects it. The hook never touches the
 //! Store, never allocates unboundedly, and never panics itself: logging
 //! and settlement of the marker happen after restart (daemon) or in the
 //! observing daemon (plugin), never inside the hook. Arbitrary panic
@@ -31,15 +33,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static INSTALLED: AtomicBool = AtomicBool::new(false);
-/// Per-spawn nonce a plugin received on argv from its daemon.
+/// Per-spawn nonce a plugin received as its first stdin line from its daemon.
 static PLUGIN_CRASH_NONCE: OnceLock<String> = OnceLock::new();
 /// Stderr line tag of a crash report.
 pub const PLUGIN_CRASH_LINE: &str = "eliot_crash";
 const MAX_MARKERS_PER_CODE: usize = 64;
 
 /// In-process crash directory, set once at startup by the owning binary.
-/// The panic hook prefers this over the `ELIOT_CRASH_DIR` environment so
-/// startup never needs an unsafe environment write.
+/// The panic hook reads only this explicit directory; no environment
+/// variable selects it.
 static CRASH_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 #[cfg(debug_assertions)]
@@ -59,9 +61,25 @@ pub fn set_crash_dir(dir: &Path) {
     let _ = CRASH_DIR.set(dir.to_owned());
 }
 
-/// Remember the per-spawn crash nonce from the plugin's argv. Only a bounded
-/// alphanumeric value is accepted; first call wins.
-pub fn set_plugin_crash_nonce(nonce: &str) {
+/// Read the per-spawn crash nonce: the first stdin line the owning daemon
+/// writes before any RPC. It reads through the process-wide buffered stdin
+/// that the plugin peer also reads, so later bytes stay available to it.
+pub fn read_plugin_crash_nonce() {
+    use std::io::{BufRead, Read};
+    let mut line = String::new();
+    if std::io::stdin()
+        .lock()
+        .take(130)
+        .read_line(&mut line)
+        .is_ok()
+    {
+        set_plugin_crash_nonce(line.trim_end_matches(['\r', '\n']));
+    }
+}
+
+/// Remember the per-spawn crash nonce. Only a bounded alphanumeric value is
+/// accepted; first call wins.
+fn set_plugin_crash_nonce(nonce: &str) {
     if !nonce.is_empty()
         && nonce.len() <= 64
         && nonce.bytes().all(|byte| byte.is_ascii_alphanumeric())
@@ -116,10 +134,8 @@ fn install_panic_hook_for(code: &'static str) {
             }
             return;
         }
-        let from_process = CRASH_DIR.get().cloned();
-        let from_env = std::env::var("ELIOT_CRASH_DIR").ok().map(PathBuf::from);
-        if let Some(dir) = from_process.or(from_env) {
-            write_marker(&dir, &marker);
+        if let Some(dir) = CRASH_DIR.get() {
+            write_marker(dir, &marker);
         }
         eprintln!("{PLUGIN_CRASH_LINE} {line}");
     }));
