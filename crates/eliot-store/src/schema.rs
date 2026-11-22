@@ -2281,7 +2281,7 @@ impl Store {
                      FOREIGN KEY(principal, rule) REFERENCES rule_state(principal, rule)
                          ON DELETE CASCADE
                  );
-                 CREATE INDEX rule_once_keys_expiry ON rule_once_keys(expires_at);
+                 CREATE INDEX rule_once_keys_oldest ON rule_once_keys(principal, rule, fired_at, key_digest);
                  CREATE TABLE rule_key_usage (
                      action_id TEXT PRIMARY KEY REFERENCES commands(id) ON DELETE CASCADE,
                      principal TEXT NOT NULL,

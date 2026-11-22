@@ -290,8 +290,9 @@ limit = { max = 2, per = "key", key = "${data.data.pull_number}", window = "24h"
 when `limit.key` is omitted. The optional `min_interval` spaces admissions in the
 same bucket and must fit within the configured window. An unavailable or invalid
 key skips the action. Keyed rules use live event traversal. The rule's
-`suppressed_count` records key suppressions, and `rate_limited_firings` records
-rate suppressions. Both advance the event cursor without a per-event rejection.
+`suppressed_count` records key suppressions. The first suppression for a rule
+also emits `rule.rejected` with its reason. Subsequent key suppressions only
+advance the cursor and counter. `rate_limited_firings` records rate suppressions.
 An event-triggered launch with `per = "agent"` uses the triggering Agent's bucket.
 
 During explicit history catch-up, project Run actions use the same freeze path as live firing,

@@ -19,7 +19,6 @@ const RULE_ACTION_WINDOW_MS: i64 = 60_000;
 const RULE_ACTION_LIMIT: i64 = 10;
 const GLOBAL_RULE_ACTION_LIMIT: i64 = 120;
 const RULE_ONCE_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
-const RULE_ONCE_KEYS_MAX: i64 = 100_000;
 const RULE_ONCE_KEYS_PER_RULE_MAX: i64 = 10_000;
 const RULE_COMMAND_ID_DOMAIN: &str = "eliot-rule-command-v1";
 
@@ -103,7 +102,7 @@ pub enum RuleCursorOutcome {
     Rejected { code: String, message: String },
     /// A matching event was skipped because its next verified cause depth is over the limit.
     SkippedCauseDepth,
-    /// A matching event was suppressed by a missing key, duplicate key or rate limit.
+    /// A matching event did not provide a usable key.
     Suppressed,
     /// A configured-capacity preparation refusal retains bounded Owner remedy
     /// text for automation readback; all other errors use `Rejected`.
@@ -591,7 +590,18 @@ impl Store {
                     }
                 }
                 RuleCursorOutcome::Suppressed => {
-                    increment_rule_suppressed_tx(&tx, principal, &state.id)?;
+                    events.extend(suppress_key_tx(
+                        &tx,
+                        principal,
+                        &stored.view,
+                        revision,
+                        through,
+                        now,
+                        &Error::new(
+                            "rule_key_unavailable",
+                            "event did not supply a usable rule key",
+                        ),
+                    )?);
                 }
                 RuleCursorOutcome::SkippedCauseDepth => {
                     let trigger = load_rule_trigger(&tx, through)?;
@@ -1001,12 +1011,11 @@ impl Store {
             }
             return Err(error);
         }
-        // A duplicate key and a full bounded key store suppress the firing without
-        // spending the key or producing a rejection event.
+        // A retained duplicate never consumes an admission or evicts another key.
         if let Some(once_per_key) = key.once_per_key.as_ref()
             && !once_per_key_available_tx(&tx, principal, &state.id, once_per_key, now)?
         {
-            return suppress_rule_event_tx(tx, &self.write_faulted, &key, now);
+            return suppress_rule_event_tx(tx, &self.write_faulted, &key, revision, now);
         }
 
         request.id = key.child_id.clone();
@@ -2547,7 +2556,15 @@ fn rule_cursor_is_retiring(state: &core::api::RuleStateView, through: i64) -> bo
         && state.retiring_cursor.is_some()
 }
 
-fn increment_rule_suppressed_tx(tx: &Transaction<'_>, principal: &str, rule: &str) -> Result<()> {
+fn suppress_key_tx(
+    tx: &Transaction<'_>,
+    principal: &str,
+    state: &core::api::RuleStateView,
+    revision: i64,
+    event_seq: i64,
+    now: i64,
+    error: &Error,
+) -> Result<Option<Event>> {
     tx.execute(
         "UPDATE rule_state
          SET suppressed_count = CASE
@@ -2555,13 +2572,25 @@ fn increment_rule_suppressed_tx(tx: &Transaction<'_>, principal: &str, rule: &st
              ELSE suppressed_count
          END
          WHERE principal = ?1 AND rule = ?2",
-        params![principal, rule],
+        params![principal, &state.id],
     )
     .map_err(sql_error)?;
     if tx.changes() != 1 {
         return Err(Error::new("bad_state", "suppressed rule state disappeared"));
     }
-    Ok(())
+    if state.suppressed_count != 0 {
+        return Ok(None);
+    }
+    let trigger = load_rule_trigger(tx, event_seq)?;
+    let data = json!({
+        "rule": state.id,
+        "project": state.project,
+        "revision": revision,
+        "event_seq": event_seq,
+        "code": error.code,
+        "message": error.message,
+    });
+    insert_rule_event_with_cause(tx, now, "rule.rejected", data, trigger.cause).map(Some)
 }
 
 fn update_rule_cursor_tx(
@@ -3562,35 +3591,15 @@ fn once_per_key_available_tx(
     key_digest: &[u8; 32],
     now: i64,
 ) -> Result<bool> {
-    tx.execute("DELETE FROM rule_once_keys WHERE expires_at <= ?1", [now])
-        .map_err(sql_error)?;
-    let exists: bool = tx
-        .query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM rule_once_keys
-                 WHERE principal = ?1 AND rule = ?2 AND key_digest = ?3
-             )",
-            params![principal, rule, key_digest.as_slice()],
-            |row| row.get(0),
-        )
-        .map_err(sql_error)?;
-    if exists {
-        return Ok(false);
-    }
-    let global_count: i64 = tx
-        .query_row("SELECT COUNT(*) FROM rule_once_keys", [], |row| row.get(0))
-        .map_err(sql_error)?;
-    if global_count >= RULE_ONCE_KEYS_MAX {
-        return Ok(false);
-    }
-    let rule_count: i64 = tx
-        .query_row(
-            "SELECT COUNT(*) FROM rule_once_keys WHERE principal = ?1 AND rule = ?2",
-            params![principal, rule],
-            |row| row.get(0),
-        )
-        .map_err(sql_error)?;
-    Ok(rule_count < RULE_ONCE_KEYS_PER_RULE_MAX)
+    tx.query_row(
+        "SELECT NOT EXISTS(
+             SELECT 1 FROM rule_once_keys
+             WHERE principal = ?1 AND rule = ?2 AND key_digest = ?3 AND expires_at > ?4
+         )",
+        params![principal, rule, key_digest.as_slice(), now],
+        |row| row.get(0),
+    )
+    .map_err(sql_error)
 }
 
 fn record_once_per_key_tx(
@@ -3600,6 +3609,24 @@ fn record_once_per_key_tx(
     key_digest: &[u8; 32],
     now: i64,
 ) -> Result<()> {
+    tx.execute(
+        "DELETE FROM rule_once_keys WHERE principal = ?1 AND rule = ?2 AND expires_at <= ?3",
+        params![principal, rule, now],
+    )
+    .map_err(sql_error)?;
+    // Make room only after the new action is admitted in this transaction.
+    tx.execute(
+        "DELETE FROM rule_once_keys
+         WHERE principal = ?1 AND rule = ?2 AND key_digest IN (
+             SELECT key_digest FROM rule_once_keys
+             WHERE principal = ?1 AND rule = ?2
+             ORDER BY fired_at, key_digest
+             LIMIT MAX(0, (SELECT COUNT(*) FROM rule_once_keys
+                           WHERE principal = ?1 AND rule = ?2) - ?3 + 1)
+         )",
+        params![principal, rule, RULE_ONCE_KEYS_PER_RULE_MAX],
+    )
+    .map_err(sql_error)?;
     tx.execute(
         "INSERT INTO rule_once_keys(principal, rule, key_digest, fired_at, expires_at)
          VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -3636,6 +3663,7 @@ fn suppress_rule_event_tx(
     tx: Transaction<'_>,
     write_faulted: &Cell<bool>,
     key: &RuleFiringKey<'_>,
+    revision: i64,
     now: i64,
 ) -> Result<RuleEventAdmission> {
     let RuleFiringIdentity::Event { event_seq } = key.identity else {
@@ -3644,14 +3672,22 @@ fn suppress_rule_event_tx(
             "event suppression has a non-event key",
         ));
     };
-    increment_rule_suppressed_tx(&tx, key.principal, &key.state.id)?;
+    let event = suppress_key_tx(
+        &tx,
+        key.principal,
+        key.state,
+        revision,
+        event_seq,
+        now,
+        &Error::new("once_per_duplicate", "rule already admitted this key"),
+    )?;
     let view = update_rule_cursor_tx(&tx, key.principal, key.state, event_seq, now)?;
     commit_transaction(tx, write_faulted)?;
     Ok(RuleEventAdmission {
         state: view,
         parent: None,
         child: None,
-        events: Vec::new(),
+        events: event.into_iter().collect(),
         is_new: true,
     })
 }
