@@ -1,8 +1,7 @@
 //! Local, bounded Git readback. Wire formats follow the official Git 2.55
 //! git-status (porcelain v2/-z), git-ls-files, git-log and git-check-ignore docs.
-//! No donor application code, shell, index/ref/object writes, or network reads.
-//! Reads require leaf custody. Workspace writes are only prepared here; their
-//! manager owns ordinary scoped execution and cancellation serialization.
+//! No donor application code, shell, or network reads. Reads require leaf
+//! custody; the publication path uses the separate scoped effect runner below.
 
 use crate::platform::{OwnedChild, is_reparse_point};
 use eliot_core::api::is_git_oid;
@@ -951,10 +950,10 @@ impl GitProbe {
         )?;
         let (dirty_digest, _) = dirty_worktree_digest(&root, &status.dirty)
             .map_err(|reason| unavailable(&format!("workspace content digest: {reason}")))?;
-        let mut hasher = Sha256::new();
-        hash_digest_part(&mut hasher, status.head.as_deref().unwrap_or("").as_bytes());
-        hash_digest_part(&mut hasher, dirty_digest.as_bytes());
-        Ok(hex_digest(hasher.finalize().as_slice()))
+        Ok(work_fingerprint_from_parts(
+            status.head.as_deref(),
+            &dirty_digest,
+        ))
     }
 
     /// HEAD and the changed paths of a Goal's workspace.
@@ -1094,6 +1093,39 @@ impl GitProbe {
     ) -> Result<Captured> {
         let overrides = self.safe_overrides(root, deadline).await?;
         self.run(root, args, &overrides, &[], deadline).await
+    }
+
+    /// Run one explicitly dispatched local Git mutation under the same
+    /// sanitized config and leaf-process fence as Git observation. Callers
+    /// own durable dispatch and settlement around this one attempt.
+    pub(crate) async fn workspace_effect_command(
+        &self,
+        root: &Path,
+        args: &[&str],
+        timeout: Duration,
+        policy: std::sync::Arc<eliot_core::SecretPolicy>,
+        cancellation: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<crate::scripts::process::ProcessOutcome> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| Error::new("invalid", "Git effect timeout is out of range"))?;
+        let overrides = self.safe_overrides(root, deadline).await?;
+        if Instant::now() >= deadline {
+            return Err(unavailable("Git effect preparation deadline elapsed"));
+        }
+        let command = self.build_command(root, args, &overrides, None)?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(unavailable("Git effect preparation deadline elapsed"));
+        }
+        Ok(crate::scripts::process::run_owned_process(
+            command,
+            Vec::new(),
+            remaining,
+            policy,
+            cancellation,
+        )
+        .await)
     }
 
     /// Read from the captured Git repository binding, even if the checkout's
@@ -2066,6 +2098,25 @@ fn count_text_lines(bytes: &[u8]) -> u64 {
 fn hash_digest_part(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update((bytes.len() as u64).to_le_bytes());
     hasher.update(bytes);
+}
+
+pub(crate) fn work_fingerprint_from_snapshot(snapshot: &GitSnapshot) -> Result<String> {
+    let dirty_digest = snapshot
+        .work
+        .as_ref()
+        .and_then(|work| work.dirty_digest.as_deref())
+        .ok_or_else(|| unavailable("workspace dirty fingerprint is unavailable"))?;
+    Ok(work_fingerprint_from_parts(
+        snapshot.head.as_deref(),
+        dirty_digest,
+    ))
+}
+
+fn work_fingerprint_from_parts(head: Option<&str>, dirty_digest: &str) -> String {
+    let mut hasher = Sha256::new();
+    hash_digest_part(&mut hasher, head.unwrap_or("").as_bytes());
+    hash_digest_part(&mut hasher, dirty_digest.as_bytes());
+    hex_digest(hasher.finalize().as_slice())
 }
 
 fn hex_digest(bytes: &[u8]) -> String {

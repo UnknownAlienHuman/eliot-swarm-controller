@@ -266,7 +266,37 @@ fn auth_fields_are_exact(auth: &serde_json::Map<String, Value>, kind: &str) -> b
 }
 
 pub(super) fn authorize_command(principal: &Principal, request: &mut SubmitCommand) -> Result<()> {
+    if request.verb == "git.publish" && !matches!(principal, Principal::ProjectRule { .. }) {
+        return Err(Error::new(
+            "not_allowed",
+            "git.publish is available only to an approved project rule",
+        ));
+    }
     if let Principal::ProjectRule { registration } = principal {
+        if request.verb == "git.publish" {
+            if !registration
+                .actions
+                .iter()
+                .any(|action| action == "git.publish")
+            {
+                return Err(Error::new(
+                    "not_allowed",
+                    "project rule is not approved for git.publish",
+                ));
+            }
+            if request.target.is_some()
+                || request.expected_generation.is_some()
+                || request.expected_turn_id.is_some()
+                || request.request_id.is_some()
+                || request.probe
+            {
+                return Err(Error::new(
+                    "invalid",
+                    "git.publish command must be targetless and unbound",
+                ));
+            }
+            return Ok(());
+        }
         if request.verb == "git.fetch" {
             if !registration
                 .actions

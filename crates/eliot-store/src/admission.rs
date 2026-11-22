@@ -669,6 +669,27 @@ fn admit_git_fetch_tx(
     admit_targetless_tx(tx, principal, request, payload_digest, now, events)
 }
 
+/// Admit one event-triggered targetless project publication with its frozen
+/// passing-check snapshot and Owner registration binding.
+fn admit_git_publish_tx(
+    tx: &Transaction<'_>,
+    principal: &str,
+    request: &SubmitCommand,
+    payload_digest: &[u8],
+    preparation: &Option<WorkspacePreparationInput>,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<Option<String>> {
+    require_no_agent_bindings(
+        request,
+        preparation,
+        "git.publish is a targetless project command without Agent bindings",
+    )?;
+    let frozen = projects::decode_frozen_git_publish(&request.args)?;
+    projects::validate_git_publish_intent_tx(tx, principal, &frozen)?;
+    admit_targetless_tx(tx, principal, request, payload_digest, now, events)
+}
+
 /// Admit one targetless `notify`/`emit` definition.
 fn admit_notify_emit_tx(
     tx: &Transaction<'_>,
@@ -1928,6 +1949,15 @@ fn submit_tx_mode(
             &mut events,
         )?,
         "git.fetch" => admit_git_fetch_tx(
+            tx,
+            principal,
+            &request,
+            &payload_digest,
+            &preparation,
+            now,
+            &mut events,
+        )?,
+        "git.publish" => admit_git_publish_tx(
             tx,
             principal,
             &request,

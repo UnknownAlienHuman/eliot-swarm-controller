@@ -865,6 +865,40 @@ Core `ProjectRegistrationView.git` is `Option<ProjectGitView>`; `ProjectGitView`
 [`api.rs`](../../crates/eliot-core/src/api.rs). These approvals are part of the saved
 registration revision and cannot be changed by project rule files.
 
+The optional `[projects.ID.git.publication]` table maps literal aliases to direct
+Owner-approved push endpoints. Endpoints are absolute local paths or direct HTTP, HTTPS,
+Git, or file URLs without credentials, rewrites, helper schemes, query data, or fragments;
+SSH and ambient remote selection are unsupported. This is an independent allowlist from
+`fetch_remotes`: a fetch approval never authorizes a push. A project rule must also be
+granted the `git.publish` action in `actions` and name an approved publication alias.
+
+The optional `[projects.ID.git.publication.github_cli]` table selects one executable,
+existing GitHub CLI config directory, host, repository (`owner/name`), and base ref. Every
+field is literal and owner-configured. For PR creation the selected HTTPS publication
+endpoint must match that host and repository. Eliot passes the config directory through
+`GH_CONFIG_DIR` for the command lifetime and reads it in place; config contents and tokens
+are never copied into settings, command args, events, or logs. The CLI executable and
+config directory must be absolute existing paths without a symlink or reparse root. These
+fields are part of the saved registration revision and are rechecked at publication.
+
+An owner-approved publication rule is stored in the registered checkout's
+`.eliot/rules/*.toml`:
+
+```toml
+[[rule]]
+id = "publish-final-check"
+on = { event = "project.check.passed" }
+do = [{ action = "git.publish", repository = "app", remote = "qa" }]
+```
+
+The rule is opt-in per project. It always commits the exact checked managed-worktree
+snapshot with the first line of the matching final answer. Omitting `remote` makes a local
+commit only. Setting `create_pr = true` requires a named approved remote and the explicit
+GitHub CLI integration above. The dedicated pass event comes only from successful final
+project-check settlement; manual Goals and ordinary `goal.changed`/turn events do not
+qualify. The event envelope and Core `ProjectCheckPassed` bind the project, retained turn,
+Agent generation, workspace fingerprint, and commit subject before Store dispatch.
+
 For `git.fetch`, a project rule must be granted `git.fetch` and its literal `repository`
 must equal the ID in its saved `project:ID` principal. Owner-global rules may select any
 owner-registered repository and use that registration's saved Git approvals. Authority

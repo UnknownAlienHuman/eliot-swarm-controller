@@ -25,6 +25,13 @@ pub(crate) fn git_fetch_timeout_ms(timeout: Option<&str>) -> Result<i64> {
         None => Ok(eliot_core::api::DEFAULT_GIT_FETCH_TIMEOUT_MS),
     }
 }
+
+pub(crate) fn git_publish_timeout_ms(timeout: Option<&str>) -> Result<i64> {
+    match timeout {
+        Some(timeout) => schedule::parse_positive_duration_ms(timeout),
+        None => Ok(eliot_core::api::DEFAULT_GIT_PUBLISH_TIMEOUT_MS),
+    }
+}
 use eliot_store::{
     RuleCursorOutcome, RuleDefinitionInput, RuleProcessingState, TimerDefinitionInput,
     TimerSlotCommit,

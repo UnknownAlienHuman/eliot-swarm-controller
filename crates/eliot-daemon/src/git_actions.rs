@@ -14,8 +14,8 @@ use eliot_core::api::is_git_oid;
 use eliot_core::{
     CommandState, Error, FrozenSetupFile, Result,
     api::{
-        FrozenGitFetch, GitCredentialHelper, GitFetchDefinitionArgs, GitFetchOutcome,
-        ProjectRegistrationView,
+        FrozenGitFetch, FrozenGitPublish, GitCredentialHelper, GitFetchDefinitionArgs,
+        GitFetchOutcome, ProjectRegistrationView,
     },
 };
 use serde_json::{Value, json};
@@ -43,6 +43,13 @@ const PRIVATE_REMOTE: &str = "eliot-approved";
 pub(crate) struct GitFetchExecution {
     pub state: CommandState,
     pub outcome: Value,
+    pub cleanup_view: Option<PathBuf>,
+}
+
+pub(crate) struct GitPublishPushExecution {
+    pub state: CommandState,
+    pub code: &'static str,
+    pub remote_ref: Option<String>,
     pub cleanup_view: Option<PathBuf>,
 }
 
@@ -609,6 +616,380 @@ pub(crate) async fn execute(
     }
 }
 
+/// Push one exact commit through the same private transport view, direct
+/// endpoint approval, helper receipt and process custody as `git.fetch`.
+/// This function makes at most one push attempt and only returns Applied when
+/// the exact destination ref reads back as the frozen commit.
+pub(crate) async fn push_project_publish(
+    data_root: &Path,
+    command_id: &str,
+    frozen: &FrozenGitPublish,
+    registration: &ProjectRegistrationView,
+    commit_oid: &str,
+    cancellation: watch::Receiver<bool>,
+) -> GitPublishPushExecution {
+    let Some(remote) = frozen.remote.as_deref() else {
+        return publish_push_execution(
+            CommandState::Rejected,
+            "git_publish_remote_missing",
+            None,
+            None,
+        );
+    };
+    let Some(endpoint) = frozen.endpoint.as_deref() else {
+        return publish_push_execution(
+            CommandState::Rejected,
+            "git_publish_endpoint_missing",
+            None,
+            None,
+        );
+    };
+    let remote_ref = format!("refs/heads/{}", frozen.branch);
+    if frozen.validate().is_err()
+        || !is_git_oid(commit_oid)
+        || validate_approved_endpoint(endpoint).is_err()
+        || automation::verify_project_registration(data_root, registration)
+            .await
+            .is_err()
+    {
+        return publish_push_execution(CommandState::Rejected, "native_not_dispatched", None, None);
+    }
+    let repo = match repository_binding(&frozen.canonical_checkout, &frozen.common_dir).await {
+        Ok(repo) => repo,
+        Err(_) => {
+            return publish_push_execution(
+                CommandState::Rejected,
+                "native_not_dispatched",
+                None,
+                None,
+            );
+        }
+    };
+    let git = match GitProbe::new() {
+        Ok(git) => git,
+        Err(_) => {
+            return publish_push_execution(
+                CommandState::Rejected,
+                "native_not_dispatched",
+                None,
+                None,
+            );
+        }
+    };
+    if verify_helper_receipt(&git, &repo, frozen.credential_helper.as_ref())
+        .await
+        .is_err()
+    {
+        return publish_push_execution(CommandState::Rejected, "native_not_dispatched", None, None);
+    }
+    let transport = FrozenGitFetch {
+        repository: frozen.repository.clone(),
+        registration_revision: frozen.registration_revision,
+        canonical_checkout: frozen.canonical_checkout.clone(),
+        common_dir: frozen.common_dir.clone(),
+        remote: remote.to_owned(),
+        endpoint: endpoint.to_owned(),
+        source_ref: remote_ref.clone(),
+        advertised_oid: commit_oid.to_owned(),
+        tracking_ref: format!("refs/remotes/eliot-publish/{}", frozen.branch),
+        expected_old_oid: None,
+        timeout_ms: frozen.timeout_ms,
+        credential_helper: frozen.credential_helper.clone(),
+    };
+    if transport.validate().is_err() {
+        return publish_push_execution(CommandState::Rejected, "native_not_dispatched", None, None);
+    }
+    let deadline = match operation_deadline(frozen.timeout_ms) {
+        Ok(deadline) => deadline,
+        Err(_) => {
+            return publish_push_execution(
+                CommandState::Rejected,
+                "native_not_dispatched",
+                None,
+                None,
+            );
+        }
+    };
+    if ensure_transport_view(
+        data_root,
+        command_id,
+        &git,
+        &repo,
+        &transport,
+        deadline,
+        cancellation.clone(),
+    )
+    .await
+    .is_err()
+    {
+        let view = private_view_path(data_root, command_id).ok();
+        return publish_push_execution(
+            CommandState::Rejected,
+            "git_publish_transport_preparation_failed",
+            None,
+            view,
+        );
+    }
+    if verify_transport_view(data_root, command_id, &transport).is_err() {
+        let view = private_view_path(data_root, command_id).ok();
+        return publish_push_execution(CommandState::Rejected, "native_not_dispatched", None, view);
+    }
+    let protocol = match endpoint_protocol(endpoint) {
+        Ok(protocol) => protocol,
+        Err(_) => {
+            let view = private_view_path(data_root, command_id).ok();
+            return publish_push_execution(
+                CommandState::Rejected,
+                "native_not_dispatched",
+                None,
+                view,
+            );
+        }
+    };
+    let view = match private_view_path(data_root, command_id) {
+        Ok(view) => view,
+        Err(_) => {
+            return publish_push_execution(
+                CommandState::Rejected,
+                "native_not_dispatched",
+                None,
+                None,
+            );
+        }
+    };
+    let object_directory = match shared_object_directory(&repo.common_dir) {
+        Ok(path) => path,
+        Err(_) => {
+            return publish_push_execution(
+                CommandState::Rejected,
+                "native_not_dispatched",
+                None,
+                Some(view),
+            );
+        }
+    };
+    let process = match git_process_context(
+        &git,
+        &repo,
+        &transport_environment(&view),
+        transport.credential_helper.as_ref(),
+        protocol,
+        Some(GitProcessBinding {
+            git_dir: view.clone(),
+            common_dir: view.clone(),
+            work_tree: None,
+            object_directory: Some(object_directory),
+        }),
+    )
+    .await
+    {
+        Ok(process) => process,
+        Err(_) => {
+            return publish_push_execution(
+                CommandState::Rejected,
+                "native_not_dispatched",
+                None,
+                Some(view),
+            );
+        }
+    };
+    let remote_args = [
+        OsString::from("ls-remote"),
+        OsString::from("--heads"),
+        OsString::from("--refs"),
+        OsString::from(PRIVATE_REMOTE),
+        OsString::from(&remote_ref),
+    ];
+    let before = match run_transport_command(
+        &process,
+        &view,
+        &remote_args,
+        deadline,
+        cancellation.clone(),
+    )
+    .await
+    {
+        Ok(result) if result.quiescent && result.exit_code == Some(0) && !result.interrupted => {
+            match parse_remote_ref(&result.stdout, &remote_ref) {
+                Ok(oid) => oid,
+                Err(_) => {
+                    return publish_push_execution(
+                        CommandState::Rejected,
+                        "git_publish_remote_readback_failed",
+                        None,
+                        Some(view),
+                    );
+                }
+            }
+        }
+        _ => {
+            return publish_push_execution(
+                CommandState::Rejected,
+                "git_publish_remote_readback_failed",
+                None,
+                Some(view),
+            );
+        }
+    };
+    if before.as_deref() == Some(commit_oid) {
+        return publish_push_execution(
+            CommandState::Applied,
+            "git_publish_remote_already_current",
+            Some(remote_ref),
+            Some(view),
+        );
+    }
+    if Instant::now() >= deadline || *cancellation.borrow() {
+        return publish_push_execution(
+            CommandState::Failed,
+            "git_publish_cancelled_before_push",
+            None,
+            Some(view),
+        );
+    }
+    if automation::verify_project_registration(data_root, registration)
+        .await
+        .is_err()
+        || verify_transport_view(data_root, command_id, &transport).is_err()
+    {
+        return publish_push_execution(
+            CommandState::Rejected,
+            "native_not_dispatched",
+            None,
+            Some(view),
+        );
+    }
+    let refspec = format!("{commit_oid}:{remote_ref}");
+    let push_args = [
+        OsString::from("push"),
+        OsString::from("--porcelain"),
+        OsString::from("--no-verify"),
+        OsString::from("--no-recurse-submodules"),
+        OsString::from(PRIVATE_REMOTE),
+        OsString::from(refspec),
+    ];
+    let push =
+        run_transport_command(&process, &view, &push_args, deadline, cancellation.clone()).await;
+    let Ok(push) = push else {
+        return publish_push_execution(
+            CommandState::Unknown,
+            "git_publish_push_outcome_unknown",
+            None,
+            None,
+        );
+    };
+    if !push.quiescent {
+        return publish_push_execution(
+            CommandState::Unknown,
+            "git_publish_push_quiescence_unknown",
+            None,
+            None,
+        );
+    }
+    if verify_transport_view(data_root, command_id, &transport).is_err()
+        || automation::verify_project_registration(data_root, registration)
+            .await
+            .is_err()
+    {
+        return publish_push_execution(
+            CommandState::Unknown,
+            "git_publish_push_authority_readback_unknown",
+            None,
+            None,
+        );
+    }
+    let after = match run_transport_command(&process, &view, &remote_args, deadline, cancellation)
+        .await
+    {
+        Ok(result) if result.quiescent && result.exit_code == Some(0) && !result.interrupted => {
+            parse_remote_ref(&result.stdout, &remote_ref).ok()
+        }
+        _ => None,
+    };
+    let after = match after {
+        Some(after) => after,
+        None => {
+            return publish_push_execution(
+                CommandState::Unknown,
+                "git_publish_push_readback_unknown",
+                None,
+                None,
+            );
+        }
+    };
+    if after.as_deref() == Some(commit_oid) {
+        return publish_push_execution(
+            CommandState::Applied,
+            "git_publish_push_applied",
+            Some(remote_ref),
+            Some(view),
+        );
+    }
+    if !push.interrupted && push.exit_code.is_some_and(|code| code != 0) && after == before {
+        return publish_push_execution(
+            CommandState::Failed,
+            "git_publish_push_rejected",
+            None,
+            Some(view),
+        );
+    }
+    publish_push_execution(
+        CommandState::Unknown,
+        "git_publish_push_outcome_unknown",
+        None,
+        None,
+    )
+}
+
+fn publish_push_execution(
+    state: CommandState,
+    code: &'static str,
+    remote_ref: Option<String>,
+    cleanup_view: Option<PathBuf>,
+) -> GitPublishPushExecution {
+    GitPublishPushExecution {
+        state,
+        code,
+        remote_ref,
+        cleanup_view: if state == CommandState::Unknown {
+            None
+        } else {
+            cleanup_view
+        },
+    }
+}
+
+fn parse_remote_ref(bytes: &[u8], expected_ref: &str) -> Result<Option<String>> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| Error::new("source_integrity", "Git remote ref readback is not UTF-8"))?;
+    let records = text
+        .strip_suffix('\n')
+        .ok_or_else(|| Error::new("source_integrity", "Git remote ref readback is truncated"))?;
+    let mut lines = records.lines();
+    let line = lines
+        .next()
+        .ok_or_else(|| Error::new("source_integrity", "Git remote ref readback is empty"))?;
+    if lines.next().is_some() {
+        return Err(Error::new(
+            "source_integrity",
+            "Git remote ref readback has multiple refs",
+        ));
+    }
+    let (oid, found_ref) = line
+        .split_once('\t')
+        .ok_or_else(|| Error::new("source_integrity", "Git remote ref readback is malformed"))?;
+    if found_ref != expected_ref || !is_git_oid(oid) {
+        return Err(Error::new(
+            "source_integrity",
+            "Git remote ref readback does not match its requested ref",
+        ));
+    }
+    Ok(Some(oid.to_owned()))
+}
+
 pub(crate) fn cleanup_after_settlement(data_root: &Path, view: &Path) {
     let Ok(root) = canonical_root(data_root.to_str().unwrap_or_default()) else {
         return;
@@ -1074,6 +1455,15 @@ async fn resolve_manager_helper(
         candidates.remove(0)
     };
     freeze_helper_file(&resolved)
+}
+
+pub(crate) async fn resolve_publication_helper(
+    checkout: &str,
+    common_dir: &str,
+) -> Result<FrozenSetupFile> {
+    let repo = repository_binding(checkout, common_dir).await?;
+    let git = GitProbe::new()?;
+    resolve_manager_helper(&git, &repo).await
 }
 
 async fn verify_helper_receipt(
