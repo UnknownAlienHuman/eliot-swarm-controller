@@ -979,15 +979,19 @@ generation binding when it differs from the current Agent, and any running or un
 round marker. A blocked check includes its bounded observation and can explain the
 diagnosis of an otherwise idle Agent.
 
-The standard log records `daemon.command_storm` once when a source completes at least
-32 submissions in its ten-second window. The Router counts authenticated
-`command.submit` attempts by principal and remote connection when present. It
-labels internal mail and attribution notices, daemon archive, attention, and admitted rule actions
-separately and includes the retained rule id when available. Counts include attempts,
-immediate refusals, and accepted commands. Later dispatch outcomes stay in the
-command history. The daemon shares the existing 1024-entry repeated-failure counter
-and flushes qualifying storm windows on closure or maintenance shutdown. These
-diagnostics leave admission and retry behavior unchanged.
+The standard log records `daemon.command_storm` once when an authenticated
+principal/method pair accumulates at least 32 refused submissions in its ten-second
+window. Accepted attempts still contribute to the reported attempt and accepted
+counts. Remote connection ids are retained only in a bounded in-memory set for
+deduplication and never written to the log. The record includes numeric
+`connection_count`, exact through 64; a value of 65 with `connections_overflow` set
+means at least 65 distinct connections. One redacted representative rule id may use
+the existing `source` field. Direct internal producers keep their method labels,
+including internal mail and attribution notices, daemon archive, attention, and
+admitted rule actions. Later dispatch outcomes stay in command history. The daemon
+shares the existing 1024-entry repeated-failure counter and flushes qualifying storm
+windows on closure or maintenance shutdown. These diagnostics leave admission and
+retry behavior unchanged.
 
 Fleet usage cells (`agent.list`, `swarm ls`, `swarm top`, desktop Monitor)
 sum uncached input, cached input and output on the [shared usage basis](core.md).

@@ -220,12 +220,18 @@ pub(crate) fn record_counts(
     write_record(policy, code, &[], Some(counts), None, error)
 }
 
+pub(crate) struct CommandStormMetadata {
+    pub(crate) connection_count: u64,
+    pub(crate) connections_overflow: bool,
+}
+
 pub(crate) fn record_command_storm(
     policy: &SecretPolicy,
     ids: &[(&str, &str)],
     attempts: u64,
     refused: u64,
     window_ms: u64,
+    metadata: CommandStormMetadata,
 ) {
     let detail = Map::from_iter([
         ("attempts".to_owned(), Value::from(attempts)),
@@ -235,6 +241,14 @@ pub(crate) fn record_command_storm(
         ),
         ("refused".to_owned(), Value::from(refused)),
         ("window_ms".to_owned(), Value::from(window_ms)),
+        (
+            "connection_count".to_owned(),
+            Value::from(metadata.connection_count),
+        ),
+        (
+            "connections_overflow".to_owned(),
+            Value::from(metadata.connections_overflow),
+        ),
     ]);
     write_record(
         policy,

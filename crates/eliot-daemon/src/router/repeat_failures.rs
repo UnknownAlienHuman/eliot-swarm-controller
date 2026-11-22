@@ -7,7 +7,7 @@ use eliot_plugin::sync::LockExt;
 use regex::Regex;
 use serde_json::Value;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::LazyLock,
     time::{Duration, Instant},
 };
@@ -17,6 +17,7 @@ const REPEAT_THRESHOLD: u32 = 3;
 const STORM_WINDOW_MS: u64 = 10_000;
 const STORM_THRESHOLD: u64 = 32;
 const MAX_TRACKED_WINDOWS: usize = 1024;
+const MAX_STORM_CONNECTION_IDS: usize = 64;
 
 static VOLATILE_MESSAGE_VALUES: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
@@ -33,23 +34,53 @@ struct FailureKey {
     message: String,
 }
 
-#[derive(PartialEq, Eq, Hash)]
-struct CommandSource {
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct StormKey {
     principal: String,
     method: &'static str,
-    context: Option<String>,
 }
 
 #[derive(PartialEq, Eq, Hash)]
 enum WindowKey {
     Failure(FailureKey),
-    Storm(CommandSource),
+    Storm(StormKey),
 }
 
 struct CounterWindow {
     ends: Instant,
     count: u64,
     refused: u64,
+    storm: StormDiagnostics,
+}
+
+#[derive(Default)]
+struct StormDiagnostics {
+    connection_ids: HashSet<String>,
+    connection_count: u64,
+    connections_overflow: bool,
+    source: Option<String>,
+}
+
+impl StormDiagnostics {
+    fn observe_connection(&mut self, connection_id: &str) {
+        let connection_id = eliot_core::bound_chars(connection_id, 256);
+        if self.connection_ids.contains(&connection_id) {
+            return;
+        }
+        if self.connection_ids.len() == MAX_STORM_CONNECTION_IDS {
+            self.connection_count = MAX_STORM_CONNECTION_IDS as u64 + 1;
+            self.connections_overflow = true;
+            return;
+        }
+        self.connection_ids.insert(connection_id);
+        self.connection_count = self.connection_ids.len() as u64;
+    }
+
+    fn observe_rule(&mut self, rule_id: &str) {
+        if self.source.is_none() {
+            self.source = Some(eliot_core::bound_chars(rule_id, 256));
+        }
+    }
 }
 
 #[derive(Default)]
@@ -124,6 +155,7 @@ impl RepeatFailures {
             ends: now + duration,
             count: 0,
             refused: 0,
+            storm: StormDiagnostics::default(),
         });
         window.count = window.count.saturating_add(count);
         window.refused = window.refused.saturating_add(refused);
@@ -146,40 +178,65 @@ impl Router {
         method: &'static str,
         result: &Result<Value>,
     ) {
-        let source = CommandSource {
+        let source = StormKey {
             principal: principal_name(principal),
             method,
-            context: remote.map(|call| call.connection_id.clone()),
         };
         let refused = result
             .as_ref()
             .map_or(true, |reply| reply["state"] == "rejected");
-        self.note_command_activity(source, 1, u64::from(refused));
+        self.note_command_activity(
+            source,
+            1,
+            u64::from(refused),
+            remote.map(|call| call.connection_id.as_str()),
+            None,
+        );
     }
 
     pub(super) fn note_rule_command_admission(&self, admission: &eliot_store::Admission) {
         if !admission.is_new {
             return;
         }
-        let source = CommandSource {
+        let source = StormKey {
             principal: admission.command.principal.clone(),
             method: "daemon.rule_action",
-            context: admission
-                .events
-                .iter()
-                .find_map(|event| event.cause.as_ref()?.rule.clone()),
         };
-        self.note_command_activity(
-            source,
-            1 + u64::from(admission.linked_command.is_some()),
-            u64::from(admission.command.state == CommandState::Rejected),
-        );
+        let attempts = 1 + u64::from(admission.linked_command.is_some());
+        let refused = u64::from(admission.command.state == CommandState::Rejected)
+            + admission.linked_command.as_ref().map_or(0, |command| {
+                u64::from(command.state == CommandState::Rejected)
+            });
+        let rule_id = admission
+            .events
+            .iter()
+            .find_map(|event| event.cause.as_ref()?.rule.as_deref());
+        self.note_command_activity(source, attempts, refused, None, rule_id);
     }
 
-    fn note_command_activity(&self, source: CommandSource, count: u64, refused: u64) {
+    fn note_command_activity(
+        &self,
+        source: StormKey,
+        count: u64,
+        refused: u64,
+        connection_id: Option<&str>,
+        rule_id: Option<&str>,
+    ) {
         let sample = {
             let mut counter = self.inner.repeat_failures.lock_recover();
-            counter.increment(WindowKey::Storm(source), Instant::now(), count, refused)
+            let key = WindowKey::Storm(source.clone());
+            let sample = counter.increment(key.clone(), Instant::now(), count, refused);
+            if sample.is_some()
+                && let Some(window) = counter.windows.get_mut(&key)
+            {
+                if let Some(connection_id) = connection_id {
+                    window.storm.observe_connection(connection_id);
+                }
+                if let Some(rule_id) = rule_id {
+                    window.storm.observe_rule(rule_id);
+                }
+            }
+            sample
         };
         if let Some((_, Some((WindowKey::Storm(source), window)))) = sample {
             self.log_command_storm(source, window);
@@ -194,7 +251,7 @@ impl Router {
                 .windows
                 .extract_if(|_, window| shutdown || window.ends <= now)
                 .filter_map(|(key, window)| match key {
-                    WindowKey::Storm(source) if window.count >= STORM_THRESHOLD => {
+                    WindowKey::Storm(source) if window.refused >= STORM_THRESHOLD => {
                         Some((source, window))
                     }
                     _ => None,
@@ -206,14 +263,14 @@ impl Router {
         }
     }
 
-    fn log_command_storm(&self, source: CommandSource, window: CounterWindow) {
-        if window.count >= STORM_THRESHOLD {
+    fn log_command_storm(&self, source: StormKey, window: CounterWindow) {
+        if window.refused >= STORM_THRESHOLD {
             let mut ids = vec![
                 ("principal", source.principal.as_str()),
                 ("method", source.method),
             ];
-            if let Some(context) = source.context.as_deref() {
-                ids.push(("source", context));
+            if let Some(rule_id) = window.storm.source.as_deref() {
+                ids.push(("source", rule_id));
             }
             crate::logging::record_command_storm(
                 &self.secret_policy_snapshot(),
@@ -221,6 +278,10 @@ impl Router {
                 window.count,
                 window.refused,
                 STORM_WINDOW_MS,
+                crate::logging::CommandStormMetadata {
+                    connection_count: window.storm.connection_count,
+                    connections_overflow: window.storm.connections_overflow,
+                },
             );
         }
     }
