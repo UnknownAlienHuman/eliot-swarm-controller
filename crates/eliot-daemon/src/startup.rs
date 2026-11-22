@@ -7,6 +7,18 @@ use eliot_core::{Error, FailureOrigin, Result};
 
 /// Failure location for the daemon's validation of its startup config.
 pub const CONFIG_STARTUP_LOCATION: &str = "daemon.start.config";
+/// The refusal of a second daemon for a root another daemon already holds.
+pub const ALREADY_RUNNING: &str = "daemon_already_running";
+
+/// Codes of a start that may succeed when tried again: nothing answered yet,
+/// the platform could not reach or spawn it, or another start holds the root.
+/// Configuration, identity and safety refusals are not among them.
+pub fn retryable(code: &str) -> bool {
+    matches!(
+        code,
+        "unavailable" | "platform_io" | "data_dir_unavailable" | ALREADY_RUNNING
+    )
+}
 
 /// Start the supplied Swarm executable only when no daemon is reachable.
 /// An authentication or safety failure is returned without changing the root.
@@ -45,7 +57,11 @@ pub async fn ensure_running(data_dir: &Path, swarm_executable: &Path) -> Result<
         if daemon_ready(data_dir).await {
             return Ok(());
         }
-        if let Some(failure) = crate::daemon_failure_since(data_dir, started) {
+        // Another start won this root (its lock or endpoint refused ours):
+        // that daemon is the one to wait for, not a failure.
+        if let Some(failure) = crate::daemon_failure_since(data_dir, started)
+            .filter(|failure| failure.error_code != ALREADY_RUNNING)
+        {
             // A concurrent successful start wins over a failure record read
             // at the same boundary.
             if daemon_ready(data_dir).await {

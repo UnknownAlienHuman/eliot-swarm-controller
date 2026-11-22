@@ -43,7 +43,7 @@ pub use daemon::{
     require_agent_identity, run, wait_command, wait_terminal,
 };
 pub use platform::data_dir::{
-    DataDir, persist_selected_root, resolve_data_dir, resolve_selected_root,
+    DataDir, owner_stopped, persist_selected_root, resolve_data_dir, resolve_selected_root,
 };
 pub use router::discovery::is_mutation_id_method;
 pub use router::discovery::mutation_id_methods;

@@ -62,18 +62,29 @@ Owner CLI callers start their private daemon when needed (`status` remains a rea
 probe). Agent and Run callers keep their inherited identity and dispatch directly;
 they never probe Owner-only readiness or start a daemon with Owner authority.
 The desktop starts the sibling `swarm.exe` and waits for daemon readiness before
-loading settings. After that first connection, a failed read asks `daemon.status`;
-when no daemon answers, the desktop runs the same startup path again (it starts a
-daemon only when none is reachable, and the data-directory lock admits one), at
-most five attempts with 1, 2, 4 and 8 s pauses between them. A notice above the
-composer counts the attempts and gives the previous attempt's reason; the polls and
-the open conversation wait and read again once the daemon answers. After the last
-attempt, or when the first start fails, the main area shows the daemon's own reason
-and the choices in this order: Retry on the same data directory (the default),
-Repair settings, Open log, Open the data folder, Use another data directory (an
-existing private Swarm root, validated and remembered by the selected-root pointer)
-and, last, a new empty data directory. The desktop does not validate the daemon's
-configuration itself. `swarm-desktop --workspace PATH` opens and registers that checkout;
+loading settings. A start whose daemon is refused by the data-directory lock (or
+endpoint) as `daemon_already_running` waits for the daemon that holds the root.
+
+An Owner `daemon.shutdown` (drain or force) writes the private `owner-stop` marker
+while the daemon still serves; the next daemon start clears it after taking the
+lock. After its first connection, a desktop read that fails asks `daemon.status`
+(repeated failing reads ask with growing pauses). When nothing answers and the
+marker is present, the desktop starts nothing: the main area says Swarm was stopped
+and offers Start, and the list's cadence asks `daemon.status` so a daemon started
+elsewhere is reconnected. When nothing answers and there is no marker, the daemon
+failed: the desktop runs its startup path again (it starts a daemon only when none
+is reachable). A restart is tried again only for `unavailable`, `platform_io`,
+`data_dir_unavailable` and `daemon_already_running`, at most five attempts with 1,
+2, 4 and 8 s pauses; a notice above the composer counts them and gives the previous
+attempt's reason, and the polls and the open conversation wait and read again once
+the daemon answers. Closing the window cancels a start before it starts a daemon.
+Any other failure, the last attempt, or a failed first start shows the daemon's own
+reason and the choices in this order: Retry on the same data directory (the
+default), Repair settings, Open log, Open the data folder, Use another data
+directory (an existing private Swarm root) and, last, a new empty data directory
+after a confirmation. A chosen or new directory is started first and written to the
+selected-root pointer only once its daemon answers. The desktop does not validate
+the daemon's configuration itself. `swarm-desktop --workspace PATH` opens and registers that checkout;
 without the flag it registers nothing: the folder it was started from never becomes
 a project implicitly. A later launch in a different checkout registers that
 workspace through the same machine-author settings writer.
@@ -84,6 +95,7 @@ workspace through the same machine-author settings writer.
   owner.token
   eliot.db, eliot.db-wal, eliot.db-shm
   daemon.lock, daemon.json, logs/daemon.log
+  owner-stop             present from an Owner `daemon.shutdown` until the next start
   skills/                daemon-materialized `eliot-swarm` Agent skill (private, rewritten at startup)
   plugins/                 only instantiated plugins
   worktrees/               L3 opt-in workspaces

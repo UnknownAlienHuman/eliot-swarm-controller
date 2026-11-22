@@ -1,12 +1,15 @@
 //! The daemon link (#826). The daemon alone says whether it runs: a read
-//! that fails asks it (`daemon.status`), and when no daemon answers the
-//! desktop starts it again through the startup path it opened with
-//! ([`DesktopApp::start_connection`], whose `ensure_running` starts one
-//! only when none is reachable, and the data directory's lock admits one
-//! daemon). The attempts pause longer each time and stop at a cap; a calm
-//! notice above the composer counts them meanwhile. After the last one,
-//! or when the first start fails, the main area shows the daemon's own
-//! failure and the owner's choices.
+//! that fails asks it (`daemon.status`), and when no daemon answers and its
+//! Owner did not stop it, the desktop starts it again through the startup
+//! path it opened with ([`DesktopApp::start_connection`], whose
+//! `ensure_running` starts one only when none is reachable, and the data
+//! directory's lock admits one daemon). Only a start that may succeed when
+//! tried again is retried, with growing pauses up to a cap; a calm notice
+//! above the composer counts the attempts. A daemon its Owner stopped
+//! (`daemon.shutdown`, which leaves the daemon's owner-stop marker) is not
+//! started again: the main area says so and offers Start. After the last
+//! attempt, or a start that cannot succeed by repeating it, the main area
+//! shows the daemon's own failure and the owner's choices.
 
 use super::*;
 use crate::theme::winui::Palette;
@@ -18,6 +21,18 @@ const RESTART_ATTEMPTS: u32 = 5;
 /// is busy, not gone.
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// What a `daemon.status` probe found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Probe {
+    /// The daemon answered, refused or was too busy to answer in time: it
+    /// is there, and the failed read speaks for itself.
+    Running,
+    /// Nothing answers and its Owner did not stop it: it failed.
+    Gone,
+    /// Nothing answers because its Owner stopped it.
+    OwnerStopped,
+}
+
 #[derive(Debug, Default)]
 pub(super) struct LinkState {
     /// A `daemon.status` probe is in flight.
@@ -25,27 +40,53 @@ pub(super) struct LinkState {
     /// The restart attempt in flight (from 1) and why the previous one
     /// failed.
     restarting: Option<(u32, Option<String>)>,
-    /// The owner's Retry or data-directory choice is starting the daemon:
-    /// no restart chain may start beside it.
+    /// The owner's Retry, Start or data-directory choice is starting the
+    /// daemon: no restart chain may start beside it.
     starting: bool,
-    /// The restarts reached their cap: the failure view says Swarm stopped.
+    /// The restarts ended without a daemon: the failure view says Swarm
+    /// stopped.
     gave_up: bool,
+    /// The daemon's Owner stopped it: nothing restarts it; the main area
+    /// offers Start, and the list's cadence watches for a start elsewhere.
+    stopped: bool,
     /// A failed read's alert, held until the probe answers: shown when the
     /// daemon runs, dropped when it is gone (the notice says why once).
     held: Option<String>,
+    /// Probes in a row that found the daemon running after a failed read,
+    /// and the earliest next one: repeated failing reads ask it with the
+    /// same growing pauses as every other retry.
+    strikes: u32,
+    quiet_until: Option<std::time::Instant>,
+    /// The start in flight: superseded starts are cancelled, and the
+    /// window's close cancels it before it starts a daemon.
+    task: Option<ComponentTask>,
+    /// The data directory being started is the owner's new choice: it is
+    /// remembered only once its daemon answers.
+    candidate: bool,
+    /// The confirmation of a new empty data directory is open.
+    pub(super) confirm_fresh: bool,
 }
 
 impl DesktopApp {
-    /// No daemon answers now: it is being started again, or it could not
-    /// start. The polls read nothing meanwhile.
+    /// No daemon answers now: it is being started, its Owner stopped it, or
+    /// it could not start. The polls read nothing meanwhile.
     pub(super) fn daemon_down(&self) -> bool {
-        self.link.restarting.is_some() || self.link.starting || self.startup_error.is_some()
+        self.link.restarting.is_some()
+            || self.link.starting
+            || self.link.stopped
+            || self.startup_error.is_some()
     }
 
     /// The daemon is being asked whether it runs, or is down: a read's
     /// transport error is not the owner's news yet.
     pub(super) fn link_unsure(&self) -> bool {
         self.link.probing || self.daemon_down()
+    }
+
+    /// The main area shows the link's state (could not start, or stopped by
+    /// its Owner) instead of the conversation.
+    pub(super) fn link_view_shown(&self) -> bool {
+        self.startup_error.is_some() || self.link.stopped
     }
 
     /// A list read failed with `text`: shown when the daemon still runs,
@@ -60,7 +101,8 @@ impl DesktopApp {
         }
         self.link.held = Some(text);
         self.link_suspect(context);
-        // No probe could start: the read's own error is the news.
+        // No probe started (none needed this soon): the read's own error
+        // is the news.
         if !self.link.probing
             && let Some(text) = self.link.held.take()
         {
@@ -68,40 +110,94 @@ impl DesktopApp {
         }
     }
 
-    /// A read failed: ask the daemon whether it runs (one probe at a time,
-    /// only once connected and not while it is being started).
+    /// A read failed: ask the daemon whether it runs. One probe at a time,
+    /// only once connected and not while it is down, and after a probe that
+    /// found it running, not again before its growing pause ends.
     pub(super) fn link_suspect(&mut self, context: &ComponentContext<Self>) {
-        if !self.preferences_loaded || self.daemon_down() || self.link.probing {
+        let resting = self
+            .link
+            .quiet_until
+            .is_some_and(|until| std::time::Instant::now() < until);
+        if !self.preferences_loaded || self.daemon_down() || self.link.probing || resting {
             return;
         }
+        self.spawn_probe(context);
+    }
+
+    /// While its Owner keeps it stopped, the list's cadence asks whether a
+    /// daemon was started elsewhere (CLI, update) and reconnects to it.
+    /// Asking never starts one.
+    pub(super) fn link_watch(&mut self, context: &ComponentContext<Self>) {
+        if self.link.stopped && !self.link.probing {
+            self.spawn_probe(context);
+        }
+    }
+
+    fn spawn_probe(&mut self, context: &ComponentContext<Self>) {
         let Ok(data_dir) = self.data_dir.clone() else {
             return;
         };
         self.link.probing = true;
         let _task = context.spawn_background(move |_| {
-            let probed = client::block_on(async {
+            let reachable = client::block_on(async {
                 tokio::time::timeout(PROBE_TIMEOUT, eliot_daemon::startup::reachable(&data_dir))
                     .await
             });
-            Message::Shell(ShellMsg::LinkProbed(probed.unwrap_or(Ok(true))))
+            let probe = match reachable {
+                Ok(Ok(false)) if eliot_daemon::owner_stopped(&data_dir) => Probe::OwnerStopped,
+                Ok(Ok(false)) => Probe::Gone,
+                _ => Probe::Running,
+            };
+            Message::Shell(ShellMsg::LinkProbed(probe))
         });
     }
 
-    pub(super) fn link_probed(
-        &mut self,
-        probed: MutationResult<bool>,
-        context: &ComponentContext<Self>,
-    ) {
+    pub(super) fn link_probed(&mut self, probe: Probe, context: &ComponentContext<Self>) {
         self.link.probing = false;
         let held = self.link.held.take();
-        // A refusal other than "nothing answers" is the read's own error.
-        if probed.unwrap_or(true) || self.daemon_down() {
-            if let Some(text) = held {
-                self.alert(text);
+        if self.link.stopped {
+            if probe == Probe::Running {
+                self.retry_startup(context);
             }
             return;
         }
-        self.restart_daemon(1, None, context);
+        if self.daemon_down() {
+            return;
+        }
+        match probe {
+            Probe::Running => {
+                self.link.strikes = self.link.strikes.saturating_add(1);
+                self.link.quiet_until = Some(
+                    std::time::Instant::now()
+                        + std::time::Duration::from_millis(live::backoff_ms(self.link.strikes)),
+                );
+                if let Some(text) = held {
+                    self.alert(text);
+                }
+            }
+            Probe::Gone => self.restart_daemon(1, None, context),
+            Probe::OwnerStopped => {
+                self.link.stopped = true;
+                self.set_status("Swarm was stopped by its owner.");
+                self.park_reads("Swarm was stopped", context);
+            }
+        }
+    }
+
+    /// No daemon serves the open conversation for now: its feed stops, and
+    /// the main area shows the link (from Settings too).
+    fn park_reads(&mut self, live_reason: &str, context: &ComponentContext<Self>) {
+        if let Some(task) = self.chat.live_task.take() {
+            task.cancel();
+        }
+        if self.chat.convo.is_some() {
+            self.chat.live = LiveStatus::Stopped(live_reason.to_owned());
+        }
+        self.close_popover();
+        if self.main != Main::Conversation {
+            self.main = Main::Conversation;
+            self.reprime_fields(context);
+        }
     }
 
     /// Start attempt `attempt` after its pause; `reason` is why the one
@@ -135,106 +231,153 @@ impl DesktopApp {
         } else {
             0
         };
-        self.start_connection(data_dir, delay_ms, context);
+        self.link.task = Some(self.start_connection(data_dir, delay_ms, context));
     }
 
-    /// The daemon answers again (at launch, after Retry, or after a
-    /// restart): the restart is over. True when it was a restart.
-    pub(super) fn link_ready(&mut self) -> bool {
-        std::mem::take(&mut self.link).restarting.is_some()
+    /// The daemon answers again (at launch, after Retry or Start, or after
+    /// a restart): the link is up. A newly chosen data directory is
+    /// remembered now. True when it was a restart.
+    pub(super) fn link_ready(&mut self, context: &ComponentContext<Self>) -> bool {
+        let link = std::mem::take(&mut self.link);
+        if link.candidate
+            && let Ok(root) = self.data_dir.clone()
+        {
+            let _task = context.spawn_background(move |_| {
+                let remembered = eliot_daemon::persist_selected_root(&root)
+                    .map_err(|error| error.user_message());
+                Message::Shell(ShellMsg::RootRemembered(root, remembered))
+            });
+        }
+        link.restarting.is_some()
     }
 
-    /// The startup path failed with `error`: the next restart attempt, or
-    /// the failure view once the attempts are spent (or at the first start).
+    /// The startup path failed with `error`. A restart tries again only
+    /// when trying again may help (nothing answered yet, the platform could
+    /// not start it, another start holds the root) and attempts remain;
+    /// otherwise the failure view shows the daemon's reason at once.
     pub(super) fn link_failed(
         &mut self,
         error: eliot_core::Error,
         context: &ComponentContext<Self>,
     ) {
         self.link.starting = false;
+        self.link.task = None;
         match self.link.restarting.take() {
-            Some((attempt, _)) if attempt < RESTART_ATTEMPTS => {
+            Some((attempt, _))
+                if attempt < RESTART_ATTEMPTS && eliot_daemon::startup::retryable(&error.code) =>
+            {
                 self.restart_daemon(attempt + 1, Some(error.user_message()), context);
             }
             restarting => {
                 self.link.gave_up = restarting.is_some();
                 self.startup_error = Some(error);
-                if self.chat.convo.is_some() {
-                    self.chat.live = LiveStatus::Stopped("Swarm is not running".to_owned());
-                }
-                // The failure and its choices take the main area, from
-                // Settings too.
-                self.close_popover();
-                if self.main != Main::Conversation {
-                    self.main = Main::Conversation;
-                    self.reprime_fields(context);
-                }
+                self.park_reads("Swarm is not running", context);
             }
         }
     }
 
-    /// Retry on the same data directory.
+    /// Retry, or Start after an Owner stop, on the current data directory
+    /// (a new choice stays pending until its daemon answers).
     pub(super) fn retry_startup(&mut self, context: &ComponentContext<Self>) {
-        if let Ok(data_dir) = self.data_dir.clone() {
-            self.startup_error = None;
-            self.link = LinkState {
-                starting: true,
-                ..LinkState::default()
-            };
-            self.alert = None;
-            self.set_status("Starting Swarm…");
-            self.start_connection(data_dir, 0, context);
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        if let Some(task) = self.link.task.take() {
+            task.cancel();
         }
+        self.startup_error = None;
+        self.link = LinkState {
+            starting: true,
+            candidate: self.link.candidate,
+            ..LinkState::default()
+        };
+        self.alert = None;
+        self.set_status("Starting Swarm…");
+        self.link.task = Some(self.start_connection(data_dir, 0, context));
     }
 
-    /// Use `selected`, already validated and remembered as the data root by
-    /// the daemon's own selection, from now on.
-    pub(super) fn switch_data_dir(&mut self, selected: PathBuf, context: &ComponentContext<Self>) {
+    /// Start on the owner's new data directory; it is remembered for the
+    /// next launch only once its daemon answers ([`Self::link_ready`]).
+    fn switch_data_dir(&mut self, candidate: PathBuf, context: &ComponentContext<Self>) {
         // An open conversation belongs to the directory left behind.
         if self.chat.convo.is_some() {
             self.new_task(context);
         }
-        self.data_dir = Ok(selected.clone());
+        self.data_dir = Ok(candidate.clone());
         self.note_window_size();
-        self.set_status(format!("Starting Swarm in {}", selected.display()));
+        self.link.candidate = true;
         self.retry_startup(context);
+        self.set_status(format!("Starting Swarm in {}", candidate.display()));
+    }
+
+    /// A data directory to start on, checked off the UI thread, or why not.
+    pub(super) fn candidate_checked(
+        &mut self,
+        checked: Result<PathBuf, String>,
+        context: &ComponentContext<Self>,
+    ) {
+        match checked {
+            Ok(candidate) => self.switch_data_dir(candidate, context),
+            Err(error) => self.alert(error),
+        }
     }
 
     /// "Use another data directory…": a Swarm data folder the owner already
-    /// has. The daemon's selection validates it and remembers it.
+    /// has. The folder dialog runs on the UI thread; the daemon library's
+    /// check of the root runs on a worker.
     pub(super) fn choose_data_dir(&mut self, context: &ComponentContext<Self>) {
         let picked = match crate::file_dialog::pick_folder("Use another Swarm data directory") {
             Ok(Some(picked)) => PathBuf::from(picked),
             Ok(None) => return,
             Err(error) => return self.alert(error),
         };
-        match eliot_daemon::DataDir::open_existing(&picked)
-            .map(|root| root.path().to_path_buf())
-            .and_then(|selected| eliot_daemon::persist_selected_root(&selected).map(|()| selected))
-        {
-            Ok(selected) => self.switch_data_dir(selected, context),
-            Err(error) => self.alert(format!(
-                "{} cannot be used: {}",
-                picked.display(),
-                error.user_message()
-            )),
-        }
+        let _task = context.spawn_background(move |_| {
+            let checked = eliot_daemon::DataDir::open_existing(&picked)
+                .map(|root| root.path().to_path_buf())
+                .map_err(|error| {
+                    format!(
+                        "{} cannot be used: {}",
+                        picked.display(),
+                        error.user_message()
+                    )
+                });
+            Message::Shell(ShellMsg::CandidateChecked(checked))
+        });
     }
 
-    /// The last choice: a new, empty private data directory beside the
-    /// current one, which keeps its chats and settings.
-    pub(super) fn use_fresh_data_dir(&mut self, context: &ComponentContext<Self>) {
-        let Ok(original) = client::data_dir() else {
+    /// The last choice, once confirmed: a new, empty private data directory
+    /// beside the current one, which keeps its chats and settings.
+    pub(super) fn fresh_confirmed(&mut self, confirmed: bool, context: &ComponentContext<Self>) {
+        self.link.confirm_fresh = false;
+        if !confirmed {
             return;
-        };
-        let fresh = original.with_file_name(format!("Eliot-private-{}", client::new_mutation_id()));
-        match eliot_daemon::bootstrap::ensure_private_data_dir(&fresh)
-            .and_then(|selected| eliot_daemon::persist_selected_root(&selected).map(|()| selected))
-        {
-            Ok(selected) => self.switch_data_dir(selected, context),
+        }
+        let _task = context.spawn_background(move |_| {
+            let checked = client::data_dir()
+                .and_then(|original| {
+                    eliot_daemon::bootstrap::ensure_private_data_dir(
+                        original
+                            .with_file_name(format!("Eliot-private-{}", client::new_mutation_id())),
+                    )
+                })
+                .map_err(|error| {
+                    format!(
+                        "A new data directory was not created: {}",
+                        error.user_message()
+                    )
+                });
+            Message::Shell(ShellMsg::CandidateChecked(checked))
+        });
+    }
+
+    /// The new data directory runs and is remembered, or runs for this
+    /// session only.
+    pub(super) fn root_remembered(&mut self, root: PathBuf, remembered: Result<(), String>) {
+        match remembered {
+            Ok(()) => self.set_status(format!("Swarm uses {} from now on", root.display())),
             Err(error) => self.alert(format!(
-                "A new data directory was not created: {}",
-                error.user_message()
+                "Swarm runs in {}, but it was not remembered for the next start: {error}",
+                root.display()
             )),
         }
     }
@@ -301,11 +444,15 @@ impl DesktopApp {
     /// The daemon could not start, or stopped and could not be started
     /// again: its own reason, then the owner's choices, the safe ones first.
     /// Nothing is moved; a new empty directory is the last, named choice.
+    /// A daemon its Owner stopped gets Start instead.
     pub(super) fn startup_error_view(
         &self,
         context: &mut ViewContext<Self>,
         palette: Palette,
     ) -> View {
+        if self.link.stopped {
+            return self.stopped_view(context, palette);
+        }
         let reason = self
             .startup_error
             .as_ref()
@@ -417,5 +564,65 @@ impl DesktopApp {
                 ),
                 notice,
             ))
+    }
+
+    /// The daemon's Owner stopped it: nothing starts it again on its own.
+    fn stopped_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+        StackPanel::new()
+            .max_width(tokens::layout::READING_WIDTH)
+            .horizontal_alignment(HorizontalAlignment::Center)
+            .vertical_alignment(VerticalAlignment::Center)
+            .spacing(tokens::spacing::MD)
+            .margin(Thickness::uniform(tokens::spacing::LG))
+            .children((
+                m3::page_title("Swarm was stopped"),
+                m3::body(
+                    "Its owner stopped it, so it is not started again on its own. \
+                     This window reconnects when Swarm runs again.",
+                )
+                .text_wrapping(TextWrapping::Wrap),
+                m3::filled(palette)
+                    .automation_name("Start Swarm")
+                    .on_click(context.message(Message::Shell(ShellMsg::RetryStartup)))
+                    .content(m3::label("Start")),
+            ))
+    }
+
+    /// Confirm the last choice: a new, empty data directory.
+    pub(super) fn fresh_confirmation(
+        &self,
+        context: &mut ViewContext<Self>,
+        palette: Palette,
+    ) -> View {
+        let current = self
+            .data_dir
+            .as_ref()
+            .map_or_else(|_| String::new(), |dir| dir.display().to_string());
+        super::dialog_ui::surface(
+            context,
+            self.dialog.epoch,
+            palette,
+            "Start over in a new empty data directory?".to_owned(),
+            m3::secondary(format!(
+                "Swarm creates a new private data directory with no chats, Agents or settings \
+                 and starts there. {current} stays as it is; use “Use another data directory…” \
+                 to return to it. The new directory is remembered once Swarm runs in it."
+            ))
+            .text_wrapping(TextWrapping::Wrap)
+            .into(),
+            super::dialog_ui::actions(
+                m3::text_button(palette)
+                    .element_ref(&self.dialog.close)
+                    .automation_name("Cancel")
+                    .on_click(context.message(Message::Shell(ShellMsg::FreshConfirmed(false))))
+                    .content(m3::label("Cancel")),
+                m3::filled(palette)
+                    .element_ref(&self.dialog.primary)
+                    .automation_name("Create empty data directory")
+                    .on_click(context.message(Message::Shell(ShellMsg::FreshConfirmed(true))))
+                    .content(m3::label("Create and start")),
+            ),
+            tokens::layout::DIALOG_WIDTH,
+        )
     }
 }

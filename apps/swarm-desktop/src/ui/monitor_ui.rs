@@ -42,6 +42,8 @@ pub(super) struct MonitorState {
     task: Option<ComponentTask>,
     refresh_gate: Arc<tokio::sync::Mutex<()>>,
     refreshing: bool,
+    /// Refreshes in a row that reported read errors: the next waits longer.
+    failures: u32,
     /// The Agent whose details (and usage) each refresh reads.
     pub(super) selected: Option<String>,
     /// Rows whose children are shown (collapsed by default).
@@ -81,12 +83,20 @@ impl DesktopApp {
                     // The state filter stays as the owner chose it, even
                     // while no Agent is in that state.
                     self.monitor.data.apply(*snapshot);
-                    if !self.monitor.data.errors.is_empty() {
+                    // A refresh with errors asks whether the daemon runs
+                    // (itself paced) and waits longer before the next, with
+                    // the same growing pauses as every retry.
+                    let delay = if self.monitor.data.errors.is_empty() {
+                        self.monitor.failures = 0;
+                        monitor::PERIOD_MS
+                    } else {
+                        self.monitor.failures = self.monitor.failures.saturating_add(1);
                         self.link_suspect(context);
-                    }
+                        live::backoff_ms(self.monitor.failures).max(monitor::PERIOD_MS)
+                    };
                     // The next read waits on its own worker: a timer message
                     // would render the whole window for nothing.
-                    self.read_monitor(monitor::PERIOD_MS, context);
+                    self.read_monitor(delay, context);
                 }
             }
             MonitorMsg::RowOpened(id) => {

@@ -878,13 +878,16 @@ of the explicitly selected release scope.
       large inventory using the same opaque token in the CLI and MCP.
 
 - [x] **Daemon restart and startup choices (#826, 2026-11-21).** A daemon that
-      exits while the desktop runs is started again through the desktop's startup
-      path, one daemon per data directory, with capped growing pauses and a calm
-      attempt notice above the composer; the reads that failed meanwhile wait for
-      it instead of showing transport errors, and the open conversation continues
-      once it answers. After the last attempt, or a failed first start, the
+      fails while the desktop runs is started again through the desktop's startup
+      path, one daemon per data directory, retrying only transient failures with
+      capped growing pauses and a calm attempt notice above the composer; the reads
+      that failed meanwhile wait for it instead of showing transport errors, and the
+      open conversation continues once it answers. A daemon its Owner stopped
+      (`swarm daemon stop`, the `owner-stop` marker) is not restarted: the desktop
+      says so and offers Start. Otherwise the
       [startup failure view](spec/configuration.md) shows the daemon's reason with
-      Retry first and a new empty data directory last.
+      Retry first and a confirmed new empty data directory last; a new directory is
+      remembered only once its daemon answers.
 
 - [ ] **K92 Backend quota and chat lifecycle (#407).** Implemented provider
       readers, durable archive/delete, settings project removal and private chats.
