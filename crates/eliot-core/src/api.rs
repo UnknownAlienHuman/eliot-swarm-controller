@@ -120,7 +120,7 @@ pub use git_integrate::{
     GitIntegrateCaller, GitIntegrateCheckClassification, GitIntegrateCheckFailure,
     GitIntegrateDefinitionArgs, GitIntegrateOutcome, GitIntegrateRefUpdate, GitIntegrateStatus,
     GitIntegrateTargetPin, MAX_GIT_INTEGRATE_BRANCHES, MAX_GIT_INTEGRATE_CHECK_TAIL_BYTES,
-    MAX_GIT_INTEGRATE_CONFLICT_PATHS,
+    MAX_GIT_INTEGRATE_CONFLICT_PATHS, validate_integration_branch,
 };
 pub use goals::{
     AssignmentGoal, CHECK_SPAWN_RETRYABLE, DEFAULT_GOAL_CHECK_TIMEOUT_MS, GOAL_CHECK_HISTORY_LIMIT,

@@ -893,6 +893,14 @@ fn admit_launch_tx(
     let parent_link = hierarchy::resolve_launch_parent(tx, principal, &request.args)?;
     if let Some(parent) = parent_link.as_ref() {
         hierarchy::check_child_fanout(tx, parent, limits)?;
+        if principal.starts_with("agent:")
+            && parent.workspace.as_deref() != request.args.get("workspace").and_then(Value::as_str)
+        {
+            return Err(Error::new(
+                "not_allowed",
+                "Agent child launches must use their parent's workspace as the source",
+            ));
+        }
     }
     let chat = request
         .args
@@ -969,9 +977,12 @@ fn admit_launch_tx(
             if !matches
                 && let Some(project) = registered.as_deref()
                 && let Some(registration) = projects::project_registration_tx(tx, project)?
-                && input.project == registration.checkout
             {
-                matches = true;
+                matches = input.project == registration.checkout;
+            } else if !matches && principal.starts_with("agent:") && parent_link.is_some() {
+                // For an unregistered checkout the scope can be a subdirectory
+                // or linked worktree. The daemon verified the shared Git identity.
+                matches = request.args.get("worktree").is_some();
             }
             if !matches {
                 return Err(Error::new(

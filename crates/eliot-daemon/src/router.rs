@@ -357,6 +357,7 @@ struct PendingEntry {
     bound: Option<usize>,
     command_unknown: bool,
     excerpt_allowed: bool,
+    branch: Option<String>,
 }
 
 /// Digest options for one wait snapshot; the default is a plain wait.
@@ -3401,8 +3402,7 @@ impl Router {
         // A requested branch name always wins, but even an explicit branch
         // lands in the standard directory. A bare `--worktree` (an empty
         // value) or a top-level launch in a `worktree`-mode project generates
-        // the standard branch instead. Workers keep sharing their parent's
-        // worktree through the parent link and never mint one.
+        // the standard branch instead. Agent children opt in explicitly.
         let requested = request
             .args
             .get("worktree")
@@ -3452,40 +3452,35 @@ impl Router {
         // registered project, resolve the base commit from that worktree while
         // freezing the new worktree against the project's registered checkout.
         let retained_workspace = required_text(&request.args, "workspace")?;
+        let child_worktree = matches!(principal, Principal::Agent { .. }) && explicit_worktree;
+        if child_worktree && registered_checkout.is_none() {
+            registered_checkout = self
+                .inner
+                .store
+                .lock()
+                .await
+                .get_workspace_by_path(retained_workspace)?
+                .map(|workspace| workspace.repo_path);
+        }
         let freeze_repo = registered_checkout
             .as_deref()
             .filter(|checkout| !checkout.trim().is_empty())
             .unwrap_or(retained_workspace);
         let base_repo = (freeze_repo != retained_workspace).then_some(retained_workspace);
-        let input = match requested {
-            Some(branch) => {
-                self.inner
-                    .workspaces
-                    .freeze_launch(
-                        freeze_repo,
-                        &branch,
-                        base,
-                        base_repo,
-                        &project_slug,
-                        &task_slug,
-                        snapshot,
-                    )
-                    .await?
-            }
-            None => {
-                self.inner
-                    .workspaces
-                    .freeze_launch_generated(
-                        freeze_repo,
-                        &project_slug,
-                        &task_slug,
-                        base,
-                        base_repo,
-                        snapshot,
-                    )
-                    .await?
-            }
-        };
+        let input = self
+            .inner
+            .workspaces
+            .freeze_launch(
+                freeze_repo,
+                requested.as_deref(),
+                base,
+                base_repo,
+                child_worktree,
+                &project_slug,
+                &task_slug,
+                snapshot,
+            )
+            .await?;
         let metadata = serde_json::to_value(&input)
             .map_err(|_| Error::new("internal", "workspace input could not be encoded"))?;
         request
@@ -5865,6 +5860,7 @@ impl Router {
             bound: None,
             command_unknown: false,
             excerpt_allowed: false,
+            branch: None,
         };
         for (idx, id) in request.commands.iter().enumerate() {
             if hidden.is_some_and(|mask| mask.get(idx).copied().unwrap_or(false)) {
@@ -5954,6 +5950,7 @@ impl Router {
                             bound: Some(bounds.len() - 1),
                             command_unknown,
                             excerpt_allowed,
+                            branch: None,
                         });
                     }
                     // A command bound to a missing turn reads unknown, never
@@ -5962,7 +5959,7 @@ impl Router {
                 }
                 continue;
             }
-            pending.push(leaf_entry(
+            let mut entry = leaf_entry(
                 "command",
                 id.clone(),
                 if command_unknown {
@@ -5979,7 +5976,24 @@ impl Router {
                     }
                     .to_owned()
                 },
-            ));
+            );
+            let generation = match command.verb.as_str() {
+                "launch" => Some(1),
+                "send" => command.generation.or(command.expected_generation),
+                _ => None,
+            };
+            if excerpt_allowed
+                && let (Some(target), Some(generation)) = (command.target.as_deref(), generation)
+                && hierarchy::authorize_agent_read(store, principal, target, Some(generation))
+                    .is_ok()
+                && (excerpt_recipient.is_none()
+                    || recipient_principal.as_ref().is_some_and(|rp| {
+                        hierarchy::authorize_agent_read(store, rp, target, Some(generation)).is_ok()
+                    }))
+            {
+                entry.branch = store.child_worktree_branch(target, generation)?;
+            }
+            pending.push(entry);
         }
         for (t_idx, turn_ref) in request.turns.iter().enumerate() {
             let id = turn_ref.canonical_id();
@@ -6028,6 +6042,7 @@ impl Router {
                         bound: Some(bounds.len() - 1),
                         command_unknown: false,
                         excerpt_allowed,
+                        branch: None,
                     });
                 }
                 None => pending.push(leaf_entry("turn", id, "not_found".to_owned())),
@@ -6089,7 +6104,9 @@ impl Router {
         let mut results = Vec::with_capacity(pending.len());
         for entry in pending {
             let Some(index) = entry.bound else {
-                results.push(WaitEntryResult::new(entry.kind, entry.id, entry.leaf));
+                let mut result = WaitEntryResult::new(entry.kind, entry.id, entry.leaf);
+                result.branch = entry.branch;
+                results.push(result);
                 continue;
             };
             let bound = &bounds[index];
@@ -6108,6 +6125,7 @@ impl Router {
                 bound.turn_id.clone(),
             );
             result.resolution_source = bound.turn.resolution_source;
+            result.branch = store.child_worktree_branch(&bound.agent, bound.generation)?;
             if bound.turn.state == TurnState::Completed
                 && let Some(text) = bound.turn.final_text.as_deref()
             {

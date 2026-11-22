@@ -219,6 +219,9 @@ pub struct WaitEntryResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 0))]
     pub generation: Option<i64>,
+    /// Retained managed worktree branch for the visible child command or turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     /// Bound turn id, when the entry resolved to a turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
@@ -245,6 +248,7 @@ impl WaitEntryResult {
             resolution_source: None,
             agent: None,
             generation: None,
+            branch: None,
             turn_id: None,
             final_text: None,
             truncated: false,

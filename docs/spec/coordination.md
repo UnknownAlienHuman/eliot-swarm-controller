@@ -760,10 +760,17 @@ harnesses. Approved same-harness profiles can set their model, effort, and daemo
 context ceiling under the parent's native authority and captured credential bindings.
 Every frozen account or proxy capacity scope of the parent
 is kept with the same bounds, alongside the child's own scopes; conflicting bounds
-reject. Control is narrowed or equal (never widened). It omits `profile_snapshot` (the daemon
-freezes it) and shares the parent's workspace (an omitted workspace defaults to
-the parent's; a different workspace rejects, so a child never escapes the
-parent's authority) and mints no worktree; owner launches are unrestricted. Fanout limits (`[daemon.limits]`, checked at launch and re-parent admission)
+reject. Control is narrowed or equal. The daemon freezes `profile_snapshot`. An Agent
+child shares the parent's workspace by default. It can request its own Swarm-managed
+worktree and branch in the same repository. A supplied workspace must match the
+parent's. Creating a child worktree requires the parent to be on a local branch.
+The frozen base is the parent's `HEAD` by default. An explicit base must resolve
+to that branch tip or one of its ancestors. Swarm applies the integration branch
+name rules and refuses an existing branch for a new child.
+It creates the branch and checkout under the usual managed-worktree preparation
+path, leaves the parent's checkout and index intact, and retains the child's branch
+for integration and proof-based cleanup. Children inherit the project policy in
+either workspace mode. Fanout limits (`[daemon.limits]`, checked at launch and re-parent admission)
 prevent accidental new work but never hide an Agent row that already exists.
 Above-limit children remain visible with no widened identity/control; over-limit
 admission reads `fanout_limit` and persists nothing. Terminal Agents (stopped,
@@ -813,7 +820,7 @@ for the Git operation and failure readback.
 
 `child.run` uses one `ChildRunRequest` / `ChildRunResponse` DTO pair
 ([Core API](../../crates/eliot-core/src/api/child_run.rs)). An Agent starts
-with `{text, `sources`?, profile?, `wait_ms`?}`. The MCP mutation wrapper supplies
+with `{text, sources?, profile?, worktree?, base?, wait_ms?}`. The MCP mutation wrapper supplies
 the operation id and returns it with the response; direct callers provide a
 ULID. The id is the ordinary launch command id, so the normal command binding
 retains the principal, payload digest, launch and linked first input. A retry
@@ -826,6 +833,7 @@ frozen profile. An explicit profile must pass the captured child-profile
 allow-list and existing same-harness/cross-harness checks. The child's first
 input is `args.text`, committed as the launch's linked `SEND`; `sources` uses the
 existing bounded source delivery and replay path.
+`worktree` and `base` use the same rules as an ordinary Agent child launch.
 
 `wait_ms` defaults to 20,000 and is limited to 25,000 ms per call, leaving
 response time within the native 30-second MCP/plugin RPC deadline. `wait_ms:0`
@@ -840,9 +848,12 @@ wake, including after a daemon restart. A digest retry reuses its registration
 and mail identity.
 
 The compact response contains the exact input status, bound Agent/generation
-when visible, bounded retained `final_text`, `truncated` and the shared bounded
+when visible, the retained managed `branch` when available, bounded retained
+`final_text`, `truncated` and the shared bounded
 `ChildRunFacts`. The same facts appear on visible settled child results in
-`swarm.wait`; the CLI serializes those `WaitEntryResult` fields. Collection runs
+`swarm.wait`. Visible waits for the child's launch, input or turn can also return
+the managed `branch` for the matching generation. Use it in a `git.integrate`
+request. The CLI serializes those `WaitEntryResult` fields. Fact collection runs
 only after the final child-wait snapshot, once per exact Agent turn, so polling
 does not repeat Git reads. `changed_files` comes from a complete owned workspace
 view or generation-bound `agent.edits` rows (up to 8 paths of at most 128 bytes, with `truncated` for

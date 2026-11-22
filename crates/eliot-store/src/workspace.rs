@@ -1159,6 +1159,20 @@ impl Store {
         load_workspace(&self.connection, parse_agent_id(agent)?)
     }
 
+    pub fn child_worktree_branch(&self, agent: &str, generation: i64) -> Result<Option<String>> {
+        self.ensure_committed_reads()?;
+        self.connection
+            .query_row(
+                "SELECT w.requested_branch FROM workspaces w JOIN agents a ON a.id = w.agent
+                 WHERE w.agent = ?1 AND w.target_generation = ?2 AND a.parent IS NOT NULL
+                   AND w.phase IN ('ready', 'removing', 'removed')",
+                params![parse_agent_id(agent)?, generation],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)
+    }
+
     pub fn get_workspace_by_path(&self, path: &str) -> Result<Option<WorkspacePreparation>> {
         require_nonempty(path, "managed workspace path")?;
         load_workspace_by_path(&self.connection, path)

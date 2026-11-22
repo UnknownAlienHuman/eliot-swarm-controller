@@ -285,8 +285,8 @@ These rules apply to plugins, services, hooks, scripts, checks, Git and workspac
 durable row. A requested `BRANCH` always wins; a bare `--worktree` generates
 the standard branch below. A top-level Owner launch in a registered project
 whose `workspace` setting is `worktree` (the default) gets its own prepared
-worktree without any flag; workers keep sharing their parent's worktree
-through the parent link and never mint one.
+worktree without any flag. Workers share their parent's worktree by default
+and can explicitly request a [managed child worktree](coordination.md#claims-and-hierarchy).
 
 ```sql
 CREATE TABLE workspaces (

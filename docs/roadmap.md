@@ -986,13 +986,16 @@ of the explicitly selected release scope.
       kept/refused as appropriate; sibling registration was denied. Static gate:
       fmt, locked workspace all-targets build, warnings-denied Clippy and 2,014
       tests passed. All owned processes exited and the private daemon drained.
-      Keep this item open: existing Agent policy prohibits managed-worktree
-      launches, so the private Owner created the children under the manager;
-      the exact manager-created-worktree scenario remains unqualified. Frozen
-      Codex archive scope and malformed acknowledgements have source/regression
+      Frozen Codex archive scope and malformed acknowledgements have source/regression
       coverage, without a native fault-injection run. Automatic approval review
       blocked deletion of the private proof directory and five scratch directories
       left by failing-before tests.
+
+      - [x] **Agent-launched managed child worktrees (2026-11-22).** A private
+        Claude manager launched Claude and OpenCode children in parallel, refused
+        an unrelated base, and integrated both child branches with the project
+        check. Cleanup classified and removed both worktrees after the checked
+        merge reached the private upstream. Both child refs survived worktree removal.
 
 Service continuity across daemon replacement requires an actual use case. The
 current contracts are not instructions to build that product in advance.
