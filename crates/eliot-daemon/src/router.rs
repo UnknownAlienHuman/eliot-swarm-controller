@@ -152,6 +152,7 @@ struct RouterInner {
     plugin_crashes: Mutex<PluginCrashStatus>,
     previous_crash: Mutex<Option<CrashMarker>>,
     worker_tasks: Mutex<Vec<WorkerTaskStatus>>,
+    automatic_cleanup: Mutex<cleanup::AutomaticCleanupState>,
     mode: AtomicU8,
     restart_lease: Mutex<Option<String>>,
     restart_writes: RwLock<()>,
@@ -415,6 +416,7 @@ impl Router {
                         })
                         .collect(),
                 ),
+                automatic_cleanup: Mutex::new(cleanup::AutomaticCleanupState::default()),
                 mode: AtomicU8::new(MODE_OPEN),
                 restart_lease: Mutex::new(None),
                 restart_writes: RwLock::new(()),

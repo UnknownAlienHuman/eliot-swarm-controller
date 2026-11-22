@@ -23,7 +23,7 @@ pub(crate) fn create(root: &Path, id: &str, store: &Store) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(120);
     let path = update_backup_path(root, id)?;
     let needed = store.online_backup_bytes()?;
-    let available = available_space(root)?;
+    let available = crate::platform::available_disk_space(root)?;
     if available < needed {
         return Err(Error::new(
             "insufficient_space",
@@ -50,21 +50,6 @@ pub(crate) fn create(root: &Path, id: &str, store: &Store) -> Result<()> {
         return Err(error);
     }
     Ok(())
-}
-
-fn available_space(path: &Path) -> Result<u64> {
-    #[cfg(windows)]
-    return crate::platform::windows::available_disk_space(path);
-    #[cfg(unix)]
-    return crate::platform::unix::available_disk_space(path);
-    #[cfg(not(any(windows, unix)))]
-    {
-        let _ = path;
-        Err(Error::new(
-            "unsupported",
-            "cannot check Store backup disk space",
-        ))
-    }
 }
 
 /// The replacement holds this lock only while publishing its admission

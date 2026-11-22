@@ -105,6 +105,7 @@ async fn run_inner(cli: Cli) -> ExitCode {
                     | CliCommand::Stand(_)
                     | CliCommand::Status
                     | CliCommand::Mcp(_)
+                    | CliCommand::Store(_)
             ) {
                 let executable = match env::current_exe() {
                     Ok(path) => path,

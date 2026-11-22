@@ -1128,6 +1128,16 @@ enum WorkspaceAction {
 }
 
 impl Store {
+    pub fn terminal_agent_end_time(&self, agent: &Agent) -> Result<i64> {
+        self.ensure_committed_reads()?;
+        terminal_agent_ended_at(
+            &self.connection,
+            parse_agent_id(&agent.id)?,
+            agent.generation,
+            agent.updated_at,
+        )
+    }
+
     /// Return the retained preparation only when its durable Agent facts pass
     /// the same removal eligibility gate used by `worktree.remove` admission.
     pub fn workspace_removal_eligibility(

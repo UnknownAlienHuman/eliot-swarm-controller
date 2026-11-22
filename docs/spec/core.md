@@ -833,6 +833,7 @@ CREATE UNIQUE INDEX commands_children ON commands(parent_command,ordinal)
   WHERE parent_command IS NOT NULL;
 CREATE TABLE turns (
   agent INTEGER NOT NULL, generation INTEGER NOT NULL, turn_id TEXT NOT NULL,
+  start_command_id TEXT,
   state TEXT NOT NULL, status TEXT, outcome TEXT, native_status TEXT,
   resolution_source TEXT,
   final_text TEXT, usage TEXT, started_at INTEGER, completed_at INTEGER,
@@ -843,6 +844,12 @@ CREATE TABLE session_usage (
   snapshot TEXT NOT NULL, observed_at INTEGER NOT NULL CHECK(observed_at >= 0),
   PRIMARY KEY(agent,generation)
 );
+
+`turns.start_command_id` retains the exact SEND command that started a controlled
+turn. It has no foreign key to `commands`, so command retention cannot erase the
+binding. Store writes it with the turn projection; migration backfills only a
+unique, consistent retained event or command fact. Missing or conflicting old
+evidence stays unbound, and event retention does not pin `turn.started` for this link.
 
 `turns.outcome` is the canonical task outcome (`success` | `failure` |
 `interrupted` | `unknown`) decided at the plugin boundary from the adapter's
@@ -985,7 +992,9 @@ the oldest root, and examines at most a bounded number of candidates per pass;
 each candidate walks one bounded breadth-first subtree over the
 `commands_prune_roots` index with a per-parent limit, skipping kept or oversize
 sets in place, so no pass revisits every kept root, rewinds the root index, or
-materializes an oversize tree into an automatic index before the outer limit. Retain command bindings/results in `commands` and other mutation bindings/results
+materializes an oversize tree into an automatic index before the outer limit.
+A pass deletes at most 128 commands and 128 writes. A command set larger than
+128 is kept intact. Retain command bindings/results in `commands` and other mutation bindings/results
 in `writes` for at least the supported retry window plus the allowed clock-skew
 margin. Cleanup must not make an accepted id look new or replay an external effect.
 An unresolved Running Goal-round reservation remains pinned in `writes` beyond
@@ -1015,12 +1024,19 @@ so a removed delivery admitted with a skew-bounded write id reads
 read paths; a retried ack over it succeeds as already acked. An unset
 `mail_days` disables mail pruning.
 
-Prune exited child process rows with the event cutoff: one bounded batch per pass of
-`processes` rows with `state = 'exited'`, `role = 'child'` and `updated_at` older than the
-`events_days` window, oldest change first. Plugin and harness rows, running or unknown
-rows, and every generation still holding a capacity reservation are never pruned; the
-owned-exit proof and restart custody read those. An unset `events_days` disables this
-pruning.
+Prune exited child process rows using the independent `processes_seconds` window.
+Each pass deletes a bounded batch of `processes` rows with `state = 'exited'`,
+`role = 'child'` and `updated_at` older than the cutoff. Plugin and harness rows,
+running or unknown rows, and rows needed by retained generation custody stay available
+to the owned-exit proof and restart recovery. Historical child process events expire
+through the ordinary event prefix; the observer suppresses new child start and exit
+events.
+
+The daemon releases the Store writer between retention batches. New Stores use
+incremental auto-vacuum to return free pages in bounded steps. Existing Stores with
+auto-vacuum disabled reuse freed pages during live retention. An explicit [startup
+conversion](configuration.md#later-configuration-example) rebuilds an older file before
+serving and allows future incremental reclamation.
 
 ## Explicit Agent tree presentation and removal
 

@@ -186,6 +186,7 @@ pub(super) fn persist_turn_fact(
                 agent: id,
                 generation: agent.generation,
                 turn_id: &turn_id,
+                start_command_id: None,
                 state: turn.state,
                 status: turn.status.as_deref(),
                 outcome: turn.outcome.as_ref().map(TurnOutcome::as_str),

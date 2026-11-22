@@ -397,6 +397,7 @@ pub(crate) struct CleanupTree {
     entries: Vec<File>,
     pub(crate) identity: String,
     pub(crate) bytes: u64,
+    pub(crate) contains_daemon_lock: bool,
 }
 
 #[cfg(windows)]
@@ -416,6 +417,7 @@ impl CleanupTree {
             entries: Vec::new(),
             identity,
             bytes: 0,
+            contains_daemon_lock: false,
         };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         tree.visit(root, 0, deadline)?;
@@ -444,6 +446,9 @@ impl CleanupTree {
             let text = name.to_str().ok_or_else(refused)?;
             plain(text)?;
             cleanup_name(text)?;
+            if text.eq_ignore_ascii_case("daemon.lock") {
+                self.contains_daemon_lock = true;
+            }
             let child = native::open_cleanup(&directory, &name, is_dir).map_err(|_| refused())?;
             if is_dir {
                 check(&child, true)?;

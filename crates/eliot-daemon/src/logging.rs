@@ -149,6 +149,12 @@ pub(crate) struct Counts {
     pub(crate) mail: u64,
     pub(crate) digests: u64,
     pub(crate) processes: u64,
+    pub(crate) pages_reclaimed: u64,
+    pub(crate) freelist_pages: u64,
+    pub(crate) auto_vacuum_mode: u64,
+    pub(crate) wal_frames: u64,
+    pub(crate) checkpointed_frames: u64,
+    pub(crate) checkpoint_busy: u64,
 }
 
 pub(crate) fn record_counts(
@@ -245,6 +251,12 @@ fn encode_record(
             "mail": counts.mail,
             "digests": counts.digests,
             "processes": counts.processes,
+            "pages_reclaimed": counts.pages_reclaimed,
+            "freelist_pages": counts.freelist_pages,
+            "auto_vacuum_mode": counts.auto_vacuum_mode,
+            "wal_frames": counts.wal_frames,
+            "checkpointed_frames": counts.checkpointed_frames,
+            "checkpoint_busy": counts.checkpoint_busy,
         });
     }
     if let Some(detail) = detail

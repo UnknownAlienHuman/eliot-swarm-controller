@@ -32,43 +32,16 @@ pub fn cleanup_worktree_command_id(apply_id: &str, artifact_id: &str) -> Result<
 }
 
 impl Store {
-    /// A bounded, stable-ID page of registered worktree artifacts whose
-    /// retained workspace row is ready and whose owner has ended.
-    pub fn auto_cleanup_worktree_inventory(
-        &self,
-        after: Option<&str>,
-    ) -> Result<(Vec<ArtifactView>, bool)> {
-        self.ensure_committed_reads()?;
-        let mut statement = self
+    pub fn record_automatic_cleanup(&mut self, data: Value, now: i64) -> Result<Event> {
+        self.ensure_writer_healthy()?;
+        let tx = self
             .connection
-            .prepare(
-                "SELECT a.body FROM artifacts a
-             JOIN workspaces w ON w.agent=a.agent AND w.target_generation=a.generation
-               AND w.worktree_path=a.path AND w.phase='ready'
-             JOIN agents g ON g.id=a.agent AND g.generation=a.generation
-             WHERE a.id > COALESCE(?1, '') AND json_extract(a.body, '$.kind')='worktree'
-               AND json_extract(a.body, '$.state')='registered'
-               AND g.state IN ('stopped','failed','lost')
-             ORDER BY a.id LIMIT 9",
-            )
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
-        let rows = statement
-            .query_map([after], |row| row.get::<_, String>(0))
-            .map_err(sql_error)?;
-        let mut items = Vec::with_capacity(8);
-        let mut more = false;
-        for body in rows {
-            let body = body.map_err(sql_error)?;
-            if items.len() == 8 {
-                more = true;
-                break;
-            }
-            items
-                .push(serde_json::from_str(&body).map_err(|_| {
-                    Error::new("source_integrity", "invalid worktree artifact row")
-                })?);
-        }
-        Ok((items, more))
+        let event =
+            insert_daemon_event(&tx, now, "cleanup.automatic", "cleanup", None, None, data)?;
+        commit_transaction(tx, &self.write_faulted)?;
+        Ok(event)
     }
 
     pub fn known_artifact_path(&self, path: &str) -> Result<Option<ArtifactView>> {
@@ -109,6 +82,11 @@ impl Store {
                 .map_err(|_| Error::new("source_integrity", "invalid artifact root"))
         })
         .transpose()
+    }
+
+    pub fn cleanup_root_has_descendants(&self, root: &ArtifactView) -> Result<bool> {
+        self.ensure_committed_reads()?;
+        cleanup_root_has_descendants(&self.connection, root)
     }
     pub fn cleanup_visible_agent(&self, principal: &str, agent: &Agent) -> Result<bool> {
         match parse_sender(principal, "cleanup")? {
@@ -365,6 +343,7 @@ impl Store {
         request: &CleanupPlanRequest,
         page: &PlanContinuation,
         limit: usize,
+        include_ownership_roots: bool,
     ) -> Result<CleanupInventoryPage> {
         request.validate()?;
         if limit > MAX_CLEANUP_ITEMS {
@@ -461,7 +440,12 @@ impl Store {
                 scanned += 1;
                 let artifact: ArtifactView = serde_json::from_str(&body)
                     .map_err(|_| Error::new("source_integrity", "invalid artifact ledger row"))?;
-                if artifact.kind.cleanup_rank() != rank || artifact.state != "registered" {
+                let owned_root = include_ownership_roots
+                    && matches!(caller, Sender::Owner)
+                    && artifact.state == "ownership_root";
+                if artifact.kind.cleanup_rank() != rank
+                    || (artifact.state != "registered" && !owned_root)
+                {
                     continue;
                 }
                 if request
@@ -1035,12 +1019,23 @@ impl Store {
                     })
                     .transpose()?;
                 if !current.is_some_and(|a| {
-                    a.state == "registered"
+                    (a.state == "registered"
+                        || (principal == "owner"
+                            && a.state == "ownership_root"
+                            && item.artifact.state == "ownership_root"))
                         && a.identity == item.artifact.identity
                         && a.generation == item.artifact.generation
+                        && a.path == item.artifact.path
                 }) {
                     response.items[index].outcome = "skipped".to_owned();
                     response.items[index].reason = Some("prior_cleanup_attempt".to_owned());
+                    continue;
+                }
+                if item.artifact.state == "ownership_root"
+                    && cleanup_root_has_descendants(&tx, &item.artifact)?
+                {
+                    response.items[index].outcome = "skipped".to_owned();
+                    response.items[index].reason = Some("registered_descendants".to_owned());
                     continue;
                 }
                 if item.artifact.kind != ArtifactKind::Worktree {
@@ -1159,6 +1154,7 @@ impl Store {
             let mut updated = artifact.clone();
             updated.state = match outcome.outcome.as_str() {
                 "removed" => "removed",
+                "skipped" if artifact.state == "ownership_root" => "ownership_root",
                 "skipped" => "registered",
                 _ => "unknown",
             }
@@ -1214,6 +1210,30 @@ impl Store {
         }
         commit_transaction(tx, &self.write_faulted)
     }
+}
+
+fn cleanup_root_has_descendants(connection: &Connection, root: &ArtifactView) -> Result<bool> {
+    let normalized_root = cleanup_path(&root.path);
+    let mut statement = connection
+        .prepare(
+            "SELECT path FROM artifacts WHERE agent=?1 AND generation=?2 AND id<>?3
+               AND json_extract(body,'$.state') IN ('registered','ownership_root','unknown')",
+        )
+        .map_err(sql_error)?;
+    let mut rows = statement
+        .query(params![
+            parse_agent_id(&root.agent)?,
+            root.generation,
+            root.id
+        ])
+        .map_err(sql_error)?;
+    while let Some(row) = rows.next().map_err(sql_error)? {
+        let path: String = row.get(0).map_err(sql_error)?;
+        if cleanup_path(&path).starts_with(&normalized_root) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn known_native_session_artifact(

@@ -281,13 +281,12 @@ fn section_value(parsed: &toml::Table, name: &str) -> core::Result<JsonValue> {
         }
     }
     if name == "automation" {
-        value
-            .as_object_mut()
-            .ok_or_else(|| {
-                core::Error::new("source_integrity", "automation settings are not an object")
-            })?
-            .entry("auto_cleanup")
-            .or_insert(JsonValue::Bool(false));
+        let automation = value.as_object_mut().ok_or_else(|| {
+            core::Error::new("source_integrity", "automation settings are not an object")
+        })?;
+        automation
+            .entry("auto_cleanup_after")
+            .or_insert(JsonValue::String("7d".to_owned()));
     }
     Ok(value)
 }

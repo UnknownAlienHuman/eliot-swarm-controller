@@ -486,7 +486,9 @@ assignment's slot with its code. A slot with no next brief advances to the next 
 Every scheduled timer slot that is skipped or rejected (no next brief is `not_found`, a
 routing miss is `routing_unavailable`) commits that code as the timer's `last_outcome`
 with the slot, and an admitted slot clears it, so timer reads show why the last check
-started nothing. A manual run changes neither `last_outcome` nor `last_key`.
+started nothing. A scheduled skip emits `rule.skipped` when its reason changes or
+the slot carries a capacity diagnostic. Repeated skips with the same bare reason
+still advance the timer cursor. A manual run changes neither `last_outcome` nor `last_key`.
 A capacity, provider, workspace or transfer wait keeps the due slot and its brief cursor.
 Settings generate a global interval timer
 rule and an ordinary completion rule. Before admitting cleanup, Store verifies that
@@ -514,6 +516,12 @@ When the assignment sets `cleanup_on_retire = true` (default false), the
 applied stop also cleans that Agent's build, temp and managed-worktree
 artifacts inline in the stop worker: same authority check, same quiescence
 gate and guarded deletion, with retained receipts, and no second executor.
+The daemon's periodic automatic cleanup uses the same guarded paged planner.
+An omitted `automation.auto_cleanup` is plan-only; explicit `true` applies only
+after one complete plan-only sweep per daemon startup, and explicit `false`
+turns the automatic planner off. It sends one Owner `notify` after a complete
+sweep, with the planned would-remove and kept totals and the configured
+enablement; pages do not each send a notice.
 `enabled = false` (default true) pauses the assignment at timer admission before
 `settings.save` acknowledges it. An unrelated rules-file parse error can retain the
 previous rule snapshot, and the saved pause still fences fresh scheduled and manual

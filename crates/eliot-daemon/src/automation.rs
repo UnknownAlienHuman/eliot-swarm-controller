@@ -1315,7 +1315,7 @@ async fn run_global_rules_inner(
         match crate::config::load_automation_config(&data_root) {
             Ok(config) => {
                 max_event_backlog = config.max_event_backlog;
-                cleanup_enabled = config.auto_cleanup;
+                cleanup_enabled = config.auto_cleanup != Some(false);
                 if !cleanup_enabled {
                     cleanup_after = None;
                     last_cleanup_at = None;

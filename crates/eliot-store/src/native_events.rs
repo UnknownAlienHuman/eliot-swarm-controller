@@ -429,6 +429,7 @@ fn persist_turn_associated(
             agent: agent_num,
             generation,
             turn_id,
+            start_command_id: Some(command_id),
             state: TurnState::Running,
             status: None,
             outcome: None,

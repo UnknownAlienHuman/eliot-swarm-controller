@@ -45,7 +45,7 @@ impl Router {
             let result = async {
                 if let Some(mut response) = started? {
                     router
-                        .apply_cleanup_artifacts("owner", &apply, &plan, &mut response, true)
+                        .apply_cleanup_artifacts("owner", &apply, &plan, &mut response, true, false)
                         .await?;
                     require_agent_delete_cleanup(&plan, &response)?;
                 }

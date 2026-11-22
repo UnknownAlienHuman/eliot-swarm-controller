@@ -86,6 +86,7 @@ impl Router {
             workspace_recovery_error: self.inner.workspace_recovery_error.lock_recover().clone(),
             cloud_mcp: crate::cloud_mcp::service_snapshot(),
             automation_tasks: self.inner.worker_tasks.lock_recover().clone(),
+            automatic_cleanup: Some(self.automatic_cleanup_view()),
             unknown_commands_count,
             unknown_commands,
             unknown_commands_truncated,
@@ -102,23 +103,27 @@ impl Router {
         .map_err(|_| Error::new("internal", "daemon status could not be encoded"))
     }
 
-    /// Retention and store-size visibility for `daemon.status`: the configured
-    /// windows (or unbounded when all are unset), the retained-event
+    /// Retention and store-size visibility for `daemon.status`: the effective
+    /// windows, SQLite auto-vacuum/freelist state, the retained-event
     /// watermark, the main+WAL file sizes, and the unbounded-growth advisory.
     /// Status stays available as the diagnostic surface when `config.toml`
     /// cannot be read, but the windows are then unknown: the view carries the
     /// typed `config_error` and never reports an unset (unbounded) policy or
-    /// its advisory. The hourly tick logs the rejection separately.
+    /// its advisory. The configured tick logs the rejection separately.
     async fn retention_view(&self) -> Result<RetentionView> {
         let config = crate::config::load_daemon_config(&self.inner.data_root);
-        let pruned_through = {
+        let (pruned_through, space) = {
             let store = self.inner.store.lock().await;
-            store.retention_watermark()?
+            (
+                store.retention_watermark()?,
+                store.retention_space_status()?,
+            )
         };
         let (db_bytes, wal_bytes) = crate::maintenance::store_file_sizes(&self.inner.data_root);
         Ok(retention_view_of(
             config.map(|config| config.retention),
             pruned_through,
+            space,
             db_bytes,
             wal_bytes,
             &self.secret_policy_snapshot(),
@@ -523,6 +528,7 @@ impl Router {
 fn retention_view_of(
     config: Result<crate::config::RetentionConfig>,
     pruned_through: i64,
+    space: eliot_store::RetentionSpaceStatus,
     db_bytes: u64,
     wal_bytes: u64,
     policy: &SecretPolicy,
@@ -543,8 +549,15 @@ fn retention_view_of(
             (crate::config::RetentionConfig::default(), Some(line))
         }
     };
-    let unbounded = config_error.is_none()
-        && retention.events_days.is_none()
+    let known = config_error.is_none();
+    let events_seconds = known.then(|| retention.events_retention_seconds());
+    let processes_seconds = known.then(|| retention.processes_retention_seconds());
+    let maintenance_interval_seconds =
+        known.then(|| retention.maintenance_interval_seconds() as i64);
+    let compact_on_start = known.then_some(retention.compact_on_start);
+    let unbounded = known
+        && events_seconds.is_none()
+        && processes_seconds.is_none()
         && retention.commands_days.is_none()
         && retention.mail_days.is_none();
     let size_advisory = if unbounded
@@ -556,9 +569,16 @@ fn retention_view_of(
         None
     };
     RetentionView {
-        events_days: retention.events_days,
+        events_days: known.then_some(retention.events_retention_days()).flatten(),
         commands_days: retention.commands_days,
         mail_days: retention.mail_days,
+        events_seconds,
+        processes_seconds,
+        maintenance_interval_seconds,
+        compact_on_start,
+        auto_vacuum_mode: space.auto_vacuum_mode,
+        page_count: space.page_count,
+        freelist_pages: space.freelist_pages,
         pruned_through,
         db_bytes,
         wal_bytes,

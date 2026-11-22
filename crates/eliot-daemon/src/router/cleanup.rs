@@ -16,6 +16,66 @@ const CLEANUP_BACKFILL_LIMIT: usize = 1_024;
 const CLEANUP_BACKFILL_BUDGET: Duration = Duration::from_secs(8);
 const CLEANUP_PLAN_MAX_PREFLIGHT: Duration = Duration::from_secs(15);
 
+#[derive(Default)]
+pub(super) struct AutomaticCleanupState {
+    kept_reasons: HashMap<String, String>,
+    first_sweep_complete: bool,
+    active_sweep: Option<AutomaticCleanupProgress>,
+    last_sweep: Option<eliot_core::api::AutomaticCleanupSweep>,
+}
+
+#[derive(Default)]
+struct AutomaticCleanupProgress {
+    summary: eliot_core::api::AutomaticCleanupSweep,
+}
+const SWARM_PLUGIN_INSTANCE_PURPOSE: &str = "Swarm plugin instance directory";
+const SWARM_ARTIFACT_ROOT_PURPOSE: &str = "Swarm artifact root";
+
+fn validate_cleanup_path(path: &Path) -> Result<()> {
+    if !path.is_absolute()
+        || path.components().any(|p| match p {
+            Component::ParentDir | Component::CurDir => true,
+            Component::Normal(name) => name.to_str().is_none_or(|n| {
+                n.contains(':')
+                    || n.ends_with(['.', ' '])
+                    || crate::platform::script_file::protected_cleanup_name(n)
+            }),
+            _ => false,
+        })
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "artifact path is not an absolute safe local directory",
+        ));
+    }
+    Ok(())
+}
+
+fn require_cleanup_outside_native_home(canonical: &Path) -> Result<()> {
+    for env in [
+        "USERPROFILE",
+        "HOME",
+        "CODEX_HOME",
+        "CODEX_SQLITE_HOME",
+        "CLAUDE_CONFIG_DIR",
+    ] {
+        if let Some(home) = std::env::var_os(env).and_then(|p| std::fs::canonicalize(p).ok())
+            && (canonical == home
+                || home.starts_with(canonical)
+                || (matches!(
+                    env,
+                    "CODEX_HOME" | "CODEX_SQLITE_HOME" | "CLAUDE_CONFIG_DIR"
+                ) && canonical.starts_with(home)))
+        {
+            return Err(Error::new(
+                "not_allowed",
+                "user or native configuration root is protected",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn encoded(value: impl serde::Serialize) -> Result<Value> {
     serde_json::to_value(value)
         .map_err(|_| Error::new("internal", "cleanup response cannot encode"))
@@ -67,6 +127,245 @@ pub(super) fn swarm_preparation_failure(mut error: Error, where_: &str, evidence
 }
 
 impl Router {
+    pub(super) fn automatic_cleanup_view(&self) -> eliot_core::api::AutomaticCleanupView {
+        let (policy, enabled, after, config_error) =
+            match crate::config::load_automation_config(&self.inner.data_root) {
+                Ok(config) => {
+                    let policy = match config.auto_cleanup {
+                        Some(true) => AutomaticCleanupPolicy::Enabled,
+                        Some(false) => AutomaticCleanupPolicy::Disabled,
+                        None => AutomaticCleanupPolicy::PlanOnly,
+                    };
+                    (
+                        policy,
+                        config.auto_cleanup == Some(true),
+                        Some(config.auto_cleanup_after),
+                        None,
+                    )
+                }
+                Err(error) => (
+                    AutomaticCleanupPolicy::Disabled,
+                    false,
+                    None,
+                    Some(error.code),
+                ),
+            };
+        let state = self.inner.automatic_cleanup.lock_recover();
+        eliot_core::api::AutomaticCleanupView {
+            policy,
+            enabled,
+            startup_plan_only_pending: !state.first_sweep_complete,
+            after,
+            config_error,
+            last_sweep: state.last_sweep.clone(),
+        }
+    }
+
+    fn automatic_cleanup_failed(&self, error: &Error) {
+        let policy = self.secret_policy_snapshot();
+        crate::logging::record(&policy, "daemon.auto_cleanup_failed", &[], Some(error));
+        self.inner.automatic_cleanup.lock_recover().last_sweep =
+            Some(eliot_core::api::AutomaticCleanupSweep {
+                finished_at: now_ms(),
+                error_code: Some(error.code.clone()),
+                ..Default::default()
+            });
+    }
+
+    async fn record_automatic_cleanup(
+        &self,
+        plan: &CleanupPlan,
+        applied: Option<&CleanupApplyResponse>,
+        enabled: bool,
+        plan_only: bool,
+    ) -> Result<AutomaticCleanupSweep> {
+        let now = now_ms();
+        let mut sweep = eliot_core::api::AutomaticCleanupSweep {
+            finished_at: now,
+            enabled,
+            plan_only,
+            ..Default::default()
+        };
+        let policy = self.secret_policy_snapshot();
+        let mut changed = Vec::new();
+        let mut keep_updates = Vec::new();
+        {
+            let state = self.inner.automatic_cleanup.lock_recover();
+            for item in &plan.items {
+                if matches!(
+                    item.artifact.kind,
+                    ArtifactKind::Branch | ArtifactKind::NativeSession
+                ) {
+                    continue;
+                }
+                let settled = applied.and_then(|response| {
+                    response
+                        .items
+                        .iter()
+                        .find(|outcome| outcome.artifact_id == item.artifact.id)
+                });
+                if item.verdict == "safe" {
+                    sweep.would_remove += 1;
+                }
+                let (outcome, reason, bytes) = if item.verdict != "safe" {
+                    ("kept", item.reason.as_str(), 0)
+                } else if plan_only {
+                    ("would_remove", item.reason.as_str(), 0)
+                } else if let Some(settled) = settled {
+                    match settled.outcome.as_str() {
+                        "removed" => ("removed", item.reason.as_str(), settled.bytes_reclaimed),
+                        "skipped" => ("kept", settled.reason.as_deref().unwrap_or("skipped"), 0),
+                        _ => ("unknown", settled.reason.as_deref().unwrap_or("unknown"), 0),
+                    }
+                } else {
+                    ("unknown", "missing_cleanup_outcome", 0)
+                };
+                match outcome {
+                    "would_remove" => {}
+                    "removed" => sweep.removed += 1,
+                    "kept" => {
+                        sweep.kept += 1;
+                        if state
+                            .kept_reasons
+                            .get(&item.artifact.id)
+                            .is_some_and(|prior| prior == reason)
+                        {
+                            continue;
+                        }
+                    }
+                    _ => sweep.unknown += 1,
+                }
+                keep_updates.push((
+                    item.artifact.id.clone(),
+                    (outcome == "kept").then(|| reason.to_owned()),
+                ));
+                changed.push(json!({
+                    "artifact_id": item.artifact.id,
+                    "agent": item.artifact.agent,
+                    "generation": item.artifact.generation,
+                    "kind": item.artifact.kind,
+                    "path": policy.redact_bounded(&item.artifact.path, 384),
+                    "outcome": outcome,
+                    "reason": reason,
+                    "bytes_reclaimed": bytes,
+                }));
+            }
+        }
+        if !changed.is_empty() {
+            let mut store = self.inner.store.lock().await;
+            let event = store.record_automatic_cleanup(
+                json!({"plan_id": plan.plan_id, "items": changed}),
+                now,
+            )?;
+            self.publish_locked(&[event]);
+        }
+        let mut state = self.inner.automatic_cleanup.lock_recover();
+        for (id, reason) in keep_updates {
+            if let Some(reason) = reason {
+                // Keep only one reason per retained artifact, with a bound
+                // matching the size of the artifact ledger.
+                if state.kept_reasons.len() >= 4096 && !state.kept_reasons.contains_key(&id) {
+                    state.kept_reasons.clear();
+                }
+                state.kept_reasons.insert(id, reason);
+            } else {
+                state.kept_reasons.remove(&id);
+            }
+        }
+        Ok(sweep)
+    }
+
+    fn accumulate_automatic_cleanup_page(
+        &self,
+        page: AutomaticCleanupSweep,
+        first_page: bool,
+        complete: bool,
+    ) -> Option<AutomaticCleanupSweep> {
+        let mut state = self.inner.automatic_cleanup.lock_recover();
+        if first_page {
+            state.active_sweep = Some(AutomaticCleanupProgress {
+                summary: AutomaticCleanupSweep {
+                    plan_only: true,
+                    ..Default::default()
+                },
+            });
+        }
+        let progress = state
+            .active_sweep
+            .get_or_insert_with(|| AutomaticCleanupProgress {
+                summary: AutomaticCleanupSweep {
+                    plan_only: true,
+                    ..Default::default()
+                },
+            });
+        progress.summary.finished_at = page.finished_at;
+        progress.summary.enabled = page.enabled;
+        progress.summary.plan_only &= page.plan_only;
+        progress.summary.would_remove += page.would_remove;
+        progress.summary.removed += page.removed;
+        progress.summary.kept += page.kept;
+        progress.summary.unknown += page.unknown;
+        if !complete {
+            return None;
+        }
+        let summary = progress.summary.clone();
+        state.active_sweep = None;
+        state.last_sweep = Some(summary.clone());
+        Some(summary)
+    }
+
+    async fn notify_automatic_cleanup_sweep(&self, sweep: &AutomaticCleanupSweep) -> Result<()> {
+        let enablement = match (sweep.enabled, sweep.plan_only) {
+            (true, true) => "Automatic cleanup is enabled. This first sweep was plan-only.",
+            (true, false) => "Automatic cleanup is enabled.",
+            (false, _) => "Set automation.auto_cleanup = true to apply.",
+        };
+        let message = format!(
+            "{} worktrees/artifacts would be removed, {} kept. Removed {}, unknown {}. {enablement}",
+            sweep.would_remove, sweep.kept, sweep.removed, sweep.unknown
+        );
+        let id = ulid::Ulid::new().to_string();
+        let mut progress = self.progress_receiver();
+        let request = json!({
+            "id": id,
+            "verb": "notify",
+            "args": {
+                "title": "Automatic cleanup sweep",
+                "message": message,
+            },
+        });
+        self.submit(&request, &Principal::Owner).await?;
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let state = self
+                    .inner
+                    .store
+                    .lock()
+                    .await
+                    .get_command(&id)?
+                    .map(|c| c.state);
+                match state {
+                    Some(CommandState::Applied) => return Ok(()),
+                    Some(state) if state.is_terminal() => {
+                        return Err(Error::new(
+                            "cleanup_notice_failed",
+                            "Owner cleanup notice did not apply",
+                        ));
+                    }
+                    _ => {}
+                }
+                progress.changed().await.map_err(|_| {
+                    Error::new(
+                        "unavailable",
+                        "Owner cleanup notice settlement is unavailable",
+                    )
+                })?;
+            }
+        })
+        .await
+        .map_err(|_| Error::new("unknown", "Owner cleanup notice settlement timed out"))?
+    }
+
     pub(super) async fn prepare_chat_directory(&self, command: &Command) -> Result<()> {
         self.prepare_chat_directory_once(command)
             .await
@@ -421,22 +720,7 @@ impl Router {
     }
     async fn checked_artifact_path(&self, agent: &Agent, path: &str) -> Result<PathBuf> {
         let path = Path::new(path);
-        if !path.is_absolute()
-            || path.components().any(|p| match p {
-                Component::ParentDir | Component::CurDir => true,
-                Component::Normal(name) => name.to_str().is_none_or(|n| {
-                    n.contains(':')
-                        || n.ends_with(['.', ' '])
-                        || crate::platform::script_file::protected_cleanup_name(n)
-                }),
-                _ => false,
-            })
-        {
-            return Err(Error::new(
-                "not_allowed",
-                "artifact path is not an absolute safe local directory",
-            ));
-        }
+        validate_cleanup_path(path)?;
         directory_identity(path)?;
         let canonical = std::fs::canonicalize(path)
             .map_err(|_| Error::new("not_allowed", "artifact directory unavailable"))?;
@@ -449,7 +733,8 @@ impl Router {
             .await
             .agent_artifact_root(&agent.id, agent.generation)?
             .ok_or_else(|| Error::new("not_allowed", "Agent has no Swarm-created artifact root"))?;
-        let own_temp = PathBuf::from(&owned.path);
+        let own_temp = std::fs::canonicalize(&owned.path)
+            .map_err(|_| Error::new("not_allowed", "Agent artifact root unavailable"))?;
         if directory_identity(&own_temp)? != owned.identity {
             return Err(Error::new(
                 "identity_changed",
@@ -464,27 +749,7 @@ impl Router {
                 "daemon data and configuration are protected",
             ));
         }
-        for env in [
-            "USERPROFILE",
-            "HOME",
-            "CODEX_HOME",
-            "CODEX_SQLITE_HOME",
-            "CLAUDE_CONFIG_DIR",
-        ] {
-            if let Some(home) = std::env::var_os(env).and_then(|p| std::fs::canonicalize(p).ok())
-                && (canonical == home
-                    || home.starts_with(&canonical)
-                    || (matches!(
-                        env,
-                        "CODEX_HOME" | "CODEX_SQLITE_HOME" | "CLAUDE_CONFIG_DIR"
-                    ) && canonical.starts_with(home)))
-            {
-                return Err(Error::new(
-                    "not_allowed",
-                    "user or native configuration root is protected",
-                ));
-            }
-        }
+        require_cleanup_outside_native_home(&canonical)?;
         let chat_directory = if agent.chat {
             let identity = directory_identity(&canonical)?;
             if let Some(workspace) = agent.workspace.as_deref() {
@@ -516,6 +781,352 @@ impl Router {
             ));
         }
         Ok(canonical)
+    }
+
+    fn selected_agent_artifact_root(&self, agent: &Agent) -> Result<PathBuf> {
+        let config = crate::config::load_daemon_config(&self.inner.data_root)?;
+        let parent = config
+            .artifact_roots
+            .first()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.inner.data_root.join("artifacts"));
+        let parent = std::fs::canonicalize(parent)
+            .map_err(|_| Error::new("not_allowed", "selected artifact root unavailable"))?;
+        std::fs::canonicalize(parent.join(format!("{}-{}", agent.id, agent.generation)))
+            .map_err(|_| Error::new("not_allowed", "Agent artifact root unavailable"))
+    }
+
+    fn current_managed_worktree_path(&self, path: &str) -> Result<PathBuf> {
+        let data_root = std::fs::canonicalize(&self.inner.data_root)
+            .map_err(|_| Error::new("unavailable", "daemon root unavailable"))?;
+        let managed_root = std::fs::canonicalize(data_root.join("worktrees"))
+            .map_err(|_| Error::new("not_allowed", "managed worktree root unavailable"))?;
+        let path = std::fs::canonicalize(path)
+            .map_err(|_| Error::new("not_allowed", "managed worktree unavailable"))?;
+        if managed_root.parent() != Some(data_root.as_path())
+            || path == managed_root
+            || !path.starts_with(&managed_root)
+        {
+            return Err(Error::new(
+                "not_allowed",
+                "worktree is outside this daemon's managed root",
+            ));
+        }
+        Ok(path)
+    }
+
+    async fn checked_cleanup_artifact_path(
+        &self,
+        agent: &Agent,
+        artifact: &ArtifactView,
+        allow_fenced_root: bool,
+    ) -> Result<PathBuf> {
+        if artifact.kind == ArtifactKind::Other
+            && artifact.state == "ownership_root"
+            && artifact.purpose == SWARM_ARTIFACT_ROOT_PURPOSE
+        {
+            return self
+                .checked_owned_artifact_root(agent, artifact, allow_fenced_root)
+                .await;
+        }
+        if artifact.kind == ArtifactKind::Other && artifact.purpose == SWARM_PLUGIN_INSTANCE_PURPOSE
+        {
+            return self.checked_plugin_instance_path(agent, artifact);
+        }
+        self.checked_artifact_path(agent, &artifact.path).await
+    }
+
+    async fn checked_owned_artifact_root(
+        &self,
+        agent: &Agent,
+        artifact: &ArtifactView,
+        allow_fenced_unknown: bool,
+    ) -> Result<PathBuf> {
+        if artifact.kind != ArtifactKind::Other
+            || artifact.state != "ownership_root"
+            || artifact.purpose != SWARM_ARTIFACT_ROOT_PURPOSE
+            || artifact.agent != agent.id
+            || artifact.generation != agent.generation
+        {
+            return Err(Error::new(
+                "stale_generation",
+                "owned artifact root binding changed",
+            ));
+        }
+        let store = self.inner.store.lock().await;
+        let current = store
+            .known_artifact_path(&artifact.path)?
+            .ok_or_else(|| Error::new("not_allowed", "Agent artifact root is not retained"))?;
+        if current.id != artifact.id
+            || current.agent != artifact.agent
+            || current.generation != artifact.generation
+            || current.path != artifact.path
+            || current.identity != artifact.identity
+            || current.kind != artifact.kind
+            || current.purpose != artifact.purpose
+            || !(current.state == "ownership_root"
+                || (allow_fenced_unknown && current.state == "unknown"))
+        {
+            return Err(Error::new(
+                "identity_changed",
+                "owned artifact root readback changed",
+            ));
+        }
+        if current.state == "ownership_root" {
+            let owned = store
+                .agent_artifact_root(&agent.id, agent.generation)?
+                .ok_or_else(|| Error::new("not_allowed", "Agent artifact root is not owned"))?;
+            if owned.id != artifact.id
+                || owned.path != artifact.path
+                || owned.identity != artifact.identity
+            {
+                return Err(Error::new(
+                    "identity_changed",
+                    "owned artifact root binding changed",
+                ));
+            }
+        } else if !allow_fenced_unknown {
+            return Err(Error::new(
+                "not_allowed",
+                "unknown artifact root is not eligible for cleanup",
+            ));
+        }
+        drop(store);
+        let source = Path::new(&artifact.path);
+        validate_cleanup_path(source)?;
+        directory_identity(source)?;
+        let path = std::fs::canonicalize(source)
+            .map_err(|_| Error::new("not_allowed", "Agent artifact root unavailable"))?;
+        if path != self.selected_agent_artifact_root(agent)?
+            || crate::platform::script_file::directory_identity(&path)? != artifact.identity
+        {
+            return Err(Error::new(
+                "identity_changed",
+                "owned artifact root is outside the selected current root",
+            ));
+        }
+        require_cleanup_outside_native_home(&path)?;
+        Ok(path)
+    }
+
+    fn checked_plugin_instance_path(
+        &self,
+        agent: &Agent,
+        artifact: &ArtifactView,
+    ) -> Result<PathBuf> {
+        if artifact.agent != agent.id || artifact.generation != agent.generation {
+            return Err(Error::new(
+                "stale_generation",
+                "plugin artifact generation changed",
+            ));
+        }
+        let data_root = std::fs::canonicalize(&self.inner.data_root)
+            .map_err(|_| Error::new("unavailable", "daemon root unavailable"))?;
+        let plugin_root = std::fs::canonicalize(data_root.join("plugins"))
+            .map_err(|_| Error::new("not_allowed", "plugin instance root unavailable"))?;
+        if plugin_root.parent() != Some(data_root.as_path())
+            || plugin_root.file_name().and_then(|name| name.to_str()) != Some("plugins")
+        {
+            return Err(Error::new(
+                "not_allowed",
+                "plugin instance root is outside this daemon data directory",
+            ));
+        }
+        let path = std::fs::canonicalize(&artifact.path)
+            .map_err(|_| Error::new("not_allowed", "plugin instance directory unavailable"))?;
+        if path.parent() != Some(plugin_root.as_path()) {
+            return Err(Error::new(
+                "not_allowed",
+                "plugin instance is outside this daemon's plugin root",
+            ));
+        }
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| Error::new("not_allowed", "plugin instance name is invalid"))?;
+        let prefix = format!("{}-g{}-", agent.id, agent.generation);
+        let suffix = name
+            .strip_prefix(&prefix)
+            .ok_or_else(|| Error::new("not_allowed", "plugin instance generation is invalid"))?;
+        let instance_id = ulid::Ulid::from_string(suffix)
+            .map_err(|_| Error::new("not_allowed", "plugin instance identity is invalid"))?;
+        if instance_id.to_string() != suffix
+            || crate::platform::script_file::directory_identity(&path)? != artifact.identity
+        {
+            return Err(Error::new(
+                "identity_changed",
+                "plugin instance directory binding changed",
+            ));
+        }
+        Ok(path)
+    }
+
+    async fn automatic_cleanup_path_is_managed(
+        &self,
+        agent: &Agent,
+        artifact: &ArtifactView,
+        allow_fenced_root: bool,
+    ) -> Result<bool> {
+        match artifact.kind {
+            ArtifactKind::Worktree => {
+                if artifact.agent != agent.id || artifact.generation != agent.generation {
+                    return Ok(false);
+                }
+                self.current_managed_worktree_path(&artifact.path)
+                    .map(|_| true)
+            }
+            ArtifactKind::Build
+            | ArtifactKind::DataDir
+            | ArtifactKind::Temp
+            | ArtifactKind::Other => {
+                if artifact.state == "ownership_root"
+                    && artifact.purpose == SWARM_ARTIFACT_ROOT_PURPOSE
+                {
+                    return self
+                        .checked_owned_artifact_root(agent, artifact, allow_fenced_root)
+                        .await
+                        .map(|_| true);
+                }
+                if artifact.purpose == SWARM_PLUGIN_INSTANCE_PURPOSE {
+                    return self
+                        .checked_plugin_instance_path(agent, artifact)
+                        .map(|_| true);
+                }
+                if artifact.agent != agent.id || artifact.generation != agent.generation {
+                    return Ok(false);
+                }
+                let selected_root = self.selected_agent_artifact_root(agent)?;
+                let owned = self
+                    .inner
+                    .store
+                    .lock()
+                    .await
+                    .agent_artifact_root(&agent.id, agent.generation)?;
+                let Some(owned) = owned else {
+                    return Ok(false);
+                };
+                let owned_path = std::fs::canonicalize(&owned.path)
+                    .map_err(|_| Error::new("not_allowed", "Agent artifact root unavailable"))?;
+                if owned_path != selected_root
+                    || crate::platform::script_file::directory_identity(&owned_path)?
+                        != owned.identity
+                {
+                    return Ok(false);
+                }
+                let path = self.checked_artifact_path(agent, &artifact.path).await?;
+                Ok(path != selected_root && path.starts_with(&selected_root))
+            }
+            ArtifactKind::Branch
+            | ArtifactKind::NativeSession
+            | ArtifactKind::ProjectRegistration => Ok(false),
+        }
+    }
+
+    async fn automatic_cleanup_worktree_keep_reason(
+        &self,
+        agent: &Agent,
+    ) -> Result<Option<String>> {
+        let artifact = {
+            let store = self.inner.store.lock().await;
+            let Some(workspace) = store.get_workspace(&agent.id)? else {
+                return Ok(agent
+                    .workspace_phase
+                    .is_some()
+                    .then(|| "worktree_unverifiable".to_owned()));
+            };
+            if workspace.target_generation != agent.generation {
+                return Ok(Some("worktree_generation_changed".to_owned()));
+            }
+            if workspace.phase == WorkspacePhase::Removed {
+                return Ok(None);
+            }
+            let Some(artifact) = store.known_artifact_path(&workspace.worktree_path)? else {
+                return Ok(Some("worktree_unverifiable".to_owned()));
+            };
+            if artifact.kind != ArtifactKind::Worktree
+                || artifact.agent != agent.id
+                || artifact.generation != agent.generation
+                || artifact.path != workspace.worktree_path
+                || artifact.state != "registered"
+            {
+                return Ok(Some("worktree_unverifiable".to_owned()));
+            }
+            artifact
+        };
+        if let Err(error) = self.current_managed_worktree_path(&artifact.path) {
+            return Ok(Some(error.code));
+        }
+        match self.worktree_cleanup_preflight(&artifact).await {
+            Ok(()) => Ok(None),
+            Err(error) => Ok(Some(error.code)),
+        }
+    }
+
+    async fn automatic_cleanup_keep_reason(
+        &self,
+        artifact: &ArtifactView,
+        retention_ms: i64,
+        now: i64,
+        allow_fenced_root: bool,
+    ) -> Result<Option<String>> {
+        let (agent, ended_at) = {
+            let store = self.inner.store.lock().await;
+            let Some(agent) = store.get_agent(&artifact.agent)? else {
+                return Ok(Some("agent_missing".to_owned()));
+            };
+            if agent.generation != artifact.generation {
+                return Ok(Some("stale_generation".to_owned()));
+            }
+            if agent.archived {
+                return Ok(Some("archived".to_owned()));
+            }
+            if !agent.state.is_terminal() {
+                return Ok(Some("agent_not_terminal".to_owned()));
+            }
+            let ended_at = store.terminal_agent_end_time(&agent)?;
+            (agent, ended_at)
+        };
+        let cutoff = now.saturating_sub(retention_ms);
+        if artifact.created_at >= cutoff || ended_at >= cutoff {
+            return Ok(Some("retention_age".to_owned()));
+        }
+        if artifact.state == "ownership_root" {
+            if artifact.kind != ArtifactKind::Other
+                || artifact.purpose != SWARM_ARTIFACT_ROOT_PURPOSE
+            {
+                return Ok(Some("ownership_root_unverified".to_owned()));
+            }
+            if self
+                .inner
+                .store
+                .lock()
+                .await
+                .cleanup_root_has_descendants(artifact)?
+            {
+                return Ok(Some("artifact_root_has_descendants".to_owned()));
+            }
+        }
+        if matches!(
+            artifact.kind,
+            ArtifactKind::Branch | ArtifactKind::NativeSession
+        ) {
+            return Ok(Some("manual_only".to_owned()));
+        }
+        if artifact.kind != ArtifactKind::Worktree {
+            match self.automatic_cleanup_worktree_keep_reason(&agent).await {
+                Ok(Some(reason)) => return Ok(Some(reason)),
+                Err(error) => return Ok(Some(error.code)),
+                Ok(None) => {}
+            }
+        }
+        match self
+            .automatic_cleanup_path_is_managed(&agent, artifact, allow_fenced_root)
+            .await
+        {
+            Ok(true) => Ok(None),
+            Ok(false) => Ok(Some("outside_managed_root".to_owned())),
+            Err(error) => Ok(Some(error.code)),
+        }
     }
 
     pub(super) async fn artifact_register(
@@ -568,6 +1179,32 @@ impl Router {
         params: &Value,
         principal: &Principal,
     ) -> Result<Value> {
+        self.cleanup_plan_page(params, principal, None, false).await
+    }
+
+    async fn auto_cleanup_plan(
+        &self,
+        params: &Value,
+        retention_ms: i64,
+        retain_for_apply: bool,
+    ) -> Result<Value> {
+        self.cleanup_plan_page(
+            params,
+            &Principal::Owner,
+            Some(retention_ms),
+            retain_for_apply,
+        )
+        .await
+    }
+
+    async fn cleanup_plan_page(
+        &self,
+        params: &Value,
+        principal: &Principal,
+        auto_cleanup_after_ms: Option<i64>,
+        retain_automatic_plan: bool,
+    ) -> Result<Value> {
+        let auto_cleanup = auto_cleanup_after_ms.is_some();
         let call_deadline = Instant::now() + Duration::from_secs(25);
         let request: CleanupPlanRequest = coordination::decode_coordination_request(
             params,
@@ -609,7 +1246,7 @@ impl Router {
         {
             return Err(Error::new("invalid", "cleanup continuation is stale"));
         }
-        if page.snapshot_seq.is_none() {
+        if !auto_cleanup && page.snapshot_seq.is_none() {
             // Backfill within one slice, then freeze the inventory on the
             // first candidate page. Large or slow fleets resume the backfill.
             page.backfill_after = self
@@ -623,7 +1260,17 @@ impl Router {
             }
         }
         let (safe_projects, kept_projects, regs_revision): (Vec<_>, Vec<_>, Option<String>) =
-            if matches!(principal, Principal::Owner) {
+            if auto_cleanup {
+                if page.safe_skipped != 0
+                    || page.kept_skipped != 0
+                    || page.regs_revision.is_some()
+                    || page.safe_ids.is_some()
+                    || page.kept_ids.is_some()
+                {
+                    return Err(Error::new("invalid", "cleanup continuation is stale"));
+                }
+                (Vec::new(), Vec::new(), None)
+            } else if matches!(principal, Principal::Owner) {
                 let (registrations, revision) = self.plan_project_registrations(&request).await?;
                 let (safe, kept): (Vec<_>, Vec<_>) = registrations
                     .into_iter()
@@ -668,7 +1315,7 @@ impl Router {
         // skipping or repeating a registration. Non-owners never carry
         // project state: any such token in their hands is stale.
         let (safe_ids, kept_ids): (Option<Vec<String>>, Option<Vec<String>>) =
-            if matches!(principal, Principal::Owner) {
+            if matches!(principal, Principal::Owner) && !auto_cleanup {
                 (
                     Some(project_ids(&safe_projects)),
                     Some(project_ids(&kept_projects)),
@@ -698,6 +1345,7 @@ impl Router {
             &request,
             &page,
             artifact_limit,
+            auto_cleanup,
         )?;
         let artifacts_total = artifacts.len();
         let mut middle = Vec::new();
@@ -708,9 +1356,55 @@ impl Router {
                 verdict: "keep".to_owned(),
                 reason: "agent_not_quiescent".to_owned(),
             };
-            if candidate.artifact.state != "registered" {
+            let ownership_root = auto_cleanup
+                && candidate.artifact.kind == ArtifactKind::Other
+                && candidate.artifact.state == "ownership_root"
+                && candidate.artifact.purpose == SWARM_ARTIFACT_ROOT_PURPOSE;
+            if candidate.artifact.state != "registered" && !ownership_root {
                 candidate.reason = candidate.artifact.state.clone();
-            } else if candidate.artifact.kind == ArtifactKind::Worktree {
+                middle.push(candidate);
+                continue;
+            }
+            if auto_cleanup
+                && call_deadline.saturating_duration_since(Instant::now())
+                    < CLEANUP_PLAN_MAX_PREFLIGHT
+            {
+                break;
+            }
+            if let Some(retention_ms) = auto_cleanup_after_ms {
+                match self
+                    .automatic_cleanup_keep_reason(
+                        &candidate.artifact,
+                        retention_ms,
+                        now_ms(),
+                        false,
+                    )
+                    .await
+                {
+                    Ok(Some(reason)) => {
+                        candidate.reason = reason;
+                        middle.push(candidate);
+                        continue;
+                    }
+                    Err(error) => {
+                        candidate.reason = error.code;
+                        middle.push(candidate);
+                        continue;
+                    }
+                    Ok(None) => {}
+                }
+            }
+            if auto_cleanup
+                && matches!(
+                    candidate.artifact.kind,
+                    ArtifactKind::Branch | ArtifactKind::NativeSession
+                )
+            {
+                candidate.reason = "manual_only".to_owned();
+                middle.push(candidate);
+                continue;
+            }
+            if candidate.artifact.kind == ArtifactKind::Worktree {
                 if call_deadline.saturating_duration_since(tokio::time::Instant::now())
                     < CLEANUP_PLAN_MAX_PREFLIGHT
                 {
@@ -748,9 +1442,6 @@ impl Router {
                     .await
                 {
                     Ok(classification) => {
-                        // Anchor the freshly classified tip in the snapshot:
-                        // the stored row may predate the latest commit, and
-                        // the worktree may be gone before apply verifies.
                         candidate.artifact.identity = classification.tip.clone();
                         candidate.verdict = "safe".to_owned();
                         candidate.reason = classification.reason.to_owned();
@@ -796,7 +1487,12 @@ impl Router {
                 match self.cleanup_preflight(&candidate.artifact).await {
                     Ok(bytes) => {
                         candidate.verdict = "safe".to_owned();
-                        candidate.reason = "terminal_owned_artifact".to_owned();
+                        candidate.reason = if ownership_root {
+                            "terminal_owned_artifact_root"
+                        } else {
+                            "terminal_owned_artifact"
+                        }
+                        .to_owned();
                         candidate.bytes = Some(bytes);
                     }
                     Err(error) => candidate.reason = error.code,
@@ -847,7 +1543,12 @@ impl Router {
                 .encode()?,
             );
         }
-        if !plan.items.is_empty() || !plan.truncated {
+        let retain_plan = if auto_cleanup {
+            retain_automatic_plan && plan.items.iter().any(|item| item.verdict == "safe")
+        } else {
+            !plan.items.is_empty() || !plan.truncated
+        };
+        if retain_plan {
             self.inner
                 .store
                 .lock()
@@ -968,56 +1669,109 @@ impl Router {
     }
 
     pub(crate) async fn auto_cleanup_worktrees(&self, after: &mut Option<String>) {
-        let inventory = self
-            .inner
-            .store
-            .lock()
-            .await
-            .auto_cleanup_worktree_inventory(after.as_deref());
-        let Ok((artifacts, more)) = inventory else {
-            *after = None;
-            return;
-        };
-        *after = if more {
-            artifacts.last().map(|artifact| artifact.id.clone())
-        } else {
-            None
-        };
-        let mut plan = CleanupPlan {
-            plan_id: ulid::Ulid::new().to_string(),
-            created_at: now_ms(),
-            items: Vec::new(),
-            truncated: false,
-            continuation: None,
-        };
-        for artifact in artifacts {
-            let mut candidate = CleanupCandidate {
-                artifact,
-                bytes: None,
-                verdict: "keep".to_owned(),
-                reason: "worktree_preflight".to_owned(),
-            };
-            self.classify_worktree(&mut candidate).await;
-            if candidate.verdict == "safe" {
-                plan.items.push(candidate);
+        if let Err(error) = self.sweep_automatic_cleanup(after).await {
+            if error.code == "invalid" {
+                *after = None;
+                self.inner.automatic_cleanup.lock_recover().active_sweep = None;
             }
+            self.automatic_cleanup_failed(&error);
         }
-        if plan.items.is_empty()
-            || !crate::config::load_automation_config(&self.inner.data_root)
-                .is_ok_and(|config| config.auto_cleanup)
+    }
+
+    async fn sweep_automatic_cleanup(&self, after: &mut Option<String>) -> Result<()> {
+        let config = crate::config::load_automation_config(&self.inner.data_root)?;
+        if config.auto_cleanup == Some(false) {
+            *after = None;
+            self.inner.automatic_cleanup.lock_recover().active_sweep = None;
+            return Ok(());
+        }
+        let first_page = after.is_none();
+        let plan_only = config.auto_cleanup != Some(true)
+            || !self
+                .inner
+                .automatic_cleanup
+                .lock_recover()
+                .first_sweep_complete;
+        let retention_ms =
+            crate::automation::parse_positive_duration_ms(&config.auto_cleanup_after)?;
+        let params = json!({"scope": "all", "continuation": after.clone()});
+        let plan: CleanupPlan = serde_json::from_value(
+            self.auto_cleanup_plan(&params, retention_ms, !plan_only)
+                .await?,
+        )
+        .map_err(|_| Error::new("source_integrity", "automatic cleanup plan readback failed"))?;
+        let selected = plan
+            .items
+            .iter()
+            .filter(|item| item.verdict == "safe")
+            .map(|item| item.artifact.id.clone())
+            .collect::<Vec<_>>();
+        let applied: Option<CleanupApplyResponse> = if plan_only || selected.is_empty() {
+            None
+        } else {
+            let request = json!({
+                "id": ulid::Ulid::new().to_string(),
+                "plan_id": plan.plan_id,
+                "artifacts": selected,
+            });
+            let value = self
+                .cleanup_apply_plan(&request, &Principal::Owner, true)
+                .await?;
+            Some(serde_json::from_value(value).map_err(|_| {
+                Error::new(
+                    "source_integrity",
+                    "automatic cleanup outcome readback failed",
+                )
+            })?)
+        };
+        let page = self
+            .record_automatic_cleanup(
+                &plan,
+                applied.as_ref(),
+                config.auto_cleanup == Some(true),
+                plan_only,
+            )
+            .await?;
+        *after = plan.continuation.clone();
+        if let Some(sweep) =
+            self.accumulate_automatic_cleanup_page(page, first_page, plan.continuation.is_none())
         {
-            return;
+            self.notify_automatic_cleanup_sweep(&sweep).await?;
+            self.inner
+                .automatic_cleanup
+                .lock_recover()
+                .first_sweep_complete = true;
         }
-        let retained = self
+        Ok(())
+    }
+
+    async fn automatic_cleanup_effect_gate(&self, artifact: &ArtifactView) -> Result<()> {
+        let config = crate::config::load_automation_config(&self.inner.data_root)?;
+        if config.auto_cleanup != Some(true) {
+            return Err(Error::new(
+                "cleanup_disabled",
+                "automatic cleanup apply requires explicit enablement",
+            ));
+        }
+        if !self
             .inner
-            .store
-            .lock()
-            .await
-            .retain_cleanup_plan("owner", &plan, now_ms());
-        if retained.is_ok() {
-            let request = json!({"id": ulid::Ulid::new().to_string(), "plan_id": plan.plan_id});
-            let _ = self.cleanup_apply(&request, &Principal::Owner).await;
+            .automatic_cleanup
+            .lock_recover()
+            .first_sweep_complete
+        {
+            return Err(Error::new(
+                "cleanup_startup_sweep_pending",
+                "the first complete daemon-startup cleanup sweep must be plan-only",
+            ));
         }
+        let age = crate::automation::parse_positive_duration_ms(&config.auto_cleanup_after)?;
+        if let Some(reason) = self
+            .automatic_cleanup_keep_reason(artifact, age, now_ms(), true)
+            .await?
+        {
+            return Err(Error::new(reason, "automatic cleanup eligibility changed"));
+        }
+        Ok(())
     }
 
     async fn cleanup_preflight(&self, artifact: &ArtifactView) -> Result<u64> {
@@ -1044,7 +1798,9 @@ impl Router {
             .await
             .get_agent(&artifact.agent)?
             .ok_or_else(|| Error::new("not_found", "Agent absent"))?;
-        let path = self.checked_artifact_path(&agent, &artifact.path).await?;
+        let path = self
+            .checked_cleanup_artifact_path(&agent, artifact, false)
+            .await?;
         self.cleanup_check_git(&agent, &path).await?;
         #[cfg(windows)]
         {
@@ -1054,6 +1810,26 @@ impl Router {
                     "identity_changed",
                     "artifact directory was substituted",
                 ));
+            }
+            if artifact.state == "ownership_root" {
+                if tree.contains_daemon_lock {
+                    return Err(Error::new(
+                        "nested_daemon_lock",
+                        "owned artifact root contains a private daemon.lock marker",
+                    ));
+                }
+                if self
+                    .inner
+                    .store
+                    .lock()
+                    .await
+                    .cleanup_root_has_descendants(artifact)?
+                {
+                    return Err(Error::new(
+                        "artifact_root_has_descendants",
+                        "owned artifact root still has retained descendants",
+                    ));
+                }
             }
             Ok(tree.bytes)
         }
@@ -1071,6 +1847,15 @@ impl Router {
         &self,
         params: &Value,
         principal: &Principal,
+    ) -> Result<Value> {
+        self.cleanup_apply_plan(params, principal, false).await
+    }
+
+    async fn cleanup_apply_plan(
+        &self,
+        params: &Value,
+        principal: &Principal,
+        automatic: bool,
     ) -> Result<Value> {
         let request: CleanupApplyRequest = coordination::decode_coordination_request(
             params,
@@ -1095,7 +1880,7 @@ impl Router {
             self.apply_project_registrations(&mut store, &request, &plan, &mut response)?;
             (plan, response)
         };
-        self.apply_cleanup_artifacts(&name, &request, &plan, &mut response, false)
+        self.apply_cleanup_artifacts(&name, &request, &plan, &mut response, false, automatic)
             .await?;
         encoded(response)
     }
@@ -1107,6 +1892,7 @@ impl Router {
         plan: &CleanupPlan,
         response: &mut CleanupApplyResponse,
         entire_tree: bool,
+        automatic: bool,
     ) -> Result<()> {
         // A native reader may need the managed workspace as its directory.
         let (sessions, other): (Vec<_>, Vec<_>) = plan
@@ -1142,8 +1928,17 @@ impl Router {
                     "native_session_kept",
                     "The tree's native session cleanup did not complete",
                 ))
+            } else if automatic {
+                match self.automatic_cleanup_effect_gate(&item.artifact).await {
+                    Ok(()) => {
+                        self.cleanup_remove(name, &item.artifact, request, true)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                }
             } else {
-                self.cleanup_remove(name, &item.artifact, request).await
+                self.cleanup_remove(name, &item.artifact, request, false)
+                    .await
             };
             let outcome = match removal {
                 Ok(bytes) => CleanupItemOutcome {
@@ -1185,6 +1980,7 @@ impl Router {
         principal: &str,
         artifact: &ArtifactView,
         request: &CleanupApplyRequest,
+        automatic: bool,
     ) -> Result<u64> {
         if artifact.kind == ArtifactKind::Branch {
             let git = artifact
@@ -1285,7 +2081,7 @@ impl Router {
         }
         if artifact.kind == ArtifactKind::Worktree {
             return self
-                .cleanup_remove_worktree(principal, artifact, &request.id)
+                .cleanup_remove_worktree(principal, artifact, &request.id, automatic)
                 .await;
         }
         let agent = self
@@ -1295,7 +2091,9 @@ impl Router {
             .await
             .get_agent(&artifact.agent)?
             .ok_or_else(|| Error::new("not_found", "Agent absent"))?;
-        let path = self.checked_artifact_path(&agent, &artifact.path).await?;
+        let path = self
+            .checked_cleanup_artifact_path(&agent, artifact, true)
+            .await?;
         self.cleanup_check_git(&agent, &path).await?;
         #[cfg(windows)]
         {
@@ -1313,6 +2111,28 @@ impl Router {
                 Self::cleanup_check_daemon_lock(Path::new(&artifact.path))?;
             }
             let store = self.inner.store.lock().await;
+            if automatic
+                && store
+                    .get_agent(&artifact.agent)?
+                    .is_some_and(|agent| agent.archived)
+            {
+                return Err(Error::new(
+                    "archived",
+                    "Archived Agent artifacts are protected",
+                ));
+            }
+            if artifact.state == "ownership_root" && tree.contains_daemon_lock {
+                return Err(Error::new(
+                    "nested_daemon_lock",
+                    "owned artifact root contains a private daemon.lock marker",
+                ));
+            }
+            if artifact.state == "ownership_root" && store.cleanup_root_has_descendants(artifact)? {
+                return Err(Error::new(
+                    "artifact_root_has_descendants",
+                    "owned artifact root still has retained descendants",
+                ));
+            }
             if !store.cleanup_authorized(principal, artifact)?
                 || !store.cleanup_agent_quiescent(artifact)?
             {
@@ -1413,10 +2233,21 @@ impl Router {
         principal: &str,
         artifact: &ArtifactView,
         apply_id: &str,
+        automatic: bool,
     ) -> Result<u64> {
         let mut progress = self.progress_receiver();
         let admission = {
             let mut store = self.inner.store.lock().await;
+            if automatic
+                && store
+                    .get_agent(&artifact.agent)?
+                    .is_some_and(|agent| agent.archived)
+            {
+                return Err(Error::new(
+                    "archived",
+                    "Archived Agent worktrees are protected",
+                ));
+            }
             if !store.cleanup_authorized(principal, artifact)?
                 || !store.cleanup_agent_quiescent(artifact)?
             {
@@ -2388,7 +3219,10 @@ impl Router {
             if item.verdict != "safe" || response.items[index].outcome != "unknown" {
                 continue;
             }
-            let outcome = match self.cleanup_remove("owner", &item.artifact, &apply).await {
+            let outcome = match self
+                .cleanup_remove("owner", &item.artifact, &apply, false)
+                .await
+            {
                 Ok(bytes) => CleanupItemOutcome {
                     artifact_id: item.artifact.id.clone(),
                     outcome: "removed".to_owned(),

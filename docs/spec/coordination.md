@@ -10,7 +10,7 @@ project and generation-bound ancestor chain. Before native startup Swarm creates
 `<first-configured-artifact-root>/<agent>-<generation>/`, or
 `<data-dir>/artifacts/<agent>-<generation>/` when none is configured. Creation is
 exclusive: an existing unbound directory is refused, never adopted. Its opened
-identity is committed as an internal, non-deletable `ownership_root` ledger row,
+identity is committed as an internal `ownership_root` ledger row,
 and the native process receives its path as `ELIOT_ARTIFACT_ROOT`. Agent-created
 directories must use absolute local paths strictly below that durable root; location in a
 workspace or a shared configured root alone proves no ownership. Legacy rows
@@ -31,7 +31,7 @@ when planning, without scanning arbitrary filesystem roots.
 `cleanup.plan {scope:self_tree|project|all,project?,older_than?,continuation?}` changes
 no filesystem objects. It retains a bounded snapshot with per-item size, reason and
 `safe`/`keep` verdict. The cutoff is an exclusive Unix-millisecond creation time.
-Only `registered` rows are candidates: settled rows (`removed`, `unknown`,
+Manual plans select `registered` rows. Settled rows (`removed`, `unknown`,
 `skipped(...)`) are attempt history read back from retained plans, and filtering
 them before the page cap keeps a settled prefix from starving later eligible
 rows. The Store pages the final candidate order once (ordinary rows, then
@@ -183,7 +183,32 @@ reviews an Owner `all` plan grouped by kind with each item's size and reason,
 applies the safe items of the checked groups through the same Router after one
 confirmation (local deletions only, one mutation id per plan and selection until a
 definite reply), and shows removed, kept-with-reason and unknown outcomes. The plan
-has no Owner per-Agent scope, so there is no per-task cleanup entry. A folder assignment opts in with
+has no Owner per-Agent scope, so there is no per-task cleanup entry.
+
+The daemon's automatic sweep pages through recorded owned artifacts of finished
+Agent generations and uses the same guarded cleanup path.
+Manual previews can backfill older ownership records. The [Owner settings]
+(configuration.md#later-configuration-example) control the age and enablement. Both
+the artifact and its exact finished generation must be older than the configured
+window. Archived Agents and their artifacts stay protected from automatic cleanup.
+An omitted `automation.auto_cleanup` runs plan-only pages, retaining no plans for
+apply and reserving no apply. Explicit `true` applies only after the first complete
+plan-only sweep of each daemon startup. Explicit `false` disables automatic
+planning and apply. Each completed paged
+sweep updates aggregate status and sends one Owner `notify` with would-remove and
+kept totals and enablement; intermediate pages do not send notices. Per-item
+`cleanup.automatic` reason events remain available. The sweep keeps dirty or
+unmerged worktrees and their generation's artifacts.
+Eligible paths include managed worktrees, recorded per-generation plugin directories,
+and artifacts under exact Swarm-created generation roots. A generation root can be
+removed when its creation identity is still bound, its registered descendants are
+settled, and the guarded scan of its contents succeeds. Branches, project registrations
+and native sessions require an explicit cleanup request. Status reports the policy
+and the latest completed sweep's aggregate outcomes since daemon startup. A
+`cleanup.automatic` event records removals, planned removals, uncertain outcomes
+and new keep reasons. Repeated keep reasons are omitted from later events.
+
+A folder assignment opts in with
 `cleanup_on_retire`: after an applied stop retires its Agent, the existing
 stop worker runs the same plan/apply for that Agent's build, temp and
 worktree artifacts with Owner authority and retained receipts. It is off by

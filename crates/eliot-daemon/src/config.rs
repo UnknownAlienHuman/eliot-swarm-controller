@@ -726,19 +726,31 @@ struct CloudMcpSettings {
 }
 
 /// Store-size threshold for the unbounded-retention advisory: `daemon.status`
-/// reports `size_advisory` and the hourly maintenance tick logs one line
-/// while the main+WAL store files pass this size with every retention window
-/// unset. Documented in docs/spec/configuration.md (daemon retention).
+/// reports `size_advisory` and maintenance logs a line while all retention
+/// windows are unset. Documented in docs/spec/configuration.md (daemon retention).
 pub(crate) const RETENTION_UNBOUNDED_SIZE_ADVISORY_BYTES: u64 = 100 * 1024 * 1024;
+const DEFAULT_EVENTS_RETENTION_DAYS: i64 = 30;
+const DEFAULT_PROCESSES_RETENTION_SECONDS: i64 = 24 * 60 * 60;
+const DEFAULT_RETENTION_INTERVAL_SECONDS: i64 = 5 * 60;
+const MAX_RETENTION_INTERVAL_SECONDS: i64 = 24 * 60 * 60;
 
-/// Physical retention windows consumed by daemon maintenance. See
-/// docs/spec/configuration.md: daemon retention. An unset window disables
-/// pruning for that side: no deletion without an owner window.
+/// Physical retention policy and SQLite space maintenance. Event retention
+/// defaults to 30 days; legacy `events_days` remains supported, while
+/// `events_seconds` permits short private qualification windows. Exited child
+/// rows default to one day. See docs/spec/configuration.md (daemon retention).
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RetentionConfig {
     #[serde(default)]
     pub(crate) events_days: Option<i64>,
+    #[serde(default)]
+    pub(crate) events_seconds: Option<i64>,
+    #[serde(default)]
+    pub(crate) processes_seconds: Option<i64>,
+    #[serde(default)]
+    pub(crate) interval_seconds: Option<i64>,
+    #[serde(default)]
+    pub(crate) compact_on_start: bool,
     #[serde(default)]
     pub(crate) commands_days: Option<i64>,
     #[serde(default)]
@@ -746,11 +758,62 @@ pub(crate) struct RetentionConfig {
 }
 
 impl RetentionConfig {
-    fn validate(self) -> core::Result<Self> {
+    pub(crate) fn events_retention_days(&self) -> Option<i64> {
+        self.events_seconds
+            .is_none()
+            .then_some(self.events_days.unwrap_or(DEFAULT_EVENTS_RETENTION_DAYS))
+    }
+
+    pub(crate) fn events_retention_seconds(&self) -> i64 {
+        self.events_seconds.unwrap_or_else(|| {
+            self.events_days
+                .unwrap_or(DEFAULT_EVENTS_RETENTION_DAYS)
+                .saturating_mul(24 * 60 * 60)
+        })
+    }
+
+    pub(crate) fn processes_retention_seconds(&self) -> i64 {
+        self.processes_seconds
+            .unwrap_or(DEFAULT_PROCESSES_RETENTION_SECONDS)
+    }
+
+    pub(crate) fn maintenance_interval_seconds(&self) -> u64 {
+        self.interval_seconds
+            .unwrap_or(DEFAULT_RETENTION_INTERVAL_SECONDS) as u64
+    }
+
+    pub(crate) fn validate(self) -> core::Result<Self> {
+        if self.events_days.is_some() && self.events_seconds.is_some() {
+            return Err(core::Error::new(
+                "profile_error",
+                "config.toml: set only one of daemon.retention.events_days and events_seconds",
+            ));
+        }
         if self.events_days.is_some_and(|days| days <= 0) {
             return Err(core::Error::new(
                 "profile_error",
                 "config.toml: daemon.retention.events_days must be a positive integer",
+            ));
+        }
+        if self.events_seconds.is_some_and(|seconds| seconds <= 0) {
+            return Err(core::Error::new(
+                "profile_error",
+                "config.toml: daemon.retention.events_seconds must be a positive integer",
+            ));
+        }
+        if self.processes_seconds.is_some_and(|seconds| seconds <= 0) {
+            return Err(core::Error::new(
+                "profile_error",
+                "config.toml: daemon.retention.processes_seconds must be a positive integer",
+            ));
+        }
+        if self
+            .interval_seconds
+            .is_some_and(|seconds| seconds <= 0 || seconds > MAX_RETENTION_INTERVAL_SECONDS)
+        {
+            return Err(core::Error::new(
+                "profile_error",
+                "config.toml: daemon.retention.interval_seconds must be within 1..=86400",
             ));
         }
         if self.commands_days.is_some_and(|days| days <= 0) {

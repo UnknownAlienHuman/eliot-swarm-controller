@@ -846,23 +846,20 @@ fn compute_git_view(
         .as_ref()
         .map(|(data, _)| decode_json(data))
         .transpose()?;
-    // Commit delivery is tracked per commit oid against retained
-    // `git.committed` events, never derived from dirty coverage: a partial
-    // persisted view must neither replay a delivered commit nor gate one the
-    // truncation hid.
+    // Keep the exact committed OID in a generation-scoped ledger before
+    // emitting its event. Event retention cannot erase this suppression, and
+    // rewinding within the same generation does not redeliver an OID.
     let mut undelivered = Vec::new();
     if snapshot.complete {
         for commit in &snapshot.commits {
-            let seen: bool = tx
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM events WHERE agent = ?1 AND generation = ?2
-                     AND source = 'git' AND kind = 'git.committed'
-                     AND json_extract(data, '$.oid') = ?3)",
+            let inserted = tx
+                .execute(
+                    "INSERT OR IGNORE INTO git_committed_oids(agent, generation, oid)
+                     VALUES (?1, ?2, ?3)",
                     params![agent_num, generation, commit.oid],
-                    |row| row.get(0),
                 )
                 .map_err(sql_error)?;
-            if !seen {
+            if inserted == 1 {
                 undelivered.push(commit.clone());
             }
         }

@@ -3,8 +3,8 @@ use super::args::{DaemonAction, DaemonArgs, MaintenanceArgs, MaintenanceCommand,
 use super::support::{Failure, mutation_id, print_value, read_and_print, response_exit_code};
 use crate::mcp;
 use eliot_core::api::{
-    DaemonShutdownRequest, DaemonShutdownResponse, DaemonStatusRequest, DaemonStatusResponse,
-    MaintenanceRunRequest, MaintenanceRunResponse, ShutdownMode,
+    AutomaticCleanupPolicy, DaemonShutdownRequest, DaemonShutdownResponse, DaemonStatusRequest,
+    DaemonStatusResponse, MaintenanceRunRequest, MaintenanceRunResponse, ShutdownMode,
 };
 use serde_json::Value;
 use serde_json::json;
@@ -173,15 +173,53 @@ pub(crate) async fn run_status(data_dir: PathBuf, json_output: bool) -> Result<u
     params
         .validate_response(&response)
         .map_err(Failure::invalid_response)?;
+    let cleanup_line = response.automatic_cleanup.as_ref().map(|cleanup| {
+        let policy = if let Some(code) = &cleanup.config_error {
+            format!("unavailable ({code})")
+        } else {
+            match cleanup.policy {
+                AutomaticCleanupPolicy::Disabled => "disabled".to_owned(),
+                AutomaticCleanupPolicy::PlanOnly => "plan-only".to_owned(),
+                AutomaticCleanupPolicy::Enabled if cleanup.startup_plan_only_pending => format!(
+                    "enabled after {} (initial plan-only sweep pending)",
+                    cleanup.after.as_deref().unwrap_or("the configured window")
+                ),
+                AutomaticCleanupPolicy::Enabled => format!(
+                    "enabled after {}",
+                    cleanup.after.as_deref().unwrap_or("the configured window")
+                ),
+            }
+        };
+        match &cleanup.last_sweep {
+            Some(sweep) => match &sweep.error_code {
+                Some(code) => format!("Automatic cleanup {policy} | last sweep failed ({code})"),
+                None => format!(
+                    "Automatic cleanup {policy} | last sweep would remove {}, kept {}, removed {}, unknown {}{}",
+                    sweep.would_remove,
+                    sweep.kept,
+                    sweep.removed,
+                    sweep.unknown,
+                    if sweep.plan_only { " (plan-only)" } else { "" },
+                ),
+            },
+            None => format!("Automatic cleanup {policy}"),
+        }
+    });
     let mut value = serde_json::to_value(response)
         .map_err(|_| Failure::new(4, "daemon.status response is invalid"))?;
     if let Some(object) = value.as_object_mut() {
+        if !json_output {
+            object.remove("automatic_cleanup");
+        }
         object.insert(
             "data_dir".to_owned(),
             Value::String(data_dir.to_string_lossy().into_owned()),
         );
     }
     print_value(&value, json_output);
+    if !json_output && let Some(line) = cleanup_line {
+        println!("{line}");
+    }
     Ok(0)
 }
 

@@ -618,17 +618,22 @@ impl Store {
             }
         } else {
             outcome = slot.skip_code.clone();
-            let mut data = json!({
-                "rule": state.id,
-                "schedule_revision": state.schedule_revision,
-                "scheduled_at_ms": slot.scheduled_at_ms,
-                "reason": slot.skip_code,
-            });
-            if let Some(message) = slot.skip_capacity_message {
-                data["message"] = json!(message);
-                data["where"] = json!("store.admission.capacity");
+            // The cursor records every slot. A repeated bare outcome adds
+            // nothing to the event history, while capacity diagnostics can
+            // carry new detail even when their reason code is unchanged.
+            if outcome != stored.view.last_outcome || slot.skip_capacity_message.is_some() {
+                let mut data = json!({
+                    "rule": state.id,
+                    "schedule_revision": state.schedule_revision,
+                    "scheduled_at_ms": slot.scheduled_at_ms,
+                    "reason": slot.skip_code,
+                });
+                if let Some(message) = slot.skip_capacity_message {
+                    data["message"] = json!(message);
+                    data["where"] = json!("store.admission.capacity");
+                }
+                events.push(insert_rule_event(&tx, now, "rule.skipped", data)?);
             }
-            events.push(insert_rule_event(&tx, now, "rule.skipped", data)?);
         }
 
         if arbitration.is_some() {
