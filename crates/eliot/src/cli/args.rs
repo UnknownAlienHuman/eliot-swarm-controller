@@ -1832,6 +1832,12 @@ pub(crate) enum ProjectTransferCommand {
         destination: String,
         #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
         generation: i64,
+        /// Retained source task SEND for the continuation brief.
+        #[arg(long)]
+        task_command: Option<String>,
+        /// Undispatched source SEND to continue after the brief. Repeat in order.
+        #[arg(long = "command", value_name = "SEND")]
+        commands: Vec<String>,
     },
     /// Cancel the intent and lift the source drain fence.
     Cancel { intent: String },

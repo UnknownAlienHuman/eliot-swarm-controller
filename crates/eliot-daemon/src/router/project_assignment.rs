@@ -80,6 +80,12 @@ impl Router {
         {
             self.schedule_command(id.clone(), None);
         }
+        if let Some(handoff) = &change.value.handoff {
+            self.queue_handoff_task_card(&mut store, handoff, &change.events);
+            for child in &handoff.children {
+                self.schedule_command(child.clone(), None);
+            }
+        }
         self.signal_progress();
         self.signal_launch_arbitration();
         encode_assignment(change.value)

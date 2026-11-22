@@ -278,6 +278,17 @@ pub(super) fn source_inputs(
     principal: Option<&str>,
     policy: &core::SecretPolicy,
 ) -> Result<(Command, Vec<Command>)> {
+    let task = source_task(connection, from, task_command, principal)?;
+    let originals = source_sends(connection, from, commands, principal, policy, false)?;
+    Ok((task, originals))
+}
+
+fn source_task(
+    connection: &Connection,
+    from: &Agent,
+    task_command: &str,
+    principal: Option<&str>,
+) -> Result<Command> {
     let task = load_command(connection, task_command)?.ok_or_else(|| {
         Error::new(
             "not_found",
@@ -302,16 +313,32 @@ pub(super) fn source_inputs(
             "handoff transfers only SENDs issued by the caller",
         ));
     }
+    Ok(task)
+}
+
+fn source_sends(
+    connection: &Connection,
+    from: &Agent,
+    commands: &[String],
+    principal: Option<&str>,
+    policy: &core::SecretPolicy,
+    project_transfer: bool,
+) -> Result<Vec<Command>> {
     let mut originals = Vec::new();
     for id in commands {
         let record = load_command_record(connection, id)?.ok_or_else(|| {
             Error::new("not_found", format!("selected SEND {id} is not retained"))
         })?;
         let c = &record.command;
+        let stopped_before_dispatch = project_transfer
+            && c.state == CommandState::Cancelled
+            && c.outcome.as_ref().and_then(|data| data["reason"].as_str())
+                == Some("generation_stopped");
         if c.verb != "send"
             || c.target.as_deref() != Some(&from.id)
             || c.generation != Some(from.generation)
-            || !matches!(c.state, CommandState::Accepted | CommandState::Queued)
+            || !(matches!(c.state, CommandState::Accepted | CommandState::Queued)
+                || stopped_before_dispatch)
             || c.turn_id.is_some()
             || record.expected_turn_id.is_some()
             || c.request_id.is_some()
@@ -343,13 +370,18 @@ pub(super) fn source_inputs(
         }
         originals.push(record.command);
     }
-    Ok((task, originals))
+    Ok(originals)
 }
 
-pub(super) enum HandoffInput {
+#[derive(Clone, Copy)]
+pub(super) enum HandoffInput<'a> {
     Brief,
     /// The switch has already proven an exact provider refusal before work.
     ProviderRetry,
+    /// The project transfer has proved source custody and performed the team edits.
+    ProjectTransfer {
+        saved_context: Option<&'a str>,
+    },
 }
 
 /// Shared transfer transaction. Caller commits, or rolls back the entire transfer.
@@ -360,9 +392,12 @@ pub(super) fn handoff_tx(
     policy: &core::SecretPolicy,
     now: i64,
     limits: core::api::HierarchyLimits,
-    input: HandoffInput,
+    input: HandoffInput<'_>,
 ) -> Result<HandoffAdmission> {
-    request.validate()?;
+    let project_transfer = matches!(input, HandoffInput::ProjectTransfer { .. });
+    if !project_transfer || !request.task_command.is_empty() {
+        request.validate()?;
+    }
     // Owner hands off anywhere with claims, Goal and children. A manager may
     // hand off only between two workers in its own controlled scope, never
     // itself, transferring only task inputs it issued itself. Agent handoffs
@@ -382,8 +417,14 @@ pub(super) fn handoff_tx(
             }
         }
     };
-    let payload = serde_json::to_value(request)
+    let mut payload = serde_json::to_value(request)
         .map_err(|_| Error::new("internal", "cannot encode handoff"))?;
+    if project_transfer
+        && request.task_command.is_empty()
+        && let Some(args) = payload.as_object_mut()
+    {
+        args.remove("task_command");
+    }
     let digest = canonical::digest(&payload)?;
     // Resolve the immutable operation binding before all mutable Agent/history gates.
     if let Some((old_principal, method, old_digest)) = command_binding(tx, &request.id)? {
@@ -445,19 +486,40 @@ pub(super) fn handoff_tx(
     }
     project_transfer::require_no_intent(tx, &from.project)?;
     project_transfer::require_no_intent(tx, &to.project)?;
-    quiescent(tx, &from, false)?;
+    if !project_transfer {
+        quiescent(tx, &from, false)?;
+    }
     quiescent(tx, &to, true)?;
-    let (task, originals) = source_inputs(
+    let input_principal = manager_caller.as_ref().map(|_| principal);
+    let task = if project_transfer && request.task_command.is_empty() {
+        None
+    } else {
+        Some(source_task(
+            tx,
+            &from,
+            &request.task_command,
+            input_principal,
+        )?)
+    };
+    let originals = source_sends(
         tx,
         &from,
-        &request.task_command,
         &request.commands,
-        manager_caller.as_ref().map(|_| principal),
+        input_principal,
         policy,
+        project_transfer,
     )?;
+    let required_task = || {
+        task.as_ref()
+            .ok_or_else(|| Error::new("source_integrity", "handoff task is missing"))
+    };
     let (brief_text, brief_truncated) = match input {
-        HandoffInput::Brief => brief::build(tx, request, &task, policy)?,
+        HandoffInput::Brief => brief::build(tx, request, Some(required_task()?), policy, None)?,
+        HandoffInput::ProjectTransfer { saved_context } => {
+            brief::build(tx, request, task.as_ref(), policy, saved_context)?
+        }
         HandoffInput::ProviderRetry => {
+            let task = required_task()?;
             if policy.contains_value(&task.args) {
                 return Err(Error::new(
                     "secret_in_payload",
@@ -477,7 +539,7 @@ pub(super) fn handoff_tx(
     // inputs the caller issued itself. Claims, Goals and children stay put;
     // moving children stays Owner-only.
     let (claims, claim_conflicts, conflicts_truncated, goal_revision, reparented) =
-        if manager_caller.is_some() {
+        if project_transfer || manager_caller.is_some() {
             (Vec::new(), Vec::new(), false, None, Vec::new())
         } else {
             let (claims, claim_conflicts, conflicts_truncated) =
@@ -556,16 +618,26 @@ pub(super) fn handoff_tx(
         json!({"command_id":request.id,"verb":"handoff"}),
     )?);
     for (original, transfer) in originals.iter().zip(&transfers) {
-        cancel_pending_command_tx(
-            tx,
-            parse_agent_id(&from.id)?,
-            from.generation,
-            &original.id,
-            "handoff_no_effect",
-            now,
-            &mut events,
-        )?;
-        tx.execute("UPDATE commands SET outcome=?1 WHERE id=?2",params![encode_json(&json!({"reason":"handoff_no_effect","no_effect":true,"handoff":request.id,"successor":transfer.successor}))?,original.id]).map_err(sql_error)?;
+        if original.state != CommandState::Cancelled {
+            cancel_pending_command_tx(
+                tx,
+                parse_agent_id(&from.id)?,
+                from.generation,
+                &original.id,
+                "handoff_no_effect",
+                now,
+                &mut events,
+            )?;
+        }
+        let mut outcome = json!({"reason":"handoff_no_effect","no_effect":true,"handoff":request.id,"successor":transfer.successor});
+        if original.state == CommandState::Cancelled {
+            outcome["previous_reason"] = json!("generation_stopped");
+        }
+        tx.execute(
+            "UPDATE commands SET outcome=?1 WHERE id=?2",
+            params![encode_json(&outcome)?, original.id],
+        )
+        .map_err(sql_error)?;
     }
     for (ordinal, id) in children.iter().enumerate() {
         let mut child = SubmitCommand::new(id.clone(), "send");

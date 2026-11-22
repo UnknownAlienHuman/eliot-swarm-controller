@@ -73,21 +73,21 @@ pub(super) fn validate_selection(
     commands: &[String],
 ) -> Result<()> {
     parse_agent_id(from)?;
-    if id.trim().is_empty()
-        || generation < 1
-        || task.is_empty()
-        || task.len() > 256
-        || commands.len() > MAX_HANDOFF_SENDS
-    {
+    if id.trim().is_empty() || generation < 1 || task.is_empty() || task.len() > 256 {
         return Err(Error::new(
             "invalid",
             "invalid transfer source or selection",
         ));
     }
+    validate_send_selection(commands)
+}
+
+pub(super) fn validate_send_selection(commands: &[String]) -> Result<()> {
     let mut seen = HashSet::new();
-    if commands
-        .iter()
-        .any(|id| id.is_empty() || id.len() > 256 || !seen.insert(id))
+    if commands.len() > MAX_HANDOFF_SENDS
+        || commands
+            .iter()
+            .any(|id| id.is_empty() || id.len() > 256 || !seen.insert(id))
     {
         return Err(Error::new(
             "invalid",
@@ -104,7 +104,7 @@ pub struct SendTransfer {
     pub successor: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HandoffResponse {
     pub id: String,

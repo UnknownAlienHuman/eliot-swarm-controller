@@ -1,4 +1,6 @@
-use super::{ProjectAssignment, ProjectManagerIdentity, ReparentedAgent};
+use super::{
+    HandoffResponse, MAX_HANDOFF_SENDS, ProjectAssignment, ProjectManagerIdentity, ReparentedAgent,
+};
 use crate::{Error, Result, parse_agent_id};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -30,6 +32,13 @@ pub enum ProjectTransferAction {
     Commit {
         intent: String,
         destination: ProjectManagerIdentity,
+        /// Retained source SEND supplying the original task for the handoff brief.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_command: Option<String>,
+        /// Ordered, plain source SENDs with a proven no-effect outcome.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[schemars(length(max = MAX_HANDOFF_SENDS), extend("uniqueItems" = true))]
+        commands: Vec<String>,
     },
     Cancel {
         intent: String,
@@ -57,7 +66,12 @@ impl ProjectTransferRequest {
             ProjectTransferAction::Launch { profile, .. } => {
                 super::project_assignment::validate_name(profile, "params.action.profile")
             }
-            ProjectTransferAction::Commit { destination, .. } => match destination {
+            ProjectTransferAction::Commit {
+                destination,
+                task_command,
+                commands,
+                ..
+            } => match destination {
                 ProjectManagerIdentity::Local { agent, generation } => {
                     parse_agent_id(agent)?;
                     if *generation < 1 {
@@ -66,7 +80,10 @@ impl ProjectTransferRequest {
                             "positive generation",
                         ));
                     }
-                    Ok(())
+                    if let Some(task) = task_command {
+                        crate::command::validate_command_id(task)?;
+                    }
+                    super::handoff::validate_send_selection(commands)
                 }
                 ProjectManagerIdentity::Remote { .. } => Err(Error::new(
                     "unsupported",
@@ -114,4 +131,7 @@ pub struct ProjectTransferResult {
     pub moved: Vec<ReparentedAgent>,
     pub claims: Vec<String>,
     pub goal_revision: Option<i64>,
+    /// Initial handoff admission. The parent command carries current delivery readback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<HandoffResponse>,
 }
