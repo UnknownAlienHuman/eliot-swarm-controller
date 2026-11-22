@@ -258,14 +258,21 @@ fn project_source_sections(source: &str, sections: &[&str]) -> String {
 /// One section of an already-parsed file as the settings reader shows it.
 fn section_value(parsed: &toml::Table, name: &str) -> core::Result<JsonValue> {
     let Some(value) = parsed.get(name) else {
-        return Ok(match name {
+        let mut value = match name {
             "routing" => serde_json::json!({"default": []}),
             "desktop" => desktop_default(),
             _ => empty_object(),
-        });
+        };
+        if name == "daemon" {
+            add_attention_settings_defaults(&mut value, super::default_attention_suspicion_secs());
+        }
+        return Ok(value);
     };
     let mut value = serde_json::to_value(value)
         .map_err(|_| core::Error::new("internal", "settings section could not be encoded"))?;
+    if name == "daemon" {
+        add_attention_settings_defaults(&mut value, super::default_attention_suspicion_secs());
+    }
     if name == "desktop" {
         let object = value.as_object_mut().ok_or_else(|| {
             core::Error::new("source_integrity", "desktop settings are not an object")
@@ -291,7 +298,62 @@ fn section_value(parsed: &toml::Table, name: &str) -> core::Result<JsonValue> {
     Ok(value)
 }
 
-/// The `[desktop]` section a file without one reads as.
+/// Add the validated effective defaults used by the daemon for attention settings.
+fn add_attention_settings_defaults(value: &mut JsonValue, legacy_secs: i64) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    let legacy_secs = object
+        .get("attention_suspicion_secs")
+        .and_then(JsonValue::as_i64)
+        .unwrap_or(legacy_secs);
+    let attention = object
+        .entry("attention")
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(attention) = attention.as_object_mut() else {
+        return;
+    };
+    for (name, timed) in [
+        ("no_progress", true),
+        ("no_code_progress", true),
+        ("children_unattended", true),
+        ("source_unhealthy", false),
+        ("agent_lost", false),
+        ("provider_refusal", false),
+        ("session_growth", false),
+        ("repeated_command_failure", false),
+    ] {
+        let config = attention
+            .entry(name)
+            .or_insert_with(|| serde_json::json!({}));
+        let Some(config) = config.as_object_mut() else {
+            continue;
+        };
+        config.entry("enabled").or_insert(JsonValue::Bool(true));
+        if timed {
+            config
+                .entry("threshold_secs")
+                .or_insert(JsonValue::from(legacy_secs));
+        }
+    }
+    if let Some(no_progress) = attention
+        .get_mut("no_progress")
+        .and_then(JsonValue::as_object_mut)
+    {
+        no_progress
+            .entry("interrupt")
+            .or_insert(JsonValue::Bool(false));
+    }
+    if let Some(session_growth) = attention
+        .get_mut("session_growth")
+        .and_then(JsonValue::as_object_mut)
+    {
+        session_growth
+            .entry("switch")
+            .or_insert(JsonValue::Bool(false));
+    }
+}
+/// The desktop section a file without one reads as.
 fn desktop_default() -> JsonValue {
     serde_json::json!({
         "theme": "system",

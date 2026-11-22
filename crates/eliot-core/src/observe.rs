@@ -18,6 +18,32 @@ use serde_json::{Value, json};
 pub const ACTIVITY_HEAVY_KIND: &str = "activity.heavy";
 /// Journal kind for a native-session size warning.
 pub const SESSION_GROWTH_KIND: &str = "session.growth";
+pub const ATTENTION_STEP_KIND: &str = "x.user.agent.attention_step";
+
+/// One recorded reaction and its binding to the original incident.
+#[derive(
+    schemars::JsonSchema, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize,
+)]
+pub struct AttentionStep {
+    pub incident_id: String,
+    pub step: String,
+    pub outcome: String,
+    pub command_id: Option<String>,
+    pub turn_id: Option<String>,
+}
+
+impl AttentionStep {
+    pub fn is_bounded(&self) -> bool {
+        !self.incident_id.is_empty()
+            && self.incident_id.len() <= 128
+            && !self.step.is_empty()
+            && self.step.len() <= 64
+            && !self.outcome.is_empty()
+            && self.outcome.len() <= 128
+            && self.command_id.as_ref().is_none_or(|id| id.len() <= 256)
+            && self.turn_id.as_ref().is_none_or(|id| id.len() <= 256)
+    }
+}
 /// Journal kind for an installed-vs-verified harness mismatch.
 pub const HARNESS_DRIFT_KIND: &str = "harness.drift";
 /// Detail level for the heavy-episode record.
@@ -516,8 +542,7 @@ pub enum SessionGrowthBasis {
 }
 
 /// One session-growth warning: exactly one `session.growth` event per basis
-/// per Agent generation until the signal clears. The message names the owner
-/// action; Eliot never compacts automatically.
+/// per Agent generation until the signal clears.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionGrowth {
     pub basis: SessionGrowthBasis,
@@ -562,18 +587,13 @@ impl SessionGrowth {
 }
 
 /// Native compact or summarize operation Eliot may name in a growth warning.
-/// On this base no harness page documents an Eliot-exposed compact or
-/// summarize operation (Muse lists compact as native-only, advertised after
-/// implementation), so every harness maps to `None` and the warning keeps
-/// the generic owner action. Revisit when a harness page documents one.
-pub fn compact_hint_for_harness(_harness: &str) -> Option<String> {
-    None
+pub fn compact_hint_for_harness(harness: &str) -> Option<String> {
+    matches!(harness, "codex" | "opencode")
+        .then(|| "compact the session at an idle boundary".to_owned())
 }
 
 fn growth_message(basis: &str, detail: &str, compact_hint: Option<&str>) -> String {
-    let action = compact_hint.unwrap_or(
-        "narrow the task or restart the session; Eliot performs no automatic compaction",
-    );
+    let action = compact_hint.unwrap_or("narrow the task or continue in a fresh session");
     format!("session growth ({basis}): {detail}; {action}")
 }
 

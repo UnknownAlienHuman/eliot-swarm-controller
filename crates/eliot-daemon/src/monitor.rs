@@ -1931,7 +1931,20 @@ impl Monitoring {
                     published.push(event);
                 }
             }
-            for (kind, data) in growth_events {
+            let active_turn = if growth_events.is_empty() {
+                None
+            } else {
+                store
+                    .get_agent(&target.agent)
+                    .ok()
+                    .flatten()
+                    .filter(|agent| agent.generation == target.generation)
+                    .and_then(|agent| agent.active_turn)
+            };
+            for (kind, mut data) in growth_events {
+                if let Some(turn_id) = &active_turn {
+                    data["turn_id"] = serde_json::json!(turn_id);
+                }
                 if let Ok(event) = store.commit_observe_event(
                     Some(&target.agent),
                     Some(target.generation),

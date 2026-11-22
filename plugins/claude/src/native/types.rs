@@ -219,6 +219,8 @@ pub(crate) struct UserContentBlock {
     pub tool_use_id: Option<String>,
     #[serde(default)]
     pub is_error: Option<bool>,
+    #[serde(default)]
+    pub content: Option<Value>,
 }
 
 /// Terminal `result` record. Autonomous task notifications are not terminals
@@ -636,16 +638,44 @@ pub(crate) fn assistant_tool_use_count(record: &Value) -> usize {
         .count()
 }
 
-/// One native tool outcome: the exact `tool_use_id` it answers plus the
-/// verdict the native frame carries (`is_error`, absent when unreported).
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// One native tool outcome bound to its exact invocation and verdict.
+/// Complete bounded text is retained only for a native failure.
 pub(crate) struct ToolResultBlock {
     pub tool_use_id: String,
     pub is_error: Option<bool>,
+    pub failure_output: Option<String>,
 }
 
 /// Tool outcomes in one `user` record, in wire order. Blocks with a missing
 /// or blank `tool_use_id` cannot bind an invocation and are dropped here.
+const MAX_TOOL_RESULT_CONTENT_BLOCKS: usize = 32;
+const MAX_TOOL_FAILURE_OUTPUT_BYTES: usize = 4 * 1024;
+
+/// Keep only complete bounded textual results. Non-text or oversized results
+/// stay out of repeated-failure matching rather than comparing a prefix.
+fn bounded_tool_result_text(content: Option<&Value>) -> Option<String> {
+    match content? {
+        Value::String(text) if text.len() <= MAX_TOOL_FAILURE_OUTPUT_BYTES => Some(text.clone()),
+        Value::Array(blocks) if blocks.len() <= MAX_TOOL_RESULT_CONTENT_BLOCKS => {
+            let mut output = String::new();
+            for block in blocks {
+                if block.get("type").and_then(Value::as_str) != Some("text") {
+                    return None;
+                }
+                let text = block.get("text").and_then(Value::as_str)?;
+                if output.len().saturating_add(text.len()) > MAX_TOOL_FAILURE_OUTPUT_BYTES {
+                    return None;
+                }
+                output.push_str(text);
+            }
+            Some(output)
+        }
+        _ => None,
+    }
+}
+
+/// Tool outcomes in one user record, in wire order. Blocks with a missing
+/// or blank tool_use_id cannot bind an invocation and are dropped here.
 pub(crate) fn user_tool_results(record: &Value) -> Vec<ToolResultBlock> {
     let Some(blocks) = record
         .get("message")
@@ -660,9 +690,13 @@ pub(crate) fn user_tool_results(record: &Value) -> Vec<ToolResultBlock> {
         .filter(|block| block.kind == "tool_result")
         .filter_map(|block| {
             let tool_use_id = block.tool_use_id.filter(|id| !id.trim().is_empty())?;
+            let failure_output = (block.is_error == Some(true))
+                .then(|| bounded_tool_result_text(block.content.as_ref()))
+                .flatten();
             Some(ToolResultBlock {
                 tool_use_id,
                 is_error: block.is_error,
+                failure_output,
             })
         })
         .collect()

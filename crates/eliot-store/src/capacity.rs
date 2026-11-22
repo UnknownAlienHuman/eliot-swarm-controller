@@ -138,6 +138,59 @@ pub struct RecordedProcess {
 }
 
 impl Store {
+    /// Reopen only a fully drained, previously idle native session. This
+    /// read and resume admission use the same serialized Store writer.
+    pub fn process_loss_resume_evidence(
+        &self,
+        agent: &str,
+        generation: i64,
+        event_seq: i64,
+    ) -> Result<bool> {
+        let agent = parse_agent_id(agent)?;
+        let eligible = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM events e JOIN agents a ON a.id = e.agent
+             WHERE e.seq = ?1 AND e.agent = ?2 AND e.generation = ?3
+               AND e.kind = 'agent.lost' AND json_extract(e.data, '$.reason') = ?4
+               AND json_extract(e.data, '$.previous_state') = 'idle'
+               AND a.generation = e.generation AND a.state = 'lost'
+               AND a.observe_only = 0 AND a.archived = 0 AND a.capacity_generation IS NULL
+               AND COALESCE(TRIM(a.native_scope), '') <> ''
+               AND COALESCE(TRIM(a.native_ref), '') <> ''
+               AND json_extract(a.profile_snapshot, '$._provider_probe') IS NOT 1
+               AND NOT EXISTS (
+                   SELECT 1 FROM commands c WHERE c.target = a.id
+                   AND (c.state IN ('accepted', 'queued', 'dispatched', 'unknown')
+                        OR (c.generation = e.generation AND c.verb = 'resume')
+                        OR (c.generation = e.generation AND c.verb = 'stop'
+                            AND c.state = 'cancelled'
+                            AND json_extract(c.outcome, '$.reason') = 'generation_lost'))
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM turns t WHERE t.agent = a.id
+                   AND t.state IN ('running', 'unknown')
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM pending_requests r WHERE r.agent = a.id
+                   AND (r.state = 'pending' OR (r.generation = e.generation AND r.state = 'stale'))
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM goal_markers g WHERE g.agent = a.id
+                   AND g.state IN ('running', 'unknown')
+               ))",
+                params![
+                    event_seq,
+                    agent,
+                    generation,
+                    core::PLUGIN_ROOT_EXITED_REASON
+                ],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(sql_error)?;
+        Ok(eligible && has_owned_exit_and_reader_drain_tx(&self.connection, agent, generation)?)
+    }
+
     /// Read the last automatic-resume refusal for the exact generation.
     pub fn restart_resume_blocked(&self, agent: &str, generation: i64) -> Result<Option<Value>> {
         let agent = parse_agent_id(agent)?;

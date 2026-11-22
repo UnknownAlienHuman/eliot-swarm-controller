@@ -14,6 +14,28 @@ pub(crate) struct ProviderProbeWork {
 }
 
 impl Router {
+    pub(crate) async fn notify_provider_attention(&self) -> Result<()> {
+        let notices = {
+            let mut store = self.inner.store.lock().await;
+            if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
+                return Ok(());
+            }
+            let notices =
+                store.admit_provider_attention_notices(now_ms(), &self.secret_policy_snapshot())?;
+            for notice in &notices {
+                self.publish_locked(&notice.events);
+            }
+            notices
+        };
+        if !notices.is_empty() {
+            for notice in &notices {
+                self.schedule_admission(notice);
+            }
+            self.signal_progress();
+        }
+        Ok(())
+    }
+
     /// Lift due known resets and admit at most `available` unknown-reset
     /// probes. Store admission claims the hold before launch dispatch can
     /// spawn a native process.

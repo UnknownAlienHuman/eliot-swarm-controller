@@ -3,6 +3,7 @@
 //! Durable L1 state for Agents, commands, native events, turns, and source acks.
 
 mod assignment;
+mod attention_steps;
 mod canonical;
 mod capacity;
 mod launch_queue;
@@ -175,6 +176,7 @@ macro_rules! db {
 }
 
 mod admission;
+mod attention_lookup;
 mod attribution;
 mod command_children;
 mod config_overlay;
@@ -704,7 +706,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
         let limits = self.hierarchy_limits;
-        let admission = if restart_idle_resume {
+        let mut admission = if restart_idle_resume {
             admission::submit_restart_resume_tx(
                 &tx,
                 request,
@@ -724,6 +726,30 @@ impl Store {
                 self.capacity_policy.as_deref(),
             )?
         };
+        if restart_idle_resume
+            && admission.is_new
+            && let (Some(agent), Some(generation)) = (
+                admission.command.target.as_deref(),
+                admission.command.generation,
+            )
+        {
+            let step = core::AttentionStep {
+                incident_id: format!("restart-{agent}-{generation}"),
+                step: "resume_after_restart".to_owned(),
+                outcome: "unknown".to_owned(),
+                command_id: Some(admission.command.id.clone()),
+                turn_id: None,
+            };
+            admission
+                .events
+                .push(attention_steps::insert_attention_step(
+                    &tx,
+                    parse_agent_id(agent)?,
+                    generation,
+                    &step,
+                    now,
+                )?);
+        }
         commit_transaction(tx, &self.write_faulted)?;
         Ok(admission)
     }
@@ -5459,7 +5485,7 @@ fn send_gate_open(connection: &Connection, agent_num: i64, generation: i64) -> R
                  SELECT 1 FROM commands
                  WHERE target = ?1 AND generation = ?2
                    AND state IN ('dispatched', 'unknown')
-                   AND (verb = 'stop' OR (verb = 'send' AND turn_id IS NULL))
+                   AND (verb IN ('stop','compact') OR (verb = 'send' AND turn_id IS NULL))
              )",
             params![agent_num, generation],
             |row| row.get(0),

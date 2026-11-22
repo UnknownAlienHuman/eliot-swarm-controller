@@ -709,7 +709,15 @@ impl Router {
     ) -> Option<Result<(Agent, PendingCommand)>> {
         if !matches!(
             command.verb.as_str(),
-            "send" | "steer" | "interrupt" | "approve" | "deny" | "answer" | "inject" | "configure"
+            "send"
+                | "steer"
+                | "interrupt"
+                | "approve"
+                | "deny"
+                | "answer"
+                | "inject"
+                | "configure"
+                | "compact"
         ) {
             return None;
         }
@@ -824,6 +832,24 @@ impl Router {
                     self.execute_native_configure_command(&id, &agent, response)
                         .await;
                     true
+                }
+                "compact" => {
+                    let response = response.and_then(|value| {
+                        if value["state"] == "applied"
+                            && (value["command_id"].as_str() != Some(id.as_str())
+                                || value["compaction"]["completed"] != true
+                                || value["compaction"]["receipt_id"]
+                                    .as_str()
+                                    .is_none_or(|receipt| receipt.trim().is_empty()))
+                        {
+                            return Err(Error::new(
+                                "unknown",
+                                "native compaction completion is unconfirmed",
+                            ));
+                        }
+                        Ok(value)
+                    });
+                    self.execute_control_command(&id, &agent, response).await
                 }
                 _ => self.execute_control_command(&id, &agent, response).await,
             };

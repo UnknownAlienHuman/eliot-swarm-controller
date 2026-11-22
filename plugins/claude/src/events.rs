@@ -14,9 +14,9 @@ use eliot_plugin::{
     native_stdio::StreamState,
     protocol::{HookEvent, HookResponse},
     session::{
-        EVENT_DEADLINE, StreamSource, approval_reply_args, attach_final_text, is_blank_native_text,
-        native_no_write, next_input_outcomes, rejected_control, request_event_id,
-        request_reply_applied, unknown_control, with_claimed_context,
+        EVENT_DEADLINE, StreamSource, approval_reply_args, attach_final_text, attach_native_error,
+        is_blank_native_text, native_no_write, next_input_outcomes, rejected_control,
+        request_event_id, request_reply_applied, unknown_control, with_claimed_context,
     },
 };
 use serde::Serialize;
@@ -1647,10 +1647,11 @@ impl EventProcessor {
                 "tool": tool_use.name,
             });
             if let Some(command) = &tool_use.command {
-                data["command"] = Value::String(
-                    SecretPolicy::new(self.secrets.iter().cloned())
-                        .redact_bounded(command, MAX_TOOL_COMMAND_BYTES),
-                );
+                let policy = SecretPolicy::new(self.secrets.iter().cloned());
+                let redacted = policy.redact_text(command);
+                data["command_truncated"] = json!(redacted.len() > MAX_TOOL_COMMAND_BYTES);
+                data["command"] =
+                    Value::String(policy.redact_bounded(&redacted, MAX_TOOL_COMMAND_BYTES));
             }
             if serde_json::to_vec(&data).map_or(true, |bytes| bytes.len() > MAX_EVENT_BYTES) {
                 return self
@@ -1717,13 +1718,20 @@ impl EventProcessor {
             if !self.tools_completed.insert(result.tool_use_id.clone()) {
                 continue;
             }
-            let data = json!({
+            let mut data = json!({
                 "command_id": command_id,
                 "turn_id": turn_id,
                 "item_id": result.tool_use_id,
                 "tool": tool,
                 "status": tool_result_status(result.is_error),
             });
+            if result.is_error == Some(true) {
+                attach_native_error(
+                    &mut data,
+                    result.failure_output.as_deref(),
+                    &SecretPolicy::new(self.secrets.iter().cloned()),
+                );
+            }
             if serde_json::to_vec(&data).map_or(true, |bytes| bytes.len() > MAX_EVENT_BYTES) {
                 return self
                     .record_gap("Claude tool completion exceeded the persisted-event bound")

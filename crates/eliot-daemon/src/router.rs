@@ -16,6 +16,7 @@ mod handoff;
 mod hierarchy;
 mod inference;
 pub(crate) mod launch_queue;
+mod loss_recovery;
 mod organization;
 mod overview;
 mod patch_digest;
@@ -25,9 +26,11 @@ mod repeat_failures;
 mod resolution;
 mod routing;
 mod rules;
+mod session_growth;
 mod sources;
 mod status;
 mod switch;
+mod tool_incident;
 
 pub(crate) use attention::run_attention;
 use auth::{authorize_command, authorize_rpc_method};
@@ -35,6 +38,7 @@ pub(crate) use coordination::run_mail_reoffer;
 pub(crate) use digests::run_completion_digest;
 use eliot_core::{is_attachment_verb, is_start_verb, is_user_event_verb};
 pub(crate) use goals::{real_goal_check, run_goal_driver};
+pub(crate) use tool_incident::run_tool_failure_attention;
 
 use crate::{
     automation::RuleDefinition,
@@ -133,6 +137,7 @@ struct RouterInner {
     store: StoreHandle,
     bus: Bus,
     mail: crate::config::MailConfig,
+    attention: crate::config::AttentionConfig,
     owner_token: String,
     secrets: SecretSet,
     agent_credentials: AgentCredentials,
@@ -346,14 +351,14 @@ struct UnknownMarks {
 }
 
 impl Router {
-    /// Build a Router with owner `[mail]` limits loaded once by the caller
-    /// (daemon startup), instead of re-reading the config file per send.
-    pub(crate) fn new_with_mail_config(
+    /// Build the Router with the Owner settings captured at daemon startup.
+    pub(crate) fn new(
         data_root: std::path::PathBuf,
         owner_token: String,
         store: StoreHandle,
         bus: Bus,
         mail: crate::config::MailConfig,
+        attention: crate::config::AttentionConfig,
     ) -> Self {
         let secrets: SecretSet = Arc::new(Mutex::new(HashSet::from([owner_token.clone()])));
         let agent_credentials: AgentCredentials = Arc::new(Mutex::new(Default::default()));
@@ -388,6 +393,7 @@ impl Router {
                 store,
                 bus,
                 mail,
+                attention,
                 owner_token,
                 secrets,
                 agent_credentials,
@@ -728,6 +734,10 @@ impl Router {
         });
     }
 
+    pub(crate) fn attention_config(&self) -> crate::config::AttentionConfig {
+        self.inner.attention
+    }
+
     pub(crate) fn monitoring(&self) -> Monitoring {
         self.inner.monitoring.clone()
     }
@@ -909,7 +919,7 @@ impl Router {
     /// are derived durably by Store, so this can run after the initial custody
     /// pass and again after a later recheck without replaying old input.
     pub(crate) async fn recover_restart_idle_agents(&self, on_restart: OnRestart) -> Result<usize> {
-        if on_restart == OnRestart::Hold {
+        if on_restart == OnRestart::Hold || !self.inner.attention.agent_lost.enabled {
             return Ok(0);
         }
         let mut after: Option<String> = None;
@@ -1555,10 +1565,13 @@ impl Router {
             ));
         }
         let (kind, _) = user_event_kind_data(&request.verb, &request.args)?;
-        if kind == ATTENTION_USER_EVENT_KIND {
+        if matches!(
+            kind.as_str(),
+            ATTENTION_USER_EVENT_KIND | eliot_core::ATTENTION_STEP_KIND
+        ) {
             return Err(Error::new(
                 "invalid",
-                "agent.attention is reserved for the internal attention producer",
+                "monitoring topics are reserved for the internal attention producer",
             ));
         }
         Ok(())
@@ -6156,6 +6169,20 @@ fn command_needs_worker(command: &Command) -> bool {
     command.verb != "inject"
         || serde_json::from_value::<eliot_core::InjectArgs>(command.args.clone())
             .is_ok_and(|args| args.point == eliot_core::InjectPoint::ActiveTurn)
+}
+
+fn attention_inject_point(agent: &Agent) -> Option<eliot_core::InjectPoint> {
+    let points = agent
+        .effective
+        .as_ref()?
+        .get("context_points")?
+        .as_array()?;
+    [
+        ("turn_safe_point", eliot_core::InjectPoint::TurnSafePoint),
+        ("active_turn", eliot_core::InjectPoint::ActiveTurn),
+    ]
+    .into_iter()
+    .find_map(|(name, point)| points.iter().any(|value| value == name).then_some(point))
 }
 
 fn rule_admission_dispatch_plan(

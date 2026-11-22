@@ -76,6 +76,7 @@ impl Router {
                 target: target.to_owned(),
                 summary: summary_for(target, &steps, "admission"),
                 steps,
+                attention_steps: Vec::new(),
                 preceded_by: None,
                 previous_crash: None,
             });
@@ -112,6 +113,7 @@ impl Router {
             steps.push(command_step(linked));
         }
         let mut preceded_by = None;
+        let mut attention_steps = Vec::new();
         if let (Some(agent), Some(generation)) = (command.target.as_deref(), command.generation)
             && let Ok(turns) = store.list_turns(agent, generation, 32)
         {
@@ -138,6 +140,7 @@ impl Router {
                 if !settled_here {
                     continue;
                 }
+                attention_steps = store.recent_attention_steps(agent, Some(&turn.turn_id))?;
                 if preceded_by.is_none() {
                     preceded_by = turn.preceded_by.clone();
                 }
@@ -156,6 +159,7 @@ impl Router {
             target: target.to_owned(),
             summary: summary_for(target, &steps, "command"),
             steps: bounded_steps(steps),
+            attention_steps,
             preceded_by,
             previous_crash: crash_if_unexplained(&origin, previous_crash),
         })
@@ -190,12 +194,14 @@ impl Router {
                 .as_ref(),
         ));
         steps.extend(loss_steps(&store, agent, generation)?);
+        let attention_steps = store.recent_attention_steps(agent, Some(turn_id))?;
         drop(store);
         let origin = chain_origin(&steps);
         Ok(DiagnoseResponse {
             target: target.to_owned(),
             summary: summary_for(target, &steps, "turn"),
             steps: bounded_steps(steps),
+            attention_steps,
             preceded_by,
             previous_crash: crash_if_unexplained(&origin, previous_crash),
         })
@@ -362,6 +368,7 @@ impl Router {
             }
         }
         steps.extend(loss_steps(&store, agent, generation)?);
+        let attention_steps = store.recent_attention_steps(agent, None)?;
         drop(store);
         let origin = chain_origin(&steps);
         Ok(DiagnoseResponse {
@@ -373,6 +380,7 @@ impl Router {
                 crash_if_unexplained(&origin, previous_crash)
             },
             steps: bounded_steps(steps),
+            attention_steps,
             preceded_by,
         })
     }

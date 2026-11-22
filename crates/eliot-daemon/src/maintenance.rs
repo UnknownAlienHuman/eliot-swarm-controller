@@ -32,6 +32,7 @@ pub(crate) async fn run(
 ) -> Result<()> {
     router.recover_ended_provider_probes(&shutdown).await?;
     reporter.running("maintenance");
+    let reactions_enabled = initial.attention.provider_refusal.enabled;
     tokio::try_join!(
         run_retention(
             store,
@@ -40,7 +41,7 @@ pub(crate) async fn run(
             initial,
             shutdown.clone()
         ),
-        run_provider_maintenance(router, policy, shutdown),
+        run_provider_maintenance(router, policy, shutdown, reactions_enabled),
     )?;
     Ok(())
 }
@@ -49,6 +50,7 @@ async fn run_provider_maintenance(
     router: crate::router::Router,
     policy: Arc<SecretPolicy>,
     mut shutdown: watch::Receiver<bool>,
+    reactions_enabled: bool,
 ) -> Result<()> {
     let mut provider_ticker = tokio::time::interval(PROVIDER_HOLD_INTERVAL);
     provider_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -58,6 +60,7 @@ async fn run_provider_maintenance(
             _ = provider_ticker.tick() => {
                 let available = eliot_store::PROVIDER_PROBE_BATCH_LIMIT
                     .saturating_sub(provider_probe_tasks.len());
+                let available = if reactions_enabled { available } else { 0 };
                 match router.maintain_provider_holds(available).await {
                     Ok(work) => {
                         for work in work {
@@ -71,6 +74,11 @@ async fn run_provider_maintenance(
                     Err(error) => {
                         logging::record(&policy, "daemon.provider_hold_maintenance_failed", &[], Some(&error));
                     }
+                }
+                if reactions_enabled
+                    && let Err(error) = router.notify_provider_attention().await
+                {
+                    logging::record(&policy, "daemon.provider_notice_failed", &[], Some(&error));
                 }
                 continue;
             }

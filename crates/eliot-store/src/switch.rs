@@ -60,6 +60,41 @@ fn decode_switch(mut args: Value) -> Result<(SwitchRequest, Option<ProviderSwitc
     ))
 }
 
+pub(super) fn reserve_rule_switch_tx(
+    tx: &Transaction<'_>,
+    principal: &str,
+    request: &SwitchRequest,
+    limits: core::api::HierarchyLimits,
+    policy: &core::SecretPolicy,
+    now: i64,
+) -> Result<Change<SwitchResponse>> {
+    owner(principal)?;
+    request.validate()?;
+    let args = serde_json::to_value(request)
+        .map_err(|_| Error::new("internal", "cannot encode rule switch"))?;
+    let digest = canonical::digest(&args)?;
+    if policy.contains_value(&args) {
+        return Err(Error::new(
+            "secret_in_payload",
+            "switch contains a known secret",
+        ));
+    }
+    if encode_json(&args)?.len() > MAX_EVENT_BYTES {
+        return Err(Error::new(
+            "frame_too_large",
+            "switch exceeds command budget",
+        ));
+    }
+    if let Err(error) = source_tx(tx, request, limits, policy) {
+        return if error.code == "busy" {
+            Err(Error::new("bad_state", *error.message))
+        } else {
+            Err(error)
+        };
+    }
+    reserve_switch_tx(tx, request, args, &digest, now)
+}
+
 fn reserve_switch_tx(
     tx: &Transaction<'_>,
     request: &SwitchRequest,
@@ -324,6 +359,17 @@ impl Store {
                     events: Vec::new(),
                 });
             }
+            let mut events = Vec::new();
+            if !matches!(
+                rules::gate_rule_action_dispatch_tx(&tx, id, now, &mut events)?,
+                rules::RuleActionDispatchGate::Ready
+            ) {
+                commit_transaction(tx, &self.write_faulted)?;
+                return Ok(Change {
+                    value: None,
+                    events,
+                });
+            }
             let value = stored_result(&command.outcome)?;
             let (request, provider_failure) = decode_switch(command.args)?;
             update_command_state(
@@ -334,7 +380,7 @@ impl Store {
                 None,
                 now,
             )?;
-            let event = insert_daemon_command_event(
+            events.push(insert_daemon_command_event(
                 &tx,
                 now,
                 "command.dispatched",
@@ -342,7 +388,7 @@ impl Store {
                 None,
                 id,
                 json!({"component":"switch_orchestration"}),
-            )?;
+            )?);
             commit_transaction(tx, &self.write_faulted)?;
             Ok(Change {
                 value: Some(SwitchWork {
@@ -350,7 +396,7 @@ impl Store {
                     plan: value,
                     provider_failure,
                 }),
-                events: vec![event],
+                events,
             })
         })();
         self.fault_on_persistence_error(&result);

@@ -370,11 +370,26 @@ name, executable, environment, credential or authority. For event-triggered `sto
 `expected_generation` must exactly match the captured `Event.agent` and `Event.generation`;
 an absent or different binding is rejected before action-child admission. Event-rule
 `interrupt` and `steer` must also bind `expected_turn_id` to that event's nonempty string
-`data.turn_id`. Store revalidates that exact turn at admission and at the dispatch effect
+`data.turn_id`. An `x.user.agent.attention` report with an active turn supplies that
+field directly. Store revalidates that exact turn at admission and at the dispatch effect
 boundary; a historical or queued action whose turn is no longer active is refused without
 retargeting current work. SEND and STEER text is rendered once and frozen from that captured
 event, with no later Agent-row lookup to fill or retarget the command. An unresolved
 placeholder fails admission.
+
+```toml
+[[rule]]
+id = "ask-about-stall"
+on = { event = "x.user.agent.attention", match = { "event.data.data.reason" = "no_progress", "event.data.data.phase" = "incident", "event.data.turn_id" = { exists = true } } }
+do = [{ action = "steer", target = "${event.agent}", expected_generation = "${event.generation}", expected_turn_id = "${event.data.turn_id}", text = "What are you waiting for?" }]
+```
+
+Owner event rules can request native `compact` on the captured generation of an
+idle Codex or OpenCode Agent. The adapter proves native completion before
+the command settles Applied. Switch actions bind the source generation and
+the retained task of the captured turn, then use the ordinary switch and handoff
+worker. A provider probe uses the ordinary `send` action with `probe = true`
+and the exact held Agent. It shares the existing hold claim and settlement.
 
 `approve`, `deny` and `answer` are event-only request replies and require
 `on.event = "request.opened"`. Each binds `expected_turn_id` to the captured event's
@@ -716,13 +731,13 @@ do = [{ action = "inject", target = "${event.agent}", at = "turn_safe_point", te
 
 `target` renders from the captured event and must equal `event.agent`;
 `expected_generation` binds the captured event's generation. For
-`at = "turn_safe_point"` the rule also binds `expected_turn_id` to the captured
+`at = "turn_safe_point"` and `at = "active_turn"` the rule also binds `expected_turn_id` to the captured
 event's nonempty `data.turn_id`. Store enforces these bindings and the live Agent
 generation at admission. For `at = "next_input"` the command carries no turn
 binding and is claimed by the next send in that generation.
-`at` is a literal `turn_safe_point` or `next_input` (no templates; `active_turn` is not
-a rule action). `text` renders once from the captured event and is frozen under the
-512 KiB text bound. Store revalidates the exact Agent and (for safe-point) turn
+`at` is a literal `turn_safe_point`, `active_turn`, or `next_input`.
+`text` renders once from the captured event and is frozen under the
+512 KiB text bound. Store revalidates the exact Agent and the bound turn
 at admission and at the dispatch effect boundary; adapters whose effective
 `context_points` lack the requested point return their typed `unsupported`, never a
 weaker send. `inject` requires an event trigger and is unsupported for timers.
@@ -845,7 +860,7 @@ hidden wait/acceptance state to the router.
 | `launch` | targetless ordinary launch command at generation 0; optional nonblank text creates the normal linked `send` |
 | `mail.send` | targetless ordinary command; Store atomically commits one scoped queued-mail fanout with its Applied outcome |
 | `var.set` | targetless ordinary command; Store atomically commits one versioned variable write with its Applied outcome |
-| `inject` | Agent-bound ordinary command through the existing `inject` verb; durable pending context claimed at `turn_safe_point` or `next_input` with exact event turn binding; unsupported points return typed `unsupported`, never a weaker send |
+| `inject` | Exact-turn context at `turn_safe_point` or `active_turn`, or generation-bound context at `next_input`. The native capability determines whether the requested point is available. |
 | `run` | targetless `SubmitCommand` via Router; bounded child under saved authority; emitted commands become ordered children |
 | `notify` | targetless ordinary command; Store atomically commits one persisted `x.user.notify` event with its Applied outcome (local log only) |
 | `emit` | targetless ordinary command; Store atomically commits one persisted `x.user.<topic>` event with its Applied outcome (local log only) |

@@ -1821,6 +1821,7 @@ impl CrashMarker {
 /// marker if relevant; and a one-line plain-language summary that starts
 /// with the failure origin.
 pub const MAX_DIAGNOSE_STEPS: usize = 16;
+pub const MAX_DIAGNOSE_ATTENTION_STEPS: usize = 32;
 pub const MAX_DIAGNOSE_SUMMARY_CHARS: usize = 512;
 pub const MAX_DIAGNOSE_MESSAGE_CHARS: usize = 1024;
 
@@ -1917,10 +1918,19 @@ pub struct DiagnoseResponse {
     pub target: String,
     pub summary: String,
     pub steps: Vec<DiagnoseStep>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attention_steps: Vec<AttentionStepReadback>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preceded_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_crash: Option<CrashMarker>,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttentionStepReadback {
+    pub generation: i64,
+    pub at: i64,
+    pub reaction: crate::AttentionStep,
 }
 
 impl DiagnoseResponse {
@@ -1931,6 +1941,11 @@ impl DiagnoseResponse {
             || self.summary.trim().is_empty()
             || self.steps.len() > MAX_DIAGNOSE_STEPS
             || self.steps.iter().any(|step| step.validate().is_err())
+            || self.attention_steps.len() > MAX_DIAGNOSE_ATTENTION_STEPS
+            || self
+                .attention_steps
+                .iter()
+                .any(|step| step.generation < 1 || step.at < 0 || !step.reaction.is_bounded())
             || self
                 .preceded_by
                 .as_deref()

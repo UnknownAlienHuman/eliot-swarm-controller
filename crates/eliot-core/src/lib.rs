@@ -63,15 +63,16 @@ pub use native_child::{
 };
 pub use native_store::NativeStoreBinding;
 pub use observe::{
-    ACTIVITY_HEAVY_KIND, BUILD_WORKER_PROGRAMS, CATEGORY_SOURCE_CMDLINE, CATEGORY_SOURCE_IMAGE,
-    CONSOLE_HOST_PROGRAMS, DEFAULT_HEAVY_CPU_SECS, DEFAULT_HEAVY_RSS_BYTES,
-    DEFAULT_HEAVY_WALL_SECS, DEFAULT_SESSION_FILE_BYTES, DEFAULT_SESSION_GROWTH_RATIO,
-    HARNESS_DRIFT_KIND, HarnessDrift, HeavyEpisode, HeavyThresholds, OBSERVE_LEVEL_DEBUG,
-    OBSERVE_LEVEL_STANDARD, SESSION_GROWTH_KIND, SHELL_WRAPPER_PROGRAMS, SessionGrowth,
-    SessionGrowthBasis, SessionGrowthThresholds, VERIFIED_HARNESSES, VerifiedHarness,
-    check_harness_drift, classify_heavy_command, compact_hint_for_harness, evaluate_session_growth,
-    merge_heavy_episodes, normalize_harness_version, resolve_heavy_category, split_unix_cmdline,
-    split_windows_command_line, unwrap_shell_command, verified_harness,
+    ACTIVITY_HEAVY_KIND, ATTENTION_STEP_KIND, AttentionStep, BUILD_WORKER_PROGRAMS,
+    CATEGORY_SOURCE_CMDLINE, CATEGORY_SOURCE_IMAGE, CONSOLE_HOST_PROGRAMS, DEFAULT_HEAVY_CPU_SECS,
+    DEFAULT_HEAVY_RSS_BYTES, DEFAULT_HEAVY_WALL_SECS, DEFAULT_SESSION_FILE_BYTES,
+    DEFAULT_SESSION_GROWTH_RATIO, HARNESS_DRIFT_KIND, HarnessDrift, HeavyEpisode, HeavyThresholds,
+    OBSERVE_LEVEL_DEBUG, OBSERVE_LEVEL_STANDARD, SESSION_GROWTH_KIND, SHELL_WRAPPER_PROGRAMS,
+    SessionGrowth, SessionGrowthBasis, SessionGrowthThresholds, VERIFIED_HARNESSES,
+    VerifiedHarness, check_harness_drift, classify_heavy_command, compact_hint_for_harness,
+    evaluate_session_growth, merge_heavy_episodes, normalize_harness_version,
+    resolve_heavy_category, split_unix_cmdline, split_windows_command_line, unwrap_shell_command,
+    verified_harness,
 };
 pub use presentation::{count_words, origin_words, reason_message, reason_words};
 pub use remote_call::{RemoteCallContext, RemoteIdentity};
