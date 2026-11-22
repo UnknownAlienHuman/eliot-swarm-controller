@@ -406,26 +406,28 @@ async fn completion_capture(
     let Some(host) = state.upgrade() else {
         return (None, None);
     };
-    let (agent, registered) = match store.try_lock() {
-        Ok(store) => {
-            let agent = store
-                .get_agent(&batch.agent_id)
-                .ok()
-                .flatten()
-                .filter(|agent| agent.generation == batch.generation);
-            let registered = agent.as_ref().and_then(|agent| {
-                if agent.project.is_empty() {
-                    Some(false)
-                } else {
-                    store
-                        .get_project_registration("owner", &agent.project)
-                        .ok()
-                        .map(|registration| registration.is_some())
-                }
-            });
-            (agent, registered)
-        }
-        Err(_) => (None, None),
+    // Both lookups and Git capture leave the native lifecycle commit its own budget.
+    let capture_until = until - RPC_GRACE;
+    let (agent, registered) = {
+        let Ok(store) = timeout_at(capture_until, store.lock()).await else {
+            return (None, None);
+        };
+        let agent = store
+            .get_agent(&batch.agent_id)
+            .ok()
+            .flatten()
+            .filter(|agent| agent.generation == batch.generation);
+        let registered = agent.as_ref().and_then(|agent| {
+            if agent.project.is_empty() {
+                Some(false)
+            } else {
+                store
+                    .get_project_registration("owner", &agent.project)
+                    .ok()
+                    .map(|registration| registration.is_some())
+            }
+        });
+        (agent, registered)
     };
     let Some(agent) = agent else {
         return (None, None);
@@ -469,9 +471,8 @@ async fn completion_capture(
             agent.base_oid.as_deref(),
         ) {
             (Ok(probe), Some(workspace), Some(base_oid)) => {
-                // Leave the authoritative lifecycle commit its own writer budget.
                 match timeout_at(
-                    until - RPC_GRACE,
+                    capture_until,
                     probe.capture_worktree(workspace, base_oid, now_ms()),
                 )
                 .await
