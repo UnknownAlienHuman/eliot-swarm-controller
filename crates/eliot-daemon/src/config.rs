@@ -2177,10 +2177,12 @@ fn insert_profile_tail(
         Value::Array(tail.pass_env.into_iter().map(Value::String).collect()),
     );
     snapshot.insert("scratch".to_owned(), json!(tail.scratch));
-    snapshot.insert(
-        "pass_agent_identity_to_shell".to_owned(),
-        Value::Bool(tail.pass_agent_identity_to_shell),
-    );
+    if !tail.pass_agent_identity_to_shell {
+        snapshot.insert(
+            "pass_agent_identity_to_shell".to_owned(),
+            Value::Bool(false),
+        );
+    }
     if !setup.is_empty() {
         snapshot.insert(
             "setup".to_owned(),

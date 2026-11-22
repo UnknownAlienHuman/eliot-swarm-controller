@@ -708,11 +708,11 @@ attachment. Eliot therefore does not claim a guard for Codex profiles with
 approval_policy set to never, which do not emit permission requests.
 
 The installed app-server accepts thread config overlays. Official configuration
-documentation defines shell_environment_policy.filters for variables passed to
-spawned commands. When pass_agent_identity_to_shell is false, Eliot excludes
-ELIOT_AGENT_TOKEN from thread shell commands while keeping the nonsecret managed identity
-markers, which make a shell CLI reject as incomplete instead of falling back to Owner
-authority. Its managed MCP server retains the explicitly named Agent env_vars. Live shell filtering remains subject to private-daemon
+documentation defines `shell_environment_policy.filters` for variables passed to
+spawned commands. When `pass_agent_identity_to_shell` is false, Eliot excludes the
+Agent identity variables and keeps a marker that prevents shell CLI calls from
+using Owner authority. Its managed MCP server retains the explicitly named Agent
+`env_vars`. Live shell filtering remains subject to private-daemon
 qualification.
 
 ## Access levels (`--access ask|auto|full`)

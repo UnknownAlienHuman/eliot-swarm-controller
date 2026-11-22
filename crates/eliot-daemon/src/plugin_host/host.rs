@@ -3189,7 +3189,6 @@ fn build_target_environment(
     let home = data_root
         .to_str()
         .ok_or_else(|| Error::new("invalid", "data directory path is not UTF-8"))?;
-    insert_environment(&mut environment, "ELIOT_HOME", home.to_owned());
     insert_environment(&mut mcp_environment, "ELIOT_HOME", home.to_owned());
     let scope_dir = crate::daemon::normalize_identity_data_dir(data_root);
     let scope_dir = scope_dir
@@ -3216,27 +3215,16 @@ fn build_target_environment(
         .get("pass_agent_identity_to_shell")
         .and_then(Value::as_bool)
         .unwrap_or(true);
-    // Keep the nonsecret identity markers so a shell CLI with a withheld token
-    // fails as an incomplete Agent instead of falling back to Owner authority.
-    insert_environment(
-        &mut environment,
-        crate::daemon::AGENT_DATA_DIR_ENV,
-        scope_dir.to_owned(),
-    );
-    insert_environment(&mut environment, "ELIOT_AGENT_ID", agent.id.clone());
-    insert_environment(
-        &mut environment,
-        "ELIOT_AGENT_GENERATION",
-        agent.generation.to_string(),
-    );
-    // Codex needs the token in its app-server process for its named MCP
-    // server. Its per-thread shell_environment_policy removes the token from
-    // spawned shell commands; other harnesses receive it only in MCP config.
+    // Codex's app-server supplies its MCP identity from named environment
+    // variables and filters those variables from its shell tools.
     if pass_identity || agent.harness == "codex" {
+        environment.extend(mcp_environment.clone());
+    }
+    if !pass_identity {
         insert_environment(
             &mut environment,
-            "ELIOT_AGENT_TOKEN",
-            agent_token.to_owned(),
+            crate::daemon::SHELL_IDENTITY_DISABLED_ENV,
+            "1".to_owned(),
         );
     }
     let executable = std::env::current_exe()

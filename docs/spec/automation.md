@@ -1380,26 +1380,24 @@ transient command string to the exact native request.opened; the daemon strips t
 context before persistence, adds the matching refusal text to approval details, and
 returns a refusal bound to the source Agent generation, request id and turn id in the
 event acknowledgement. That acknowledgement follows the committed request event.
-The plugin then issues one native denial. Store admission rejects approve for a request
-that carries guard_refusal, including after an uncertain native write. Uncertain writes
-are never replayed.
+Store admission rejects `approve` for a guarded request. A refreshed native offer
+retains the refusal for the same request. Each native denial is attempted once.
 
-The current text-bearing surfaces are Claude can_use_tool for Bash and OpenCode 2.2.7
-permission.asked for bash. OpenCode's native reject closes every pending permission
+Claude `can_use_tool` and OpenCode 2.2.7 `permission.asked` carry the refusal text
+in their native reply. OpenCode's native reject closes every pending permission
 for the session, so the adapter reads back the pending list and auto-rejects only when
 the guarded ask is the sole pending permission. If readback fails or a sibling permission
 exists, the guarded request remains pending with its refusal and cannot be approved.
 The native API has no atomic single-request reject; this does not claim exact behavior
 for a sibling permission created after readback but before the session-wide reject.
 
-The guard does not inspect commands outside the exact permission request supplied by a
-supported translator. Codex 0.167.1 exposes execpolicy check --rules as a standalone
-evaluator, but no verified app-server per-session rule attachment; approval_policy
-never emits no permission callback. Codex approval responses carry only a decision,
-Antigravity ACP replies select an offered option without refusal text, and Muse separates
-its request acknowledgement from approval/decide. Those paths do not claim this
-text-bearing guard. This remains a static permission table, not an on.hook rule trigger
-or hook.decide action.
+Codex, Muse and Antigravity attach command text when the permission request supplies it.
+The daemon sends a generation- and turn-bound `deny` through the existing
+native reply path and delivers the refusal text through the turn's context delivery.
+An ambiguous Muse refusal offer stays pending with the recorded guard text.
+Codex 0.167.1 provides the standalone `execpolicy check --rules` evaluator. Its
+app-server has no verified per-session rule attachment for `approval_policy = "never"`.
+The existing prohibition on `on.hook` and `hook.decide` applies.
 
 ## Goal loop
 

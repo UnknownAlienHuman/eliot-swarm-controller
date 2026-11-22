@@ -1365,6 +1365,14 @@ async fn run_global_rules_inner(
             received = events.recv() => match received {
                 Ok(event) => {
                     router.note_unknown(std::slice::from_ref(&event));
+                    if let Err(error) = router.deliver_project_guard(&event).await {
+                        logging::record(
+                            &router.secret_policy_snapshot(),
+                            "daemon.project_guard_delivery_failed",
+                            &[("event_seq", &event.seq.to_string())],
+                            Some(&error),
+                        );
+                    }
                     recover_rule_children = true;
                     if event_wakes_launch_arbitration(&event) {
                         arbitrate_launches = true;

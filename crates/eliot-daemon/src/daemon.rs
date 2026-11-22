@@ -118,6 +118,7 @@ pub fn compact_store_offline(
         .chain(&RUN_IDENTITY_ENV)
         .any(|name| std::env::var_os(name).is_some())
         || std::env::var_os(AGENT_DATA_DIR_ENV).is_some()
+        || std::env::var_os(SHELL_IDENTITY_DISABLED_ENV).is_some()
     {
         return Err(Error::new(
             "not_allowed",
@@ -2200,6 +2201,7 @@ const AGENT_IDENTITY_ENV: [&str; 3] = [
 /// Issuing data directory of the inherited Agent identity, normalized by the
 /// spawning daemon (see [`normalize_identity_data_dir`]).
 pub(crate) const AGENT_DATA_DIR_ENV: &str = "ELIOT_AGENT_DATA_DIR";
+pub(crate) const SHELL_IDENTITY_DISABLED_ENV: &str = "ELIOT_SHELL_IDENTITY_DISABLED";
 const RUN_IDENTITY_ENV: [&str; 2] = ["ELIOT_RUN_COMMAND_ID", "ELIOT_RUN_TOKEN"];
 const OWNER_IDENTITY_ENV: [&str; 3] = [
     "ELIOT_OWNER_ID",
@@ -2259,13 +2261,22 @@ pub(crate) fn identity_data_dirs_equal(left: &Path, right: &Path) -> bool {
 }
 
 fn caller_identity_for_target(target: &Path) -> Result<ClientIdentity> {
-    caller_identity_from(
+    let identity = caller_identity_from(
         target,
         AGENT_IDENTITY_ENV.map(std::env::var_os),
         std::env::var_os(AGENT_DATA_DIR_ENV),
         RUN_IDENTITY_ENV.map(std::env::var_os),
         OWNER_IDENTITY_ENV.map(std::env::var_os),
-    )
+    )?;
+    if matches!(identity, ClientIdentity::Owner)
+        && std::env::var_os(SHELL_IDENTITY_DISABLED_ENV).is_some()
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "this Agent shell has no scoped identity; use its managed Swarm MCP connection",
+        ));
+    }
+    Ok(identity)
 }
 
 /// Whether the effective inherited identity for `target` is the local Owner.

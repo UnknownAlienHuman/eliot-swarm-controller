@@ -168,6 +168,10 @@ impl NativeThreadConfigOverrides {
         let shell_environment_policy = (!pass_agent_identity_to_shell).then(|| {
             serde_json::json!({
                 "filters": {
+                    "ELIOT_HOME": "exclude",
+                    "ELIOT_AGENT_DATA_DIR": "exclude",
+                    "ELIOT_AGENT_ID": "exclude",
+                    "ELIOT_AGENT_GENERATION": "exclude",
                     "ELIOT_AGENT_TOKEN": "exclude"
                 }
             })

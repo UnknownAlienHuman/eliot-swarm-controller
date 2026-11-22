@@ -492,6 +492,13 @@ fn apply_command_guard(
     policy: &CommandGuardPolicy,
     credentials: &[String],
 ) -> Result<Option<PermissionRefusal>> {
+    for event in &mut batch.events {
+        if event.kind == "request.opened"
+            && let Some(details) = event.data.get_mut("details").and_then(Value::as_object_mut)
+        {
+            details.remove("guard_refusal");
+        }
+    }
     if !batch
         .events
         .iter()
@@ -507,17 +514,15 @@ fn apply_command_guard(
     }
     let mut refusal = None;
     for event in &mut batch.events {
-        if event.kind == "request.opened"
-            && let Some(details) = event.data.get_mut("details").and_then(Value::as_object_mut)
-        {
-            details.remove("guard_refusal");
-        }
         let Some(data) = event.data.as_object_mut() else {
             continue;
         };
         let Some(raw_guard) = data.remove(REQUEST_FIELD) else {
             continue;
         };
+        if policy.is_empty() {
+            continue;
+        }
         if event.kind != "request.opened" {
             return Err(Error::new(
                 "not_allowed",

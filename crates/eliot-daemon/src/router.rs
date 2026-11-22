@@ -1289,6 +1289,91 @@ impl Router {
         });
     }
 
+    /// Route a committed refusal for native requests whose reply cannot carry
+    /// text. The synchronous request intake already holds the tool and blocks
+    /// approval. Only this live receipt drives the ordinary deny and context.
+    pub(crate) async fn deliver_project_guard(&self, event: &Event) -> Result<()> {
+        use eliot_core::{
+            InjectArgs, InjectPoint,
+            requests::{ApprovalArgs, ApprovalDecision, ApprovalRequest},
+        };
+
+        if event.kind != "request.opened" || event.source != "stream" {
+            return Ok(());
+        }
+        let Some(subject) = &event.subject else {
+            return Ok(());
+        };
+        let point = match subject.harness.as_str() {
+            "codex" | "muse" => InjectPoint::ActiveTurn,
+            "antigravity" => InjectPoint::TurnSafePoint,
+            _ => return Ok(()),
+        };
+        let details = &event.data["details"];
+        if details.get("guard_refusal").is_none() {
+            return Ok(());
+        }
+        let approval: ApprovalRequest = serde_json::from_value(details.clone())
+            .map_err(|_| Error::new("source_integrity", "guarded approval details are invalid"))?;
+        let Some(message) = approval.guard_refusal else {
+            return Ok(());
+        };
+        let Some(agent) = &event.agent else {
+            return Err(Error::new(
+                "source_integrity",
+                "guarded request has no Agent",
+            ));
+        };
+        let Some(generation) = event.generation else {
+            return Err(Error::new(
+                "source_integrity",
+                "guarded request has no generation",
+            ));
+        };
+        let turn_id = required_text(&event.data, "turn_id")?.to_owned();
+        let request_id = required_text(&event.data, "request_id")?.to_owned();
+        let mut approvals = approval
+            .choices
+            .into_iter()
+            .filter(|choice| choice.decision == ApprovalDecision::Deny);
+        let first = approvals
+            .next()
+            .ok_or_else(|| Error::new("unsupported", "guarded request offers no refusal option"))?;
+        let choice_id = match subject.harness.as_str() {
+            "muse" if approvals.next().is_none() => Some(first.id),
+            "muse" => {
+                return Err(Error::new(
+                    "unsupported",
+                    "Muse guarded request offers multiple refusal options",
+                ));
+            }
+            _ => None,
+        };
+        let mut deny = SubmitCommand::new(ulid::Ulid::new().to_string(), "deny");
+        deny.target = Some(agent.clone());
+        deny.expected_generation = Some(generation);
+        deny.expected_turn_id = Some(turn_id.clone());
+        deny.request_id = Some(request_id);
+        deny.args = serde_json::to_value(ApprovalArgs {
+            choice_id,
+            feedback: None,
+        })
+        .map_err(|_| Error::new("internal", "guard reply could not be encoded"))?;
+        self.submit(&json!(deny), &Principal::Owner, "command.submit").await?;
+
+        let mut inject = SubmitCommand::new(ulid::Ulid::new().to_string(), "inject");
+        inject.target = Some(agent.clone());
+        inject.expected_generation = Some(generation);
+        inject.expected_turn_id = Some(turn_id);
+        inject.args = json!(InjectArgs {
+            text: message,
+            point,
+            expires_at_ms: Some(now_ms().saturating_add(60_000)),
+        });
+        self.submit(&json!(inject), &Principal::Owner, "command.submit").await?;
+        Ok(())
+    }
+
     async fn submit(
         &self,
         params: &Value,
@@ -3104,7 +3189,9 @@ impl Router {
             .get_mut("profile_snapshot")
             .and_then(Value::as_object_mut)
             .ok_or_else(|| Error::new("internal", "launch profile snapshot is not an object"))?;
-        snapshot.insert(crate::command_guard::SNAPSHOT_FIELD.to_owned(), guards);
+        if guards.as_array().is_some_and(|guards| !guards.is_empty()) {
+            snapshot.insert(crate::command_guard::SNAPSHOT_FIELD.to_owned(), guards);
+        }
         Ok(())
     }
 

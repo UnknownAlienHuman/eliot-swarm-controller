@@ -2193,7 +2193,7 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
             let request_id = required_text(event, "request_id")?;
             let turn_id = required_text(event, "turn_id")?;
             let kind = required_text(event, "kind")?;
-            let details = optional_details(event)?;
+            let mut details = optional_details(event)?;
             if let Some(existing) = agent.pending.iter().find(|p| p.id == request_id) {
                 // Same binding, new offer: a harness may re-open its exact pending
                 // id with updated details proven from its authentic native stream
@@ -2207,6 +2207,11 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
                             agent.id
                         ),
                     ));
+                }
+                if let Some(refusal) = existing.details.get("guard_refusal")
+                    && let Some(current) = details.as_object_mut()
+                {
+                    current.insert("guard_refusal".to_owned(), refusal.clone());
                 }
                 if existing.details != details
                     && let Some(slot) = next.pending.iter_mut().find(|p| p.id == request_id)

@@ -1434,15 +1434,15 @@ Private routing tokens are handled separately from semantic profile data. Native
 children receive their own identity only where isolated environment injection is possible;
 otherwise their CLI calls remain attributed to the parent, as the plugin reports.
 
-The profile switch pass_agent_identity_to_shell defaults to true. When false, the
-frozen profile withholds ELIOT_AGENT_TOKEN from shell commands. The nonsecret
-ELIOT_AGENT_ID, ELIOT_AGENT_GENERATION and ELIOT_AGENT_DATA_DIR markers remain so a
-shell CLI fails as an incomplete Agent instead of falling back to Owner authority.
-Codex keeps the token in its per-Agent app-server environment for the named MCP server
-and applies the documented shell environment filter to spawned commands. Claude,
-OpenCode and Antigravity receive the scoped identity in their managed MCP configuration
-while the token is removed from their native process environment. Muse has no managed
-Swarm MCP tool; with this switch off its Agent cannot authenticate swarm CLI calls.
+The profile switch `pass_agent_identity_to_shell` defaults to `true`. With `false`,
+shell commands omit the Agent identity variables. A marker carrying no Agent
+identity makes the shell CLI reject requests that would use Owner authority.
+Codex supplies its named MCP server from the per-Agent app-server environment
+and filters identity variables from shell tools. Claude, OpenCode and Antigravity
+pass scoped identity directly to the managed MCP server. OpenCode's inherited
+identity path continues to use the process environment when the switch is `true`.
+Muse currently uses shell CLI identity, so disabling it prevents Agent
+authentication from that shell.
 
 ## Accounts and configured capacity
 

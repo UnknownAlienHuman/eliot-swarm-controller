@@ -1583,13 +1583,20 @@ impl EventProcessor {
             self.defer_gap("Muse public request view could not be normalized");
             return Ok(());
         };
-        let data = json!({
+        let mut data = json!({
             "command_id": command_id,
             "request_id": request.id,
             "turn_id": request.turn_id,
             "kind": public_kind,
             "details": redact_request_details_for_commit(&public_details, &policy),
         });
+        if request.kind == "approval"
+            && let Some(raw_args) = params.get("rawArgs").and_then(Value::as_str)
+            && let Ok(input) = serde_json::from_str::<Value>(raw_args)
+            && let Some(command) = input.get("command").and_then(Value::as_str)
+        {
+            data[eliot_core::COMMAND_GUARD_CONTEXT_FIELD] = json!({"commands": [command]});
+        }
         if serde_json::to_vec(&data).map_or(true, |bytes| bytes.len() > MAX_EVENT_BYTES) {
             self.defer_gap("Muse normalized request exceeded the persisted-event bound");
             return Ok(());

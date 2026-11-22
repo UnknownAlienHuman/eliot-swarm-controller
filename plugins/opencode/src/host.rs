@@ -1124,10 +1124,8 @@ impl OpenCodePlugin {
         )?;
         secrets.extend(mcp_environment.secrets.iter().cloned());
         secrets.push(initialized.credential.clone());
-        // The per-Agent MCP config receives the validated scoped identity
-        // explicitly; the serve process environment may omit its token when
-        // shell identity is disabled. The MCP child still uses --require-agent
-        // and never falls back to Owner authority.
+        // The MCP child binds the exact data root. When shell identity is
+        // disabled, only its private MCP config receives the scoped identity.
         let swarm_data_dir = eliot_plugin::native_cli::unique_environment_value(
             &mcp_environment.variables,
             "ELIOT_HOME",
@@ -1146,6 +1144,11 @@ impl OpenCodePlugin {
                 "active Swarm executable could not be resolved for the OpenCode Agent MCP",
             )
         })?;
+        let swarm_mcp_environment = if params.pass_agent_identity_to_shell.unwrap_or(true) {
+            Vec::new()
+        } else {
+            mcp_environment.variables
+        };
         Ok(Box::new(ParsedStart {
             params,
             native_subagents,
@@ -1170,7 +1173,7 @@ impl OpenCodePlugin {
             resume,
             swarm_executable,
             swarm_data_dir,
-            swarm_mcp_environment: mcp_environment.variables,
+            swarm_mcp_environment,
         }))
     }
 
@@ -4333,7 +4336,8 @@ fn verify_managed_mcp_transport(
         .is_none_or(|kind| kind == "local")
         && server.command.as_deref() == Some(expected_command)
         && server.url.as_deref().is_none_or(str::is_empty)
-        && server.environment.as_ref() == Some(expected_environment);
+        && (server.environment.as_ref() == Some(expected_environment)
+            || (expected_environment.is_empty() && server.environment.is_none()));
     if !transport_ok {
         return Err(Error::new(
             "profile_error",

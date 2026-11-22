@@ -40,6 +40,10 @@ impl CommandGuardPolicy {
         Self { rules: Vec::new() }
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.rules.is_empty()
+    }
+
     pub(crate) fn from_profile(profile: &Value) -> Result<Self> {
         let Some(value) = profile.get(SNAPSHOT_FIELD) else {
             return Ok(Self { rules: Vec::new() });
