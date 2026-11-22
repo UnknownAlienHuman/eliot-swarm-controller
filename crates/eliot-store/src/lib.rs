@@ -229,6 +229,7 @@ mod resolution;
 mod retention;
 mod schema;
 mod source_batches;
+pub use source_batches::CompletionWorktreeCapture;
 mod source_handoff;
 mod source_install;
 mod switch;
