@@ -1062,7 +1062,7 @@ pub(super) fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<RuleEvalu
             return submit_git_fetch_command(definition).map(|action| keys.command(action));
         }
         ActionDefinition::GitIntegrate { definition } => {
-            return submit_git_integrate_command(definition).map(RuleEvaluation::Command);
+            return submit_git_integrate_command(definition).map(|action| keys.command(action));
         }
         ActionDefinition::GitPublish { definition } => {
             return submit_git_publish_command(definition, event)

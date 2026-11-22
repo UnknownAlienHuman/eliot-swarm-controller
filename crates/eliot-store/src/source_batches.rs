@@ -549,25 +549,6 @@ impl Store {
         now: i64,
     ) -> Result<BatchCommit> {
         let observed = expected_subject.is_some() || native_producer.is_some();
-        let event_payload_digests = batch
-            .events
-            .iter()
-            .map(|event| canonical::digest(&event.semantic_value()))
-            .collect::<Result<Vec<_>>>()?;
-        let batch_digest = batch
-            .semantic_digest()
-            .map_err(|error| Error::new("invalid", error.to_string()))?
-            .to_vec();
-        for event in batch
-            .events
-            .iter_mut()
-            .filter(|event| event.kind == "turn.completed")
-        {
-            if let Some(data) = event.data.as_object_mut() {
-                data.remove("worktree");
-                data.remove("project_check");
-            }
-        }
         if let Some(worktree) = completion_worktree.as_ref() {
             worktree.validate()?;
         }
@@ -595,6 +576,25 @@ impl Store {
                 "frame_too_large",
                 "native batch exceeds 900 KiB",
             ));
+        }
+        let event_payload_digests = batch
+            .events
+            .iter()
+            .map(|event| canonical::digest(&event.semantic_value()))
+            .collect::<Result<Vec<_>>>()?;
+        let batch_digest = batch
+            .semantic_digest()
+            .map_err(|error| Error::new("invalid", error.to_string()))?
+            .to_vec();
+        for event in batch
+            .events
+            .iter_mut()
+            .filter(|event| event.kind == "turn.completed")
+        {
+            if let Some(data) = event.data.as_object_mut() {
+                data.remove("worktree");
+                data.remove("project_check");
+            }
         }
         let agent_num = parse_agent_id(&batch.agent_id)?;
         let mut native_ids = HashSet::with_capacity(batch.events.len());

@@ -16,7 +16,6 @@ use super::{native_children, observation, source_handoff};
 use crate::command_guard::{CommandGuardPolicy, CommandGuardRequest, REQUEST_FIELD};
 use crate::common::{now_ms, secure_eq};
 use crate::git_monitor::GitProbe;
-use crate::monitor::Monitoring;
 
 use eliot_core::{Error, PermissionRefusal, Result, SecretPolicy, SourceBatch, SourceGap};
 use eliot_plugin::protocol::{HookEvent, HookResponse};

@@ -949,7 +949,11 @@ impl GitProbe {
         let snapshot = self
             .probe(workspace, None, Some(base_oid), &[], now)
             .await?;
-        worktree_capture_from_snapshot(&snapshot)
+        let capture = worktree_capture_from_snapshot(&snapshot)?;
+        if self.work_fingerprint(workspace).await? != capture.fingerprint {
+            return Err(unavailable("workspace changed during completion capture"));
+        }
+        Ok(capture)
     }
     /// A Goal's no-progress fingerprint, read now: HEAD and the monitor's
     /// content `dirty_digest` over the dirty set. A read past the monitor's
