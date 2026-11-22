@@ -76,7 +76,8 @@ pub(super) fn dispatch_tx(
         projects::validate_project_command_dispatch_tx(tx, command)?;
         return dispatch_targetless_tx(tx, id, command, now, events, "targetless action");
     }
-    if command.command.verb == "git.fetch" {
+    let verb = command.command.verb.as_str();
+    if matches!(verb, "git.fetch" | "git.publish") {
         if command.target.is_some()
             || command.command.generation.is_some()
             || command.command.expected_generation.is_some()
@@ -87,11 +88,18 @@ pub(super) fn dispatch_tx(
         {
             return Err(Error::new(
                 "source_integrity",
-                "stored git.fetch command has an Agent binding",
+                "stored Git command has an Agent binding",
             ));
         }
-        let frozen = projects::decode_frozen_git_fetch(&command.command.args)?;
-        projects::validate_git_fetch_intent_tx(tx, &command.command.principal, &frozen)?;
+        let common_dir = if verb == "git.fetch" {
+            let frozen = projects::decode_frozen_git_fetch(&command.command.args)?;
+            projects::validate_git_fetch_intent_tx(tx, &command.command.principal, &frozen)?;
+            frozen.common_dir
+        } else {
+            let frozen = projects::decode_frozen_git_publish(&command.command.args)?;
+            projects::validate_git_publish_intent_tx(tx, &command.command.principal, &frozen)?;
+            frozen.common_dir
+        };
         projects::validate_project_command_dispatch_tx(tx, command)?;
         match rules::gate_rule_action_dispatch_tx(tx, id, now, events)? {
             rules::RuleActionDispatchGate::Ready => {}
@@ -101,7 +109,7 @@ pub(super) fn dispatch_tx(
                 return Ok(Some(command));
             }
         }
-        if repo_git_write_blocked_tx(tx, id, &frozen.common_dir)? {
+        if repo_git_write_blocked_tx(tx, id, &common_dir)? {
             if command.state == CommandState::Accepted {
                 update_command_state(tx, id, CommandState::Queued, None, None, now)?;
                 events.push(insert_daemon_command_event(
@@ -113,13 +121,13 @@ pub(super) fn dispatch_tx(
                     id,
                     json!({
                         "command_id": id,
-                        "verb": "git.fetch",
+                        "verb": verb,
                         "reason": "same_repository_write_pending",
                     }),
                 )?);
             }
             let command = load_command(tx, id)?
-                .ok_or_else(|| Error::new("internal", "queued git.fetch disappeared"))?;
+                .ok_or_else(|| Error::new("internal", "queued Git command disappeared"))?;
             return Ok(Some(command));
         }
         update_command_state(tx, id, CommandState::Dispatched, None, None, now)?;
@@ -130,10 +138,10 @@ pub(super) fn dispatch_tx(
             None,
             None,
             id,
-            json!({"command_id": id, "verb": "git.fetch"}),
+            json!({"command_id": id, "verb": verb}),
         )?);
         let command = load_command(tx, id)?
-            .ok_or_else(|| Error::new("internal", "dispatched git.fetch disappeared"))?;
+            .ok_or_else(|| Error::new("internal", "dispatched Git command disappeared"))?;
         return Ok(Some(command));
     }
     Ok(None)
