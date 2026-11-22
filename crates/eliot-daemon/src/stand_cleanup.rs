@@ -546,15 +546,15 @@ pub fn stand_key_root(path: &Path) -> Result<PathBuf> {
 /// A stand root opened by handle. Every ancestor stays held without delete
 /// sharing, so no component can be renamed or swapped for a junction while
 /// held, no component may be a reparse point, and files are read relative to
-/// the held root.
-struct PinnedStandRoot {
+/// the held root. `stand up` holds one from creation through the owner bind.
+pub struct PinnedStandRoot {
     root: PathBuf,
     dir: crate::platform::script_file::Directory,
     identity: String,
 }
 
 impl PinnedStandRoot {
-    fn open(root: &Path) -> Result<Self> {
+    pub fn open(root: &Path) -> Result<Self> {
         let dir = crate::platform::script_file::Directory::open(root).map_err(|_| {
             Error::new(
                 "not_allowed",
@@ -567,6 +567,11 @@ impl PinnedStandRoot {
             dir,
             identity,
         })
+    }
+
+    /// Handle identity (volume serial and file index) of the held root.
+    pub fn identity(&self) -> &str {
+        &self.identity
     }
 
     /// Read `name` relative to the held root; `None` when it does not exist.
@@ -586,18 +591,9 @@ impl PinnedStandRoot {
     }
 }
 
-/// Handle identity of a freshly created stand root, recorded by `stand up`.
-pub fn stand_root_identity(root: &Path) -> Result<String> {
-    Ok(PinnedStandRoot::open(root)?.identity)
-}
-
 /// Open the stand root by handle and prove it is the exact directory `stand
-/// up` created and marked for `registration`; then read its owner token from
-/// that same held directory. Returns the held root and the token, if minted.
-fn pinned_stand_token(
-    root: &Path,
-    registration: &StandRegistration,
-) -> Result<(PinnedStandRoot, Option<String>)> {
+/// up` created and marked for `registration`. Returns the held root.
+fn pinned_stand_root(root: &Path, registration: &StandRegistration) -> Result<PinnedStandRoot> {
     let pinned = PinnedStandRoot::open(root)?;
     let expected = registration.root_identity.as_deref().ok_or_else(|| {
         Error::new(
@@ -625,15 +621,20 @@ fn pinned_stand_token(
             "stand ownership marker does not match the external registration",
         ));
     }
-    let token = pinned
-        .read("owner.token")?
-        .map(|bytes| {
-            String::from_utf8(bytes)
-                .map(|token| token.trim().to_owned())
-                .map_err(|_| Error::new("not_allowed", "stand owner token is not UTF-8"))
-        })
-        .transpose()?;
-    Ok((pinned, token))
+    Ok(pinned)
+}
+
+impl PinnedStandRoot {
+    /// The owner token read from the held root, if minted.
+    fn owner_token(&self) -> Result<Option<String>> {
+        self.read("owner.token")?
+            .map(|bytes| {
+                String::from_utf8(bytes)
+                    .map(|token| token.trim().to_owned())
+                    .map_err(|_| Error::new("not_allowed", "stand owner token is not UTF-8"))
+            })
+            .transpose()
+    }
 }
 
 /// Bind the registration to the owner token the stand's own daemon minted at
@@ -653,8 +654,10 @@ pub fn bind_stand_owner_token(root: &Path) -> Result<bool> {
     let name = registry_name(&root);
     let mut registration = read_stand_registration(&registry, &name, &root)?;
     crate::operator::refuse_issuing_root(&root, &registration)?;
-    let (pinned, token) = pinned_stand_token(&root, &registration)?;
-    let Some(token) = token else {
+    let pinned = pinned_stand_root(&root, &registration)?;
+    // A token still being written (or unreadable) is "not minted yet": retry,
+    // never bind anything but a complete token from the held root.
+    let Ok(Some(token)) = pinned.owner_token() else {
         return Ok(false);
     };
     let digest = owner_token_digest(&token);
@@ -687,8 +690,10 @@ pub fn verify_stand_owner_binding(root: &Path, registration: &StandRegistration)
             "stand registration carries no owner binding from stand up",
         )
     })?;
-    let (_pinned, token) = pinned_stand_token(root, registration)?;
-    let token = token.ok_or_else(|| Error::new("not_allowed", "stand has no owner token"))?;
+    let pinned = pinned_stand_root(root, registration)?;
+    let token = pinned
+        .owner_token()?
+        .ok_or_else(|| Error::new("not_allowed", "stand has no owner token"))?;
     if owner_token_digest(&token) != bound {
         return Err(Error::new(
             "not_allowed",

@@ -7,13 +7,13 @@ use eliot_core::api::{
     SWARM_STAND_ARTIFACT_PURPOSE,
 };
 use eliot_daemon::operator::{
-    STAND_MARKER, StandExternalCleanupReport, StandMarker, StandRegistration,
+    PinnedStandRoot, STAND_MARKER, StandExternalCleanupReport, StandMarker, StandRegistration,
     check_directory_chain, check_nested_roots, cleanup_stand_external_git, create_stand_root,
     daemon_alive, daemon_info, data_dirs_match, ensure_registry_is_external,
     inherited_agent_parent_data_dir, list_stand_registrations, lock_offline, lock_transition,
     parse_stand_ttl_ms, read_stand_registration, registry_name, remove_offline_stand_root,
-    remove_stand_registration, stand_base, stand_now_ms, stand_registry, stand_root_identity,
-    verify_stand_marker, verify_stand_target, write_stand_registration,
+    remove_stand_registration, stand_base, stand_now_ms, stand_registry, verify_stand_marker,
+    verify_stand_target, write_stand_registration,
 };
 use serde_json::{Value, json};
 use std::fs::{self, File};
@@ -111,11 +111,15 @@ pub(crate) async fn up(
     let root = root
         .canonicalize()
         .map_err(|error| io_failure("resolve created stand", error))?;
-    // Handle identity of the directory just created; every later owner
-    // operation requires this exact directory.
-    let root_identity = stand_root_identity(&root).map_err(Failure::for_read)?;
+    // Hold the directory just created and every ancestor by handle until the
+    // daemon's owner token is bound: none of them can be renamed or swapped
+    // for a junction meanwhile. Every later owner operation requires this
+    // exact directory identity.
+    let pinned_root = PinnedStandRoot::open(&root).map_err(Failure::for_read)?;
+    let root_identity = pinned_root.identity().to_owned();
     let workspace = root.join("repo");
     if let Err(failure) = prepare(&root, &workspace, profile).await {
+        drop(pinned_root);
         super::cleanup::remove_dir_all(&root).map_err(|error| {
             io_failure(
                 &format!(
@@ -189,6 +193,7 @@ pub(crate) async fn up(
             }
             Err(error) => {
                 drop(_transition);
+                drop(pinned_root);
                 let _ = remove_stand_registration(&registry, &reg_name);
                 let _ = super::cleanup::remove_dir_all(&root);
                 return Err(Failure::for_mutation(error));
@@ -204,6 +209,8 @@ pub(crate) async fn up(
             failure.message = format!("{}; stand retained at {}", failure.message, display(&root));
             failure
         })?;
+    // The owner token is bound; release the creation pin.
+    drop(pinned_root);
     let data_dir = display(&root);
     let workspace = display(&workspace);
     if json_output {

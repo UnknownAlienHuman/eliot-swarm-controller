@@ -7,13 +7,13 @@ use std::path::{Path, PathBuf};
 pub use crate::daemon::run_for_update;
 pub use crate::platform::data_dir::{DaemonInfo, DaemonLock, OperatorLock};
 pub use crate::stand_cleanup::{
-    STAND_MARKER, StandBranchOutcome, StandEntry, StandExternalCleanupReport, StandMarker,
-    StandRegistration, StandWorktreeOutcome, bind_stand_owner_token, check_directory_chain,
-    check_nested_roots, cleanup_stand_external_git, ensure_registry_is_external,
-    list_stand_registrations, parse_stand_ttl_ms, read_stand_registration, registry_name,
-    remove_offline_stand_root, remove_stand_registration, stand_base, stand_key_root, stand_now_ms,
-    stand_registry, stand_root_identity, verify_stand_marker, verify_stand_owner_binding,
-    write_stand_registration,
+    PinnedStandRoot, STAND_MARKER, StandBranchOutcome, StandEntry, StandExternalCleanupReport,
+    StandMarker, StandRegistration, StandWorktreeOutcome, bind_stand_owner_token,
+    check_directory_chain, check_nested_roots, cleanup_stand_external_git,
+    ensure_registry_is_external, list_stand_registrations, parse_stand_ttl_ms,
+    read_stand_registration, registry_name, remove_offline_stand_root, remove_stand_registration,
+    stand_base, stand_key_root, stand_now_ms, stand_registry, verify_stand_marker,
+    verify_stand_owner_binding, write_stand_registration,
 };
 pub use crate::update_backup::{
     discard_update_backup, lock_update_publication, restore_update_backup, update_backup_path,
