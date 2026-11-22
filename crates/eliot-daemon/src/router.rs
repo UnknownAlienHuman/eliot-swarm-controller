@@ -16,6 +16,7 @@ mod goals;
 mod handoff;
 mod hierarchy;
 mod inference;
+mod instructions;
 pub(crate) mod launch_queue;
 mod loss_recovery;
 mod organization;
@@ -4504,13 +4505,21 @@ impl Router {
         let request: AgentGetRequest = eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         let id = request.id.as_str();
-        let (agent, source_states, observer_active, provider_hold, native_notice) = {
+        let (
+            agent,
+            source_states,
+            observer_active,
+            provider_hold,
+            native_notice,
+            instruction_delivery,
+        ) = {
             let store = self.inner.store.lock().await;
             hierarchy::authorize_agent_read(&store, principal, id, None)?;
             let agent = store
                 .get_agent(id)?
                 .ok_or_else(|| Error::new("not_found", format!("Agent {id} was not found")))?;
             let (provider_hold, native_notice) = store.agent_status_projection(&agent)?;
+            let instruction_delivery = store.get_agent_instruction_delivery(id)?;
             let mut source_states = store.list_source_states(id, agent.generation)?;
             if let Some(workspace) = store.get_workspace(id)?
                 && workspace.target_generation != agent.generation
@@ -4525,6 +4534,7 @@ impl Router {
                 observer_active,
                 provider_hold,
                 native_notice,
+                instruction_delivery,
             )
         };
         let live_presence = if agent.observe_only {
@@ -4602,6 +4612,7 @@ impl Router {
             work,
             provider_hold,
             native_notice,
+            instruction_delivery,
         };
         display_agent_get_response(&mut response);
         serde_json::to_value(response)
@@ -7212,6 +7223,11 @@ fn display_agent_get_response(response: &mut AgentGetResponse) {
     }
     response.agent.project = eliot_core::display_path(&response.agent.project);
     display_observation(&mut response.observation);
+    if let Some(facts) = &mut response.instruction_delivery
+        && let Some(workspace) = facts.source_workspace.as_deref()
+    {
+        facts.source_workspace = Some(eliot_core::display_path(workspace));
+    }
 }
 
 /// Owner-facing spelling of one project registration view: `checkout`,

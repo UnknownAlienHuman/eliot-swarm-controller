@@ -38,6 +38,10 @@ impl AgentGetRequest {
             || reply.agent.id != self.id
             || !valid_agent(&reply.agent)
             || reply
+                .instruction_delivery
+                .as_ref()
+                .is_some_and(|facts| facts.validate().is_err())
+            || reply
                 .session_usage
                 .as_ref()
                 .is_some_and(|usage| usage.validate().is_err())

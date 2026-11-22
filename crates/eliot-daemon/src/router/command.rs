@@ -557,7 +557,109 @@ impl Router {
             self.signal_progress();
             return false;
         }
+        if command.verb == "launch" && !self.capture_launch_instruction_delivery(id, command).await
+        {
+            return false;
+        }
         true
+    }
+
+    /// Inventory the actual execution checkout after workspace preparation,
+    /// then persist its facts and optional primary source before start dispatch.
+    async fn capture_launch_instruction_delivery(&self, id: &str, command: &Command) -> bool {
+        let Some(agent_id) = command.target.as_deref() else {
+            return false;
+        };
+        let initial = {
+            let store = self.inner.store.lock().await;
+            (|| {
+                let agent = store
+                    .get_agent(agent_id)?
+                    .ok_or_else(|| Error::new("not_found", "launch Agent was not found"))?;
+                let existing = store.get_agent_instruction_delivery(agent_id)?;
+                let linked = store.get_linked_send(id)?;
+                Ok::<_, Error>((agent, existing, linked))
+            })()
+        };
+        let (agent, existing, linked) = match initial {
+            Ok(values) => values,
+            Err(error) => {
+                self.abandon_unreadable_command(id, &error).await;
+                return false;
+            }
+        };
+        if agent.chat {
+            return true;
+        }
+        if existing.is_some() {
+            return true;
+        }
+
+        let workspace = agent.workspace.clone();
+        let harness = agent.harness.clone();
+        let profile = agent.profile_snapshot.clone();
+        let capture = tokio::task::spawn_blocking(move || {
+            super::instructions::capture(workspace.as_deref(), &harness, &profile)
+        })
+        .await;
+        let mut capture = match capture {
+            Ok(capture) => capture,
+            Err(_) => {
+                let mut unavailable =
+                    super::instructions::capture(None, &agent.harness, &agent.profile_snapshot);
+                unavailable.facts.source_workspace = agent.workspace.clone();
+                unavailable
+            }
+        };
+
+        let mut expected_text = None;
+        let mut delivered_text = None;
+        if capture.should_deliver_primary {
+            match (agent.workspace.as_deref(), linked.as_ref()) {
+                (Some(workspace), Some(linked)) => {
+                    if let Some(text) = linked.args.get("text").and_then(Value::as_str) {
+                        match self
+                            .deliver_instruction_source(
+                                std::path::Path::new(workspace),
+                                text,
+                                &capture.facts.primary_path,
+                            )
+                            .await
+                        {
+                            Ok((text_after, delivery)) => {
+                                super::instructions::apply_delivery(&mut capture, delivery);
+                                expected_text = Some(text.to_owned());
+                                delivered_text = Some(text_after);
+                            }
+                            Err(_) => super::instructions::mark_unavailable(&mut capture),
+                        }
+                    } else {
+                        super::instructions::mark_unavailable(&mut capture);
+                    }
+                }
+                _ => super::instructions::mark_unavailable(&mut capture),
+            }
+        }
+
+        let result = self
+            .inner
+            .store
+            .lock()
+            .await
+            .record_launch_instruction_delivery(
+                id,
+                &capture.facts,
+                expected_text.as_deref(),
+                delivered_text.as_deref(),
+                now_ms(),
+            );
+        match result {
+            Ok(_) => true,
+            Err(error) => {
+                self.abandon_unreadable_command(id, &error).await;
+                false
+            }
+        }
     }
 
     /// Capture launch and resume start inputs: the admitted launch Agent,

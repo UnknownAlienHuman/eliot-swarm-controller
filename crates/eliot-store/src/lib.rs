@@ -45,7 +45,9 @@ pub use scripts::ScriptRunAdmission;
 pub use turn_recovery::{ActiveTurnRecovery, RecoveredTurn};
 pub use usage::ResolvedUsageScope;
 
-use eliot_core::api::{HeavySummaryView, SessionGrowthView, agent_state_name, is_git_oid};
+use eliot_core::api::{
+    HeavySummaryView, InstructionDeliveryView, SessionGrowthView, agent_state_name, is_git_oid,
+};
 use eliot_core::limits::{MAX_COMMAND_ID_BYTES, MAX_EVENT_BYTES, MAX_FRAME_BYTES, MAX_TEXT_BYTES};
 use eliot_core::{
     self as core, Agent, AgentControl, AgentEdit, AgentState, BatchAck, Command, CommandState,
@@ -1063,6 +1065,141 @@ impl Store {
     pub fn get_agent(&self, id: &str) -> Result<Option<Agent>> {
         let agent_num = parse_agent_id(id)?;
         load_agent_by_num(&self.connection, agent_num)
+    }
+
+    pub fn get_agent_instruction_delivery(
+        &self,
+        id: &str,
+    ) -> Result<Option<InstructionDeliveryView>> {
+        self.ensure_committed_reads()?;
+        let agent_num = parse_agent_id(id)?;
+        let value: Option<Option<String>> = self
+            .connection
+            .query_row(
+                "SELECT instruction_delivery FROM agents WHERE id = ?1",
+                [agent_num],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        value
+            .flatten()
+            .map(|value| {
+                serde_json::from_str(&value).map_err(|error| {
+                    Error::new(
+                        "internal",
+                        format!("invalid stored instruction delivery: {error}"),
+                    )
+                })
+            })
+            .transpose()
+    }
+
+    /// Retain the instruction facts and optional automatic primary source before
+    /// the launch dispatch can perform native I/O. Replays keep the first capture.
+    pub fn record_launch_instruction_delivery(
+        &mut self,
+        command_id: &str,
+        facts: &InstructionDeliveryView,
+        expected_text: Option<&str>,
+        delivered_text: Option<&str>,
+        now: i64,
+    ) -> Result<bool> {
+        facts.validate()?;
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let Some(launch) = load_command(&tx, command_id)? else {
+                return Err(Error::new("not_found", "launch command was not found"));
+            };
+            if launch.verb != "launch"
+                || !matches!(launch.state, CommandState::Accepted | CommandState::Queued)
+            {
+                return Ok(false);
+            }
+            let target = launch
+                .target
+                .as_deref()
+                .ok_or_else(|| Error::new("source_integrity", "launch command has no Agent"))?;
+            let agent_num = parse_agent_id(target)?;
+            let agent: Option<(i64, Option<String>, bool, Option<String>)> = tx
+                .query_row(
+                    "SELECT generation, workspace, chat, instruction_delivery FROM agents WHERE id = ?1",
+                    [agent_num],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()
+                .map_err(sql_error)?;
+            let Some((generation, workspace, chat, existing)) = agent else {
+                return Err(Error::new("not_found", "launch Agent was not found"));
+            };
+            if generation != 0 || chat || existing.is_some() {
+                return Ok(false);
+            }
+            if facts.source_workspace.as_deref() != workspace.as_deref() {
+                return Err(Error::new(
+                    "stale_generation",
+                    "instruction workspace changed before launch facts were committed",
+                ));
+            }
+
+            if let Some(delivered_text) = delivered_text {
+                let expected_text = expected_text.ok_or_else(|| {
+                    Error::new("invalid", "instruction delivery has no linked input text")
+                })?;
+                let mut linked = load_linked_command(&tx, command_id)?.ok_or_else(|| {
+                    Error::new(
+                        "bad_state",
+                        "launch input disappeared before instruction delivery",
+                    )
+                })?;
+                if !matches!(linked.state, CommandState::Accepted | CommandState::Queued)
+                    || launch.args.get("text").and_then(Value::as_str) != Some(expected_text)
+                    || linked.args.get("text").and_then(Value::as_str) != Some(expected_text)
+                {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "retained launch and linked input do not share the expected text",
+                    ));
+                }
+                linked.args["text"] = Value::String(delivered_text.to_owned());
+                let linked_args = encode_json(&linked.args)?;
+                // The frozen launch request and both mutation digests still
+                // bind the caller's original request. Only the internal
+                // first input gains the automatic source before dispatch.
+                let changed = tx
+                    .execute(
+                        "UPDATE commands SET args = ?1, updated_at = ?2
+                         WHERE id = ?3 AND state IN ('accepted', 'queued')",
+                        params![linked_args, now, linked.id],
+                    )
+                    .map_err(sql_error)?;
+                if changed != 1 {
+                    return Err(Error::new(
+                        "bad_state",
+                        "launch input settled before instruction delivery committed",
+                    ));
+                }
+            }
+            let encoded = encode_json(facts)?;
+            let changed = tx
+                .execute(
+                    "UPDATE agents SET instruction_delivery = ?1
+                     WHERE id = ?2 AND generation = 0 AND instruction_delivery IS NULL",
+                    params![encoded, agent_num],
+                )
+                .map_err(sql_error)?;
+            if changed != 1 {
+                return Ok(false);
+            }
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(true)
+        })();
+        self.fault_on_persistence_error(&result);
+        result
     }
 
     /// Load the current-generation token for native environment installation.

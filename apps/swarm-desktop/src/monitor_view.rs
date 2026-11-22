@@ -4,6 +4,10 @@
 //! and generation shown on screen, so a click acts on exactly what was
 //! displayed.
 
+use eliot_core::api::{
+    AgentGetResponse, InstructionFileStatus, InstructionReadStatus, InstructionSourceStatus,
+};
+use std::fmt::Write as _;
 use windows_reactor::*;
 
 use crate::monitor::{
@@ -12,6 +16,80 @@ use crate::monitor::{
 };
 use crate::theme::winui::Palette;
 use crate::ui::tokens;
+
+pub fn project_instruction_lines(reply: &AgentGetResponse) -> Option<Vec<String>> {
+    let delivery = reply.instruction_delivery.as_ref()?;
+    let Some(workspace) = delivery.source_workspace.as_deref() else {
+        return Some(vec!["Project instruction scan unavailable.".to_owned()]);
+    };
+    let mut lines = Vec::new();
+    for file in delivery
+        .files
+        .iter()
+        .filter(|file| file.status != InstructionFileStatus::Missing)
+    {
+        let mut line = file.path.clone();
+        if delivery.primary_path == file.path {
+            line.push_str(" · primary");
+        }
+        if let Some(size) = file.size_bytes {
+            let _ = write!(line, " · {size} bytes");
+        }
+        let file_status = match file.status {
+            InstructionFileStatus::Present | InstructionFileStatus::Missing => None,
+            InstructionFileStatus::Unreadable => Some("File read failed"),
+            InstructionFileStatus::NotRegular => Some("File type unsupported"),
+            InstructionFileStatus::OutsideWorkspace => Some("Path outside the workspace"),
+            InstructionFileStatus::TooLarge => Some("File exceeds the scan limit"),
+            InstructionFileStatus::Binary => Some("Binary contents"),
+            InstructionFileStatus::WorkspaceUnavailable => Some("Workspace unavailable"),
+        };
+        if let Some(file_status) = file_status {
+            let _ = write!(line, "\n{file_status}");
+        }
+        let status = match file.native_read_status {
+            InstructionReadStatus::Documented => "Documented native instructions",
+            InstructionReadStatus::Conditional => "Native reading depends on harness settings",
+            InstructionReadStatus::NotNative => "Outside the harness's native instruction lookup",
+            InstructionReadStatus::Unknown => "Native reading unverified",
+        };
+        let _ = write!(line, "\n{status}");
+        if let Some(version) = &file.native_read_version {
+            let _ = write!(line, " · {version}");
+        }
+        let sources = match file.delivery_status {
+            InstructionSourceStatus::NotNeeded => None,
+            InstructionSourceStatus::Complete => {
+                Some("Swarm attached the complete file to the input")
+            }
+            InstructionSourceStatus::Truncated => {
+                Some("Swarm attached part of the file to the input")
+            }
+            InstructionSourceStatus::Unavailable => {
+                Some("Swarm could not attach the file to the input")
+            }
+        };
+        if let Some(sources) = sources {
+            let _ = write!(line, "\n{sources}");
+        }
+        if let Some(sha256) = &file.sha256 {
+            let _ = write!(line, "\nSHA-256 {sha256}");
+        }
+        lines.push(line);
+    }
+    if lines.is_empty() {
+        lines.push("No project instruction files found at launch.".to_owned());
+    }
+    if reply.agent.workspace.as_deref().map(crate::nav::path_key)
+        != Some(crate::nav::path_key(workspace))
+    {
+        lines.insert(
+            0,
+            format!("Scanned {}", eliot_core::display_path(workspace)),
+        );
+    }
+    Some(lines)
+}
 
 /// A note: secondary size, wrapped and selectable (callers lower its
 /// emphasis where it is supporting text).

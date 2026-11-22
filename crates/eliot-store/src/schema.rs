@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 82;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 83;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -2041,6 +2041,18 @@ impl Store {
                      ON agent_wakes(agent, generation)
                      WHERE state IN ('waiting','satisfied','delivery_pending');
                  INSERT INTO schema_migrations(version) VALUES (82);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 83 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE agents ADD COLUMN instruction_delivery TEXT;
+                 INSERT INTO schema_migrations(version) VALUES (83);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;

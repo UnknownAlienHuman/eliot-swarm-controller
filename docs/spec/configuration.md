@@ -184,6 +184,55 @@ permissions = "workspace-write"
 pass_env = ["CODEX_HOME"]
 ```
 
+## Launch instruction delivery
+
+Every new launch records a bounded inventory of instruction files from the actual
+execution checkout after workspace preparation and setup, before the native start
+is dispatched. This timing means a managed launch reads its final worktree, including
+its selected base and setup output. It never substitutes a file from the donor checkout.
+The launch facts are committed once and retained across held retries; a retry does not
+rescan a changed checkout. Legacy Agents keep a null fact column and omit this optional
+readback.
+
+The inventory is limited to these seven paths: AGENTS.md, AGENTS.override.md,
+CLAUDE.md, CLAUDE.local.md, .claude/CLAUDE.md, .claude/CLAUDE.local.md, and
+GEMINI.md. It reports each relative path, file status, byte size when available,
+full SHA-256 when read within the bound, native-read status, and source-delivery status.
+Catalog reads are capped at 8 MiB total and use the same canonical workspace containment
+and 8 MiB per-file limit as normal source delivery. File contents are not stored in the
+launch facts.
+
+The daemon prefers AGENTS.md as the primary file, then AGENTS.override.md,
+CLAUDE.md, .claude/CLAUDE.md, GEMINI.md and the local Claude instruction files.
+When the primary file's native reading isn't established, the daemon attaches it
+through the existing required-sources renderer to the launch's linked first input.
+That renderer keeps its path, SHA-256 prefix and completeness wording, secret redaction,
+frame budget and retained command input. Explicit user sources continue to be read at
+admission from their requested workspace; the automatic primary file is read from
+the prepared execution checkout. If the workspace, file, input, or source budget prevents
+a delivery, the typed facts report that outcome. Launches without a first input
+record the catalog without starting a separate model turn.
+
+Native-read status is evidence-labeled: documented means the vendor documents the
+file convention; conditional means documented behavior depends on settings, precedence
+or exclusions that this launch did not prove; not_native means the active Eliot
+adapter configuration does not enable that reader; unknown means no supported
+conclusion. These are not claims that a model consumed the file. In particular,
+Claude Code 2.1.277 and later document AGENTS.md reading when no applicable
+CLAUDE.md, .claude/CLAUDE.md, or CLAUDE.local.md takes precedence, subject to
+project-instruction settings, plugins, telemetry/version and excludes. The frozen
+Claude cmd_version is exposed where available, but this inventory does not claim
+per-launch native consumption. The managed Claude adapter leaves ordinary instruction
+settings to the vendor; its empty --setting-sources is limited to the separate print
+inference path. Muse's current launch args omit --trust-workspace, so its root
+AGENTS.md status is not_native. Ordinary Codex and OpenCode AGENTS.md reading is
+vendor-documented; the Codex provider-probe profile explicitly sets
+project_doc_max_bytes to zero. OpenCode reads CLAUDE.md as a fallback. Antigravity
+does not return project-instruction readback, so its status remains unknown.
+
+agent.get returns the retained object as optional instruction_delivery; swarm show
+prints the same typed readback. Missing fields from older Store rows remain absent.
+
 ## Ad-hoc Owner launch (no stored profile)
 
 `swarm launch --harness <codex|claude|muse|opencode|antigravity>

@@ -161,6 +161,7 @@ struct UiDetail {
     project: String,
     /// Actual task checkout, which can differ from its project on a worktree.
     workspace: Option<String>,
+    project_instructions: Option<Vec<String>>,
     /// The routing decision recorded at admission (None: an explicit
     /// profile or harness).
     routing: Option<eliot_core::RoutingDecision>,
@@ -671,6 +672,7 @@ fn detail_from(reply: &AgentGetResponse) -> UiDetail {
         observe_only: reply.agent.observe_only,
         project: reply.agent.project.clone(),
         workspace: reply.agent.workspace.clone(),
+        project_instructions: crate::monitor_view::project_instruction_lines(reply),
         routing: reply.agent.profile_choice.clone(),
     }
 }

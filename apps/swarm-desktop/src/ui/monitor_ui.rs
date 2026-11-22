@@ -792,6 +792,15 @@ impl DesktopApp {
             "agent",
             spoken_section(palette, "Summary", &agent_lines, &agent_spoken),
         ));
+        if let Some(lines) = detail
+            .and_then(|detail| detail.project_instructions.clone())
+            .or_else(|| read.and_then(|read| monitor_view::project_instruction_lines(&read.agent)))
+        {
+            sections.push(KeyedView::new(
+                "project-instructions",
+                section(palette, "Project instructions", &lines),
+            ));
+        }
 
         // Whether it writes code: the Git-aware work summary of this
         // generation (`agent.get`, else the Monitor's row), and an open

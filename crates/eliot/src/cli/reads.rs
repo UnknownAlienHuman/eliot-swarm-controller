@@ -161,8 +161,53 @@ pub(crate) async fn run_show(
             if !agent.pending.is_empty() {
                 println!("Pending native requests: {}", agent.pending.len());
             }
+            if let Some(instructions) = &response.instruction_delivery {
+                print_project_instructions(instructions);
+            }
         });
         Ok(0)
+    }
+}
+
+fn print_project_instructions(instructions: &eliot_core::api::InstructionDeliveryView) {
+    use eliot_core::api::{InstructionFileStatus, InstructionReadStatus, InstructionSourceStatus};
+    println!("Project instructions");
+    let mut files = instructions
+        .files
+        .iter()
+        .filter(|file| file.status != InstructionFileStatus::Missing)
+        .peekable();
+    if files.peek().is_none() {
+        println!("  No project instruction files found at launch");
+    }
+    for file in files {
+        print!("  {}", file.path);
+        if file.path == instructions.primary_path {
+            print!(" (primary)");
+        }
+        if let Some(bytes) = file.size_bytes {
+            print!(" · {bytes} bytes");
+        }
+        if let Some(digest) = &file.sha256 {
+            print!(" · SHA-256 {digest}");
+        }
+        let native = match file.native_read_status {
+            InstructionReadStatus::Documented => "native reading documented",
+            InstructionReadStatus::Conditional => "native reading depends on settings",
+            InstructionReadStatus::NotNative => "outside native instruction lookup",
+            InstructionReadStatus::Unknown => "native reading unverified",
+        };
+        print!(" · {native}");
+        match file.delivery_status {
+            InstructionSourceStatus::Complete => print!(" · Swarm attached the complete file"),
+            InstructionSourceStatus::Truncated => print!(" · Swarm attached part of the file"),
+            InstructionSourceStatus::Unavailable => print!(" · source attachment unavailable"),
+            InstructionSourceStatus::NotNeeded => {}
+        }
+        if file.status != InstructionFileStatus::Present {
+            print!(" · file status {:?}", file.status);
+        }
+        println!();
     }
 }
 
