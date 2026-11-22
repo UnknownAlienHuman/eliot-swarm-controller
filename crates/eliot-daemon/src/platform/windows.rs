@@ -1,4 +1,7 @@
-#![allow(unsafe_code)]
+#![allow(
+    unsafe_code,
+    reason = "Windows process custody requires Job and process-handle FFI."
+)]
 
 use super::process_observation::{
     CommandClass, MAX_PROCESS_SAMPLES, exited_sample, same_identity, unknown_sample,
@@ -1134,7 +1137,10 @@ unsafe extern "system" {
 /// `PROCESS_BASIC_INFORMATION` prefix for the parent pid read (Microsoft
 /// Learn: NtQueryInformationProcess). Only the inherited pid is used.
 #[repr(C)]
-#[allow(non_snake_case)]
+#[allow(
+    non_snake_case,
+    reason = "Windows ABI fields must retain the platform's required spelling."
+)]
 struct ProcessBasicInformation {
     ExitStatus: i32,
     PebBaseAddress: *mut c_void,

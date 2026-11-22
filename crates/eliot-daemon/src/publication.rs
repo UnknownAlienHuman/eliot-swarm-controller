@@ -26,7 +26,12 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::{process::Command, sync::watch, time::Instant};
+#[expect(
+    clippy::disallowed_types,
+    reason = "Publication prepares the GitHub CLI command for explicitly configured effects."
+)]
+use tokio::process::Command;
+use tokio::{sync::watch, time::Instant};
 
 use crate::scripts::process::{
     ProcessFailure, ProcessOutcome, local_process_command, run_owned_process,
@@ -1623,6 +1628,10 @@ async fn run_gh(
     .await)
 }
 
+#[expect(
+    clippy::disallowed_types,
+    reason = "This builder freezes the GitHub CLI child command for one publication effect."
+)]
 fn build_gh_command(gh: &ProjectGitHubCliView, args: &[&str], workspace: &str) -> Result<Command> {
     let mut command = local_process_command(&gh.program)?;
     command

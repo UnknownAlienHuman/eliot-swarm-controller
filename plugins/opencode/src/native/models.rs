@@ -22,7 +22,12 @@ use eliot_core::{Error, Result};
 pub(crate) use eliot_plugin::native_cli::MAX_MODEL_ID_BYTES;
 use eliot_plugin::native_cli::{BoundedReadLabels, run_bounded_utf8, valid_model_id};
 use serde_json::Value;
-use tokio::{process::Command, time::Instant};
+#[expect(
+    clippy::disallowed_types,
+    reason = "OpenCode model discovery returns a command owned by the native adapter."
+)]
+use tokio::process::Command;
+use tokio::time::Instant;
 
 /// Keep the private server under the reader Job, never the background service.
 pub(crate) fn models_argv() -> [&'static str; 2] {
@@ -75,7 +80,15 @@ pub(crate) struct ReaderContext<'a> {
 }
 
 impl ReaderContext<'_> {
+    #[expect(
+        clippy::disallowed_types,
+        reason = "This builder configures an OpenCode native model-query command."
+    )]
     fn command(&self, program: &OsStr) -> Command {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "This statement constructs a process owned by this module."
+        )]
         let mut command = Command::new(program);
         command.current_dir(self.workspace);
         apply_environment(&mut command, self.environment, self.local_provider);

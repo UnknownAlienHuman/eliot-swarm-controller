@@ -217,6 +217,10 @@ pub fn reread(
 
 /// Run `future`, giving up promptly when the UI cancelled this task. A
 /// dropped read only closes its IPC connection; it has no side effect.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "This helper owns the bounded cancellation poll."
+)]
 pub(crate) async fn cancellable<F: Future>(
     future: F,
     cancelled: &dyn Fn() -> bool,
@@ -236,6 +240,10 @@ pub(crate) async fn cancellable<F: Future>(
 
 /// One live step. `wake` long-polls for the first event and then drains the
 /// burst; otherwise only drains. `Ok(None)` means the task was cancelled.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "This event drain owns its bounded burst-coalescing wait."
+)]
 pub fn deliver(
     data_dir: &Path,
     agent: &str,
@@ -297,6 +305,10 @@ pub fn deliver(
 }
 
 /// Sleep for a reconnect backoff, giving up promptly on cancellation.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "This helper owns the bounded reconnect delay."
+)]
 pub fn backoff(delay_ms: u64, cancelled: &dyn Fn() -> bool) -> bool {
     client::block_on(async {
         cancellable(

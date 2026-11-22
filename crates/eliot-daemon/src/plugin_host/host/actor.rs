@@ -82,7 +82,10 @@ pub(super) fn arbitrate_reader_close(root_exited: bool, reader_ok: bool) -> (&'s
 /// this path, so EOF can never mask an observed root exit. This runs only
 /// from terminal arms where no stop was planned, matching the old
 /// `!planned_exit` guard at the call sites.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The operation's distinct inputs remain explicit at its established call boundary."
+)]
 pub(super) async fn settle_observed_root_exit(
     state: &Weak<super::HostState>,
     key: &super::AgentKey,
@@ -195,7 +198,10 @@ pub(super) async fn settle_observed_root_exit(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The operation's distinct inputs remain explicit at its established call boundary."
+)]
 pub(super) async fn run_agent_inner(
     actor: AgentActorConfig,
     mut child: Option<OwnedChild>,
@@ -357,6 +363,7 @@ async fn run_agent_startup(
         agent_id: actor.agent.id.clone(),
         generation: actor.agent.generation,
         command_id: actor.start_command.id.clone(),
+        owner_rules: actor.owner_rules.clone(),
         profile: Some({
             let mut profile = actor.agent.profile_snapshot.clone();
             if let Some(values) = profile.as_object_mut() {
@@ -514,7 +521,10 @@ async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
     let mut planned_exit = false;
     // while_let_loop does not apply: the child borrow must end before
     // take() on break paths, which a while-let condition cannot express.
-    #[allow(clippy::while_let_loop)]
+    #[allow(
+        clippy::while_let_loop,
+        reason = "A while-let borrow would overlap the required take on loop exit."
+    )]
     loop {
         let Some(child) = child_slot.as_mut() else {
             // take() below only runs on break paths; the loop never re-enters
@@ -909,7 +919,10 @@ async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
 /// then drain retained steer responses within bounded waits. Every handle is
 /// borrowed from the actor frame, so the drop order there never moves; the
 /// snapshot set moves in only to be dropped first, exactly as before.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The operation's distinct inputs remain explicit at its established call boundary."
+)]
 async fn settle_agent_actor(
     state: &Weak<super::HostState>,
     key: &super::AgentKey,

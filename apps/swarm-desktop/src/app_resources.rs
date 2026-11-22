@@ -49,7 +49,10 @@
 //! `GetFromWindowId`, `IAppWindow` slot 16 `get_TitleBar` and the
 //! `IAppWindowTitleBar` color setters listed in [`title_bar_colors`]. Only
 //! these calls are declared; Reactor's own bindings are crate-private.
-#![allow(unsafe_code)]
+#![allow(
+    unsafe_code,
+    reason = "Window resources require direct Win32 handles and resource APIs."
+)]
 
 mod templates;
 

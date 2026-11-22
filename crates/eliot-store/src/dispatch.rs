@@ -65,7 +65,10 @@ fn dispatch_rule_hold_tx(
 
 /// Dispatch one `launch`: first generation, native snapshot, and starting
 /// state.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The operation's distinct inputs remain explicit at its established call boundary."
+)]
 fn dispatch_launch_tx(
     tx: &Transaction<'_>,
     id: &str,
@@ -160,7 +163,10 @@ fn dispatch_launch_tx(
 
 /// Dispatch one `resume`: close the old generation, carry the native
 /// subject forward, and cancel superseded commands.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The operation's distinct inputs remain explicit at its established call boundary."
+)]
 fn dispatch_resume_tx(
     tx: &Transaction<'_>,
     id: &str,
@@ -367,7 +373,10 @@ fn dispatch_resume_tx(
 /// Dispatch one `worktree.remove`: same-repository writes fence it, and a
 /// still-accepted command queues instead of dispatching. Returns the queued
 /// command when the caller must commit early.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The operation's distinct inputs remain explicit at its established call boundary."
+)]
 fn dispatch_worktree_remove_tx(
     tx: &Transaction<'_>,
     id: &str,
@@ -440,7 +449,10 @@ fn dispatch_worktree_remove_tx(
 /// Dispatch one `send`: generation, turn, settings-lane, and FIFO gates,
 /// then input claiming and the frozen configuration revision. Returns the
 /// queued command when a gate is not yet open.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The operation's distinct inputs remain explicit at its established call boundary."
+)]
 fn dispatch_send_tx(
     tx: &Transaction<'_>,
     id: &str,
@@ -545,7 +557,10 @@ fn dispatch_send_tx(
 }
 
 /// Dispatch one `stop`: generation and turn binding, then state change.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The operation's distinct inputs remain explicit at its established call boundary."
+)]
 fn dispatch_stop_tx(
     tx: &Transaction<'_>,
     id: &str,
@@ -613,7 +628,10 @@ fn dispatch_stop_tx(
 /// Dispatch one `configure`: the settings lane holds behind earlier
 /// configures and unresolved sends. Returns the queued command when the
 /// lane is held.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The operation's distinct inputs remain explicit at its established call boundary."
+)]
 fn dispatch_configure_tx(
     tx: &Transaction<'_>,
     id: &str,
@@ -723,7 +741,10 @@ fn require_no_in_flight_stop(tx: &Transaction<'_>, agent: i64, generation: i64) 
 
 /// Dispatch one active-turn `inject`: expiry settles rejected, otherwise the
 /// context is claimed. Queued injects are never dispatched directly.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The operation's distinct inputs remain explicit at its established call boundary."
+)]
 fn dispatch_inject_tx(
     tx: &Transaction<'_>,
     id: &str,
@@ -837,7 +858,10 @@ fn dispatch_inject_tx(
 
 /// Dispatch one turn-control command (`steer`, `interrupt`, `approve`,
 /// `deny`, `answer`): recheck the captured turn and pending request.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The operation's distinct inputs remain explicit at its established call boundary."
+)]
 fn dispatch_control_tx(
     tx: &Transaction<'_>,
     id: &str,

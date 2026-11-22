@@ -42,6 +42,10 @@ impl AgentGetRequest {
                 .as_ref()
                 .is_some_and(|facts| facts.validate().is_err())
             || reply
+                .owner_rules_delivery
+                .as_ref()
+                .is_some_and(|facts| facts.validate().is_err())
+            || reply
                 .session_usage
                 .as_ref()
                 .is_some_and(|usage| usage.validate().is_err())

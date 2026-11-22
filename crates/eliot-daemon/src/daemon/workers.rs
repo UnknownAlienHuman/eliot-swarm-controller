@@ -222,6 +222,10 @@ fn is_stopping(shutdown: &watch::Receiver<bool>) -> bool {
 }
 
 async fn wait_for_retry(shutdown: &mut watch::Receiver<bool>, delay: Duration) -> bool {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "This bounded wait is owned by the surrounding operation."
+    )]
     let sleep = tokio::time::sleep(delay);
     tokio::pin!(sleep);
     loop {

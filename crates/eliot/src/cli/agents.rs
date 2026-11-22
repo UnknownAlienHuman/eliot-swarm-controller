@@ -1287,7 +1287,10 @@ pub(crate) fn validate_text(text: Option<&str>) -> Result<(), Failure> {
 /// is frozen client-side before the RPC; the daemon never adds later turns or
 /// children. Exit 0 only when every entry succeeded (`--all`) or at least one
 /// succeeded (`--any`); timeout exits 5 with the honest per-entry snapshot.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The operation's distinct inputs remain explicit at its established call boundary."
+)]
 pub(crate) async fn swarm_wait(
     data_dir: &Path,
     all: bool,
@@ -1354,7 +1357,10 @@ pub(crate) async fn swarm_wait(
 /// coalesced mail when the set satisfies `all`/`any` and wakes through the
 /// standard mail notice. Reusing `--id` replays the same digest without a
 /// second mail. Exit 0 when the digest is accepted (pending or delivered).
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The operation's distinct inputs remain explicit at its established call boundary."
+)]
 pub(crate) async fn swarm_digest(
     data_dir: &Path,
     all: bool,

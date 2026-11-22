@@ -403,7 +403,10 @@ impl DesktopApp {
     /// step in (recursively: a child may have its own). `selected` is the
     /// open Agent's id, drawn as the selection. `now` is the snapshot's
     /// read time, so the entries change only with a snapshot.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "The operation's distinct inputs remain explicit at its established call boundary."
+    )]
     fn monitor_entries(
         &self,
         row: &MonitorRow,

@@ -15,9 +15,14 @@ use std::{
     process::Stdio,
     time::Duration,
 };
+#[expect(
+    clippy::disallowed_types,
+    reason = "Git monitoring prepares native commands for bounded workspace observation."
+)]
+use tokio::process::Command;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
-    process::{ChildStdout, Command},
+    process::ChildStdout,
     time::{Instant, timeout_at},
 };
 
@@ -658,7 +663,10 @@ impl GitProbe {
         ))
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "The operation's distinct inputs remain explicit at its established call boundary."
+    )]
     async fn work_probe(
         &self,
         root: &Path,
@@ -1165,6 +1173,10 @@ impl GitProbe {
         .await)
     }
 
+    #[expect(
+        clippy::disallowed_types,
+        reason = "This prepares a Git effect command with its private index binding."
+    )]
     pub(crate) async fn prepare_workspace_effect_with_index(
         &self,
         root: &Path,
@@ -1201,6 +1213,10 @@ impl GitProbe {
     }
 
     /// Build, but never execute, an explicitly authorized workspace mutation.
+    #[expect(
+        clippy::disallowed_types,
+        reason = "This prepares one authorized workspace Git command."
+    )]
     pub(crate) async fn prepare_workspace_command(
         &self,
         root: &Path,
@@ -1222,6 +1238,10 @@ impl GitProbe {
     /// Prepare a workspace mutation with executable Git configuration disabled
     /// for both the command checkout and every checkout whose configuration Git
     /// may consult while performing the mutation.
+    #[expect(
+        clippy::disallowed_types,
+        reason = "This prepares workspace Git with executable config disabled for all roots."
+    )]
     pub(crate) async fn prepare_workspace_command_with_config_roots(
         &self,
         root: &Path,
@@ -1300,6 +1320,10 @@ impl GitProbe {
             .await
     }
 
+    #[expect(
+        clippy::disallowed_types,
+        reason = "This builds the configured Git command for monitored workspace work."
+    )]
     fn build_command(
         &self,
         root: &Path,
@@ -1310,6 +1334,10 @@ impl GitProbe {
         self.build_command_with_index(root, args, overrides, binding, None)
     }
 
+    #[expect(
+        clippy::disallowed_types,
+        reason = "This builds the Git command with the workspace index and explicit environment."
+    )]
     fn build_command_with_index(
         &self,
         root: &Path,
@@ -1318,6 +1346,10 @@ impl GitProbe {
         binding: Option<GitBinding<'_>>,
         index_file: Option<&Path>,
     ) -> Result<Command> {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "This statement constructs a process owned by this module."
+        )]
         let mut command = Command::new(&self.program);
         command.current_dir(root).env_clear();
         if let Some(binding) = binding {
@@ -1429,6 +1461,10 @@ impl GitProbe {
         .await?;
         Ok(Captured { code, stdout })
     }
+    #[expect(
+        clippy::disallowed_types,
+        reason = "This capture path takes ownership of the prepared Git child command."
+    )]
     async fn capture_git<T, F: Future<Output = Result<T>>>(
         command: Command,
         input: &[u8],

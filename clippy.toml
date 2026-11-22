@@ -1,0 +1,12 @@
+disallowed-methods = [
+    { path = "std::process::Command::new", reason = "Process creation belongs in named owner modules." },
+    { path = "tokio::process::Command::new", reason = "Process creation belongs in named owner modules." },
+    { path = "tokio::time::sleep", reason = "Vendor plugins must use the shared retry policy." },
+    { path = "std::fs::remove_dir_all", reason = "Recursive directory removal belongs in cleanup modules." },
+    { path = "tokio::fs::remove_dir_all", reason = "Recursive directory removal belongs in cleanup modules.", allow-invalid = true },
+]
+
+disallowed-types = [
+    { path = "std::process::Command", reason = "Process command types stay within explicit process owners." },
+    { path = "tokio::process::Command", reason = "Process command types stay within explicit process owners." },
+]

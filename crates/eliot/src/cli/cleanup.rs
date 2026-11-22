@@ -5,6 +5,14 @@ use super::{
 use eliot_core::api::*;
 use std::path::PathBuf;
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "Recursive directory removal is centralized in CLI cleanup."
+)]
+pub(super) fn remove_dir_all(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::remove_dir_all(path)
+}
+
 pub(crate) async fn run_cleanup(
     args: CleanupArgs,
     data: PathBuf,

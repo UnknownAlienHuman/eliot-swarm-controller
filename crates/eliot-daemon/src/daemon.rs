@@ -1822,6 +1822,10 @@ pub async fn wait_command(
         ) {
             return Ok(Some(command));
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "This bounded wait is owned by the surrounding operation."
+        )]
         tokio::time::sleep(SETTLE_LAG.min(deadline.saturating_duration_since(Instant::now())))
             .await;
     }

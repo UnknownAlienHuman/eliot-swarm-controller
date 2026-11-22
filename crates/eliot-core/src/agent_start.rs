@@ -15,6 +15,10 @@ pub struct AgentStartParams {
     pub command_id: String,
     #[serde(default)]
     pub profile: Option<Value>,
+    /// Frozen owner rules supplied only to a native adapter's private start
+    /// request; never stored in the public Agent/profile projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_rules: Option<String>,
     #[serde(default)]
     pub workspace: Option<String>,
     #[serde(default)]
@@ -67,6 +71,7 @@ impl AgentStartParams {
             generation,
             command_id: command_id.into(),
             profile: None,
+            owner_rules: None,
             workspace: None,
             target_environment: None,
             mcp_environment: None,

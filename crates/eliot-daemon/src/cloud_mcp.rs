@@ -26,9 +26,14 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
+#[expect(
+    clippy::disallowed_types,
+    reason = "The Cloud MCP supervisor owns the configured HTTP and tunnel child commands."
+)]
+use tokio::process::Command;
 use tokio::{
     io::AsyncReadExt,
-    process::{ChildStdin, ChildStdout, Command},
+    process::{ChildStdin, ChildStdout},
     time::timeout,
 };
 use tokio_util::sync::CancellationToken;
@@ -269,7 +274,15 @@ async fn supervise(
     }
 }
 
+#[expect(
+    clippy::disallowed_types,
+    reason = "This function creates the configured local HTTP MCP child."
+)]
 fn spawn_http(config: &CloudMcpConfig, data_root: &Path, public_url: &str) -> Result<OwnedChild> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "This statement constructs a process owned by this module."
+    )]
     let mut command = Command::new(&config.http_mcp_executable);
     command
         .arg("--data-dir")
@@ -291,11 +304,19 @@ fn spawn_http(config: &CloudMcpConfig, data_root: &Path, public_url: &str) -> Re
     OwnedChild::spawn(command)
 }
 
+#[expect(
+    clippy::disallowed_types,
+    reason = "This function creates the configured cloudflared tunnel child."
+)]
 fn spawn_tunnel(
     config: &CloudMcpConfig,
     data_root: &Path,
     config_file: &Path,
 ) -> Result<OwnedChild> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "This statement constructs a process owned by this module."
+    )]
     let mut command = Command::new(&config.cloudflared_executable);
     command
         .arg("tunnel")
@@ -363,6 +384,10 @@ fn collect_secret_strings(value: &serde_json::Value, out: &mut Vec<String>) {
     }
 }
 
+#[expect(
+    clippy::disallowed_types,
+    reason = "This helper applies the allowlisted environment to the Cloud MCP child."
+)]
 fn add_minimal_os_environment(command: &mut Command) -> Result<()> {
     #[cfg(windows)]
     {

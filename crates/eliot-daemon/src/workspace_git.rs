@@ -14,10 +14,12 @@ use std::{
     path::{Component, Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::{
-    process::Command,
-    time::{Instant, timeout_at},
-};
+#[expect(
+    clippy::disallowed_types,
+    reason = "Workspace Git prepares native commands for authorized worktree effects."
+)]
+use tokio::process::Command;
+use tokio::time::{Instant, timeout_at};
 
 pub(crate) mod containment;
 mod readback;
@@ -391,6 +393,10 @@ impl WorkspaceGit {
 
     /// Requires the manager's durable `creating` intent. This never spawns the
     /// returned mutator and cannot repair/replay a partial previous creation.
+    #[expect(
+        clippy::disallowed_types,
+        reason = "This prepares the Git command for an admitted worktree creation."
+    )]
     pub(crate) async fn prepare_create(
         &self,
         preparation: &WorkspacePreparation,
@@ -480,6 +486,10 @@ impl WorkspaceGit {
 
     /// Git can leave its new branch after a failed checkout has removed its
     /// registration and directory. Authorize deletion only for our own ref.
+    #[expect(
+        clippy::disallowed_types,
+        reason = "This prepares rollback of the branch left by a failed checkout."
+    )]
     pub(crate) async fn prepare_failed_checkout_rollback(
         &self,
         preparation: &WorkspacePreparation,
@@ -539,6 +549,10 @@ impl WorkspaceGit {
             .map(Some)
     }
 
+    #[expect(
+        clippy::disallowed_types,
+        reason = "This prepares removal of a worktree created by the failed launch."
+    )]
     pub(crate) async fn prepare_created_worktree_rollback(
         &self,
         preparation: &WorkspacePreparation,
@@ -914,6 +928,10 @@ impl WorkspaceGit {
 
     /// Only prepares ordinary, non-force removal. The manager removes explicitly
     /// allowed scratch after committing `removing`, before calling this method.
+    #[expect(
+        clippy::disallowed_types,
+        reason = "This prepares the authorized non-force worktree removal command."
+    )]
     pub(crate) async fn prepare_remove(
         &self,
         preparation: &WorkspacePreparation,

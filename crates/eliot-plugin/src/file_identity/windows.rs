@@ -1,4 +1,7 @@
-#![allow(unsafe_code)]
+#![allow(
+    unsafe_code,
+    reason = "Windows file identity requires this isolated handle FFI boundary."
+)]
 
 //! Small FFI boundary using locked windows-sys 0.61.2 (MIT OR Apache-2.0).
 //! No upstream implementation is copied. FileIdInfo supplies the full 128-bit ID:

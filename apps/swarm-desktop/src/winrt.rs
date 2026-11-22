@@ -3,7 +3,10 @@
 //! crate-private, so each caller declares only the vtable slots it calls,
 //! with ids and slot numbers read from the Windows App SDK metadata
 //! (`Microsoft.UI.Xaml.winmd` 2.3.0, `Microsoft.UI.winmd` 2.1.3).
-#![allow(unsafe_code)]
+#![allow(
+    unsafe_code,
+    reason = "WinRT UI integration requires COM and native interface calls."
+)]
 
 use std::ffi::c_void;
 

@@ -610,6 +610,7 @@ pub fn section_label(section: eliot_core::api::SettingsSection) -> &'static str 
         S::Desktop => "desktop",
         S::Accounts => "accounts",
         S::Proxies => "proxies",
+        S::OwnerRules => "owner rules",
     }
 }
 

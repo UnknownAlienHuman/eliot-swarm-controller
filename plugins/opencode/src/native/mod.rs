@@ -15,6 +15,10 @@ pub(crate) use client::{HttpOutcome, OpenCodeHttp};
 pub(crate) use server::{OwnedServer, SWARM_MCP_SERVER_NAME, ServerLaunch};
 
 /// Use the same isolated config discovery for serve and both model readers.
+#[expect(
+    clippy::disallowed_types,
+    reason = "This shared environment helper configures an OpenCode native child command."
+)]
 pub(crate) fn apply_environment(
     command: &mut tokio::process::Command,
     environment: &[(std::ffi::OsString, std::ffi::OsString)],

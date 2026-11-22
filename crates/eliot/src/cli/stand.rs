@@ -83,7 +83,7 @@ pub(crate) async fn up(
         .map_err(|error| io_failure("resolve created stand", error))?;
     let workspace = root.join("repo");
     if let Err(failure) = prepare(&root, &workspace, profile).await {
-        fs::remove_dir_all(&root).map_err(|error| {
+        super::cleanup::remove_dir_all(&root).map_err(|error| {
             io_failure(
                 &format!(
                     "{}; remove incomplete stand {}",
@@ -254,7 +254,7 @@ fn remove_offline_root(
         if metadata.is_dir() && is_link(&metadata) {
             fs::remove_dir(path).map_err(failure)?;
         } else if metadata.is_dir() {
-            fs::remove_dir_all(path).map_err(failure)?;
+            super::cleanup::remove_dir_all(&path).map_err(failure)?;
         } else {
             fs::remove_file(path).map_err(failure)?;
         }
@@ -422,6 +422,14 @@ async fn prepare(root: &Path, workspace: &Path, profile: Option<Vec<u8>>) -> Res
 }
 
 async fn git(workspace: &Path, args: &[&str]) -> Result<(), Failure> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "This statement constructs a process owned by this module."
+    )]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "This helper invokes Git while assembling the private QA stand."
+    )]
     let mut command = tokio::process::Command::new("git");
     for (name, _) in std::env::vars_os() {
         if name

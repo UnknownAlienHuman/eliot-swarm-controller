@@ -4,10 +4,15 @@
 //! are registered with Cargo so moving a branch invalidates the embedded id,
 //! including when Git resolves the worktree through an ancestor marker.
 
+#[expect(
+    clippy::disallowed_types,
+    reason = "Build identity imports the command type for its compile-time Git probe"
+)]
+use std::process::Command;
 use std::{
     env, fs,
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::Output,
 };
 
 pub fn emit() {
@@ -142,6 +147,14 @@ fn watch_git_markers(workspace_root: &Path) {
 }
 
 fn git_output(directory: &Path, arguments: &[&str]) -> Option<Output> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "Read the compiling checkout's Git identity before linking"
+    )]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "The build identity probe configures this Git command"
+    )]
     let output = Command::new("git")
         .args(arguments)
         // Avoid Git's optional index refresh writes while calculating identity.

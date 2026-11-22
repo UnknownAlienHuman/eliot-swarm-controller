@@ -113,6 +113,10 @@ const GUI_ENV: &[&str] = &[
     "HOMEPATH",
 ];
 
+#[expect(
+    clippy::disallowed_types,
+    reason = "This public helper returns the editor child command for a script."
+)]
 pub fn editor_command(editor: &Path, script: &str) -> std::process::Command {
     let environment = GUI_ENV
         .iter()
@@ -120,11 +124,19 @@ pub fn editor_command(editor: &Path, script: &str) -> std::process::Command {
     editor_command_with_env(editor, script, environment)
 }
 
+#[expect(
+    clippy::disallowed_types,
+    reason = "This helper constructs an editor child command with the selected environment."
+)]
 fn editor_command_with_env(
     editor: &Path,
     script: &str,
     environment: impl IntoIterator<Item = (impl AsRef<std::ffi::OsStr>, impl AsRef<std::ffi::OsStr>)>,
 ) -> std::process::Command {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "This statement constructs a process owned by this module."
+    )]
     let mut command = std::process::Command::new(editor);
     command.env_clear().arg(script);
     for (name, value) in environment {

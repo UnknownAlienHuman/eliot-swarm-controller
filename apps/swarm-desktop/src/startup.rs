@@ -12,7 +12,10 @@
 //!   is written only into a data directory that already exists (the daemon
 //!   creates and secures it), never under its daemon-owned `logs/`.
 //! - A fatal start-up error is also shown in a plain message box.
-#![allow(unsafe_code)]
+#![allow(
+    unsafe_code,
+    reason = "Desktop startup requires the Windows process and window APIs."
+)]
 
 use std::io::Write;
 use std::os::windows::io::IntoRawHandle;

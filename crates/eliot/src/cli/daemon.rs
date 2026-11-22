@@ -1,4 +1,5 @@
 //! Daemon lifecycle and serving commands: daemon, status, mcp.
+
 use super::args::{
     DaemonAction, DaemonArgs, MaintenanceArgs, MaintenanceCommand, McpArgs,
     PurgeLegacyAttentionAdvisoriesArgs,
@@ -14,7 +15,13 @@ use eliot_core::api::{
 use serde_json::Value;
 use serde_json::json;
 #[cfg(not(windows))]
-use std::process::{Command as ProcessCommand, Stdio};
+#[expect(
+    clippy::disallowed_types,
+    reason = "Unix daemon lifecycle owns the process command used for detached startup."
+)]
+use std::process::Command as ProcessCommand;
+#[cfg(not(windows))]
+use std::process::Stdio;
 use std::{
     path::{Path, PathBuf},
     time::Duration,
@@ -333,6 +340,14 @@ pub(crate) async fn start_daemon(data_dir: &Path, json_output: bool) -> Result<u
     {
         let executable = std::env::current_exe()
             .map_err(|error| Failure::new(1, format!("cannot locate Eliot executable: {error}")))?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "This statement constructs a process owned by this module."
+        )]
+        #[expect(
+            clippy::disallowed_types,
+            reason = "This starts the detached daemon executable from the Unix CLI."
+        )]
         let mut command = ProcessCommand::new(executable);
         #[cfg(unix)]
         {
@@ -481,6 +496,10 @@ pub(crate) async fn wait_for_daemon_ready(
         if Instant::now() >= deadline {
             break;
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "CLI daemon startup polls readiness within its caller's deadline"
+        )]
         sleep(STARTUP_POLL.min(deadline.saturating_duration_since(Instant::now()))).await;
         if Instant::now() >= deadline {
             break;

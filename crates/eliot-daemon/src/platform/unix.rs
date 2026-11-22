@@ -1,4 +1,7 @@
-#![allow(unsafe_code)]
+#![allow(
+    unsafe_code,
+    reason = "Unix process custody requires process-group and signal FFI."
+)]
 
 use super::process_observation::unknown_sample;
 #[cfg(target_os = "linux")]
@@ -109,6 +112,10 @@ pub(crate) fn validate_private_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[expect(
+    clippy::disallowed_types,
+    reason = "This Unix helper adds the leaf-process fence to the prepared Git command."
+)]
 pub(crate) fn prepare_leaf_command(
     mut command: tokio::process::Command,
 ) -> Result<tokio::process::Command> {

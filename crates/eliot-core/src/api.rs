@@ -72,23 +72,26 @@ pub use agent_views::{
     InstructionReadStatus, InstructionSourceStatus, MAX_DIAGNOSE_ATTENTION_STEPS,
     MAX_DIAGNOSE_MESSAGE_CHARS, MAX_DIAGNOSE_STEPS, MAX_DIAGNOSE_SUMMARY_CHARS,
     MAX_PATCH_DIGEST_OUTSIDE_CLAIMS, MAX_PATCH_DIGEST_PATH_BYTES, NativeNotice, NativeNoticeKind,
-    OwnedProcessKind, OwnedProcessSummary, PROCESS_CURSOR_MAX_BYTES,
-    PROJECT_POLICY_OPT_OUT_REASON_MAX_BYTES, PROJECT_POLICY_OPTOUTS_MAX, PatchDigestFile,
-    ProcessPageCursor, ProjectCheckoutView, ProjectDiscoverResponse, ProjectGitHubCliView,
-    ProjectGitPublicationView, ProjectGitView, ProjectPolicyOptOutView, ProjectPolicyUsageView,
-    ProjectRegistrationView, RetainedUnknownSummary, RetentionView, RunningTurnSummary,
-    SourceOwner, SourceState, StatusBlocker, UnsettledCommandSummary, WorkerTaskHealth,
-    WorkerTaskStatus, WorkspaceCustodyView, activity_state_name, agent_state_name,
-    agent_status_line, diagnosis_reason, process_state_name, repository_name_from_url,
+    OwnedProcessKind, OwnedProcessSummary, OwnerRulesDeliveryMethod, OwnerRulesDeliveryStatus,
+    OwnerRulesDeliveryView, PROCESS_CURSOR_MAX_BYTES, PROJECT_POLICY_OPT_OUT_REASON_MAX_BYTES,
+    PROJECT_POLICY_OPTOUTS_MAX, PatchDigestFile, ProcessPageCursor, ProjectCheckoutView,
+    ProjectDiscoverResponse, ProjectGitHubCliView, ProjectGitPublicationView, ProjectGitView,
+    ProjectPolicyOptOutView, ProjectPolicyUsageView, ProjectRegistrationView,
+    RetainedUnknownSummary, RetentionView, RunningTurnSummary, SourceOwner, SourceState,
+    StatusBlocker, UnsettledCommandSummary, WorkerTaskHealth, WorkerTaskStatus,
+    WorkspaceCustodyView, activity_state_name, agent_state_name, agent_status_line,
+    diagnosis_reason, process_state_name, repository_name_from_url,
     sanitize_project_policy_opt_out_reason, stats_coverage_name,
     valid_project_policy_opt_out_reason,
 };
 pub use config_views::{
-    CONFIG_REVISION_HEX_LEN, MAX_LISTED_PROFILES, MAX_PROFILES_SOURCE_BYTES, ProfileListRequest,
+    CONFIG_REVISION_HEX_LEN, MAX_LISTED_PROFILES, MAX_OWNER_RULES_BYTES, MAX_PROFILES_SOURCE_BYTES,
+    OWNER_RULES_WARNING_BYTES, PROJECT_RULES_WARNING_BYTES, ProfileListRequest,
     ProfileListResponse, ProfileSummary, REDACTION_MARKER, RoutingPreviewRequest,
     RoutingPreviewResponse, RuleListEntry, RuleListRequest, RuleListResponse, SettingsClientSource,
     SettingsHistoryEntry, SettingsHistoryStatus, SettingsReadIssue, SettingsReadRequest,
-    SettingsReadResponse, SettingsSaveRequest, SettingsSaveResponse, SettingsSection,
+    SettingsReadResponse, SettingsReadWarning, SettingsSaveRequest, SettingsSaveResponse,
+    SettingsSection,
 };
 pub use coordination::{
     ClaimConflict, ClaimListRequest, ClaimListResponse, ClaimReleaseRequest, ClaimReleaseResponse,
@@ -179,8 +182,8 @@ pub use notify::{EmitDefinitionArgs, NotifyDefinitionArgs};
 pub use observe::{
     DEFAULT_OBSERVE_WINDOW_SECS, DoctorHarnessEntry, HarnessDoctorRequest, HarnessDoctorResponse,
     HeavyAgentTotals, HeavyEpisodeView, HeavySummaryView, MAX_DOCTOR_HARNESSES, MAX_HEAVY_EPISODES,
-    MAX_OBSERVE_WINDOW_SECS, ObserveHeavyRequest, ObserveHeavyResponse, SessionGrowthView,
-    WorkSummaryView, is_read_only_or_audit_profile,
+    MAX_OBSERVE_WINDOW_SECS, ObserveHeavyRequest, ObserveHeavyResponse, OwnerRulesGlobalFile,
+    OwnerRulesGlobalFileStatus, SessionGrowthView, WorkSummaryView, is_read_only_or_audit_profile,
 };
 pub use organization::{
     ChatAttachRequest, ChatDetachRequest, ChatOrganizationMutationResponse,

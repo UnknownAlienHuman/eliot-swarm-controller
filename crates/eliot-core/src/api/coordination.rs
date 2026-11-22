@@ -95,7 +95,10 @@ impl MailMode {
 #[derive(schemars::JsonSchema)]
 #[schemars(untagged)]
 #[doc(hidden)]
-#[allow(dead_code)] // Used only through Schemars field overrides.
+#[allow(
+    dead_code,
+    reason = "Schemars consumes this hidden schema through field overrides."
+)] // Used only through Schemars field overrides.
 enum MailIdentifierListSchema {
     One(#[schemars(length(min = 1))] String),
     Many(

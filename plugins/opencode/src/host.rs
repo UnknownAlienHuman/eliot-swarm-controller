@@ -17,6 +17,7 @@ use crate::{
 };
 use eliot_core::local_provider::LocalProvider;
 use eliot_core::{ContextItem, Error, FailureOrigin, InjectPoint, McpPolicy, Result, SecretPolicy};
+use eliot_plugin::retry::{Retry, RetryFact, RetryOperation};
 use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
     MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
@@ -40,7 +41,7 @@ use std::{
 };
 use tokio::{
     sync::mpsc,
-    time::{Instant, sleep, timeout_at},
+    time::{Instant, timeout_at},
 };
 
 const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -48,7 +49,6 @@ const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// available. Its native catalogue fetch allows 10 seconds; leave time for
 /// the provider reload while keeping the start cleanup reserve intact.
 const START_CATALOGUE_READY_BUDGET: std::time::Duration = std::time::Duration::from_secs(12);
-const START_CATALOGUE_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Total bound for one agent.start dispatch, from admission to the ready,
 /// failed, or unknown response. The daemon allows 90 s for the agent.start
@@ -1233,6 +1233,7 @@ impl OpenCodePlugin {
                     reuse_existing: parsed.resume.is_some(),
                 }),
                 local_provider: parsed.local_provider.clone(),
+                owner_rules: parsed.params.owner_rules.clone(),
                 frozen_pass_env: parsed
                     .params
                     .profile
@@ -4610,8 +4611,8 @@ async fn wait_for_start_catalogue(
         })
     };
     let mut entries = http.list_native_models(deadline).await?;
-    while !ready(&entries) && Instant::now() + START_CATALOGUE_POLL < deadline {
-        sleep(START_CATALOGUE_POLL).await;
+    let mut retry = Retry::new(RetryOperation::ReadinessPoll);
+    while !ready(&entries) && retry.wait(RetryFact::Idempotent, Some(deadline)).await {
         entries = http.list_native_models(deadline).await?;
     }
     Ok(entries)

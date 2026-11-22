@@ -244,6 +244,10 @@ fn script_custody(custody: CustodyGuarantee) -> ScriptCustody {
 fn script_custody(_: CustodyGuarantee) -> ScriptCustody {
     ScriptCustody::Unknown
 }
+#[expect(
+    clippy::disallowed_types,
+    reason = "This helper removes inherited Swarm authority from script child commands."
+)]
 fn scrub_role_environment(command: &mut tokio::process::Command) {
     for name in [
         "ELIOT_AGENT_ID",

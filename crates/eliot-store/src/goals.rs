@@ -341,7 +341,10 @@ enum StoredGoalRoundOutcome {
     Failed(Error),
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The Goal round event records explicit outcome, timing, and causal evidence"
+)]
 fn insert_goal_round_event(
     tx: &Transaction<'_>,
     record: &GoalRoundRecord,
@@ -888,7 +891,10 @@ pub(super) fn transfer_goal_tx(
 }
 
 impl Store {
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "The operation's distinct inputs remain explicit at its established call boundary."
+    )]
     pub fn goal_set(
         &mut self,
         agent: &str,
@@ -1420,7 +1426,10 @@ impl Store {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "The failure settlement carries the exact request, observed deadlines, and ownership state"
+    )]
     fn goal_finish_round_error(
         &mut self,
         principal: &str,
@@ -1496,7 +1505,10 @@ impl Store {
         result
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "The operation's distinct inputs remain explicit at its established call boundary."
+    )]
     fn goal_set_inner(
         &mut self,
         agent: &str,

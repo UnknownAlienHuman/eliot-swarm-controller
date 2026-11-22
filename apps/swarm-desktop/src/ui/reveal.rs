@@ -86,6 +86,14 @@ fn explorer_arg(target: &Target) -> String {
 }
 
 /// `%SystemRoot%\explorer.exe`, by absolute path.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "This helper builds the platform file-reveal command."
+)]
+#[expect(
+    clippy::disallowed_types,
+    reason = "This helper returns the File Explorer command used by file reveal."
+)]
 fn explorer() -> Result<std::process::Command, String> {
     let root = std::env::var_os("SystemRoot")
         .ok_or_else(|| "File Explorer was not found: SystemRoot is not set.".to_owned())?;

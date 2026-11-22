@@ -7,6 +7,7 @@ use eliot_core::api::{
     inference::sha256_hex,
     native_profile::{CODEX_DEFAULT_PROJECT_DOC_MAX_BYTES, codex_project_doc_override},
 };
+use eliot_plugin::MAX_EVENT_BYTES;
 use serde_json::Value;
 use std::path::Path;
 
@@ -16,6 +17,28 @@ pub(super) struct Capture {
     pub facts: InstructionDeliveryView,
     pub should_deliver_primary: bool,
     source_path: Option<String>,
+}
+
+/// Append trusted owner guidance after any quoted project-source blocks. This
+/// is an instruction block, not untrusted project data, and counts UTF-8 bytes.
+pub(super) fn append_owner_rules(
+    input: &str,
+    revision: &str,
+    digest: &str,
+    rules: &str,
+) -> Result<String, eliot_core::Error> {
+    let quoted = eliot_core::fence_untrusted_text(rules);
+    let block = format!(
+        "Apply the Swarm owner rules in this block (settings revision {revision}, SHA-256 {digest}).\n{quoted}"
+    );
+    let delivered = sources::append_block(input, &block);
+    if delivered.len() > MAX_EVENT_BYTES {
+        return Err(eliot_core::Error::new(
+            "frame_too_large",
+            "owner rules and first input exceed the 64 KiB persisted-text limit",
+        ));
+    }
+    Ok(delivered)
 }
 
 pub(super) fn capture(workspace: Option<&str>, harness: &str, profile: &Value) -> Capture {

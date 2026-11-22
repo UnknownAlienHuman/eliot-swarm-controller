@@ -4,6 +4,10 @@ use serde_json::Value;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
+#[expect(
+    clippy::disallowed_types,
+    reason = "Windows CLI autostart launches the owner-selected PowerShell helper."
+)]
 use tokio::process::Command;
 use tokio::time::timeout;
 
@@ -369,6 +373,14 @@ async fn run_task_scheduler(
     action: Option<(&Path, &str)>,
 ) -> Result<Value, Failure> {
     let powershell = powershell_executable()?;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "This statement constructs a process owned by this module."
+    )]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "This command invokes PowerShell for the requested autostart action."
+    )]
     let mut command = Command::new(powershell);
     command
         .args([

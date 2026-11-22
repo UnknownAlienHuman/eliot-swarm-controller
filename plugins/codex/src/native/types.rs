@@ -205,6 +205,8 @@ pub struct NativeThreadStartParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_policy: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub developer_instructions: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<NativeThreadConfigOverrides>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
@@ -833,6 +835,8 @@ pub struct NativeThreadResumeParams {
     pub sandbox: Option<NativeSandboxMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_policy: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub developer_instructions: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<NativeThreadConfigOverrides>,
 }

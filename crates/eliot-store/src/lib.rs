@@ -51,7 +51,8 @@ pub use turn_recovery::{ActiveTurnRecovery, RecoveredTurn};
 pub use usage::ResolvedUsageScope;
 
 use eliot_core::api::{
-    HeavySummaryView, InstructionDeliveryView, SessionGrowthView, agent_state_name, is_git_oid,
+    HeavySummaryView, InstructionDeliveryView, OwnerRulesDeliveryStatus, OwnerRulesDeliveryView,
+    SessionGrowthView, agent_state_name, is_git_oid,
 };
 use eliot_core::limits::{MAX_COMMAND_ID_BYTES, MAX_EVENT_BYTES, MAX_FRAME_BYTES, MAX_TEXT_BYTES};
 use eliot_core::{
@@ -241,6 +242,13 @@ mod wakes;
 pub use wakes::{AgentWakeRecord, AgentWakeRunReceipt, AgentWakeTurnReadiness};
 mod workspace;
 
+fn decode_owner_rules_delivery(value: &str) -> Result<StoredOwnerRulesDelivery> {
+    let stored: StoredOwnerRulesDelivery = serde_json::from_str(value)
+        .map_err(|_| Error::new("internal", "stored owner rules delivery is invalid"))?;
+    stored.view.validate()?;
+    Ok(stored)
+}
+
 fn sql_error(error: rusqlite::Error) -> Error {
     if matches!(
         error.sqlite_error_code(),
@@ -334,6 +342,12 @@ pub struct WriteAdmission {
 
 /// A single SQLite connection is the Store's writer. All mutations use an
 /// IMMEDIATE transaction and return events only after commit succeeds.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct StoredOwnerRulesDelivery {
+    view: OwnerRulesDeliveryView,
+    input_command_id: Option<String>,
+}
+
 pub struct Store {
     connection: Connection,
     write_faulted: Cell<bool>,
@@ -1231,6 +1245,210 @@ impl Store {
                 })
             })
             .transpose()
+    }
+
+    /// Read retained delivery evidence without copying the settings text into the Agent.
+    pub fn get_agent_owner_rules_delivery(
+        &self,
+        id: &str,
+    ) -> Result<Option<OwnerRulesDeliveryView>> {
+        Ok(self
+            .read_owner_rules_delivery(id)?
+            .map(|stored| stored.view))
+    }
+
+    /// The exact send binding is used to reuse a prepared input without fencing it twice.
+    pub fn get_agent_owner_rules_offer(
+        &self,
+        id: &str,
+    ) -> Result<Option<(OwnerRulesDeliveryView, Option<String>)>> {
+        Ok(self
+            .read_owner_rules_delivery(id)?
+            .map(|stored| (stored.view, stored.input_command_id)))
+    }
+
+    fn read_owner_rules_delivery(&self, id: &str) -> Result<Option<StoredOwnerRulesDelivery>> {
+        self.ensure_committed_reads()?;
+        let value: Option<Option<String>> = self
+            .connection
+            .query_row(
+                "SELECT owner_rules_delivery FROM agents WHERE id = ?1",
+                [parse_agent_id(id)?],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        value
+            .flatten()
+            .as_deref()
+            .map(decode_owner_rules_delivery)
+            .transpose()
+    }
+
+    /// Freeze delivery metadata even when a launch has no applicable linked input.
+    /// A refusal can retain a diagnostic receipt without authorizing native start.
+    pub fn record_launch_owner_rules_delivery(
+        &mut self,
+        command_id: &str,
+        view: &OwnerRulesDeliveryView,
+    ) -> Result<bool> {
+        view.validate()?;
+        self.ensure_writer_healthy()?;
+        let stored = StoredOwnerRulesDelivery {
+            view: view.clone(),
+            input_command_id: None,
+        };
+        let result = self
+            .connection
+            .execute(
+                "UPDATE agents SET owner_rules_delivery = ?1
+             WHERE generation = 0 AND owner_rules_delivery IS NULL
+               AND id = (SELECT target FROM commands WHERE id = ?2 AND verb = 'launch'
+                         AND (?3 OR state IN ('accepted','queued')))",
+                params![
+                    encode_json(&stored)?,
+                    command_id,
+                    view.status == OwnerRulesDeliveryStatus::NotDelivered,
+                ],
+            )
+            .map_err(sql_error);
+        self.fault_on_persistence_error(&result);
+        Ok(result? == 1)
+    }
+
+    /// Retain a first owner-rules receipt when reopening a legacy Agent.
+    pub fn record_resume_owner_rules_snapshot(
+        &mut self,
+        agent: &str,
+        generation: i64,
+        view: &OwnerRulesDeliveryView,
+    ) -> Result<bool> {
+        view.validate()?;
+        self.ensure_writer_healthy()?;
+        let stored = StoredOwnerRulesDelivery {
+            view: view.clone(),
+            input_command_id: None,
+        };
+        let result = self
+            .connection
+            .execute(
+                "UPDATE agents SET owner_rules_delivery = ?1
+             WHERE id = ?2 AND generation = ?3 AND owner_rules_delivery IS NULL",
+                params![encode_json(&stored)?, parse_agent_id(agent)?, generation],
+            )
+            .map_err(sql_error);
+        self.fault_on_persistence_error(&result);
+        Ok(result? == 1)
+    }
+
+    /// Bind a prepared first input to the retained digest before native I/O.
+    /// Reuse the exact prepared command, or rebind after a terminal refusal.
+    pub fn record_send_owner_rules_offer(
+        &mut self,
+        command_id: &str,
+        digest: &str,
+        expected_text: &str,
+        delivered_text: Option<&str>,
+        now: i64,
+    ) -> Result<bool> {
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let Some(command) = load_command(&tx, command_id)? else {
+                return Err(Error::new("not_found", "send command was not found"));
+            };
+            if command.verb != "send"
+                || !matches!(command.state, CommandState::Accepted | CommandState::Queued)
+            {
+                return Ok(false);
+            }
+            let target = command
+                .target
+                .as_deref()
+                .ok_or_else(|| Error::new("source_integrity", "send command has no Agent"))?;
+            let agent_num = parse_agent_id(target)?;
+            let agent: Option<(i64, Option<String>)> = tx
+                .query_row(
+                    "SELECT generation, owner_rules_delivery FROM agents WHERE id = ?1",
+                    [agent_num],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(sql_error)?;
+            let Some((generation, Some(encoded))) = agent else {
+                return Ok(false);
+            };
+            if command.generation.is_some_and(|value| value != generation) {
+                return Ok(false);
+            }
+            let mut stored = decode_owner_rules_delivery(&encoded)?;
+            if stored.view.digest != digest {
+                return Ok(false);
+            }
+            match stored.view.status {
+                OwnerRulesDeliveryStatus::Delivered | OwnerRulesDeliveryStatus::Unknown => {
+                    return Ok(true);
+                }
+                OwnerRulesDeliveryStatus::Offered => {
+                    if stored.input_command_id.as_deref() == Some(command_id) {
+                        return Ok(true);
+                    }
+                    let Some(previous_id) = stored.input_command_id.as_deref() else {
+                        return Ok(false);
+                    };
+                    let Some(previous) = load_command(&tx, previous_id)? else {
+                        return Ok(false);
+                    };
+                    if !matches!(
+                        previous.state,
+                        CommandState::Rejected | CommandState::Failed | CommandState::Cancelled
+                    ) {
+                        return Ok(false);
+                    }
+                }
+                OwnerRulesDeliveryStatus::Pending | OwnerRulesDeliveryStatus::NotDelivered => {}
+            }
+            if command.args.get("text").and_then(Value::as_str) != Some(expected_text) {
+                return Err(Error::new(
+                    "source_integrity",
+                    "send text changed before owner rules delivery",
+                ));
+            }
+            if stored.view.method == eliot_core::api::OwnerRulesDeliveryMethod::FirstInput
+                && delivered_text.is_none()
+            {
+                return Ok(false);
+            }
+            if let Some(delivered_text) = delivered_text {
+                if delivered_text.len() > MAX_TEXT_BYTES {
+                    return Err(Error::new(
+                        "frame_too_large",
+                        "owner rules exceed the input byte budget",
+                    ));
+                }
+                tx.execute(
+                    "UPDATE commands SET args = json_set(args, '$.text', ?1), updated_at = ?2
+                     WHERE id = ?3",
+                    params![delivered_text, now, command_id],
+                )
+                .map_err(sql_error)?;
+            }
+            stored.view.status = OwnerRulesDeliveryStatus::Offered;
+            stored.view.delivered = false;
+            stored.input_command_id = Some(command_id.to_owned());
+            tx.execute(
+                "UPDATE agents SET owner_rules_delivery = ?1 WHERE id = ?2",
+                params![encode_json(&stored)?, agent_num],
+            )
+            .map_err(sql_error)?;
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(true)
+        })();
+        self.fault_on_persistence_error(&result);
+        result
     }
 
     /// Retain the instruction facts and optional automatic primary source before
@@ -2184,7 +2402,10 @@ impl Store {
     /// along through the `events_kind` index, so an Agent waiting on a
     /// variable it can read sees the version bump; the fact never carries
     /// the value.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "The operation's distinct inputs remain explicit at its established call boundary."
+    )]
     pub fn read_agent_events(
         &self,
         agents: &[i64],
@@ -4961,7 +5182,73 @@ fn update_command_state(
         ));
     }
     write_command_state(tx, id, state, outcome, generation, now)?;
+    settle_owner_rules_input_failure_tx(tx, id, state, outcome)?;
     provider_holds::command_terminal_tx(tx, id, previous, state, now)
+}
+
+fn settle_owner_rules_input_failure_tx(
+    tx: &Transaction<'_>,
+    command_id: &str,
+    state: CommandState,
+    outcome: Option<&Value>,
+) -> Result<()> {
+    let asserted = outcome
+        .and_then(|value| value.get("resolution_source"))
+        .and_then(Value::as_str)
+        == Some("owner");
+    let status = match (state, asserted) {
+        (CommandState::Unknown, _) | (CommandState::Applied, true) => {
+            OwnerRulesDeliveryStatus::Unknown
+        }
+        (CommandState::Rejected | CommandState::Failed | CommandState::Cancelled, _) => {
+            OwnerRulesDeliveryStatus::NotDelivered
+        }
+        _ => return Ok(()),
+    };
+    let target: Option<Option<i64>> = tx
+        .query_row(
+            "SELECT target FROM commands WHERE id = ?1 AND verb = 'send'",
+            [command_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    let Some(agent_num) = target.flatten() else {
+        return Ok(());
+    };
+    update_owner_rules_input_status(tx, agent_num, command_id, status)
+}
+
+fn update_owner_rules_input_status(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    command_id: &str,
+    status: OwnerRulesDeliveryStatus,
+) -> Result<()> {
+    let encoded: Option<Option<String>> = tx
+        .query_row(
+            "SELECT owner_rules_delivery FROM agents WHERE id = ?1",
+            [agent_num],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    let Some(encoded) = encoded.flatten() else {
+        return Ok(());
+    };
+    let mut stored = decode_owner_rules_delivery(&encoded)?;
+    if stored.input_command_id.as_deref() != Some(command_id) {
+        return Ok(());
+    }
+    stored.view.status = status;
+    stored.view.delivered = status == OwnerRulesDeliveryStatus::Delivered;
+    stored.view.validate()?;
+    tx.execute(
+        "UPDATE agents SET owner_rules_delivery = ?1 WHERE id = ?2",
+        params![encode_json(&stored)?, agent_num],
+    )
+    .map_err(sql_error)?;
+    Ok(())
 }
 
 fn write_command_state(

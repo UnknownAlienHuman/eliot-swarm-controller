@@ -409,7 +409,12 @@ pub(crate) fn command_state_result(command: &CoreCommand) -> Result<bool, Failur
 pub(crate) const INTERRUPTED_EXIT_CODE: u8 = 7;
 
 pub(crate) async fn sleep_before_deadline(deadline: Instant) -> Result<(), Failure> {
-    timeout_at(deadline, sleep(WAIT_POLL_INTERVAL))
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "The CLI uses a bounded wait between readback polls"
+    )]
+    let poll_interval = sleep(WAIT_POLL_INTERVAL);
+    timeout_at(deadline, poll_interval)
         .await
         .map_err(|_| Failure::timeout())
 }

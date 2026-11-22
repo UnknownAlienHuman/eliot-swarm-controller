@@ -20,7 +20,6 @@ mod maintenance;
 mod monitor;
 pub mod operator;
 mod platform;
-mod plugin_host;
 mod proxy;
 pub(crate) mod publication;
 mod redaction;

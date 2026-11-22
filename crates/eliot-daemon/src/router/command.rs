@@ -10,7 +10,7 @@ use super::{
     validate_project_rule_resume_command, validate_retained_resume_agent,
 };
 use crate::common::now_ms;
-use crate::plugin_host::PendingCommand;
+use crate::router::plugin_host::PendingCommand;
 use eliot_core::{
     Agent, AgentState, Command, CommandState, ContextItem, Error, Event, FailureOrigin,
     FrozenScriptRun, InjectPoint, Result, SecretPolicy,
@@ -218,6 +218,9 @@ impl Router {
         let assignment = self.inner.store.lock().await.check_assignment_dispatch(id);
         if let Err(error) = assignment {
             self.reject_undispatched_error(id, &error).await;
+            return None;
+        }
+        if command.verb == "send" && !self.capture_send_owner_rules_delivery(id, &command).await {
             return None;
         }
         if !self.prepare_start_workspace(id, &command).await {
@@ -706,6 +709,10 @@ impl Router {
         {
             return false;
         }
+        if command.verb == "resume" && !self.capture_resume_owner_rules_delivery(id, command).await
+        {
+            return false;
+        }
         if command.verb == "launch"
             && command
                 .args
@@ -743,10 +750,10 @@ impl Router {
             }
         };
         if agent.chat {
-            return true;
+            return self.capture_launch_owner_rules_delivery(id, &agent).await;
         }
         if existing.is_some() {
-            return true;
+            return self.capture_launch_owner_rules_delivery(id, &agent).await;
         }
 
         let workspace = agent.workspace.clone();
@@ -812,12 +819,220 @@ impl Router {
                 now_ms(),
             );
         match result {
-            Ok(_) => true,
+            Ok(_) => self.capture_launch_owner_rules_delivery(id, &agent).await,
             Err(error) => {
                 self.abandon_unreadable_command(id, &error).await;
                 false
             }
         }
+    }
+
+    async fn capture_launch_owner_rules_delivery(&self, id: &str, agent: &Agent) -> bool {
+        let existing = self
+            .inner
+            .store
+            .lock()
+            .await
+            .get_agent_owner_rules_delivery(&agent.id);
+        match existing {
+            Ok(Some(view))
+                if view.status != eliot_core::api::OwnerRulesDeliveryStatus::NotDelivered =>
+            {
+                return true;
+            }
+            Ok(Some(_)) => {
+                let error = Error::new(
+                    "owner_rules_unavailable",
+                    "launch retained a refusal to deliver owner rules",
+                );
+                self.reject_undispatched_error(id, &error).await;
+                return false;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.abandon_unreadable_command(id, &error).await;
+                return false;
+            }
+        }
+        let view = match self.read_owner_rules_receipt(&agent.harness) {
+            Ok(Some(view)) => view,
+            Ok(None) => return true,
+            Err(error) => {
+                self.reject_undispatched_error(id, &error).await;
+                return false;
+            }
+        };
+        let result = {
+            let mut store = self.inner.store.lock().await;
+            (|| {
+                if store.record_launch_owner_rules_delivery(id, &view)? {
+                    return Ok(true);
+                }
+                if let Some(retained) = store.get_agent_owner_rules_delivery(&agent.id)? {
+                    return Ok(
+                        retained.status != eliot_core::api::OwnerRulesDeliveryStatus::NotDelivered
+                    );
+                }
+                let mut refused = view;
+                refused.status = eliot_core::api::OwnerRulesDeliveryStatus::NotDelivered;
+                store.record_launch_owner_rules_delivery(id, &refused)?;
+                Ok::<_, Error>(false)
+            })()
+        };
+        match result {
+            Ok(true) => true,
+            Ok(false) => {
+                let error = Error::new(
+                    "owner_rules_unavailable",
+                    "launch could not retain owner rules delivery; no native start was dispatched",
+                );
+                self.reject_undispatched_error(id, &error).await;
+                false
+            }
+            Err(error) => {
+                self.abandon_unreadable_command(id, &error).await;
+                false
+            }
+        }
+    }
+
+    fn read_owner_rules_receipt(
+        &self,
+        harness: &str,
+    ) -> Result<Option<eliot_core::api::OwnerRulesDeliveryView>> {
+        use eliot_core::api::{
+            OwnerRulesDeliveryMethod, OwnerRulesDeliveryStatus, OwnerRulesDeliveryView,
+        };
+        let Some((revision, text)) =
+            crate::config::settings::owner_rules_snapshot(&self.inner.data_root)?
+        else {
+            return Ok(None);
+        };
+        crate::config::settings::validate_owner_rules_text(&text, &self.secret_policy_snapshot())?;
+        let method = match harness {
+            "codex" => OwnerRulesDeliveryMethod::CodexDeveloperInstructions,
+            "claude" => OwnerRulesDeliveryMethod::ClaudeAppendSystemPromptFile,
+            "opencode" => OwnerRulesDeliveryMethod::OpenCodeAgentsFile,
+            _ => OwnerRulesDeliveryMethod::FirstInput,
+        };
+        Ok(Some(OwnerRulesDeliveryView {
+            revision,
+            digest: eliot_core::api::inference::sha256_hex(text.as_bytes()),
+            method,
+            status: OwnerRulesDeliveryStatus::Pending,
+            delivered: false,
+        }))
+    }
+
+    async fn capture_resume_owner_rules_delivery(&self, id: &str, command: &Command) -> bool {
+        let result = async {
+            let agent_id = command
+                .target
+                .as_deref()
+                .ok_or_else(|| Error::new("source_integrity", "resume has no Agent target"))?;
+            let agent = {
+                let store = self.inner.store.lock().await;
+                if store.get_agent_owner_rules_delivery(agent_id)?.is_some() {
+                    return Ok(());
+                }
+                store
+                    .get_agent(agent_id)?
+                    .ok_or_else(|| Error::new("not_found", "resume Agent was not found"))?
+            };
+            if let Some(view) = self.read_owner_rules_receipt(&agent.harness)? {
+                let mut store = self.inner.store.lock().await;
+                if !store.record_resume_owner_rules_snapshot(agent_id, agent.generation, &view)?
+                    && store.get_agent_owner_rules_delivery(agent_id)?.is_none()
+                {
+                    return Err(Error::new(
+                        "owner_rules_unavailable",
+                        "resume could not retain owner rules delivery",
+                    ));
+                }
+            }
+            Ok::<_, Error>(())
+        }
+        .await;
+        if let Err(error) = result {
+            self.reject_undispatched_error(id, &error).await;
+            return false;
+        }
+        true
+    }
+
+    async fn capture_send_owner_rules_delivery(&self, id: &str, command: &Command) -> bool {
+        use eliot_core::api::{OwnerRulesDeliveryMethod, OwnerRulesDeliveryStatus};
+        let result = async {
+            let agent_id = command
+                .target
+                .as_deref()
+                .ok_or_else(|| Error::new("source_integrity", "send has no Agent target"))?;
+            let offer = self
+                .inner
+                .store
+                .lock()
+                .await
+                .get_agent_owner_rules_offer(agent_id)?;
+            let Some((view, bound)) = offer else {
+                return Ok(());
+            };
+            if matches!(
+                view.status,
+                OwnerRulesDeliveryStatus::Delivered | OwnerRulesDeliveryStatus::Unknown
+            ) {
+                return Ok(());
+            }
+            let input = command
+                .args
+                .get("text")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    Error::new("invalid", "send requires text for owner rules delivery")
+                })?;
+            let already_prepared =
+                view.status == OwnerRulesDeliveryStatus::Offered && bound.as_deref() == Some(id);
+            let delivered_text =
+                if view.method == OwnerRulesDeliveryMethod::FirstInput && !already_prepared {
+                    let text = crate::config::settings::owner_rules_for_delivery(
+                        &self.inner.data_root,
+                        &view.digest,
+                        &self.secret_policy_snapshot(),
+                    )?;
+                    Some(super::instructions::append_owner_rules(
+                        input,
+                        &view.revision,
+                        &view.digest,
+                        &text,
+                    )?)
+                } else {
+                    None
+                };
+            if self
+                .inner
+                .store
+                .lock()
+                .await
+                .record_send_owner_rules_offer(
+                    id,
+                    &view.digest,
+                    input,
+                    delivered_text.as_deref(),
+                    now_ms(),
+                )?
+            {
+                return Ok(());
+            }
+            Err(Error::new(
+                "owner_rules_unavailable",
+                "send could not bind the retained owner rules to this input",
+            ))
+        }
+        .await;
+        if let Err(error) = result {
+            self.reject_undispatched_error(id, &error).await;
+            return false;
+        }
+        true
     }
 
     /// Record A3's starting point in the final workspace before native start.

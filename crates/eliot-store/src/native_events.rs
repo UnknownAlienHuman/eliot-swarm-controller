@@ -530,6 +530,12 @@ fn persist_turn_associated(
                              updated_at = ?3 WHERE id = ?4",
         params![turn_id, encode_json(&outcome)?, now, command_id],
     ));
+    update_owner_rules_input_status(
+        tx,
+        agent_num,
+        command_id,
+        OwnerRulesDeliveryStatus::Delivered,
+    )?;
     handoff::refresh_parent_tx(tx, command_id, now)?;
     // Native acceptance starts the wake-attempt cooldown. It does not
     // establish that the model received the inline mail.
@@ -943,7 +949,10 @@ fn settle_inline_mail(scope: EffectScope<'_, '_>, turn_id: &str, delivered: bool
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The operation's distinct inputs remain explicit at its established call boundary."
+)]
 fn persist_turn_terminal(
     scope: EffectScope<'_, '_>,
     command_id: Option<&str>,

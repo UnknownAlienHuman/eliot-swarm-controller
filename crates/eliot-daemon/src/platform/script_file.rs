@@ -1,7 +1,10 @@
 //! Directory-relative script I/O with pinned ancestors.
 //! Windows: Microsoft Learn NtCreateFile/OBJECT_ATTRIBUTES and FILE_RENAME_INFORMATION.
 //! Unix: existing libc openat/renameat; external namespace limits are in the spec.
-#![allow(unsafe_code)]
+#![allow(
+    unsafe_code,
+    reason = "Platform file identity and cleanup require this isolated native API boundary."
+)]
 
 use std::fs::File;
 use std::io::{Read, Seek, Write};

@@ -5,7 +5,10 @@
 //! dependency. Like the daemon's platform module it is the only place that
 //! allows `unsafe`; every handle it creates is either handed to the
 //! clipboard (which then owns it) or freed here.
-#![allow(unsafe_code)]
+#![allow(
+    unsafe_code,
+    reason = "Clipboard ownership and transfer require the Windows clipboard API."
+)]
 
 use windows_sys::Win32::Foundation::{GetLastError, GlobalFree, HWND};
 use windows_sys::Win32::System::DataExchange::{

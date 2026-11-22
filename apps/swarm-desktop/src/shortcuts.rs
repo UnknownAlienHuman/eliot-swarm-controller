@@ -23,7 +23,10 @@
 //! key passes on through `CallNextHookEx`. windows-rs master (unreleased
 //! Reactor 0.101.0) adds `on_preview_key_down`; a release with it replaces
 //! this.
-#![allow(unsafe_code)]
+#![allow(
+    unsafe_code,
+    reason = "Global shortcuts require Windows registration and message APIs."
+)]
 
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};

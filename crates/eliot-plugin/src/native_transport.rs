@@ -21,8 +21,13 @@ use std::{
 use futures_util::{FutureExt, SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[expect(
+    clippy::disallowed_types,
+    reason = "The native transport launches selected adapters inside owned process custody."
+)]
+use tokio::process::Command;
 use tokio::{
-    process::{ChildStdin, ChildStdout, Command},
+    process::{ChildStdin, ChildStdout},
     sync::{mpsc, oneshot, watch},
     time::{Instant, timeout_at},
 };
@@ -87,7 +92,10 @@ pub fn process_birth_boundary() -> Result<u64> {
 }
 
 #[cfg(windows)]
-#[allow(unsafe_code)]
+#[allow(
+    unsafe_code,
+    reason = "Platform process-birth evidence requires this isolated FFI adapter."
+)]
 mod process_birth {
     use std::{ffi::c_void, mem::size_of, ptr};
 
@@ -296,7 +304,10 @@ mod process_birth {
 }
 
 #[cfg(target_os = "linux")]
-#[allow(unsafe_code)]
+#[allow(
+    unsafe_code,
+    reason = "Platform process-birth evidence requires this isolated FFI adapter."
+)]
 mod process_birth {
     use std::{fs, io};
 
@@ -969,6 +980,14 @@ impl NativeChild {
         policy: SecretPolicy,
         labels: NativeLabels,
     ) -> Result<(Self, ChildStdout)> {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "This statement constructs a process owned by this module."
+        )]
+        #[expect(
+            clippy::disallowed_types,
+            reason = "This launch builds the native adapter's owned child command."
+        )]
         let mut command = Command::new(&launch.program);
         command
             .args(&launch.args)
@@ -1724,7 +1743,10 @@ type OversizedNotification<Frame> = Option<(&'static str, fn(OversizedFrame) -> 
 /// queue. Other consumers keep their existing watch-only fault contract.
 /// An adapter may also nominate a JSON-RPC notification to discard and report
 /// in order when an oversized record ends at a newline.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The operation's distinct inputs remain explicit at its established call boundary."
+)]
 pub async fn spawn_pumped<Frame, Classify>(
     launch: NativeLaunch,
     policy: SecretPolicy,
@@ -2067,7 +2089,10 @@ async fn next_native_line(
 /// classification of each parsed record, one overflow gap, and a bounded
 /// post-exit drain before any loss conclusion. The classifier owns every
 /// protocol decision; the pump owns every transport decision.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The operation's distinct inputs remain explicit at its established call boundary."
+)]
 async fn pump_framed_lines<Frame, Classify>(
     stdout: ChildStdout,
     frames: mpsc::Sender<Frame>,

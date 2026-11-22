@@ -292,6 +292,11 @@ Arm the reader/subscription before native create/resume/input. For a session-fir
 harness: create/resume without input → establish subject/effective settings → commit
 `session.ready` → return start success → host sends the linked input normally.
 
+The private start payload can carry the frozen [owner rules](configuration.md#shared-owner-rules).
+Codex passes them as native thread developer instructions, Claude appends them from a
+private instance file, and OpenCode loads them from the instance's isolated
+`AGENTS.md`. The daemon supplies the first-input delivery for Muse and Antigravity.
+
 For resumed `session.ready`, Store requires `data.native_scope` and `data.native_ref` to
 match the retained subject pair exactly before reducing the event. `data.command_id` may be
 absent or null; when supplied, it must match the unique Resume command for that target

@@ -127,7 +127,10 @@ impl StoreContext {
 
 /// The host supplies the prepared workspace in launch.cwd. Capture broad diagnostic
 /// secrets independently from the credential-only metadata checks.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The operation's distinct inputs remain explicit at its established call boundary."
+)]
 pub(crate) async fn profile_store(
     launch: &NativeLaunch,
     environment: &Value,

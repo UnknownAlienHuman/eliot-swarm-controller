@@ -878,7 +878,10 @@ pub fn required_native_cmd<'a>(snapshot: &'a Value, message: &str) -> Result<&'a
 /// native scope no input was sent to (`"session"`, or `"thread"` for
 /// Codex). The caller resolves the pid through its own child handle; a
 /// missing or zero pid fails before any session or input is sent.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The operation's distinct inputs remain explicit at its established call boundary."
+)]
 pub async fn register_native_process(
     peer: &PeerClient,
     credential: &str,

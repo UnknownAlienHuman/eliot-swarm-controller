@@ -95,7 +95,10 @@ impl CodexRoute {
         Ok(args)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "The operation's distinct inputs remain explicit at its established call boundary."
+    )]
     pub(super) fn args_with_agent_mcp(
         &self,
         server_name: &str,

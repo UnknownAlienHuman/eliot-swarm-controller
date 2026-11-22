@@ -76,6 +76,8 @@ enum StartPhase {
     Plan,
     /// Private per-session MCP config file creation (MCP config write).
     McpConfig,
+    /// Private per-session file for Claude's append-system-prompt option.
+    OwnerRules,
     /// Daemon-materialized skill-root availability check (skill
     /// materialization) before `--plugin-dir` is passed to the CLI.
     Skill,
@@ -99,9 +101,11 @@ enum StartPhase {
 fn start_point_for_phase(phase: StartPhase) -> eliot_plugin::start_classification::StartPoint {
     use eliot_plugin::start_classification::StartPoint;
     match phase {
-        StartPhase::Plan | StartPhase::McpConfig | StartPhase::Skill | StartPhase::Auth => {
-            StartPoint::BeforeSpawn
-        }
+        StartPhase::Plan
+        | StartPhase::McpConfig
+        | StartPhase::OwnerRules
+        | StartPhase::Skill
+        | StartPhase::Auth => StartPoint::BeforeSpawn,
         StartPhase::Spawn => StartPoint::SpawnRefused,
         StartPhase::PostSpawn => StartPoint::AfterDispatch,
     }
@@ -130,6 +134,7 @@ fn prespawn_reason(phase: StartPhase, code: &str) -> String {
     let what = match phase {
         StartPhase::Plan => "Claude start refused pre-spawn",
         StartPhase::McpConfig => "Claude MCP config could not be prepared",
+        StartPhase::OwnerRules => "Claude owner rules could not be prepared",
         StartPhase::Skill => "Claude skill root is unavailable",
         StartPhase::Auth => "Claude CLI authentication status is unavailable",
         StartPhase::Spawn => "Claude CLI failed to spawn",
@@ -674,6 +679,7 @@ impl ClaudePlugin {
         let phase = match failure.phase {
             StartPhase::Plan => "plan",
             StartPhase::McpConfig => "mcp_config",
+            StartPhase::OwnerRules => "owner_rules",
             StartPhase::Skill => "skill",
             StartPhase::Auth => "auth",
             StartPhase::Spawn => "spawn",
@@ -683,7 +689,11 @@ impl ClaudePlugin {
         if error.origin.is_none()
             && matches!(
                 failure.phase,
-                StartPhase::McpConfig | StartPhase::Skill | StartPhase::Auth | StartPhase::Spawn
+                StartPhase::McpConfig
+                    | StartPhase::OwnerRules
+                    | StartPhase::Skill
+                    | StartPhase::Auth
+                    | StartPhase::Spawn
             )
         {
             error = error.with_origin(
@@ -2328,6 +2338,18 @@ async fn launch_session(
     if let Some(effort) = plan.requested_effort.as_deref() {
         argv.push(OsString::from("--effort"));
         argv.push(OsString::from(effort));
+    }
+    if let Some(rules) = &params.owner_rules {
+        let path = plan.instance_dir.join("owner-rules.md");
+        std::fs::write(&path, rules).map_err(|_| PhaseFailure {
+            phase: StartPhase::OwnerRules,
+            error: Box::new(Error::new(
+                "platform_io",
+                "Claude could not write the private owner rules file",
+            )),
+        })?;
+        argv.push(OsString::from("--append-system-prompt-file"));
+        argv.push(path.into_os_string());
     }
     argv.extend(native_subagents_argv(plan.native_subagents_deny));
     argv.extend(mcp_argv(

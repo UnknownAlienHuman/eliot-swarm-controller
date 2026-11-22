@@ -49,7 +49,10 @@ use rmcp::model::{
     PaginatedRequestParams, ServerCapabilities, ServerConfig, ServerNotification,
     SetLevelRequestMethod, Tool, ToolAnnotations,
 };
-#[allow(deprecated)] // SEP-2577: logging is deprecated but functional in rmcp 3.9.
+#[allow(
+    deprecated,
+    reason = "The required rmcp 3.9 logging surface remains functional under SEP-2577."
+)] // SEP-2577: logging is deprecated but functional in rmcp 3.9.
 use rmcp::model::{
     LoggingLevel, LoggingMessageNotification, LoggingMessageNotificationParam,
     SetLevelRequestParams,
@@ -84,7 +87,10 @@ pub async fn run_stdio(data_dir: PathBuf, require_agent: bool) -> Result<(), Str
             .await
             .map_err(|error| format!("{}: {}", error.code, error.message))?;
     }
-    #[allow(deprecated)] // SEP-2577: LoggingLevel default is deprecated but functional in rmcp 3.9.
+    #[allow(
+        deprecated,
+        reason = "The required rmcp 3.9 logging surface remains functional under SEP-2577."
+    )] // SEP-2577: LoggingLevel default is deprecated but functional in rmcp 3.9.
     let handler = EliotMcpHandler {
         data_dir,
         notify_owner_events: false,
@@ -125,7 +131,10 @@ struct EliotMcpHandler {
     session_lifetime: Arc<origin_auth::SessionLifetime>,
     /// Per-session `logging/setLevel` minimum severity (default `Info`).
     /// Written by `set_level`, read by the session notify task.
-    #[allow(deprecated)] // SEP-2577: LoggingLevel is deprecated but functional in rmcp 3.9.
+    #[allow(
+        deprecated,
+        reason = "The required rmcp 3.9 logging surface remains functional under SEP-2577."
+    )] // SEP-2577: LoggingLevel is deprecated but functional in rmcp 3.9.
     log_level: Arc<RwLock<LoggingLevel>>,
 }
 
@@ -188,7 +197,10 @@ impl ServerHandler for EliotMcpHandler {
         std::future::ready(())
     }
 
-    #[allow(deprecated)] // SEP-2577: setLevel is deprecated but functional in rmcp 3.9.
+    #[allow(
+        deprecated,
+        reason = "The required rmcp 3.9 logging surface remains functional under SEP-2577."
+    )] // SEP-2577: setLevel is deprecated but functional in rmcp 3.9.
     fn set_level(
         &self,
         request: SetLevelRequestParams,
@@ -434,7 +446,10 @@ const NOTIFY_LOGGER: &str = "eliot";
 ///
 /// The `allow` is SEP-2577 scope: logging is deprecated but functional and
 /// is the only server-to-client message channel in rmcp 3.9.
-#[allow(deprecated)]
+#[allow(
+    deprecated,
+    reason = "The required rmcp 3.9 logging surface remains functional under SEP-2577."
+)]
 fn server_capabilities(notify_owner_events: bool) -> ServerCapabilities {
     let builder = ServerCapabilities::builder().enable_tools();
     if notify_owner_events {
@@ -453,7 +468,10 @@ fn server_capabilities(notify_owner_events: bool) -> ServerCapabilities {
 /// disconnect). Assertion expiry pauses reads until verified session renewal;
 /// it does not destroy the existing task or cursor. Other daemon/transport
 /// failures end the task until the client opens a new session.
-#[allow(deprecated)] // SEP-2577: LoggingLevel is deprecated but functional in rmcp 3.9.
+#[allow(
+    deprecated,
+    reason = "The required rmcp 3.9 logging surface remains functional under SEP-2577."
+)] // SEP-2577: LoggingLevel is deprecated but functional in rmcp 3.9.
 fn spawn_owner_notify_task(
     data_dir: PathBuf,
     peer: Peer<RoleServer>,
@@ -559,6 +577,10 @@ async fn current_tip_remote(
 
 /// Renew only the existing notification task's read-only polls. Cancellation,
 /// expiry or renewal leaves its cursor unchanged; no write is retried here.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "The session poll owns its bounded authorization-renewal wait."
+)]
 async fn session_read<R: serde::de::DeserializeOwned>(
     data_dir: &Path,
     method: &str,
@@ -645,7 +667,10 @@ async fn remote_read<R: serde::de::DeserializeOwned>(
 /// or `None` when the kind is not delivered. Only normalized scalar fields
 /// cross this boundary: never raw tool args, environment, credentials, or
 /// log bodies. Malformed data is skipped, never forwarded raw.
-#[allow(deprecated)] // SEP-2577: LoggingLevel is deprecated but functional in rmcp 3.9.
+#[allow(
+    deprecated,
+    reason = "The required rmcp 3.9 logging surface remains functional under SEP-2577."
+)] // SEP-2577: LoggingLevel is deprecated but functional in rmcp 3.9.
 fn normalize_owner_event(event: &Event) -> Option<(LoggingLevel, Value)> {
     if !NOTIFY_EVENT_KINDS.contains(&event.kind.as_str()) {
         return None;
@@ -739,7 +764,10 @@ fn normalize_owner_event(event: &Event) -> Option<(LoggingLevel, Value)> {
 /// Syslog severity rank for [`LoggingLevel`]: higher is more severe. Only
 /// `Info`/`Warning` are ever emitted; the full rank keeps client minimums
 /// (e.g. `warning`) filtering exactly.
-#[allow(deprecated)] // SEP-2577: LoggingLevel is deprecated but functional in rmcp 3.9.
+#[allow(
+    deprecated,
+    reason = "The required rmcp 3.9 logging surface remains functional under SEP-2577."
+)] // SEP-2577: LoggingLevel is deprecated but functional in rmcp 3.9.
 fn severity(level: &LoggingLevel) -> u8 {
     match level {
         LoggingLevel::Debug => 0,
@@ -757,7 +785,10 @@ fn severity(level: &LoggingLevel) -> u8 {
 /// `clientInfo` is never read: the peer is the owner service principal by
 /// verified origin identity and the owner-only Access application,
 /// and the logger name is fixed.
-#[allow(deprecated)] // SEP-2577: deprecated but functional in rmcp 3.9.
+#[allow(
+    deprecated,
+    reason = "The required rmcp 3.9 logging surface remains functional under SEP-2577."
+)] // SEP-2577: deprecated but functional in rmcp 3.9.
 fn owner_notification(level: LoggingLevel, data: Value) -> ServerNotification {
     ServerNotification::LoggingMessageNotification(LoggingMessageNotification::new(
         LoggingMessageNotificationParam::new(level, data).with_logger(NOTIFY_LOGGER),

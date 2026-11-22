@@ -5,7 +5,10 @@
 //! `theme::winui::Palette`). Like the clipboard module this is a small Win32
 //! boundary through the workspace `windows-sys` dependency and allows
 //! `unsafe` for the one read-only system call; it allocates nothing.
-#![allow(unsafe_code)]
+#![allow(
+    unsafe_code,
+    reason = "UI Automation access requires COM interface calls."
+)]
 
 use windows_sys::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
 use windows_sys::Win32::UI::WindowsAndMessaging::{SPI_GETHIGHCONTRAST, SystemParametersInfoW};

@@ -788,7 +788,10 @@ fn admit_attention_emit_tx(
 }
 
 /// Admit one rule-derived `mail.send`/`var.set` definition.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The operation's distinct inputs remain explicit at its established call boundary."
+)]
 fn admit_rule_action_tx(
     tx: &Transaction<'_>,
     principal: &str,
@@ -860,7 +863,10 @@ fn admit_rule_action_tx(
 
 /// Admit one `launch`: new Agent row, creation events, and optional linked
 /// first input. Returns the linked send id, if any.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The operation's distinct inputs remain explicit at its established call boundary."
+)]
 fn admit_launch_tx(
     tx: &Transaction<'_>,
     principal: &str,
@@ -1984,7 +1990,10 @@ fn admit_start_postlude_tx(
     Ok((command, linked_command))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The operation's distinct inputs remain explicit at its established call boundary."
+)]
 pub(super) fn submit_tx(
     tx: &Transaction<'_>,
     principal: &str,
@@ -2023,7 +2032,10 @@ pub(super) fn submit_restart_resume_tx(
     Ok(admission)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The operation's distinct inputs remain explicit at its established call boundary."
+)]
 fn submit_tx_mode(
     tx: &Transaction<'_>,
     principal: &str,

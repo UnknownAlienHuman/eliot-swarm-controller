@@ -433,6 +433,10 @@ if ($created.ReturnValue -ne 0) {
 }
 
 #[cfg(windows)]
+#[expect(
+    clippy::disallowed_types,
+    reason = "This Windows operator helper owns the PowerShell child command."
+)]
 fn powershell(script: &str, request: &impl serde::Serialize) -> Result<std::process::Output> {
     use std::io::Write;
     use std::os::windows::process::CommandExt;
@@ -444,6 +448,10 @@ fn powershell(script: &str, request: &impl serde::Serialize) -> Result<std::proc
         .ok_or_else(|| Error::new("platform_io", "Windows system directory is unavailable"))?;
     let powershell =
         Path::new(&system_root).join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "This statement constructs a process owned by this module."
+    )]
     let mut helper = Command::new(powershell)
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)

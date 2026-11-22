@@ -8,7 +8,12 @@ use std::{
     path::Path,
     time::Duration,
 };
-use tokio::{process::Command, time::Instant};
+#[expect(
+    clippy::disallowed_types,
+    reason = "Claude auth status uses an explicitly owned native CLI command."
+)]
+use tokio::process::Command;
+use tokio::time::Instant;
 
 const STATUS_DEADLINE: Duration = Duration::from_secs(20);
 
@@ -97,7 +102,15 @@ pub(crate) async fn auth_status(
     })
 }
 
+#[expect(
+    clippy::disallowed_types,
+    reason = "This helper constructs the Claude auth-status child command."
+)]
 fn cli(program: &OsStr, cwd: &Path, environment: &[(OsString, OsString)]) -> Command {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "This statement constructs a process owned by this module."
+    )]
     let mut command = Command::new(program);
     command
         .current_dir(cwd)

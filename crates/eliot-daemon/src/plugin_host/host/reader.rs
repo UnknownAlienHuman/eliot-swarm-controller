@@ -374,7 +374,7 @@ impl ReaderTransport {
 }
 
 fn remove_model_catalogue_dir(dir: &std::path::Path) -> bool {
-    let _ = std::fs::remove_dir_all(dir);
+    let _ = crate::router::cleanup::remove_dir_all(dir);
     std::fs::symlink_metadata(dir).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
 }
 

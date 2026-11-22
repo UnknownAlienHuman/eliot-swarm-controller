@@ -8,7 +8,7 @@
 //! resolution proof. Native I/O runs outside the Store lock; the resolving
 //! transaction re-checks the stored terminality and the proof binding.
 use super::{Principal, Router, contains_known_secret_including_keys, require_owner};
-use crate::{common::now_ms, plugin_host::SecretSet};
+use crate::{common::now_ms, router::SecretSet};
 use eliot_core::{
     Agent, Error, Result,
     api::{CommandResolveRequest, SettleStoppedRequest, TurnResolveRequest},

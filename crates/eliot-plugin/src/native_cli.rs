@@ -14,7 +14,12 @@ use std::{
 };
 
 use eliot_core::{Error, Result};
-use tokio::{io::AsyncReadExt, process::Command, time::Instant};
+#[expect(
+    clippy::disallowed_types,
+    reason = "The bounded native CLI adapter accepts an explicitly owned process command."
+)]
+use tokio::process::Command;
+use tokio::{io::AsyncReadExt, time::Instant};
 
 use crate::native_lifecycle::kill_and_reap;
 
@@ -38,6 +43,10 @@ pub struct BoundedReadLabels {
 /// `deadline`, refuses an over-cap read, waits for the exit under the same
 /// deadline and requires a successful status. Every failure after spawn
 /// kills and reaps the child; `kill_on_drop` stays the backstop.
+#[expect(
+    clippy::disallowed_types,
+    reason = "This helper bounds output and custody for a native CLI child."
+)]
 pub async fn run_bounded(
     command: Command,
     cap: usize,
@@ -64,6 +73,10 @@ pub enum BoundedReadError {
 
 /// Read one owned CLI's bounded output. Some read-only native queries encode
 /// their authoritative status in stdout even when the process exits nonzero.
+#[expect(
+    clippy::disallowed_types,
+    reason = "This helper reads bounded stdout from a native query child."
+)]
 pub async fn read_bounded_stdout(
     mut command: Command,
     cap: usize,
@@ -119,6 +132,10 @@ pub async fn read_bounded_stdout(
 
 /// Run one bounded one-shot child and decode its stdout as UTF-8, mapping
 /// invalid bytes to the same unreadable readback error as an over-cap read.
+#[expect(
+    clippy::disallowed_types,
+    reason = "This helper decodes the bounded output of a one-shot native CLI child."
+)]
 pub async fn run_bounded_utf8(
     command: Command,
     cap: usize,

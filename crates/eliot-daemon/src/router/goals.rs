@@ -5,6 +5,7 @@
 //! commits one outcome only if generation, revision and round still match.
 //! Unknown check outcomes retain no Goal progress or continuation and never
 //! authorize another check; the reservation retains their error.
+
 use super::{
     Principal, Router,
     coordination::decode_coordination_request,
@@ -45,8 +46,12 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+#[expect(
+    clippy::disallowed_types,
+    reason = "Goal checks receive the frozen command that their router-owned runner will execute."
+)]
+use tokio::process::Command as TokioCommand;
 use tokio::{
-    process::Command as TokioCommand,
     sync::{broadcast, watch},
     task::JoinSet,
 };
@@ -54,6 +59,10 @@ use tokio::{
 /// Spawn one already-resolved check command. Production passes
 /// [`real_goal_check`]; tests inject a fake outcome. The future is boxed so
 /// the seam stays a plain function pointer.
+#[expect(
+    clippy::disallowed_types,
+    reason = "This runner type binds Goal checks to their configured process command."
+)]
 pub(crate) type GoalCheckRunner = fn(
     TokioCommand,
     Vec<u8>,
@@ -197,6 +206,10 @@ impl Drop for ClaimedGoalRound {
     }
 }
 
+#[expect(
+    clippy::disallowed_types,
+    reason = "This adapter transfers the frozen Goal command to supervised process custody."
+)]
 pub(crate) fn real_goal_check(
     command: TokioCommand,
     stdin: Vec<u8>,
@@ -216,7 +229,7 @@ pub(crate) fn real_goal_check(
 fn decode_goal_request<T>(
     params: &Value,
     principal: &Principal,
-    secrets: &crate::plugin_host::SecretSet,
+    secrets: &crate::router::plugin_host::SecretSet,
     method: &str,
     validate: fn(&T) -> Result<()>,
 ) -> Result<T>

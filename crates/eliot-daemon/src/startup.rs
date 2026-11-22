@@ -1,4 +1,5 @@
 //! Shared CLI/desktop startup using the same private daemon and readiness RPC.
+
 use std::path::Path;
 use std::time::Duration;
 
@@ -22,6 +23,13 @@ pub fn retryable(code: &str) -> bool {
 
 /// Start the supplied Swarm executable only when no daemon is reachable.
 /// An authentication or safety failure is returned without changing the root.
+#[cfg_attr(
+    not(windows),
+    expect(
+        clippy::disallowed_types,
+        reason = "Unix startup creates the detached daemon process after the private-root checks."
+    )
+)]
 pub async fn ensure_running(data_dir: &Path, swarm_executable: &Path) -> Result<()> {
     // daemon.status is Owner-only. Use the same target-bound identity parser
     // as RPC calls so scoped Agent identities remain Agents and malformed role
@@ -42,6 +50,10 @@ pub async fn ensure_running(data_dir: &Path, swarm_executable: &Path) -> Result<
     crate::platform::windows::start_background_daemon_executable(swarm_executable, data_dir)?;
     #[cfg(not(windows))]
     {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "This statement starts the daemon process."
+        )]
         std::process::Command::new(swarm_executable)
             .arg("--data-dir")
             .arg(data_dir)
@@ -91,6 +103,10 @@ pub async fn ensure_running(data_dir: &Path, swarm_executable: &Path) -> Result<
                 "daemon did not become ready within 30 seconds",
             ));
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "This bounded wait is owned by the surrounding operation."
+        )]
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }

@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 96;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 97;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -2292,6 +2292,18 @@ impl Store {
                  CREATE INDEX rule_key_usage_window
                      ON rule_key_usage(principal, rule, key_digest, used_at);
                  INSERT INTO schema_migrations(version) VALUES (96);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 97 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE agents ADD COLUMN owner_rules_delivery TEXT;
+                 INSERT INTO schema_migrations(version) VALUES (97);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
