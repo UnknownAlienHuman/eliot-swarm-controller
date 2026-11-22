@@ -2081,6 +2081,10 @@ pub struct AutomaticCleanupSweep {
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonStatusResponse {
+    #[serde(default)]
+    pub owner_inbox: std::collections::BTreeMap<super::OwnerInboxKind, usize>,
+    #[serde(default)]
+    pub liveness: super::SwarmLiveness,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_identity: Option<DaemonBuildIdentity>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

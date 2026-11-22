@@ -112,6 +112,27 @@ pub(crate) fn record(
     write_record(policy, code, ids, None, None, error)
 }
 
+pub(crate) fn record_liveness_stuck(policy: &SecretPolicy, subject: &str, reason: &str) {
+    let detail = Map::from_iter([
+        (
+            "subject".to_owned(),
+            json!(bounded_text(policy, subject, 256)),
+        ),
+        (
+            "reason".to_owned(),
+            json!(bounded_text(policy, reason, 128)),
+        ),
+    ]);
+    write_record(
+        policy,
+        "daemon.liveness_stuck",
+        &[],
+        None,
+        Some(detail),
+        None,
+    );
+}
+
 pub(crate) fn record_repeated_rule_failure(
     policy: &SecretPolicy,
     principal: &str,

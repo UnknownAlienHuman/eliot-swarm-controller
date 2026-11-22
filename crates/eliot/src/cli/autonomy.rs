@@ -120,10 +120,12 @@ fn print_report(report: &AutonomyResponse) {
         "Waiting for the owner over 24h",
         &report.owner_waiting,
         |counts| {
-            println!(
-                "  {} unknown commands, {} failed or lost Agents, {} provider holds",
-                counts.unknown_commands, counts.failed_or_lost_agents, counts.provider_holds
-            );
+            println!("  {} items", counts.total);
+            for (kind, count) in &counts.by_kind {
+                if *count > 0 {
+                    println!("  {} {}", count, kind.as_str().replace('_', " "));
+                }
+            }
             for item in &counts.oldest {
                 println!(
                     "  {} {} since {}",

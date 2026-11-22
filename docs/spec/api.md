@@ -750,9 +750,37 @@ of failure or permission to replay the effect.
 
 ## Agent and daemon read views
 
+`owner.inbox` gives the Owner one decision queue over retained Store rows.
+`OwnerInboxRequest` accepts an optional opaque
+`after` cursor and `limit`. `OwnerInboxResponse` returns `items` and an optional
+`next` cursor. Each item carries a snake_case kind, subject, subject revision,
+age in milliseconds, one-line reason, optional recommended action and offered
+choices. An action names the existing method and JSON arguments that implement
+the choice. The projection includes harness requests, unknown command/turn
+outcomes, owner-required holds, unarchived lost/failed Agents, blocked Goals,
+launch items waiting for the owner, and #871 stuck objects. Recommendations
+are derived from retained facts. Send `owner.decide` with the item kind,
+subject, revision, and an offered choice name, `recommended`, or `snooze`.
+The daemon checks the revision under the Store writer when it admits the
+selected mutation. A stale item returns `stale_item`. A snooze lasts until
+the next event on that subject. Supply required inputs in `args` to fill the
+choice's displayed input fields. The same decision ID and payload reuse the
+same inner mutation ID. [Owner inbox DTOs](../../crates/eliot-core/src/api/owner_inbox.rs)
+
+`swarm inbox` prints Owner decisions in text. With `--json` it emits the
+response DTO. An Agent's `swarm inbox` reads its own mailbox. Use
+`swarm msg inbox` or the existing mailbox selectors to read mail explicitly.
+Copy the printed item reference into `swarm inbox decide ITEM CHOICE`.
+Use repeatable `--arg KEY=VALUE` flags for displayed inputs such as
+`choice_id` and `feedback`. Pass JSON for `answers`.
+`swarm inbox snooze ITEM` hides the displayed revision.
+
 The view calls use the Core view DTOs linked above. `daemon.status` is owner-only
 and accepts an empty object. Its bounded blocker/command lists retain truncation flags;
 unknown commands remain unknown. Agent list observations appear only when requested.
+`owner_inbox` counts visible items by kind. `liveness` counts the current
+Moving, Asked, Stuck, and Long classifications and groups Stuck and Long
+objects by reason.
 Absent source cursors and sequence/acknowledgement values remain null.
 When explicit Claude profile cmd paths no longer exist, status and doctor return
 `claude_profile_command_issues` with the configured path, discovered replacement

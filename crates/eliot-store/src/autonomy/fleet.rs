@@ -37,7 +37,12 @@ CREATE INDEX IF NOT EXISTS autonomy_fleet_turn_window
     ON turns(COALESCE(completed_at, started_at, 0), agent, generation, turn_id);
 "#;
 
-pub(super) fn read(tx: &Connection, since: i64, until: i64) -> eliot_core::Result<Fleet> {
+pub(super) fn read(
+    tx: &Connection,
+    since: i64,
+    until: i64,
+    confirmed: &crate::StuckStates,
+) -> eliot_core::Result<Fleet> {
     if since > until {
         return Err(crate::Error::new(
             "invalid",
@@ -47,7 +52,7 @@ pub(super) fn read(tx: &Connection, since: i64, until: i64) -> eliot_core::Resul
 
     Ok(Fleet {
         project_policy: read_project_policy(tx, since, until)?,
-        owner_waiting: read_owner_waiting(tx, until)?,
+        owner_waiting: read_owner_waiting(tx, until, confirmed)?,
         usage: read_usage(tx, since, until)?,
     })
 }
@@ -174,229 +179,77 @@ fn read_project_policy(
 fn read_owner_waiting(
     tx: &Connection,
     until: i64,
+    confirmed: &crate::StuckStates,
 ) -> eliot_core::Result<AutonomyRow<AutonomyOwnerWaiting>> {
-    let cutoff = until.saturating_sub(DAY_MS);
-    let (unknown_items, unknown_overflow, unknown_time_missing) =
-        read_unknown_commands(tx, cutoff)?;
-    let (failed_items, failed_overflow, failed_time_missing) =
-        read_terminal_agents(tx, cutoff, "failed")?;
-    let (lost_items, lost_overflow, lost_time_missing) = read_terminal_agents(tx, cutoff, "lost")?;
-    let (hold_items, hold_overflow) = read_provider_holds(tx, cutoff)?;
-
-    let unknown_commands = unknown_items.len() as u64;
-    let failed_or_lost_agents = (failed_items.len() + lost_items.len()) as u64;
-    let provider_holds = hold_items.len() as u64;
-
-    let mut oldest = Vec::with_capacity(
-        unknown_items.len() + failed_items.len() + lost_items.len() + hold_items.len(),
-    );
-    oldest.extend(unknown_items);
-    oldest.extend(failed_items);
-    oldest.extend(lost_items);
-    oldest.extend(hold_items);
-    oldest.sort_by(|left, right| {
-        left.since_ms
-            .cmp(&right.since_ms)
-            .then_with(|| left.kind.cmp(&right.kind))
-            .then_with(|| left.id.cmp(&right.id))
+    let (items, _) = crate::owner_inbox::project(tx, until)?;
+    let waiting = items
+        .into_iter()
+        .filter(|item| {
+            item.age_ms > DAY_MS && crate::owner_decisions::is_reportable(item, until, confirmed)
+        })
+        .collect::<Vec<_>>();
+    let mut by_kind = std::collections::BTreeMap::new();
+    for item in &waiting {
+        *by_kind.entry(item.kind).or_insert(0_u64) += 1;
+    }
+    let unknown_commands = waiting
+        .iter()
+        .filter(|item| item.kind == eliot_core::api::OwnerInboxKind::UnknownCommand)
+        .count() as u64;
+    let failed_or_lost_agents = waiting
+        .iter()
+        .filter(|item| item.kind == eliot_core::api::OwnerInboxKind::Agent)
+        .count() as u64;
+    let provider_holds = waiting
+        .iter()
+        .filter(|item| item.kind == eliot_core::api::OwnerInboxKind::Hold)
+        .count() as u64;
+    let mut oldest = waiting
+        .iter()
+        .map(|item| {
+            let kind = match item.kind {
+                eliot_core::api::OwnerInboxKind::UnknownCommand => "command.unknown",
+                eliot_core::api::OwnerInboxKind::Agent if item.reason.starts_with("lost_agent") => {
+                    "agent.lost"
+                }
+                eliot_core::api::OwnerInboxKind::Agent => "agent.failed",
+                eliot_core::api::OwnerInboxKind::Hold => "provider_hold",
+                kind => kind.as_str(),
+            };
+            (
+                item.age_ms,
+                AutonomyWaitingItem {
+                    kind: kind.to_owned(),
+                    id: item.subject.clone(),
+                    since_ms: until.saturating_sub(item.age_ms),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    oldest.sort_by(|(age_a, a), (age_b, b)| {
+        age_b
+            .cmp(age_a)
+            .then_with(|| a.kind.cmp(&b.kind))
+            .then_with(|| a.id.cmp(&b.id))
     });
-
-    let input_overflow = unknown_overflow || failed_overflow || lost_overflow || hold_overflow;
-    let time_missing = unknown_time_missing || failed_time_missing || lost_time_missing;
-    let oldest_truncated = input_overflow || oldest.len() > LIST_CAP;
+    let oldest_truncated = oldest.len() > LIST_CAP;
     oldest.truncate(LIST_CAP);
-
+    let oldest = oldest.into_iter().map(|(_, item)| item).collect();
     let counts = AutonomyOwnerWaiting {
         unknown_commands,
         failed_or_lost_agents,
         provider_holds,
+        total: waiting.len() as u64,
+        by_kind,
         oldest,
         oldest_truncated,
     };
-
-    let mut reasons = Vec::new();
-    if unknown_overflow {
-        reasons.push(format!(
-            "current unknown-command scan exceeded {INPUT_CAP} rows"
-        ));
-    }
-    if failed_overflow || lost_overflow {
-        reasons.push(format!(
-            "current failed/lost Agent scan exceeded {INPUT_CAP} rows per state"
-        ));
-    }
-    if hold_overflow {
-        reasons.push(format!(
-            "provider-hold scan exceeded {INPUT_CAP} old active holds"
-        ));
-    }
-    if time_missing {
-        reasons.push(
-            "some current rows use their last update as a lower bound on time waiting".to_owned(),
-        );
-    }
     Ok(row_with_coverage(
-        "sqlite:current_commands+current_agents+provider_holds.held_since",
-        reasons,
+        "sqlite:owner_inbox.project",
+        Vec::new(),
         counts,
     ))
 }
-
-fn read_unknown_commands(
-    tx: &Connection,
-    cutoff: i64,
-) -> eliot_core::Result<(Vec<AutonomyWaitingItem>, bool, bool)> {
-    let mut statement = tx
-        .prepare_cached(
-            "WITH current_unknown AS (
-                 SELECT id, updated_at
-                 FROM commands INDEXED BY autonomy_fleet_current_unknown_commands
-                 WHERE state = 'unknown'
-                 ORDER BY id
-                 LIMIT ?1
-             )
-             SELECT current_unknown.id, current_unknown.updated_at,
-                    (
-                        SELECT events.ts
-                        FROM events INDEXED BY autonomy_fleet_unknown_event_lookup
-                        WHERE events.kind = 'command.unknown'
-                          AND CAST(json_extract(events.data, '$.command_id') AS TEXT) = current_unknown.id
-                        ORDER BY events.ts DESC, events.seq DESC
-                        LIMIT 1
-                    )
-             FROM current_unknown
-             ORDER BY current_unknown.id",
-        )
-        .map_err(crate::sql_error)?;
-    let mut rows = statement
-        .query(params![FETCH_LIMIT])
-        .map_err(crate::sql_error)?;
-
-    let mut items = Vec::with_capacity(INPUT_CAP);
-    let mut examined = 0_usize;
-    let mut overflow = false;
-    let mut missing_time = false;
-    while let Some(row) = rows.next().map_err(crate::sql_error)? {
-        if examined == INPUT_CAP {
-            overflow = true;
-            break;
-        }
-        examined += 1;
-
-        let id = row.get::<_, String>(0).map_err(crate::sql_error)?;
-        let fallback = row.get::<_, i64>(1).map_err(crate::sql_error)?;
-        let entered = row.get::<_, Option<i64>>(2).map_err(crate::sql_error)?;
-        missing_time |= entered.is_none();
-        let since_ms = entered.unwrap_or(fallback);
-        if since_ms < cutoff {
-            items.push(AutonomyWaitingItem {
-                kind: "command.unknown".to_owned(),
-                id,
-                since_ms,
-            });
-        }
-    }
-    Ok((items, overflow, missing_time))
-}
-
-fn read_terminal_agents(
-    tx: &Connection,
-    cutoff: i64,
-    state: &str,
-) -> eliot_core::Result<(Vec<AutonomyWaitingItem>, bool, bool)> {
-    let mut statement = tx
-        .prepare_cached(
-            "WITH current_agents AS (
-                 SELECT id, generation, updated_at
-                 FROM agents INDEXED BY agents_list_archived_state
-                 WHERE state = ?1 AND archived = 0
-                 ORDER BY id
-                 LIMIT ?2
-             )
-             SELECT current_agents.id, current_agents.updated_at,
-                    (
-                        SELECT events.ts
-                        FROM events INDEXED BY autonomy_fleet_agent_state_event
-                        WHERE events.agent = current_agents.id
-                          AND events.generation = current_agents.generation
-                          AND events.kind = ?3
-                          AND events.kind IN ('agent.failed', 'agent.lost')
-                        ORDER BY events.ts DESC, events.seq DESC
-                        LIMIT 1
-                    )
-             FROM current_agents
-             ORDER BY current_agents.id",
-        )
-        .map_err(crate::sql_error)?;
-    let event_kind = if state == "failed" {
-        "agent.failed"
-    } else {
-        "agent.lost"
-    };
-    let mut rows = statement
-        .query(params![state, FETCH_LIMIT, event_kind])
-        .map_err(crate::sql_error)?;
-
-    let mut items = Vec::with_capacity(INPUT_CAP);
-    let mut examined = 0_usize;
-    let mut overflow = false;
-    let mut missing_time = false;
-    while let Some(row) = rows.next().map_err(crate::sql_error)? {
-        if examined == INPUT_CAP {
-            overflow = true;
-            break;
-        }
-        examined += 1;
-
-        let id = row.get::<_, i64>(0).map_err(crate::sql_error)?;
-        let fallback = row.get::<_, i64>(1).map_err(crate::sql_error)?;
-        let entered = row.get::<_, Option<i64>>(2).map_err(crate::sql_error)?;
-        missing_time |= entered.is_none();
-        let since_ms = entered.unwrap_or(fallback);
-        if since_ms < cutoff {
-            items.push(AutonomyWaitingItem {
-                kind: event_kind.to_owned(),
-                id: crate::format_agent_id(id),
-                since_ms,
-            });
-        }
-    }
-    Ok((items, overflow, missing_time))
-}
-
-fn read_provider_holds(
-    tx: &Connection,
-    cutoff: i64,
-) -> eliot_core::Result<(Vec<AutonomyWaitingItem>, bool)> {
-    let mut statement = tx
-        .prepare_cached(
-            "SELECT scope, held_since
-             FROM provider_holds INDEXED BY autonomy_fleet_provider_hold_age
-             WHERE state IN ('held', 'probing') AND held_since < ?1
-             ORDER BY held_since, scope
-             LIMIT ?2",
-        )
-        .map_err(crate::sql_error)?;
-    let mut rows = statement
-        .query(params![cutoff, FETCH_LIMIT])
-        .map_err(crate::sql_error)?;
-
-    let mut items = Vec::with_capacity(INPUT_CAP);
-    let mut overflow = false;
-    while let Some(row) = rows.next().map_err(crate::sql_error)? {
-        if items.len() == INPUT_CAP {
-            overflow = true;
-            break;
-        }
-        items.push(AutonomyWaitingItem {
-            kind: "provider_hold".to_owned(),
-            id: row.get(0).map_err(crate::sql_error)?,
-            since_ms: row.get(1).map_err(crate::sql_error)?,
-        });
-    }
-    Ok((items, overflow))
-}
-
 fn read_usage(
     tx: &Connection,
     since: i64,

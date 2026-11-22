@@ -214,6 +214,9 @@ pub use native_children::{
 mod agent_lifecycle;
 mod native_events;
 mod observer;
+mod owner_decisions;
+mod owner_inbox;
+pub use owner_decisions::{OwnerDecisionAdmission, StuckStates};
 mod observer_live;
 mod organization;
 mod processes;
@@ -836,6 +839,29 @@ impl Store {
         commit_transaction(tx, &self.write_faulted)?;
         Ok(admission)
     }
+}
+
+fn unknown_start_command(connection: &Connection, agent: i64) -> Result<Option<String>> {
+    connection
+        .prepare_cached(
+            "SELECT id FROM commands WHERE target = ?1
+                 AND verb IN ('launch', 'resume') AND state = 'unknown'
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .map_err(sql_error)?
+        .query_row([agent], |row| row.get(0))
+        .optional()
+        .map_err(sql_error)
+}
+
+fn require_resolved_start(connection: &Connection, agent: i64) -> Result<()> {
+    if let Some(command) = unknown_start_command(connection, agent)? {
+        return Err(Error::new(
+            "bad_state",
+            format!("resolve unknown start command {command} before resuming this Agent"),
+        ));
+    }
+    Ok(())
 }
 
 fn has_pending_resume_tx(

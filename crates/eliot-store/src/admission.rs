@@ -1450,6 +1450,7 @@ fn admit_resume_tx(
             "resume requires a stopped, failed, or lost Agent with no active turn",
         ));
     }
+    require_resolved_start(tx, agent_num)?;
     if has_pending_resume_tx(tx, agent_num, agent.generation, &request.id)? {
         return Err(Error::new(
             "bad_state",

@@ -37,6 +37,16 @@ macro_rules! method {
 // Every Router match arm is described here. The coverage regression below makes
 // omission deliberate: new methods must be described before they can ship.
 const METHODS: &[Method] = &[
+    method!(
+        "owner.inbox",
+        OwnerInboxRequest,
+        OwnerInboxResponse,
+        true,
+        false,
+        "Read the Owner decision queue and offered actions.",
+        {}
+    ),
+    method!("owner.decide", OwnerDecideRequest, OwnerDecideResponse, true, true, "Execute a revision-bound choice or snooze the item until its subject changes.", {"id":EXAMPLE_ID,"item":{"kind":"agent","subject":"a1","revision":"example"},"choice":"snooze"}),
     method!("launch.enqueue", LaunchQueueRequest, LaunchIntentView, false, true, "Enqueue an interactive launch intent for fair admission.", {"id":EXAMPLE_ID,"args":{"profile":"worker","workspace":"C:/work"}}),
     method!("launch.intent.get", LaunchIntentGetRequest, LaunchIntentView, false, false, "Read the current state of a queued interactive launch intent.", {"id":EXAMPLE_ID}),
     method!(
@@ -601,7 +611,8 @@ impl Router {
             "claim.list" => &["swarm claim list"],
             "claim.release" => &["swarm claim release"],
             "mail.send" => &["swarm msg send"],
-            "mail.inbox" => &["swarm inbox"],
+            "mail.inbox" => &["swarm msg inbox", "swarm inbox (Agent)"],
+            "owner.inbox" => &["swarm inbox"],
             "mail.read" => &["swarm msg show"],
             "mail.ack" => &["swarm msg ack"],
             "var.set" => &["swarm var set"],
@@ -995,6 +1006,12 @@ fn method_scopes(name: &str, principal: &Principal, identity: &IdentityResponse)
 
 fn method_limits(name: &str) -> &'static str {
     match name {
+        "owner.inbox" => {
+            "Owner only. Page at most 100 current items. Continue with next, when present."
+        }
+        "owner.decide" => {
+            "Owner only. Use the displayed kind, subject and revision with an offered choice, recommended, or snooze. Arguments fill only the chosen action's input fields."
+        }
         "chat.attach" | "chat.detach" | "chat.tag" => {
             "Owner only. Placement and tags only; execution scope is untouched. At most 16 Agents per call. Retry the same id for the retained readback."
         }

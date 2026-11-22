@@ -177,6 +177,23 @@ authorize a later force-stop of the conflicting Job.
 | restart of a remaining live generation | lost, open turn and dispatched effects become unknown |
 | exact controlled producer generation ends (native observed child) | stopped, `agent.stopped {reason: ended_with_parent}` |
 
+The Owner inbox projects existing Store facts. Each item identifies its source
+subject and revision so a later decision
+can be checked against the exact generation, turn, hold revision or other
+source version displayed. Choices name existing actions and carry their
+arguments. Swarm derives those choices from retained facts. Snooze
+suppression ends on the next event for that subject.
+
+Core's pure `mover(object)` liveness classification covers every non-terminal
+Agent state, command, Goal, hold, launch intent, assignment wait, harness
+request and timer. It reports `Moving` with the expected mover and deadline,
+`Asked` with the matching Owner inbox item, `Long` when a live item exceeds its
+kind-specific state-duration threshold, or `Stuck` with a reason when neither
+movement nor an Owner question exists. State handling is exhaustive: matching
+has no default arm, so adding a non-terminal state requires defining its mover.
+Existing reaction ladders own repair and preserve unknown outcomes.
+[Core mover](../../crates/eliot-core/src/liveness.rs)
+
 A controlled loss records its cause on `agent.lost` and, when a turn is open,
 on that turn's `turn.unknown`: `root_exited` for a spontaneous plugin root
 exit (the drain detail stays on `source.gap`), `daemon_restart` for restart

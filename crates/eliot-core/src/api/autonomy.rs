@@ -167,6 +167,10 @@ pub struct AutonomyNotes {
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct AutonomyOwnerWaiting {
+    #[serde(default)]
+    pub total: u64,
+    #[serde(default)]
+    pub by_kind: std::collections::BTreeMap<super::OwnerInboxKind, u64>,
     pub unknown_commands: u64,
     pub failed_or_lost_agents: u64,
     pub provider_holds: u64,

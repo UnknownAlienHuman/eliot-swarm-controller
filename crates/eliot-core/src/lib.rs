@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod limits;
+pub mod liveness;
 pub mod requests;
 
 pub use api::{

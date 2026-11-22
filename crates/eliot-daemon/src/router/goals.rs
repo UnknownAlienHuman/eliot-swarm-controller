@@ -341,13 +341,17 @@ impl Router {
             GoalClearRequest::validate,
         )?;
         require_eliot_mode(request.mode)?;
-        let view = self.inner.store.lock().await.goal_clear(
-            &request.agent,
-            request.mode.as_str(),
-            &request.id,
-            &super::principal_name(principal),
-            now_ms(),
-        )?;
+        let view = {
+            let mut store = self.inner.store.lock().await;
+            super::owner_inbox::check_binding(&store)?;
+            store.goal_clear(
+                &request.agent,
+                request.mode.as_str(),
+                &request.id,
+                &super::principal_name(principal),
+                now_ms(),
+            )?
+        };
         request.validate_response(&view)?;
         serde_json::to_value(view)
             .map_err(|_| Error::new("internal", "goal state could not be encoded"))
@@ -362,13 +366,17 @@ impl Router {
             GoalResumeRequest::validate,
         )?;
         require_eliot_mode(request.mode)?;
-        let view = self.inner.store.lock().await.goal_resume(
-            &request.agent,
-            request.mode.as_str(),
-            &request.id,
-            &super::principal_name(principal),
-            now_ms(),
-        )?;
+        let view = {
+            let mut store = self.inner.store.lock().await;
+            super::owner_inbox::check_binding(&store)?;
+            store.goal_resume(
+                &request.agent,
+                request.mode.as_str(),
+                &request.id,
+                &super::principal_name(principal),
+                now_ms(),
+            )?
+        };
         if view.definition.cadence_ms.is_none() {
             self.notify_goal_reconcile();
         }

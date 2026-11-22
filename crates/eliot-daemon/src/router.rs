@@ -23,6 +23,7 @@ pub(crate) mod launch_queue;
 mod loss_recovery;
 mod organization;
 mod overview;
+pub(crate) mod owner_inbox;
 mod patch_digest;
 mod project_assignment;
 mod project_broadcast;
@@ -150,6 +151,7 @@ struct RouterInner {
     data_root: PathBuf,
     store: StoreHandle,
     autonomy_reader: Arc<tokio::sync::Semaphore>,
+    confirmed_stuck: Mutex<Arc<eliot_store::StuckStates>>,
     integration_cleanup: AsyncMutex<()>,
     bus: Bus,
     mail: crate::config::MailConfig,
@@ -416,6 +418,7 @@ impl Router {
                 data_root,
                 store,
                 autonomy_reader: Arc::new(tokio::sync::Semaphore::new(1)),
+                confirmed_stuck: Mutex::new(Arc::default()),
                 integration_cleanup: AsyncMutex::new(()),
                 bus,
                 mail,
@@ -794,6 +797,8 @@ impl Router {
             "goal.clear" => self.goal_clear(&params, &principal).await,
             "goal.resume" => self.goal_resume(&params, &principal).await,
             "goal.round" => self.goal_round(&params, &principal).await,
+            "owner.inbox" => self.owner_inbox(&params, &principal).await,
+            "owner.decide" => self.owner_decide(&params, &principal, context).await,
             "mail.send" => self.mail_send(&params, &principal).await,
             "mail.inbox" => self.mail_inbox(&params, &principal).await,
             "mail.read" => self.mail_read(&params, &principal).await,
@@ -1621,6 +1626,7 @@ impl Router {
         {
             return Ok(admission);
         }
+        owner_inbox::check_binding(store)?;
         self.check_command_admission_mode(&request.verb)?;
         if request.verb == "answer" {
             validate_answer_request(store, &request)?;
@@ -3958,6 +3964,7 @@ impl Router {
         request.validate()?;
         let change = {
             let mut store = self.inner.store.lock().await;
+            owner_inbox::check_binding(&store)?;
             let change = store.clear_provider_hold("owner", &request, now_ms())?;
             self.publish_locked(&change.events);
             change
