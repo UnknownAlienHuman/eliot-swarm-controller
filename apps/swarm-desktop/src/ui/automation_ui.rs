@@ -396,6 +396,18 @@ pub(super) fn assignment_sentence(
     )
 }
 
+fn assignment_outcome_label(code: &str) -> Option<&'static str> {
+    match code {
+        "not_found" => Some("no new brief"),
+        "bad_state" | "capacity_unavailable" => Some("its tasks are at the limit"),
+        "brief_settling" => Some("a brief is still settling"),
+        "brief_requires_include" => {
+            Some("this pending legacy brief needs timer run --include NAME")
+        }
+        _ => None,
+    }
+}
+
 /// Last and next scheduled run of a timer, on this computer's clock. A
 /// Run now is not a scheduled run and moves neither (docs/spec/automation.md).
 fn times(timer: &TimerStateView, assignment: bool) -> String {
@@ -405,14 +417,15 @@ fn times(timer: &TimerStateView, assignment: bool) -> String {
         ("Last scheduled run", "Next run")
     };
     let note = match timer.last_outcome.as_deref() {
-        Some("not_found") if assignment => " (no new brief)",
-        Some("bad_state") if assignment => " (its tasks are at the limit)",
-        Some(_) => " (started nothing)",
-        None => "",
+        Some(code) if assignment => assignment_outcome_label(code)
+            .map(|label| format!(" ({label})"))
+            .unwrap_or_else(|| " (started nothing)".to_owned()),
+        Some(_) => " (started nothing)".to_owned(),
+        None => String::new(),
     };
     let mut parts = vec![match timer.last_key {
         Some(at) => format!("{last} {}{note}", local_time(at)),
-        None => format!("{last}: not yet"),
+        None => format!("{last}: not yet{note}"),
     }];
     if timer.enabled
         && let Some(at) = timer.next_due_at
@@ -422,23 +435,33 @@ fn times(timer: &TimerStateView, assignment: bool) -> String {
     parts.join(" · ")
 }
 
-/// A firing card: Running, or Blocked when its last scheduled check started
-/// nothing for a reason the Owner must act on. No new brief, or an
-/// assignment already at its limit, is normal.
+/// A firing card: Running while an assignment brief settles, or Blocked when
+/// its last scheduled check produced nothing for a reason the Owner must act on.
+/// No new brief, or an assignment already at its limit, is normal.
 fn firing(timer: Option<&TimerStateView>, assignment: bool) -> CardState {
     let Some(code) = timer.and_then(|timer| timer.last_outcome.as_deref()) else {
         return CardState::Running;
     };
-    if assignment && matches!(code, "not_found" | "bad_state") {
+    if assignment
+        && matches!(
+            code,
+            "not_found" | "bad_state" | "brief_settling" | "capacity_unavailable"
+        )
+    {
         return CardState::Running;
     }
-    let what = match code {
+    let what = if assignment {
+        assignment_outcome_label(code).map(str::to_owned)
+    } else {
+        None
+    }
+    .unwrap_or_else(|| match code {
         "routing_unavailable" => {
             "no model could take the task. Pick one for this kind of task in Routing, or check Usage".to_owned()
         }
         "unavailable" if assignment => "the briefs folder could not be read".to_owned(),
         code => eliot_core::reason_words(code).to_lowercase(),
-    };
+    });
     CardState::Blocked(format!("Its last check started nothing: {what}."))
 }
 
@@ -654,8 +677,13 @@ pub(super) fn refusal_words(error: &eliot_core::Error) -> RunLine {
         ("not_found", message) if message.contains("no next brief") => {
             quiet("Run now: nothing to start. There is no new brief in the folder.")
         }
-        ("bad_state", message) if message.contains("max_busy") => {
+        ("bad_state" | "capacity_unavailable", message) if message.contains("max_busy") => {
             quiet("Run now: nothing to start. The most tasks at once are already running.")
+        }
+        ("brief_settling", _) => quiet("Run now: a brief is still settling."),
+        ("capacity_unavailable", _) => quiet("Run now: capacity is currently unavailable."),
+        ("brief_requires_include", _) => {
+            quiet("Run now: this pending legacy brief needs timer run --include NAME.")
         }
         (code, message) => RunLine {
             text: format!("Run now didn't run: {message} ({code})."),
@@ -1057,6 +1085,7 @@ fn timer_run_action(
         id: id.clone(),
         project: key.0.clone(),
         rule: key.1.clone(),
+        include: None,
     };
     let parent = if retained {
         match client::block_on(client::read_command(data_dir, &id)).and_then(|parent| {

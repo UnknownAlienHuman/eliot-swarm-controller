@@ -492,7 +492,7 @@ or base itself. `max_busy` counts unresolved launches,
 linked initial sends and live Agents; an unknown command holds its slot. Store records
 the admitted filename in the same transaction as the durable launch command. The name
 stays recorded after restart and command retention. An unknown launch keeps its original
-binding and outcome. The brief and its ready marker stay in the folder.
+binding and outcome. The brief and any ready marker stay in the folder.
 This is an automation increment, not a Task/Issue/acceptance engine.
 
 The owner configures a global assignment under `[automation.assignments.<key>]`:
@@ -507,32 +507,36 @@ interval = "30s"
 enabled = true
 ```
 
-`key` identifies one queue. Write each `.md` brief in the folder, close it, then
-create an empty regular file with the same name in the `.ready` subdirectory,
-such as `.ready/0010-review.md`. Keep the published brief unchanged. A new write requires
-a fresh marker after close. On each interval the daemon selects the
-lexicographically first ready name it has yet to admit, even if it sorts before
-a previously admitted name. It requires the marker to be at least as recent as
-the brief and checks the opened brief's size and modification time across the
-read. The Store admits each exact filename at most once per key.
+`key` identifies one queue. A regular `.md` brief becomes ready when its size
+and modification time match across scans at least three seconds apart. To
+publish immediately, close the brief and create an empty regular file with the
+same name in `.ready`, such as `.ready/0010-review.md`. The marker must be at
+least as recent as the brief. The daemon checks the opened file's size and
+modification time across the read in both cases. On each interval it selects
+the lexicographically first eligible ready name. The Store admits each exact
+filename at most once per key.
 
-An upgrade seeds admitted names from retained launch commands and each saved
-legacy cursor. For older names whose launch history has expired, only publish
-briefs you have confirmed are still pending. The marker provides an explicit
-publication step for existing folders.
+An upgrade seeds admitted names from retained launch commands and freezes the
+legacy cursor as a floor. A name at or below that floor requires the Owner to
+select it explicitly with `swarm timer run assignment-KEY --include NAME`.
+Explicit inclusion uses the same readiness and deduplication checks. Names
+above the floor can arrive in any order. New queues have no legacy floor.
 
 Each firing scans up to 500 entries in the briefs folder, excluding `.ready`.
 Overflow fails the slot before selection. Each brief is
 limited to the ordinary 64 KiB launch-text bound. Unsafe, oversized or invalid UTF-8
 briefs fail the slot visibly. An unreadable or missing briefs folder fails only that
-assignment's slot with its code. A slot with no ready, unadmitted brief advances to the next
-interval. Every scheduled timer slot that is skipped or rejected (no ready brief is `not_found`, a
-routing miss is `routing_unavailable`) commits that code as the timer's `last_outcome`
+assignment's slot with its code. A scheduled check that starts no work advances to the next
+interval when the folder has no new brief (`not_found`), eligible briefs are settling
+(`brief_settling`), or only older names await explicit inclusion (`brief_requires_include`).
+Each skipped or rejected slot commits its code as the timer's `last_outcome`
 with the slot, and an admitted slot clears it, so timer reads show why the last check
 started nothing. A scheduled skip emits `rule.skipped` when its reason changes or
 the slot carries a capacity diagnostic. Repeated skips with the same bare reason
 still advance the timer cursor. A manual run changes neither `last_outcome` nor `last_key`.
-A capacity, provider, workspace or transfer wait keeps the due slot.
+A capacity, provider, workspace or transfer wait keeps the due slot. Timer and
+rule-list readback report the current wait code in `last_outcome` while the
+slot remains due.
 Settings generate a global interval timer
 rule and an ordinary completion rule. Before admitting cleanup, Store verifies that
 the captured Agent/generation was launched by this assignment's own launch for the
@@ -571,7 +575,7 @@ previous rule snapshot, and the saved pause still fences fresh scheduled and man
 admissions. Effective timer reads report the pause. The admitted names and schedule
 position are retained. The completion rule stays enabled, so Agents already running
 still retire.
-Manual timer runs use the same ready-marker and admission checks. Store serializes
+Manual timer runs use the same readiness and admission checks. Store serializes
 simultaneous firings using the unique assignment key and filename.
 The ordinary command ID remains the timer child ID, preserving exact same-ID replay.
 
@@ -596,8 +600,9 @@ key and capacity bound accompany the normal launch command for Store validation.
 maintains unresolved assignment membership transactionally with command and turn changes.
 It counts indexed unresolved membership, including unresolved launches,
 linked initial sends, and starting, running or unknown native turns. Counting stops
-at `max_busy` and excludes completed history. A terminal turn releases the slot;
-process liveness by itself does not establish completion. Store checks admission history,
+at `max_busy` and excludes completed history. An unknown turn on a lost generation
+can release its assignment slot after 60 seconds from the persisted unknown transition
+once custody has closed. Its outcome remains unknown. Store checks admission history,
 all applicable capacity bounds and provider holds in the normal launch transaction.
 A full scope keeps the due slot available for the next arbitration pass. Capacity waits
 re-arbitrate on committed `capacity.released` (not on `stop` acceptance), and a

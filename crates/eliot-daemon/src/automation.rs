@@ -2379,7 +2379,7 @@ async fn reconcile_timer(
                                 "assignments require an Owner timer",
                             ))
                         } else {
-                            match assignment::prepare(router, action).await {
+                            match assignment::prepare(router, action, None).await {
                                 Ok(action) => match rule.project.as_ref() {
                                     Some(project) => {
                                         router

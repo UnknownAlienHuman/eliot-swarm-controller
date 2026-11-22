@@ -92,7 +92,14 @@ fn print_timer_summary(timer: &TimerStateView) {
         due
     );
     if let Some(outcome) = timer.last_outcome.as_deref() {
-        println!("    Last scheduled outcome: {outcome}");
+        let description = match outcome {
+            "brief_settling" => "Briefs are still settling",
+            "brief_requires_include" => "Older briefs require explicit Owner inclusion",
+            "not_found" => "No new brief",
+            "capacity_unavailable" => "Waiting for capacity",
+            other => other,
+        };
+        println!("    Last scheduled outcome: {description}");
     }
 }
 
@@ -519,8 +526,13 @@ pub(crate) async fn run_timer(
             print_value_or_human(&value, json_output, || print_timer_summary(&timer));
             Ok(0)
         }
-        TimerCommand::Run(TimerRunArgs { rule, project }) => {
-            let request = TimerRunRequest::new(mutation_id(id)?, rule);
+        TimerCommand::Run(TimerRunArgs {
+            rule,
+            project,
+            include,
+        }) => {
+            let mut request = TimerRunRequest::new(mutation_id(id)?, rule);
+            request.include = include;
             let request = match project {
                 Some(project) => request.in_project(project),
                 None => request,

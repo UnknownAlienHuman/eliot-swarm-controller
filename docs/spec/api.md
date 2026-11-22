@@ -851,9 +851,12 @@ project fences and `applied` semantics are defined in
 [Connected event rules](automation.md#connected-event-rules).
 
 `timer.get` uses `TimerGetRequest`/`TimerStateView` and reads the selected timer without
-advancing its schedule. `timer.run` accepts `TimerRunRequest { id, rule, project? }`,
+advancing its schedule. The `last_outcome` field reports the current assignment wait,
+when present, or the last scheduled check. `timer.run` accepts
+`TimerRunRequest { id, rule, project?, include? }`,
 where `id` is the external ULID mutation ID and `rule` is the timer ID. An optional
 `project` selects the registered project principal; omission selects global Owner scope.
+An optional `include` selects one exact filename on a global Owner folder assignment.
 It returns the existing Core `Command` parent bound to that timer and exact mutation ID.
 An exact mutation-ID retry returns that parent without admitting or dispatching another
 action child. Manual runs do not consume the scheduled slot. See the timer semantics in
@@ -1602,7 +1605,7 @@ first turn. Markers can recur when two pages include turns from the same generat
 
 The existing principal checks and unknown-state masking apply. `current_generation`
 identifies the current Agent generation. Request `metadata: true` or use
-`swarm result --metadata` to include the full current `agent_metadata` object.
+`swarm result --json --metadata` to include the full current `agent_metadata` object.
 On a self-read, the response's `generation` is the
 credential's generation. On other reads it echoes an explicit filter, or reports
 the current Agent generation when the filter is omitted. Each turn carries its
@@ -2682,11 +2685,15 @@ are positional; `--to` remains the named-recipient selector for `msg send` and
 For one compatibility release, the former pagination flags remain aliases:
 `events --since`, `discover --cursor`, `history --cursor`,
 `project overview --cursor`, and `cleanup plan --continuation`.
+The legacy `--agent` options for `usage`, `heavy`, mail show/ack, and
+claim set/list/release remain accepted. Command resolution accepts legacy
+`--as applied|failed` alongside the canonical `--status` form.
 The default presentation is concise human-readable output for status, Agent,
 command, project, Goal and timer details, rule/timer lists, daemon update, Store
 compaction and stop settlement. `--json` keeps each command's existing response
 shape and prints it as compact JSON. `result` starts with the newest retained
-final answer and includes its turn status. Use `--json` for the full page.
+final answer and includes its turn status. Scripts and agents parsing `show`
+or `result` must request `--json`. Use `result --json` for the full page.
 Generation/turn/request flags are optional for immediate calls, explicit for delayed ones.
 The synopsis is target grammar; later-layer forms are not an inventory of current help.
 
@@ -2743,7 +2750,7 @@ swarm rule read NAME.toml [--project PROJECT]
 swarm rule save NAME.toml --file FILE [--expected-revision SHA256] [--project PROJECT]
 swarm rule delete NAME.toml --expected-revision SHA256 [--project PROJECT]
 swarm rule catch-up ID --after SEQ [--through SEQ] [--project PROJECT]
-swarm timer show ID [--project PROJECT] | run ID [--project PROJECT]
+swarm timer show ID [--project PROJECT] | run ID [--project PROJECT | --include NAME]
 swarm timer list [--project PROJECT] [--after ID] [--limit N]
 swarm goal set A --text TEXT --check CMD [ARGS...] [--mode eliot|native] [--check-cwd PATH] [--check-timeout-ms MS] [--max-turns N] [--max-rounds N] [--max-without-progress N] [--cadence-ms MS] [--scope GLOB]... [--check-input GLOB]... [--max-cost AMOUNT --cost-unit UNIT] [--escalate-model M] [--escalate-effort E] [--escalate-reason TEXT]
 swarm goal show|pause|clear|resume A [--mode eliot|native] [--reason R]

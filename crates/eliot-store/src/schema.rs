@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 80;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 81;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -1973,6 +1973,28 @@ impl Store {
                    AND set_by='owner' AND note='automation assignment cursor'
                    AND json_type(value,'$.cursor')='text';
                  INSERT INTO schema_migrations(version) VALUES (80);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 81 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE TABLE assignment_legacy_floors (
+                     assignment_key TEXT PRIMARY KEY,
+                     cursor TEXT NOT NULL
+                 ) WITHOUT ROWID;
+                 INSERT OR IGNORE INTO assignment_legacy_floors (assignment_key, cursor)
+                 SELECT substr(key, length('assignment.') + 1),
+                        json_extract(value,'$.cursor')
+                 FROM vars
+                 WHERE scope='global' AND key GLOB 'assignment.*'
+                   AND set_by='owner' AND note='automation assignment cursor'
+                   AND json_type(value,'$.cursor')='text';
+                 INSERT INTO schema_migrations(version) VALUES (81);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;

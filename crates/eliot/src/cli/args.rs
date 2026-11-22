@@ -21,6 +21,19 @@ pub(crate) struct PageArgs {
     pub(crate) limit: usize,
 }
 
+#[derive(Args)]
+pub(crate) struct OptionalAgent {
+    #[arg(value_name = "AGENT", conflicts_with = "legacy_agent")]
+    pub(crate) agent: Option<String>,
+    #[arg(
+        long = "agent",
+        hide = true,
+        value_name = "AGENT",
+        conflicts_with = "agent"
+    )]
+    pub(crate) legacy_agent: Option<String>,
+}
+
 #[derive(Parser)]
 #[command(
     name = "swarm",
@@ -685,8 +698,8 @@ pub(crate) struct StatsArgs {
 
 #[derive(Args)]
 pub(crate) struct HeavyArgs {
-    #[arg(value_name = "AGENT")]
-    pub(crate) agent: Option<String>,
+    #[command(flatten)]
+    pub(crate) agent: OptionalAgent,
     #[command(flatten)]
     pub(crate) generation: ReadGenerationArgs,
     /// Window in seconds; defaults to 3600.
@@ -1235,8 +1248,22 @@ pub(crate) struct CmdResolveArgs {
     #[arg(value_name = "COMMAND_ID", value_parser = command_id)]
     pub(crate) command_id: String,
     /// Assert a completed command effect or a definite failure.
-    #[arg(long, value_parser = ["completed", "failed"])]
-    pub(crate) status: String,
+    #[arg(
+        long,
+        value_name = "STATUS",
+        value_parser = ["completed", "failed"],
+        required_unless_present = "legacy_as",
+        conflicts_with = "legacy_as"
+    )]
+    pub(crate) status: Option<String>,
+    #[arg(
+        long = "as",
+        hide = true,
+        value_name = "STATUS",
+        value_parser = ["applied", "failed"],
+        conflicts_with = "status"
+    )]
+    pub(crate) legacy_as: Option<String>,
     #[arg(long, value_name = "TEXT")]
     pub(crate) reason: String,
 }
@@ -1303,14 +1330,14 @@ pub(crate) struct MsgSendArgs {
 pub(crate) struct MsgShowArgs {
     #[arg(value_name = "DELIVERY")]
     pub(crate) delivery: String,
-    #[arg(value_name = "AGENT")]
-    pub(crate) agent: Option<String>,
+    #[command(flatten)]
+    pub(crate) agent: OptionalAgent,
 }
 
 #[derive(Args)]
 pub(crate) struct MsgAckArgs {
-    #[arg(value_name = "AGENT")]
-    pub(crate) agent: Option<String>,
+    #[command(flatten)]
+    pub(crate) agent: OptionalAgent,
     #[arg(long, value_name = "DELIVERY")]
     pub(crate) delivery: Vec<String>,
 }
@@ -1381,8 +1408,8 @@ pub(crate) enum ClaimCommand {
 pub(crate) struct ClaimSetArgs {
     #[arg(value_name = "GLOB")]
     pub(crate) glob: String,
-    #[arg(value_name = "AGENT")]
-    pub(crate) agent: Option<String>,
+    #[command(flatten)]
+    pub(crate) agent: OptionalAgent,
     #[arg(long, value_name = "TEXT")]
     pub(crate) note: Option<String>,
     /// Claim lifetime in seconds (1 to 86400, default 3600).
@@ -1394,16 +1421,16 @@ pub(crate) struct ClaimSetArgs {
 pub(crate) struct ClaimListArgs {
     #[arg(long, value_name = "PROJECT")]
     pub(crate) project: Option<String>,
-    #[arg(value_name = "AGENT")]
-    pub(crate) agent: Option<String>,
+    #[command(flatten)]
+    pub(crate) agent: OptionalAgent,
 }
 
 #[derive(Args)]
 pub(crate) struct ClaimReleaseArgs {
     #[arg(value_name = "GLOB")]
     pub(crate) glob: String,
-    #[arg(value_name = "AGENT")]
-    pub(crate) agent: Option<String>,
+    #[command(flatten)]
+    pub(crate) agent: OptionalAgent,
 }
 
 #[derive(Subcommand)]
@@ -1534,6 +1561,8 @@ pub(crate) struct TimerRunArgs {
     pub(crate) rule: String,
     #[arg(long, value_name = "PROJECT")]
     pub(crate) project: Option<String>,
+    #[arg(long, value_name = "NAME")]
+    pub(crate) include: Option<String>,
 }
 
 #[derive(Subcommand)]

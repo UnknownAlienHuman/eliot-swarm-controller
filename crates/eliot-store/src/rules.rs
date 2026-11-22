@@ -2977,6 +2977,17 @@ fn admit_rule_action_tx(
     policy: Option<&capacity::PolicyLoader>,
     secret_policy: Option<&core::SecretPolicy>,
 ) -> Result<(Command, Admission, Vec<Event>)> {
+    if let Some(include) = request
+        .args
+        .get("assignment")
+        .and_then(|assignment| assignment.get("include"))
+        && key.args.get("include") != Some(include)
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "brief inclusion requires an exact manual timer binding",
+        ));
+    }
     if (request.probe || matches!(request.verb.as_str(), "compact" | "switch"))
         && key.principal != "owner"
     {

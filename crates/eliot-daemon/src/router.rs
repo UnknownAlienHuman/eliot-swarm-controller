@@ -148,6 +148,7 @@ struct RouterInner {
     unknown_causes: Mutex<HashMap<String, String>>,
     repeat_failures: Mutex<repeat_failures::RepeatFailures>,
     rule_definitions: Mutex<HashMap<(String, String), (i64, RuleDefinition)>>,
+    assignment_observations: Mutex<crate::automation::assignment::Observations>,
     rule_source_files: Mutex<HashMap<String, HashMap<String, String>>>,
     catalog_cache: Mutex<catalog::CatalogCache>,
     profile_cache: Mutex<crate::config::ProfileCache>,
@@ -410,6 +411,7 @@ impl Router {
                 unknown_causes: Mutex::new(HashMap::new()),
                 repeat_failures: Mutex::default(),
                 rule_definitions: Mutex::new(HashMap::new()),
+                assignment_observations: Mutex::default(),
                 rule_source_files: Mutex::new(HashMap::new()),
                 catalog_cache: Mutex::new(catalog::CatalogCache::default()),
                 profile_cache: Mutex::new(crate::config::ProfileCache::default()),
@@ -3328,12 +3330,8 @@ impl Router {
         let request: TimerGetRequest = eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         let rule_principal = rule_principal(request.project.as_deref());
-        let state = self
-            .inner
-            .store
-            .lock()
-            .await
-            .get_timer_state(&rule_principal, &request.id)?
+        let store = self.inner.store.lock().await;
+        let state = rules::timer_readback(&store, &rule_principal, &request.id)?
             .ok_or_else(|| Error::new("not_found", "timer was not found"))?;
         request.validate_response(&state)?;
         serde_json::to_value(state)
@@ -3345,6 +3343,16 @@ impl Router {
         principal: &str,
         definitions: &[(i64, RuleDefinition)],
     ) {
+        if principal == "owner" {
+            let active = definitions
+                .iter()
+                .filter_map(|(_, definition)| definition.id.strip_prefix("assignment-"))
+                .collect();
+            self.inner
+                .assignment_observations
+                .lock_recover()
+                .retain_queues(&active);
+        }
         let mut stored = self.inner.rule_definitions.lock_recover();
         stored.retain(|(stored_principal, _), _| stored_principal != principal);
         stored.extend(definitions.iter().map(|(revision, definition)| {

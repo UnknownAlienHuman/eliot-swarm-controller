@@ -75,10 +75,14 @@ impl<'a> RuleFiringKey<'a> {
         state: &'a core::api::RuleStateView,
         parent_id: &'a str,
         parent_digest: Vec<u8>,
+        include: Option<&str>,
     ) -> Result<Self> {
         let mut args = json!({"rule": state.id});
         if let Some(project) = &state.project {
             args["project"] = json!(project);
+        }
+        if let Some(include) = include {
+            args["include"] = json!(include);
         }
         Ok(Self {
             principal,
@@ -726,6 +730,7 @@ impl Store {
                 blocked: false,
             });
         }
+        validate_manual_assignment_include(principal, request, &action)?;
         let project = validate_rule_principal_tx(&tx, principal)?;
         if request.project.as_deref()
             != project
@@ -775,7 +780,13 @@ impl Store {
         }
         let timer = load_timer_state(&tx, principal, &request.rule)?
             .ok_or_else(|| Error::new("not_found", "timer state was not found"))?;
-        if timer.view != *state || !timer.view.enabled || !rule.view.enabled {
+        if timer.view.schedule_revision != state.schedule_revision {
+            return Err(Error::new(
+                "bad_state",
+                "timer schedule changed before manual run admission",
+            ));
+        }
+        if !timer.view.enabled || !rule.view.enabled {
             return Err(Error::new("bad_state", "timer is disabled or paused"));
         }
         let timer_context = if action.verb == "run" {
@@ -818,7 +829,13 @@ impl Store {
             ));
         }
 
-        let mut key = RuleFiringKey::manual(principal, &rule.view, &request.id, digest)?;
+        let mut key = RuleFiringKey::manual(
+            principal,
+            &rule.view,
+            &request.id,
+            digest,
+            request.include.as_deref(),
+        )?;
         key.script_context = timer_context;
         if action.verb == "run" {
             // Freeze the admission rate policy in the committed timer parent;
@@ -1088,6 +1105,7 @@ fn replay_timer_run_tx(
     principal: &str,
     request: &core::api::TimerRunRequest,
 ) -> Result<Option<(Command, Option<Admission>)>> {
+    validate_manual_include_scope(principal, request)?;
     let digest = timer_run_digest(request)?;
     let Some((old_principal, old_method, old_digest)) = command_binding(connection, &request.id)?
     else {
@@ -1109,7 +1127,62 @@ fn replay_timer_run_tx(
     }
     let child_id = derived_manual_timer_id(principal, &request.rule, &request.id)?;
     let child = load_rule_child(connection, &request.id, &child_id)?;
+    if let Some(child) = child.as_ref() {
+        let child_include = child
+            .command
+            .args
+            .get("assignment")
+            .and_then(|assignment| assignment.get("include"))
+            .and_then(Value::as_str);
+        if child_include != request.include.as_deref() {
+            return Err(Error::new(
+                "source_integrity",
+                "manual timer child assignment include differs from its request",
+            ));
+        }
+    }
     Ok(Some((parent, child)))
+}
+
+fn validate_manual_include_scope(
+    principal: &str,
+    request: &core::api::TimerRunRequest,
+) -> Result<()> {
+    if request.include.is_some() && (principal != "owner" || request.project.is_some()) {
+        return Err(Error::new(
+            "not_allowed",
+            "manual timer include is available only to a global Owner assignment",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_manual_assignment_include(
+    principal: &str,
+    request: &core::api::TimerRunRequest,
+    action: &SubmitCommand,
+) -> Result<()> {
+    validate_manual_include_scope(principal, request)?;
+    let child_include = action
+        .args
+        .get("assignment")
+        .and_then(|assignment| assignment.get("include"))
+        .and_then(Value::as_str);
+    if request.include.as_deref() != child_include {
+        return Err(Error::new(
+            "not_allowed",
+            "manual timer assignment include must match its frozen launch",
+        ));
+    }
+    if request.include.is_some()
+        && (action.verb != "launch" || action.args.get("assignment").is_none())
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "manual timer include is available only to a global Owner assignment",
+        ));
+    }
+    Ok(())
 }
 
 fn timer_run_digest(request: &core::api::TimerRunRequest) -> Result<Vec<u8>> {
@@ -1122,6 +1195,9 @@ fn timer_run_digest(request: &core::api::TimerRunRequest) -> Result<Vec<u8>> {
     });
     if let Some(project) = &request.project {
         value["args"]["project"] = json!(project);
+    }
+    if let Some(include) = &request.include {
+        value["args"]["include"] = json!(include);
     }
     canonical::digest(&value)
 }
@@ -1301,6 +1377,15 @@ pub(super) fn validate_timer_script_run_admitted_origin_tx(
                 core::api::TimerRunRequest::new(parent.command.id.clone(), rule.clone());
             if let Some(project) = project {
                 request = request.in_project(project);
+            }
+            if let Some(include) = parent.command.args.get("include") {
+                let Some(include) = include.as_str() else {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "manual timer include is malformed",
+                    ));
+                };
+                request.include = Some(include.to_owned());
             }
             request
                 .validate_response(&parent.command)

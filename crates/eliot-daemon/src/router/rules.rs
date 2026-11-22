@@ -23,9 +23,27 @@ use eliot_core::{
     },
     is_deterministic_pre_admission_rejection,
 };
+use eliot_plugin::sync::LockExt;
 use eliot_store::{RuleCatchUpAction, RuleCatchUpAdmission, TimerSlotAdmission};
 use serde_json::Value;
-use std::sync::atomic::Ordering;
+use std::{collections::HashSet, path::Path, sync::atomic::Ordering};
+
+pub(super) fn timer_readback(
+    store: &eliot_store::Store,
+    principal: &str,
+    id: &str,
+) -> Result<Option<TimerStateView>> {
+    let Some(mut state) = store.get_timer_state(principal, id)? else {
+        return Ok(None);
+    };
+    if principal == "owner"
+        && state.enabled
+        && let Some((_, wait)) = store.timer_wait(&state)?
+    {
+        state.last_outcome = Some(wait.reason.code);
+    }
+    Ok(Some(state))
+}
 
 impl Router {
     pub(crate) async fn require_assignment_slot(&self, key: &str, max_busy: u64) -> Result<()> {
@@ -33,15 +51,32 @@ impl Router {
             .store
             .lock()
             .await
-            .require_assignment_slot(key, max_busy)
+            .require_assignment_slot(key, max_busy, now_ms())
     }
 
     pub(crate) async fn unadmitted_briefs(
         &self,
         key: &str,
         briefs: Vec<String>,
-    ) -> Result<Vec<String>> {
-        self.inner.store.lock().await.unadmitted_briefs(key, briefs)
+        include: Option<&str>,
+    ) -> Result<(Vec<String>, bool)> {
+        self.inner
+            .store
+            .lock()
+            .await
+            .unadmitted_briefs(key, briefs, include)
+    }
+
+    pub(crate) fn stable_assignment_briefs(
+        &self,
+        key: &str,
+        folder: &Path,
+        versions: &[(String, crate::automation::assignment::BriefVersion)],
+    ) -> HashSet<String> {
+        self.inner
+            .assignment_observations
+            .lock_recover()
+            .stable_names(key, folder, versions)
     }
 
     pub(crate) async fn is_assignment_event(&self, event: &Event, key: &str) -> Result<bool> {
@@ -351,7 +386,13 @@ impl Router {
                     .await;
             }
         };
-        let prepared_result = if command.verb == "run" {
+        let is_assignment = command.args.get("assignment").is_some();
+        let prepared_result = if request.include.is_some() && !is_assignment {
+            Err(Error::new(
+                "invalid",
+                "include requires a folder assignment timer",
+            ))
+        } else if command.verb == "run" {
             self.prepare_timer_rule_run_submission(
                 command,
                 project_view.as_ref(),
@@ -365,14 +406,20 @@ impl Router {
                 ),
             )
             .await
-        } else if command.args.get("assignment").is_some() {
+        } else if is_assignment {
             if project_view.is_some() {
                 Err(Error::new(
                     "not_allowed",
                     "assignments require an Owner timer",
                 ))
             } else {
-                match crate::automation::assignment::prepare(self, command).await {
+                match crate::automation::assignment::prepare(
+                    self,
+                    command,
+                    request.include.as_deref(),
+                )
+                .await
+                {
                     Ok(command) => self.prepare_owner_submission(command).await,
                     Err(error) => Err(error),
                 }
@@ -484,7 +531,7 @@ impl Router {
                 | "emit"
                 | "mail.send"
                 | "var.set"
-        ) || workspace.is_some()
+        ) || (workspace.is_some() && action.verb != "launch")
         {
             return Err(Error::new(
                 "invalid",

@@ -26,6 +26,8 @@ pub fn is_deterministic_pre_admission_rejection(code: &str) -> bool {
     matches!(
         code,
         "assignment_occupied"
+            | "brief_settling"
+            | "brief_requires_include"
             | "bad_state"
             | "capacity_unavailable"
             | "conflict"

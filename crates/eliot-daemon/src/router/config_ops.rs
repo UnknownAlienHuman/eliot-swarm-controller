@@ -198,7 +198,7 @@ impl Router {
                 serde_json::from_str(&state.current_definition).map_err(|_| {
                     Error::new("source_integrity", "stored rule definition is not JSON")
                 })?;
-            let timer = store.get_timer_state(&namespace, &state.view.id)?;
+            let timer = super::rules::timer_readback(&store, &namespace, &state.view.id)?;
             let source_file = if state.source_present {
                 self.rule_source_file(&namespace, &state.view.id)
             } else {

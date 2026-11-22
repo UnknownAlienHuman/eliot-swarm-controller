@@ -1,8 +1,8 @@
 //! Read-only agent views and their table rendering.
 use super::args::{
     EditsArgs, EventsArgs, GenerationArgs, GitStatusArgs, HeavyArgs, HistoryArgs, ListFilterArgs,
-    LsArgs, PageArgs, ProcessesArgs, ReadGenerationArgs, ResultArgs, ShowArgs, StatsArgs, TopArgs,
-    UsageArgs, WatchArgs, WhyArgs,
+    LsArgs, OptionalAgent, PageArgs, ProcessesArgs, ReadGenerationArgs, ResultArgs, ShowArgs,
+    StatsArgs, TopArgs, UsageArgs, WatchArgs, WhyArgs,
 };
 use super::support::read_and_print;
 use super::support::{Failure, PAGE_SIZE, print_value, print_value_or_human, validate_limit};
@@ -22,6 +22,19 @@ use eliot_core::{AgentState, Error as CoreError};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+pub(crate) fn resolve_agent_target(
+    positional: Option<String>,
+    legacy: Option<String>,
+) -> Result<Option<String>, Failure> {
+    match (positional, legacy) {
+        (Some(_), Some(_)) => Err(Failure::new(
+            2,
+            "provide the Agent target positionally or with --agent, not both",
+        )),
+        (positional, legacy) => Ok(positional.or(legacy)),
+    }
+}
 
 struct TopListRead {
     response: AgentListResponse,
@@ -314,7 +327,7 @@ pub(crate) async fn run_usage(
     json_output: bool,
 ) -> Result<u8, Failure> {
     let params = UsageSummaryRequest {
-        agent: agent.or(agent_positional),
+        agent: resolve_agent_target(agent_positional, agent)?,
         generation,
         project,
         root,
@@ -412,7 +425,11 @@ pub(crate) fn print_doctor_table(response: &HarnessDoctorResponse) {
 
 pub(crate) async fn run_heavy(
     HeavyArgs {
-        agent,
+        agent:
+            OptionalAgent {
+                agent: agent_positional,
+                legacy_agent,
+            },
         generation: ReadGenerationArgs { generation },
         window_secs,
     }: HeavyArgs,
@@ -420,7 +437,7 @@ pub(crate) async fn run_heavy(
     json_output: bool,
 ) -> Result<u8, Failure> {
     let params = ObserveHeavyRequest {
-        agent,
+        agent: resolve_agent_target(agent_positional, legacy_agent)?,
         generation,
         window_secs,
     };

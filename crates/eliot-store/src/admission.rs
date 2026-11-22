@@ -485,6 +485,18 @@ fn submit_head_tx(
             "run commands must be admitted by an event-rule firing",
         ));
     }
+    if !derived_rule
+        && request
+            .args
+            .get("assignment")
+            .and_then(|assignment| assignment.get("include"))
+            .is_some()
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "brief inclusion requires an Owner timer run",
+        ));
+    }
     if !request.args.is_object() {
         return Err(Error::new("invalid", "command args must be a JSON object"));
     }
@@ -1006,7 +1018,7 @@ fn admit_launch_tx(
             params![encode_json(&choice)?, agent_num]
         ));
     }
-    if let Some((goal, cause)) = assignment::record_admission_tx(tx, principal, request)? {
+    if let Some((goal, cause)) = assignment::record_admission_tx(tx, principal, request, now)? {
         // A first launch starts generation 1; its Goal binds to it now.
         goals::install_assignment_goal_tx(tx, agent_num, 1, &goal, cause, now)?;
     }
