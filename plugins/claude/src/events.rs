@@ -1555,6 +1555,9 @@ impl EventProcessor {
                 "item_id": tool_use.id,
                 "tool": tool_use.name,
             });
+            if tool_use.run_in_background {
+                data["native_background"] = json!(true);
+            }
             if let Some(command) = &tool_use.command {
                 let policy = SecretPolicy::new(self.secrets.iter().cloned());
                 let redacted = policy.redact_text(command);

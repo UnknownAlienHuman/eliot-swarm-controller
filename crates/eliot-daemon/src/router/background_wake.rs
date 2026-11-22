@@ -60,7 +60,7 @@ impl Router {
         };
 
         let (tool_item_id, output_tail) = match candidate.tool_item {
-            Some((tool_turn, item_id)) => {
+            Some(item_id) => {
                 let tail = self
                     .inner
                     .store
@@ -69,16 +69,16 @@ impl Router {
                     .background_wake_tool_output_tail(
                         &agent.id,
                         agent.generation,
-                        &tool_turn,
+                        turn_id,
                         &item_id,
                     )?
-                    .map(|text| bounded_redacted_tail(&text, &secrets))
-                    .filter(|text| !text.is_empty());
+                    .map(|text| bounded_redacted_tail(&text, &secrets));
                 (Some(item_id), tail)
             }
-            // Empty tail marks an ambiguous process start covered by multiple
-            // concurrent tool windows, so delivery omits any output tail and explains why.
-            None => (None, Some(String::new())),
+            None => (
+                None,
+                Some(eliot_core::BACKGROUND_WAKE_AMBIGUOUS_TAIL.to_owned()),
+            ),
         };
         // Held locally and installed only after the wake commits, so every
         // refusal or error drops (closes) the handle.

@@ -156,10 +156,9 @@ pub(crate) struct BackgroundProcessCandidate {
     pub(crate) identity: ProcessIdentity,
     pub(crate) command_line: String,
     pub(crate) command_truncated: bool,
-    /// `(turn_id, item_id)` of the completing turn's unique native tool window
-    /// covering the process start; `None` when multiple overlapping tool
-    /// windows contain the process start.
-    pub(crate) tool_item: Option<(String, String)>,
+    /// Item id of the completing turn's only tool window containing the process
+    /// start; `None` when several windows contain it.
+    pub(crate) tool_item: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -547,9 +546,9 @@ impl Monitoring {
         }
     }
 
-    /// Fresh-sample `agent`'s custody tree and pick the newest running
-    /// non-server descendant under its verified native harness session whose
-    /// start time falls inside a native tool call window of the completing turn.
+    /// Fresh-sample `agent`'s custody tree and pick the first running
+    /// non-server descendant of the newest native tool call of the completing
+    /// turn that contains a process start.
     pub(crate) async fn inspect_running_background_processes(
         &self,
         agent: &Agent,
@@ -660,7 +659,8 @@ impl Monitoring {
             chain: Vec<u32>,
             command_line: String,
             command_truncated: bool,
-            tool_item: Option<(String, String)>,
+            tool_item: Option<String>,
+            tool_started_at: i64,
         }
         let mut qualifying: Vec<QualifiedCandidate<'_>> = Vec::new();
         let mut server_ancestor_pids: HashSet<u32> = HashSet::new();
@@ -677,15 +677,10 @@ impl Monitoring {
             else {
                 continue;
             };
-            if proc_start_ms < context.window_start.saturating_sub(START_SKEW_MS)
-                || proc_start_ms > context.window_end.saturating_add(START_SKEW_MS)
-            {
+            let Some((tool_item, tool_started_at)) =
+                match_tool_window(proc_start_ms, &context.tool_windows)
+            else {
                 continue;
-            }
-            let tool_item = match match_tool_window(proc_start_ms, &context.tool_windows) {
-                ToolWindowMatch::None => continue,
-                ToolWindowMatch::Unique(tool_turn, item_id) => Some((tool_turn, item_id)),
-                ToolWindowMatch::Ambiguous => None,
             };
             let Some(chain) = harness_descendant_chain(
                 sample.record.identity.pid,
@@ -723,6 +718,7 @@ impl Monitoring {
                 command_line,
                 command_truncated,
                 tool_item,
+                tool_started_at,
             });
         }
 
@@ -740,10 +736,13 @@ impl Monitoring {
                 .any(|pid| qualifying_pids.contains(pid))
         });
 
+        // The newest tool call's first surviving process is the job root even
+        // when a shell runtime (Git Bash) does not keep Windows parent links.
         let Some(winner) = qualifying.into_iter().max_by_key(|candidate| {
             (
-                candidate.sample.record.identity.start_time,
-                candidate.sample.record.identity.pid,
+                candidate.tool_started_at,
+                std::cmp::Reverse(candidate.sample.record.identity.start_time),
+                std::cmp::Reverse(candidate.sample.record.identity.pid),
             )
         }) else {
             return Ok(None);
@@ -2718,7 +2717,7 @@ fn harness_descendant_chain(
         current_pid = parent_pid;
         current_start = parent_start;
     }
-    after_harness.then_some(chain)
+    None
 }
 
 fn matches_declared_command(
@@ -2742,44 +2741,33 @@ fn matches_declared_command(
     })
 }
 
-enum ToolWindowMatch {
-    None,
-    Unique(String, String),
-    Ambiguous,
-}
-
+/// The tool call binding of a process start: the item id when exactly one call
+/// contains it, and the start of the newest containing call.
+///
+/// The lower bound allows for `tool.started` committing after the spawn and
+/// for Linux start-time rounding. The upper bound has no skew: `tool.completed`
+/// commits after the tool ended, so a post-turn harness helper never matches.
+/// A call still open at turn end covers only its own spawn, because the turn's
+/// end is when a harness starts its helpers. A process bound only to a call the
+/// harness runs as its own background task is skipped: the harness wakes itself.
 fn match_tool_window(
     proc_start_ms: i64,
     tool_windows: &[eliot_store::BackgroundWakeToolWindow],
-) -> ToolWindowMatch {
-    const TOOL_WINDOW_EXACT_SKEW_MS: i64 = 25;
-    #[cfg(windows)]
-    const TOOL_WINDOW_START_SKEW_MS: i64 = 500;
-    #[cfg(not(windows))]
-    const TOOL_WINDOW_START_SKEW_MS: i64 = 1_500;
-    const TOOL_WINDOW_END_SKEW_MS: i64 = 50;
-
-    let classify = |start_skew: i64, end_skew: i64| -> ToolWindowMatch {
-        let mut matched: Option<&eliot_store::BackgroundWakeToolWindow> = None;
-        for window in tool_windows {
-            if proc_start_ms >= window.started_at.saturating_sub(start_skew)
-                && proc_start_ms <= window.completed_at.saturating_add(end_skew)
-            {
-                if matched.is_some() {
-                    return ToolWindowMatch::Ambiguous;
-                }
-                matched = Some(window);
-            }
-        }
-        match matched {
-            Some(window) => ToolWindowMatch::Unique(window.turn_id.clone(), window.item_id.clone()),
-            None => ToolWindowMatch::None,
-        }
-    };
-
-    match classify(TOOL_WINDOW_EXACT_SKEW_MS, TOOL_WINDOW_EXACT_SKEW_MS) {
-        ToolWindowMatch::None => classify(TOOL_WINDOW_START_SKEW_MS, TOOL_WINDOW_END_SKEW_MS),
-        other => other,
+) -> Option<(Option<String>, i64)> {
+    let containing: Vec<_> = tool_windows
+        .iter()
+        .filter(|window| {
+            let end = window
+                .completed_at
+                .unwrap_or_else(|| window.started_at.saturating_add(START_SKEW_MS));
+            proc_start_ms >= window.started_at.saturating_sub(START_SKEW_MS) && proc_start_ms <= end
+        })
+        .collect();
+    match containing.as_slice() {
+        [] => None,
+        [window] if window.native_background => None,
+        [window] => Some((Some(window.item_id.clone()), window.started_at)),
+        several => Some((None, several.iter().map(|window| window.started_at).max()?)),
     }
 }
 

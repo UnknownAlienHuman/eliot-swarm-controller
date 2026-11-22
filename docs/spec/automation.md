@@ -898,16 +898,17 @@ inserts can still be delivered by the before-tool and after-tool callbacks.
 For [#879](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/879), [#883](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/883), and [#903](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/903), Swarm wakes an Agent whose turn ended
 while a process it started is still running. When a `turn.completed` with outcome
 `success` or `failure` commits, the note worker freshly samples that generation's
-custody and picks the newest top-level [candidate](monitoring.md#background-process-wake-candidates)
-whose OS creation time falls within a committed native tool call window
-(`tool.started` to `tool.completed`, or turn completion while open) of that
-completing turn. A candidate outside every tool window of that turn (such as a
-post-turn harness notify hook) never arms, and Store verifies at least one
-committed native `tool.started` item in that completing turn (plus the matching
-tool item when unique) before arming. It retains one `waiting` row in
-`background_process_wakes`. Nothing arms when the
-turn ended with a stop or interrupt, when the completing turn ran no native tool
-(including turns started by an automatic background wake or self-wake), or when the Agent has an open or same-turn
+custody and picks one top-level [candidate](monitoring.md#background-process-wake-candidates)
+started inside a native tool call of that completing turn: the first process still
+running from the newest such call. A process started
+outside every tool call, such as a harness notify helper at turn end, never arms.
+A process from an earlier turn does not arm either, nor does one bound only to a
+call the harness runs as its own background task (`native_background` on
+`tool.started`, Claude `run_in_background`), because the harness wakes itself when
+that task ends. Swarm retains one `waiting`
+row in `background_process_wakes`. Nothing arms when the turn ended with a stop or
+interrupt, when it ran no native tool (including a turn started by a wake), or
+when the Agent has an open or same-turn
 [self-wake](coordination.md#agent-self-wake-833-item-3). It also does not arm when an
 automatic wake is open for the generation or already ran for that turn, or the
 process already had one in the generation. A lagging or replayed completion arms
@@ -919,15 +920,13 @@ ancestors never arm. The arm reads only bounded fields under a short Store lock.
 When that exact process identity exits, Swarm delivers one note in the
 [shared insertion frame](#inject-context-at-the-safe-point) at the soonest point.
 That is an `inject` into an active turn whose context points allow it, otherwise
-an ordinary `send` with the reserved delivery command id. Both `inject` and `send`
-deliveries are attributed in the command journal to the Swarm background-wake
-principal (`swarm_note:background_process_wake`), never `owner`, and appear as
-`[Swarm note from Swarm]`. The note gives the pid,
-the exit code (or `unknown`), the redacted process command line (at most 512 bytes),
-and a bounded output tail only when exactly one tool window contains the process
-start and its `tool.completed` captured one at arm time; when multiple concurrent
-tool windows overlap the process start, any tail is omitted and the note says so. Redaction of the command and
-tail masks known Swarm secrets literally plus common shapes: `--password`,
+an ordinary `send` with the reserved delivery command id. The command journal
+attributes both to the Swarm principal `swarm_note:background_process_wake`, never
+`owner`. The note gives the pid, the exit code (or `unknown`), the redacted process
+command line (at most 512 bytes), and a bounded output tail when exactly one tool
+call contains the process start and its `tool.completed` captured one at arm time.
+When several tool calls contain the start, the note says the tail was omitted.
+Redaction of the command and tail masks known Swarm secrets literally plus common shapes: `--password`,
 `--token`, `--secret` and `--api-key` style flag values, `Authorization:` and
 `Bearer` credentials, and `NAME=value` where NAME contains TOKEN, SECRET,
 PASSWORD or API_KEY. Other secret forms in a command line or output can remain. After `daemon.background_wake_max_wait_secs`

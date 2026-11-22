@@ -13,6 +13,9 @@ pub const BACKGROUND_WAKE_NOTE_KIND: &str = "background_process_wake";
 pub const BACKGROUND_WAKE_PRINCIPAL: &str = "swarm_note:background_process_wake";
 pub const MAX_BACKGROUND_WAKE_COMMAND_BYTES: usize = 512;
 pub const MAX_BACKGROUND_WAKE_OUTPUT_TAIL_BYTES: usize = 1_024;
+/// Stored in place of a tail when several tool windows contain the process start.
+pub const BACKGROUND_WAKE_AMBIGUOUS_TAIL: &str =
+    "(omitted: several tool calls overlapped this process start)";
 pub const BACKGROUND_SERVER_TOPIC: &str = "background.server";
 
 const SWARM_INFRA_SUBCOMMANDS: &[&str] = &["mcp", "hook", "plugin", "daemon"];
@@ -157,6 +160,7 @@ pub fn is_harness_owned_process(
         if crate::CONSOLE_HOST_PROGRAMS.contains(&stem)
             || matches!(stem, "winpty-agent" | "conpty")
             || HARNESS_OWNED_STEMS.contains(&stem)
+            || stem.starts_with("codex-")
             || stem.starts_with("language_server_")
             || stem.starts_with("language-server-")
         {
@@ -344,20 +348,9 @@ pub fn format_background_wake_note_body(
         "Background process exited (pid {pid}, exit code {code_str}).\n\
          Command: {command_line}{suffix}"
     );
-    match output_tail {
-        Some("") => {
-            body.push_str(
-                "\nOutput tail: omitted (multiple concurrent tools overlapped process start).",
-            );
-        }
-        Some(tail) => {
-            let trimmed = tail.trim();
-            if !trimmed.is_empty() {
-                body.push_str("\nOutput tail:\n");
-                body.push_str(trimmed);
-            }
-        }
-        None => {}
+    if let Some(tail) = output_tail.map(str::trim).filter(|tail| !tail.is_empty()) {
+        body.push_str("\nOutput tail:\n");
+        body.push_str(tail);
     }
     body
 }

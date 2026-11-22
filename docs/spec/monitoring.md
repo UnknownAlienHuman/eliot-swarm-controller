@@ -146,20 +146,19 @@ attachment cannot issue either native stop or other control operations.
 
 The [automatic background-process wake](automation.md#automatic-background-process-wake)
 reads custody only. A candidate is a running `child` of the Agent generation with
-a complete fresh snapshot whose OS start time (Unix ms) lies between the
-completing turn's start and completion (with one second of skew for Linux `btime`)
-and falls inside at least one committed native tool call window (`tool.started` to
-`tool.completed`, or turn completion while open) of that completing turn; sampling
-order and daemon restarts do not change this. Its parent chain reaches the live
-`harness` process (or terminates cleanly for a detached descendant whose launching
-wrapper shell already exited after `harness` started) without passing through the
-`plugin`. It must also not be harness-owned: console hosts, harness runtimes,
-language servers, or Swarm or configured MCP servers. A candidate outside every
-tool window of that turn (such as a post-turn harness notify hook) is skipped and
-cannot shadow a qualifying background process. When a candidate's ancestor also
+a complete fresh snapshot. Its OS start time (Unix ms) falls inside a native tool
+call window of the completing turn: from one second before the committed
+`tool.started` (commit lag and Linux `btime` rounding) up to the committed
+`tool.completed`. A call with no `tool.completed` covers only one second after its
+`tool.started`, because a harness starts its own helpers at turn end. A process
+whose only containing call has `native_background` is not a candidate. Sampling order
+and daemon restarts do not change this. Its parent chain reaches the live `harness`
+process without passing through the `plugin`, or breaks at an exited launcher for a
+process started after `harness`, as a detached job does. The chain has at most 16
+links. It must also not be harness-owned: console hosts, harness runtimes, language
+servers, or Swarm or configured MCP servers. When a candidate's ancestor also
 qualifies, the ancestor wins. On Windows Swarm opens a query handle to the armed
-identity and keeps it
-only once the wake commits, so the exact exit code survives the harness closing
+identity and keeps it only once the wake commits, so the exact exit code survives the harness closing
 its own handle. A refused or failed arm, a self-wake and every retirement close
 it. Without a handle (after a restart or a failed open), each check probes the
 exact boot, PID and start time directly and reopens the handle while the process

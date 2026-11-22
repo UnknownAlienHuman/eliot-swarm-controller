@@ -59,24 +59,22 @@ pub struct BackgroundWakeRecord {
     pub expires_at: i64,
 }
 
-/// One native tool execution window (`tool.started` to `tool.completed`, or
-/// turn completion if still open) committed for the completing turn.
+/// One native tool call of the completing turn. `completed_at` is `None` while
+/// the call has no committed `tool.completed`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BackgroundWakeToolWindow {
-    pub turn_id: String,
     pub item_id: String,
     pub started_at: i64,
-    pub completed_at: i64,
+    pub completed_at: Option<i64>,
+    /// The harness tracks this call as its own background task and wakes
+    /// itself when the task ends.
+    pub native_background: bool,
 }
 
 /// Everything the Router needs to pick a candidate, read in one short
 /// Store call. Only bounded fields are selected; no event payload is decoded.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BackgroundWakeArmContext {
-    /// Earliest process start (Unix ms): this completing turn's start.
-    pub window_start: i64,
-    /// Latest process start (Unix ms): this completing turn's completion.
-    pub window_end: i64,
     pub declared_pids: HashSet<u32>,
     pub declared_commands: Vec<String>,
     /// Committed native tool call windows belonging strictly to this completing turn.
@@ -98,24 +96,7 @@ impl Store {
         if !background_wake_arm_eligible_tx(&self.connection, agent_num, generation, turn_id)? {
             return Ok(None);
         }
-        let window: Option<(Option<i64>, Option<i64>)> = self
-            .connection
-            .query_row(
-                "SELECT started_at, completed_at
-                 FROM turns WHERE agent = ?1 AND generation = ?2 AND turn_id = ?3",
-                params![agent_num, generation, turn_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(sql_error)?;
-        let Some((Some(window_start), Some(window_end))) = window else {
-            return Ok(None);
-        };
-        let mut context = BackgroundWakeArmContext {
-            window_start,
-            window_end,
-            ..Default::default()
-        };
+        let mut context = BackgroundWakeArmContext::default();
 
         let mut declared = self
             .connection
@@ -159,78 +140,46 @@ impl Store {
             }
         }
 
-        // Collect native `tool.started` -> `tool.completed` windows belonging strictly
-        // to this completing turn; any process started outside every tool window of
-        // this turn (including post-turn notify hooks) is excluded.
-        let mut completed_at_by_item: HashMap<String, i64> = HashMap::new();
-        let mut completed_tools = self
-            .connection
-            .prepare(
-                "SELECT json_extract(data, '$.item_id'), ts
+        // The newest native tool calls of this completing turn. Each kind reads
+        // its own partial-index range, newest first, so a long turn keeps the
+        // calls most likely to have left a process running.
+        let read_tool_times = |kind: &str| -> Result<Vec<(String, i64, bool)>> {
+            let sql = format!(
+                "SELECT json_extract(data, '$.item_id'), ts,
+                        json_extract(data, '$.native_background') IS 1
                  FROM events INDEXED BY events_tool_turn
                  WHERE agent = ?1 AND generation = ?2
-                   AND kind = 'tool.completed'
+                   AND kind = '{kind}'
                    AND json_extract(data, '$.turn_id') = ?3
                    AND source = 'stream'
                    AND json_type(data, '$.item_id') = 'text'
                    AND length(trim(json_extract(data, '$.item_id'))) > 0
-                 ORDER BY seq ASC LIMIT ?4",
-            )
-            .map_err(sql_error)?;
-        let rows = completed_tools
-            .query_map(
-                params![agent_num, generation, turn_id, MAX_TOOL_WINDOWS],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-            )
-            .map_err(sql_error)?;
-        for row in rows {
-            let (item_id, ts) = row.map_err(sql_error)?;
-            completed_at_by_item
-                .entry(item_id)
-                .and_modify(|prev| *prev = (*prev).max(ts))
-                .or_insert(ts);
-        }
-
-        let mut started_tools = self
-            .connection
-            .prepare(
-                "SELECT json_extract(data, '$.turn_id'), json_extract(data, '$.item_id'), ts
-                 FROM events INDEXED BY events_tool_turn
-                 WHERE agent = ?1 AND generation = ?2
-                   AND kind = 'tool.started'
-                   AND json_extract(data, '$.turn_id') = ?3
-                   AND source = 'stream'
-                   AND json_type(data, '$.item_id') = 'text'
-                   AND length(trim(json_extract(data, '$.item_id'))) > 0
-                 ORDER BY seq ASC LIMIT ?4",
-            )
-            .map_err(sql_error)?;
-        let rows = started_tools
-            .query_map(
-                params![agent_num, generation, turn_id, MAX_TOOL_WINDOWS],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
-                    ))
+                 ORDER BY seq DESC LIMIT ?4"
+            );
+            let mut statement = self.connection.prepare(&sql).map_err(sql_error)?;
+            let rows = statement
+                .query_map(
+                    params![agent_num, generation, turn_id, MAX_TOOL_WINDOWS],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .map_err(sql_error)?;
+            rows.collect::<rusqlite::Result<_>>().map_err(sql_error)
+        };
+        let completed: HashMap<String, i64> = read_tool_times("tool.completed")?
+            .into_iter()
+            .map(|(item_id, completed_at, _)| (item_id, completed_at))
+            .collect();
+        context.tool_windows = read_tool_times("tool.started")?
+            .into_iter()
+            .map(
+                |(item_id, started_at, native_background)| BackgroundWakeToolWindow {
+                    completed_at: completed.get(&item_id).copied(),
+                    item_id,
+                    started_at,
+                    native_background,
                 },
             )
-            .map_err(sql_error)?;
-        for row in rows {
-            let (tool_turn, item_id, started_at) = row.map_err(sql_error)?;
-            let completed_at = completed_at_by_item
-                .get(&item_id)
-                .copied()
-                .unwrap_or(window_end)
-                .max(started_at);
-            context.tool_windows.push(BackgroundWakeToolWindow {
-                turn_id: tool_turn,
-                item_id,
-                started_at,
-                completed_at,
-            });
-        }
+            .collect();
         if context.tool_windows.is_empty() {
             return Ok(None);
         }
