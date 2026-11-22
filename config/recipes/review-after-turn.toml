@@ -1,0 +1,22 @@
+# Copy to <data_dir>/rules/review-after-turn.toml.
+# Set the author and reviewer profile names, the registered checkout path,
+# and the concrete manager Agent ID. Use a distinct reviewer profile with
+# the Eliot Swarm MCP server enabled so it can send the verdict by mail.
+
+[[rule]]
+id = "review-after-turn"
+on = { event = "turn.completed", match = { "subject.profile" = "author-profile", "subject.workspace" = { exists = true }, "event.data.outcome" = "success" } }
+
+[[rule.do]]
+action = "launch"
+profile = "reviewer-profile"
+workspace = "C:/src/app"
+text = """
+Review the changes made by Agent ${event.agent} in turn ${event.data.turn_id}.
+Read its worktree at ${subject.workspace} with Git and inspect the relevant files.
+On Windows, use the ordinary drive path if Git requires it.
+Review only. Do not edit files or change Git state.
+Write VERDICT: approve or VERDICT: changes, followed by up to three findings with file and line.
+Queue the verdict and findings to MANAGER_AGENT_ID with Eliot Swarm mail.send
+(mode queue, to an array containing that Agent ID). Report the delivery result in your final reply.
+"""

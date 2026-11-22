@@ -799,10 +799,11 @@ time. Like `agent.list`, the response carries the required `total` ignoring the
 cursor, explicit `truncated`, and `next` at the last row of a nonempty page; `limit`
 defaults to 100 and must be 1–1,000. Settings › Worktrees pages it to the end.
 
-`rule.get` uses `RuleGetRequest`/`RuleStateView`, is owner-only, and reads the selected
-global or project rule's current cursor and any retiring definition's cursor/boundary. An
-optional `project` selects that registered project principal; omission selects global
-Owner scope. It does not reload configuration or advance either cursor.
+`rule.get` uses `RuleGetRequest`/`RuleShowView` and is Owner-only. It reads the selected
+rule's cursor and retirement boundary, latest action outcome and latest refusal when
+available. An optional `project` selects a registered project principal. Omission selects
+the global Owner scope. A global miss with a matching project rule includes a
+`--project` hint. The read does not reload configuration or advance either cursor.
 `rule.catch_up` accepts `RuleCatchUpRequest` and returns the retained Core `Command` parent
 for a finite committed-event range. Its ULID binds the principal and original semantic
 request; the retained command records the revision and captured range selected on first
@@ -2112,6 +2113,9 @@ id. Like `agent.list`, every nonempty page sets `next` to its last id and the
 caller continues until an empty page; a page shortened by the byte budget never
 hides later rules. It changes nothing.
 
+`swarm timer list` uses the same namespace read and returns timer entries only. Its
+`--limit` counts timers and its `next` cursor is the last returned timer id.
+
 `rule.read`, `rule.save` and `rule.delete` select the global namespace by default or a
 registered namespace by `project`. `path` is a top-level TOML filename in that
 namespace. `rule.read` returns the source and its byte revision. `rule.save` takes
@@ -2647,11 +2651,13 @@ swarm var set KEY [VALUE | --value-file PATH] [--as-json] [...] | var get ... | 
 swarm project list | show ID
 swarm rule list [--project PROJECT] [--after ID] [--limit N]
 swarm rule show ID [--project PROJECT]
+swarm rule list [--project PROJECT] [--after ID] [--limit N]
 swarm rule read NAME.toml [--project PROJECT]
 swarm rule save NAME.toml --file FILE [--expected-revision SHA256] [--project PROJECT]
 swarm rule delete NAME.toml --expected-revision SHA256 [--project PROJECT]
 swarm rule catch-up ID --after SEQ [--through SEQ] [--project PROJECT]
 swarm timer show ID [--project PROJECT] | run ID [--project PROJECT]
+swarm timer list [--project PROJECT] [--after ID] [--limit N]
 swarm goal set A --text TEXT --check CMD [ARGS...] [--mode eliot|native] [--check-cwd PATH] [--check-timeout-ms MS] [--max-turns N] [--max-rounds N] [--max-without-progress N] [--cadence-ms MS] [--scope GLOB]... [--check-input GLOB]... [--max-cost AMOUNT --cost-unit UNIT] [--escalate-model M] [--escalate-effort E] [--escalate-reason TEXT]
 swarm goal show|pause|clear|resume A [--mode eliot|native] [--reason R]
 swarm goal round A (--idle-seq SEQ | --slot N) [--mode eliot|native]

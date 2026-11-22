@@ -276,7 +276,7 @@ const METHODS: &[Method] = &[
     method!("script.read", ScriptReadRequest, ScriptReadResponse, true, false, "Read one existing script entry through a verified handle.", {"project":null,"path":"check.ps1"}),
     method!("script.save", ScriptSaveRequest, ScriptSaveResponse, true, true, "Validate (dry_run) or replace one existing script entry guarded by its revision; never executes.", {"project":null,"path":"check.ps1","expected_revision":"0000000000000000000000000000000000000000000000000000000000000000","content":"Write-Output ok\n","dry_run":true}),
     method!("rule.list", RuleListRequest, RuleListResponse, true, false, "Page one rule namespace's stored states and timer states.", {"limit":20}),
-    method!("rule.get", RuleGetRequest, RuleStateView, true, false, "Read one rule's current and retiring cursors.", {"id":"rule-1"}),
+    method!("rule.get", RuleGetRequest, RuleShowView, true, false, "Read one rule's cursors, latest action outcome and latest refusal.", {"id":"rule-1"}),
     method!("rule.read", RuleReadRequest, RuleReadResponse, true, false, "Read one approved rule source file and its byte revision.", {"path":"notify.toml"}),
     method!("rule.save", RuleSaveRequest, RuleSaveResponse, true, true, "Create or replace a rule source file against its expected revision.", {"path":"notify.toml","expected_revision":null,"content":"[[rule]]\nid = 'notify-finished'\non = { event = 'turn.completed' }\ndo = [{ action = 'notify', message = 'Task done' }]\n"}),
     method!("rule.delete", RuleDeleteRequest, RuleDeleteResponse, true, true, "Remove one rule source file against its expected revision.", {"path":"notify.toml","expected_revision":"0000000000000000000000000000000000000000000000000000000000000000"}),

@@ -5,6 +5,7 @@ mod reload;
 pub(crate) mod rule_edit;
 mod schedule;
 pub(crate) use definition::RuleDefinition;
+use definition::RuleEvaluation;
 pub(crate) use schedule::parse_positive_duration_ms;
 
 use crate::{common::now_ms, logging, router::Router};
@@ -119,7 +120,8 @@ pub(crate) enum RuleWorkerExit {
     Exited,
 }
 
-fn rule_cursor_rejection(error: &Error) -> RuleCursorOutcome {
+fn rule_cursor_rejection(router: &Router, error: &Error) -> RuleCursorOutcome {
+    let error = error.clone().sanitized(&router.secret_policy_snapshot());
     if error.code == "capacity_unavailable"
         && error.failure_where.as_deref() == Some("store.admission.capacity")
     {
@@ -131,17 +133,27 @@ fn rule_cursor_rejection(error: &Error) -> RuleCursorOutcome {
     } else {
         RuleCursorOutcome::Rejected {
             code: error.code.clone(),
+            message: error.message.to_string(),
         }
     }
 }
 
-fn rule_catch_up_rejection(event_seq: i64, error: &Error) -> eliot_store::RuleCatchUpAction {
+fn rule_catch_up_rejection(
+    router: &Router,
+    event_seq: i64,
+    error: &Error,
+) -> eliot_store::RuleCatchUpAction {
+    let error = error.clone().sanitized(&router.secret_policy_snapshot());
     if error.code == "capacity_unavailable"
         && error.failure_where.as_deref() == Some("store.admission.capacity")
     {
-        eliot_store::RuleCatchUpAction::rejected_with_capacity(event_seq, error)
+        eliot_store::RuleCatchUpAction::rejected_with_capacity(event_seq, &error)
     } else {
-        eliot_store::RuleCatchUpAction::rejected(event_seq, error.code.clone())
+        eliot_store::RuleCatchUpAction::rejected_with_message(
+            event_seq,
+            error.code,
+            error.message.as_str(),
+        )
     }
 }
 
@@ -1597,9 +1609,21 @@ async fn process_rule_cursor(
                 continue;
             }
             let action = match definition::evaluate(&definition, &event) {
-                Ok(Some(action)) => action,
-                Ok(None) => {
+                Ok(RuleEvaluation::Command(action)) => action,
+                Ok(RuleEvaluation::NoMatch) => {
                     no_match_through = Some(event.seq);
+                    continue;
+                }
+                Ok(RuleEvaluation::CauseDepth) => {
+                    flush_rule_no_match(router, rule, retiring, &mut no_match_through).await?;
+                    advance_rule_cursor(
+                        router,
+                        rule,
+                        retiring,
+                        event.seq,
+                        RuleCursorOutcome::SkippedCauseDepth,
+                    )
+                    .await?;
                     continue;
                 }
                 Err(error) => {
@@ -1609,7 +1633,7 @@ async fn process_rule_cursor(
                         rule,
                         retiring,
                         event.seq,
-                        rule_cursor_rejection(&error),
+                        rule_cursor_rejection(router, &error),
                     )
                     .await?;
                     continue;
@@ -1642,7 +1666,7 @@ async fn process_rule_cursor(
                         rule,
                         retiring,
                         event.seq,
-                        rule_cursor_rejection(&error),
+                        rule_cursor_rejection(router, &error),
                     )
                     .await?;
                     continue;
@@ -1669,7 +1693,7 @@ async fn process_rule_cursor(
                         rule,
                         retiring,
                         event.seq,
-                        rule_cursor_rejection(&error),
+                        rule_cursor_rejection(router, &error),
                     )
                     .await?;
                     continue;
@@ -2471,10 +2495,16 @@ pub(crate) async fn prepare_rule_catch_up_actions(
     let mut rendered = Vec::new();
     for event in events {
         let request = match definition::evaluate(definition, event) {
-            Ok(Some(request)) => request,
-            Ok(None) => continue,
+            Ok(RuleEvaluation::Command(request)) => request,
+            Ok(RuleEvaluation::NoMatch) => continue,
+            Ok(RuleEvaluation::CauseDepth) => {
+                actions.push(eliot_store::RuleCatchUpAction::skipped_cause_depth(
+                    event.seq,
+                ));
+                continue;
+            }
             Err(error) if is_deterministic_pre_admission_rejection(&error.code) => {
-                actions.push(rule_catch_up_rejection(event.seq, &error));
+                actions.push(rule_catch_up_rejection(router, event.seq, &error));
                 continue;
             }
             Err(error) => return Err(error),
@@ -2510,9 +2540,10 @@ pub(crate) async fn prepare_rule_catch_up_actions(
                 .verify_project_rule_target_scope(project, target, generation)
                 .await?
             {
-                actions.push(eliot_store::RuleCatchUpAction::rejected(
+                actions.push(eliot_store::RuleCatchUpAction::rejected_with_message(
                     event_seq,
-                    "stale_generation".to_owned(),
+                    "stale_generation",
+                    "captured project Agent is no longer in scope",
                 ));
                 continue;
             }
@@ -2521,14 +2552,8 @@ pub(crate) async fn prepare_rule_catch_up_actions(
                 .await
             {
                 Ok(()) => {}
-                Err(error) if error.code == "stale_generation" => {
-                    actions.push(eliot_store::RuleCatchUpAction::rejected(
-                        event_seq, error.code,
-                    ));
-                    continue;
-                }
                 Err(error) if is_deterministic_pre_admission_rejection(&error.code) => {
-                    actions.push(rule_catch_up_rejection(event_seq, &error));
+                    actions.push(rule_catch_up_rejection(router, event_seq, &error));
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -2577,7 +2602,7 @@ pub(crate) async fn prepare_rule_catch_up_actions(
                 prepared.request,
             )),
             Err(error) if is_deterministic_pre_admission_rejection(&error.code) => {
-                actions.push(rule_catch_up_rejection(event_seq, &error));
+                actions.push(rule_catch_up_rejection(router, event_seq, &error));
             }
             Err(error) => return Err(error),
         }

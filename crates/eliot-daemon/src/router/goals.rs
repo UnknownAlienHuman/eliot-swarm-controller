@@ -16,7 +16,9 @@ use super::{
 use crate::{
     common::now_ms,
     git_monitor::GitProbe,
-    scripts::process::{ProcessCapture, ProcessFailure, ProcessOutcome, run_owned_process},
+    scripts::process::{
+        ProcessCapture, ProcessFailure, ProcessOutcome, local_process_command, run_owned_process,
+    },
 };
 use eliot_core::{
     AgentState, Error, Event, Result, SecretPolicy, StderrSnapshot,
@@ -371,6 +373,15 @@ impl Router {
             { store.goal_round_probe(&request.agent, request.mode.as_str(), key, now_ms())? };
         goal_round_gates(&probe, key)?;
         let definition = probe.view.definition.clone();
+        let mut command = local_process_command(&definition.check[0])?;
+        command.args(&definition.check[1..]);
+        if let Some(cwd) = definition
+            .check_cwd
+            .as_deref()
+            .or(probe.workspace.as_deref())
+        {
+            command.current_dir(cwd);
+        }
         let stdin = serde_json::to_vec(&json!({
             "agent": request.agent,
             "generation": probe.view.generation,
@@ -489,15 +500,6 @@ impl Router {
         // read taken right after the previous failed check.
         let fingerprint_before = work_fingerprint(probe.workspace.as_deref()).await;
         let policy = self.secret_policy_snapshot();
-        let mut command = TokioCommand::new(&definition.check[0]);
-        command.args(&definition.check[1..]);
-        if let Some(cwd) = definition
-            .check_cwd
-            .as_deref()
-            .or(probe.workspace.as_deref())
-        {
-            command.current_dir(cwd);
-        }
         let timeout = Duration::from_millis(definition.check_timeout_ms.max(0) as u64);
         claimed.quiescent = false;
         claimed.check = Some(run_check(

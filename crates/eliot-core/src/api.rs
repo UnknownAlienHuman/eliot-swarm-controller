@@ -173,7 +173,10 @@ pub use rule_edit::{
     MAX_RULE_FILE_BYTES, MAX_RULE_PATH_BYTES, RULE_REVISION_HEX_LEN, RuleDeleteRequest,
     RuleDeleteResponse, RuleReadRequest, RuleReadResponse, RuleSaveRequest, RuleSaveResponse,
 };
-pub use rules::{RuleCatchUpRequest, RuleLimit, RuleLimitScope};
+pub use rules::{
+    MAX_RULE_REJECTION_MESSAGE_BYTES, MAX_RULE_SHOW_STDERR_BYTES, MAX_RULE_SHOW_STDERR_LINES,
+    RuleCatchUpRequest, RuleLastOutcome, RuleLastRefusal, RuleLimit, RuleLimitScope, RuleShowView,
+};
 pub use script_edit::{
     MAX_SCRIPT_EDIT_BYTES, MAX_SCRIPT_ENTRIES, MAX_SCRIPT_PAGE_BYTES, MAX_SCRIPT_PATH_BYTES,
     ScriptEntryView, ScriptListRequest, ScriptListResponse, ScriptReadRequest, ScriptReadResponse,

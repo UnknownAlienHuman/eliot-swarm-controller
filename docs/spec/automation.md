@@ -183,10 +183,17 @@ definition through H and start the new definition after H. While retirement rema
 defer another edit and report it; reread the latest valid file when retirement finishes.
 Identical reload is a no-op. This is not a definition/activation hierarchy.
 
-For each event, atomically either admit deterministic command rows and advance the
-cursor, advance without a match, or record a deterministic validation failure and advance.
-Store failure rolls back both. Disable/pause explicitly records the skipped range and
-advances without firing. No silent history reinterpretation.
+For each event, atomically admit deterministic command rows, advance without a match,
+or record a guardrail skip or deterministic validation failure. Each outcome advances
+the cursor. Store failure rolls back the admission and cursor update. Disable/pause
+records the skipped range and advances without firing.
+
+`rule.rejected` includes the failure code and a bounded, redacted message.
+`rule show` reports the latest settled action outcome and the latest refusal in the
+selected namespace within retained history. A script outcome includes the observed exit
+code and the first bounded lines of redacted stderr when present. A refusal includes
+its triggering event sequence, time, code and message. Three matching refusals or Run failures on one rule
+in one minute produce one `repeated` daemon log entry and one Owner attention notice.
 
 Referenced script changes are semantic edits. Frozen content/path validation catches
 missed watcher notifications. Already admitted commands retain their original inputs.
@@ -416,8 +423,8 @@ Each committed event retains its event-time subject snapshot (or absence) and an
 Store-verified cause. Depth 0 denotes a proven ordinary controller command; rule, timer
 and manual-timer commands carry depth 1 or one greater than their triggering verified cause. Native
 `data.cause` is not trusted and old events are never reconstructed from current Agent
-state. A verified cause depth above 5 silently advances the cursor without admitting a
-parent/action or emitting another event, so suppression cannot create a cause loop.
+state. A matching trigger at verified cause depth 5 or greater is skipped before
+preparation. The next action would exceed the maximum depth of 5.
 
 New rules seed their cursor at captured event high-water `H` in the same transaction as
 the definition insert. A semantic edit captures `H`, retires the current definition
@@ -443,13 +450,18 @@ existing Router path, keeps its exact target generation and turn association, an
 `applied` does not assert task completion. `allow_self` defaults to false; see [Guardrails](#guardrails)
 for the same-principal self-cause behavior for SEND and Run. Goal actions and project
 configuration overlays remain outside this connected event-rule contour.
-Cause-depth suppression is silent and does not emit an endlessly retriggerable rejection event.
 
 ### Targetless launch
 
 Candidate selection and its recorded reason follow the configuration routing contract at
 first admission. Project/child authority is intersected before selection; retries retain
 the original choice.
+
+Live Owner rules and history catch-up use the same managed-worktree preparation
+for targetless launch. The [review-after-turn recipe](../../config/recipes/review-after-turn.toml)
+launches a separate reviewer profile after a successful author turn. It passes the
+author's captured worktree for read-only review and directs the reviewer to send the
+verdict to a configured manager Agent using Swarm mail.
 
 Queue assignment is configured in the unified settings file and runs through the existing
 timer and ordinary `launch` path. Each firing reads the next bounded `.md` brief by
@@ -1043,13 +1055,13 @@ canonical regular entry under the root may be selected with an approved global R
 interpreter; rules have no per-entry or per-rule file allowlist. Event data cannot alter
 argv or become a shell command string.
 
-`cwd` for project Run defaults to the registered canonical project checkout. A supplied
-project cwd must be a literal relative path resolving inside that checkout after
-canonicalization and link/reparse checks. Global event Run defaults to the canonical
-private `<data_dir>/scripts/` root. A safe relative global cwd resolves against that root
-and must remain inside it after canonicalization and link/reparse checks. An explicit
-absolute literal cwd is allowed only for global owner rules and must resolve to an existing
-safe canonical directory with link/reparse checks; project cwd remains checkout-confined.
+Event Run uses the triggering Agent's captured worktree as its working directory when
+present. A project Run verifies that this worktree belongs to the registered repository.
+Without an event worktree, the working directory defaults to the registered checkout for
+project Run and the private `<data_dir>/scripts/` root for global Run. A relative `cwd`
+resolves inside the selected root after canonicalization and link/reparse checks.
+Global Owner rules can select an explicit absolute `cwd` that resolves to an existing
+safe canonical directory. Script entry resolution always uses the approved script root.
 
 `timeout` uses the humantime duration grammar and positive-millisecond validation already
 used for timer intervals. It must represent a positive whole number of milliseconds and
@@ -1170,11 +1182,10 @@ does not. Then admit all validated records atomically as ordered command childre
 applied outcome retains their IDs, not recursive Command objects. Empty stdout admits an
 empty child set.
 
-The same `ScriptProcessResult` is used for process-backed failed-capture diagnostics;
-the existing failure code/cause remains authoritative, with no separate stderr DTO.
-Its optional bounded Core [`StderrSnapshot`](../../crates/eliot-core/src/diagnostics.rs)
-is diagnostic only. A stderr read/truncation condition does not invalidate an otherwise
-known direct exit, complete stdout result and custody result.
+The same `ScriptProcessResult` carries process-backed failure diagnostics. Its optional
+Core [`StderrSnapshot`](../../crates/eliot-core/src/diagnostics.rs) retains a bounded prefix
+of redacted stderr while the daemon drains the pipe. A stderr read or truncation condition
+does not change an otherwise known direct exit, stdout result and custody result.
 
 A known unsuccessful direct exit, including timeout/cancellation with a confirmed
 unsuccessful exit and quiescence, or a conclusive output-limit violation or fully observed
@@ -1208,6 +1219,13 @@ do = [{ action = "run", cmd = ["pwsh", ".eliot/scripts/check.ps1", "-Changed"], 
 # stdout from check.ps1 (one NDJSON record)
 {"action":"send","target":"a1","expected_generation":7,"text":"check completed"}
 ```
+
+The script runs with the selected worktree as its working directory for this
+event. Its JSON stdin provides the ordinary display spelling of the directory
+in `subject.workspace`. A successful script can report a failed project check as a
+SEND record. A nonzero script exit records a failed Run and discards stdout actions.
+Goal checks and Run scripts share the [platform environment baseline](configuration.md#environment-and-secrets),
+including PATH for tools such as `git` and `python`.
 
 ## Approvals and hooks
 
@@ -1501,15 +1519,19 @@ ordinary action child command rows once; Store-only admission parents are exclud
 
 ## Guardrails
 
-Only Store-verified causes control depth; a rule never trusts native `data.cause` or
-reconstructs old provenance from a current Agent row. Cause depth above 5 silently
-advances the cursor without a parent/action command or a new event, so suppression is
-quiescent. Default per-rule limit is 10/minute, global
-120 actions/minute; configured windows must fit retained accounting history. SEND
+Only Store-verified causes control depth. Default per-rule limit is 10/minute,
+and the global limit is 120 actions/minute. Configured windows must fit retained
+accounting history.
+
 Self-triggering SEND and Run default off. Store suppresses a SEND or Run only when
 Store-verified cause and origin command/parent rows prove the same principal and rule;
 it checks Run before invoking the script. `EventCause.rule` alone is not authority.
 `allow_self=true` permits intentional SEND or Run feedback, still subject to the existing
 cause-depth and rate limits.
+
+For a matching event, `rule.skipped` records `self_cause` or `cause_depth` with its
+trigger sequence. A guardrail skip on an existing `rule.*` event emits no new marker,
+so skip events cannot reproduce themselves. Use a bounded Goal to repeat a project
+check after turns until it passes.
 Draining or paused automation admits no new firings. Every action uses normal router
 checks. These are execution limits, not a task approval process.

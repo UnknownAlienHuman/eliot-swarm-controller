@@ -180,8 +180,12 @@ impl Router {
         has_linked: bool,
     ) -> Option<PreparedCommand> {
         let command = match self.load_command_for_dispatch(id).await {
-            Ok(Some(command)) => command,
-            Ok(None) => return None,
+            Ok(Some(command))
+                if matches!(command.state, CommandState::Accepted | CommandState::Queued) =>
+            {
+                command
+            }
+            Ok(_) => return None,
             Err(error) => {
                 self.abandon_unreadable_command(id, &error).await;
                 return None;
@@ -1179,12 +1183,6 @@ impl Router {
         // parameter, prompt or model output: the error was sanitized above.
         let error = self.sanitized_failure(error, "router.dispatch.unknown");
         let outcome = self.command_error_outcome(&error, "reason");
-        crate::logging::record(
-            &SecretPolicy::new(self.daemon_secrets()),
-            &error.code,
-            &[("command", id)],
-            Some(&error),
-        );
         let (result, write_faulted) = {
             let mut store = self.inner.store.lock().await;
             let result = match store.get_command(id) {
@@ -1227,6 +1225,17 @@ impl Router {
             }
             (result, store.is_write_faulted())
         };
+        if result
+            .as_ref()
+            .is_ok_and(|change| !change.events.is_empty())
+        {
+            crate::logging::record(
+                &SecretPolicy::new(self.daemon_secrets()),
+                &error.code,
+                &[("command", id)],
+                Some(&error),
+            );
+        }
         self.finish_settlement(id, result, write_faulted, "store_settlement_failed", false)
             .await;
     }

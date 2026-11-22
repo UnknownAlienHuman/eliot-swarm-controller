@@ -765,19 +765,16 @@ impl TriggerDefinition {
     }
 }
 
+pub(super) enum RuleEvaluation {
+    NoMatch,
+    CauseDepth,
+    Command(SubmitCommand),
+}
+
 /// Matches a committed event and projects its one ordinary command action.
-/// `None` means disabled, a different event, or no exact match. The caller advances
-/// disabled/no-match cursors and settles rate-limit skips with the event transaction.
-pub fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<Option<SubmitCommand>, Error> {
+pub(super) fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<RuleEvaluation, Error> {
     if !rule.enabled || rule.trigger.event.as_deref() != Some(event.kind.as_str()) {
-        return Ok(None);
-    }
-    if event
-        .cause
-        .as_ref()
-        .is_some_and(|cause| cause.depth >= MAX_RULE_CAUSE_DEPTH)
-    {
-        return Ok(None);
+        return Ok(RuleEvaluation::NoMatch);
     }
 
     let event_value = serde_json::to_value(event)
@@ -798,7 +795,14 @@ pub fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<Option<SubmitCom
     if !matches_group(&rule.trigger.compiled_matches)
         || (!alternatives.is_empty() && !alternatives.iter().any(matches_group))
     {
-        return Ok(None);
+        return Ok(RuleEvaluation::NoMatch);
+    }
+    if event
+        .cause
+        .as_ref()
+        .is_some_and(|cause| cause.depth >= MAX_RULE_CAUSE_DEPTH)
+    {
+        return Ok(RuleEvaluation::CauseDepth);
     }
 
     let action = rule
@@ -806,21 +810,23 @@ pub fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<Option<SubmitCom
         .first()
         .ok_or_else(|| Error::new("invalid", "rule has no action"))?;
     let action = match action {
-        ActionDefinition::Run { definition } => return submit_run_command(definition).map(Some),
+        ActionDefinition::Run { definition } => {
+            return submit_run_command(definition).map(RuleEvaluation::Command);
+        }
         ActionDefinition::GitFetch { definition } => {
-            return submit_git_fetch_command(definition).map(Some);
+            return submit_git_fetch_command(definition).map(RuleEvaluation::Command);
         }
         ActionDefinition::Notify { definition } => {
-            return submit_notify_command(definition).map(Some);
+            return submit_notify_command(definition).map(RuleEvaluation::Command);
         }
         ActionDefinition::Emit { definition } => {
-            return submit_emit_command(definition).map(Some);
+            return submit_emit_command(definition).map(RuleEvaluation::Command);
         }
         ActionDefinition::Mail { definition } => {
-            return submit_mail_command(definition).map(Some);
+            return submit_mail_command(definition).map(RuleEvaluation::Command);
         }
         ActionDefinition::Var { definition } => {
-            return submit_var_command(definition).map(Some);
+            return submit_var_command(definition).map(RuleEvaluation::Command);
         }
         ActionDefinition::Inject { definition } => {
             return submit_inject_event_command(
@@ -830,7 +836,7 @@ pub fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<Option<SubmitCom
                 subject,
                 &event.data,
             )
-            .map(Some);
+            .map(RuleEvaluation::Command);
         }
         ActionDefinition::Agent(action) => action,
     };
@@ -860,7 +866,7 @@ pub fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<Option<SubmitCom
             assignment.as_ref(),
             text,
         )
-        .map(Some);
+        .map(RuleEvaluation::Command);
     }
     let target_source = action
         .target()
@@ -916,7 +922,7 @@ pub fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<Option<SubmitCom
         })
         .transpose()?;
 
-    Ok(Some(submit_command(
+    Ok(RuleEvaluation::Command(submit_command(
         action.verb(),
         target,
         generation,
