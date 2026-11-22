@@ -1,7 +1,17 @@
 # Copy to <data_dir>/rules/review-after-turn.toml.
-# Set the author and reviewer profile names, the registered checkout path,
-# and the concrete manager Agent ID. Use a distinct reviewer profile with
-# the Eliot Swarm MCP server enabled so it can send the verdict by mail.
+# Replace author-profile, reviewer-profile, C:/src/app and MANAGER_AGENT_ID
+# with your author profile, reviewer profile, registered checkout path and
+# manager Agent ID. Use a distinct reviewer profile with native read-only
+# permissions and the Eliot Swarm MCP server enabled for mail. For example,
+# add this to <data_dir>/config.toml, using your installed executable and model:
+#
+# [profiles.reviewer-profile]
+# harness = "codex"
+# cmd = "codex"
+# model = "gpt-6-luna"
+# permissions = "read-only"
+# approval_policy = "never"
+# mcp = "minimal"
 
 [[rule]]
 id = "review-after-turn"

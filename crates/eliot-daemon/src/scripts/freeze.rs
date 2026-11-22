@@ -229,6 +229,17 @@ fn verify_run_in_scope(
     }
 
     let cwd = resolve_script_cwd(&scope, frozen)?;
+    #[cfg(windows)]
+    let cwd = {
+        let changed = || source_changed("display Run cwd differs from the admitted directory");
+        let rendered = eliot_core::display_path(cwd.to_str().ok_or_else(changed)?);
+        let path = PathBuf::from(rendered);
+        let verified = crate::setup::canonical_directory(&path).map_err(|_| changed())?;
+        if verified != cwd {
+            return Err(changed());
+        }
+        path
+    };
     project_run_timeout(frozen)?;
 
     let entry_argument =

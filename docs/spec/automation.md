@@ -192,8 +192,10 @@ records the skipped range and advances without firing.
 `rule show` reports the latest settled action outcome and the latest refusal in the
 selected namespace within retained history. A script outcome includes the observed exit
 code and the first bounded lines of redacted stderr when present. A refusal includes
-its triggering event sequence, time, code and message. Three matching refusals or Run failures on one rule
-in one minute produce one `repeated` daemon log entry and one Owner attention notice.
+its triggering event sequence, time, code and message. The repeat counter groups failures
+by rule namespace, rule, code and message after normalizing whitespace, IDs and numbers.
+Three matching failures in one minute produce one `repeated` entry and one Owner notice.
+A saturated counter logs `daemon.rule_failure_counter_overflow` at most once per minute.
 
 Referenced script changes are semantic edits. Frozen content/path validation catches
 missed watcher notifications. Already admitted commands retain their original inputs.
@@ -462,6 +464,9 @@ for targetless launch. The [review-after-turn recipe](../../config/recipes/revie
 launches a separate reviewer profile after a successful author turn. It passes the
 author's captured worktree for read-only review and directs the reviewer to send the
 verdict to a configured manager Agent using Swarm mail.
+Configure the reviewer with native read-only permissions, such as a Codex profile with
+`permissions = "read-only"` and `approval_policy = "never"`. The launch uses the named
+profile's native sandbox.
 
 Queue assignment is configured in the unified settings file and runs through the existing
 timer and ordinary `launch` path. Each firing reads the next bounded `.md` brief by
@@ -1062,6 +1067,8 @@ project Run and the private `<data_dir>/scripts/` root for global Run. A relativ
 resolves inside the selected root after canonicalization and link/reparse checks.
 Global Owner rules can select an explicit absolute `cwd` that resolves to an existing
 safe canonical directory. Script entry resolution always uses the approved script root.
+On Windows, Run passes the ordinary display path as the working directory after checking
+that it resolves to the same admitted canonical directory.
 
 `timeout` uses the humantime duration grammar and positive-millisecond validation already
 used for timer intervals. It must represent a positive whole number of milliseconds and

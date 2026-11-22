@@ -1,14 +1,23 @@
 use super::Router;
 use eliot_core::{Command, CommandState, Error, Event, FrozenScriptContext, FrozenScriptRun};
 use eliot_plugin::sync::LockExt;
+use regex::Regex;
 use std::{
     collections::HashMap,
+    sync::LazyLock,
     time::{Duration, Instant},
 };
 
 const REPEAT_WINDOW: Duration = Duration::from_secs(60);
 const REPEAT_THRESHOLD: u32 = 3;
 const MAX_TRACKED_FAILURES: usize = 1024;
+
+static VOLATILE_MESSAGE_VALUES: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"\b(?:[[:xdigit:]]{8}(?:-[[:xdigit:]]{4}){3}-[[:xdigit:]]{12}|[0-7][0-9A-HJKMNP-TV-Z]{25}|a[0-9]+|[0-9]+)\b",
+    )
+    .expect("valid pattern for UUIDs, ULIDs, Agent ids and numbers")
+});
 
 #[derive(PartialEq, Eq, Hash)]
 struct FailureKey {
@@ -21,22 +30,42 @@ struct FailureKey {
 #[derive(Default)]
 pub(super) struct RepeatFailures {
     windows: HashMap<FailureKey, (Instant, u32)>,
+    overflow_logged_at: Option<Instant>,
+}
+
+enum RepeatOutcome {
+    Quiet,
+    Threshold,
+    Overflow,
 }
 
 impl RepeatFailures {
-    fn record(&mut self, principal: &str, object: &str, code: &str, message: &str) -> Option<u32> {
+    fn record(
+        &mut self,
+        principal: &str,
+        object: &str,
+        code: &str,
+        message: &str,
+    ) -> RepeatOutcome {
         let now = Instant::now();
         let key = FailureKey {
             principal: principal.to_owned(),
             object: object.to_owned(),
             code: code.to_owned(),
-            message: message.to_owned(),
+            message: normalized_message(message),
         };
         if self.windows.len() >= MAX_TRACKED_FAILURES && !self.windows.contains_key(&key) {
             self.windows
                 .retain(|_, (started, _)| now.duration_since(*started) < REPEAT_WINDOW);
             if self.windows.len() >= MAX_TRACKED_FAILURES {
-                return None;
+                if self
+                    .overflow_logged_at
+                    .is_none_or(|logged| now.duration_since(logged) >= REPEAT_WINDOW)
+                {
+                    self.overflow_logged_at = Some(now);
+                    return RepeatOutcome::Overflow;
+                }
+                return RepeatOutcome::Quiet;
             }
         }
         let (started, count) = self.windows.entry(key).or_insert((now, 0));
@@ -45,8 +74,19 @@ impl RepeatFailures {
             *count = 0;
         }
         *count = count.saturating_add(1);
-        (*count == REPEAT_THRESHOLD).then_some(*count)
+        if *count == REPEAT_THRESHOLD {
+            RepeatOutcome::Threshold
+        } else {
+            RepeatOutcome::Quiet
+        }
     }
+}
+
+fn normalized_message(message: &str) -> String {
+    let message = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    VOLATILE_MESSAGE_VALUES
+        .replace_all(&message, "<value>")
+        .into_owned()
 }
 
 impl Router {
@@ -90,14 +130,20 @@ impl Router {
     fn note_repeated_failure(&self, principal: &str, rule: &str, code: &str, message: &str) {
         let policy = self.secret_policy_snapshot();
         let message = eliot_core::bound_chars(&policy.redact_text(message), 512);
-        let count = self
+        let outcome = self
             .inner
             .repeat_failures
             .lock_recover()
             .record(principal, rule, code, &message);
-        let Some(count) = count else {
-            return;
-        };
+        match outcome {
+            RepeatOutcome::Quiet => return,
+            RepeatOutcome::Overflow => {
+                crate::logging::record(&policy, "daemon.rule_failure_counter_overflow", &[], None);
+                return;
+            }
+            RepeatOutcome::Threshold => {}
+        }
+        let count = REPEAT_THRESHOLD;
         crate::logging::record_repeated_rule_failure(
             &policy, principal, rule, code, &message, count,
         );
