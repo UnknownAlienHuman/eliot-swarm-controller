@@ -1585,16 +1585,30 @@ fn freeze_child_profiles(
     snapshot["child_profiles"] = Value::Array(frozen);
     Ok(snapshot)
 }
-/// Freeze the harness-native subagent switch for this profile: `allow` keeps
-/// today's behavior, `deny` asks the harness plugin to disable its native
-/// subagent surface for the session. An omitted value defaults to `deny`
-/// when the profile names a non-empty `child_profiles` allow-list (managers
-/// delegate through Swarm), and to `allow` otherwise. The frozen value is
-/// reported in the snapshot so effective settings stay truthful. `deny` has
-/// a per-session mapping on Codex, Claude and OpenCode only; on Muse and
-/// Antigravity the installed binaries expose no verified switch, so `deny`
-/// is `unsupported` at config load, matching the existing pattern for
-/// unmapped fields.
+/// Harnesses with a verified per-session native subagent denial mapping.
+pub(crate) const NATIVE_SUBAGENT_DENY_HARNESSES: [&str; 3] = ["codex", "claude", "opencode"];
+
+/// Default native subagent policy for each supported harness. Muse and
+/// Antigravity have no verified switch and therefore stay enabled.
+pub(crate) fn native_subagents_default(harness: &str) -> Option<&'static str> {
+    if NATIVE_SUBAGENT_DENY_HARNESSES.contains(&harness) {
+        Some("deny")
+    } else {
+        match harness {
+            "muse" | "antigravity" => Some("allow"),
+            _ => None,
+        }
+    }
+}
+
+/// Freeze the harness-native subagent switch for this profile: `allow` is an
+/// explicit opt-in, while `deny` asks the harness plugin to disable its
+/// native subagent surface for the session. When omitted, use the harness
+/// default: `deny` on Codex, Claude and OpenCode, and fixed `allow` on Muse
+/// and Antigravity. The frozen value is reported in the snapshot so effective
+/// settings stay truthful. `deny` has a per-session mapping on Codex, Claude
+/// and OpenCode only; on Muse and Antigravity the installed binaries expose
+/// no verified switch, so explicit `deny` is `unsupported` at config load.
 fn freeze_native_subagents(
     profile_name: &str,
     entry: &ProfileEntry,
@@ -1626,13 +1640,18 @@ fn freeze_native_subagents(
             }
             value.to_owned()
         }
-        None => {
-            let has_children = entry
-                .child_profiles
-                .as_deref()
-                .is_some_and(|names| !names.is_empty());
-            if has_children { "deny" } else { "allow" }.to_owned()
-        }
+        None => native_subagents_default(&harness)
+            .ok_or_else(|| {
+                profile_field_error(
+                    source,
+                    table_offset,
+                    profile_name,
+                    "native_subagents",
+                    "has no default mapping for this harness",
+                    "unsupported",
+                )
+            })?
+            .to_owned(),
     };
     if effective == "deny" && matches!(harness.as_str(), "muse" | "antigravity") {
         return Err(profile_field_error(

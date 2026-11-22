@@ -269,12 +269,15 @@ fn ensure_bootstrap_settings(
             let Some(profile) = profiles.get_mut(&manager) else {
                 continue;
             };
-            // A manager whose harness cannot disable native subagents keeps
-            // them explicitly; the derived `deny` would make the whole
-            // bootstrap settings save (and daemon startup) fail.
-            if !workers.is_empty() && !manager_supports_native_deny(&manager) {
-                profile["native_subagents"] = json!("allow");
-            }
+            // Bootstrap records the policy explicitly: switchable managers
+            // default to Swarm delegation, while fixed-allow managers keep
+            // their native subagents enabled because no session switch exists.
+            let native_subagents = if manager_supports_native_deny(&manager) {
+                "deny"
+            } else {
+                "allow"
+            };
+            profile["native_subagents"] = json!(native_subagents);
             profile["child_profiles"] = json!(workers);
             profile["control"] = json!("tree");
         }
@@ -327,16 +330,11 @@ fn ensure_bootstrap_settings(
     Ok(())
 }
 
-/// Harnesses whose native subagents can be turned off per session
-/// (`native_subagents = "deny"`), in bootstrap manager preference order. A
-/// manager on one of them delegates through Swarm by default.
-const DENY_CAPABLE_MANAGERS: [&str; 3] = ["codex", "claude", "opencode"];
-
-/// The hot-start managers: every installed deny-capable harness in
-/// preference order, else the first installed profile (Muse or Antigravity,
-/// which keep native subagents).
+/// The hot-start managers: every installed harness that supports native
+/// subagent denial in preference order; otherwise the first installed profile
+/// (Muse or Antigravity), whose native subagents stay enabled.
 fn bootstrap_managers(names: &[String]) -> Vec<String> {
-    let managers: Vec<String> = DENY_CAPABLE_MANAGERS
+    let managers: Vec<String> = crate::config::NATIVE_SUBAGENT_DENY_HARNESSES
         .iter()
         .filter_map(|preferred| names.iter().find(|name| name.as_str() == *preferred))
         .cloned()
@@ -363,7 +361,7 @@ fn bootstrap_default_candidates(names: &[String]) -> Vec<String> {
 
 /// Whether a hot-start manager on this profile can disable native subagents.
 fn manager_supports_native_deny(profile: &str) -> bool {
-    DENY_CAPABLE_MANAGERS.contains(&profile)
+    crate::config::native_subagents_default(profile) == Some("deny")
 }
 
 /// A manager's workers in the default routing order, so the harnesses that

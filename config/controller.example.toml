@@ -10,6 +10,9 @@
 # names; Swarm MCP names can never be allow-listed). `inherit` is an explicit
 # opt-in to the owner's full native MCP surface. Muse and Antigravity have no
 # minimal mapping, so a profile that omits `mcp` resolves to `inherit` there.
+# Omitted `native_subagents` denies for Codex, Claude and OpenCode; set it to
+# `allow` on a profile to opt in. Muse and Antigravity resolve to `allow` because
+# neither has a verified per-session denial mapping.
 
 [profiles.codex-luna]
 harness = "codex"
