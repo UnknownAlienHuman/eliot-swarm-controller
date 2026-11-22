@@ -368,11 +368,16 @@ async fn pair_thresholds_for_agent(
         }
     }
 
-    let (native_gaps_ms, git_gaps_ms) = {
-        let store = router.inner.store.lock().await;
-        let include_git = store.attention_pair_code_eligible(&agent.profile, &agent.project)?;
-        store.attention_quiet_gaps(&agent.profile, &agent.project, include_git)?
-    };
+    let db_path = router.inner.data_root.join("eliot.db");
+    let profile = agent.profile.clone();
+    let project = agent.project.clone();
+    let (native_gaps_ms, git_gaps_ms) = tokio::task::spawn_blocking(move || {
+        let store = eliot_store::Store::open_read_only(&db_path)?;
+        let include_git = store.attention_pair_code_eligible(&profile, &project)?;
+        store.attention_quiet_gaps(&profile, &project, include_git)
+    })
+    .await
+    .map_err(|_| eliot_core::Error::new("internal", "attention threshold reader failed"))??;
     let thresholds = pair_attention_thresholds(&native_gaps_ms, &git_gaps_ms, config);
     let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
     if !state.threshold_cache.contains_key(&key)
@@ -399,26 +404,29 @@ impl Router {
     /// Current profile and project thresholds for doctor.
     pub(super) async fn attention_thresholds(&self) -> Result<AttentionThresholdsResponse> {
         let config = self.inner.attention;
-        let mut profile_pairs = {
-            let store = self.inner.store.lock().await;
-            store.attention_profile_pairs(eliot_core::api::MAX_ATTENTION_THRESHOLD_PAIRS + 1)?
-        };
-        let truncated = profile_pairs.len() > eliot_core::api::MAX_ATTENTION_THRESHOLD_PAIRS;
-        profile_pairs.truncate(eliot_core::api::MAX_ATTENTION_THRESHOLD_PAIRS);
-        let mut pairs = Vec::with_capacity(profile_pairs.len());
-        for (profile, project, code_eligible) in profile_pairs {
-            let (native_gaps_ms, git_gaps_ms) = {
-                let store = self.inner.store.lock().await;
-                store.attention_quiet_gaps(&profile, &project, code_eligible)?
-            };
-            let thresholds = pair_attention_thresholds(&native_gaps_ms, &git_gaps_ms, config);
-            pairs.push(AttentionThresholdPair {
-                profile,
-                project,
-                no_progress: thresholds.no_progress,
-                no_code_progress: thresholds.no_code_progress,
-            });
-        }
+        let db_path = self.inner.data_root.join("eliot.db");
+        let (pairs, truncated) = tokio::task::spawn_blocking(move || {
+            let store = eliot_store::Store::open_read_only(&db_path)?;
+            let mut profile_pairs = store
+                .attention_profile_pairs(eliot_core::api::MAX_ATTENTION_THRESHOLD_PAIRS + 1)?;
+            let truncated = profile_pairs.len() > eliot_core::api::MAX_ATTENTION_THRESHOLD_PAIRS;
+            profile_pairs.truncate(eliot_core::api::MAX_ATTENTION_THRESHOLD_PAIRS);
+            let mut pairs = Vec::with_capacity(profile_pairs.len());
+            for (profile, project, code_eligible) in profile_pairs {
+                let (native_gaps_ms, git_gaps_ms) =
+                    store.attention_quiet_gaps(&profile, &project, code_eligible)?;
+                let thresholds = pair_attention_thresholds(&native_gaps_ms, &git_gaps_ms, config);
+                pairs.push(AttentionThresholdPair {
+                    profile,
+                    project,
+                    no_progress: thresholds.no_progress,
+                    no_code_progress: thresholds.no_code_progress,
+                });
+            }
+            Ok::<_, eliot_core::Error>((pairs, truncated))
+        })
+        .await
+        .map_err(|_| eliot_core::Error::new("internal", "attention thresholds reader failed"))??;
         let response = AttentionThresholdsResponse { pairs, truncated };
         response.validate()?;
         Ok(response)

@@ -162,6 +162,7 @@ struct RouterInner {
     data_root: PathBuf,
     store: StoreHandle,
     autonomy_reader: Arc<tokio::sync::Semaphore>,
+    agent_list_readers: Arc<tokio::sync::Semaphore>,
     confirmed_stuck: Mutex<Arc<eliot_store::StuckStates>>,
     integration_cleanup: AsyncMutex<()>,
     bus: Bus,
@@ -436,6 +437,7 @@ impl Router {
                 data_root,
                 store,
                 autonomy_reader: Arc::new(tokio::sync::Semaphore::new(1)),
+                agent_list_readers: Arc::new(tokio::sync::Semaphore::new(4)),
                 confirmed_stuck: Mutex::new(Arc::default()),
                 integration_cleanup: AsyncMutex::new(()),
                 bus,
@@ -5420,9 +5422,45 @@ impl Router {
             .map_err(|_| Error::new("internal", "usage summary could not be encoded"))
     }
 
+    fn read_agent_list_page_from_store(
+        store: &eliot_store::Store,
+        agent_caller: Option<&str>,
+        filter: &AgentListFilter,
+        after: Option<&str>,
+        limit: usize,
+        now: i64,
+        growth: &eliot_core::SessionGrowthThresholds,
+    ) -> Result<eliot_store::AgentListPage> {
+        match agent_caller {
+            None => store.list_agent_summaries(filter, after, limit, now, growth),
+            Some(id) => {
+                let caller = store
+                    .get_agent(id)?
+                    .ok_or_else(|| Error::new("not_found", format!("Agent {id} was not found")))?;
+                store.list_agent_summaries_scoped(&caller, filter, after, limit, now, growth)
+            }
+        }
+    }
+
     async fn agent_list(&self, params: &Value, principal: &Principal) -> Result<Value> {
         let request: AgentListRequest = eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
+        let agent_caller = match principal {
+            Principal::Owner => None,
+            Principal::Agent { id, .. } => Some(id.clone()),
+            Principal::Run { .. } | Principal::MemoryInference { .. } => {
+                return Err(Error::new(
+                    "not_allowed",
+                    "Run credentials cannot list Agents",
+                ));
+            }
+            Principal::ProjectRule { .. } => {
+                return Err(Error::new(
+                    "not_allowed",
+                    "project rule authority cannot list Agents",
+                ));
+            }
+        };
         let filter = AgentListFilter {
             archived: request.archived,
             order: request.order,
@@ -5437,42 +5475,44 @@ impl Router {
         };
         let limit = request.limit;
         let observations = request.observations;
-        let page = {
-            let store = self.inner.store.lock().await;
-            match principal {
-                Principal::Owner => store.list_agent_summaries(
-                    &filter,
-                    request.after.as_deref(),
+        let after = request.after.clone();
+        let growth = self.inner.observe.lock_recover().growth;
+        let page = if !observations {
+            let permit = self
+                .inner
+                .agent_list_readers
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| Error::new("unavailable", "agent list readers are closed"))?;
+            let db_path = self.inner.data_root.join("eliot.db");
+            let filter_clone = filter.clone();
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let store = eliot_store::Store::open_read_only(&db_path)?;
+                Self::read_agent_list_page_from_store(
+                    &store,
+                    agent_caller.as_deref(),
+                    &filter_clone,
+                    after.as_deref(),
                     limit,
                     now_ms(),
-                    &self.inner.observe.lock_recover().growth,
-                )?,
-                Principal::Agent { id, .. } => {
-                    let caller = store.get_agent(id)?.ok_or_else(|| {
-                        Error::new("not_found", format!("Agent {id} was not found"))
-                    })?;
-                    store.list_agent_summaries_scoped(
-                        &caller,
-                        &filter,
-                        request.after.as_deref(),
-                        limit,
-                        now_ms(),
-                        &self.inner.observe.lock_recover().growth,
-                    )?
-                }
-                Principal::Run { .. } | Principal::MemoryInference { .. } => {
-                    return Err(Error::new(
-                        "not_allowed",
-                        "Run credentials cannot list Agents",
-                    ));
-                }
-                Principal::ProjectRule { .. } => {
-                    return Err(Error::new(
-                        "not_allowed",
-                        "project rule authority cannot list Agents",
-                    ));
-                }
-            }
+                    &growth,
+                )
+            })
+            .await
+            .map_err(|_| Error::new("internal", "agent list reader failed"))??
+        } else {
+            let store = self.inner.store.lock().await;
+            Self::read_agent_list_page_from_store(
+                &store,
+                agent_caller.as_deref(),
+                &filter,
+                after.as_deref(),
+                limit,
+                now_ms(),
+                &growth,
+            )?
         };
         if !observations {
             return serde_json::to_value(AgentListResponse {

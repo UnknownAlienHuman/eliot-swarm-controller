@@ -15,11 +15,13 @@ use super::*;
 
 const MS_PER_SECOND: i64 = 1_000;
 const MS_PER_DAY: i64 = 24 * 60 * 60 * MS_PER_SECOND;
-/// Event, process, command and write retention delete at most this many rows
+/// Event retention amortizes commit overhead over one bounded sequence range.
+const RETENTION_EVENT_BATCH_ENTRIES: i64 = 512;
+/// Process, command and write retention delete at most this many rows
 /// of each kind per Store-lock acquisition. The daemon releases it between calls.
 const RETENTION_BATCH_ENTRIES: i64 = 128;
 /// Incremental auto-vacuum work is page-bounded for fairness with writers.
-const INCREMENTAL_VACUUM_PAGES: i64 = 256;
+const INCREMENTAL_VACUUM_PAGES: i64 = 32;
 /// Traversal backstop for parent/child sets. Parent links are bound once at
 /// admission, so sets are acyclic; reaching this fails the pass loudly rather
 /// than looping.
@@ -318,13 +320,28 @@ impl Store {
         Ok((before.page_count.saturating_sub(after.page_count), after))
     }
 
-    /// Run the passive WAL checkpoint without using the shared Store writer.
+    /// Checkpoint without the shared Store writer and release large reusable WAL files.
     pub fn checkpoint_retention(path: &Path) -> Result<(i64, i64, bool)> {
+        const WAL_TRUNCATE_THRESHOLD_BYTES: u64 = 4 * 1024 * 1024;
+        let wal_bytes = std::fs::metadata(path.with_extension("db-wal"))
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        #[cfg(windows)]
+        let path = &core::verbatim_path(path);
         let connection =
             Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
                 .map_err(sql_error)?;
         connection.busy_timeout(Duration::ZERO).map_err(sql_error)?;
-        read_passive_checkpoint(&connection)
+        let (frames, checkpointed, mut busy) = read_passive_checkpoint(&connection)?;
+        if !busy && wal_bytes > WAL_TRUNCATE_THRESHOLD_BYTES {
+            // Transactions may start between checkpoints. With a zero busy timeout
+            // SQLite can defer the truncation to the next maintenance pass.
+            let truncate_busy: i64 = connection
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+                .map_err(sql_error)?;
+            busy = truncate_busy != 0;
+        }
+        Ok((frames, checkpointed, busy))
     }
 
     fn prune_events(&mut self, cutoff: i64) -> Result<(i64, i64)> {
@@ -348,7 +365,7 @@ impl Store {
                 "SELECT MAX(seq) FROM (
                      SELECT seq FROM events WHERE seq > ?1 ORDER BY seq LIMIT ?2
                  )",
-                params![pruned_through, RETENTION_BATCH_ENTRIES],
+                params![pruned_through, RETENTION_EVENT_BATCH_ENTRIES],
                 |row| row.get(0),
             )
             .map_err(sql_error)?;

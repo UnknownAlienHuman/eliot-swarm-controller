@@ -1070,8 +1070,14 @@ to the owned-exit proof and restart recovery. Historical child process events ex
 through the ordinary event prefix; the observer suppresses new child start and exit
 events.
 
-The daemon releases the Store writer between retention batches. New Stores use
-incremental auto-vacuum to return free pages in bounded steps. Existing Stores with
+The daemon releases the Store writer between retention batches. An event pass
+deletes up to 512 entries from the eligible prefix. Each maintenance epoch
+checkpoints the WAL outside the Store writer lock, even when no rows expire.
+A passive checkpoint that copies all frames is followed by a truncate
+attempt when the WAL exceeds 4 MiB. Both checkpoints use a zero busy timeout.
+If a reader or writer keeps the WAL in use, maintenance reports the busy
+checkpoint and retries on a later epoch. New Stores use
+incremental auto-vacuum to return up to 32 free pages per pass. Existing Stores with
 auto-vacuum disabled reuse freed pages during live retention. An explicit [startup
 conversion](configuration.md#daemon-and-automation-settings) rebuilds an older file before
 serving and allows future incremental reclamation.

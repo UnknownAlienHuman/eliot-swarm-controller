@@ -410,6 +410,32 @@ impl Store {
         Self::open_with_observer(path, |_| {})
     }
 
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        #[cfg(windows)]
+        let owned_path = core::verbatim_path(path);
+        #[cfg(windows)]
+        let path: &Path = &owned_path;
+        let connection =
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(sql_error)?;
+        connection
+            .busy_timeout(Duration::from_secs(1))
+            .map_err(sql_error)?;
+        connection
+            .execute_batch("PRAGMA query_only = ON; BEGIN DEFERRED;")
+            .map_err(sql_error)?;
+        Ok(Self {
+            connection,
+            write_faulted: Cell::new(false),
+            retention_commands_cursor: None,
+            retention_processes_cursor: None,
+            goal_holder: String::new(),
+            hierarchy_limits: core::api::HierarchyLimits::default(),
+            capacity_policy: None,
+            git_observed_at: BTreeMap::new(),
+        })
+    }
+
     pub fn open_with_observer<F>(path: &Path, mut on_phase: F) -> Result<Self>
     where
         F: FnMut(StoreOpenPhase),
@@ -1622,9 +1648,22 @@ impl Store {
                 agent_record_columns!(),
                 "
                  FROM agents
-                 WHERE id > ?1 AND observe_only = 0 AND (state IN ('busy', 'waiting')
-                   OR EXISTS(SELECT 1 FROM native_child_registrations r
-                     WHERE r.producer = agents.id AND r.producer_generation = agents.generation))
+                 WHERE id IN (
+                     SELECT id FROM (
+                         SELECT id FROM agents INDEXED BY agents_attention_active
+                         WHERE id > ?1 AND observe_only = 0 AND state IN ('busy', 'waiting')
+                         ORDER BY id LIMIT ?2
+                     )
+                     UNION
+                     SELECT id FROM (
+                         SELECT r.producer AS id
+                         FROM native_child_registrations r INDEXED BY native_children_producer
+                         CROSS JOIN agents a
+                         WHERE r.producer > ?1 AND a.id = r.producer
+                           AND a.generation = r.producer_generation AND a.observe_only = 0
+                         GROUP BY r.producer ORDER BY r.producer LIMIT ?2
+                     )
+                 )
                  ORDER BY id LIMIT ?2"
             ))
             .map_err(sql_error)?;
@@ -1661,9 +1700,9 @@ impl Store {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT id, generation, updated_at FROM agents
+                "SELECT id, generation, updated_at FROM agents INDEXED BY agents_lost_recent
                  WHERE observe_only = 0 AND state = 'lost'
-                   AND (updated_at < ?1 OR (updated_at = ?1 AND id < ?2))
+                   AND (updated_at, id) < (?1, ?2)
                  ORDER BY updated_at DESC, id DESC LIMIT ?3",
             )
             .map_err(sql_error)?;
@@ -5450,25 +5489,25 @@ fn insert_event(tx: &Transaction<'_>, mut event: EventInsert<'_>) -> Result<Even
         validate_event_cause_shape(cause, None)?;
     }
     let cause_json = event.cause.as_ref().map(encode_json).transpose()?;
-    db!(tx.execute(
+    let mut insert = db!(tx.prepare_cached(
         "INSERT INTO events(ts, kind, family, agent, generation, source, native_id,
                             cursor, payload_digest, data, subject, cause)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-        params![
-            event.ts,
-            event.kind,
-            event.family,
-            event.agent,
-            event.generation,
-            event.source,
-            event.native_id,
-            event.cursor,
-            event.payload_digest,
-            data_json,
-            subject_json,
-            cause_json,
-        ],
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
     ));
+    db!(insert.execute(params![
+        event.ts,
+        event.kind,
+        event.family,
+        event.agent,
+        event.generation,
+        event.source,
+        event.native_id,
+        event.cursor,
+        event.payload_digest,
+        data_json,
+        subject_json,
+        cause_json,
+    ]));
     let seq = tx.last_insert_rowid();
     Ok(Event {
         seq,
@@ -6877,7 +6916,7 @@ fn latest_lost_seq(
 ) -> Result<Option<i64>> {
     connection
         .query_row(
-            "SELECT seq FROM events
+            "SELECT seq FROM events INDEXED BY events_agent_lost
              WHERE kind = 'agent.lost' AND agent = ?1 AND generation = ?2
              ORDER BY seq DESC LIMIT 1",
             params![agent_num, generation],

@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 98;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 99;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -2352,6 +2352,36 @@ impl Store {
                      ON background_process_wakes(settled_at, id)
                      WHERE state IN ('delivered', 'expired', 'cancelled', 'failed', 'stale');
                  INSERT INTO schema_migrations(version) VALUES (98);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 99 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE INDEX IF NOT EXISTS events_turn_notice
+                     ON events(agent, generation, json_extract(data, '$.turn_id'), seq DESC)
+                     WHERE kind = 'turn.notice';
+                 CREATE INDEX IF NOT EXISTS events_turn_lifecycle
+                     ON events(agent, generation, seq DESC)
+                     WHERE kind IN ('turn.started', 'turn.completed', 'turn.unknown');
+                 CREATE INDEX IF NOT EXISTS events_agent_lost
+                     ON events(agent, generation, seq DESC)
+                     WHERE kind = 'agent.lost';
+                 CREATE INDEX IF NOT EXISTS agents_attention_active
+                     ON agents(id)
+                     WHERE observe_only = 0 AND state IN ('busy', 'waiting');
+                 CREATE INDEX IF NOT EXISTS agents_lost_recent
+                     ON agents(updated_at DESC, id DESC)
+                     WHERE observe_only = 0 AND state = 'lost';
+                 CREATE INDEX IF NOT EXISTS commands_target_active_start
+                     ON commands(target, generation, expected_generation)
+                     WHERE verb IN ('launch', 'resume')
+                       AND state IN ('accepted', 'queued', 'dispatched');
+                 INSERT INTO schema_migrations(version) VALUES (99);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;

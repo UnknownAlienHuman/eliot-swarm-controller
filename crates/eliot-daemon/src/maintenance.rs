@@ -300,7 +300,7 @@ async fn run_epochs(
             return Ok(total);
         }
         let epoch_start = std::time::Instant::now();
-        let mut report = match run_once(store, retention, now).await {
+        let mut report = match run_once(store, retention, policy, now).await {
             Ok(report) => report,
             Err(error) => {
                 logging::record(
@@ -316,39 +316,36 @@ async fn run_epochs(
             }
         };
         let rows = report.rows_deleted();
-        if rows > 0 || report.pages_reclaimed > 0 {
-            let path = data_root.join("eliot.db");
-            let result =
-                tokio::task::spawn_blocking(move || Store::checkpoint_retention(&path)).await;
-            match result {
-                Ok(Ok((frames, checkpointed, busy))) => {
-                    report.wal_frames = frames;
-                    report.checkpointed_frames = checkpointed;
-                    report.checkpoint_busy = busy;
-                }
-                Ok(Err(error)) => {
-                    logging::record(
-                        policy,
-                        "daemon.retention_checkpoint_failed",
-                        &[
-                            ("producer", "daemon.retention"),
-                            ("method", "retention.checkpoint"),
-                        ],
-                        Some(&error),
-                    );
-                }
-                Err(error) => {
-                    let error = maintenance_join_error("retention checkpoint", &error);
-                    logging::record(
-                        policy,
-                        "daemon.retention_checkpoint_failed",
-                        &[
-                            ("producer", "daemon.retention"),
-                            ("method", "retention.checkpoint.join"),
-                        ],
-                        Some(&error),
-                    );
-                }
+        let path = data_root.join("eliot.db");
+        let result = tokio::task::spawn_blocking(move || Store::checkpoint_retention(&path)).await;
+        match result {
+            Ok(Ok((frames, checkpointed, busy))) => {
+                report.wal_frames = frames;
+                report.checkpointed_frames = checkpointed;
+                report.checkpoint_busy = busy;
+            }
+            Ok(Err(error)) => {
+                logging::record(
+                    policy,
+                    "daemon.retention_checkpoint_failed",
+                    &[
+                        ("producer", "daemon.retention"),
+                        ("method", "retention.checkpoint"),
+                    ],
+                    Some(&error),
+                );
+            }
+            Err(error) => {
+                let error = maintenance_join_error("retention checkpoint", &error);
+                logging::record(
+                    policy,
+                    "daemon.retention_checkpoint_failed",
+                    &[
+                        ("producer", "daemon.retention"),
+                        ("method", "retention.checkpoint.join"),
+                    ],
+                    Some(&error),
+                );
             }
         }
         total.accumulate(report);
@@ -389,48 +386,43 @@ async fn run_epochs(
 pub(crate) async fn run_once(
     store: &Mutex<Store>,
     retention: &config::RetentionConfig,
+    policy: &SecretPolicy,
     now: i64,
 ) -> Result<RetentionReport> {
-    run_once_with_budgets(
-        store,
-        retention,
-        now,
-        RETENTION_TICK_ROW_BUDGET,
-        RETENTION_TICK_TIME_BUDGET,
-    )
-    .await
-}
+    use std::time::Instant;
 
-/// Run bounded passes until a pass deletes nothing or the tick budgets run
-/// out. At least one pass always runs. `now` stays fixed so every pass
-/// shares the same cutoffs. The Store lock is taken per bounded pass and
-/// released between passes, so one epoch never holds the lock for the whole
-/// time budget.
-pub(crate) async fn run_once_with_budgets(
-    store: &Mutex<Store>,
-    retention: &config::RetentionConfig,
-    now: i64,
-    row_budget: i64,
-    time_budget: Duration,
-) -> Result<RetentionReport> {
-    let start = std::time::Instant::now();
+    let start = Instant::now();
     let mut total = RetentionReport::default();
     loop {
-        let pass = {
-            let mut guard = store.lock().await;
-            guard.prune_retention(
-                retention.events_retention_seconds(),
-                retention.processes_retention_seconds(),
-                retention.commands_days,
-                retention.mail_days,
-                now,
-            )?
-        };
+        let queued = Instant::now();
+        let mut guard = store.lock().await;
+        let acquired = Instant::now();
+        let pass = guard.prune_retention(
+            retention.events_retention_seconds(),
+            retention.processes_retention_seconds(),
+            retention.commands_days,
+            retention.mail_days,
+            now,
+        );
+        let held = acquired.elapsed();
+        drop(guard);
+        logging::record_debug(
+            policy,
+            "store.retention_pass",
+            &[],
+            &[
+                ("lock_wait_us", (acquired - queued).as_micros() as u64),
+                ("lock_hold_us", held.as_micros() as u64),
+            ],
+        );
+        let pass = pass?;
         total.accumulate(pass);
         if pass.rows_deleted() == 0 && pass.pages_reclaimed == 0 && !pass.process_scan_more {
             break;
         }
-        if total.work_count() >= row_budget || start.elapsed() >= time_budget {
+        if total.work_count() >= RETENTION_TICK_ROW_BUDGET
+            || start.elapsed() >= RETENTION_TICK_TIME_BUDGET
+        {
             break;
         }
         tokio::task::yield_now().await;

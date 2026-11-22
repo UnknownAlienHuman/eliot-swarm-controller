@@ -271,12 +271,14 @@ fn project_unknown_commands(
 ) -> eliot_core::Result<()> {
     let mut stmt = projection_query(db,
         "SELECT c.id,c.verb,c.method,c.target,c.generation,c.turn_id,c.created_at,c.state,
-                COALESCE((SELECT e.ts FROM events e WHERE e.kind='command.unknown'
+                COALESCE((SELECT e.ts FROM events e
+                  WHERE e.kind='command.unknown'
                   AND CAST(json_extract(e.data,'$.command_id') AS TEXT)=c.id ORDER BY e.seq DESC LIMIT 1),c.updated_at),
-                COALESCE((SELECT MAX(e.seq) FROM events e WHERE e.kind='command.unknown'
+                COALESCE((SELECT MAX(e.seq) FROM events e
+                  WHERE e.kind='command.unknown'
                   AND CAST(json_extract(e.data,'$.command_id') AS TEXT)=c.id),0),
                 json_extract(c.outcome,'$.stage'),c.args,
-                EXISTS(SELECT 1 FROM processes p WHERE p.owner='agent:a'||c.target||'#'||c.generation AND p.state IN ('running','unknown')),
+                (EXISTS(SELECT 1 FROM processes p WHERE p.owner='agent:a'||c.target||'#'||c.generation AND p.state IN ('running','unknown'))),
                 EXISTS(SELECT 1 FROM source_state s WHERE s.agent=c.target AND s.generation=c.generation
                   AND s.source NOT IN ('daemon','os','git','workspace_process') AND s.state='open')
          FROM commands c WHERE c.state IN ('accepted','queued','dispatched','unknown')", "c.id=?1", bindings)?;
@@ -610,13 +612,14 @@ fn project_agents(
     let mut stmt = projection_query(db,
         "SELECT a.id,a.generation,a.state,a.updated_at,a.active_turn,a.archived,
                 a.native_scope,a.native_ref,a.observe_only,
-                EXISTS(SELECT 1 FROM commands c WHERE c.target=a.id
-                  AND (c.generation=a.generation OR c.expected_generation=a.generation)
-                  AND c.verb IN ('launch','resume') AND c.state IN ('accepted','queued','dispatched')),
-                EXISTS(SELECT 1 FROM processes p WHERE p.owner IN ('agent:a'||a.id||'#'||a.generation,'workspace:a'||a.id||'#'||a.generation) AND p.state='running'),
-                COALESCE((SELECT MAX(e.seq) FROM events e WHERE e.agent=a.id AND e.generation=a.generation),0),
-                COALESCE((SELECT MAX(e.ts) FROM events e WHERE e.agent=a.id AND e.generation=a.generation
-                  AND e.kind IN ('agent.lost','agent.failed')),a.updated_at),
+                CASE WHEN a.state IN ('created','starting','failed','lost') THEN EXISTS(SELECT 1 FROM commands c
+                  WHERE c.target=a.id AND (c.generation=a.generation OR c.expected_generation=a.generation)
+                  AND c.verb IN ('launch','resume') AND c.state IN ('accepted','queued','dispatched')) ELSE 0 END,
+                EXISTS(SELECT 1 FROM processes p WHERE p.owner IN (
+                  'agent:a'||a.id||'#'||a.generation,'workspace:a'||a.id||'#'||a.generation) AND p.state='running'),
+                COALESCE((SELECT MAX(e.seq) FROM events e INDEXED BY events_agent WHERE e.agent=a.id AND e.generation=a.generation),0),
+                CASE WHEN a.state IN ('failed','lost') THEN COALESCE((SELECT MAX(e.ts) FROM events e
+                  WHERE e.agent=a.id AND e.generation=a.generation AND e.kind IN ('agent.failed','agent.lost')),a.updated_at) ELSE a.updated_at END,
                 EXISTS(SELECT 1 FROM pending_requests r WHERE r.agent=a.id
                   AND r.generation=a.generation AND r.state='pending'),
                 EXISTS(SELECT 1 FROM turns t WHERE t.agent=a.id AND t.generation=a.generation

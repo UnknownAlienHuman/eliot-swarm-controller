@@ -1062,7 +1062,13 @@ across the harness adapters. Remote StreamableHTTP calls carry authenticated
 remote Owner context but no local Agent generation or turn; their events remain
 unbound and are excluded from per-turn usage.
 
-`daemon.status` also exposes retention and drain honesty in one place. The
+`daemon.status` also exposes retention and drain honesty in one place. Compact
+`agent.list` reads and history-derived attention thresholds use SQLite read
+snapshots outside the Store writer lock. Compact list requests wait for a reader
+slot before scheduling blocking work, with up to four snapshots active at once.
+Debug logs include attention sweep
+duration and Store lock wait and hold times for retention and native event batches.
+The
 retention view reports the `eliot.db` main and WAL sizes, the configured
 windows and `pruned_through`, along with the SQLite auto-vacuum mode,
 total pages and reusable pages. The drain
