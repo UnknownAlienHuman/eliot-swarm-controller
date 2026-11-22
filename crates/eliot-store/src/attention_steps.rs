@@ -20,11 +20,18 @@ pub(super) fn insert_attention_step(
     )
 }
 
+struct RetainedCeilingClaim {
+    event_seq: i64,
+    claimed_at: i64,
+    step: String,
+    turn_id: Option<String>,
+}
+
 fn retained_pre_upgrade_ceiling_claim(
     connection: &rusqlite::Connection,
     agent: i64,
     generation: i64,
-) -> Result<Option<(i64, i64, String, Option<String>)>> {
+) -> Result<Option<RetainedCeilingClaim>> {
     connection
         .query_row(
             "SELECT seq, ts, json_extract(data, '$.step'), json_extract(data, '$.turn_id')
@@ -41,7 +48,14 @@ fn retained_pre_upgrade_ceiling_claim(
                 ATTENTION_STEP_KIND,
                 format!("ceiling-{generation}-%")
             ],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok(RetainedCeilingClaim {
+                    event_seq: row.get(0)?,
+                    claimed_at: row.get(1)?,
+                    step: row.get(2)?,
+                    turn_id: row.get(3)?,
+                })
+            },
         )
         .optional()
         .map_err(sql_error)
@@ -305,8 +319,12 @@ impl Store {
 
             let mut adopted_pre_upgrade_claim = false;
             if reason == "session_growth_ceiling"
-                && let Some((event_seq, claimed_at, old_step, old_turn_id)) =
-                    retained_pre_upgrade_ceiling_claim(&tx, agent, generation)?
+                && let Some(RetainedCeilingClaim {
+                    event_seq,
+                    claimed_at,
+                    step: old_step,
+                    turn_id: old_turn_id,
+                }) = retained_pre_upgrade_ceiling_claim(&tx, agent, generation)?
             {
                 let old_turn = if let Some(old_turn_id) = old_turn_id {
                     tx.query_row(
