@@ -15,11 +15,13 @@ use super::*;
 
 const MS_PER_SECOND: i64 = 1_000;
 const MS_PER_DAY: i64 = 24 * 60 * 60 * MS_PER_SECOND;
-/// Event, process, command and write retention delete at most this many rows
+/// Event retention amortizes commit overhead over one bounded sequence range.
+const RETENTION_EVENT_BATCH_ENTRIES: i64 = 512;
+/// Process, command and write retention delete at most this many rows
 /// of each kind per Store-lock acquisition. The daemon releases it between calls.
-const RETENTION_BATCH_ENTRIES: i64 = 2_048;
+const RETENTION_BATCH_ENTRIES: i64 = 128;
 /// Incremental auto-vacuum work is page-bounded for fairness with writers.
-const INCREMENTAL_VACUUM_PAGES: i64 = 256;
+const INCREMENTAL_VACUUM_PAGES: i64 = 32;
 /// Traversal backstop for parent/child sets. Parent links are bound once at
 /// admission, so sets are acyclic; reaching this fails the pass loudly rather
 /// than looping.
@@ -30,7 +32,7 @@ const MAX_SET_DEPTH: i64 = 1_000;
 const MAX_SET_MEMBERS: usize = RETENTION_BATCH_ENTRIES as usize;
 /// Prunable roots deleted per pass. The candidate sweep skips kept roots in
 /// place and stops here, so kept sets never starve the pass.
-const MAX_PRUNE_ROOTS: i64 = 256;
+const MAX_PRUNE_ROOTS: i64 = 50;
 /// Expired root candidates, oldest first: the first page and the keyed
 /// continuation past the last examined `(created_at, id)`. Both ride the
 /// `commands_prune_roots` partial index and stop at the batch bound, so no
@@ -318,28 +320,26 @@ impl Store {
         Ok((before.page_count.saturating_sub(after.page_count), after))
     }
 
-    /// Run the passive WAL checkpoint without using the shared Store writer.
+    /// Checkpoint without the shared Store writer and release large reusable WAL files.
     pub fn checkpoint_retention(path: &Path) -> Result<(i64, i64, bool)> {
+        const WAL_TRUNCATE_THRESHOLD_BYTES: u64 = 4 * 1024 * 1024;
+        let wal_bytes = std::fs::metadata(path.with_extension("db-wal"))
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        #[cfg(windows)]
+        let path = &core::verbatim_path(path);
         let connection =
             Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
                 .map_err(sql_error)?;
         connection.busy_timeout(Duration::ZERO).map_err(sql_error)?;
-        let (frames, checkpointed, busy) = read_passive_checkpoint(&connection)?;
-        if !busy {
-            let mut wal_os = path.as_os_str().to_os_string();
-            wal_os.push("-wal");
-            let wal_bytes = std::fs::metadata(Path::new(&wal_os))
-                .map(|meta| meta.len())
-                .unwrap_or(0);
-            if frames > 1_024 || wal_bytes > 1_048_576 {
-                let _ = connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)?,
-                    ))
-                });
-            }
+        let (frames, checkpointed, mut busy) = read_passive_checkpoint(&connection)?;
+        if !busy && wal_bytes > WAL_TRUNCATE_THRESHOLD_BYTES {
+            // Transactions may start between checkpoints. With a zero busy timeout
+            // SQLite can defer the truncation to the next maintenance pass.
+            let truncate_busy: i64 = connection
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+                .map_err(sql_error)?;
+            busy = truncate_busy != 0;
         }
         Ok((frames, checkpointed, busy))
     }
@@ -365,7 +365,7 @@ impl Store {
                 "SELECT MAX(seq) FROM (
                      SELECT seq FROM events WHERE seq > ?1 ORDER BY seq LIMIT ?2
                  )",
-                params![pruned_through, RETENTION_BATCH_ENTRIES],
+                params![pruned_through, RETENTION_EVENT_BATCH_ENTRIES],
                 |row| row.get(0),
             )
             .map_err(sql_error)?;
@@ -688,14 +688,13 @@ fn event_prune_end_tx(
                  WHERE enabled = 1
                    AND retiring_cursor IS NOT NULL AND retire_through IS NOT NULL
                  UNION ALL
-                 SELECT MIN(e.seq) - 1 FROM source_state s
-                 JOIN agents a ON a.id = s.agent AND a.generation = s.generation
-                 JOIN events e INDEXED BY events_agent
-                    ON e.agent = s.agent AND e.seq > ?1 AND e.seq <= ?2
-                 WHERE s.source = 'git' AND s.state = 'open'
-                   AND s.cursor IS NOT NULL
-                   AND e.generation = s.generation
-                   AND e.seq > CAST(s.cursor AS INTEGER)
+                 SELECT MIN(e.seq) - 1 FROM events e
+                 CROSS JOIN source_state s
+                    ON s.agent = e.agent AND s.generation = e.generation AND s.source = 'git'
+                 CROSS JOIN agents a ON a.id = e.agent AND a.generation = e.generation
+                 WHERE s.state = 'open'
+                   AND s.cursor IS NOT NULL AND e.seq > CAST(s.cursor AS INTEGER)
+                   AND e.seq > ?1 AND e.seq <= ?2
                    AND e.family = 'tool' AND e.kind = 'tool.completed'
                    AND e.native_id IS NOT NULL AND e.source NOT IN ('git', 'os', 'daemon')
                    AND json_extract(e.data, '$.tool') = 'fileChange'
@@ -731,15 +730,15 @@ fn event_prune_end_tx(
     // comparison alone would silently disable the pin for that source.
     let first_pinned: Option<i64> = tx
         .query_row(
-            "SELECT MIN(e.seq) FROM source_state s
-             JOIN events e INDEXED BY events_agent
-               ON e.agent = s.agent AND e.seq > ?1 AND e.seq <= ?2
-             WHERE s.state = 'open'
-               AND e.generation = s.generation
-               AND e.source = s.source
-               AND e.native_id IS NOT NULL
-               AND (s.last_batch_first_seq IS NULL
-                    OR e.seq >= s.last_batch_first_seq)",
+            "SELECT MIN(e.seq) FROM events e
+             WHERE e.seq > ?1 AND e.seq <= ?2 AND e.native_id IS NOT NULL
+               AND EXISTS (
+                   SELECT 1 FROM source_state s
+                   WHERE s.agent = e.agent AND s.generation = e.generation
+                     AND s.source = e.source AND s.state = 'open'
+                     AND (s.last_batch_first_seq IS NULL
+                          OR e.seq >= s.last_batch_first_seq)
+               )",
             params![pruned_through, ceiling],
             |row| row.get(0),
         )

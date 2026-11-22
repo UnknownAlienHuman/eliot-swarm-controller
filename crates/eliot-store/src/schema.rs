@@ -2371,17 +2371,9 @@ impl Store {
                  CREATE INDEX IF NOT EXISTS events_goal_changed
                      ON events(agent, generation, seq DESC)
                      WHERE kind = 'goal.changed';
-                 CREATE INDEX IF NOT EXISTS turns_completed_success
-                     ON turns(completed_at DESC, agent DESC, turn_id DESC)
-                     WHERE state = 'completed' AND outcome = 'success'
-                       AND started_at > 0 AND completed_at >= started_at;
-                 CREATE INDEX IF NOT EXISTS provider_holds_probe_command
-                     ON provider_holds(probe_command)
-                     WHERE probe_command IS NOT NULL;
-                 CREATE INDEX IF NOT EXISTS agents_nonterminal_controlled
-                     ON agents(id)
-                     WHERE observe_only = 0 AND archived = 0
-                       AND state IN ('created','starting','idle','busy','waiting','failed','lost','unknown');
+                 CREATE INDEX IF NOT EXISTS events_agent_lost
+                     ON events(agent, generation, seq DESC)
+                     WHERE kind = 'agent.lost';
                  CREATE INDEX IF NOT EXISTS agents_attention_active
                      ON agents(id)
                      WHERE observe_only = 0 AND state IN ('busy', 'waiting');

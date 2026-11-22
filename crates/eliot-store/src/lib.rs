@@ -422,7 +422,7 @@ impl Store {
             .busy_timeout(Duration::from_secs(1))
             .map_err(sql_error)?;
         connection
-            .execute_batch("BEGIN DEFERRED; SELECT 1 FROM schema_migrations LIMIT 1;")
+            .execute_batch("BEGIN DEFERRED")
             .map_err(sql_error)?;
         Ok(Self {
             connection,
@@ -1655,9 +1655,14 @@ impl Store {
                          ORDER BY id LIMIT ?2
                      )
                      UNION
-                     SELECT a.id FROM native_child_registrations r
-                     JOIN agents a ON a.id = r.producer AND a.generation = r.producer_generation
-                     WHERE a.id > ?1 AND a.observe_only = 0
+                     SELECT id FROM (
+                         SELECT r.producer AS id
+                         FROM native_child_registrations r INDEXED BY native_children_producer
+                         CROSS JOIN agents a
+                         WHERE r.producer > ?1 AND a.id = r.producer
+                           AND a.generation = r.producer_generation AND a.observe_only = 0
+                         GROUP BY r.producer ORDER BY r.producer LIMIT ?2
+                     )
                  )
                  ORDER BY id LIMIT ?2"
             ))
@@ -1697,7 +1702,7 @@ impl Store {
             .prepare(
                 "SELECT id, generation, updated_at FROM agents INDEXED BY agents_lost_recent
                  WHERE observe_only = 0 AND state = 'lost'
-                   AND (updated_at < ?1 OR (updated_at = ?1 AND id < ?2))
+                   AND (updated_at, id) < (?1, ?2)
                  ORDER BY updated_at DESC, id DESC LIMIT ?3",
             )
             .map_err(sql_error)?;
@@ -5484,25 +5489,25 @@ fn insert_event(tx: &Transaction<'_>, mut event: EventInsert<'_>) -> Result<Even
         validate_event_cause_shape(cause, None)?;
     }
     let cause_json = event.cause.as_ref().map(encode_json).transpose()?;
-    db!(tx.execute(
+    let mut insert = db!(tx.prepare_cached(
         "INSERT INTO events(ts, kind, family, agent, generation, source, native_id,
                             cursor, payload_digest, data, subject, cause)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-        params![
-            event.ts,
-            event.kind,
-            event.family,
-            event.agent,
-            event.generation,
-            event.source,
-            event.native_id,
-            event.cursor,
-            event.payload_digest,
-            data_json,
-            subject_json,
-            cause_json,
-        ],
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
     ));
+    db!(insert.execute(params![
+        event.ts,
+        event.kind,
+        event.family,
+        event.agent,
+        event.generation,
+        event.source,
+        event.native_id,
+        event.cursor,
+        event.payload_digest,
+        data_json,
+        subject_json,
+        cause_json,
+    ]));
     let seq = tx.last_insert_rowid();
     Ok(Event {
         seq,
@@ -6911,10 +6916,9 @@ fn latest_lost_seq(
 ) -> Result<Option<i64>> {
     connection
         .query_row(
-            "SELECT seq FROM events INDEXED BY autonomy_fleet_agent_state_event
-             WHERE kind IN ('agent.failed', 'agent.lost')
-               AND kind = 'agent.lost' AND agent = ?1 AND generation = ?2
-             ORDER BY ts DESC, seq DESC LIMIT 1",
+            "SELECT seq FROM events INDEXED BY events_agent_lost
+             WHERE kind = 'agent.lost' AND agent = ?1 AND generation = ?2
+             ORDER BY seq DESC LIMIT 1",
             params![agent_num, generation],
             |row| row.get(0),
         )

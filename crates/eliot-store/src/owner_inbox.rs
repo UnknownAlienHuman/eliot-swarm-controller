@@ -271,12 +271,12 @@ fn project_unknown_commands(
 ) -> eliot_core::Result<()> {
     let mut stmt = projection_query(db,
         "SELECT c.id,c.verb,c.method,c.target,c.generation,c.turn_id,c.created_at,c.state,
-                CASE WHEN c.state='unknown' THEN COALESCE((SELECT e.ts FROM events e INDEXED BY autonomy_fleet_unknown_event_lookup
+                COALESCE((SELECT e.ts FROM events e
                   WHERE e.kind='command.unknown'
-                  AND CAST(json_extract(e.data,'$.command_id') AS TEXT)=c.id ORDER BY e.ts DESC, e.seq DESC LIMIT 1),c.updated_at) ELSE c.updated_at END,
-                CASE WHEN c.state='unknown' THEN COALESCE((SELECT MAX(e.seq) FROM events e INDEXED BY autonomy_fleet_unknown_event_lookup
+                  AND CAST(json_extract(e.data,'$.command_id') AS TEXT)=c.id ORDER BY e.seq DESC LIMIT 1),c.updated_at),
+                COALESCE((SELECT MAX(e.seq) FROM events e
                   WHERE e.kind='command.unknown'
-                  AND CAST(json_extract(e.data,'$.command_id') AS TEXT)=c.id),0) ELSE 0 END,
+                  AND CAST(json_extract(e.data,'$.command_id') AS TEXT)=c.id),0),
                 json_extract(c.outcome,'$.stage'),c.args,
                 (EXISTS(SELECT 1 FROM processes p WHERE p.owner='agent:a'||c.target||'#'||c.generation AND p.state IN ('running','unknown'))),
                 EXISTS(SELECT 1 FROM source_state s WHERE s.agent=c.target AND s.generation=c.generation
@@ -612,7 +612,7 @@ fn project_agents(
     let mut stmt = projection_query(db,
         "SELECT a.id,a.generation,a.state,a.updated_at,a.active_turn,a.archived,
                 a.native_scope,a.native_ref,a.observe_only,
-                CASE WHEN a.state IN ('created','starting','failed','lost') THEN EXISTS(SELECT 1 FROM commands c INDEXED BY commands_target_active_start
+                CASE WHEN a.state IN ('created','starting','failed','lost') THEN EXISTS(SELECT 1 FROM commands c
                   WHERE c.target=a.id AND (c.generation=a.generation OR c.expected_generation=a.generation)
                   AND c.verb IN ('launch','resume') AND c.state IN ('accepted','queued','dispatched')) ELSE 0 END,
                 CASE WHEN a.state IN ('starting','busy','waiting','failed','lost') THEN (
@@ -620,9 +620,9 @@ fn project_agents(
                   OR EXISTS(SELECT 1 FROM processes p WHERE p.owner='workspace:a'||a.id||'#'||a.generation AND p.state='running')
                 ) ELSE 0 END,
                 COALESCE((SELECT MAX(e.seq) FROM events e INDEXED BY events_agent WHERE e.agent=a.id AND e.generation=a.generation),0),
-                CASE WHEN a.state IN ('failed','lost') THEN COALESCE((SELECT MAX(e.ts) FROM events e INDEXED BY autonomy_fleet_agent_state_event
+                CASE WHEN a.state IN ('failed','lost') THEN COALESCE((SELECT MAX(e.ts) FROM events e
                   WHERE e.agent=a.id AND e.generation=a.generation AND e.kind IN ('agent.failed','agent.lost')),a.updated_at) ELSE a.updated_at END,
-                CASE WHEN a.state='waiting' THEN EXISTS(SELECT 1 FROM pending_requests r WHERE r.agent=a.id
+                CASE WHEN a.state IN ('starting','idle','busy','waiting') THEN EXISTS(SELECT 1 FROM pending_requests r WHERE r.agent=a.id
                   AND r.generation=a.generation AND r.state='pending') ELSE 0 END,
                 CASE WHEN a.active_turn IS NOT NULL THEN EXISTS(SELECT 1 FROM turns t WHERE t.agent=a.id AND t.generation=a.generation
                   AND t.turn_id=a.active_turn AND t.state='running') ELSE 0 END,
@@ -791,7 +791,7 @@ fn project_goals(
          AND NOT EXISTS(SELECT 1 FROM goal_markers m WHERE m.agent=g.agent AND m.mode=g.mode
             AND m.generation=g.generation AND m.revision=g.revision AND m.state='unknown'),
        EXISTS(SELECT 1 FROM goal_markers m WHERE m.agent=g.agent AND m.mode=g.mode AND m.generation=g.generation AND m.revision=g.revision AND m.state='running'),
-       COALESCE((SELECT MAX(e.seq) FROM events e INDEXED BY events_goal_changed WHERE e.agent=g.agent AND e.generation=g.generation AND e.kind='goal.changed'),0),
+       COALESCE((SELECT MAX(e.seq) FROM events e WHERE e.agent=g.agent AND e.generation=g.generation AND e.kind='goal.changed'),0),
        json_extract(g.state,'$.cadence_anchor_ms') + json_extract(g.definition,'$.cadence_ms')
            * (COALESCE(json_extract(g.state,'$.last_committed_slot'),0) + 1)
        FROM goals g JOIN agents a ON a.id=g.agent WHERE json_extract(g.state,'$.status') IN ('active','blocked')", "g.agent=?1 AND g.mode=?2", bindings)?;

@@ -10,7 +10,7 @@ use eliot_core::Result;
 use std::{
     collections::HashSet,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::task::JoinSet;
 
@@ -45,6 +45,7 @@ pub(super) fn launch_sweep(
     let router = router.clone();
     tasks.spawn(async move {
         let _reset = SweepReset(running);
+        let started = Instant::now();
         if let Err(error) =
             scan_attention_agents(&router, Arc::clone(&state), suspicion_window).await
         {
@@ -63,6 +64,12 @@ pub(super) fn launch_sweep(
                 Some(&error),
             );
         }
+        crate::logging::record_debug(
+            &eliot_core::SecretPolicy::default(),
+            "daemon.attention_sweep",
+            &[],
+            &[("elapsed_us", started.elapsed().as_micros() as u64)],
+        );
     });
 }
 

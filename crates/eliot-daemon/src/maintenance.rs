@@ -15,7 +15,7 @@ use tokio::sync::{Mutex, watch};
 
 /// One retention epoch loops bounded passes until a pass deletes nothing
 /// or a budget runs out.
-pub(crate) const RETENTION_TICK_ROW_BUDGET: i64 = 65_536;
+pub(crate) const RETENTION_TICK_ROW_BUDGET: i64 = 10_000;
 pub(crate) const RETENTION_TICK_TIME_BUDGET: Duration = Duration::from_secs(30);
 
 /// Known provider resets and due probes are serviced within one second.
@@ -300,7 +300,7 @@ async fn run_epochs(
             return Ok(total);
         }
         let epoch_start = std::time::Instant::now();
-        let mut report = match run_once(store, retention, now).await {
+        let mut report = match run_once(store, retention, policy, now).await {
             Ok(report) => report,
             Err(error) => {
                 logging::record(
@@ -386,48 +386,43 @@ async fn run_epochs(
 pub(crate) async fn run_once(
     store: &Mutex<Store>,
     retention: &config::RetentionConfig,
+    policy: &SecretPolicy,
     now: i64,
 ) -> Result<RetentionReport> {
-    run_once_with_budgets(
-        store,
-        retention,
-        now,
-        RETENTION_TICK_ROW_BUDGET,
-        RETENTION_TICK_TIME_BUDGET,
-    )
-    .await
-}
+    use std::time::Instant;
 
-/// Run bounded passes until a pass deletes nothing or the tick budgets run
-/// out. At least one pass always runs. `now` stays fixed so every pass
-/// shares the same cutoffs. The Store lock is taken per bounded pass and
-/// released between passes, so one epoch never holds the lock for the whole
-/// time budget.
-pub(crate) async fn run_once_with_budgets(
-    store: &Mutex<Store>,
-    retention: &config::RetentionConfig,
-    now: i64,
-    row_budget: i64,
-    time_budget: Duration,
-) -> Result<RetentionReport> {
-    let start = std::time::Instant::now();
+    let start = Instant::now();
     let mut total = RetentionReport::default();
     loop {
-        let pass = {
-            let mut guard = store.lock().await;
-            guard.prune_retention(
-                retention.events_retention_seconds(),
-                retention.processes_retention_seconds(),
-                retention.commands_days,
-                retention.mail_days,
-                now,
-            )?
-        };
+        let queued = Instant::now();
+        let mut guard = store.lock().await;
+        let acquired = Instant::now();
+        let pass = guard.prune_retention(
+            retention.events_retention_seconds(),
+            retention.processes_retention_seconds(),
+            retention.commands_days,
+            retention.mail_days,
+            now,
+        );
+        let held = acquired.elapsed();
+        drop(guard);
+        logging::record_debug(
+            policy,
+            "store.retention_pass",
+            &[],
+            &[
+                ("lock_wait_us", (acquired - queued).as_micros() as u64),
+                ("lock_hold_us", held.as_micros() as u64),
+            ],
+        );
+        let pass = pass?;
         total.accumulate(pass);
         if pass.rows_deleted() == 0 && pass.pages_reclaimed == 0 && !pass.process_scan_more {
             break;
         }
-        if total.work_count() >= row_budget || start.elapsed() >= time_budget {
+        if total.work_count() >= RETENTION_TICK_ROW_BUDGET
+            || start.elapsed() >= RETENTION_TICK_TIME_BUDGET
+        {
             break;
         }
         tokio::task::yield_now().await;

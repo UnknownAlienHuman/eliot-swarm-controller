@@ -741,38 +741,47 @@ impl Store {
             ));
         }
 
-        for event in &batch.events {
-            let family = family_for_kind(&event.kind)?;
-            let owner: Option<String> = tx
-                .query_row(
+        {
+            let mut source_owner = tx
+                .prepare_cached(
                     "SELECT source FROM source_owners
                      WHERE agent = ?1 AND generation = ?2 AND family = ?3",
-                    params![agent_num, batch.generation, family],
-                    |row| row.get(0),
                 )
-                .optional()
                 .map_err(sql_error)?;
-            if owner.as_deref() != Some(batch.source.as_str()) {
-                return Err(Error::new(
-                    "source_integrity",
-                    format!("source {} does not own family {family}", batch.source),
-                ));
-            }
-            let exists: bool = tx
-                .query_row(
+            let mut native_id_exists = tx
+                .prepare_cached(
                     "SELECT EXISTS(
                          SELECT 1 FROM events
                          WHERE agent = ?1 AND generation = ?2 AND source = ?3 AND native_id = ?4
                      )",
-                    params![agent_num, batch.generation, batch.source, event.native_id],
-                    |row| row.get(0),
                 )
                 .map_err(sql_error)?;
-            if exists {
-                return Err(Error::new(
-                    "source_integrity",
-                    "batch mixes previously committed native ids with new events",
-                ));
+            for event in &batch.events {
+                let family = family_for_kind(&event.kind)?;
+                let owner: Option<String> = source_owner
+                    .query_row(params![agent_num, batch.generation, family], |row| {
+                        row.get(0)
+                    })
+                    .optional()
+                    .map_err(sql_error)?;
+                if owner.as_deref() != Some(batch.source.as_str()) {
+                    return Err(Error::new(
+                        "source_integrity",
+                        format!("source {} does not own family {family}", batch.source),
+                    ));
+                }
+                let exists: bool = native_id_exists
+                    .query_row(
+                        params![agent_num, batch.generation, batch.source, event.native_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(sql_error)?;
+                if exists {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "batch mixes previously committed native ids with new events",
+                    ));
+                }
             }
         }
 

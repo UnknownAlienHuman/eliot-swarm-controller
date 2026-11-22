@@ -41,8 +41,8 @@ pub(crate) async fn run_context_notes(
             page
         };
         if !page.is_empty() {
-            for event in &page {
-                if let Err(error) = router.note_committed_fact(event).await {
+            for event in page {
+                if let Err(error) = router.note_committed_fact(&event).await {
                     crate::logging::record(
                         &router.secret_policy_snapshot(),
                         "daemon.context_note_fact_failed",
@@ -50,14 +50,14 @@ pub(crate) async fn run_context_notes(
                         Some(&error),
                     );
                 }
+                router
+                    .inner
+                    .store
+                    .lock()
+                    .await
+                    .advance_context_notes_cursor(event.seq)?;
                 cursor = event.seq;
             }
-            router
-                .inner
-                .store
-                .lock()
-                .await
-                .advance_context_notes_cursor(cursor)?;
             continue;
         }
         tokio::select! {

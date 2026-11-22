@@ -23,7 +23,7 @@ use tokio::{
 };
 use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
 
-const PIPE_QUEUE_CAPACITY: usize = 64;
+const PIPE_QUEUE_CAPACITY: usize = 16;
 pub(crate) const MAX_PENDING_CALLS: usize = 32;
 pub(super) const PLUGIN_TRANSPORT_WHERE: &str = "plugin.command.transport";
 

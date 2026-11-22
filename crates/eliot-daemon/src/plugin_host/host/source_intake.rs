@@ -577,8 +577,10 @@ async fn put_events(
         .map(|event| event.kind.chars().take(48).collect::<String>())
         .collect::<Vec<_>>()
         .join(",");
+    let queued = Instant::now();
     let result = match timeout_at(until, store.lock()).await {
         Ok(mut store) => {
+            let acquired = Instant::now();
             let now = now_ms();
             let result = if is_child {
                 store.put_native_child_batch(binding.agent_id, binding.generation, batch, now)
@@ -594,6 +596,22 @@ async fn put_events(
             };
             if let Ok(commit) = &result {
                 bus.publish(&commit.events);
+            }
+            let held = acquired.elapsed();
+            drop(store);
+            if crate::logging::is_debug()
+                && let Ok(commit) = &result
+            {
+                crate::logging::record_debug(
+                    &SecretPolicy::new(credentials),
+                    "store.source_batch",
+                    &[("agent", &gap.agent_id), ("source", &gap.source)],
+                    &[
+                        ("lock_wait_us", (acquired - queued).as_micros() as u64),
+                        ("lock_hold_us", held.as_micros() as u64),
+                        ("events", commit.events.len() as u64),
+                    ],
+                );
             }
             result
         }

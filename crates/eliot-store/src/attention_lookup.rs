@@ -316,8 +316,8 @@ fn successful_attention_turns(
             "SELECT t.agent, t.generation, t.turn_id, t.started_at, t.completed_at,
                     started.seq, completed.seq,
                     json_extract(started.subject, '$.workspace')
-             FROM turns AS t INDEXED BY turns_completed_success
-             JOIN agents AS a ON a.id = t.agent
+             FROM agents AS a INDEXED BY agents_list_project
+             CROSS JOIN turns AS t ON t.agent = a.id
              CROSS JOIN events AS started INDEXED BY attention_turn_endpoints
                ON started.agent = t.agent AND started.generation = t.generation
               AND started.kind = 'turn.started'
