@@ -275,15 +275,18 @@ pub(super) fn authorize_command(principal: &Principal, request: &mut SubmitComma
         ));
     }
     if let Principal::ProjectRule { registration } = principal {
-        if request.verb == "git.publish" {
+        if matches!(
+            request.verb.as_str(),
+            "git.fetch" | "git.integrate" | "git.publish"
+        ) {
             if !registration
                 .actions
                 .iter()
-                .any(|action| action == "git.publish")
+                .any(|action| action == &request.verb)
             {
                 return Err(Error::new(
                     "not_allowed",
-                    "project rule is not approved for git.publish",
+                    format!("project rule is not approved for {}", request.verb),
                 ));
             }
             if request.target.is_some()
@@ -294,31 +297,7 @@ pub(super) fn authorize_command(principal: &Principal, request: &mut SubmitComma
             {
                 return Err(Error::new(
                     "invalid",
-                    "git.publish command must be targetless and unbound",
-                ));
-            }
-            return Ok(());
-        }
-        if request.verb == "git.fetch" {
-            if !registration
-                .actions
-                .iter()
-                .any(|action| action == "git.fetch")
-            {
-                return Err(Error::new(
-                    "not_allowed",
-                    "project rule is not approved for git.fetch",
-                ));
-            }
-            if request.target.is_some()
-                || request.expected_generation.is_some()
-                || request.expected_turn_id.is_some()
-                || request.request_id.is_some()
-                || request.probe
-            {
-                return Err(Error::new(
-                    "invalid",
-                    "git.fetch command must be targetless and unbound",
+                    format!("{} command must be targetless and unbound", request.verb),
                 ));
             }
             return Ok(());

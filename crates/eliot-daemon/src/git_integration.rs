@@ -4,7 +4,11 @@
 //! admission. This module uses fixed Git argv, a private index, scoped process
 //! custody and the registered project policy check. It never pushes.
 
-use crate::{git_monitor::GitProbe, publication::TemporaryGitIndex, workspace_git::WorkspaceGit};
+use crate::{
+    git_monitor::{GitProbe, git_path_argument},
+    publication::TemporaryGitIndex,
+    workspace_git::WorkspaceGit,
+};
 use eliot_core::{
     CommandState, Error, Result, SecretPolicy,
     api::{
@@ -752,8 +756,8 @@ async fn cleanup_temporary_worktree(
     let registered = worktree_registered(git, repository_root, &temporary.path).await?;
     let exists = fs::symlink_metadata(&temporary.path).is_ok();
     if registered || exists {
-        let path = path_text(&temporary.path)?;
-        let args = ["worktree", "remove", "--force", path];
+        let path = git_path_argument(&temporary.path)?;
+        let args = ["worktree", "remove", "--force", path.as_str()];
         let outcome = run_git_effect(
             git,
             repository_root,
@@ -1126,7 +1130,7 @@ pub(crate) async fn execute(
     };
     let repo_root = Path::new(&frozen.canonical_checkout);
     let temporary_root = temporary.path.as_path();
-    let temporary_path = match path_text(temporary_root) {
+    let temporary_path = match git_path_argument(temporary_root) {
         Ok(path) => path,
         Err(_) => {
             let _ = temporary.cleanup_root();
@@ -1139,7 +1143,7 @@ pub(crate) async fn execute(
         "add",
         "--detach",
         "--no-checkout",
-        temporary_path,
+        temporary_path.as_str(),
         frozen.base_oid.as_str(),
     ];
     let added = match run_git_effect(
