@@ -1083,6 +1083,9 @@ pub struct AgentPatchDigestResponse {
     /// Changed paths that match none of the Agent generation's active claim globs.
     #[serde(default)]
     pub outside_claims: Vec<String>,
+    /// Whether the complete current claim listing declares any scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outside_claims_declared: Option<bool>,
     /// False when Git paths, claim coverage, workspace attribution or the list were incomplete.
     #[serde(default)]
     pub outside_claims_complete: bool,

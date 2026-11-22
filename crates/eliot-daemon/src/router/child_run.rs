@@ -8,7 +8,7 @@ use eliot_core::{
         ChildRunResponse, ChildRunStatus, ChildRunWake, ClaimListRequest, CommandSubmitResponse,
         GitView, MAX_CHILD_RUN_CHANGED_FILES, MAX_CHILD_RUN_COMMITS, MAX_CHILD_RUN_FILE_PATH_BYTES,
         SwarmDigestRequest, SwarmDigestResponse, SwarmWaitRequest, SwarmWaitResponse,
-        WaitEntryResult, claim_glob_matches_normalized,
+        WaitEntryResult, advisory_claim_matches,
     },
 };
 use serde_json::{Value, json};
@@ -309,15 +309,15 @@ impl Router {
         })
     }
 
-    /// Attach one bounded fact snapshot per visible settled Agent generation.
+    /// Attach one bounded fact snapshot per visible settled Agent turn.
     /// Called only after a wait's final Store snapshot, never inside its poll
-    /// loop; repeated command/turn targets for one generation share the read.
+    /// loop; repeated targets for the same turn share the read.
     pub(super) async fn attach_wait_facts(
         &self,
         results: &mut [WaitEntryResult],
         principal: &Principal,
     ) {
-        let mut by_agent: HashMap<(String, i64), ChildRunFacts> = HashMap::new();
+        let mut by_turn: HashMap<(String, i64, Option<String>), ChildRunFacts> = HashMap::new();
         for entry in results {
             if !matches!(
                 entry.status.as_str(),
@@ -328,12 +328,14 @@ impl Router {
             let (Some(agent), Some(generation)) = (entry.agent.as_deref(), entry.generation) else {
                 continue;
             };
-            let key = (agent.to_owned(), generation);
-            let facts = if let Some(facts) = by_agent.get(&key) {
+            let key = (agent.to_owned(), generation, entry.turn_id.clone());
+            let facts = if let Some(facts) = by_turn.get(&key) {
                 facts.clone()
             } else {
-                let facts = self.child_run_facts(agent, generation, principal).await;
-                by_agent.insert(key, facts.clone());
+                let facts = self
+                    .child_run_facts(agent, generation, entry.turn_id.as_deref(), principal)
+                    .await;
+                by_turn.insert(key, facts.clone());
                 facts
             };
             entry.facts = facts;
@@ -347,6 +349,7 @@ impl Router {
         &self,
         agent: &str,
         generation: i64,
+        turn_id: Option<&str>,
         principal: &Principal,
     ) -> ChildRunFacts {
         let mut facts = ChildRunFacts::unobserved();
@@ -391,9 +394,20 @@ impl Router {
             let commits = exclusively_bound
                 .then(|| store.observed_git_commits(agent, generation, MAX_CHILD_RUN_COMMITS + 1))
                 .and_then(Result::ok);
-            (target, edits, goal, claims, exclusively_bound, commits)
+            let settled_at = turn_id
+                .and_then(|turn| store.get_turn(agent, generation, turn).ok().flatten())
+                .and_then(|turn| turn.completed_at);
+            (
+                target,
+                edits,
+                goal,
+                claims,
+                exclusively_bound,
+                commits,
+                settled_at,
+            )
         };
-        let (target, edits, goal, claims, exclusively_bound, commits) = captured;
+        let (target, edits, goal, claims, exclusively_bound, commits, settled_at) = captured;
         if let Some(edits) = edits.as_ref().filter(|edits| !edits.is_empty()) {
             facts.changed_files = observed_changes(
                 edits
@@ -422,7 +436,7 @@ impl Router {
                     claims
                         .claims
                         .iter()
-                        .all(|claim| !claim_glob_matches_normalized(&claim.glob, &edit.path))
+                        .all(|claim| !advisory_claim_matches(&claim.glob, &edit.path))
                 })
             })
         {
@@ -432,8 +446,12 @@ impl Router {
         }
 
         if exclusively_bound
+            && let Some(settled_at) = settled_at
             && let Ok(GitView::Data(view)) = self.inner.monitoring.git_view(&target).await
             && view.available
+            && view
+                .observed_at
+                .is_some_and(|observed_at| observed_at >= settled_at)
         {
             if let Some(counts) = view.line_counts {
                 facts.line_counts = ChildRunFact::Observed(counts);
@@ -464,7 +482,7 @@ impl Router {
                             claims
                                 .claims
                                 .iter()
-                                .all(|claim| !claim_glob_matches_normalized(&claim.glob, path))
+                                .all(|claim| !advisory_claim_matches(&claim.glob, path))
                         });
                     facts.outside_claims = ChildRunFact::Observed(outside);
                 }

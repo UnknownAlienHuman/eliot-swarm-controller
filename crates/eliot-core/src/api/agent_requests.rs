@@ -734,6 +734,8 @@ impl AgentPatchDigestRequest {
         if self.validate().is_err()
             || !binding(&self.id, self.generation, &reply.agent, reply.generation)
             || reply.outside_claims.len() > super::MAX_PATCH_DIGEST_OUTSIDE_CLAIMS
+            || reply.outside_claims_declared == Some(false)
+                && (reply.outside_claims_complete || !reply.outside_claims.is_empty())
             || reply.outside_claims.iter().any(|path| {
                 path.trim().is_empty()
                     || path.len() > super::MAX_PATCH_DIGEST_PATH_BYTES

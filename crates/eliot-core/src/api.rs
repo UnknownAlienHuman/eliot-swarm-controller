@@ -93,9 +93,9 @@ pub use coordination::{
     MailAckResponse, MailDefinitionArgs, MailDelivery, MailDeliverySummary, MailInboxRequest,
     MailInboxResponse, MailLimits, MailMode, MailReadRequest, MailSendRequest, MailSendResponse,
     VarDefinitionArgs, VarGetRequest, VarGetResponse, VarScope, VarSetRequest, VarSetResponse,
-    WhoRequest, WhoResponse, WhoSharedWorkspace, WhoWorker, claim_glob_matches,
-    claim_glob_matches_normalized, claim_globs_overlap, claim_globs_overlap_normalized,
-    normalize_claim_glob, parse_var_scope,
+    WhoRequest, WhoResponse, WhoSharedWorkspace, WhoWorker, advisory_claim_matches,
+    claim_glob_matches, claim_glob_matches_normalized, claim_globs_overlap,
+    claim_globs_overlap_normalized, normalize_claim_glob, parse_var_scope,
 };
 pub use digests::{
     DIGEST_THREAD_PREFIX, SwarmDigestRequest, SwarmDigestResponse, digest_mode_completed,

@@ -9,7 +9,7 @@ use eliot_core::{
     Error, Result,
     api::{
         AgentPatchDigestRequest, AgentPatchDigestResponse, ClaimListRequest, ClaimView,
-        MAX_PATCH_DIGEST_OUTSIDE_CLAIMS, PatchDigestFile, claim_glob_matches_normalized,
+        MAX_PATCH_DIGEST_OUTSIDE_CLAIMS, PatchDigestFile, advisory_claim_matches,
     },
 };
 use serde_json::Value;
@@ -118,7 +118,7 @@ impl Router {
                     super::now_ms(),
                 )
                 .ok()
-                .filter(|claims| !claims.truncated && !claims.claims.is_empty())
+                .filter(|claims| !claims.truncated)
                 .map(|claims| claims.claims);
             let exclusively_bound = !current.state.is_terminal()
                 && current.workspace.as_deref().is_some_and(|workspace| {
@@ -163,12 +163,13 @@ impl Router {
                 exclusively_bound,
             )
         };
+        let outside_claims_declared = claims.as_ref().map(|claims| !claims.is_empty());
         let root = read.root.clone();
         let digest = tokio::task::spawn_blocking(move || {
             digest(
                 &root,
                 &read,
-                claims.as_deref(),
+                claims.as_deref().filter(|claims| !claims.is_empty()),
                 exclusively_bound,
                 attributed_paths.as_deref(),
                 attributed_truncated,
@@ -179,6 +180,7 @@ impl Router {
         serde_json::to_value(AgentPatchDigestResponse {
             agent: agent.id,
             generation: agent.generation,
+            outside_claims_declared,
             ..digest
         })
         .map_err(|_| Error::new("internal", "patch digest could not be encoded"))
@@ -208,6 +210,7 @@ fn digest(
         checker_changes: Vec::new(),
         suppressions: Vec::new(),
         outside_claims: Vec::new(),
+        outside_claims_declared: None,
         outside_claims_complete: false,
         truncated: false,
     };
@@ -318,7 +321,7 @@ fn digest(
             .filter(|path| {
                 claims
                     .iter()
-                    .all(|claim| !claim_glob_matches_normalized(&claim.glob, path))
+                    .all(|claim| !advisory_claim_matches(&claim.glob, path))
             })
             .collect();
         out.outside_claims_complete = exclusively_bound
