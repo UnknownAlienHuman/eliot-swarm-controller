@@ -166,46 +166,46 @@ impl Drop for ClaimedGoalRound {
         let workspace_permit = self.workspace_permit.take();
         let wake_driver = self.wake_driver;
         self.runtime.spawn(async move {
-            let workspace_permit = workspace_permit;
             if let Some(commit) = pending_decision {
                 // This exact decision was made before awaiting the Store.
+                let _workspace_permit = workspace_permit;
                 let _ = router
                     .commit_goal_round(&principal, &request, &commit)
                     .await;
-            } else {
-                if let Some(check) = check {
-                    // Await this exact invocation, never reconstruct or replay it.
-                    // run_owned_process retains and drains its existing supervisor.
-                    let outcome = check.await;
-                    quiescent = goal_check_quiescent(&outcome);
-                    if !quiescent {
-                        let policy = router.secret_policy_snapshot();
-                        error = match goal_check_result(outcome, &policy) {
-                            Err(error) => error,
-                            Ok(_) => Error::new("unknown", "goal check cleanup is unproven"),
-                        };
-                        crate::logging::record(
-                            &policy,
-                            "daemon.goal_check_cleanup_unproven",
-                            &[("agent", &request.agent)],
-                            None,
-                        );
-                    }
-                }
-                // A previously retained terminal reply/error is never overwritten.
-                // A persistence failure faults the Store; restart resolves any
-                // remaining reservation under the old holder to unknown.
-                let _ = router
-                    .settle_goal_round_error(
-                        &principal,
-                        &request,
-                        &error,
-                        quiescent,
-                        check_timeout_ms,
-                        retry_timeout_ms,
-                    )
-                    .await;
+                return;
             }
+            if let Some(check) = check {
+                // Await this exact invocation, never reconstruct or replay it.
+                // run_owned_process retains and drains its existing supervisor.
+                let outcome = check.await;
+                quiescent = goal_check_quiescent(&outcome);
+                if !quiescent {
+                    let policy = router.secret_policy_snapshot();
+                    error = match goal_check_result(outcome, &policy) {
+                        Err(error) => error,
+                        Ok(_) => Error::new("unknown", "goal check cleanup is unproven"),
+                    };
+                    crate::logging::record(
+                        &policy,
+                        "daemon.goal_check_cleanup_unproven",
+                        &[("agent", &request.agent)],
+                        None,
+                    );
+                }
+            }
+            // A previously retained terminal reply/error is never overwritten.
+            // A persistence failure faults the Store; restart resolves any
+            // remaining reservation under the old holder to unknown.
+            let _ = router
+                .settle_goal_round_error(
+                    &principal,
+                    &request,
+                    &error,
+                    quiescent,
+                    check_timeout_ms,
+                    retry_timeout_ms,
+                )
+                .await;
             drop(workspace_permit);
             if wake_driver {
                 router.notify_goal_reconcile();
@@ -1389,6 +1389,44 @@ async fn spawn_auto_round(
         .goal_event_is_swarm_note(event.seq)
         .unwrap_or(false)
     {
+        // A settled note may have been the open command that refused this
+        // Goal's round, so re-offer the latest unspent key.
+        if !matches!(
+            event.kind.as_str(),
+            "command.accepted" | "command.queued" | "command.dispatched"
+        ) && event
+            .subject
+            .as_ref()
+            .is_some_and(|subject| subject.state == AgentState::Idle)
+            && let Some(generation) = event.generation
+        {
+            let offer = {
+                let store = router.inner.store.lock().await;
+                match (
+                    store.goal_latest_idle_key(&agent, generation),
+                    store.goal_get(&agent, "eliot"),
+                ) {
+                    (Ok(Some(seq)), Ok(Some(goal))) => Some((seq, goal.revision)),
+                    _ => None,
+                }
+            };
+            if let Some((seq, revision)) = offer {
+                reserve_idle_round(
+                    router,
+                    run_check,
+                    rounds,
+                    in_flight,
+                    pending,
+                    pending_reconcile,
+                    IdleSubject::Retained {
+                        agent,
+                        generation,
+                        revision,
+                        seq,
+                    },
+                );
+            }
+        }
         return;
     }
     let subject = match event.generation {

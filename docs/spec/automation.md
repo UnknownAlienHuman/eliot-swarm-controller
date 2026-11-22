@@ -1659,10 +1659,16 @@ pending requests, every open harness source healthy (`daemon`/`os`/`git`/
 `workspace_process` monitors stay advisory), no unknown command, no open
 command, and the key is fresh — an idle key names an idle event of that
 Agent generation and is still its latest, a slot key names a due slot. A Swarm
-note is an `inject` from a `swarm_note:*` or `project_check` principal. An
-unclaimed queued note is not an open command, and no event of a note's lifecycle
-names an idle point or makes a key stale; neither does a `stale_round` abandonment
-event. Every other pending inject stays an open command by its principal, whatever
+note is an `inject` from a `swarm_note:*` or `project_check` principal. A note
+queued at `next_input` or `turn_safe_point` is not an open command. A queued
+`active_turn` note counts, but it exists only during its turn, which already
+refuses a round: the turn's terminal transaction moves it to `next_input` or
+cancels it. A dispatched note counts because its delivery is in flight and its
+result is not yet known; one that settles `unknown` blocks the round as an unknown
+command. No event of a note's lifecycle names an idle point or makes a key stale;
+neither does a `stale_round` abandonment event. A note's settlement re-offers the
+Goal's latest unspent idle key, so a round refused for that note still runs. Every
+other pending inject stays an open command by its principal, whatever
 its delivery outcome, so the round waits for it, and a real newer turn or command
 still wins. A
 turn budget already spent outside any round blocks without running the check. A
@@ -1889,7 +1895,8 @@ skips cadenced Goals (slot-keyed), paused or terminal Goals, drifted
 generations, and anything while automation is draining; it waits while an
 active native Goal drives. The driver starts each automatic round in its own task
 and runs up to four across Goals. Automatic and explicit rounds share the same
-per-Goal single-flight marker. Swarm note events schedule no round. After
+per-Goal single-flight marker. A Swarm note's admission and dispatch schedule no
+round; its settlement re-offers the latest unspent idle key. After
 `stale_round`, the driver moves to the latest unspent idle key if it is strictly
 newer and sends it through the same gates, so no idle point runs twice and each
 retry needs a new real Agent event (#904). The driver follows up on a newer event for a Goal
