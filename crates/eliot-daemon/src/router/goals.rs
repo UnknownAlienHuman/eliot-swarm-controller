@@ -75,6 +75,7 @@ struct ClaimedGoalRound {
     check: Option<Pin<Box<dyn Future<Output = ProcessOutcome> + Send>>>,
     quiescent: bool,
     pending_decision: Option<GoalRoundCommit>,
+    workspace_permit: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 impl ClaimedGoalRound {
@@ -108,6 +109,7 @@ impl ClaimedGoalRound {
             observation,
             fingerprint_before: None,
             fingerprint_after: None,
+            project_check: None,
             continuation: None,
         });
         let result = self
@@ -132,7 +134,9 @@ impl Drop for ClaimedGoalRound {
         self.cancellation.send_replace(true);
         let check = self.check.take();
         let pending_decision = self.pending_decision.take();
+        let workspace_permit = self.workspace_permit.take();
         self.runtime.spawn(async move {
+            let _workspace_permit = workspace_permit;
             if let Some(commit) = pending_decision {
                 // This exact decision was made before awaiting the Store.
                 let _ = router
@@ -429,6 +433,20 @@ impl Router {
                 "goal check input exceeds 1 MiB",
             ));
         }
+        drop(store);
+        let workspace_permit = if let Some(workspace) = probe.workspace.as_deref() {
+            let lock = self.workspace_check_lock(workspace);
+            Some(tokio::select! {
+                biased;
+                _ = super::project_checks::wait_for_check_shutdown(&mut cancellation) => {
+                    return Err(Error::new("cancelled", "Goal cancelled before checking its worktree"));
+                }
+                permit = lock.lock_owned() => permit,
+            })
+        } else {
+            None
+        };
+        let mut store = self.inner.store.lock().await;
         // The claim re-validates the probe and commits the durable in-flight
         // marker. Everything after it resolves the marker exactly once: the
         // commit consumes it, every other exit abandons it to `unknown`.
@@ -464,6 +482,7 @@ impl Router {
             check: None,
             quiescent: true,
             pending_decision: None,
+            workspace_permit,
         };
         let turns_used = probe
             .turn_count
@@ -620,6 +639,7 @@ impl Router {
                 observation: None,
                 fingerprint_before,
                 fingerprint_after,
+                project_check: None,
                 continuation: Some(GoalContinuation {
                     id: continuation_id,
                     text,
@@ -678,6 +698,16 @@ impl Router {
             ));
             GoalRoundDecision::Block(reason.to_owned())
         });
+        let project_check = if probe.project_default
+            && decision.is_none()
+            && let Some(fingerprint) = fingerprint_before.as_ref()
+            && let Some(project) = self.publication_check_project(&probe, &definition).await
+            && work_fingerprint(probe.workspace.as_deref()).await.as_ref() == Some(fingerprint)
+        {
+            Some((project, fingerprint.clone()))
+        } else {
+            None
+        };
         let commit = GoalRoundCommit {
             id: request.id.clone(),
             principal: principal.clone(),
@@ -692,10 +722,49 @@ impl Router {
             observation: None,
             fingerprint_before,
             fingerprint_after: None,
+            project_check,
             continuation: None,
         };
         let result = self.commit_goal_round(&principal, &request, &commit).await;
         claimed.complete(result)
+    }
+
+    async fn publication_check_project(
+        &self,
+        probe: &eliot_store::GoalRoundProbe,
+        definition: &GoalDefinition,
+    ) -> Option<String> {
+        let workspace = probe.workspace.as_deref()?;
+        if definition
+            .check_cwd
+            .as_deref()
+            .is_some_and(|cwd| cwd != workspace)
+        {
+            return None;
+        }
+        let agent = self
+            .inner
+            .store
+            .lock()
+            .await
+            .get_agent(&probe.view.agent)
+            .ok()??;
+        if agent.generation != probe.view.generation
+            || agent.workspace.as_deref() != Some(workspace)
+            || agent.branch.is_none()
+            || agent.parent.is_some()
+        {
+            return None;
+        }
+        crate::config::load_project_registration_config(&self.inner.data_root)
+            .ok()?
+            .into_iter()
+            .find(|project| {
+                project.id == agent.project
+                    && project.check == definition.check
+                    && project.actions.iter().any(|action| action == "git.publish")
+            })
+            .map(|project| project.id)
     }
 
     /// Retain the error; only proven custody closure may release the marker.

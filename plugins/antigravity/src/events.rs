@@ -880,6 +880,7 @@ impl State {
             summary,
             choices,
             feedback_allowed: false,
+            guard_refusal: None,
         })
         .map_err(|_| {
             Error::new(
@@ -887,12 +888,23 @@ impl State {
                 "Antigravity approval details could not be encoded",
             )
         })?;
-        let data = json!({
+        let mut data = json!({
             "command_id": command_id,
             "turn_id": turn_id,
             "kind": "approval",
             "details": details,
         });
+        if (ask.tool_kind.as_deref() == Some("execute")
+            || ask.tool_name.as_deref() == Some("run_command"))
+            && let Some(command) = ask
+                .raw_input
+                .get("command")
+                .or_else(|| ask.raw_input.get("CommandLine"))
+                .unwrap_or(&ask.raw_input)
+                .as_str()
+        {
+            data[eliot_core::COMMAND_GUARD_CONTEXT_FIELD] = json!({"commands": [command]});
+        }
         let publication = self
             .publish_permission_request(
                 data,

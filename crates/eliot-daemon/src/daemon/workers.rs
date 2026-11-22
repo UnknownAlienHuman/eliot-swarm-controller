@@ -1,17 +1,19 @@
 use crate::{logging, router::Router};
-use eliot_core::{Error, Result, SecretPolicy};
+use eliot_core::{Error, Result, SecretPolicy, api::DaemonStatusResponse};
 use std::{future::Future, sync::Arc, time::Duration};
 use tokio::{sync::watch, task::JoinSet, time::Instant};
 
-pub(crate) const WORKER_NAMES: [&str; 9] = [
+pub(crate) const WORKER_NAMES: [&str; DaemonStatusResponse::MAX_AUTOMATION_TASKS] = [
     "rule_worker",
     "goal_driver",
+    "project_checks",
     "maintenance",
     "monitor",
     "git_sampler",
     "attention",
     "tool_failure_attention",
     "mail_reoffer",
+    "agent_wake",
     "completion_digest",
 ];
 

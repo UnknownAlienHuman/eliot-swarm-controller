@@ -110,6 +110,90 @@ impl Router {
         self.signal_progress();
     }
 
+    /// Execute one frozen project-check publication and settle its ordinary
+    /// command. A retained unknown is never executed again.
+    pub(super) async fn execute_git_publish_command(
+        &self,
+        id: &str,
+        dispatched: Command,
+        registration: Option<ProjectRegistrationView>,
+    ) {
+        let Some(registration) = registration else {
+            self.settle(
+                id,
+                CommandState::Rejected,
+                Some(json!({"code":"git_publish_registration_missing"})),
+            )
+            .await;
+            self.signal_progress();
+            return;
+        };
+        let frozen = match serde_json::from_value::<eliot_core::api::FrozenGitPublish>(
+            dispatched.args.clone(),
+        ) {
+            Ok(frozen) if frozen.validate().is_ok() => frozen,
+            _ => {
+                self.settle(
+                    id,
+                    CommandState::Rejected,
+                    Some(json!({"code":"git_publish_frozen_intent_invalid"})),
+                )
+                .await;
+                self.signal_progress();
+                return;
+            }
+        };
+        let binding = {
+            let store = self.inner.store.lock().await;
+            match (
+                store.get_agent(&frozen.agent),
+                store.get_workspace(&frozen.agent),
+            ) {
+                (Ok(Some(agent)), Ok(Some(workspace))) => Ok((agent, workspace)),
+                (Ok(_), Ok(_)) => Err("git_publish_managed_workspace_missing"),
+                _ => Err("git_publish_workspace_read_failed"),
+            }
+        };
+        let (agent, workspace) = match binding {
+            Ok(binding) => binding,
+            Err(code) => {
+                self.settle(id, CommandState::Rejected, Some(json!({"code":code})))
+                    .await;
+                self.signal_progress();
+                return;
+            }
+        };
+        let mut execution =
+            crate::publication::execute(crate::publication::GitPublishExecutionContext {
+                router: self,
+                data_root: &self.inner.data_root,
+                command_id: id,
+                frozen: &frozen,
+                registration: &registration,
+                agent: &agent,
+                workspace: &workspace,
+                cancellation: self.run_cancellation_receiver(),
+                secret_policy: self.secret_policy_snapshot(),
+            })
+            .await;
+        self.redact_native_value(&mut execution.outcome);
+        let state = execution.state;
+        let expected_outcome = execution.outcome.clone();
+        let cleanup_view = execution.cleanup_view.take();
+        let settled = self.settle(id, state, Some(execution.outcome)).await;
+        let durable_match = settled.as_ref().is_some_and(|command| {
+            command.id == id
+                && command.verb == "git.publish"
+                && command.state == state
+                && state != CommandState::Unknown
+                && command.outcome.as_ref() == Some(&expected_outcome)
+        });
+        if durable_match && let Some(view) = cleanup_view {
+            crate::git_actions::cleanup_after_settlement(&self.inner.data_root, &view);
+        }
+        self.signal_progress();
+    }
+
     /// Execute a dispatched local `notify`/`emit`: commit its validated DTO
     /// as one persisted `x.user.*` event together with its Applied
     /// settlement in a single Store transaction, publishing the committed

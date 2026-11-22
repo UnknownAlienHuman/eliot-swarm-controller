@@ -14,7 +14,9 @@ use crate::plugin_host::PendingCommand;
 use eliot_core::{
     Agent, AgentState, Command, CommandState, ContextItem, Error, Event, FailureOrigin,
     FrozenScriptRun, InjectArgs, InjectPoint, Result, SecretPolicy,
-    api::{FrozenGitFetch, ProjectRegistrationView, configure_uses_native_session},
+    api::{
+        FrozenGitFetch, FrozenGitPublish, ProjectRegistrationView, configure_uses_native_session,
+    },
     classify_dispatched_error,
 };
 use eliot_core::{is_coordination_verb, is_start_verb, is_user_event_verb};
@@ -316,6 +318,60 @@ impl Router {
         id: &str,
         command: &Command,
     ) -> std::result::Result<Option<ProjectRegistrationView>, ()> {
+        if command.verb == "git.publish" {
+            let frozen = match serde_json::from_value::<FrozenGitPublish>(command.args.clone()) {
+                Ok(frozen) if frozen.validate().is_ok() => frozen,
+                _ => {
+                    self.reject_undispatched_error(
+                        id,
+                        &Error::new("invalid", "git.publish args are not a valid frozen intent")
+                            .with_where("router.dispatch.git_publish_gate"),
+                    )
+                    .await;
+                    return Err(());
+                }
+            };
+            if command.principal != format!("project:{}", frozen.repository) {
+                self.reject_undispatched_error(
+                    id,
+                    &Error::new(
+                        "not_allowed",
+                        "git.publish principal does not own the repository",
+                    )
+                    .with_where("router.dispatch.git_publish_gate"),
+                )
+                .await;
+                return Err(());
+            }
+            let registration = {
+                let store = self.inner.store.lock().await;
+                store.get_project_registration("owner", &frozen.repository)
+            };
+            return match registration {
+                Ok(Some(registration))
+                    if registration.revision == frozen.registration_revision
+                        && registration.id == frozen.repository =>
+                {
+                    Ok(Some(registration))
+                }
+                Ok(_) => {
+                    self.reject_undispatched_error(
+                        id,
+                        &Error::new(
+                            "not_allowed",
+                            "git.publish project registration is unavailable or stale",
+                        )
+                        .with_where("router.dispatch.git_publish_gate"),
+                    )
+                    .await;
+                    Err(())
+                }
+                Err(error) => {
+                    self.reject_undispatched_error(id, &error).await;
+                    Err(())
+                }
+            };
+        }
         if command.verb != "git.fetch" {
             return Ok(None);
         }
@@ -394,7 +450,7 @@ impl Router {
         let Some(project_id) = command.principal.strip_prefix("project:") else {
             return true;
         };
-        let registration = if command.verb == "git.fetch" {
+        let registration = if matches!(command.verb.as_str(), "git.fetch" | "git.publish") {
             match git_fetch_registration {
                 Some(registration) => Ok(Some(registration.clone())),
                 None => Err(Error::new(
@@ -628,6 +684,14 @@ impl Router {
                             "force shutdown prevents Git fetch dispatch",
                         ))
                     }
+                    None if command.verb == "git.publish"
+                        && self.inner.mode.load(Ordering::SeqCst) == MODE_FORCE =>
+                    {
+                        Err(Error::new(
+                            "bad_state",
+                            "force shutdown prevents Git publication dispatch",
+                        ))
+                    }
                     None if matches!(
                         command.verb.as_str(),
                         "notify" | "emit" | "attention.emit"
@@ -803,7 +867,7 @@ impl Router {
 
     /// Run native I/O for one Store-confirmed dispatch and settle it, keeping
     /// the order committed dispatch, native I/O, then settlement. `run` and
-    /// `git.fetch` carry their own settlement; every other verb loads its
+    /// `git.fetch` and `git.publish` carry their own settlement; every other verb loads its
     /// Agent and runs one verb-family helper.
     async fn execute_dispatched_command(
         &self,
@@ -864,6 +928,11 @@ impl Router {
         }
         if dispatched.verb == "git.fetch" {
             self.execute_git_fetch_command(&id, dispatched, git_fetch_registration)
+                .await;
+            return;
+        }
+        if dispatched.verb == "git.publish" {
+            self.execute_git_publish_command(&id, dispatched, git_fetch_registration)
                 .await;
             return;
         }

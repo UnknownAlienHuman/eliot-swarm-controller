@@ -45,6 +45,7 @@ mod switch;
 mod timers;
 mod usage;
 mod waits;
+mod wakes;
 mod workspaces;
 
 pub(crate) use string_list::deserialize_string_list;
@@ -65,11 +66,12 @@ pub use agent_views::{
     MAX_DIAGNOSE_ATTENTION_STEPS, MAX_DIAGNOSE_MESSAGE_CHARS, MAX_DIAGNOSE_STEPS,
     MAX_DIAGNOSE_SUMMARY_CHARS, NativeNotice, NativeNoticeKind, OwnedProcessKind,
     OwnedProcessSummary, PROCESS_CURSOR_MAX_BYTES, PatchDigestFile, ProcessPageCursor,
-    ProjectCheckoutView, ProjectDiscoverResponse, ProjectGitView, ProjectRegistrationView,
-    RetainedUnknownSummary, RetentionView, RunningTurnSummary, SourceOwner, SourceState,
-    StatusBlocker, UnsettledCommandSummary, WorkerTaskHealth, WorkerTaskStatus,
-    WorkspaceCustodyView, activity_state_name, agent_state_name, agent_status_line,
-    diagnosis_reason, process_state_name, repository_name_from_url, stats_coverage_name,
+    ProjectCheckoutView, ProjectDiscoverResponse, ProjectGitHubCliView, ProjectGitPublicationView,
+    ProjectGitView, ProjectRegistrationView, RetainedUnknownSummary, RetentionView,
+    RunningTurnSummary, SourceOwner, SourceState, StatusBlocker, UnsettledCommandSummary,
+    WorkerTaskHealth, WorkerTaskStatus, WorkspaceCustodyView, activity_state_name,
+    agent_state_name, agent_status_line, diagnosis_reason, process_state_name,
+    repository_name_from_url, stats_coverage_name,
 };
 pub use config_views::{
     CONFIG_REVISION_HEX_LEN, MAX_LISTED_PROFILES, MAX_PROFILES_SOURCE_BYTES, ProfileListRequest,
@@ -98,8 +100,10 @@ pub use digests::{
     digest_text, digest_thread, fair_excerpt_cap,
 };
 pub use git::{
-    DEFAULT_GIT_FETCH_TIMEOUT_MS, FrozenGitFetch, GitFetchDefinitionArgs, GitFetchOutcome,
-    is_git_oid,
+    DEFAULT_GIT_FETCH_TIMEOUT_MS, DEFAULT_GIT_PUBLISH_TIMEOUT_MS, FrozenGitFetch, FrozenGitPublish,
+    GitFetchDefinitionArgs, GitFetchOutcome, GitPublishDefinitionArgs, GitPublishOutcome,
+    GitPublishTrigger, MAX_GIT_PUBLISH_SUBJECT_BYTES, ProjectCheckPassed, is_git_oid,
+    validate_git_publish_subject,
 };
 pub use goals::{
     AssignmentGoal, CHECK_SPAWN_RETRYABLE, DEFAULT_GOAL_CHECK_TIMEOUT_MS, GoalClearRequest,
@@ -107,7 +111,8 @@ pub use goals::{
     GoalGetRequest, GoalMarkerState, GoalMode, GoalPauseRequest, GoalResumeRequest, GoalRoundEvent,
     GoalRoundEventOutcome, GoalRoundMarker, GoalRoundOutcome, GoalRoundRequest, GoalRoundResponse,
     GoalScopeBase, GoalScopeStart, GoalSetRequest, GoalStatus, GoalView, MAX_GOAL_CADENCE_MS,
-    MAX_GOAL_LIMIT, MAX_GOAL_OBSERVATION_BYTES, MAX_GOAL_SCOPE_BASE_PATHS, MIN_GOAL_CADENCE_MS,
+    MAX_GOAL_CHECK_ARG_BYTES, MAX_GOAL_CHECK_ARGS, MAX_GOAL_LIMIT, MAX_GOAL_OBSERVATION_BYTES,
+    MAX_GOAL_SCOPE_BASE_PATHS, MIN_GOAL_CADENCE_MS,
 };
 pub use handoff::{
     CommandCancelRequest, CommandCancelResponse, HandoffRequest, HandoffResponse,
@@ -216,6 +221,11 @@ pub use usage::{
 pub use waits::{
     MAX_SWARM_WAIT_MS, MAX_SWARM_WAIT_TARGETS, MAX_WAIT_FINAL_TEXT_BYTES, MAX_WAIT_FRAME_BYTES,
     SwarmWaitRequest, SwarmWaitResponse, WaitEntryResult, WaitTurnRef, truncate_bytes,
+};
+pub use wakes::{
+    AgentWakeCondition, AgentWakeRequest, AgentWakeResponse, DEFAULT_AGENT_WAKE_TIMEOUT_SECS,
+    MAX_AGENT_WAKE_ID_BYTES, MAX_AGENT_WAKE_PATH_BYTES, MAX_AGENT_WAKE_PATH_COMPONENTS,
+    MAX_AGENT_WAKE_RUN_ID_BYTES, MAX_AGENT_WAKE_TIMEOUT_SECS, MAX_AGENT_WAKE_TURN_ID_BYTES,
 };
 pub use workspaces::{ManagedWorkspaceView, WorkspaceListRequest, WorkspaceListResponse};
 

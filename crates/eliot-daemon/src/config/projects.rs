@@ -5,6 +5,7 @@ use super::{
     FileConfig, MAX_PROFILE_NAME_LEN, MAX_PROFILES, config_error_at,
     configured_route_credential_env_names, read_config, validate_profile_name,
 };
+use crate::command_guard::ProjectCommandGuard;
 use eliot_core as core;
 use serde::Deserialize;
 use std::{
@@ -13,6 +14,8 @@ use std::{
 };
 
 const MAX_PROJECT_PATH_LEN: usize = 4096;
+const MAX_PROJECT_CHECK_ROUNDS: i64 = 16;
+const DEFAULT_PROJECT_CHECK_ROUNDS: i64 = 3;
 
 /// Managed-worktree policy for top-level launches in a registered project.
 /// `worktree` (the default) prepares one standard worktree per top-level
@@ -34,6 +37,11 @@ pub(crate) struct ProjectRegistrationConfig {
     pub git: Option<core::api::ProjectGitView>,
     pub interpreters: BTreeMap<String, core::api::ScriptInterpreter>,
     pub run_env: Vec<String>,
+    pub format: Vec<String>,
+    pub check: Vec<String>,
+    pub check_at_turn_end: bool,
+    pub max_rounds: Option<i64>,
+    pub command_guards: Vec<ProjectCommandGuard>,
     pub workspace: ProjectWorkspaceMode,
 }
 
@@ -305,6 +313,20 @@ pub(super) struct ProjectEntry {
     interpreters: BTreeMap<String, core::api::ScriptInterpreter>,
     #[serde(default)]
     run_env: Vec<String>,
+    /// Explicit argv run after a debounced file edit to format the Agent worktree.
+    #[serde(default)]
+    format: Vec<String>,
+    /// Explicit argv used for fast checks and the project default Goal.
+    #[serde(default)]
+    check: Vec<String>,
+    /// Run a heavy check only through the idle Goal driver.
+    #[serde(default)]
+    check_at_turn_end: bool,
+    /// Bounds automatic Goal rounds.
+    #[serde(default)]
+    max_rounds: Option<i64>,
+    #[serde(default)]
+    command_guards: Vec<ProjectCommandGuard>,
     /// `workspace = "worktree" | "shared"`, default `worktree`.
     #[serde(default)]
     workspace: ProjectWorkspaceMode,
@@ -399,6 +421,7 @@ pub(super) fn project_registrations_in(
                             | "stop"
                             | "send"
                             | "git.fetch"
+                            | "git.publish"
                             | "steer"
                             | "interrupt"
                             | "approve"
@@ -411,6 +434,33 @@ pub(super) fn project_registrations_in(
                             | "var.set"
                     )
             })?;
+        let format = normalize_project_command_argv(&entry.format, source, offset, id, "format")?;
+        let check = normalize_project_command_argv(&entry.check, source, offset, id, "check")?;
+        let max_rounds = match (check.is_empty(), entry.max_rounds) {
+            (false, Some(rounds)) if (1..=MAX_PROJECT_CHECK_ROUNDS).contains(&rounds) => {
+                Some(rounds)
+            }
+            (false, None) => Some(DEFAULT_PROJECT_CHECK_ROUNDS),
+            (false, Some(_)) => {
+                return Err(config_error_at(
+                    source,
+                    offset,
+                    &format!("projects.{id}.max_rounds"),
+                    "must be between 1 and 16",
+                    "profile_error",
+                ));
+            }
+            (true, Some(_)) => {
+                return Err(config_error_at(
+                    source,
+                    offset,
+                    &format!("projects.{id}.max_rounds"),
+                    "requires a project check command",
+                    "profile_error",
+                ));
+            }
+            (true, None) => None,
+        };
         let git = entry.git.clone();
         if let Some(git) = &git {
             validate_project_git_config(git, source, offset, id)?;
@@ -423,6 +473,7 @@ pub(super) fn project_registrations_in(
             offset,
             &format!("projects.{id}"),
         )?;
+        validate_project_command_guards(id, &entry.command_guards, source, offset)?;
 
         projects.push(ProjectRegistrationConfig {
             id: id.clone(),
@@ -432,11 +483,90 @@ pub(super) fn project_registrations_in(
             git,
             interpreters: run_grant.interpreters,
             run_env: run_grant.run_env,
+            format,
+            check,
+            check_at_turn_end: entry.check_at_turn_end,
+            max_rounds,
+            command_guards: entry.command_guards.clone(),
             workspace: entry.workspace,
         });
     }
     projects.sort_by(|left, right| left.id.cmp(&right.id));
     Ok(projects)
+}
+
+fn normalize_project_command_argv(
+    argv: &[String],
+    source: &str,
+    offset: usize,
+    project_id: &str,
+    field: &str,
+) -> core::Result<Vec<String>> {
+    if argv.is_empty() {
+        return Ok(Vec::new());
+    }
+    if argv.len() > core::api::MAX_GOAL_CHECK_ARGS
+        || argv.iter().any(|arg| {
+            arg.is_empty()
+                || arg.len() > core::api::MAX_GOAL_CHECK_ARG_BYTES
+                || arg.chars().any(char::is_control)
+        })
+    {
+        return Err(config_error_at(
+            source,
+            offset,
+            &format!("projects.{project_id}.{field}"),
+            "must be explicit argv with 1 to 32 nonempty arguments of at most 4 KiB and no control characters",
+            "profile_error",
+        ));
+    }
+    Ok(argv.to_vec())
+}
+
+fn validate_project_command_guards(
+    project_id: &str,
+    entries: &[ProjectCommandGuard],
+    source: &str,
+    offset: usize,
+) -> core::Result<()> {
+    let field = format!("projects.{project_id}.command_guards");
+    if entries.len() > crate::command_guard::MAX_PROJECT_GUARDS {
+        return Err(config_error_at(
+            source,
+            offset,
+            &field,
+            "exceeds 64 entries",
+            "profile_error",
+        ));
+    }
+    for entry in entries {
+        if entry.pattern.is_empty()
+            || entry.pattern.len() > crate::command_guard::MAX_PATTERN_BYTES
+            || entry.pattern.chars().any(char::is_control)
+            || globset::Glob::new(&entry.pattern).is_err()
+        {
+            return Err(config_error_at(
+                source,
+                offset,
+                &field,
+                "patterns must be valid nonempty globs of at most 1024 bytes",
+                "profile_error",
+            ));
+        }
+        if entry.refusal.trim().is_empty()
+            || entry.refusal.len() > crate::command_guard::MAX_REFUSAL_BYTES
+            || entry.refusal.chars().any(char::is_control)
+        {
+            return Err(config_error_at(
+                source,
+                offset,
+                &field,
+                "refusal text must be a nonempty single line of at most 512 bytes",
+                "profile_error",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn normalize_project_allowlist(
@@ -503,6 +633,19 @@ fn validate_project_git_config(
                 "must be an absolute local path or direct HTTP, HTTPS, Git, or file URL without credentials or helper schemes; SSH is unsupported",
                 "profile_error",
             ));
+        }
+    }
+    if let Some(publication) = &git.publication {
+        for (remote, endpoint) in &publication.remotes {
+            if !is_direct_project_fetch_endpoint(endpoint) {
+                return Err(config_error_at(
+                    source,
+                    offset,
+                    &format!("projects.{project_id}.git.publication.remotes.{remote}"),
+                    "must be an absolute local path or direct HTTP, HTTPS, Git, or file URL without credentials or helper schemes; SSH is unsupported",
+                    "profile_error",
+                ));
+            }
         }
     }
     Ok(())

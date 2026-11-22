@@ -216,6 +216,8 @@ pub use switch::{PROVIDER_SWITCH_QUEUED, PROVIDER_SWITCH_SETTLED, SwitchWork};
 mod swarm_usage;
 mod turn_recovery;
 pub(crate) mod usage;
+mod wakes;
+pub use wakes::{AgentWakeRecord, AgentWakeRunReceipt, AgentWakeTurnReadiness};
 mod workspace;
 
 fn sql_error(error: rusqlite::Error) -> Error {
@@ -4004,12 +4006,12 @@ fn repo_git_write_blocked_tx(
             |row| row.get(0),
         )
         .map_err(sql_error)?;
-    let fetch_pending = tx
+    let git_action_pending = tx
         .query_row(
             "SELECT EXISTS(
              SELECT 1
              FROM commands prior
-             WHERE prior.verb = 'git.fetch'
+             WHERE prior.verb IN ('git.fetch','git.publish')
                AND prior.id <> ?1
                AND prior.state IN ('accepted','queued','dispatched','unknown')
                AND json_extract(prior.args, '$.common_dir') = ?2
@@ -4019,7 +4021,7 @@ fn repo_git_write_blocked_tx(
             |row| row.get(0),
         )
         .map_err(sql_error)?;
-    if fetch_pending {
+    if git_action_pending {
         return Ok(true);
     }
     tx.query_row(

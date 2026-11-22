@@ -25,6 +25,13 @@ pub(crate) fn git_fetch_timeout_ms(timeout: Option<&str>) -> Result<i64> {
         None => Ok(eliot_core::api::DEFAULT_GIT_FETCH_TIMEOUT_MS),
     }
 }
+
+pub(crate) fn git_publish_timeout_ms(timeout: Option<&str>) -> Result<i64> {
+    match timeout {
+        Some(timeout) => schedule::parse_positive_duration_ms(timeout),
+        None => Ok(eliot_core::api::DEFAULT_GIT_PUBLISH_TIMEOUT_MS),
+    }
+}
 use eliot_store::{
     RuleCursorOutcome, RuleDefinitionInput, RuleProcessingState, TimerDefinitionInput,
     TimerSlotCommit,
@@ -1358,6 +1365,14 @@ async fn run_global_rules_inner(
             received = events.recv() => match received {
                 Ok(event) => {
                     router.note_unknown(std::slice::from_ref(&event));
+                    if let Err(error) = router.deliver_project_guard(&event).await {
+                        logging::record(
+                            &router.secret_policy_snapshot(),
+                            "daemon.project_guard_delivery_failed",
+                            &[("event_seq", &event.seq.to_string())],
+                            Some(&error),
+                        );
+                    }
                     recover_rule_children = true;
                     if event_wakes_launch_arbitration(&event) {
                         arbitrate_launches = true;

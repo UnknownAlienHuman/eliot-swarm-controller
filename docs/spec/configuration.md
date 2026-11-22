@@ -782,6 +782,16 @@ allowlist. Project Run remains confined to its separate registered-checkout
 
 ## Project registration and rule authority
 
+A registered project may define a static command refusal table with
+[[projects.ID.command_guards]]. Each entry has a pattern glob and a literal,
+single-line refusal. Globs match the full command supplied by a native
+permission request and each trimmed segment separated by unquoted, unescaped
+`;`, `|`, `&`, or a newline. Matching uses the supplied text without shell
+expansion. Up to 64 entries are accepted; patterns are at most 1024 bytes and refusal
+text at most 512 bytes. The daemon freezes the registered project's table into each
+admitted launch after project discovery. It is evaluated only when a supported native
+permission request exposes the command.
+
 Owner-global `[projects.ID]` entries register projects. On an Owner open or launch in
 an unregistered Git checkout, S2 creates an entry through the settings writer,
 recorded as a machine change. Its profile allowlist is the existing profiles;
@@ -807,8 +817,14 @@ profiles and implemented actions. Missing or empty allowlists deny all.
 `workspace` selects managed-worktree policy for top-level launches in the
 project: `worktree` (the default for registered projects) prepares one standard
 worktree per top-level launch without any flag, while `shared` keeps sharing
-the registered checkout as before. Any other value is invalid. Project
-registration readback uses the canonical Core [`ProjectRegistrationView`](../../crates/eliot-core/src/api/agent_views.rs);
+the registered checkout as before. Any other value is invalid.
+`format` and `check` are optional explicit argv arrays (1–32 nonempty
+arguments, at most 4 KiB each); the daemon never parses them through a shell.
+After a Git-confirmed `file.changed` hint or dirty `git.changed` snapshot
+settles, the daemon runs `format` and then `check` in the Agent's managed
+worktree. Set `check_at_turn_end = true` for a heavy check that runs through
+the idle Goal driver. With `check`, `max_rounds` defaults to 3 and accepts 1–16.
+Project registration readback uses the canonical Core [`ProjectRegistrationView`](../../crates/eliot-core/src/api/agent_views.rs);
 project identity includes the canonical checkout and Git common directory. The registration ID names nothing a person reads: a project's name is the
 owner's `[desktop] display_names` entry, else the repository name of its `origin` remote
 (the readback's read-only `origin`, [api](api.md)), else the folder of the repository's
@@ -858,6 +874,40 @@ Core `ProjectRegistrationView.git` is `Option<ProjectGitView>`; `ProjectGitView`
 [`agent_views.rs`](../../crates/eliot-core/src/api/agent_views.rs) and are exported by
 [`api.rs`](../../crates/eliot-core/src/api.rs). These approvals are part of the saved
 registration revision and cannot be changed by project rule files.
+
+The optional `[projects.ID.git.publication]` table maps literal aliases to direct
+Owner-approved push endpoints. Endpoints are absolute local paths or direct HTTP, HTTPS,
+Git, or file URLs without credentials, rewrites, helper schemes, query data, or fragments;
+SSH and ambient remote selection are unsupported. This is an independent allowlist from
+`fetch_remotes`: a fetch approval never authorizes a push. A project rule must also be
+granted the `git.publish` action in `actions` and name an approved publication alias.
+
+The optional `[projects.ID.git.publication.github_cli]` table selects one executable,
+existing GitHub CLI config directory, host, repository (`owner/name`), and base ref. Every
+field is literal and owner-configured. For PR creation the selected HTTPS publication
+endpoint must match that host and repository. Eliot passes the config directory through
+`GH_CONFIG_DIR` for the command lifetime and reads it in place; config contents and tokens
+are never copied into settings, command args, events, or logs. The CLI executable and
+config directory must be absolute existing paths without a symlink or reparse root. These
+fields are part of the saved registration revision and are rechecked at publication.
+
+An owner-approved publication rule is stored in the registered checkout's
+`.eliot/rules/*.toml`:
+
+```toml
+[[rule]]
+id = "publish-final-check"
+on = { event = "project.check.passed" }
+do = [{ action = "git.publish", repository = "app", remote = "qa" }]
+```
+
+The rule is opt-in per project. It always commits the exact checked managed-worktree
+snapshot with the first line of the matching final answer. Omitting `remote` makes a local
+commit only. Setting `create_pr = true` requires a named approved remote and the explicit
+GitHub CLI integration above. The dedicated pass event comes only from successful final
+project-check settlement; manual Goals and ordinary `goal.changed`/turn events do not
+qualify. The event envelope and Core `ProjectCheckPassed` bind the project, retained turn,
+Agent generation, workspace fingerprint, and commit subject before Store dispatch.
 
 For `git.fetch`, a project rule must be granted `git.fetch` and its literal `repository`
 must equal the ID in its saved `project:ID` principal. Owner-global rules may select any
@@ -1385,6 +1435,16 @@ Mask known secret values in native output and reject them in caller durable text
 Private routing tokens are handled separately from semantic profile data. Native
 children receive their own identity only where isolated environment injection is possible;
 otherwise their CLI calls remain attributed to the parent, as the plugin reports.
+
+The profile switch `pass_agent_identity_to_shell` defaults to `true`. With `false`,
+shell commands omit the Agent identity variables. A marker carrying no Agent
+identity makes the shell CLI reject requests that would use Owner authority.
+Codex supplies its named MCP server from the per-Agent app-server environment
+and filters identity variables from shell tools. Claude, OpenCode and Antigravity
+pass scoped identity directly to the managed MCP server. OpenCode's inherited
+identity path continues to use the process environment when the switch is `true`.
+Muse currently uses shell CLI identity, so disabling it prevents Agent
+authentication from that shell.
 
 ## Accounts and configured capacity
 

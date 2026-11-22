@@ -100,6 +100,9 @@ fn is_false(value: &bool) -> bool {
     !value
 }
 
+/// Daemon-derived launch argument carrying the default project-check Goal.
+pub const PROJECT_CHECK_GOAL_ARG: &str = "_project_check_goal";
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FrozenSetupFile {
     pub canonical_path: String,
@@ -1366,11 +1369,27 @@ impl SourceBatch {
     }
 }
 
+/// Ephemeral request field carrying a native command to daemon-side guards.
+pub const COMMAND_GUARD_CONTEXT_FIELD: &str = "command_guard";
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BatchAck {
     pub first_seq: i64,
     pub last_seq: i64,
     pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_refusal: Option<PermissionRefusal>,
+}
+
+/// Daemon refusal returned with the durable acknowledgement for one exact
+/// native permission request. The source batch binds the Agent generation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionRefusal {
+    pub agent_id: String,
+    pub generation: i64,
+    pub request_id: String,
+    pub turn_id: String,
+    pub message: String,
 }
 
 /// Stream-loss boundary reported by the Codex producer via `source.gap`.
@@ -2174,7 +2193,7 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
             let request_id = required_text(event, "request_id")?;
             let turn_id = required_text(event, "turn_id")?;
             let kind = required_text(event, "kind")?;
-            let details = optional_details(event)?;
+            let mut details = optional_details(event)?;
             if let Some(existing) = agent.pending.iter().find(|p| p.id == request_id) {
                 // Same binding, new offer: a harness may re-open its exact pending
                 // id with updated details proven from its authentic native stream
@@ -2188,6 +2207,11 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
                             agent.id
                         ),
                     ));
+                }
+                if let Some(refusal) = existing.details.get("guard_refusal")
+                    && let Some(current) = details.as_object_mut()
+                {
+                    current.insert("guard_refusal".to_owned(), refusal.clone());
                 }
                 if existing.details != details
                     && let Some(slot) = next.pending.iter_mut().find(|p| p.id == request_id)

@@ -9,6 +9,7 @@ mod reader;
 mod source_handoff;
 mod source_intake;
 use crate::bus::Bus;
+use crate::command_guard::CommandGuardPolicy;
 use crate::common::{now_ms, valid_environment_name};
 use crate::monitor::Monitoring;
 use crate::platform::OwnedChild;
@@ -390,6 +391,8 @@ struct AgentActorConfig {
     plugin_credential: String,
     _prepared_mcp: Option<antigravity_mcp::PreparedConfig>,
     target_environment: Value,
+    mcp_environment: Option<Value>,
+    pass_agent_identity_to_shell: bool,
     source_credentials: Arc<[String]>,
     resume_from: Option<Value>,
     source_state: Option<Value>,
@@ -430,6 +433,7 @@ struct EventSource {
     generation: i64,
     expected_credential: String,
     observation: Option<Agent>,
+    command_guard_policy: CommandGuardPolicy,
 }
 
 #[derive(Clone)]
@@ -635,7 +639,7 @@ impl PluginHost {
                     )
                 })?
         };
-        let mut target_environment =
+        let (mut target_environment, mcp_environment) =
             build_target_environment(&self.state.data_root, &agent, &agent_token)?;
         if let Some(root) = self
             .state
@@ -829,6 +833,7 @@ impl PluginHost {
                 generation: key.generation,
                 expected_credential: credential.clone(),
                 observation: None,
+                command_guard_policy: CommandGuardPolicy::from_profile(&agent.profile_snapshot)?,
             },
         ));
         let (message_tx, message_rx) = mpsc::channel(16);
@@ -862,6 +867,17 @@ impl PluginHost {
             plugin_credential: credential.clone(),
             _prepared_mcp: prepared_mcp,
             target_environment,
+            mcp_environment: (!agent.is_automatic_provider_probe()
+                && matches!(
+                    agent.harness.as_str(),
+                    "codex" | "claude" | "opencode" | "antigravity"
+                ))
+            .then_some(mcp_environment),
+            pass_agent_identity_to_shell: agent
+                .profile_snapshot
+                .get("pass_agent_identity_to_shell")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
             source_credentials: Arc::clone(&source_credentials),
             resume_from,
             source_state,
@@ -3152,7 +3168,11 @@ fn prepare_process_environment(
     Ok((environment, identity))
 }
 
-fn build_target_environment(data_root: &Path, agent: &Agent, agent_token: &str) -> Result<Value> {
+fn build_target_environment(
+    data_root: &Path,
+    agent: &Agent,
+    agent_token: &str,
+) -> Result<(Value, Value)> {
     if agent.harness == "codex"
         && !agent
             .profile_snapshot
@@ -3165,30 +3185,48 @@ fn build_target_environment(data_root: &Path, agent: &Agent, agent_token: &str) 
         ));
     }
     let mut environment = build_process_environment(&agent.profile_snapshot)?;
+    let mut mcp_environment = Map::new();
     let home = data_root
         .to_str()
         .ok_or_else(|| Error::new("invalid", "data directory path is not UTF-8"))?;
-    insert_environment(&mut environment, "ELIOT_HOME", home.to_owned());
+    insert_environment(&mut mcp_environment, "ELIOT_HOME", home.to_owned());
     let scope_dir = crate::daemon::normalize_identity_data_dir(data_root);
     let scope_dir = scope_dir
         .to_str()
         .ok_or_else(|| Error::new("invalid", "data directory path is not UTF-8"))?;
     insert_environment(
-        &mut environment,
+        &mut mcp_environment,
         crate::daemon::AGENT_DATA_DIR_ENV,
         scope_dir.to_owned(),
     );
-    insert_environment(&mut environment, "ELIOT_AGENT_ID", agent.id.clone());
+    insert_environment(&mut mcp_environment, "ELIOT_AGENT_ID", agent.id.clone());
     insert_environment(
-        &mut environment,
+        &mut mcp_environment,
         "ELIOT_AGENT_GENERATION",
         agent.generation.to_string(),
     );
     insert_environment(
-        &mut environment,
+        &mut mcp_environment,
         "ELIOT_AGENT_TOKEN",
         agent_token.to_owned(),
     );
+    let pass_identity = agent
+        .profile_snapshot
+        .get("pass_agent_identity_to_shell")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    // Codex's app-server supplies its MCP identity from named environment
+    // variables and filters those variables from its shell tools.
+    if pass_identity || agent.harness == "codex" {
+        environment.extend(mcp_environment.clone());
+    }
+    if !pass_identity {
+        insert_environment(
+            &mut environment,
+            crate::daemon::SHELL_IDENTITY_DISABLED_ENV,
+            "1".to_owned(),
+        );
+    }
     let executable = std::env::current_exe()
         .map_err(|error| Error::new("platform_io", format!("locate Eliot executable: {error}")))?;
     let controller_dir = executable
@@ -3238,7 +3276,7 @@ fn build_target_environment(data_root: &Path, agent: &Agent, agent_token: &str) 
         .into_string()
         .map_err(|_| Error::new("invalid", "managed target PATH is not valid Unicode"))?;
     insert_environment(&mut environment, "PATH", path_value);
-    Ok(Value::Object(environment))
+    Ok((Value::Object(environment), Value::Object(mcp_environment)))
 }
 
 fn insert_environment(environment: &mut Map<String, Value>, name: &str, value: String) {

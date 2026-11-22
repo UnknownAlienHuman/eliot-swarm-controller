@@ -1337,6 +1337,8 @@ struct ProfileEntry {
     #[serde(default)]
     pass_env: Option<Vec<String>>,
     #[serde(default)]
+    pass_agent_identity_to_shell: Option<bool>,
+    #[serde(default)]
     setup: Vec<crate::setup::SetupEntry>,
     #[serde(default = "default_scratch")]
     scratch: Vec<String>,
@@ -2083,6 +2085,7 @@ struct ProfileTail {
     pass_env: Vec<String>,
     cmd: Option<String>,
     scratch: Vec<String>,
+    pass_agent_identity_to_shell: bool,
 }
 
 fn validate_profile_tail(
@@ -2155,6 +2158,7 @@ fn validate_profile_tail(
         pass_env,
         cmd,
         scratch,
+        pass_agent_identity_to_shell: entry.pass_agent_identity_to_shell.unwrap_or(true),
     })
 }
 
@@ -2173,6 +2177,12 @@ fn insert_profile_tail(
         Value::Array(tail.pass_env.into_iter().map(Value::String).collect()),
     );
     snapshot.insert("scratch".to_owned(), json!(tail.scratch));
+    if !tail.pass_agent_identity_to_shell {
+        snapshot.insert(
+            "pass_agent_identity_to_shell".to_owned(),
+            Value::Bool(false),
+        );
+    }
     if !setup.is_empty() {
         snapshot.insert(
             "setup".to_owned(),

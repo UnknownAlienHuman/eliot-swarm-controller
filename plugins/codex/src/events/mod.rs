@@ -1219,13 +1219,18 @@ impl EventProcessor {
             self.defer_gap("Codex public request view could not be normalized");
             return Ok(());
         };
-        let data = json!({
+        let mut data = json!({
             "command_id": command_id,
             "request_id": request.id,
             "turn_id": request.turn_id,
             "kind": public_kind,
             "details": public_details,
         });
+        if request.kind == "command_execution_approval"
+            && let Some(command) = request.details["command"].as_str()
+        {
+            data[eliot_core::COMMAND_GUARD_CONTEXT_FIELD] = json!({"commands": [command]});
+        }
         if serde_json::to_vec(&data).map_or(true, |bytes| bytes.len() > MAX_EVENT_BYTES) {
             let _ = self
                 .native

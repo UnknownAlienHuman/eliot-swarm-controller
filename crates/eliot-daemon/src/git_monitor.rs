@@ -1,8 +1,7 @@
 //! Local, bounded Git readback. Wire formats follow the official Git 2.55
 //! git-status (porcelain v2/-z), git-ls-files, git-log and git-check-ignore docs.
-//! No donor application code, shell, index/ref/object writes, or network reads.
-//! Reads require leaf custody. Workspace writes are only prepared here; their
-//! manager owns ordinary scoped execution and cancellation serialization.
+//! No donor application code, shell, or network reads. Reads require leaf
+//! custody; the publication path uses the separate scoped effect runner below.
 
 use crate::platform::{OwnedChild, is_reparse_point};
 use eliot_core::api::is_git_oid;
@@ -951,10 +950,10 @@ impl GitProbe {
         )?;
         let (dirty_digest, _) = dirty_worktree_digest(&root, &status.dirty)
             .map_err(|reason| unavailable(&format!("workspace content digest: {reason}")))?;
-        let mut hasher = Sha256::new();
-        hash_digest_part(&mut hasher, status.head.as_deref().unwrap_or("").as_bytes());
-        hash_digest_part(&mut hasher, dirty_digest.as_bytes());
-        Ok(hex_digest(hasher.finalize().as_slice()))
+        Ok(work_fingerprint_from_parts(
+            status.head.as_deref(),
+            &dirty_digest,
+        ))
     }
 
     /// HEAD and the changed paths of a Goal's workspace.
@@ -1094,6 +1093,59 @@ impl GitProbe {
     ) -> Result<Captured> {
         let overrides = self.safe_overrides(root, deadline).await?;
         self.run(root, args, &overrides, &[], deadline).await
+    }
+
+    /// Read using one explicitly scoped index file, without inheriting any
+    /// caller-provided Git index override.
+    pub(crate) async fn workspace_command_with_index(
+        &self,
+        root: &Path,
+        args: &[&str],
+        index_file: &Path,
+        deadline: Instant,
+    ) -> Result<Captured> {
+        let overrides = self.safe_overrides(root, deadline).await?;
+        let command =
+            self.build_command_with_index(root, args, &overrides, None, Some(index_file))?;
+        let (code, stdout) = Self::capture_git(command, &[], deadline, |stdout| {
+            bounded_read(stdout, OUTPUT_BYTES)
+        })
+        .await?;
+        Ok(Captured { code, stdout })
+    }
+
+    /// Run one explicitly dispatched local Git mutation with a private index
+    /// and the same sanitized config and process fence as Git observation.
+    pub(crate) async fn workspace_effect_command_with_index(
+        &self,
+        root: &Path,
+        args: &[&str],
+        index_file: &Path,
+        timeout: Duration,
+        policy: std::sync::Arc<eliot_core::SecretPolicy>,
+        cancellation: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<crate::scripts::process::ProcessOutcome> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| Error::new("invalid", "Git effect timeout is out of range"))?;
+        let overrides = self.safe_overrides(root, deadline).await?;
+        if Instant::now() >= deadline {
+            return Err(unavailable("Git effect preparation deadline elapsed"));
+        }
+        let command =
+            self.build_command_with_index(root, args, &overrides, None, Some(index_file))?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(unavailable("Git effect preparation deadline elapsed"));
+        }
+        Ok(crate::scripts::process::run_owned_process(
+            command,
+            Vec::new(),
+            remaining,
+            policy,
+            cancellation,
+        )
+        .await)
     }
 
     /// Read from the captured Git repository binding, even if the checkout's
@@ -1244,6 +1296,17 @@ impl GitProbe {
         overrides: &[(String, String)],
         binding: Option<GitBinding<'_>>,
     ) -> Result<Command> {
+        self.build_command_with_index(root, args, overrides, binding, None)
+    }
+
+    fn build_command_with_index(
+        &self,
+        root: &Path,
+        args: &[&str],
+        overrides: &[(String, String)],
+        binding: Option<GitBinding<'_>>,
+        index_file: Option<&Path>,
+    ) -> Result<Command> {
         let mut command = Command::new(&self.program);
         command.current_dir(root).env_clear();
         if let Some(binding) = binding {
@@ -1251,6 +1314,9 @@ impl GitProbe {
                 .env("GIT_DIR", git_path_argument(binding.git_dir)?)
                 .env("GIT_COMMON_DIR", git_path_argument(binding.common_dir)?)
                 .env("GIT_WORK_TREE", git_path_argument(root)?);
+        }
+        if let Some(index_file) = index_file {
+            command.env("GIT_INDEX_FILE", git_path_argument(index_file)?);
         }
         // Only the executable's trusted directory is searched by Git's own helpers.
         let executable_dir = self
@@ -2066,6 +2132,25 @@ fn count_text_lines(bytes: &[u8]) -> u64 {
 fn hash_digest_part(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update((bytes.len() as u64).to_le_bytes());
     hasher.update(bytes);
+}
+
+pub(crate) fn work_fingerprint_from_snapshot(snapshot: &GitSnapshot) -> Result<String> {
+    let dirty_digest = snapshot
+        .work
+        .as_ref()
+        .and_then(|work| work.dirty_digest.as_deref())
+        .ok_or_else(|| unavailable("workspace dirty fingerprint is unavailable"))?;
+    Ok(work_fingerprint_from_parts(
+        snapshot.head.as_deref(),
+        dirty_digest,
+    ))
+}
+
+fn work_fingerprint_from_parts(head: Option<&str>, dirty_digest: &str) -> String {
+    let mut hasher = Sha256::new();
+    hash_digest_part(&mut hasher, head.unwrap_or("").as_bytes());
+    hash_digest_part(&mut hasher, dirty_digest.as_bytes());
+    hex_digest(hasher.finalize().as_slice())
 }
 
 fn hex_digest(bytes: &[u8]) -> String {

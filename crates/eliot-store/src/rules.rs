@@ -868,7 +868,7 @@ impl Store {
         let binding_error = if request.verb == "run" {
             rule_run_action_binding_error(&tx, principal, &state.id, revision, event_seq, &request)?
         } else {
-            rule_action_binding_error(&trigger, &request)
+            rule_action_binding_error(&trigger, event_seq, &request)
         };
         if let Some(code) = binding_error {
             request.id = key.child_id.clone();
@@ -1307,6 +1307,22 @@ fn validate_project_rule_action_tx(
         }
         let registration = super::projects::validate_git_fetch_intent_tx(tx, principal, &frozen)?;
         return Ok(Some(registration));
+    }
+    if request.verb == "git.publish" {
+        let Some(project_id) = rule_project_id(principal)? else {
+            return Err(Error::new(
+                "not_allowed",
+                "git.publish requires an approved project rule",
+            ));
+        };
+        let frozen = super::projects::decode_frozen_git_publish(&request.args)?;
+        if frozen.repository != project_id {
+            return Err(Error::new(
+                "not_allowed",
+                "Project git.publish repository must match its saved principal",
+            ));
+        }
+        return super::projects::validate_git_publish_intent_tx(tx, principal, &frozen).map(Some);
     }
     if request.verb == "resume" {
         let target = request
@@ -1974,6 +1990,9 @@ fn valid_event_rule_action_request(request: &SubmitCommand) -> bool {
     if request.verb == "git.fetch" {
         return valid_targetless_git_fetch_request(request);
     }
+    if request.verb == "git.publish" {
+        return valid_targetless_git_publish_request(request);
+    }
     if is_user_event_verb(request.verb.as_str()) {
         return valid_targetless_user_event_request(request);
     }
@@ -2097,6 +2116,18 @@ fn valid_targetless_git_fetch_request(request: &SubmitCommand) -> bool {
         && request.request_id.is_none()
         && !request.probe
         && super::projects::decode_frozen_git_fetch(&request.args).is_ok()
+}
+
+fn valid_targetless_git_publish_request(request: &SubmitCommand) -> bool {
+    request.validate().is_ok()
+        && request.verb == "git.publish"
+        && request.target.is_none()
+        && request.expected_generation.is_none()
+        && request.expected_turn_id.is_none()
+        && request.request_id.is_none()
+        && !request.probe
+        && serde_json::from_value::<core::api::FrozenGitPublish>(request.args.clone())
+            .is_ok_and(|frozen| frozen.validate().is_ok())
 }
 
 /// The managed worktree the daemon froze for an Owner rule launch into a
@@ -2556,13 +2587,29 @@ fn valid_switch_rule_action_request(request: &SubmitCommand) -> bool {
         && parse_rule_switch_args(&request.args).is_ok()
 }
 
-fn rule_action_binding_error(event: &StoredRuleTrigger, request: &SubmitCommand) -> Option<String> {
+fn rule_action_binding_error(
+    event: &StoredRuleTrigger,
+    event_seq: i64,
+    request: &SubmitCommand,
+) -> Option<String> {
     if !valid_event_rule_action_request(request) {
         return Some("rule_action_binding_invalid".to_owned());
     }
+    if request.verb == "git.publish" {
+        let Ok(frozen) =
+            serde_json::from_value::<core::api::FrozenGitPublish>(request.args.clone())
+        else {
+            return Some("rule_action_binding_invalid".to_owned());
+        };
+        return (event.kind != "project.check.passed"
+            || frozen.source_event_seq != event_seq
+            || event.agent.map(format_agent_id).as_deref() != Some(frozen.agent.as_str())
+            || event.generation != Some(frozen.generation))
+        .then(|| "rule_action_binding_invalid".to_owned());
+    }
     if matches!(
         request.verb.as_str(),
-        "launch" | "git.fetch" | "notify" | "emit" | "mail.send" | "var.set"
+        "launch" | "git.fetch" | "git.publish" | "notify" | "emit" | "mail.send" | "var.set"
     ) {
         return None;
     }

@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug)]
 pub struct GoalRoundProbe {
     pub view: GoalView,
+    pub project_default: bool,
     pub agent_state: AgentState,
     pub active_turn: Option<String>,
     pub pending_count: usize,
@@ -178,6 +179,8 @@ pub struct GoalRoundCommit {
     /// Workspace fingerprint read right after a failed check: the next
     /// round's baseline, so the check's own writes are never progress.
     pub fingerprint_after: Option<String>,
+    /// Exact registered project and unchanged checked worktree fingerprint.
+    pub project_check: Option<(String, String)>,
     pub continuation: Option<GoalContinuation>,
 }
 
@@ -452,6 +455,10 @@ struct GoalStatePersist {
     /// Turns consumed before the current Agent baseline (task handoff).
     #[serde(default)]
     transferred_turns: i64,
+    #[serde(default)]
+    await_first_turn: bool,
+    #[serde(default)]
+    project_default: bool,
     status: GoalStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     paused_reason: Option<String>,
@@ -1067,6 +1074,12 @@ impl Store {
             }
         }
         let turn_count = count_turns(&self.connection, agent_num, agent_row.generation)?;
+        if row.state.await_first_turn && turn_count <= row.state.counters.turns_at_set {
+            return Err(Error::new(
+                "bad_state",
+                "the default project Goal awaits the Agent's first turn",
+            ));
+        }
         let spent_by_goal_continuation = goal_continuation_spent_budget(
             &self.connection,
             agent_num,
@@ -1077,9 +1090,11 @@ impl Store {
             turn_count.saturating_add(row.state.transferred_turns),
         )?;
         let scope_base = row.state.scope_base.clone();
+        let project_default = row.state.project_default;
         let view = self.goal_view(row)?;
         let probe = GoalRoundProbe {
             scope_base,
+            project_default,
             agent_state: agent_row.state,
             active_turn: agent_row.active_turn.clone(),
             pending_count: agent_row.pending.len(),
@@ -1312,6 +1327,7 @@ impl Store {
         if let Some(row) = load_goal_row(&tx, agent_num, mode)? {
             if row.generation == agent_row.generation
                 && row.state.status == GoalStatus::Active
+                && !row.state.project_default
                 && encode_json(&row.definition)? == encoded
             {
                 let view = goal_view_on(&tx, &goal_holder, row)?;
@@ -1324,6 +1340,8 @@ impl Store {
             let revision = row.revision + 1;
             let state = GoalStatePersist {
                 transferred_turns: 0,
+                await_first_turn: false,
+                project_default: false,
                 status: GoalStatus::Active,
                 paused_reason: None,
                 blocked_reason: None,
@@ -1364,6 +1382,8 @@ impl Store {
             goal_cost_base_tx(&tx, agent_num, agent_row.generation, definition, turn_count)?;
         let state = GoalStatePersist {
             transferred_turns: 0,
+            await_first_turn: false,
+            project_default: false,
             status: GoalStatus::Active,
             paused_reason: None,
             blocked_reason: None,
@@ -1499,6 +1519,8 @@ impl Store {
         } else {
             let state = GoalStatePersist {
                 transferred_turns: row.state.transferred_turns,
+                await_first_turn: row.state.await_first_turn,
+                project_default: row.state.project_default,
                 status: GoalStatus::Cleared,
                 paused_reason: None,
                 blocked_reason: None,
@@ -1615,6 +1637,8 @@ impl Store {
             .map_err(sql_error)?;
         let state = GoalStatePersist {
             transferred_turns: row.state.transferred_turns,
+            await_first_turn: row.state.await_first_turn,
+            project_default: row.state.project_default,
             status: GoalStatus::Paused,
             paused_reason: Some(reason.to_owned()),
             blocked_reason: row.state.blocked_reason.clone(),
@@ -1674,6 +1698,8 @@ impl Store {
             if row.state.status == GoalStatus::Active {
                 let state = GoalStatePersist {
                     transferred_turns: row.state.transferred_turns,
+                    await_first_turn: row.state.await_first_turn,
+                    project_default: row.state.project_default,
                     status: GoalStatus::Paused,
                     paused_reason: Some("Agent generation advanced".to_owned()),
                     blocked_reason: row.state.blocked_reason.clone(),
@@ -2280,6 +2306,7 @@ impl Store {
             ));
         };
         let mut state = row.state;
+        state.await_first_turn = false;
         // A zero baseline (no session yet at set) binds the first session seen.
         if let (Some(base), Some(source)) = (state.cost_base.as_mut(), learned_cost_source)
             && base.source.is_none()
@@ -2342,6 +2369,14 @@ impl Store {
             ],
         ));
         let mut events = Vec::new();
+        if state.project_default
+            && matches!(outcome, GoalCommitOutcome::Completed)
+            && let Some((project, fingerprint)) = &commit.project_check
+            && let Some(event) =
+                project_check_passed_event(&tx, agent_num, &agent_row, project, fingerprint, now)?
+        {
+            events.push(event);
+        }
         if let (Some(cause), Some((status, reason))) = (
             state.assignment_cause.clone(),
             match &outcome {
@@ -2417,6 +2452,73 @@ impl Store {
             events,
         })
     }
+}
+
+fn project_check_passed_event(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    agent: &Agent,
+    project: &str,
+    fingerprint: &str,
+    now: i64,
+) -> Result<Option<Event>> {
+    if agent.project != project
+        || agent.branch.is_none()
+        || agent.parent.is_some()
+        || projects::project_registration_tx(tx, project)?.is_none_or(|registration| {
+            !registration
+                .actions
+                .iter()
+                .any(|action| action == "git.publish")
+        })
+    {
+        return Ok(None);
+    }
+    let turn_id: Option<String> = tx
+        .query_row(
+            "SELECT turn_id FROM turns WHERE agent = ?1 AND generation = ?2
+             ORDER BY COALESCE(completed_at, started_at, 0) DESC, rowid DESC LIMIT 1",
+            params![agent_num, agent.generation],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    let Some(turn_id) = turn_id else {
+        return Ok(None);
+    };
+    let Some(turn) = load_turn(tx, agent_num, agent.generation, &turn_id)? else {
+        return Ok(None);
+    };
+    let Some(subject) = turn
+        .final_text
+        .as_deref()
+        .and_then(|text| text.lines().next())
+    else {
+        return Ok(None);
+    };
+    if turn.state != TurnState::Completed || turn.outcome != Some(core::TurnOutcome::Success) {
+        return Ok(None);
+    }
+    let receipt = core::api::ProjectCheckPassed {
+        project: project.to_owned(),
+        turn_id,
+        fingerprint: fingerprint.to_owned(),
+        subject: subject.to_owned(),
+    };
+    if receipt.validate().is_err() {
+        return Ok(None);
+    }
+    insert_daemon_event(
+        tx,
+        now,
+        "project.check.passed",
+        "goal",
+        Some(agent_num),
+        Some(agent.generation),
+        serde_json::to_value(receipt)
+            .map_err(|_| Error::new("internal", "project check receipt could not be encoded"))?,
+    )
+    .map(Some)
 }
 
 /// One continuation command row as the probe reads it. Only the fields
@@ -3210,12 +3312,15 @@ pub(super) fn install_assignment_goal_tx(
     generation: i64,
     definition: &GoalDefinition,
     cause: core::EventCause,
+    project_default: bool,
     now: i64,
 ) -> Result<()> {
     definition.validate()?;
     definition.require_auto_bound()?;
     let state = GoalStatePersist {
         transferred_turns: 0,
+        await_first_turn: project_default,
+        project_default,
         status: GoalStatus::Active,
         paused_reason: None,
         blocked_reason: None,

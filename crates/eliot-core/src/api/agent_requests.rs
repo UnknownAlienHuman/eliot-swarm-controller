@@ -862,7 +862,7 @@ impl DaemonStatusRequest {
                 .as_ref()
                 .is_some_and(|status| status.validate().is_err())
             || reply.automation_tasks.is_empty()
-            || reply.automation_tasks.len() > 9
+            || reply.automation_tasks.len() > DaemonStatusResponse::MAX_AUTOMATION_TASKS
             || reply
                 .automation_tasks
                 .iter()

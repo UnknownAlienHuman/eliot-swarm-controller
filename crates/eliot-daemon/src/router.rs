@@ -22,6 +22,7 @@ mod organization;
 mod overview;
 mod patch_digest;
 mod project_assignment;
+mod project_checks;
 mod provider_resilience;
 mod repeat_failures;
 mod resolution;
@@ -33,6 +34,7 @@ mod status;
 mod swarm_usage;
 mod switch;
 mod tool_incident;
+mod wake;
 
 pub(crate) use attention::run_attention;
 use auth::{authorize_command, authorize_rpc_method};
@@ -40,7 +42,9 @@ pub(crate) use coordination::run_mail_reoffer;
 pub(crate) use digests::run_completion_digest;
 use eliot_core::{is_attachment_verb, is_start_verb, is_user_event_verb};
 pub(crate) use goals::{real_goal_check, run_goal_driver};
+pub(crate) use project_checks::run_project_checks;
 pub(crate) use tool_incident::run_tool_failure_attention;
+pub(crate) use wake::run_agent_wakes;
 
 use crate::{
     automation::RuleDefinition,
@@ -66,19 +70,20 @@ use eliot_core::{
         CommandSubmitRequest, CommandSubmitResponse, CrashMarker, DaemonShutdownRequest,
         DaemonShutdownResponse, DaemonStatusRequest, DiscoverPage, DoctorHarnessEntry,
         EmitDefinitionArgs, EventsBoundsRequest, EventsFilter, EventsReadRequest,
-        EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse,
-        GitFetchDefinitionArgs, GitView, HarnessDoctorRequest, HarnessDoctorResponse,
-        HeavyAgentTotals, HeavyEpisodeView, HeavySummaryView, MAX_OBSERVATION_PAGE_BYTES,
-        MAX_SWARM_WAIT_MS, MAX_SWARM_WAIT_TARGETS, MAX_WAIT_FINAL_TEXT_BYTES, MAX_WAIT_FRAME_BYTES,
-        MaintenancePurgeLegacyAttentionRequest, MaintenancePurgeLegacyAttentionResponse,
-        MaintenanceRunRequest, MaintenanceRunResponse, NotifyDefinitionArgs, ObservationPage,
-        ObservationQuery, ObservationView, ObserveHeavyRequest, ObserveHeavyResponse,
-        ProcessPageCursor, ProjectDiscoverRequest, ProjectRegistrationView,
-        ProviderClearHoldRequest, ProviderHoldsRequest, RuleGetRequest, RuleStateView,
-        SWITCH_BLANK_SCOPE_ARG, SWITCH_PROJECT_REVISION_ARG, SessionGrowthView, ShutdownMode,
-        SourceState, SwarmWaitRequest, SwarmWaitResponse, TimerGetRequest, TimerStateView,
-        TurnGetRequest, UsageScopeView, UsageSummaryRequest, WaitEntryResult, WorkSummaryView,
-        WorkerTaskHealth, WorkerTaskStatus, fair_excerpt_cap, is_supported_harness,
+        EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse, FrozenGitPublish,
+        GitFetchDefinitionArgs, GitPublishTrigger, GitView, HarnessDoctorRequest,
+        HarnessDoctorResponse, HeavyAgentTotals, HeavyEpisodeView, HeavySummaryView,
+        MAX_OBSERVATION_PAGE_BYTES, MAX_SWARM_WAIT_MS, MAX_SWARM_WAIT_TARGETS,
+        MAX_WAIT_FINAL_TEXT_BYTES, MAX_WAIT_FRAME_BYTES, MaintenancePurgeLegacyAttentionRequest,
+        MaintenancePurgeLegacyAttentionResponse, MaintenanceRunRequest, MaintenanceRunResponse,
+        NotifyDefinitionArgs, ObservationPage, ObservationQuery, ObservationView,
+        ObserveHeavyRequest, ObserveHeavyResponse, ProcessPageCursor, ProjectDiscoverRequest,
+        ProjectRegistrationView, ProviderClearHoldRequest, ProviderHoldsRequest, RuleGetRequest,
+        RuleStateView, SWITCH_BLANK_SCOPE_ARG, SWITCH_PROJECT_REVISION_ARG, SessionGrowthView,
+        ShutdownMode, SourceState, SwarmWaitRequest, SwarmWaitResponse, TimerGetRequest,
+        TimerStateView, TurnGetRequest, UsageScopeView, UsageSummaryRequest, WaitEntryResult,
+        WorkSummaryView, WorkerTaskHealth, WorkerTaskStatus, fair_excerpt_cap,
+        is_supported_harness,
     },
 };
 use eliot_plugin::{MAX_EVENT_BYTES, sync::LockExt};
@@ -170,6 +175,7 @@ struct RouterInner {
     shutdown_ready: AtomicBool,
     progress: watch::Sender<u64>,
     run_cancellation: watch::Sender<bool>,
+    workspace_check_locks: Mutex<HashMap<PathBuf, std::sync::Weak<AsyncMutex<()>>>>,
     run_workers: Mutex<HashMap<String, RunWorkerHandle>>,
     inference_ops: AsyncMutex<()>,
     inference_runner: AsyncMutex<()>,
@@ -444,6 +450,7 @@ impl Router {
                 progress,
                 run_cancellation,
                 run_workers: Mutex::new(HashMap::new()),
+                workspace_check_locks: Mutex::new(HashMap::new()),
                 inference_ops: AsyncMutex::new(()),
                 inference_runner: AsyncMutex::new(()),
                 inference_workers: Mutex::new(HashMap::new()),
@@ -653,6 +660,7 @@ impl Router {
             "events.read" => self.events_read(&params, &principal).await,
             "events.subscribe" => self.events_subscribe(&params, &principal).await,
             "child.run" => self.child_run(&params, &principal).await,
+            "agent.wake" => self.agent_wake(&params, &principal).await,
             "swarm.wait" => self.swarm_wait(&params, &principal).await,
             "swarm.digest" => self.swarm_digest(&params, &principal).await,
             "swarm.reparent" => self.swarm_reparent(&params, &principal).await,
@@ -1284,6 +1292,93 @@ impl Router {
         });
     }
 
+    /// Route a committed refusal for native requests whose reply cannot carry
+    /// text. The synchronous request intake already holds the tool and blocks
+    /// approval. Only this live receipt drives the ordinary deny and context.
+    pub(crate) async fn deliver_project_guard(&self, event: &Event) -> Result<()> {
+        use eliot_core::{
+            InjectArgs, InjectPoint,
+            requests::{ApprovalArgs, ApprovalDecision, ApprovalRequest},
+        };
+
+        if event.kind != "request.opened" || event.source != "stream" {
+            return Ok(());
+        }
+        let Some(subject) = &event.subject else {
+            return Ok(());
+        };
+        let point = match subject.harness.as_str() {
+            "codex" | "muse" => InjectPoint::ActiveTurn,
+            "antigravity" => InjectPoint::TurnSafePoint,
+            _ => return Ok(()),
+        };
+        let details = &event.data["details"];
+        if details.get("guard_refusal").is_none() {
+            return Ok(());
+        }
+        let approval: ApprovalRequest = serde_json::from_value(details.clone())
+            .map_err(|_| Error::new("source_integrity", "guarded approval details are invalid"))?;
+        let Some(message) = approval.guard_refusal else {
+            return Ok(());
+        };
+        let Some(agent) = &event.agent else {
+            return Err(Error::new(
+                "source_integrity",
+                "guarded request has no Agent",
+            ));
+        };
+        let Some(generation) = event.generation else {
+            return Err(Error::new(
+                "source_integrity",
+                "guarded request has no generation",
+            ));
+        };
+        let turn_id = required_text(&event.data, "turn_id")?.to_owned();
+        let request_id = required_text(&event.data, "request_id")?.to_owned();
+        let mut approvals = approval
+            .choices
+            .into_iter()
+            .filter(|choice| choice.decision == ApprovalDecision::Deny);
+        let first = approvals
+            .next()
+            .ok_or_else(|| Error::new("unsupported", "guarded request offers no refusal option"))?;
+        let choice_id = match subject.harness.as_str() {
+            "muse" if approvals.next().is_none() => Some(first.id),
+            "muse" => {
+                return Err(Error::new(
+                    "unsupported",
+                    "Muse guarded request offers multiple refusal options",
+                ));
+            }
+            _ => None,
+        };
+        let mut deny = SubmitCommand::new(ulid::Ulid::new().to_string(), "deny");
+        deny.target = Some(agent.clone());
+        deny.expected_generation = Some(generation);
+        deny.expected_turn_id = Some(turn_id.clone());
+        deny.request_id = Some(request_id);
+        deny.args = serde_json::to_value(ApprovalArgs {
+            choice_id,
+            feedback: None,
+        })
+        .map_err(|_| Error::new("internal", "guard reply could not be encoded"))?;
+        self.submit(&json!(deny), &Principal::Owner, "command.submit")
+            .await?;
+
+        let mut inject = SubmitCommand::new(ulid::Ulid::new().to_string(), "inject");
+        inject.target = Some(agent.clone());
+        inject.expected_generation = Some(generation);
+        inject.expected_turn_id = Some(turn_id);
+        inject.args = json!(InjectArgs {
+            text: message,
+            point,
+            expires_at_ms: Some(now_ms().saturating_add(60_000)),
+        });
+        self.submit(&json!(inject), &Principal::Owner, "command.submit")
+            .await?;
+        Ok(())
+    }
+
     async fn submit(
         &self,
         params: &Value,
@@ -1872,6 +1967,184 @@ impl Router {
             .await
     }
 
+    async fn prepare_git_publish_submission(
+        &self,
+        mut request: SubmitCommand,
+        principal: &Principal,
+        expected_registration: Option<&ProjectRegistrationView>,
+    ) -> Result<PreparedSubmission> {
+        if request.verb != "git.publish"
+            || request.target.is_some()
+            || request.expected_generation.is_some()
+            || request.expected_turn_id.is_some()
+            || request.request_id.is_some()
+            || request.probe
+        {
+            return Err(Error::new(
+                "invalid",
+                "git.publish must be a targetless project-check action",
+            ));
+        }
+        authorize_command(principal, &mut request)?;
+        if contains_known_secret(&request.args, &self.inner.secrets) {
+            return Err(Error::new(
+                "secret_in_payload",
+                "git.publish request contains a known credential",
+            ));
+        }
+        let trigger: GitPublishTrigger =
+            eliot_core::api::discovery::decode_params_at(request.args.clone(), "params.args")?;
+        trigger.validate()?;
+        let Principal::ProjectRule {
+            registration: saved,
+        } = principal
+        else {
+            return Err(Error::new(
+                "not_allowed",
+                "git.publish requires a project rule principal",
+            ));
+        };
+        if trigger.repository != saved.id
+            || expected_registration.is_some_and(|expected| expected != saved.as_ref())
+        {
+            return Err(Error::new(
+                "not_allowed",
+                "git.publish project differs from its saved rule principal",
+            ));
+        }
+        let (registration, agent, workspace, event) = {
+            let store = self.inner.store.lock().await;
+            let registration = store
+                .get_project_registration("owner", &trigger.repository)?
+                .ok_or_else(|| {
+                    Error::new("not_allowed", "git.publish project is not registered")
+                })?;
+            let agent = store.get_agent(&trigger.agent)?.ok_or_else(|| {
+                Error::new("not_allowed", "git.publish Agent is no longer retained")
+            })?;
+            let workspace = store.get_workspace(&trigger.agent)?.ok_or_else(|| {
+                Error::new("not_allowed", "git.publish managed workspace is absent")
+            })?;
+            let mut events = store.read_events(
+                trigger.source_event_seq - 1,
+                1,
+                Some(trigger.source_event_seq),
+            )?;
+            let event = events
+                .pop()
+                .filter(|event| event.seq == trigger.source_event_seq)
+                .ok_or_else(|| {
+                    Error::new("not_found", "git.publish check event is not retained")
+                })?;
+            (registration, agent, workspace, event)
+        };
+        if &registration != saved.as_ref()
+            || expected_registration.is_some_and(|expected| expected != &registration)
+            || event.kind != "project.check.passed"
+            || event.agent.as_deref() != Some(trigger.agent.as_str())
+            || event.generation != Some(trigger.generation)
+            || event
+                .subject
+                .as_ref()
+                .and_then(|subject| subject.workspace.as_deref())
+                != Some(trigger.workspace.as_str())
+        {
+            return Err(Error::new(
+                "not_allowed",
+                "git.publish no longer matches its successful project check event",
+            ));
+        }
+        let check = serde_json::from_value::<eliot_core::api::ProjectCheckPassed>(event.data)
+            .map_err(|_| Error::new("source_integrity", "project check event data is invalid"))?;
+        if check != trigger.check {
+            return Err(Error::new(
+                "not_allowed",
+                "git.publish check evidence differs from its retained event",
+            ));
+        }
+        let frozen: FrozenGitPublish =
+            crate::publication::freeze(&registration, &agent, &workspace, trigger).await?;
+        request.args = serde_json::to_value(frozen)
+            .map_err(|_| Error::new("internal", "frozen git.publish intent cannot be encoded"))?;
+        self.prepare_submission_after_authorization(request, principal, true, false)
+            .await
+    }
+
+    pub(crate) async fn verify_git_publish_state(&self, frozen: &FrozenGitPublish) -> Result<()> {
+        frozen.validate()?;
+        let (registration, agent, workspace, event) = {
+            let store = self.inner.store.lock().await;
+            let registration = store
+                .get_project_registration("owner", &frozen.repository)?
+                .ok_or_else(|| {
+                    Error::new("not_allowed", "git.publish project is not registered")
+                })?;
+            let agent = store
+                .get_agent(&frozen.agent)?
+                .ok_or_else(|| Error::new("not_allowed", "git.publish Agent is not retained"))?;
+            let workspace = store.get_workspace(&frozen.agent)?.ok_or_else(|| {
+                Error::new("not_allowed", "git.publish managed workspace is absent")
+            })?;
+            let mut events = store.read_events(
+                frozen.source_event_seq - 1,
+                1,
+                Some(frozen.source_event_seq),
+            )?;
+            let event = events
+                .pop()
+                .filter(|event| event.seq == frozen.source_event_seq)
+                .ok_or_else(|| {
+                    Error::new("not_found", "git.publish check event is not retained")
+                })?;
+            (registration, agent, workspace, event)
+        };
+        if registration.id != frozen.repository
+            || registration.revision != frozen.registration_revision
+            || registration.checkout != frozen.canonical_checkout
+            || registration.repo_common_dir != frozen.common_dir
+            || !registration
+                .actions
+                .iter()
+                .any(|action| action == "git.publish")
+            || agent.id != frozen.agent
+            || agent.generation != frozen.generation
+            || agent.active_turn.is_some()
+            || agent.workspace.as_deref() != Some(frozen.workspace.as_str())
+            || workspace.agent != frozen.agent
+            || workspace.target_generation != frozen.generation
+            || workspace.phase != WorkspacePhase::Ready
+            || workspace.worktree_path != frozen.workspace
+            || workspace.worktree_path == registration.checkout
+            || workspace.project != registration.checkout
+            || workspace.repo_path != registration.checkout
+            || workspace.repo_common_dir != registration.repo_common_dir
+            || workspace.base_oid != frozen.base_oid
+            || workspace.requested_branch != frozen.branch
+            || event.kind != "project.check.passed"
+            || event.agent.as_deref() != Some(frozen.agent.as_str())
+            || event.generation != Some(frozen.generation)
+            || event
+                .subject
+                .as_ref()
+                .and_then(|subject| subject.workspace.as_deref())
+                != Some(frozen.workspace.as_str())
+        {
+            return Err(Error::new(
+                "not_allowed",
+                "git.publish project-check state changed before its effect",
+            ));
+        }
+        let check = serde_json::from_value::<eliot_core::api::ProjectCheckPassed>(event.data)
+            .map_err(|_| Error::new("source_integrity", "project check event data is invalid"))?;
+        if check != frozen.check {
+            return Err(Error::new(
+                "not_allowed",
+                "git.publish check evidence differs from its retained event",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) async fn prepare_owner_submission(
         &self,
         request: SubmitCommand,
@@ -2000,6 +2273,9 @@ impl Router {
             let prepared_request = if request.verb == "git.fetch" {
                 self.prepare_git_fetch_submission(request, &principal, Some(registration))
                     .await?
+            } else if request.verb == "git.publish" {
+                self.prepare_git_publish_submission(request, &principal, Some(registration))
+                    .await?
             } else {
                 self.prepare_submission(request, &principal).await?
             };
@@ -2052,6 +2328,14 @@ impl Router {
             };
             return self
                 .prepare_git_fetch_submission(request, &principal, Some(registration))
+                .await;
+        }
+        if request.verb == "git.publish" {
+            let principal = Principal::ProjectRule {
+                registration: Box::new(registration.clone()),
+            };
+            return self
+                .prepare_git_publish_submission(request, &principal, Some(registration))
                 .await;
         }
         validate_rule_launch_action(&request, Some(registration))?;
@@ -2396,14 +2680,17 @@ impl Router {
                         hierarchy::inherit_launch_project_scope(&store, &mut request)?
                     };
                     let resolve_project = !chat && request.args.get("parent").is_none();
-                    self.freeze_launch_admission(
-                        principal,
-                        &mut request,
-                        resolve_project,
-                        parent_workspace_shared,
-                        arbitrated,
-                    )
-                    .await
+                    let input = self
+                        .freeze_launch_admission(
+                            principal,
+                            &mut request,
+                            resolve_project,
+                            parent_workspace_shared,
+                            arbitrated,
+                        )
+                        .await?;
+                    project_checks::attach_default_goal(self, &mut request, false).await?;
+                    Ok(input)
                 }
                 .await;
                 workspace = match frozen {
@@ -2637,6 +2924,7 @@ impl Router {
             .freeze_launch_profile(principal, request, arbitrated)
             .await?
         {
+            self.freeze_project_command_guards(request).await?;
             return retained_preparation(&request.args);
         }
         // A switch that requests neither a workspace nor a branch keeps its
@@ -2648,6 +2936,7 @@ impl Router {
             .and_then(|args| args.remove("switch_reuse_source_checkout"))
             .is_some()
         {
+            self.freeze_project_command_guards(request).await?;
             return Ok(None);
         }
         let mut registered_checkout = None;
@@ -2688,6 +2977,7 @@ impl Router {
                 .get_project_registration("owner", project)?
                 .map(|registration| registration.checkout);
         }
+        self.freeze_project_command_guards(request).await?;
         // A requested branch name always wins, but even an explicit branch
         // lands in the standard directory. A bare `--worktree` (an empty
         // value) or a top-level launch in a `worktree`-mode project generates
@@ -2848,6 +3138,64 @@ impl Router {
         };
         if let Some(model) = catalog::launch_model_default(harness, &response)? {
             snapshot["daemon_model"] = Value::String(model);
+        }
+        Ok(())
+    }
+
+    async fn freeze_project_command_guards(&self, request: &mut SubmitCommand) -> Result<()> {
+        if request
+            .args
+            .get("profile_snapshot")
+            .and_then(|snapshot| snapshot.get(crate::command_guard::SNAPSHOT_FIELD))
+            .is_some()
+        {
+            return Ok(());
+        }
+        let project_id = request
+            .args
+            .get("registered_project")
+            .and_then(Value::as_str)
+            .filter(|project| !project.trim().is_empty())
+            .map(str::to_owned);
+        let guards = if let Some(project_id) = project_id {
+            let registrations =
+                crate::config::load_project_registration_config(&self.inner.data_root)?;
+            let registration = registrations
+                .iter()
+                .find(|registration| registration.id == project_id)
+                .ok_or_else(|| {
+                    Error::new(
+                        "not_found",
+                        "registered project command guard policy is unavailable",
+                    )
+                })?;
+            serde_json::to_value(&registration.command_guards)
+                .map_err(|_| Error::new("internal", "project command guards could not be frozen"))?
+        } else if let Some(parent_id) = request.args.get("parent").and_then(Value::as_str) {
+            let store = self.inner.store.lock().await;
+            let parent = store
+                .get_agent(parent_id)?
+                .ok_or_else(|| Error::new("not_found", "launch parent was not found"))?;
+            parent
+                .profile_snapshot
+                .get(crate::command_guard::SNAPSHOT_FIELD)
+                .cloned()
+                .unwrap_or_else(|| Value::Array(Vec::new()))
+        } else {
+            request
+                .args
+                .get("profile_snapshot")
+                .and_then(|snapshot| snapshot.get(crate::command_guard::SNAPSHOT_FIELD))
+                .cloned()
+                .unwrap_or_else(|| Value::Array(Vec::new()))
+        };
+        let snapshot = request
+            .args
+            .get_mut("profile_snapshot")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| Error::new("internal", "launch profile snapshot is not an object"))?;
+        if guards.as_array().is_some_and(|guards| !guards.is_empty()) {
+            snapshot.insert(crate::command_guard::SNAPSHOT_FIELD.to_owned(), guards);
         }
         Ok(())
     }
@@ -7681,6 +8029,7 @@ fn reject_launch_derived_keys(args: &Value) -> Result<()> {
     }
     for reserved in [
         "registered_project",
+        eliot_core::PROJECT_CHECK_GOAL_ARG,
         "admission_mode",
         "auto_worktree",
         "project_assignment_launch",

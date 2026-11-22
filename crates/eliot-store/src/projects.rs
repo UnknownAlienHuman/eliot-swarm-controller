@@ -234,6 +234,152 @@ pub(super) fn decode_frozen_git_fetch(args: &Value) -> Result<core::api::FrozenG
     Ok(frozen)
 }
 
+pub(super) fn decode_frozen_git_publish(args: &Value) -> Result<core::api::FrozenGitPublish> {
+    let frozen = serde_json::from_value::<core::api::FrozenGitPublish>(args.clone())
+        .map_err(|_| Error::new("invalid", "git.publish args must be a frozen intent"))?;
+    frozen.validate()?;
+    Ok(frozen)
+}
+
+pub(super) fn validate_git_publish_intent_tx(
+    tx: &Transaction<'_>,
+    principal: &str,
+    frozen: &core::api::FrozenGitPublish,
+) -> Result<core::api::ProjectRegistrationView> {
+    let project_id = project_id_from_principal(principal)?
+        .ok_or_else(|| Error::new("not_allowed", "git.publish requires project authority"))?;
+    if project_id != frozen.repository {
+        return Err(Error::new(
+            "not_allowed",
+            "Project git.publish repository must match its saved principal",
+        ));
+    }
+    let registration = load_project_registration(tx, &project_id)?
+        .ok_or_else(|| Error::new("not_allowed", "git.publish project is not registered"))?;
+    registration
+        .validate()
+        .map_err(|_| Error::new("source_integrity", "stored project registration is invalid"))?;
+    if registration.id != frozen.repository
+        || registration.revision != frozen.registration_revision
+        || registration.checkout != frozen.canonical_checkout
+        || registration.repo_common_dir != frozen.common_dir
+        || !registration
+            .actions
+            .iter()
+            .any(|action| action == "git.publish")
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "git.publish registration or action approval is stale",
+        ));
+    }
+    let agent_num = parse_agent_id(&frozen.agent)?;
+    let agent = load_agent_by_num(tx, agent_num)?
+        .ok_or_else(|| Error::new("not_allowed", "git.publish Agent is not retained"))?;
+    let workspace = workspace::load_workspace(tx, agent_num)?
+        .ok_or_else(|| Error::new("not_allowed", "git.publish managed workspace is absent"))?;
+    if agent.id != frozen.agent
+        || agent.generation != frozen.generation
+        || agent.active_turn.is_some()
+        || agent.workspace.as_deref() != Some(frozen.workspace.as_str())
+        || workspace.agent != frozen.agent
+        || workspace.target_generation != frozen.generation
+        || workspace.phase != WorkspacePhase::Ready
+        || workspace.worktree_path != frozen.workspace
+        || workspace.worktree_path == registration.checkout
+        || workspace.project != registration.checkout
+        || workspace.repo_path != registration.checkout
+        || workspace.repo_common_dir != registration.repo_common_dir
+        || workspace.base_oid != frozen.base_oid
+        || workspace.requested_branch != frozen.branch
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "git.publish Agent or managed worktree state changed",
+        ));
+    }
+    let publication = registration
+        .git
+        .as_ref()
+        .and_then(|git| git.publication.as_ref());
+    match (&frozen.remote, &frozen.endpoint) {
+        (Some(remote), Some(endpoint))
+            if publication.and_then(|publication| publication.remotes.get(remote))
+                == Some(endpoint) => {}
+        (None, None) if !frozen.create_pr => {}
+        _ => {
+            return Err(Error::new(
+                "not_allowed",
+                "git.publish endpoint does not match Owner approval",
+            ));
+        }
+    }
+    let registered_gh = publication.and_then(|publication| publication.github_cli.as_ref());
+    if frozen.create_pr && frozen.github_cli.as_ref() != registered_gh {
+        return Err(Error::new(
+            "not_allowed",
+            "git.publish GitHub integration does not match Owner approval",
+        ));
+    }
+    let helper_approved = frozen.remote.is_some()
+        && registration
+            .git
+            .as_ref()
+            .and_then(|git| git.credential_helper)
+            == Some(core::api::GitCredentialHelper::Manager);
+    if helper_approved != frozen.credential_helper.is_some() {
+        return Err(Error::new(
+            "not_allowed",
+            "git.publish helper receipt does not match Owner approval",
+        ));
+    }
+    let (kind, agent, generation, encoded_data, encoded_subject): (
+        String,
+        Option<i64>,
+        Option<i64>,
+        String,
+        String,
+    ) = tx
+        .query_row(
+            "SELECT kind, agent, generation, data, subject FROM events WHERE seq = ?1",
+            [frozen.source_event_seq],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sql_error)?
+        .ok_or_else(|| Error::new("not_found", "git.publish check event was not retained"))?;
+    let data: Value = serde_json::from_str(&encoded_data)
+        .map_err(|_| Error::new("source_integrity", "project check event data is invalid"))?;
+    let check = serde_json::from_value::<core::api::ProjectCheckPassed>(data)
+        .map_err(|_| Error::new("source_integrity", "project check event data is invalid"))?;
+    let subject: core::EventSubject = serde_json::from_str(&encoded_subject)
+        .map_err(|_| Error::new("source_integrity", "project check event subject is invalid"))?;
+    check
+        .validate()
+        .map_err(|_| Error::new("source_integrity", "project check event data is invalid"))?;
+    if kind != "project.check.passed"
+        || check != frozen.check
+        || check.project != frozen.repository
+        || agent.map(format_agent_id).as_deref() != Some(frozen.agent.as_str())
+        || generation != Some(frozen.generation)
+        || subject.workspace.as_deref() != Some(frozen.workspace.as_str())
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "git.publish does not match its successful project check event",
+        ));
+    }
+    Ok(registration)
+}
+
 pub(super) fn validate_git_fetch_intent_tx(
     tx: &Transaction<'_>,
     principal: &str,
@@ -345,6 +491,10 @@ pub(super) fn capture_project_command_binding_tx(
         let frozen = decode_frozen_git_fetch(command.args)?;
         validate_git_fetch_intent_tx(tx, command.principal, &frozen)?;
         targetless_project_command_binding(registration.revision)
+    } else if command.verb == "git.publish" {
+        let frozen = decode_frozen_git_publish(command.args)?;
+        validate_git_publish_intent_tx(tx, command.principal, &frozen)?;
+        targetless_project_command_binding(registration.revision)
     } else if command.verb == "run" {
         require_project_registration_action(&registration, "run")?;
         targetless_project_command_binding(registration.revision)
@@ -430,6 +580,17 @@ pub(super) fn validate_project_command_dispatch_tx(
             return Err(Error::new(
                 "not_allowed",
                 "Project git.fetch binding does not match its saved registration",
+            ));
+        }
+        return Ok(());
+    }
+    if command.target.is_none() && command.command.verb == "git.publish" {
+        let frozen = decode_frozen_git_publish(&command.command.args)?;
+        validate_git_publish_intent_tx(tx, &command.command.principal, &frozen)?;
+        if binding != targetless_project_command_binding(registration.revision) {
+            return Err(Error::new(
+                "not_allowed",
+                "Project git.publish binding does not match its saved registration",
             ));
         }
         return Ok(());
@@ -965,6 +1126,7 @@ fn is_supported_project_action(action: &str) -> bool {
             | "deny"
             | "answer"
             | "git.fetch"
+            | "git.publish"
             | "notify"
             | "emit"
             | "mail.send"

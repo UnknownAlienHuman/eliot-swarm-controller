@@ -15,8 +15,8 @@
 use std::{ffi::OsString, path::Path, time::Duration};
 
 use eliot_core::{
-    ContextItem, ContextOutcome, Error, InjectPoint, NativeEvent, ProcessRecord, ProcessState,
-    ProviderRestriction, Result, SecretPolicy, SourceBatch, SourceGap,
+    ContextItem, ContextOutcome, Error, InjectPoint, NativeEvent, PermissionRefusal, ProcessRecord,
+    ProcessState, ProviderRestriction, Result, SecretPolicy, SourceBatch, SourceGap,
 };
 use serde_json::{Map, Value, json};
 use tokio::time::Instant;
@@ -59,9 +59,9 @@ pub fn classify_start_failure(mut error: Error, harness: &str, phase: &str) -> E
 pub fn failed_start_value(params: &crate::AgentStartParams, error: Error) -> Value {
     let secrets: Vec<_> = params
         .target_environment
-        .as_ref()
-        .and_then(Value::as_object)
-        .into_iter()
+        .iter()
+        .chain(params.mcp_environment.iter())
+        .filter_map(Value::as_object)
         .flat_map(|env| env.iter())
         .filter(|(name, _)| {
             is_secret_name(name)
@@ -189,6 +189,93 @@ pub fn target_environment(
         variables: vars,
         secrets,
     })
+}
+
+/// Resolve the exact Agent identity for one private MCP server. The normal
+/// path uses the daemon's separate MCP environment; a missing field retains
+/// compatibility only for old profiles that still pass identity to the
+/// harness process.
+pub fn agent_mcp_environment(
+    mcp_environment: Option<&Value>,
+    target_environment_value: Option<&Value>,
+    pass_agent_identity_to_shell: Option<bool>,
+    agent_id: &str,
+    generation: i64,
+    harness: &str,
+) -> Result<TargetEnvironment> {
+    const IDENTITY_NAMES: &[&str] = &[
+        "ELIOT_HOME",
+        "ELIOT_AGENT_DATA_DIR",
+        "ELIOT_AGENT_ID",
+        "ELIOT_AGENT_GENERATION",
+        "ELIOT_AGENT_TOKEN",
+    ];
+    let value = if let Some(value) = mcp_environment {
+        value.clone()
+    } else if pass_agent_identity_to_shell.unwrap_or(true) {
+        let source = target_environment_value
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                Error::new(
+                    "not_allowed",
+                    format!("{harness} Agent MCP requires its explicit identity environment"),
+                )
+            })?;
+        let mut filtered = Map::new();
+        for &name in IDENTITY_NAMES {
+            if let Some(value) = source.iter().find_map(|(key, value)| {
+                (key == name || (cfg!(windows) && key.eq_ignore_ascii_case(name))).then_some(value)
+            }) {
+                filtered.insert(name.to_owned(), value.clone());
+            }
+        }
+        Value::Object(filtered)
+    } else {
+        return Err(Error::new(
+            "not_allowed",
+            format!("{harness} shell identity is withheld but its MCP identity is missing"),
+        ));
+    };
+    let object = value.as_object().ok_or_else(|| {
+        Error::new(
+            "profile_error",
+            format!("{harness} MCP identity environment must be an object"),
+        )
+    })?;
+    if object.len() != IDENTITY_NAMES.len()
+        || object.keys().any(|name| {
+            !IDENTITY_NAMES.iter().any(|allowed| {
+                name == *allowed || (cfg!(windows) && name.eq_ignore_ascii_case(allowed))
+            })
+        })
+    {
+        return Err(Error::new(
+            "profile_error",
+            format!("{harness} MCP identity environment has an invalid field set"),
+        ));
+    }
+    let mapped = target_environment(Some(&value), None, harness)?;
+    crate::native_cli::require_agent_mcp_root(
+        &mapped.variables,
+        agent_id,
+        generation,
+        "Agent MCP identity does not match its bound generation",
+        "Agent MCP identity has no owned Eliot data root",
+    )?;
+    let data_dir =
+        crate::native_cli::unique_environment_value(&mapped.variables, "ELIOT_AGENT_DATA_DIR")
+            .and_then(std::ffi::OsStr::to_str)
+            .filter(|path| {
+                std::path::Path::new(path).is_absolute() && std::path::Path::new(path).is_dir()
+            })
+            .ok_or_else(|| Error::new("not_allowed", "Agent MCP data directory is unavailable"))?;
+    if data_dir.trim().is_empty() {
+        return Err(Error::new(
+            "not_allowed",
+            "Agent MCP data directory is empty",
+        ));
+    }
+    Ok(mapped)
 }
 
 /// Refuse a request whose Agent/generation does not match the bound session.
@@ -1012,12 +1099,42 @@ pub struct StreamSource<'a> {
 impl StreamSource<'_> {
     /// Send one native record and wait for the host's outcome.
     pub async fn commit_event(&mut self, kind: &str, native_id: String, data: Value) -> Result<()> {
+        self.commit_event_with_refusal(kind, native_id, data)
+            .await
+            .map(|_| ())
+    }
+
+    /// Commit one exact native permission ask and return the daemon refusal,
+    /// if its frozen project policy matched this request.
+    pub async fn commit_request_event(
+        &mut self,
+        native_id: String,
+        data: Value,
+    ) -> Result<Option<PermissionRefusal>> {
+        self.commit_event_with_refusal("request.opened", native_id, data)
+            .await
+    }
+
+    async fn commit_event_with_refusal(
+        &mut self,
+        kind: &str,
+        native_id: String,
+        data: Value,
+    ) -> Result<Option<PermissionRefusal>> {
         if *self.writes_blocked {
             return Err(Error::new(
                 "unknown",
                 format!("{} event acknowledgement is unresolved", self.harness),
             ));
         }
+        let request_id = data
+            .get("request_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let turn_id = data
+            .get("turn_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         let batch = SourceBatch {
             batch_id: format!("{native_id}:batch"),
             agent_id: self.agent_id.to_owned(),
@@ -1031,25 +1148,51 @@ impl StreamSource<'_> {
             }],
             cursor: None,
         };
-        let error = match self
+        let ack = match self
             .sink
             .commit(batch, Instant::now() + EVENT_DEADLINE)
             .await
         {
-            Ok(_) => return Ok(()),
-            Err(error) => error,
+            Ok(ack) => ack,
+            Err(error) if crate::is_definite_batch_rejection(&error.code) => {
+                return Err(error.with_where("plugin.events.put"));
+            }
+            Err(error) => {
+                *self.writes_blocked = true;
+                *self.source_unknown = true;
+                *self.failure = Some(format!(
+                    "{} event batch acknowledgement is unknown",
+                    self.harness
+                ));
+                *self.batch_unknown = true;
+                return Err(error);
+            }
         };
-        if crate::is_definite_batch_rejection(&error.code) {
-            return Err(error.with_where("plugin.events.put"));
+        let Some(refusal) = ack.permission_refusal else {
+            return Ok(None);
+        };
+        if kind != "request.opened"
+            || refusal.agent_id != self.agent_id
+            || refusal.generation != self.generation
+            || request_id.as_deref() != Some(refusal.request_id.as_str())
+            || turn_id.as_deref() != Some(refusal.turn_id.as_str())
+        {
+            *self.writes_blocked = true;
+            *self.source_unknown = true;
+            *self.failure = Some(format!(
+                "{} permission refusal acknowledgement binding is unknown",
+                self.harness
+            ));
+            *self.batch_unknown = true;
+            return Err(Error::new(
+                "unknown",
+                format!(
+                    "{} permission refusal acknowledgement binding is invalid",
+                    self.harness
+                ),
+            ));
         }
-        *self.writes_blocked = true;
-        *self.source_unknown = true;
-        *self.failure = Some(format!(
-            "{} event batch acknowledgement is unknown",
-            self.harness
-        ));
-        *self.batch_unknown = true;
-        Err(error)
+        Ok(Some(refusal))
     }
 
     /// Commit one turn-bound `message.completed`. A blank native reply (its
@@ -1264,6 +1407,15 @@ pub fn redact_request_details_for_commit(details: &Value, policy: &SecretPolicy)
         }
     }
     redacted
+}
+
+/// Extract the command supplied by a Bash or PowerShell permission callback.
+pub fn shell_permission_command<'a>(tool: &str, input: Option<&'a Value>) -> Option<&'a str> {
+    if tool.eq_ignore_ascii_case("bash") || tool.eq_ignore_ascii_case("powershell") {
+        input?.get("command")?.as_str()
+    } else {
+        None
+    }
 }
 
 /// Refuse a `model.list` or `quota.read` call on a session-bound plugin

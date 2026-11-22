@@ -5,7 +5,14 @@ use eliot_core::{is_attachment_verb, is_request_reply_verb, is_start_verb};
 /// commands cannot use it; only the internal `attention.emit` verb admits it.
 pub(super) const ATTENTION_RESERVED_TOPIC: &str = "agent.attention";
 
-pub(super) fn command_semantic_payload(request: &SubmitCommand, args: Value) -> Result<Value> {
+pub(super) fn command_semantic_payload(request: &SubmitCommand, mut args: Value) -> Result<Value> {
+    // Project-check Goals are frozen from owner configuration during launch
+    // preparation; callers omit them on an exact same-ID replay.
+    if request.verb == "launch"
+        && let Some(args) = args.as_object_mut()
+    {
+        args.remove(core::PROJECT_CHECK_GOAL_ARG);
+    }
     let mut payload = json!({
         "target": request.target,
         "verb": request.verb,
@@ -662,6 +669,27 @@ fn admit_git_fetch_tx(
     admit_targetless_tx(tx, principal, request, payload_digest, now, events)
 }
 
+/// Admit one event-triggered targetless project publication with its frozen
+/// passing-check snapshot and Owner registration binding.
+fn admit_git_publish_tx(
+    tx: &Transaction<'_>,
+    principal: &str,
+    request: &SubmitCommand,
+    payload_digest: &[u8],
+    preparation: &Option<WorkspacePreparationInput>,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<Option<String>> {
+    require_no_agent_bindings(
+        request,
+        preparation,
+        "git.publish is a targetless project command without Agent bindings",
+    )?;
+    let frozen = projects::decode_frozen_git_publish(&request.args)?;
+    projects::validate_git_publish_intent_tx(tx, principal, &frozen)?;
+    admit_targetless_tx(tx, principal, request, payload_digest, now, events)
+}
+
 /// Admit one targetless `notify`/`emit` definition.
 fn admit_notify_emit_tx(
     tx: &Transaction<'_>,
@@ -1020,7 +1048,33 @@ fn admit_launch_tx(
     }
     if let Some((goal, cause)) = assignment::record_admission_tx(tx, principal, request, now)? {
         // A first launch starts generation 1; its Goal binds to it now.
-        goals::install_assignment_goal_tx(tx, agent_num, 1, &goal, cause, now)?;
+        let default_project_goal = request.args.get(core::PROJECT_CHECK_GOAL_ARG).is_some();
+        goals::install_assignment_goal_tx(
+            tx,
+            agent_num,
+            1,
+            &goal,
+            cause,
+            default_project_goal,
+            now,
+        )?;
+    } else if let Some(goal) = assignment::project_check_goal(request)? {
+        // Role launches have no folder-assignment cause, but their project
+        // check Goal still binds atomically before native dispatch.
+        goals::install_assignment_goal_tx(
+            tx,
+            agent_num,
+            1,
+            &goal,
+            core::EventCause {
+                command_id: request.id.clone(),
+                rule: None,
+                depth: 0,
+                remote_call: None,
+            },
+            true,
+            now,
+        )?;
     }
     let root_num = parent_link
         .as_ref()
@@ -1670,6 +1724,18 @@ pub(super) fn admit_control_tx(
                     "pending request row does not match the Agent projection",
                 ));
             }
+            if request.verb == "approve"
+                && pending
+                    .details
+                    .get("guard_refusal")
+                    .and_then(Value::as_str)
+                    .is_some_and(|message| !message.trim().is_empty())
+            {
+                return Err(Error::new(
+                    "not_allowed",
+                    "native permission request was refused by the project command guard",
+                ));
+            }
             if request.verb == "answer" && contains_secret_marker(&pending.details) {
                 return Err(Error::new(
                     "secret_in_payload",
@@ -1895,6 +1961,15 @@ fn submit_tx_mode(
             &mut events,
         )?,
         "git.fetch" => admit_git_fetch_tx(
+            tx,
+            principal,
+            &request,
+            &payload_digest,
+            &preparation,
+            now,
+            &mut events,
+        )?,
+        "git.publish" => admit_git_publish_tx(
             tx,
             principal,
             &request,

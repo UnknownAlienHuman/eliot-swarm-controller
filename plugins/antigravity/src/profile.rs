@@ -50,16 +50,14 @@ pub(crate) struct Plan {
 /// v1 schema `schema/v1/schema.json`: stdio entries carry name, command,
 /// args and env, all required, and every Agent MUST support stdio).
 /// The command is the current Eliot executable with the Agent-bound data
-/// root; `--require-agent` enforces the inherited Agent identity and never
-/// falls back to Owner auth (same server and identity injection as the Codex
-/// `route.rs` override and the Claude `mcp_config.rs` file). `env` stays
-/// empty by design: the stdio child inherits the ACP server's environment,
-/// which already carries the Agent-bound `ELIOT_AGENT_*` identity the daemon
-/// injected, so no token crosses the session params.
+/// root; `--require-agent` enforces the scoped Agent identity and never
+/// falls back to Owner auth. The ACP stdio entry carries that identity in its
+/// per-session `env` list, so shell tools do not inherit it.
 pub(crate) struct SwarmMcp {
     name: String,
     command: PathBuf,
     data_dir: PathBuf,
+    environment: Vec<(OsString, OsString)>,
 }
 
 impl SwarmMcp {
@@ -91,6 +89,7 @@ impl SwarmMcp {
             name: WORKER_SWARM_MCP_SERVER_NAME.to_owned(),
             command,
             data_dir,
+            environment: environment.to_vec(),
         })
     }
 
@@ -108,7 +107,10 @@ impl SwarmMcp {
             "name": self.name,
             "command": command,
             "args": worker_swarm_mcp_args(data_dir),
-            "env": [],
+            "env": self.environment.iter().map(|(name, value)| json!({
+                "name": name.to_string_lossy(),
+                "value": value.to_string_lossy(),
+            })).collect::<Vec<_>>(),
         }))
     }
 }
@@ -234,9 +236,21 @@ impl Plan {
             prepend_system32_to_path(&mut environment.variables)?;
             environment
         };
-        let swarm_mcp =
-            SwarmMcp::require(&environment.variables, &params.agent_id, params.generation)?;
+        let mcp_environment = eliot_plugin::session::agent_mcp_environment(
+            params.mcp_environment.as_ref(),
+            params.target_environment.as_ref(),
+            params.pass_agent_identity_to_shell,
+            &params.agent_id,
+            params.generation,
+            "Antigravity",
+        )?;
+        let swarm_mcp = SwarmMcp::require(
+            &mcp_environment.variables,
+            &params.agent_id,
+            params.generation,
+        )?;
         let mut secrets = environment.secrets;
+        secrets.extend(mcp_environment.secrets.iter().cloned());
         secrets.push(credential.to_owned());
         secrets.push(hook_token.to_owned());
         let resume = params

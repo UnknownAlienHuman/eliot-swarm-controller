@@ -343,9 +343,22 @@ impl Store {
     }
 }
 
+pub(super) fn project_check_goal(
+    request: &SubmitCommand,
+) -> Result<Option<core::api::GoalDefinition>> {
+    let Some(value) = request.args.get(core::PROJECT_CHECK_GOAL_ARG) else {
+        return Ok(None);
+    };
+    let definition: core::api::GoalDefinition = serde_json::from_value(value.clone())
+        .map_err(|_| Error::new("invalid", "project check Goal is invalid"))?;
+    definition.validate()?;
+    definition.require_auto_bound()?;
+    Ok(Some(definition))
+}
+
 /// Record the name inside ordinary launch admission. The insert rolls back with
 /// any later admission failure and is visible only after commit. Returns the
-/// brief's frozen Goal and its launch cause for Goal-owned work.
+/// selected Goal and its launch cause for Goal-owned work.
 pub(super) fn record_admission_tx(
     tx: &Transaction<'_>,
     principal: &str,
@@ -407,7 +420,7 @@ pub(super) fn record_admission_tx(
             "assignment brief was already admitted",
         ));
     }
-    Ok(launch.goal.map(|goal| {
+    Ok(launch.goal.or(project_check_goal(request)?).map(|goal| {
         let cause = core::EventCause {
             command_id: request.id.clone(),
             rule: Some(format!("assignment-{}", launch.key)),

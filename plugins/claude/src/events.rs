@@ -2684,6 +2684,7 @@ impl EventProcessor {
                 },
             ],
             feedback_allowed: false,
+            guard_refusal: None,
         };
         let details = serde_json::to_value(&approval)
             .map_err(|_| Error::new("internal", "Claude approval details could not be encoded"))?;
@@ -2700,6 +2701,12 @@ impl EventProcessor {
                 .record_gap("Claude normalized request exceeded the persisted-event bound")
                 .await;
         }
+        let guard_command =
+            eliot_plugin::session::shell_permission_command(&body.tool_name, body.input.as_ref());
+        let mut event_data = data;
+        if let Some(command) = guard_command {
+            event_data[eliot_core::COMMAND_GUARD_CONTEXT_FIELD] = json!({"commands": [command]});
+        }
         let native_id = match request_event_id(request_id, "request.opened", "claude", "Claude") {
             Ok(native_id) => native_id,
             Err(_) => {
@@ -2709,11 +2716,20 @@ impl EventProcessor {
                     .await;
             }
         };
-        self.commit_event("request.opened", native_id, data).await?;
+        let refusal = self.commit_request_event(native_id, event_data).await?;
+        if refusal
+            .as_ref()
+            .is_some_and(|refusal| refusal.request_id != request_id || refusal.turn_id != turn_id)
+        {
+            return Err(Error::new(
+                "unknown",
+                "Claude guard refusal did not bind to its exact permission request",
+            ));
+        }
         self.pending_requests.insert(
             request_id.to_owned(),
             PendingNativeRequest {
-                turn_id,
+                turn_id: turn_id.clone(),
                 tool_name: body.tool_name,
                 tool_use_id: body.tool_use_id,
                 input: body.input.unwrap_or(Value::Null),
@@ -2721,6 +2737,90 @@ impl EventProcessor {
                 reply_state: NativeReplyState::Available,
             },
         );
+        if let Some(refusal) = refusal {
+            self.refuse_guarded_permission(request_id, &turn_id, &refusal.message)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Deliver a daemon refusal through Claude's one-shot can_use_tool
+    /// response. A write with uncertain delivery is retained and never
+    /// retried; the persisted guard refusal also blocks a later approval.
+    async fn refuse_guarded_permission(
+        &mut self,
+        request_id: &str,
+        turn_id: &str,
+        message: &str,
+    ) -> Result<()> {
+        if self.status.active_turn_id.as_deref() != Some(turn_id) {
+            return Err(Error::new(
+                "unknown",
+                "Claude guard refusal lost its exact turn",
+            ));
+        }
+        let Some(native) = self.native.clone() else {
+            self.record_gap("Claude guard refusal has no live native control channel")
+                .await?;
+            return Ok(());
+        };
+        if let Some(entry) = self.pending_requests.get_mut(request_id) {
+            if entry.turn_id != turn_id || entry.reply_state != NativeReplyState::Available {
+                return Err(Error::new(
+                    "unknown",
+                    "Claude guarded permission binding changed",
+                ));
+            }
+            entry.reply_state = NativeReplyState::Writing;
+        } else {
+            return Err(Error::new(
+                "unknown",
+                "Claude guarded permission was not retained",
+            ));
+        }
+        let result = PermissionResult::Deny {
+            message: message.to_owned(),
+        };
+        match native
+            .respond_control(request_id, result, Instant::now() + EVENT_DEADLINE)
+            .await
+        {
+            Ok(()) => {
+                let native_id = request_event_id(request_id, "request.closed", "claude", "Claude")?;
+                if let Err(error) = self
+                    .commit_event(
+                        "request.closed",
+                        native_id,
+                        json!({"request_id": request_id, "turn_id": turn_id}),
+                    )
+                    .await
+                {
+                    if let Some(entry) = self.pending_requests.get_mut(request_id) {
+                        entry.reply_state = NativeReplyState::Unknown;
+                    }
+                    return Err(error);
+                }
+                self.pending_requests.remove(request_id);
+            }
+            Err(error) if native_no_write(&error.code) => {
+                if let Some(entry) = self.pending_requests.get_mut(request_id) {
+                    entry.reply_state = NativeReplyState::Available;
+                }
+                self.record_gap(
+                    "Claude guard refusal was not dispatched; guarded request remains blocked from approval",
+                )
+                .await?;
+            }
+            Err(_) => {
+                if let Some(entry) = self.pending_requests.get_mut(request_id) {
+                    entry.reply_state = NativeReplyState::Unknown;
+                }
+                self.record_gap(
+                    "Claude guard refusal outcome is unresolved and will not be repeated",
+                )
+                .await?;
+            }
+        }
         Ok(())
     }
 
@@ -3336,6 +3436,16 @@ impl EventProcessor {
             let result = self.finish_stop().await;
             let _ = reply.send(result);
         }
+    }
+
+    async fn commit_request_event(
+        &mut self,
+        native_id: String,
+        data: Value,
+    ) -> Result<Option<eliot_core::PermissionRefusal>> {
+        self.stream_source()
+            .commit_request_event(native_id, data)
+            .await
     }
 
     async fn commit_event(&mut self, kind: &str, native_id: String, data: Value) -> Result<()> {

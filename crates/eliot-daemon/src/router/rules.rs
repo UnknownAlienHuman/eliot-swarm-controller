@@ -638,10 +638,12 @@ impl Router {
         event_seq: i64,
         prepared: PreparedSubmission,
     ) -> Result<Option<eliot_store::RuleEventAdmission>> {
-        if matches!(prepared.request.verb.as_str(), "resume" | "git.fetch")
-            && let Some(admission) = self
-                .replay_rule_event_action(principal, state, revision, event_seq)
-                .await?
+        if matches!(
+            prepared.request.verb.as_str(),
+            "resume" | "git.fetch" | "git.publish"
+        ) && let Some(admission) = self
+            .replay_rule_event_action(principal, state, revision, event_seq)
+            .await?
         {
             return Ok(Some(admission));
         }
@@ -702,6 +704,7 @@ impl Router {
         } else if request.verb != "launch"
             && request.verb != "resume"
             && request.verb != "git.fetch"
+            && request.verb != "git.publish"
             && !matches!(
                 request.verb.as_str(),
                 "stop"
@@ -725,10 +728,41 @@ impl Router {
                 "rule firing must contain a prepared stop, send, launch, resume, steer, interrupt, reply, Run, inject, mail.send, var.set, or local event action",
             ));
         }
+        if request.verb == "git.publish" {
+            let frozen: eliot_core::api::FrozenGitPublish =
+                serde_json::from_value(request.args.clone())
+                    .map_err(|_| Error::new("invalid", "git.publish args are not frozen"))?;
+            frozen.validate()?;
+            match project {
+                Some(registration)
+                    if registration.id == frozen.repository
+                        && registration.revision == frozen.registration_revision
+                        && principal == format!("project:{}", registration.id)
+                        && registration
+                            .actions
+                            .iter()
+                            .any(|action| action == "git.publish") => {}
+                _ => {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "git.publish needs its current approved project rule",
+                    ));
+                }
+            }
+            if frozen.source_event_seq != event_seq {
+                return Err(Error::new(
+                    "not_allowed",
+                    "git.publish must bind its exact project.check.passed event",
+                ));
+            }
+        }
         let secret_policy = self.secret_policy_snapshot();
         let admission = {
             let mut store = self.inner.store.lock().await;
-            let retained_resume = if matches!(request.verb.as_str(), "resume" | "git.fetch") {
+            let retained_resume = if matches!(
+                request.verb.as_str(),
+                "resume" | "git.fetch" | "git.publish"
+            ) {
                 store.replay_rule_event_action(principal, state, revision, event_seq)?
             } else {
                 None
@@ -741,7 +775,7 @@ impl Router {
                 }
                 let replay_first_action = matches!(
                     request.verb.as_str(),
-                    "launch" | "approve" | "deny" | "answer" | "git.fetch"
+                    "launch" | "approve" | "deny" | "answer" | "git.fetch" | "git.publish"
                 );
                 // Store resolves retained launch/reply parents before current gates.
                 if !replay_first_action && let Some(expected) = project {

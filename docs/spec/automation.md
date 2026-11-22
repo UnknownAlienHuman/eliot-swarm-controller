@@ -151,6 +151,38 @@ and supported actions. Missing or empty allowlists deny all. `project list` and
 `project show ID` are owner-only readbacks of the canonical registration; there is no
 project-registration mutation command in this increment.
 
+A project may also declare optional `format` and `check` argv arrays plus a
+bounded `max_rounds`. The daemon debounces committed `file.changed` hints and
+dirty `git.changed` snapshots per exact Agent generation; the latter also covers
+adapters without native file hints. Each event is fenced to the Agent's owned,
+registered worktree. A post-run fingerprint suppresses follow-up hints and snapshots
+for the same content, including reports the check writes. Once edits settle, the daemon runs the formatter
+in that Agent's verified worktree, then runs the fast check in the same minimal
+script/process environment. Events in the same debounce window coalesce. Only a
+definite nonzero exit is delivered. The live turn is selected when the diagnostic
+is admitted. Claude, OpenCode and Antigravity receive it at their existing
+exact-turn hook point. Codex and Muse receive it through active-turn inject/steer.
+When the Agent is idle, the latest failure replaces its unclaimed project-check
+context and waits for the next input. A passing check clears unclaimed failures.
+The fast path uses the current project check. A project can set
+`check_at_turn_end = true` to reserve a heavy check for its Goal. Manual Goal
+checks also run at turn end. Fast checks and Goal checks share one execution lock
+per worktree. Successful fast checks stay silent. Unknown outcomes fence further
+fast checks for the affected Agent generation. Its fence expires when that
+generation ends.
+
+A launch into any registered project with `check` receives a default Eliot Goal
+when it is admitted by assignment or routing role. Projects that enable `git.publish` also
+receive it on profile-selected launches. An explicit assignment Goal takes
+priority, and a later manual `goal.set` replaces the default through the ordinary
+Goal revision. The first round waits for the Agent's first turn to settle. The
+idle Goal driver runs the check at turn end and enforces `max_rounds`.
+A successful final round records the frozen check and its result in the Goal.
+With publication enabled, the default project Goal's successful check records a
+[`project.check.passed` receipt](#final-project-check-publication) after the
+configured project check passes against the same worktree state. Only the
+default project Goal carries publication authority.
+
 Load project rules only from the registered canonical checkout's `.eliot/rules/*.toml`,
 never from an Agent worktree. Their principal is `project:ID`. Router authorization and
 Store admission/dispatch fences revalidate the registration's canonical checkout and
@@ -881,7 +913,8 @@ hidden wait/acceptance state to the router.
 | `notify` | targetless ordinary command; Store atomically commits one persisted `x.user.notify` event with its Applied outcome (local log only) |
 | `emit` | targetless ordinary command; Store atomically commits one persisted `x.user.<topic>` event with its Applied outcome (local log only) |
 | `git.fetch` | targetless ordinary `SubmitCommand` through Router/Store with frozen intent and readback |
-| `git.push`, `git.worktree` | unsupported in this fetch-only increment |
+| `git.publish` | targetless project-rule command bound to one retained `project.check.passed` event; commit, optional approved push, and optional approved PR use one durable dispatch |
+| `git.push`, `git.worktree` | unsupported as general actions; `git.publish` owns only its check-bound branch push |
 
 Scripts/commands that finish unsuccessfully can have partial effects. `failed` does not
 mean rollback; uncertain outcomes stay `unknown`, and neither is automatically rerun.
@@ -940,17 +973,52 @@ are not turned into Owner RPC clients.
 
 ## Git actions
 
-This increment connects only the concrete `git.fetch` recipe below, as a native effect on
-the existing Router/Store command path. Owner-global and registered-project event/timer
-actions use the same targetless `git.fetch` command; it is not a `run` wrapper or a second
-executor. Project authority comes from the saved principal and canonical registration, not
-from action args. The literal `repository` names an owner registration ID; Owner rules may
-select any registration, and a project principal `project:ID` must match that ID. These
-actions do not intercept Git used by a coding harness. There is no generic built-in pull;
-merge, rebase and repository integration remain explicit script/workflow work, while
-`git.fetch` is the bounded project fetch wrapper. `git.push` and `git.worktree` remain
-unsupported here. Both action callers use the existing Router/Store admission path and
-ordinary `Store::dispatch`/`Store::settle` methods; no parallel admission API is added.
+This increment connects `git.fetch` and the check-bound `git.publish` recipe below through
+the existing Router/Store command path. `git.fetch` remains available to Owner and
+registered-project event/timer rules. `git.publish` is project-rule-only and requires the
+exact `project.check.passed` event. The dedicated event is committed
+atomically with the final project-check success and carries Core `ProjectCheckPassed`
+(`project`, `turn_id`, `fingerprint`, `subject`). Its envelope binds the Agent generation
+and workspace. `subject` is the first line of that same retained final answer; the Router
+does not render or accept a rule-supplied commit message.
+
+Project registration authority comes from the saved principal and canonical registration,
+not action arguments. For `git.publish`, the action's `repository` must equal its
+`project:ID` principal, and the Owner registration must approve `git.publish`. The exact
+source event sequence, event data, current registration revision, Agent generation, and
+Store-managed workspace are frozen before admission and rechecked before dispatch/effects.
+The passed Git fingerprint is the existing SHA-256 work fingerprint over HEAD and the
+worktree dirty digest. Publication refuses a stale fingerprint, incomplete Git observation,
+detached branch, unmerged worktree, non-ready/shared checkout, or changed managed-worktree
+identity. A clean tree never creates an empty commit. If HEAD equals the managed base, it
+performs no push or PR; if the checked branch already contains commits ahead of its base,
+a configured remote may publish that exact HEAD without creating another commit.
+
+`git.publish` commits the nonignored changes from the passed snapshot using the
+answer subject. It initializes one private, command-owned `GIT_INDEX_FILE` from
+the checked HEAD and stages with `git add --all`, leaving the Agent's index
+untouched. It verifies the staged contents, writes the commit from that
+immutable tree, and updates the managed branch only if it still points to the
+checked parent. It uses bounded Git argv and existing process custody with hooks
+disabled. A named `remote` selects only an Owner-approved
+`[projects.ID.git.publication].remotes` endpoint; the endpoint is frozen, direct, and never
+derived from `origin` or `pushurl`. The push targets only
+`refs/heads/<managed-branch>` without force. `create_pr = true` additionally requires the
+Owner-configured `github_cli` integration and matching HTTPS remote. PR title is the same
+answer subject, the configured base ref is literal, and the existing owner-selected
+`GH_CONFIG_DIR` is read in place. Eliot does not copy or persist Git or GitHub credentials.
+SSH and implicit remote/credential fallbacks are unsupported.
+
+The command is committed before any Git or GitHub effect. Each effect is attempted at most
+once. Commit readback must prove the new HEAD's exact parent, subject, branch, matching
+tracked worktree, and absence of untracked paths relative to the private index. The preserved
+Agent index is not a cleanliness check after the branch update. Push readback must prove the
+configured remote ref equals that commit. PR creation uses the explicit repository/branch/base
+and readback; any uncertain push or PR stays
+`unknown` and is never replayed. A known failed effect is not rolled back; Store command
+state remains authoritative, and private transport cleanup follows durable settlement.
+These actions do not intercept Git run by a coding harness or Run script. There is no
+generic built-in pull, merge, rebase, or push action.
 
 Validate an owner-registered repository, approved remote and exact OIDs. `source_ref` is a
 full valid ref. `tracking_ref` must be a full valid ref under `refs/remotes/` with a
@@ -1030,6 +1098,43 @@ object downloads do not imply rollback and do not make a known failed transfer `
 A missing exit status is not a definite nonzero exit: it still requires the
 private-ref/OID validation, and an unreadable private ref stays `unknown`. Private-view
 cleanup follows durable settlement through the existing Router/Store path.
+
+### Final project-check publication
+
+Only a project rule can opt in. Its action must use the exact event trigger:
+
+```toml
+[[rule]]
+id = "publish-final-check"
+on = { event = "project.check.passed" }
+do = [{ action = "git.publish", repository = "app", remote = "qa" }]
+```
+
+Omit `remote` for local commit only. `create_pr` defaults to `false`; enabling it requires
+both a named approved publication remote and the Owner's `github_cli` settings. `timeout`
+uses humantime, positive whole milliseconds, and defaults to 10 minutes. The action's
+literal arguments and the event's retained snapshot become Core `GitPublishTrigger` and
+`FrozenGitPublish` values in the ordinary command args. No separate publication queue or
+effect table is added. Rule-event replay resolves the retained child first; an unknown
+commit, push, or PR is read-only on recovery and cannot start a second effect.
+
+The Owner approval and project rule are configured separately:
+
+```toml
+# Owner config.toml
+[projects.app]
+actions = ["git.publish"]
+
+[projects.app.git.publication]
+remotes = { qa = "C:/qa-833/app.git", private = "https://github.com/example/app-qa.git" }
+
+[projects.app.git.publication.github_cli]
+program = "C:/Program Files/GitHub CLI/gh.exe"
+config_dir = "C:/qa-833/gh-config"
+host = "github.com"
+repository = "example/app-qa"
+base_ref = "main"
+```
 
 After proving the process stopped, read back the tracking ref through the same frozen
 configuration and canonical common directory. Unknown settlement is read-only: it never
@@ -1275,11 +1380,40 @@ it for a later callback or turn. Its first native consumer is Claude Code 2.1.27
 `PreToolUse.additionalContext`; the source schema is confirmed and runtime application is
 still pending qualification.
 
+### Project command guards
+
+The registered project's static command_guards table is frozen into the admitted launch
+after registration resolution. Only the daemon evaluates it. A plugin may attach a
+transient command string to the exact native request.opened; the daemon strips that
+context before persistence, adds the matching refusal text to approval details, and
+returns a refusal bound to the source Agent generation, request id and turn id in the
+event acknowledgement. That acknowledgement follows the committed request event.
+Store admission rejects `approve` for a guarded request. A refreshed native offer
+retains the refusal for the same request. Each native denial is attempted once.
+
+Claude `can_use_tool` for Bash or PowerShell and OpenCode 2.2.7
+`permission.asked` carry the refusal text
+in their native reply. OpenCode's native reject closes every pending permission
+for the session, so the adapter reads back the pending list and auto-rejects only when
+the guarded ask is the sole pending permission. If readback fails or a sibling permission
+exists, the guarded request remains pending with its refusal and cannot be approved.
+The native API has no atomic single-request reject; this does not claim exact behavior
+for a sibling permission created after readback but before the session-wide reject.
+
+Codex, Muse and Antigravity attach command text when the permission request supplies it.
+The daemon sends a generation- and turn-bound `deny` through the existing
+native reply path and delivers the refusal text through the turn's context delivery.
+An ambiguous Muse refusal offer stays pending with the recorded guard text.
+Codex 0.167.1 provides the standalone `execpolicy check --rules` evaluator. Its
+app-server has no verified per-session rule attachment for `approval_policy = "never"`.
+The existing prohibition on `on.hook` and `hook.decide` applies.
+
 ## Goal loop
 
 A Goal is keyed by `(agent,generation,mode,revision)`; native and Eliot modes are
 independent. `set`, definition changes, pause, clear and resume advance revision.
-An identical `set` on an active Goal's bound generation is a no-op. A fresh
+An identical `set` on an active manual Goal's bound generation is a no-op.
+Replacing a default project Goal establishes a manual Goal. A fresh
 `goal set` on a blocked Goal clears its reason and resets its budget, even with
 the same definition. Generation change pauses
 the old Goal on its next round attempt, and `resume` on a drifted generation is
