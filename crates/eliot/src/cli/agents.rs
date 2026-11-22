@@ -13,6 +13,7 @@ use super::support::{
     turn_exit_code, turn_value, validate_limit, validate_no_policy, wait_call, wait_deadline,
     wait_for_command, wait_for_linked_turn, wait_for_turn,
 };
+use eliot_core::api::harness::{QuotaUsageOrigin, RECOMMENDED_QUOTA_RESERVE_PERCENT};
 use eliot_core::api::{
     AgentDiscoverRequest, AgentGetRequest, AgentGetResponse, CommandGetRequest, DiscoverPage,
     HarnessListRequest, HarnessListResponse, HarnessModelsRequest, HarnessModelsResponse,
@@ -157,13 +158,83 @@ pub(crate) async fn run_quota(
     {
         return Err(Failure::new(2, "--profile must not be empty"));
     }
-    read_and_print!(
-        &data_dir,
-        json_output,
-        "harness.quota",
-        HarnessQuotaRequest { harness, profile },
-        HarnessQuotaResponse
-    )
+    let request = HarnessQuotaRequest { harness, profile };
+    request.validate().map_err(Failure::for_read)?;
+    let response: HarnessQuotaResponse =
+        eliot_daemon::client_call_typed(&data_dir, "harness.quota", &request)
+            .await
+            .map_err(Failure::for_read)?;
+    request
+        .validate_response(&response)
+        .map_err(Failure::invalid_response)?;
+    if json_output {
+        let value = serde_json::to_value(response)
+            .map_err(|_| Failure::new(4, "harness.quota response is invalid"))?;
+        print_value(&value, true);
+        return Ok(0);
+    }
+    println!("Quota {} ({})", response.scope, response.status);
+    println!(
+        "Quota reserve {}% (recommended {}%)",
+        response.effective_reserve_percent, RECOMMENDED_QUOTA_RESERVE_PERCENT
+    );
+    println!(
+        "Provider reading at {} ms (TTL {} ms, credential {})",
+        response.fetched_at_ms, response.ttl_ms, response.credential
+    );
+    if let Some(note) = &response.note {
+        println!("{note}");
+    }
+    if let Some(details) = &response.details {
+        print_value(details, false);
+    }
+    if response.observed_usage.is_empty() {
+        println!("Observed Owner and automation usage unavailable for this route");
+    }
+    for window in &response.observed_usage {
+        println!("{} observed Swarm usage", window.label);
+        print_quota_origin("Owner", &window.by_origin.owner);
+        print_quota_origin("Automation", &window.by_origin.automation);
+        for (label, origin) in [
+            ("Other", &window.by_origin.other),
+            ("Unattributed", &window.by_origin.unattributed),
+        ] {
+            if origin.turns_counted > 0 {
+                print_quota_origin(label, origin);
+            }
+        }
+        println!(
+            "  Coverage {} of {} overlapping turns counted across {} Agents. {}",
+            window.coverage.turns_counted,
+            window.coverage.turns_overlapping,
+            window.coverage.agents_matched,
+            window.coverage.history_reason,
+        );
+    }
+    Ok(0)
+}
+
+fn print_quota_origin(label: &str, origin: &QuotaUsageOrigin) {
+    use super::reads::counter_cell;
+
+    println!(
+        "  {label} {} recorded turns ({} without usage)",
+        origin.turns_counted, origin.turns_without_usage
+    );
+    for scope in &origin.by_scope {
+        println!(
+            "    {} tokens ({} turns) input {} output {} reasoning {} thinking {} cache read {} cache write {} total {}",
+            scope.scope,
+            scope.turns_counted,
+            counter_cell(scope.totals.input_tokens),
+            counter_cell(scope.totals.output_tokens),
+            counter_cell(scope.totals.reasoning_tokens),
+            counter_cell(scope.totals.thinking_tokens),
+            counter_cell(scope.totals.cache_read_tokens),
+            counter_cell(scope.totals.cache_write_tokens),
+            counter_cell(scope.totals.total_tokens),
+        );
+    }
 }
 
 pub(crate) async fn run_attach(

@@ -21,13 +21,17 @@ pub(crate) use role::{RoleUsage, manager_at_sql};
 
 use super::*;
 use super::{hierarchy, retention};
+use eliot_core::api::harness::{
+    MAX_QUOTA_USAGE_WINDOWS, QuotaUsageCoverage, QuotaUsageOrigin, QuotaUsageSplit,
+    QuotaWindowBounds, QuotaWindowUsage,
+};
 use eliot_core::api::{
     FirstCallInput, MAX_FIRST_CALL_TURNS, PROFILE_FIRST_CALL_WINDOW, ProfileFirstCallInput,
     SessionCostTotal, SessionCumulativeTotals, SessionFacts, SessionTokenSubtotal,
     TurnCounterMissing, TurnCounterTotals, TurnExpenditure, TurnScopeTotals, UsageScopeView,
     UsageSummaryRequest, UsageSummaryResponse,
 };
-use rusqlite::params_from_iter;
+use rusqlite::{Connection, params, params_from_iter};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// One resolved usage scope: retained (agent, generation) pairs with the
@@ -40,6 +44,18 @@ pub struct ResolvedUsageScope {
 
 /// Counter positions shared by the turn aggregation below.
 const TURN_COUNTERS: usize = 7;
+
+const MAX_QUOTA_RETAINED_TURNS: usize = 4096;
+const QUOTA_ROUTE_MATCH: &str = "
+    a.harness = ?1 AND a.profile = ?2 AND a.observe_only = 0
+    AND json_extract(a.profile_snapshot, '$.native_route_identity') = ?4
+    AND json_extract(a.profile_snapshot, '$.account') IS json_extract(?3, '$.account')
+    AND json_extract(a.profile_snapshot, '$.auth_integration') IS json_extract(?3, '$.auth_integration')
+    AND json_extract(a.profile_snapshot, '$.route_binding') IS json_extract(?3, '$.route_binding')
+    AND json_extract(a.profile_snapshot, '$.local_provider') IS json_extract(?3, '$.local_provider')
+    AND json_extract(a.profile_snapshot, '$.proxy') IS json_extract(?3, '$.proxy')
+    AND json_extract(a.profile_snapshot, '$.api_key_env') IS json_extract(?3, '$.api_key_env')
+    AND json_extract(a.profile_snapshot, '$.cmd') IS json_extract(?3, '$.cmd')";
 
 fn turn_counter(usage: &TurnUsage, index: usize) -> Option<i64> {
     match index {
@@ -93,6 +109,128 @@ struct ScopeAccum {
     counted: usize,
     sums: [i128; TURN_COUNTERS],
     supplied: [usize; TURN_COUNTERS],
+}
+
+#[derive(Default)]
+struct QuotaOriginAccum {
+    turns_counted: usize,
+    turns_without_usage: usize,
+    scopes: BTreeMap<String, ScopeAccum>,
+}
+
+#[derive(Default)]
+struct QuotaSplitAccum {
+    owner: QuotaOriginAccum,
+    automation: QuotaOriginAccum,
+    other: QuotaOriginAccum,
+    unattributed: QuotaOriginAccum,
+}
+
+#[derive(Clone, Copy)]
+enum QuotaOriginKind {
+    Owner,
+    Automation,
+    Other,
+    Unattributed,
+}
+
+impl QuotaSplitAccum {
+    fn origin_mut(&mut self, kind: QuotaOriginKind) -> &mut QuotaOriginAccum {
+        match kind {
+            QuotaOriginKind::Owner => &mut self.owner,
+            QuotaOriginKind::Automation => &mut self.automation,
+            QuotaOriginKind::Other => &mut self.other,
+            QuotaOriginKind::Unattributed => &mut self.unattributed,
+        }
+    }
+
+    fn finish(self) -> QuotaUsageSplit {
+        let finish_origin = |origin: QuotaOriginAccum| QuotaUsageOrigin {
+            turns_counted: origin.turns_counted,
+            turns_without_usage: origin.turns_without_usage,
+            by_scope: origin
+                .scopes
+                .into_iter()
+                .map(|(scope, accum)| TurnScopeTotals {
+                    scope,
+                    turns_counted: accum.counted,
+                    totals: counter_totals(&accum.sums, &accum.supplied),
+                    turns_missing: counter_missing(accum.counted, &accum.supplied),
+                })
+                .collect(),
+        };
+        QuotaUsageSplit {
+            owner: finish_origin(self.owner),
+            automation: finish_origin(self.automation),
+            other: finish_origin(self.other),
+            unattributed: finish_origin(self.unattributed),
+        }
+    }
+}
+
+struct QuotaTurn {
+    state: String,
+    started_at: Option<i64>,
+    completed_at: Option<i64>,
+    usage: Option<String>,
+    command_id: Option<String>,
+}
+
+fn quota_turn_origin(connection: &Connection, command_id: &str) -> Result<QuotaOriginKind> {
+    let (principal, has_rule_cause, has_agent_principal, reaches_root, commands_seen): (
+        Option<String>,
+        i64,
+        i64,
+        i64,
+        i64,
+    ) = connection
+        .query_row(
+            "WITH RECURSIVE command_chain(id, parent_command, verb, principal, cause, depth) AS (
+                 SELECT id, parent_command, verb, principal, cause, 0
+                   FROM commands WHERE id = ?1
+                 UNION ALL
+                 SELECT parent.id, parent.parent_command, parent.verb,
+                        parent.principal, parent.cause, command_chain.depth + 1
+                   FROM commands parent
+                   JOIN command_chain ON parent.id = command_chain.parent_command
+                  WHERE command_chain.depth < 64
+             )
+             SELECT MAX(CASE WHEN depth = 0 THEN principal END),
+                    COALESCE(MAX(CASE WHEN verb IN ('rule','timer.run','rule.catch_up')
+                                      OR json_extract(cause, '$.rule') IS NOT NULL
+                                      THEN 1 ELSE 0 END), 0),
+                    COALESCE(MAX(CASE WHEN principal LIKE 'agent:%'
+                                      THEN 1 ELSE 0 END), 0),
+                    COALESCE(MAX(CASE WHEN parent_command IS NULL
+                                      THEN 1 ELSE 0 END), 0),
+                    COUNT(*)
+               FROM command_chain",
+            [command_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .map_err(sql_error)?;
+    if commands_seen == 0 {
+        return Ok(QuotaOriginKind::Unattributed);
+    }
+    if has_rule_cause != 0 || has_agent_principal != 0 {
+        return Ok(QuotaOriginKind::Automation);
+    }
+    if reaches_root == 0 {
+        return Ok(QuotaOriginKind::Unattributed);
+    }
+    Ok(match principal.as_deref() {
+        Some("owner") => QuotaOriginKind::Owner,
+        Some(_) => QuotaOriginKind::Other,
+        None => QuotaOriginKind::Unattributed,
+    })
 }
 
 fn normalize_turn_scope(scope: &Option<String>) -> String {
@@ -426,6 +564,257 @@ impl Store {
             swarm_mcp,
             swarm_mcp_truncated,
         })
+    }
+
+    /// Attribute retained native turn units to one named profile's frozen
+    /// route selectors and current Agent generations. Older generations are
+    /// excluded because their immutable route snapshots are not retained.
+    pub fn summarize_quota_usage(
+        &self,
+        harness: &str,
+        profile_name: &str,
+        snapshot: &serde_json::Value,
+        windows: &[QuotaWindowBounds],
+    ) -> Result<Vec<QuotaWindowUsage>> {
+        self.ensure_committed_reads()?;
+        if windows.len() > MAX_QUOTA_USAGE_WINDOWS {
+            return Err(eliot_core::Error::new(
+                "invalid",
+                "quota usage window count exceeds its bound",
+            ));
+        }
+        for window in windows {
+            window.validate()?;
+        }
+        let route_identity = snapshot
+            .get("native_route_identity")
+            .and_then(serde_json::Value::as_str)
+            .filter(|identity| !identity.trim().is_empty());
+        let snapshot_json = encode_json(snapshot)?;
+        let pruned_through = retention::coverage_pruned_through(&self.connection)?;
+        let history_complete = pruned_through == 0;
+        let history_reason = if history_complete {
+            "Current-generation turns for the selected profile route. No event history pruned."
+                .to_owned()
+        } else {
+            format!(
+                "Current-generation turns for the selected profile route. Event history pruned through sequence {pruned_through}."
+            )
+        };
+        let (agents_matched, older_generations_excluded) = if let Some(identity) = route_identity {
+            let agents_matched: i64 = self
+                .connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM agents a WHERE {QUOTA_ROUTE_MATCH}"),
+                    params![harness, profile_name, snapshot_json, identity],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error)?;
+            let older_generations_excluded: i64 = self
+                .connection
+                .query_row(
+                    &format!(
+                        "SELECT EXISTS(
+                         SELECT 1 FROM agents a
+                         JOIN turns t ON t.agent = a.id AND t.generation <> a.generation
+                         WHERE {QUOTA_ROUTE_MATCH}
+                     )"
+                    ),
+                    params![harness, profile_name, snapshot_json, identity],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error)?;
+            (
+                agents_matched.max(0) as usize,
+                older_generations_excluded != 0,
+            )
+        } else {
+            (0, false)
+        };
+        let mut result = Vec::with_capacity(windows.len());
+        for window in windows {
+            let mut coverage = QuotaUsageCoverage {
+                route_identity_available: route_identity.is_some(),
+                window_bounds_available: window.starts_at_ms.is_some(),
+                agents_matched,
+                older_generations_excluded,
+                history_complete,
+                history_reason: history_reason.clone(),
+                ..QuotaUsageCoverage::default()
+            };
+            let mut usage_split = QuotaSplitAccum::default();
+            let Some(starts_at_ms) = window.starts_at_ms else {
+                coverage.history_complete = false;
+                coverage.history_reason =
+                    "provider quota window has no known start time; no turn interval was inferred"
+                        .to_owned();
+                result.push(QuotaWindowUsage {
+                    label: window.label.clone(),
+                    starts_at_ms: None,
+                    through_ms: window.through_ms,
+                    by_origin: usage_split.finish(),
+                    coverage,
+                });
+                continue;
+            };
+            let Some(identity) = route_identity else {
+                coverage.history_complete = false;
+                coverage.history_reason =
+                    "frozen profile has no canonical route identity; no turn usage was attributed"
+                        .to_owned();
+                result.push(QuotaWindowUsage {
+                    label: window.label.clone(),
+                    starts_at_ms: Some(starts_at_ms),
+                    through_ms: window.through_ms,
+                    by_origin: usage_split.finish(),
+                    coverage,
+                });
+                continue;
+            };
+            if agents_matched == 0 {
+                coverage.history_reason =
+                    "No current Agent generation matched the selected profile route.".to_owned();
+                result.push(QuotaWindowUsage {
+                    label: window.label.clone(),
+                    starts_at_ms: Some(starts_at_ms),
+                    through_ms: window.through_ms,
+                    by_origin: usage_split.finish(),
+                    coverage,
+                });
+                continue;
+            }
+
+            let turns = {
+                let mut statement = self
+                    .connection
+                    .prepare(&format!(
+                        "SELECT t.state, t.started_at, t.completed_at, t.usage, c.id
+                           FROM agents a
+                           JOIN turns t ON t.agent = a.id AND t.generation = a.generation
+                           LEFT JOIN commands c
+                             ON c.id = t.start_command_id
+                            AND c.target = t.agent
+                            AND c.generation = t.generation
+                            AND c.turn_id = t.turn_id
+                            AND c.verb = 'send' AND c.state = 'applied'
+                          WHERE {QUOTA_ROUTE_MATCH}
+                            AND (
+                                (t.started_at <= ?6
+                                 AND (t.completed_at IS NULL OR t.completed_at >= ?5))
+                                OR (t.started_at IS NULL
+                                    AND t.completed_at BETWEEN ?5 AND ?6)
+                                OR (t.started_at IS NULL AND t.completed_at IS NULL)
+                            )
+                          ORDER BY t.insertion_seq DESC, t.agent, t.turn_id
+                          LIMIT ?7"
+                    ))
+                    .map_err(sql_error)?;
+                let rows = statement
+                    .query_map(
+                        params![
+                            harness,
+                            profile_name,
+                            snapshot_json,
+                            identity,
+                            starts_at_ms,
+                            window.through_ms,
+                            (MAX_QUOTA_RETAINED_TURNS + 1) as i64,
+                        ],
+                        |row| {
+                            Ok(QuotaTurn {
+                                state: row.get(0)?,
+                                started_at: row.get(1)?,
+                                completed_at: row.get(2)?,
+                                usage: row.get(3)?,
+                                command_id: row.get(4)?,
+                            })
+                        },
+                    )
+                    .map_err(sql_error)?;
+                let mut turns = Vec::new();
+                for row in rows {
+                    turns.push(row.map_err(sql_error)?);
+                }
+                turns
+            };
+            if turns.len() > MAX_QUOTA_RETAINED_TURNS {
+                coverage.history_complete = false;
+                coverage.history_reason.push_str(&format!(
+                    " Read limited to the latest {MAX_QUOTA_RETAINED_TURNS} matching turns."
+                ));
+            }
+            for turn in turns.into_iter().take(MAX_QUOTA_RETAINED_TURNS) {
+                if turn.started_at.is_none() && turn.completed_at.is_none() {
+                    coverage.turns_missing_time += 1;
+                    continue;
+                }
+                let overlaps = match (turn.started_at, turn.completed_at) {
+                    (Some(start), Some(end)) => start <= window.through_ms && end >= starts_at_ms,
+                    (Some(start), None) => start <= window.through_ms,
+                    (None, Some(end)) => end >= starts_at_ms && end <= window.through_ms,
+                    (None, None) => false,
+                };
+                if !overlaps {
+                    continue;
+                }
+                coverage.turns_overlapping += 1;
+                if turn.state != "completed" {
+                    if turn.state == "running" {
+                        coverage.turns_running_excluded += 1;
+                    } else {
+                        coverage.turns_unknown_excluded += 1;
+                    }
+                    continue;
+                }
+                let (Some(start), Some(end)) = (turn.started_at, turn.completed_at) else {
+                    coverage.turns_missing_time += 1;
+                    continue;
+                };
+                if start > end {
+                    coverage.turns_missing_time += 1;
+                    continue;
+                }
+                if start < starts_at_ms || end > window.through_ms {
+                    coverage.turns_crossing_window += 1;
+                    continue;
+                }
+                coverage.turns_counted += 1;
+                let origin_kind = match turn.command_id.as_deref() {
+                    Some(command_id) => quota_turn_origin(&self.connection, command_id)?,
+                    None => {
+                        coverage.turns_missing_command += 1;
+                        QuotaOriginKind::Unattributed
+                    }
+                };
+                let origin = usage_split.origin_mut(origin_kind);
+                origin.turns_counted += 1;
+                let Some(usage) = turn.usage else {
+                    origin.turns_without_usage += 1;
+                    coverage.turns_without_usage += 1;
+                    continue;
+                };
+                let usage = decode_turn_usage(&usage, harness)?;
+                let accum = origin
+                    .scopes
+                    .entry(normalize_turn_scope(&usage.scope))
+                    .or_default();
+                accum.counted += 1;
+                for index in 0..TURN_COUNTERS {
+                    if let Some(value) = turn_counter(&usage, index) {
+                        accum.sums[index] += i128::from(value);
+                        accum.supplied[index] += 1;
+                    }
+                }
+            }
+            result.push(QuotaWindowUsage {
+                label: window.label.clone(),
+                starts_at_ms: Some(starts_at_ms),
+                through_ms: window.through_ms,
+                by_origin: usage_split.finish(),
+                coverage,
+            });
+        }
+        Ok(result)
     }
 
     /// The newest retained turn rows give doctor a fixed-size observation

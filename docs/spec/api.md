@@ -2285,12 +2285,12 @@ call it available. With no observation, or no installed MSP method, Muse
 returns `unsupported` and its reason. No quota query starts a turn, performs
 inference or polls Agents. CLI: `swarm quota --harness H [--profile P]`.
 
-The quota response includes the effective [Owner reserve](configuration.md#owner-quota-reserve-872).
-`swarm quota` displays it and the recommended setting of 20%. For provider
-windows with known bounds the command reports attributable retained Swarm usage
-for the Owner and automation. Provider window percentages are account totals.
-The attribution uses observed Swarm usage units, with coverage shown separately,
-since provider readback does not identify the caller for each debit.
+The quota response includes the effective [Owner reserve](configuration.md#owner-quota-reserve-872)
+and `swarm quota` displays it with the recommended setting of 20%. For current
+account-wide windows with known bounds, the command reports retained Swarm
+usage for the selected profile route by Owner and automation, with coverage.
+The provider reports account-wide percentages. Per-caller usage uses native
+Swarm turn counters because the provider supplies no per-caller quota debit.
 
 An automatic launch refused by the reserve or unknown-reading policy returns
 `quota_reserve` or `quota_unknown`. Role-routed refusals include the typed

@@ -177,10 +177,6 @@ impl Router {
         } else {
             candidates
         };
-        let bound = mode.bound_profile.filter(|_| mode.automatic(principal));
-        if let Some(bound) = bound {
-            candidates.retain(|candidate| candidate == bound);
-        }
         let decision = RoutingDecision {
             role: role.clone(),
             profile: None,
@@ -200,11 +196,16 @@ impl Router {
         // harness. Policy may still select a different native harness.
         let mut preflight = RoutePreflight {
             arbitrated: mode.arbitrated,
-            bound_candidate: bound.is_some(),
             ..RoutePreflight::default()
         };
         if mode.automatic(principal) {
             self.prepare_quota_policies(&mut preflight, &candidates, parent.as_ref());
+            if preflight.quota_deadline.is_some()
+                && let Some(bound) = mode.bound_profile
+            {
+                candidates.retain(|candidate| candidate == bound);
+                preflight.bound_candidate = true;
+            }
         }
         self.choose_route(
             principal,
@@ -266,7 +267,14 @@ impl Router {
         let quota = self
             .read_candidate_quota(profile, harness, snapshot, deadline)
             .await;
-        if let Some(reason) = policy.refusal(quota.headroom.as_ref()) {
+        let refusal = policy.refusal(quota.headroom.as_ref());
+        if quota.exhausted && refusal != Some(RouteSkipReason::QuotaReserve) {
+            return Err(Error::new(
+                "provider_held",
+                format!("{profile}: quota used up"),
+            ));
+        }
+        if let Some(reason) = refusal {
             let message = match (
                 reason,
                 quota
@@ -353,8 +361,8 @@ impl Router {
         mut preflight: RoutePreflight,
     ) -> Result<(String, String, Value)> {
         let rank_by_quota = preflight.quota_deadline.is_some();
-        let failover_candidates =
-            (rank_by_quota && decision.provider_failover.is_some()).then(|| candidates.clone());
+        let mut failover_candidates =
+            (rank_by_quota && decision.provider_failover.is_some()).then(Vec::new);
         let mut selected: Option<AvailableRoute> = None;
         let mut candidates = candidates.into_iter();
         while let Some(name) = candidates.next() {
@@ -371,6 +379,9 @@ impl Router {
                 .await?;
             match evaluated {
                 Ok(candidate) => {
+                    if let Some(tail) = &mut failover_candidates {
+                        tail.push(candidate.name.clone());
+                    }
                     if selected.as_ref().is_none_or(|prior| {
                         candidate.quota.weekly_used().is_some_and(|used| {
                             prior.quota.weekly_used().is_none_or(|first| used < first)

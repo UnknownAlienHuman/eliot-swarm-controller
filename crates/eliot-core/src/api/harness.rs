@@ -63,6 +63,10 @@ pub const CLAUDE_EXTERNAL_ROUTE_MARKERS: &[&str] = &[
 /// Maximum encoded bytes for structured quota details (provider-verbatim
 /// quota signals, never secrets or personal data).
 pub const MAX_HARNESS_QUOTA_DETAILS_BYTES: usize = 8192;
+/// Recommended reserve shown by the quota CLI; not a measured provider value.
+pub const RECOMMENDED_QUOTA_RESERVE_PERCENT: u8 = 20;
+/// Maximum provider quota windows carried with observed turn usage.
+pub const MAX_QUOTA_USAGE_WINDOWS: usize = 32;
 /// Freshness bound for cached catalogue/quota readback: five minutes.
 pub const HARNESS_READ_TTL_MS: u64 = 300_000;
 /// Maximum freshness bound the daemon may serve.
@@ -605,6 +609,165 @@ pub struct HarnessQuotaResponse {
     /// other personal data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<serde_json::Value>,
+    /// Effective configured reserve. Missing fields from older peers mean zero.
+    #[serde(default)]
+    pub effective_reserve_percent: u8,
+    /// Retained native turn usage grouped by provider quota window. This is
+    /// observed token usage, not a split of the provider-reported percentage.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observed_usage: Vec<QuotaWindowUsage>,
+}
+
+/// Bounds normalized from one provider-reported account quota window.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq)]
+pub struct QuotaWindowBounds {
+    pub label: String,
+    pub starts_at_ms: Option<i64>,
+    pub through_ms: i64,
+}
+
+impl QuotaWindowBounds {
+    pub fn validate(&self) -> Result<()> {
+        if self.label.trim().is_empty()
+            || self.label.len() > 128
+            || self.label.chars().any(char::is_control)
+            || self.through_ms < 0
+            || self
+                .starts_at_ms
+                .is_some_and(|start| start < 0 || start > self.through_ms)
+        {
+            return Err(Error::new("invalid", "quota window bounds are invalid"));
+        }
+        Ok(())
+    }
+}
+
+/// Observed retained turn usage for one provider quota window.
+#[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuotaWindowUsage {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starts_at_ms: Option<i64>,
+    pub through_ms: i64,
+    pub by_origin: QuotaUsageSplit,
+    pub coverage: QuotaUsageCoverage,
+}
+
+/// Native turns grouped by the exact command principal and automation cause.
+#[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuotaUsageSplit {
+    pub owner: QuotaUsageOrigin,
+    pub automation: QuotaUsageOrigin,
+    pub other: QuotaUsageOrigin,
+    pub unattributed: QuotaUsageOrigin,
+}
+
+/// Native counters for one origin, kept separate by native usage scope.
+#[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuotaUsageOrigin {
+    pub turns_counted: usize,
+    pub turns_without_usage: usize,
+    pub by_scope: Vec<super::usage::TurnScopeTotals>,
+}
+
+/// Coverage applies only to retained turns matched to this route identity.
+#[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuotaUsageCoverage {
+    pub route_identity_available: bool,
+    pub window_bounds_available: bool,
+    pub agents_matched: usize,
+    pub turns_overlapping: usize,
+    pub turns_counted: usize,
+    pub turns_without_usage: usize,
+    pub turns_unknown_excluded: usize,
+    pub turns_running_excluded: usize,
+    pub turns_crossing_window: usize,
+    pub turns_missing_time: usize,
+    pub turns_missing_command: usize,
+    pub older_generations_excluded: bool,
+    pub history_complete: bool,
+    pub history_reason: String,
+}
+
+impl QuotaWindowUsage {
+    pub fn validate(&self) -> Result<()> {
+        if self.label.trim().is_empty()
+            || self.label.len() > 128
+            || self.label.chars().any(char::is_control)
+            || self.through_ms < 0
+            || self
+                .starts_at_ms
+                .is_some_and(|start| start < 0 || start > self.through_ms)
+            || self.coverage.history_reason.trim().is_empty()
+            || self.coverage.window_bounds_available != self.starts_at_ms.is_some()
+        {
+            return Err(Error::new("invalid", "quota usage window is invalid"));
+        }
+        let origins = [
+            &self.by_origin.owner,
+            &self.by_origin.automation,
+            &self.by_origin.other,
+            &self.by_origin.unattributed,
+        ];
+        let mut counted = 0_usize;
+        let mut without_usage = 0_usize;
+        for origin in origins {
+            if origin.turns_without_usage > origin.turns_counted {
+                return Err(Error::new("invalid", "quota usage coverage is invalid"));
+            }
+            let scoped = origin.by_scope.iter().try_fold(0_usize, |total, scope| {
+                total.checked_add(scope.turns_counted)
+            });
+            if scoped != Some(origin.turns_counted - origin.turns_without_usage) {
+                return Err(Error::new("invalid", "quota usage scopes are invalid"));
+            }
+            let mut names = std::collections::BTreeSet::new();
+            for scope in &origin.by_scope {
+                if scope.scope.trim().is_empty()
+                    || !names.insert(scope.scope.as_str())
+                    || [
+                        scope.totals.input_tokens,
+                        scope.totals.output_tokens,
+                        scope.totals.reasoning_tokens,
+                        scope.totals.thinking_tokens,
+                        scope.totals.cache_read_tokens,
+                        scope.totals.cache_write_tokens,
+                        scope.totals.total_tokens,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .any(|value| value < 0)
+                    || [
+                        scope.turns_missing.input_tokens,
+                        scope.turns_missing.output_tokens,
+                        scope.turns_missing.reasoning_tokens,
+                        scope.turns_missing.thinking_tokens,
+                        scope.turns_missing.cache_read_tokens,
+                        scope.turns_missing.cache_write_tokens,
+                        scope.turns_missing.total_tokens,
+                    ]
+                    .into_iter()
+                    .any(|missing| missing > scope.turns_counted)
+                {
+                    return Err(Error::new("invalid", "quota usage scope is invalid"));
+                }
+            }
+            counted = counted.saturating_add(origin.turns_counted);
+            without_usage = without_usage.saturating_add(origin.turns_without_usage);
+        }
+        if counted != self.coverage.turns_counted
+            || without_usage != self.coverage.turns_without_usage
+            || self.coverage.turns_without_usage > self.coverage.turns_counted
+            || self.coverage.turns_missing_command > self.coverage.turns_counted
+        {
+            return Err(Error::new("invalid", "quota usage coverage is invalid"));
+        }
+        Ok(())
+    }
 }
 
 impl HarnessQuotaResponse {
@@ -647,6 +810,15 @@ impl HarnessQuotaResponse {
                 "invalid",
                 "harness quota details requires supported status",
             ));
+        }
+        if self.effective_reserve_percent > 100
+            || self.observed_usage.len() > MAX_QUOTA_USAGE_WINDOWS
+            || self
+                .observed_usage
+                .iter()
+                .any(|usage| usage.validate().is_err())
+        {
+            return Err(Error::new("invalid", "harness quota usage is invalid"));
         }
         validate_scope(&self.scope)?;
         validate_credential(&self.credential)?;

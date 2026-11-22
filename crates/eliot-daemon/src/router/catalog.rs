@@ -367,15 +367,38 @@ impl Router {
         params: &Value,
         principal: &Principal,
     ) -> Result<Value> {
-        let evidence = self
-            .harness_quota_until(
-                params,
-                principal,
-                Instant::now() + crate::adhoc::DISCOVERY_BUDGET,
-            )
+        let deadline = Instant::now() + crate::adhoc::DISCOVERY_BUDGET;
+        let (harness, snapshot, label) = self
+            .resolve_quota_target(params, principal, deadline)
             .await?;
-        serde_json::to_value(evidence.response)
-            .map_err(|_| Error::new("internal", "quota encoding failed"))
+        let evidence = self
+            .quota_for_snapshot(harness, snapshot.clone(), label.clone(), deadline)
+            .await?;
+        let mut response = evidence.response;
+        if let Some(snapshot) = snapshot {
+            response.effective_reserve_percent =
+                crate::config::profile_quota_reserve_percent(&snapshot);
+            let now = now_ms();
+            if evidence.route_verified && quota_fresh(response.fetched_at_ms, response.ttl_ms, now)
+            {
+                let windows = quota_usage_windows(&response, now);
+                if !windows.is_empty() {
+                    let profile = if label == "adhoc" {
+                        crate::adhoc::adhoc_profile_name(&response.harness)
+                    } else {
+                        label
+                    };
+                    response.observed_usage = self.inner.store.lock().await.summarize_quota_usage(
+                        &response.harness,
+                        &profile,
+                        &snapshot,
+                        &windows,
+                    )?;
+                }
+            }
+        }
+        response.validate()?;
+        serde_json::to_value(response).map_err(|_| Error::new("internal", "quota encoding failed"))
     }
 
     async fn harness_quota_until(
@@ -384,6 +407,19 @@ impl Router {
         principal: &Principal,
         deadline: Instant,
     ) -> Result<catalog::ScopedQuota> {
+        let (harness, snapshot, label) = self
+            .resolve_quota_target(params, principal, deadline)
+            .await?;
+        self.quota_for_snapshot(harness, snapshot, label, deadline)
+            .await
+    }
+
+    async fn resolve_quota_target(
+        &self,
+        params: &Value,
+        principal: &Principal,
+        deadline: Instant,
+    ) -> Result<(String, Option<Value>, String)> {
         require_owner(principal)?;
         let request: eliot_core::api::HarnessQuotaRequest =
             eliot_core::api::discovery::decode_params(params.clone())?;
@@ -399,8 +435,7 @@ impl Router {
         let (snapshot, label, _) = self
             .resolve_catalog_snapshot(&harness, profile, true, deadline)
             .await?;
-        self.quota_for_snapshot(harness, snapshot, label, deadline)
-            .await
+        Ok((harness, snapshot, label))
     }
 
     pub(super) async fn quota_for_snapshot(
@@ -435,6 +470,8 @@ impl Router {
                 status: eliot_core::api::HARNESS_QUOTA_SUPPORTED.to_owned(),
                 note: None,
                 details: None,
+                effective_reserve_percent: 0,
+                observed_usage: Vec::new(),
             };
             catalog::quota_read_error(&mut response, eliot_plugin::quota::environment(note));
             request.validate_response(&response)?;
@@ -483,6 +520,8 @@ impl Router {
                     note: Some("Muse subscription usage observed during a turn".to_owned()),
                     details: Some(json!({"windows": observation.windows, "state": "ready",
                         "origin": "provider", "source": "Muse MSP usage/changed"})),
+                    effective_reserve_percent: 0,
+                    observed_usage: Vec::new(),
                 },
             });
         }
@@ -512,6 +551,8 @@ impl Router {
             status: eliot_core::api::HARNESS_QUOTA_SUPPORTED.to_owned(),
             note: None,
             details: None,
+            effective_reserve_percent: 0,
+            observed_usage: Vec::new(),
         };
         match raw {
             Ok(raw) => {
@@ -1905,6 +1946,60 @@ fn window_reset_ms(window: &Value) -> Option<i64> {
                 .filter(|reset| *reset >= 0)
                 .and_then(|reset| reset.checked_mul(1000))
         })
+}
+
+/// Only account-wide windows with explicit bounds can be joined to retained
+/// Swarm usage. Model families can have different native windows and billing.
+fn quota_usage_windows(
+    response: &HarnessQuotaResponse,
+    now: i64,
+) -> Vec<eliot_core::api::harness::QuotaWindowBounds> {
+    use eliot_core::api::harness::QuotaWindowBounds;
+
+    let mut bounds = Vec::new();
+    let Some(details) = response.details.as_ref() else {
+        return bounds;
+    };
+    let mut collect = |label: &str, window: &Value, duration: Option<i64>| {
+        let Some((resets, minutes)) =
+            window_reset_ms(window).zip(window["windowDurationMins"].as_i64().or(duration))
+        else {
+            return;
+        };
+        if window_used_percent(window).is_some()
+            && minutes > 0
+            && resets > now
+            && let Some(starts_at_ms) = minutes
+                .checked_mul(60_000)
+                .and_then(|ms| resets.checked_sub(ms))
+            && (0..now).contains(&starts_at_ms)
+        {
+            bounds.push(QuotaWindowBounds {
+                label: label.to_owned(),
+                starts_at_ms: Some(starts_at_ms),
+                through_ms: now,
+            });
+        }
+    };
+    if response.harness == "codex" {
+        let rates = &details["rateLimits"];
+        for (key, label) in [("primary", "Primary"), ("secondary", "Secondary")] {
+            collect(label, &rates[key], None);
+        }
+    } else if let Some(windows) = details["windows"].as_array() {
+        for window in windows {
+            if let Some(label) = window["label"].as_str()
+                && window_family(label).is_none()
+            {
+                collect(label, window, None);
+            }
+        }
+    } else if response.harness == "muse" {
+        let usage = details.get("usage").unwrap_or(details);
+        collect("5-hour", &usage["window"], None);
+        collect("Weekly", &usage["weekly"], Some(10_080));
+    }
+    bounds
 }
 
 /// Full with a future (or unknown) reset: without reset evidence the window
