@@ -921,7 +921,8 @@ remain unsupported.
   Saved continuation context and any expressly selected source SENDs enter the
   ordinary Handoff delivery gate in the same transaction. The Owner may cite a
   retained original task and select ordered plain SENDs, including inputs that
-  the exact source stop cancelled before dispatch. Their successors preserve
+  the transfer drain fence rejected during dispatch preflight and inputs the
+  exact source stop cancelled before dispatch. Their successors preserve
   the original principals and wait for the brief to become Applied. The
   retained handoff parent reports brief delivery and the original-to-successor
   command links. Failed or unknown brief delivery keeps successors queued.

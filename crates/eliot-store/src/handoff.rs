@@ -330,15 +330,23 @@ fn source_sends(
             Error::new("not_found", format!("selected SEND {id} is not retained"))
         })?;
         let c = &record.command;
-        let stopped_before_dispatch = project_transfer
-            && c.state == CommandState::Cancelled
-            && c.outcome.as_ref().and_then(|data| data["reason"].as_str())
-                == Some("generation_stopped");
+        let fenced_before_dispatch = project_transfer
+            && c.outcome.as_ref().is_some_and(|outcome| {
+                outcome.get("successor").is_none()
+                    && match c.state {
+                        CommandState::Cancelled => outcome["reason"] == "generation_stopped",
+                        CommandState::Rejected => {
+                            outcome["reason"] == "transfer_in_progress"
+                                && outcome["where"] == "router.dispatch.preflight"
+                        }
+                        _ => false,
+                    }
+            });
         if c.verb != "send"
             || c.target.as_deref() != Some(&from.id)
             || c.generation != Some(from.generation)
             || !(matches!(c.state, CommandState::Accepted | CommandState::Queued)
-                || stopped_before_dispatch)
+                || fenced_before_dispatch)
             || c.turn_id.is_some()
             || record.expected_turn_id.is_some()
             || c.request_id.is_some()
@@ -618,7 +626,11 @@ pub(super) fn handoff_tx(
         json!({"command_id":request.id,"verb":"handoff"}),
     )?);
     for (original, transfer) in originals.iter().zip(&transfers) {
-        if original.state != CommandState::Cancelled {
+        let mut outcome = if original.state.is_terminal() {
+            original.outcome.clone().ok_or_else(|| {
+                Error::new("source_integrity", "no-effect SEND outcome disappeared")
+            })?
+        } else {
             cancel_pending_command_tx(
                 tx,
                 parse_agent_id(&from.id)?,
@@ -628,11 +640,11 @@ pub(super) fn handoff_tx(
                 now,
                 &mut events,
             )?;
-        }
-        let mut outcome = json!({"reason":"handoff_no_effect","no_effect":true,"handoff":request.id,"successor":transfer.successor});
-        if original.state == CommandState::Cancelled {
-            outcome["previous_reason"] = json!("generation_stopped");
-        }
+            json!({"reason": "handoff_no_effect"})
+        };
+        outcome["no_effect"] = json!(true);
+        outcome["handoff"] = json!(request.id);
+        outcome["successor"] = json!(transfer.successor);
         tx.execute(
             "UPDATE commands SET outcome=?1 WHERE id=?2",
             params![encode_json(&outcome)?, original.id],
