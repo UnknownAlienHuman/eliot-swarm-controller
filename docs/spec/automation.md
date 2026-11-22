@@ -877,7 +877,10 @@ worktree or the frozen Goal scope, repeated command failures, and a turn with ed
 and no observed configured check before completion. Swarm does not queue
 `no_check_before_end` when the Goal's check already ran after the turn started, or
 when the automatic driver's own enablement, key, probe and gates admit a round for
-that idle point (#904, #868, #881). Notes bind to the captured
+that idle point (#904, #868, #881). A recorded Goal check has no `completed_at`
+upper bound: a round commits only while the Agent is idle, so its check lands after
+the turn and covers the turn's final files. A round already in flight also counts,
+because the driver runs on the newest unspent idle key when that round ends. Notes bind to the captured
 Agent and generation. Git snapshots supply scope evidence when Swarm can bind
 the observation to a running turn. An edit note lists only paths not already
 noted for its kind in that generation. Up to four edit notes can be admitted
@@ -1659,8 +1662,9 @@ Agent generation and is still its latest, a slot key names a due slot. A Swarm
 note is an `inject` from a `swarm_note:*` or `project_check` principal. An
 unclaimed queued note is not an open command, and no event of a note's lifecycle
 names an idle point or makes a key stale; neither does a `stale_round` abandonment
-event. An Owner or manager `next_input` inject stays an open command, so the round
-waits for it, and a real newer turn or command still wins. A
+event. Every other pending inject stays an open command by its principal, whatever
+its delivery outcome, so the round waits for it, and a real newer turn or command
+still wins. A
 turn budget already spent outside any round blocks without running the check. A
 budget spent solely by the Goal's own last admitted continuation is not outside
 any round: that round still runs its final check, and the postcheck budgets
@@ -1889,7 +1893,9 @@ per-Goal single-flight marker. Swarm note events schedule no round. After
 `stale_round`, the driver moves to the latest unspent idle key if it is strictly
 newer and sends it through the same gates, so no idle point runs twice and each
 retry needs a new real Agent event (#904). The driver follows up on a newer event for a Goal
-when its in-flight round resolves. An idle point past the cap waits for a free
+when its in-flight round resolves. An explicit round that ends without a committed
+result wakes the driver, so an idle point that arrived during it still gets its
+round. An idle point past the cap waits for a free
 slot and then runs on the Goal's latest unspent key. Bus lag is logged and sweeps
 the retained idle subjects. Queued waits and stale rounds are logged. Other races
 against explicit rounds resolve through the

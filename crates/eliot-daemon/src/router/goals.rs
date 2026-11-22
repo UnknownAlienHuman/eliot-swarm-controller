@@ -88,6 +88,9 @@ struct ClaimedGoalRound {
     quiescent: bool,
     pending_decision: Option<GoalRoundCommit>,
     workspace_permit: Option<tokio::sync::OwnedMutexGuard<()>>,
+    /// An explicit round is outside the driver's follow-up tracking, so its
+    /// abandonment wakes the driver for any idle point that arrived meanwhile.
+    wake_driver: bool,
 }
 
 struct GoalCheckDeadlineCandidate {
@@ -161,47 +164,52 @@ impl Drop for ClaimedGoalRound {
         let check = self.check.take();
         let pending_decision = self.pending_decision.take();
         let workspace_permit = self.workspace_permit.take();
+        let wake_driver = self.wake_driver;
         self.runtime.spawn(async move {
-            let _workspace_permit = workspace_permit;
+            let workspace_permit = workspace_permit;
             if let Some(commit) = pending_decision {
                 // This exact decision was made before awaiting the Store.
                 let _ = router
                     .commit_goal_round(&principal, &request, &commit)
                     .await;
-                return;
-            }
-            if let Some(check) = check {
-                // Await this exact invocation, never reconstruct or replay it.
-                // run_owned_process retains and drains its existing supervisor.
-                let outcome = check.await;
-                quiescent = goal_check_quiescent(&outcome);
-                if !quiescent {
-                    let policy = router.secret_policy_snapshot();
-                    error = match goal_check_result(outcome, &policy) {
-                        Err(error) => error,
-                        Ok(_) => Error::new("unknown", "goal check cleanup is unproven"),
-                    };
-                    crate::logging::record(
-                        &policy,
-                        "daemon.goal_check_cleanup_unproven",
-                        &[("agent", &request.agent)],
-                        None,
-                    );
+            } else {
+                if let Some(check) = check {
+                    // Await this exact invocation, never reconstruct or replay it.
+                    // run_owned_process retains and drains its existing supervisor.
+                    let outcome = check.await;
+                    quiescent = goal_check_quiescent(&outcome);
+                    if !quiescent {
+                        let policy = router.secret_policy_snapshot();
+                        error = match goal_check_result(outcome, &policy) {
+                            Err(error) => error,
+                            Ok(_) => Error::new("unknown", "goal check cleanup is unproven"),
+                        };
+                        crate::logging::record(
+                            &policy,
+                            "daemon.goal_check_cleanup_unproven",
+                            &[("agent", &request.agent)],
+                            None,
+                        );
+                    }
                 }
+                // A previously retained terminal reply/error is never overwritten.
+                // A persistence failure faults the Store; restart resolves any
+                // remaining reservation under the old holder to unknown.
+                let _ = router
+                    .settle_goal_round_error(
+                        &principal,
+                        &request,
+                        &error,
+                        quiescent,
+                        check_timeout_ms,
+                        retry_timeout_ms,
+                    )
+                    .await;
             }
-            // A previously retained terminal reply/error is never overwritten.
-            // A persistence failure faults the Store; restart resolves any
-            // remaining reservation under the old holder to unknown.
-            let _ = router
-                .settle_goal_round_error(
-                    &principal,
-                    &request,
-                    &error,
-                    quiescent,
-                    check_timeout_ms,
-                    retry_timeout_ms,
-                )
-                .await;
+            drop(workspace_permit);
+            if wake_driver {
+                router.notify_goal_reconcile();
+            }
         });
     }
 }
@@ -264,9 +272,10 @@ fn failed_check_message(reason: ProcessFailure) -> &'static str {
 impl Router {
     /// Wake the goal driver to sweep retained idle subjects. Called by
     /// `goal.set`/`goal.resume` once the Goal is active and idle-keyed,
-    /// so an already-idle Agent rounds without a new bus event. Reads,
-    /// pauses and clears never call it; the Store single-flight marker
-    /// keeps every sweep to at most one round per subject.
+    /// so an already-idle Agent rounds without a new bus event, and when an
+    /// explicit round ends without a committed result. Reads, pauses and
+    /// clears never call it; the Store single-flight marker keeps every
+    /// sweep to at most one round per subject.
     pub(crate) fn notify_goal_reconcile(&self) {
         let current = *self.inner.goal_reconcile.borrow();
         self.inner
@@ -523,7 +532,7 @@ impl Router {
         run_check: GoalCheckRunner,
     ) -> Result<Value> {
         let cancellation = self.run_cancellation_receiver();
-        self.goal_round_with_cancellation(params, principal, run_check, cancellation)
+        self.goal_round_with_cancellation(params, principal, run_check, cancellation, true)
             .await
     }
 
@@ -533,6 +542,7 @@ impl Router {
         principal: &Principal,
         run_check: GoalCheckRunner,
         mut cancellation: watch::Receiver<bool>,
+        wake_driver: bool,
     ) -> Result<Value> {
         let request: GoalRoundRequest = decode_goal_request(
             params,
@@ -629,6 +639,7 @@ impl Router {
             quiescent: true,
             pending_decision: None,
             workspace_permit,
+            wake_driver,
         };
         if turn_budget_blocks_check(&probe) {
             return claimed
@@ -1103,32 +1114,8 @@ fn goal_round_key(request: &GoalRoundRequest) -> Result<GoalRoundKey> {
 /// keys pin the latest event; slot keys pin time and enforce freshness at
 /// the claim and the commit instead.
 fn goal_round_gates(probe: &eliot_store::GoalRoundProbe, key: GoalRoundKey) -> Result<()> {
-    if probe.agent_state != AgentState::Idle {
-        return Err(Error::new("bad_state", "goal round needs an idle Agent"));
-    }
-    if probe.active_turn.is_some() {
-        return Err(Error::new("bad_state", "goal round needs no active turn"));
-    }
-    if probe.pending_count > 0 {
-        return Err(Error::new(
-            "bad_state",
-            "goal round needs no pending requests",
-        ));
-    }
-    if let Some(source) = probe.unhealthy_sources.first() {
-        return Err(Error::new(
-            "bad_state",
-            format!("goal round needs healthy harness sources; {source} is not healthy"),
-        ));
-    }
-    if probe.unknown_commands > 0 {
-        return Err(Error::new(
-            "bad_state",
-            "resolve unknown commands before the goal round",
-        ));
-    }
-    if probe.open_commands > 0 {
-        return Err(Error::new("busy", "Agent has open commands"));
+    if let Some(refusal) = &probe.idle_refusal {
+        return Err(refusal.clone());
     }
     if let GoalRoundKey::Idle(idle_seq) = key
         && probe.max_seq != idle_seq
@@ -1619,7 +1606,9 @@ impl Router {
         let key = GoalRoundKey::Idle(seq);
         match store.goal_round_probe(agent, "eliot", key, now_ms()) {
             Ok(probe) => goal_round_gates(&probe, key).is_ok() && !turn_budget_blocks_check(&probe),
-            // Only a live round marker refuses the probe as busy.
+            // Only a live round marker refuses the probe as busy. When that
+            // round ends, the driver runs on the newest unspent idle key: a
+            // follow-up for its own round, a wake for an explicit one.
             Err(error) => error.code == "busy",
         }
     }
@@ -1663,6 +1652,7 @@ async fn drive_goal_at_idle(
                 &Principal::Owner,
                 run_check,
                 cancellation.clone(),
+                false,
             )
             .await
         {

@@ -37,12 +37,9 @@ pub struct GoalRoundProbe {
     pub view: GoalView,
     pub project_id: String,
     pub project_default: bool,
-    pub agent_state: AgentState,
-    pub active_turn: Option<String>,
-    pub pending_count: usize,
-    pub unhealthy_sources: Vec<String>,
-    pub open_commands: i64,
-    pub unknown_commands: i64,
+    /// First reason the Agent is not cleanly idle, from the same gate the
+    /// claim enforces.
+    pub idle_refusal: Option<Error>,
     pub max_seq: i64,
     pub turn_count: i64,
     /// True when the turn budget was spent solely by this Goal's own last
@@ -1332,25 +1329,11 @@ impl Store {
             scope_base,
             project_default,
             project_id: agent_row.project.clone(),
-            agent_state: agent_row.state,
-            active_turn: agent_row.active_turn.clone(),
-            pending_count: agent_row.pending.len(),
-            unhealthy_sources: unhealthy_open_sources(
+            idle_refusal: idle_round_refusal(
                 &self.connection,
                 agent_num,
+                &agent_row,
                 agent_row.generation,
-            )?,
-            open_commands: count_agent_commands(
-                &self.connection,
-                agent_num,
-                agent_row.generation,
-                false,
-            )?,
-            unknown_commands: count_agent_commands(
-                &self.connection,
-                agent_num,
-                agent_row.generation,
-                true,
             )?,
             max_seq: max_agent_seq(&self.connection, agent_num, agent_row.generation)?,
             turn_count,
@@ -3691,26 +3674,6 @@ fn max_agent_seq(connection: &Connection, agent_num: i64, generation: i64) -> Re
         .map_err(sql_error)
 }
 
-fn unhealthy_open_sources(
-    connection: &Connection,
-    agent_num: i64,
-    generation: i64,
-) -> Result<Vec<String>> {
-    let mut statement = connection
-        .prepare(
-            "SELECT source FROM source_state
-             WHERE agent = ?1 AND generation = ?2 AND state = 'open' AND health <> 'ok'
-               AND source NOT IN ('daemon', 'os', 'git', 'workspace_process')
-             ORDER BY source",
-        )
-        .map_err(sql_error)?;
-    statement
-        .query_map(params![agent_num, generation], |row| row.get(0))
-        .map_err(sql_error)?
-        .collect::<rusqlite::Result<Vec<String>>>()
-        .map_err(sql_error)
-}
-
 fn first_unhealthy_open_source(
     connection: &Connection,
     agent_num: i64,
@@ -3740,11 +3703,11 @@ fn count_agent_commands(
     } else {
         concat!(
             "state IN ('accepted', 'queued', 'dispatched')
-             AND NOT (verb = 'inject' AND state IN ('accepted', 'queued')
+             AND NOT (state IN ('accepted', 'queued')
                       AND json_extract(args, '$.point') IN ('next_input', 'turn_safe_point')
-                      AND (outcome IS NULL OR ",
+                      AND ",
             swarm_note_command_sql!(),
-            "))"
+            ")"
         )
     };
     let sql = format!(
