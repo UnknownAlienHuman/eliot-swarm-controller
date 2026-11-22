@@ -5,7 +5,7 @@ use eliot_core::{
     AgentState, Command, CommandState, Error, Result, SecretPolicy,
     api::{
         AutonomyRequest, DaemonStatusResponse, DrainReport, OwnedProcessKind, OwnedProcessSummary,
-        RetainedUnknownSummary, RetentionView, RunningTurnSummary, StatusBlocker,
+        OwnerInboxKind, RetainedUnknownSummary, RetentionView, RunningTurnSummary, StatusBlocker,
         UnsettledCommandSummary, WorkspaceCustodyView,
     },
 };
@@ -24,9 +24,10 @@ impl Router {
             .try_acquire_owned()
             .map_err(|_| Error::new("unavailable", "an autonomy report is already running"))?;
         let path = self.inner.data_root.join("eliot.db");
+        let confirmed = self.confirmed_stuck();
         let report = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            eliot_store::Store::read_autonomy(&path, since, until)
+            eliot_store::Store::read_autonomy(&path, since, until, &confirmed)
         })
         .await
         .map_err(|_| Error::new("internal", "autonomy reader failed"))??;
@@ -35,6 +36,14 @@ impl Router {
     }
 
     pub(super) async fn status(&self) -> Result<Value> {
+        let (inbox, liveness) = self.read_owner_projection().await?;
+        let mut owner_inbox = OwnerInboxKind::ALL
+            .into_iter()
+            .map(|kind| (kind, 0))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        for item in inbox {
+            *owner_inbox.entry(item.kind).or_default() += 1;
+        }
         let claude_profile_command_issues = self.claude_profile_command_issues(None).await;
         let blockers = self.status_blockers().await?;
         let drain = self.drain_report().await?;
@@ -92,6 +101,8 @@ impl Router {
             (status.markers.clone(), status.truncated)
         };
         serde_json::to_value(DaemonStatusResponse {
+            owner_inbox,
+            liveness,
             build_identity: Some(crate::build_identity::current().clone()),
             provider_probe_attention,
             state: if mode == "open" { "running" } else { mode }.to_owned(),

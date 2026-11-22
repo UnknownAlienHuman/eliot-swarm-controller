@@ -142,7 +142,7 @@ pub struct ManagerBudgetView {
     pub paused: bool,
 }
 
-fn validate_id(id: &str) -> Result<()> {
+pub(super) fn validate_id(id: &str) -> Result<()> {
     if id.len() != 26
         || !matches!(id.as_bytes().first(), Some(b'0'..=b'7'))
         || !id

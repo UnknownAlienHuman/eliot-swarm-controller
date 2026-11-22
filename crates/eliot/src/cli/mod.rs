@@ -112,7 +112,7 @@ pub(crate) async fn dispatch(
             organization::run_chat(args.command, &data_dir, json_output, id).await
         }
         CliCommand::Msg(args) => coord::run_msg(args, data_dir, json_output, id).await,
-        CliCommand::Inbox(args) => coord::run_inbox(args, data_dir, json_output).await,
+        CliCommand::Inbox(args) => coord::run_inbox(args, data_dir, json_output, id).await,
         CliCommand::Var(args) => coord::run_var(args, data_dir, json_output, id).await,
         CliCommand::Who(args) => coord::run_who(args, data_dir, json_output).await,
         CliCommand::Identity => coord::run_identity(data_dir, json_output).await,

@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 91;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 92;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -2172,6 +2172,42 @@ impl Store {
                  ALTER TABLE assignment_waits ADD COLUMN owner_automation INTEGER NOT NULL
                      DEFAULT 1 CHECK(owner_automation IN (0,1));
                  INSERT INTO schema_migrations(version) VALUES(91);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 92 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE TABLE owner_inbox_snoozes (
+                     kind TEXT NOT NULL,
+                     subject TEXT NOT NULL,
+                     revision TEXT NOT NULL,
+                     PRIMARY KEY (kind, subject)
+                 ) WITHOUT ROWID;
+                 CREATE INDEX owner_inbox_unknown_starts ON commands(target, created_at DESC, id DESC)
+                     WHERE verb IN ('launch','resume') AND state = 'unknown';
+                 CREATE INDEX owner_inbox_request_events
+                     ON events(agent,generation,json_extract(data,'$.request_id'),kind,seq)
+                     WHERE kind IN ('request.opened','request.resolved','request.closed');
+                 CREATE INDEX owner_inbox_turn_events
+                     ON events(agent,generation,CAST(json_extract(data,'$.turn_id') AS TEXT),seq)
+                     WHERE json_type(data,'$.turn_id')='text';
+                 CREATE INDEX owner_inbox_hold_events
+                     ON events(CAST(json_extract(data,'$.scope') AS TEXT),seq)
+                     WHERE kind IN ('provider.hold_updated','provider.hold_probe_started','provider.hold_probe_budget_exhausted',
+                                    'provider.hold_probe_outcome_unknown','provider.hold_cleared','provider.hold_probe_deferred');
+                 CREATE INDEX owner_inbox_timer_events
+                     ON events(CAST(json_extract(data,'$.rule') AS TEXT),json_extract(data,'$.schedule_revision'),seq)
+                     WHERE kind IN ('rule.fired','rule.skipped','rule.rejected');
+                 CREATE INDEX owner_inbox_active_goals ON goals(agent,mode)
+                     WHERE json_extract(state,'$.status') IN ('active','blocked');
+                 CREATE INDEX owner_inbox_unknown_turns ON turns(agent,generation,turn_id)
+                     WHERE state='unknown';
+                 INSERT INTO schema_migrations(version) VALUES (92);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;

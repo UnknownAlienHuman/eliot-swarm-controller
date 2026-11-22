@@ -1058,9 +1058,16 @@ writer lock. A source that exceeds its work cap reports partial coverage.
 | Checks | Captured shell invocations and recorded Swarm Goal or fast project check runs. |
 | Waits | Captured shell invocations matching wait commands. |
 | Swarm fact notes | Deliveries, moves and cancellations of retained fact notes, with counts and confirmed corrections by kind. |
-| Owner backlog | Current unknown commands, current unarchived failed or lost Agents, and open provider holds, aged from their recorded transition or hold time. |
+| Owner backlog | All current decision subjects, including snoozed revisions, with per-kind counts and ages from each source row's recorded transition time. |
 | Usage | Retained normalized turn input and measured first-call context. The role is evaluated at turn completion. |
 | Executors calling Swarm | Retained turn starts and authenticated Swarm MCP starts attributed to executor activity, grouped by profile. |
+
+The attention worker samples liveness on startup and every three minutes.
+An unchanged Stuck candidate becomes reportable after two consecutive sweeps
+and produces one `daemon.liveness_stuck` log line for the episode.
+`daemon.status` and `owner.inbox` project current Store facts on read.
+Snooze hides the current inbox revision until its subject changes. The sweep
+prunes snoozes for subjects that no longer project.
 
 Shell matching counts one check per matching command segment and at most one wait
 per captured shell-tool start. It uses the executable basename, ignoring case and

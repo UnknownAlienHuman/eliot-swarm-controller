@@ -2,8 +2,9 @@
 use super::args::{
     ClaimArgs, ClaimCommand, ClaimListArgs, ClaimReleaseArgs, ClaimSetArgs, CmdArgs,
     CmdChildrenArgs, CmdCommand, CmdResolveArgs, CmdSettleStoppedArgs, CmdShowArgs, InboxArgs,
-    MsgAckArgs, MsgArgs, MsgCommand, MsgSendArgs, MsgShowArgs, OptionalAgent, PageArgs, TurnArgs,
-    TurnCommand, TurnResolveArgs, VarArgs, VarCommand, VarGetArgs, VarSetArgs, WhoArgs,
+    MsgAckArgs, MsgArgs, MsgCommand, MsgSendArgs, MsgShowArgs, OptionalAgent, OwnerInboxArgs,
+    OwnerInboxCommand, PageArgs, TurnArgs, TurnCommand, TurnResolveArgs, VarArgs, VarCommand,
+    VarGetArgs, VarSetArgs, WhoArgs,
 };
 use super::reads::resolve_agent_target;
 use super::support::{
@@ -18,9 +19,10 @@ use eliot_core::api::{
     CommandGetRequest, CommandResolution, CommandResolveRequest, CommandResolveResponse,
     MAX_VAR_VALUE_BYTES, MailAckRequest, MailAckResponse, MailDelivery, MailInboxRequest,
     MailInboxResponse, MailMode, MailReadRequest, MailSendRequest, MailSendResponse,
-    SettleStoppedRequest, SettleStoppedResponse, TurnResolveRequest, TurnResolveResponse,
-    TurnResolveStatus, VarGetRequest, VarGetResponse, VarSetRequest, VarSetResponse, WhoRequest,
-    WhoResponse,
+    OwnerDecideRequest, OwnerDecideResponse, OwnerInboxItemRef, OwnerInboxKind, OwnerInboxRequest,
+    OwnerInboxResponse, SettleStoppedRequest, SettleStoppedResponse, TurnResolveRequest,
+    TurnResolveResponse, TurnResolveStatus, VarGetRequest, VarGetResponse, VarSetRequest,
+    VarSetResponse, WhoRequest, WhoResponse,
 };
 use serde_json::Value;
 use std::{
@@ -268,6 +270,7 @@ pub(crate) async fn run_msg(
     id: Option<String>,
 ) -> Result<u8, Failure> {
     match command {
+        MsgCommand::Inbox(args) => run_mail_inbox(args, data_dir, json_output).await,
         MsgCommand::Send(MsgSendArgs {
             to,
             text,
@@ -354,6 +357,111 @@ pub(crate) async fn run_msg(
 }
 
 pub(crate) async fn run_inbox(
+    OwnerInboxArgs { page, command }: OwnerInboxArgs,
+    data_dir: PathBuf,
+    json_output: bool,
+    id: Option<String>,
+) -> Result<u8, Failure> {
+    if let Some(command) = command {
+        let (item, choice, args) = match command {
+            OwnerInboxCommand::Decide { item, choice, args } => (item, choice, args),
+            OwnerInboxCommand::Snooze { item } => (item, "snooze".to_owned(), Vec::new()),
+        };
+        return decide_inbox(&data_dir, &item, choice, args, json_output, id).await;
+    }
+    let InboxArgs {
+        agent,
+        limit,
+        after,
+        thread,
+        reply_to,
+        wait,
+    } = page;
+    // Agent's historical unflagged invocation remains its mailbox. Owner
+    // calls default to the unified decision queue; mail-specific selectors
+    // retain their original meaning for Owner mail access.
+    if agent.is_none()
+        && thread.is_none()
+        && reply_to.is_none()
+        && wait.is_none()
+        && std::env::var_os("ELIOT_AGENT_ID").is_none()
+    {
+        let request = OwnerInboxRequest { after, limit };
+        let response: OwnerInboxResponse =
+            eliot_daemon::client_call_typed(&data_dir, "owner.inbox", &request)
+                .await
+                .map_err(Failure::for_read)?;
+        return print_owner_inbox(&response, json_output);
+    }
+    run_mail_inbox(
+        InboxArgs {
+            agent,
+            limit,
+            after,
+            thread,
+            reply_to,
+            wait,
+        },
+        data_dir,
+        json_output,
+    )
+    .await
+}
+
+async fn decide_inbox(
+    data_dir: &Path,
+    item: &str,
+    choice: String,
+    args: Vec<String>,
+    json_output: bool,
+    id: Option<String>,
+) -> Result<u8, Failure> {
+    let invalid_item =
+        || Failure::new(2, "expected the inbox item reference KIND/SUBJECT@REVISION");
+    let (cursor, revision) = item.rsplit_once('@').ok_or_else(invalid_item)?;
+    let (kind, subject) = cursor.split_once('/').ok_or_else(invalid_item)?;
+    let kind = OwnerInboxKind::ALL
+        .into_iter()
+        .find(|candidate| candidate.as_str() == kind)
+        .ok_or_else(invalid_item)?;
+    let mut fields = serde_json::Map::new();
+    for arg in args {
+        let (key, value) = arg
+            .split_once('=')
+            .filter(|(key, _)| !key.is_empty())
+            .ok_or_else(|| Failure::new(2, "--arg must use KEY=VALUE"))?;
+        let value = if key == "answers" {
+            serde_json::from_str(value)
+                .map_err(|_| Failure::new(2, "--arg answers must be valid JSON"))?
+        } else {
+            Value::String(value.to_owned())
+        };
+        if fields.insert(key.to_owned(), value).is_some() {
+            return Err(Failure::new(2, "duplicate --arg key"));
+        }
+    }
+    let request = OwnerDecideRequest {
+        id: mutation_id(id)?,
+        item: OwnerInboxItemRef {
+            kind,
+            subject: subject.to_owned(),
+            revision: revision.to_owned(),
+        },
+        choice,
+        args: (!fields.is_empty()).then_some(Value::Object(fields)),
+    };
+    request.validate().map_err(Failure::for_mutation)?;
+    let response: OwnerDecideResponse =
+        eliot_daemon::client_call_typed(data_dir, "owner.decide", &request)
+            .await
+            .map_err(Failure::for_mutation)?;
+    let value = serde_json::to_value(response)
+        .map_err(|_| Failure::new(4, "owner.decide response is invalid"))?;
+    print_value(&value, json_output);
+    Ok(0)
+}
+
+async fn run_mail_inbox(
     InboxArgs {
         agent,
         limit,
@@ -450,6 +558,48 @@ pub(crate) async fn run_inbox(
             None => return Ok(0),
         }
     }
+}
+
+fn print_owner_inbox(response: &OwnerInboxResponse, json_output: bool) -> Result<u8, Failure> {
+    let value = serde_json::to_value(response)
+        .map_err(|_| Failure::new(4, "owner.inbox response is invalid"))?;
+    if json_output {
+        print_value(&value, true);
+    } else {
+        if response.items.is_empty() {
+            println!("Owner inbox is clear.");
+        }
+        for item in &response.items {
+            let seconds = item.age_ms / 1000;
+            let age = if seconds >= 86_400 {
+                format!("{}d {}h", seconds / 86_400, seconds / 3_600 % 24)
+            } else if seconds >= 3_600 {
+                format!("{}h {}m", seconds / 3_600, seconds / 60 % 60)
+            } else if seconds >= 60 {
+                format!("{}m", seconds / 60)
+            } else {
+                format!("{seconds}s")
+            };
+            println!("{}@{} · {age}", item.cursor(), item.revision);
+            println!("  {}", item.reason);
+            if let Some(action) = &item.recommended {
+                println!("  Recommended: {} {}", action.method, action.args);
+            }
+            for action in &item.choices {
+                if item.recommended.as_ref() == Some(action) {
+                    continue;
+                }
+                println!(
+                    "  Choice: {} → {} {}",
+                    action.choice, action.method, action.args
+                );
+            }
+        }
+        if let Some(next) = &response.next {
+            println!("Next: {next}");
+        }
+    }
+    Ok(0)
 }
 
 /// Print one validated inbox page; serialization failure stays exit 4.

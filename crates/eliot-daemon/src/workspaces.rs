@@ -352,6 +352,7 @@ impl WorkspaceManager {
                 ));
             }
             let mut store = self.inner.store.lock().await;
+            crate::router::owner_inbox::check_binding(&store)?;
             let change = store.resolve_command_with_absent_workspace(
                 "owner",
                 request,

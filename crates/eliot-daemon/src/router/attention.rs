@@ -32,7 +32,7 @@ use sweep::{
     launch_check, launch_sweep, queue_startup_losses, request_full_reconcile, reserve_incident,
 };
 use tokio::{
-    sync::{broadcast, watch},
+    sync::{broadcast, oneshot, watch},
     task::JoinSet,
     time::{MissedTickBehavior, interval},
 };
@@ -270,6 +270,10 @@ pub(crate) async fn run_attention(
     let mut events = router.inner.bus.subscribe();
     let mut ticks = interval(SWEEP_INTERVAL);
     ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut liveness_ticks = interval(Duration::from_secs(180));
+    liveness_ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut previous_stuck = eliot_store::StuckStates::new();
+    let mut liveness_result: Option<oneshot::Receiver<Result<eliot_store::StuckStates>>> = None;
     let suspicion_window = attention_duration(attention_config.no_progress.threshold_secs);
     let state = Arc::new(Mutex::new(AttentionState {
         config: attention_config,
@@ -360,6 +364,34 @@ pub(crate) async fn run_attention(
                 suspicion_window,
                 &mut tasks,
             ),
+            _ = liveness_ticks.tick(), if liveness_result.is_none() => {
+                let (sender, receiver) = oneshot::channel();
+                let router = router.clone();
+                tasks.spawn(async move {
+                    let _ = sender.send(router.sweep_liveness().await);
+                });
+                liveness_result = Some(receiver);
+            }
+            result = async { liveness_result.as_mut().expect("pending sweep").await },
+                if liveness_result.is_some() =>
+            {
+                liveness_result = None;
+                let result = result.unwrap_or_else(|_| Err(eliot_core::Error::new(
+                    "internal", "owner inbox sweep ended without a sample",
+                )));
+                match result {
+                    Ok(current) => router.publish_liveness(current, &mut previous_stuck),
+                    Err(error) => {
+                        previous_stuck.clear();
+                    crate::logging::record(
+                        &router.secret_policy_snapshot(),
+                        "daemon.liveness_sweep_failed",
+                        &[],
+                        Some(&error),
+                    );
+                    }
+                }
+            }
             joined = tasks.join_next(), if !tasks.is_empty() => {
                 if let Some(Err(_)) = joined {
                     crate::logging::record(

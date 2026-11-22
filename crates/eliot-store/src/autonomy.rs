@@ -12,7 +12,12 @@ use std::{path::Path, time::Duration};
 pub(super) const INDEXES: &[&str] = &[activity::INDEXES, fleet::INDEXES];
 
 impl Store {
-    pub fn read_autonomy(path: &Path, since: i64, until: i64) -> Result<AutonomyResponse> {
+    pub fn read_autonomy(
+        path: &Path,
+        since: i64,
+        until: i64,
+        confirmed: &super::StuckStates,
+    ) -> Result<AutonomyResponse> {
         #[cfg(windows)]
         let path = &eliot_core::verbatim_path(path);
         let mut connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -22,7 +27,7 @@ impl Store {
             .map_err(sql_error)?;
         let tx = connection.transaction().map_err(sql_error)?;
         let activity = activity::read(&tx, since, until)?;
-        let fleet = fleet::read(&tx, since, until)?;
+        let fleet = fleet::read(&tx, since, until, confirmed)?;
         let mut report = AutonomyResponse {
             since_ms: since,
             until_ms: until,

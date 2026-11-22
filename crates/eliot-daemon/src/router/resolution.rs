@@ -99,6 +99,7 @@ impl Router {
         )?;
         let change = {
             let mut store = self.inner.store.lock().await;
+            super::owner_inbox::check_binding(&store)?;
             let change = store.settle_stopped(&request, now_ms())?;
             self.publish_locked(&change.events);
             change
@@ -196,6 +197,7 @@ impl Router {
         };
         let change = {
             let mut store = self.inner.store.lock().await;
+            super::owner_inbox::check_binding(&store)?;
             let change = store.resolve_command_with_readback(
                 "owner",
                 &request,
@@ -289,6 +291,7 @@ impl Router {
         };
         let change = {
             let mut store = self.inner.store.lock().await;
+            super::owner_inbox::check_binding(&store)?;
             let change = store.resolve_turn("owner", &request, proof.as_ref(), now_ms())?;
             self.publish_locked(&change.events);
             change

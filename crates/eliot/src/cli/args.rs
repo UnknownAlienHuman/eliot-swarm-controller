@@ -199,8 +199,9 @@ pub(crate) enum CliCommand {
     Chat(ChatArgs),
     /// Send, read or acknowledge addressed Agent mail.
     Msg(MsgArgs),
-    /// Read one page of unread mail for a mailbox.
-    Inbox(InboxArgs),
+    /// Read or decide Owner inbox items, or read Agent mail.
+    #[command(args_conflicts_with_subcommands = true)]
+    Inbox(OwnerInboxArgs),
     /// Read or compare-and-swap shared variables.
     Var(VarArgs),
     /// Show current workers and their file areas.
@@ -1139,6 +1140,27 @@ pub(crate) struct InboxArgs {
 }
 
 #[derive(Args)]
+pub(crate) struct OwnerInboxArgs {
+    #[command(flatten)]
+    pub(crate) page: InboxArgs,
+    #[command(subcommand)]
+    pub(crate) command: Option<OwnerInboxCommand>,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum OwnerInboxCommand {
+    /// Execute a choice using the item reference printed by the inbox.
+    Decide {
+        item: String,
+        choice: String,
+        #[arg(long = "arg", value_name = "KEY=VALUE")]
+        args: Vec<String>,
+    },
+    /// Hide this revision until its subject changes.
+    Snooze { item: String },
+}
+
+#[derive(Args)]
 pub(crate) struct VarArgs {
     #[command(subcommand)]
     pub(crate) command: VarCommand,
@@ -1360,6 +1382,8 @@ pub(crate) struct TurnResolveArgs {
 
 #[derive(Subcommand)]
 pub(crate) enum MsgCommand {
+    /// Read one page of unread mail for the current Agent mailbox.
+    Inbox(InboxArgs),
     /// Queue one message to the named recipients.
     Send(MsgSendArgs),
     /// Read one exact delivery without marking it.
