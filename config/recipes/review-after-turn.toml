@@ -1,32 +1,42 @@
-# Copy to <data_dir>/rules/review-after-turn.toml.
-# Replace author-profile, reviewer-profile, C:/src/app and MANAGER_AGENT_ID
-# with your author profile, reviewer profile, registered checkout path and
-# manager Agent ID. Use a distinct reviewer profile with native read-only
-# permissions and the Eliot Swarm MCP server enabled for mail. For example,
-# add this to <data_dir>/config.toml, using your installed executable and model:
+# Install in the registered checkout's .eliot/rules/ directory to enable review.
+# Approve launch, send and mail.send in the project registration. Replace
+# author-profile, reviewer-profile and C:/src/app. Use a distinct reviewer
+# profile with read-only native permissions, such as Codex with
+# permissions = "read-only" and approval_policy = "never".
 #
-# [profiles.reviewer-profile]
-# harness = "codex"
-# cmd = "codex"
-# model = "gpt-6-luna"
-# permissions = "read-only"
-# approval_policy = "never"
-# mcp = "minimal"
+# Where a manager assignment reserves the author's project for its own team,
+# install this as an Owner rule, match the author's subject.project, and set
+# workspace to a separate registered reviewer checkout with no assignment.
+#
+# With no project check configured, replace the launch trigger below with:
+# on = { event = "turn.completed", match = { "subject.profile" = "author-profile", "data.outcome" = "success", "data.project_check" = "off", "data.worktree.files" = { not = 0 }, "data.worktree.lines" = { at_most = 600 } } }
 
 [[rule]]
 id = "review-after-turn"
-on = { event = "turn.completed", match = { "subject.profile" = "author-profile", "subject.workspace" = { exists = true }, "event.data.outcome" = "success" } }
+on = { event = "project.worktree.check.passed", match = { "subject.profile" = "author-profile", "data.worktree.files" = { not = 0 }, "data.worktree.lines" = { at_most = 600 } } }
+once_per = "${data.worktree.fingerprint}"
+limit = { max = 2, per = "agent", window = "24h", min_interval = "2h" }
 
 [[rule.do]]
 action = "launch"
 profile = "reviewer-profile"
 workspace = "C:/src/app"
+require_worktree = true
+no_policy = "Read-only review of a separately checked author worktree."
 text = """
-Review the changes made by Agent ${event.agent} in turn ${event.data.turn_id}.
-Read its worktree at ${subject.workspace} with Git and inspect the relevant files.
-On Windows, use the ordinary drive path if Git requires it.
-Review only. Do not edit files or change Git state.
-Write VERDICT: approve or VERDICT: changes, followed by up to three findings with file and line.
-Queue the verdict and findings to MANAGER_AGENT_ID with Eliot Swarm mail.send
-(mode queue, to an array containing that Agent ID). Report the delivery result in your final reply.
+Review the changes by Agent ${event.agent} in turn ${data.turn_id}.
+Author worktree: ${subject.workspace}
+Base commit: ${data.worktree.base}
+Worktree fingerprint: ${data.worktree.fingerprint}
+Inspect the changes against that base, including nonignored untracked files.
+Use the ordinary drive path on Windows if Git requires it.
+Keep the worktree and Git state unchanged.
+Give your assessment as your final reply, including actionable findings with
+file and line references when available. Keep the complete review under 12 KiB.
 """
+
+[[rule]]
+id = "deliver-review"
+on = { event = "turn.completed", match = { "event.cause.rule" = "review-after-turn", "data.outcome" = "success" } }
+do = [{ action = "mail.send", from_launch = "review-after-turn" }]
+# To select a particular manager, add to = "a1" with the real Agent ID above.

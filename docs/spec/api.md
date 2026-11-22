@@ -1654,7 +1654,13 @@ When the reply exceeds the encoded event budget, the retained suffix starts
 with `[... truncated ...]`. Status, exact command/turn binding and any
 structured provider restriction remain authoritative. `Turn.final_text = None`
 means the public final text is unavailable. Full native text remains private history.
-`Turn.usage = None` likewise means native token usage is unavailable. A present usage
+`turn.completed` can also carry a captured `data.worktree` with the SHA-256
+`fingerprint`, the exact `base` commit, changed `files`, and changed `lines`
+(insertions plus deletions) for [worktree review rules](automation.md#worktree-review-recipe).
+Unavailable worktree observations do not supply a fingerprint or change totals.
+When a project check applies, the rules consume the separately bound passing fact
+for that worktree and author turn.
+`Turn.usage = None` means native token usage is unavailable. A present usage
 carries nullable token members with `scope`/`message_id` attribution when the harness
 reports it; null attribution means the native scope is unknown. Message scope is never
 a turn or session total, and a populated native total must not be assumed a per-turn or

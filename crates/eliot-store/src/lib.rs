@@ -8,6 +8,7 @@ mod autonomy;
 mod canonical;
 mod capacity;
 mod launch_queue;
+mod launch_result;
 mod online_backup;
 pub use launch_queue::{ArbitratedTimer, PendingLaunch, TimerWait};
 mod cleanup;

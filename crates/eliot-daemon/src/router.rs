@@ -20,6 +20,8 @@ mod inference;
 mod insertion_facts;
 mod instructions;
 pub(crate) mod launch_queue;
+mod launch_result;
+pub(crate) use launch_result::RULE_WORKTREE_GUARD_ARG;
 mod loss_recovery;
 mod organization;
 mod overview;
@@ -8513,6 +8515,7 @@ fn reject_launch_derived_keys(args: &Value) -> Result<()> {
     }
     for reserved in [
         "registered_project",
+        RULE_WORKTREE_GUARD_ARG,
         eliot_core::PROJECT_CHECK_GOAL_ARG,
         eliot_core::PROJECT_POLICY_APPLIED_ARG,
         "admission_mode",

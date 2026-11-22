@@ -1781,37 +1781,39 @@ async fn process_rule_cursor(
                 no_match_through = Some(event.seq);
                 continue;
             }
-            let action = match definition::evaluate(&definition, &event) {
-                Ok(RuleEvaluation::Command(action)) => action,
-                Ok(RuleEvaluation::NoMatch) => {
-                    no_match_through = Some(event.seq);
-                    continue;
-                }
-                Ok(RuleEvaluation::CauseDepth) => {
-                    flush_rule_no_match(router, rule, retiring, &mut no_match_through).await?;
-                    advance_rule_cursor(
-                        router,
-                        rule,
-                        retiring,
-                        event.seq,
-                        RuleCursorOutcome::SkippedCauseDepth,
-                    )
-                    .await?;
-                    continue;
-                }
-                Err(error) => {
-                    flush_rule_no_match(router, rule, retiring, &mut no_match_through).await?;
-                    advance_rule_cursor(
-                        router,
-                        rule,
-                        retiring,
-                        event.seq,
-                        rule_cursor_rejection(router, &error),
-                    )
-                    .await?;
-                    continue;
-                }
-            };
+            let action =
+                match evaluate_event_action(router, &rule.principal, &definition, &event).await {
+                    Ok(RuleEvaluation::Command(action)) => action,
+                    Ok(RuleEvaluation::NoMatch) => {
+                        no_match_through = Some(event.seq);
+                        continue;
+                    }
+                    Ok(RuleEvaluation::CauseDepth) => {
+                        flush_rule_no_match(router, rule, retiring, &mut no_match_through).await?;
+                        advance_rule_cursor(
+                            router,
+                            rule,
+                            retiring,
+                            event.seq,
+                            RuleCursorOutcome::SkippedCauseDepth,
+                        )
+                        .await?;
+                        continue;
+                    }
+                    Ok(RuleEvaluation::LaunchResultMail(_)) => unreachable!("mail was resolved"),
+                    Err(error) => {
+                        flush_rule_no_match(router, rule, retiring, &mut no_match_through).await?;
+                        advance_rule_cursor(
+                            router,
+                            rule,
+                            retiring,
+                            event.seq,
+                            rule_cursor_rejection(router, &error),
+                        )
+                        .await?;
+                        continue;
+                    }
+                };
 
             flush_rule_no_match(router, rule, retiring, &mut no_match_through).await?;
             if !router.rule_firings_open() {
@@ -1830,7 +1832,7 @@ async fn process_rule_cursor(
                     None => router.prepare_owner_submission(action).await,
                 }
             };
-            let prepared = match prepared_result {
+            let mut prepared = match prepared_result {
                 Ok(prepared) => prepared,
                 Err(_) if !router.rule_firings_open() => return Ok(false),
                 Err(error) if is_deterministic_pre_admission_rejection(&error.code) => {
@@ -1846,6 +1848,9 @@ async fn process_rule_cursor(
                 }
                 Err(error) => return Err(error),
             };
+            if definition.guards_launch_worktree() {
+                prepared.request.args[crate::router::RULE_WORKTREE_GUARD_ARG] = json!(true);
+            }
             let admission = match router
                 .admit_rule_action(
                     &rule.principal,
@@ -2670,6 +2675,34 @@ fn project_rule_catch_up_binds_agent(verb: &str) -> bool {
     crate::router::project_rule_action_binds_agent_target(verb)
 }
 
+async fn evaluate_event_action(
+    router: &Router,
+    principal: &str,
+    definition: &RuleDefinition,
+    event: &Event,
+) -> Result<RuleEvaluation> {
+    match definition::evaluate(definition, event)? {
+        RuleEvaluation::Command(_)
+            if definition.guards_launch_worktree()
+                && !router.rule_worktree_is_current(event).await? =>
+        {
+            Ok(RuleEvaluation::NoMatch)
+        }
+        RuleEvaluation::LaunchResultMail(mail) => {
+            match router
+                .rule_launch_result_mail(principal, &mail.from_launch, mail.to.as_deref(), event)
+                .await?
+            {
+                Some(definition) => {
+                    definition::submit_mail_command(&definition).map(RuleEvaluation::Command)
+                }
+                None => Ok(RuleEvaluation::NoMatch),
+            }
+        }
+        evaluation => Ok(evaluation),
+    }
+}
+
 pub(crate) async fn prepare_rule_catch_up_actions(
     router: &Router,
     definition: &RuleDefinition,
@@ -2677,10 +2710,20 @@ pub(crate) async fn prepare_rule_catch_up_actions(
     events: &[Event],
     project: Option<&ProjectRegistrationView>,
 ) -> Result<Vec<eliot_store::RuleCatchUpAction>> {
+    if definition.guards_launch_worktree() {
+        return Err(Error::new(
+            "unsupported",
+            "worktree-bound launches require live event processing",
+        ));
+    }
+    let principal = project.map_or_else(
+        || "owner".to_owned(),
+        |project| format!("project:{}", project.id),
+    );
     let mut actions = Vec::new();
     let mut rendered = Vec::new();
     for event in events {
-        let request = match definition::evaluate(definition, event) {
+        let request = match evaluate_event_action(router, &principal, definition, event).await {
             Ok(RuleEvaluation::Command(request)) => request,
             Ok(RuleEvaluation::NoMatch) => continue,
             Ok(RuleEvaluation::CauseDepth) => {
@@ -2689,6 +2732,7 @@ pub(crate) async fn prepare_rule_catch_up_actions(
                 ));
                 continue;
             }
+            Ok(RuleEvaluation::LaunchResultMail(_)) => unreachable!("mail was resolved"),
             Err(error) if is_deterministic_pre_admission_rejection(&error.code) => {
                 actions.push(rule_catch_up_rejection(router, event.seq, &error));
                 continue;

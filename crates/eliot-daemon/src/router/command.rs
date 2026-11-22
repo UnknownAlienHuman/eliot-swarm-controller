@@ -224,6 +224,10 @@ impl Router {
             return None;
         }
         let inputs = self.load_dispatch_binding(id, &command).await?;
+        if let Err(error) = self.check_rule_worktree_guard(&command).await {
+            self.reject_undispatched_error(id, &error).await;
+            return None;
+        }
         Some(PreparedCommand {
             command,
             git_fetch_registration,
