@@ -653,6 +653,49 @@ at the owning daemon dispatch boundary. Child control stays a later increment,
 as do tree forms for mail recipients (non-Agent ids stay `invalid`) and watch filters
 (a tree value matches no events today).
 
+### One-call child run
+
+`child.run` uses one `ChildRunRequest` / `ChildRunResponse` DTO pair
+([Core API](../../crates/eliot-core/src/api/child_run.rs)). An Agent starts
+with `{text, `sources`?, profile?, `wait_ms`?}`. The MCP mutation wrapper supplies
+the operation id and returns it with the response; direct callers provide a
+ULID. The id is the ordinary launch command id, so the normal command binding
+retains the principal, payload digest, launch and linked first input. A retry
+with that same id cannot admit another child or first input.
+
+The request uses the caller as `args.parent` and goes through ordinary child
+launch admission. The current Agent generation and `control=tree|project` are
+checked there; `control=self` refuses. An omitted profile reuses the parent's
+frozen profile. An explicit profile must pass the captured child-profile
+allow-list and existing same-harness/cross-harness checks. The child's first
+input is `args.text`, committed as the launch's linked `SEND`; `sources` uses the
+existing bounded source delivery and replay path.
+
+`wait_ms` defaults to 20,000 and is limited to 25,000 ms per call, leaving
+response time within the native 30-second MCP/plugin RPC deadline. `wait_ms:0`
+takes an immediate durable snapshot. The same method continues with
+`{id, wait_ms?}` and reads the same launch's exact linked first input; it never
+launches or sends again. A pending or `unknown` result, and every zero-wait
+request, registers the existing completion digest over that one linked input.
+The registration id is a deterministic sibling ULID, preserving retry
+identity while keeping the digest reservation separate from the launch
+command id. Existing digest delivery provides one durable completion mail
+wake, including after a daemon restart. A digest retry reuses its registration
+and mail identity.
+
+The compact response contains the exact input status, bound Agent/generation
+when visible, bounded retained `final_text`, and `truncated`. `unknown` remains
+an explicit result and never triggers an effect retry. The same operation id
+continues reading the retained first input. `changed_files` comes only from
+generation-bound observed `agent.edits` rows, with a truncation marker.
+`last_goal_check` contains the exact generation's retained Goal exit code and
+check time, read from `Store` only after the current subtree scope check.
+Workspace line counts and commits are unobserved: child work shares its
+parent's workspace, so the current Git view cannot attribute those counters to
+this run. `outside_claims` is unobserved when retained claim state cannot prove
+coverage at each edit time; claims are live rows and do not provide a
+historical coverage snapshot.
+
 ## Project transfer
 
 The Owner uses `project.transfer` to move a registered project's assignment to an

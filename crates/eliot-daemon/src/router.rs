@@ -2,6 +2,7 @@ mod attention;
 mod attribution;
 mod auth;
 mod catalog;
+mod child_run;
 mod cleanup;
 mod command;
 mod command_verbs;
@@ -590,6 +591,7 @@ impl Router {
             "events.bounds" => self.events_bounds(&params, &principal).await,
             "events.read" => self.events_read(&params, &principal).await,
             "events.subscribe" => self.events_subscribe(&params, &principal).await,
+            "child.run" => self.child_run(&params, &principal).await,
             "swarm.wait" => self.swarm_wait(&params, &principal).await,
             "swarm.digest" => self.swarm_digest(&params, &principal).await,
             "swarm.reparent" => self.swarm_reparent(&params, &principal).await,

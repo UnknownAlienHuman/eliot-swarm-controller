@@ -196,6 +196,7 @@ const METHODS: &[Method] = &[
     ),
     method!("events.read", EventsReadRequest, EventsReadResponse, false, false, "Read a bounded event page; history gaps remain explicit.", {"after":0,"limit":20}),
     method!("events.subscribe", EventsSubscribeRequest, EventsSubscribeResponse, false, false, "Long-poll a bounded event page, at most 30 seconds.", {"after":0,"limit":20,"wait_ms":1000}),
+    method!("child.run", ChildRunRequest, ChildRunResponse, false, true, "Launch one child with its first input and return the exact result; wait_ms:0 registers a durable completion wake.", {"text":"Review the requested source and summarize the result.","wait_ms":0}),
     method!("swarm.wait", SwarmWaitRequest, SwarmWaitResponse, false, false, "Wait up to 30 s for frozen child commands/turns (all/any); completed turns return final_text.", {"commands":[EXAMPLE_ID],"turns":[],"mode":"all","wait_ms":30000}),
     method!("swarm.digest", SwarmDigestRequest, SwarmDigestResponse, false, true, "Register a durable completion digest with the standard mail wake.", {"id":EXAMPLE_ID,"to":"a1","mode":"all","commands":[EXAMPLE_ID],"turns":[]}),
     method!("swarm.reparent", ReparentRequest, ReparentResponse, true, true, "Move one Agent subtree or all children to a controlled manager; Owner only.", {"id":EXAMPLE_ID,"agent":"a2","expected_generation":1,"parent":"a3","parent_generation":1}),
