@@ -615,19 +615,17 @@ fn project_agents(
                 CASE WHEN a.state IN ('created','starting','failed','lost') THEN EXISTS(SELECT 1 FROM commands c
                   WHERE c.target=a.id AND (c.generation=a.generation OR c.expected_generation=a.generation)
                   AND c.verb IN ('launch','resume') AND c.state IN ('accepted','queued','dispatched')) ELSE 0 END,
-                CASE WHEN a.state IN ('starting','busy','waiting','failed','lost') THEN (
-                  EXISTS(SELECT 1 FROM processes p WHERE p.owner='agent:a'||a.id||'#'||a.generation AND p.state='running')
-                  OR EXISTS(SELECT 1 FROM processes p WHERE p.owner='workspace:a'||a.id||'#'||a.generation AND p.state='running')
-                ) ELSE 0 END,
+                EXISTS(SELECT 1 FROM processes p WHERE p.owner IN (
+                  'agent:a'||a.id||'#'||a.generation,'workspace:a'||a.id||'#'||a.generation) AND p.state='running'),
                 COALESCE((SELECT MAX(e.seq) FROM events e INDEXED BY events_agent WHERE e.agent=a.id AND e.generation=a.generation),0),
                 CASE WHEN a.state IN ('failed','lost') THEN COALESCE((SELECT MAX(e.ts) FROM events e
                   WHERE e.agent=a.id AND e.generation=a.generation AND e.kind IN ('agent.failed','agent.lost')),a.updated_at) ELSE a.updated_at END,
-                CASE WHEN a.state IN ('starting','idle','busy','waiting') THEN EXISTS(SELECT 1 FROM pending_requests r WHERE r.agent=a.id
-                  AND r.generation=a.generation AND r.state='pending') ELSE 0 END,
-                CASE WHEN a.active_turn IS NOT NULL THEN EXISTS(SELECT 1 FROM turns t WHERE t.agent=a.id AND t.generation=a.generation
-                  AND t.turn_id=a.active_turn AND t.state='running') ELSE 0 END,
-                CASE WHEN a.state IN ('idle','busy','waiting','unknown') THEN EXISTS(SELECT 1 FROM source_state s WHERE s.agent=a.id AND s.generation=a.generation
-                  AND s.state='open' AND s.source NOT IN ('daemon','os','git','workspace_process')) ELSE 0 END
+                EXISTS(SELECT 1 FROM pending_requests r WHERE r.agent=a.id
+                  AND r.generation=a.generation AND r.state='pending'),
+                EXISTS(SELECT 1 FROM turns t WHERE t.agent=a.id AND t.generation=a.generation
+                  AND t.turn_id=a.active_turn AND t.state='running'),
+                EXISTS(SELECT 1 FROM source_state s WHERE s.agent=a.id AND s.generation=a.generation
+                  AND s.state='open' AND s.source NOT IN ('daemon','os','git','workspace_process'))
          FROM agents a WHERE a.observe_only=0 AND a.archived=0
             AND a.state IN ('created','starting','idle','busy','waiting','failed','lost','unknown')", "a.id=?1", bindings)?;
     let rows = stmt

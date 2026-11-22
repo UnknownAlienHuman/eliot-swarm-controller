@@ -2368,9 +2368,6 @@ impl Store {
                  CREATE INDEX IF NOT EXISTS events_turn_lifecycle
                      ON events(agent, generation, seq DESC)
                      WHERE kind IN ('turn.started', 'turn.completed', 'turn.unknown');
-                 CREATE INDEX IF NOT EXISTS events_goal_changed
-                     ON events(agent, generation, seq DESC)
-                     WHERE kind = 'goal.changed';
                  CREATE INDEX IF NOT EXISTS events_agent_lost
                      ON events(agent, generation, seq DESC)
                      WHERE kind = 'agent.lost';

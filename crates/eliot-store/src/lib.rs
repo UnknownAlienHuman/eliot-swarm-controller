@@ -422,7 +422,7 @@ impl Store {
             .busy_timeout(Duration::from_secs(1))
             .map_err(sql_error)?;
         connection
-            .execute_batch("BEGIN DEFERRED")
+            .execute_batch("PRAGMA query_only = ON; BEGIN DEFERRED;")
             .map_err(sql_error)?;
         Ok(Self {
             connection,
