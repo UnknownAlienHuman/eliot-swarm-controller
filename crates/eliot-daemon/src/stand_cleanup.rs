@@ -406,8 +406,10 @@ pub fn read_stand_registration(
             "not_found",
             format!("directory is not registered by swarm stand up: no registration at {shown}"),
         ),
+        // A refusal before any effect: callers on a write path must not
+        // report it as an uncertain outcome.
         RecordFailure::Unusable(detail) => Error::new(
-            "platform_io",
+            "not_allowed",
             format!("stand registration at {shown} is unusable: {detail}"),
         ),
     })?;

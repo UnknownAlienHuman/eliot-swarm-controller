@@ -2889,9 +2889,10 @@ still being written is retried, never bound. While a stand daemon prepares a
 managed worktree, before any Git effect, it records the repository common
 directory, branch, creation OID and worktree path in a sidecar of its
 registration; a stand whose registration cannot be verified refuses the
-creation. A missing registration refuses with `not_found`; one that exists but
-cannot be inspected, opened, read or parsed refuses with `platform_io`. Both
-name the exact lookup path, and the second names the failed step without
+creation. A missing registration refuses with `not_found`. One that exists but
+is not a plain file, exceeds the record size limit, or cannot be inspected,
+opened, read or parsed refuses with `not_allowed`. Both refusals precede any
+effect and name the exact lookup path; the second names the reason without
 quoting file content. `stand list` inspects registered stands with expiry and liveness
 state, and `stand prune` tears down expired registered stands.
 
