@@ -125,3 +125,10 @@ impl crate::api::DiagnoseStep {
         )
     }
 }
+/// Quote one external text body with a delimiter longer than every backtick run.
+/// Compose trusted labels and metadata outside the returned block.
+pub fn fence_untrusted_text(text: &str) -> String {
+    let longest = text.split(|ch| ch != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(3.max(longest + 1));
+    format!("{fence}text\n{text}\n{fence}")
+}
