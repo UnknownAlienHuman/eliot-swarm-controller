@@ -15,11 +15,11 @@ Start one child with `child.run`; parent workspace and profile are inherited. `s
 ```
 `wait_ms:0` returns promptly and registers a durable result wake. Use it when you can finish your turn. To get the result in this turn, wait during the launch:
 ```json
-{"method":"child.run","params":{"text":"Count lines in words.txt.","wait_ms":30000}}
+{"method":"child.run","params":{"text":"Count lines in words.txt.","wait_ms":25000}}
 ```
 If the wait returns pending, continue by its returned `id`:
 ```json
-{"method":"child.run","params":{"id":"<returned id>","wait_ms":30000}}
+{"method":"child.run","params":{"id":"<returned id>","wait_ms":25000}}
 ```
 Check `status` and `final_text`; if truncated, use `agent.result` with the exact Agent, generation and turn. Never replay an uncertain effect.
 
