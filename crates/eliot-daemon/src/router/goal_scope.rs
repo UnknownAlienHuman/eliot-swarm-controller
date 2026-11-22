@@ -173,17 +173,23 @@ pub(super) fn outside_scope<'a>(
     definition: &GoalDefinition,
     changed: &'a BTreeSet<String>,
 ) -> Vec<&'a str> {
-    if definition.scope.is_empty() {
+    if definition.scope.is_empty() && definition.policy_scope.is_empty() {
         return Vec::new();
     }
-    let globs = normalized(&definition.scope);
+    let scopes = [&definition.scope, &definition.policy_scope]
+        .into_iter()
+        .filter(|scope| !scope.is_empty())
+        .map(|scope| normalized(scope))
+        .collect::<Vec<_>>();
     changed
         .iter()
         .map(String::as_str)
         .filter(|path| {
-            !globs
-                .iter()
-                .any(|glob| claim_glob_matches_normalized(glob, path))
+            scopes.iter().any(|scope| {
+                !scope
+                    .iter()
+                    .any(|glob| claim_glob_matches_normalized(glob, path))
+            })
         })
         .collect()
 }
@@ -233,6 +239,18 @@ pub(super) fn with_finding(finding: &str, observation: Option<&str>, bound: usiz
 
 /// The scope line a continuation repeats so the limit survives every round.
 pub(super) fn scope_reminder(definition: &GoalDefinition) -> Option<String> {
+    if !definition.policy_scope.is_empty() {
+        let policy = definition.policy_scope.join(", ");
+        if !definition.scope.is_empty() {
+            return Some(format!(
+                "Change only paths matching both the project scope ({policy}) and the launch scope ({}).",
+                definition.scope.join(", ")
+            ));
+        }
+        return Some(format!(
+            "Change only paths within the project scope ({policy})."
+        ));
+    }
     (!definition.scope.is_empty()).then(|| {
         format!(
             "Change only these paths; Swarm blocks the Goal on any other change: {}",

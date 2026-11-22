@@ -16,7 +16,7 @@ use crate::{
 };
 use eliot_core::{
     Error, Event, Result, SecretPolicy, SubmitCommand,
-    api::{DEFAULT_GOAL_CHECK_TIMEOUT_MS, GoalDefinition},
+    api::{DEFAULT_GOAL_CHECK_TIMEOUT_MS, GoalCostLimit, GoalDefinition},
 };
 use eliot_plugin::sync::LockExt;
 use serde_json::{Map, Value, json};
@@ -78,8 +78,14 @@ struct CheckDisposition {
 
 struct ProjectWork {
     config: crate::config::ProjectRegistrationConfig,
-    check: Option<(Vec<String>, i64)>,
+    check: Option<ProjectWorkCheck>,
     workspace: String,
+}
+
+struct ProjectWorkCheck {
+    argv: Vec<String>,
+    cwd: Option<String>,
+    deadline_ms: i64,
 }
 
 impl Router {
@@ -113,18 +119,28 @@ pub(super) async fn freeze_launch_goal(
     request: &mut SubmitCommand,
     principal: &Principal,
 ) -> Result<()> {
-    validate_launch_inputs(&request.args, matches!(principal, Principal::Owner))?;
+    let owner = matches!(principal, Principal::Owner);
+    validate_launch_inputs(&request.args, owner)?;
     let explicit = request
         .args
         .get("goal")
         .or_else(|| request.args.pointer("/assignment/goal"))
         .and_then(Value::as_object);
     let mut defaults = Map::new();
-    if request.args.get("no_policy").is_none()
-        && let Some(project_id) = request.args["registered_project"]
-            .as_str()
-            .filter(|id| !id.is_empty())
-    {
+    let project_id = request
+        .args
+        .get("registered_project")
+        .filter(|_| request.args.get("chat") != Some(&Value::Bool(true)))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty());
+    let opted_out = request.args.get("no_policy").is_some();
+    if opted_out && project_id.is_none() {
+        return Err(Error::new(
+            "invalid",
+            "project policy opt-out requires a registered project",
+        ));
+    }
+    if !opted_out && let Some(project_id) = project_id {
         let registration = router
             .inner
             .store
@@ -139,17 +155,15 @@ pub(super) async fn freeze_launch_goal(
                     Error::new("not_allowed", "project registration is no longer approved")
                 })?;
             if let Some(policy) = config.policy
-                && (policy.check.is_some() || explicit.is_some())
+                && let Some(check) = policy.check
             {
                 crate::automation::verify_project_registration(
                     &router.inner.data_root,
                     &registration,
                 )
                 .await?;
-                if let Some(check) = policy.check {
-                    defaults.insert("check".to_owned(), json!(check.argv));
-                    defaults.insert("check_timeout_ms".to_owned(), json!(check.deadline_ms));
-                }
+                defaults.insert("check".to_owned(), json!(check.argv));
+                defaults.insert("check_timeout_ms".to_owned(), json!(check.deadline_ms));
                 if let Some(max_rounds) = policy.budget.max_rounds {
                     defaults.insert("max_rounds".to_owned(), json!(max_rounds));
                 }
@@ -173,7 +187,11 @@ pub(super) async fn freeze_launch_goal(
         .keys()
         .any(|field| explicit.is_none_or(|goal| !goal.contains_key(field)));
     if let Some(explicit) = explicit {
-        defaults.extend(explicit.clone());
+        if owner || defaults.is_empty() {
+            defaults.extend(explicit.clone());
+        } else {
+            merge_tighter_goal_fields(&mut defaults, explicit)?;
+        }
     }
     defaults
         .entry("text")
@@ -190,6 +208,79 @@ pub(super) async fn freeze_launch_goal(
     Ok(())
 }
 
+fn merge_tighter_goal_fields(
+    defaults: &mut Map<String, Value>,
+    explicit: &Map<String, Value>,
+) -> Result<()> {
+    for (field, value) in explicit {
+        let refusal = || {
+            Error::new(
+                "not_allowed",
+                format!(
+                    "launch Goal {field} must tighten project policy; use no_policy with a reason to deviate"
+                ),
+            )
+        };
+        match field.as_str() {
+            "max_rounds" | "check_timeout_ms" => {
+                let requested = value
+                    .as_i64()
+                    .filter(|limit| *limit > 0)
+                    .ok_or_else(refusal)?;
+                if defaults
+                    .get(field)
+                    .and_then(Value::as_i64)
+                    .is_some_and(|limit| requested > limit)
+                {
+                    return Err(refusal());
+                }
+            }
+            "max_cost" => {
+                let requested: GoalCostLimit =
+                    serde_json::from_value(value.clone()).map_err(|_| refusal())?;
+                requested.validate()?;
+                if let Some(inherited) = defaults.get(field) {
+                    let inherited: GoalCostLimit = serde_json::from_value(inherited.clone())
+                        .map_err(|_| Error::new("internal", "invalid project policy cost limit"))?;
+                    if requested.unit != inherited.unit
+                        || requested.amount_micros > inherited.amount_micros
+                    {
+                        return Err(refusal());
+                    }
+                }
+            }
+            "scope" | "check_inputs" => {
+                let requested = value
+                    .as_array()
+                    .filter(|globs| !globs.is_empty())
+                    .ok_or_else(refusal)?;
+                if let Some(inherited) = defaults.remove(field) {
+                    if field == "scope" {
+                        // Each scope is a union of globs. Require membership in both
+                        // unions so adding broad globs cannot expand the allowed paths.
+                        defaults.insert("policy_scope".to_owned(), inherited);
+                    } else if let Value::Array(mut globs) = inherited {
+                        for glob in requested {
+                            if !globs.contains(glob) {
+                                globs.push(glob.clone());
+                            }
+                        }
+                        defaults.insert(field.clone(), Value::Array(globs));
+                        continue;
+                    }
+                }
+            }
+            "cadence_ms" if !value.is_null() => {
+                // Cadenced Goals only run on explicit slots and lose idle driving.
+                return Err(refusal());
+            }
+            _ => {}
+        }
+        defaults.insert(field.clone(), value.clone());
+    }
+    Ok(())
+}
+
 pub(super) fn validate_launch_inputs(args: &Value, owner: bool) -> Result<()> {
     if let Some(reason) = args.get("no_policy")
         && !reason
@@ -199,9 +290,15 @@ pub(super) fn validate_launch_inputs(args: &Value, owner: bool) -> Result<()> {
         return Err(Error::invalid_field(
             "args.no_policy",
             format!(
-                "nonblank reason of at most {} bytes without control characters",
+                "nonblank reason of at most {} bytes without control or invisible format characters",
                 eliot_core::api::PROJECT_POLICY_OPT_OUT_REASON_MAX_BYTES
             ),
+        ));
+    }
+    if args.get("no_policy").is_some() && args.get("chat") == Some(&Value::Bool(true)) {
+        return Err(Error::new(
+            "invalid",
+            "private chats have no project policy to opt out of",
         ));
     }
     if let Some(goal) = args.get("goal")
@@ -213,15 +310,26 @@ pub(super) fn validate_launch_inputs(args: &Value, owner: bool) -> Result<()> {
         ));
     }
     if !owner
-        && let Some(goal) = args.get("goal").and_then(Value::as_object)
-        && ["check", "check_cwd", "escalation"]
+        && let Some(goal) = args
+            .get("goal")
+            .or_else(|| args.pointer("/assignment/goal"))
+            .and_then(Value::as_object)
+    {
+        if goal.contains_key("policy_scope") {
+            return Err(Error::new(
+                "invalid",
+                "launch Goal policy_scope is resolved by the daemon",
+            ));
+        }
+        if ["check", "check_cwd", "escalation"]
             .iter()
             .any(|field| goal.contains_key(*field))
-    {
-        return Err(Error::new(
-            "not_allowed",
-            "only the Owner can set launch Goal check, check_cwd or escalation",
-        ));
+        {
+            return Err(Error::new(
+                "not_allowed",
+                "only the Owner can set launch Goal check, check_cwd or escalation",
+            ));
+        }
     }
     Ok(())
 }
@@ -569,12 +677,12 @@ async fn check_after_edit(
         }
     }
     if failure.is_none()
-        && let Some((argv, deadline_ms)) = &work.check
+        && let Some(check) = &work.check
     {
         match run_argv(
-            argv,
-            &work.workspace,
-            *deadline_ms,
+            &check.argv,
+            check.cwd.as_deref().unwrap_or(&work.workspace),
+            check.deadline_ms,
             Arc::clone(&policy),
             shutdown,
         )
@@ -675,7 +783,24 @@ async fn load_project_work(
         .policy
         .as_ref()
         .and_then(|policy| policy.check.as_ref());
-    let configured_argv = json!([&config.format, project_check.map(|check| &check.argv)]);
+    let check = project_check
+        .filter(|check| !opted_out && check.at_turn_end != Some(true))
+        .map(|check| match launch_goal {
+            Some(goal) => ProjectWorkCheck {
+                argv: goal.check,
+                cwd: goal.check_cwd,
+                deadline_ms: goal.check_timeout_ms,
+            },
+            None => ProjectWorkCheck {
+                argv: check.argv.clone(),
+                cwd: None,
+                deadline_ms: check.deadline_ms,
+            },
+        });
+    let configured_argv = json!([
+        &config.format,
+        check.as_ref().map(|check| (&check.argv, &check.cwd))
+    ]);
     if router
         .secret_policy_snapshot()
         .contains_value(&configured_argv)
@@ -685,19 +810,6 @@ async fn load_project_work(
             "project check argv contains a known credential",
         ));
     }
-    let check = project_check
-        .filter(|check| !opted_out && check.at_turn_end != Some(true))
-        .filter(|check| {
-            launch_goal
-                .as_ref()
-                .is_none_or(|goal| goal.check == check.argv && goal.check_cwd.is_none())
-        })
-        .map(|check| {
-            let deadline = launch_goal
-                .as_ref()
-                .map_or(check.deadline_ms, |goal| goal.check_timeout_ms);
-            (check.argv.clone(), deadline)
-        });
     if config.format.is_empty() && check.is_none() {
         return Ok(None);
     }

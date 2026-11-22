@@ -585,14 +585,29 @@ fn normalize_project_policy(
 
     let legacy_rounds_used = policy.budget.max_rounds.is_none() && legacy_max_rounds.is_some();
     let mut max_rounds = policy.budget.max_rounds.or(legacy_max_rounds);
-    if legacy_rounds_used && check.is_none() {
-        return Err(config_error_at(
-            source,
-            offset,
-            &format!("projects.{id}.max_rounds"),
-            "requires a project check command",
-            "profile_error",
-        ));
+    if check.is_none() {
+        let check_required_by = if legacy_rounds_used {
+            Some("max_rounds")
+        } else if policy.budget.max_rounds.is_some() {
+            Some("policy.budget.max_rounds")
+        } else if policy.budget.max_cost.is_some() {
+            Some("policy.budget.max_cost")
+        } else if !policy.scope.is_empty() {
+            Some("policy.scope")
+        } else if !policy.check_inputs.is_empty() {
+            Some("policy.check_inputs")
+        } else {
+            None
+        };
+        if let Some(field) = check_required_by {
+            return Err(config_error_at(
+                source,
+                offset,
+                &format!("projects.{id}.{field}"),
+                "requires a project check command",
+                "profile_error",
+            ));
+        }
     }
     if check.is_some() && max_rounds.is_none() {
         max_rounds = Some(DEFAULT_PROJECT_CHECK_ROUNDS);

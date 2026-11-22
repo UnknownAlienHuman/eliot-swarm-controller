@@ -179,23 +179,22 @@ selection, routing, assignment, rules and timers retain their existing owners.
 Project policy supplies defaults to those paths; it adds no launch or assignment
 engine.
 
-Policy defaults fill only Goal fields omitted by the launch. CLI `--goal-json`, an
-API `args.goal` object or a rule/timer `goal` object supplies explicit fields that
-win individually. Explicit `null` for a nullable Goal member and explicit empty
-collections remain supplied values; the Goal object itself cannot be null. The
-`no_policy` launch field opts out of project defaults and requires a nonblank reason.
-Store records event kind `project.policy.opted_out`, and Agent readback retains the
-reason. Opting out does not discard explicitly supplied Goal fields. Only the Owner
-may override `check`, `check_cwd` or `escalation`; Agent and project-rule callers may
-override safe Goal fields or opt out. A settings-configured project check applies to
-all principals.
+The Owner's explicit Goal fields replace defaults individually. Agent and
+project-rule launches can tighten policy by lowering limits or the check deadline,
+adding check-input globs, or adding a scope that intersects the project scope.
+They can opt out explicitly with a nonblank `no_policy` reason. Executable check
+overrides and escalation require Owner authority. Opting out skips the policy Goal
+and the fast project check. A separately supplied Goal continues under the caller's
+existing authority. Store records `project.policy.opted_out`, and Agent and project
+readback show the reason.
 
-The project policy check continues to serve the fast project-check path. Setting
-`policy.check.at_turn_end = true` reserves that check for the default Eliot Goal's
-turn-end rounds. Its budget, `scope` and `check_inputs` provide defaults to the Goal;
-explicit launch fields take precedence individually, and a later manual `goal.set`
-replaces the installed Goal through the ordinary revision. The first round waits for
-the Agent's first turn to settle. The idle Goal driver runs the check at turn end and
+The fast path uses the Agent's resolved launch Goal check, including any Owner argv,
+working-directory and deadline overrides. Setting `policy.check.at_turn_end = true`
+reserves the check for Goal rounds. A later manual `goal.set` replaces the Goal through
+the ordinary revision. Every launch-installed Goal waits for the first turn to settle,
+so a check cannot finish the Goal before the Agent receives its work. A supplied
+cadence anchors at launch admission and still waits for that first turn.
+The idle Goal driver runs the check at turn end and
 enforces `max_rounds`. A successful final round records the frozen check and its
 result in the Goal. With publication enabled, the default project Goal's successful
 check records a [`project.check.passed` receipt](#final-project-check-publication)
@@ -683,7 +682,7 @@ ordinary launch's `args.goal` and `args.no_policy`; `goal` fields override polic
 defaults individually, while `no_policy` skips those defaults. Nullable member `null`
 and empty collections remain explicit; whole-object `goal = null` is invalid. Only an
 Owner may override `check`, `check_cwd` or `escalation`; an Agent or project-rule
-caller can set safe Goal fields or opt out. Settings-generated assignment timers add
+caller can tighten project policy or opt out. Settings-generated assignment timers add
 `assignment = { key, folder, max_busy }`; this
 form requires a role and obtains `text` from the next brief at timer admission.
 Launch text follows the ordinary launch/linked-send 64 KiB persisted-text bound. A
@@ -1623,10 +1622,9 @@ already committed baseline rather than replacing it.
 session cost since `set`, in that verbatim unit (Claude reports `usd_estimate`; units
 are never converted, and subscription quota is a separate resource). At `set` the Store
 records a baseline from the generation's latest `session_usage` snapshot in that unit.
-For a launch-installed Goal, Router and Store commit the same baseline after workspace
-setup and before native start or the linked first input. An Agent generation that has
-run no turn starts from zero when no native snapshot exists, and binds the first session
-it sees.
+For a launch-installed Goal, Store initializes a zero cost baseline at admission,
+when the new native session has no usage. The baseline binds to the first observed
+session. The Git scope baseline is captured separately after workspace setup.
 `set` is refused as `unsupported` when the harness reports no session cost, reports
 another unit, or ran turns without one. After each failed check, the round commit reads
 the latest snapshot. The spent cost is that cumulative amount minus the baseline. It

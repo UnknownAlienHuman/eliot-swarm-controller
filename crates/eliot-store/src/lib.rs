@@ -3970,7 +3970,9 @@ fn agent_from_record(connection: &Connection, record: AgentRecord) -> Result<Age
         control: AgentControl::parse(&record.control)?,
         name: record.name,
         project: record.project,
-        policy_opt_out_reason: record.policy_opt_out_reason,
+        policy_opt_out_reason: record
+            .policy_opt_out_reason
+            .map(core::api::sanitize_project_policy_opt_out_reason),
         project_scope: record.project_scope,
         harness: record.harness,
         profile: record.profile,

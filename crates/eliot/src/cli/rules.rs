@@ -650,6 +650,7 @@ pub(crate) async fn run_goal(
                     max_without_progress,
                     cadence_ms,
                     scope,
+                    policy_scope: Vec::new(),
                     check_inputs,
                     max_cost,
                     escalation,

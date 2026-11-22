@@ -75,7 +75,8 @@ pub use agent_views::{
     SourceOwner, SourceState, StatusBlocker, UnsettledCommandSummary, WorkerTaskHealth,
     WorkerTaskStatus, WorkspaceCustodyView, activity_state_name, agent_state_name,
     agent_status_line, diagnosis_reason, process_state_name, repository_name_from_url,
-    stats_coverage_name, valid_project_policy_opt_out_reason,
+    sanitize_project_policy_opt_out_reason, stats_coverage_name,
+    valid_project_policy_opt_out_reason,
 };
 pub use config_views::{
     CONFIG_REVISION_HEX_LEN, MAX_LISTED_PROFILES, MAX_PROFILES_SOURCE_BYTES, ProfileListRequest,

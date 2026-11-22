@@ -305,6 +305,13 @@ impl Router {
             } else {
                 prepared.request.args["registered_project"] = json!(source.project);
             }
+            if target
+                .as_ref()
+                .is_none_or(|target| target.id == source.project)
+                && let Some(reason) = &source.policy_opt_out_reason
+            {
+                prepared.request.args["no_policy"] = json!(reason);
+            }
             if scope.is_empty() {
                 prepared.request.args[SWITCH_BLANK_SCOPE_ARG] = json!(true);
             }

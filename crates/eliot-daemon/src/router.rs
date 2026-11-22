@@ -3583,8 +3583,13 @@ impl Router {
             let store = self.inner.store.lock().await;
             let mut registrations = store.list_project_registrations("owner", None, PAGE_MAX)?;
             let now = now_ms();
-            for registration in &mut registrations {
-                registration.policy_usage = store.project_policy_usage(&registration.id, now)?;
+            let projects: Vec<_> = registrations
+                .iter()
+                .map(|registration| registration.id.as_str())
+                .collect();
+            let policy_usage = store.project_policy_usage_for_projects(&projects, now)?;
+            for (registration, policy_usage) in registrations.iter_mut().zip(policy_usage) {
+                registration.policy_usage = policy_usage;
             }
             registrations
         };

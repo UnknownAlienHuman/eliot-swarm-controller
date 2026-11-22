@@ -38,7 +38,7 @@ pub(crate) fn validate_no_policy(reason: Option<String>) -> Result<Option<String
         return Err(Failure::new(
             2,
             format!(
-                "--no-policy needs a nonblank, one-line reason of at most {} bytes",
+                "--no-policy needs a nonblank, one-line reason of at most {} bytes without control, format, bidi, or invisible zero-width characters",
                 eliot_core::api::PROJECT_POLICY_OPT_OUT_REASON_MAX_BYTES
             ),
         ));

@@ -2,7 +2,7 @@
 
 use super::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 const PROJECT_PRINCIPAL_PREFIX: &str = "project:";
 const PROJECT_POLICY_USAGE_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
@@ -167,58 +167,118 @@ impl Store {
         project: &str,
         now: i64,
     ) -> Result<core::api::ProjectPolicyUsageView> {
+        self.project_policy_usage_for_projects(&[project], now)?
+            .pop()
+            .ok_or_else(|| Error::new("internal", "project policy usage was not returned"))
+    }
+
+    /// Read usage in the caller's project order using two bounded page queries.
+    pub fn project_policy_usage_for_projects(
+        &self,
+        projects: &[&str],
+        now: i64,
+    ) -> Result<Vec<core::api::ProjectPolicyUsageView>> {
         self.ensure_committed_reads()?;
+        if projects.is_empty() {
+            return Ok(Vec::new());
+        }
+        validate_limit(projects.len())?;
+        let indexes: HashMap<_, _> = projects
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, project)| (project, index))
+            .collect();
+        if indexes.len() != projects.len() {
+            return Err(Error::new(
+                "invalid",
+                "project policy page contains duplicate IDs",
+            ));
+        }
+
+        let page = encode_json(&projects)?;
         let cutoff = now.saturating_sub(PROJECT_POLICY_USAGE_WINDOW_MS);
-        let (total, applied, opted_out): (i64, i64, i64) = self
-            .connection
-            .query_row(
-                "SELECT COUNT(*), COALESCE(SUM(policy_applied), 0),
-                        COALESCE(SUM(policy_opt_out_reason IS NOT NULL), 0)
-                 FROM agents
-                 WHERE project = ?1 AND origin = 'eliot' AND created_at BETWEEN ?2 AND ?3",
-                params![project, cutoff, now],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .map_err(sql_error)?;
+        let mut usage = vec![core::api::ProjectPolicyUsageView::default(); projects.len()];
+        let index = |project: &str| {
+            indexes.get(project).copied().ok_or_else(|| {
+                Error::new("source_integrity", "project policy query escaped its page")
+            })
+        };
+        let count = |value: i64| {
+            u64::try_from(value)
+                .map_err(|_| Error::new("source_integrity", "negative project policy count"))
+        };
+        {
+            let mut statement = self
+                .connection
+                .prepare_cached(
+                    "SELECT p.value, COUNT(*), COALESCE(SUM(a.policy_applied), 0),
+                        COALESCE(SUM(a.policy_opt_out_reason IS NOT NULL), 0)
+                 FROM json_each(?1) AS p CROSS JOIN agents AS a
+                 WHERE a.project = p.value AND a.origin = 'eliot'
+                   AND a.created_at BETWEEN ?2 AND ?3
+                 GROUP BY p.value",
+                )
+                .map_err(sql_error)?;
+            let rows = statement
+                .query_map(params![page, cutoff, now], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                    ))
+                })
+                .map_err(sql_error)?;
+            for row in rows {
+                let (project, total, applied, opted_out) = row.map_err(sql_error)?;
+                let view = &mut usage[index(&project)?];
+                view.applied = count(applied)?;
+                view.total = count(total)?;
+                view.opted_out = count(opted_out)?;
+            }
+        }
         let mut statement = self
             .connection
             .prepare_cached(
-                "SELECT id, policy_opt_out_reason, created_at FROM agents
-                 WHERE project = ?1 AND origin = 'eliot' AND created_at BETWEEN ?2 AND ?3
-                   AND policy_opt_out_reason IS NOT NULL
-                 ORDER BY created_at DESC, id DESC LIMIT ?4",
+                "SELECT p.value, a.id, a.policy_opt_out_reason, a.created_at
+             FROM json_each(?1) AS p CROSS JOIN agents AS a
+             WHERE a.id IN (
+                 SELECT id FROM agents
+                 WHERE project = p.value AND origin = 'eliot'
+                   AND created_at BETWEEN ?2 AND ?3 AND policy_opt_out_reason IS NOT NULL
+                 ORDER BY created_at DESC, id DESC LIMIT ?4
+             )
+             ORDER BY p.value, a.created_at DESC, a.id DESC",
             )
             .map_err(sql_error)?;
         let rows = statement
             .query_map(
                 params![
-                    project,
+                    page,
                     cutoff,
                     now,
                     core::api::PROJECT_POLICY_OPTOUTS_MAX as i64
                 ],
                 |row| {
-                    Ok(core::api::ProjectPolicyOptOutView {
-                        agent: format_agent_id(row.get(0)?),
-                        reason: row.get(1)?,
-                        created_at: row.get(2)?,
-                    })
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        core::api::ProjectPolicyOptOutView {
+                            agent: format_agent_id(row.get(1)?),
+                            reason: core::api::sanitize_project_policy_opt_out_reason(row.get(2)?),
+                            created_at: row.get(3)?,
+                        },
+                    ))
                 },
             )
             .map_err(sql_error)?;
-        let count = |value| {
-            u64::try_from(value)
-                .map_err(|_| Error::new("source_integrity", "negative project policy count"))
-        };
-        let usage = core::api::ProjectPolicyUsageView {
-            applied: count(applied)?,
-            total: count(total)?,
-            opted_out: count(opted_out)?,
-            opt_outs: rows
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(sql_error)?,
-        };
-        usage.validate()?;
+        for row in rows {
+            let (project, opt_out) = row.map_err(sql_error)?;
+            usage[index(&project)?].opt_outs.push(opt_out);
+        }
+        for project_usage in &usage {
+            project_usage.validate()?;
+        }
         Ok(usage)
     }
 }

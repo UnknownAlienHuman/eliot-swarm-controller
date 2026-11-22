@@ -1181,14 +1181,14 @@ process statistics nor model progress.
 ## Command admission
 
 `swarm launch --queue` calls `launch.enqueue` with a mutation ID and ordinary launch
-arguments. `args.goal`, when present, is a partial Goal object; only included fields
-override project defaults. A nullable member's explicit `null` and an empty collection
-remain explicit, while the Goal object itself must be a JSON object. `args.no_policy`,
-when present, is a nonblank reason of at most 256 bytes with no control characters;
-it skips project defaults and records the `project.policy.opted_out` event with the
-reason. The same arguments reach direct and queued launch admission. Only the Owner
-may override Goal `check`, `check_cwd` or `escalation`; other launch principals may
-supply safe Goal fields or opt out. A queued intent has no Agent or command until
+arguments. `args.goal`, when present, is a partial Goal object. The Owner may
+override individual defaults, while other principals may only tighten an applied
+policy. `args.no_policy` is a nonblank reason of at most 256 bytes without control
+or invisible format characters. It skips both the policy Goal and the fast check and
+records `project.policy.opted_out` with the reason. Private chats have no registered
+execution project or policy. A same-project switch retains the opt-out reason.
+The same arguments reach direct and queued launch admission. Executable check
+overrides and escalation require Owner authority. A queued intent has no Agent or command until
 admitted. Exact retry
 returns the current intent. When admission succeeds, the receipt gives the
 ordinary launch command ID. Use `swarm launch-queue [INTENT]` for exact readback or
