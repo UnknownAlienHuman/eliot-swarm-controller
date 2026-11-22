@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 79;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 80;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -1941,6 +1941,38 @@ impl Store {
                  ALTER TABLE provider_holds ADD COLUMN attention_notified INTEGER NOT NULL DEFAULT 0
                      CHECK(attention_notified IN (0,1));
                  INSERT INTO schema_migrations(version) VALUES (79);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 80 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            // A legacy cursor preserves only the latest name. Recover older
+            // names from surviving launches before command retention runs.
+            tx.execute_batch(
+                "CREATE TABLE assignment_admissions (
+                     assignment_key TEXT NOT NULL,
+                     brief TEXT NOT NULL,
+                     PRIMARY KEY (assignment_key, brief)
+                 ) WITHOUT ROWID;
+                 INSERT OR IGNORE INTO assignment_admissions
+                 SELECT json_extract(args,'$.assignment.key'),
+                        json_extract(args,'$.assignment.brief')
+                 FROM commands
+                 WHERE verb='launch' AND principal='owner'
+                   AND json_type(args,'$.assignment.key')='text'
+                   AND json_type(args,'$.assignment.brief')='text';
+                 INSERT OR IGNORE INTO assignment_admissions
+                 SELECT substr(key, length('assignment.') + 1),
+                        json_extract(value,'$.cursor')
+                 FROM vars
+                 WHERE scope='global' AND key GLOB 'assignment.*'
+                   AND set_by='owner' AND note='automation assignment cursor'
+                   AND json_type(value,'$.cursor')='text';
+                 INSERT INTO schema_migrations(version) VALUES (80);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;

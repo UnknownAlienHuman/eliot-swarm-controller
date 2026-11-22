@@ -19,7 +19,6 @@ mod scripts;
 mod settings;
 mod status_views;
 
-pub use assignment::AssignmentStatus;
 pub use attribution::WhoWorkerRow;
 pub use capacity::{OwnedExitProof, RecordedProcess, RestartResumeCandidate, RetainedGeneration};
 pub use command_children::{CommandChildrenPage, history_expired};

@@ -28,16 +28,20 @@ use serde_json::Value;
 use std::sync::atomic::Ordering;
 
 impl Router {
-    pub(crate) async fn assignment_status(
-        &self,
-        key: &str,
-        max_busy: u64,
-    ) -> Result<eliot_store::AssignmentStatus> {
+    pub(crate) async fn require_assignment_slot(&self, key: &str, max_busy: u64) -> Result<()> {
         self.inner
             .store
             .lock()
             .await
-            .assignment_status(key, max_busy)
+            .require_assignment_slot(key, max_busy)
+    }
+
+    pub(crate) async fn unadmitted_briefs(
+        &self,
+        key: &str,
+        briefs: Vec<String>,
+    ) -> Result<Vec<String>> {
+        self.inner.store.lock().await.unadmitted_briefs(key, briefs)
     }
 
     pub(crate) async fn is_assignment_event(&self, event: &Event, key: &str) -> Result<bool> {

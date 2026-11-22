@@ -489,10 +489,10 @@ filename and emits one routing-aware launch. In a `worktree`-mode project that l
 gets the standard managed worktree an interactive top-level launch would get, frozen by
 the daemon and prepared by Store in the launch admission; a rule cannot name a worktree
 or base itself. `max_busy` counts unresolved launches,
-linked initial sends and live Agents; an unknown command holds its slot. Store advances
-the filename cursor only in the transaction that admits the durable launch command.
-An unknown launch is never rerouted or replayed. No brief is moved or marked started in
-the filesystem, so a crash or restart leaves the durable cursor and command as authority.
+linked initial sends and live Agents; an unknown command holds its slot. Store records
+the admitted filename in the same transaction as the durable launch command. The name
+stays recorded after restart and command retention. An unknown launch keeps its original
+binding and outcome. The brief and its ready marker stay in the folder.
 This is an automation increment, not a Task/Issue/acceptance engine.
 
 The owner configures a global assignment under `[automation.assignments.<key>]`:
@@ -507,21 +507,32 @@ interval = "30s"
 enabled = true
 ```
 
-`key` is a stable identity; changing it starts a separate cursor. On each interval the
-daemon selects the lexicographically first regular `.md` file whose filename is after the
-retained cursor. New queue entries must sort after the cursor. The folder scan is bounded
-to 500 entries per firing; overflow fails closed rather than skipping an unseen earlier
-brief. Each brief is
+`key` identifies one queue. Write each `.md` brief in the folder, close it, then
+create an empty regular file with the same name in the `.ready` subdirectory,
+such as `.ready/0010-review.md`. Keep the published brief unchanged. A new write requires
+a fresh marker after close. On each interval the daemon selects the
+lexicographically first ready name it has yet to admit, even if it sorts before
+a previously admitted name. It requires the marker to be at least as recent as
+the brief and checks the opened brief's size and modification time across the
+read. The Store admits each exact filename at most once per key.
+
+An upgrade seeds admitted names from retained launch commands and each saved
+legacy cursor. For older names whose launch history has expired, only publish
+briefs you have confirmed are still pending. The marker provides an explicit
+publication step for existing folders.
+
+Each firing scans up to 500 entries in the briefs folder, excluding `.ready`.
+Overflow fails the slot before selection. Each brief is
 limited to the ordinary 64 KiB launch-text bound. Unsafe, oversized or invalid UTF-8
 briefs fail the slot visibly. An unreadable or missing briefs folder fails only that
-assignment's slot with its code. A slot with no next brief advances to the next interval.
-Every scheduled timer slot that is skipped or rejected (no next brief is `not_found`, a
+assignment's slot with its code. A slot with no ready, unadmitted brief advances to the next
+interval. Every scheduled timer slot that is skipped or rejected (no ready brief is `not_found`, a
 routing miss is `routing_unavailable`) commits that code as the timer's `last_outcome`
 with the slot, and an admitted slot clears it, so timer reads show why the last check
 started nothing. A scheduled skip emits `rule.skipped` when its reason changes or
 the slot carries a capacity diagnostic. Repeated skips with the same bare reason
 still advance the timer cursor. A manual run changes neither `last_outcome` nor `last_key`.
-A capacity, provider, workspace or transfer wait keeps the due slot and its brief cursor.
+A capacity, provider, workspace or transfer wait keeps the due slot.
 Settings generate a global interval timer
 rule and an ordinary completion rule. Before admitting cleanup, Store verifies that
 the captured Agent/generation was launched by this assignment's own launch for the
@@ -557,11 +568,11 @@ enablement; pages do not each send a notice.
 `enabled = false` (default true) pauses the assignment at timer admission before
 `settings.save` acknowledges it. An unrelated rules-file parse error can retain the
 previous rule snapshot, and the saved pause still fences fresh scheduled and manual
-admissions. Effective timer reads report the pause. The folder cursor and schedule
+admissions. Effective timer reads report the pause. The admitted names and schedule
 position are retained. The completion rule stays enabled, so Agents already running
 still retire.
-Manual timer runs use the same admission and cursor checks. Multiple firings race
-through the same retained cursor and are serialized by Store's cursor compare-and-swap.
+Manual timer runs use the same ready-marker and admission checks. Store serializes
+simultaneous firings using the unique assignment key and filename.
 The ordinary command ID remains the timer child ID, preserving exact same-ID replay.
 
 The existing Owner timer worker arbitrates due assignments and explicit interactive
@@ -569,8 +580,8 @@ launch intents. It uses the oldest eligible due timer or enqueued intent within 
 project. A timer with an open action keeps its due slot and yields to other work in
 its project until the action settles. Ties between
 assignment timers use their rule IDs. An interactive intent wins an exact timestamp
-tie with a timer. Briefs within an assignment remain in filename order. The cursor
-advances in the same Store transaction as successful admission. A head waiting on
+tie with a timer. Ready, unadmitted briefs within an assignment are considered in
+filename order. A head waiting on
 capacity, a provider, a workspace or transfer keeps its position within its project
 and other projects still get a chance.
 
@@ -580,13 +591,13 @@ attempts the selected model, account and route bindings must still match. The
 manager's Owner-granted priority orders fresh heads from highest to lowest. Within
 each priority tier, projects rotate after the last successful admission. At 30 seconds
 of waiting, heads take precedence in a single project rotation, so repeated priority
-changes cannot keep overtaking them. The selected brief filename, previous cursor, assignment
+changes cannot keep overtaking them. The selected brief filename, assignment
 key and capacity bound accompany the normal launch command for Store validation. Store
 maintains unresolved assignment membership transactionally with command and turn changes.
 It counts indexed unresolved membership, including unresolved launches,
 linked initial sends, and starting, running or unknown native turns. Counting stops
 at `max_busy` and excludes completed history. A terminal turn releases the slot;
-process liveness by itself does not establish completion. Store checks the cursor,
+process liveness by itself does not establish completion. Store checks admission history,
 all applicable capacity bounds and provider holds in the normal launch transaction.
 A full scope keeps the due slot available for the next arbitration pass. Capacity waits
 re-arbitrate on committed `capacity.released` (not on `stop` acceptance), and a

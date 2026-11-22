@@ -1006,7 +1006,7 @@ fn admit_launch_tx(
             params![encode_json(&choice)?, agent_num]
         ));
     }
-    if let Some((goal, cause)) = assignment::commit_cursor_tx(tx, principal, request, now)? {
+    if let Some((goal, cause)) = assignment::record_admission_tx(tx, principal, request)? {
         // A first launch starts generation 1; its Goal binds to it now.
         goals::install_assignment_goal_tx(tx, agent_num, 1, &goal, cause, now)?;
     }

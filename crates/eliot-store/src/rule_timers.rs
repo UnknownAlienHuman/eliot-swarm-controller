@@ -133,7 +133,7 @@ fn derived_manual_timer_id(principal: &str, rule: &str, mutation_id: &str) -> Re
 
 impl Store {
     /// Settings-owned pauses fence new admissions without rewriting the
-    /// retained rule, schedule or assignment cursor.
+    /// retained rule, schedule or assignment admissions.
     pub fn set_paused_assignment_timers(&mut self, rules: &[String]) -> Result<bool> {
         self.ensure_writer_healthy()?;
         let result = (|| {
