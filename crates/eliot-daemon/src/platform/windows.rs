@@ -616,6 +616,16 @@ pub(crate) struct LocalPeer {
 }
 
 impl LocalPeer {
+    pub(crate) fn process_id(&self) -> u32 {
+        self.pid
+    }
+
+    pub(crate) fn image_path(&self) -> Option<String> {
+        self.process
+            .as_ref()
+            .and_then(|process| process_image_path(process.0))
+    }
+
     pub(crate) fn capture(pipe: &tokio::net::windows::named_pipe::NamedPipeServer) -> Option<Self> {
         let mut pid = 0;
         // SAFETY: the accepted pipe instance is live and pid is a writable DWORD.
@@ -1031,7 +1041,7 @@ pub(crate) fn recorded_process_argv(pid: u32, start_time: u64) -> Result<Vec<Str
 
 pub(crate) fn recorded_process_image(pid: u32, start_time: u64) -> Result<PathBuf> {
     let process = verified_process(pid, start_time, 0)?;
-    process_image_basename(process.0)
+    process_image_path(process.0)
         .map(PathBuf::from)
         .ok_or_else(|| Error::new("process_identity", "the daemon executable is unavailable"))
 }
@@ -1199,7 +1209,7 @@ pub(crate) fn resolve_heavy_category(pid: u32) -> Option<CommandClass> {
         return None;
     }
     let process = QueryHandle(process);
-    let image = process_image_basename(process.0).unwrap_or_default();
+    let image = process_image_path(process.0).unwrap_or_default();
     let image_category = eliot_core::classify_heavy_command(&image, &[]);
     if image_category == "unknown" {
         return None;
@@ -1263,7 +1273,7 @@ pub(crate) fn resolve_heavy_category(pid: u32) -> Option<CommandClass> {
     }
 }
 
-fn process_image_basename(process: HANDLE) -> Option<String> {
+fn process_image_path(process: HANDLE) -> Option<String> {
     let mut size: u32 = 32_768;
     let mut name = vec![0u16; size as usize];
     // SAFETY: the buffer holds size UTF-16 units; the kernel writes at most

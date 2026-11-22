@@ -194,7 +194,12 @@ impl Router {
     async fn admit_provider_command(&self, prepared: PreparedSubmission) -> Result<Admission> {
         let admission = {
             let mut store = self.inner.store.lock().await;
-            let admission = self.admit_prepared_submission(&mut store, "owner", prepared, None)?;
+            let admission = self.admit_prepared_submission(
+                &mut store,
+                "owner",
+                prepared,
+                SubmissionContext::default(),
+            )?;
             self.publish_locked(&admission.events);
             admission
         };

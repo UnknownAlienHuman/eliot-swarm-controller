@@ -46,7 +46,12 @@ impl Router {
             let Ok(prepared) = prepared else {
                 return Ok(());
             };
-            let admission = self.admit_prepared_submission(&mut store, "owner", prepared, None)?;
+            let admission = self.admit_prepared_submission(
+                &mut store,
+                "owner",
+                prepared,
+                SubmissionContext::default(),
+            )?;
             self.publish_locked(&admission.events);
             admission
         };

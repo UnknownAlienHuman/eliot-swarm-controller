@@ -58,9 +58,11 @@ impl Router {
         launch.args = args;
         let params = serde_json::to_value(launch)
             .map_err(|_| Error::new("internal", "child.run launch could not be encoded"))?;
-        let submitted: CommandSubmitResponse =
-            serde_json::from_value(self.submit_bound(&params, principal, None).await?)
-                .map_err(|_| Error::new("internal", "child.run launch reply was invalid"))?;
+        let submitted: CommandSubmitResponse = serde_json::from_value(
+            self.submit_bound(&params, principal, Default::default())
+                .await?,
+        )
+        .map_err(|_| Error::new("internal", "child.run launch reply was invalid"))?;
         if submitted.command_id != request.id {
             return Err(Error::new(
                 "unknown",

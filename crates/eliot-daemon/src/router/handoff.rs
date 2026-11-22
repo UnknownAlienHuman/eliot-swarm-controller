@@ -7,6 +7,7 @@ impl Router {
         &self,
         params: &Value,
         principal: &Principal,
+        owner_process: Option<&OwnerProcess>,
     ) -> Result<Value> {
         // Authority lives in the Store: Owner anywhere with claims/Goal/children,
         // or a manager for two workers (never itself) in its own controlled scope
@@ -30,7 +31,13 @@ impl Router {
                     "handoff request contains a known credential",
                 ));
             }
-            let change = store.handoff(&principal_name(principal), &request, &policy, now_ms())?;
+            let change = store.handoff(
+                &principal_name(principal),
+                &request,
+                &policy,
+                owner_process,
+                now_ms(),
+            )?;
             self.publish_locked(&change.events);
             // No await between commit and scheduling: cancellation cannot strand inputs.
             if change.is_new {

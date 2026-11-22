@@ -398,6 +398,13 @@ do not create an audit event, and other RPC results carry call context without
 claiming command-cause attribution. JWTs, OAuth tokens, cookies and owner credentials
 never enter that context or semantic data.
 
+An Owner command's admission event carries `data.owner_process` with the PID
+and executable path observed on the daemon's local connection. For cloud MCP,
+this identifies the local bridge process, while `remote_call` identifies the
+cloud caller. Fields are null when the OS cannot supply them. Queued launches
+retain the original sender, and an idempotent retry leaves the original event
+intact. This metadata is diagnostic.
+
 Session handling is native rmcp negotiation with no override: pre-2026 clients get
 stateful in-memory SDK sessions (`LocalSessionManager`); clients negotiating
 2026-07-28 or later are always served statelessly per SEP-2567, with no session ID

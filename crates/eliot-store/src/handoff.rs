@@ -62,10 +62,11 @@ impl Store {
         principal: &str,
         request: &HandoffRequest,
         policy: &core::SecretPolicy,
+        owner_process: Option<&OwnerProcess>,
         now: i64,
     ) -> Result<HandoffAdmission> {
         self.ensure_writer_healthy()?;
-        let result = self.handoff_inner(principal, request, policy, now);
+        let result = self.handoff_inner(principal, request, policy, owner_process, now);
         self.fault_on_persistence_error(&result);
         result
     }
@@ -75,13 +76,14 @@ impl Store {
         principal: &str,
         request: &HandoffRequest,
         policy: &core::SecretPolicy,
+        owner_process: Option<&OwnerProcess>,
         now: i64,
     ) -> Result<HandoffAdmission> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
-        let change = handoff_tx(
+        let mut change = handoff_tx(
             &tx,
             principal,
             request,
@@ -90,6 +92,7 @@ impl Store {
             self.hierarchy_limits,
             HandoffInput::Brief,
         )?;
+        annotate_owner_events(&tx, &mut change.events, owner_process)?;
         commit_transaction(tx, &self.write_faulted)?;
         Ok(change)
     }

@@ -2302,21 +2302,7 @@ fn caller_identity_from(
     run_values: [Option<std::ffi::OsString>; 2],
     owner_values: [Option<std::ffi::OsString>; 3],
 ) -> Result<ClientIdentity> {
-    // An inherited Agent identity applies only to the daemon that issued it.
-    // When the target data directory differs from the issuing directory, the
-    // Agent credentials are ignored entirely so the call connects as the local
-    // Owner of the target instead of sending a foreign token. Spawns that
-    // predate the issuing-directory marker keep the previous behavior.
-    let raw_has_agent = agent_values.iter().any(Option::is_some);
-    let agent_in_scope = match agent_data_dir
-        .as_ref()
-        .and_then(|value| value.to_str())
-        .filter(|value| !value.is_empty())
-    {
-        None => true,
-        Some(issuing) => identity_data_dirs_equal(target, Path::new(issuing)),
-    };
-    let has_agent = raw_has_agent && agent_in_scope;
+    let has_agent = agent_values.iter().any(Option::is_some) || agent_data_dir.is_some();
     let has_run = run_values.iter().any(Option::is_some);
     let has_owner = owner_values.iter().any(Option::is_some);
     if has_owner || (has_agent && has_run) {
@@ -2327,6 +2313,20 @@ fn caller_identity_from(
     }
 
     if has_agent {
+        if let Some(issuing) = agent_data_dir.as_deref() {
+            if issuing.is_empty() || !Path::new(issuing).is_absolute() {
+                return Err(Error::new(
+                    "not_allowed",
+                    "managed Agent issuing data directory is invalid",
+                ));
+            }
+            if !identity_data_dirs_equal(target, Path::new(issuing)) {
+                return Err(Error::new(
+                    "not_allowed",
+                    "managed Agent credentials belong to another daemon data directory",
+                ));
+            }
+        }
         if agent_values.iter().any(Option::is_none) {
             return Err(Error::new(
                 "not_allowed",

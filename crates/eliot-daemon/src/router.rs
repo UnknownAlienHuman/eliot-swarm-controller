@@ -89,8 +89,9 @@ use eliot_core::{
 };
 use eliot_plugin::{MAX_EVENT_BYTES, sync::LockExt};
 use eliot_store::{
-    Admission, AgentListFilter, ProjectRegistrationInput, RestartResumeCandidate,
-    RuleProcessingState, TimerDefinitionInput, TimerSlotAdmission, TimerSlotCommit,
+    Admission, AgentListFilter, OwnerProcess, ProjectRegistrationInput, RestartResumeCandidate,
+    RuleProcessingState, SubmissionContext, TimerDefinitionInput, TimerSlotAdmission,
+    TimerSlotCommit,
 };
 use serde_json::{Value, json};
 use std::{
@@ -471,6 +472,16 @@ impl Router {
         peer: Option<crate::platform::custody::LocalPeer>,
         log_principal: &mut String,
     ) -> Result<Value> {
+        let owner_process = (matches!(
+            method,
+            "command.submit"
+                | "launch.enqueue"
+                | "project.assignment.launch"
+                | "project.transfer"
+                | "swarm.handoff"
+                | "swarm.switch"
+        ) && wire_params["_auth"]["kind"] == "owner")
+            .then(|| self.owner_process(peer.as_ref()));
         let remote = wire_params
             .get("_auth")
             .and_then(|a| a.get("remote_call"))
@@ -495,8 +506,12 @@ impl Router {
         } else {
             None
         };
+        let context = SubmissionContext {
+            remote: remote.as_ref(),
+            owner_process: owner_process.as_ref(),
+        };
         let result = self
-            .handle_authorized(method, params, principal, remote.as_ref())
+            .handle_authorized(method, params, principal, context)
             .await;
         if let Some(trace) = mcp_trace {
             self.finish_swarm_mcp_tool_call(&trace, result.is_err())
@@ -509,12 +524,27 @@ impl Router {
         })
     }
 
+    fn owner_process(&self, peer: Option<&crate::platform::custody::LocalPeer>) -> OwnerProcess {
+        #[cfg(any(windows, target_os = "linux"))]
+        let (pid, image_path) = (
+            peer.map(|peer| peer.process_id()),
+            peer.and_then(|peer| peer.image_path())
+                .map(|path| self.secret_policy_snapshot().redact_text(&path)),
+        );
+        #[cfg(not(any(windows, target_os = "linux")))]
+        let (pid, image_path) = {
+            let _ = peer;
+            (None, None)
+        };
+        OwnerProcess { pid, image_path }
+    }
+
     async fn handle_authorized(
         &self,
         method: &str,
         params: Value,
         principal: Principal,
-        remote: Option<&eliot_core::RemoteCallContext>,
+        context: SubmissionContext<'_>,
     ) -> Result<Value> {
         authorize_rpc_method(&principal, method)?;
         let _write = if method != "daemon.shutdown" && discovery::is_mutation(method) {
@@ -592,8 +622,8 @@ impl Router {
             "cleanup.plan" => self.cleanup_plan(&params, &principal).await,
             "cleanup.apply" => self.cleanup_apply(&params, &principal).await,
             "command.submit" => {
-                let result = self.submit_bound(&params, &principal, remote).await;
-                self.note_command_submission(&principal, remote, "command.submit", &result);
+                let result = self.submit_bound(&params, &principal, context).await;
+                self.note_command_submission(&principal, context.remote, "command.submit", &result);
                 // Capacity preflight can refuse before a command exists.
                 // Retain diagnostic metadata under the caller's exact ID in
                 // the existing bounded log; this grants no replay authority.
@@ -616,7 +646,7 @@ impl Router {
                 }
                 result
             }
-            "launch.enqueue" => self.enqueue_launch(&params, &principal, remote).await,
+            "launch.enqueue" => self.enqueue_launch(&params, &principal, context).await,
             "launch.intent.get" => self.read_launch_intent(&params, &principal).await,
             "launch.queue" => self.read_launch_queue(&params, &principal).await,
             "project.budget.set" => self.set_manager_budget(&params, &principal).await,
@@ -665,18 +695,28 @@ impl Router {
             "swarm.wait" => self.swarm_wait(&params, &principal).await,
             "swarm.digest" => self.swarm_digest(&params, &principal).await,
             "swarm.reparent" => self.swarm_reparent(&params, &principal).await,
-            "swarm.handoff" => self.swarm_handoff(&params, &principal).await,
-            "swarm.switch" => self.swarm_switch(&params, &principal).await,
+            "swarm.handoff" => {
+                self.swarm_handoff(&params, &principal, context.owner_process)
+                    .await
+            }
+            "swarm.switch" => {
+                self.swarm_switch(&params, &principal, context.owner_process)
+                    .await
+            }
             "chat.organization" => self.chat_organization(&params, &principal).await,
             "chat.attach" => self.chat_attach(&params, &principal).await,
             "chat.detach" => self.chat_detach(&params, &principal).await,
             "chat.tag" => self.chat_tag(&params, &principal).await,
             "command.cancel" => self.command_cancel(&params, &principal).await,
-            "project.transfer" => self.project_transfer(&params, &principal).await,
+            "project.transfer" => {
+                self.project_transfer(&params, &principal, context.owner_process)
+                    .await
+            }
             "project.assignment.get" => self.project_assignment_get(&params, &principal).await,
             "project.assignment.claim" => self.project_assignment_claim(&params, &principal).await,
             "project.assignment.launch" => {
-                self.project_assignment_launch(&params, &principal).await
+                self.project_assignment_launch(&params, &principal, context.owner_process)
+                    .await
             }
             "project.assignment.release" => {
                 self.project_assignment_release(&params, &principal).await
@@ -1386,7 +1426,9 @@ impl Router {
         principal: &Principal,
         method: &'static str,
     ) -> Result<Value> {
-        let result = self.submit_bound(params, principal, None).await;
+        let result = self
+            .submit_bound(params, principal, SubmissionContext::default())
+            .await;
         self.note_command_submission(principal, None, method, &result);
         result
     }
@@ -1395,13 +1437,14 @@ impl Router {
         &self,
         params: &Value,
         principal: &Principal,
-        remote: Option<&eliot_core::RemoteCallContext>,
+        context: SubmissionContext<'_>,
     ) -> Result<Value> {
         let mut request: CommandSubmitRequest =
             eliot_core::api::discovery::decode_params(params.clone())?;
         if request.verb == "git.fetch" {
-            return self.submit_git_fetch(request, principal, remote).await;
+            return self.submit_git_fetch(request, principal, context).await;
         }
+        let remote = context.remote;
         // The internal attention verb is admitted only through
         // `submit_attention_event`; the public path never carries it.
         if request.verb == "attention.emit" {
@@ -1463,7 +1506,7 @@ impl Router {
             let mut store = self.inner.store.lock().await;
             let principal = principal_name(principal);
             let submitted =
-                self.admit_prepared_submission(&mut store, &principal, prepared, remote);
+                self.admit_prepared_submission(&mut store, &principal, prepared, context);
             match submitted {
                 Ok(admission) => {
                     if !admission.events.is_empty() {
@@ -1522,17 +1565,19 @@ impl Router {
         store: &mut eliot_store::Store,
         principal: &str,
         prepared: PreparedSubmission,
-        remote: Option<&eliot_core::RemoteCallContext>,
+        context: SubmissionContext<'_>,
     ) -> Result<Admission> {
         let PreparedSubmission { request, workspace } = prepared;
-        if let Some(admission) = store.replay_command_submission(principal, &request, remote)? {
+        if let Some(admission) =
+            store.replay_command_submission(principal, &request, context.remote)?
+        {
             return Ok(admission);
         }
         self.check_command_admission_mode(&request.verb)?;
         if request.verb == "answer" {
             validate_answer_request(store, &request)?;
         }
-        store.submit_with_remote_context(principal, request, workspace, remote, now_ms())
+        store.submit_with_context(principal, request, workspace, context, now_ms())
     }
 
     fn check_command_admission_mode(&self, verb: &str) -> Result<()> {
@@ -1632,7 +1677,7 @@ impl Router {
         &self,
         request: CommandSubmitRequest,
         principal: &Principal,
-        remote: Option<&eliot_core::RemoteCallContext>,
+        context: SubmissionContext<'_>,
     ) -> Result<Value> {
         request.validate()?;
         let definition = eliot_core::api::discovery::decode_params_at::<GitFetchDefinitionArgs>(
@@ -1668,7 +1713,7 @@ impl Router {
         let admission = {
             let mut store = self.inner.store.lock().await;
             let result =
-                self.admit_prepared_submission(&mut store, &principal_name, prepared, remote);
+                self.admit_prepared_submission(&mut store, &principal_name, prepared, context);
             match result {
                 Ok(admission) => {
                     self.publish_locked(&admission.events);
@@ -1765,7 +1810,7 @@ impl Router {
                 &mut store,
                 &principal_name(&Principal::Owner),
                 prepared,
-                None,
+                SubmissionContext::default(),
             );
             match submitted {
                 Ok(admission) => {

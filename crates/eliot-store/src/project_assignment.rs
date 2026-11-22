@@ -159,6 +159,7 @@ impl Store {
         &mut self,
         request: &ProjectAssignmentLaunchRequest,
         prepared: Result<(SubmitCommand, Option<WorkspacePreparationInput>)>,
+        owner_process: Option<&OwnerProcess>,
         now: i64,
     ) -> Result<Change<ProjectAssignmentResult>> {
         request.validate()?;
@@ -219,7 +220,7 @@ impl Store {
             };
             launch.args["registered_project"] = json!(request.project);
             launch.args[MANAGER_LAUNCH_ARG] = json!(registration.revision);
-            let admission = admission::submit_tx(
+            let mut admission = admission::submit_tx(
                 tx,
                 "owner",
                 launch,
@@ -229,6 +230,7 @@ impl Store {
                 limits,
                 policy.as_deref(),
             )?;
+            annotate_owner_events(tx, &mut admission.events, owner_process)?;
             let bound_path = match adopted_path {
                 Some(workspace) => workspace,
                 None => {

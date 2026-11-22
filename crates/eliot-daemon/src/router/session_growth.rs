@@ -77,7 +77,7 @@ impl Router {
                 self.submit(&action, &Principal::Owner, "daemon.session_growth")
                     .await?;
             } else {
-                self.swarm_switch(&action, &Principal::Owner).await?;
+                self.swarm_switch(&action, &Principal::Owner, None).await?;
             }
         }
         self.report_session_growth(agent, &reaction).await
