@@ -2,6 +2,18 @@ use super::*;
 use eliot_core::api::ProjectManagerIdentity;
 
 impl Store {
+    pub fn has_project_worktree_check_pass(&self, event: &Event) -> Result<bool> {
+        let (Some(agent), Some(generation)) = (event.agent.as_deref(), event.generation) else {
+            return Ok(false);
+        };
+        worktree_check_pass_exists(
+            &self.connection,
+            parse_agent_id(agent)?,
+            generation,
+            event.seq,
+        )
+    }
+
     pub fn record_project_worktree_check_pass(
         &mut self,
         event: &Event,
@@ -47,17 +59,7 @@ impl Store {
         {
             return Ok(empty);
         }
-        let exists: bool = tx
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM events
-              WHERE agent = ?1 AND generation = ?2 AND seq > ?3
-                AND kind = 'project.worktree.check.passed'
-                AND json_extract(data, '$.completion_seq') = ?3)",
-                params![agent, generation, retained.seq],
-                |row| row.get(0),
-            )
-            .map_err(sql_error)?;
-        if exists {
+        if worktree_check_pass_exists(&tx, agent, generation, retained.seq)? {
             return Ok(empty);
         }
         let mut passed = DaemonEventInput::new(
@@ -131,6 +133,24 @@ pub(super) fn rule_launch_insertion_binding(
         request.target.as_deref() == Some(recipient.id.as_str())
             && request.expected_generation == Some(recipient.generation)
     })))
+}
+
+fn worktree_check_pass_exists(
+    connection: &Connection,
+    agent: i64,
+    generation: i64,
+    completion_seq: i64,
+) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM events
+          WHERE agent = ?1 AND generation = ?2 AND seq > ?3
+            AND kind = 'project.worktree.check.passed'
+            AND json_extract(data, '$.completion_seq') = ?3)",
+            params![agent, generation, completion_seq],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)
 }
 
 fn rule_launch_result(

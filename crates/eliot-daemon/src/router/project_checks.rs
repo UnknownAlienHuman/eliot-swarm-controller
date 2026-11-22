@@ -16,7 +16,7 @@ use crate::{
 };
 use eliot_core::{
     Error, Event, Result, SecretPolicy, SubmitCommand,
-    api::{DEFAULT_GOAL_CHECK_TIMEOUT_MS, GoalCostLimit, GoalDefinition},
+    api::{DEFAULT_GOAL_CHECK_TIMEOUT_MS, GoalCostLimit, GoalDefinition, GoalStatus},
 };
 use eliot_plugin::sync::LockExt;
 use serde_json::{Map, Value, json};
@@ -680,7 +680,7 @@ async fn check_after_edit(
         }
         permit = lock.lock_owned() => permit,
     };
-    let work = match load_project_work(router, key, expected_workspace, edit.review.is_some()).await
+    let work = match load_project_work(router, key, expected_workspace, edit.review.as_ref()).await
     {
         Ok(Some(work)) => work,
         Ok(None) => {
@@ -901,11 +901,72 @@ async fn record_worktree_check_pass(router: &Router, key: &WorkKey, event: &Even
     }
 }
 
+pub(super) async fn publish_goal_worktree_pass(
+    router: &Router,
+    seq: i64,
+    fingerprint: &str,
+    definition: &GoalDefinition,
+) {
+    let Ok(events) = router.read_rule_events(seq.saturating_sub(1), seq, 1).await else {
+        return;
+    };
+    let Some(event) = events.first() else {
+        return;
+    };
+    if event.data["worktree"]["fingerprint"] != fingerprint
+        || !wants_checked_review(router, event).await
+    {
+        return;
+    }
+    let (Some(agent), Some(generation), Some(workspace)) = (
+        event.agent.as_deref(),
+        event.generation,
+        event
+            .subject
+            .as_ref()
+            .and_then(|subject| subject.workspace.as_deref()),
+    ) else {
+        return;
+    };
+    let Ok(Some(agent)) = router.inner.store.lock().await.get_agent(agent) else {
+        return;
+    };
+    let Ok(projects) = crate::config::load_project_registration_config(&router.inner.data_root)
+    else {
+        return;
+    };
+    let matches_policy = projects.into_iter().any(|project| {
+        project.id == agent.project
+            && project
+                .policy
+                .and_then(|policy| policy.check)
+                .is_some_and(|check| {
+                    check.at_turn_end == Some(true)
+                        && check.argv == definition.check
+                        && definition
+                            .check_cwd
+                            .as_deref()
+                            .is_none_or(|cwd| cwd == workspace)
+                })
+    });
+    if matches_policy
+        && work_fingerprint(workspace)
+            .await
+            .is_ok_and(|current| current == fingerprint)
+    {
+        let key = WorkKey {
+            agent: agent.id,
+            generation,
+        };
+        record_worktree_check_pass(router, &key, event, &agent.project).await;
+    }
+}
+
 async fn load_project_work(
     router: &Router,
     key: &WorkKey,
     expected_workspace: &str,
-    review: bool,
+    review: Option<&Event>,
 ) -> Result<Option<ProjectWork>> {
     let (agent, registration, opted_out, launch_goal) = {
         let store = router.inner.store.lock().await;
@@ -937,8 +998,20 @@ async fn load_project_work(
         .policy
         .as_ref()
         .and_then(|policy| policy.check.as_ref());
+    let review_after_goal = if let Some(event) = review
+        && project_check.is_some_and(|check| check.at_turn_end == Some(true))
+    {
+        let store = router.inner.store.lock().await;
+        store.goal_get(&key.agent, "eliot")?.is_some_and(|goal| {
+            goal.generation == key.generation
+                && goal.status == GoalStatus::Completed
+                && goal.round_marker.is_none()
+        }) && !store.has_project_worktree_check_pass(event)?
+    } else {
+        false
+    };
     let check = project_check
-        .filter(|check| !opted_out && (review || check.at_turn_end != Some(true)))
+        .filter(|check| !opted_out && (review_after_goal || check.at_turn_end != Some(true)))
         .map(|check| match launch_goal {
             Some(goal) => ProjectWorkCheck {
                 argv: goal.check,
