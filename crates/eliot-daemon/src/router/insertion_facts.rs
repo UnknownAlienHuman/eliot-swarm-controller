@@ -162,11 +162,17 @@ impl Router {
                     && edit.updated_at >= started_at
                     && edit.updated_at <= completed_at
             });
+            // No upper bound: a Goal round commits only while the Agent is
+            // idle, so its check always lands after this turn and covers the
+            // turn's final files. Bounding it by `completed_at` would report a
+            // finished round for this idle point as a missing check.
             let check_ran = check_observed
-                || goal.counters.last_check_at.is_some_and(|checked_at| {
-                    checked_at >= started_at && checked_at <= completed_at
-                });
-            if edited && !check_ran {
+                || goal
+                    .counters
+                    .last_check_at
+                    .is_some_and(|checked_at| checked_at >= started_at);
+            if edited && !check_ran && !self.goal_auto_round_will_check(agent_id, generation).await
+            {
                 facts.push(InsertionFact::NoCheckBeforeEnd);
             }
         }

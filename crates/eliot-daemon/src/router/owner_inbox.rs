@@ -160,6 +160,7 @@ impl Router {
                         }
                         "goal.resume" => self.goal_resume(&action.args, principal).await,
                         "goal.clear" => self.goal_clear(&action.args, principal).await,
+                        "goal.round" => self.goal_round(&action.args, principal).await,
                         _ => Err(Error::new(
                             "internal",
                             "owner inbox produced an unsupported action",
