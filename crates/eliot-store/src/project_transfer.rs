@@ -235,33 +235,39 @@ impl Store {
                     }
                     if value.blockers.is_empty() {
                         db!(tx.execute_batch("SAVEPOINT project_transfer_commit"));
-                        match commit_transfer(tx, &from, &to, &mut value, limits, policy, now, capacity_policy.as_deref()) {
-                            Ok(committed) => {
-                                events = committed;
-                                if value.saved_context.is_some() || task_command.is_some() || !commands.is_empty() {
-                                    let handoff = handoff::handoff_tx(
-                                        tx,
-                                        "owner",
-                                        &HandoffRequest {
-                                            id: ulid::Ulid::new().to_string(),
-                                            from: from.id,
-                                            from_generation: from.generation,
-                                            to: to.id,
-                                            to_generation: to.generation,
-                                            task_command: task_command.clone().unwrap_or_default(),
-                                            commands: commands.clone(),
-                                        },
-                                        policy,
-                                        now,
-                                        limits,
-                                        handoff::HandoffInput::ProjectTransfer {
-                                            saved_context: value.saved_context.as_deref(),
-                                        },
-                                    )?;
-                                    events.extend(handoff.events);
-                                    value.handoff = Some(handoff.value);
-                                }
+                        let mut committed = value.clone();
+                        let attempt = (|| {
+                            let mut events = commit_transfer(tx, &from, &to, &mut committed, limits, policy, now, capacity_policy.as_deref())?;
+                            if committed.saved_context.is_some() || task_command.is_some() || !commands.is_empty() {
+                                let handoff = handoff::handoff_tx(
+                                    tx,
+                                    "owner",
+                                    &HandoffRequest {
+                                        id: ulid::Ulid::new().to_string(),
+                                        from: from.id,
+                                        from_generation: from.generation,
+                                        to: to.id,
+                                        to_generation: to.generation,
+                                        task_command: task_command.clone().unwrap_or_default(),
+                                        commands: commands.clone(),
+                                    },
+                                    policy,
+                                    now,
+                                    limits,
+                                    handoff::HandoffInput::ProjectTransfer {
+                                        saved_context: committed.saved_context.as_deref(),
+                                    },
+                                )?;
+                                events.extend(handoff.events);
+                                committed.handoff = Some(handoff.value);
+                            }
+                            Ok::<_, Error>(events)
+                        })();
+                        match attempt {
+                            Ok(committed_events) => {
                                 db!(tx.execute_batch("RELEASE project_transfer_commit"));
+                                value = committed;
+                                events = committed_events;
                                 value.outcome = ProjectTransferOutcome::Transferred;
                             }
                             Err(error) if matches!(error.code.as_str(), "busy" | "bad_state" | "claim_limit" | "fanout_limit") => {

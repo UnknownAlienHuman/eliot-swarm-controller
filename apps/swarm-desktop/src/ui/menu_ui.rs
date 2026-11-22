@@ -1192,7 +1192,9 @@ fn agent_folder(agent: &UiAgent) -> Option<&str> {
         .filter(|workspace| !workspace.is_empty())
         .or_else(|| {
             let project = agent.project_id.as_str();
-            std::path::Path::new(project).is_absolute().then_some(project)
+            std::path::Path::new(project)
+                .is_absolute()
+                .then_some(project)
         })
 }
 

@@ -330,8 +330,8 @@ fn source_sends(
             Error::new("not_found", format!("selected SEND {id} is not retained"))
         })?;
         let c = &record.command;
-        let fenced_before_dispatch = project_transfer
-            && c.outcome.as_ref().is_some_and(|outcome| {
+        let transferable = if project_transfer {
+            c.outcome.as_ref().is_some_and(|outcome| {
                 outcome.get("successor").is_none()
                     && match c.state {
                         CommandState::Cancelled => outcome["reason"] == "generation_stopped",
@@ -341,12 +341,14 @@ fn source_sends(
                         }
                         _ => false,
                     }
-            });
+            })
+        } else {
+            matches!(c.state, CommandState::Accepted | CommandState::Queued)
+        };
         if c.verb != "send"
             || c.target.as_deref() != Some(&from.id)
             || c.generation != Some(from.generation)
-            || !(matches!(c.state, CommandState::Accepted | CommandState::Queued)
-                || fenced_before_dispatch)
+            || !transferable
             || c.turn_id.is_some()
             || record.expected_turn_id.is_some()
             || c.request_id.is_some()
@@ -356,10 +358,15 @@ fn source_sends(
                 .as_object()
                 .is_none_or(|args| args.len() != 1 || !args.contains_key("text"))
         {
+            let required = if project_transfer {
+                "a plain SEND stopped or fenced before dispatch"
+            } else {
+                "an undispatched plain SEND"
+            };
             return Err(Error::new(
                 "bad_state",
                 format!(
-                    "selected command {id} is not an undispatched plain SEND on {} generation {}",
+                    "selected command {id} must be {required} on {} generation {}",
                     from.id, from.generation
                 ),
             ));
@@ -494,7 +501,9 @@ pub(super) fn handoff_tx(
     }
     project_transfer::require_no_intent(tx, &from.project)?;
     project_transfer::require_no_intent(tx, &to.project)?;
-    if !project_transfer {
+    if project_transfer && from.is_terminal() {
+        require_settled_input(tx, &from, parse_agent_id(&from.id)?)?;
+    } else {
         quiescent(tx, &from, false)?;
     }
     quiescent(tx, &to, true)?;
@@ -706,15 +715,7 @@ pub(super) fn quiescent(tx: &Transaction<'_>, agent: &Agent, destination: bool) 
             ),
         ));
     }
-    if has_unknown_gate(tx, num)? || !send_gate_open(tx, num, agent.generation)? {
-        return Err(Error::new(
-            "busy",
-            format!(
-                "Agent {} generation {} has an unresolved outcome blocking handoff",
-                agent.id, agent.generation
-            ),
-        ));
-    }
+    require_settled_input(tx, agent, num)?;
     let open: Option<String> = tx
         .query_row(
             "SELECT id FROM commands WHERE target=?1 AND
@@ -744,6 +745,19 @@ pub(super) fn quiescent(tx: &Transaction<'_>, agent: &Agent, destination: bool) 
             format!(
                 "Agent {} has an unresolved request blocking handoff",
                 agent.id
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn require_settled_input(tx: &Transaction<'_>, agent: &Agent, num: i64) -> Result<()> {
+    if has_unknown_gate(tx, num)? || !send_outcome_gate_open(tx, num, agent.generation)? {
+        return Err(Error::new(
+            "busy",
+            format!(
+                "Agent {} generation {} has an unresolved outcome blocking handoff",
+                agent.id, agent.generation
             ),
         ));
     }

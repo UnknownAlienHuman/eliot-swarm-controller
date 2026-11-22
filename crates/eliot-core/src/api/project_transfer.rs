@@ -35,7 +35,7 @@ pub enum ProjectTransferAction {
         /// Retained source SEND supplying the original task for the handoff brief.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         task_command: Option<String>,
-        /// Ordered, plain source SENDs with a proven no-effect outcome.
+        /// Ordered plain source SENDs cancelled by stop or refused by transfer drain before dispatch.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         #[schemars(length(max = MAX_HANDOFF_SENDS), extend("uniqueItems" = true))]
         commands: Vec<String>,

@@ -472,9 +472,7 @@ pub fn agent_place_label(agent: &UiAgent, checkouts: &[Checkout]) -> String {
             }
         }
         None => {
-            let fallback = display_path(
-                agent.workspace.as_deref().unwrap_or(&agent.project_id),
-            );
+            let fallback = display_path(agent.workspace.as_deref().unwrap_or(&agent.project_id));
             folder_name(&fallback).to_owned()
         }
     }

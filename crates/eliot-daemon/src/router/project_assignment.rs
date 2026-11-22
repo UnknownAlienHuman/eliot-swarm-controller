@@ -2,8 +2,9 @@ use super::*;
 use eliot_core::api::{
     ProjectAssignmentClaimRequest, ProjectAssignmentGetRequest, ProjectAssignmentLaunchRequest,
     ProjectAssignmentReleaseRequest, ProjectTransferAction, ProjectTransferOutcome,
-    ProjectTransferRequest, discovery::decode_params,
+    ProjectTransferRequest, ProjectTransferResult, discovery::decode_params,
 };
+use eliot_store::Store;
 
 impl Router {
     pub(super) async fn project_transfer(
@@ -18,7 +19,7 @@ impl Router {
         let policy = self.secret_policy_snapshot();
         let source = {
             let store = self.inner.store.lock().await;
-            if let Some(retained) = store.replay_project_transfer(&request, now_ms())? {
+            if let Some(retained) = self.replay_project_transfer(&store, &request)? {
                 return encode_assignment(retained);
             }
             if let ProjectTransferAction::Launch { intent, .. } = &request.action {
@@ -60,7 +61,7 @@ impl Router {
             _ => None,
         };
         let mut store = self.inner.store.lock().await;
-        if let Some(retained) = store.replay_project_transfer(&request, now_ms())? {
+        if let Some(retained) = self.replay_project_transfer(&store, &request)? {
             return encode_assignment(retained);
         }
         if !matches!(request.action, ProjectTransferAction::Cancel { .. })
@@ -89,6 +90,27 @@ impl Router {
         self.signal_progress();
         self.signal_launch_arbitration();
         encode_assignment(change.value)
+    }
+
+    fn replay_project_transfer(
+        &self,
+        store: &Store,
+        request: &ProjectTransferRequest,
+    ) -> Result<Option<ProjectTransferResult>> {
+        let retained = store.replay_project_transfer(request, now_ms())?;
+        if self.inner.mode.load(Ordering::SeqCst) == MODE_OPEN
+            && !store.is_write_faulted()
+            && let Some(handoff) = retained.as_ref().and_then(|value| value.handoff.as_ref())
+        {
+            // Use the same accepted/queued filter as startup recovery. The
+            // Store still gates dispatch by command state and generation.
+            for id in &handoff.children {
+                if let Some(admission) = store.recover_accepted_admission(id)? {
+                    self.schedule_admission(&admission);
+                }
+            }
+        }
+        Ok(retained)
     }
 
     pub(super) async fn project_assignment_get(

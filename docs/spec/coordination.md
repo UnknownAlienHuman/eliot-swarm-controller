@@ -920,9 +920,9 @@ remain unsupported.
   stay project-owned and targeted automation follows current membership.
   Saved continuation context and any expressly selected source SENDs enter the
   ordinary Handoff delivery gate in the same transaction. The Owner may cite a
-  retained original task and select ordered plain SENDs, including inputs that
-  the transfer drain fence rejected during dispatch preflight and inputs the
-  exact source stop cancelled before dispatch. Their successors preserve
+  retained original task and select ordered plain SENDs from the exact source
+  generation that the transfer drain fence rejected during dispatch preflight
+  or that source stop cancelled before dispatch. Their successors preserve
   the original principals and wait for the brief to become Applied. The
   retained handoff parent reports brief delivery and the original-to-successor
   command links. Failed or unknown brief delivery keeps successors queued.
@@ -931,8 +931,10 @@ remain unsupported.
   through ordinary recovery.
 
 The transfer receipt links to the [Handoff](#handoff) command for current
-delivery state. Replaying the transfer reads the same admission and creates no
-new input.
+delivery state. Commit blockers roll back assignment and handoff writes
+together. Exact replay reads the same admission and schedules any accepted or
+queued handoff children while the daemon is open. Dispatch still checks their
+retained state and generation.
 
 ## Handoff
 

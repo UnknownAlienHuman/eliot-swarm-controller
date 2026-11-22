@@ -1835,7 +1835,7 @@ pub(crate) enum ProjectTransferCommand {
         /// Retained source task SEND for the continuation brief.
         #[arg(long)]
         task_command: Option<String>,
-        /// Undispatched source SEND to continue after the brief. Repeat in order.
+        /// Source SEND cancelled by stop or refused by the transfer fence before dispatch. Repeat in order.
         #[arg(long = "command", value_name = "SEND")]
         commands: Vec<String>,
     },

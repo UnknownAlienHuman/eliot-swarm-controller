@@ -5825,6 +5825,15 @@ fn send_gate_open(connection: &Connection, agent_num: i64, generation: i64) -> R
     {
         return Ok(false);
     }
+    send_outcome_gate_open(connection, agent_num, generation)
+}
+
+/// The durable part of the SEND gate also applies after a generation stops.
+fn send_outcome_gate_open(
+    connection: &Connection,
+    agent_num: i64,
+    generation: i64,
+) -> Result<bool> {
     let turn_block: bool = connection
         .query_row(
             "SELECT EXISTS(
