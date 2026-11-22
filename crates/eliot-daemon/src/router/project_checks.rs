@@ -496,9 +496,7 @@ async fn check_after_edit(
     let active_turn = work.agent.active_turn.clone();
     let mut failure = None;
     let mut checked_fingerprint = None;
-    let mut ran_command = false;
     if !work.config.format.is_empty() {
-        ran_command = true;
         match run_argv(
             &work.config.format,
             &work.workspace,
@@ -543,16 +541,16 @@ async fn check_after_edit(
     }
     if failure.is_none() && !work.check.is_empty() {
         let check_input = work_fingerprint(&work.workspace).await.ok();
-        ran_command = true;
         match run_argv(&work.check, &work.workspace, Arc::clone(&policy), shutdown).await {
-            Ok(CheckOutcome::Passed) => {
+            Ok(outcome @ (CheckOutcome::Passed | CheckOutcome::Failed { .. })) => {
                 let after = work_fingerprint(&work.workspace).await.ok();
-                checked_fingerprint = (check_input == after).then_some(after).flatten();
-            }
-            Ok(CheckOutcome::Failed { exit_code, output }) => {
-                failure = Some(format_failure("fast check", exit_code, &output, &policy));
-                let after = work_fingerprint(&work.workspace).await.ok();
-                checked_fingerprint = (check_input == after).then_some(after).flatten();
+                checked_fingerprint =
+                    after.filter(|fingerprint| check_input.as_ref() == Some(fingerprint));
+                if checked_fingerprint.is_some()
+                    && let CheckOutcome::Failed { exit_code, output } = outcome
+                {
+                    failure = Some(format_failure("fast check", exit_code, &output, &policy));
+                }
             }
             Ok(CheckOutcome::Unknown(reason)) => {
                 log_worker(router, "daemon.project_check_unknown", Some(key), &reason);
@@ -599,18 +597,6 @@ async fn check_after_edit(
         }
     }
 
-    if ran_command && checked_fingerprint.is_none() {
-        log_worker(
-            router,
-            "daemon.project_check_fingerprint_unknown",
-            Some(key),
-            "the checked worktree fingerprint could not be confirmed",
-        );
-        return CheckDisposition {
-            uncertain: true,
-            fingerprint: None,
-        };
-    }
     CheckDisposition {
         uncertain: false,
         fingerprint: checked_fingerprint,
