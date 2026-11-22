@@ -365,6 +365,7 @@ pub(super) fn build_report(
         activity,
         observed_at,
         suspicion_window,
+        threshold_basis,
         trigger_event_seq,
         native_status,
         process_observation,
@@ -434,8 +435,15 @@ pub(super) fn build_report(
                 captured.progress_age_ms,
             )
         };
+    let observed_quiet_ms = match kind {
+        IncidentKind::NoProgress => progress_age_ms,
+        IncidentKind::CodeProgress => code_progress_at
+            .and_then(|at| observed_at.checked_sub(at))
+            .filter(|age| *age >= 0),
+        _ => None,
+    };
     AttentionReport {
-        schema: 1,
+        schema: 2,
         incident_id,
         phase,
         reason: kind.as_str().to_owned(),
@@ -447,6 +455,18 @@ pub(super) fn build_report(
         observed_at,
         suspicion_window_ms: suspicion_window
             .and_then(|window| i64::try_from(window.as_millis()).ok()),
+        observed_quiet_ms,
+        normal_quiet_gap_p90_ms: threshold_basis.and_then(|basis| {
+            basis
+                .normal_p90_secs
+                .map(|seconds| seconds.saturating_mul(1_000))
+        }),
+        threshold_configured_ms: threshold_basis
+            .map(|basis| basis.configured_secs.saturating_mul(1_000)),
+        threshold_baseline_ms: threshold_basis
+            .map(|basis| basis.baseline_secs.saturating_mul(1_000)),
+        threshold_history_count: threshold_basis.map(|basis| basis.history_count),
+        threshold_fallback: threshold_basis.map(|basis| basis.fallback),
         last_model_progress_at,
         progress_basis_at,
         progress_age_ms,

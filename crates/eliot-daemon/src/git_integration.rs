@@ -1004,7 +1004,7 @@ pub(crate) async fn execute(
             execute_in_scratch(
                 &git,
                 frozen,
-                (&check.argv, check.deadline_ms),
+                (&check.argv, check.fixed_deadline_ms()),
                 &scratch,
                 run,
             )

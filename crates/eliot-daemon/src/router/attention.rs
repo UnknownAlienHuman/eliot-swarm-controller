@@ -10,7 +10,9 @@ mod sweep;
 
 use super::{Router, StoreHandle};
 use crate::common::now_ms;
-use eliot_core::api::SourceState;
+use eliot_core::api::{
+    AttentionThreshold, AttentionThresholdPair, AttentionThresholdsResponse, SourceState,
+};
 use eliot_core::{Agent, AgentState, Result};
 use eliot_store::CodeProgressState;
 use incidents::{
@@ -26,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use sweep::{
     launch_check, launch_sweep, queue_startup_losses, request_full_reconcile, reserve_incident,
@@ -38,6 +40,9 @@ use tokio::{
 };
 
 const SWEEP_INTERVAL: Duration = Duration::from_secs(15);
+const ATTENTION_THRESHOLD_FLOOR_SECS: i64 = eliot_core::api::MIN_ATTENTION_THRESHOLD_SECS;
+const ATTENTION_THRESHOLD_CACHE_TTL: Duration = Duration::from_secs(30);
+const ATTENTION_THRESHOLD_CACHE_MAX: usize = eliot_core::api::MAX_ATTENTION_THRESHOLD_PAIRS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum IncidentKind {
@@ -103,6 +108,25 @@ struct AttentionState {
     active_reconcile_cursor: usize,
     reserved_incidents: usize,
     config: crate::config::AttentionConfig,
+    threshold_cache: HashMap<AttentionPairKey, CachedAttentionThresholds>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct AttentionPairKey {
+    profile: String,
+    project: String,
+}
+
+#[derive(Clone, Copy)]
+struct CachedAttentionThresholds {
+    thresholds: PairAttentionThresholds,
+    refreshed_at: Instant,
+}
+
+#[derive(Clone, Copy)]
+struct PairAttentionThresholds {
+    no_progress: AttentionThreshold,
+    no_code_progress: AttentionThreshold,
 }
 
 #[derive(Clone)]
@@ -132,6 +156,7 @@ struct ReportContext {
     activity: String,
     observed_at: i64,
     suspicion_window: Option<Duration>,
+    threshold_basis: Option<AttentionThreshold>,
     trigger_event_seq: Option<i64>,
     native_status: NativeStatus,
     process_observation: ProcessObservation,
@@ -172,6 +197,18 @@ struct AttentionReport {
     parent_agent: Option<String>,
     observed_at: i64,
     suspicion_window_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed_quiet_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    normal_quiet_gap_p90_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    threshold_configured_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    threshold_baseline_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    threshold_history_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    threshold_fallback: Option<bool>,
     last_model_progress_at: Option<i64>,
     progress_basis_at: Option<i64>,
     progress_age_ms: Option<i64>,
@@ -259,6 +296,133 @@ enum Trigger {
 
 fn attention_duration(threshold_secs: Option<i64>) -> Duration {
     Duration::from_secs(threshold_secs.unwrap_or(15 * 60) as u64)
+}
+
+fn attention_threshold(samples_ms: &[i64], configured_secs: Option<i64>) -> AttentionThreshold {
+    let configured_secs = configured_secs
+        .unwrap_or(ATTENTION_THRESHOLD_FLOOR_SECS)
+        .max(1);
+    let baseline_secs = configured_secs.max(ATTENTION_THRESHOLD_FLOOR_SECS);
+    let mut samples = samples_ms
+        .iter()
+        .copied()
+        .filter(|sample| *sample >= 0)
+        .take(eliot_core::api::MAX_ATTENTION_HISTORY)
+        .collect::<Vec<_>>();
+    samples.sort_unstable();
+    let history_count = samples.len();
+    let fallback = history_count < eliot_core::api::MIN_ATTENTION_HISTORY;
+    let normal_p90_secs = if fallback {
+        None
+    } else {
+        let nearest_rank = (history_count * 90).div_ceil(100);
+        let p90_ms = samples[nearest_rank - 1];
+        Some(
+            p90_ms
+                .saturating_add(999)
+                .checked_div(1_000)
+                .unwrap_or(0)
+                .min(i64::MAX / 1_000),
+        )
+    };
+    let threshold_secs = baseline_secs
+        .max(normal_p90_secs.unwrap_or_default())
+        .min(i64::MAX / 1_000);
+    AttentionThreshold {
+        threshold_secs,
+        configured_secs,
+        baseline_secs,
+        normal_p90_secs,
+        history_count,
+        fallback,
+    }
+}
+
+fn pair_attention_thresholds(
+    native_gaps_ms: &[i64],
+    git_gaps_ms: &[i64],
+    config: crate::config::AttentionConfig,
+) -> PairAttentionThresholds {
+    PairAttentionThresholds {
+        no_progress: attention_threshold(native_gaps_ms, config.no_progress.threshold_secs),
+        no_code_progress: attention_threshold(git_gaps_ms, config.no_code_progress.threshold_secs),
+    }
+}
+
+async fn pair_thresholds_for_agent(
+    router: &Router,
+    state: &Arc<Mutex<AttentionState>>,
+    agent: &Agent,
+    config: crate::config::AttentionConfig,
+) -> Result<PairAttentionThresholds> {
+    let key = AttentionPairKey {
+        profile: agent.profile.clone(),
+        project: agent.project.clone(),
+    };
+    {
+        let state = state.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(cached) = state.threshold_cache.get(&key)
+            && cached.refreshed_at.elapsed() < ATTENTION_THRESHOLD_CACHE_TTL
+        {
+            return Ok(cached.thresholds);
+        }
+    }
+
+    let (native_gaps_ms, git_gaps_ms) = {
+        let store = router.inner.store.lock().await;
+        let include_git = store.attention_pair_code_eligible(&agent.profile, &agent.project)?;
+        store.attention_quiet_gaps(&agent.profile, &agent.project, include_git)?
+    };
+    let thresholds = pair_attention_thresholds(&native_gaps_ms, &git_gaps_ms, config);
+    let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+    if !state.threshold_cache.contains_key(&key)
+        && state.threshold_cache.len() >= ATTENTION_THRESHOLD_CACHE_MAX
+        && let Some(oldest) = state
+            .threshold_cache
+            .iter()
+            .min_by_key(|(_, cached)| cached.refreshed_at)
+            .map(|(key, _)| key.clone())
+    {
+        state.threshold_cache.remove(&oldest);
+    }
+    state.threshold_cache.insert(
+        key,
+        CachedAttentionThresholds {
+            thresholds,
+            refreshed_at: Instant::now(),
+        },
+    );
+    Ok(thresholds)
+}
+
+impl Router {
+    /// Current profile and project thresholds for doctor.
+    pub(super) async fn attention_thresholds(&self) -> Result<AttentionThresholdsResponse> {
+        let config = self.inner.attention;
+        let mut profile_pairs = {
+            let store = self.inner.store.lock().await;
+            store.attention_profile_pairs(eliot_core::api::MAX_ATTENTION_THRESHOLD_PAIRS + 1)?
+        };
+        let truncated = profile_pairs.len() > eliot_core::api::MAX_ATTENTION_THRESHOLD_PAIRS;
+        profile_pairs.truncate(eliot_core::api::MAX_ATTENTION_THRESHOLD_PAIRS);
+        let mut pairs = Vec::with_capacity(profile_pairs.len());
+        for (profile, project, code_eligible) in profile_pairs {
+            let (native_gaps_ms, git_gaps_ms) = {
+                let store = self.inner.store.lock().await;
+                store.attention_quiet_gaps(&profile, &project, code_eligible)?
+            };
+            let thresholds = pair_attention_thresholds(&native_gaps_ms, &git_gaps_ms, config);
+            pairs.push(AttentionThresholdPair {
+                profile,
+                project,
+                no_progress: thresholds.no_progress,
+                no_code_progress: thresholds.no_code_progress,
+            });
+        }
+        let response = AttentionThresholdsResponse { pairs, truncated };
+        response.validate()?;
+        Ok(response)
+    }
 }
 
 pub(crate) async fn run_attention(
@@ -440,8 +604,6 @@ async fn inspect_agent(
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .config;
-    let no_progress_window = suspicion_window;
-    let no_code_progress_window = attention_duration(config.no_code_progress.threshold_secs);
     let children_window = attention_duration(config.children_unattended.threshold_secs);
     let trigger_event_seq = match trigger {
         Trigger::SourceEvent { event_seq, .. } => Some(event_seq),
@@ -454,6 +616,10 @@ async fn inspect_agent(
     if captured.agent.observe_only {
         return Ok(());
     }
+    let thresholds = pair_thresholds_for_agent(router, &state, &captured.agent, config).await?;
+    let no_progress_window = Duration::from_secs(thresholds.no_progress.threshold_secs as u64);
+    let no_code_progress_window =
+        Duration::from_secs(thresholds.no_code_progress.threshold_secs as u64);
     if captured.agent.state == AgentState::Idle
         && config.session_growth.enabled
         && let Err(error) = router.react_to_session_growth(&captured.agent).await
@@ -472,7 +638,7 @@ async fn inspect_agent(
                 recovery_due: true,
                 ..
             }
-    ) && recovery::recover_active_turn(router, &captured, no_progress_window).await?
+    ) && recovery::recover_active_turn(router, &captured, suspicion_window).await?
     {
         return Ok(());
     }
@@ -506,8 +672,13 @@ async fn inspect_agent(
         )
         .await;
     }
-    let desired = desired_incident(&captured, &config);
-    report_cleared_incidents(router, &state, &captured, no_progress_window).await?;
+    let desired = desired_incident(
+        &captured,
+        &config,
+        no_progress_window,
+        no_code_progress_window,
+    );
+    report_cleared_incidents(router, &state, &captured, thresholds).await?;
 
     let Some((key, _activity)) = desired else {
         return Ok(());
@@ -520,7 +691,8 @@ async fn inspect_agent(
             key.kind,
             IncidentKind::NoProgress | IncidentKind::CodeProgress
         ) {
-            steps::advance_time_ladder(router, &state, &key, &captured, config).await?;
+            steps::advance_time_ladder(router, &state, &key, &captured, config, no_progress_window)
+                .await?;
         }
         return Ok(());
     }
@@ -542,7 +714,12 @@ async fn inspect_agent(
     if after_probe.agent.state == AgentState::Lost && key.kind != IncidentKind::ChildrenUnattended {
         return Ok(());
     }
-    let Some((still_key, still_activity)) = desired_incident(&after_probe, &config) else {
+    let Some((still_key, still_activity)) = desired_incident(
+        &after_probe,
+        &config,
+        no_progress_window,
+        no_code_progress_window,
+    ) else {
         return Ok(());
     };
     if still_key != key
@@ -563,6 +740,11 @@ async fn inspect_agent(
                 IncidentKind::CodeProgress => Some(no_code_progress_window),
                 IncidentKind::ChildrenUnattended => Some(children_window),
                 IncidentKind::SourceUnhealthy => None,
+            },
+            threshold_basis: match key.kind {
+                IncidentKind::NoProgress => Some(thresholds.no_progress),
+                IncidentKind::CodeProgress => Some(thresholds.no_code_progress),
+                IncidentKind::ChildrenUnattended | IncidentKind::SourceUnhealthy => None,
             },
             trigger_event_seq,
             native_status,
@@ -600,7 +782,15 @@ async fn inspect_agent(
         key.kind,
         IncidentKind::NoProgress | IncidentKind::CodeProgress
     ) {
-        steps::advance_time_ladder(router, &state, &key, &after_probe, config).await?;
+        steps::advance_time_ladder(
+            router,
+            &state,
+            &key,
+            &after_probe,
+            config,
+            no_progress_window,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -715,6 +905,7 @@ async fn inspect_lost_agent(
             activity: activity_context(&after_probe),
             observed_at: now_ms(),
             suspicion_window: None,
+            threshold_basis: None,
             trigger_event_seq: Some(event_seq),
             native_status,
             process_observation,

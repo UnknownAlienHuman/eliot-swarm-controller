@@ -10,11 +10,14 @@ use eliot_core::api::{
 };
 use serde::{Deserialize, Serialize};
 
+const MAX_GOAL_CHECK_HISTORY_ROWS: i64 = 8_192;
+
 /// Pre-round facts. The Router evaluates gates from this snapshot; the commit
 /// re-verifies generation, revision and round freshness atomically.
 #[derive(Clone, Debug)]
 pub struct GoalRoundProbe {
     pub view: GoalView,
+    pub project_id: String,
     pub project_default: bool,
     pub agent_state: AgentState,
     pub active_turn: Option<String>,
@@ -41,6 +44,22 @@ pub struct GoalCheckResult {
     pub output_complete: bool,
     pub output_digest: Option<String>,
     pub observation: Option<String>,
+}
+
+/// One successful check attempt, frozen to its project and argv identity.
+#[derive(Clone, Debug)]
+pub struct GoalCheckHistoryEntry {
+    pub project_id: String,
+    pub check_digest: String,
+    pub duration_ms: i64,
+}
+
+/// A current Goal check owned by an Agent on its current project generation.
+#[derive(Clone, Debug)]
+pub struct GoalCheckDeadlineTarget {
+    pub project_id: String,
+    pub agent: String,
+    pub definition: GoalDefinition,
 }
 
 /// One ordinary `send` continuation admitted atomically with the round commit.
@@ -93,6 +112,35 @@ fn goal_set_digest(agent: &str, mode: &str, definition: &GoalDefinition) -> Resu
         "mode": mode,
         "definition": definition,
     }))
+}
+
+fn record_goal_check_history_tx(tx: &Transaction<'_>, entry: &GoalCheckHistoryEntry) -> Result<()> {
+    db!(tx.execute(
+        "INSERT INTO goal_check_history(project_id, check_digest, duration_ms)
+         VALUES (?1, ?2, ?3)",
+        params![entry.project_id, entry.check_digest, entry.duration_ms],
+    ));
+    db!(tx.execute(
+        "DELETE FROM goal_check_history
+         WHERE id IN (
+             SELECT id FROM goal_check_history
+             WHERE project_id = ?1 AND check_digest = ?2
+             ORDER BY id DESC LIMIT -1 OFFSET ?3
+         )",
+        params![
+            entry.project_id,
+            entry.check_digest,
+            core::api::GOAL_CHECK_HISTORY_LIMIT as i64,
+        ],
+    ));
+    db!(tx.execute(
+        "DELETE FROM goal_check_history
+         WHERE id <= (
+             SELECT id FROM goal_check_history ORDER BY id DESC LIMIT 1 OFFSET ?1
+         )",
+        params![MAX_GOAL_CHECK_HISTORY_ROWS],
+    ));
+    Ok(())
 }
 
 fn replay_goal_write<T: serde::de::DeserializeOwned>(
@@ -168,6 +216,11 @@ pub struct GoalRoundCommit {
     /// key itself instead.
     pub claim_seq: i64,
     pub check: Option<GoalCheckResult>,
+    /// Successful command timing and frozen check identity, recorded atomically.
+    pub check_history: Option<GoalCheckHistoryEntry>,
+    /// Deadlines actually passed to the runner for this round's attempts.
+    pub check_timeout_ms: Option<i64>,
+    pub retry_timeout_ms: Option<i64>,
     /// A Router decision for a round that cannot proceed. A scope block may
     /// also override a passing check.
     pub decision: Option<GoalRoundDecision>,
@@ -288,12 +341,15 @@ enum StoredGoalRoundOutcome {
     Failed(Error),
 }
 
+#[allow(clippy::too_many_arguments)]
 fn insert_goal_round_event(
     tx: &Transaction<'_>,
     record: &GoalRoundRecord,
     outcome: GoalRoundEventOutcome,
     reason: Option<String>,
     exit_code: Option<i32>,
+    check_timeout_ms: Option<i64>,
+    retry_timeout_ms: Option<i64>,
     cause: Option<core::EventCause>,
     now: i64,
 ) -> Result<Event> {
@@ -305,6 +361,8 @@ fn insert_goal_round_event(
         outcome,
         reason,
         exit_code,
+        check_timeout_ms,
+        retry_timeout_ms,
     })
     .map_err(|_| Error::new("internal", "could not encode Goal round event"))?;
     let event = DaemonEventInput::new(
@@ -877,6 +935,83 @@ impl Store {
             .transpose()
     }
 
+    /// Current-generation active Eliot Goals, bounded for deadline status.
+    pub fn goal_check_deadline_targets(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<GoalCheckDeadlineTarget>> {
+        self.ensure_committed_reads()?;
+        validate_limit(limit)?;
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT a.id, a.project, g.definition
+                 FROM goals g JOIN agents a ON a.id = g.agent AND a.generation = g.generation
+                 WHERE g.mode = 'eliot' AND json_extract(g.state, '$.status') = 'active'
+                 ORDER BY a.project, a.id LIMIT ?1",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(params![limit as i64], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(sql_error)?;
+        let mut targets = Vec::new();
+        for row in rows {
+            let (agent, project_id, encoded) = row.map_err(sql_error)?;
+            let definition: GoalDefinition = serde_json::from_str(&encoded).map_err(|error| {
+                Error::new(
+                    "source_integrity",
+                    format!("stored Goal is invalid: {error}"),
+                )
+            })?;
+            targets.push(GoalCheckDeadlineTarget {
+                project_id,
+                agent: format_agent_id(agent),
+                definition,
+            });
+        }
+        Ok(targets)
+    }
+
+    /// Newest successful durations for one exact project/argv identity.
+    pub fn goal_check_history(&self, project_id: &str, check_digest: &str) -> Result<Vec<i64>> {
+        self.ensure_committed_reads()?;
+        if project_id.is_empty()
+            || check_digest.len() != 64
+            || !check_digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(Error::new(
+                "invalid",
+                "goal check history identity is invalid",
+            ));
+        }
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT duration_ms FROM goal_check_history
+                 WHERE project_id = ?1 AND check_digest = ?2
+                 ORDER BY id DESC LIMIT ?3",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(
+                params![
+                    project_id,
+                    check_digest,
+                    core::api::GOAL_CHECK_HISTORY_LIMIT as i64,
+                ],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
+        rows.collect::<std::result::Result<Vec<i64>, _>>()
+            .map_err(sql_error)
+    }
+
     /// Read the Goal attached to an ordinary launch before native dispatch.
     pub fn launch_goal_scope_target(&self, agent: &str, launch: &str) -> Result<Option<GoalView>> {
         self.ensure_committed_reads()?;
@@ -1156,6 +1291,7 @@ impl Store {
         let probe = GoalRoundProbe {
             scope_base,
             project_default,
+            project_id: agent_row.project.clone(),
             agent_state: agent_row.state,
             active_turn: agent_row.active_turn.clone(),
             pending_count: agent_row.pending.len(),
@@ -1247,9 +1383,19 @@ impl Store {
         principal: &str,
         request: &GoalRoundRequest,
         error: &Error,
+        check_timeout_ms: Option<i64>,
+        retry_timeout_ms: Option<i64>,
         now: i64,
     ) -> Result<Change<Error>> {
-        self.goal_finish_round_error(principal, request, error, now, true)
+        self.goal_finish_round_error(
+            principal,
+            request,
+            error,
+            check_timeout_ms,
+            retry_timeout_ms,
+            now,
+            true,
+        )
     }
 
     /// Retain the request error without releasing process single-flight.
@@ -1259,16 +1405,29 @@ impl Store {
         principal: &str,
         request: &GoalRoundRequest,
         error: &Error,
+        check_timeout_ms: Option<i64>,
+        retry_timeout_ms: Option<i64>,
         now: i64,
     ) -> Result<Change<Error>> {
-        self.goal_finish_round_error(principal, request, error, now, false)
+        self.goal_finish_round_error(
+            principal,
+            request,
+            error,
+            check_timeout_ms,
+            retry_timeout_ms,
+            now,
+            false,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn goal_finish_round_error(
         &mut self,
         principal: &str,
         request: &GoalRoundRequest,
         error: &Error,
+        check_timeout_ms: Option<i64>,
+        retry_timeout_ms: Option<i64>,
         now: i64,
         release_marker: bool,
     ) -> Result<Change<Error>> {
@@ -1302,6 +1461,8 @@ impl Store {
                     GoalRoundEventOutcome::Unknown,
                     Some(retained.code.clone()),
                     None,
+                    check_timeout_ms,
+                    retry_timeout_ms,
                     None,
                     now,
                 )?);
@@ -2043,6 +2204,17 @@ impl Store {
                 "goal continuation requires a check result",
             ));
         }
+        if commit.check_history.is_some()
+            && commit
+                .check
+                .as_ref()
+                .is_none_or(|check| check.exit_code != Some(0))
+        {
+            return Err(Error::new(
+                "internal",
+                "only a successful check may add Goal check history",
+            ));
+        }
         // A checked round decides its own block, except the Router's scope
         // finding on a passing check, which never carries a continuation.
         let blocked_reason = match &commit.decision {
@@ -2189,6 +2361,20 @@ impl Store {
         }
         let agent_row = load_agent_by_num(&tx, agent_num)?
             .ok_or_else(|| Error::new("not_found", "goal Agent was not found"))?;
+        if let Some(history) = &commit.check_history
+            && (history.duration_ms < 0
+                || history.project_id != agent_row.project
+                || history.check_digest
+                    != core::api::goal_check_digest(
+                        &row.definition.check,
+                        row.definition.check_cwd.as_deref(),
+                    )?)
+        {
+            return Err(Error::new(
+                "stale_round",
+                "Goal check history does not match the frozen project and argv",
+            ));
+        }
         if count_agent_commands(&tx, agent_num, row.generation, true)? > 0 {
             return Err(Error::new(
                 "stale_round",
@@ -2423,6 +2609,9 @@ impl Store {
                 "goal round without a check requires a block or retry decision",
             ));
         };
+        if let Some(history) = &commit.check_history {
+            record_goal_check_history_tx(&tx, history)?;
+        }
         let mut state = row.state;
         state.await_first_turn = false;
         // A zero baseline (no session yet at set) binds the first session seen.
@@ -2490,8 +2679,15 @@ impl Store {
         if state.project_default
             && matches!(outcome, GoalCommitOutcome::Completed)
             && let Some((project, fingerprint)) = &commit.project_check
-            && let Some(event) =
-                project_check_passed_event(&tx, agent_num, &agent_row, project, fingerprint, now)?
+            && let Some(event) = project_check_passed_event(
+                &tx,
+                agent_num,
+                &agent_row,
+                project,
+                fingerprint,
+                commit.retry_timeout_ms.or(commit.check_timeout_ms),
+                now,
+            )?
         {
             events.push(event);
         }
@@ -2555,6 +2751,8 @@ impl Store {
             response.outcome.into(),
             response.reason.clone(),
             commit.check.as_ref().and_then(|check| check.exit_code),
+            commit.check_timeout_ms,
+            commit.retry_timeout_ms,
             state.assignment_cause.clone(),
             now,
         )?);
@@ -2578,6 +2776,7 @@ fn project_check_passed_event(
     agent: &Agent,
     project: &str,
     fingerprint: &str,
+    check_deadline_ms: Option<i64>,
     now: i64,
 ) -> Result<Option<Event>> {
     if agent.project != project
@@ -2621,6 +2820,7 @@ fn project_check_passed_event(
         project: project.to_owned(),
         turn_id,
         fingerprint: fingerprint.to_owned(),
+        check_deadline_ms,
         subject: subject.to_owned(),
     };
     if receipt.validate().is_err() {

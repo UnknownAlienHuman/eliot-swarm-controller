@@ -1676,6 +1676,9 @@ pub(crate) struct GoalSetArgs {
     pub(crate) check_cwd: Option<String>,
     #[arg(long, value_name = "MS")]
     pub(crate) check_timeout_ms: Option<i64>,
+    /// Owner approval for one 10-minute retry after owned process closure is proven.
+    #[arg(long)]
+    pub(crate) check_timeout_retry_safe: bool,
     #[arg(long, value_name = "N")]
     pub(crate) max_turns: Option<i64>,
     #[arg(long, value_name = "N")]

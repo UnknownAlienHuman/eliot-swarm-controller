@@ -32,8 +32,9 @@ pub use digests::{DigestRegisterOutcome, DigestRow, DigestTurn};
 pub use fleet::{AgentListFilter, AgentListPage};
 pub use git::CodeProgressState;
 pub use goals::{
-    GoalCheckResult, GoalCommitOutcome, GoalContinuation, GoalRoundClaim, GoalRoundCommit,
-    GoalRoundCommitResult, GoalRoundDecision, GoalRoundKey, GoalRoundProbe,
+    GoalCheckDeadlineTarget, GoalCheckHistoryEntry, GoalCheckResult, GoalCommitOutcome,
+    GoalContinuation, GoalRoundClaim, GoalRoundCommit, GoalRoundCommitResult, GoalRoundDecision,
+    GoalRoundKey, GoalRoundProbe,
 };
 pub use handoff::HandoffAdmission;
 pub use projects::ProjectRegistrationInput;

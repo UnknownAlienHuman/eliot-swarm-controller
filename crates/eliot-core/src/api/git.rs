@@ -144,6 +144,9 @@ pub struct ProjectCheckPassed {
     pub project: String,
     pub turn_id: String,
     pub fingerprint: String,
+    /// Deadline of the successful attempt. Absent on older receipts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_deadline_ms: Option<i64>,
     /// The first line of the same retained final answer; used verbatim as the
     /// automatic commit subject.
     pub subject: String,
@@ -154,6 +157,12 @@ impl ProjectCheckPassed {
         validate_publish_literal(&self.project, "project", 128)?;
         validate_publish_literal(&self.turn_id, "turn_id", 256)?;
         validate_sha256(&self.fingerprint, "fingerprint")?;
+        if self.check_deadline_ms.is_some_and(|deadline| {
+            !(super::goals::MIN_GOAL_CHECK_TIMEOUT_MS..=super::goals::MAX_GOAL_CHECK_TIMEOUT_MS)
+                .contains(&deadline)
+        }) {
+            return Err(invalid("publication check deadline is out of bounds"));
+        }
         validate_commit_subject(&self.subject)
     }
 }

@@ -445,6 +445,12 @@ impl HarnessDoctorRequest {
         if sampled_turns > super::usage::PROFILE_FIRST_CALL_WINDOW {
             return Err(Error::new("invalid", "doctor context sample is oversized"));
         }
+        if reply.goal_check_deadlines.len() > super::goals::MAX_GOAL_CHECK_DEADLINE_STATUS {
+            return Err(Error::new("invalid", "doctor check history is oversized"));
+        }
+        if let Some(attention) = &reply.attention_thresholds {
+            attention.validate()?;
+        }
         Ok(())
     }
 }
@@ -459,6 +465,10 @@ pub struct HarnessDoctorResponse {
     pub profile_first_calls: Vec<super::usage::ProfileFirstCallInput>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub profile_first_calls_truncated: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub goal_check_deadlines: Vec<super::goals::GoalCheckDeadlineStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_thresholds: Option<super::monitor_views::AttentionThresholdsResponse>,
 }
 
 /// Bounded per-Agent work summary covering Git progress versus frozen `base_oid`

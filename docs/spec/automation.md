@@ -1067,8 +1067,8 @@ Integration performs no remote operations.
 
 `git.publish` is project-rule-only and requires the
 exact `project.check.passed` event. The dedicated event is committed
-atomically with the final project-check success and carries Core `ProjectCheckPassed`
-(`project`, `turn_id`, `fingerprint`, `subject`). Its envelope binds the Agent generation
+atomically with the final project-check success and carries Core `ProjectCheckPassed`,
+including the deadline of the successful check attempt. Its envelope binds the Agent generation
 and workspace. `subject` is the first line of that same retained final answer; the Router
 does not render or accept a rule-supplied commit message.
 
@@ -1579,10 +1579,15 @@ successor revision. Continued and unknown round events supply no idle key.
 
 The check is the frozen explicit argv from `goal set`, run through the shared
 owned-process custody outside the Store lock with a bounded timeout, a small
-round-context stdin and the daemon environment. The timeout accepts 1s through
-10m and defaults to 60s. Its deadline starts immediately before spawning the
-check child, after round preparation. Timeout cleanup and custody settlement use
-their own limits. See the [Goal API bounds](../../crates/eliot-core/src/api/goals.rs#L19-L22).
+round-context stdin and the daemon environment. An explicit check deadline
+of 1–600 seconds in the Goal or its project policy takes precedence. With at
+least three successful runs with the same argv and working-directory
+override in the same project, the default is five times the median of the
+newest twenty successful run durations, clamped to 60–600 seconds. With
+fewer samples the default is 60 seconds. The deadline starts
+immediately before spawning the check child, after round preparation. Timeout
+cleanup and custody settlement use their own limits. `swarm doctor` shows the
+effective deadlines and sample counts.
 
 Both check streams are
 secret-redacted into one bounded observation: labelled `[stdout]` and `[stderr]`
@@ -1609,7 +1614,14 @@ permission errors and resource failures, consume one round and release the marke
 With budget left, the round records `retryable` with reason `check_spawn_retryable`.
 A later eligible idle event, explicit idle round or cadence slot can try the check
 again. The consumed key and mutation id retain the original result.
-A timed-out check with proven closure blocks as `check_timeout`.
+The Owner can set `check_timeout_retry_safe` for a pure direct command
+whose rerun is safe. A change to its argv or working directory requires
+explicit reapproval. When a history-derived deadline expires and
+process-family closure is proven, an approved check gets one more attempt
+in the same round with the 600-second upper bound. The retry uses the existing round reservation and
+admits no Agent input. A timeout with proven closure blocks as
+`check_timeout` when the retry is unavailable or also times out. Unproven
+closure keeps the round excluded under the unknown-outcome rules below.
 A check whose output exceeded the capture limit with proven closure blocks as
 `check_output_limit`. The Goal view retains a bounded, redacted observation with
 the command and the available cause. A blocked check consumes the round reservation

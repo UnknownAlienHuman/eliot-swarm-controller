@@ -102,6 +102,10 @@ engine, second scheduler or critic loop.
 - [x] **Swarm autonomy (#883).** Owner CLI and MCP report windowed Store counts
       with source coverage. A private Claude Haiku and OpenCode run contributed
       native and Swarm facts. The report read an upgraded Store with 600,000 events.
+- [x] **Store-derived deadlines and attention (#873).** Three Claude Haiku
+      checks raised the project deadline. OpenCode's timed-out check passed on
+      one retry in the same Goal round. Doctor showed learned native and Git
+      quiet-gap thresholds, a cold-pair fallback, and explicit deadline priority.
 - [x] **File wake (#833).** OpenCode arms a file condition, ends its turn and
       receives one follow-up when the file appears in its worktree.
 - [x] **Project command guard and shell identity (#833).** OpenCode refuses

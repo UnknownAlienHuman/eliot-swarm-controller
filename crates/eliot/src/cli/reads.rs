@@ -13,9 +13,9 @@ use eliot_core::api::{
     AgentProcessesResponse, AgentResultRequest, AgentResultResponse, AgentStatsRequest,
     AgentStatsResponse, DiagnoseRequest, DiagnoseResponse, EventsBoundsRequest,
     EventsBoundsResponse, EventsFilter, EventsReadRequest, EventsReadResponse,
-    EventsSubscribeRequest, EventsSubscribeResponse, HarnessDoctorRequest, HarnessDoctorResponse,
-    MAX_SWARM_MCP_TURNS, ObservationPage, ObserveHeavyRequest, ObserveHeavyResponse,
-    TurnCounterMissing, UsageSummaryRequest, UsageSummaryResponse,
+    EventsSubscribeRequest, EventsSubscribeResponse, GoalCheckDeadlineSource, HarnessDoctorRequest,
+    HarnessDoctorResponse, MAX_SWARM_MCP_TURNS, ObservationPage, ObserveHeavyRequest,
+    ObserveHeavyResponse, TurnCounterMissing, UsageSummaryRequest, UsageSummaryResponse,
 };
 use eliot_core::api::{AgentSummary, activity_state_name};
 use eliot_core::{AgentState, Error as CoreError};
@@ -495,6 +495,45 @@ pub(crate) fn print_doctor_table(response: &HarnessDoctorResponse) {
             "  Limited to the newest {} retained turn rows",
             eliot_core::api::PROFILE_FIRST_CALL_WINDOW
         );
+    }
+    if !response.goal_check_deadlines.is_empty() {
+        println!("Goal check deadlines");
+    }
+    for check in &response.goal_check_deadlines {
+        let source = match check.source {
+            GoalCheckDeadlineSource::Explicit => "explicit",
+            GoalCheckDeadlineSource::History => "history",
+            GoalCheckDeadlineSource::Fallback => "fallback",
+        };
+        let subject = check.agent.as_deref().unwrap_or("project policy");
+        println!(
+            "  {} / {} / {}  {} ms ({source}, {} successful runs)",
+            check.project_id, subject, check.check_program, check.deadline_ms, check.history_size,
+        );
+    }
+    if let Some(attention) = &response.attention_thresholds
+        && !attention.pairs.is_empty()
+    {
+        println!("Attention thresholds");
+        for pair in &attention.pairs {
+            println!("  {} / {}", pair.project, pair.profile);
+            for (kind, value) in [
+                ("no_progress", pair.no_progress),
+                ("no_code_progress", pair.no_code_progress),
+            ] {
+                let basis = match value.normal_p90_secs {
+                    Some(normal) => format!("p90 {normal} s"),
+                    None => "fallback".to_owned(),
+                };
+                println!(
+                    "    {kind}  {} s ({basis}, {} successful turns)",
+                    value.threshold_secs, value.history_count,
+                );
+            }
+        }
+        if attention.truncated {
+            println!("  Additional profile/project pairs omitted");
+        }
     }
 }
 

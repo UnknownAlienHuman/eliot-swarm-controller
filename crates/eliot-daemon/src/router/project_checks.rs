@@ -127,6 +127,7 @@ pub(super) async fn freeze_launch_goal(
         .or_else(|| request.args.pointer("/assignment/goal"))
         .and_then(Value::as_object);
     let mut defaults = Map::new();
+    let mut retry_approval_identity: Option<(Vec<String>, Option<String>)> = None;
     let project_id = request
         .args
         .get("registered_project")
@@ -162,8 +163,15 @@ pub(super) async fn freeze_launch_goal(
                     &registration,
                 )
                 .await?;
+                let approved_argv = check.argv.clone();
                 defaults.insert("check".to_owned(), json!(check.argv));
-                defaults.insert("check_timeout_ms".to_owned(), json!(check.deadline_ms));
+                if let Some(deadline_ms) = check.deadline_ms {
+                    defaults.insert("check_timeout_ms".to_owned(), json!(deadline_ms));
+                }
+                if check.check_timeout_retry_safe {
+                    defaults.insert("check_timeout_retry_safe".to_owned(), json!(true));
+                    retry_approval_identity = Some((approved_argv, None));
+                }
                 if let Some(max_rounds) = policy.budget.max_rounds {
                     defaults.insert("max_rounds".to_owned(), json!(max_rounds));
                 }
@@ -192,6 +200,18 @@ pub(super) async fn freeze_launch_goal(
         } else {
             merge_tighter_goal_fields(&mut defaults, explicit)?;
         }
+    }
+    if retry_approval_identity.is_some_and(|(approved_argv, approved_cwd)| {
+        defaults.get("check") != Some(&json!(approved_argv))
+            || defaults.get("check_cwd").and_then(Value::as_str) != approved_cwd.as_deref()
+    }) && !(owner
+        && explicit.is_some_and(|goal| {
+            goal.get("check_timeout_retry_safe")
+                .and_then(Value::as_bool)
+                == Some(true)
+        }))
+    {
+        defaults.remove("check_timeout_retry_safe");
     }
     defaults
         .entry("text")
@@ -227,11 +247,20 @@ fn merge_tighter_goal_fields(
                     .as_i64()
                     .filter(|limit| *limit > 0)
                     .ok_or_else(refusal)?;
-                if defaults
+                let baseline = defaults
                     .get(field)
                     .and_then(Value::as_i64)
-                    .is_some_and(|limit| requested > limit)
-                {
+                    .or((field == "check_timeout_ms").then_some(DEFAULT_GOAL_CHECK_TIMEOUT_MS));
+                if baseline.is_some_and(|limit| requested > limit) {
+                    return Err(refusal());
+                }
+            }
+            "check" | "check_cwd" if defaults.get(field).unwrap_or(&Value::Null) != value => {
+                return Err(refusal());
+            }
+            "check_timeout_retry_safe" => {
+                let requested = value.as_bool().ok_or_else(refusal)?;
+                if requested && defaults.get(field).and_then(Value::as_bool) != Some(true) {
                     return Err(refusal());
                 }
             }
@@ -299,6 +328,20 @@ pub(super) fn validate_launch_inputs(args: &Value, owner: bool) -> Result<()> {
         return Err(Error::new(
             "invalid",
             "private chats have no project policy to opt out of",
+        ));
+    }
+    if !owner
+        && args
+            .get("goal")
+            .or_else(|| args.pointer("/assignment/goal"))
+            .and_then(Value::as_object)
+            .and_then(|goal| goal.get("check_timeout_retry_safe"))
+            .and_then(Value::as_bool)
+            == Some(true)
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "only the Owner can approve a Goal check timeout retry",
         ));
     }
     if let Some(goal) = args.get("goal")
@@ -794,12 +837,14 @@ async fn load_project_work(
             Some(goal) => ProjectWorkCheck {
                 argv: goal.check,
                 cwd: goal.check_cwd,
-                deadline_ms: goal.check_timeout_ms,
+                deadline_ms: goal
+                    .check_timeout_ms
+                    .unwrap_or(eliot_core::api::DEFAULT_GOAL_CHECK_TIMEOUT_MS),
             },
             None => ProjectWorkCheck {
                 argv: check.argv.clone(),
                 cwd: None,
-                deadline_ms: check.deadline_ms,
+                deadline_ms: check.fixed_deadline_ms(),
             },
         });
     let configured_argv = json!([

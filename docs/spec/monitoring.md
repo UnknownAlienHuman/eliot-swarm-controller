@@ -735,8 +735,17 @@ native lifecycle source becomes unhealthy or a validated `agent.lost` event is
 committed.
 Those triggers do not wait for the no-progress window. A busy Agent with a
 healthy authoritative source becomes a no-progress suspicion after
-`daemon.attention.no_progress.threshold_secs` (default 900 seconds). This starts the
-reaction ladder for the affected turn.
+the effective `no_progress` window. This starts the reaction ladder for the
+affected turn.
+
+The `no_progress` and `no_code_progress` windows use the 90th percentile
+of the longest quiet gap per turn across the latest twenty successful turns
+of the same profile and project. Turns with an attention incident or
+an intervention are excluded. Each kind needs at least three samples with
+retained source coverage. Its window is at least 900 seconds and at least the
+configured threshold, which together determine the fallback. Reports include
+the observed gap and history basis when available. `swarm doctor` shows the
+windows and the number of successful turns that contributed to each one.
 Stopped Agents do not open source-unhealthy incidents; existing ones retire
 without a recovery claim, while no-progress may still recover on explicit stop.
 
@@ -909,7 +918,11 @@ The work probe runs inside the ordinary Git probe: only after the workspace watc
 
 ### Git-aware attention: no_code_progress
 
-A busy Agent whose tool and message activity continues but whose worktree has had no write and no commit for `daemon.attention.no_code_progress.threshold_secs` gets a distinct `no_code_progress` diagnostic. The window counts from the later of the last write or commit and the active turn's start. Complete model inactivity uses the `no_progress` window.
+A busy Agent whose tool and message activity continues but whose worktree
+has had no write and no commit for the effective `no_code_progress` window
+gets a distinct diagnostic. The window counts from the later of the last
+write or commit and the active turn's start. Complete model inactivity uses
+the `no_progress` window.
 - suppressed for read-only and audit profiles (is_read_only_or_audit_profile) and for Agents without a worktree;
 - requires a current Git observation: while the work probe is unavailable (for example a capped digest), the retained last write or commit time stays history only and no no_code_progress is raised from it;
 - retires as soon as a write or commit lands (last_code_progress_at advances);

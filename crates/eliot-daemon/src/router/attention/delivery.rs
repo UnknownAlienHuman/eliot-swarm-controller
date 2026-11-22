@@ -438,6 +438,34 @@ fn attention_summary(report: &AttentionReport) -> String {
             _ => format!("{agent} has an unhealthy observation source."),
         }
     };
+    let fact = if report.phase == ReportPhase::Incident
+        && matches!(report.reason.as_str(), "no_progress" | "no_code_progress")
+    {
+        let basis = match (
+            report.threshold_fallback,
+            report.threshold_history_count,
+            report.normal_quiet_gap_p90_ms,
+        ) {
+            (Some(true), Some(count), _) => format!(
+                "No p90 yet ({count}/20 valid turns); effective baseline {} s from configured {} s.",
+                report.threshold_baseline_ms.unwrap_or_default() / 1_000,
+                report.threshold_configured_ms.unwrap_or_default() / 1_000,
+            ),
+            (Some(false), Some(count), Some(p90_ms)) => format!(
+                "Normal p90 {} s from {count} successful turns; effective threshold {} s.",
+                p90_ms / 1_000,
+                report.suspicion_window_ms.unwrap_or_default() / 1_000,
+            ),
+            _ => String::new(),
+        };
+        if basis.is_empty() {
+            fact
+        } else {
+            format!("{fact} {basis}")
+        }
+    } else {
+        fact
+    };
     if report.reason == "children_unattended" {
         format!("{fact} Can you check those child turns?")
     } else {

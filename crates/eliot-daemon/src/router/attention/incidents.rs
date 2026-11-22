@@ -237,7 +237,7 @@ pub(super) async fn report_cleared_incidents(
     router: &Router,
     state: &Arc<Mutex<AttentionState>>,
     captured: &CapturedAgent,
-    suspicion_window: Duration,
+    thresholds: super::PairAttentionThresholds,
 ) -> Result<()> {
     retire_stopped_source_incidents(router, state, captured).await;
     // Mail wakes an idle manager and starts/completes a new parent turn. That
@@ -273,21 +273,36 @@ pub(super) async fn report_cleared_incidents(
                 let process_observation = process_observation.as_ref().ok_or_else(|| {
                     Error::new("internal", "recovery process observation is unavailable")
                 })?;
-                let report = build_report(
-                    captured,
-                    key.kind,
-                    ReportContext {
-                        phase: ReportPhase::Recovery,
-                        incident_id: incident.incident_id.clone(),
-                        activity: "condition_cleared".to_owned(),
-                        observed_at: now_ms(),
-                        suspicion_window: (key.kind == IncidentKind::NoProgress)
-                            .then_some(suspicion_window),
-                        trigger_event_seq: None,
-                        native_status: NativeStatus::not_requested(),
-                        process_observation: process_observation.clone(),
-                    },
-                );
+                let report =
+                    build_report(
+                        captured,
+                        key.kind,
+                        ReportContext {
+                            phase: ReportPhase::Recovery,
+                            incident_id: incident.incident_id.clone(),
+                            activity: "condition_cleared".to_owned(),
+                            observed_at: now_ms(),
+                            suspicion_window: match key.kind {
+                                IncidentKind::NoProgress => Some(Duration::from_secs(
+                                    thresholds.no_progress.threshold_secs as u64,
+                                )),
+                                IncidentKind::CodeProgress => Some(Duration::from_secs(
+                                    thresholds.no_code_progress.threshold_secs as u64,
+                                )),
+                                IncidentKind::ChildrenUnattended
+                                | IncidentKind::SourceUnhealthy => None,
+                            },
+                            threshold_basis: match key.kind {
+                                IncidentKind::NoProgress => Some(thresholds.no_progress),
+                                IncidentKind::CodeProgress => Some(thresholds.no_code_progress),
+                                IncidentKind::ChildrenUnattended
+                                | IncidentKind::SourceUnhealthy => None,
+                            },
+                            trigger_event_seq: None,
+                            native_status: NativeStatus::not_requested(),
+                            process_observation: process_observation.clone(),
+                        },
+                    );
                 let delivery = freeze_report(report);
                 let mut state_guard = state.lock().unwrap_or_else(|error| error.into_inner());
                 let Some(current) = state_guard.active.get_mut(&key) else {
@@ -571,6 +586,8 @@ pub(super) async fn deliver_active_incident(
 pub(super) fn desired_incident(
     captured: &CapturedAgent,
     config: &crate::config::AttentionConfig,
+    no_progress_window: Duration,
+    no_code_window: Duration,
 ) -> Option<(IncidentKey, String)> {
     let children_window = super::attention_duration(config.children_unattended.threshold_secs);
     if config.children_unattended.enabled
@@ -601,7 +618,6 @@ pub(super) fn desired_incident(
         ));
     }
 
-    let no_code_window = super::attention_duration(config.no_code_progress.threshold_secs);
     let no_code_threshold_ms = i64::try_from(no_code_window.as_millis()).ok()?;
     if config.no_code_progress.enabled
         && !is_read_only_or_audit_profile(&captured.agent)
@@ -634,7 +650,6 @@ pub(super) fn desired_incident(
     if !config.no_progress.enabled {
         return None;
     }
-    let no_progress_window = super::attention_duration(config.no_progress.threshold_secs);
     let threshold_ms = i64::try_from(no_progress_window.as_millis()).ok()?;
     if captured.agent.state != AgentState::Busy
         || captured.agent.active_turn.is_none()
